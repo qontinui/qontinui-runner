@@ -45,6 +45,38 @@ export const PRIMARY_RUNNER_PORT = 9876;
 /** @param {number} ms */
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** A sleep that ends early when `signal` aborts (and clears its timer). */
+export function abortableSleep(ms, signal = null) {
+  if (!signal) return sleep(ms);
+  return new Promise((r) => {
+    if (signal.aborted) return setImmediate(r);
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      r();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+/** A wait the run's abort signal ended. */
+export class WaitAborted extends Error {
+  constructor(what) {
+    super(`interrupted while waiting for ${what}`);
+    this.name = "WaitAborted";
+  }
+}
+
+/** The supervisor does not list the runner: it is already gone, nothing was stopped. */
+export class RunnerNotListed extends Error {
+  constructor(id) {
+    super(`runner ${id} is not listed by the supervisor; nothing was stopped`);
+    this.name = "RunnerNotListed";
+    this.id = id;
+  }
+}
+
 /**
  * A non-2xx answer or a non-JSON body. The message is exactly what
  * perf-harness's private `httpJson` threw; `status` and `body` are added so a
@@ -190,7 +222,7 @@ export class SupervisorClient {
    */
   async stopRunnerChecked(id, { requesterId } = {}) {
     const row = (await this.runners()).find((r) => r?.id === id);
-    if (!row) throw new Error(`runner ${id} is not listed by the supervisor; nothing was stopped`);
+    if (!row) throw new RunnerNotListed(id);
     if (row.protected === true) throw new Error(`runner ${id} is protected; it was not stopped`);
     if (requesterId && row.requester_id && row.requester_id !== requesterId) {
       throw new Error(`runner ${id} belongs to requester ${row.requester_id}, not ${requesterId}; it was not stopped`);
@@ -253,12 +285,13 @@ export class SupervisorClient {
    */
   async awaitSpawn(
     submissionId,
-    { timeoutMs = 45 * 60_000, pollMs = 5000, sleepFn = sleep, now = Date.now } = {},
+    { timeoutMs = 45 * 60_000, pollMs = 5000, signal = null, sleepFn = (ms) => abortableSleep(ms, signal), now = Date.now } = {},
   ) {
     const deadline = now() + timeoutMs;
     let lastError = null;
     let lastState = "unknown";
     while (now() < deadline) {
+      if (signal?.aborted) throw new WaitAborted(`spawn submission ${submissionId} (last state ${lastState})`);
       let sub = null;
       try {
         sub = await this.buildStatus(submissionId);
@@ -537,10 +570,11 @@ export class RunnerClient {
    *   `alive` returns false once the launched process has exited (fail fast)
    * @returns {Promise<object>} the `/health` data that showed readiness
    */
-  async waitUiBridgeReady(timeoutMs, { alive = () => true, sleepFn = sleep, now = Date.now } = {}) {
+  async waitUiBridgeReady(timeoutMs, { alive = () => true, signal = null, sleepFn = (ms) => abortableSleep(ms, signal), now = Date.now } = {}) {
     const deadline = now() + timeoutMs;
     let last = "no answer yet";
     while (now() < deadline) {
+      if (signal?.aborted) throw new WaitAborted(`runner ${this.baseUrl} to become ready (${last})`);
       if (!alive()) throw new Error(`runner ${this.baseUrl} exited before becoming ready (${last})`);
       let responsive = false;
       try {

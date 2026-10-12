@@ -96,18 +96,22 @@ export function slotsWithFirstMarker(genDir) {
  *
  * @param {string} genDir
  * @param {number} n
- * @param {{timeoutMs?: number, sleepFn?: (ms: number) => Promise<void>, now?: () => number}} [o]
+ * @param {{timeoutMs?: number, sleepFn?: (ms: number) => Promise<void>, now?: () => number,
+ *   signal?: AbortSignal}} [o] `signal`: the run's abort; the wait ends at it, not ok
  * @returns {Promise<{ok: boolean, ready: number[], slots: number, detail: string}>}
  */
 export async function waitForGenerators(
   genDir,
   n,
-  { timeoutMs = 60000, sleepFn = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {},
+  { timeoutMs = 60000, sleepFn = (ms) => abortableSleep(ms, signal), now = Date.now, signal = null } = {},
 ) {
   const deadline = now() + timeoutMs;
   let ready = new Set();
   let slots = new Map();
   while (now() < deadline) {
+    if (signal?.aborted) {
+      return { ok: false, ready: [...ready].sort((a, b) => a - b), slots: slots.size, detail: `the run was interrupted while waiting for ${n} generator(s) (${ready.size} painting)` };
+    }
     slots = readSlots(genDir);
     ready = slotsWithFirstMarker(genDir);
     if (ready.size >= n) break;
@@ -124,6 +128,20 @@ export async function waitForGenerators(
   };
 }
 
+/** A sleep that ends early when `signal` aborts (and clears its timer). */
+export function abortableSleep(ms, signal = null) {
+  return new Promise((r) => {
+    if (signal?.aborted) return setImmediate(r);
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      r();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
 /**
  * Wait for a NEW slot (beyond `known`) whose generator reported `hostId` — how a
  * session added by `spawnOne` is matched to its slot. Falls back to the first new
@@ -134,10 +152,10 @@ export async function waitForGenerators(
 export async function waitForNewSlot(
   genDir,
   known,
-  { key = null, hostId = null, tCmdNs = 0n, timeoutMs = 30000, sleepFn = (ms) => new Promise((r) => setTimeout(r, ms)) } = {},
+  { key = null, hostId = null, tCmdNs = 0n, timeoutMs = 30000, signal = null, sleepFn = (ms) => abortableSleep(ms, signal) } = {},
 ) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !signal?.aborted) {
     const slots = readSlots(genDir);
     const fresh = [...slots.values()].filter((s) => !known.has(s.slot));
     const exact = key && hostId ? fresh.find((s) => s.host_terminal_id?.[key] === hostId) : null;

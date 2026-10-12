@@ -248,16 +248,37 @@ export function buildResultSchema() {
           id: { enum: [...SETUP_IDS] },
           variant: { type: "string", pattern: "^[a-z0-9][a-z0-9-]*$" },
           app_version: orAbsent({ type: "string", minLength: 1 }),
-          build: orAbsent({
-            type: "object",
-            required: ["commit", "source", "role"],
-            additionalProperties: false,
-            properties: {
-              commit: { type: "string", pattern: "^[0-9a-f]{40}$" },
-              source: { enum: ["worktree", "git_ref", "artifact", "installed"] },
-              role: { enum: ["head", "baseline", "single"] },
-            },
-          }),
+          // A proven build; an UNPROVEN one (unknown, but still the head or
+          // baseline the unit was FOR, so A/B rows stay distinct — the row carries
+          // the unknown_build label and is never compared, D12); or an absence.
+          build: {
+            anyOf: [
+              {
+                type: "object",
+                required: ["commit", "source", "role"],
+                additionalProperties: false,
+                properties: {
+                  commit: { type: "string", pattern: "^[0-9a-f]{40}$" },
+                  source: { enum: ["worktree", "git_ref", "artifact", "installed"] },
+                  role: { enum: ["head", "baseline", "single"] },
+                },
+              },
+              {
+                type: "object",
+                required: ["state", "reason", "role"],
+                additionalProperties: false,
+                properties: {
+                  state: { const: "unknown" },
+                  reason: ref("reason"),
+                  detail: { type: "string", minLength: 1 },
+                  role: { enum: ["head", "baseline", "single"] },
+                  requested_commit: { type: "string", pattern: "^[0-9a-f]{40}$" },
+                  requested_source: { enum: ["worktree", "git_ref", "artifact", "installed"] },
+                },
+              },
+              ref("absent"),
+            ],
+          },
           settings_digest: orAbsent(ref("sha256")),
           pty_host_impl: orAbsent({ enum: [...PTY_HOST_IMPLS] }),
           render_backend: orAbsent({ type: "string", pattern: SNAKE }),

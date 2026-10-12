@@ -37,8 +37,13 @@ function jwtPayload(token) {
   }
 }
 
-/** The first device JWT that is still live for at least 30 s: `$COORD_DEVICE_JWT`, then the file. */
-export function liveDeviceToken({ env = process.env, home = homedir(), read = readFileSync, now = Date.now } = {}) {
+/** How to get a live device JWT back, for a refusal that found none. */
+export const DEVICE_TOKEN_REFRESH =
+  "device JWTs live about 4 h: export a fresh one as $COORD_DEVICE_JWT, or rewrite ~/.qontinui/coord-device-jwt " +
+  "(a signed-in local runner mints one through its UI Bridge), then run the doctor again";
+
+/** Every device JWT offered: `$COORD_DEVICE_JWT`, then the file. */
+function deviceTokenCandidates({ env, home, read }) {
   const candidates = [];
   if (typeof env.COORD_DEVICE_JWT === "string" && env.COORD_DEVICE_JWT.trim()) candidates.push(env.COORD_DEVICE_JWT.trim());
   try {
@@ -47,7 +52,12 @@ export function liveDeviceToken({ env = process.env, home = homedir(), read = re
   } catch {
     // no file token
   }
-  for (const t of candidates) {
+  return candidates;
+}
+
+/** The first device JWT that is still live for at least 30 s: `$COORD_DEVICE_JWT`, then the file. */
+export function liveDeviceToken({ env = process.env, home = homedir(), read = readFileSync, now = Date.now } = {}) {
+  for (const t of deviceTokenCandidates({ env, home, read })) {
     const p = jwtPayload(t);
     if (p && (typeof p.exp !== "number" || p.exp * 1000 > now() + 30000)) return t;
   }
@@ -83,7 +93,15 @@ export async function readDeviceDrain({
   }
   const token = liveDeviceToken({ env, home, read, now });
   if (!token) {
-    return { state: "unknown", detail: "no live device JWT ($COORD_DEVICE_JWT or ~/.qontinui/coord-device-jwt) to read this device's drain with" };
+    const offered = deviceTokenCandidates({ env, home, read }).length;
+    return {
+      state: "unknown",
+      detail:
+        (offered > 0
+          ? `the device JWT(s) offered ($COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt) are expired or unreadable, so this device's drain cannot be read`
+          : "no device JWT ($COORD_DEVICE_JWT or ~/.qontinui/coord-device-jwt) to read this device's drain with") +
+        `; to refresh: ${DEVICE_TOKEN_REFRESH}`,
+    };
   }
   const base = String(env.COORD_HTTP_URL || DEFAULT_COORD_URL).replace(/\/+$/, "");
   try {

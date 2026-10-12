@@ -11,6 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -265,4 +266,36 @@ test("an invalid results file is reported by path and keyword only, never with t
   assert.match(text, /^INVALID: /m);
   assert.match(text, /\/rows\/1\/kpis\/jank_share\/value \[maximum\]/);
   assert.doesNotMatch(text, /143/, "a third-party reading never reaches the log (D7)");
+});
+
+test("the bench job's Doctor step writes its summary when the doctor blocks, then fails with its exit code (review round 2 nit 2)", (t) => {
+  const yml = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", ".github", "workflows", "termhost-bench.yml"), "utf8");
+  const at = yml.indexOf("node scripts/termhost-bench/cli.mjs doctor");
+  assert.ok(at > 0, "the step runs the bench doctor");
+  const runAt = yml.lastIndexOf("run: |\n", at);
+  const lines = yml.slice(runAt + "run: |\n".length).split("\n");
+  const indent = lines[0].match(/^ */)[0].length;
+  const body = [];
+  for (const l of lines) {
+    if (l.trim() !== "" && l.match(/^ */)[0].length < indent) break;
+    body.push(l.slice(indent));
+  }
+  const tmp = mkdtempSync(join(tmpdir(), "tb-step-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const fakeNode = join(tmp, "fake-node.sh").replace(/\\/g, "/");
+  writeFileSync(fakeNode, 'echo "BLOCKED device.drain UNKNOWN"\nexit 3\n');
+  // The step as written, with the doctor replaced by one that blocks (exit 3).
+  const script = body.join("\n").replace("node scripts/termhost-bench/cli.mjs doctor", `sh "${fakeNode}" doctor`);
+  writeFileSync(join(tmp, "step.sh"), script);
+  const summary = join(tmp, "summary.md").replace(/\\/g, "/");
+  const res = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", join(tmp, "step.sh").replace(/\\/g, "/")], {
+    cwd: tmp,
+    env: { ...process.env, GITHUB_STEP_SUMMARY: summary, RUNNER_TEMP: tmp.replace(/\\/g, "/"), GITHUB_WORKSPACE: tmp.replace(/\\/g, "/") },
+    encoding: "utf8",
+  });
+  if (res.error) return t.skip(`no bash here: ${res.error.message}`);
+  assert.equal(res.status, 3, res.stderr);
+  const md = readFileSync(summary, "utf8");
+  assert.match(md, /### termhost-bench doctor \(linux-xvfb\)/);
+  assert.match(md, /BLOCKED device\.drain UNKNOWN/);
 });

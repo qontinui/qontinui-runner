@@ -402,6 +402,11 @@ export const PROGRESS_INTERVAL_MS = 500;
  * a `write` blocks it, and the time spent inside a write is added to `blocked_ns`
  * only when the write RETURNS. A write that never returns, or fails when teardown
  * closes the PTY, leaves no trace in the counters at all (`timedWrite`).
+ *
+ * The rule is a heuristic and a lower bound on what it detects: only stretches
+ * over this threshold are seen at all, and a stretch it does see is attributed to
+ * a write the host was not draining although a GC pause or CPU starvation of the
+ * generator's process looks the same from its records.
  */
 export const RECORD_GAP_MS = 2 * PROGRESS_INTERVAL_MS;
 
@@ -470,8 +475,9 @@ export function generatorWindow(gens, win) {
   if (gaps.length > 0) {
     notes.push(
       `producer_stall_pct: ${gaps.length} session(s) ran no JavaScript for part of the window ` +
-        `(${gaps.map((x) => `session ${x.session}: ${Math.round(x.ms)} ms`).join(", ")}): counted as blocked, ` +
-        "because a generator that writes no record for that long is inside a write the host is not draining",
+        `(${gaps.map((x) => `session ${x.session}: ${Math.round(x.ms)} ms`).join(", ")}): counted as blocked. ` +
+        `Only gaps over ${RECORD_GAP_MS} ms are seen, so this is a lower bound on such stretches; each is most likely a write ` +
+        "the host was not draining, but a GC pause or CPU starvation of the generator looks the same in its records",
     );
   }
   if (clamped > 0) notes.push(`producer_stall_pct: ${clamped} session stall reading(s) above 100% were clamped (a write straddling a record)`);

@@ -65,11 +65,12 @@ import net from "node:net";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
-import { HttpError, PRIMARY_RUNNER_PORT, RunnerClient, SupervisorClient, httpJson, sleep, unwrap } from "../../lib/runner-clients.mjs";
+import { HttpError, PRIMARY_RUNNER_PORT, RunnerClient, RunnerNotListed, SupervisorClient, httpJson, sleep, unwrap } from "../../lib/runner-clients.mjs";
 import { ECHO_REGION, MARKER_KINDS, markerOverlay, markerSeq } from "../marker.mjs";
 import { platformDirs } from "../neutrality.mjs";
 import { listProcesses, startKeyCompare, terminatePid, terminateTree } from "../proc.mjs";
 import { assertInside, commandLine } from "../rundir.mjs";
+import { unprovenBuild } from "../results.mjs";
 import { percentile } from "../stats.mjs";
 import { AdapterRefusal, rowMajorOrder } from "./index.mjs";
 
@@ -485,6 +486,7 @@ export class RunnerAdapter {
    */
   async launch(ctx) {
     this.ctx = ctx;
+    this.abortSignal = ctx.signal ?? null;
     const fixes = checkFixCommits(this.build.commit, { repoRoot: this.repoRoot, run: this.run });
     if (fixes.state !== "OPERATIVE") throw new AdapterRefusal("harness_error", `refusing the build: ${fixes.reason}`);
     if (this.mode === "subject") await this.launchSubject(ctx);
@@ -492,7 +494,7 @@ export class RunnerAdapter {
     this.client = new RunnerClient(`http://127.0.0.1:${this.port}`, this.log, this.fetch ? { fetch: this.fetch } : {});
     const alive = () => (this.child ? this.childExit === null : true);
     try {
-      this.health = await this.client.waitUiBridgeReady(this.readyTimeoutMs, { alive });
+      this.health = await this.client.waitUiBridgeReady(this.readyTimeoutMs, { alive, signal: this.abortSignal });
     } catch (e) {
       throw new AdapterRefusal("harness_error", `${e.message}${this.refusalLogText()}`);
     }
@@ -610,7 +612,7 @@ export class RunnerAdapter {
     this.log(`runner: spawn-test queued ${queued.submission_id} -> ${queued.id} on :${queued.port}`);
     let outcome;
     try {
-      outcome = await sup.awaitSpawn(queued.submission_id, { timeoutMs: this.buildTimeoutMs });
+      outcome = await sup.awaitSpawn(queued.submission_id, { timeoutMs: this.buildTimeoutMs, signal: this.abortSignal });
     } catch (e) {
       const found = await this.recoverLostSpawn(sup);
       throw new AdapterRefusal("harness_error", `${e.message.slice(0, 300)}${found ? `; temp runner ${found.id} will be stopped` : ""}`);
@@ -1167,7 +1169,10 @@ export class RunnerAdapter {
       build:
         commit && /^[0-9a-f]{40}$/.test(commit)
           ? { commit, source: this.build.source ?? (this.mode === "supervisor" ? (this.build.gitRef ? "git_ref" : "worktree") : "artifact"), role: this.build.role }
-          : { state: "unknown", reason: "harness_error", detail: "the build's commit could not be proven (D12)" },
+          : unprovenBuild(
+              { ...this.build, source: this.build?.source ?? (this.mode === "supervisor" ? (this.build?.gitRef ? "git_ref" : "worktree") : "artifact") },
+              "the build's commit could not be proven from the running binary (D12)",
+            ),
       settings_digest: this.settingsDigest(),
       pty_host_impl: this.platform === "win32" ? { state: "unknown", reason: "not_instrumented", detail: "the Windows PTY host census arrives with Phase 4" } : "unix_pty",
       render_backend: this.facts.renderBackend ?? { state: "unknown", reason: "harness_error", detail: "not read" },
@@ -1424,6 +1429,31 @@ export class RunnerAdapter {
     return out;
   }
 
+  /**
+   * A second signal's last act (no full teardown follows): stop the temp runner whose
+   * supervisor id is already known, through the same checked stop teardown uses, or
+   * signal a subject child whose identity was proven by its start key. Returns what
+   * it did, or null when there was nothing known to stop.
+   *
+   * @returns {Promise<string | null>}
+   */
+  async emergencyStop() {
+    if (this.mode === "supervisor" && this.supervisorRunnerId) {
+      try {
+        await this.supervisor.stopRunnerChecked(this.supervisorRunnerId, { requesterId: this.requesterId });
+      } catch (e) {
+        if (e instanceof RunnerNotListed) return `temp runner ${this.supervisorRunnerId} already gone`;
+        throw e;
+      }
+      return `stopped temp runner ${this.supervisorRunnerId}`;
+    }
+    if (this.mode === "subject" && Number.isInteger(this.pid) && this.childExit === null && this.startKey) {
+      const res = await terminateTree({ pid: this.pid, startKey: this.startKey }, { list: this.list, ...(this.kill ? { kill: this.kill } : {}) });
+      return `signalled subject runner pid ${this.pid} (${res.signalled.length} process(es))`;
+    }
+    return null;
+  }
+
   async teardown() {
     const closed = [];
     const survivors = [];
@@ -1446,7 +1476,10 @@ export class RunnerAdapter {
         await this.supervisor.stopRunnerChecked(this.supervisorRunnerId, { requesterId: this.requesterId });
         closed.push(`temp runner ${this.supervisorRunnerId}`);
       } catch (e) {
-        survivors.push({ what: `temp runner ${this.supervisorRunnerId}`, detail: `stop failed: ${e.message.slice(0, 200)}` });
+        // No longer listed: the runner is gone (stopped earlier, or reaped), which is
+        // what teardown wanted — closed, not a survivor.
+        if (e instanceof RunnerNotListed) closed.push(`temp runner ${this.supervisorRunnerId} (already gone: not listed)`);
+        else survivors.push({ what: `temp runner ${this.supervisorRunnerId}`, detail: `stop failed: ${e.message.slice(0, 200)}` });
       }
       // Read back: the temp runner is gone, or at least no longer running.
       try {

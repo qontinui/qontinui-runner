@@ -63,7 +63,7 @@ export function renderReport(doc) {
   for (const rows of groups.values()) {
     const s = rows[0].setup;
     lines.push(
-      `### ${s.id}${s.variant !== "default" ? `/${s.variant}` : ""}${s.build?.role ? ` (${s.build.role} ${s.build.commit?.slice(0, 12) ?? ""})` : ""}`,
+      `### ${s.id}${s.variant !== "default" ? `/${s.variant}` : ""}${s.build?.role ? ` (${s.build.role} ${s.build.state ? "unproven build" : (s.build.commit?.slice(0, 12) ?? "")})` : ""}`,
       "",
       `app ${absentText(s.app_version)}; launch ${s.launch_mode}; pty host ${absentText(s.pty_host_impl)}; render ${absentText(s.render_backend)}; ` +
         `holder ${absentText(s.pty_holder)}; shell ${s.session_shell} (${absentText(s.shell_integration)})`,

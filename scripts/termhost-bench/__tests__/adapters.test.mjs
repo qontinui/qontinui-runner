@@ -16,7 +16,8 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { HttpError } from "../../lib/runner-clients.mjs";
+import { HttpError, RunnerClient, SupervisorClient, WaitAborted } from "../../lib/runner-clients.mjs";
+import { waitForGenerators, waitForNewSlot } from "../sessions.mjs";
 import { OPTIONAL_METHODS, REQUIRED_METHODS, assertAdapter, createAdapter, rowMajorOrder } from "../adapters/index.mjs";
 import {
   DECLINE_LABELS,
@@ -804,4 +805,70 @@ test("the coord read-back waits out a grace period before calling a session left
   assert.equal(stays.r.incidents.length, 1);
   assert.equal(stays.r.incidents[0].kind, "coord_session_left_open");
   assert.ok(stays.reads >= 7, `read until the grace ran out (${stays.reads} reads)`);
+});
+
+test("an unproven build keeps its role and requested commit, never a proven commit (review round 2 M1)", () => {
+  // The review's reproduction (review-p3/describe-role.mjs).
+  for (const [role, c] of [["head", "a"], ["baseline", "b"]]) {
+    const a = new RunnerAdapter({ mode: "subject", build: { role, commit: c.repeat(40), exe: "x", source: "artifact" }, repoRoot: ".", platform: "linux", list: () => new Map() });
+    const b = a.describe().build;
+    assert.equal(b.state, "unknown");
+    assert.equal(b.role, role);
+    assert.equal(b.requested_commit, c.repeat(40));
+    assert.equal(b.requested_source, "artifact");
+    assert.equal(b.commit, undefined);
+  }
+  const sup = new RunnerAdapter({ mode: "supervisor", build: { role: "head", gitRef: "main" }, repoRoot: ".", platform: "linux", list: () => new Map() });
+  assert.deepEqual(
+    [sup.describe().build.role, sup.describe().build.requested_source, sup.describe().build.requested_commit],
+    ["head", "git_ref", undefined],
+    "a ref that is not a commit is not quoted as one",
+  );
+  const short = new RunnerAdapter({ mode: "subject", build: { role: "head", commit: "deadbeef", exe: "x", source: "artifact" }, repoRoot: ".", platform: "linux", list: () => new Map() });
+  assert.equal(short.describe().build.requested_commit, undefined, "an abbreviated sha is not a 40-hex commit, so it is not carried");
+});
+
+test("teardown counts a temp runner the supervisor no longer lists as closed, not a survivor (review round 2 nit 1)", async () => {
+  const sup = fakeSupervisor({ lost: false, runners: [] });
+  const a = new RunnerAdapter({ mode: "supervisor", build: { role: "single", commit: "a".repeat(40), gitRef: "a".repeat(40) }, repoRoot: ".", fetch: sup.fetch });
+  a.supervisor = new SupervisorClient("http://127.0.0.1:9875", () => {}, { fetch: sup.fetch });
+  a.supervisorRunnerId = "test-9883";
+  a.requesterId = "termhost-bench-r-n1";
+  const td = await a.teardown();
+  assert.equal(sup.calls.includes("POST /runners/test-9883/stop"), false, "nothing to stop");
+  assert.deepEqual(td.survivors, []);
+  assert.ok(td.closed.some((c) => /test-9883 \(already gone: not listed\)/.test(c)), JSON.stringify(td.closed));
+});
+
+test("emergencyStop stops a known temp runner by its checked stop, and does nothing without one (review round 2 nit 5)", async () => {
+  const requester = "termhost-bench-r-n5";
+  const sup = fakeSupervisor({ lost: false, runners: [{ id: "test-9883", requester_id: requester }] });
+  const a = new RunnerAdapter({ mode: "supervisor", build: { role: "single", commit: "a".repeat(40), gitRef: "a".repeat(40) }, repoRoot: ".", fetch: sup.fetch });
+  a.supervisor = new SupervisorClient("http://127.0.0.1:9875", () => {}, { fetch: sup.fetch });
+  assert.equal(await a.emergencyStop(), null, "no id known yet: nothing to stop");
+  a.supervisorRunnerId = "test-9883";
+  a.requesterId = requester;
+  assert.match(await a.emergencyStop(), /stopped temp runner test-9883/);
+  assert.ok(sup.calls.includes("POST /runners/test-9883/stop"));
+});
+
+test("the launch waits end at the run's abort signal, not at their timeouts (review round 2 nit 5)", async (t) => {
+  const health = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ uiBridgeIpcObserved: false, responsive: false }) });
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 50);
+  const t0 = Date.now();
+  await assert.rejects(new RunnerClient("http://127.0.0.1:1", () => {}, { fetch: health }).waitUiBridgeReady(600_000, { signal: ac.signal }), WaitAborted);
+  const building = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ status: { state: "building" } }) });
+  const ac2 = new AbortController();
+  setTimeout(() => ac2.abort(), 50);
+  await assert.rejects(new SupervisorClient("http://127.0.0.1:9875", () => {}, { fetch: building }).awaitSpawn("s-1", { signal: ac2.signal }), WaitAborted);
+  const dir = mkdtempSync(join(tmpdir(), "tb-wait-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const ac3 = new AbortController();
+  setTimeout(() => ac3.abort(), 50);
+  const gens = await waitForGenerators(dir, 2, { timeoutMs: 600_000, signal: ac3.signal });
+  assert.equal(gens.ok, false);
+  assert.match(gens.detail, /interrupted/);
+  assert.equal(await waitForNewSlot(dir, new Set(), { timeoutMs: 600_000, signal: ac3.signal }), null);
+  assert.ok(Date.now() - t0 < 10_000, `every wait ended at the abort (${Date.now() - t0} ms)`);
 });

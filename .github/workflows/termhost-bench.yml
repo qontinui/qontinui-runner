@@ -526,20 +526,25 @@ jobs:
       - name: Doctor
         shell: bash
         working-directory: head/qontinui-runner
+        # `doctor` exits 3 when it blocks a run. That is exactly when the summary
+        # matters, so the exit code is held until the summary is written.
         run: |
           set -o pipefail
+          rc=0
           node scripts/termhost-bench/cli.mjs doctor --env linux-xvfb --setups runner,tmux \
             --runner-mode subject \
             --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner" \
             --head-commit "$(git rev-parse HEAD)" \
             --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/termhost-probe" \
-            | tee "$RUNNER_TEMP/termhost-bench-doctor.txt"
+            | tee "$RUNNER_TEMP/termhost-bench-doctor.txt" || rc=$?
           {
             echo "### termhost-bench doctor (linux-xvfb)"
             echo '```'
             cat "$RUNNER_TEMP/termhost-bench-doctor.txt"
             echo '```'
+            if [ "$rc" -ne 0 ]; then echo "doctor exited $rc"; fi
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
 
       # A session bus (dbus-run-session), because a desktop session has one and
       # GTK and WebKitGTK reach for it. WEBKIT_DISABLE_DMABUF_RENDERER, because a

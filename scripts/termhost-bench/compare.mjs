@@ -79,8 +79,12 @@ export function compareBuilds(head, baseline = null, { setup = "runner", variant
       `refusing to compare ${head.machine?.environment} with ${baseline.machine?.environment}: numbers compare only within one environment (D6)`,
     );
   }
+  // A row whose build is not proven (an absence, or an unproven head/baseline) is
+  // never one side of a comparison (D12).
   const pick = (doc, roles) =>
-    doc.rows.filter((r) => r.setup.id === setup && r.setup.variant === variant && roles.includes(r.setup.build?.role ?? "single"));
+    doc.rows.filter(
+      (r) => r.setup.id === setup && r.setup.variant === variant && !r.setup.build?.state && roles.includes(r.setup.build?.role ?? "single"),
+    );
   const headRows = baseline ? pick(head, ["head", "single"]) : pick(head, ["head"]);
   const baseRows = baseline ? pick(baseline, ["baseline", "single"]) : pick(head, ["baseline"]);
   if (headRows.length === 0) throw new Error(`no ${setup}/${variant} head rows to compare`);

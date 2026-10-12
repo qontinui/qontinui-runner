@@ -152,7 +152,9 @@ test("the device drain: not enrolled and clear let a run start; drained and ever
   assert.equal((await read({ machine: DEVICE })).state, "unknown", "a device with no token");
   const expired = await read({ machine: DEVICE, tokenFile: jwt(NOW / 1000 - 10) });
   assert.equal(expired.state, "unknown", "an expired token is no token");
-  assert.match(expired.detail, /no live device JWT/);
+  assert.match(expired.detail, /expired or unreadable/);
+  assert.match(expired.detail, /to refresh: device JWTs live about 4 h: export a fresh one as \$COORD_DEVICE_JWT, or rewrite ~\/\.qontinui\/coord-device-jwt/);
+  assert.match((await read({ machine: DEVICE })).detail, /no device JWT .*; to refresh:/, "an absent token says how to supply one too");
   assert.equal(unexpected, 0, "no read is attempted without a live credential");
   assert.equal((await read({ machine: DEVICE, tokenFile: live, fetch: answer(200, { state: "clear" }) })).state, "clear");
   const drained = await read({ machine: DEVICE, tokenFile: live, fetch: answer(200, { state: "drained", reason: "rebuild" }) });

@@ -212,3 +212,15 @@ test("a gate failure carries the runner's detail text but only a third party's s
   const tmux = checkAssertions(doc, { requireMeasured: ["switch_latency_ms"], atN: [5], setups: ["tmux"], arms: ["focus"] });
   assert.deepEqual(tmux, ["tmux N = 5 focus run 0: switch_latency_ms is unknown(harness_error)"]);
 });
+
+test("an unproven build is never one side of a comparison (D12, review round 2 M1)", () => {
+  const doc = abDoc();
+  for (const r of doc.rows) {
+    if (r.setup.build?.role === "baseline") {
+      r.setup.build = { state: "unknown", reason: "harness_error", detail: "never booted", role: "baseline", requested_commit: BASE };
+      r.labels = ["unknown_build"];
+    }
+  }
+  assert.equal(validateResults(doc).valid, true, JSON.stringify(validateResults(doc).errors.slice(0, 3)));
+  assert.throws(() => compareBuilds(doc), /no runner\/default baseline rows to compare/);
+});

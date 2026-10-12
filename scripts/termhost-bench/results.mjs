@@ -114,6 +114,22 @@ export function errorWhere(errors, max = 40) {
   return `${errors.length} error(s): ${shown.join("; ")}${more}`;
 }
 
+/**
+ * A runner build that could not be proven (D12), still naming what the unit asked
+ * for: its role (so head and baseline rows stay distinct) and, when known, the
+ * requested commit and source. Never a proven `commit` — the row carries the
+ * `unknown_build` label and compare leaves it out.
+ *
+ * @param {{role?: string, commit?: string, source?: string} | null | undefined} build
+ * @param {string} detail
+ */
+export function unprovenBuild(build, detail) {
+  const out = { state: "unknown", reason: "harness_error", detail, role: build?.role ?? "single" };
+  if (typeof build?.commit === "string" && /^[0-9a-f]{40}$/.test(build.commit)) out.requested_commit = build.commit;
+  if (["worktree", "git_ref", "artifact", "installed"].includes(build?.source)) out.requested_source = build.source;
+  return out;
+}
+
 /** The results document could not be written as a valid file. */
 export class InvalidResults extends Error {
   constructor(message, asidePath) {

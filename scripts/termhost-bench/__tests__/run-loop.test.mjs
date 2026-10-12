@@ -10,19 +10,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { machineBlock } from "../machine.mjs";
 import { NeutralityGuard } from "../neutrality.mjs";
 import { InvalidResults, convertProbeIncident, redactRunnerOnly } from "../results.mjs";
-import { RunAbort, RunFailed, planUnits, runBench } from "../run.mjs";
+import { AdapterRefusal } from "../adapters/index.mjs";
+import { RunnerAdapter } from "../adapters/runner.mjs";
+import { RunAbort, RunFailed, abortAwareSleep, planUnits, runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
 
 /** A run on fakes; returns the result and every adapter call. */
-async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null } = {}) {
+async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null, adapterHook = null } = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "tb-run-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   mkdirSync(join(tmp, "primary"), { recursive: true });
@@ -50,6 +52,7 @@ async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = 
         const base = current.describe.bind(current);
         current.describe = (slots) => describe(base(slots), setup);
       }
+      adapterHook?.(current, setup);
       return current;
     },
     probe: fakeProbe({ clock, current: () => current }),
@@ -200,7 +203,11 @@ test("a refusal ends one ladder — its subject's, in its run, from the refused 
   for (const r of skipped) {
     assert.equal(r.kpis.output_latency_ms.reason, "admission_refused");
     assert.ok(["head", "baseline"].includes(r.setup.build.role), "a skipped row keeps its build's role");
-    assert.equal(r.setup.build.commit, r.setup.build.role === "head" ? "a".repeat(40) : "b".repeat(40));
+    // Nothing ran that could prove the build: the requested commit, never a proven one (D12).
+    assert.equal(r.setup.build.state, "unknown");
+    assert.equal(r.setup.build.commit, undefined);
+    assert.equal(r.setup.build.requested_commit, r.setup.build.role === "head" ? "a".repeat(40) : "b".repeat(40));
+    assert.ok(r.labels.includes("unknown_build"));
   }
   // Run 1's lower levels were measured again rather than skipped.
   assert.equal(res.doc.rows.filter((r) => r.setup.id === "runner" && r.scenario.run_index === 1 && r.scenario.n === 1 && r.kpis.output_latency_ms.state === "measured").length, 4);
@@ -212,7 +219,7 @@ test("a skipped row records the launch mode the run used", async (t) => {
   assert.ok(skipped.length > 0);
   for (const r of skipped) {
     assert.equal(r.setup.launch_mode, "supervisor_spawn_test");
-    assert.equal(r.setup.build.source, "git_ref");
+    assert.equal(r.setup.build.requested_source, "git_ref");
   }
 });
 
@@ -324,4 +331,172 @@ test("a run that stops before any row exists fails (exit 1), it is not a doctor 
   const err = await fakeRun(t, { deps: { neutrality: changedAtOnce } }).then(() => null, (e) => e);
   assert.ok(err instanceof RunFailed, String(err));
   assert.ok(!(err instanceof RunAbort));
+});
+
+test("both A/B builds failing to boot still write a valid file: each row keeps its role, unproven and labelled (review round 2 M1)", async (t) => {
+  // The review's reproduction (review-p3/describe-role.mjs), inside a run: the REAL
+  // runner adapter's describe(), with launch failing the way waitUiBridgeReady does.
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"], runnerBuilds: AB },
+    deps: {
+      createAdapter: async (setup, o) => {
+        const a = new RunnerAdapter({ ...o, mode: "subject", platform: "linux", repoRoot: ".", list: () => new Map(), log: () => {} });
+        a.launch = async () => {
+          throw new AdapterRefusal("harness_error", "runner did not report uiBridgeIpcObserved:true within 120s");
+        };
+        a.teardown = async () => ({ closed: [], survivors: [], incidents: [], notes: [] });
+        a.coordReadback = undefined;
+        return a;
+      },
+    },
+  });
+  assert.equal(validateResults(res.doc).valid, true, JSON.stringify(validateResults(res.doc).errors.slice(0, 3)));
+  const rows = res.doc.rows.filter((r) => r.setup.id === "runner");
+  assert.equal(rows.length, 4, "head and baseline, both arms");
+  for (const r of rows) {
+    assert.equal(r.setup.build.state, "unknown");
+    assert.equal(r.setup.build.commit, undefined, "never a proven commit");
+    assert.equal(r.setup.build.requested_commit, r.setup.build.role === "head" ? "a".repeat(40) : "b".repeat(40));
+    assert.ok(r.labels.includes("unknown_build"));
+    assert.equal(r.kpis.output_latency_ms.reason, "harness_error");
+  }
+  assert.deepEqual([...new Set(rows.map((r) => r.setup.build.role))].sort(), ["baseline", "head"]);
+});
+
+test("a signal during the switch phase stops the switch loop at once, and the arm reads interrupted (review round 2 S1)", async (t) => {
+  // The review's reproduction (review-p3/sigint-switch.mjs).
+  const signals = new EventEmitter();
+  let shows = 0;
+  const shown = [];
+  const { res } = await fakeRun(t, {
+    opts: { ns: [5], setups: ["runner"], switchSamples: 20 },
+    deps: { signals },
+    adapterHook: (a) => {
+      const show = a.show.bind(a);
+      a.show = async (k) => {
+        shown.push(k);
+        if (++shows === 3) signals.emit("SIGINT", "SIGINT");
+        return show(k);
+      };
+    },
+  });
+  // Three samples, then only the restore of the arm's focus session (the fake's
+  // lowest slot): no switch after the signal, whose settle time is gone.
+  assert.equal(shows, 4, `shown: ${JSON.stringify(shown)}`);
+  assert.equal(shown[3], Math.min(...shown), "the fourth show() is the focus restore");
+  const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
+  assert.equal(focus.kpis.switch_latency_ms.state, "unknown");
+  assert.equal(focus.kpis.output_latency_ms.state, "unknown");
+  assert.match(focus.kpis.output_latency_ms.detail, /interrupted/);
+});
+
+test("a signal during the spawn phase stops the spawn loop, and the arm reads interrupted (review round 2 S1)", async (t) => {
+  const signals = new EventEmitter();
+  let spawns = 0;
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"], spawnSamples: 10 },
+    deps: { signals },
+    adapterHook: (a) => {
+      const one = a.spawnOne.bind(a);
+      a.spawnOne = async () => {
+        if (++spawns === 2) signals.emit("SIGINT", "SIGINT");
+        return one();
+      };
+    },
+  });
+  assert.equal(spawns, 2, "no spawnOne() after the signal");
+  const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
+  assert.equal(focus.kpis.spawn_latency_ms.state, "unknown");
+  assert.match(focus.kpis.output_latency_ms.detail, /interrupted/);
+});
+
+test("after the abort the run's sleep still yields a turn of the event loop, on both clocks (review round 2 S1)", async () => {
+  for (const inner of [null, (ms) => new Promise((r) => setTimeout(r, ms))]) {
+    const ac = new AbortController();
+    const sleep = abortAwareSleep(ac.signal, inner);
+    const t0 = Date.now();
+    const pending = sleep(60_000);
+    ac.abort();
+    await pending;
+    assert.ok(Date.now() - t0 < 5000, "the abort ends a sleep in progress");
+    let turned = false;
+    setImmediate(() => (turned = true));
+    await sleep(60_000);
+    assert.equal(turned, true, `${inner ? "virtual" : "real"} clock: a sleep after the abort lets the event loop turn`);
+  }
+});
+
+test("a second signal still stops the temp runners already known, then exits 130 (review round 2 nit 5)", async (t) => {
+  const signals = new EventEmitter();
+  const stopped = [];
+  const exits = [];
+  const launchSignals = [];
+  await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"] },
+    deps: { signals, exit: (code) => exits.push(code), hardExitGraceMs: 2000 },
+    adapterHook: (a) => {
+      const launch = a.launch.bind(a);
+      a.launch = async (ctx) => {
+        launchSignals.push(ctx.signal);
+        return launch(ctx);
+      };
+      a.emergencyStop = async () => {
+        stopped.push("temp runner test-9883");
+        return "stopped temp runner test-9883";
+      };
+    },
+    onArrange: (arm) => {
+      if (arm === "focus") {
+        signals.emit("SIGINT", "SIGINT");
+        signals.emit("SIGTERM", "SIGTERM");
+      }
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(stopped, ["temp runner test-9883"]);
+  assert.deepEqual(exits, [130]);
+  // launch was handed the run's abort signal, so its own long waits end at it.
+  assert.ok(launchSignals.length > 0 && launchSignals.every((x) => x instanceof AbortSignal && x.aborted));
+});
+
+test("a signal while waiting for a spawned session's first marker ends that wait at once (review round 2 S1)", async (t) => {
+  const signals = new EventEmitter();
+  let clock = null;
+  let armed = false;
+  let signalAt = null;
+  let closedAt = null;
+  await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"], spawnSamples: 3, spawnTimeoutMs: 4000 },
+    deps: {
+      signals,
+      // The poll's own 100 ms sleep is where the signal lands.
+      sleep: async (ms) => {
+        if (ms === 100 && armed) {
+          armed = false;
+          signalAt = Date.now();
+          signals.emit("SIGINT", "SIGINT");
+        }
+        return clock.sleep(ms);
+      },
+    },
+    adapterHook: (a) => {
+      clock = a.clock;
+      a.spawnOne = async () => {
+        // A session that claims its slot but never paints a marker.
+        const k = readdirSync(a.genDir).filter((f) => /^slot-\d+$/.test(f)).length;
+        const hostId = `quiet${k}`;
+        writeFileSync(join(a.genDir, `slot-${k}`), `${JSON.stringify({ schema: "termhost-bench/slot/v1", slot: k, run_id: "x", pid: 4_100_000 + k, ppid: 3_100_000 + k, host_terminal_id: { TERMHOST_BENCH_TERMINAL_ID: hostId }, claimed_at_ns: String(a.clock.now()), argv: a.argv })}\n`);
+        writeFileSync(join(a.genDir, `gen-${k}.jsonl`), "");
+        armed = true;
+        return { ok: true, hostId, tCmdNs: a.clock.now() };
+      };
+      const close = a.closeOne.bind(a);
+      a.closeOne = async (h) => {
+        closedAt ??= Date.now();
+        return close(h);
+      };
+    },
+  });
+  assert.ok(signalAt !== null && closedAt !== null);
+  assert.ok(closedAt - signalAt < 1000, `the marker wait ended ${closedAt - signalAt} ms after the signal, not at its 4 s deadline`);
 });

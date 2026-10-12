@@ -40,7 +40,7 @@ import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
 import { carriesFlag, listProcesses, terminatePid } from "./proc.mjs";
 import { loadProfile } from "./profile.mjs";
-import { buildDocument, convertProbeIncident, finalizeLadder, incident, redactRunnerOnly, writeResultsOrSetAside } from "./results.mjs";
+import { buildDocument, convertProbeIncident, finalizeLadder, incident, redactRunnerOnly, unprovenBuild, writeResultsOrSetAside } from "./results.mjs";
 import { createRunDir, createUnitDir, generatorArgv, generatorRunId, makeRunId } from "./rundir.mjs";
 import { echoCount, readGeneratorLog, readGeneratorLogs, readSlots, slotForHostId, waitForGenerators, waitForNewSlot } from "./sessions.mjs";
 
@@ -169,10 +169,41 @@ export function rowLabels({ softwareRendered, setup, smoke, paneSizes, geometry 
 }
 
 /**
+ * The run's sleep: it ends at the abort, and after the abort it still YIELDS (one
+ * setImmediate turn) rather than resolving as a bare microtask, so a loop that
+ * missed the abort cannot spin without the event loop servicing a second signal
+ * or the probe's pipes. The real sleep clears its own timer on abort, so nothing
+ * lingers after the run; an injected `inner` sleep (a virtual clock) is raced
+ * against the abort.
+ *
+ * @param {AbortSignal} signal
+ * @param {((ms: number) => Promise<void>) | null} [inner]
+ */
+export function abortAwareSleep(signal, inner = null) {
+  const yieldOnce = () => new Promise((r) => setImmediate(r));
+  if (inner) {
+    const abortedPromise = new Promise((r) => signal.addEventListener("abort", () => r(), { once: true }));
+    return (ms) => (signal.aborted ? yieldOnce() : Promise.race([inner(ms), abortedPromise]));
+  }
+  return (ms) =>
+    new Promise((r) => {
+      if (signal.aborted) return setImmediate(r);
+      const done = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", done);
+        r();
+      };
+      const timer = setTimeout(done, ms);
+      signal.addEventListener("abort", done, { once: true });
+    });
+}
+
+/**
  * A fallback `setup` object when an adapter could not describe itself (or was
  * never launched). What the plan already knows is kept: the runner build the unit
- * was FOR (commit, source and role), so head and baseline rows stay distinct and
- * comparable, and the launch mode the run actually used.
+ * was FOR (role, and the requested commit and source), so head and baseline rows
+ * stay distinct, and the launch mode the run actually used. The build stays
+ * UNPROVEN (D12): nothing ran that could prove it.
  */
 export function fallbackSetup(unit, detail, o = {}) {
   const absent = { state: "unknown", reason: "harness_error", detail };
@@ -180,9 +211,10 @@ export function fallbackSetup(unit, detail, o = {}) {
   const build =
     unit.setup !== "runner"
       ? { state: "not_applicable", reason: "not_applicable_to_setup" }
-      : b && typeof b.commit === "string" && /^[0-9a-f]{40}$/.test(b.commit)
-        ? { commit: b.commit, source: b.source ?? (o.runnerMode === "supervisor" ? "git_ref" : "artifact"), role: b.role ?? "single" }
-        : { state: "unknown", reason: "harness_error", detail: `${detail}; the build's commit is not known` };
+      : unprovenBuild(
+          { ...(b ?? {}), source: b?.source ?? (o.runnerMode === "supervisor" ? "git_ref" : "artifact") },
+          `${detail}; the build was not proven (D12)`,
+        );
   return {
     id: unit.setup,
     variant: unit.variant,
@@ -216,28 +248,31 @@ export async function runBench(opts, deps = {}) {
   // SIGINT, then SIGTERM about 7.5 s later, then SIGKILL); a second signal exits at once.
   const abort = new AbortController();
   const aborted = () => abort.signal.aborted;
-  const abortedPromise = new Promise((r) => abort.signal.addEventListener("abort", () => r(), { once: true }));
-  // The real sleep clears its own timer on abort, so nothing lingers after the run.
-  const realSleep = (ms) =>
-    new Promise((r) => {
-      if (aborted()) return r();
-      const done = () => {
-        clearTimeout(timer);
-        abort.signal.removeEventListener("abort", done);
-        r();
-      };
-      const timer = setTimeout(done, ms);
-      abort.signal.addEventListener("abort", done, { once: true });
-    });
-  const sleep = deps.sleep ? (ms) => (aborted() ? Promise.resolve() : Promise.race([deps.sleep(ms), abortedPromise])) : realSleep;
+  const sleep = abortAwareSleep(abort.signal, deps.sleep ?? null);
   const signals = deps.signals ?? process;
+  const exit = deps.exit ?? (signals === process ? (code) => process.exit(code) : null);
+  // Adapters launched and not yet torn down: a second signal still stops the temp
+  // runners among them whose id is known (`emergencyStop`), bounded in time.
+  const live = new Set();
+  let hardExiting = false;
   let writePartial = () => {};
   const onSignal = (sig) => {
     if (aborted()) {
-      if (signals === process) {
-        log(`received a second signal (${sig}): exiting now, without the rest of the teardown`);
-        process.exit(130);
-      }
+      if (hardExiting || !exit) return;
+      hardExiting = true;
+      log(`received a second signal (${sig}): stopping the temp runners already known, then exiting without the rest of the teardown`);
+      const stops = [...live].map((a) =>
+        Promise.resolve()
+          .then(() => a.emergencyStop?.())
+          .then((what) => what && log(`second signal: ${what}`))
+          .catch((e) => log(`second signal: emergency stop failed: ${e.message}`)),
+      );
+      let timer;
+      const bound = new Promise((r) => (timer = setTimeout(r, deps.hardExitGraceMs ?? 3000)));
+      Promise.race([Promise.all(stops), bound]).finally(() => {
+        clearTimeout(timer);
+        exit(130);
+      });
       return;
     }
     log(`received ${sig}: ending the unit in progress and writing the units completed so far`);
@@ -251,14 +286,14 @@ export async function runBench(opts, deps = {}) {
   signals.on("SIGINT", onSignal);
   signals.on("SIGTERM", onSignal);
   try {
-    return await runBenchInner(opts, deps, { log, now, sleep, aborted, abort, setWritePartial: (fn) => (writePartial = fn) });
+    return await runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live, setWritePartial: (fn) => (writePartial = fn) });
   } finally {
     signals.off("SIGINT", onSignal);
     signals.off("SIGTERM", onSignal);
   }
 }
 
-async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, setWritePartial }) {
+async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live = new Set(), setWritePartial }) {
   const spec = environmentSpec(opts.env);
   if (spec.notBuilt) throw new RunAbort(spec.notBuilt);
   const o = { ...RUN_DEFAULTS, ...opts };
@@ -343,6 +378,8 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, setW
       refreshSeen,
       reapGenerators: deps.reapGenerators,
       aborted,
+      abortSignal: abort?.signal,
+      live,
     };
 
     // What the signal interrupted, captured when it arrived.
@@ -537,7 +574,8 @@ export async function runUnit(unit, ctx) {
   log(`unit ${name}: launching`);
   try {
     adapter = await ctx.createAdapter(unit.setup, ctx.adapterOptions(unit));
-    await adapter.launch({ runDir: ctx.runDir, unitDir, genDir, genRunId, runId: ctx.runId, unit, env: ctx.environment });
+    ctx.live?.add(adapter);
+    await adapter.launch({ runDir: ctx.runDir, unitDir, genDir, genRunId, runId: ctx.runId, unit, env: ctx.environment, signal: ctx.abortSignal });
     const argv = generatorArgv({ genDir, profile: o.profile, seed: o.seed, genRunId });
     const spawned = await adapter.spawnSessions(unit.n, argv);
     if (spawned.admission?.refused) {
@@ -545,7 +583,7 @@ export async function runUnit(unit, ctx) {
       failure = { reason: "admission_refused", detail: `resource guard refused at ${admission.n_reached} session(s) (${admission.lane}): ${admission.detail ?? ""}`.trim() };
       incidents.push(incident("admission_refused", failure.detail, { data: { setup: unit.setup, unit: name, ...admission } }));
     } else {
-      const ready = await waitForGenerators(genDir, unit.n, { timeoutMs: 60000 + 4000 * unit.n });
+      const ready = await waitForGenerators(genDir, unit.n, { timeoutMs: 60000 + 4000 * unit.n, signal: ctx.abortSignal });
       if (!ready.ok) failure = { reason: "harness_error", detail: ready.detail };
     }
     const slots = readSlots(genDir);
@@ -623,6 +661,7 @@ export async function runUnit(unit, ctx) {
   if (adapter) {
     try {
       const td = await adapter.teardown();
+      ctx.live?.delete(adapter);
       for (const s of td.survivors ?? []) {
         incidents.push(incident("harness_error", `unit ${name}: teardown left ${s.what ?? `pid ${s.pid}`}: ${s.detail ?? "still running"}`, { data: { setup: unit.setup, unit: name } }));
       }
@@ -858,6 +897,7 @@ export async function runArm(unit, arm, ctx) {
       const list = [];
       let current = arr.focusSession;
       for (let j = 0, c = 0; j < o.switchSamples; j += 1) {
+        if (interrupted()) break;
         let k = candidates[c++ % candidates.length];
         if (k === current) k = candidates[c++ % candidates.length];
         const r = await adapter.show(k);
@@ -882,6 +922,7 @@ export async function runArm(unit, arm, ctx) {
     const known = new Set(readSlots(genDir).keys());
     let refused = null;
     for (let j = 0; j < o.spawnSamples; j += 1) {
+      if (interrupted()) break;
       const r = await adapter.spawnOne();
       if (!r.ok) {
         if (r.admission) {
@@ -890,12 +931,12 @@ export async function runArm(unit, arm, ctx) {
         }
         continue;
       }
-      const slot = await waitForNewSlot(genDir, known, { key: adapter.hostIdKey, hostId: r.hostId, tCmdNs: r.tCmdNs, timeoutMs: o.spawnTimeoutMs });
+      const slot = await waitForNewSlot(genDir, known, { key: adapter.hostIdKey, hostId: r.hostId, tCmdNs: r.tCmdNs, timeoutMs: o.spawnTimeoutMs, signal: ctx.abortSignal });
       if (slot !== null) {
         known.add(slot);
         // Let its first marker reach the screen before closing it.
         const until = Date.now() + Math.min(o.spawnTimeoutMs, 15000);
-        while (Date.now() < until) {
+        while (Date.now() < until && !interrupted()) {
           if (readGeneratorLog(genDir, slot).some((x) => x?.type === "marker")) break;
           await sleep(100);
         }
@@ -911,6 +952,10 @@ export async function runArm(unit, arm, ctx) {
       : { records: seg.records, list };
     if (refused) out.spawnAdmission = refused;
   }
+
+  // A signal that arrived at any point in this arm cut a phase short: the arm's
+  // measurements are not the ones its row would claim.
+  if (interrupted()) out.interrupted = true;
 
   // ---- diagnostics (runner only) ----------------------------------------------
   if (typeof adapter.diagnostics === "function") {

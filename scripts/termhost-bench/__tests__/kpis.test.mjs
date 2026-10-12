@@ -489,6 +489,9 @@ test("a generator blocked inside a write that never returned counts as stalled f
   assert.ok(Math.abs(gw.stall[1] - 0.2) < 1e-9, `healthy ${gw.stall[1]}`);
   assert.deepEqual(gw.gaps.map((g) => [g.session, Math.round(g.ms)]), [[0, 20000]]);
   assert.match(gw.notes.join("\n"), /ran no JavaScript for part of the window \(session 0: 20000 ms\)/);
+  // A heuristic, said as one (review round 2 nit 4): a lower bound, with the look-alikes named.
+  assert.match(gw.notes.join("\n"), /Only gaps over 1000 ms are seen, so this is a lower bound/);
+  assert.match(gw.notes.join("\n"), /a GC pause or CPU starvation of the generator looks the same/);
   assert.deepEqual(gw.silent, []);
 });
 

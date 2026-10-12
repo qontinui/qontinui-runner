@@ -496,6 +496,46 @@
               }
             },
             {
+              "type": "object",
+              "required": [
+                "state",
+                "reason",
+                "role"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "state": {
+                  "const": "unknown"
+                },
+                "reason": {
+                  "$ref": "#/$defs/reason"
+                },
+                "detail": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "role": {
+                  "enum": [
+                    "head",
+                    "baseline",
+                    "single"
+                  ]
+                },
+                "requested_commit": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{40}$"
+                },
+                "requested_source": {
+                  "enum": [
+                    "worktree",
+                    "git_ref",
+                    "artifact",
+                    "installed"
+                  ]
+                }
+              }
+            },
+            {
               "$ref": "#/$defs/absent"
             }
           ]
