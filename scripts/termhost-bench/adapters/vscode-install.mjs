@@ -184,6 +184,9 @@ export async function downloadVerified({ urls, dest, expected, fetch = globalThi
       if (fh) await fh.close().catch(() => {});
       rmSync(part, { force: true });
       if (e instanceof ArchiveIntegrityError) throw e;
+      // An abort mid-download is the run ending, not a failed URL — on the last URL
+      // too, where the loop's own check would never run again.
+      if (signal?.aborted) throw new WaitAborted(`the VS Code archive download (${url})`);
       errors.push(`${url}: ${e?.message ?? e}`);
     }
   }

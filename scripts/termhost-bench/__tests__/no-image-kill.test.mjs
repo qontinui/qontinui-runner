@@ -383,15 +383,17 @@ test("VS Code's emergency stop kills only the proven tree, children first, and c
   const table = new Map([[800, P(800, 1, "Code.exe", 100)], [801, P(801, 800, "Code.exe", 101)], [802, P(802, 800, "pwsh.exe", 50)]]);
   const make = () => {
     const signalled = [];
-    const a = new VscodeAdapter({ platform: "win32", list: () => new Map(table), kill: (pid, sig) => signalled.push([pid, sig]), sleep: async () => {} });
+    const reads = { n: 0 };
+    const a = new VscodeAdapter({ platform: "win32", list: () => (reads.n++, new Map(table)), kill: (pid, sig) => signalled.push([pid, sig]), sleep: async () => {} });
     a.child = new EventEmitter();
     a.pid = 800;
     a.startKey = "100";
-    return { a, signalled };
+    return { a, signalled, reads };
   };
   const ok = make();
   assert.match(await ok.a.emergencyStop(), /signalled VS Code pid 800 \(2 of 2/);
   assert.deepEqual(ok.signalled, [[801, "SIGKILL"], [800, "SIGKILL"]]);
+  assert.equal(ok.reads.n, 1, "one process-table read (1-2 s of PowerShell on Windows) inside the 3 s grace");
 
   const exited = make();
   exited.a.childExit = { code: 0, signal: null, afterMs: 5 };

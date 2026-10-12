@@ -813,6 +813,24 @@ test("every launch-time wait ends at the run's abort, not at its timeout (Phase 
   );
   assert.deepEqual(fetched, ["https://a/1"]);
   assert.deepEqual(readdirSync(dlDir), [], "the partial download is removed");
+  // An abort during the LAST URL (here the only one, already streaming) is still
+  // the run ending, never the generic "could not download" harness error.
+  const acLast = new AbortController();
+  const streaming = (url, init) => ({
+    ok: true,
+    status: 200,
+    body: (async function* () {
+      yield new Uint8Array(16);
+      acLast.abort();
+      throw init.signal.reason ?? new Error("aborted");
+    })(),
+  });
+  const lastDir = join(dir, "dl-last");
+  await assert.rejects(
+    downloadVerified({ urls: ["https://a/only"], dest: join(lastDir, "a.zip"), expected: "0".repeat(64), fetch: streaming, timeoutMs: 600_000, signal: acLast.signal }),
+    WaitAborted,
+  );
+  assert.deepEqual(readdirSync(lastDir), [], "the last URL's partial download is removed too");
 
   // A control-endpoint call.
   const ac2 = new AbortController();

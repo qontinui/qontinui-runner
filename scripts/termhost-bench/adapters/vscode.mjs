@@ -896,42 +896,47 @@ export class VscodeAdapter {
    * Teardown and `emergencyStop` both act only on this.
    *
    * @param {string} who  the caller, for the notes
-   * @returns {{owned: {pid: number, startKey: string, name: string}[], unprovable: string | null}}
+   * The table the proof was read from comes back too (`null` when none was read),
+   * so a caller re-checks identities against it instead of reading again — each
+   * read is a blocking PowerShell call of 1-2 s on Windows.
+   *
+   * @returns {{owned: {pid: number, startKey: string, name: string}[], unprovable: string | null, table: Map<number, object> | null}}
    */
   provenTree(who) {
-    if (!Number.isInteger(this.pid)) return { owned: [], unprovable: null };
+    if (!Number.isInteger(this.pid)) return { owned: [], unprovable: null, table: null };
     let unprovable = null;
     if (this.startKey === null || this.startKey === undefined) unprovable = "its start key was never recorded";
     else if (this.childExit !== null) unprovable = `our child exited (${JSON.stringify(this.childExit)}) before ${who}`;
     if (unprovable) {
       this.notes.push(`${who}: VS Code pid ${this.pid} cannot be proven this run's (${unprovable}); nothing is signalled`);
-      return { owned: [], unprovable };
+      return { owned: [], unprovable, table: null };
     }
+    let table = null;
     try {
-      const table = this.list();
+      table = this.list();
       const root = table.get(this.pid);
       if (root && root.startKey === this.startKey) {
         const desc = descendantsOf(table, this.pid).filter((p) => isDescendantOf(table, p.pid, this.pid));
-        return { owned: [root, ...desc].map((p) => ({ pid: p.pid, startKey: p.startKey, name: p.name })), unprovable: null };
+        return { owned: [root, ...desc].map((p) => ({ pid: p.pid, startKey: p.startKey, name: p.name })), unprovable: null, table };
       }
       this.notes.push(`${who}: pid ${this.pid} no longer holds the process this run started; nothing is signalled`);
     } catch (e) {
       this.notes.push(`${who}: process table unreadable: ${e.message}`);
     }
-    return { owned: [], unprovable: null };
+    return { owned: [], unprovable: null, table };
   }
 
   /**
    * A second signal's last act (no teardown follows): SIGKILL the process tree this
    * run proved it started (`provenTree`, the same rule as teardown), children first,
-   * each PID re-checked against its start key at the signal. No graceful quit: the
-   * run is exiting within seconds. Returns what was done, or null when nothing is
-   * provably ours.
+   * each PID's start key checked by `terminatePid` against the one table the proof
+   * read (no second read: the stop has a 3 s grace and a read costs 1-2 s on
+   * Windows). No graceful quit: the run is exiting within seconds. Returns what was
+   * done, or null when nothing is provably ours.
    */
   async emergencyStop() {
-    const { owned } = this.provenTree("emergency stop");
+    const { owned, table } = this.provenTree("emergency stop");
     if (owned.length === 0) return null;
-    const table = this.list();
     let signalled = 0;
     for (const o of [...owned].reverse()) {
       const r = terminatePid(o.pid, { signal: "SIGKILL", table, expect: (p) => p.startKey === o.startKey, ...(this.kill ? { kill: this.kill } : {}) });
