@@ -121,6 +121,39 @@ export function diffSnapshots(before, after) {
 }
 
 /**
+ * What the guard can protect, from its baseline: OPERATIVE when it watches at
+ * least one primary-state file, or when the machine has no primary at all (every
+ * file ABSENT and nothing on :9876 — nothing to protect, which the verdict says).
+ * UNKNOWN when none is watched but a primary is, or may be, present
+ * (`primaryPresent` true or null), or a file exists that cannot be read (state the
+ * guard cannot see is not state that is not there): a guard watching nothing would
+ * pass every check, so the result is not "unchanged" but unknown.
+ *
+ * @param {{label: string, state: string, sha256?: string}[]} base the baseline snapshot
+ * @param {boolean | null} primaryPresent :9876 listening (true), refused (false), or unknown (null)
+ * @returns {{state: "OPERATIVE" | "UNKNOWN", reason: string, watched: number}}
+ */
+export function neutralityVerdict(base, primaryPresent) {
+  const files = base.map((d) => `${d.label} ${d.state === "present" ? `${String(d.sha256).slice(0, 19)}…` : d.state}`).join("; ");
+  const watched = base.filter((d) => d.state === "present").length;
+  if (watched > 0) return { state: "OPERATIVE", reason: `watching ${watched} of ${base.length} primary-state file(s): ${files}`, watched };
+  const unreadable = base.filter((d) => d.state === "unreadable").length;
+  if (unreadable > 0) {
+    return { state: "UNKNOWN", reason: `${unreadable} primary-state file(s) exist but cannot be read (${files}): the D12 guard would watch nothing`, watched };
+  }
+  if (primaryPresent === false) {
+    return { state: "OPERATIVE", reason: `no primary runner on this machine (nothing listens on :9876; ${files}): nothing to protect`, watched };
+  }
+  return {
+    state: "UNKNOWN",
+    reason:
+      `a primary runner ${primaryPresent === true ? "is" : "may be"} present (:9876 ${primaryPresent === true ? "listens" : "did not answer either way"}) ` +
+      `but none of its state files could be read (${files}): the D12 guard would watch nothing`,
+    watched,
+  };
+}
+
+/**
  * Baseline once, then `check(stage)` before and after every runner arm.
  */
 export class NeutralityGuard {

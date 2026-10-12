@@ -11,8 +11,10 @@
  *            [--redact-to <file>] [--require-measured k1,k2 --at-n 15] [--require-rows-n 1,5,15]
  *   node scripts/termhost-bench/cli.mjs compare <results.json> [<baseline-results.json>]
  *
- * Exit: 0 success; 1 a failure (an invalid file, a failed assertion, a unit error
- * that left no row); 2 usage; 3 the doctor says a run cannot start here.
+ * Exit: 0 success; 1 a failure (an invalid file, a failed assertion, a run that
+ * left no row, a run that stopped on an incident); 2 usage; 3 the doctor says a run
+ * cannot start here (`run` refuses before any unit; `doctor` reports a blocking
+ * mechanism).
  *
  * Node built-ins only; no package.json change (plan D8).
  */
@@ -23,12 +25,13 @@ import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { compareBuilds, renderComparison } from "./compare.mjs";
-import { doctorReport, gatherDoctorFacts, mapDoctor, renderDoctor } from "./doctor.mjs";
+import { blockingMechanisms, doctorReport, gatherDoctorFacts, mapDoctor, renderDoctor } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
 import { ARMS, SETUP_IDS } from "./kpi-catalog.mjs";
 import { resolveProbeBinary } from "./probe.mjs";
 import { checkAssertions, prepareReport, renderReport } from "./report.mjs";
-import { RUN_DEFAULTS, RunAbort, planUnits, runBench } from "./run.mjs";
+import { InvalidResults } from "./results.mjs";
+import { RUN_DEFAULTS, RunAbort, RunFailed, planUnits, runBench } from "./run.mjs";
 import { createAdapter } from "./adapters/index.mjs";
 import { supervisorAnswers } from "./adapters/runner.mjs";
 
@@ -189,7 +192,14 @@ export async function normaliseRunOptions(flags, deps = {}) {
   let runnerMode = flags["runner-mode"] ?? "auto";
   if (!["auto", "subject", "supervisor"].includes(runnerMode)) throw new UsageError("--runner-mode is auto, subject or supervisor");
   if (setups.includes("runner") && runnerMode === "auto") {
-    runnerMode = (await (deps.probeSupervisor ?? supervisorAnswers)(supervisorUrl)) ? "supervisor" : "subject";
+    const answers = await (deps.probeSupervisor ?? supervisorAnswers)(supervisorUrl);
+    if (answers === null) {
+      throw new UsageError(
+        `--runner-mode auto cannot tell whether a supervisor answers at ${supervisorUrl} (no answer in time); ` +
+          "pass --runner-mode supervisor or subject — an unknown is never read as absent (D12)",
+      );
+    }
+    runnerMode = answers ? "supervisor" : "subject";
   }
   const variants = flags["runner-variants"] ? LIST(flags["runner-variants"]) : ["default"];
   const baseline = flags["ab-baseline"] ? resolveFn(flags["ab-baseline"]) : null;
@@ -249,7 +259,7 @@ export async function normaliseRunOptions(flags, deps = {}) {
   };
 }
 
-async function cmdDoctor(flags, io) {
+async function cmdDoctor(flags, io, deps = {}) {
   const env = flags.env;
   if (!env) throw new UsageError("--env is required");
   const spec = environmentSpec(env);
@@ -278,7 +288,7 @@ async function cmdDoctor(flags, io) {
   let display = null;
   if (spec.start && process.platform === spec.platform) {
     try {
-      environment = await spec.start({ log: () => {} });
+      environment = await (deps.startEnvironment ?? spec.start)({ log: () => {} });
       display = { started: true, detail: environment.display ?? "started" };
     } catch (e) {
       display = { started: false, detail: e.message };
@@ -287,7 +297,7 @@ async function cmdDoctor(flags, io) {
     display = { started: false, detail: `the ${env} environment starts only on Linux` };
   }
   try {
-    const facts = await gatherDoctorFacts({
+    const facts = await (deps.gatherDoctorFacts ?? gatherDoctorFacts)({
       environment: env,
       spec,
       probePath: resolveProbeBinary({ explicit: flags.probe ? resolve(flags.probe) : null }),
@@ -295,18 +305,24 @@ async function cmdDoctor(flags, io) {
       envVars: environment?.env ?? null,
       display,
     });
-    const report = doctorReport(mapDoctor(facts), { environment: env });
+    const mechanisms = mapDoctor(facts);
+    const report = doctorReport(mechanisms, { environment: env });
     io.out(flags.json ? `${JSON.stringify(report)}\n` : renderDoctor(report));
+    const blocking = blockingMechanisms(mechanisms);
+    if (blocking.length > 0) {
+      io.err(`termhost-bench: a run cannot start here: ${blocking.map((b) => `${b.id} ${b.state}`).join(", ")}\n`);
+      return 3;
+    }
     return 0;
   } finally {
     await environment?.stop?.();
   }
 }
 
-async function cmdRun(flags, io, argv) {
-  const o = await normaliseRunOptions(flags, { argv });
+async function cmdRun(flags, io, argv, deps = {}) {
+  const o = await normaliseRunOptions(flags, { argv, ...(deps.probeSupervisor ? { probeSupervisor: deps.probeSupervisor } : {}) });
   try {
-    const res = await runBench(o, { log: (s) => io.err(`termhost-bench: ${s}\n`) });
+    const res = await (deps.runBench ?? runBench)(o, { log: (s) => io.err(`termhost-bench: ${s}\n`) });
     io.out(`${res.outPath}\n`);
     if (res.stopped) {
       io.err(`termhost-bench: the run STOPPED: ${res.stopped.detail}\n`);
@@ -317,6 +333,10 @@ async function cmdRun(flags, io, argv) {
     if (e instanceof RunAbort) {
       io.err(`termhost-bench: ${e.message}\n`);
       return 3;
+    }
+    if (e instanceof RunFailed || e instanceof InvalidResults) {
+      io.err(`termhost-bench: ${e.message}\n`);
+      return 1;
     }
     throw e;
   }
@@ -335,8 +355,10 @@ function cmdReport(positional, flags, io) {
   const doc = readDoc(positional[0]);
   const prep = prepareReport(doc);
   if (!prep.valid) {
+    // Paths and keywords only: a validator message can quote a value, this output
+    // can reach a public CI log, and a third-party reading never leaves the job (D7).
     io.out(`INVALID: ${positional[0]} (${prep.errors.length} errors)\n`);
-    for (const e of prep.errors.slice(0, 50)) io.out(`  ${e.path || "/"} [${e.keyword}] ${e.message}\n`);
+    for (const e of prep.errors.slice(0, 50)) io.out(`  ${e.path || "/"} [${e.keyword}]\n`);
     return 1;
   }
   if (flags["redact-to"]) {
@@ -377,7 +399,7 @@ function cmdCompare(positional, flags, io) {
  * @param {{out?: (s: string) => void, err?: (s: string) => void}} [io]
  * @returns {Promise<number>} exit code
  */
-export async function main(argv, io = {}) {
+export async function main(argv, io = {}, deps = {}) {
   const out = io.out ?? ((s) => process.stdout.write(s));
   const err = io.err ?? ((s) => process.stderr.write(s));
   let parsed;
@@ -395,9 +417,9 @@ export async function main(argv, io = {}) {
   try {
     switch (command) {
       case "doctor":
-        return await cmdDoctor(flags, { out, err });
+        return await cmdDoctor(flags, { out, err }, deps);
       case "run":
-        return await cmdRun(flags, { out, err }, argv);
+        return await cmdRun(flags, { out, err }, argv, deps);
       case "report":
         return cmdReport(positional, flags, { out, err });
       case "compare":

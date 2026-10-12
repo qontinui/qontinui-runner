@@ -137,6 +137,45 @@ export function readRecordsFrom(path, offset = 0) {
 const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
 
 /**
+ * `promise`, or "timeout" after `ms` — with the timer CLEARED either way, so a
+ * finished race never keeps the process alive (or a test waiting) for the rest
+ * of the timeout.
+ *
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @returns {Promise<T | "timeout">}
+ */
+export function raceTimeout(promise, ms, { setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  let timer;
+  const timeout = new Promise((r) => {
+    timer = setTimer(() => r("timeout"), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimer(timer));
+}
+
+/**
+ * End our own child by its handle: SIGTERM, then SIGKILL if it is still there
+ * after `graceMs` (a child that ignores SIGTERM must not be waited on forever).
+ *
+ * @returns {Promise<"exited" | "killed" | "survived">}
+ */
+export async function endChild(child, exited, { graceMs = 5000 } = {}) {
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // already gone
+  }
+  if ((await raceTimeout(exited, graceMs)) !== "timeout") return "exited";
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // already gone
+  }
+  return (await raceTimeout(exited, graceMs)) !== "timeout" ? "killed" : "survived";
+}
+
+/**
  * Set a finished run's file aside: `<runDir>/<name>.jsonl` becomes
  * `<runDir>/<name>-<label>.jsonl` (with a counter if that exists), so the next
  * `watch` or `inject` in the directory starts on no file. Call it only after the
@@ -214,11 +253,12 @@ export class WatchProcess {
    * @param {{probe: string, args: string[], runDir: string, label: string, env?: object,
    *   spawnFn?: typeof spawn, log?: (s: string) => void}} o
    */
-  constructor({ probe, args, runDir, label, env = process.env, spawnFn = spawn, log = () => {} }) {
+  constructor({ probe, args, runDir, label, env = process.env, spawnFn = spawn, log = () => {}, killGraceMs = 5000 }) {
     if (!args.includes("--stdin-stop")) throw new Error("a WatchProcess must run with --stdin-stop");
     if (!LABEL.test(label ?? "")) throw new RangeError(`bad watch label ${JSON.stringify(label)}`);
     this.runDir = runDir;
     this.label = label;
+    this.killGraceMs = killGraceMs;
     this.probeJsonl = join(runDir, "probe.jsonl");
     if (fileSize(this.probeJsonl) > 0) {
       throw new Error(`${this.probeJsonl} already holds a run's records: the previous watch's file was not set aside`);
@@ -271,13 +311,12 @@ export class WatchProcess {
       // already closed
     }
     let timedOut = false;
-    const timer = new Promise((r) => setTimeout(() => r("timeout"), timeoutMs));
-    if ((await Promise.race([this.exited, timer])) === "timeout") {
+    if ((await raceTimeout(this.exited, timeoutMs)) === "timeout") {
       timedOut = true;
       this.log(`watch pid ${this.pid} did not exit ${timeoutMs} ms after stdin closed; ending our child by its handle`);
       // Our own child, by its handle: Node signals exactly this PID.
-      this.child.kill("SIGTERM");
-      await Promise.race([this.exited, new Promise((r) => setTimeout(r, 5000))]);
+      const how = await endChild(this.child, this.exited, { graceMs: this.killGraceMs });
+      if (how === "survived") this.log(`watch pid ${this.pid} survived SIGTERM and SIGKILL`);
     }
     const taken = takeRunFile(this.runDir, "probe", this.label);
     if (taken.error) this.log(`watch pid ${this.pid}: ${taken.error}`);
@@ -297,29 +336,33 @@ export class WatchProcess {
  *
  * @returns {Promise<{code: number | null, stdout: string, stderr: string}>}
  */
-export function runProbe({ probe, args, env = process.env, timeoutMs = 120000, spawnFn = spawn }) {
+export function runProbe({ probe, args, env = process.env, timeoutMs = 120000, spawnFn = spawn, killGraceMs = 5000 }) {
   return new Promise((resolveRun) => {
     const child = spawnFn(probe, args, { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const finish = (r) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveRun(r);
+    };
+    const exited = new Promise((r) => child.on("exit", (code) => r(code)));
     child.stdout?.on("data", (d) => {
       stdout = (stdout + d.toString("utf8")).slice(-64 * 1024);
     });
     child.stderr?.on("data", (d) => {
       stderr = (stderr + d.toString("utf8")).slice(-16 * 1024);
     });
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       stderr += `\n(termhost-bench: ${args[0]} exceeded ${timeoutMs} ms; ending our child by its handle)`;
-      child.kill("SIGTERM");
+      // SIGTERM, then SIGKILL: a child that ignores the first never holds the run.
+      const how = await endChild(child, exited, { graceMs: killGraceMs });
+      if (how === "survived") finish({ code: null, stdout, stderr: `${stderr}\n(termhost-bench: our child survived SIGTERM and SIGKILL)` });
     }, timeoutMs);
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolveRun({ code, stdout, stderr });
-    });
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      resolveRun({ code: null, stdout, stderr: `${stderr}\n${e.message}` });
-    });
+    exited.then((code) => finish({ code, stdout, stderr }));
+    child.on("error", (e) => finish({ code: null, stdout, stderr: `${stderr}\n${e.message}` }));
   });
 }
 

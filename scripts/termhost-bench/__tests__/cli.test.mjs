@@ -11,12 +11,17 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { KNOWN_FLAGS, UsageError, main, normaliseRunOptions, parseArgv } from "../cli.mjs";
 import { KPI_CATALOG } from "../kpi-catalog.mjs";
+import { InvalidResults } from "../results.mjs";
+import { RunAbort, RunFailed } from "../run.mjs";
+import { linuxXvfbResults } from "./helpers/results.mjs";
+import { healthyFacts } from "./helpers/fake-bench.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKFLOW = join(HERE, "..", "..", "..", ".github", "workflows", "termhost-bench.yml");
@@ -220,4 +225,44 @@ test("the job builds the baseline only when there is one, and the smoke is N = 1
   }
   assert.match(yml, /^ {2}schedule:\n {4}- cron: "[^"]+"$/m, "a weekly schedule");
   assert.match(yml, /^ {2}workflow_dispatch:\n[\s\S]*?baseline_sha:/m, "dispatch takes a baseline");
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1
+// ---------------------------------------------------------------------------
+
+test("auto mode refuses to guess when the supervisor probe is unanswered (D12)", async () => {
+  await assert.rejects(
+    normaliseRunOptions({ env: "linux-xvfb", setups: "runner", "runner-exe": "/x" }, { resolve, probeSupervisor: async () => null }),
+    (e) => e instanceof UsageError && /cannot tell whether a supervisor answers/.test(e.message),
+  );
+});
+
+test("exit codes follow the header: 3 when the doctor blocks, 1 when a run fails or stops, 0 otherwise", async () => {
+  const quiet = { out: () => {}, err: () => {} };
+  const runWith = (impl) => main(["run", "--env", "linux-xvfb", "--setups", "tmux"], quiet, { runBench: impl });
+  assert.equal(await runWith(async () => ({ outPath: "/x", stopped: null })), 0);
+  assert.equal(await runWith(async () => ({ outPath: "/x", stopped: { detail: "interrupted" } })), 1);
+  assert.equal(await runWith(async () => { throw new RunAbort("the doctor reports a run cannot start here"); }), 3);
+  assert.equal(await runWith(async () => { throw new RunFailed("no row was produced"); }), 1, "no row is a failure, not a doctor refusal");
+  assert.equal(await runWith(async () => { throw new InvalidResults("invalid", "/r/results.invalid.json"); }), 1);
+  const doctor = (facts) => main(["doctor", "--env", "linux-xvfb", "--setups", "tmux"], quiet, { gatherDoctorFacts: async () => facts, startEnvironment: async () => ({ env: {}, display: ":99", stop: async () => {} }) });
+  assert.equal(await doctor(healthyFacts()), 0);
+  assert.equal(await doctor({ ...healthyFacts(), drain: { state: "drained", detail: "coord reports this device drained" } }), 3, "a drained device blocks the run");
+  assert.equal(await doctor({ ...healthyFacts(), xvfbPath: null }), 3);
+});
+
+test("an invalid results file is reported by path and keyword only, never with the value", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-cli-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const doc = linuxXvfbResults();
+  doc.rows[1].kpis.jank_share = { state: "measured", unit: "%", n: 500, value: 143.75 };
+  const file = join(dir, "results.json");
+  writeFileSync(file, JSON.stringify(doc));
+  const out = [];
+  assert.equal(await main(["report", file], { out: (x) => out.push(x), err: () => {} }), 1);
+  const text = out.join("");
+  assert.match(text, /^INVALID: /m);
+  assert.match(text, /\/rows\/1\/kpis\/jank_share\/value \[maximum\]/);
+  assert.doesNotMatch(text, /143/, "a third-party reading never reaches the log (D7)");
 });

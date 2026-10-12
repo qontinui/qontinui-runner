@@ -288,3 +288,24 @@ test("httpJson and unwrap throw perf-harness's exact messages (run side by side)
   const env = { success: false, data: null, error: "x" };
   assert.throws(() => unwrap(env), { message: (() => { try { theirUnwrap(env); } catch (e) { return e.message; } })() });
 });
+
+test("stopRunnerChecked stops only a listed, unprotected runner of the right requester (review N8)", async () => {
+  const run = async (rows, opts) => {
+    const { fetch, calls } = fakeFetch((url, init) => (url.endsWith("/runners") && (init.method ?? "GET") === "GET" ? { json: rows } : { json: { stopped: true } }));
+    const sup = new SupervisorClient("http://127.0.0.1:9875", quiet, { fetch });
+    const r = await sup.stopRunnerChecked("test-9881", opts).then(() => "stopped", (e) => e.message);
+    return { r, posted: calls.some((c) => c.method === "POST" && c.url.endsWith("/runners/test-9881/stop")) };
+  };
+  assert.deepEqual(await run([{ id: "test-9881", requester_id: "me" }], { requesterId: "me" }), { r: "stopped", posted: true });
+  const prot = await run([{ id: "test-9881", protected: true }], {});
+  assert.equal(prot.posted, false);
+  assert.match(prot.r, /is protected/);
+  const other = await run([{ id: "test-9881", requester_id: "someone" }], { requesterId: "me" });
+  assert.equal(other.posted, false);
+  assert.match(other.r, /belongs to requester someone/);
+  const gone = await run([], {});
+  assert.equal(gone.posted, false);
+  assert.match(gone.r, /not listed/);
+  const wrapped = await run({ runners: [{ id: "test-9881" }] }, {});
+  assert.equal(wrapped.posted, true, "a {runners: [...]} body is read too");
+});

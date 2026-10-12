@@ -309,6 +309,27 @@ export function firstSeenIndex(seg, primary) {
   return idx;
 }
 
+/**
+ * Time from a switch command to the first primary frame that shows `session`'s
+ * marker (at or after `newestSeq`) as the ONLY session displayed: the frame's
+ * accumulated `v` is 1, or, on a record without `v`, no other session's output
+ * marker is in it. A frame that shows the session among others — a grid
+ * repainted on the way, before the maximize took — is not the switch.
+ *
+ * @returns {number | null} ms
+ */
+export function timeToSoleMarker(frames, session, tCmd, newestSeq, timeoutNs) {
+  for (const f of frames) {
+    if (f.t < tCmd) continue;
+    if (f.t > tCmd + timeoutNs) return null;
+    const outputs = (f.markers ?? []).filter((m) => m.kind === "output");
+    const shown = outputs.some((m) => m.session === session && seqAtOrAfter(m.seq, newestSeq));
+    const alone = Number.isInteger(f.v) ? f.v === 1 : outputs.every((m) => m.session === session);
+    if (shown && alone) return nsToMs(f.t - tCmd);
+  }
+  return null;
+}
+
 /** Is marker seq `m` (mod M) at or after the full counter `newest`? */
 export function seqAtOrAfter(m, newest) {
   if (newest === null || newest === undefined) return true;
@@ -318,7 +339,8 @@ export function seqAtOrAfter(m, newest) {
 
 /**
  * Time from a command to the first primary frame showing `session`'s output
- * marker at or after `newestSeq` (null = any), within `timeoutNs`.
+ * marker at or after `newestSeq` (null = any), within `timeoutNs`. A frame before
+ * the command never counts.
  *
  * @returns {number | null} ms
  */
@@ -357,13 +379,32 @@ export function interpolate(points, t, field) {
   return before[field] + (after[field] - before[field]) * frac;
 }
 
+/** The generators' progress cadence (`generator/ai-session.mjs` `PROGRESS_INTERVAL_MS`). */
+export const PROGRESS_INTERVAL_MS = 500;
+
+/**
+ * A gap between two of a generator's records longer than this means it ran no
+ * JavaScript in between. Its loop writes a `progress` record every 500 ms unless
+ * a `write` blocks it, and the time spent inside a write is added to `blocked_ns`
+ * only when the write RETURNS. A write that never returns, or fails when teardown
+ * closes the PTY, leaves no trace in the counters at all (`timedWrite`).
+ */
+export const RECORD_GAP_MS = 2 * PROGRESS_INTERVAL_MS;
+
 /**
  * Per session over the window: producer stall (share of wall time blocked inside
- * `write`), delivered ratio and bytes written — each counter interpolated at the
- * window's ends between the records that bracket them. A session with no record
- * after the window (a generator killed while blocked in one write, which then runs
- * no JavaScript at all) has no reading and is named in the notes, not dropped
- * silently.
+ * `write`), delivered ratio and bytes written. Each counter is integrated over the
+ * record-to-record segments that overlap the window, linearly within a segment.
+ *
+ * A segment longer than {@link RECORD_GAP_MS} is a stretch in which the generator
+ * ran no JavaScript: it was inside a write the host was not draining. That stretch
+ * counts as blocked (to within one progress interval) whatever the counters say,
+ * because a write that failed at teardown never credits its time to `blocked_ns`.
+ *
+ * A session with no record at or before the window's start, or none at or after
+ * its end, has no reading at all. It is returned in `silent`, and the caller makes
+ * the KPIs unknown: dropping it would shrink the sample to the sessions that kept
+ * running, which is the opposite of what happened.
  */
 export function generatorWindow(gens, win) {
   const stall = [];
@@ -371,35 +412,56 @@ export function generatorWindow(gens, win) {
   let bytes = 0;
   const notes = [];
   const silent = [];
+  const gaps = [];
   let clamped = 0;
+  const gapNs = BigInt(RECORD_GAP_MS) * NS_PER_MS;
+  const spanNs = Number(win.t1 - win.t0);
   for (const [session, g] of gens) {
-    const b0 = interpolate(g.points, win.t0, "blocked");
-    const b1 = interpolate(g.points, win.t1, "blocked");
-    const w0 = interpolate(g.points, win.t0, "written");
-    const w1 = interpolate(g.points, win.t1, "written");
-    const s0 = interpolate(g.points, win.t0, "scheduled");
-    const s1 = interpolate(g.points, win.t1, "scheduled");
-    if (b0 === null || b1 === null || w0 === null || w1 === null) {
+    const pts = g.points;
+    if (pts.length === 0 || pts[0].t > win.t0 || pts[pts.length - 1].t < win.t1) {
       silent.push(session);
       continue;
     }
-    let pct = ((b1 - b0) / Number(win.t1 - win.t0)) * 100;
+    let blocked = 0;
+    let written = 0;
+    let scheduled = 0;
+    let gapInWindow = 0n;
+    for (let i = 0; i + 1 < pts.length; i += 1) {
+      const a = pts[i];
+      const b = pts[i + 1];
+      const lo = a.t > win.t0 ? a.t : win.t0;
+      const hi = b.t < win.t1 ? b.t : win.t1;
+      if (hi <= lo) continue;
+      const seg = b.t - a.t;
+      const frac = Number(hi - lo) / Number(seg);
+      if (seg > gapNs) {
+        blocked += Number(hi - lo);
+        gapInWindow += hi - lo;
+      } else {
+        blocked += (b.blocked - a.blocked) * frac;
+      }
+      written += (b.written - a.written) * frac;
+      scheduled += (b.scheduled - a.scheduled) * frac;
+    }
+    if (gapInWindow > 0n) gaps.push({ session, ms: nsToMs(gapInWindow) });
+    let pct = (blocked / spanNs) * 100;
     if (pct > 100) {
       pct = 100;
       clamped += 1;
     }
     stall.push(Math.max(0, pct));
-    bytes += Math.max(0, w1 - w0);
-    if (s0 !== null && s1 !== null && s1 - s0 > 0) delivered.push((w1 - w0) / (s1 - s0));
+    bytes += Math.max(0, written);
+    if (scheduled > 0) delivered.push(written / scheduled);
   }
-  if (silent.length > 0) {
+  if (gaps.length > 0) {
     notes.push(
-      `producer_stall_pct: ${silent.length} session(s) have no generator record bracketing the window (${silent.join(", ")}): ` +
-        "a generator blocked inside one write writes nothing until it returns",
+      `producer_stall_pct: ${gaps.length} session(s) ran no JavaScript for part of the window ` +
+        `(${gaps.map((x) => `session ${x.session}: ${Math.round(x.ms)} ms`).join(", ")}): counted as blocked, ` +
+        "because a generator that writes no record for that long is inside a write the host is not draining",
     );
   }
   if (clamped > 0) notes.push(`producer_stall_pct: ${clamped} session stall reading(s) above 100% were clamped (a write straddling a record)`);
-  return { stall, delivered, bytes, notes, silent };
+  return { stall, delivered, bytes, notes, silent, gaps };
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +522,18 @@ function stateOf(capabilities, id) {
   return capabilities?.[id]?.state ?? "UNKNOWN";
 }
 
+/**
+ * unknown(clock_unaligned) for a KPI that compares a time node took (a generator's
+ * emission, a harness command) with a time the probe took, unless the doctor
+ * showed the two share a timebase; null when the KPI may be computed.
+ */
+function clockGate(p, id) {
+  if (stateOf(p.capabilities, "clock.aligned") === "OPERATIVE") return null;
+  return unknownKpi(id, "clock_unaligned", {
+    detail: `clock.aligned is ${stateOf(p.capabilities, "clock.aligned")}: ${p.capabilities?.["clock.aligned"]?.reason ?? "no doctor verdict"}`,
+  });
+}
+
 /** The soak KPIs the probe computes over its own window (`records.rs` `WatchSummary`). */
 export const PROBE_CAPTURE_KPIS = Object.freeze([
   "output_latency_ms",
@@ -501,10 +575,18 @@ export function fromProbe(id, v, { what = `the probe's ${id}` } = {}) {
   if (n < minN) {
     return unknownKpi(id, "insufficient_samples", { n, detail: `${what} was measured over ${n} samples; the catalog needs ${minN}` });
   }
+  // Outside the catalog's range the value would make the whole results file
+  // invalid. The detail names the bound, never the number (it can reach a public
+  // log, and a third-party reading never leaves the job: D7).
+  const range = k.value_range ?? {};
+  const outOfRange = (x) => (range.minimum !== undefined && x < range.minimum) || (range.maximum !== undefined && x > range.maximum);
+  const rangeText = `[${range.minimum ?? "-inf"}, ${range.maximum ?? "+inf"}]`;
   if (k.shape === "value") {
     if (typeof v.value !== "number" || !Number.isFinite(v.value)) {
       return unknownKpi(id, "harness_error", { n, detail: `${what} is measured without a finite value` });
     }
+    if (outOfRange(v.value)) return unknownKpi(id, "harness_error", { n, detail: `${what} lies outside the catalog's range ${rangeText}` });
+    if (k.integer && !Number.isInteger(v.value)) return unknownKpi(id, "harness_error", { n, detail: `${what} is a count, but not an integer` });
     return measureKpi(id, { value: v.value, n });
   }
   const stats = {};
@@ -513,6 +595,7 @@ export function fromProbe(id, v, { what = `the probe's ${id}` } = {}) {
     if (typeof x !== "number" || !Number.isFinite(x)) {
       return unknownKpi(id, "harness_error", { n, detail: `${what} is measured without its ${s}` });
     }
+    if (outOfRange(x)) return unknownKpi(id, "harness_error", { n, detail: `${what}'s ${s} lies outside the catalog's range ${rangeText}` });
     stats[s] = x;
   }
   return { state: "measured", unit: k.unit, n, stats };
@@ -546,7 +629,6 @@ export function computeRowKpis(p) {
   const seg = p.soak ? indexProbeSegment(p.soak.records) : null;
   const win = seg ? segmentWindow(seg) : null;
   const cap = seg ? captureInfo(seg) : null;
-  const clockOk = stateOf(p.capabilities, "clock.aligned") === "OPERATIVE";
 
   // --- the capture gate --------------------------------------------------
   // The soak watch's summary is the probe's verdict over exactly this window.
@@ -589,13 +671,9 @@ export function computeRowKpis(p) {
   for (const id of PROBE_CAPTURE_KPIS) {
     if (gated(id)) {
       set(id, gateValue(id));
-    } else if (id === "output_latency_ms" && !clockOk) {
-      set(
-        id,
-        unknownKpi(id, "clock_unaligned", {
-          detail: `clock.aligned is ${stateOf(p.capabilities, "clock.aligned")}: ${p.capabilities?.["clock.aligned"]?.reason ?? "no doctor verdict"}`,
-        }),
-      );
+    } else if (id === "output_latency_ms" && clockGate(p, id)) {
+      // A generator's emission (node hrtime) against a first appearance (probe).
+      set(id, clockGate(p, id));
     } else {
       set(id, fromProbe(id, summary[id], { what: `the soak watch's ${id}` }));
     }
@@ -632,16 +710,22 @@ export function computeRowKpis(p) {
     const gw = generatorWindow(p.gens, win);
     notes.push(...gw.notes);
     const coverage = { observed: gw.stall.length, expected: Math.max(p.n, gw.stall.length) };
-    set("producer_stall_pct", measureKpi("producer_stall_pct", gw.stall, { coverage }));
-    if (gw.delivered.length > 0) {
+    if (gw.silent.length > 0) {
+      const detail =
+        `session(s) ${gw.silent.join(", ")} wrote no generator record bracketing the soak window ` +
+        "(blocked inside one write, or gone): a silent session makes the reading unknown, never a smaller sample";
+      set("producer_stall_pct", unknownKpi("producer_stall_pct", "harness_error", { n: gw.stall.length, detail }));
+      set("delivered_ratio", unknownKpi("delivered_ratio", "harness_error", { n: gw.delivered.length, detail }));
+    } else {
+      set("producer_stall_pct", measureKpi("producer_stall_pct", gw.stall, { coverage }));
       set(
         "delivered_ratio",
-        measureKpi("delivered_ratio", { value: Math.min(...gw.delivered), n: gw.delivered.length }, {
-          coverage: { observed: gw.delivered.length, expected: Math.max(p.n, gw.delivered.length) },
-        }),
+        gw.delivered.length > 0
+          ? measureKpi("delivered_ratio", { value: Math.min(...gw.delivered), n: gw.delivered.length }, {
+              coverage: { observed: gw.delivered.length, expected: Math.max(p.n, gw.delivered.length) },
+            })
+          : unknownKpi("delivered_ratio", "insufficient_samples", { n: 0, detail: "no session scheduled bytes in the window" }),
       );
-    } else {
-      set("delivered_ratio", unknownKpi("delivered_ratio", "insufficient_samples", { n: 0, detail: "no session scheduled bytes in the window" }));
     }
     // cpu_ms_per_mb needs the window's bytes; computed here once both are known.
     // It is a SUM of the host's CPU time over the window's sample intervals (the
@@ -670,7 +754,7 @@ export function computeRowKpis(p) {
   }
 
   // --- input, switch and spawn phases -------------------------------------
-  set("input_latency_ms", inputLatencyKpi(p, clockOk, captureGate));
+  set("input_latency_ms", inputLatencyKpi(p, captureGate));
   set("switch_latency_ms", switchLatencyKpi(p, notes));
   set("spawn_latency_ms", spawnLatencyKpi(p, notes));
 
@@ -829,13 +913,14 @@ export function injectAbortReason(reason) {
  * aborted part-way keeps the keys sent before the abort; when they are too few,
  * the abort, not the count, is the reason.
  */
-export function inputLatencyKpi(p, clockOk, captureGate) {
+export function inputLatencyKpi(p, captureGate) {
   const id = "input_latency_ms";
   const inp = p.input;
   if (!inp) return unknownKpi(id, "input_unsafe", { detail: "the input arm did not run" });
   if (inp.unavailable) return unknownKpi(id, inp.unavailable.reason, inp.unavailable.detail ? { detail: inp.unavailable.detail } : {});
   if (captureGate) return unknownKpi(id, captureGate.reason, { detail: captureGate.detail });
-  if (!clockOk) return unknownKpi(id, "clock_unaligned");
+  // No clock gate: `t_inject_ns` (inject) and the echo's first appearance (watch)
+  // are both the probe's clock, so node's alignment with it does not enter.
   const seg = indexProbeSegment(inp.records ?? []);
   const cap = captureInfo(seg);
   if (!cap.primary) return unknownKpi(id, "capture_unavailable", { detail: "the input phase's watch opened no capture source" });
@@ -893,6 +978,10 @@ export function switchLatencyKpi(p, notes) {
   if (p.n === 1) return notApplicableKpi(id, "single_session");
   if (!sw) return unknownKpi(id, "insufficient_samples", { n: 0, detail: "the switch phase did not run" });
   if (sw.unavailable) return unknownKpi(id, sw.unavailable.reason, sw.unavailable.detail ? { detail: sw.unavailable.detail } : {});
+  // The command time is the harness's (node hrtime) and the frame time the
+  // probe's: comparing them needs the doctor's clock verdict.
+  const clock = clockGate(p, id);
+  if (clock) return clock;
   const seg = indexProbeSegment(sw.records ?? []);
   const win = segmentWindow(seg);
   const cap = captureInfo(seg);
@@ -907,11 +996,11 @@ export function switchLatencyKpi(p, notes) {
     const g = p.gens.get(s.k);
     let newest = null;
     for (const m of g?.markers ?? []) if (m.kind === "output" && m.tEmit <= s.tCmdNs) newest = m.seq;
-    const ms = timeToMarker(frames, s.k, s.tCmdNs, newest, timeoutNs);
+    const ms = timeToSoleMarker(frames, s.k, s.tCmdNs, newest, timeoutNs);
     if (ms === null) missed += 1;
     else samples.push(ms);
   }
-  if (missed > 0) notes.push(`switch_latency_ms: ${missed} switch(es) never showed the session within the timeout`);
+  if (missed > 0) notes.push(`switch_latency_ms: ${missed} switch(es) never showed the session alone within the timeout`);
   return measureKpi(id, samples);
 }
 
@@ -921,6 +1010,8 @@ export function spawnLatencyKpi(p, notes) {
   const sp = p.spawns;
   if (!sp) return unknownKpi(id, "insufficient_samples", { n: 0, detail: "the spawn phase did not run" });
   if (sp.unavailable) return unknownKpi(id, sp.unavailable.reason, sp.unavailable.detail ? { detail: sp.unavailable.detail } : {});
+  const clock = clockGate(p, id);
+  if (clock) return clock;
   const seg = indexProbeSegment(sp.records ?? []);
   const win = segmentWindow(seg);
   const cap = captureInfo(seg);

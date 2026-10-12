@@ -173,6 +173,31 @@ export class SupervisorClient {
   // termhost-bench additions (perf-harness does not use these)
   // -------------------------------------------------------------------------
 
+  /** `GET /runners` — the supervisor's runner rows (`id`, `port`, `pid`, `protected`, `requester_id`, …). */
+  async runners() {
+    const rows = await this.http(`${this.baseUrl}/runners`, { timeoutMs: 20000 });
+    return Array.isArray(rows) ? rows : Array.isArray(rows?.runners) ? rows.runners : [];
+  }
+
+  /**
+   * Stop a temp runner only after reading its row back: it must still be listed,
+   * never `protected`, and — when `requesterId` is given — owned by that requester.
+   * `stopRunner` trusts the id it is given; this is the defence in depth a harness
+   * that runs on an operator's box wants before it stops anything.
+   *
+   * @param {string} id
+   * @param {{requesterId?: string}} [opts]
+   */
+  async stopRunnerChecked(id, { requesterId } = {}) {
+    const row = (await this.runners()).find((r) => r?.id === id);
+    if (!row) throw new Error(`runner ${id} is not listed by the supervisor; nothing was stopped`);
+    if (row.protected === true) throw new Error(`runner ${id} is protected; it was not stopped`);
+    if (requesterId && row.requester_id && row.requester_id !== requesterId) {
+      throw new Error(`runner ${id} belongs to requester ${row.requester_id}, not ${requesterId}; it was not stopped`);
+    }
+    return this.stopRunner(id);
+  }
+
   /**
    * `POST /runners/spawn-test` with `async: true`: the supervisor answers `202
    * {submission_id, id, port, poll_url, …}` at once and builds in the

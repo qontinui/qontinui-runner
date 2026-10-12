@@ -271,12 +271,20 @@ export function terminatePid(pid, { signal = "SIGTERM", table, expect, kill = pr
  * the process still being the one we started (same PID AND same start key, so a
  * recycled PID is never touched). Returns what was signalled and what survived.
  *
- * @param {{pid: number, startKey?: string}} root the process this run spawned
+ * The root's start key is REQUIRED: it is the only proof that the PID is still the
+ * process the run started. Without one (a process table read that missed a child
+ * which died at startup), the root and its tree are left alone and the result says
+ * so (`refused`); a root that is gone, or whose start key no longer matches, is not
+ * walked either. `alsoPids` — processes proven ours by their own start keys — are
+ * handled in every case.
+ *
+ * @param {{pid: number, startKey?: string | null} | null} root the process this run spawned (null: none to walk)
  * @param {{graceMs?: number, list?: () => Map<number, ProcInfo>, kill?: typeof process.kill,
  *   sleepFn?: (ms: number) => Promise<void>, now?: () => number,
  *   alsoPids?: {pid: number, startKey: string}[]}} [opts]
  *   `alsoPids` are further processes the run proved it owns (e.g. a daemonised
  *   postmaster named by its own pid file) that are not descendants of the root.
+ * @returns {Promise<{signalled: number[], survivors: number[], refused?: string, note?: string}>}
  */
 export async function terminateTree(
   root,
@@ -290,16 +298,22 @@ export async function terminateTree(
   } = {},
 ) {
   const table = list();
-  const rootProc = table.get(root.pid);
-  if (!rootProc || (root.startKey && rootProc.startKey !== root.startKey)) {
-    return { signalled: [], survivors: [], note: `root ${root.pid} already gone` };
+  let refused;
+  let note;
+  let walk = [];
+  if (root && !root.startKey) {
+    refused = `pid ${root.pid}: no start key was captured, so its identity cannot be proven; its tree was not signalled`;
+  } else if (root) {
+    const rootProc = table.get(root.pid);
+    if (!rootProc || rootProc.startKey !== root.startKey) note = `root ${root.pid} already gone`;
+    else walk = [...descendantsOf(table, root.pid).map((p) => ({ pid: p.pid, startKey: p.startKey }))];
   }
-  const targets = [
-    ...descendantsOf(table, root.pid).map((p) => ({ pid: p.pid, startKey: p.startKey })),
-    ...alsoPids,
-  ];
-  // Children first (deepest last in `targets`, so iterate in reverse), then the root.
-  const order = [...targets].reverse().concat([{ pid: root.pid, startKey: rootProc.startKey }]);
+  const owned = alsoPids.filter((t) => t && Number.isInteger(t.pid) && t.startKey);
+  const rootLive = Boolean(root) && !refused && !note;
+  // Children first (deepest last in the walk, so iterate in reverse), then the root.
+  const order = [...walk, ...owned].reverse().concat(rootLive ? [{ pid: root.pid, startKey: root.startKey }] : []);
+  const extra = { ...(refused ? { refused } : {}), ...(note ? { note } : {}) };
+  if (order.length === 0) return { signalled: [], survivors: [], ...extra };
   const same = (want) => (p) => p.startKey === want.startKey;
   const signalled = [];
   for (const t of order) {
@@ -322,5 +336,5 @@ export async function terminateTree(
   for (const t of order) {
     if (final.get(t.pid)?.startKey === t.startKey) survivors.push(t.pid);
   }
-  return { signalled, survivors };
+  return { signalled, survivors, ...extra };
 }

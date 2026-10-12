@@ -62,29 +62,32 @@ test("every catalog KPI is present, in catalog order", () => {
   assert.deepEqual(Object.keys(kpis), [...KPI_IDS]);
 });
 
-test("output latency, cadence, jank, hangs and loss measure the stated answers", () => {
-  const { kpis, vActual: va } = computeRowKpis(focusFixture());
+/** The fixture's soak records with these probe summary values in place of its own. */
+function withSummary(fixture, patch) {
+  const records = fixture.soak.records.map((r) => (r.type === "summary" ? { ...r, ...patch } : r));
+  return { ...fixture, soak: { records } };
+}
+
+test("the soak's capture KPIs are the probe's summary values, passed through unchanged", () => {
+  // Sentinel values the fixture's own model would never produce: the test checks
+  // what kpis.mjs does with the probe's verdict, not the fixture's arithmetic.
+  const sentinel = {
+    output_latency_ms: { state: "measured", unit: "ms", n: 412, stats: { p50: 11.5, p95: 22.25, p99: 33.125 } },
+    frame_interval_ms: { state: "measured", unit: "ms", n: 2399, stats: { p50: 16.5, p95: 18.75 } },
+    jank_share: { state: "measured", unit: "%", n: 2399, value: 1.25 },
+    hangs: { state: "measured", unit: "count", n: 80, value: 2 },
+    marker_loss: { state: "measured", unit: "%", n: 400, value: 0.5 },
+    marker_skipped: { state: "measured", unit: "%", n: 400, value: 3.75 },
+    v_actual_p50: 1,
+  };
+  const { kpis, vActual: va } = computeRowKpis(withSummary(focusFixture(), sentinel));
   assert.equal(va, 1);
-  const lat = kpis.output_latency_ms;
-  assert.equal(lat.state, "measured");
-  // Markers are shown 20 ms after emission; frames tick every 16.67 ms, so the first
-  // frame showing a marker is 20..36.7 ms after it.
-  assert.ok(lat.stats.p50 >= 20 && lat.stats.p50 <= 37, `p50 ${lat.stats.p50}`);
-  assert.ok(lat.stats.p99 <= 37, `p99 ${lat.stats.p99}`);
-  assert.ok(lat.n >= 350, `n ${lat.n}`);
-  assert.deepEqual(lat.coverage, { observed: 1, expected: 1 });
-  const fi = kpis.frame_interval_ms;
-  assert.equal(fi.state, "measured");
-  assert.ok(Math.abs(fi.stats.p50 - 16.667) < 0.01, `frame p50 ${fi.stats.p50}`);
-  assert.equal(kpis.jank_share.state, "measured");
-  assert.equal(kpis.jank_share.value, 0);
-  assert.equal(kpis.hangs.state, "measured");
-  assert.equal(kpis.hangs.value, 0);
-  assert.equal(kpis.hangs.n, SOAK_MS / 500);
-  assert.equal(kpis.marker_loss.state, "measured");
-  assert.equal(kpis.marker_loss.value, 0);
-  assert.equal(kpis.marker_skipped.state, "measured");
-  assert.equal(kpis.marker_skipped.value, 0);
+  const { coverage, ...lat } = kpis.output_latency_ms;
+  assert.deepEqual(lat, sentinel.output_latency_ms);
+  assert.deepEqual(coverage, { observed: 1, expected: 1 }, "coverage: the displayed sessions that gave a sample");
+  for (const id of ["frame_interval_ms", "jank_share", "hangs", "marker_loss", "marker_skipped"]) {
+    assert.deepEqual(kpis[id], sentinel[id], id);
+  }
 });
 
 test("process accounting reads the host, workload and compositor groups", () => {
@@ -386,12 +389,124 @@ test("an inject abort names its catalog reason; an arm aborted part-way reports 
   assert.match(r.kpis.input_latency_ms.detail, /aborted at key 30 \(operator_input\)/);
 });
 
-test("a generator silent after the window is named, not counted as 0 % stall", () => {
-  const gen = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: 20000, exit: false });
-  const gw = generatorWindow(indexGenerators(new Map([[0, gen]])), { t0: T0, t1: T0 + 40000n * MS });
-  assert.deepEqual(gw.stall, []);
+test("a generator silent after the window makes both generator KPIs unknown, never a smaller sample", () => {
+  const silent = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: 20000, exit: false });
+  const healthy = genLog({ session: 1, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 15000 });
+  const gw = generatorWindow(indexGenerators(new Map([[0, silent], [1, healthy]])), { t0: T0, t1: T0 + BigInt(SOAK_MS) * MS });
   assert.deepEqual(gw.silent, [0]);
-  assert.ok(gw.notes[0].startsWith("producer_stall_pct: "));
+  assert.equal(gw.stall.length, 1, "only the session with a reading");
+  const r = computeRowKpis({ ...focusFixture(), gens: indexGenerators(new Map([[0, silent], [1, healthy]])) });
+  assertUnknown(r.kpis.producer_stall_pct, "harness_error");
+  assertUnknown(r.kpis.delivered_ratio, "harness_error");
+  assert.match(r.kpis.producer_stall_pct.detail, /session\(s\) 0 wrote no generator record/);
+});
+
+/**
+ * The review's reproduction (scratchpad review-p3/stall.mjs): a generator blocked
+ * inside one write from t0+20 s until teardown closed the PTY at t0+70 s. Its last
+ * progress is at t0+20 s, and its exit record's `blocked_ns` leaves the failed
+ * write out (`timedWrite` credits a write only when it returns).
+ */
+function wedgedGenerator() {
+  const S = 1_000_000_000n;
+  const t0 = 10_000n * S;
+  const recs = [{ type: "start", session: 0, t0_ns: String(t0 - 5n * S) }];
+  let blocked = 0;
+  for (let t = t0 - 5n * S; t <= t0 + 20n * S; t += S / 2n) {
+    recs.push({ type: "progress", t_ns: String(t), blocked_ns: blocked, bytes_written: 1000, bytes_scheduled: 1000 });
+    blocked += 1_000_000;
+  }
+  recs.push({ type: "exit", reason: "stdout_closed", t_ns: String(t0 + 70n * S), blocked_ns: blocked, bytes_written: 1000, bytes_scheduled: 1000 });
+  const healthy = [{ type: "start", session: 1, t0_ns: String(t0 - 5n * S) }];
+  let b2 = 0;
+  for (let t = t0 - 5n * S; t <= t0 + 75n * S; t += S / 2n) {
+    healthy.push({ type: "progress", t_ns: String(t), blocked_ns: b2, bytes_written: 1000, bytes_scheduled: 1000 });
+    b2 += 1_000_000;
+  }
+  return { t0, S, gens: indexGenerators(new Map([[0, recs], [1, healthy]])) };
+}
+
+test("a generator blocked inside a write that never returned counts as stalled for the whole block", () => {
+  const { t0, S, gens } = wedgedGenerator();
+  const gw = generatorWindow(gens, { t0, t1: t0 + 40n * S });
+  // 40 ordinary 500 ms segments at 1 ms each, then 20 000 ms with no JavaScript run.
+  assert.ok(Math.abs(gw.stall[0] - ((40 + 20000) / 40000) * 100) < 1e-9, `wedged ${gw.stall[0]}`);
+  assert.ok(Math.abs(gw.stall[1] - 0.2) < 1e-9, `healthy ${gw.stall[1]}`);
+  assert.deepEqual(gw.gaps.map((g) => [g.session, Math.round(g.ms)]), [[0, 20000]]);
+  assert.match(gw.notes.join("\n"), /ran no JavaScript for part of the window \(session 0: 20000 ms\)/);
+  assert.deepEqual(gw.silent, []);
+});
+
+test("an ordinary record cadence is interpolated, not mistaken for a block", () => {
+  const { kpis } = computeRowKpis(focusFixture());
+  // genLog: 1 ms blocked per write at 10 writes a second = 1 %, with records every 500 ms.
+  assert.ok(Math.abs(kpis.producer_stall_pct.stats.mean - 1) < 0.05, `stall ${kpis.producer_stall_pct.stats.mean}`);
+  assert.ok(!(kpis.producer_stall_pct.notes ?? []).some((n) => /no JavaScript/.test(n)));
+});
+
+test("the clock verdict gates exactly the KPIs that compare node's clock with the probe's", () => {
+  const caps = { "clock.aligned": { state: "UNKNOWN", reason: "node not found" } };
+  const injectT0 = T0 + BigInt(SOAK_MS + 1000) * MS;
+  const keys = [];
+  const echoes = [];
+  const seen = [];
+  for (let i = 0; i < 120; i += 1) {
+    const tInject = injectT0 + BigInt(i * 100) * MS;
+    keys.push({ type: "inject", index: i, key: "a", t_inject_ns: String(tInject), t_check_ns: String(tInject), tagged: true });
+    echoes.push({ seq: i, byte: 97, tEmit: tInject + 2n * MS });
+    seen.push({ session: 0, seq: i, t: tInject + 30n * MS });
+  }
+  const gen = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 30000, echoes });
+  const inputRecords = watchSegment({ t0: injectT0 - 200n * MS, durationMs: 13000, sessions: [{ session: 0, gen, latencyMs: 20 }], echoSeen: seen });
+  const r = computeRowKpis({
+    ...focusFixture({ caps }),
+    n: 2,
+    gens: indexGenerators(new Map([[0, gen]])),
+    input: { records: inputRecords, injects: keys, focusSession: 0, echoBase: 0 },
+    switches: { records: inputRecords, list: [{ k: 0, tCmdNs: injectT0 }] },
+    spawns: { records: inputRecords, list: [{ session: 0, tCmdNs: injectT0 }] },
+  });
+  // Both of input latency's times are the probe's (inject's t_inject, watch's first_seen).
+  assert.equal(r.kpis.input_latency_ms.state, "measured", JSON.stringify(r.kpis.input_latency_ms));
+  // Output, switch and spawn latency each set a node time against a probe time.
+  assertUnknown(r.kpis.output_latency_ms, "clock_unaligned");
+  assertUnknown(r.kpis.switch_latency_ms, "clock_unaligned");
+  assertUnknown(r.kpis.spawn_latency_ms, "clock_unaligned");
+});
+
+test("a switch counts the first frame that shows the session ALONE, not a repaint showing it among others", () => {
+  const gens = [0, 1].map((s) => genLog({ session: s, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 30000 }));
+  const sw0 = T0 + BigInt(SOAK_MS + 1050) * MS;
+  const list = [];
+  const records = watchSegment({ t0: sw0 - 100n * MS, durationMs: 11000, sessions: [], frameHz: 60 });
+  const marker = (session, t) => {
+    let cur = null;
+    for (const r of gens[session]) if (r.type === "marker" && BigInt(r.t_emit_ns) <= t) cur = r;
+    return { kind: "output", session, seq: cur.seq, rect: { x: 0, y: 0, w: 1, h: 1 } };
+  };
+  for (let j = 0; j < 20; j += 1) {
+    const tCmd = sw0 + BigInt(j * 500) * MS;
+    list.push({ k: 1, tCmdNs: tCmd });
+    // 30 ms: the grid repaints with session 1 shown beside session 0 (v = 2).
+    records.push({ type: "frame", source: "x11", index: 0, t_ns: String(tCmd + 30n * MS), w: 1, h: 1, v: 2, markers: [marker(0, tCmd + 30n * MS), marker(1, tCmd + 30n * MS)], rejected: 0 });
+    // 90 ms: session 1 alone (v = 1) — the switch.
+    records.push({ type: "frame", source: "x11", index: 0, t_ns: String(tCmd + 90n * MS), w: 1, h: 1, v: 1, markers: [marker(1, tCmd + 90n * MS)], rejected: 0 });
+  }
+  const r = computeRowKpis({ ...focusFixture(), n: 2, gens: indexGenerators(new Map([[0, gens[0]], [1, gens[1]]])), switches: { records, list } });
+  assert.equal(r.kpis.switch_latency_ms.state, "measured");
+  assert.ok(Math.abs(r.kpis.switch_latency_ms.stats.p50 - 90) < 1e-6, `switch p50 ${r.kpis.switch_latency_ms.stats.p50}`);
+});
+
+test("a probe value outside the catalog's range is the harness's error, and its detail never quotes the number", () => {
+  const over = fromProbe("jank_share", { state: "measured", unit: "%", n: 500, value: 140.25 });
+  assertUnknown(over, "harness_error");
+  assert.match(over.detail, /outside the catalog's range \[0, 100\]/);
+  assert.doesNotMatch(over.detail, /140/);
+  const negative = fromProbe("output_latency_ms", { state: "measured", unit: "ms", n: 400, stats: { p50: -3.5, p95: 4, p99: 5 } });
+  assertUnknown(negative, "harness_error");
+  assert.match(negative.detail, /p50 lies outside/);
+  const fractionalCount = fromProbe("hangs", { state: "measured", unit: "count", n: 80, value: 1.5 });
+  assertUnknown(fractionalCount, "harness_error");
 });
 
 test("helpers: JSON lines, sequence order, notes attachment", () => {

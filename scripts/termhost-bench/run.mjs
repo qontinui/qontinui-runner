@@ -30,15 +30,17 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { AdapterRefusal, createAdapter as defaultCreateAdapter } from "./adapters/index.mjs";
+import { isPortListening } from "./adapters/runner.mjs";
+import { PRIMARY_RUNNER_PORT } from "../lib/runner-clients.mjs";
 import { gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
 import { allUnknown, computeRowKpis, indexGenerators, injectAbortReason } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
-import { NeutralityGuard } from "./neutrality.mjs";
+import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
 import { carriesFlag, listProcesses, terminatePid } from "./proc.mjs";
 import { loadProfile } from "./profile.mjs";
-import { buildDocument, convertProbeIncident, finalizeLadder, incident, redactRunnerOnly, writeResults } from "./results.mjs";
+import { buildDocument, convertProbeIncident, finalizeLadder, incident, redactRunnerOnly, writeResultsOrSetAside } from "./results.mjs";
 import { createRunDir, createUnitDir, generatorArgv, generatorRunId, makeRunId } from "./rundir.mjs";
 import { echoCount, readGeneratorLog, readGeneratorLogs, readSlots, slotForHostId, waitForGenerators, waitForNewSlot } from "./sessions.mjs";
 
@@ -57,6 +59,14 @@ export const RUN_DEFAULTS = Object.freeze({
   profile: "claude-tui",
   seed: 1,
 });
+
+/** A run that started but produced nothing usable (exit 1, cli.mjs). */
+export class RunFailed extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RunFailed";
+  }
+}
 
 export class RunAbort extends Error {}
 
@@ -158,19 +168,31 @@ export function rowLabels({ softwareRendered, setup, smoke, paneSizes, geometry 
   return labels;
 }
 
-/** A fallback `setup` object when an adapter could not describe itself. */
-function fallbackSetup(unit, detail) {
+/**
+ * A fallback `setup` object when an adapter could not describe itself (or was
+ * never launched). What the plan already knows is kept: the runner build the unit
+ * was FOR (commit, source and role), so head and baseline rows stay distinct and
+ * comparable, and the launch mode the run actually used.
+ */
+export function fallbackSetup(unit, detail, o = {}) {
   const absent = { state: "unknown", reason: "harness_error", detail };
+  const b = unit.build;
+  const build =
+    unit.setup !== "runner"
+      ? { state: "not_applicable", reason: "not_applicable_to_setup" }
+      : b && typeof b.commit === "string" && /^[0-9a-f]{40}$/.test(b.commit)
+        ? { commit: b.commit, source: b.source ?? (o.runnerMode === "supervisor" ? "git_ref" : "artifact"), role: b.role ?? "single" }
+        : { state: "unknown", reason: "harness_error", detail: `${detail}; the build's commit is not known` };
   return {
     id: unit.setup,
     variant: unit.variant,
     app_version: absent,
-    build: unit.setup === "runner" ? absent : { state: "not_applicable", reason: "not_applicable_to_setup" },
+    build,
     settings_digest: absent,
     pty_host_impl: absent,
     render_backend: absent,
     pty_holder: absent,
-    launch_mode: unit.setup === "runner" ? "subject_instance_root" : "private_server",
+    launch_mode: unit.setup === "runner" ? (o.runnerMode === "supervisor" ? "supervisor_spawn_test" : "subject_instance_root") : "private_server",
     session_shell: "unknown",
     shell_integration: absent,
   };
@@ -186,7 +208,57 @@ function fallbackSetup(unit, detail) {
 export async function runBench(opts, deps = {}) {
   const log = deps.log ?? ((s) => process.stderr.write(`termhost-bench: ${s}\n`));
   const now = deps.now ?? (() => new Date());
-  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  // SIGINT / SIGTERM (Ctrl+C, a CI step timeout) end the run, never abandon it: every
+  // sleep returns at once, the unit in progress skips its remaining phases and arms
+  // and tears down, and the units completed so far are written as a valid file whose
+  // incident says it is partial. The completed units are also written at the moment
+  // the signal arrives, in case a second, harder signal follows (GitHub Actions sends
+  // SIGINT, then SIGTERM about 7.5 s later, then SIGKILL); a second signal exits at once.
+  const abort = new AbortController();
+  const aborted = () => abort.signal.aborted;
+  const abortedPromise = new Promise((r) => abort.signal.addEventListener("abort", () => r(), { once: true }));
+  // The real sleep clears its own timer on abort, so nothing lingers after the run.
+  const realSleep = (ms) =>
+    new Promise((r) => {
+      if (aborted()) return r();
+      const done = () => {
+        clearTimeout(timer);
+        abort.signal.removeEventListener("abort", done);
+        r();
+      };
+      const timer = setTimeout(done, ms);
+      abort.signal.addEventListener("abort", done, { once: true });
+    });
+  const sleep = deps.sleep ? (ms) => (aborted() ? Promise.resolve() : Promise.race([deps.sleep(ms), abortedPromise])) : realSleep;
+  const signals = deps.signals ?? process;
+  let writePartial = () => {};
+  const onSignal = (sig) => {
+    if (aborted()) {
+      if (signals === process) {
+        log(`received a second signal (${sig}): exiting now, without the rest of the teardown`);
+        process.exit(130);
+      }
+      return;
+    }
+    log(`received ${sig}: ending the unit in progress and writing the units completed so far`);
+    abort.abort(sig);
+    try {
+      writePartial(sig);
+    } catch (e) {
+      log(`could not write the partial results at the signal: ${e.message}`);
+    }
+  };
+  signals.on("SIGINT", onSignal);
+  signals.on("SIGTERM", onSignal);
+  try {
+    return await runBenchInner(opts, deps, { log, now, sleep, aborted, abort, setWritePartial: (fn) => (writePartial = fn) });
+  } finally {
+    signals.off("SIGINT", onSignal);
+    signals.off("SIGTERM", onSignal);
+  }
+}
+
+async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, setWritePartial }) {
   const spec = environmentSpec(opts.env);
   if (spec.notBuilt) throw new RunAbort(spec.notBuilt);
   const o = { ...RUN_DEFAULTS, ...opts };
@@ -227,14 +299,32 @@ export async function runBench(opts, deps = {}) {
     const probe = deps.probe ?? realProbeDriver({ probePath, envVars: environment.env, log });
 
     const neutrality = deps.neutrality ?? new NeutralityGuard(o.primaryStatePaths ? { paths: o.primaryStatePaths } : {});
-    neutrality.baseline();
+    const base = neutrality.baseline();
+    // The guard's baseline goes into the results, and a guard that would watch
+    // nothing while a primary may be present is UNKNOWN, never a pass (D12).
+    const primaryPresent = await (deps.primaryPresent ?? (() => isPortListening(PRIMARY_RUNNER_PORT)))();
+    const nv = neutralityVerdict(base, primaryPresent);
+    capabilities["harness.neutrality"] = { state: nv.state, reason: nv.reason, checked_at: now().toISOString() };
+    if (nv.state !== "OPERATIVE" && o.runnerMode === "supervisor" && o.setups.includes("runner")) {
+      throw new RunAbort(`the primary-state guard cannot protect this supervisor box: ${nv.reason}`);
+    }
+    const unreadableReported = new Set();
+    const noteUnreadable = (res, stage) => {
+      for (const label of res.unreadable ?? []) {
+        if (unreadableReported.has(label)) continue;
+        unreadableReported.add(label);
+        incidents.push(incident("harness_error", `the primary-state guard could not read ${label} ${stage}: a change to it would not be seen`, { data: { file: label, stage } }));
+      }
+    };
 
     // ---- units --------------------------------------------------------------
     const units = planUnits({ setups: o.setups, ns: o.ns, runs: o.runs, runnerBuilds: o.runnerBuilds, runnerVariants: o.runnerVariants });
     const rows = [];
     const incidents = [];
+    // A refusal ends ONE ladder: this subject's, in this run index, from the refused N up.
     const ladderEnded = new Map();
     let stopped = null;
+    let completedUnits = 0;
     const refreshSeen = { hz: null, known: false, source: null };
     const ctxBase = {
       runId,
@@ -252,67 +342,115 @@ export async function runBench(opts, deps = {}) {
       neutrality,
       refreshSeen,
       reapGenerators: deps.reapGenerators,
+      aborted,
     };
+
+    // What the signal interrupted, captured when it arrived.
+    let atSignal = null;
+    const interruption = (sig) =>
+      incident(
+        "harness_error",
+        `the run was interrupted by ${sig} after ${atSignal?.completed ?? completedUnits} of ${units.length} unit(s) had completed` +
+          (atSignal?.inUnit !== null && atSignal?.inUnit !== undefined ? `, during unit ${atSignal.inUnit}, whose arms cut short read unknown` : "") +
+          ": this file holds no unit run after it",
+        { stopsRun: true, data: { signal: String(sig), units_completed: atSignal?.completed ?? completedUnits, units_planned: units.length } },
+      );
+    const assemble = (rowsNow, incidentsNow) => {
+      const finalRows = structuredClone(rowsNow);
+      finalizeLadder(finalRows);
+      const machine = (deps.machineBlock ?? machineBlock)({
+        environment: o.env,
+        screen: environment.screen ? { width: environment.screen.width, height: environment.screen.height, scalePct: environment.screen.scalePct ?? 100 } : null,
+        refresh: refreshSeen,
+        backgroundLoad,
+      });
+      return buildDocument({
+        run: {
+          id: runId,
+          started_at: startedAt,
+          finished_at: now().toISOString(),
+          harness_commit: harnessCommit(o.repoRoot),
+          node_version: process.version,
+          command: o.command ?? ["node", "scripts/termhost-bench/cli.mjs", "run"],
+        },
+        machine,
+        capabilities,
+        rows: finalRows,
+        incidents: incidentsNow,
+      });
+    };
+    const aside = join(runDir, "results.invalid.json");
+    // At a signal: write what is complete NOW (synchronously), before the unit in
+    // progress has torn down, in case a harder signal follows the first.
+    let currentUnit = null;
+    setWritePartial((sig) => {
+      atSignal = { completed: completedUnits, inUnit: currentUnit };
+      if (rows.length === 0) return;
+      writeResultsOrSetAside(outPath, assemble(rows, [...incidents, interruption(sig)]), aside);
+      log(`wrote ${outPath} with the ${completedUnits} unit(s) completed before ${sig}`);
+    });
 
     for (const unit of units) {
       if (stopped) break;
+      if (aborted()) break;
       const subject = `${unit.setup}|${unit.variant}|${unit.role}`;
-      if (ladderEnded.has(subject)) {
-        const why = ladderEnded.get(subject);
-        rows.push(...unknownRows(unit, o, ctxBase, "admission_refused", `the ${subject} ladder ended at N = ${why.n} (${why.detail})`, fallbackSetup(unit, "not launched: ladder ended")));
+      const ladderKey = `${subject}|r${unit.runIndex}`;
+      const ended = ladderEnded.get(ladderKey);
+      if (ended && unit.n >= ended.n) {
+        rows.push(
+          ...unknownRows(
+            unit,
+            o,
+            ctxBase,
+            "admission_refused",
+            `the ${subject} ladder of run ${unit.runIndex} ended at N = ${ended.n} (${ended.detail})`,
+            fallbackSetup(unit, "not launched: the ladder ended", o),
+          ),
+        );
+        completedUnits += 1;
         continue;
       }
       const pre = neutrality.check(`before unit ${unit.index} (${subject}, N = ${unit.n})`);
+      noteUnreadable(pre, `before unit ${unit.index}`);
       if (pre.changed) {
         incidents.push(pre.incident);
         stopped = pre.incident;
         break;
       }
+      currentUnit = unit.index;
       const res = await runUnit(unit, { ...ctxBase, createAdapter, adapterOptions });
+      currentUnit = null;
       rows.push(...res.rows);
       incidents.push(...res.incidents);
-      if (res.admission) ladderEnded.set(subject, { n: unit.n, detail: res.admission.detail ?? res.admission.lane });
+      completedUnits += 1;
+      if (res.admission) ladderEnded.set(ladderKey, { n: unit.n, detail: res.admission.detail ?? res.admission.lane });
       if (res.stop) {
         stopped = res.stop;
         break;
       }
       const post = neutrality.check(`after unit ${unit.index} (${subject}, N = ${unit.n})`);
+      noteUnreadable(post, `after unit ${unit.index}`);
       if (post.changed) {
         incidents.push(post.incident);
         stopped = post.incident;
         break;
       }
     }
+    if (aborted() && !stopped) {
+      const inc = interruption(abort.signal.reason ?? "a signal");
+      incidents.push(inc);
+      stopped = inc;
+    }
 
-    if (rows.length === 0) throw new RunAbort(`no row was produced${stopped ? `: ${stopped.detail}` : ""}`);
-    finalizeLadder(rows);
-    const machine = (deps.machineBlock ?? machineBlock)({
-      environment: o.env,
-      screen: environment.screen ? { width: environment.screen.width, height: environment.screen.height, scalePct: environment.screen.scalePct ?? 100 } : null,
-      refresh: refreshSeen,
-      backgroundLoad,
-    });
-    const doc = buildDocument({
-      run: {
-        id: runId,
-        started_at: startedAt,
-        finished_at: now().toISOString(),
-        harness_commit: harnessCommit(o.repoRoot),
-        node_version: process.version,
-        command: o.command ?? ["node", "scripts/termhost-bench/cli.mjs", "run"],
-      },
-      machine,
-      capabilities,
-      rows,
-      incidents,
-    });
-    writeResults(outPath, doc);
-    log(`wrote ${outPath} (${rows.length} rows, ${incidents.length} incidents)`);
+    if (rows.length === 0) throw new RunFailed(`no row was produced${stopped ? `: ${stopped.detail}` : ""}`);
+    const doc = assemble(rows, incidents);
+    writeResultsOrSetAside(outPath, doc, aside);
+    log(`wrote ${outPath} (${doc.rows.length} rows, ${incidents.length} incidents)`);
     let redactedPath = null;
     if (o.redactedOut) {
       const red = redactRunnerOnly(doc);
       if (red) {
-        writeResults(o.redactedOut, red);
+        writeResultsOrSetAside(o.redactedOut, red, join(runDir, "redacted.invalid.json"));
         redactedPath = o.redactedOut;
         log(`wrote the redacted (runner rows only) copy ${redactedPath}`);
       }
@@ -389,6 +527,7 @@ export async function runUnit(unit, ctx) {
   const genRunId = generatorRunId(ctx.runId, unit.index);
   const incidents = [];
   const arms = new Map();
+  const armErrors = new Map();
   let adapter = null;
   let failure = null;
   let admission = null;
@@ -431,13 +570,26 @@ export async function runUnit(unit, ctx) {
     }
     if (!failure) {
       for (const arm of o.arms) {
+        if (ctx.aborted?.()) break;
         const pre = ctx.neutrality.check(`before ${name} arm ${arm}`);
         if (pre.changed) {
           incidents.push(pre.incident);
           stop = pre.incident;
           break;
         }
-        arms.set(arm, await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }));
+        // One arm's failure is that arm's alone: the arms that measured keep their
+        // rows, and the failed one carries its own reason.
+        try {
+          arms.set(arm, await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }));
+        } catch (e) {
+          const f = e instanceof AdapterRefusal ? { reason: e.reason, detail: e.detail } : { reason: "harness_error", detail: e?.message ?? String(e) };
+          armErrors.set(arm, f);
+          log(`unit ${name} arm ${arm}: ${f.reason}: ${f.detail}`);
+          if (!(e instanceof AdapterRefusal) || e.reason === "harness_error") {
+            incidents.push(incident("harness_error", `unit ${name} arm ${arm}: ${f.detail}`, { data: { setup: unit.setup, unit: name, arm } }));
+          }
+          if (e instanceof AdapterRefusal && e.incident) incidents.push(e.incident);
+        }
         const post = ctx.neutrality.check(`after ${name} arm ${arm}`);
         if (post.changed) {
           incidents.push(post.incident);
@@ -466,7 +618,7 @@ export async function runUnit(unit, ctx) {
   try {
     setup = adapter ? adapter.describe(readSlots(genDir)) : null;
   } catch (e) {
-    setup = fallbackSetup(unit, `describe() failed: ${e.message}`);
+    setup = fallbackSetup(unit, `describe() failed: ${e.message}`, o);
   }
   if (adapter) {
     try {
@@ -491,21 +643,29 @@ export async function runUnit(unit, ctx) {
       }),
     );
   }
-  setup = setup ?? fallbackSetup(unit, failure?.detail ?? "the adapter could not be created");
+  setup = setup ?? fallbackSetup(unit, failure?.detail ?? "the adapter could not be created", o);
 
   // ---- rows -------------------------------------------------------------------
-  if (failure || arms.size === 0) {
-    const reason = failure?.reason ?? "harness_error";
-    const detail = failure?.detail ?? (stop ? `the run stopped: ${stop.detail}` : "no arm was measured");
-    return { rows: unknownRows(unit, o, ctx, reason, detail, setup, []), incidents, admission, stop };
+  if (failure) {
+    return { rows: unknownRows(unit, o, ctx, failure.reason, failure.detail, setup, []), incidents, admission, stop };
   }
-  const gens = indexGenerators(readGeneratorLogs(genDir));
+  const gens = arms.size > 0 ? indexGenerators(readGeneratorLogs(genDir)) : new Map();
   const baseGens = new Map([...gens].filter(([s]) => baseSessions.has(s)));
   const rows = [];
   for (const arm of o.arms) {
     const a = arms.get(arm);
+    const armError = armErrors.get(arm);
+    if (armError) {
+      rows.push(...unknownRows({ ...unit }, { ...o, arms: [arm] }, ctx, armError.reason, armError.detail, setup));
+      continue;
+    }
     if (!a) {
-      rows.push(...unknownRows({ ...unit }, { ...o, arms: [arm] }, ctx, "harness_error", "the arm did not run (the run stopped)", setup));
+      const why = stop ? `the run stopped: ${stop.detail}` : ctx.aborted?.() ? "the run was interrupted before this arm" : "the arm did not run";
+      rows.push(...unknownRows({ ...unit }, { ...o, arms: [arm] }, ctx, "harness_error", why, setup));
+      continue;
+    }
+    if (a.interrupted) {
+      rows.push(...unknownRows({ ...unit }, { ...o, arms: [arm] }, ctx, "harness_error", "the run was interrupted during this arm: its phases were cut short", setup));
       continue;
     }
     const computed = computeRowKpis({
@@ -626,10 +786,15 @@ export async function runArm(unit, arm, ctx) {
   await sleep(o.soakMs);
   const soak = await stopPhaseWatch(soakWatch, "soak");
   out.soak = { records: soak.records };
+  const interrupted = () => ctx.aborted?.() === true;
+  // A soak a signal cut short measured a shorter window than its row will say.
+  if (interrupted()) out.interrupted = true;
 
   // ---- input (D9) ---------------------------------------------------------------
   const inputSafe = ctx.capabilities["input.safe"];
-  if (inputSafe?.state !== "OPERATIVE") {
+  if (interrupted()) {
+    out.input = { unavailable: { reason: "harness_error", detail: "the run was interrupted before the input phase" } };
+  } else if (inputSafe?.state !== "OPERATIVE") {
     out.input = { unavailable: { reason: "input_unsafe", detail: `input.safe is ${inputSafe?.state ?? "UNKNOWN"}: ${inputSafe?.reason ?? "no verdict"}` } };
   } else if (o.inputKeys <= 0) {
     out.input = { unavailable: { reason: "insufficient_samples", detail: "the input arm was disabled (--input-keys 0)" } };
@@ -677,7 +842,9 @@ export async function runArm(unit, arm, ctx) {
   }
 
   // ---- switch (focus arm) --------------------------------------------------------
-  if (arm === "focus" && unit.n > 1 && o.switchSamples > 0) {
+  if (interrupted()) {
+    if (arm === "focus" && unit.n > 1) out.switches = { unavailable: { reason: "harness_error", detail: "the run was interrupted before the switch phase" } };
+  } else if (arm === "focus" && unit.n > 1 && o.switchSamples > 0) {
     const candidates = (arr.switchable ?? []).filter((s) => slotMap.has(s));
     if (candidates.length < 2) {
       out.switches = {
@@ -707,7 +874,9 @@ export async function runArm(unit, arm, ctx) {
   }
 
   // ---- spawn ---------------------------------------------------------------------
-  if (o.spawnSamples > 0) {
+  if (interrupted()) {
+    out.spawns = { unavailable: { reason: "harness_error", detail: "the run was interrupted before the spawn phase" } };
+  } else if (o.spawnSamples > 0) {
     const w = await startPhaseWatch("spawn");
     const list = [];
     const known = new Set(readSlots(genDir).keys());

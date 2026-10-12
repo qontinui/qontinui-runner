@@ -98,12 +98,42 @@ export function buildDocument({ run, machine, capabilities, rows, incidents }) {
 /** Throw with every error when `doc` is not a valid results file. */
 export function assertValid(doc, label = "results") {
   const res = validateResults(doc);
-  if (!res.valid) {
-    const lines = res.errors.slice(0, 40).map((e) => `  ${e.path || "/"} [${e.keyword}] ${e.message}`);
-    const more = res.errors.length > 40 ? `\n  … ${res.errors.length - 40} more` : "";
-    throw new Error(`${label} is not a valid termhost-bench/v1 file (${res.errors.length} error(s)):\n${lines.join("\n")}${more}`);
-  }
+  if (!res.valid) throw new Error(`${label} is not a valid termhost-bench/v1 file: ${errorWhere(res.errors)}`);
   return doc;
+}
+
+/**
+ * A validator error list as paths and keywords only. The messages are left out
+ * on purpose: some quote the offending value (`validate.mjs` `validateNumber`),
+ * these lines reach public CI logs, and a third-party reading never leaves the
+ * job (D7).
+ */
+export function errorWhere(errors, max = 40) {
+  const shown = errors.slice(0, max).map((e) => `${e.path || "/"} [${e.keyword}]`);
+  const more = errors.length > max ? `; … ${errors.length - max} more` : "";
+  return `${errors.length} error(s): ${shown.join("; ")}${more}`;
+}
+
+/** The results document could not be written as a valid file. */
+export class InvalidResults extends Error {
+  constructor(message, asidePath) {
+    super(message);
+    this.name = "InvalidResults";
+    this.asidePath = asidePath;
+  }
+}
+
+/**
+ * Validate, then write atomically; an INVALID document is written to `asidePath`
+ * instead (a private path inside the run directory, never the published one) so a
+ * long run's data survives a harness bug, and an {@link InvalidResults} names only
+ * paths and keywords.
+ */
+export function writeResultsOrSetAside(path, doc, asidePath) {
+  const res = validateResults(doc);
+  if (res.valid) return writeResults(path, doc);
+  writeFileSync(asidePath, `${JSON.stringify(doc, null, 2)}\n`);
+  throw new InvalidResults(`the results document is invalid (${errorWhere(res.errors)}); it was set aside, unpublished, at ${asidePath}`, asidePath);
 }
 
 /**

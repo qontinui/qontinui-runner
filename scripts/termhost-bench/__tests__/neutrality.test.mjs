@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { machineBlock } from "../machine.mjs";
-import { NeutralityGuard, diffSnapshots, digestFile, platformDirs, primaryStatePaths, snapshot } from "../neutrality.mjs";
+import { NeutralityGuard, diffSnapshots, digestFile, neutralityVerdict, platformDirs, primaryStatePaths, snapshot } from "../neutrality.mjs";
 import { runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
@@ -116,6 +116,7 @@ test("D12 fixture: the primary's settings.json changing mid-run produces an inci
       machineBlock: (o) => machineBlock({ ...o, gpu: { state: "unknown", reason: "not_instrumented", detail: "test" } }),
       neutrality: new NeutralityGuard({ paths: [{ label: "settings.json", path: settings }] }),
       reapGenerators: async () => ({ ended: [], survivors: [] }),
+      primaryPresent: async () => false,
     },
   );
   assert.ok(res.stopped, "the run stopped");
@@ -131,4 +132,18 @@ test("D12 fixture: the primary's settings.json changing mid-run produces an inci
   assert.equal(validateResults(res.doc).valid, true);
   const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
   assert.equal(tiled.kpis.output_latency_ms.state, "unknown");
+});
+
+test("the guard's verdict: watching is OPERATIVE, nothing-to-protect says so, and watching nothing beside a primary is UNKNOWN (review S7)", () => {
+  const present = { label: "settings.json", state: "present", sha256: `sha256:${"ab".repeat(32)}` };
+  const absent = (label) => ({ label, state: "absent" });
+  const all = [absent("settings.json"), absent("paired_user.json"), absent("auth_tokens.enc")];
+  assert.equal(neutralityVerdict([present, absent("paired_user.json"), absent("auth_tokens.enc")], true).state, "OPERATIVE");
+  const none = neutralityVerdict(all, false);
+  assert.equal(none.state, "OPERATIVE");
+  assert.match(none.reason, /nothing to protect/);
+  assert.equal(neutralityVerdict(all, true).state, "UNKNOWN", "a primary is present, and the guard would watch nothing");
+  assert.equal(neutralityVerdict(all, null).state, "UNKNOWN", "an unanswered :9876 probe may be a primary");
+  const unreadable = neutralityVerdict([{ label: "settings.json", state: "unreadable", error: "EACCES" }, absent("paired_user.json"), absent("auth_tokens.enc")], false);
+  assert.equal(unreadable.state, "UNKNOWN", "a file that exists but cannot be read is not absent");
 });

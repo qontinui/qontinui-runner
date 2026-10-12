@@ -18,6 +18,7 @@
 
 import os from "node:os";
 
+import { drainMechanism, readDeviceDrain } from "./drain.mjs";
 import { DOCTOR_STATES } from "./kpi-catalog.mjs";
 import { probeDoctor } from "./probe.mjs";
 import { findOnPath } from "./envs/linux-xvfb.mjs";
@@ -91,6 +92,8 @@ export function mapDoctor(f) {
   for (const [id, verdict] of Object.entries(f.setupMechanisms ?? {})) {
     m[id] = DOCTOR_STATES.includes(verdict?.state) ? v(verdict.state, String(verdict.reason || "(no reason given)")) : v(UNKNOWN, `malformed verdict for ${id}`);
   }
+  // Read before any unit, so a drained (or unknown-drain) box spawns nothing.
+  m["device.drain"] = drainMechanism(f.drain);
   return m;
 }
 
@@ -99,7 +102,7 @@ export function mapDoctor(f) {
  * with its reason instead of stopping the run).
  */
 export function blockingMechanisms(mechanisms) {
-  return ["env.platform", "env.harness", "env.xvfb", "probe.binary", "node.version"]
+  return ["env.platform", "env.harness", "env.xvfb", "probe.binary", "node.version", "device.drain"]
     .filter((id) => mechanisms[id] && mechanisms[id].state !== OPERATIVE)
     .map((id) => ({ id, ...mechanisms[id] }));
 }
@@ -155,6 +158,7 @@ export async function gatherDoctorFacts({
   display = null,
   which = (name) => findOnPath(name),
   doctorFn = probeDoctor,
+  drainFn = readDeviceDrain,
 }) {
   const facts = {
     environment,
@@ -166,6 +170,7 @@ export async function gatherDoctorFacts({
     probeDoctor: null,
     display,
     setupMechanisms: {},
+    drain: await drainFn(),
   };
   if (environment === "linux-xvfb") {
     facts.xvfbPath = process.platform === "linux" ? which("Xvfb") : null;

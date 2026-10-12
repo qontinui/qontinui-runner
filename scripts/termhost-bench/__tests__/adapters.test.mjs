@@ -11,6 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import net from "node:net";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +20,12 @@ import { HttpError } from "../../lib/runner-clients.mjs";
 import { OPTIONAL_METHODS, REQUIRED_METHODS, assertAdapter, createAdapter, rowMajorOrder } from "../adapters/index.mjs";
 import {
   DECLINE_LABELS,
+  isPortListening,
+  parseGuardWarnings,
+  shaMatches,
+  subjectLaunchVerdict,
+  summarizeGuardWarnings,
+  supervisorAnswers,
   MAX_SPAWN_COUNT,
   NEVER_CLICK,
   RunnerAdapter,
@@ -252,18 +259,27 @@ test("the spawn-test body: rebuild, strict frontend, async, exactly one selector
   assert.throws(() => spawnTestBody({ gitRef: "x", worktreePath: "/w", requesterId: "r" }), /exactly one/);
 });
 
-test("a spawn-test outcome is judged by source and sha (D12)", () => {
+test("a spawn-test outcome is judged by the RUNNING child's sha, not the tree it was asked to build (D12)", () => {
   const sha = "c".repeat(40);
-  const ok = judgeSpawnOutcome({ httpStatus: 200, body: { source: "worktree", build_sha: sha, port: 9880 } }, { gitRef: sha, expectedCommit: sha });
+  // git_sha is what the supervisor probed from the child's own /health (12 chars).
+  const ok = judgeSpawnOutcome({ httpStatus: 200, body: { source: "worktree", git_sha: sha.slice(0, 12), port: 9880 } }, { gitRef: sha, expectedCommit: sha });
   assert.equal(ok.ok, true);
-  assert.equal(ok.buildSha, sha);
+  assert.equal(ok.buildSha, sha, "a matching probed sha proves the requested commit");
   assert.equal(ok.port, 9880);
   assert.equal(judgeSpawnOutcome({ httpStatus: 503, body: { error: "frontend_stale" } }, { gitRef: sha }).ok, false);
-  assert.match(judgeSpawnOutcome({ httpStatus: 200, body: { source: "live_tree", build_sha: sha } }, { gitRef: sha }).detail, /expected "worktree"/);
-  assert.match(judgeSpawnOutcome({ httpStatus: 200, body: { source: "worktree", build_sha: "d".repeat(40) } }, { gitRef: sha, expectedCommit: sha }).detail, /not the requested/);
-  const unknown = judgeSpawnOutcome({ httpStatus: 200, body: { source: "worktree_path" } }, { worktreePath: "/w" });
-  assert.equal(unknown.ok, true);
-  assert.equal(unknown.buildSha, null, "an absent sha is an unknown build, never a baseline");
+  assert.match(judgeSpawnOutcome({ httpStatus: 200, body: { source: "live_tree", git_sha: sha } }, { gitRef: sha }).detail, /expected "worktree"/);
+  const other = judgeSpawnOutcome({ httpStatus: 200, body: { source: "worktree", git_sha: "d".repeat(12) } }, { gitRef: sha, expectedCommit: sha });
+  assert.equal(other.ok, false);
+  assert.match(other.detail, /reports git_sha d{12}, not the requested/);
+  const lkg = judgeSpawnOutcome({ httpStatus: 200, body: { source: "worktree", git_sha: sha.slice(0, 12), used_lkg: true } }, { gitRef: sha, expectedCommit: sha });
+  assert.equal(lkg.ok, false, "a last-known-good fallback is not the requested build");
+  assert.match(lkg.detail, /used_lkg/);
+  // The tree's HEAD is not the binary: git_ref_resolved_sha alone proves nothing.
+  const treeOnly = judgeSpawnOutcome({ httpStatus: 200, body: { source: "worktree", git_ref_resolved_sha: sha, build_sha: sha } }, { gitRef: sha, expectedCommit: sha });
+  assert.equal(treeOnly.ok, true);
+  assert.equal(treeOnly.buildSha, null, "no probed sha: an unknown build, never a baseline");
+  assert.equal(shaMatches("cccccccccccc", sha), true);
+  assert.equal(shaMatches("unknown", sha), false);
 });
 
 test("the #1756 fix check: ancestor, not ancestor, unknown", () => {
@@ -428,10 +444,10 @@ test("focus resolves the session's zone from the probe's markers and verifies th
   assert.deepEqual(max[3], { zoneIndex: 0 });
   assert.deepEqual(r.switchable, [2, 0, 1]);
   assert.equal(r.layout.zoneMapping, "row_major_rank");
-  // show(k): restore, then maximize k's zone.
+  // show(k): ONE maximize-zone on k's zone (no restore that would repaint the grid first).
+  const before = client.calls.length;
   await a.show(1);
-  const last = client.calls.slice(-2).map((c) => [c[2], c[3]]);
-  assert.deepEqual(last, [["restore-zone", {}], ["maximize-zone", { zoneIndex: 2 }]]);
+  assert.deepEqual(client.calls.slice(before).map((c) => [c[2], c[3]]), [["maximize-zone", { zoneIndex: 2 }]]);
 });
 
 test("a maximize that leaves two sessions visible is unknown(zone_unresolved)", async (t) => {
@@ -490,4 +506,302 @@ test("closeOne deletes exactly the terminal it is given", async (t) => {
   await a.closeOne();
   assert.deepEqual(deleted, ["t9"]);
   assert.deepEqual(a.terminals, ["t1"]);
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1
+// ---------------------------------------------------------------------------
+
+test("a spawn is timed from immediately before the action, after the harness's own GET /terminals", async (t) => {
+  const marks = [];
+  const client = fakeClient();
+  const list = client.listTerminals;
+  client.listTerminals = async () => {
+    marks.push(["list", process.hrtime.bigint()]);
+    return list();
+  };
+  const action = client.componentAction;
+  client.componentAction = async (...args) => {
+    marks.push(["action", process.hrtime.bigint()]);
+    return action(...args);
+  };
+  const a = subjectAdapter(t, client);
+  a.command = "gen";
+  const r = await a.spawnOne();
+  const firstList = marks.find((m) => m[0] === "list")[1];
+  const act = marks.find((m) => m[0] === "action")[1];
+  assert.ok(r.tCmdNs > firstList, "the harness's GET /terminals is not part of the spawn");
+  assert.ok(r.tCmdNs <= act, "the start is taken before the action is sent");
+});
+
+test("a subject launch needs a definite 'nothing there' from both probes; an unknown is never absent (D12)", () => {
+  assert.equal(subjectLaunchVerdict(false, false).state, "OPERATIVE");
+  assert.equal(subjectLaunchVerdict(true, false).state, "INOPERATIVE-ON-THIS-MACHINE");
+  assert.equal(subjectLaunchVerdict(false, true).state, "INOPERATIVE-ON-THIS-MACHINE");
+  assert.equal(subjectLaunchVerdict(null, false).state, "UNKNOWN");
+  assert.equal(subjectLaunchVerdict(false, null).state, "UNKNOWN");
+  assert.match(subjectLaunchVerdict(null, false).reason, /could not be told in time/);
+});
+
+test("isPortListening answers accepted, refused, or unknown — a timeout is not 'not listening'", async () => {
+  const srv = net.createServer((c) => c.destroy());
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const port = srv.address().port;
+  assert.equal(await isPortListening(port), true);
+  await new Promise((r) => srv.close(r));
+  assert.equal(await isPortListening(port), false, "a closed port refuses");
+  // A connection that neither connects nor errors before the timeout.
+  const hanging = () => {
+    const s = new EventEmitter();
+    s.setTimeout = (ms, cb) => setTimeout(cb, ms);
+    s.destroy = () => {};
+    return s;
+  };
+  assert.equal(await isPortListening(1, { timeoutMs: 20, connect: hanging }), null);
+  const odd = () => {
+    const s = new EventEmitter();
+    s.setTimeout = () => {};
+    s.destroy = () => {};
+    setImmediate(() => s.emit("error", Object.assign(new Error("unreachable"), { code: "EHOSTUNREACH" })));
+    return s;
+  };
+  assert.equal(await isPortListening(1, { connect: odd }), null, "only ECONNREFUSED means nothing listens");
+});
+
+test("supervisorAnswers: any HTTP answer is a supervisor, a refusal is none, a timeout is unknown", async () => {
+  const answer = (status) => async () => ({ ok: status < 300, status, text: async () => "{}" });
+  assert.equal(await supervisorAnswers("http://127.0.0.1:9875", { fetch: answer(200) }), true);
+  assert.equal(await supervisorAnswers("http://127.0.0.1:9875", { fetch: answer(503) }), true);
+  const refused = async () => {
+    throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+  };
+  assert.equal(await supervisorAnswers("http://127.0.0.1:9875", { fetch: refused }), false);
+  const slow = async (url, init) =>
+    new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }))));
+  assert.equal(await supervisorAnswers("http://127.0.0.1:9875", { fetch: slow, timeoutMs: 20 }), null);
+});
+
+test("the per-launch drain check passes clear and not_enrolled, and refuses drained, unknown and a boot read still pending", async (t) => {
+  const run = async (sequence, waitMs = 5000) => {
+    let i = 0;
+    let clock = 0;
+    const client = { restartReadiness: async () => ({ success: true, data: { drain: { coordDrain: sequence[Math.min(i++, sequence.length - 1)] } } }) };
+    const a = subjectAdapter(t, client);
+    try {
+      await a.checkDrain({ waitMs, sleepFn: async (ms) => { clock += ms; }, now: () => clock });
+      return { ok: true, reads: i };
+    } catch (e) {
+      return { ok: false, reason: e.reason, detail: e.detail, reads: i };
+    }
+  };
+  assert.equal((await run([{ state: "clear" }])).ok, true);
+  assert.equal((await run([{ state: "not_enrolled", cause: "no machine.json" }])).ok, true);
+  const drained = await run([{ state: "drained", reason: "rebuild" }]);
+  assert.deepEqual([drained.ok, drained.reason], [false, "device_drained"]);
+  const unknown = await run([{ state: "unknown", cause: "three missed heartbeats" }]);
+  assert.deepEqual([unknown.ok, unknown.reason], [false, "device_drained"]);
+  const settles = await run([{ state: "unknown", bootReadPending: true }, { state: "unknown", bootReadPending: true }, { state: "clear", bootReadPending: false }]);
+  assert.equal(settles.ok, true, "a boot read is waited for");
+  assert.equal(settles.reads, 3);
+  const pending = await run([{ state: "unknown", bootReadPending: true }], 3000);
+  assert.deepEqual([pending.ok, pending.reason], [false, "device_drained"]);
+  assert.match(pending.detail, /still pending/);
+});
+
+/** A subject adapter whose launch reaches the runner through a fake HTTP layer. */
+function subjectLaunch(t, { gitSha, drain = { state: "not_enrolled" } } = {}) {
+  const fetch = async (url, init = {}) => {
+    const u = new URL(url);
+    const json = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+    if (u.pathname === "/health") return json({ success: true, data: { uiBridgeIpcObserved: true, gitSha, version: "0.1.0" } });
+    if (u.pathname === "/restart-readiness") return json({ success: true, data: { drain: { coordDrain: drain } } });
+    return json({ success: true, data: {} });
+  };
+  const a = new RunnerAdapter({
+    mode: "subject",
+    build: { role: "single", commit: "f".repeat(40), exe: "x", source: "artifact" },
+    repoRoot: ".",
+    platform: "linux",
+    fetch,
+    run: () => ({ status: 0, stdout: "", stderr: "" }),
+    list: () => new Map([[4242, { pid: 4242, ppid: 1, name: "qontinui-runner", argv: ["qontinui-runner"], cmdline: "qontinui-runner", startKey: "77" }]]),
+  });
+  a.launchSubject = async () => {
+    a.port = 9881;
+    a.pid = 4242;
+  };
+  return a;
+}
+
+test("a subject whose running binary reports another commit is refused; describe() proves a build only by that binary", async (t) => {
+  const wrong = subjectLaunch(t, { gitSha: "0123456789ab" });
+  await assert.rejects(wrong.launch({ runDir: "/r", unitDir: "/r/u", genDir: "/r/u/gen", genRunId: "r-u0", env: { env: {} } }), (e) => /reports gitSha 0123456789ab, not the build's f{40}/.test(e.detail));
+  const right = subjectLaunch(t, { gitSha: "ffffffffffff" });
+  await right.launch({ runDir: "/r", unitDir: "/r/u", genDir: "/r/u/gen", genRunId: "r-u1", env: { env: {} } });
+  assert.deepEqual(right.describe().build, { commit: "f".repeat(40), source: "artifact", role: "single" });
+  assert.equal(right.startKey, "77", "the start key is taken again once the binary answers");
+  const blind = subjectLaunch(t, { gitSha: "unknown" });
+  await blind.launch({ runDir: "/r", unitDir: "/r/u", genDir: "/r/u/gen", genRunId: "r-u2", env: { env: {} } });
+  assert.equal(blind.describe().build.state, "unknown", "a binary that names no sha is an unknown build");
+  // Supervisor mode: the requested commit is never taken on trust.
+  const sup = new RunnerAdapter({ mode: "supervisor", build: { role: "head", commit: "a".repeat(40), gitRef: "a".repeat(40) }, repoRoot: "." });
+  assert.equal(sup.describe().build.state, "unknown");
+  sup.buildSha = "a".repeat(40);
+  assert.equal(sup.describe().build.commit, "a".repeat(40));
+});
+
+/** A fake supervisor HTTP layer; `lost` makes the spawn-test POST lose its answer. */
+function fakeSupervisor({ lost = true, inflight = [], runners = [] } = {}) {
+  const calls = [];
+  const fetch = async (url, init = {}) => {
+    const u = new URL(url);
+    calls.push(`${init.method ?? "GET"} ${u.pathname}${u.search}`);
+    const json = (body, status = 200) => ({ ok: status < 300, status, text: async () => JSON.stringify(body) });
+    if (u.pathname === "/health") return json({ ok: true });
+    if (u.pathname === "/runners/spawn-test" && init.method === "POST") {
+      if (lost) throw new TypeError("fetch failed: socket hang up");
+      return json({ submission_id: "s-9", id: "test-9882", port: 9882 }, 202);
+    }
+    if (u.pathname === "/runners/spawn-test/in-flight") return json({ count: inflight.length, spawns: inflight });
+    if (u.pathname.startsWith("/build/")) {
+      return json({ status: { state: "succeeded" }, spawn: { http_status: 200, port: 9881, body: { source: "worktree", git_sha: "aaaaaaaaaaaa", port: 9881 } } });
+    }
+    if (u.pathname === "/runners" && (init.method ?? "GET") === "GET") return json(runners);
+    if (/\/runners\/[^/]+\/stop$/.test(u.pathname)) return json({ stopped: true });
+    return json({});
+  };
+  return { fetch, calls };
+}
+
+test("a lost spawn-test answer is recovered from the in-flight index; once the build is over, /runners finds the runner for teardown", async () => {
+  const requester = "termhost-bench-r-u0";
+  const sup = fakeSupervisor({ inflight: [{ requester_id: requester, id: "test-9881", port: 9881, submission_id: "s-1" }], runners: [{ id: "test-9881", pid: 5151, requester_id: requester }] });
+  const a = new RunnerAdapter({ mode: "supervisor", build: { role: "single", commit: "a".repeat(40), gitRef: "a".repeat(40) }, repoRoot: ".", platform: "linux", fetch: sup.fetch, list: () => new Map() });
+  await a.launchSupervisor({ genRunId: "r-u0", env: { env: {} } });
+  assert.equal(a.supervisorRunnerId, "test-9881");
+  assert.equal(a.buildSha, "a".repeat(40));
+  assert.ok(sup.calls.includes(`GET /runners/spawn-test/in-flight?requester_id=${requester}`));
+  assert.ok(sup.calls.includes("GET /build/s-1/status"), "the recovered submission is awaited");
+  assert.ok(a.notes.some((n) => /recovered submission s-1/.test(n)));
+
+  // The build already ended: the in-flight key is released, /runners still names it.
+  const gone = fakeSupervisor({ inflight: [], runners: [{ id: "test-9890", requester_id: requester, protected: false }] });
+  const b = new RunnerAdapter({ mode: "supervisor", build: { role: "single", commit: "a".repeat(40), gitRef: "a".repeat(40) }, repoRoot: ".", platform: "linux", fetch: gone.fetch, list: () => new Map() });
+  await assert.rejects(b.launchSupervisor({ genRunId: "r-u0", env: { env: {} } }), (e) => /found by requester id and will be stopped/.test(e.detail));
+  assert.equal(b.supervisorRunnerId, "test-9890");
+  const td = await b.teardown();
+  assert.ok(gone.calls.includes("POST /runners/test-9890/stop"), "teardown stops the runner the lost answer left behind");
+  assert.ok(td.closed.includes("temp runner test-9890"));
+});
+
+test("teardown stops a supervisor runner only after its row reads back unprotected and ours", async () => {
+  const requester = "termhost-bench-r-u3";
+  for (const [row, stopped] of [
+    [{ id: "test-9883", requester_id: requester }, true],
+    [{ id: "test-9883", requester_id: requester, protected: true }, false],
+    [{ id: "test-9883", requester_id: "someone-else" }, false],
+  ]) {
+    const sup = fakeSupervisor({ lost: false, runners: [row] });
+    const a = new RunnerAdapter({ mode: "supervisor", build: { role: "single", commit: "a".repeat(40), gitRef: "a".repeat(40) }, repoRoot: ".", fetch: sup.fetch });
+    a.supervisor = new (await import("../../lib/runner-clients.mjs")).SupervisorClient("http://127.0.0.1:9875", () => {}, { fetch: sup.fetch });
+    a.supervisorRunnerId = "test-9883";
+    a.requesterId = requester;
+    const td = await a.teardown();
+    assert.equal(sup.calls.includes("POST /runners/test-9883/stop"), stopped, JSON.stringify(row));
+    if (!stopped) assert.ok(td.survivors.some((x) => /not stopped/.test(x.detail)));
+  }
+});
+
+test("teardown never walks a tree whose root start key was not captured, nor the PID of a child that already exited", async (t) => {
+  const signalled = [];
+  const table = new Map([
+    [4242, { pid: 4242, ppid: 1, name: "qontinui-runner", argv: ["x"], cmdline: "x", startKey: "9" }],
+    [4243, { pid: 4243, ppid: 4242, name: "WebKitWebProcess", argv: ["w"], cmdline: "w", startKey: "10" }],
+  ]);
+  const noKey = subjectAdapter(t, {}, { list: () => table, kill: (pid, sig) => signalled.push([pid, sig]) });
+  noKey.client = null;
+  noKey.pid = 4242;
+  noKey.startKey = null;
+  const r1 = await noKey.teardown();
+  assert.deepEqual(signalled, [], "an unproven identity is never signalled");
+  assert.ok(r1.survivors.some((x) => /no start key was captured/.test(x.detail)));
+  const exited = subjectAdapter(t, {}, { list: () => table, kill: (pid, sig) => signalled.push([pid, sig]) });
+  exited.client = null;
+  exited.pid = 4242;
+  exited.startKey = "9";
+  exited.childExit = { code: 78, signal: null };
+  const r2 = await exited.teardown();
+  assert.deepEqual(signalled, [], "a PID whose child already exited may belong to another process now");
+  assert.ok(r2.closed.some((c) => /had already exited/.test(c)));
+});
+
+test("pty_holder is what the runner ran: its fallback log lines and this instance's holder processes", (t) => {
+  const a = subjectAdapter(t, {});
+  a.root = "/tmp/tb/run/units/u0/runner-root";
+  const holder = (pid) => ({ pid, ppid: 1, name: "qontinui-pty-holder", argv: ["/x/qontinui-pty-holder"], cmdline: `/x/qontinui-pty-holder --pane-dir ${a.root}/scope/pty-panes/p${pid}`, startKey: "5" });
+  const foreign = { pid: 90, ppid: 1, name: "qontinui-pty-holder", argv: ["/x/qontinui-pty-holder"], cmdline: "/x/qontinui-pty-holder --pane-dir /home/u/.local/share/runner/pty-panes/p1", startKey: "5" };
+  const fallback = "WARN pty holder: terminal.pty_holder is on but the holder could not be started — spawn refused\n";
+  a.holderSetting = false;
+  assert.equal(a.ptyHolderAsRun({ sessions: 2, logText: "", table: new Map() }), false);
+  a.holderSetting = true;
+  assert.equal(a.ptyHolderAsRun({ sessions: 2, logText: "", table: new Map([[1, holder(1)], [2, holder(2)], [90, foreign]]) }), true);
+  assert.deepEqual(a.holderPids(new Map([[1, holder(1)], [90, foreign]])), [1], "another instance's holder is not ours");
+  // A holder binary run from inside the root for something else (no pane directory) is not a pane holder.
+  const selftest = { pid: 91, ppid: 1, name: "qontinui-pty-holder", argv: [`${a.root}/bin/qontinui-pty-holder`], cmdline: `${a.root}/bin/qontinui-pty-holder --selftest`, startKey: "5" };
+  assert.deepEqual(a.holderPids(new Map([[1, holder(1)], [91, selftest]])), [1]);
+  assert.equal(a.ptyHolderAsRun({ sessions: 2, logText: fallback.repeat(2), table: new Map() }), false, "every pane fell back");
+  const mixed = a.ptyHolderAsRun({ sessions: 2, logText: fallback, table: new Map([[1, holder(1)]]) });
+  assert.equal(mixed.state, "unknown");
+  assert.match(mixed.detail, /1 of 2 pane\(s\) logged a fallback/);
+});
+
+test("the resource guard's WARN notices are parsed and kept as a diagnostic, never as a refusal", async (t) => {
+  const lines = [
+    '2026-10-12T01:00:00Z  WARN qontinui_runner::resource_guard: resource_guard: spawning past the session warn limit lane=session metric="thread_count" observed=270 limit=256 what=terminal',
+    "2026-10-12T01:00:01Z  WARN qontinui_runner::resource_guard: resource_guard: spawning past the session warn limit lane=session metric=thread_count observed=290 limit=256 what=terminal",
+    "unrelated line",
+  ].join("\n");
+  const w = parseGuardWarnings(lines);
+  assert.deepEqual(w, [
+    { metric: "thread_count", lane: "session", observed: 270, limit: 256 },
+    { metric: "thread_count", lane: "session", observed: 290, limit: 256 },
+  ]);
+  assert.deepEqual(summarizeGuardWarnings(w), { count: 2, by_metric: { thread_count: { count: 2, max_observed: 290, limit: 256 } } });
+  const dir = mkdtempSync(join(tmpdir(), "tb-warn-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const log = join(dir, "runner.log");
+  writeFileSync(log, "boot\n");
+  const client = fakeClient({
+    componentAction: async (component, action) => {
+      if (action === "create-with-command") appendFileSync(log, `${lines}\n`);
+      return undefined;
+    },
+  });
+  const a = subjectAdapter(t, client);
+  a.logFile = log;
+  const res = await a.spawnSessions(2, ARGV);
+  assert.equal(res.admission, null, "a WARN notice is not an admission refusal");
+  const d = await a.diagnostics();
+  assert.equal(d["spawn.admission_warnings"].state, "measured");
+  assert.equal(d["spawn.admission_warnings"].data.count, 2);
+});
+
+test("the coord read-back waits out a grace period before calling a session left open", async (t) => {
+  const payload = Buffer.from(JSON.stringify({ exp: 4102444800 })).toString("base64url");
+  const env = { COORD_DEVICE_JWT: `h.${payload}.s` };
+  const run = async (answers) => {
+    let i = 0;
+    let clock = 0;
+    const fetch = async () => ({ ok: true, status: 200, json: async () => answers[Math.min(i++, answers.length - 1)] });
+    const a = subjectAdapter(t, {}, { env, fetch, sleepFn: async (ms) => { clock += ms; }, now: () => clock });
+    a.coordSessions = new Map([["t1", "sess-1"]]);
+    return { r: await a.coordReadback({ graceMs: 30000, pollMs: 5000 }), reads: i };
+  };
+  const closes = await run([{ sessions: [{ sessionId: "sess-1" }] }, { sessions: [] }]);
+  assert.deepEqual(closes.r.incidents, [], "closed on the second read: not left open");
+  assert.equal(closes.r.diagnostic.data.reads, 2);
+  const stays = await run([{ sessions: [{ sessionId: "sess-1" }] }]);
+  assert.equal(stays.r.incidents.length, 1);
+  assert.equal(stays.r.incidents[0].kind, "coord_session_left_open");
+  assert.ok(stays.reads >= 7, `read until the grace ran out (${stays.reads} reads)`);
 });

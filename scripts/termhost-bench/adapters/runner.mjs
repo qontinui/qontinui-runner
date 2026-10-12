@@ -95,17 +95,34 @@ export const SUPERVISOR_URL = "http://127.0.0.1:9875";
 
 const hrtime = () => process.hrtime.bigint();
 
-/** Whether something accepts TCP connections on 127.0.0.1:`port`. */
-export function isPortListening(port, { timeoutMs = 1000, connect = net.connect } = {}) {
+/**
+ * The runner's documented `/health` tail on a loaded box is about 10 s (CLAUDE.md
+ * "Service Architecture & Ports"), so a probe that must not mistake a slow server
+ * for an absent one waits longer than that.
+ */
+export const PROBE_TIMEOUT_MS = 12000;
+
+/**
+ * Does something accept TCP connections on 127.0.0.1:`port`? Three answers: true (a
+ * connection was accepted), false (refused, ECONNREFUSED: nothing listens), null
+ * (neither within `timeoutMs`, or another error: a full accept backlog, a firewall).
+ * A caller that refuses to run beside a live primary treats null as "may be there".
+ *
+ * @returns {Promise<boolean | null>}
+ */
+export function isPortListening(port, { timeoutMs = PROBE_TIMEOUT_MS, connect = net.connect } = {}) {
   return new Promise((resolve) => {
+    let settled = false;
     const sock = connect({ host: "127.0.0.1", port });
     const done = (v) => {
+      if (settled) return;
+      settled = true;
       sock.destroy();
       resolve(v);
     };
-    sock.setTimeout?.(timeoutMs, () => done(false));
+    sock.setTimeout?.(timeoutMs, () => done(null));
     sock.once("connect", () => done(true));
-    sock.once("error", () => done(false));
+    sock.once("error", (e) => done(e?.code === "ECONNREFUSED" ? false : null));
   });
 }
 
@@ -113,7 +130,8 @@ export function isPortListening(port, { timeoutMs = 1000, connect = net.connect 
 export async function freePort(from = 9877, { tries = 200, listening = isPortListening } = {}) {
   for (let p = from; p < from + tries; p += 1) {
     if (p === PRIMARY_RUNNER_PORT) continue;
-    if (!(await listening(p, { timeoutMs: 300 }))) {
+    // Only a bind decides: a port whose probe is refused or unanswered is tried.
+    if ((await listening(p, { timeoutMs: 300 })) !== true) {
       const free = await new Promise((resolve) => {
         const srv = net.createServer();
         srv.once("error", () => resolve(false));
@@ -125,15 +143,41 @@ export async function freePort(from = 9877, { tries = 200, listening = isPortLis
   throw new Error(`no free port in ${from}..${from + tries - 1}`);
 }
 
-/** Does `supervisorUrl` answer `/health`? */
-export async function supervisorAnswers(url = SUPERVISOR_URL, { fetch } = {}) {
+/**
+ * Does a supervisor answer at `url`? Three answers: true (any HTTP answer to
+ * `/health`: a supervisor is there, healthy or not), false (connection refused:
+ * nothing listens), null (no answer within `timeoutMs`, or another failure: a slow
+ * or wedged supervisor is not an absent one). D12 lets a hand-rolled subject runner
+ * start only on a definite false.
+ *
+ * @returns {Promise<boolean | null>}
+ */
+export async function supervisorAnswers(url = SUPERVISOR_URL, { fetch, timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   try {
-    await httpJson(`${url.replace(/\/+$/, "")}/health`, { timeoutMs: 3000, ...(fetch ? { fetch } : {}) });
+    await httpJson(`${url.replace(/\/+$/, "")}/health`, { timeoutMs, ...(fetch ? { fetch } : {}) });
     return true;
   } catch (e) {
-    // Any HTTP answer at all means a server is there.
-    return e instanceof HttpError;
+    if (e instanceof HttpError) return true;
+    const code = e?.cause?.code ?? e?.code;
+    return code === "ECONNREFUSED" ? false : null;
   }
+}
+
+/** The subject-launch verdict from the two probes (D12): only "nothing there" passes. */
+export function subjectLaunchVerdict(supervisor, primary) {
+  if (supervisor === false && primary === false) {
+    return { state: "OPERATIVE", reason: "subject_instance_root: no supervisor on :9875 and nothing on :9876" };
+  }
+  if (supervisor === true || primary === true) {
+    return {
+      state: "INOPERATIVE-ON-THIS-MACHINE",
+      reason: `subject launch refused: ${supervisor === true ? "a supervisor answers on :9875" : "something listens on :9876"}; use supervisor mode (D12)`,
+    };
+  }
+  return {
+    state: "UNKNOWN",
+    reason: `subject launch refused: ${supervisor === null ? "whether a supervisor answers on :9875" : "whether anything listens on :9876"} could not be told in time; an unknown is never read as absent (D12)`,
+  };
 }
 
 /**
@@ -228,9 +272,21 @@ export function spawnTestBody({ gitRef = null, worktreePath = null, requesterId,
   return body;
 }
 
+/** Does a runner's reported sha (often the 12-char `--short=12`) name `commit`? */
+export function shaMatches(reported, commit) {
+  if (typeof reported !== "string" || typeof commit !== "string") return false;
+  const r = reported.trim().toLowerCase();
+  const c = commit.trim().toLowerCase();
+  return /^[0-9a-f]{7,40}$/.test(r) && /^[0-9a-f]{7,40}$/.test(c) && (c.startsWith(r) || r.startsWith(c));
+}
+
 /**
- * Judge a spawn-test outcome: the source must match the selector and the built sha
- * must equal the requested head; an absent sha is an unknown build.
+ * Judge a spawn-test outcome (D12). What decides the build is the RUNNING child's
+ * own sha — `git_sha`, which the supervisor probes from the child's `/health`
+ * (qontinui-supervisor `src/routes/runners.rs`) — never the tree the build was
+ * asked for (`git_ref_resolved_sha` is that worktree's HEAD). A last-known-good
+ * fallback (`used_lkg`) is not the requested build and is refused; a response with
+ * no probed sha is an unknown build (labelled `unknown_build`, never a baseline).
  *
  * @returns {{ok: boolean, detail: string, buildSha: string | null, port: number | null}}
  */
@@ -243,16 +299,18 @@ export function judgeSpawnOutcome(outcome, { gitRef, worktreePath, expectedCommi
   if (body.source !== wantSource && !(gitRef && body.source === "origin_main" && /^origin\/main$/.test(gitRef))) {
     return { ok: false, detail: `spawn-test built source "${body.source}", expected "${wantSource}" (D12)`, buildSha: null, port: null };
   }
-  const sha = [body.build_sha, body.git_ref_resolved_sha].find((s) => typeof s === "string" && /^[0-9a-f]{40}$/.test(s)) ?? null;
-  if (sha && expectedCommit && !sha.startsWith(expectedCommit.toLowerCase())) {
-    return { ok: false, detail: `spawn-test built ${sha}, not the requested ${expectedCommit} (D12)`, buildSha: sha, port: null };
+  if (body.used_lkg === true) {
+    return { ok: false, detail: "spawn-test fell back to a last-known-good exe (used_lkg): not the requested build (D12)", buildSha: null, port: null };
   }
-  return {
-    ok: true,
-    detail: sha ? `built ${sha} from ${body.source}` : `built from ${body.source}, sha UNKNOWN (never a baseline)`,
-    buildSha: sha,
-    port: Number.isInteger(body.port) ? body.port : (outcome.port ?? null),
-  };
+  const probed = typeof body.git_sha === "string" && /^[0-9a-f]{7,40}$/i.test(body.git_sha) ? body.git_sha.toLowerCase() : null;
+  const port = Number.isInteger(body.port) ? body.port : (outcome.port ?? null);
+  if (probed && expectedCommit && !shaMatches(probed, expectedCommit)) {
+    return { ok: false, detail: `the running child reports git_sha ${probed}, not the requested ${expectedCommit} (D12)`, buildSha: null, port: null };
+  }
+  if (!probed || !expectedCommit || !/^[0-9a-f]{40}$/.test(expectedCommit)) {
+    return { ok: true, detail: `built from ${body.source}; the running child's sha is UNKNOWN (never a baseline)`, buildSha: null, port };
+  }
+  return { ok: true, detail: `the running child reports ${probed}, the requested ${expectedCommit}, built from ${body.source}`, buildSha: expectedCommit, port };
 }
 
 /** `terminal_spawn.<span>` close times (ms) from runner log lines. */
@@ -273,6 +331,42 @@ export function parseSpawnSpans(text) {
 export function refusalLane(line) {
   const m = /metric[=:]\s*"?([a-z_]+)"?/.exec(line) ?? /resource_guard:critical:([a-z_]+):/.exec(line);
   return m ? m[1] : "unknown";
+}
+
+/**
+ * The WARN notices the resource guard logs for a spawn it lets through past the
+ * session WARN limit (`resource_guard.rs`: "resource_guard: spawning past the
+ * session warn limit", with `lane`, `metric`, `observed` and `limit` fields). They
+ * are a diagnostic, never a refusal.
+ *
+ * @returns {{metric: string, lane: string | null, observed: number | null, limit: number | null}[]}
+ */
+export function parseGuardWarnings(text) {
+  const out = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    if (!/resource_guard: spawning past the session warn limit/.test(line)) continue;
+    const field = (k) => {
+      const m = new RegExp(`\\b${k}=("?)([^\\s"]+)\\1`).exec(line);
+      return m ? m[2] : null;
+    };
+    const num = (k) => {
+      const v = Number(field(k));
+      return field(k) !== null && Number.isFinite(v) ? v : null;
+    };
+    out.push({ metric: field("metric") ?? "unknown", lane: field("lane"), observed: num("observed"), limit: num("limit") });
+  }
+  return out;
+}
+
+/** WARN notices as one diagnostic: how many, per metric, and the highest reading. */
+export function summarizeGuardWarnings(warnings) {
+  const byMetric = {};
+  for (const w of warnings) {
+    const m = (byMetric[w.metric] ??= { count: 0, max_observed: null, limit: w.limit });
+    m.count += 1;
+    if (w.observed !== null && (m.max_observed === null || w.observed > m.max_observed)) m.max_observed = w.observed;
+  }
+  return { count: warnings.length, by_metric: byMetric };
 }
 
 /** A device JWT's payload, or null (the payload is base64, not encrypted). */
@@ -318,6 +412,11 @@ export class RunnerAdapter {
     this.spawnFn = o.spawnFn ?? spawn;
     this.run = o.run ?? spawnSync;
     this.list = o.list ?? (() => listProcesses({ platform: this.platform }));
+    this.portListening = o.portListening ?? isPortListening;
+    // Tests hand in a recording signal function; by default proc.mjs's own door.
+    this.kill = o.kill;
+    this.sleepFn = o.sleepFn ?? sleep;
+    this.now = o.now ?? Date.now;
     this.coordUrl = o.coordUrl ?? "https://coord.qontinui.io";
     this.client = null;
     this.port = null;
@@ -341,6 +440,7 @@ export class RunnerAdapter {
     this.spawnLogStart = null;
     this.spawnSpans = null;
     this.admission = null;
+    this.guardWarnings = [];
     this.facts = {};
     this.notes = [];
     if (!["subject", "supervisor"].includes(this.mode)) throw new RangeError(`runner mode must be subject or supervisor, got ${this.mode}`);
@@ -356,14 +456,8 @@ export class RunnerAdapter {
     mechanisms["runner.build_fixes"] = fixes;
     if (this.mode === "subject") {
       const sup = await supervisorAnswers(this.supervisorUrl, { fetch: this.fetch });
-      const primary = await isPortListening(PRIMARY_RUNNER_PORT);
-      mechanisms["runner.launch_mode"] =
-        sup || primary
-          ? {
-              state: "INOPERATIVE-ON-THIS-MACHINE",
-              reason: `subject launch refused: ${sup ? "a supervisor answers on :9875" : "something listens on :9876"}; use supervisor mode (D12)`,
-            }
-          : { state: "OPERATIVE", reason: "subject_instance_root: no supervisor on :9875 and nothing on :9876" };
+      const primary = await this.portListening(PRIMARY_RUNNER_PORT);
+      mechanisms["runner.launch_mode"] = subjectLaunchVerdict(sup, primary);
       const exe = this.build.exe;
       mechanisms["setup.runner"] =
         exe && existsSync(exe)
@@ -371,15 +465,17 @@ export class RunnerAdapter {
           : { state: "INOPERATIVE-ON-THIS-MACHINE", reason: `no runner exe at ${exe ?? "(none given: --runner-exe)"}` };
     } else {
       const sup = await supervisorAnswers(this.supervisorUrl, { fetch: this.fetch });
-      mechanisms["runner.launch_mode"] = sup
-        ? { state: "OPERATIVE", reason: `supervisor_spawn_test via ${this.supervisorUrl}` }
-        : { state: "INOPERATIVE-ON-THIS-MACHINE", reason: `no supervisor answers ${this.supervisorUrl}/health` };
+      mechanisms["runner.launch_mode"] =
+        sup === true
+          ? { state: "OPERATIVE", reason: `supervisor_spawn_test via ${this.supervisorUrl}` }
+          : sup === false
+            ? { state: "INOPERATIVE-ON-THIS-MACHINE", reason: `no supervisor listens at ${this.supervisorUrl}` }
+            : { state: "UNKNOWN", reason: `the supervisor at ${this.supervisorUrl} did not answer /health in time` };
       mechanisms["setup.runner"] =
         this.build.gitRef || this.build.worktreePath
           ? { state: sup ? "OPERATIVE" : "UNKNOWN", reason: `spawn-test ${this.build.gitRef ? `git_ref ${this.build.gitRef}` : `worktree_path ${this.build.worktreePath}`}` }
           : { state: "INOPERATIVE-ON-THIS-MACHINE", reason: "supervisor mode needs --head-ref <sha> or --head-worktree <path>" };
     }
-    mechanisms["runner.drain"] = { state: "UNKNOWN", reason: "read from the runner under test once it is up (GET /restart-readiness drain.coordDrain)" };
     return { mechanisms };
   }
 
@@ -400,6 +496,17 @@ export class RunnerAdapter {
     } catch (e) {
       throw new AdapterRefusal("harness_error", `${e.message}${this.refusalLogText()}`);
     }
+    if (this.mode === "subject") {
+      // The build is proven by the binary that is RUNNING: its /health gitSha.
+      const sha = typeof this.health?.gitSha === "string" ? this.health.gitSha : null;
+      if (sha && /^[0-9a-f]{7,40}$/i.test(sha) && this.build.commit && !shaMatches(sha, this.build.commit)) {
+        throw new AdapterRefusal("harness_error", `the running subject reports gitSha ${sha}, not the build's ${this.build.commit} (D12)`);
+      }
+      this.buildProven = Boolean(sha && this.build.commit && shaMatches(sha, this.build.commit));
+      // The start key is the only identity proof teardown has; take it again when the
+      // first read (racing a slow process table) came back empty.
+      if (!this.startKey && this.childExit === null && Number.isInteger(this.pid)) this.startKey = this.list().get(this.pid)?.startKey ?? null;
+    }
     await this.checkDrain();
     await this.client.activateTab("terminal");
     try {
@@ -410,17 +517,17 @@ export class RunnerAdapter {
     }
     if (this.variant === "ghostty") await this.setBackend("ghostty");
     this.facts.renderBackend = await this.readRenderBackend();
-    this.facts.ptyHolder = this.readPtyHolder();
+    this.holderSetting = this.readPtyHolder();
+    this.facts.ptyHolder = this.holderSetting;
     return { ok: true };
   }
 
   async launchSubject(ctx) {
-    if (await supervisorAnswers(this.supervisorUrl, { fetch: this.fetch })) {
-      throw new AdapterRefusal("harness_error", "subject launch refused: a supervisor answers on :9875; on a supervisor box the runner is a spawn-test temp runner (D12)");
-    }
-    if (await isPortListening(PRIMARY_RUNNER_PORT)) {
-      throw new AdapterRefusal("harness_error", "subject launch refused: something listens on :9876, the primary runner's port (D12)");
-    }
+    const verdict = subjectLaunchVerdict(
+      await supervisorAnswers(this.supervisorUrl, { fetch: this.fetch }),
+      await this.portListening(PRIMARY_RUNNER_PORT),
+    );
+    if (verdict.state !== "OPERATIVE") throw new AdapterRefusal("harness_error", verdict.reason);
     const exe = this.build.exe;
     if (!exe || !existsSync(exe)) throw new AdapterRefusal("harness_error", `no runner exe at ${exe}`);
     this.root = assertInside(ctx.runDir, join(ctx.unitDir, "runner-root"));
@@ -477,18 +584,37 @@ export class RunnerAdapter {
     } catch (e) {
       throw new AdapterRefusal("harness_error", `the supervisor at ${this.supervisorUrl} does not answer: ${e.message}`);
     }
+    this.requesterId = `termhost-bench-${ctx.genRunId}`.slice(0, 64);
     const body = spawnTestBody({
       gitRef: this.build.gitRef ?? null,
       worktreePath: this.build.worktreePath ?? null,
-      requesterId: `termhost-bench-${ctx.genRunId}`.slice(0, 64),
+      requesterId: this.requesterId,
       display: ctx.env?.env?.DISPLAY ?? null,
       platform: this.platform,
     });
-    const queued = await sup.spawnTestAsync(body);
+    let queued = null;
+    try {
+      queued = await sup.spawnTestAsync(body);
+    } catch (e) {
+      // The answer was lost (a timeout, a dropped connection): the supervisor may
+      // still have minted a runner. Find it, or at least remember it for teardown.
+      const found = await this.recoverLostSpawn(sup);
+      if (!found?.submissionId) {
+        throw new AdapterRefusal("harness_error", `spawn-test failed (${e.message.slice(0, 200)})${found ? `; temp runner ${found.id} found by requester id and will be stopped` : ""}`);
+      }
+      queued = { submission_id: found.submissionId, id: found.id, port: found.port };
+      this.notes.push(`spawn-test answer lost (${e.message.slice(0, 120)}); recovered submission ${found.submissionId} from /runners/spawn-test/in-flight`);
+    }
     this.supervisorRunnerId = queued.id;
     this.port = queued.port;
     this.log(`runner: spawn-test queued ${queued.submission_id} -> ${queued.id} on :${queued.port}`);
-    const outcome = await sup.awaitSpawn(queued.submission_id, { timeoutMs: this.buildTimeoutMs });
+    let outcome;
+    try {
+      outcome = await sup.awaitSpawn(queued.submission_id, { timeoutMs: this.buildTimeoutMs });
+    } catch (e) {
+      const found = await this.recoverLostSpawn(sup);
+      throw new AdapterRefusal("harness_error", `${e.message.slice(0, 300)}${found ? `; temp runner ${found.id} will be stopped` : ""}`);
+    }
     const verdict = judgeSpawnOutcome(outcome, {
       gitRef: this.build.gitRef,
       worktreePath: this.build.worktreePath,
@@ -511,19 +637,58 @@ export class RunnerAdapter {
     }
   }
 
-  async checkDrain({ waitMs = 30000 } = {}) {
-    const deadline = Date.now() + waitMs;
+  /**
+   * After a lost spawn-test answer: the runner the supervisor reserved for OUR
+   * requester id. The in-flight index answers while the build runs (with its
+   * submission id, so the spawn can still be awaited); once the build ends the key
+   * is released, and `GET /runners` filtered by `requester_id` finds the runner.
+   * Whatever is found is remembered, so teardown stops it.
+   *
+   * @returns {Promise<{id: string, port: number | null, submissionId?: string} | null>}
+   */
+  async recoverLostSpawn(sup) {
+    try {
+      const inflight = await sup.spawnInFlight({ requesterId: this.requesterId });
+      const hit = (inflight?.spawns ?? []).find((x) => x?.requester_id === this.requesterId && typeof x?.id === "string");
+      if (hit) {
+        this.supervisorRunnerId = hit.id;
+        return { id: hit.id, port: Number.isInteger(hit.port) ? hit.port : null, submissionId: hit.submission_id ?? hit.build_id };
+      }
+    } catch (e) {
+      this.notes.push(`GET /runners/spawn-test/in-flight failed: ${e.message.slice(0, 160)}`);
+    }
+    try {
+      const row = (await sup.runners()).find((r) => r?.requester_id === this.requesterId && typeof r?.id === "string");
+      if (row) {
+        this.supervisorRunnerId = row.id;
+        return { id: row.id, port: Number.isInteger(row.port) ? row.port : null };
+      }
+    } catch (e) {
+      this.notes.push(`GET /runners failed while recovering a lost spawn: ${e.message.slice(0, 160)}`);
+    }
+    return null;
+  }
+
+  /**
+   * The device drain as the runner under test reads it (`/restart-readiness`
+   * `drain.coordDrain`, `coord_drain_state.rs`). A backstop to the doctor's own
+   * read before the first unit: `clear` and `not_enrolled` pass; `drained` and
+   * `unknown` refuse; a boot read still pending is waited for, and a wait that ends
+   * pending is refused like any other unknown.
+   */
+  async checkDrain({ waitMs = 30000, sleepFn = this.sleepFn, now = this.now } = {}) {
+    const deadline = now() + waitMs;
     let cd = null;
     let lastErr = null;
-    while (Date.now() < deadline) {
+    while (now() < deadline) {
       try {
-        const rr = await this.client.restartReadiness();
+        const rr = unwrap(await this.client.restartReadiness());
         cd = rr?.drain?.coordDrain ?? null;
         if (cd && cd.bootReadPending !== true) break;
       } catch (e) {
         lastErr = e;
       }
-      await sleep(1000);
+      await sleepFn(1000);
     }
     this.drain = cd;
     if (!cd) {
@@ -532,7 +697,10 @@ export class RunnerAdapter {
         `the coord drain state could not be read (${lastErr?.message ?? "no drain.coordDrain in /restart-readiness"}); an unknown drain is refused`,
       );
     }
-    if (cd.state === "drained" || cd.state === "unknown") {
+    if (cd.bootReadPending === true) {
+      throw new AdapterRefusal("device_drained", `the runner's first coord drain read was still pending after ${Math.round(waitMs / 1000)} s; an unknown drain is refused`);
+    }
+    if (cd.state !== "clear" && cd.state !== "not_enrolled") {
       throw new AdapterRefusal("device_drained", `coord drain state ${cd.state}${cd.cause ? `: ${cd.cause}` : ""}${cd.reason ? ` (${cd.reason})` : ""}`);
     }
   }
@@ -556,7 +724,7 @@ export class RunnerAdapter {
 
   /** The settings.json the runner under test reads `terminal.pty_holder` from. */
   settingsPath() {
-    if (this.mode === "subject") return join(this.root, "config", "settings.json");
+    if (this.mode === "subject") return this.root ? join(this.root, "config", "settings.json") : null;
     if (this.supervisorRunnerId) {
       return join(platformDirs({ platform: this.platform, env: this.baseEnv }).configDir, "com.qontinui.runner", "instances", this.supervisorRunnerId, "settings.json");
     }
@@ -624,6 +792,9 @@ export class RunnerAdapter {
     const before = new Set((await this.terminalIds()).map((t) => t.id));
     const logStart = this.logSize();
     let settled = null;
+    // The spawn's start: after the harness's own `GET /terminals`, immediately
+    // before the action, so none of the harness's round trips are counted.
+    const tCmdNs = hrtime();
     const call = this.client
       .componentAction(LAUNCH_MENU, "create-with-command", { count, command: this.command }, 60000 + 8000 * count)
       .then(
@@ -662,6 +833,8 @@ export class RunnerAdapter {
     return {
       tabIds: created.map((t) => t.id),
       refusals,
+      tCmdNs,
+      warnings: parseGuardWarnings(this.logSince(logStart)),
       error: settled.ok ? null : settled.error?.message ?? String(settled.error),
     };
   }
@@ -674,10 +847,10 @@ export class RunnerAdapter {
     let remaining = n;
     while (remaining > 0 && !this.admission) {
       const count = Math.min(MAX_SPAWN_COUNT, remaining);
-      const tCmdNs = hrtime();
       const r = await this.createWithCommand(count);
+      this.guardWarnings.push(...r.warnings);
       for (const id of r.tabIds) {
-        sessions.push({ hostId: id, tCmdNs });
+        sessions.push({ hostId: id, tCmdNs: r.tCmdNs });
         this.terminals.push(id);
       }
       if (r.refusals.length > 0) {
@@ -846,19 +1019,26 @@ export class RunnerAdapter {
     };
   }
 
+  /**
+   * Show session `k` alone: `maximize-zone` on its zone, directly. No `restore-zone`
+   * first — maximize moves the maximized zone in one step
+   * (`src/components/terminal/zone-grid/maximizeActions.ts`), while a restore would
+   * repaint the whole grid with k visible before the maximize, and the switch would
+   * time that repaint. The command time is taken immediately before the action.
+   */
   async show(k) {
     const zone = this.zoneOf.get(k);
     if (zone === undefined) return { ok: false, detail: `session ${k} has no resolved zone` };
     const tCmdNs = hrtime();
-    await this.restoreZone();
     await this.maximizeZone(zone);
     this.focusSession = k;
     return { ok: true, tCmdNs };
   }
 
   async spawnOne() {
-    const tCmdNs = hrtime();
     const r = await this.createWithCommand(1);
+    const tCmdNs = r.tCmdNs;
+    this.guardWarnings.push(...r.warnings);
     if (r.refusals.length > 0) {
       return { ok: false, tCmdNs, admission: { refused: true, lane: r.refusals[0].lane, detail: r.refusals[0].message } };
     }
@@ -900,15 +1080,45 @@ export class RunnerAdapter {
     }
   }
 
-  /** PTY holder processes this runner started (their command line names its root). */
+  /**
+   * PTY holder processes this runner started: a `qontinui-pty-holder` whose
+   * command line names this instance's pane directory (`<root>/.../pty-panes`,
+   * `terminal/daemon_pane_io.rs` `runner_pane_dir`). The runner serves no holder
+   * census yet (`settings.rs` `pty_holder`: it lands with Phase 5 of the holder
+   * plan), so the process table, narrowed to this instance's own pane directory,
+   * is the evidence; holders escape the runner's process tree by design.
+   */
   holderPids(table = this.list()) {
-    if (this.facts.ptyHolder !== true || !this.root) return [];
+    if (this.holderSetting !== true || !this.root) return [];
     const out = [];
     for (const p of table.values()) {
       const exe = basename(Array.isArray(p.argv) ? (p.argv[0] ?? "") : p.name);
-      if (/^qontinui-pty-holder/.test(exe) && p.cmdline.includes(this.root)) out.push(p.pid);
+      if (/^qontinui-pty-holder/.test(exe) && p.cmdline.includes(this.root) && p.cmdline.includes("pty-panes")) out.push(p.pid);
     }
     return out;
+  }
+
+  /**
+   * `pty_holder` as the runner RAN it, not as the adapter configured it. With the
+   * setting on, a pane whose holder cannot start falls back to an in-process PTY and
+   * says so in the runner log (`terminal/daemon_pane_io.rs`: "the holder could not
+   * be started"). So: setting off -> false; on, no fallback logged and a holder per
+   * session found -> true; every pane fell back -> false; a mix, or no holder process
+   * found -> unknown with what was seen.
+   */
+  ptyHolderAsRun({ sessions = this.terminals.length, logText = this.spawnLogStart === null ? "" : this.logSince(this.spawnLogStart), table = this.list() } = {}) {
+    const setting = this.holderSetting;
+    if (setting === false) return false;
+    if (setting !== true) return setting ?? { state: "unknown", reason: "harness_error", detail: "the pty_holder setting could not be read" };
+    const fallbacks = (logText.match(/pty holder: terminal\.pty_holder is on but the holder could not be started/g) ?? []).length;
+    const holders = this.holderPids(table).length;
+    if (fallbacks === 0 && holders >= Math.max(1, sessions)) return true;
+    if (fallbacks >= sessions && sessions > 0 && holders === 0) return false;
+    return {
+      state: "unknown",
+      reason: "harness_error",
+      detail: `pty_holder is on, but ${fallbacks} of ${sessions} pane(s) logged a fallback to an in-process PTY and ${holders} holder process(es) were found for this instance`,
+    };
   }
 
   processRoots() {
@@ -941,7 +1151,10 @@ export class RunnerAdapter {
   }
 
   describe(slots = new Map()) {
-    const commit = this.buildSha ?? this.build.commit ?? null;
+    // Supervisor mode: only the running child's probed sha proves the build (S5);
+    // subject mode: the artifact's commit, confirmed by the binary's own /health
+    // gitSha at launch.
+    const commit = this.mode === "supervisor" ? this.buildSha : this.buildProven ? this.build.commit : null;
     const shell = this.shellFacts(slots);
     return {
       id: "runner",
@@ -958,7 +1171,7 @@ export class RunnerAdapter {
       settings_digest: this.settingsDigest(),
       pty_host_impl: this.platform === "win32" ? { state: "unknown", reason: "not_instrumented", detail: "the Windows PTY host census arrives with Phase 4" } : "unix_pty",
       render_backend: this.facts.renderBackend ?? { state: "unknown", reason: "harness_error", detail: "not read" },
-      pty_holder: this.facts.ptyHolder ?? { state: "unknown", reason: "harness_error", detail: "not read" },
+      pty_holder: this.client ? this.ptyHolderAsRun() : (this.facts.ptyHolder ?? { state: "unknown", reason: "harness_error", detail: "not read" }),
       launch_mode: this.mode === "subject" ? "subject_instance_root" : "supervisor_spawn_test",
       session_shell: shell?.session_shell ?? (this.platform === "win32" ? "powershell.exe -NoLogo -NoExit" : basename(this.baseEnv.SHELL || "bash")),
       shell_integration: shell?.shell_integration ?? { state: "unknown", reason: "harness_error", detail: "no session shell found in the process table" },
@@ -1041,6 +1254,10 @@ export class RunnerAdapter {
     }
     d["drain.coord"] = this.drain ? diag("GET /restart-readiness drain.coordDrain", { state: "measured", data: this.drain }) : diag("GET /restart-readiness", { state: "unknown", reason: "harness_error", detail: "not read" });
     if (this.admission) d["spawn.admission"] = diag("create-with-command + resource guard", { state: "measured", data: this.admission });
+    d["spawn.admission_warnings"] = diag("runner log: resource_guard spawning past the session warn limit", {
+      state: "measured",
+      data: summarizeGuardWarnings(this.guardWarnings),
+    });
     return d;
   }
 
@@ -1106,7 +1323,7 @@ export class RunnerAdapter {
    * After teardown, read back from coord that every terminal's mirrored session is
    * closed (D12 (a)). Moot for an unpaired subject, whose terminals mirror nothing.
    */
-  async coordReadback() {
+  async coordReadback({ graceMs = 30000, pollMs = 5000 } = {}) {
     const ids = [...this.coordSessions.values()].filter((v) => typeof v === "string");
     const source = "GET coord /coord/sessions/fleet?include_closed=false";
     if (ids.length === 0) {
@@ -1130,9 +1347,9 @@ export class RunnerAdapter {
         incidents: [],
       };
     }
-    const open = new Set();
-    let cursor = null;
-    try {
+    const readOpen = async () => {
+      const open = new Set();
+      let cursor = null;
       for (let page = 0; page < 20; page += 1) {
         const q = new URLSearchParams({ include_closed: "false", limit: "500" });
         if (cursor) q.set("cursor", cursor);
@@ -1146,10 +1363,24 @@ export class RunnerAdapter {
         cursor = body.nextCursor ?? null;
         if (!cursor) break;
       }
+      return open;
+    };
+    // A session closes in coord a moment after its terminal does (the mirror's own
+    // close, then coord's write): read again until none is open, or the grace ends.
+    const deadline = this.now() + graceMs;
+    let leftOpen = [];
+    let reads = 0;
+    try {
+      for (;;) {
+        const open = await readOpen();
+        reads += 1;
+        leftOpen = ids.filter((id) => open.has(id));
+        if (leftOpen.length === 0 || this.now() >= deadline) break;
+        await this.sleepFn(pollMs);
+      }
     } catch (e) {
       return { diagnostic: { comparable: false, source, state: "unknown", reason: "harness_error", detail: `coord read failed: ${e.message}` }, incidents: [] };
     }
-    const leftOpen = ids.filter((id) => open.has(id));
     const incidents = leftOpen.map((id) => ({
       kind: "coord_session_left_open",
       at: new Date().toISOString(),
@@ -1158,7 +1389,7 @@ export class RunnerAdapter {
       data: { coord_session_id: id },
     }));
     return {
-      diagnostic: { comparable: false, source, state: "measured", data: { checked: ids.length, left_open: leftOpen.length } },
+      diagnostic: { comparable: false, source, state: "measured", data: { checked: ids.length, left_open: leftOpen.length, reads, grace_ms: graceMs } },
       incidents,
     };
   }
@@ -1210,7 +1441,9 @@ export class RunnerAdapter {
     }
     if (this.mode === "supervisor" && this.supervisorRunnerId) {
       try {
-        await this.supervisor.stopRunner(this.supervisorRunnerId);
+        // Checked against the supervisor's own row first: never a protected runner,
+        // never one another requester owns (N8).
+        await this.supervisor.stopRunnerChecked(this.supervisorRunnerId, { requesterId: this.requesterId });
         closed.push(`temp runner ${this.supervisorRunnerId}`);
       } catch (e) {
         survivors.push({ what: `temp runner ${this.supervisorRunnerId}`, detail: `stop failed: ${e.message.slice(0, 200)}` });
@@ -1231,14 +1464,21 @@ export class RunnerAdapter {
       const also = [...this.postmasters(table)];
       for (const pid of this.holderPids(table)) {
         const p = table.get(pid);
-        if (p && (!this.startKey || startKeyCompare(p.startKey, this.startKey) >= 0)) also.push({ pid, startKey: p.startKey });
+        if (p && this.startKey && startKeyCompare(p.startKey, this.startKey) >= 0) also.push({ pid, startKey: p.startKey });
       }
-      const res = await terminateTree({ pid: this.pid, startKey: this.startKey ?? undefined }, { list: this.list, alsoPids: also });
-      closed.push(`subject runner pid ${this.pid} (+${res.signalled.length - 1} descendant/owned process(es))`);
+      // Our child, by its own handle: when it has already exited, its PID may belong
+      // to something else by now, so the tree walk is skipped (only the processes
+      // proven ours by their own start keys are signalled). And a tree walk needs the
+      // root's start key: without one, the PID's identity cannot be proven (S8).
+      const exited = this.childExit !== null;
+      const root = exited ? null : { pid: this.pid, startKey: this.startKey ?? null };
+      const res = await terminateTree(root, { list: this.list, alsoPids: also, ...(this.kill ? { kill: this.kill } : {}) });
+      if (res.refused) survivors.push({ what: `subject runner pid ${this.pid}`, detail: res.refused });
+      closed.push(`subject runner pid ${this.pid}${exited ? " (had already exited)" : ""} (${res.signalled.length} process(es) signalled)`);
       for (const pid of res.survivors) survivors.push({ what: `pid ${pid}`, detail: "survived SIGTERM and SIGKILL" });
       // A daemonised postmaster that appeared after the tree walk is still ours by its pid file.
       for (const pm of this.postmasters(this.list())) {
-        terminatePid(pm.pid, { signal: "SIGINT", table: this.list(), expect: (p) => p.startKey === pm.startKey });
+        terminatePid(pm.pid, { signal: "SIGINT", table: this.list(), expect: (p) => p.startKey === pm.startKey, ...(this.kill ? { kill: this.kill } : {}) });
       }
     }
     return { closed, survivors, incidents, notes: [...this.notes] };

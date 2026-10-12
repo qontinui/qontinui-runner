@@ -16,7 +16,7 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { WatchProcess, activate, freshTag, injectArgs, setAside, takeRunFile, watchArgs } from "../probe.mjs";
+import { WatchProcess, activate, endChild, freshTag, injectArgs, raceTimeout, runProbe, setAside, takeRunFile, watchArgs } from "../probe.mjs";
 
 function dir(t) {
   const d = mkdtempSync(join(tmpdir(), "tb-probe-"));
@@ -131,4 +131,48 @@ test("an injection tag is 0x-hex and never 0 (what an untagged injection carries
   assert.match(freshTag(), /^0x[0-9a-f]{8}$/);
   const seq = [0, 0, 5];
   assert.equal(freshTag(() => seq.shift()), "0x00000005");
+});
+
+test("a finished race clears its timer, so nothing waits out the rest of a timeout (review N6)", async () => {
+  const set = [];
+  const cleared = [];
+  const fakeTimers = { setTimer: (fn, ms) => { set.push(ms); return { id: set.length }; }, clearTimer: (t) => cleared.push(t.id) };
+  assert.equal(await raceTimeout(Promise.resolve("done"), 20000, fakeTimers), "done");
+  assert.deepEqual(set, [20000]);
+  assert.deepEqual(cleared, [1], "the 20 s timer is cleared as soon as the race is won");
+  assert.equal(await raceTimeout(new Promise(() => {}), 5), "timeout");
+});
+
+/** A child that ignores SIGTERM and dies only on SIGKILL. */
+function stubbornChild() {
+  const child = new EventEmitter();
+  child.pid = 777;
+  child.signals = [];
+  child.stdin = { end: () => {} };
+  child.kill = (sig) => {
+    child.signals.push(sig);
+    if (sig === "SIGKILL") setImmediate(() => child.emit("exit", null, "SIGKILL"));
+    return true;
+  };
+  return child;
+}
+
+test("a child that ignores SIGTERM is killed, never waited on forever (review N6)", async (t) => {
+  const child = stubbornChild();
+  const exited = new Promise((r) => child.once("exit", () => r()));
+  assert.equal(await endChild(child, exited, { graceMs: 20 }), "killed");
+  assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  // runProbe past its timeout: SIGTERM, then SIGKILL, then it answers.
+  const c2 = stubbornChild();
+  const res = await runProbe({ probe: "p", args: ["inject"], timeoutMs: 10, killGraceMs: 20, spawnFn: () => c2 });
+  assert.deepEqual(c2.signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(res.code, null);
+  assert.match(res.stderr, /exceeded 10 ms/);
+  // A watch that does not exit when its stdin closes.
+  const d = dir(t);
+  const c3 = stubbornChild();
+  const w = new WatchProcess({ probe: "p", args: ["watch", "--stdin-stop"], runDir: d, label: "focus-soak", spawnFn: () => c3, killGraceMs: 20 });
+  const seg = await w.stop({ timeoutMs: 10 });
+  assert.equal(seg.timedOut, true);
+  assert.deepEqual(c3.signals, ["SIGTERM", "SIGKILL"]);
 });

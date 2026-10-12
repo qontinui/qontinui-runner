@@ -9,19 +9,20 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { machineBlock } from "../machine.mjs";
 import { NeutralityGuard } from "../neutrality.mjs";
-import { convertProbeIncident, redactRunnerOnly } from "../results.mjs";
-import { planUnits, runBench } from "../run.mjs";
+import { InvalidResults, convertProbeIncident, redactRunnerOnly } from "../results.mjs";
+import { RunAbort, RunFailed, planUnits, runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
 
 /** A run on fakes; returns the result and every adapter call. */
-async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts() } = {}) {
+async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null } = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "tb-run-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   mkdirSync(join(tmp, "primary"), { recursive: true });
@@ -42,9 +43,13 @@ async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = 
         variant: o.variant,
         build: o.build ? { role: o.build.role, commit: o.build.commit } : null,
         refuseAt: refuseAt[setup] ?? null,
-        onArrange: onArrange ? (arm, unit) => onArrange(arm, unit, settings) : null,
+        onArrange: onArrange ? (arm, unit) => onArrange(arm, unit, settings, { tmp, calls }) : null,
         calls,
       });
+      if (describe) {
+        const base = current.describe.bind(current);
+        current.describe = (slots) => describe(base(slots), setup);
+      }
       return current;
     },
     probe: fakeProbe({ clock, current: () => current }),
@@ -53,8 +58,9 @@ async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = 
     machineBlock: (o) => machineBlock({ ...o, gpu: { state: "unknown", reason: "not_instrumented", detail: "test" } }),
     neutrality: new NeutralityGuard({ paths: [{ label: "settings.json", path: settings }] }),
     reapGenerators: async () => ({ ended: [], survivors: [] }),
+    primaryPresent: async () => false,
   };
-  const res = await runBench(fakeRunOptions(join(tmp, "work"), { out: join(tmp, "results.json"), redactedOut: join(tmp, "redacted.json"), ...opts }), deps);
+  const res = await runBench(fakeRunOptions(join(tmp, "work"), { out: join(tmp, "results.json"), redactedOut: join(tmp, "redacted.json"), ...opts }), { ...deps, ...overrides });
   return { res, calls, tmp, probe: deps.probe };
 }
 
@@ -172,4 +178,150 @@ test("a probe incident keeps its data (data.source) and is placed where the harn
   assert.equal(odd.kind, "harness_error");
   assert.equal(odd.data.probe_kind, "cosmic");
   assert.equal(odd.data.source, "wgc");
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1
+// ---------------------------------------------------------------------------
+
+const AB = [
+  { role: "head", commit: "a".repeat(40), exe: "fake", source: "artifact" },
+  { role: "baseline", commit: "b".repeat(40), exe: "fake", source: "artifact" },
+];
+
+test("a refusal ends one ladder — its subject's, in its run, from the refused N up — and the A/B file is still written (review M1)", async (t) => {
+  // The review's reproduction (review-p3/ladder-dup.mjs), extended to three levels.
+  const { res, calls } = await fakeRun(t, { opts: { ns: [1, 5, 15], runs: 2, runnerBuilds: AB }, refuseAt: { runner: 5 } });
+  assert.equal(validateResults(res.doc).valid, true, JSON.stringify(validateResults(res.doc).errors.slice(0, 3)));
+  // r0: 0-2 at N=1, 3-5 at N=5 (3, 4 refused), 6-8 at N=15; r1: 9-17 likewise.
+  assert.deepEqual(calls.filter((c) => c[0] === "launch").map((c) => c[1]), [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 17]);
+  const skipped = res.doc.rows.filter((r) => r.setup.id === "runner" && r.scenario.n === 15);
+  assert.equal(skipped.length, 2 * 2 * 2, "head and baseline, both arms, both runs");
+  for (const r of skipped) {
+    assert.equal(r.kpis.output_latency_ms.reason, "admission_refused");
+    assert.ok(["head", "baseline"].includes(r.setup.build.role), "a skipped row keeps its build's role");
+    assert.equal(r.setup.build.commit, r.setup.build.role === "head" ? "a".repeat(40) : "b".repeat(40));
+  }
+  // Run 1's lower levels were measured again rather than skipped.
+  assert.equal(res.doc.rows.filter((r) => r.setup.id === "runner" && r.scenario.run_index === 1 && r.scenario.n === 1 && r.kpis.output_latency_ms.state === "measured").length, 4);
+});
+
+test("a skipped row records the launch mode the run used", async (t) => {
+  const { res } = await fakeRun(t, { opts: { ns: [1, 5], runnerMode: "supervisor", runnerBuilds: [{ role: "single", commit: "a".repeat(40), gitRef: "a".repeat(40), source: "git_ref" }] }, refuseAt: { runner: 1 }, deps: { primaryPresent: async () => false } });
+  const skipped = res.doc.rows.filter((r) => r.setup.id === "runner" && r.scenario.n === 5);
+  assert.ok(skipped.length > 0);
+  for (const r of skipped) {
+    assert.equal(r.setup.launch_mode, "supervisor_spawn_test");
+    assert.equal(r.setup.build.source, "git_ref");
+  }
+});
+
+test("an invalid results document is set aside privately, and the error names paths and keywords only", async (t) => {
+  // `ram_mb` below its schema minimum: the validator's own message for that
+  // keyword quotes the value ("-31337 < minimum 1"), so this is the case that
+  // can leak it.
+  const err = await fakeRun(t, {
+    deps: {
+      machineBlock: (o) => ({ ...machineBlock({ ...o, gpu: { state: "unknown", reason: "not_instrumented", detail: "test" } }), ram_mb: -31337 }),
+    },
+  }).then(() => null, (e) => e);
+  assert.ok(err instanceof InvalidResults, String(err));
+  assert.ok(existsSync(err.asidePath), "the data survives, unpublished");
+  assert.match(err.asidePath, /results\.invalid\.json$/);
+  assert.match(readFileSync(err.asidePath, "utf8"), /-31337/, "the aside copy is the whole document");
+  assert.match(err.message, /\/machine\/ram_mb \[minimum\]/);
+  assert.doesNotMatch(err.message, /31337/, "a value never reaches the log (D7)");
+});
+
+test("one arm's failure is that arm's alone: the measured arm keeps its row (review S1)", async (t) => {
+  // The review's reproduction (review-p3/second-arm.mjs).
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"] },
+    onArrange: (arm) => {
+      if (arm === "tiled") throw new Error("tiled arrange timed out");
+    },
+  });
+  const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
+  const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
+  assert.equal(focus.kpis.output_latency_ms.state, "measured");
+  assert.equal(tiled.kpis.output_latency_ms.state, "unknown");
+  assert.equal(tiled.kpis.output_latency_ms.reason, "harness_error");
+  assert.match(tiled.kpis.output_latency_ms.detail, /tiled arrange timed out/);
+  assert.ok(res.doc.incidents.some((i) => /arm tiled: tiled arrange timed out/.test(i.detail)));
+});
+
+test("the primary-state guard's baseline is in the results, and a guard watching nothing blocks a supervisor run (review S7)", async (t) => {
+  const watched = await fakeRun(t, {});
+  assert.equal(watched.res.doc.capabilities["harness.neutrality"].state, "OPERATIVE");
+  assert.match(watched.res.doc.capabilities["harness.neutrality"].reason, /watching 1 of 1 primary-state file\(s\): settings\.json sha256:/);
+  const nothing = (extra) => new NeutralityGuard({ paths: [{ label: "settings.json", path: join(tmpdir(), "no-such-dir-tb", "settings.json") }], ...extra });
+  const blocked = await fakeRun(t, { opts: { runnerMode: "supervisor" }, deps: { neutrality: nothing(), primaryPresent: async () => true } }).then(() => null, (e) => e);
+  assert.ok(blocked instanceof RunAbort, String(blocked));
+  assert.match(blocked.message, /would watch nothing/);
+  const unknownPrimary = await fakeRun(t, { opts: { runnerMode: "supervisor" }, deps: { neutrality: nothing(), primaryPresent: async () => null } }).then(() => null, (e) => e);
+  assert.ok(unknownPrimary instanceof RunAbort, "an unanswered :9876 probe counts as 'may be present'");
+  const noPrimary = await fakeRun(t, { deps: { neutrality: nothing(), primaryPresent: async () => false } });
+  assert.equal(noPrimary.res.doc.capabilities["harness.neutrality"].state, "OPERATIVE");
+  assert.match(noPrimary.res.doc.capabilities["harness.neutrality"].reason, /nothing to protect/);
+});
+
+test("a primary-state file the guard cannot read is UNKNOWN at baseline and an incident at each check, not a silent pass (review S7)", async (t) => {
+  const unreadable = () =>
+    new NeutralityGuard({
+      paths: [{ label: "settings.json", path: join(tmpdir(), "tb-unreadable", "settings.json") }],
+      read: () => {
+        throw Object.assign(new Error("denied"), { code: "EACCES" });
+      },
+    });
+  // Subject mode records it and carries on: the incident says what was not seen.
+  const { res } = await fakeRun(t, { deps: { neutrality: unreadable(), primaryPresent: async () => false } });
+  assert.equal(res.doc.capabilities["harness.neutrality"].state, "UNKNOWN", "an unreadable file is state the guard cannot see");
+  assert.equal(res.doc.incidents.filter((i) => i.kind === "harness_error" && /could not read settings\.json/.test(i.detail)).length, 1, "reported once");
+  // A supervisor run on such a box is refused before any unit.
+  const blocked = await fakeRun(t, { opts: { runnerMode: "supervisor" }, deps: { neutrality: unreadable(), primaryPresent: async () => false } }).then(() => null, (e) => e);
+  assert.ok(blocked instanceof RunAbort, String(blocked));
+});
+
+test("SIGINT ends the unit in progress and writes the completed units as a partial file, at once and at the end (review S9)", async (t) => {
+  const signals = new EventEmitter();
+  let atSignal = null;
+  const { res, calls, tmp } = await fakeRun(t, {
+    opts: { ns: [1, 5] },
+    deps: { signals },
+    onArrange: (arm, unit, settings, ctx) => {
+      if (unit === 1 && arm === "focus") {
+        signals.emit("SIGINT", "SIGINT");
+        const out = join(ctx.tmp, "results.json");
+        atSignal = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : null;
+      }
+    },
+  });
+  // Written synchronously at the signal: unit 0 only, marked partial.
+  assert.ok(atSignal, "the completed units were written the moment the signal arrived");
+  assert.deepEqual([...new Set(atSignal.rows.map((r) => r.setup.id))], ["runner"]);
+  assert.ok(atSignal.incidents.some((i) => i.stops_run && /interrupted by SIGINT after 1 of 4 unit\(s\)/.test(i.detail)));
+  // Then the unit in progress tore down, nothing later launched, and the final file says partial.
+  assert.deepEqual(calls.filter((c) => c[0] === "launch").map((c) => c[1]), [0, 1]);
+  assert.deepEqual(calls.filter((c) => c[0] === "teardown").map((c) => c[1]), [0, 1]);
+  assert.ok(res.stopped && /interrupted by SIGINT/.test(res.stopped.detail));
+  assert.equal(validateResults(res.doc).valid, true);
+  // The interrupted unit's arms were cut short: unknown, never a short window passed off as the soak.
+  const cut = res.doc.rows.filter((r) => r.setup.id === "tmux");
+  assert.equal(cut.length, 2);
+  for (const r of cut) {
+    assert.equal(r.kpis.output_latency_ms.state, "unknown");
+    assert.match(r.kpis.output_latency_ms.detail, /interrupted/);
+  }
+  assert.equal(signals.listenerCount("SIGINT"), 0, "the handlers are removed when the run ends");
+  void tmp;
+});
+
+test("a run that stops before any row exists fails (exit 1), it is not a doctor refusal (review N4)", async (t) => {
+  const changedAtOnce = {
+    baseline: () => [{ label: "settings.json", state: "present", sha256: `sha256:${"0".repeat(64)}` }],
+    check: () => ({ changed: true, incident: { kind: "primary_state_changed", at: new Date().toISOString(), detail: "changed", stops_run: true } }),
+  };
+  const err = await fakeRun(t, { deps: { neutrality: changedAtOnce } }).then(() => null, (e) => e);
+  assert.ok(err instanceof RunFailed, String(err));
+  assert.ok(!(err instanceof RunAbort));
 });

@@ -182,3 +182,33 @@ test("tmux teardown is kill-server on the PRIVATE socket, and a lingering server
   assert.deepEqual(signalled, [], "the recycled PID is not our server");
   assert.deepEqual(res.survivors, []);
 });
+
+test("a tree walk needs the root's start key: without one nothing of the tree is signalled, but proven extras still are (review S8)", async () => {
+  const proc = (pid, ppid, name, startKey) => ({ pid, ppid, name, argv: [name], cmdline: name, startKey });
+  let table = new Map([
+    [100, proc(100, 1, "qontinui-runner", "1000")],
+    [101, proc(101, 100, "WebKitWebProcess", "1001")],
+    [300, proc(300, 1, "postgres", "1100")],
+  ]);
+  const signalled = [];
+  const kill = (pid, sig) => {
+    signalled.push([pid, sig]);
+    table = new Map([...table].filter(([p]) => p !== pid));
+  };
+  const res = await terminateTree(
+    { pid: 100, startKey: null },
+    { list: () => table, kill, sleepFn: async () => {}, graceMs: 0, alsoPids: [{ pid: 300, startKey: "1100" }] },
+  );
+  assert.deepEqual(signalled.map(([p]) => p), [300], "only the extra proven ours by its own start key");
+  assert.match(res.refused, /no start key was captured/);
+  assert.ok(table.has(100) && table.has(101));
+  // A root that is already gone does not stop the proven extras either.
+  const t2 = new Map([[301, proc(301, 1, "postgres", "1200")]]);
+  const s2 = [];
+  const r2 = await terminateTree({ pid: 100, startKey: "1000" }, { list: () => t2, kill: (pid, sig) => s2.push([pid, sig]), sleepFn: async () => {}, graceMs: 0, alsoPids: [{ pid: 301, startKey: "1200" }] });
+  assert.deepEqual(s2.map(([p]) => p).slice(0, 1), [301]);
+  assert.match(r2.note, /already gone/);
+  // No root at all (our child already exited): only the extras.
+  const r3 = await terminateTree(null, { list: () => new Map(), kill: () => assert.fail("nothing to signal"), sleepFn: async () => {}, graceMs: 0 });
+  assert.deepEqual(r3, { signalled: [], survivors: [] });
+});

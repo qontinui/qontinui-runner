@@ -143,3 +143,15 @@ Both timing formats (classic, advanced) and both typescript layouts (`--log-out`
 
 - **Phase 2 (`crates/termhost-probe`)** reproduces `marker-golden.json`: port `codec.pixel` (`marker-raster.mjs` is the reference), decode every `rows[]` row to exactly its `expected` list, decode every `valid` vector and reject every `invalid` one with its `reason`, in `codec.decode_order`. Markers sit at `codec.region` / `codec.echo_region` of each pane.
 - **Phase 3 (orchestrator)** imports `KPI_CATALOG` / `getKpi` / vocabularies (`kpi-catalog.mjs`), `validateResults` (`validate.mjs`, run before writing any results file), `measureKpi` / `unknownKpi` / `notApplicableKpi` / `degradationKpi` / `slope` (`stats.mjs`), `loadProfile` / `profileDigest` (`profile.mjs`) and `parseOverlays` (`marker.mjs`, display-free checks); it launches the generator with the D13 command line above (`--echo` included), maps `slot-<k>` files to host sessions, starts measuring once every `gen-<k>.jsonl` has its first `marker`, stops with `<run-dir>/stop`, and kills any generator still alive by its slot-file PID.
+
+## Post-land items (deferred, not missing)
+
+Two Phase 3 outputs can only come from a scheduled run of the landed
+`linux-xvfb` job, so they arrive after this code lands rather than with it:
+
+- `scripts/termhost-bench/baselines/linux-xvfb.json`, taken from the first
+  scheduled run's results file;
+- the `linux-xvfb` report in `qontinui-dev-notes`, rendered from that same run.
+
+Until then there is no Linux baseline to compare against, and `compare` has
+nothing to read for that environment.

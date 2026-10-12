@@ -238,6 +238,7 @@ export function healthyFacts({ inputSafe = false } = {}) {
       error: null,
     },
     setupMechanisms: {},
+    drain: { state: "not_enrolled", detail: "fake: no machine.json" },
   };
 }
 
