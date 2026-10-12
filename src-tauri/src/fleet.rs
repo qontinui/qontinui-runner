@@ -2471,7 +2471,7 @@ fn command_exit_within(mut cmd: std::process::Command, budget: Duration) -> Prob
 
 /// D2's gh table (census `probe_gh`), applied to the exit of
 /// `gh auth status --active --hostname github.com` ([`GH_AUTH_STATUS_ARGS`])
-/// — or, on a gh too old to know `--active` (< 2.40), of the legacy
+/// — or, on a gh too old to know `--active`, of the legacy
 /// `gh auth status --hostname github.com` ([`GH_AUTH_STATUS_LEGACY_ARGS`]).
 /// Which one ran is decided by [`gh_knows_active_flag`]'s value-free
 /// `gh auth status --active --help` check, so an old gh is never asked a flag
@@ -2528,7 +2528,7 @@ fn classify_aws_sts(exit: Option<ProbeExit>, has_config: impl FnOnce() -> bool) 
 /// account (see [`classify_gh`]).
 const GH_AUTH_STATUS_ARGS: [&str; 5] = ["auth", "status", "--active", "--hostname", "github.com"];
 
-/// The gh probe's arguments on a gh that predates `--active` (< 2.40).
+/// The gh probe's arguments on a gh that predates `--active`.
 const GH_AUTH_STATUS_LEGACY_ARGS: [&str; 4] = ["auth", "status", "--hostname", "github.com"];
 
 /// The value-free capability check: exit 0 iff this gh parses `--active`.
@@ -2536,13 +2536,16 @@ const GH_AUTH_STATUS_LEGACY_ARGS: [&str; 4] = ["auth", "status", "--hostname", "
 /// `--help` touches no credential.
 const GH_ACTIVE_FLAG_CHECK_ARGS: [&str; 4] = ["auth", "status", "--active", "--help"];
 
-/// Per-process memo of "does the gh at this path know `--active`", keyed by
-/// the resolved binary path (a gh at a different path — an upgrade installed
-/// elsewhere — is checked afresh). Only a DEFINITIVE answer is memoized: a
-/// timeout or spawn failure falls back to the legacy args for that run and
-/// is re-checked next time.
-static GH_ACTIVE_FLAG_CACHE: Mutex<Option<std::collections::HashMap<PathBuf, bool>>> =
-    Mutex::new(None);
+/// Memo of "does the gh at this path know `--active`", keyed by the resolved
+/// binary path and EXPIRING after [`HOST_PROBE_TTL`]: an in-place upgrade or
+/// downgrade keeps the path (MSI, apt, brew, a scoop shim), and a non-zero
+/// exit may come from a broken config rather than the flag, so a
+/// process-lifetime memo would pin a stale answer until the runner restarts.
+/// Only a DEFINITIVE answer is memoized: a timeout or spawn failure falls back
+/// to the legacy args for that run and is re-checked next time.
+static GH_ACTIVE_FLAG_CACHE: Mutex<
+    Option<std::collections::HashMap<PathBuf, (bool, std::time::Instant)>>,
+> = Mutex::new(None);
 
 /// Whether the gh at `gh` knows `auth status --active`: the memo, else
 /// [`GH_ACTIVE_FLAG_CHECK_ARGS`] run under the same null stdio, withheld
@@ -2553,6 +2556,8 @@ fn gh_knows_active_flag(gh: &std::path::Path, budget: Duration) -> bool {
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .and_then(|m| m.get(gh).copied())
+        .filter(|(_, at)| at.elapsed() < HOST_PROBE_TTL)
+        .map(|(knows, _)| knows)
     {
         return known;
     }
@@ -2571,14 +2576,14 @@ fn gh_knows_active_flag(gh: &std::path::Path, budget: Duration) -> bool {
     };
     if !knows {
         info!(
-            "host_capabilities: {CRED_GH_CAPABILITY}: gh does not know `auth status --active` (< 2.40) — probing with legacy args"
+            "host_capabilities: {CRED_GH_CAPABILITY}: gh does not know `auth status --active` — probing with legacy args"
         );
     }
     GH_ACTIVE_FLAG_CACHE
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(Default::default)
-        .insert(gh.to_path_buf(), knows);
+        .insert(gh.to_path_buf(), (knows, std::time::Instant::now()));
     knows
 }
 
@@ -9954,7 +9959,7 @@ Add-Content -LiteralPath $Out -Value $lines
 
     /// A gh shim that appends `args=<argv>` to `log` per run, prints the fake
     /// secret, and exits 1 when handed `--active` unless `accepts_active` (a
-    /// gh < 2.40 rejecting the unknown flag); otherwise exits 0.
+    /// an older gh rejecting the unknown flag); otherwise exits 0.
     fn write_gh_active_shim(
         dir: &std::path::Path,
         name: &str,
@@ -10014,7 +10019,7 @@ Add-Content -LiteralPath $Out -Value $lines
             .collect()
     }
 
-    /// W-1: a gh that rejects `--active` (< 2.40) is detected by the
+    /// W-1: a gh that rejects `--active` is detected by the
     /// value-free capability check and probed with the LEGACY args: exit 0
     /// there reads Present, not the Unknown-forever an `--active` exit 1
     /// would give. The bit is memoized: a second probe skips the check.
