@@ -37,6 +37,16 @@
 //! remote `http_request` relay is a separate allowlist
 //! (`relay_path_policy::RELAY_ALLOWED`) and does not reach it.
 //!
+//! # Deliberate differences from coord's door
+//!
+//! The key sets match `GET /coord/glossary` (qontinui-coord#3151; pinned by
+//! `field_set_is_pinned`), with two deliberate differences in values:
+//! `build_id` here is ALWAYS a string — this binary's `RUNNER_BUILD_ID`, the
+//! same value `/health` serves as `buildId` (an unstamped build says so as
+//! `unstamped-<sha>`) — never `null`, so there is no `build_id_unknown_reason`
+//! field; and the echoed `discriminator` is truncated to 128 characters, where
+//! coord echoes the id unbounded.
+//!
 //! # The 404 body is not an `ApiResponse`
 //!
 //! It is the schemas `Refusal` envelope (plus `known_version`), which carries
@@ -124,31 +134,27 @@ fn envelope(terms: Vec<&'static GlossaryEntry>) -> GlossaryResponse {
 /// fails the same way, and the valid ids are listed in `detail` so the caller
 /// can correct it without a second request.
 pub fn unknown_term_refusal(id: &str, observed_at: String) -> GlossaryTermUnknownBody {
-    let known = GlossaryTerm::ALL
-        .iter()
-        .map(|t| t.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let known = KNOWN_IDS.as_str();
     let base = Refusal::new(
         RefusalCode::GlossaryTermUnknown,
         NextAction::new(NextActionKind::FixRequest).with_target("term"),
         RefusalSource::Runner,
         observed_at,
     );
-    let refusal = if id.is_empty() {
-        // `discriminator` is the empty id itself — coord's 404 always carries
-        // the id asked for, so a reader never special-cases which door
-        // answered; the detail says plainly that it was empty.
-        base.with_discriminator(String::new()).with_detail(format!(
-            "the term id was empty; glossary version {GLOSSARY_VERSION} defines: {known}"
-        ))
+    // `discriminator` is ALWAYS the id asked for (bounded so a huge query
+    // cannot bloat the body), the empty or blank string included — coord's
+    // 404 carries it the same way, so a reader never special-cases which door
+    // answered. A blank id (`id.trim().is_empty()`, coord's test too) gets a
+    // detail that says plainly it was empty.
+    let shown: String = id.chars().take(MAX_ECHOED_ID_CHARS).collect();
+    let detail = if id.trim().is_empty() {
+        format!("the term id was empty; glossary version {GLOSSARY_VERSION} defines: {known}")
     } else {
-        // The caller's id is echoed, bounded so a huge query cannot bloat the body.
-        let shown: String = id.chars().take(MAX_ECHOED_ID_CHARS).collect();
-        base.with_discriminator(shown.clone()).with_detail(format!(
+        format!(
             "{shown:?} is not defined by glossary version {GLOSSARY_VERSION}; defined ids: {known}"
-        ))
+        )
     };
+    let refusal = base.with_discriminator(shown).with_detail(detail);
     let message = refusal.render();
     GlossaryTermUnknownBody {
         refusal,
@@ -157,8 +163,16 @@ pub fn unknown_term_refusal(id: &str, observed_at: String) -> GlossaryTermUnknow
     }
 }
 
-/// Resolve a query to its response. Pure apart from the timestamp, so the
-/// whole contract is testable without a router.
+/// Every id this glossary version defines, comma-separated, for the refusal's
+/// detail — built once, like [`WHOLE_GLOSSARY_JSON`].
+static KNOWN_IDS: LazyLock<String> = LazyLock::new(|| {
+    GlossaryTerm::ALL
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+});
+
 /// The whole-glossary `200` body, serialized ONCE per process. Every field is a
 /// constant of this build, and the route is credential-free, so its
 /// per-request cost should not be a table walk plus a serialization.
@@ -169,6 +183,8 @@ static WHOLE_GLOSSARY_JSON: LazyLock<Bytes> = LazyLock::new(|| {
     )
 });
 
+/// Resolve a query to its response. Pure apart from the timestamp, so the
+/// whole contract is testable without a router.
 pub fn answer(term: Option<&str>) -> Response {
     match term {
         None => (
@@ -338,11 +354,11 @@ mod tests {
         );
     }
 
-    /// The fields coord's `GET /coord/glossary` serves are the fields served
-    /// here (qontinui-coord#3151): the same `200` envelope keys and the same
-    /// `404` refusal keys, so one reader decodes either door.
+    /// The exact `200` and `404` key sets — the keys a coord reader decodes
+    /// from `GET /coord/glossary` (qontinui-coord#3151). A key added or
+    /// dropped here fails this test rather than silently diverging.
     #[tokio::test]
-    async fn the_field_set_matches_the_coord_door() {
+    async fn field_set_is_pinned() {
         let (_, whole) = get_path("/glossary").await;
         let mut keys: Vec<&str> = whole
             .as_object()
@@ -356,18 +372,30 @@ mod tests {
             ["build_id", "content_sha256", "source", "terms", "version"]
         );
         let (_, refused) = get_path("/glossary?term=no_such_term").await;
-        for k in [
-            "code",
-            "next_action",
-            "source",
-            "observed_at",
-            "discriminator",
-            "detail",
-            "known_version",
-            "message",
-        ] {
-            assert!(refused.get(k).is_some(), "404 body lacks `{k}`: {refused}");
-        }
+        let mut keys: Vec<&str> = refused
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "code",
+                "detail",
+                "discriminator",
+                // The schemas `Refusal` envelope's own field (qontinui-types
+                // 4.4.0 serializes it); it rides the flatten unchanged.
+                "glossary_terms",
+                "known_version",
+                "message",
+                "next_action",
+                "observed_at",
+                "source",
+            ],
+            "{refused}"
+        );
         let decoded: Refusal = serde_json::from_value(refused.clone()).expect("a Refusal");
         assert_eq!(refused["message"], decoded.render());
     }
@@ -387,6 +415,21 @@ mod tests {
         let served = body_json(resp).await;
         let built = serde_json::to_value(envelope(GLOSSARY.iter().collect())).unwrap();
         assert_eq!(served, built);
+    }
+
+    /// A whitespace-only id is a blank id: refused with the "was empty"
+    /// detail (coord's `id.trim().is_empty()`), never the whole table.
+    #[tokio::test]
+    async fn a_whitespace_only_term_is_treated_as_empty() {
+        let (status, body) = get_path("/glossary?term=%20%20").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "glossary_term_unknown");
+        assert_eq!(body["discriminator"], "  ");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("the term id was empty"));
+        assert!(body.get("terms").is_none(), "{body}");
     }
 
     /// Every id the table defines resolves through the route.
