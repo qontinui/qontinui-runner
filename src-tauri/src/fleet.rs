@@ -1985,15 +1985,32 @@ fn binary_on_path(name: &str) -> bool {
 /// On Windows the `PATHEXT` rule applies — see [`resolve_in_dirs`].
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let exts: Option<Vec<String>> = cfg!(target_os = "windows").then(|| {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .map(|e| e.to_string())
-            .collect()
-    });
+    let exts: Option<Vec<String>> = cfg!(target_os = "windows")
+        .then(|| parse_pathext(std::env::var("PATHEXT").ok().as_deref()));
     resolve_in_dirs(name, std::env::split_paths(&path), exts.as_deref())
+}
+
+/// The default `PATHEXT` subset used when the variable is unset — or set but
+/// yielding no extension at all (`PATHEXT=` / `PATHEXT=;;`), which would
+/// otherwise make EVERY tool read as not-on-PATH: a silent false negative.
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// Split a `PATHEXT` value into its non-empty extensions, falling back to
+/// [`DEFAULT_PATHEXT`] when the value is absent or filters down to nothing.
+fn parse_pathext(raw: Option<&str>) -> Vec<String> {
+    let split = |v: &str| -> Vec<String> {
+        v.split(';')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let exts = raw.map(split).unwrap_or_default();
+    if exts.is_empty() {
+        split(DEFAULT_PATHEXT)
+    } else {
+        exts
+    }
 }
 
 /// PATH resolution over `dirs`. `pathext` is `Some` for Windows semantics and
@@ -2452,17 +2469,22 @@ fn command_exit_within(mut cmd: std::process::Command, budget: Duration) -> Prob
     }
 }
 
-/// D2's gh table (census `probe_gh`), applied to
-/// `gh auth status --active --hostname github.com` ([`GH_AUTH_STATUS_ARGS`]).
-/// `--active` matters: without it gh exits 1 when ANY stored account for the
-/// host has a problem — a stale, inactive second login included — which would
-/// read a working active login as Unknown. `exit` is `None` when gh is not on
-/// PATH. `login` is consulted only on exit 1/4, where gh reports both "not
-/// logged in" and "logged in, token check failed" (invalid token OR GitHub
-/// unreachable): only a definitively-absent login makes that an Absent. A gh
-/// too old to know `--active` exits 1 on the unknown flag, which lands in that
-/// same arm and so reads Unknown (configured) or Absent (no login) — never a
-/// false Present.
+/// D2's gh table (census `probe_gh`), applied to the exit of
+/// `gh auth status --active --hostname github.com` ([`GH_AUTH_STATUS_ARGS`])
+/// — or, on a gh too old to know `--active` (< 2.40), of the legacy
+/// `gh auth status --hostname github.com` ([`GH_AUTH_STATUS_LEGACY_ARGS`]).
+/// Which one ran is decided by [`gh_knows_active_flag`]'s value-free
+/// `gh auth status --active --help` check, so an old gh is never asked a flag
+/// it rejects (it would exit 1 on the unknown flag and read Unknown forever —
+/// a silent false negative). Both forms are classified by this same table.
+/// `--active` matters where it exists: without it gh exits 1 when ANY stored
+/// account for the host has a problem — a stale, inactive second login
+/// included — which would read a working active login as Unknown; on the
+/// legacy path that imprecision is accepted, since a gh without `--active`
+/// has no way to scope the check. `exit` is `None` when gh is not on PATH.
+/// `login` is consulted only on exit 1/4, where gh reports both "not logged
+/// in" and "logged in, token check failed" (invalid token OR GitHub
+/// unreachable): only a definitively-absent login makes that an Absent.
 fn classify_gh(exit: Option<ProbeExit>, login: impl FnOnce() -> GhLogin) -> CredState {
     match exit {
         None => CredState::Absent,
@@ -2506,6 +2528,70 @@ fn classify_aws_sts(exit: Option<ProbeExit>, has_config: impl FnOnce() -> bool) 
 /// account (see [`classify_gh`]).
 const GH_AUTH_STATUS_ARGS: [&str; 5] = ["auth", "status", "--active", "--hostname", "github.com"];
 
+/// The gh probe's arguments on a gh that predates `--active` (< 2.40).
+const GH_AUTH_STATUS_LEGACY_ARGS: [&str; 4] = ["auth", "status", "--hostname", "github.com"];
+
+/// The value-free capability check: exit 0 iff this gh parses `--active`.
+/// cobra rejects an unknown flag (exit 1) before it would print help, and
+/// `--help` touches no credential.
+const GH_ACTIVE_FLAG_CHECK_ARGS: [&str; 4] = ["auth", "status", "--active", "--help"];
+
+/// Per-process memo of "does the gh at this path know `--active`", keyed by
+/// the resolved binary path (a gh at a different path — an upgrade installed
+/// elsewhere — is checked afresh). Only a DEFINITIVE answer is memoized: a
+/// timeout or spawn failure falls back to the legacy args for that run and
+/// is re-checked next time.
+static GH_ACTIVE_FLAG_CACHE: Mutex<Option<std::collections::HashMap<PathBuf, bool>>> =
+    Mutex::new(None);
+
+/// Whether the gh at `gh` knows `auth status --active`: the memo, else
+/// [`GH_ACTIVE_FLAG_CHECK_ARGS`] run under the same null stdio, withheld
+/// tokens, timeout and process-tree guard as the probe itself.
+fn gh_knows_active_flag(gh: &std::path::Path, budget: Duration) -> bool {
+    if let Some(known) = GH_ACTIVE_FLAG_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(gh).copied())
+    {
+        return known;
+    }
+    let knows = match command_exit_within(
+        cred_probe_command(gh, &GH_ACTIVE_FLAG_CHECK_ARGS),
+        budget,
+    ) {
+        ProbeExit::Code(0) => true,
+        ProbeExit::Code(_) => false,
+        other => {
+            debug!(
+                "host_capabilities: {CRED_GH_CAPABILITY}: `--active` capability check inconclusive ({other:?}) — legacy args this run"
+            );
+            return false;
+        }
+    };
+    if !knows {
+        info!(
+            "host_capabilities: {CRED_GH_CAPABILITY}: gh does not know `auth status --active` (< 2.40) — probing with legacy args"
+        );
+    }
+    GH_ACTIVE_FLAG_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(gh.to_path_buf(), knows);
+    knows
+}
+
+/// The `gh auth status` arguments for the gh at `gh`: `--active` when it
+/// knows the flag, the legacy form otherwise.
+fn gh_auth_status_args(gh: &std::path::Path, budget: Duration) -> &'static [&'static str] {
+    if gh_knows_active_flag(gh, budget) {
+        &GH_AUTH_STATUS_ARGS
+    } else {
+        &GH_AUTH_STATUS_LEGACY_ARGS
+    }
+}
+
 /// The aws probe's arguments. `--query Account --output text` keeps the
 /// census's command line; the output itself goes to the null device unread.
 const AWS_STS_ARGS: [&str; 6] = [
@@ -2525,7 +2611,7 @@ fn log_cred_binary_not_on_path(token: &str, binary: &str) {
 fn probe_gh(env: &CredProbeEnv) -> CredState {
     let exit = match env.gh.as_deref() {
         Some(gh) => Some(command_exit_within(
-            cred_probe_command(gh, &GH_AUTH_STATUS_ARGS),
+            cred_probe_command(gh, gh_auth_status_args(gh, env.budget)),
             env.budget,
         )),
         None => {
@@ -8912,14 +8998,56 @@ mod tests {",
         );
     }
 
+    /// Serializes the tests that seed the process-global
+    /// [`CRED_FAMILY_CACHE`], so one test's seeded state never leaks into
+    /// another's reads.
+    static CRED_FAMILY_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Cache invariant: two back-to-back calls agree, and the OS fact is
     /// always present (it is `cfg!`-derived, so it cannot fail to probe).
     /// Also records what THIS host actually advertises.
+    ///
+    /// M1 is NON-vacuous: [`CRED_FAMILY_CACHE`] is seeded with an advertised
+    /// `cred:gh` first (it is otherwise always empty under test, since the
+    /// refresh is suppressed), so the "host facts exclude the cred family"
+    /// assertion is made against a cache that HAS cred tokens to leak, and
+    /// [`heartbeat_capabilities`] is shown to carry them. The prior cache
+    /// state is restored on every exit, panics included.
     #[test]
     fn host_capabilities_probe_smoke() {
+        let _serial = CRED_FAMILY_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<CredFamilyState>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    *CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = prior;
+                }
+            }
+        }
+        let _restore = {
+            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let mut seeded = CredFamilyState::new();
+            // Fresh (ran_at = now), so `cred_capabilities` sees it as not
+            // stale and serves it as-is.
+            seeded.apply(
+                &[(CRED_GH_CAPABILITY, CredState::Present)],
+                std::time::Instant::now(),
+                HOST_PROBE_TTL,
+            );
+            Restore(Some(std::mem::replace(&mut *g, seeded)))
+        };
+
         if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
             *g = None;
         }
+        let heartbeat = heartbeat_capabilities();
+        assert!(
+            heartbeat.iter().any(|c| c == CRED_PROBES_MARKER)
+                && heartbeat.iter().any(|c| c == CRED_GH_CAPABILITY),
+            "anti-vacuity: heartbeat_capabilities must carry the seeded cred family, got {heartbeat:?}"
+        );
         let first = host_capabilities();
         let second = host_capabilities();
         assert!(
@@ -9504,17 +9632,38 @@ Add-Content -LiteralPath $Out -Value $lines
             let report = std::fs::read_to_string(&stdio_report)
                 .expect("anti-vacuity: the gh shim must have written its stdio report");
             let lines: Vec<&str> = report.lines().map(str::trim).collect();
-            assert!(
-                lines
-                    .iter()
-                    .any(|l| *l == "args=auth status --active --hostname github.com"),
-                "gh must be probed as `auth status --active --hostname github.com`, got {report:?}"
+            // Two invocations: the value-free `--active` capability check,
+            // then (the shim accepting it) the `--active` status probe.
+            let args: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|l| l.starts_with("args="))
+                .collect();
+            assert_eq!(
+                args,
+                vec![
+                    "args=auth status --active --help",
+                    "args=auth status --active --hostname github.com"
+                ],
+                "gh must be capability-checked, then probed as \
+                 `auth status --active --hostname github.com`, got {report:?}"
             );
             #[cfg(target_os = "linux")]
             for fd in ["fd1", "fd2"] {
+                let prefix = format!("{fd}=");
+                let seen: Vec<&str> = lines
+                    .iter()
+                    .copied()
+                    .filter(|l| l.starts_with(&prefix))
+                    .collect();
+                assert_eq!(
+                    seen.len(),
+                    2,
+                    "one {fd} line per invocation, got {report:?}"
+                );
                 assert!(
-                    lines.contains(&format!("{fd}=/dev/null").as_str()),
-                    "the probe child's {fd} must be the null device, got {report:?}"
+                    seen.iter().all(|l| *l == format!("{fd}=/dev/null")),
+                    "every probe child's {fd} must be the null device, got {report:?}"
                 );
             }
             #[cfg(windows)]
@@ -9522,8 +9671,8 @@ Add-Content -LiteralPath $Out -Value $lines
                 let handles: Vec<&&str> = lines.iter().filter(|l| l.starts_with("type=")).collect();
                 assert_eq!(
                     handles.len(),
-                    2,
-                    "one stdout + one stderr line expected, got {report:?}"
+                    4,
+                    "one stdout + one stderr line per invocation expected, got {report:?}"
                 );
                 for h in handles {
                     assert_eq!(
@@ -9792,6 +9941,168 @@ Add-Content -LiteralPath $Out -Value $lines
         assert_eq!(
             GH_AUTH_STATUS_ARGS,
             ["auth", "status", "--active", "--hostname", "github.com"]
+        );
+        assert_eq!(
+            GH_AUTH_STATUS_LEGACY_ARGS,
+            ["auth", "status", "--hostname", "github.com"]
+        );
+        assert_eq!(
+            GH_ACTIVE_FLAG_CHECK_ARGS,
+            ["auth", "status", "--active", "--help"]
+        );
+    }
+
+    /// A gh shim that appends `args=<argv>` to `log` per run, prints the fake
+    /// secret, and exits 1 when handed `--active` unless `accepts_active` (a
+    /// gh < 2.40 rejecting the unknown flag); otherwise exits 0.
+    fn write_gh_active_shim(
+        dir: &std::path::Path,
+        name: &str,
+        accepts_active: bool,
+        log: &std::path::Path,
+    ) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            let refuse = if accepts_active {
+                String::new()
+            } else {
+                "for %%a in (%*) do if \"%%~a\"==\"--active\" exit /b 1\r\n".to_string()
+            };
+            let body = format!(
+                "@echo off\r\n\
+                 echo args=%*>>\"{log}\"\r\n\
+                 echo {CRED_FAKE_SECRET}\r\n\
+                 echo {CRED_FAKE_SECRET} 1>&2\r\n\
+                 {refuse}\
+                 exit /b 0\r\n",
+                log = log.display(),
+            );
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            let refuse = if accepts_active {
+                String::new()
+            } else {
+                "for a in \"$@\"; do [ \"$a\" = --active ] && exit 1; done\n".to_string()
+            };
+            let body = format!(
+                "#!/bin/sh\n\
+                 echo \"args=$*\" >>'{log}'\n\
+                 echo {CRED_FAKE_SECRET}\n\
+                 echo {CRED_FAKE_SECRET} >&2\n\
+                 {refuse}\
+                 exit 0\n",
+                log = log.display(),
+            );
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    fn gh_shim_invocations(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .expect("anti-vacuity: the gh shim must have logged its invocations")
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// W-1: a gh that rejects `--active` (< 2.40) is detected by the
+    /// value-free capability check and probed with the LEGACY args: exit 0
+    /// there reads Present, not the Unknown-forever an `--active` exit 1
+    /// would give. The bit is memoized: a second probe skips the check.
+    #[test]
+    fn gh_without_active_flag_falls_back_to_legacy_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        plant_gh_hosts(tmp.path(), true);
+        let log = tmp.path().join("gh-old.log");
+        let mut env = hermetic_cred_env(tmp.path());
+        env.gh = Some(write_gh_active_shim(&bin, "gh", false, &log));
+
+        assert_eq!(probe_gh(&env), CredState::Present);
+        assert_eq!(
+            gh_shim_invocations(&log),
+            vec![
+                "args=auth status --active --help",
+                "args=auth status --hostname github.com",
+            ],
+            "an old gh must be capability-checked, then probed WITHOUT `--active`"
+        );
+
+        assert_eq!(probe_gh(&env), CredState::Present);
+        let calls = gh_shim_invocations(&log);
+        assert_eq!(
+            calls.len(),
+            3,
+            "the `--active` bit is cached per process: no second capability check, got {calls:?}"
+        );
+        assert_eq!(calls[2], "args=auth status --hostname github.com");
+    }
+
+    /// W-1: a gh that knows `--active` is probed with it.
+    #[test]
+    fn gh_with_active_flag_uses_active_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        plant_gh_hosts(tmp.path(), true);
+        let log = tmp.path().join("gh-new.log");
+        let mut env = hermetic_cred_env(tmp.path());
+        env.gh = Some(write_gh_active_shim(&bin, "gh", true, &log));
+
+        assert_eq!(probe_gh(&env), CredState::Present);
+        assert_eq!(
+            gh_shim_invocations(&log),
+            vec![
+                "args=auth status --active --help",
+                "args=auth status --active --hostname github.com",
+            ],
+        );
+    }
+
+    /// S-2: `PATHEXT` set but yielding no extension falls back to the
+    /// default list instead of making every tool read not-on-PATH.
+    #[test]
+    fn empty_pathext_falls_back_to_the_default_list() {
+        let default: Vec<String> = [".COM", ".EXE", ".BAT", ".CMD"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_pathext(None), default, "unset");
+        assert_eq!(parse_pathext(Some("")), default, "set but empty");
+        assert_eq!(parse_pathext(Some(";;")), default, "only separators");
+        assert_eq!(parse_pathext(Some(" ; ")), default, "only whitespace");
+        assert_eq!(
+            parse_pathext(Some(".EXE;;.PS1")),
+            vec![".EXE".to_string(), ".PS1".to_string()],
+            "a real value is kept, empties dropped"
+        );
+
+        // End to end: the fallback list still resolves a `.cmd` tool.
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("gh.cmd");
+        std::fs::write(&tool, "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let exts: Vec<String> = parse_pathext(Some(""))
+            .into_iter()
+            .map(|e| e.to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            resolve_in_dirs("gh", vec![tmp.path().to_path_buf()], Some(&exts)),
+            Some(tool)
         );
     }
 
