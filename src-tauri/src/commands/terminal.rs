@@ -2040,11 +2040,13 @@ pub async fn terminal_migrate_session_account(
         crate::ai_provider::record_handoff(&dst);
     }
 
-    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)
-        .inspect_err(|_| {
-            // The session never reached `dst`: it must not count as a handoff.
-            crate::ai_provider::unrecord_handoff(&dst);
-        })?;
+    let outcome =
+        crate::terminal::account_migration::migrate_session_off_runtime(&app, &record, &src, &dst)
+            .await
+            .inspect_err(|_| {
+                // The session never reached `dst`: it must not count as a handoff.
+                crate::ai_provider::unrecord_handoff(&dst);
+            })?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(

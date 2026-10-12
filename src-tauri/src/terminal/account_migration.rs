@@ -35,7 +35,9 @@
 //!    windows).
 //! 4. **Migrate** — copy the session transcript
 //!    (`<src>/projects/<slug>/<sid>.jsonl` → same slug under the target dir;
-//!    the source file is never touched), respawn
+//!    the source file is never touched) and, best-effort, its sibling
+//!    directory `<sid>/` (subagent transcripts — without it no subagent spawned
+//!    before the migration can be resumed), respawn
 //!    `claude --permission-mode bypassPermissions --resume <sid>` in a fresh
 //!    PTY pinned to the target account, on the same grid page/zone, and only
 //!    THEN close the old pane. The respawn re-keys the session's lifecycle
@@ -226,7 +228,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // cache's.
     crate::claude_session::trust_gate::warm_dial().await;
 
-    match migrate_session(&app, &record, &src, &dst) {
+    match migrate_session_off_runtime(&app, &record, &src, &dst).await {
         Ok(outcome) => {
             info!(
                 session = %record.claude_session_id,
@@ -282,7 +284,11 @@ fn transcript_last_model(path: &Path) -> Option<String> {
 /// Text typed into the migrated session once the resumed CLI is idle.
 const CONTINUE_NUDGE: &str = "This session was automatically migrated to a fresh Claude account \
 after the previous account hit a usage limit. Continue the task you were working on from where \
-it left off; if you were idle awaiting operator input, say so and wait.";
+it left off; if you were idle awaiting operator input, say so and wait. Subagents interrupted by \
+the limit should still have their transcripts on this account: resume each one with SendMessage \
+to its agent id instead of spawning a replacement (cancel any resume gate you booked for it \
+first), and only if SendMessage reports \"No transcript found\" fall back to its checkpoint or \
+worktree.";
 
 /// How the watcher decides the resumed CLI is ready for input:
 /// [`crate::terminal::graceful_exit::input_prompt_ready`], the predicate the
@@ -443,16 +449,81 @@ pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label:
     });
 }
 
+/// What [`copy_transcript`] carried across accounts.
+#[derive(Debug)]
+pub(crate) struct TranscriptCopy {
+    /// The session transcript (`<sid>.jsonl`) under the destination account.
+    pub path: std::path::PathBuf,
+    /// The session's sibling directory (`<sid>/`), carried best-effort.
+    pub session_dir: SessionDirCarry,
+}
+
+/// Tally of the best-effort `<sid>/` directory carry, counted per file (a
+/// directory cut off by [`SESSION_DIR_MAX_DEPTH`] counts once).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionDirCarry {
+    /// Files written to the destination.
+    pub copied: usize,
+    /// Destination already held the file (an append-only `.jsonl` at least as
+    /// large, or any other file with identical bytes) — left untouched.
+    pub skipped_present: usize,
+    /// Never followed: a symlink or junction (including `<sid>/` itself), a
+    /// leftover `*.partial`, a directory past the depth bound, or a session id
+    /// that is not one plain path component.
+    pub skipped_other: usize,
+    /// Read or write errors (including an unreadable `<sid>/`); each is logged.
+    pub failed: usize,
+}
+
+/// Nesting bound for the `<sid>/` carry. Measured 2026-10-12, Claude Code
+/// writes one level of directories under `<sid>/` (`subagents/`,
+/// `tool-results/`) plus top-level files such as `custom-title.json`; the bound
+/// only stops a pathological tree.
+const SESSION_DIR_MAX_DEPTH: usize = 8;
+
+/// Suffix of the temporary file a copy writes before renaming it into place.
+const PARTIAL_SUFFIX: &str = ".partial";
+
 /// Copy the session transcript from the source account's project dir into
 /// the target account's matching project dir. The source file is never
 /// modified or removed. Skips the copy when the destination already exists
 /// and is at least as large (idempotent retry).
+///
+/// Then carries the session's sibling directory `<sid>/` file by file. Claude
+/// Code keeps each subagent's transcript there
+/// (`<sid>/subagents/agent-<id>.jsonl` + `.meta.json`) and resolves a
+/// `SendMessage` resume against the ACTIVE account's config dir, so copying
+/// `<sid>.jsonl` alone left every subagent spawned before the migration
+/// unresumable — "No transcript found for agent ID" — which is exactly the
+/// state a usage-limit kill leaves a fan-out in. Plan
+/// `2026-10-12-account-migration-leaves-subagent-transcripts-behind`.
+///
+/// The directory carry never fails the call: a session that spawned no
+/// subagent has no `<sid>/`, and a per-file error is logged and counted rather
+/// than stranding the whole session on an exhausted account. It runs even when
+/// the main transcript was already present, so a retry completes a partial
+/// carry. Every write goes to `<name>.partial` and is renamed into place, so a
+/// copy cut short by a killed runner never looks finished to the size rule.
 pub(crate) fn copy_transcript(
     src_config_dir: &str,
     dst_config_dir: &str,
     working_dir: &str,
     claude_session_id: &str,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<TranscriptCopy, String> {
+    // The id names files and a directory we copy recursively; a Claude session
+    // id is a uuid, and anything else is refused before any path is built.
+    // Strict: the hyphenated form only (`parse_str` also takes the simple,
+    // braced and `urn:uuid:` spellings).
+    let is_hyphenated_uuid = uuid::Uuid::try_parse(claude_session_id).is_ok_and(|u| {
+        u.hyphenated()
+            .to_string()
+            .eq_ignore_ascii_case(claude_session_id)
+    });
+    if !is_hyphenated_uuid {
+        return Err(format!(
+            "not a Claude session id (expected a uuid): {claude_session_id:?}"
+        ));
+    }
     let src = super::transcript::session_transcript_path(
         Path::new(src_config_dir),
         working_dir,
@@ -463,6 +534,7 @@ pub(crate) fn copy_transcript(
         working_dir,
         claude_session_id,
     );
+    let started = std::time::Instant::now();
     // Before the first copy the target has no project dir to resolve, and for
     // a cwd over 200 encoded chars `session_transcript_path` then answers the
     // UNTRUNCATED name, which is not where `claude --resume` looks. Reuse the
@@ -477,18 +549,233 @@ pub(crate) fn copy_transcript(
     };
     let src_meta = std::fs::metadata(&src)
         .map_err(|e| format!("source transcript missing at {}: {e}", src.display()))?;
-    if let Ok(dst_meta) = std::fs::metadata(&dst) {
-        if dst_meta.len() >= src_meta.len() {
-            return Ok(dst); // already migrated (retry / repeated hint)
+    let dst_len = std::fs::metadata(&dst).map(|dst_meta| dst_meta.len()).ok();
+    // Which side ran the session last, decided once from the append-only main
+    // transcript: the larger one. Sidecars that are rewritten in place (not
+    // appended) follow it -- on a migration the source is newer, but on a
+    // respawn that tops up from several holders the TARGET may be.
+    let source_is_newer = dst_len.is_none_or(|len| src_meta.len() >= len);
+    // Already migrated (retry / repeated hint).
+    let already_present = dst_len.is_some_and(|len| len >= src_meta.len());
+    if !already_present {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
+        }
+        copy_via_partial(&src, &dst)
+            .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
+    }
+    let session_dir = carry_session_dir(&src, &dst, claude_session_id, source_is_newer);
+    // Times the main copy and the `<sid>/` carry together.
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if session_dir.failed > 0 {
+        warn!(
+            session = %claude_session_id,
+            copied = session_dir.copied,
+            skipped_present = session_dir.skipped_present,
+            skipped_other = session_dir.skipped_other,
+            failed = session_dir.failed,
+            elapsed_ms,
+            "session transcript carry: <sid>/ carried PARTIALLY — some subagent transcripts may not resume on this account"
+        );
+    } else if session_dir != SessionDirCarry::default() {
+        info!(
+            session = %claude_session_id,
+            copied = session_dir.copied,
+            skipped_present = session_dir.skipped_present,
+            skipped_other = session_dir.skipped_other,
+            elapsed_ms,
+            "session transcript carry: carried the session directory (subagent transcripts)"
+        );
+    }
+    Ok(TranscriptCopy {
+        path: dst,
+        session_dir,
+    })
+}
+
+/// Copy `from` to a temporary `<to>.<pid>.<seq>.partial`, then rename it over
+/// `to`. The name is unique per call, so two writers racing on one destination
+/// (a manual migrate click against the automatic hint, or a migration against
+/// a respawn) never rename each other's half-written file into place.
+fn copy_via_partial(from: &Path, to: &Path) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut partial_name = to
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .ok_or_else(|| std::io::Error::other("destination has no file name"))?;
+    partial_name.push(format!(".{}.{seq}{PARTIAL_SUFFIX}", std::process::id()));
+    let partial = to.with_file_name(partial_name);
+    let renamed = std::fs::copy(from, &partial).and_then(|_| rename_with_retry(&partial, to));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    renamed
+}
+
+/// `rename`, retried once after a short pause on `PermissionDenied` -- on
+/// Windows an antivirus or indexer filter can briefly hold a file that was just
+/// written. Callers run on the blocking pool (see [`migrate_session_off_runtime`]).
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::fs::rename(from, to)
+        }
+        other => other,
+    }
+}
+
+/// Carry `<sid>/` from beside `src_transcript` to beside `dst_transcript`.
+/// Only "no such directory" is silent; every other way of carrying nothing is
+/// counted and logged, so a stranded fan-out never reads as "no subagents".
+fn carry_session_dir(
+    src_transcript: &Path,
+    dst_transcript: &Path,
+    claude_session_id: &str,
+    source_is_newer: bool,
+) -> SessionDirCarry {
+    let mut carry = SessionDirCarry::default();
+    // The id names a directory we copy recursively, so it must be exactly one
+    // ordinary path component — never `..`, a separator, or a drive prefix.
+    let mut components = Path::new(claude_session_id).components();
+    let single_normal = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !single_normal {
+        warn!(
+            session = %claude_session_id,
+            "session transcript carry: session id is not one plain path component — <sid>/ not carried"
+        );
+        carry.skipped_other += 1;
+        return carry;
+    }
+    let (Some(src_parent), Some(dst_parent)) = (src_transcript.parent(), dst_transcript.parent())
+    else {
+        return carry;
+    };
+    let src_dir = src_parent.join(claude_session_id);
+    match std::fs::symlink_metadata(&src_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            warn!(
+                dir = %src_dir.display(),
+                "session transcript carry: <sid> is not a plain directory (symlink/junction/file) — not followed"
+            );
+            carry.skipped_other += 1;
+            return carry;
+        }
+        // No subagents, no sidecars: the common case, and the only silent one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return carry,
+        Err(e) => {
+            warn!(dir = %src_dir.display(), error = %e, "session transcript carry: <sid>/ unreadable");
+            carry.failed += 1;
+            return carry;
         }
     }
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
+    copy_tree(
+        &src_dir,
+        &dst_parent.join(claude_session_id),
+        0,
+        source_is_newer,
+        &mut carry,
+    );
+    carry
+}
+
+/// Whether the destination already holds what `from` should leave there. A
+/// `.jsonl` transcript is append-only, so a destination at least as large is
+/// the newer copy (a repeated hint, or a migration back) and must never be
+/// truncated. Anything else (e.g. `custom-title.json`, a JSON file overwritten
+/// in place rather than appended to) keeps the destination's copy when the
+/// destination side ran the session last, and otherwise is current only when
+/// its bytes are identical.
+fn destination_is_current(from: &Path, to: &Path, from_len: u64, source_is_newer: bool) -> bool {
+    let Ok(to_meta) = std::fs::metadata(to) else {
+        return false;
+    };
+    if from.extension().is_some_and(|ext| ext == "jsonl") {
+        return to_meta.len() >= from_len;
     }
-    std::fs::copy(&src, &dst)
-        .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
-    Ok(dst)
+    !source_is_newer
+        || (to_meta.len() == from_len
+            && matches!(
+                (std::fs::read(from), std::fs::read(to)),
+                (Ok(a), Ok(b)) if a == b
+            ))
+}
+
+fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    depth: usize,
+    source_is_newer: bool,
+    carry: &mut SessionDirCarry,
+) {
+    if depth >= SESSION_DIR_MAX_DEPTH {
+        warn!(dir = %src.display(), "session transcript carry: depth bound reached — not followed");
+        carry.skipped_other += 1;
+        return;
+    }
+    let entries = match std::fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(dir = %src.display(), error = %e, "session transcript carry: dir unreadable");
+            carry.failed += 1;
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!(dir = %src.display(), error = %e, "session transcript carry: unreadable entry");
+                carry.failed += 1;
+                continue;
+            }
+        };
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let meta = match std::fs::symlink_metadata(&from) {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!(path = %from.display(), error = %e, "session transcript carry: stat failed");
+                carry.failed += 1;
+                continue;
+            }
+        };
+        if meta.is_dir() {
+            copy_tree(&from, &to, depth + 1, source_is_newer, carry);
+            continue;
+        }
+        let is_partial = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(PARTIAL_SUFFIX));
+        if !meta.is_file() || is_partial {
+            carry.skipped_other += 1;
+            continue;
+        }
+        if destination_is_current(&from, &to, meta.len(), source_is_newer) {
+            carry.skipped_present += 1;
+            continue;
+        }
+        let written = std::fs::create_dir_all(dst).and_then(|()| copy_via_partial(&from, &to));
+        match written {
+            Ok(()) => carry.copied += 1,
+            Err(e) => {
+                warn!(
+                    from = %from.display(),
+                    to = %to.display(),
+                    error = %e,
+                    "session transcript carry: file copy failed"
+                );
+                carry.failed += 1;
+            }
+        }
+    }
 }
 
 /// One resumed-Claude PTY spawn, described.
@@ -676,8 +963,9 @@ pub(crate) fn spawn_resumed_pane(
 ///
 /// `resolve_claude_bin` does blocking filesystem stats. Its callers here —
 /// [`spawn_resumed_pane`] via [`migrate_session`] and the respawn receiver —
-/// run on async tasks that already block on transcript copy, terminal close
-/// and the PTY spawn itself, so a PATH walk widens nothing.
+/// run on the blocking pool ([`migrate_session_off_runtime`], and the
+/// receiver's own `spawn_blocking_tracked` around the transcript copy) or
+/// alongside the PTY spawn itself, so a PATH walk widens nothing.
 fn resume_respawn_argv(
     claude_bin: &str,
     claude_session_id: &str,
@@ -710,6 +998,30 @@ fn resume_respawn_extra_required(
         out.extend(carrier.argv());
     }
     out
+}
+
+/// [`migrate_session`] on the blocking pool rather than an async worker.
+///
+/// The migration is synchronous file and process work, and since the `<sid>/`
+/// carry it can copy a whole session directory — measured 2026-10-12 at up to
+/// ~125 MB / 250 files per session on this fleet. A usage limit is per
+/// account, so every session on that account migrates at about the same moment;
+/// run inline, each of those would hold a tokio worker for the length of its
+/// copy. Both async callers (the usage-limit hint and the manual Tauri command)
+/// go through here.
+pub async fn migrate_session_off_runtime(
+    app: &tauri::AppHandle,
+    record: &TerminalSessionRecord,
+    src_config_dir: &str,
+    dst_config_dir: &str,
+) -> Result<MigrationOutcome, String> {
+    let (app, record) = (app.clone(), record.clone());
+    let (src, dst) = (src_config_dir.to_string(), dst_config_dir.to_string());
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        migrate_session(&app, &record, &src, &dst)
+    })
+    .await
+    .map_err(|e| format!("migration task did not complete: {e}"))?
 }
 
 /// Perform the migration mechanics: transcript copy → trust for the
@@ -765,7 +1077,8 @@ pub fn migrate_session(
         .clone();
 
     // 1. Transcript first — if this fails the old pane is left untouched.
-    copy_transcript(
+    // The `<sid>/` carry inside it is best-effort; its tally rides the event.
+    let carried = copy_transcript(
         src_config_dir,
         dst_config_dir,
         &working_dir,
@@ -985,6 +1298,12 @@ pub fn migrate_session(
             "newTerminalId": outcome.new_terminal_id,
             "pageId": record.page_id,
             "zoneIndex": record.zone_index,
+            "sessionDirCarry": {
+                "copied": carried.session_dir.copied,
+                "skippedPresent": carried.session_dir.skipped_present,
+                "skippedOther": carried.session_dir.skipped_other,
+                "failed": carried.session_dir.failed,
+            },
         }),
     ) {
         warn!(error = %e, "failed to emit session-account-migrated");
@@ -1262,7 +1581,8 @@ mod tests {
             working_dir,
             sid,
         )
-        .expect("copy should succeed");
+        .expect("copy should succeed")
+        .path;
         assert!(dst.exists());
         assert_eq!(
             std::fs::read(&dst).unwrap(),
@@ -1278,7 +1598,8 @@ mod tests {
             working_dir,
             sid,
         )
-        .expect("idempotent retry should succeed");
+        .expect("idempotent retry should succeed")
+        .path;
         assert_eq!(dst, dst2);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1312,7 +1633,8 @@ mod tests {
             &working_dir,
             sid,
         )
-        .expect("copy should succeed");
+        .expect("copy should succeed")
+        .path;
         assert_eq!(
             dst,
             dst_cfg
@@ -1328,8 +1650,470 @@ mod tests {
             &working_dir,
             sid,
         )
-        .unwrap();
+        .unwrap()
+        .path;
         assert_eq!(dst, dst2);
+    }
+
+    /// Lay out `<cfg>/projects/<slug>/<sid>.jsonl` plus the files given as
+    /// `(path relative to <sid>/, bytes)`; returns the `<sid>/` directory.
+    fn seed_session(
+        cfg: &Path,
+        working_dir: &str,
+        sid: &str,
+        files: &[(&str, &[u8])],
+    ) -> std::path::PathBuf {
+        let transcript =
+            crate::terminal::transcript::session_transcript_path(cfg, working_dir, sid);
+        let project = transcript.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+        let session_dir = project.join(sid);
+        for (rel, bytes) in files {
+            let path = session_dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        session_dir
+    }
+
+    fn session_dir_of(cfg: &Path, working_dir: &str, sid: &str) -> std::path::PathBuf {
+        crate::terminal::transcript::session_transcript_path(cfg, working_dir, sid)
+            .parent()
+            .unwrap()
+            .join(sid)
+    }
+
+    #[test]
+    fn copy_transcript_carries_subagent_transcripts_and_sidecars() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src_cfg, dst_cfg) = (tmp.join(".claude-erik"), tmp.join(".claude-qontinui"));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "beeae8aa-7d4d-4843-87fb-8d71dcce6f2e";
+        let files: &[(&str, &[u8])] = &[
+            (
+                "subagents/agent-a0a89f0b0f9dfeb83.jsonl",
+                b"{\"type\":\"assistant\"}\n",
+            ),
+            (
+                "subagents/agent-a0a89f0b0f9dfeb83.meta.json",
+                b"{\"agentType\":\"x\"}",
+            ),
+            ("tool-results/hook-1-stdout.txt", b"large tool output"),
+        ];
+        seed_session(&src_cfg, working_dir, sid, files);
+
+        let carried = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("copy should succeed");
+        assert_eq!(
+            carried.session_dir,
+            SessionDirCarry {
+                copied: 3,
+                ..SessionDirCarry::default()
+            }
+        );
+        let dst_dir = session_dir_of(&dst_cfg, working_dir, sid);
+        for (rel, bytes) in files {
+            assert_eq!(
+                std::fs::read(dst_dir.join(rel)).unwrap(),
+                *bytes,
+                "{rel} must land under the destination account byte-for-byte"
+            );
+        }
+
+        // A retry (the main transcript is now present) still runs the carry,
+        // and finds everything already there.
+        let again = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("retry should succeed");
+        assert_eq!(
+            again.session_dir,
+            SessionDirCarry {
+                skipped_present: 3,
+                ..SessionDirCarry::default()
+            }
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn copy_transcript_without_session_dir_carries_nothing() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-nodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src_cfg, dst_cfg) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "22222222-3333-4444-5555-666666666666";
+        seed_session(&src_cfg, working_dir, sid, &[]);
+
+        let carried = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("a session that spawned no subagent still migrates");
+        assert!(carried.path.exists());
+        assert_eq!(carried.session_dir, SessionDirCarry::default());
+        assert!(!session_dir_of(&dst_cfg, working_dir, sid).exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn copy_transcript_never_truncates_a_newer_destination_subagent_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-newer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src_cfg, dst_cfg) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "33333333-4444-5555-6666-777777777777";
+        seed_session(
+            &src_cfg,
+            working_dir,
+            sid,
+            &[
+                ("subagents/agent-old.jsonl", b"short"),
+                (
+                    "subagents/agent-grown.jsonl",
+                    b"a much longer source transcript",
+                ),
+            ],
+        );
+        // Ping-pong: the destination already holds a LONGER copy of one file
+        // (the session ran there after an earlier migration) and a SHORTER,
+        // stale copy of the other.
+        seed_session(
+            &dst_cfg,
+            working_dir,
+            sid,
+            &[
+                ("subagents/agent-old.jsonl", b"short, then appended to"),
+                ("subagents/agent-grown.jsonl", b"stale"),
+            ],
+        );
+
+        let carried = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("copy should succeed");
+        assert_eq!(
+            carried.session_dir,
+            SessionDirCarry {
+                copied: 1,
+                skipped_present: 1,
+                ..SessionDirCarry::default()
+            }
+        );
+        let dst_dir = session_dir_of(&dst_cfg, working_dir, sid);
+        assert_eq!(
+            std::fs::read(dst_dir.join("subagents/agent-old.jsonl")).unwrap(),
+            b"short, then appended to",
+            "a larger destination file is the newer copy and is left alone"
+        );
+        assert_eq!(
+            std::fs::read(dst_dir.join("subagents/agent-grown.jsonl")).unwrap(),
+            b"a much longer source transcript",
+            "a smaller destination file is replaced with the source bytes"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn carry_session_dir_refuses_a_session_id_that_is_not_one_path_component() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-traverse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src_project = tmp.join("src").join("project");
+        let dst_project = tmp.join("dst").join("project");
+        // A sibling directory a hostile id could reach with `..`.
+        std::fs::create_dir_all(&src_project).unwrap();
+        std::fs::create_dir_all(tmp.join("src").join("secret")).unwrap();
+        std::fs::write(tmp.join("src").join("secret").join("f"), b"x").unwrap();
+        let mut bad_ids = vec!["..", "../secret", "a/b", ""];
+        if cfg!(windows) {
+            bad_ids.extend(["..\\secret", "C:", "C:secret"]);
+        }
+        for bad in bad_ids {
+            let carried = carry_session_dir(
+                &src_project.join("t.jsonl"),
+                &dst_project.join("t.jsonl"),
+                bad,
+                true,
+            );
+            assert_eq!(
+                carried,
+                SessionDirCarry {
+                    skipped_other: 1,
+                    ..SessionDirCarry::default()
+                },
+                "id {bad:?} must carry nothing, and say so rather than read as 'no subagents'"
+            );
+        }
+        assert!(!tmp.join("dst").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn copy_transcript_replaces_a_stale_non_transcript_file_even_when_larger() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src_cfg, dst_cfg) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "44444444-5555-6666-7777-888888888888";
+        // Renamed to something SHORTER on the account the session just ran on;
+        // the destination holds the older, longer title from a prior migration.
+        seed_session(
+            &src_cfg,
+            working_dir,
+            sid,
+            &[("custom-title.json", b"{\"customTitle\":\"x\"}")],
+        );
+        seed_session(
+            &dst_cfg,
+            working_dir,
+            sid,
+            &[(
+                "custom-title.json",
+                b"{\"customTitle\":\"a much longer old title\"}",
+            )],
+        );
+        let carried = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("copy should succeed");
+        assert_eq!(carried.session_dir.copied, 1);
+        assert_eq!(
+            std::fs::read(session_dir_of(&dst_cfg, working_dir, sid).join("custom-title.json"))
+                .unwrap(),
+            b"{\"customTitle\":\"x\"}",
+            "only append-only .jsonl files use the size rule"
+        );
+        // Identical bytes afterwards: a retry leaves it alone.
+        let again = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("retry should succeed");
+        assert_eq!(again.session_dir.skipped_present, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn copy_transcript_keeps_the_destination_sidecar_when_the_destination_ran_last() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-newer-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src_cfg, dst_cfg) = (tmp.join(".claude-old"), tmp.join(".claude-new"));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "88888888-9999-aaaa-bbbb-cccccccccccc";
+        // A respawn topping up from an OLDER holder: the target's main
+        // transcript is the larger one, so its rewritten-in-place sidecar wins.
+        seed_session(
+            &src_cfg,
+            working_dir,
+            sid,
+            &[("custom-title.json", b"{\"customTitle\":\"old\"}")],
+        );
+        seed_session(
+            &dst_cfg,
+            working_dir,
+            sid,
+            &[("custom-title.json", b"{\"customTitle\":\"new\"}")],
+        );
+        let dst_main =
+            crate::terminal::transcript::session_transcript_path(&dst_cfg, working_dir, sid);
+        std::fs::write(
+            &dst_main,
+            b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+        )
+        .unwrap();
+
+        let carried = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("copy should succeed");
+        assert_eq!(carried.session_dir.skipped_present, 1);
+        assert_eq!(
+            std::fs::read(session_dir_of(&dst_cfg, working_dir, sid).join("custom-title.json"))
+                .unwrap(),
+            b"{\"customTitle\":\"new\"}",
+            "the side that ran the session last keeps its sidecar"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn copy_transcript_refuses_a_session_id_that_is_not_a_uuid() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-notuuid-{}", std::process::id()));
+        let err = copy_transcript(
+            tmp.join("src").to_str().unwrap(),
+            tmp.join("dst").to_str().unwrap(),
+            "D:\\qontinui-root",
+            "../11111111-2222-3333-4444-555555555555",
+        )
+        .unwrap_err();
+        assert!(err.contains("expected a uuid"), "got: {err}");
+        assert!(!tmp.exists(), "nothing is written for a refused id");
+    }
+
+    #[test]
+    fn copy_transcript_never_carries_a_leftover_partial_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src_cfg, dst_cfg) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "55555555-6666-7777-8888-999999999999";
+        seed_session(
+            &src_cfg,
+            working_dir,
+            sid,
+            &[
+                ("subagents/agent-a.jsonl", b"{}\n"),
+                ("subagents/agent-b.jsonl.partial", b"half a co"),
+            ],
+        );
+        let carried = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("copy should succeed");
+        assert_eq!(
+            carried.session_dir,
+            SessionDirCarry {
+                copied: 1,
+                skipped_other: 1,
+                ..SessionDirCarry::default()
+            }
+        );
+        let dst_sub = session_dir_of(&dst_cfg, working_dir, sid).join("subagents");
+        assert!(dst_sub.join("agent-a.jsonl").exists());
+        assert!(!dst_sub.join("agent-b.jsonl.partial").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dst_sub)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(PARTIAL_SUFFIX))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file left behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Link `link` -> `target` as a directory symlink (unix) or a junction
+    /// (Windows; `mklink /J` needs no privilege). `false` when the platform
+    /// refused, so the caller can say the case went unexercised.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        }
+    }
+
+    #[test]
+    fn carry_never_follows_a_linked_directory() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src_cfg, dst_cfg) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+        let session_dir = seed_session(
+            &src_cfg,
+            working_dir,
+            sid,
+            &[("subagents/agent-a.jsonl", b"{}\n")],
+        );
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"must not be copied").unwrap();
+        assert!(
+            link_dir(&outside, &session_dir.join("linked")),
+            "could not create a directory link to exercise the rule"
+        );
+
+        let carried = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            sid,
+        )
+        .expect("copy should succeed");
+        assert_eq!(
+            carried.session_dir,
+            SessionDirCarry {
+                copied: 1,
+                skipped_other: 1,
+                ..SessionDirCarry::default()
+            }
+        );
+        let dst_dir = session_dir_of(&dst_cfg, working_dir, sid);
+        assert!(
+            !dst_dir.join("linked").exists(),
+            "a linked dir is never followed"
+        );
+
+        // `<sid>` itself being a link is refused and counted, not read as "none".
+        let other_sid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
+        let other_transcript =
+            crate::terminal::transcript::session_transcript_path(&src_cfg, working_dir, other_sid);
+        std::fs::write(&other_transcript, b"{}\n").unwrap();
+        assert!(link_dir(
+            &session_dir,
+            &other_transcript.parent().unwrap().join(other_sid)
+        ));
+        let linked_root = copy_transcript(
+            src_cfg.to_str().unwrap(),
+            dst_cfg.to_str().unwrap(),
+            working_dir,
+            other_sid,
+        )
+        .expect("main transcript still migrates");
+        assert_eq!(
+            linked_root.session_dir,
+            SessionDirCarry {
+                skipped_other: 1,
+                ..SessionDirCarry::default()
+            }
+        );
+        assert!(!session_dir_of(&dst_cfg, working_dir, other_sid).exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
