@@ -10,9 +10,17 @@
 //! else's injection; from a device = real input. Only the device kind and the
 //! origin are kept — never which key or where the pointer went.
 //!
-//! The injector sends KEYEVENTF_UNICODE key presses (layout-independent) with
-//! the tag, after checking that the input desktop is the interactive one and
-//! that the target is foreground.
+//! The injector sends VIRTUAL-KEY presses (`VK_A`..`VK_Z`, `VK_0`..`VK_9`)
+//! with the tag, after checking that the input desktop is the interactive
+//! one and that the target is foreground. Not KEYEVENTF_UNICODE (a VK_PACKET
+//! delivered to the foreground thread): on the first hosted run (PR #2177,
+//! run 38315983341, windows-latest) the Raw Input listener heard NONE of
+//! such a key's events — it had recognised 0 of 2 about a second after the
+//! key was sent, and the next arm's subscription had received no event of
+//! it either. That is deafness, not latency. A virtual key goes through the
+//! system's keyboard input path, which Raw Input reports for injected input
+//! (`hDevice` NULL, the tag in `ExtraInformation`). The keys are lowercase letters and digits only (as
+//! `--keys` allows), typed unshifted.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -29,8 +37,8 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    MAPVK_VK_TO_VSC, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -342,23 +350,38 @@ impl Injector {
     }
 }
 
-fn key(ch: u16, up: bool, extra: usize) -> INPUT {
-    INPUT {
+/// The virtual key that types `ch` unshifted: `VK_A`..`VK_Z` are the
+/// uppercase ASCII codes, `VK_0`..`VK_9` the digits'.
+fn virtual_key(ch: char) -> Option<u16> {
+    match ch {
+        'a'..='z' => Some(ch.to_ascii_uppercase() as u16),
+        '0'..='9' => Some(ch as u16),
+        _ => None,
+    }
+}
+
+/// The key-down and key-up events that type `ch`, tagged with `extra`.
+fn key_events(ch: char, extra: usize) -> Option<[INPUT; 2]> {
+    let vk = virtual_key(ch)?;
+    // SAFETY: a pure table lookup in the active keyboard layout.
+    let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as u16;
+    let event = |up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(0),
-                wScan: ch,
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan,
                 dwFlags: if up {
-                    KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                    KEYEVENTF_KEYUP
                 } else {
-                    KEYEVENTF_UNICODE
+                    Default::default()
                 },
                 time: 0,
                 dwExtraInfo: extra,
             },
         },
-    }
+    };
+    Some([event(false), event(true)])
 }
 
 impl KeyInjector for Injector {
@@ -383,9 +406,8 @@ impl KeyInjector for Injector {
     }
 
     fn can_send(&self, ch: char) -> bool {
-        // KEYEVENTF_UNICODE types any character of the Basic Multilingual
-        // Plane as one key press.
-        ch.len_utf16() == 1
+        // A virtual key Raw Input reports: lowercase letters and digits.
+        virtual_key(ch).is_some()
     }
 
     fn ledger_ids(&self, _ch: char) -> Vec<u32> {
@@ -398,13 +420,12 @@ impl KeyInjector for Injector {
     }
 
     fn send_char(&mut self, ch: char, tagged: bool) -> Result<(), String> {
-        let mut units = [0u16; 2];
-        let encoded = ch.encode_utf16(&mut units);
-        if encoded.len() != 1 {
-            return Err(format!("{ch:?} is outside the Basic Multilingual Plane"));
-        }
         let extra = if tagged { self.tagging.tag as usize } else { 0 };
-        let inputs = [key(encoded[0], false, extra), key(encoded[0], true, extra)];
+        let Some(inputs) = key_events(ch, extra) else {
+            return Err(format!(
+                "{ch:?} has no virtual key here (lowercase letters and digits only)"
+            ));
+        };
         // SAFETY: two well-formed INPUT records; SendInput reads them.
         let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
         if sent != 2 {
@@ -432,7 +453,7 @@ impl KeyInjector for Injector {
 
     fn describe(&self) -> String {
         format!(
-            "SendInput (KEYEVENTF_UNICODE) into {} with tag 0x{:08x}",
+            "SendInput (virtual keys) into {} with tag 0x{:08x}",
             WindowHandle(self.target),
             self.tagging.tag
         )
@@ -442,6 +463,24 @@ impl KeyInjector for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_are_virtual_keys_raw_input_reports_not_unicode_packets() {
+        let tag = 0x3e2a_5220usize;
+        let [down, up] = key_events('a', tag).expect("a letter");
+        // SAFETY: reading the keyboard variant just built.
+        let (d, u) = unsafe { (down.Anonymous.ki, up.Anonymous.ki) };
+        assert_eq!(d.wVk, VIRTUAL_KEY(0x41), "VK_A, not a VK_PACKET carrier");
+        assert_eq!(d.dwFlags, Default::default(), "no KEYEVENTF_UNICODE");
+        assert_eq!(u.dwFlags, KEYEVENTF_KEYUP);
+        assert_eq!((d.dwExtraInfo, u.dwExtraInfo), (tag, tag));
+        let seven = key_events('7', 0).expect("a digit");
+        // SAFETY: as above.
+        assert_eq!(unsafe { seven[0].Anonymous.ki.wVk }, VIRTUAL_KEY(0x37));
+        for ch in ['A', 'é', ' ', '~'] {
+            assert!(key_events(ch, tag).is_none(), "{ch:?}");
+        }
+    }
 
     #[test]
     fn a_raw_input_buffer_always_covers_a_whole_rawinput() {
