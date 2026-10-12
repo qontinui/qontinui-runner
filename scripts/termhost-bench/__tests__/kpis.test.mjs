@@ -16,6 +16,7 @@ import {
   captureInfo,
   computeRowKpis,
   fromProbe,
+  generatorExits,
   generatorWindow,
   indexGenerators,
   indexProbeSegment,
@@ -29,6 +30,7 @@ import { MS, genLog, operativeCapabilities, watchSegment } from "./helpers/bench
 
 const T0 = 1_000_000_000_000n;
 const SOAK_MS = 40_000;
+const toBig = (v) => BigInt(v);
 
 /** A one-session focus arm: markers at 10 Hz, shown 20 ms after emission, 60 fps. */
 function focusFixture(over = {}) {
@@ -247,6 +249,59 @@ test("a process group the probe could not read whole is unknown(harness_error); 
   assert.ok(some.kpis.memory_mb.notes.some((n) => /withheld/.test(n)));
   // A CPU-time SUM with a withheld sample is not the host's.
   assertUnknown(some.kpis.cpu_ms_per_mb, "harness_error");
+});
+
+test("memory at the end is the probe's LAST sample: a last sample not read whole is unknown, never an earlier reading (Phase 2 round 2 NM1)", () => {
+  const last = SOAK_MS / 500; // the fixture samples every 500 ms, t0..t1 inclusive
+  const tail = computeRowKpis(focusFixture({ watch: { groupNote: (g, k) => (g === "host" && k === last ? "unreadable_members" : null) } }));
+  assertUnknown(tail.kpis.memory_mb, "harness_error");
+  assert.match(tail.kpis.memory_mb.detail, /last host sample was not readable whole/);
+  assert.equal(tail.kpis.cpu_pct.state, "measured", "only the end value is missing");
+  const gone = computeRowKpis(focusFixture({ watch: { groupNote: (g, k) => (g === "workload" && k === last ? "no_live_process" : null) } }));
+  assertUnknown(gone.kpis.workload_memory_mb, "harness_error");
+  // The value is the probe's memory_mb_end, not the harness's own last readable sample.
+  const soak = watchSegment({ t0: T0, durationMs: SOAK_MS, memMb: 300 });
+  const patched = soak.map((r) => (r.type === "summary" ? { ...r, processes: { ...r.processes, host: { ...r.processes.host, memory_mb_end: 512.5 } } } : r));
+  const { kpis } = computeRowKpis({ ...focusFixture(), soak: { records: patched } });
+  assert.equal(kpis.memory_mb.state, "measured");
+  assert.equal(kpis.memory_mb.value, 512.5);
+});
+
+test("a null probe.behind with frames is never 'kept up': every KPI it guards is harness_error (Phase 2 round 2 NS1)", () => {
+  const r = computeRowKpis(focusFixture({ watch: { behind: null } }));
+  for (const id of ["output_latency_ms", "frame_interval_ms", "jank_share", "marker_loss", "marker_skipped", "hangs"]) {
+    assertUnknown(r.kpis[id], "harness_error");
+  }
+  const unknownLag = watchSegment({ t0: T0 + BigInt(SOAK_MS + 1000) * MS, durationMs: 11000, behind: null });
+  const gate = probeHealthGate(indexProbeSegment(unknownLag));
+  assert.equal(gate.reason, "harness_error");
+  assert.match(gate.detail, /could not show it kept up/);
+  const sw = computeRowKpis({ ...focusFixture(), n: 2, switches: { records: unknownLag, list: [{ k: 0, tCmdNs: T0 + BigInt(SOAK_MS + 2000) * MS }] } });
+  assertUnknown(sw.kpis.switch_latency_ms, "harness_error");
+  const sp = computeRowKpis({ ...focusFixture(), spawns: { records: unknownLag, list: [{ session: 3, tCmdNs: T0 + BigInt(SOAK_MS + 2000) * MS }] } });
+  assertUnknown(sp.kpis.spawn_latency_ms, "harness_error");
+  // A probe that kept up, and one that saw no frame at all, are not gated here.
+  assert.equal(probeHealthGate(indexProbeSegment(watchSegment({ t0: T0, durationMs: 2000, behind: false }))), null);
+  assert.equal(probeHealthGate(indexProbeSegment(watchSegment({ t0: T0, durationMs: 2000, behind: null, captureFailed: true }))), null);
+});
+
+test("a silent session whose generator process the probe saw exit is named a workload death (Phase 2 round 2 NN3)", () => {
+  const silent = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: 20000, exit: false });
+  const soak = watchSegment({ t0: T0, durationMs: SOAK_MS });
+  let marked = false;
+  const records = soak.map((r) => {
+    if (r.type !== "sample" || marked || toBig(r.t_ns) < T0 + 16000n * MS) return r;
+    marked = true;
+    // An exit the probe could not tie to a slot file carries no session and names none.
+    return { ...r, exited: [...r.exited, { pid: 4242, group: "workload", name: "node", session: 0 }, { pid: 4243, group: "workload", name: "sh" }] };
+  });
+  assert.ok(marked);
+  assert.deepEqual(generatorExits(indexProbeSegment(records)), [0]);
+  const r = computeRowKpis({ ...focusFixture(), gens: indexGenerators(new Map([[0, silent]])), soak: { records } });
+  assertUnknown(r.kpis.producer_stall_pct, "harness_error");
+  assert.match(r.kpis.producer_stall_pct.detail, /generator process of session\(s\) 0 exit \(a workload death, not a host hang\)/);
+  const quiet = computeRowKpis({ ...focusFixture(), gens: indexGenerators(new Map([[0, silent]])) });
+  assert.doesNotMatch(quiet.kpis.producer_stall_pct.detail, /workload death/, "no exit seen, none claimed");
 });
 
 test("no host group (no live host root) is unknown(harness_error), never a measured 0", () => {

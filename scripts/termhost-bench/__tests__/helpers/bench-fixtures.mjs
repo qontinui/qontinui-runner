@@ -90,7 +90,7 @@ export function genLog({
  *   frameHz?: number, bands?: boolean, intervalClass?: (i: number) => string | null,
  *   hostPids?: number[], cpuPct?: number, memMb?: number, gpu?: string, hostExits?: object[],
  *   crosscheck?: string, captureFailed?: boolean, echoSeen?: {session: number, seq: number, t: bigint}[],
- *   behind?: boolean, hangs?: number, groupNote?: (group: string, k: number) => string | null,
+ *   behind?: boolean | null, hangs?: number, groupNote?: (group: string, k: number) => string | null,
  * }} o
  */
 export function watchSegment({
@@ -158,7 +158,7 @@ export function watchSegment({
       }
       for (const m of markers) if (m.kind === "output") displayed.add(m.session);
       // `v` accumulates across partial (band) reads, as the probe's does.
-      recs.push({ type: "frame", source: primary, index, t_ns: String(t), w: 1920, h: 1080, missed: null, v: displayed.size, markers, rejected: 0, scan_ms: 0.4, lag_ms: behind ? 250 : 2 });
+      recs.push({ type: "frame", source: primary, index, t_ns: String(t), w: 1920, h: 1080, missed: null, v: displayed.size, markers, rejected: 0, scan_ms: 0.4, lag_ms: behind === null ? null : behind ? 250 : 2 });
     }
     for (const [key, fs] of firstSeen) {
       recs.push({ type: "first_seen", source: primary, kind: key.split(":")[0], session: fs.session, seq: fs.seq, t_ns: String(fs.t), frame: fs.frame, rect: { x: 0, y: 0, w: 1, h: 1 } });
@@ -189,6 +189,7 @@ export function watchSegment({
     if (note) {
       if (note === "no_live_process") acc.empty += 1;
       else acc.unreadable += 1;
+      acc.memEnd = null; // the probe's memory_mb_end: the LAST sample, whole or null
       return { pids: note === "no_live_process" ? [] : pids, cpu_pct: null, cpu_ms: null, memory_mb: null, rss_mb: null, gpu_pct: null, gpu_by_engine: {}, unreadable: note === "unreadable_members" ? 1 : 0, note };
     }
     if (!first) acc.cpu.push(cpu);
@@ -281,6 +282,7 @@ function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, r
   let blocked = null;
   if (captureFailed) blocked = ["capture_unavailable", "no capture source able to be primary was opened"];
   else if (behind) blocked = ["harness_error", "the probe fell behind: frames reached it up to 250.0 ms after presentation (bound 100.0 ms)"];
+  else if (behind === null && frames.length > 0) blocked = ["harness_error", `no primary frame's presentation time was known (${frames.length} frames), so the probe cannot show it kept up with them`];
   const gate = (id, refreshDependent, value) => {
     if (blocked) return unknownKpi(id, blocked[0], { n: value.n ?? 0, detail: blocked[1] });
     if (refreshDependent && refreshAssumed) return unknownKpi(id, "refresh_rate_unknown", { n: value.n ?? 0, detail: "the display reported no refresh rate (16.67 ms assumed)" });
@@ -293,7 +295,9 @@ function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, r
   const minValid = getKpi("hangs").min_n;
   const hangsKpi = captureFailed
     ? unknownKpi("hangs", "capture_unavailable", { n: tally.valid, detail: "no primary capture source" })
-    : tally.valid >= minValid
+    : behind === null && frames.length > 0
+      ? unknownKpi("hangs", "harness_error", { n: tally.valid, detail: blocked[1] })
+      : tally.valid >= minValid
       ? measureKpi("hangs", { value: hangs, n: tally.valid })
       : unknownKpi("hangs", exclusionReason(tally.valid, excludedCount, minValid), { n: tally.valid });
   const vs = frames.map((f) => f.v).sort((a, b) => a - b);
@@ -344,13 +348,14 @@ function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, r
     processes: Object.fromEntries(Object.entries(groupAcc).map(([name, acc]) => [name, processSummary(acc)])),
     probe: {
       frames: frames.length,
+      frames_lag_unknown: behind === null ? frames.length : 0,
       scan_ms_p50: frames.length ? 0.4 : null,
       scan_ms_max: frames.length ? 0.4 : null,
-      lag_ms_p50: frames.length ? (behind ? 250 : 2) : null,
-      lag_ms_judged: frames.length ? (behind ? 250 : 2) : null,
-      lag_ms_max: frames.length ? (behind ? 250 : 2) : null,
+      lag_ms_p50: frames.length && behind !== null ? (behind ? 250 : 2) : null,
+      lag_ms_judged: frames.length && behind !== null ? (behind ? 250 : 2) : null,
+      lag_ms_max: frames.length && behind !== null ? (behind ? 250 : 2) : null,
       lag_bound_ms: 100,
-      behind,
+      behind: frames.length ? behind : null,
     },
   };
 }

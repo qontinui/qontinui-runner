@@ -215,15 +215,29 @@ export function captureInfo(seg) {
  * could have distorted are unknown(harness_error) — the probe's rule
  * (`records.rs` `ProbeHealth`), applied here to the KPIs the harness times itself.
  *
+ * `behind` is null when frames arrived but not one's presentation time was known
+ * (X11's first frame; every X11 frame while the server clock is not established):
+ * whether the probe kept up was never established, so that is harness_error too —
+ * the probe applies the same rule to its own KPIs. A null is never read as false.
+ *
  * @returns {{reason: string, detail: string} | null}
  */
 export function probeHealthGate(seg) {
   const p = seg?.summary?.probe;
-  if (!p || p.behind !== true) return null;
-  return {
-    reason: "harness_error",
-    detail: `the probe fell behind its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged, bound ${p.lag_bound_ms ?? "?"} ms), so first appearances may be late`,
-  };
+  if (!p) return null;
+  if (p.behind === true) {
+    return {
+      reason: "harness_error",
+      detail: `the probe fell behind its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged, bound ${p.lag_bound_ms ?? "?"} ms), so first appearances may be late`,
+    };
+  }
+  if (p.behind !== false && Number(p.frames ?? 0) > 0) {
+    return {
+      reason: "harness_error",
+      detail: `the probe could not show it kept up with its capture source: no primary frame's presentation time was known (${p.frames_lag_unknown ?? "?"} of ${p.frames} frame(s) without one)`,
+    };
+  }
+  return null;
 }
 
 /**
@@ -480,6 +494,20 @@ export function groupSeries(seg, group, field) {
   return out;
 }
 
+/**
+ * Sessions whose generator process the probe saw exit (`sample.exited[]` `session`,
+ * named from the generator's slot file), in ascending order.
+ */
+export function generatorExits(seg) {
+  const out = new Set();
+  for (const s of seg?.samples ?? []) {
+    for (const e of s.exited ?? []) {
+      if (Number.isInteger(e?.session)) out.add(e.session);
+    }
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
 /** Host processes alive at the first sample that exited during the window. */
 export function hostExits(seg) {
   if (seg.samples.length === 0) return { monitored: 0, crashed: [], transient: 0 };
@@ -711,9 +739,11 @@ export function computeRowKpis(p) {
     notes.push(...gw.notes);
     const coverage = { observed: gw.stall.length, expected: Math.max(p.n, gw.stall.length) };
     if (gw.silent.length > 0) {
+      const died = generatorExits(seg).filter((k) => gw.silent.includes(k));
       const detail =
         `session(s) ${gw.silent.join(", ")} wrote no generator record bracketing the soak window ` +
-        "(blocked inside one write, or gone): a silent session makes the reading unknown, never a smaller sample";
+        "(blocked inside one write, or gone): a silent session makes the reading unknown, never a smaller sample" +
+        (died.length > 0 ? `; the probe saw the generator process of session(s) ${died.join(", ")} exit (a workload death, not a host hang)` : "");
       set("producer_stall_pct", unknownKpi("producer_stall_pct", "harness_error", { n: gw.stall.length, detail }));
       set("delivered_ratio", unknownKpi("delivered_ratio", "harness_error", { n: gw.delivered.length, detail }));
     } else {
@@ -830,20 +860,28 @@ function computeProcessKpis(p, seg, win, set, notes) {
     return fromProbe(id, ps.cpu_pct, { what: `the probe's ${group} cpu_pct` });
   };
 
-  /** A group's memory at the end of the window: its last readable sample. */
+  /**
+   * A group's memory at the end of the window: the probe's `memory_mb_end`, the
+   * group's LAST sample, null unless that sample was whole. An earlier readable
+   * sample is not an end value — a host that crashed, or a launcher that handed
+   * off and exited, has none — so a null is unknown, never the last good reading.
+   */
   const groupMemory = (id, group) => {
     if (noSeg) return unknownKpi(id, "harness_error", { detail: "no soak watch segment" });
     const series = groupSeries(seg, group, "memory_mb");
     const w = withheldCounts(seg, group);
-    if (series.length === 0) {
-      if (w.present === 0) return unknownKpi(id, seg.samples.length === 0 ? "insufficient_samples" : "harness_error", { n: 0, detail: `no sample carried a ${group} group` });
+    if (w.present === 0) return unknownKpi(id, seg.samples.length === 0 ? "insufficient_samples" : "harness_error", { n: 0, detail: `no sample carried a ${group} group` });
+    const ps = procs?.[group];
+    if (!ps) return unknownKpi(id, "harness_error", { n: series.length, detail: `the soak watch's summary has no ${group} process group` });
+    const end = ps.memory_mb_end;
+    if (typeof end !== "number" || !Number.isFinite(end)) {
       return unknownKpi(id, "harness_error", {
-        n: 0,
-        detail: `no ${group} sample was readable whole (${w.empty} with no live process, ${w.unreadable} with unreadable members)`,
+        n: series.length,
+        detail: `the last ${group} sample was not readable whole, so there is no end-of-window value (${w.empty} sample(s) with no live process, ${w.unreadable} with unreadable members)`,
       });
     }
     const extra = w.empty + w.unreadable > 0 ? { notes: [`${w.empty + w.unreadable} ${group} sample(s) withheld (${w.empty} with no live process, ${w.unreadable} with unreadable members)`] } : {};
-    return measureKpi(id, { value: series[series.length - 1].v, n: series.length }, extra);
+    return measureKpi(id, { value: end, n: Math.max(1, series.length) }, extra);
   };
 
   const hostPresent = !noSeg && seg.samples.some((s) => s.groups?.host);
