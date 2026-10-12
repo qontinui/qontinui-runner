@@ -4895,15 +4895,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // unresumable record, recreating the same
                                     // blank terminal forever. See
                                     // `close_reason_for_dead_shell`.
-                                    let reason =
-                                        close_reason_for_dead_shell(rec.restore_tier.as_deref());
-                                    poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, reason);
+                                    //
+                                    // The call is passed straight into
+                                    // `record_close`: the stop-reason close
+                                    // census pins this forwarder by that exact
+                                    // expression, so a reason bound to a local
+                                    // here could change without it noticing.
+                                    poll_lifecycle_store.record_close(
+                                        &rec.claude_session_id,
+                                        close_reason_for_dead_shell(rec.restore_tier.as_deref()),
+                                    );
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
                                         claude_session = %rec.claude_session_id,
-                                        reason = %reason,
+                                        reason = %close_reason_for_dead_shell(
+                                            rec.restore_tier.as_deref()
+                                        ),
                                         "session lifecycle poll: closing dead session"
                                     );
                                 }

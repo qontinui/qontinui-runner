@@ -802,8 +802,17 @@ mod tests {
                 };
                 format!("{}.{member}", render(&f.base))
             }
-            syn::Expr::MethodCall(m) => format!("{}.{}()", render(&m.receiver), m.method),
-            syn::Expr::Call(c) => format!("{}(..)", render(&c.func)),
+            syn::Expr::MethodCall(m) => format!(
+                "{}.{}({})",
+                render(&m.receiver),
+                m.method,
+                m.args.iter().map(render).collect::<Vec<_>>().join(", ")
+            ),
+            syn::Expr::Call(c) => format!(
+                "{}({})",
+                render(&c.func),
+                c.args.iter().map(render).collect::<Vec<_>>().join(", ")
+            ),
             syn::Expr::Reference(r) => render(&r.expr),
             syn::Expr::Paren(p) => render(&p.expr),
             syn::Expr::Macro(m) => format!(
@@ -828,7 +837,10 @@ mod tests {
     /// A COPY of another record's value: exactly a `<expr>.close_reason`
     /// field read, optionally behind `&`, parens, `.clone()`, `.as_deref()`
     /// or `.as_ref()`. A local merely NAMED `close_reason`, or a call whose
-    /// name contains it, is not a copy — it is [`Recorded::Indirect`].
+    /// name contains it, is not a copy — it is [`Recorded::Indirect`]. Only
+    /// trusted where a value moves between records (an assignment or a struct
+    /// field); as a `record_close` argument it is a NEW close — see
+    /// [`classify_close_arg`].
     fn is_close_reason_copy(e: &syn::Expr) -> bool {
         match e {
             syn::Expr::Reference(r) => is_close_reason_copy(&r.expr),
@@ -892,6 +904,18 @@ mod tests {
         }
     }
 
+    /// The reason argument of `record_close` / `record_close_checked`. A
+    /// field read there is never a copy — whatever struct it came off (a
+    /// deserialized request, say), passing it to `record_close` records a new
+    /// close — so it is [`Recorded::Indirect`] and must be a named forwarder.
+    fn classify_close_arg(e: &syn::Expr) -> Recorded {
+        if is_close_reason_copy(e) {
+            Recorded::Indirect(render(e))
+        } else {
+            classify(e)
+        }
+    }
+
     /// `cfg(test)` or `cfg(all(.., test, ..))` — and nothing wider: a
     /// `cfg(any(test, feature = ".."))` item also compiles into production.
     fn cfg_is_test_only(meta: &syn::Meta) -> bool {
@@ -934,11 +958,28 @@ mod tests {
 
     struct CloseWriteCensus {
         file: String,
+        /// The enclosing `impl` / `trait` type, so a method is keyed
+        /// `Type::method`.
+        type_stack: Vec<String>,
         fn_stack: Vec<String>,
         sites: Vec<Site>,
     }
 
     impl CloseWriteCensus {
+        fn new(file: &str) -> Self {
+            Self {
+                file: file.to_string(),
+                type_stack: Vec::new(),
+                fn_stack: Vec::new(),
+                sites: Vec::new(),
+            }
+        }
+        fn method_name(&self, ident: &syn::Ident) -> String {
+            match self.type_stack.last() {
+                Some(t) => format!("{t}::{ident}"),
+                None => ident.to_string(),
+            }
+        }
         fn push(&mut self, recorded: Recorded) {
             self.sites.push(Site {
                 file: self.file.clone(),
@@ -956,26 +997,50 @@ mod tests {
         }
         fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
             if !is_test_only(&i.attrs) {
+                let ty = match &*i.self_ty {
+                    syn::Type::Path(p) => p
+                        .path
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default(),
+                    _ => "<impl>".to_string(),
+                };
+                self.type_stack.push(ty);
                 syn::visit::visit_item_impl(self, i);
+                self.type_stack.pop();
+            }
+        }
+        fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+            if !is_test_only(&i.attrs) {
+                self.type_stack.push(i.ident.to_string());
+                syn::visit::visit_item_trait(self, i);
+                self.type_stack.pop();
             }
         }
         fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
             if !is_test_only(&i.attrs) {
+                // A free fn — even one nested inside a method — is keyed by
+                // its own name, not its parent's.
+                let outer = std::mem::take(&mut self.type_stack);
                 self.fn_stack.push(i.sig.ident.to_string());
                 syn::visit::visit_item_fn(self, i);
                 self.fn_stack.pop();
+                self.type_stack = outer;
             }
         }
         fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
             if !is_test_only(&i.attrs) {
-                self.fn_stack.push(i.sig.ident.to_string());
+                let name = self.method_name(&i.sig.ident);
+                self.fn_stack.push(name);
                 syn::visit::visit_impl_item_fn(self, i);
                 self.fn_stack.pop();
             }
         }
         fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
             if !is_test_only(&i.attrs) {
-                self.fn_stack.push(i.sig.ident.to_string());
+                let name = self.method_name(&i.sig.ident);
+                self.fn_stack.push(name);
                 syn::visit::visit_trait_item_fn(self, i);
                 self.fn_stack.pop();
             }
@@ -987,7 +1052,7 @@ mod tests {
             let method = m.method.to_string();
             if RECORD_CLOSE_FNS.contains(&method.as_str()) {
                 if let Some(reason) = m.args.last() {
-                    self.push(classify(reason));
+                    self.push(classify_close_arg(reason));
                 }
             } else if OPTION_MUTATORS.contains(&method.as_str())
                 && is_close_reason_field(&m.receiver)
@@ -1010,7 +1075,7 @@ mod tests {
                     .unwrap_or_default();
                 if RECORD_CLOSE_FNS.contains(&last.as_str()) {
                     if let Some(reason) = c.args.last() {
-                        self.push(classify(reason));
+                        self.push(classify_close_arg(reason));
                     }
                 } else if last == "replace"
                     && c.args.len() == 2
@@ -1033,14 +1098,11 @@ mod tests {
             syn::visit::visit_expr_assign(self, a);
         }
         // `close_reason: r` in a struct literal. The field-init shorthand
-        // (`close_reason,`) carries a value read elsewhere: a copy.
+        // (`close_reason,`) is a LOCAL named `close_reason` — whatever bound
+        // it — so it is Indirect, like any other local.
         fn visit_field_value(&mut self, fv: &'ast syn::FieldValue) {
             if matches!(&fv.member, syn::Member::Named(n) if n == "close_reason") {
-                if fv.colon_token.is_none() {
-                    self.push(Recorded::NotAMint);
-                } else {
-                    self.push(classify(&fv.expr));
-                }
+                self.push(classify(&fv.expr));
             }
             syn::visit::visit_field_value(self, fv);
         }
@@ -1126,11 +1188,7 @@ mod tests {
                 continue;
             }
             let file = syn::parse_file(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
-            let mut census = CloseWriteCensus {
-                file: rel,
-                fn_stack: Vec::new(),
-                sites: Vec::new(),
-            };
+            let mut census = CloseWriteCensus::new(&rel);
             census.visit_file(&file);
             sites.extend(census.sites);
         }
@@ -1155,16 +1213,27 @@ mod tests {
     ///
     /// Each site must record a string literal or a `CLOSE_REASON_*` constant
     /// that maps to a known code (pinned exactly, by file and fn, in
-    /// `MINTS`), or be one of the named forwarders in `FORWARDERS`, each
-    /// pinned to its enclosing fn with an exact count and backed by a test of
-    /// its own source. A copy of another record's `close_reason` field (or the
-    /// field-init shorthand) mints nothing.
+    /// `MINTS`), or be one of the named forwarders in `FORWARDERS`: pinned by
+    /// file, enclosing fn (`Type::method` for a method) and the exact
+    /// expression forwarded, with an exact count, and backed by a test of its
+    /// own source. A copy of another record's `close_reason` FIELD into an
+    /// assignment or a struct field mints nothing; the same field read passed
+    /// to `record_close` is a new close and must be a forwarder. A local named
+    /// `close_reason` (including the field-init shorthand) is a forwarder too.
     ///
-    /// Known blind spots, stated so the census is not trusted past them: a
-    /// write through an alias (`let slot = &mut r.close_reason; *slot = ..`,
-    /// or `if let Some(r) = &mut x.close_reason { *r = .. }`); a macro that
-    /// names only `close_reason` and does not parse as expressions (a tracing
-    /// field or a `json!` object); and code outside `src/`.
+    /// Known blind spots, stated so the census is not trusted past them:
+    /// - a write through an alias (`let slot = &mut r.close_reason; *slot =
+    ///   ..`, `if let Some(r) = &mut x.close_reason { *r = .. }`, or an
+    ///   `x.close_reason.as_mut()` chain);
+    /// - UFCS Option mutators other than `mem::replace`
+    ///   (`Option::insert(&mut x.close_reason, ..)`) and `std::mem::swap`;
+    /// - a field read off a deserialized value moved into a record by
+    ///   assignment or struct field (`rec.close_reason =
+    ///   args.close_reason.clone()`) — read as a copy, so it mints nothing
+    ///   here even though the value is new to the registry;
+    /// - a macro that names only `close_reason` and does not parse as
+    ///   expressions (a tracing field or a `json!` object);
+    /// - code outside `src/`.
     #[test]
     fn every_close_reason_a_production_writer_records_maps_to_a_known_code() {
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1192,40 +1261,44 @@ mod tests {
             ),
             (
                 "session/session_lifecycle_store.rs",
-                "record_open",
+                "SessionLifecycleStore::record_open",
                 "CLOSE_REASON_SUPERSEDED",
             ),
             (
                 "session/session_lifecycle_store.rs",
-                "record_open",
+                "SessionLifecycleStore::record_open",
                 "CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE",
             ),
             (
                 "session/session_lifecycle_store.rs",
-                "repair_terminal_id_collisions",
+                "SessionLifecycleStore::repair_terminal_id_collisions",
                 "CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE",
             ),
         ];
         // Sites that forward a reason chosen elsewhere, by (file, enclosing
-        // fn, expression) with the exact number of such sites. Each forwarded
-        // value is pinned by a test of its own source:
-        // - the store's `record_close` → `record_close_checked` → field
-        //   assignment chain forwards its caller's `reason`;
-        // - `terminal_session_record_close` forwards the FRONTEND's reason
+        // fn, the exact expression forwarded) with the exact number of such
+        // sites. What each forwards is pinned elsewhere:
+        // - `SessionLifecycleStore::record_close` hands its `reason` parameter
+        //   to `record_close_checked`, which stores it in the field; their
+        //   callers are the other sites in this census;
+        // - `terminal_session_record_close` forwards the FRONTEND's `reason`
         //   (`frontend_close_reasons_are_enumerated`);
-        // - the liveness poll in `run_app` forwards
-        //   `close_reason_for_dead_shell(..)`
-        //   (`the_dead_shell_close_reasons_are_enumerated`).
+        // - the liveness poll in `run_app` passes
+        //   `close_reason_for_dead_shell(rec.restore_tier.as_deref())` straight
+        //   into `record_close` (`the_dead_shell_close_reasons_are_enumerated`);
+        // - `build_enriched` (a read-side VIEW, not a registry write) takes
+        //   `close_reason` as a parameter its callers read off a record or a
+        //   history snapshot, and stores it by field-init shorthand.
         const FORWARDERS: &[(&str, &str, &str, usize)] = &[
             (
                 "session/session_lifecycle_store.rs",
-                "record_close",
+                "SessionLifecycleStore::record_close",
                 "reason",
                 1,
             ),
             (
                 "session/session_lifecycle_store.rs",
-                "record_close_checked",
+                "SessionLifecycleStore::record_close_checked",
                 "reason",
                 1,
             ),
@@ -1235,7 +1308,18 @@ mod tests {
                 "reason",
                 1,
             ),
-            ("main.rs", "run_app", "reason", 1),
+            (
+                "main.rs",
+                "run_app",
+                "close_reason_for_dead_shell(rec.restore_tier.as_deref())",
+                1,
+            ),
+            (
+                "session/past_sessions.rs",
+                "build_enriched",
+                "close_reason",
+                1,
+            ),
         ];
 
         let sites = close_write_census();
@@ -1311,65 +1395,97 @@ mod tests {
         );
     }
 
-    /// The census's own reach, on planted sources: each blind spot the review
-    /// named is now a recorded site, a local merely NAMED `close_reason` is
-    /// not mistaken for a copy, and a widened `cfg(any(test, ..))` item is
-    /// still scanned.
+    /// The census's own reach, on planted sources: every write shape it
+    /// claims is recorded with the value it records; a local named
+    /// `close_reason` (shorthand included) and a field read passed to
+    /// `record_close` are forwarders, not copies; test-only items are skipped
+    /// while a widened `cfg(any(test, ..))` item is scanned; and each site is
+    /// attributed to the right fn — a closure to its enclosing fn, a nested fn
+    /// to itself, a method to `Type::method`.
     #[test]
     fn the_close_reason_census_sees_the_shapes_it_claims() {
         use syn::visit::Visit;
         let src = r#"
-            fn planted(store: &S, r: &mut Rec, id: &str) {
+            fn planted(store: &S, r: &mut Rec, rec: Rec, args: Args, id: &str) {
                 let close_reason = format!("x{}", 1);
                 store.record_close(id, &close_reason);
+                store.record_close(id, &args.close_reason);
+                store.record_close_checked(id, None, "checked");
                 SessionLifecycleStore::record_close(store, id, "ufcs");
+                r.close_reason = Some("plain".into());
+                *r.close_reason = Some("deref".to_string());
                 r.close_reason.replace("replaced".to_string());
+                r.close_reason.insert("inserted".to_string());
+                r.close_reason.get_or_insert("eager".to_string());
                 r.close_reason.get_or_insert_with(|| "lazy".to_string());
                 std::mem::replace(&mut r.close_reason, Some("swapped".to_string()));
-                *r.close_reason = Some("deref".to_string());
                 let copy = View { close_reason: r.close_reason.clone() };
-                let shorthand = View { close_reason };
+                let close_reason = Some(format!("x{}", 2));
+                let shorthand = Rec { close_reason, ..rec };
                 let picked = View { close_reason: self.pick_close_reason(t) };
+                let cb = || store.record_close(id, "in-a-closure");
+                fn nested(store: &S, id: &str) { store.record_close(id, "in-a-nested-fn"); }
                 tokio::spawn(async move { store.record_close(id, "in-a-block") });
                 vec![store.record_close(id, "in-a-macro")];
                 tokio::select! { _ = a => store.record_close(id, "in-select"), }
             }
+            impl Store {
+                fn method(&self, id: &str) {
+                    self.record_close(id, "in-a-method");
+                    fn helper(s: &S, id: &str) { s.record_close(id, "in-a-method-helper"); }
+                }
+            }
             #[cfg(any(test, feature = "x"))]
             fn widened(store: &S, id: &str) { store.record_close(id, "widened"); }
             #[cfg(all(unix, test))]
-            fn test_only(store: &S, id: &str) { store.record_close(id, "hidden"); }
+            fn all_test(store: &S, id: &str) { store.record_close(id, "hidden-all"); }
+            #[cfg(test)]
+            fn cfg_test(store: &S, id: &str) { store.record_close(id, "hidden-cfg"); }
+            #[test]
+            fn a_test() { store.record_close(id, "hidden-test"); }
+            #[cfg(test)]
+            mod tests {
+                fn f(store: &S, id: &str) { store.record_close(id, "hidden-mod"); }
+            }
         "#;
         let file = syn::parse_file(src).unwrap();
-        let mut c = CloseWriteCensus {
-            file: "planted.rs".into(),
-            fn_stack: Vec::new(),
-            sites: Vec::new(),
-        };
+        let mut c = CloseWriteCensus::new("planted.rs");
         c.visit_file(&file);
-        let got: Vec<Recorded> = c.sites.iter().map(|s| s.recorded.clone()).collect();
-        let lit = |s: &str| Recorded::Literal(s.to_string());
+        let got: Vec<(String, Recorded)> = c
+            .sites
+            .iter()
+            .map(|s| (s.func.clone(), s.recorded.clone()))
+            .collect();
+        let at = |f: &str, r: Recorded| (f.to_string(), r);
+        let lit = |f: &str, s: &str| (f.to_string(), Recorded::Literal(s.to_string()));
+        let ind = |f: &str, s: &str| (f.to_string(), Recorded::Indirect(s.to_string()));
         assert_eq!(
             got,
             vec![
-                Recorded::Indirect("close_reason".into()),
-                lit("ufcs"),
-                lit("replaced"),
-                lit("lazy"),
-                lit("swapped"),
-                lit("deref"),
-                Recorded::NotAMint,
-                Recorded::NotAMint,
-                Recorded::Indirect("self.pick_close_reason()".into()),
-                lit("in-a-block"),
-                lit("in-a-macro"),
-                Recorded::UnparsedMacro,
-                lit("widened"),
+                ind("planted", "close_reason"),
+                ind("planted", "args.close_reason"),
+                lit("planted", "checked"),
+                lit("planted", "ufcs"),
+                lit("planted", "plain"),
+                lit("planted", "deref"),
+                lit("planted", "replaced"),
+                lit("planted", "inserted"),
+                lit("planted", "eager"),
+                lit("planted", "lazy"),
+                lit("planted", "swapped"),
+                at("planted", Recorded::NotAMint),
+                ind("planted", "close_reason"),
+                ind("planted", "self.pick_close_reason(t)"),
+                lit("planted", "in-a-closure"),
+                lit("nested", "in-a-nested-fn"),
+                lit("planted", "in-a-block"),
+                lit("planted", "in-a-macro"),
+                at("planted", Recorded::UnparsedMacro),
+                lit("Store::method", "in-a-method"),
+                lit("helper", "in-a-method-helper"),
+                lit("widened", "widened"),
             ]
         );
-        assert!(c
-            .sites
-            .iter()
-            .all(|s| s.func == "planted" || s.func == "widened"));
     }
 
     /// The liveness poll's forwarded reason (`close_reason_for_dead_shell`)
