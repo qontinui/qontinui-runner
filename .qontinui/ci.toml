@@ -305,6 +305,7 @@ command = [
   "scripts/termhost-bench/__tests__/marker.test.mjs",
   "scripts/termhost-bench/__tests__/neutrality.test.mjs",
   "scripts/termhost-bench/__tests__/no-image-kill.test.mjs",
+  "scripts/termhost-bench/__tests__/probe-driver.test.mjs",
   "scripts/termhost-bench/__tests__/results-fixtures.test.mjs",
   "scripts/termhost-bench/__tests__/run-loop.test.mjs",
   "scripts/termhost-bench/__tests__/rundir.test.mjs",

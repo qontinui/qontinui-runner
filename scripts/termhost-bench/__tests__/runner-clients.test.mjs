@@ -209,6 +209,7 @@ test("the #1856 transport counters: reset is a POST, the read is raw, alt_screen
 test("waitUiBridgeReady pokes the elements door once the shell is responsive, until the IPC round trip is observed", async () => {
   const health = [
     { success: true, data: { responsive: false, uiBridgeIpcObserved: false } },
+    { success: true, data: { responsive: false, uiBridgeIpcObserved: false } },
     { success: true, data: { responsive: true, uiBridgeIpcObserved: false } },
     { success: true, data: { responsive: true, uiBridgeIpcObserved: true, version: "x" } },
   ];
@@ -218,8 +219,12 @@ test("waitUiBridgeReady pokes the elements door once the shell is responsive, un
   let t = 0;
   const data = await r.waitUiBridgeReady(60_000, { sleepFn: async (ms) => { t += ms; }, now: () => t });
   assert.equal(data.version, "x");
-  const pokes = calls.filter((c) => c.url.endsWith("/ui-bridge/control/elements"));
-  assert.equal(pokes.length, 1, "poked only while responsive, and a 503 poke is tolerated");
+  // health, health, health (responsive) -> poke, health (observed): the poke comes
+  // only after a responsive reading, and a 503 poke is tolerated.
+  assert.deepEqual(
+    calls.map((c) => (c.url.endsWith("/health") ? "health" : c.url.endsWith("/ui-bridge/control/elements") ? "poke" : c.url)),
+    ["health", "health", "health", "poke", "health"],
+  );
 });
 
 test("waitUiBridgeReady fails fast when the process exits, and times out with the last reading", async () => {

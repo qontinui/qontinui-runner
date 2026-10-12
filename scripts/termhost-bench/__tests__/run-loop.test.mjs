@@ -15,7 +15,7 @@ import { join } from "node:path";
 
 import { machineBlock } from "../machine.mjs";
 import { NeutralityGuard } from "../neutrality.mjs";
-import { redactRunnerOnly } from "../results.mjs";
+import { convertProbeIncident, redactRunnerOnly } from "../results.mjs";
 import { planUnits, runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
@@ -55,7 +55,7 @@ async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = 
     reapGenerators: async () => ({ ended: [], survivors: [] }),
   };
   const res = await runBench(fakeRunOptions(join(tmp, "work"), { out: join(tmp, "results.json"), redactedOut: join(tmp, "redacted.json"), ...opts }), deps);
-  return { res, calls, tmp };
+  return { res, calls, tmp, probe: deps.probe };
 }
 
 test("units interleave head and baseline per run index and N (D11)", () => {
@@ -72,7 +72,7 @@ test("units interleave head and baseline per run index and N (D11)", () => {
 });
 
 test("a run writes a schema-valid file: one row per unit and arm, every KPI present", async (t) => {
-  const { res, calls } = await fakeRun(t);
+  const { res, calls, probe } = await fakeRun(t);
   assert.equal(validateResults(res.doc).valid, true, JSON.stringify(validateResults(res.doc).errors.slice(0, 5)));
   assert.equal(res.doc.rows.length, 2 * 2 * 2, "2 setups x 2 levels x 2 arms");
   assert.equal(res.stopped, null);
@@ -99,6 +99,14 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
     assert.ok(Object.values(r.diagnostics).every((d) => d.comparable === false), "runner diagnostics are non-comparable");
   }
   for (const r of res.doc.rows.filter((x) => x.setup.id === "tmux")) assert.deepEqual(r.diagnostics, {});
+  // One watch at a time per gen dir, each under its own label, so every phase's
+  // run file is set aside under a distinct name (records.rs: one run per file).
+  assert.equal(probe.labels.size, 4, "one gen dir per unit");
+  for (const labels of probe.labels.values()) {
+    assert.deepEqual(labels, ["focus-soak", "focus-switch", "focus-spawn", "tiled-soak", "tiled-spawn"].filter((l) => labels.includes(l)));
+    assert.equal(new Set(labels).size, labels.length);
+    assert.ok(labels.includes("focus-soak") && labels.includes("tiled-soak"));
+  }
 });
 
 test("the redacted copy keeps the runner's rows only and still validates", async (t) => {
@@ -122,9 +130,8 @@ test("a resource-guard refusal ends that setup's ladder; higher levels read admi
     }
   }
   assert.equal(runnerRows.filter((r) => r.scenario.n === 1 && r.kpis.output_latency_ms.state === "measured").length, 2);
-  // The runner at N = 15 was never launched; tmux ran every level.
-  const runnerLaunches = calls.filter((c) => c[0] === "spawnSessions");
-  assert.ok(!runnerLaunches.some((c) => c[1] === 15 && false));
+  // The runner at N = 15 (unit 4) was never launched; tmux ran every level.
+  assert.deepEqual(calls.filter((c) => c[0] === "launch").map((c) => c[1]), [0, 1, 2, 3, 5]);
   assert.equal(res.doc.rows.filter((r) => r.setup.id === "tmux" && r.kpis.output_latency_ms.state === "measured").length, 6);
   const inc = res.doc.incidents.find((i) => i.kind === "admission_refused");
   assert.ok(inc, "the refusal is an incident");
@@ -149,4 +156,20 @@ test("an arm that throws still tears the unit down, and its rows say why", async
 test("a doctor that blocks the run aborts before any unit launches", async (t) => {
   const facts = { ...healthyFacts(), probePath: null };
   await assert.rejects(fakeRun(t, { facts }), /cannot start here: probe.binary/);
+});
+
+test("a probe incident keeps its data (data.source) and is placed where the harness met it", () => {
+  const rec = { schema: "termhost-probe/v1", type: "incident", kind: "capture_lost", at: "2026-10-12T01:00:00Z", detail: "x11 lost", stops_run: false, data: { source: "x11" } };
+  assert.deepEqual(convertProbeIncident(rec, { setup: "tmux", unit: "u001", phase: "focus/soak" }), {
+    kind: "capture_lost",
+    at: "2026-10-12T01:00:00Z",
+    detail: "x11 lost",
+    stops_run: false,
+    data: { source: "x11", setup: "tmux", unit: "u001", phase: "focus/soak" },
+  });
+  // A kind the schema does not know is the harness's error, the probe's kind kept.
+  const odd = convertProbeIncident({ kind: "cosmic", detail: "?", data: { source: "wgc" } });
+  assert.equal(odd.kind, "harness_error");
+  assert.equal(odd.data.probe_kind, "cosmic");
+  assert.equal(odd.data.source, "wgc");
 });

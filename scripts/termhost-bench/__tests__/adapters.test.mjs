@@ -380,7 +380,9 @@ test("a resource-guard refusal is declined — never 'Start anyway' — and reco
       ctx.create();
       // The third spawn is refused: the runner logs it and its dialog holds the action open.
       appendFileSync(log, 'WARN resource_guard: refusing to spawn past the session critical limit metric=thread_count observed=401 limit=400\n');
-      await declined;
+      // A runner whose dialog is never declined would hold the action open for good:
+      // bound the wait so a regression fails here instead of hanging the suite.
+      await Promise.race([declined, new Promise((_, reject) => setTimeout(() => reject(new Error("the guard dialog was never declined")), 5000))]);
       throw new HttpError("POST create-with-command -> 400", { status: 400, body: { error: "spawned 2 of 5 terminals" }, method: "POST", url: "x" });
     },
     discover: () => ({

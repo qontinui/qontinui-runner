@@ -916,8 +916,13 @@ export class RunnerAdapter {
     return [...new Set(roots)];
   }
 
+  /**
+   * The window the probe measures: the instance's own process. Never a title — on
+   * a workstation "Qontinui" also names the operator's own runner windows (D5).
+   * With no pid there is no target, and the arm fails as the harness's error.
+   */
   windowTarget() {
-    return Number.isInteger(this.pid) ? { pid: this.pid } : { title: "Qontinui" };
+    return Number.isInteger(this.pid) ? { pid: this.pid } : null;
   }
 
   /** The session shell's integration, measured from its command line. */

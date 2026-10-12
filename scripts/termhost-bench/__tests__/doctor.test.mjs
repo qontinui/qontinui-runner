@@ -88,10 +88,14 @@ test("setup verdicts pass through; a malformed one becomes UNKNOWN", () => {
 });
 
 test("the report counts every verdict and every id fits the results schema's capability pattern", () => {
-  const m = mapDoctor(healthyFacts());
+  const m = mapDoctor({ ...healthyFacts(), windowManagerPath: null });
   const r = doctorReport(m, { environment: "linux-xvfb", checkedAt: "2026-10-12T00:00:00Z" });
   const total = r.summary.operative + r.summary.degraded + r.summary.inoperative + r.summary.unknown;
   assert.equal(total, r.mechanisms.length);
+  for (const [key, state] of [["operative", OPERATIVE], ["degraded", DEGRADED], ["inoperative", INOPERATIVE], ["unknown", UNKNOWN]]) {
+    assert.equal(r.summary[key], r.mechanisms.filter((x) => x.state === state).length, key);
+  }
+  assert.equal(r.summary.degraded, 1, "the missing window manager");
   for (const x of r.mechanisms) assert.ok(DOCTOR_STATES.includes(x.state));
   const caps = toCapabilities(m, "2026-10-12T00:00:00Z");
   for (const id of Object.keys(caps)) assert.match(id, /^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$/);

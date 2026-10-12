@@ -2,11 +2,20 @@
  * Synthetic, mutually consistent probe (`termhost-probe/v1`) and generator
  * (`termhost-bench/gen/v1`) records for the orchestrator's tests: a generator log
  * whose markers advance at `markerHz`, and a `watch` segment whose frames show each
- * session's marker a known `latencyMs` after it was emitted — so every KPI the
- * harness computes from them has an answer the test can state in advance.
+ * session's marker a known `latencyMs` after it was emitted — so every KPI has an
+ * answer the test can state in advance.
+ *
+ * The segment ends in a `summary` shaped like the probe's (`records.rs`
+ * `WatchSummary`), its KPI values computed here from the segment's own records with
+ * the probe's rules for these simple cases (first appearance on the primary, the
+ * window from the first frame, interval exclusion, the capture / lag / refresh
+ * gates). The harness takes the soak's capture KPIs from that summary, so a test can
+ * also hand it a summary the probe would write in a case the fixture cannot draw.
  */
 
+import { getKpi } from "../../kpi-catalog.mjs";
 import { SEQ_MODULUS } from "../../marker.mjs";
+import { measureKpi, percentile, share, unknownKpi } from "../../stats.mjs";
 
 export const MS = 1_000_000n;
 
@@ -75,11 +84,13 @@ export function genLog({
  * One `watch` segment over `[t0, t0 + durationMs]`.
  *
  * @param {{
- *   t0: bigint, durationMs: number, primary?: string, refreshHz?: number | null, refreshSource?: string,
+ *   t0: bigint, durationMs: number, primary?: string, refreshHz?: number, refreshSource?: string,
+ *   refreshAssumed?: boolean,
  *   sessions?: {session: number, gen: object[], latencyMs: number, rect?: object, hidden?: boolean}[],
  *   frameHz?: number, bands?: boolean, intervalClass?: (i: number) => string | null,
  *   hostPids?: number[], cpuPct?: number, memMb?: number, gpu?: string, hostExits?: object[],
  *   crosscheck?: string, captureFailed?: boolean, echoSeen?: {session: number, seq: number, t: bigint}[],
+ *   behind?: boolean, hangs?: number, groupNote?: (group: string, k: number) => string | null,
  * }} o
  */
 export function watchSegment({
@@ -88,6 +99,7 @@ export function watchSegment({
   primary = "x11",
   refreshHz = 60,
   refreshSource = "RandR screen info",
+  refreshAssumed = false,
   sessions = [],
   frameHz = 60,
   bands = false,
@@ -100,15 +112,16 @@ export function watchSegment({
   crosscheck = "not_performed",
   captureFailed = false,
   echoSeen = [],
+  behind = false,
+  hangs = 0,
+  groupNote = () => null,
 }) {
   const t1 = t0 + BigInt(durationMs) * MS;
   const recs = [{ schema: "termhost-probe/v1", type: "start", subcommand: "watch", t0_ns: String(t0 - 5n * MS), tool: "termhost-probe" }];
-  recs.push(
-    captureFailed
-      ? { type: "capture", source: primary, state: "failed", detail: "no display", refresh_hz: refreshHz, refresh_source: refreshSource }
-      : { type: "capture", source: primary, state: "started", detail: "fixture", refresh_hz: refreshHz, refresh_source: refreshSource },
-  );
+  const capture = { type: "capture", source: primary, refresh_hz: refreshHz, refresh_source: refreshSource, refresh_assumed: refreshAssumed };
+  recs.push(captureFailed ? { ...capture, state: "failed", detail: "no display" } : { ...capture, state: "started", detail: "fixture" });
   const firstSeen = new Map();
+  const displayed = new Set();
   if (!captureFailed) {
     const period = BigInt(Math.round(1e9 / frameHz));
     let index = 0;
@@ -143,8 +156,9 @@ export function watchSegment({
           if (!firstSeen.has(key)) firstSeen.set(key, { t, session: e.session, seq: e.seq % SEQ_MODULUS, frame: index, kind: "echo" });
         }
       }
-      const v = new Set(markers.filter((m) => m.kind === "output").map((m) => m.session)).size;
-      recs.push({ type: "frame", source: primary, index, t_ns: String(t), w: 1920, h: 1080, missed: null, v, markers, rejected: 0 });
+      for (const m of markers) if (m.kind === "output") displayed.add(m.session);
+      // `v` accumulates across partial (band) reads, as the probe's does.
+      recs.push({ type: "frame", source: primary, index, t_ns: String(t), w: 1920, h: 1080, missed: null, v: displayed.size, markers, rejected: 0, scan_ms: 0.4, lag_ms: behind ? 250 : 2 });
     }
     for (const [key, fs] of firstSeen) {
       recs.push({ type: "first_seen", source: primary, kind: key.split(":")[0], session: fs.session, seq: fs.seq, t_ns: String(fs.t), frame: fs.frame, rect: { x: 0, y: 0, w: 1, h: 1 } });
@@ -164,24 +178,181 @@ export function watchSegment({
     });
   }
   recs.push({ type: "interval", index: full, t_start_ns: String(t0 + BigInt(full) * 500n * MS), t_end_ns: String(t1), partial: true, valid: false, exclusion_class: null });
+  // Process samples. A group the probe could not read whole carries null values
+  // and a note (`no_live_process`, `unreadable_members`); there is no host group
+  // without host roots.
+  const groupAcc = {};
+  const group = (name, k, first, pids, cpu, mem) => {
+    const note = groupNote(name, k);
+    const acc = (groupAcc[name] ??= { cpu: [], memEnd: null, samples: 0, empty: 0, unreadable: 0 });
+    acc.samples += 1;
+    if (note) {
+      if (note === "no_live_process") acc.empty += 1;
+      else acc.unreadable += 1;
+      return { pids: note === "no_live_process" ? [] : pids, cpu_pct: null, cpu_ms: null, memory_mb: null, rss_mb: null, gpu_pct: null, gpu_by_engine: {}, unreadable: note === "unreadable_members" ? 1 : 0, note };
+    }
+    if (!first) acc.cpu.push(cpu);
+    acc.memEnd = mem;
+    return { pids, cpu_pct: first ? null : cpu, cpu_ms: first ? null : (cpu / 100) * 500, memory_mb: mem, rss_mb: mem, gpu_pct: null, gpu_by_engine: {}, unreadable: 0 };
+  };
+  let crashes = 0;
   for (let t = t0, k = 0; t <= t1; t += 500n * MS, k += 1) {
     const first = k === 0;
-    recs.push({
-      type: "sample",
-      t_ns: String(t),
-      dt_ms: first ? null : 500,
-      gpu,
-      groups: {
-        host: { pids: hostPids, cpu_pct: first ? null : cpuPct + (k % 3), cpu_ms: first ? null : ((cpuPct + (k % 3)) / 100) * 500, memory_mb: memMb + k * 0.1, rss_mb: memMb, gpu_pct: null, gpu_by_engine: {}, unreadable: 0 },
-        workload: { pids: [200, 201], cpu_pct: first ? null : 40, cpu_ms: first ? null : 200, memory_mb: 90, rss_mb: 90, gpu_pct: null, gpu_by_engine: {}, unreadable: 0 },
-        compositor: { pids: [50], cpu_pct: first ? null : 5, cpu_ms: first ? null : 25, memory_mb: 40, rss_mb: 40, gpu_pct: null, gpu_by_engine: {}, unreadable: 0 },
-      },
-      exited: hostExits.filter((e) => e.k === k).map((e) => ({ pid: e.pid, group: "host", name: e.name ?? "x" })),
-    });
+    const groups = {};
+    if (hostPids.length > 0) groups.host = group("host", k, first, hostPids, cpuPct + (k % 3), memMb + k * 0.1);
+    groups.workload = group("workload", k, first, [200, 201], 40, 90);
+    groups.compositor = group("compositor", k, first, [50], 5, 40);
+    const exited = hostPids.length > 0 ? hostExits.filter((e) => e.k === k).map((e) => ({ pid: e.pid, group: "host", name: e.name ?? "x" })) : [];
+    crashes += exited.length;
+    recs.push({ type: "sample", t_ns: String(t), dt_ms: first ? null : 500, gpu, groups, exited });
   }
-  recs.push({ type: "summary", t_start_ns: String(t0), t_end_ns: String(t1), primary, secondary: null, crosscheck: { verdict: crosscheck, detail: crosscheck === "disagree" ? "3 of 40 markers disagreed" : "n/a" } });
+  recs.push({
+    type: "summary",
+    ...probeSummary({
+      t0,
+      t1,
+      primary,
+      recs,
+      sessions,
+      firstSeen,
+      refreshMs: 1000 / refreshHz,
+      refreshAssumed,
+      captureFailed,
+      crosscheck,
+      behind,
+      hangs,
+      groupAcc,
+      crashes: hostPids.length > 0 ? crashes : null,
+    }),
+  });
   recs.push({ type: "end", t_ns: String(t1 + MS), exit_code: 0, reason: "stdin closed" });
   return recs;
+}
+
+/**
+ * The summary the probe would write for a fixture segment (`model/mod.rs`
+ * `finish`, for the cases a fixture draws): the capture KPIs, V, the sessions
+ * seen, interval counts, process groups and the probe's own health.
+ */
+function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, refreshAssumed, captureFailed, crosscheck, behind, hangs, groupAcc, crashes }) {
+  const frames = recs.filter((r) => r.type === "frame" && r.source === primary);
+  const deltas = [];
+  for (let i = 1; i < frames.length; i += 1) deltas.push(Number(BigInt(frames[i].t_ns) - BigInt(frames[i - 1].t_ns)) / 1e6);
+  const firstFrame = frames.length > 0 ? BigInt(frames[0].t_ns) : null;
+  const intervals = recs.filter((r) => r.type === "interval" && !r.partial);
+  const tally = { valid: 0, occluded: 0, operator: 0, harness: 0 };
+  for (const r of intervals) {
+    if (r.valid) tally.valid += 1;
+    else if (r.exclusion_class === "occluded") tally.occluded += 1;
+    else if (r.exclusion_class === "operator_activity") tally.operator += 1;
+    else tally.harness += 1;
+  }
+  const excludedCount = tally.occluded + tally.operator + tally.harness;
+  const exclusionReason = (valid, excluded, minN) => {
+    if (excluded === 0 || valid + excluded < minN) return "insufficient_samples";
+    const classes = [["occluded", tally.occluded], ["operator_activity", tally.operator], ["harness_error", tally.harness]];
+    return classes.sort((a, b) => b[1] - a[1])[0][0];
+  };
+  const intervalValidAt = (t) => {
+    const i = Number((t - t0) / (500n * MS));
+    const r = intervals.find((x) => x.index === i);
+    return Boolean(r?.valid);
+  };
+  // Latency and loss over the markers emitted from the first frame on.
+  const samples = [];
+  let counted = 0;
+  let lost = 0;
+  let excludedMarkers = 0;
+  for (const s of sessions.filter((x) => !x.hidden)) {
+    for (const r of s.gen) {
+      if (r.type !== "marker" || r.kind !== "output") continue;
+      const tEmit = BigInt(r.t_emit_ns);
+      if (firstFrame === null || tEmit < firstFrame || tEmit > t1) continue;
+      const fs = firstSeen.get(`output:${s.session}:${r.seq % SEQ_MODULUS}`);
+      if (fs && fs.t >= tEmit) samples.push(Number(fs.t - tEmit) / 1e6);
+      if (!intervalValidAt(tEmit)) {
+        excludedMarkers += 1;
+        continue;
+      }
+      counted += 1;
+      if (!fs) lost += 1;
+    }
+  }
+  let blocked = null;
+  if (captureFailed) blocked = ["capture_unavailable", "no capture source able to be primary was opened"];
+  else if (behind) blocked = ["harness_error", "the probe fell behind: frames reached it up to 250.0 ms after presentation (bound 100.0 ms)"];
+  const gate = (id, refreshDependent, value) => {
+    if (blocked) return unknownKpi(id, blocked[0], { n: value.n ?? 0, detail: blocked[1] });
+    if (refreshDependent && refreshAssumed) return unknownKpi(id, "refresh_rate_unknown", { n: value.n ?? 0, detail: "the display reported no refresh rate (16.67 ms assumed)" });
+    return value;
+  };
+  const shareKpi = (id, hits, n) =>
+    n >= getKpi(id).min_n ? measureKpi(id, { value: (100 * hits) / n, n }) : unknownKpi(id, exclusionReason(n, excludedMarkers, getKpi(id).min_n), { n });
+  let output = measureKpi("output_latency_ms", samples);
+  if (crosscheck === "disagree" && samples.length > 0) output = unknownKpi("output_latency_ms", "capture_disagreement", { n: samples.length, detail: "3 of 40 markers disagreed" });
+  const minValid = getKpi("hangs").min_n;
+  const hangsKpi = captureFailed
+    ? unknownKpi("hangs", "capture_unavailable", { n: tally.valid, detail: "no primary capture source" })
+    : tally.valid >= minValid
+      ? measureKpi("hangs", { value: hangs, n: tally.valid })
+      : unknownKpi("hangs", exclusionReason(tally.valid, excludedCount, minValid), { n: tally.valid });
+  const vs = frames.map((f) => f.v).sort((a, b) => a - b);
+  const v50 = vs.length > 0 ? percentile(vs, 50) : null;
+  const processSummary = (acc) => {
+    const noneWhole = acc.samples > 0 && acc.empty + acc.unreadable === acc.samples;
+    const cpu = acc.cpu.length === 0 && noneWhole
+      ? unknownKpi("cpu_pct", "harness_error", { n: 0, detail: `no sample of ${acc.samples} was readable whole (${acc.empty} empty, ${acc.unreadable} with unreadable members)` })
+      : measureKpi("cpu_pct", acc.cpu);
+    return {
+      cpu_pct: cpu,
+      gpu_pct: unknownKpi("gpu_pct", "gpu_counters_unavailable", { n: 0 }),
+      memory_mb_end: acc.memEnd,
+      samples: acc.samples,
+      samples_empty: acc.empty,
+      samples_unreadable: acc.unreadable,
+    };
+  };
+  return {
+    t_start_ns: String(t0),
+    t_end_ns: String(t1),
+    primary,
+    secondary: null,
+    refresh_ms: refreshMs,
+    refresh_assumed: refreshAssumed,
+    frames: { [primary]: frames.length },
+    frame_interval_ms: gate("frame_interval_ms", false, measureKpi("frame_interval_ms", deltas)),
+    jank_share: gate("jank_share", true, measureKpi("jank_share", share(deltas, (d) => d > 2 * refreshMs, { minN: 100 }))),
+    v_actual_max: vs.length > 0 ? vs[vs.length - 1] : null,
+    v_actual_p50: v50 && v50.state === "measured" ? v50.value : vs.length > 0 ? vs[0] : null,
+    sessions_seen: [...new Set(frames.flatMap((f) => f.markers.filter((m) => m.kind === "output").map((m) => m.session)))].sort((a, b) => a - b),
+    intervals_total: intervals.length,
+    intervals_valid: tally.valid,
+    intervals_excluded_occluded: tally.occluded,
+    intervals_excluded_operator_activity: tally.operator,
+    intervals_excluded_harness_error: tally.harness,
+    hangs: hangsKpi,
+    hang_episodes_excluded: 0,
+    emitted_markers: counted + excludedMarkers,
+    output_latency_ms: gate("output_latency_ms", false, output),
+    echo_latency_ms: unknownKpi("output_latency_ms", "insufficient_samples", { n: 0 }),
+    input_latency_ms: unknownKpi("input_latency_ms", "not_instrumented", { n: 0, detail: "watch receives no injection times" }),
+    marker_loss: gate("marker_loss", true, shareKpi("marker_loss", lost, counted)),
+    marker_skipped: gate("marker_skipped", true, shareKpi("marker_skipped", 0, counted)),
+    crosscheck: { verdict: crosscheck, compared: 0, agreed: 0, disagreed: 0, detail: crosscheck === "disagree" ? "3 of 40 markers disagreed" : "n/a" },
+    negative_latencies: 0,
+    crashes,
+    processes: Object.fromEntries(Object.entries(groupAcc).map(([name, acc]) => [name, processSummary(acc)])),
+    probe: {
+      frames: frames.length,
+      scan_ms_p50: frames.length ? 0.4 : null,
+      scan_ms_max: frames.length ? 0.4 : null,
+      lag_ms_p50: frames.length ? (behind ? 250 : 2) : null,
+      lag_ms_judged: frames.length ? (behind ? 250 : 2) : null,
+      lag_ms_max: frames.length ? (behind ? 250 : 2) : null,
+      lag_bound_ms: 100,
+      behind,
+    },
+  };
 }
 
 /** Doctor capabilities with everything OPERATIVE unless overridden. */

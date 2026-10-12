@@ -190,6 +190,25 @@ test("only the runner's rows leave the job: the artifact and the summary come fr
   for (const inv of cliInvocations(job).filter((t) => /cli\.mjs report "\$results"/.test(t))) assert.match(inv, /--format json/);
 });
 
+test("the benchmark runs on its own scope: a PR touching the bench, schedule and dispatch — never push", () => {
+  const yml = readFileSync(WORKFLOW, "utf8");
+  const run = jobText(yml, "run-linux-xvfb").join("\n");
+  assert.match(run, /^ {4}needs: bench-scope$/m);
+  assert.match(run, /^ {4}if: needs\.bench-scope\.outputs\.run == 'true'$/m);
+  const scope = jobText(yml, "bench-scope").join("\n");
+  assert.match(scope, /schedule\|workflow_dispatch\) run=true ;;/);
+  assert.match(scope, /\*\) run=false ;;/, "push (and anything else) does not run it");
+  const pattern = /grep -qE '([^']+)'/.exec(scope);
+  assert.ok(pattern, "the PR scope is a path pattern");
+  const re = new RegExp(pattern[1]);
+  for (const p of ["scripts/termhost-bench/run.mjs", "crates/termhost-probe/src/watch.rs", "scripts/lib/runner-clients.mjs", ".github/workflows/termhost-bench.yml"]) {
+    assert.ok(re.test(p), `${p} is in the plan's smoke scope`);
+  }
+  for (const p of ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml", "src-tauri/src/main.rs", ".github/actions/checkout-sibling/action.yml"]) {
+    assert.ok(!re.test(p), `${p} rebuilds the probe but does not run the benchmark`);
+  }
+});
+
 test("the job builds the baseline only when there is one, and the smoke is N = 1, one run, head only", () => {
   const yml = readFileSync(WORKFLOW, "utf8");
   const job = jobText(yml, "run-linux-xvfb").join("\n");

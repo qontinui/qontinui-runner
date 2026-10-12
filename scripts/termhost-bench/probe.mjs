@@ -10,26 +10,32 @@
  *   - Every MEASURING `watch` runs with `--run-dir <gen-dir>`: the generators'
  *     `gen-<k>.jsonl` (emitted markers) and `slot-<k>` files (which fix workload
  *     membership for the whole run — generator pid -> parent pid = session shell)
- *     live there, and on Linux `inject` records the keys it is about to send in
- *     `<gen-dir>/inject.jsonl`, which `watch` matches to tell the probe's own keys
- *     from an operator's. So the input phase's `watch` and `inject` share it.
+ *     live there, and `inject` announces each key it is about to send in
+ *     `<gen-dir>/inject.jsonl`, which `watch` reads to tell the probe's own keys
+ *     from an operator's. So the input phase's `watch` and `inject` share the
+ *     directory, and on Windows a `--tag` too.
  *   - Every measuring `watch` is given the host's root PIDs (`--host-pid`,
  *     repeatable) and the generators' run id (`--run-id`): without live roots the
- *     host group is unknown, never 0.
+ *     probe samples no host group at all, so the host KPIs are unknown, never 0.
  *   - A `watch` ends when its stdin closes (`--stdin-stop`), never through the stop
  *     file — `<gen-dir>/stop` also stops the generators.
- *   - `probe.jsonl` is APPENDED by every watch in the same directory, so a phase's
- *     records are the file's bytes from the offset taken just before that watch
- *     started.
+ *   - The probe writes one run per file: `watch` refuses a `probe.jsonl` that
+ *     already holds records, and `inject` an `inject.jsonl` (`records.rs`
+ *     `FileMode::New`). The generators keep running across a unit's phases, so
+ *     the phases share the gen dir, and each phase's file is set aside — renamed
+ *     to `probe-<label>.jsonl` / `inject-<label>.jsonl` — once the process that
+ *     wrote it has exited, before the next one starts.
  *   - A short "look" (`watch --duration-ms`, frames on change, no process sampler)
  *     in its own scratch directory answers "which sessions are visible, where" for
- *     zone resolution and arrangement checks.
+ *     zone resolution and arrangement checks; an activation (`inject --count 0
+ *     --activate`) gets its own directory too.
  *
  * Every process here is started with an argv array, never a shell string.
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -88,11 +94,13 @@ export function watchArgs(o) {
 }
 
 /**
- * argv for `inject` (D9). Keys are letters only (`--count`), so no injected key is
- * Ctrl+C or anything a shell would act on.
+ * argv for `inject` (D9). Keys are letters only (`--count`: a-z, repeating), so no
+ * injected key is Ctrl+C or anything a shell would act on. `inject` first waits
+ * `--quiet-ms` (default 2000) for a desktop nobody is using.
  *
  * @param {{runDir: string, target: object, count: number, intervalMs?: number,
- *   startDelayMs?: number, settleMs?: number, activate?: boolean, tag?: string}} o
+ *   startDelayMs?: number, settleMs?: number, activate?: boolean, tag?: string,
+ *   quietMs?: number}} o
  */
 export function injectArgs(o) {
   if (!Number.isInteger(o.count) || o.count < 0) throw new RangeError(`inject count must be >= 0, got ${o.count}`);
@@ -102,6 +110,7 @@ export function injectArgs(o) {
   if (o.settleMs !== undefined) args.push("--settle-ms", String(o.settleMs));
   if (o.activate) args.push("--activate");
   if (o.tag) args.push("--tag", o.tag);
+  if (o.quietMs !== undefined) args.push("--quiet-ms", String(o.quietMs));
   return args;
 }
 
@@ -123,6 +132,47 @@ export function readRecordsFrom(path, offset = 0) {
     return { records: [], malformed: 0, partial: false };
   }
   return parseJsonl(buf.subarray(Math.min(offset, buf.length)).toString("utf8"));
+}
+
+const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
+
+/**
+ * Set a finished run's file aside: `<runDir>/<name>.jsonl` becomes
+ * `<runDir>/<name>-<label>.jsonl` (with a counter if that exists), so the next
+ * `watch` or `inject` in the directory starts on no file. Call it only after the
+ * process that wrote the file has exited.
+ *
+ * @returns {string | null} the new path, or null when there was no file
+ */
+export function setAside(runDir, name, label) {
+  if (!LABEL.test(label)) throw new RangeError(`bad run-file label ${JSON.stringify(label)}`);
+  const src = join(runDir, `${name}.jsonl`);
+  if (!existsSync(src)) return null;
+  let dst = join(runDir, `${name}-${label}.jsonl`);
+  for (let i = 1; existsSync(dst); i += 1) dst = join(runDir, `${name}-${label}-${i}.jsonl`);
+  renameSync(src, dst);
+  return dst;
+}
+
+/**
+ * Read a finished run's file and set it aside.
+ *
+ * @returns {{records: object[], path: string | null, error?: string}}
+ */
+export function takeRunFile(runDir, name, label) {
+  const { records } = readRecordsFrom(join(runDir, `${name}.jsonl`));
+  try {
+    return { records, path: setAside(runDir, name, label) };
+  } catch (e) {
+    return { records, path: null, error: `could not set ${name}.jsonl aside: ${e.message}` };
+  }
+}
+
+/** A fresh injection tag (0x-hex; never 0, which an untagged injection carries). */
+export function freshTag(random = () => randomBytes(4).readUInt32BE(0)) {
+  let t = 0;
+  while (t === 0) t = random() >>> 0;
+  return `0x${t.toString(16).padStart(8, "0")}`;
 }
 
 /**
@@ -155,18 +205,24 @@ export function probeDoctor({ probe, node = process.execPath, env = process.env,
 
 /**
  * A running measuring `watch`. Start it, run the phase, `stop()` it: stdin closes
- * (`--stdin-stop`), the probe writes its summary and exits, and the records the
- * phase produced are read back from `probe.jsonl`.
+ * (`--stdin-stop`), the probe writes its summary and exits, and the phase's
+ * records are read back from `<runDir>/probe.jsonl`, which is then set aside as
+ * `probe-<label>.jsonl` so the next phase's watch starts on no file.
  */
 export class WatchProcess {
   /**
-   * @param {{probe: string, args: string[], probeJsonl: string, env?: object,
+   * @param {{probe: string, args: string[], runDir: string, label: string, env?: object,
    *   spawnFn?: typeof spawn, log?: (s: string) => void}} o
    */
-  constructor({ probe, args, probeJsonl, env = process.env, spawnFn = spawn, log = () => {} }) {
+  constructor({ probe, args, runDir, label, env = process.env, spawnFn = spawn, log = () => {} }) {
     if (!args.includes("--stdin-stop")) throw new Error("a WatchProcess must run with --stdin-stop");
-    this.probeJsonl = probeJsonl;
-    this.offset = fileSize(probeJsonl);
+    if (!LABEL.test(label ?? "")) throw new RangeError(`bad watch label ${JSON.stringify(label)}`);
+    this.runDir = runDir;
+    this.label = label;
+    this.probeJsonl = join(runDir, "probe.jsonl");
+    if (fileSize(this.probeJsonl) > 0) {
+      throw new Error(`${this.probeJsonl} already holds a run's records: the previous watch's file was not set aside`);
+    }
     this.log = log;
     this.stdout = "";
     this.stderr = "";
@@ -196,16 +252,17 @@ export class WatchProcess {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (this.exit) return false;
-      if (readRecordsFrom(this.probeJsonl, this.offset).records.some((r) => r?.type === "start")) return true;
+      if (readRecordsFrom(this.probeJsonl).records.some((r) => r?.type === "start")) return true;
       await sleepFn(100);
     }
     return false;
   }
 
   /**
-   * End the watch and collect its records.
+   * End the watch, collect its records and set its file aside.
    *
-   * @returns {Promise<{records: object[], exit: object, stderr: string, timedOut: boolean}>}
+   * @returns {Promise<{records: object[], exit: object, stderr: string, timedOut: boolean,
+   *   path: string | null, error?: string}>}
    */
   async stop({ timeoutMs = 20000 } = {}) {
     try {
@@ -222,8 +279,16 @@ export class WatchProcess {
       this.child.kill("SIGTERM");
       await Promise.race([this.exited, new Promise((r) => setTimeout(r, 5000))]);
     }
-    const { records } = readRecordsFrom(this.probeJsonl, this.offset);
-    return { records, exit: this.exit, stderr: this.stderr, timedOut };
+    const taken = takeRunFile(this.runDir, "probe", this.label);
+    if (taken.error) this.log(`watch pid ${this.pid}: ${taken.error}`);
+    return {
+      records: taken.records,
+      exit: this.exit,
+      stderr: this.stderr,
+      timedOut,
+      path: taken.path,
+      ...(taken.error ? { error: taken.error } : {}),
+    };
   }
 }
 
@@ -277,7 +342,8 @@ export async function look({ probe, lookDir, target, durationMs = 2500, env = pr
 export function summarizeLook(records, res = { code: 0, stderr: "" }) {
   const captures = records.filter((r) => r?.type === "capture");
   const opened = captures.filter((c) => c.state === "started").map((c) => c.source);
-  const primary = opened[0] ?? null;
+  // Desktop Duplication is the cross-check, never the primary source (Phase 2 S6).
+  const primary = opened.find((s) => s !== "dda") ?? null;
   const sessions = new Map();
   let frames = 0;
   for (const f of records) {
@@ -310,7 +376,10 @@ export function summarizeLook(records, res = { code: 0, stderr: "" }) {
 
 /**
  * Make the measured window foreground without typing anything: `inject --count 0
- * --activate` (D9 still applies — the probe refuses when real input is heard).
+ * --activate`, in a directory of its own (`inject` writes one run per file). D9
+ * still applies: after the quiet period the probe refuses when real input is
+ * heard. A failed activation is not an exit status — `inject` records it as an
+ * incident and completes — so the records are read back.
  *
  * @returns {Promise<{ok: boolean, detail: string}>}
  */
@@ -318,10 +387,19 @@ export async function activate({ probe, runDir, target, env = process.env, run =
   if (target?.pid === undefined && target?.hwnd === undefined) {
     return { ok: false, detail: "activation needs a pid or hwnd target" };
   }
+  mkdirSync(runDir, { recursive: true });
   const args = injectArgs({ runDir, target, count: 0, settleMs: 0, activate: true });
   const res = await run({ probe, args, env, timeoutMs: 30000 });
+  const { records } = readRecordsFrom(join(runDir, "inject.jsonl"));
+  const failed = records.find((r) => r?.type === "incident" && /--activate/.test(String(r.detail ?? "")));
+  const abort = records.find((r) => r?.type === "inject_abort");
+  if (res.code === 0 && !failed) return { ok: true, detail: "target activated" };
   return {
-    ok: res.code === 0,
-    detail: res.code === 0 ? "target activated" : `inject --activate exited ${res.code}: ${`${res.stdout}${res.stderr}`.slice(-400)}`,
+    ok: false,
+    detail: failed
+      ? String(failed.detail)
+      : abort
+        ? `inject --activate refused (${abort.reason}): ${abort.detail}`
+        : `inject --activate exited ${res.code}: ${`${res.stdout}${res.stderr}`.slice(-400)}`,
   };
 }

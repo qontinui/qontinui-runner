@@ -157,15 +157,28 @@ export class FakeAdapter {
   }
 }
 
-/** A fake probe driver over the fake adapters' sessions. */
+/**
+ * A fake probe driver over the fake adapters' sessions. Like the real one it
+ * allows one run per file: a second `watch` while one is open in the same run
+ * directory throws, as the real `WatchProcess` would on an unset-aside
+ * `probe.jsonl`. Every watch's label is kept in `labels` (by run directory).
+ */
 export function fakeProbe({ clock, current }) {
+  const open = new Set();
+  const labels = new Map();
   return {
     path: "fake-probe",
+    labels,
     startWatch(o) {
+      if (open.has(o.runDir)) throw new Error(`${o.runDir}/probe.jsonl already holds a run's records`);
+      if (!o.label) throw new Error("a watch needs a label (its run file is set aside under it)");
+      open.add(o.runDir);
+      labels.set(o.runDir, [...(labels.get(o.runDir) ?? []), o.label]);
       const t0 = clock.now();
       return {
         ready: async () => true,
         stop: async () => {
+          open.delete(o.runDir);
           const t1 = clock.now();
           const adapter = current();
           const slots = readSlots(o.runDir);
@@ -185,8 +198,7 @@ export function fakeProbe({ clock, current }) {
     inject: async () => ({ code: 0, stdout: "", stderr: "" }),
     look: async () => ({ ok: true, sessions: new Map(current().visible().map((k) => [k, { x: 0, y: 0, w: 160, h: 16 }])), frames: 5, detail: "fake look" }),
     activate: async () => ({ ok: true, detail: "fake" }),
-    readInject: () => [],
-    injectOffset: () => 0,
+    takeInject: () => ({ records: [], path: null }),
   };
 }
 

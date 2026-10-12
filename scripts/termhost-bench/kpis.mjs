@@ -1,35 +1,50 @@
 /**
- * termhost-bench KPI computation: the probe's records (`<gen-dir>/probe.jsonl`,
- * Phase 2's `termhost-probe/v1`) and the generators' records (`gen-<k>.jsonl`,
- * Phase 1's `termhost-bench/gen/v1`) in, one catalog value per KPI out — every
- * number through `stats.mjs`, so a statistic below its minimum sample count is
- * `unknown`, never a plausible-looking 0, and every unknown carries its reason.
+ * termhost-bench KPI computation: the probe's records (one `probe.jsonl` per
+ * `watch`, Phase 2's `termhost-probe/v1`) and the generators' records
+ * (`gen-<k>.jsonl`, Phase 1's `termhost-bench/gen/v1`) in, one catalog value per
+ * KPI out. A statistic below its minimum sample count is `unknown`, never a
+ * plausible-looking 0, and every unknown carries its reason.
  *
  * Plan `2026-10-11-terminal-page-performance-kpis-across-setups`, Phase 3 ("compute
  * KPIs from probe.jsonl plus the generator logs with stats.mjs"). Pure: no files,
  * clocks or processes — the run loop reads the records and hands them over, and the
  * tests feed fixtures.
  *
- * Why the harness recomputes rather than copying the probe's own `summary`: the
- * summary covers the whole `watch`, while a KPI covers exactly its measurement
- * window, and the generators' records span their whole life (markers emitted before
- * the window, echo markers re-drawn from an earlier input phase). Every KPI here is
- * restricted to the window `[summary.t_start_ns, summary.t_end_ns]` of the watch
- * that measured it. The rules are the probe's (`crates/termhost-probe/src/model/`):
- * nearest-rank statistics, first appearance on the PRIMARY source, the
- * loss-versus-coalescing split at two refresh intervals, interval exclusion.
+ * Who computes what. Every phase is its own `watch` with its own run file, so a
+ * watch's `summary` covers exactly that phase's window:
+ *   - The capture KPIs of the soak — output_latency_ms, frame_interval_ms,
+ *     jank_share, hangs, marker_loss, marker_skipped — are the soak watch's
+ *     summary values, taken as they are. They are catalog values already (the
+ *     probe's `stats.rs` copies the catalog's units and minimums, and a probe test
+ *     fails on drift), and the probe owns the rules behind them. Those rules are
+ *     first appearance on the PRIMARY source, the loss-versus-coalescing split,
+ *     interval exclusion with amended verdicts, markers before the first frame
+ *     left out, a blocked generator pending by its schedule, a hang still open at
+ *     the end counted, and a lagging probe or an assumed refresh rate making what
+ *     they could distort unknown. Re-deriving those rules here would be a second
+ *     implementation drifting from the first. Per-host CPU and GPU come from the
+ *     same summary's process groups.
+ *   - The harness gates them with what the probe cannot know: whether the arm put
+ *     the expected number of sessions on screen (V, D4), whether the arm could be
+ *     arranged at all, and the doctor's clock verdict.
+ *   - The harness computes what only it can see: keystroke-to-echo latency (the
+ *     probe's is not_instrumented; inject.jsonl's t_inject joined with the echo
+ *     markers' first appearance), switch and spawn latency (from commands the
+ *     harness timed), the generators' own stall and delivery counters, memory, its
+ *     growth, crashes and CPU per MB from the samples, and the ladder KPIs
+ *     (results.mjs).
  *
  * Phases a row is computed from:
- *   soak    one `watch` over the steady state — latency, cadence, loss, hangs,
- *           process accounting (host / workload / compositor groups);
+ *   soak    one `watch` over the steady state — capture KPIs and process accounting
+ *           (host / workload / compositor groups);
  *   input   a `watch` beside an `inject` — keystroke-to-echo latency (D9);
  *   switch  a `watch` while the adapter shows session after session (focus arm);
  *   spawn   a `watch` while the adapter adds and closes sessions.
  */
 
-import { KPI_CATALOG, getKpi } from "./kpi-catalog.mjs";
+import { KPI_CATALOG, REASON_CODES, getKpi, minSamplesForStatistic } from "./kpi-catalog.mjs";
 import { SEQ_MODULUS } from "./marker.mjs";
-import { measureKpi, notApplicableKpi, percentile, share, slope, unknownKpi } from "./stats.mjs";
+import { measureKpi, notApplicableKpi, slope, unknownKpi } from "./stats.mjs";
 
 const NS_PER_MS = 1_000_000n;
 const MIB = 1024 * 1024;
@@ -76,9 +91,18 @@ export function nsToMs(ns) {
   return Number(ns) / 1e6;
 }
 
+/** The last record per key, in the order keys first appeared. */
+function lastBy(records, key) {
+  const m = new Map();
+  for (const r of records) m.set(key(r), r);
+  return [...m.values()];
+}
+
 /**
  * Classify one `watch`'s records (the last `start`..`end` span when several are
- * present). Records of another schema are ignored.
+ * present). Records of another schema are ignored. Late input re-emits an
+ * `interval` (and any `hang` it invalidates) with `amended: true`; the LAST record
+ * per interval index and per hang start is the verdict, so only that one is kept.
  *
  * @param {object[]} records
  */
@@ -140,6 +164,8 @@ export function indexProbeSegment(records) {
         break;
     }
   }
+  seg.intervals = lastBy(seg.intervals, (r) => r.index);
+  seg.hangs = lastBy(seg.hangs, (r) => r.t_start_ns);
   return seg;
 }
 
@@ -163,28 +189,41 @@ export function segmentWindow(seg) {
 }
 
 /**
- * What the segment's capture looked like: the sources opened, the primary one,
- * and whether the refresh rate is KNOWN (the probe reports an assumed 60 Hz on a
- * server whose RandR names no rate — `platform/linux/x11.rs` `refresh` — which is
- * not a known refresh rate).
+ * What the segment's capture looked like: the sources opened, the primary one
+ * (only a source that opened and can be primary — Desktop Duplication is the
+ * cross-check, never the primary), and whether the refresh rate is KNOWN (the
+ * probe marks a rate it assumed with `refresh_assumed`).
  */
 export function captureInfo(seg) {
   const opened = seg.captures.filter((c) => c.state === "started").map((c) => c.source);
   const failed = seg.captures
     .filter((c) => c.state === "failed")
     .map((c) => ({ source: c.source, detail: c.detail }));
-  const primary = seg.summary?.primary ?? opened[0] ?? null;
-  const ref = seg.captures.find((c) => c.refresh_hz !== undefined) ?? null;
+  const named = seg.summary?.primary ?? opened.find((s) => s !== "dda") ?? null;
+  const primary = named !== null && named !== "dda" && opened.includes(named) ? named : null;
+  const ref = seg.captures.find((c) => c.state === "started" && c.refresh_hz !== undefined) ?? seg.captures.find((c) => c.refresh_hz !== undefined) ?? null;
   const refreshHz = typeof ref?.refresh_hz === "number" ? ref.refresh_hz : null;
   const refreshSource = typeof ref?.refresh_source === "string" ? ref.refresh_source : null;
-  // An assumed rate is not a known one, however it is spelled: a null rate, an
-  // explicit flag (the probe's planned `refresh_assumed`), or a source that says so.
-  const assumed =
-    ref?.refresh_assumed === true ||
-    ref?.refresh_known === false ||
-    (refreshSource !== null && /^assumed/i.test(refreshSource));
-  const refreshKnown = refreshHz !== null && refreshHz > 0 && refreshSource !== null && !assumed;
+  const assumed = ref?.refresh_assumed === true || seg.summary?.refresh_assumed === true;
+  const refreshKnown = refreshHz !== null && refreshHz > 0 && !assumed;
   return { opened, failed, primary, refreshHz, refreshSource, refreshKnown };
+}
+
+/**
+ * The probe's verdict on its own health over a watch: when it fell behind its
+ * source, every first appearance may be late, so latency, loss and cadence it
+ * could have distorted are unknown(harness_error) — the probe's rule
+ * (`records.rs` `ProbeHealth`), applied here to the KPIs the harness times itself.
+ *
+ * @returns {{reason: string, detail: string} | null}
+ */
+export function probeHealthGate(seg) {
+  const p = seg?.summary?.probe;
+  if (!p || p.behind !== true) return null;
+  return {
+    reason: "harness_error",
+    detail: `the probe fell behind its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged, bound ${p.lag_bound_ms ?? "?"} ms), so first appearances may be late`,
+  };
 }
 
 /**
@@ -258,56 +297,6 @@ export function primaryFrames(seg, primary, win) {
     .sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
 }
 
-/** Intervals (ms) between consecutive primary frames. */
-export function frameIntervalsMs(frames) {
-  const out = [];
-  for (let i = 1; i < frames.length; i += 1) out.push(nsToMs(frames[i].t - frames[i - 1].t));
-  return out;
-}
-
-/** Sessions whose output marker any primary frame carried. */
-export function sessionsSeen(frames) {
-  const s = new Set();
-  for (const f of frames) for (const m of f.markers ?? []) if (m.kind === "output") s.add(m.session);
-  return s;
-}
-
-/** How long a session counts as displayed after its marker was last observed. */
-export const DISPLAYED_HORIZON_MS = 500;
-
-/**
- * V measured: the median, over the window's primary frames, of the number of
- * sessions whose output marker was observed within the last
- * {@link DISPLAYED_HORIZON_MS} — the "currently displayed" state accumulated across
- * frames rather than the markers inside one frame. On X11 a "frame" is one damaged
- * band of the window, so a per-frame count under-reports V in a tiled arm whose
- * panes repaint at different times (Phase 2 review S5); every visible session
- * redraws its marker at the profile's marker rate (>= 2 Hz), so a displayed session
- * is re-observed well inside the horizon. On a full-window source (WGC) every
- * frame carries every visible marker and the two counts agree. The first horizon of
- * the window is skipped while that state fills.
- *
- * @param {{t: bigint, markers?: {kind: string, session: number}[]}[]} frames sorted by t
- * @returns {number | null}
- */
-export function vActual(frames, { horizonMs = DISPLAYED_HORIZON_MS } = {}) {
-  if (frames.length === 0) return null;
-  const horizon = BigInt(Math.round(horizonMs * 1e6));
-  const lastSeen = new Map();
-  const warm = frames[0].t + horizon;
-  const vs = [];
-  for (const f of frames) {
-    for (const m of f.markers ?? []) if (m.kind === "output") lastSeen.set(m.session, f.t);
-    if (f.t < warm) continue;
-    let v = 0;
-    for (const t of lastSeen.values()) if (f.t - t <= horizon) v += 1;
-    vs.push(v);
-  }
-  if (vs.length === 0) return lastSeen.size;
-  const r = percentile(vs, 50);
-  return r.state === "measured" ? r.value : vs[0];
-}
-
 /** First appearance (primary source) by `kind:session:seq`. */
 export function firstSeenIndex(seg, primary) {
   const idx = new Map();
@@ -318,134 +307,6 @@ export function firstSeenIndex(seg, primary) {
     if (t !== null && !idx.has(key)) idx.set(key, t);
   }
   return idx;
-}
-
-/**
- * Output latencies: for every output marker a visible session emitted inside the
- * window, its first appearance minus its emission. A first appearance BEFORE the
- * emission is impossible on a shared timebase: counted as an anomaly and excluded,
- * exactly as the probe does (`model/analysis.rs` `latencies`).
- */
-export function outputLatencies(seg, gens, visible, primary, win) {
-  const seen = firstSeenIndex(seg, primary);
-  const samples = [];
-  let negative = 0;
-  const perSession = new Map();
-  for (const session of visible) {
-    const g = gens.get(session);
-    if (!g) continue;
-    let count = 0;
-    for (const m of g.markers) {
-      if (m.kind !== "output" || m.tEmit < win.t0 || m.tEmit > win.t1) continue;
-      const t = seen.get(`output:${session}:${m.seq % SEQ_MODULUS}`);
-      if (t === undefined) continue;
-      if (t < m.tEmit) {
-        negative += 1;
-        continue;
-      }
-      samples.push(nsToMs(t - m.tEmit));
-      count += 1;
-    }
-    perSession.set(session, count);
-  }
-  return { samples, negative, perSession };
-}
-
-/**
- * The interval grid of a watch (`model/intervals.rs`): validity per 500 ms
- * interval and whether a span touched an invalid or partial one.
- */
-export function intervalModel(seg) {
-  const recs = seg.intervals
-    .map((r) => ({ ...r, a: toNs(r.t_start_ns), b: toNs(r.t_end_ns) }))
-    .filter((r) => r.a !== null && r.b !== null && Number.isInteger(r.index));
-  const full = recs.find((r) => !r.partial);
-  const lenNs = full ? full.b - full.a : 500n * NS_PER_MS;
-  const start =
-    toNs(seg.summary?.t_start_ns) ??
-    (recs.length > 0 ? recs[0].a - BigInt(recs[0].index) * lenNs : null);
-  const byIndex = new Map(recs.map((r) => [r.index, r]));
-  let valid = 0;
-  let occluded = 0;
-  let operator = 0;
-  let harness = 0;
-  for (const r of recs) {
-    if (r.partial) continue;
-    if (r.valid && !r.exclusion_class) valid += 1;
-    else if (r.exclusion_class === "occluded") occluded += 1;
-    else if (r.exclusion_class === "operator_activity") operator += 1;
-    // Any other class (the probe's planned third class for its OWN failures — a
-    // listener that never started, no window inspector) is the harness's fault,
-    // never the operator's or an occluder's (Phase 2 review S14).
-    else harness += 1;
-  }
-  const spanValid = (a, b) => {
-    if (start === null || lenNs <= 0n || b < start) return false;
-    const first = a < start ? 0n : (a - start) / lenNs;
-    const last = (b - start) / lenNs;
-    for (let i = first; i <= last; i += 1n) {
-      const r = byIndex.get(Number(i));
-      if (!r || !r.valid || r.partial) return false;
-    }
-    return true;
-  };
-  return { start, lenNs, byIndex, tally: { valid, occluded, operator, harness }, spanValid };
-}
-
-/**
- * Why too few valid units remain (`Model::exclusion_reason`, with two corrections
- * from the Phase 2 review): when no full interval was actually excluded the cause
- * is too few samples, not occlusion (S4); and the probe's own failures read as
- * `harness_error`, never as operator activity or occlusion (S14). Ties go to the
- * harness, then to the operator.
- */
-export function exclusionReason(tally, valid, excluded, minN) {
-  if (valid + excluded < minN) return "insufficient_samples";
-  const harness = tally.harness ?? 0;
-  if (tally.occluded + tally.operator + harness === 0) return "insufficient_samples";
-  if (harness > 0 && harness >= tally.operator && harness >= tally.occluded) return "harness_error";
-  return tally.operator > tally.occluded ? "operator_activity" : "occluded";
-}
-
-/**
- * Marker loss versus coalescing per visible session (`model/analysis.rs` `loss`).
- * A sequence is current from its emission until the next one's (the last until
- * the window's end); eligible when current >= 2 refresh intervals.
- */
-export function lossTally(seg, gens, visible, primary, win, refreshNs, model) {
-  const seen = firstSeenIndex(seg, primary);
-  const t = { eligible: 0, lost: 0, outOfOrder: 0, counted: 0, skipped: 0, excluded: 0 };
-  for (const session of visible) {
-    const g = gens.get(session);
-    if (!g) continue;
-    const seqs = g.markers.filter((m) => m.kind === "output" && m.tEmit >= win.t0 && m.tEmit <= win.t1);
-    const seenAt = seqs.map((m) => seen.get(`output:${session}:${m.seq % SEQ_MODULUS}`) ?? null);
-    const suffixMin = new Array(seqs.length + 1).fill(null);
-    for (let j = seqs.length - 1; j >= 0; j -= 1) {
-      const nxt = suffixMin[j + 1];
-      const s = seenAt[j];
-      suffixMin[j] = s === null ? nxt : nxt === null || s < nxt ? s : nxt;
-    }
-    for (let j = 0; j < seqs.length; j += 1) {
-      const begin = seqs[j].tEmit;
-      const end = j + 1 < seqs.length ? seqs[j + 1].tEmit : win.t1;
-      if (!model.spanValid(begin, end)) {
-        t.excluded += 1;
-        continue;
-      }
-      t.counted += 1;
-      const eligible = end - begin >= 2n * refreshNs;
-      const ooo = seenAt[j] !== null && suffixMin[j + 1] !== null && suffixMin[j + 1] < seenAt[j];
-      if (eligible) {
-        t.eligible += 1;
-        if (seenAt[j] === null || ooo) t.lost += 1;
-      } else if (seenAt[j] === null) {
-        t.skipped += 1;
-      }
-      if (ooo) t.outOfOrder += 1;
-    }
-  }
-  return t;
 }
 
 /** Is marker seq `m` (mod M) at or after the full counter `newest`? */
@@ -599,6 +460,64 @@ function stateOf(capabilities, id) {
   return capabilities?.[id]?.state ?? "UNKNOWN";
 }
 
+/** The soak KPIs the probe computes over its own window (`records.rs` `WatchSummary`). */
+export const PROBE_CAPTURE_KPIS = Object.freeze([
+  "output_latency_ms",
+  "frame_interval_ms",
+  "jank_share",
+  "hangs",
+  "marker_loss",
+  "marker_skipped",
+]);
+
+/**
+ * A KPI value the probe wrote (a summary field, or a process group's), as this
+ * catalog's value. The schema's fields are copied, the unit and reason are checked
+ * against the catalog, and a measured value under the catalog's minimum becomes
+ * unknown(insufficient_samples). Anything the catalog cannot hold is the
+ * harness's error, and the value says so; it is never passed on as a number.
+ *
+ * @param {string} id catalog id
+ * @param {object | undefined} v the probe's value
+ * @param {{what?: string}} [o] how to name the value in a detail
+ */
+export function fromProbe(id, v, { what = `the probe's ${id}` } = {}) {
+  const k = getKpi(id);
+  if (!v || typeof v !== "object" || !["measured", "unknown", "not_applicable"].includes(v.state)) {
+    return unknownKpi(id, "harness_error", { detail: `${what} is missing` });
+  }
+  if (v.unit !== k.unit) {
+    return unknownKpi(id, "harness_error", { detail: `${what} is in "${v.unit}", the catalog's ${id} in "${k.unit}"` });
+  }
+  const n = Number.isInteger(v.n) && v.n >= 0 ? v.n : 0;
+  if (v.state !== "measured") {
+    if (!Object.hasOwn(REASON_CODES, v.reason)) {
+      return unknownKpi(id, "harness_error", { n, detail: `${what} gave the reason "${v.reason}", which the catalog does not define` });
+    }
+    const detail = v.detail ? String(v.detail) : undefined;
+    return v.state === "unknown" ? unknownKpi(id, v.reason, { n, detail }) : notApplicableKpi(id, v.reason, { detail });
+  }
+  const minN = Math.max(k.min_n, ...k.statistics.map(minSamplesForStatistic));
+  if (n < minN) {
+    return unknownKpi(id, "insufficient_samples", { n, detail: `${what} was measured over ${n} samples; the catalog needs ${minN}` });
+  }
+  if (k.shape === "value") {
+    if (typeof v.value !== "number" || !Number.isFinite(v.value)) {
+      return unknownKpi(id, "harness_error", { n, detail: `${what} is measured without a finite value` });
+    }
+    return measureKpi(id, { value: v.value, n });
+  }
+  const stats = {};
+  for (const s of k.statistics) {
+    const x = v.stats?.[s];
+    if (typeof x !== "number" || !Number.isFinite(x)) {
+      return unknownKpi(id, "harness_error", { n, detail: `${what} is measured without its ${s}` });
+    }
+    stats[s] = x;
+  }
+  return { state: "measured", unit: k.unit, n, stats };
+}
+
 /**
  * Compute one row's KPIs.
  *
@@ -630,131 +549,76 @@ export function computeRowKpis(p) {
   const clockOk = stateOf(p.capabilities, "clock.aligned") === "OPERATIVE";
 
   // --- the capture gate --------------------------------------------------
-  let frames = [];
-  let va = null;
-  let visible = new Set();
+  // The soak watch's summary is the probe's verdict over exactly this window.
+  // The harness decides only whether the arm put the right sessions on screen
+  // (V, D4), whether the arm could be arranged, and whether the clock holds.
+  const summary = seg?.summary ?? null;
+  const va = Number.isInteger(summary?.v_actual_p50) ? summary.v_actual_p50 : null;
+  const visible = new Set(Array.isArray(summary?.sessions_seen) ? summary.sessions_seen.filter(Number.isInteger) : []);
+  const primaryFrameCount = cap?.primary ? Number(summary?.frames?.[cap.primary] ?? 0) : 0;
   let captureGate = null;
-  if (!seg || !win) {
-    captureGate = { reason: "harness_error", detail: "no complete soak watch segment was recorded" };
-  } else if (!cap.primary || cap.opened.length === 0) {
+  if (!seg || !win || !summary) {
+    captureGate = {
+      reason: "harness_error",
+      detail: seg?.end
+        ? `the soak watch ended (${seg.end.reason ?? "?"}, exit ${seg.end.exit_code ?? "?"}) without writing its summary`
+        : "no complete soak watch segment was recorded",
+    };
+  } else if (!cap.primary) {
     captureGate = {
       reason: "capture_unavailable",
       detail:
         cap.failed.length > 0
-          ? `no capture source opened: ${cap.failed.map((f) => `${f.source}: ${f.detail}`).join("; ")}`
-          : "no capture source opened",
+          ? `no primary capture source opened: ${cap.failed.map((f) => `${f.source}: ${f.detail}`).join("; ")}`
+          : "no primary capture source opened",
     };
-  } else {
-    frames = primaryFrames(seg, cap.primary, win);
-    va = vActual(frames);
-    visible = sessionsSeen(frames);
-    if (p.armFailure) {
-      captureGate = p.armFailure;
-    } else if (frames.length === 0) {
-      captureGate = { reason: "sessions_not_rendered", detail: "the window produced no captured frame in the soak" };
-    } else if (p.arm === "focus" ? va !== 1 : va < p.vTarget) {
-      captureGate = {
-        reason: p.arm === "focus" && p.setupId === "runner" && va > 1 ? "zone_unresolved" : "sessions_not_rendered",
-        detail: `V measured ${va} per frame (median), the ${p.arm} arm needs ${p.arm === "focus" ? "exactly 1" : `>= ${p.vTarget}`}; sessions seen: ${[...visible].sort((a, b) => a - b).join(",") || "none"}`,
-      };
-    }
+  } else if (p.armFailure) {
+    captureGate = p.armFailure;
+  } else if (primaryFrameCount === 0 || va === null) {
+    captureGate = { reason: "sessions_not_rendered", detail: "the window produced no captured frame in the soak" };
+  } else if (p.arm === "focus" ? va !== 1 : va < p.vTarget) {
+    captureGate = {
+      reason: p.arm === "focus" && p.setupId === "runner" && va > 1 ? "zone_unresolved" : "sessions_not_rendered",
+      detail: `V measured ${va} (the median number of sessions displayed), the ${p.arm} arm needs ${p.arm === "focus" ? "exactly 1" : `>= ${p.vTarget}`}; sessions seen: ${[...visible].sort((a, b) => a - b).join(",") || "none"}`,
+    };
   }
   const gated = (id) => captureGate && CAPTURE_KPIS.includes(id);
   const gateValue = (id) => unknownKpi(id, captureGate.reason, { detail: captureGate.detail });
-  const disagreement =
-    seg && (seg.summary?.crosscheck?.verdict === "disagree" || seg.crosschecks.length > 0)
-      ? seg.summary?.crosscheck?.detail ?? `${seg.crosschecks.length} cross-check disagreement(s)`
-      : null;
 
-  // --- output latency -------------------------------------------------------
-  if (gated("output_latency_ms")) set("output_latency_ms", gateValue("output_latency_ms"));
-  else if (!clockOk) {
-    set(
-      "output_latency_ms",
-      unknownKpi("output_latency_ms", "clock_unaligned", {
-        detail: `clock.aligned is ${stateOf(p.capabilities, "clock.aligned")}: ${p.capabilities?.["clock.aligned"]?.reason ?? "no doctor verdict"}`,
-      }),
-    );
-  } else if (disagreement) {
-    set("output_latency_ms", unknownKpi("output_latency_ms", "capture_disagreement", { detail: disagreement }));
-  } else {
-    const lat = outputLatencies(seg, p.gens, visible, cap.primary, win);
-    if (lat.negative > 0) notes.push(`output_latency_ms: ${lat.negative} first appearance(s) before emission excluded`);
-    const observed = [...lat.perSession.values()].filter((c) => c > 0).length;
-    set(
-      "output_latency_ms",
-      measureKpi("output_latency_ms", lat.samples, {
-        coverage: { observed, expected: Math.max(p.vTarget, visible.size, observed) },
-      }),
-    );
-  }
-
-  // --- frame cadence and jank ----------------------------------------------
-  const intervals = frameIntervalsMs(frames);
-  if (gated("frame_interval_ms")) set("frame_interval_ms", gateValue("frame_interval_ms"));
-  else set("frame_interval_ms", measureKpi("frame_interval_ms", intervals));
-  if (gated("jank_share")) set("jank_share", gateValue("jank_share"));
-  else if (!cap.refreshKnown) {
-    set(
-      "jank_share",
-      unknownKpi("jank_share", "refresh_rate_unknown", {
-        n: intervals.length,
-        detail: `refresh ${cap.refreshHz ?? "?"} Hz from "${cap.refreshSource ?? "nothing"}" is not a measured rate`,
-      }),
-    );
-  } else {
-    const refreshMs = 1000 / cap.refreshHz;
-    set("jank_share", measureKpi("jank_share", share(intervals, (d) => d > 2 * refreshMs, { minN: 100 })));
-  }
-
-  // --- hangs, marker loss and coalescing (interval exclusion) --------------
-  const model = seg ? intervalModel(seg) : null;
-  if (gated("hangs")) set("hangs", gateValue("hangs"));
-  else {
-    const fullTotal = model.tally.valid + model.tally.occluded + model.tally.operator + model.tally.harness;
-    const minN = getKpi("hangs").min_n;
-    if (model.tally.valid >= minN) {
-      const count = seg.hangs.filter((h) => h.valid === true).length;
-      const excluded = seg.hangs.length - count;
-      set(
-        "hangs",
-        measureKpi("hangs", { value: count, n: model.tally.valid }, excluded > 0 ? { notes: [`${excluded} hang episode(s) excluded: they touched an invalid interval`] } : {}),
-      );
-    } else {
-      set(
-        "hangs",
-        unknownKpi("hangs", exclusionReason(model.tally, model.tally.valid, fullTotal - model.tally.valid, minN), {
-          n: model.tally.valid,
-          detail: `${model.tally.valid} valid of ${fullTotal} intervals (need ${minN}); excluded ${model.tally.occluded} occluded-class, ${model.tally.operator} operator-activity, ${model.tally.harness} probe-failure`,
-        }),
-      );
-    }
-  }
-  for (const id of ["marker_loss", "marker_skipped"]) {
+  // --- the probe's capture KPIs -------------------------------------------
+  for (const id of PROBE_CAPTURE_KPIS) {
     if (gated(id)) {
       set(id, gateValue(id));
-      continue;
-    }
-    if (!cap.refreshKnown) {
-      set(id, unknownKpi(id, "refresh_rate_unknown", { detail: `refresh source "${cap.refreshSource ?? "nothing"}"` }));
-      continue;
-    }
-    const refreshNs = BigInt(Math.round(1e9 / cap.refreshHz));
-    const t = lossTally(seg, p.gens, visible, cap.primary, win, refreshNs, model);
-    const minN = getKpi(id).min_n;
-    const [hits, denom] = id === "marker_loss" ? [t.lost, t.eligible] : [t.skipped, t.counted];
-    if (denom >= minN) {
-      const extra = id === "marker_loss" && t.outOfOrder > 0 ? { notes: [`${t.outOfOrder} sequence(s) observed out of order`] } : {};
-      set(id, measureKpi(id, { value: (hits / denom) * 100, n: denom }, extra));
-    } else {
+    } else if (id === "output_latency_ms" && !clockOk) {
       set(
         id,
-        unknownKpi(id, exclusionReason(model.tally, denom, t.excluded, minN), {
-          n: denom,
-          detail: `${denom} countable sequences, ${t.excluded} excluded by invalid intervals`,
+        unknownKpi(id, "clock_unaligned", {
+          detail: `clock.aligned is ${stateOf(p.capabilities, "clock.aligned")}: ${p.capabilities?.["clock.aligned"]?.reason ?? "no doctor verdict"}`,
         }),
       );
+    } else {
+      set(id, fromProbe(id, summary[id], { what: `the soak watch's ${id}` }));
     }
+  }
+  if (kpis.output_latency_ms.state === "measured") {
+    // Which displayed sessions contributed: a session whose output marker never
+    // first-appeared in the window gave no latency sample.
+    const observed = new Set(
+      seg.firstSeen
+        .filter((fs) => fs.source === cap.primary && fs.kind === "output" && visible.has(fs.session))
+        .filter((fs) => {
+          const t = toNs(fs.t_ns);
+          return t !== null && t >= win.t0 && t <= win.t1;
+        })
+        .map((fs) => fs.session),
+    ).size;
+    kpis.output_latency_ms.coverage = { observed, expected: Math.max(p.vTarget, visible.size, observed) };
+  }
+  if (Number(summary?.negative_latencies) > 0) {
+    notes.push(`output_latency_ms: ${summary.negative_latencies} first appearance(s) before their emission excluded by the probe`);
+  }
+  if (kpis.hangs.state === "measured" && Number(summary?.hang_episodes_excluded) > 0) {
+    notes.push(`hangs: ${summary.hang_episodes_excluded} hang episode(s) excluded: they touched an invalid interval`);
   }
 
   // --- process accounting -------------------------------------------------
@@ -780,14 +644,27 @@ export function computeRowKpis(p) {
       set("delivered_ratio", unknownKpi("delivered_ratio", "insufficient_samples", { n: 0, detail: "no session scheduled bytes in the window" }));
     }
     // cpu_ms_per_mb needs the window's bytes; computed here once both are known.
-    const cpuMs = seg ? groupSeries(seg, "host", "cpu_ms") : [];
+    // It is a SUM of the host's CPU time over the window's sample intervals (the
+    // first sample has no interval: dt_ms null), so one withheld sample — no live
+    // process, or a member unreadable — leaves a sum that is not the host's.
+    const intervalsSampled = seg ? seg.samples.filter((s) => s.dt_ms !== null && s.dt_ms !== undefined && s.groups?.host) : [];
+    const cpuMs = intervalsSampled.map((s) => s.groups.host.cpu_ms);
+    const withheld = cpuMs.filter((v) => !(typeof v === "number" && Number.isFinite(v))).length;
     const mb = gw.bytes / MIB;
     if (cpuMs.length < getKpi("cpu_ms_per_mb").min_n) {
       set("cpu_ms_per_mb", unknownKpi("cpu_ms_per_mb", "insufficient_samples", { n: cpuMs.length }));
+    } else if (withheld > 0) {
+      set(
+        "cpu_ms_per_mb",
+        unknownKpi("cpu_ms_per_mb", "harness_error", {
+          n: cpuMs.length - withheld,
+          detail: `${withheld} of ${cpuMs.length} host samples withheld their CPU time (no live process or an unreadable member), so a sum over the rest is not the host's`,
+        }),
+      );
     } else if (!(mb > 0)) {
       set("cpu_ms_per_mb", unknownKpi("cpu_ms_per_mb", "degenerate_input", { n: cpuMs.length, detail: "the generators wrote no bytes in the window" }));
     } else {
-      const total = cpuMs.reduce((a, s) => a + s.v, 0);
+      const total = cpuMs.reduce((a, v) => a + v, 0);
       set("cpu_ms_per_mb", measureKpi("cpu_ms_per_mb", { value: total / mb, n: cpuMs.length }));
     }
   }
@@ -838,30 +715,66 @@ export function attachNotes(kpis, notes) {
   return rest;
 }
 
+/**
+ * Why a process group's values were withheld in some samples: the probe reports
+ * `null` with a note (`no_live_process`, `unreadable_members`) rather than a
+ * partial sum (Phase 2 review M2).
+ */
+function withheldCounts(seg, group) {
+  let present = 0;
+  let empty = 0;
+  let unreadable = 0;
+  for (const s of seg.samples) {
+    const g = s.groups?.[group];
+    if (!g) continue;
+    present += 1;
+    if (g.note === "no_live_process") empty += 1;
+    else if (g.note === "unreadable_members") unreadable += 1;
+  }
+  return { present, empty, unreadable };
+}
+
 function computeProcessKpis(p, seg, win, set, notes) {
   const noSeg = !seg || !win;
-  const series = (group, field) => (noSeg ? [] : groupSeries(seg, group, field));
-  const statsKpi = (id, group) => {
-    const s = series(group, "cpu_pct");
-    const unreadable = s.filter((x) => x.unreadable > 0).length;
-    const extra = unreadable > 0 ? { notes: [`${unreadable} sample(s) had unreadable ${group} PIDs: a lower bound`] } : {};
-    return measureKpi(id, s.map((x) => x.v), extra);
+  const procs = seg?.summary?.processes ?? null;
+
+  /** A group's CPU: the probe's own mean/p95 over the samples it could read whole. */
+  const groupCpu = (id, group) => {
+    if (noSeg) return unknownKpi(id, "harness_error", { detail: "no soak watch segment" });
+    const ps = procs?.[group];
+    if (!ps) return unknownKpi(id, "harness_error", { detail: `the soak watch's summary has no ${group} process group` });
+    return fromProbe(id, ps.cpu_pct, { what: `the probe's ${group} cpu_pct` });
   };
-  const endValue = (id, group) => {
-    const s = series(group, "memory_mb");
-    if (s.length === 0) return unknownKpi(id, "insufficient_samples", { n: 0 });
-    return measureKpi(id, { value: s[s.length - 1].v, n: s.length });
+
+  /** A group's memory at the end of the window: its last readable sample. */
+  const groupMemory = (id, group) => {
+    if (noSeg) return unknownKpi(id, "harness_error", { detail: "no soak watch segment" });
+    const series = groupSeries(seg, group, "memory_mb");
+    const w = withheldCounts(seg, group);
+    if (series.length === 0) {
+      if (w.present === 0) return unknownKpi(id, seg.samples.length === 0 ? "insufficient_samples" : "harness_error", { n: 0, detail: `no sample carried a ${group} group` });
+      return unknownKpi(id, "harness_error", {
+        n: 0,
+        detail: `no ${group} sample was readable whole (${w.empty} with no live process, ${w.unreadable} with unreadable members)`,
+      });
+    }
+    const extra = w.empty + w.unreadable > 0 ? { notes: [`${w.empty + w.unreadable} ${group} sample(s) withheld (${w.empty} with no live process, ${w.unreadable} with unreadable members)`] } : {};
+    return measureKpi(id, { value: series[series.length - 1].v, n: series.length }, extra);
   };
+
+  const hostPresent = !noSeg && seg.samples.some((s) => s.groups?.host);
   const hostPids = noSeg ? 0 : Math.max(0, ...seg.samples.map((s) => s.groups?.host?.pids?.length ?? 0));
-  if (!noSeg && seg.samples.length > 0 && hostPids === 0) {
-    const detail = "the host process tree was empty in every sample: the probe was given no live root";
+  if (!noSeg && seg.samples.length > 0 && (!hostPresent || hostPids === 0)) {
+    const detail = hostPresent
+      ? "the host group had no live process in any sample: the probe was given no live root"
+      : "the probe sampled no host group: it was given no live host root (--host-pid)";
     for (const id of ["cpu_pct", "memory_mb", "memory_growth_mb_per_min", "crashes", "gpu_pct"]) {
       set(id, unknownKpi(id, "harness_error", { detail }));
     }
   } else {
-    set("cpu_pct", statsKpi("cpu_pct", "host"));
-    set("memory_mb", endValue("memory_mb", "host"));
-    const mem = series("host", "memory_mb");
+    set("cpu_pct", groupCpu("cpu_pct", "host"));
+    set("memory_mb", groupMemory("memory_mb", "host"));
+    const mem = noSeg ? [] : groupSeries(seg, "host", "memory_mb");
     if (mem.length > 0 && win) {
       const xs = mem.map((m) => Number(m.t - win.t0) / 60e9);
       set("memory_growth_mb_per_min", measureKpi("memory_growth_mb_per_min", slope(xs, mem.map((m) => m.v), { minN: 20 })));
@@ -882,22 +795,39 @@ function computeProcessKpis(p, seg, win, set, notes) {
           ? notApplicableKpi("gpu_pct", "not_applicable_to_environment", { detail: `no per-process GPU engine counters on Linux (${gpuStatus[0]})` })
           : unknownKpi("gpu_pct", "gpu_counters_unavailable", { detail: gpuStatus[0] }),
       );
+    } else if (noSeg || !procs?.host) {
+      set("gpu_pct", unknownKpi("gpu_pct", "harness_error", { detail: "the soak watch's summary has no host process group" }));
     } else {
-      const g = series("host", "gpu_pct");
-      set("gpu_pct", measureKpi("gpu_pct", g.map((x) => x.v)));
+      set("gpu_pct", fromProbe("gpu_pct", procs.host.gpu_pct, { what: "the probe's host gpu_pct" }));
     }
   }
-  set("workload_cpu_pct", statsKpi("workload_cpu_pct", "workload"));
-  set("workload_memory_mb", endValue("workload_memory_mb", "workload"));
-  set("compositor_cpu_pct", statsKpi("compositor_cpu_pct", "compositor"));
-  set("compositor_memory_mb", endValue("compositor_memory_mb", "compositor"));
+  set("workload_cpu_pct", groupCpu("workload_cpu_pct", "workload"));
+  set("workload_memory_mb", groupMemory("workload_memory_mb", "workload"));
+  set("compositor_cpu_pct", groupCpu("compositor_cpu_pct", "compositor"));
+  set("compositor_memory_mb", groupMemory("compositor_memory_mb", "compositor"));
+}
+
+/**
+ * The catalog reason an `inject_abort` stands for (`inject.rs` `AbortReason`).
+ * Real input or another injector is the operator's activity; a key the platform
+ * cannot type, a send that failed or a target check that errored is the
+ * harness's; everything else — no foreground, no desktop, a listener that is down
+ * or deaf, a foreground that changed mid-arm — means the D9 safeguard could not be
+ * established.
+ */
+export function injectAbortReason(reason) {
+  if (reason === "operator_input" || reason === "foreign_injection") return "operator_activity";
+  if (["unsupported_key", "send_failed", "target_check_failed", "stop_requested"].includes(reason)) return "harness_error";
+  return "input_unsafe";
 }
 
 /**
  * Keystroke-to-echo latency from one input phase: key i of the `inject` arm is the
  * focused generator's echo with sequence `echoBase + i` (its echo counter is
  * cumulative over its life), checked byte for byte; the echo marker's first
- * appearance in the input phase's watch minus the key's `t_inject`.
+ * appearance in the input phase's watch minus the key's `t_inject`. An arm that
+ * aborted part-way keeps the keys sent before the abort; when they are too few,
+ * the abort, not the count, is the reason.
  */
 export function inputLatencyKpi(p, clockOk, captureGate) {
   const id = "input_latency_ms";
@@ -909,6 +839,8 @@ export function inputLatencyKpi(p, clockOk, captureGate) {
   const seg = indexProbeSegment(inp.records ?? []);
   const cap = captureInfo(seg);
   if (!cap.primary) return unknownKpi(id, "capture_unavailable", { detail: "the input phase's watch opened no capture source" });
+  const health = probeHealthGate(seg);
+  if (health) return unknownKpi(id, health.reason, { detail: health.detail });
   if (seg.summary?.crosscheck?.verdict === "disagree") {
     return unknownKpi(id, "capture_disagreement", { detail: seg.summary.crosscheck.detail });
   }
@@ -942,7 +874,15 @@ export function inputLatencyKpi(p, clockOk, captureGate) {
   if (unaligned > 0) notes.push(`${unaligned} key(s) had no matching echo (byte or sequence mismatch)`);
   if (unseen > 0) notes.push(`${unseen} echo marker(s) never appeared on the primary source`);
   if (negative > 0) notes.push(`${negative} echo(es) appeared before their key: excluded`);
-  return measureKpi(id, samples, notes.length ? { notes } : {});
+  if (inp.abort) notes.push(`the arm aborted at key ${inp.abort.index} (${inp.abort.reason}): ${inp.abort.detail ?? ""}`.trim());
+  const value = measureKpi(id, samples, notes.length ? { notes } : {});
+  if (value.state !== "measured" && inp.abort) {
+    return unknownKpi(id, injectAbortReason(inp.abort.reason), {
+      n: samples.length,
+      detail: `the arm aborted at key ${inp.abort.index} (${inp.abort.reason}) after ${samples.length} usable key(s): ${inp.abort.detail ?? ""}`.trim(),
+    });
+  }
+  return value;
 }
 
 /** Switch latency over the switch phase (focus arm, N > 1). */
@@ -957,6 +897,8 @@ export function switchLatencyKpi(p, notes) {
   const win = segmentWindow(seg);
   const cap = captureInfo(seg);
   if (!cap.primary || !win) return unknownKpi(id, "capture_unavailable", { detail: "the switch phase's watch captured nothing" });
+  const health = probeHealthGate(seg);
+  if (health) return unknownKpi(id, health.reason, { detail: health.detail });
   const frames = primaryFrames(seg, cap.primary, win);
   const timeoutNs = BigInt(Math.round((p.switchTimeoutMs ?? 5000) * 1e6));
   const samples = [];
@@ -983,6 +925,8 @@ export function spawnLatencyKpi(p, notes) {
   const win = segmentWindow(seg);
   const cap = captureInfo(seg);
   if (!cap.primary || !win) return unknownKpi(id, "capture_unavailable", { detail: "the spawn phase's watch captured nothing" });
+  const health = probeHealthGate(seg);
+  if (health) return unknownKpi(id, health.reason, { detail: health.detail });
   const frames = primaryFrames(seg, cap.primary, win);
   const timeoutNs = BigInt(Math.round((p.spawnTimeoutMs ?? 30000) * 1e6));
   const samples = [];

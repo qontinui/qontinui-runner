@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 
@@ -66,6 +66,9 @@ test("units are exclusive directories inside their run, each with its own gen di
   assert.throws(() => createUnitDir(run, unit), /EEXIST/);
   const v = createUnitDir(run, { ...unit, index: 4 });
   assert.notEqual(v.genDir, u.genDir);
+  // A unit directory someone else made (even an empty one) is never adopted.
+  mkdirSync(join(run, "units", "u005-runner-default-head-n15-r1"));
+  assert.throws(() => createUnitDir(run, { ...unit, index: 5 }), /EEXIST/);
 });
 
 test("nothing may be written outside the run directory", (t) => {

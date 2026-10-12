@@ -46,7 +46,9 @@ name: termhost-bench probe
 # and lock (a `windows` 0.61.x or x11rb bump), the toolchain pin, and the
 # sibling checkout action. Nothing else compiles the probe (ci.yml builds
 # src-tauri). The `push` to main runs the same paths so the cache saved
-# there (`save-if` below) exists for pull requests to restore.
+# there (`save-if` below) exists for pull requests to restore. The shared
+# runner clients are a path of the benchmark's alone; the benchmark narrows
+# these triggers further for itself (`bench-scope`, below).
 on:
   pull_request:
     paths:
@@ -258,11 +260,13 @@ jobs:
   # instance under its own QONTINUI_INSTANCE_ROOT inside the run directory
   # (D12); the harness's Xvfb display is private to the run.
   #
-  # Triggers:
-  #   - pull_request (paths above): a smoke run. N = 1, one run, head only.
+  # Triggers (decided by `bench-scope`):
+  #   - pull_request that touches the benchmark itself: a smoke run. N = 1, one
+  #     run, head only.
   #   - workflow_dispatch: the inputs above (default: the full ladder).
   #   - schedule: the full ladder against the newest main commit at least seven
   #     days old.
+  #   - never on push: that trigger exists to save the probe jobs' cache.
   #
   # Gate (the plan's Phase 3 gate and arming): the full results file is
   # schema-valid; runner and tmux rows exist for every N of the ladder in every
@@ -292,8 +296,55 @@ jobs:
   # leaves the report and upload steps time to say what happened. Tighten both
   # once there are runs to measure.
   # ---------------------------------------------------------------------------
+
+  # The run job's own trigger filter. The workflow's `pull_request` paths are the
+  # probe jobs' (they include the workspace manifest, lock, toolchain pin and
+  # sibling action, so a dependency bump rebuilds the probe), and `push` to main
+  # exists to save the probe jobs' cache. Neither is a reason to spend an hour
+  # building and booting the runner: the plan's smoke runs on a pull request
+  # that touches the benchmark (scripts/termhost-bench/**,
+  # crates/termhost-probe/**, plus the shared runner clients and this file).
+  # Schedule and dispatch always run it; push never does.
+  bench-scope:
+    name: termhost-bench run scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+
+      - name: Decide whether the benchmark runs
+        id: scope
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            schedule|workflow_dispatch) run=true ;;
+            pull_request)
+              # The checkout is GitHub's merge commit; its first parent is the
+              # base tip, so this diff is exactly what the PR changes.
+              changed="$(git diff --name-only HEAD^1 HEAD)"
+              if grep -qE '^(scripts/termhost-bench/|crates/termhost-probe/|scripts/lib/runner-clients\.mjs$|\.github/workflows/termhost-bench\.yml$)' <<<"$changed"; then
+                run=true
+              else
+                run=false
+              fi
+              ;;
+            *) run=false ;;
+          esac
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT: the benchmark runs: $run"
+
   run-linux-xvfb:
     name: termhost-bench run (linux-xvfb, ubuntu-22.04)
+    needs: bench-scope
+    if: needs.bench-scope.outputs.run == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 350
     steps:

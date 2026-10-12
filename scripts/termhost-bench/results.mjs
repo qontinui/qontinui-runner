@@ -64,8 +64,10 @@ export function finalizeLadder(rows) {
  */
 export function convertProbeIncident(rec, where = {}) {
   const kind = Object.prototype.hasOwnProperty.call(INCIDENT_KINDS, rec?.kind) ? rec.kind : "harness_error";
-  const data = { ...where };
-  if (rec?.source !== undefined && rec.source !== null) data.source = rec.source;
+  // The probe's own `data` (the capture source it is about is `data.source`),
+  // then where the harness met it; a pre-N8 top-level `source` still lands there.
+  const data = { ...(rec?.data && typeof rec.data === "object" && !Array.isArray(rec.data) ? rec.data : {}), ...where };
+  if (data.source === undefined && rec?.source !== undefined && rec.source !== null) data.source = rec.source;
   if (kind !== rec?.kind) data.probe_kind = String(rec?.kind);
   return {
     kind,

@@ -1,7 +1,8 @@
 /**
  * KPI computation from fixture `probe.jsonl` records and generator logs
- * (`kpis.mjs`): the measured values have answers stated in advance, and every
- * unknown path carries its reason and no number.
+ * (`kpis.mjs`): the measured values have answers stated in advance, the probe's
+ * summary values reach the row only as catalog values, and every unknown path
+ * carries its reason and no number.
  *
  *   node --test scripts/termhost-bench/__tests__/kpis.test.mjs
  */
@@ -12,18 +13,18 @@ import assert from "node:assert/strict";
 import { KPI_IDS } from "../kpi-catalog.mjs";
 import {
   attachNotes,
+  captureInfo,
   computeRowKpis,
-  exclusionReason,
+  fromProbe,
   generatorWindow,
   indexGenerators,
   indexProbeSegment,
-  intervalModel,
+  injectAbortReason,
   parseJsonl,
-  primaryFrames,
+  probeHealthGate,
   seqAtOrAfter,
-  segmentWindow,
-  vActual,
 } from "../kpis.mjs";
+import { measureKpi } from "../stats.mjs";
 import { MS, genLog, operativeCapabilities, watchSegment } from "./helpers/bench-fixtures.mjs";
 
 const T0 = 1_000_000_000_000n;
@@ -124,11 +125,11 @@ test("no capture source: every capture KPI is unknown(capture_unavailable)", () 
 });
 
 test("an assumed refresh rate makes refresh-dependent KPIs unknown(refresh_rate_unknown)", () => {
-  const assumedSource = computeRowKpis(focusFixture({ watch: { refreshSource: "assumed (RandR reports no rate; Xvfb's vsync is a fake 60 Hz timer)" } }));
-  for (const id of ["jank_share", "marker_loss", "marker_skipped"]) assertUnknown(assumedSource.kpis[id], "refresh_rate_unknown");
-  assert.equal(assumedSource.kpis.output_latency_ms.state, "measured", "latency needs no refresh rate");
-  const nullRate = computeRowKpis(focusFixture({ watch: { refreshHz: null } }));
-  assertUnknown(nullRate.kpis.jank_share, "refresh_rate_unknown");
+  const assumed = computeRowKpis(focusFixture({ watch: { refreshAssumed: true } }));
+  for (const id of ["jank_share", "marker_loss", "marker_skipped"]) assertUnknown(assumed.kpis[id], "refresh_rate_unknown");
+  assert.equal(assumed.kpis.output_latency_ms.state, "measured", "latency needs no refresh rate");
+  const seg = indexProbeSegment(watchSegment({ t0: T0, durationMs: 2000, refreshAssumed: true }));
+  assert.equal(captureInfo(seg).refreshKnown, false);
 });
 
 test("an unaligned clock or a capture disagreement makes latency unknown, never a number", () => {
@@ -153,7 +154,7 @@ test("a focus arm showing two sessions is unknown(zone_unresolved) for the runne
   assertUnknown(told.kpis.frame_interval_ms, "zone_unresolved");
 });
 
-test("V is the displayed state accumulated across X11 damage bands, not per band", () => {
+test("V is the probe's displayed state accumulated across X11 damage bands, not a per-band count", () => {
   const gens = [0, 1, 2].map((s) => genLog({ session: s, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 15000 }));
   const records = watchSegment({
     t0: T0,
@@ -161,11 +162,11 @@ test("V is the displayed state accumulated across X11 damage bands, not per band
     bands: true,
     sessions: gens.map((gen, s) => ({ session: s, gen, latencyMs: 20, rect: { x: 10 + 600 * s, y: 40, w: 160, h: 16 } })),
   });
-  const seg = indexProbeSegment(records);
-  const frames = primaryFrames(seg, "x11", segmentWindow(seg));
-  assert.ok(frames.every((f) => f.v <= 1), "each band carries one session");
-  assert.equal(vActual(frames), 3);
+  const frames = records.filter((r) => r.type === "frame");
+  assert.ok(frames.every((f) => f.markers.filter((m) => m.kind === "output").length <= 1), "each band carries one session's marker");
   const r = computeRowKpis({ environment: "linux-xvfb", setupId: "runner", n: 3, arm: "tiled", vTarget: 3, capabilities: operativeCapabilities(), gens: indexGenerators(new Map(gens.map((g, s) => [s, g]))), soak: { records } });
+  assert.equal(r.vActual, 3, "the summary's v_actual_p50");
+  assert.deepEqual(r.sessionsSeen, [0, 1, 2]);
   assert.equal(r.kpis.output_latency_ms.state, "measured");
 });
 
@@ -179,21 +180,73 @@ test("too few markers is unknown(insufficient_samples) with its count", () => {
   assertUnknown(kpis.hangs, "insufficient_samples");
 });
 
-test("interval exclusion names occlusion, operator activity, or the probe itself", () => {
+test("interval exclusion reaches the row with the probe's reason: occlusion, operator activity, or the probe itself", () => {
   const occluded = computeRowKpis(focusFixture({ watch: { intervalClass: (i) => (i % 2 ? "occluded" : null) } }));
   assertUnknown(occluded.kpis.hangs, "occluded");
   const operator = computeRowKpis(focusFixture({ watch: { intervalClass: (i) => (i % 3 ? "operator_activity" : null) } }));
   assertUnknown(operator.kpis.hangs, "operator_activity");
   const harness = computeRowKpis(focusFixture({ watch: { intervalClass: () => "harness_error" } }));
   assertUnknown(harness.kpis.hangs, "harness_error");
-  // With no full interval excluded, too few samples is insufficient_samples (review S4).
-  assert.equal(exclusionReason({ valid: 10, occluded: 0, operator: 0, harness: 0 }, 10, 40, 60), "insufficient_samples");
-  assert.equal(exclusionReason({ valid: 10, occluded: 30, operator: 20, harness: 0 }, 10, 50, 60), "occluded");
-  assert.equal(exclusionReason({ valid: 10, occluded: 20, operator: 30, harness: 0 }, 10, 50, 60), "operator_activity");
-  assert.equal(exclusionReason({ valid: 10, occluded: 20, operator: 20, harness: 20 }, 10, 60, 60), "harness_error");
 });
 
-test("an empty host group is unknown(harness_error), never a measured 0", () => {
+test("the probe's values reach the row only as catalog values", () => {
+  const lat = measureKpi("output_latency_ms", Array.from({ length: 150 }, (_, i) => 10 + i / 10));
+  assert.deepEqual(fromProbe("output_latency_ms", lat), lat, "a catalog-shaped measured value passes as it is");
+  assert.deepEqual(fromProbe("hangs", { state: "measured", value: 2, unit: "count", n: 80 }), measureKpi("hangs", { value: 2, n: 80 }));
+  assertUnknown(fromProbe("hangs", { state: "unknown", unit: "count", n: 3, reason: "occluded", detail: "x" }), "occluded");
+  // What the catalog cannot hold is the harness's error, never a number.
+  assertUnknown(fromProbe("output_latency_ms", undefined), "harness_error");
+  assertUnknown(fromProbe("output_latency_ms", { ...lat, unit: "s" }), "harness_error");
+  assertUnknown(fromProbe("hangs", { state: "unknown", unit: "count", n: 0, reason: "cosmic_rays" }), "harness_error");
+  assertUnknown(fromProbe("output_latency_ms", { ...lat, stats: { p50: 1, p95: 2 } }), "harness_error");
+  assertUnknown(fromProbe("hangs", { state: "measured", unit: "count", n: 80, value: Number.NaN }), "harness_error");
+  // A measured value under the catalog's minimum is not measured here either.
+  const thin = fromProbe("output_latency_ms", { ...lat, n: 99 });
+  assertUnknown(thin, "insufficient_samples");
+  assert.equal(thin.n, 99);
+});
+
+test("a probe that fell behind: its capture KPIs carry its harness_error, and so do the latencies the harness times", () => {
+  const r = computeRowKpis(focusFixture({ watch: { behind: true } }));
+  for (const id of ["output_latency_ms", "frame_interval_ms", "jank_share", "marker_loss", "marker_skipped"]) {
+    assertUnknown(r.kpis[id], "harness_error");
+  }
+  const lagging = watchSegment({ t0: T0 + BigInt(SOAK_MS + 1000) * MS, durationMs: 11000, behind: true });
+  assert.equal(probeHealthGate(indexProbeSegment(lagging)).reason, "harness_error");
+  assert.equal(probeHealthGate(indexProbeSegment(watchSegment({ t0: T0, durationMs: 2000 }))), null);
+  const sw = computeRowKpis({ ...focusFixture(), n: 2, switches: { records: lagging, list: [{ k: 0, tCmdNs: T0 + BigInt(SOAK_MS + 2000) * MS }] } });
+  assertUnknown(sw.kpis.switch_latency_ms, "harness_error");
+  const sp = computeRowKpis({ ...focusFixture(), spawns: { records: lagging, list: [{ session: 3, tCmdNs: T0 + BigInt(SOAK_MS + 2000) * MS }] } });
+  assertUnknown(sp.kpis.spawn_latency_ms, "harness_error");
+});
+
+test("Desktop Duplication alone is no primary source: the capture KPIs are unknown(capture_unavailable)", () => {
+  const records = watchSegment({ t0: T0, durationMs: SOAK_MS, primary: "wgc", captureFailed: true });
+  records.splice(2, 0, { type: "capture", source: "dda", state: "started", detail: "fixture", refresh_hz: 60, refresh_source: "DXGI", refresh_assumed: false });
+  const seg = indexProbeSegment(records);
+  assert.equal(captureInfo(seg).primary, null);
+  const gen = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 15000 });
+  const { kpis } = computeRowKpis({ ...focusFixture(), gens: indexGenerators(new Map([[0, gen]])), soak: { records } });
+  assertUnknown(kpis.output_latency_ms, "capture_unavailable");
+  assertUnknown(kpis.hangs, "capture_unavailable");
+});
+
+test("a process group the probe could not read whole is unknown(harness_error); a partly withheld one is noted", () => {
+  const none = computeRowKpis(focusFixture({ watch: { groupNote: (g) => (g === "host" ? "unreadable_members" : null) } }));
+  assertUnknown(none.kpis.cpu_pct, "harness_error");
+  assertUnknown(none.kpis.memory_mb, "harness_error");
+  const gone = computeRowKpis(focusFixture({ watch: { groupNote: (g) => (g === "workload" ? "no_live_process" : null) } }));
+  assertUnknown(gone.kpis.workload_cpu_pct, "harness_error");
+  assertUnknown(gone.kpis.workload_memory_mb, "harness_error");
+  const some = computeRowKpis(focusFixture({ watch: { groupNote: (g, k) => (g === "host" && k % 10 === 3 ? "unreadable_members" : null) } }));
+  assert.equal(some.kpis.cpu_pct.state, "measured", "the probe's mean over the samples it read whole");
+  assert.equal(some.kpis.memory_mb.state, "measured");
+  assert.ok(some.kpis.memory_mb.notes.some((n) => /withheld/.test(n)));
+  // A CPU-time SUM with a withheld sample is not the host's.
+  assertUnknown(some.kpis.cpu_ms_per_mb, "harness_error");
+});
+
+test("no host group (no live host root) is unknown(harness_error), never a measured 0", () => {
   const { kpis } = computeRowKpis(focusFixture({ watch: { hostPids: [] } }));
   assertUnknown(kpis.cpu_pct, "harness_error");
   assertUnknown(kpis.memory_mb, "harness_error");
@@ -216,14 +269,17 @@ test("switch latency is not applicable in the tiled arm and at N = 1", () => {
 
 test("switch latency: show(k) to k's newest marker on screen", () => {
   const gens = [0, 1].map((s) => genLog({ session: s, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 30000 }));
-  const sw0 = T0 + BigInt(SOAK_MS + 1000) * MS;
-  // Session 1 becomes visible 70 ms after each command (it is hidden before).
+  // Commands 50 ms after a marker emission: k's newest marker at the command is 50 ms old.
+  const sw0 = T0 + BigInt(SOAK_MS + 1050) * MS;
+  // Session 1 shows its newest marker 70 ms after each command, and also flickers
+  // into view 20 ms BEFORE it: a frame before the command never counts (it would
+  // be a negative latency).
   const list = [];
   const frames = [];
   for (let j = 0; j < 20; j += 1) {
     const tCmd = sw0 + BigInt(j * 500) * MS;
     list.push({ k: 1, tCmdNs: tCmd });
-    frames.push(tCmd + 70n * MS);
+    frames.push(tCmd - 20n * MS, tCmd + 70n * MS);
   }
   const records = watchSegment({ t0: sw0 - 100n * MS, durationMs: 11000, sessions: [{ session: 0, gen: gens[0], latencyMs: 20 }], frameHz: 60 });
   // Add frames that show session 1's newest marker 70 ms after each switch.
@@ -299,6 +355,37 @@ test("an input arm that could not run carries its reason", () => {
   assertUnknown(none.kpis.input_latency_ms, "input_unsafe");
 });
 
+test("an inject abort names its catalog reason; an arm aborted part-way reports the abort, not the count", () => {
+  assert.equal(injectAbortReason("operator_input"), "operator_activity");
+  assert.equal(injectAbortReason("foreign_injection"), "operator_activity");
+  assert.equal(injectAbortReason("unsupported_key"), "harness_error");
+  assert.equal(injectAbortReason("send_failed"), "harness_error");
+  for (const r of ["not_foreground", "desktop_unavailable", "monitor_down", "monitor_deaf", "foreground_changed_during_injection", "something_new"]) {
+    assert.equal(injectAbortReason(r), "input_unsafe", r);
+  }
+  const injectT0 = T0 + BigInt(SOAK_MS + 1000) * MS;
+  const keys = [];
+  const echoes = [];
+  const seen = [];
+  for (let i = 0; i < 30; i += 1) {
+    const tInject = injectT0 + BigInt(i * 100) * MS;
+    const key = String.fromCharCode(97 + (i % 26));
+    keys.push({ type: "inject", index: i, key, t_inject_ns: String(tInject), t_check_ns: String(tInject), tagged: true });
+    echoes.push({ seq: i, byte: key.charCodeAt(0), tEmit: tInject + 2n * MS });
+    seen.push({ session: 0, seq: i, t: tInject + 30n * MS });
+  }
+  const gen = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 30000, echoes });
+  const records = watchSegment({ t0: injectT0 - 200n * MS, durationMs: 4000, sessions: [{ session: 0, gen, latencyMs: 20 }], echoSeen: seen });
+  const r = computeRowKpis({
+    ...focusFixture(),
+    gens: indexGenerators(new Map([[0, gen]])),
+    input: { records, injects: keys, focusSession: 0, echoBase: 0, abort: { type: "inject_abort", index: 30, reason: "operator_input", detail: "a key was pressed", keys_sent: 30 } },
+  });
+  assertUnknown(r.kpis.input_latency_ms, "operator_activity");
+  assert.equal(r.kpis.input_latency_ms.n, 30);
+  assert.match(r.kpis.input_latency_ms.detail, /aborted at key 30 \(operator_input\)/);
+});
+
 test("a generator silent after the window is named, not counted as 0 % stall", () => {
   const gen = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: 20000, exit: false });
   const gw = generatorWindow(indexGenerators(new Map([[0, gen]])), { t0: T0, t1: T0 + 40000n * MS });
@@ -318,8 +405,17 @@ test("helpers: JSON lines, sequence order, notes attachment", () => {
   const kpis = { cpu_pct: { state: "measured" } };
   assert.deepEqual(attachNotes(kpis, ["cpu_pct: one", "loose note"]), ["loose note"]);
   assert.deepEqual(kpis.cpu_pct.notes, ["one"]);
-  const model = intervalModel(indexProbeSegment(watchSegment({ t0: T0, durationMs: 2100, sessions: [] })));
-  assert.equal(model.spanValid(T0, T0 + 1400n * MS), true);
-  assert.equal(model.spanValid(T0, T0 + 2050n * MS), false, "touches the trailing partial interval");
-  assert.equal(model.spanValid(T0 - 2000n * MS, T0 - 1000n * MS), false, "entirely before the watch");
+});
+
+test("amended interval and hang records: the last record per interval index and per hang start is the verdict", () => {
+  const seg = indexProbeSegment([
+    { type: "start", subcommand: "watch", t0_ns: "1" },
+    { type: "interval", index: 0, valid: true },
+    { type: "interval", index: 1, valid: true },
+    { type: "hang", t_start_ns: "500", valid: true },
+    { type: "interval", index: 0, valid: false, exclusion_class: "operator_activity", amended: true },
+    { type: "hang", t_start_ns: "500", valid: false, amended: true },
+  ]);
+  assert.deepEqual(seg.intervals.map((r) => [r.index, r.valid]), [[0, false], [1, true]]);
+  assert.deepEqual(seg.hangs.map((h) => h.valid), [false]);
 });

@@ -32,7 +32,7 @@ import { join } from "node:path";
 import { AdapterRefusal, createAdapter as defaultCreateAdapter } from "./adapters/index.mjs";
 import { gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
-import { allUnknown, computeRowKpis, indexGenerators } from "./kpis.mjs";
+import { allUnknown, computeRowKpis, indexGenerators, injectAbortReason } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
 import { NeutralityGuard } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
@@ -88,7 +88,12 @@ export function planUnits({ setups, ns, runs, runnerBuilds = [{ role: "single" }
   return units;
 }
 
-/** The real probe driver; tests substitute a fake with the same five calls. */
+/**
+ * The real probe driver; tests substitute a fake with the same calls. Every
+ * `watch` and `inject` writes one run per file (`records.rs` `FileMode::New`):
+ * `startWatch({label})` sets its `probe.jsonl` aside as `probe-<label>.jsonl` when
+ * it stops, and `takeInject(runDir, label)` reads `inject.jsonl` and sets it aside.
+ */
 export function realProbeDriver({ probePath, envVars = {}, log = () => {} }) {
   const env = { ...process.env, ...envVars };
   return {
@@ -97,15 +102,15 @@ export function realProbeDriver({ probePath, envVars = {}, log = () => {} }) {
       new probeLib.WatchProcess({
         probe: probePath,
         args: probeLib.watchArgs({ ...o, stdinStop: true }),
-        probeJsonl: join(o.runDir, "probe.jsonl"),
+        runDir: o.runDir,
+        label: o.label,
         env,
         log,
       }),
     inject: (o) => probeLib.runProbe({ probe: probePath, args: probeLib.injectArgs(o), env, timeoutMs: o.timeoutMs ?? 120000 }),
+    takeInject: (runDir, label) => probeLib.takeRunFile(runDir, "inject", label),
     look: (o) => probeLib.look({ probe: probePath, env, ...o }),
     activate: (o) => probeLib.activate({ probe: probePath, env, ...o }),
-    readInject: (runDir, offset) => probeLib.readRecordsFrom(join(runDir, "inject.jsonl"), offset).records,
-    injectOffset: (runDir) => probeLib.fileSize(join(runDir, "inject.jsonl")),
   };
 }
 
@@ -550,9 +555,9 @@ function zoneDiagnostic(a) {
 
 function noteRefresh(seen, soak) {
   if (seen.known || !soak?.records) return;
-  const cap = soak.records.find((r) => r?.type === "capture" && r.refresh_hz !== undefined);
+  const cap = soak.records.find((r) => r?.type === "capture" && r.state === "started" && r.refresh_hz !== undefined);
   if (!cap) return;
-  const assumed = cap.refresh_assumed === true || cap.refresh_known === false || /^assumed/i.test(String(cap.refresh_source ?? ""));
+  const assumed = cap.refresh_assumed === true;
   seen.hz = typeof cap.refresh_hz === "number" ? cap.refresh_hz : null;
   seen.source = cap.refresh_source ?? null;
   seen.known = !assumed && seen.hz > 0;
@@ -580,22 +585,47 @@ export async function runArm(unit, arm, ctx) {
     spawns: null,
     diagnostics: {},
   };
-  const act = await probe.activate({ runDir: join(unitDir, "activate"), target: target() });
+  const act = await probe.activate({ runDir: join(unitDir, `activate-${arm}`), target: target() });
   if (!act.ok) out.arrangeNotes.push(`activation: ${act.detail}`);
   await sleep(o.warmupMs);
 
-  const watchOpts = () => ({ runDir: genDir, target: target(), hostPids: adapter.processRoots(), runId: genRunId, frames: "all" });
+  const watchOpts = (phase, extra = {}) => ({
+    runDir: genDir,
+    label: `${arm}-${phase}`,
+    target: target(),
+    hostPids: adapter.processRoots(),
+    runId: genRunId,
+    frames: "all",
+    ...extra,
+  });
   const probeIncidents = (records, phase) =>
     records.filter((r) => r?.type === "incident").map((r) => convertProbeIncident(r, { setup: unit.setup, unit: name, phase: `${arm}/${phase}` }));
+  // A phase's watch, started and confirmed. One that never wrote its start record
+  // (refused, or crashed) is recorded as the harness's error, with its stderr.
+  const startPhaseWatch = async (phase, extra) => {
+    const w = probe.startWatch(watchOpts(phase, extra));
+    if (!(await w.ready())) {
+      const detail = `unit ${name} arm ${arm}: the ${phase} watch did not start (exit ${JSON.stringify(w.exit ?? null)}): ${String(w.stderr ?? "").slice(-300)}`;
+      log(detail);
+      out.incidents.push(incident("harness_error", detail, { data: { setup: unit.setup, unit: name, phase: `${arm}/${phase}` } }));
+    }
+    return w;
+  };
+  const stopPhaseWatch = async (w, phase) => {
+    const seg = await w.stop();
+    if (seg.error) {
+      out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: ${phase}: ${seg.error}`, { data: { setup: unit.setup, unit: name, phase: `${arm}/${phase}` } }));
+    }
+    out.incidents.push(...probeIncidents(seg.records, phase));
+    return seg;
+  };
 
   // ---- soak -------------------------------------------------------------------
   log(`unit ${name} arm ${arm}: soak ${o.soakMs} ms`);
-  const soakWatch = probe.startWatch(watchOpts());
-  await soakWatch.ready();
+  const soakWatch = await startPhaseWatch("soak");
   await sleep(o.soakMs);
-  const soak = await soakWatch.stop();
+  const soak = await stopPhaseWatch(soakWatch, "soak");
   out.soak = { records: soak.records };
-  out.incidents.push(...probeIncidents(soak.records, "soak"));
 
   // ---- input (D9) ---------------------------------------------------------------
   const inputSafe = ctx.capabilities["input.safe"];
@@ -609,9 +639,10 @@ export async function runArm(unit, arm, ctx) {
       out.input = { unavailable: f.failure ?? { reason: "harness_error", detail: "focusObserved failed" } };
     } else {
       const echoBase = echoCount(readGeneratorLog(genDir, f.session));
-      const injectOffset = probe.injectOffset(genDir);
-      const w = probe.startWatch(watchOpts());
-      await w.ready();
+      // watch and inject share the gen dir (inject.jsonl announces each key) and,
+      // for Windows, one tag, so the watch knows the probe's keys from an operator's.
+      const tag = probeLib.freshTag();
+      const w = await startPhaseWatch("input", { tag });
       const res = await probe.inject({
         runDir: genDir,
         target: target(),
@@ -619,17 +650,25 @@ export async function runArm(unit, arm, ctx) {
         intervalMs: o.inputIntervalMs,
         startDelayMs: 300,
         settleMs: 800,
+        tag,
         timeoutMs: 60000 + o.inputKeys * (o.inputIntervalMs + 50),
       });
-      const seg = await w.stop();
-      const injectRecords = probe.readInject(genDir, injectOffset);
+      const seg = await stopPhaseWatch(w, "input");
+      const taken = probe.takeInject(genDir, `${arm}-input`);
+      if (taken.error) out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: input: ${taken.error}`, { data: { setup: unit.setup, unit: name } }));
+      const injectRecords = taken.records;
       const injects = injectRecords.filter((r) => r?.type === "inject");
       const abort = injectRecords.find((r) => r?.type === "inject_abort") ?? null;
-      out.incidents.push(...probeIncidents(seg.records, "input"));
       out.incidents.push(...probeIncidents(injectRecords, "inject"));
       if (injects.length === 0) {
-        const reason = abort && /operator|foreign/.test(abort.reason) ? "operator_activity" : "input_unsafe";
-        out.input = { unavailable: { reason, detail: abort ? `inject aborted at key ${abort.index} (${abort.reason}): ${abort.detail}` : `inject sent no key (exit ${res.code}): ${`${res.stdout}${res.stderr}`.slice(-300)}` } };
+        out.input = {
+          unavailable: {
+            reason: abort ? injectAbortReason(abort.reason) : "input_unsafe",
+            detail: abort
+              ? `inject refused or aborted at key ${abort.index} (${abort.reason}): ${abort.detail}`
+              : `inject sent no key (exit ${res.code}): ${`${res.stdout}${res.stderr}`.slice(-300)}`,
+          },
+        };
       } else {
         out.input = { records: seg.records, injects, focusSession: f.session, echoBase, abort };
       }
@@ -648,8 +687,7 @@ export async function runArm(unit, arm, ctx) {
         },
       };
     } else {
-      const w = probe.startWatch(watchOpts());
-      await w.ready();
+      const w = await startPhaseWatch("switch");
       const list = [];
       let current = arr.focusSession;
       for (let j = 0, c = 0; j < o.switchSamples; j += 1) {
@@ -662,17 +700,15 @@ export async function runArm(unit, arm, ctx) {
         }
         await sleep(o.switchSettleMs);
       }
-      const seg = await w.stop();
+      const seg = await stopPhaseWatch(w, "switch");
       out.switches = { records: seg.records, list };
-      out.incidents.push(...probeIncidents(seg.records, "switch"));
       if (arr.focusSession !== undefined && current !== arr.focusSession) await adapter.show(arr.focusSession);
     }
   }
 
   // ---- spawn ---------------------------------------------------------------------
   if (o.spawnSamples > 0) {
-    const w = probe.startWatch(watchOpts());
-    await w.ready();
+    const w = await startPhaseWatch("spawn");
     const list = [];
     const known = new Set(readSlots(genDir).keys());
     let refused = null;
@@ -700,11 +736,10 @@ export async function runArm(unit, arm, ctx) {
       await adapter.closeOne(r.hostId);
       await sleep(300);
     }
-    const seg = await w.stop();
+    const seg = await stopPhaseWatch(w, "spawn");
     out.spawns = refused && list.length === 0
       ? { unavailable: { reason: "admission_refused", detail: `the resource guard refused session N + 1 (${refused.lane}): ${refused.detail ?? ""}` } }
       : { records: seg.records, list };
-    out.incidents.push(...probeIncidents(seg.records, "spawn"));
     if (refused) out.spawnAdmission = refused;
   }
 
