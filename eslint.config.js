@@ -82,11 +82,47 @@ const TERMINAL_POPULATION_NAME_SELECTORS = [
  */
 const CATCH_SITE_DISCARD_MESSAGE =
   "Hand-rolled `x instanceof Error ? x.message : …` discards the cause of every non-Error " +
-  "rejection (Tauri `invoke()` rejects with a STRING). Use `describeThrown(err, \"<what failed>\")` " +
+  'rejection (Tauri `invoke()` rejects with a STRING). Use `describeThrown(err, "<what failed>")` ' +
   "from `@/lib/utils` (plan 2026-09-09-catch-site-discard-is-repo-wide-and-the-deferral-was-never-measured).";
+// Four spellings of one discard, measured on the whole src tree (plan
+// 2026-10-08-catch-site-guard-escape-routes-and-diagnostic-logs-lost-the-raw-object).
+// `/Error$/` covers subclasses (`instanceof TypeError ? e.message : …`); the
+// ChainExpression arms cover `e?.message`; the negated arms cover
+// `!(e instanceof Error) ? … : e.message`. Each REPLACES rather than
+// accompanies the original plain-`Error` arm, so a ternary reports once.
+// A ternary whose OTHER branch already calls describeThrown keeps the cause
+// (`e instanceof ApiError ? e.message : describeThrown(e, "…")` — a deliberate
+// subclass-specific text), so each arm excludes it with :not().
+// Known residual: a qualified constructor (`instanceof ns.ApiError`) is not
+// matched — its `right` is a MemberExpression.
 const CATCH_SITE_DISCARD_SELECTORS = [
-  'ConditionalExpression[test.type="BinaryExpression"][test.operator="instanceof"][test.right.name="Error"][consequent.type="MemberExpression"][consequent.property.name="message"]',
+  'ConditionalExpression[test.type="BinaryExpression"][test.operator="instanceof"][test.right.name=/Error$/][consequent.type="MemberExpression"][consequent.property.name="message"]:not([alternate.callee.name="describeThrown"])',
+  'ConditionalExpression[test.type="BinaryExpression"][test.operator="instanceof"][test.right.name=/Error$/][consequent.type="ChainExpression"][consequent.expression.type="MemberExpression"][consequent.expression.property.name="message"]:not([alternate.callee.name="describeThrown"])',
+  'ConditionalExpression[test.type="UnaryExpression"][test.operator="!"][test.argument.type="BinaryExpression"][test.argument.operator="instanceof"][test.argument.right.name=/Error$/][alternate.type="MemberExpression"][alternate.property.name="message"]:not([consequent.callee.name="describeThrown"])',
+  'ConditionalExpression[test.type="UnaryExpression"][test.operator="!"][test.argument.type="BinaryExpression"][test.argument.operator="instanceof"][test.argument.right.name=/Error$/][alternate.type="ChainExpression"][alternate.expression.property.name="message"]:not([consequent.callee.name="describeThrown"])',
 ].map((selector) => ({ selector, message: CATCH_SITE_DISCARD_MESSAGE }));
+
+/**
+ * The CAST spelling of the same discard, production files only:
+ * `catch (err) { setError((err as Error).message) }`. A cast is not a check —
+ * on a Tauri `invoke()` string rejection `.message` is `undefined`, so the user
+ * sees a BLANK error. Scoped to a `catch` clause (where the value's type is
+ * genuinely unknown) and to non-test files: a test's cast on an Error it
+ * provoked itself is correct code, and a rule that fires on correct code gets
+ * disabled. Known residual: `err as Error | undefined` (a union),
+ * `<Error>err`, `(err as any).message` and `(err as {message: string}).message`
+ * are not matched. That split is why the blocks below come in production/test pairs —
+ * flat config REPLACES rule options, so each pair re-states its full list.
+ */
+const CATCH_SITE_CAST_MESSAGE =
+  "`(err as Error).message` in a catch is a cast, not a check: a Tauri `invoke()` string " +
+  'rejection yields `undefined`, a blank error. Use `describeThrown(err, "<what failed>")` ' +
+  "from `@/lib/utils` (plan 2026-10-08-catch-site-guard-escape-routes-and-diagnostic-logs-lost-the-raw-object).";
+const CATCH_SITE_CAST_SELECTORS = [
+  'CatchClause MemberExpression[property.name="message"][object.type="TSAsExpression"][object.typeAnnotation.typeName.name=/Error$/]',
+].map((selector) => ({ selector, message: CATCH_SITE_CAST_MESSAGE }));
+
+const TEST_FILES = ["**/*.test.{ts,tsx}", "**/__tests__/**", "**/__test-helpers__/**"];
 
 export default [
   js.configs.recommended,
@@ -187,19 +223,44 @@ export default [
     },
   },
   {
-    // Catch-site discard guard — see CATCH_SITE_DISCARD_SELECTORS above.
+    // Catch-site discard guard — see CATCH_SITE_DISCARD_SELECTORS and
+    // CATCH_SITE_CAST_SELECTORS above. Production files get both lists.
     files: ["src/**/*.{ts,tsx}"],
+    ignores: TEST_FILES,
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        ...CATCH_SITE_DISCARD_SELECTORS,
+        ...CATCH_SITE_CAST_SELECTORS,
+      ],
+    },
+  },
+  {
+    // Test files: the ternary arms only (a test's cast on an Error it provoked is correct).
+    files: TEST_FILES.map((g) => `src/${g}`),
     rules: {
       "no-restricted-syntax": ["error", ...CATCH_SITE_DISCARD_SELECTORS],
     },
   },
   {
     // Population-name guard — see TERMINAL_POPULATION_NAME_SELECTORS above.
-    // Spreads CATCH_SITE_DISCARD_SELECTORS too: flat config REPLACES this
-    // rule's options, so omitting it would switch the catch-site guard off
-    // under src/components/terminal/** (pinned by
-    // src/lib/eslintConfig.catchSiteGuard.test.ts).
+    // Spreads the catch-site lists too: flat config REPLACES this rule's
+    // options, so omitting them would switch the catch-site guard off under
+    // src/components/terminal/** (pinned by
+    // src/lib/eslintConfig.catchSiteGuard.test.ts). Same production/test split.
     files: ["src/components/terminal/**/*.{ts,tsx}"],
+    ignores: TEST_FILES,
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        ...TERMINAL_POPULATION_NAME_SELECTORS,
+        ...CATCH_SITE_DISCARD_SELECTORS,
+        ...CATCH_SITE_CAST_SELECTORS,
+      ],
+    },
+  },
+  {
+    files: TEST_FILES.map((g) => `src/components/terminal/${g}`),
     rules: {
       "no-restricted-syntax": [
         "error",

@@ -1,7 +1,8 @@
 //! How a PTY holder is spawned on Windows so that it outlives its spawner.
 //!
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
-//! D4 as corrected on 2026-09-27, Phase 0 (survival spike).
+//! D4 as corrected on 2026-09-27. Written in Phase 0 (survival spike); the
+//! runner's holder spawner (`qontinui_pty_holder::spawn`) calls it since Phase 2.
 //!
 //! **Which job kills a holder.** The runner never places *itself* in its own
 //! `KILL_ON_JOB_CLOSE` job (`job_object::init_job_object` only creates it; PTY
@@ -73,7 +74,8 @@ impl HolderSpawnRoute {
         }
     }
 
-    /// Parse the spelling the spike's parent arm takes on argv.
+    /// Parse a route's argv spelling (the deleted Phase 0 spike's parent arm
+    /// used it; kept for the Phase 3 Windows survival tests).
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "plain" => Some(HolderSpawnRoute::Plain),
@@ -151,8 +153,8 @@ mod imp {
         Ok(in_job != 0)
     }
 
-    /// Spawn `cmd` by an explicitly chosen route. Used by the spike's tests
-    /// to exercise each arm on its own; production code calls [`spawn_holder`].
+    /// Spawn `cmd` by an explicitly chosen route — for tests that exercise
+    /// each arm on its own (Phase 3); production code calls [`spawn_holder`].
     pub fn spawn_holder_via(
         cmd: &mut Command,
         route: HolderSpawnRoute,

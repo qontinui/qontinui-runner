@@ -842,7 +842,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("coord_http.rs", "escalated", 1),
     ("coord_http.rs", "session-noop", 1),
     ("coord_questions.rs", "session-noop", 1),
-    ("fleet.rs", "device", 5),
+    ("fleet.rs", "device", 4),
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 5),
     ("mcp/probe_executor.rs", "device", 1),
@@ -939,8 +939,14 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// waits on escalation E3, not on another credential-threading phase. (The two
 /// Phase-5 `mcp/plan_library.rs` forwards are among those that remain: they are
 /// qontinui-web-bound, so Phase 6's coord-side seam does not reach them.)
+///
+/// Plan `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// (review finding 1) then moved `fleet.rs`'s register heartbeat onto the
+/// stating seam: its bearer follows the binding set's source
+/// (`LocalBindingSet::bearer_scope` — the default's own per-tenant slot when
+/// the set came from those slots), so `device` 22 -> 21.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 22),
+    ("device", 21),
     ("session-noop", 10),
     ("session-owed", 0),
     ("work-owed", 8),
@@ -1102,8 +1108,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 42,
-        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 41,
+        "expected 41 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1145,7 +1151,10 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          its stacked base #1447 ff-landed): the branch carried 40 off a narrative that stopped \
          at 51, because its base predated Phase 5's two plan_library forwards. main's 53 is the \
          current derivation, so the count is main's 43 minus the ONE site this commit moves, \
-         never either side's literal. Found {sites}. A change here \
+         never either side's literal. Plan \
+         2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential \
+         (review finding 1) then moved fleet.rs's register heartbeat onto the stating seam \
+         (its bearer follows the binding set's source): 42 - 1 = 41. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \

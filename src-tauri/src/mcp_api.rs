@@ -80,6 +80,609 @@ use crate::mcp::types::ApiState;
 use crate::str_utils::truncate_str;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+/// Every source file of the `mcp_api` module, as `(path relative to src/, text)`:
+/// this root file first, then every `*.rs` under `src/mcp_api/` (recursive),
+/// sorted by path.
+///
+/// Read at RUNTIME from `CARGO_MANIFEST_DIR`, because `include_str!` cannot
+/// glob a directory. The directory may not exist yet: until the split moves an
+/// item into it, this returns the root alone.
+///
+/// Source-text scans of this module go through here (or [`mcp_api_sources`])
+/// rather than naming `mcp_api.rs`, so moving an item into a child file cannot
+/// leave a scan reading only part of the module. Plan
+/// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+/// D5.
+#[cfg(test)]
+pub(crate) fn mcp_api_source_files() -> Vec<(String, String)> {
+    mcp_api_source_files_under(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+}
+
+/// [`mcp_api_source_files`] over an arbitrary `src` root, so the walk can be
+/// driven against a fixture tree that HAS an `mcp_api/` directory.
+#[cfg(test)]
+fn mcp_api_source_files_under(src: &std::path::Path) -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut paths = vec![src.join("mcp_api.rs")];
+    let children = src.join("mcp_api");
+    if children.is_dir() {
+        walk(&children, &mut paths);
+    }
+    let mut files: Vec<(String, String)> = paths
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(src)
+                .expect("every mcp_api source lives under src/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            (rel, text)
+        })
+        .collect();
+    // By the relative path STRING, so the root (`mcp_api.rs`) sorts before its
+    // children (`mcp_api/…`): `.` is below `/`.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+/// The whole `mcp_api` module's source text: [`mcp_api_source_files`]
+/// concatenated in order, each file ending in a newline. For scans asking
+/// "does this text exist anywhere in the module"; a scan that must name a
+/// file or a line, or mutate one file, uses [`mcp_api_source_files`].
+#[cfg(test)]
+pub(crate) fn mcp_api_sources() -> String {
+    join_sources(&mcp_api_source_files())
+}
+
+/// Concatenate `(path, text)` pairs in order, each file ending in a newline so
+/// one file's last line never fuses with the next file's first.
+#[cfg(test)]
+fn join_sources(files: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (_, text) in files {
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The `mcp_api` module's PRODUCTION text, per file: each file's lines with
+/// its column-0 `#[cfg(test)]` items removed, and every file that is itself an
+/// out-of-line test module left out whole. Returned as `(path, text)` pairs in
+/// [`mcp_api_source_files`] order, so a scan that must not cross a file
+/// boundary can stay inside one file.
+///
+/// `split("#[cfg(test)]").next()` was WRONG for this — it stops at the FIRST
+/// occurrence, which in `mcp_api.rs` was about 62% of the way in, so a
+/// construction added after that line was invisible and a scan passed by
+/// placement luck.
+///
+/// A column-0 `#[cfg(test)]` is skipped by its item's SHAPE, and any other
+/// shape is asserted rather than assumed, because guessing wrong swallows
+/// production code up to the next column-0 brace:
+/// - a braced `mod … {` or `fn … {` (rustfmt closes it with a column-0
+///   `}`) is skipped through that brace;
+/// - an out-of-line `mod name;` is skipped as one line, and the file it
+///   names (`<dir>/name.rs`, or anything under `<dir>/name/`) is excluded.
+///
+/// Positions are reported as `file:line`, per file, never as an offset into a
+/// concatenation.
+#[cfg(test)]
+pub(crate) fn production_files(files: &[(String, String)]) -> Vec<(String, String)> {
+    fn child_dir(rel: &str) -> String {
+        match rel.strip_suffix("/mod.rs") {
+            Some(dir) => dir.to_string(),
+            None => rel.strip_suffix(".rs").unwrap_or(rel).to_string(),
+        }
+    }
+    let mut test_files: Vec<String> = Vec::new();
+    let mut kept: Vec<(String, String)> = Vec::new();
+    for (rel, text) in files {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut production = String::new();
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i] != "#[cfg(test)]" {
+                production.push_str(lines[i]);
+                production.push('\n');
+                i += 1;
+                continue;
+            }
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            let item = strip_visibility(next);
+            if let Some(name) = item
+                .strip_prefix("mod ")
+                .and_then(|rest| rest.strip_suffix(';'))
+            {
+                test_files.push(format!("{}/{}", child_dir(rel), name.trim()));
+                i += 2;
+                continue;
+            }
+            assert!(
+                (item.starts_with("mod ") || item.starts_with("fn ")) && next.ends_with('{'),
+                "column-0 #[cfg(test)] at {rel}:{} gates `{next}`, not a braced \
+                 `mod`/`fn` or an out-of-line `mod name;` — this scan would \
+                 swallow production code up to the next column-0 brace",
+                i + 1
+            );
+            i += 1;
+            while i < lines.len() && lines[i] != "}" {
+                i += 1;
+            }
+            i += 1;
+        }
+        kept.push((rel.clone(), production));
+    }
+    kept.into_iter()
+        .filter(|(rel, _)| {
+            !test_files.iter().any(|t| {
+                rel.strip_prefix(t.as_str())
+                    .is_some_and(|rest| rest == ".rs" || rest.starts_with('/'))
+            })
+        })
+        .collect()
+}
+
+/// A line with one leading `pub(crate) ` / `pub(super) ` / `pub ` removed —
+/// the visibilities this module's items are declared with.
+#[cfg(test)]
+fn strip_visibility(line: &str) -> &str {
+    ["pub(crate) ", "pub(super) ", "pub "]
+        .iter()
+        .find_map(|v| line.strip_prefix(v))
+        .unwrap_or(line)
+}
+
+/// The source of the ONE production item in the `mcp_api` module whose
+/// column-0 declaration starts with `signature` (after an optional
+/// visibility), e.g. `"async fn coord_mcp_proxy_handler("`: from that line
+/// through the first column-0 `}` after it, in the SAME file. Comments are
+/// kept; a caller that must not be satisfied by a comment strips them.
+///
+/// Every file is searched, so the item may live in any of them — which is the
+/// point once the split moves it out of `mcp_api.rs` (plan
+/// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+/// D5). The three rules each close a vacuous pass a `find` over the
+/// concatenation allowed:
+/// - test code is filtered out first ([`production_files`]), so a test that
+///   QUOTES the signature in a string literal is never mistaken for the item;
+/// - the declaration must sit at column 0, so an indented mention cannot match;
+/// - the body ends inside its own file, so it can never run on into the next
+///   file's text; and the item must be declared exactly once, so a duplicate
+///   cannot shadow the real one by sorting first.
+///
+/// Two shapes the line-based scan cannot bound, stated so nobody relies on
+/// them:
+/// - a declaration that ENDS on its signature line (a one-line `fn x() {}`,
+///   with or without a trailing comment, or a one-line `const` / `static`
+///   ending in `;`) has no column-0 `}` of its own, so the body would run on
+///   into the next item — it is REFUSED with a panic naming the line rather
+///   than returned wrong ([`declaration_ends_on_its_line`]);
+/// - a raw string (or any literal) inside a `#[cfg(test)]` span that holds a
+///   line consisting of exactly `}` ends that span's skip early, so the test
+///   text after it would read as production code. Nothing in the module does
+///   that today; a test fixture that needs a column-0 `}` must build it with
+///   an escape (`"\n}\n"`) instead of a literal line.
+#[cfg(test)]
+pub(crate) fn mcp_api_item_source(signature: &str) -> String {
+    item_source_in(&mcp_api_source_files(), signature)
+}
+
+/// [`mcp_api_item_source`] over arbitrary `(path, text)` files, so its rules
+/// can be driven against a split-shaped fixture.
+#[cfg(test)]
+fn item_source_in(files: &[(String, String)], signature: &str) -> String {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for (rel, text) in production_files(files) {
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !strip_visibility(line).starts_with(signature) {
+                continue;
+            }
+            assert!(
+                !declaration_ends_on_its_line(line),
+                "`{signature}` in {rel}:{} is declared on one line (`{line}`); its \
+                 body has no column-0 `}}` of its own, so this scan would run on \
+                 into the next item — spread the item over several lines",
+                i + 1
+            );
+            let close = lines
+                .iter()
+                .skip(i + 1)
+                .position(|l| *l == "}")
+                .unwrap_or_else(|| {
+                    panic!("`{signature}` in {rel} has no column-0 `}}` closing it in that file")
+                });
+            found.push((rel.clone(), lines[i..=i + 1 + close].join("\n")));
+        }
+    }
+    assert!(
+        found.len() == 1,
+        "`{signature}` must be declared exactly once at column 0 in the mcp_api \
+         module's production code; found it in {:?}",
+        found.iter().map(|(rel, _)| rel).collect::<Vec<_>>()
+    );
+    found
+        .pop()
+        .map(|(_, body)| body)
+        .expect("exactly one, asserted above")
+}
+
+/// Does the item declared on `line` END on that line — so the column-0 `}`
+/// [`item_source_in`] looks for belongs to some LATER item?
+///
+/// Read from the line's CODE only: string literals (plain, byte, and raw —
+/// `r"…"`, `r#"a"b"#`, `br#"…"#`), char literals and comments (`/* … */`,
+/// nested as Rust nests them, and a trailing `//`) are skipped, so neither a
+/// `"{"` in a literal, a `"` inside a raw string, a `/* { */` nor a `// why`
+/// after the body can change the answer. A literal or block comment still
+/// open at the end of the line hides the rest of that line. Two shapes end on
+/// the line: a body whose braces open AND close there (`fn tiny() {} // why`,
+/// `struct S { a: u8 }`), and a bodiless item ending in `;` (a one-line
+/// `const` / `static` / `type` / `use`). Anything else — a signature ending in
+/// `{`, `(`, `,`, or a return type whose `where` / `{` follows on the next
+/// line — continues below.
+#[cfg(test)]
+fn declaration_ends_on_its_line(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    // Does a token start at `i` (nothing identifier-like glued before it)?
+    let token_start = |i: usize| i == 0 || !is_ident(chars[i - 1]);
+    let mut code = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        // A raw string: `r` (or `br`) opening a token, then N `#`, then `"`;
+        // it closes at the first `"` followed by N `#`, escapes and all.
+        if c == 'r' && (token_start(i) || (i >= 1 && chars[i - 1] == 'b' && token_start(i - 1))) {
+            let hashes = chars[i + 1..].iter().take_while(|h| **h == '#').count();
+            if chars.get(i + 1 + hashes) == Some(&'"') {
+                let body = i + 2 + hashes;
+                let close = (body..chars.len()).find(|&j| {
+                    chars[j] == '"'
+                        && chars.len() - j > hashes
+                        && chars[j + 1..=j + hashes].iter().all(|h| *h == '#')
+                });
+                i = close.map_or(chars.len(), |j| j + 1 + hashes);
+                continue;
+            }
+        }
+        match c {
+            '"' => {
+                // A string literal: skip to its unescaped closing quote.
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => i += 2,
+                        '"' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            '\'' => {
+                // A char literal (`'{'`, `'\''`) is skipped; a lifetime (`'a`)
+                // has no closing quote within two chars and is kept as code.
+                let literal_len = match next {
+                    Some('\\') => (chars.get(i + 3) == Some(&'\'')).then_some(4),
+                    Some(_) => (chars.get(i + 2) == Some(&'\'')).then_some(3),
+                    None => None,
+                };
+                match literal_len {
+                    Some(n) => i += n,
+                    None => {
+                        code.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            '/' if next == Some('/') => break,
+            '/' if next == Some('*') => {
+                // A block comment, nested as Rust nests them.
+                let mut depth = 0usize;
+                while i < chars.len() {
+                    match (chars[i], chars.get(i + 1)) {
+                        ('/', Some('*')) => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        ('*', Some('/')) => {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            _ => {
+                code.push(c);
+                i += 1;
+            }
+        }
+    }
+    let opens = code.matches('{').count();
+    let closes = code.matches('}').count();
+    (opens > 0 && opens == closes) || code.trim_end().ends_with(';')
+}
+
+#[cfg(test)]
+mod mcp_api_sources_tests {
+    /// The helper sees the module as it will be once split: the root FIRST,
+    /// then every `.rs` under `mcp_api/` at any depth in path order, and
+    /// nothing that is not Rust. Driven against a fixture `src/`, because the
+    /// real tree has no `mcp_api/` yet and a walk that skipped it would be
+    /// green there.
+    #[test]
+    fn walks_the_root_then_every_child_file_in_path_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path();
+        for (rel, text) in [
+            ("mcp_api.rs", "ROOT"),
+            ("mcp_api/vcs_pr.rs", "VCS\n"),
+            ("mcp_api/coord_mcp_proxy/tool_policy.rs", "POLICY"),
+            ("mcp_api/notes.md", "NOT RUST"),
+            ("mcp_api_other.rs", "NOT THE MODULE"),
+        ] {
+            let path = src.join(rel);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write fixture");
+        }
+        let files = super::mcp_api_source_files_under(src);
+        let names: Vec<&str> = files.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "mcp_api.rs",
+                "mcp_api/coord_mcp_proxy/tool_policy.rs",
+                "mcp_api/vcs_pr.rs",
+            ]
+        );
+        // A file without a trailing newline never fuses with the next one.
+        assert_eq!(super::join_sources(&files), "ROOT\nPOLICY\nVCS\n");
+    }
+
+    /// The real tree: the root is read, and is the first file.
+    #[test]
+    fn the_real_module_starts_with_its_root() {
+        let files = super::mcp_api_source_files();
+        assert_eq!(
+            files.first().map(|(rel, _)| rel.as_str()),
+            Some("mcp_api.rs")
+        );
+        assert!(super::mcp_api_sources().contains("pub(crate) fn mcp_api_sources() -> String {"));
+    }
+
+    /// The production filter, driven against a split-shaped fixture so each of
+    /// its rules is seen to bite: an inline test `mod`, a test-only `fn`, an
+    /// out-of-line test module and its file (plus a nested one under it) are
+    /// all dropped, and production text in every file survives, per file.
+    #[test]
+    fn production_files_drop_every_test_shape_and_keep_production() {
+        let files = vec![
+            (
+                "mcp_api.rs".to_string(),
+                "fn keep_root() {}\n#[cfg(test)]\npub(crate) fn helper() {\n    BUILD();\n}\n\
+                 #[cfg(test)]\nmod extracted_tests;\n#[cfg(test)]\nmod inline_tests {\n    BUILD();\n}\n\
+                 fn keep_after() {}\n"
+                    .to_string(),
+            ),
+            (
+                "mcp_api/extracted_tests.rs".to_string(),
+                "fn fixture() { BUILD(); }\n".to_string(),
+            ),
+            (
+                "mcp_api/extracted_tests/deeper.rs".to_string(),
+                "fn fixture() { BUILD(); }\n".to_string(),
+            ),
+            (
+                "mcp_api/extracted_tests_not.rs".to_string(),
+                "fn keep_sibling() {}\n".to_string(),
+            ),
+            (
+                "mcp_api/vcs_pr.rs".to_string(),
+                "fn keep_child() {}\n#[cfg(test)]\nmod tests {\n    BUILD();\n}\n".to_string(),
+            ),
+        ];
+        let production = super::production_files(&files);
+        let names: Vec<&str> = production.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "mcp_api.rs",
+                "mcp_api/extracted_tests_not.rs",
+                "mcp_api/vcs_pr.rs"
+            ]
+        );
+        let text = super::join_sources(&production);
+        assert!(!text.contains("BUILD"), "{text}");
+        for kept in ["keep_root", "keep_after", "keep_sibling", "keep_child"] {
+            assert!(text.contains(kept), "{kept} dropped:\n{text}");
+        }
+    }
+
+    /// A `#[cfg(test)]` on a shape the filter cannot bound is refused, named by
+    /// file and line — never silently swallowed.
+    #[test]
+    #[should_panic(expected = "mcp_api/vcs_pr.rs:2 gates `use foo;`")]
+    fn production_files_refuse_an_unboundable_cfg_test_item() {
+        super::production_files(&[(
+            "mcp_api/vcs_pr.rs".to_string(),
+            "fn a() {}\n#[cfg(test)]\nuse foo;\nfn b() {}\n".to_string(),
+        )]);
+    }
+
+    /// The post-split shape the finder exists for: the item lives in a CHILD
+    /// file, while the root (which sorts first) carries the tests that quote
+    /// its signature in a string literal and mention it in an indented line.
+    /// The finder must return the child's real body, stop at that body's own
+    /// closing brace, and never run on into the next file.
+    #[test]
+    fn item_source_finds_the_moved_body_not_the_tests_quoting_it() {
+        let files = vec![
+            (
+                "mcp_api.rs".to_string(),
+                "mod coord_mcp_proxy;\n    async fn handler( indented mention\n\
+                 #[cfg(test)]\nmod tests {\n    fn t() { find(\"async fn handler(\"); QUOTED(); }\n}\n"
+                    .to_string(),
+            ),
+            (
+                "mcp_api/coord_mcp_proxy.rs".to_string(),
+                "/// docs\npub(super) async fn handler(\n    x: u8,\n) {\n    REAL();\n}\n\
+                 fn after() { AFTER(); }\n"
+                    .to_string(),
+            ),
+            (
+                "mcp_api/zz_next.rs".to_string(),
+                "fn next_file() { NEXT(); }\n".to_string(),
+            ),
+        ];
+        let body = super::item_source_in(&files, "async fn handler(");
+        assert!(body.starts_with("pub(super) async fn handler("), "{body}");
+        assert!(body.contains("REAL()") && body.ends_with("\n}"), "{body}");
+        for absent in ["QUOTED", "AFTER", "NEXT", "indented"] {
+            assert!(!body.contains(absent), "{absent} leaked into:\n{body}");
+        }
+    }
+
+    /// Declared twice is refused, naming both files: the first-sorting copy
+    /// must not silently shadow the other.
+    #[test]
+    #[should_panic(expected = "found it in [\"mcp_api.rs\", \"mcp_api/b.rs\"]")]
+    fn item_source_refuses_a_duplicate_declaration() {
+        super::item_source_in(
+            &[
+                ("mcp_api.rs".to_string(), "fn dup() {\n}\n".to_string()),
+                ("mcp_api/b.rs".to_string(), "fn dup() {\n}\n".to_string()),
+            ],
+            "fn dup(",
+        );
+    }
+
+    /// Absent is refused too — a scan over nothing must not pass.
+    #[test]
+    #[should_panic(expected = "found it in []")]
+    fn item_source_refuses_an_absent_item() {
+        super::item_source_in(
+            &[("mcp_api.rs".to_string(), "fn other() {\n}\n".to_string())],
+            "fn missing(",
+        );
+    }
+
+    /// A one-line item is refused by name: its `{}` closes on the signature
+    /// line, so the next column-0 `}` belongs to some LATER item and the
+    /// returned "body" would carry that item's text.
+    #[test]
+    #[should_panic(expected = "`fn tiny(` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_declaration() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "fn tiny() {}\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "fn tiny(",
+        );
+    }
+
+    /// The same one-line body with a trailing comment: `// why` must not hide
+    /// the `}` that already closed it.
+    #[test]
+    #[should_panic(expected = "`fn tiny(` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_declaration_with_a_trailing_comment() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "fn tiny() {} // why\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "fn tiny(",
+        );
+    }
+
+    /// A one-line `const` has no braces at all and ends in `;` — it too would
+    /// run on into the next item's body.
+    #[test]
+    #[should_panic(expected = "`const LIMIT:` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_const() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "const LIMIT: usize = 4;\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "const LIMIT:",
+        );
+    }
+
+    /// What the refusal must NOT catch: a signature line that continues — an
+    /// opening `{`, a split parameter list, a return type whose `{` is on the
+    /// next line — and literals or comments that only LOOK like a close.
+    #[test]
+    fn a_continuing_signature_line_is_not_a_one_line_declaration() {
+        for line in [
+            "async fn health(State(s): State<S>) -> Json<Value> {",
+            "async fn coord_mcp_proxy_handler(",
+            "fn split(a: A,",
+            "fn returns() -> impl Fn() -> u8",
+            "fn braces_in_a_literal() -> &'static str { // \"}\" is text",
+            "const URL: &str = concat!(\"http://x\", {",
+            "fn ch() -> char { '}' // a char literal",
+            "fn raw() -> &'static str { r#\"a\"b}\"#",
+            "fn raw() -> &'static [u8] { br#\"}\"#",
+            "fn plain_raw() -> &'static str { r\"}\"",
+            "fn commented() { /* } */",
+            "fn nested() { /* /* } */ } */",
+            "fn esc() -> char { '\\'' // }",
+        ] {
+            assert!(
+                !super::declaration_ends_on_its_line(line),
+                "{line:?} continues on the next line"
+            );
+        }
+        for line in [
+            "fn tiny() {}",
+            "fn tiny() {} // why",
+            "struct S { a: u8 }",
+            "const URL: &str = \"http://x\";",
+            "static N: AtomicU64 = AtomicU64::new(0); // count",
+            "fn ch() -> char { '{' }",
+            "fn raw() -> &'static str { r#\"a\"b{\"# }",
+            "fn commented() {} /* { */",
+            "fn tail() {} /* an open comment {",
+            "fn ident_r() -> u8 { for_r(\"{\") }",
+        ] {
+            assert!(
+                super::declaration_ends_on_its_line(line),
+                "{line:?} ends on its own line"
+            );
+        }
+    }
+
+    /// The real module: the handler the source-scan pins read is found once.
+    #[test]
+    fn item_source_finds_the_real_coord_mcp_proxy_handler() {
+        let body = super::mcp_api_item_source("async fn coord_mcp_proxy_handler(");
+        assert!(body.contains("coord_mcp_url_with_source"), "{body}");
+    }
+}
+
 // Cached embedding-service probe state. Module-scope so heartbeats can read
 // the reachability bit without running the full async probe path — the
 // /health handler is the sole writer (compare_exchange-gated on 30s stale).
@@ -1616,6 +2219,7 @@ async fn health(
         native_ui_wedged: native_ui.wedged,
         embedding_reachable: embedding_reachable_cached(),
         pg_reachable,
+        pg_schema_ok: schema_ok,
         relay_connected,
         // M7: a credential-dark runner is DEGRADED, not healthy. `None` while
         // no refresher pass has concluded — UNKNOWN, never health.
@@ -8104,8 +8708,9 @@ async fn coord_mcp_proxy_handler(
 /// settled answer is returned as is; a transient unknown is returned at once
 /// and, once its retry window has passed, retried in a background task — a
 /// retry never delays a `tools/call`. A key with no live
-/// binding — a superseded key inside its grace window — carries no
-/// expectation, which is UNKNOWN and said, never agreement.
+/// binding and no grace entry carries no expectation, which is UNKNOWN and
+/// said, never agreement. A superseded key inside its grace window shares its
+/// evicted binding's expectation.
 async fn coord_mcp_apply_tenant_verdict(
     nonce: Option<&str>,
     request: &[u8],
@@ -8125,8 +8730,8 @@ async fn coord_mcp_apply_tenant_verdict(
             ),
             None => (
                 qontinui_runner_lib::repo_tenant::CwdTenant::unknown(
-                    "this proxy key has no live binding to carry an expectation \
-                     (a superseded key inside its grace window)",
+                    "this proxy key has no live binding or grace entry to carry an \
+                     expectation",
                 ),
                 None,
             ),
@@ -12866,6 +13471,7 @@ pub fn create_router(
         .merge(crate::mcp::disk_reclaim::routes())
         .merge(crate::mcp::agent_tokens::routes())
         .merge(crate::install_effects_producer::routes())
+        .merge(crate::session::resume_door::routes())
         .merge(crate::mcp::token_analytics::routes())
         .merge(crate::mcp::otel_status::routes())
         .merge(crate::mcp::container_status::routes())
@@ -12874,6 +13480,7 @@ pub fn create_router(
         .merge(crate::mcp::knowledge_acquisition_api::routes())
         .merge(crate::mcp::reviews::routes())
         .merge(crate::mcp::snapshots::routes())
+        .merge(crate::mcp::session_review::routes())
         .merge(crate::mcp::session_recap::routes())
         .merge(crate::mcp::api_surface::routes())
         .merge(crate::mcp::api_surface_diff::routes())
@@ -13314,7 +13921,7 @@ pub async fn start_server(
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
     // This can happen on Windows when previous process crashes leave orphaned sockets
-    let ports_to_try = [port, port + 1, port + 2];
+    let ports_to_try = crate::instance::api_ports_to_try(port);
     let mut last_error = None;
 
     for try_port in ports_to_try {
@@ -14109,17 +14716,11 @@ mod transport_rung_counter_tests {
         );
     }
 
-    /// The body of one `async fn` / `fn` in this file, comments stripped.
+    /// The body of one `async fn` / `fn` in the `mcp_api` module (whichever of
+    /// its files declares it — [`crate::mcp_api::mcp_api_item_source`]),
+    /// comments stripped.
     fn fn_body(name_with_paren: &str) -> String {
-        let text = include_str!("mcp_api.rs");
-        let start = text
-            .find(name_with_paren)
-            .unwrap_or_else(|| panic!("{name_with_paren} exists"));
-        let end = text[start..]
-            .find("\n}\n")
-            .map(|i| start + i)
-            .expect("its body ends");
-        text[start..end]
+        crate::mcp_api::mcp_api_item_source(name_with_paren)
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -14144,7 +14745,9 @@ mod transport_rung_counter_tests {
             record < forward,
             "the rung row must be written BEFORE the upstream forward"
         );
-        let call = &code[record..forward];
+        let call = code
+            .get(record..forward)
+            .expect("`find` returns char boundaries");
         assert!(
             call.contains("OPERATION_WRITE"),
             "the forwarder's row must say `write`, not a body-classified operation"
@@ -14167,7 +14770,10 @@ mod transport_rung_counter_tests {
             .find(") -> axum::response::Response")
             .expect("signature ends");
         assert!(
-            !code[..sig_end].contains("HeaderMap"),
+            !code
+                .get(..sig_end)
+                .expect("`find` returns a char boundary")
+                .contains("HeaderMap"),
             "forward_coord_write must not take the caller's request headers"
         );
         assert!(
@@ -14182,7 +14788,9 @@ mod transport_rung_counter_tests {
         }
         // …and the handler hands the leg no header map either.
         let handler = fn_body("async fn coord_write_proxy_handler(");
-        let call = &handler[handler.find("forward_coord_write(").unwrap()..];
+        let call = handler
+            .get(handler.find("forward_coord_write(").unwrap()..)
+            .expect("`find` returns a char boundary");
         assert!(
             !call.contains("&headers") && !call.contains("headers,"),
             "the handler must not pass request headers to the upstream leg"
@@ -16594,8 +17202,7 @@ mod coord_mcp_body_gate_tests {
                 .is_ok(),
             "membership is a binary_search, so the entry must sit in sorted position"
         );
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         assert_eq!(
             parsed
                 .allowed
@@ -16615,8 +17222,7 @@ mod coord_mcp_body_gate_tests {
     /// entry back exactly once despite the comments above them.
     #[test]
     fn phase_attestation_tools_are_allowed_and_parse_from_source() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         for tool in [
             "coord_work_unit_attest_phase",
             "coord_work_unit_retract_phase_attestation",
@@ -17398,14 +18004,32 @@ mod coord_mcp_body_gate_tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The parser reads THIS file's four consts back exactly as they compiled.
-    /// A reformat that breaks the parser breaks this test, not production
-    /// (production degrades to `cause: "unknown"`), so the parser cannot rot
-    /// silently against the one file it exists to read.
+    /// The tool policy as PRODUCTION reads it — through
+    /// [`crate::build_drift::first_parsable_tool_policy`], ONE file at a time
+    /// from its path list — but over this working tree instead of `git show`
+    /// at trunk. Parsing the whole module's concatenation instead would stay
+    /// green while production answered `cause: "unknown"`: consts moved to a
+    /// file not on the path list, or split across two files, both still parse
+    /// as one text.
+    fn working_tree_tool_policy() -> crate::build_drift::ParsedToolPolicy {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        crate::build_drift::first_parsable_tool_policy(|rel| {
+            std::fs::read_to_string(repo_root.join(rel)).ok()
+        })
+        .expect(
+            "one file on build_drift's TOOL_POLICY_SOURCE_PATHS declares all four \
+             consts in a shape its parser reads",
+        )
+    }
+
+    /// The parser reads THIS module's four consts back exactly as they compiled,
+    /// along production's own path ([`working_tree_tool_policy`]). A reformat
+    /// that breaks the parser, or a move of the consts off the path list, breaks
+    /// this test, not production (production degrades to `cause: "unknown"`),
+    /// so the reader cannot rot silently against the source it exists to read.
     #[test]
     fn trunk_policy_parser_round_trips_this_files_consts() {
-        let p = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let p = working_tree_tool_policy();
         assert_eq!(p.allowed, strings(COORD_MCP_ALLOWED_TOOLS));
         assert_eq!(
             p.allowed_prefixes,
@@ -18253,24 +18877,8 @@ mod coord_claims_proxy_tests {
     /// technique `ui_error`'s writer guard uses. It fails against a
     /// `coord_mcp_proxy_handler` that does not make the call.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
-        // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
-        // from anywhere.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
-        let start = text
-            .find("async fn coord_mcp_proxy_handler(")
-            .expect("coord_mcp_proxy_handler exists");
-        // The next top-level item ends the handler's body.
-        let end = text[start..]
-            .find("\n/// ")
-            .map(|i| start + i)
-            .unwrap_or(text.len());
-        let body = &text[start..end];
+        let body = &crate::mcp_api::mcp_api_item_source("async fn coord_mcp_proxy_handler(");
         assert!(
             body.contains("note_coord_upstream_verdict"),
             "the highest-volume device-credential consumer must report coord's \
@@ -18395,21 +19003,8 @@ mod coord_claims_proxy_tests {
     /// `coord_mcp_url_with_source()` would still dial coord and still hand the
     /// caller `token_expired`, which is the whole incident.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
-        let start = text
-            .find("async fn coord_mcp_proxy_handler(")
-            .expect("coord_mcp_proxy_handler exists");
-        let end = text[start..]
-            .find("\n/// ")
-            .map(|i| start + i)
-            .unwrap_or(text.len());
-        let body = &text[start..end];
+        let body = &crate::mcp_api::mcp_api_item_source("async fn coord_mcp_proxy_handler(");
 
         let gate = body.find("runner_credential_local_refusal").expect(
             "the forwarder must ask whether THIS RUNNER's credential can answer before \
@@ -19382,21 +19977,10 @@ mod coord_provision_session_gate_tests {
     /// `the_health_handler_emits_the_supervised_workers_block`).
     #[test]
     fn the_health_handler_emits_the_active_tenant_fields() {
-        let src = include_str!("mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let src = &crate::mcp_api::mcp_api_sources();
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -19425,21 +20009,9 @@ mod coord_provision_session_gate_tests {
     /// `Condition` task (same source-scan technique as the tests around it).
     #[test]
     fn the_health_handler_emits_the_scheduler_conditions_capability() {
-        let src = include_str!("mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -19472,21 +20044,9 @@ mod coord_provision_session_gate_tests {
     /// pin the active-tenant fields use.
     #[test]
     fn the_health_handler_emits_the_thread_census_and_the_tails_gauge() {
-        let src = include_str!("mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -19629,6 +20189,7 @@ mod coord_provision_session_gate_tests {
             CoordCredentialPosture::Absent,
             CoordCredentialPosture::Unrefreshable,
             CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+            CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding),
         ];
         for posture in dark {
             let v =
@@ -21637,12 +22198,20 @@ mod oauth_dcr_surface_absent_tests {
     }
 
     /// The one that actually catches someone "fixing" this by standing up OAuth
-    /// later: no `.route("<oauth path>"` registration exists anywhere in this
-    /// file. The needle is composed at runtime so this test's own source cannot
-    /// match it.
+    /// later: no `.route("<oauth path>"` registration exists anywhere in the
+    /// `mcp_api` module. The needles are composed at runtime so this test's own
+    /// source cannot match them.
     #[test]
     fn no_oauth_or_dcr_route_is_registered_in_this_router() {
-        let src = include_str!("mcp_api.rs");
+        let src = &crate::mcp_api::mcp_api_sources();
+        // An absence proves nothing about text that was never read: the scan
+        // must see the router's real registrations before it may vouch that
+        // none of them is an OAuth path.
+        let health_route = format!(".route(\"{}\"", "/health");
+        assert!(
+            src.contains(&health_route),
+            "the scanned text carries no `{health_route}` — it is not the router"
+        );
         for (_, path) in OAUTH_PATHS {
             let needle = format!(".route(\"{path}\"");
             assert!(
@@ -22058,24 +22627,10 @@ mod supervised_workers_health_tests {
 
     #[test]
     fn the_health_handler_emits_the_supervised_workers_block() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
-        )
-        .expect("read mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let src = crate::mcp_api::mcp_api_sources();
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -22159,24 +22714,10 @@ mod ui_bridge_binding_health_tests {
 
     #[test]
     fn the_health_handler_emits_the_ui_bridge_binding_block() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
-        )
-        .expect("read mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let src = crate::mcp_api::mcp_api_sources();
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -22202,45 +22743,9 @@ mod ui_bridge_binding_health_tests {
     /// once, and `RelayState`'s `FromRef` only ever clones that `Arc`.
     #[test]
     fn production_constructs_exactly_one_relay_binding() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
-        )
-        .expect("read mcp_api.rs");
-        // Strip the test modules: their fixtures legitimately build their own.
-        //
-        // `split("#[cfg(test)]").next()` was WRONG here — it stops at the
-        // FIRST occurrence, which in this file is about 62% of the way in, so
-        // a second construction added after that line was invisible and the
-        // test passed by placement luck.
-        //
-        // Skip only a column-0 `#[cfg(test)]` that gates a `mod` — that is the
-        // shape whose body closes with a column-0 `}`. A `#[cfg(test)]` on a
-        // bare `fn` or `use` would otherwise make this swallow production code
-        // up to the next column-0 brace, so it is asserted, not assumed.
-        let lines: Vec<&str> = src.lines().collect();
-        let mut production = String::new();
-        let mut i = 0usize;
-        while i < lines.len() {
-            if lines[i] == "#[cfg(test)]" {
-                let next = lines.get(i + 1).copied().unwrap_or("");
-                assert!(
-                    next.starts_with("mod "),
-                    "column-0 #[cfg(test)] at line {} gates `{next}`, not a `mod` — \
-                     this scan would swallow production code up to the next \
-                     column-0 brace",
-                    i + 1
-                );
-                i += 1;
-                while i < lines.len() && lines[i] != "}" {
-                    i += 1;
-                }
-                i += 1;
-                continue;
-            }
-            production.push_str(lines[i]);
-            production.push('\n');
-            i += 1;
-        }
+        let production = crate::mcp_api::join_sources(&crate::mcp_api::production_files(
+            &crate::mcp_api::mcp_api_source_files(),
+        ));
         // Anchor on known production symbols rather than a line-count ratio:
         // the ratio flips to a spurious failure the day the test modules
         // exceed half the file, which is a property of test volume, not of
