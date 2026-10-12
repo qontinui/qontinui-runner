@@ -228,7 +228,7 @@ export function probeHealthGate(seg) {
   if (p.behind === true) {
     return {
       reason: "harness_error",
-      detail: `the probe fell behind its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged, bound ${p.lag_bound_ms ?? "?"} ms), so first appearances may be late`,
+      detail: `the probe fell behind its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged${p.lag_statistic ? ` as the ${p.lag_statistic}` : ""}, bound ${p.lag_bound_ms ?? "?"} ms${Number.isInteger(p.frames_over_bound) ? `, ${p.frames_over_bound} frame(s) over it` : ""}), so first appearances may be late`,
     };
   }
   if (p.behind !== false && Number(p.frames ?? 0) > 0) {

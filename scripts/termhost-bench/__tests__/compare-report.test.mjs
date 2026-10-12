@@ -238,3 +238,18 @@ test("an A/B gate fails on a runner row whose build is unproven, even a measured
     `runner (${r.setup.build.role}) N = 5 focus run 0: the build is unproven (unknown_build); an A/B gate needs both builds proven (D12)`,
   ]);
 });
+
+test("only an UNPROVEN build is left out of a comparison: a third party's not_applicable build is compared (Phase 4 finding)", () => {
+  const a = abDoc();
+  const b = abDoc();
+  const tmux = (doc) => doc.rows.find((r) => r.setup.id === "tmux");
+  assert.equal(tmux(a).setup.build.state, "not_applicable");
+  const cmp = compareBuilds(a, b, { setup: "tmux" });
+  assert.ok(cmp.entries.length > 0, "tmux rows pair across two files");
+  assert.ok(cmp.entries.some((e) => e.head.total === 1 && e.baseline.total === 1));
+  // ... while an unproven runner baseline is still never one side.
+  for (const r of b.rows) {
+    if (r.setup.id === "runner") r.setup.build = { state: "unknown", reason: "harness_error", detail: "never proven", role: "baseline", requested_commit: BASE };
+  }
+  assert.throws(() => compareBuilds(a, b), /no runner\/default baseline rows to compare/);
+});

@@ -218,6 +218,7 @@ test("a probe that fell behind: its capture KPIs carry its harness_error, and so
   }
   const lagging = watchSegment({ t0: T0 + BigInt(SOAK_MS + 1000) * MS, durationMs: 11000, behind: true });
   assert.equal(probeHealthGate(indexProbeSegment(lagging)).reason, "harness_error");
+  assert.match(probeHealthGate(indexProbeSegment(lagging)).detail, /judged as the p95, bound 100 ms, \d+ frame\(s\) over it/, "which statistic was judged (Phase 2 round 3)");
   assert.equal(probeHealthGate(indexProbeSegment(watchSegment({ t0: T0, durationMs: 2000 }))), null);
   const sw = computeRowKpis({ ...focusFixture(), n: 2, switches: { records: lagging, list: [{ k: 0, tCmdNs: T0 + BigInt(SOAK_MS + 2000) * MS }] } });
   assertUnknown(sw.kpis.switch_latency_ms, "harness_error");

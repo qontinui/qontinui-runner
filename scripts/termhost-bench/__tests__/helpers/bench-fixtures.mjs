@@ -355,6 +355,8 @@ function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, r
       lag_ms_judged: frames.length && behind !== null ? (behind ? 250 : 2) : null,
       lag_ms_max: frames.length && behind !== null ? (behind ? 250 : 2) : null,
       lag_bound_ms: 100,
+      lag_statistic: frames.length && behind !== null ? (frames.length >= 20 ? "p95" : frames.length >= 2 ? "second_largest" : "only_frame") : null,
+      frames_over_bound: behind === true ? frames.length : 0,
       behind: frames.length ? behind : null,
     },
   };
