@@ -797,7 +797,8 @@ Let `/vet-plan` run to completion — it audits the claims, edits the plan in
 place, resolves open questions via its Decision policy, and stamps the plan
 `Status: VETTED <date>` (and, under this chain, registers the `time_elapsed`
 safety-net gate — **not** a `unit_ready` record gate; see the table below —
-unless it took its §5.4 step 6 **hold-gate skip**, which registers neither). Do
+unless it took its §5.4 step 6 **hold-gate skip**, which registers neither, or
+its **delivery skip**, which registers neither and makes no `→ vetted` transition). Do
 not short-circuit any of it.
 
 **Collect its report; do not emit it.** `/vet-plan` Step 6 produces a complete,
@@ -816,15 +817,17 @@ point, so do not reintroduce it as a "quick summary of the vet" either.
 about the MIDPOINT, not a cap on output.)
 
 **`/vet-plan` registers exactly ONE gate for a `/vet-imp` run — the net
-(changed 2026-09-04) — or NONE when it takes its §5.4 step 6 hold-gate skip**
+(changed 2026-09-04) — or NONE when it takes its §5.4 step 6 hold-gate skip or
+§5.4 delivery skip**
 (the plan is held behind a live trigger gate that already dispatches back to
-it; see Step 3's VETTED-HELD arm). If this chain drops after vetting, coord dispatches a
+it; see Step 3's VETTED-HELD arm; or, under the delivery skip, the plan landed
+mid-vet and Step 3's arm-1 read routes to closeout). If this chain drops after vetting, coord dispatches a
 fresh visible session to implement the plan instead of leaving it stranded.
 
 | Gate | `phase_name` | Predicate | Continuation | Registered under `/vet-imp`? |
 |---|---|---|---|---|
 | **Record** | the plan title, or `"vet→implement handoff"` | `unit_ready` `{work_unit_id, ready_status}` | **NEVER** — unconditional | **NO — standalone `/vet-plan` only** |
-| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always**, except under `/vet-plan` §5.4 step 6's hold-gate skip |
+| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always**, except under `/vet-plan` §5.4's delivery skip or step 6's hold-gate skip |
 
 > **The net's continuation carries a brief; `/vet-plan` §5.4 shows the shape in
 > step 5 and step 6 registers it.** The session coord dispatches has never read the plan and does
@@ -971,6 +974,17 @@ states that legitimately stop the lifecycle must stop it here too:
      below)
   7. `evidence_gaps` carries no `NO PHASE ATTRIBUTION` entry
 
+  **Before routing to closeout, retire this run's net.** If Step 2's `/vet-plan`
+  registered a `vet→implement safety net` (its §5.4 step 6) that is still OPEN —
+  its `gate_id` is in `/vet-plan`'s step-6 report and step-8 read-back row
+  (`phase_name` `vet→implement safety net`), or read
+  `coord_gate_list {work_unit_id, open_only: true}` — withdraw it — `coord_withdraw_gate {gate_id, reason}`, or the bare
+  device-authed `POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw {reason}`;
+  on `NotRegistrant`, cancel then mute, exactly as `/implement-plan` Step 0.5 —
+  and name its `gate_id` in full in the Step 5 report. Left armed, it
+  dispatches an implement session onto delivered work in 30 minutes; nothing
+  else on this path retires it.
+
   Short of all seven it is a fall-through, not a stop. Read the response
   through `/vet-plan`'s arm table in its stated order — **4, 3, 2, 1, 5, then
   6** — with these seven as arm 1 here (a NON-EMPTY `phases_remaining` beside
@@ -982,7 +996,8 @@ states that legitimately stop the lifecycle must stop it here too:
   **unidentified default**
   (an `IN PROGRESS` stamp with no session marker, or one that cannot be
   positively attributed at all, is a STOP, not an overwrite; a marker naming a
-  probed-dead peer is case 2, adopt), before it rewrote the stamp.
+  probed-dead peer is case 2, adopt, or the hold gate's own continuation is
+  case 2b, adopt), before it rewrote the stamp.
 
   **Conjunct 3 is carried explicitly even though that arm order already
   enforces it** — `/vet-plan`'s arm 3 pre-empts arm 1 on a
