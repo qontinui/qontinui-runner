@@ -1227,7 +1227,7 @@ fn cmd_device_pair(
             // Best-effort, exactly like the sign-out-marker clear above: a
             // failed promotion must never fail a pairing that already
             // persisted. The helper refuses a SECONDARY instance (it would
-            // demote the primary's shared settings.json) and refuses an
+            // demote the primary: its settings.json may be the primary's) and refuses an
             // unparseable settings.json (it would clobber recoverable state).
             match qontinui_runner_lib::profiles::promote_tier_to_account() {
                 // The path is printed, not implied. This writer resolves
@@ -1247,7 +1247,8 @@ fn cmd_device_pair(
                 Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
                     eprintln!(
                         "warning: QONTINUI_INSTANCE_NAME is set, so this is a SECONDARY runner \
-                         instance — refusing to write the shared settings.json (it would demote \
+                         instance — refusing to write a settings.json that may be the primary's \
+                         (it would demote \
                          the primary). Run `device pair` from the primary, or set the tier there."
                     );
                 }
@@ -1465,7 +1466,8 @@ fn cmd_tier(set: Option<&str>, clear_choice: bool) -> ExitCode {
         Ok(TierWrite::SkippedSecondary) => {
             eprintln!(
                 "QONTINUI_INSTANCE_NAME is set, so this is a SECONDARY runner instance — \
-                 refusing to write the shared settings.json (it would demote the primary). \
+                 refusing to write a settings.json that may be the primary's (it would \
+                 demote the primary). \
                  Run this from the primary."
             );
             ExitCode::from(1)

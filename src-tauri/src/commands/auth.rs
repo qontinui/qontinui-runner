@@ -950,7 +950,7 @@ pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String
             settings::set_in_memory_tier(parsed);
             warn!(
                 "set_runner_tier: secondary runner — applied in memory only (tier={:?}), \
-                 skipping save_settings so the primary's shared settings.json is not clobbered",
+                 skipping save_settings so a settings.json that may be the primary's is not clobbered",
                 parsed
             );
             Ok(SetRunnerTierResult {

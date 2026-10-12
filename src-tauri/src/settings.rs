@@ -4982,7 +4982,7 @@ pub fn load_settings_full() -> LoadedSettings {
         if first {
             info!(
                 "Skipping tier/local_user_id migration persist for secondary runner \
-                 (instance={:?}) — would clobber the primary's shared settings.json; \
+                 (instance={:?}) — its settings.json may be the primary's; \
                  keeping the migration in-memory only (tier={:?}). Logged once per process.",
                 crate::instance::instance_name(),
                 settings.tier

@@ -1539,7 +1539,7 @@ pub const TIER_VALUES: &[&str] = &[LOCAL_TIER, LOCAL_PROVIDER_TIER, QONTINUI_ACC
 /// 1. **Something to persist.** A file where every named key already holds the
 ///    target value is left BYTE-IDENTICAL ([`TierWrite::Unchanged`]).
 /// 2. **`!is_secondary`.** A supervisor-launched runner carrying
-///    `QONTINUI_INSTANCE_NAME` must never write the shared `settings.json`:
+///    `QONTINUI_INSTANCE_NAME` must never write a `settings.json` that may be the primary's:
 ///    `settings::migrate_tier_in_place` infers `Local` for it (no
 ///    `runner_token`), so a secondary write silently DEMOTES the primary on
 ///    disk — the FOOTGUN GUARD in `settings::load_settings_full`. Note the

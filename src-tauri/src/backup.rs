@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 use zip::write::FileOptions;
 use zip::{ZipArchive, ZipWriter};
@@ -82,7 +82,14 @@ struct BackupFile {
     /// Where THIS runner keeps it, per the owning module's resolver, or why
     /// that could not be resolved.
     path: Result<PathBuf, String>,
+    /// The ONE directory a restore may write this file under, resolved
+    /// independently of `path`, so a regressed `path` is refused rather than
+    /// written.
+    base: Result<PathBuf, String>,
 }
+
+/// Archive name of the machine-global Claude account roster.
+const ROSTER_ARCHIVE_NAME: &str = "claude-accounts.json";
 
 /// The files a backup carries, each located by its OWNING module's resolver.
 ///
@@ -98,49 +105,81 @@ struct BackupFile {
 ///   machine-global by design. Every runner on the box shares that one roster.
 ///
 /// Every resolver here creates nothing. [`restore_backup`] creates a
-/// destination's directory only for a file the archive actually carries.
+/// destination's directory only for a file the archive actually carries, and
+/// only after the destination passed its base check.
+///
+/// # Each file has its OWN restore base
+///
+/// - `settings.json` may only be written under the config dir
+///   [`crate::settings::resolve_config_dir`] answers. Under
+///   `QONTINUI_CONFIG_DIR` that is the per-instance dir alone, so a settings
+///   entry that regressed to the platform file is refused, even though the
+///   platform dir CONTAINS a supervisor runner's
+///   `com.qontinui.runner/instances/<id>` dir. The old shared allow-list
+///   (platform config dir + platform data-local dir, for every file) could not
+///   see that regression, because both files lie under the platform dir.
+/// - The other three may only be written under the platform
+///   `com.qontinui.runner` dir ([`crate::settings::resolve_platform_config_dir`]).
+///   Their modules join that dir themselves, so this base is an independent
+///   statement of where they must land, not a derivation of their paths.
 fn get_backup_files() -> Vec<BackupFile> {
+    let settings_base = crate::settings::resolve_config_dir().map(|(dir, _source)| dir);
+    let platform_base = crate::settings::resolve_platform_config_dir;
     vec![
         BackupFile {
             archive_name: SETTINGS_ARCHIVE_NAME,
             path: crate::settings::resolve_settings_path(),
+            base: settings_base,
         },
         BackupFile {
             archive_name: "prompts.json",
             path: crate::prompts::resolve_prompts_path(),
+            base: platform_base(),
         },
         BackupFile {
             archive_name: "playwright-tests.json",
             path: crate::playwright::resolve_tests_path(),
+            base: platform_base(),
         },
         BackupFile {
-            archive_name: "claude-accounts.json",
+            archive_name: ROSTER_ARCHIVE_NAME,
             path: crate::claude_accounts::claude_accounts_file_path()
                 .ok_or_else(|| "Failed to get config directory".to_string()),
+            base: platform_base(),
         },
     ]
 }
 
-/// The directories a restore may write into, in the order they are tried.
-///
-/// 1. The config dir this runner's settings resolve to
-///    ([`crate::settings::resolve_config_dir`]), which is per-instance under
-///    `QONTINUI_CONFIG_DIR`.
-/// 2. The platform `com.qontinui.runner` dir that the prompts, Playwright and
-///    roster stores live under ([`crate::settings::resolve_platform_config_dir`]).
-///
-/// Both come from the settings resolver, so this check cannot drift from the
-/// destinations it guards. It used to hard-code the platform dirs. A
-/// per-instance `settings.json` does not lie under those, so a correctly
-/// resolved destination would have been refused.
-fn allowed_restore_bases() -> Vec<PathBuf> {
-    [
-        crate::settings::resolve_config_dir().map(|(dir, _source)| dir),
-        crate::settings::resolve_platform_config_dir(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+/// `path` canonicalized WITHOUT requiring it to exist and without creating
+/// anything: the nearest existing ancestor is canonicalized and the missing
+/// tail re-joined. `None` when no ancestor exists or the tail is not plain
+/// names (a `..` or `.` there could walk out of the canonical prefix).
+fn canonicalize_creating_nothing(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            return Some(tail.iter().rev().fold(canonical, |acc, c| acc.join(c)));
+        }
+        match existing.components().next_back() {
+            Some(std::path::Component::Normal(name)) => tail.push(name.to_os_string()),
+            _ => return None,
+        }
+        existing = existing.parent()?;
+    }
+}
+
+/// Is `dest` inside `base`? Decided before anything is created, so a refused
+/// destination leaves no directory behind (a typo'd `QONTINUI_CONFIG_DIR`
+/// used to be `create_dir_all`ed before this check ran).
+fn destination_is_within(dest: &Path, base: &Path) -> bool {
+    match (
+        canonicalize_creating_nothing(dest),
+        canonicalize_creating_nothing(base),
+    ) {
+        (Some(dest), Some(base)) => dest.starts_with(base),
+        _ => false,
+    }
 }
 
 /// Create a backup of all user data
@@ -167,7 +206,10 @@ fn create_backup_of(files: Vec<BackupFile>) -> Result<(Vec<u8>, BackupResult), S
     let mut file_infos = Vec::new();
 
     // Backup each file
-    for BackupFile { archive_name, path } in files {
+    for BackupFile {
+        archive_name, path, ..
+    } in files
+    {
         match path {
             Ok(path) => {
                 if path.exists() {
@@ -289,13 +331,11 @@ fn restore_backup_into(data: &[u8], files: Vec<BackupFile>) -> Result<RestoreRes
         backup_version, backup_date
     );
 
-    // Every destination must stay within the directories this runner owns.
-    let allowed_bases = allowed_restore_bases();
-
     // Restore each file
     for BackupFile {
         archive_name,
         path: dest_path,
+        base,
     } in files
     {
         if archive_name == MANIFEST_FILE {
@@ -303,8 +343,35 @@ fn restore_backup_into(data: &[u8], files: Vec<BackupFile>) -> Result<RestoreRes
         }
 
         match archive.by_name(archive_name) {
+            // The roster is machine-global: it overrides the roster fields of
+            // EVERY instance's settings, the primary's included
+            // (`claude_accounts::apply_roster_overlay`). A secondary restoring
+            // it would rewrite the primary's account selection, so it is
+            // skipped there, and said so.
+            Ok(_) if archive_name == ROSTER_ARCHIVE_NAME && crate::instance::is_secondary() => {
+                let msg = format!(
+                    "Skipped {}: it is the machine-global Claude account roster, which a \
+                     secondary runner must not replace; restore it on the primary",
+                    archive_name
+                );
+                warn!("{}", msg);
+                errors.push(msg);
+            }
             Ok(mut file) => match dest_path {
                 Ok(dest_path) => {
+                    let inside = base
+                        .as_ref()
+                        .is_ok_and(|base| destination_is_within(&dest_path, base));
+                    if !inside {
+                        let msg = format!(
+                            "Destination path for {} is outside allowed directories",
+                            archive_name
+                        );
+                        error!("{}", msg);
+                        errors.push(msg);
+                        continue;
+                    }
+
                     if let Some(parent) = dest_path.parent() {
                         if let Err(e) = fs::create_dir_all(parent) {
                             let msg =
@@ -313,50 +380,6 @@ fn restore_backup_into(data: &[u8], files: Vec<BackupFile>) -> Result<RestoreRes
                             errors.push(msg);
                             continue;
                         }
-                    }
-
-                    let canonical_dest = match dest_path.parent() {
-                        Some(parent) => match parent.canonicalize() {
-                            Ok(canonical_parent) => {
-                                canonical_parent.join(dest_path.file_name().unwrap_or_default())
-                            }
-                            Err(_) => {
-                                let msg = format!(
-                                    "Failed to resolve destination path for {}",
-                                    archive_name
-                                );
-                                error!("{}", msg);
-                                errors.push(msg);
-                                continue;
-                            }
-                        },
-                        None => {
-                            let msg =
-                                format!("Failed to resolve destination path for {}", archive_name);
-                            error!("{}", msg);
-                            errors.push(msg);
-                            continue;
-                        }
-                    };
-
-                    // Lazy and in order: a destination under the first base
-                    // never makes the second one be stat'ed.
-                    let path_is_safe = allowed_bases.iter().any(|base| {
-                        if let Ok(canonical_base) = base.canonicalize() {
-                            canonical_dest.starts_with(&canonical_base)
-                        } else {
-                            false
-                        }
-                    });
-
-                    if !path_is_safe {
-                        let msg = format!(
-                            "Destination path for {} is outside allowed directories",
-                            archive_name
-                        );
-                        error!("{}", msg);
-                        errors.push(msg);
-                        continue;
                     }
 
                     // Read file contents
@@ -450,7 +473,6 @@ mod tests {
         SettingsProvenance,
     };
     use crate::test_env::{isolated_ambient, EnvVarRestore, IsolatedAmbient};
-    use std::path::Path;
 
     /// A runner whose `settings.json` is NOT the primary's: inside an
     /// [`IsolatedAmbient`], `QONTINUI_CONFIG_DIR` names a per-instance dir, as
@@ -512,13 +534,17 @@ mod tests {
 
     /// A backup archive carrying `settings.json` (and a manifest) only.
     fn archive_with_settings(settings: &[u8]) -> Vec<u8> {
+        archive_with(SETTINGS_ARCHIVE_NAME, settings)
+    }
+
+    /// A backup archive carrying one entry (and a manifest) only.
+    fn archive_with(name: &str, bytes: &[u8]) -> Vec<u8> {
         let mut buffer = Vec::new();
         {
             let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buffer));
             let options: FileOptions<'_, ()> = FileOptions::<'_, ()>::default();
-            zip.start_file(SETTINGS_ARCHIVE_NAME, options)
-                .expect("start settings entry");
-            zip.write_all(settings).expect("write settings entry");
+            zip.start_file(name, options).expect("start the entry");
+            zip.write_all(bytes).expect("write the entry");
             let manifest = BackupManifest {
                 version: BACKUP_VERSION.to_string(),
                 created_at: "2026-10-12T00:00:00Z".to_string(),
@@ -666,6 +692,120 @@ mod tests {
             read_settings_from_disk().settings.local_user_id,
             "after--restore",
             "a settings load after a restore must see the restored document"
+        );
+    }
+
+    /// Each file's restore base is resolved independently of its path, and
+    /// under `QONTINUI_CONFIG_DIR` the settings base is the per-instance dir
+    /// ALONE. A base that admitted the platform dir would also admit the
+    /// primary's `settings.json`, which a regressed settings path resolves to,
+    /// because the platform dir contains a supervisor runner's
+    /// `instances/<id>` dir. No I/O.
+    #[test]
+    fn settings_restore_base_is_the_per_instance_config_dir_alone() {
+        let runner = per_instance_runner();
+        let settings = get_backup_files()
+            .into_iter()
+            .find(|f| f.archive_name == SETTINGS_ARCHIVE_NAME)
+            .expect("the backup list carries settings.json");
+        assert_eq!(
+            settings.base,
+            Ok(runner.config_dir.clone()),
+            "settings.json may only be restored under QONTINUI_CONFIG_DIR"
+        );
+    }
+
+    /// A settings destination outside its base (here: the platform file a
+    /// regressed resolver would name, placed in the fixture) is refused, and
+    /// refused BEFORE anything is created, so no directory is left behind.
+    #[test]
+    fn restore_refuses_a_settings_destination_outside_its_base_and_creates_nothing() {
+        let runner = per_instance_runner();
+        let own = runner.config_dir.join("settings.json");
+        let platform_dir = runner.amb.dir().join("platform-config");
+        let regressed = platform_dir
+            .join("com.qontinui.runner")
+            .join("settings.json");
+        let mut entries = settings_entry_asserting(&own);
+        entries[0].path = Ok(regressed.clone());
+
+        let restored =
+            restore_backup_into(&archive_with_settings(b"{}"), entries).expect("restore runs");
+        assert!(!restored.success);
+        assert!(restored.files_restored.is_empty());
+        assert!(
+            restored
+                .errors
+                .iter()
+                .any(|e| e.contains("outside allowed directories")),
+            "{:?}",
+            restored.errors
+        );
+        assert!(!regressed.exists(), "the refused file was written");
+        assert!(
+            !platform_dir.exists(),
+            "the refused destination's directory was created before the check"
+        );
+    }
+
+    /// A secondary must not replace the machine-global roster: it overrides
+    /// the roster fields of every instance, the primary's included. The skip
+    /// keys on the archive name, so the entry is pointed into the fixture and a
+    /// regression could only ever write there.
+    #[test]
+    fn a_secondary_restore_skips_the_machine_global_roster() {
+        let runner = per_instance_runner();
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "backup-roster-test");
+        let roster_dir = runner.amb.dir().join("roster");
+        let roster = roster_dir.join(ROSTER_ARCHIVE_NAME);
+        let entries = vec![BackupFile {
+            archive_name: ROSTER_ARCHIVE_NAME,
+            path: Ok(roster.clone()),
+            base: Ok(roster_dir.clone()),
+        }];
+
+        let restored = restore_backup_into(
+            &archive_with(ROSTER_ARCHIVE_NAME, br#"{"claude_config_dirs":[]}"#),
+            entries,
+        )
+        .expect("restore runs");
+        assert!(restored.files_restored.is_empty(), "{:?}", restored);
+        assert!(
+            restored
+                .errors
+                .iter()
+                .any(|e| e.starts_with("Skipped claude-accounts.json")),
+            "the skip must be reported: {:?}",
+            restored.errors
+        );
+        assert!(!roster.exists(), "a secondary replaced the roster");
+    }
+
+    /// Prompts, Playwright tests and the roster are located by their OWNING
+    /// modules' resolvers, not by copies here. No I/O. (On Windows under this
+    /// fixture the platform dir is unresolvable, so there the results compared
+    /// are the resolvers' errors; Linux and macOS compare real paths.)
+    #[test]
+    fn non_settings_files_are_located_by_their_owning_resolvers() {
+        let _runner = per_instance_runner();
+        let by_name = |name: &str| {
+            get_backup_files()
+                .into_iter()
+                .find(|f| f.archive_name == name)
+                .unwrap_or_else(|| panic!("the backup list carries {name}"))
+        };
+        assert_eq!(
+            by_name("prompts.json").path,
+            crate::prompts::resolve_prompts_path()
+        );
+        assert_eq!(
+            by_name("playwright-tests.json").path,
+            crate::playwright::resolve_tests_path()
+        );
+        assert_eq!(
+            by_name(ROSTER_ARCHIVE_NAME).path,
+            crate::claude_accounts::claude_accounts_file_path()
+                .ok_or_else(|| "Failed to get config directory".to_string())
         );
     }
 }
