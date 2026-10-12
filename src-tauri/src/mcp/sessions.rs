@@ -1331,7 +1331,8 @@ const CLOSED_RETENTION_HOURS: i64 =
 /// `404` for an id the registry does not hold — never a default reason. The
 /// registry keeps closed records for [`CLOSED_RETENTION_HOURS`] hours; older
 /// sessions are listed by `GET /sessions/history`, which carries no work axis and so cannot back an
-/// honest next action here.
+/// honest next action here. `503` when the registry is unreadable (a
+/// poisoned lock): whether the session exists is then itself unknown.
 ///
 /// Read-only; no coord round-trip, so it answers on an offline, unpaired box.
 async fn get_stop_reason(
@@ -1383,12 +1384,11 @@ fn transcript_on_disk(
 /// record over an unconfirmed one, else the most recently opened. The chosen
 /// record's id is echoed as `session_id` in the answer.
 fn latest_record_for_terminal(
-    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     terminal_id: &str,
 ) -> Option<crate::session::session_lifecycle_store::TerminalSessionRecord> {
-    store
-        .all_records()
-        .into_iter()
+    records
+        .iter()
         .filter(|r| r.terminal_id == terminal_id)
         // The session id is the last key so equal `opened_at`s resolve the
         // same way every time (the registry is a HashMap).
@@ -1397,6 +1397,7 @@ fn latest_record_for_terminal(
                 .cmp(&(b.state == "open", b.confirmed_at.is_some(), b.opened_at))
                 .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
         })
+        .cloned()
 }
 
 /// The handler's logic over a store, separated so it is testable without an
@@ -1410,9 +1411,24 @@ fn stop_reason_for(
     id: &str,
     transcript_exists: impl Fn(&crate::session::session_lifecycle_store::TerminalSessionRecord) -> bool,
 ) -> Result<crate::session::stop_reason::StopReason, (StatusCode, Json<ApiResponse<()>>)> {
-    match store
-        .get(id)
-        .or_else(|| latest_record_for_terminal(store, id))
+    // One checked read: a poisoned registry lock is a 503 (the answer is
+    // UNKNOWN), never a 404 claiming the session does not exist.
+    let records = store.all_records_checked().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error_with_code(
+                "the session lifecycle registry is unreadable (its lock is poisoned), so why \
+                 this session stopped is UNKNOWN — not absent. Retry; if it persists the \
+                 runner has a defect worth reporting",
+                "SERVICE_UNAVAILABLE",
+            )),
+        )
+    })?;
+    match records
+        .iter()
+        .find(|r| r.claude_session_id == id)
+        .cloned()
+        .or_else(|| latest_record_for_terminal(&records, id))
     {
         Some(rec) => Ok(crate::session::stop_reason::stop_reason(
             &rec,
@@ -1424,8 +1440,10 @@ fn stop_reason_for(
                 format!(
                     "no terminal session or terminal `{id}` in the lifecycle registry. Closed \
                      terminal sessions are kept {CLOSED_RETENTION_HOURS} hours (older ones are \
-                     listed by GET /sessions/history); sessions started by POST /sessions/spawn \
-                     are task runs, which this route does not cover"
+                     listed by GET /sessions/history). A task run started by POST /sessions/spawn \
+                     is not a terminal session and this route does not cover it, except an \
+                     orchestration-loop worker, whose record is keyed by its task_run_id — \
+                     pass that id"
                 ),
                 "SESSION_NOT_FOUND",
             )),
@@ -2666,6 +2684,19 @@ mod tests {
         let r = stop_reason_for(&store, "term-known", |_| true).unwrap();
         assert_eq!(r.session_id, "known");
         assert_eq!(r.code, crate::session::stop_reason::StopCode::ProcessExited);
+    }
+
+    /// A poisoned registry lock is a 503 — the answer is UNKNOWN, and a 404
+    /// would claim the session does not exist.
+    #[test]
+    fn stop_reason_from_a_poisoned_registry_is_a_503_not_a_404() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        store.poison_for_test();
+        let (status, Json(body)) = stop_reason_for(&store, "known", |_| true).unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["code"], "SERVICE_UNAVAILABLE");
+        assert!(v["error"].as_str().unwrap().contains("UNKNOWN"));
     }
 
     /// An id the registry does not hold is a 404 — never a default reason.

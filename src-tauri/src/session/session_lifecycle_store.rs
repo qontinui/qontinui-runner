@@ -1117,6 +1117,11 @@ pub enum SetFinishedError {
     Unavailable,
 }
 
+/// The registry could not be read (its lock is poisoned) — returned by the
+/// `_checked` readers so "unreadable" is never collapsed into "no record".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryUnavailable;
+
 /// The result of a [`SessionLifecycleStore::set_finished`] call on a KNOWN
 /// session: the record as it now stands, what changed, and whether coord was
 /// told.
@@ -3033,6 +3038,32 @@ impl SessionLifecycleStore {
                 Vec::new()
             }
         }
+    }
+
+    /// [`Self::all_records`] for a reader that must not answer "not found"
+    /// from an unreadable registry: a poisoned lock is
+    /// `Err(RegistryUnavailable)`, never an empty `Vec`. `GET
+    /// /sessions/{id}/stop-reason` reads through this so a poisoned lock is a
+    /// 503, not a 404 for a session that may well exist.
+    pub fn all_records_checked(&self) -> Result<Vec<TerminalSessionRecord>, RegistryUnavailable> {
+        match self.map.lock() {
+            Ok(m) => Ok(m.values().cloned().collect()),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on all_records_checked");
+                Err(RegistryUnavailable)
+            }
+        }
+    }
+
+    /// Poison the registry lock, for tests of a reader's unreadable-registry
+    /// arm.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = self.map.lock();
+            panic!("poisoning the session lifecycle registry for a test");
+        }));
+        assert!(self.map.is_poisoned());
     }
 
     /// Run `f` over [`Self::unsynced_finished_records`] with `finish_forward`
