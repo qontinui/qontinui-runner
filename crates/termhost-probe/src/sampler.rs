@@ -319,6 +319,23 @@ impl Sampler {
         self.sample_table(&table, now_ns)
     }
 
+    /// Whether `pid` (started at `start`) is gone, asked after a read of it
+    /// failed: the reader's answer, else the process table re-read for it.
+    fn has_exited(&mut self, pid: u32, start: u64) -> bool {
+        if let Some(gone) = self.reader.gone(pid) {
+            return gone;
+        }
+        let spid = sysinfo::Pid::from_u32(pid);
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[spid]),
+            true,
+            ProcessRefreshKind::new(),
+        );
+        self.sys
+            .process(spid)
+            .is_none_or(|p| p.start_time() != start)
+    }
+
     /// One sample of an already-read process table.
     fn sample_table(&mut self, table: &BTreeMap<u32, ProcInfo>, now_ns: u64) -> SampleRecord {
         let slots = self
@@ -345,6 +362,7 @@ impl Sampler {
 
         let mut out_groups = BTreeMap::new();
         let mut now_members = HashMap::new();
+        let mut exited_now = Vec::new();
         for (&name, pids) in &groups {
             let mut g = GroupSample {
                 pids: pids.clone(),
@@ -361,16 +379,30 @@ impl Sampler {
             let mut rss_sum: u64 = 0;
             for &pid in pids {
                 let start = table.get(&pid).map_or(0, |p| p.start_time);
-                now_members.insert(
-                    pid,
-                    Member {
-                        group: name,
-                        name: table.get(&pid).map(|p| p.name.clone()).unwrap_or_default(),
-                        start_time: start,
-                        session: self.gen_sessions.get(&(pid, start)).copied(),
-                    },
-                );
-                match self.reader.cpu_ns(pid) {
+                let member = Member {
+                    group: name,
+                    name: table.get(&pid).map(|p| p.name.clone()).unwrap_or_default(),
+                    start_time: start,
+                    session: self.gen_sessions.get(&(pid, start)).copied(),
+                };
+                let cpu = self.reader.cpu_ns(pid);
+                let mem = self.reader.memory(pid);
+                if (cpu.is_none() || mem.is_none()) && self.has_exited(pid, start) {
+                    // It exited between the table read and its own read:
+                    // an exit, not an unreadable member — the group's sums
+                    // are whole without it.
+                    exited_now.push(ExitedProcess {
+                        pid,
+                        group: member.group,
+                        name: member.name,
+                        session: member.session,
+                    });
+                    self.prev_cpu.remove(&pid);
+                    g.pids.retain(|&p| p != pid);
+                    continue;
+                }
+                now_members.insert(pid, member);
+                match cpu {
                     Some(c) => {
                         if let Some(&(prev_start, prev_cpu)) = self.prev_cpu.get(&pid) {
                             if prev_start == start && c >= prev_cpu {
@@ -382,7 +414,7 @@ impl Sampler {
                     }
                     None => g.unreadable += 1,
                 }
-                match self.reader.memory(pid) {
+                match mem {
                     Some(m) => {
                         mem_sum += m.catalog_bytes;
                         rss_sum += m.rss_bytes;
@@ -397,7 +429,10 @@ impl Sampler {
                     }
                 }
             }
-            if g.unreadable > 0 {
+            if g.pids.is_empty() {
+                // Every member exited mid-read.
+                g.note = Some(NOTE_EMPTY);
+            } else if g.unreadable > 0 {
                 g.note = Some(NOTE_UNREADABLE);
             } else {
                 if let Some(dt) = dt_ns.filter(|&d| d > 0) {
@@ -409,13 +444,13 @@ impl Sampler {
                 g.memory_mb = Some(mem_sum as f64 / 1_048_576.0);
                 g.rss_mb = Some(rss_sum as f64 / 1_048_576.0);
             }
-            if gpu_by_pid.is_some() {
+            if gpu_by_pid.is_some() && !g.pids.is_empty() {
                 g.gpu_pct = Some(g.gpu_by_engine.values().copied().fold(0.0, f64::max));
             }
             out_groups.insert(name, g);
         }
 
-        let mut exited = Vec::new();
+        let mut exited = exited_now;
         for (pid, m) in &self.members {
             let gone = table.get(pid).is_none_or(|p| p.start_time != m.start_time);
             if gone {
@@ -655,19 +690,29 @@ mod tests {
     struct FakeReader {
         cpu: HashMap<u32, u64>,
         unreadable: Option<u32>,
+        /// Exits between the table read and its own read.
+        exited_mid_read: Option<u32>,
     }
 
     impl ProcessReader for FakeReader {
+        fn gone(&mut self, pid: u32) -> Option<bool> {
+            Some(self.exited_mid_read == Some(pid))
+        }
         fn cpu_ns(&mut self, pid: u32) -> Option<u64> {
+            if self.exited_mid_read == Some(pid) {
+                return None;
+            }
             // Any other live process in the tree (a node another test spawned
             // as our child) reads as idle, never as unreadable.
             (self.unreadable != Some(pid)).then(|| self.cpu.get(&pid).copied().unwrap_or(0))
         }
         fn memory(&mut self, pid: u32) -> Option<crate::platform::ProcMem> {
-            (self.unreadable != Some(pid)).then_some(crate::platform::ProcMem {
-                catalog_bytes: 1_048_576,
-                rss_bytes: 2_097_152,
-            })
+            (self.unreadable != Some(pid) && self.exited_mid_read != Some(pid)).then_some(
+                crate::platform::ProcMem {
+                    catalog_bytes: 1_048_576,
+                    rss_bytes: 2_097_152,
+                },
+            )
         }
         fn gpu(&mut self) -> GpuReading {
             let mut m = HashMap::new();
@@ -690,6 +735,7 @@ mod tests {
             Box::new(FakeReader {
                 cpu: HashMap::from([(me, 1_000_000_000)]),
                 unreadable: None,
+                exited_mid_read: None,
             }),
         );
         let first = s.sample(0);
@@ -702,6 +748,7 @@ mod tests {
         s.reader = Box::new(FakeReader {
             cpu: HashMap::from([(me, 1_250_000_000)]),
             unreadable: None,
+            exited_mid_read: None,
         });
         let second = s.sample(500_000_000);
         assert_eq!(second.dt_ms, Some(500.0));
@@ -725,6 +772,7 @@ mod tests {
             Box::new(FakeReader {
                 cpu: HashMap::new(),
                 unreadable: None,
+                exited_mid_read: None,
             }),
         );
         for t in [0, 500_000_000] {
@@ -774,6 +822,7 @@ mod tests {
             Box::new(FakeReader {
                 cpu: HashMap::new(),
                 unreadable: None,
+                exited_mid_read: None,
             }),
         );
         let t = table();
@@ -800,6 +849,42 @@ mod tests {
     }
 
     #[test]
+    fn a_member_that_exits_mid_read_is_an_exit_not_an_unreadable_member() {
+        // OpenConsole (101) exits between the table read and its own read,
+        // in what turns out to be the run's last sample: the host group's
+        // numbers are whole without it, so its end memory is not lost.
+        let mut s = Sampler::new(
+            SamplerConfig {
+                host_pids: vec![100],
+                run_id: Some("run-7".into()),
+                ..SamplerConfig::default()
+            },
+            Box::new(FakeReader {
+                cpu: HashMap::new(),
+                unreadable: None,
+                exited_mid_read: Some(101),
+            }),
+        );
+        let rec = s.sample_table(&table(), 0);
+        let host = &rec.groups[GROUP_HOST];
+        assert_eq!(host.note, None, "{host:?}");
+        assert_eq!(host.unreadable, 0);
+        assert_eq!(host.pids, vec![100, 104, 105]);
+        assert_eq!(host.memory_mb, Some(3.0));
+        assert_eq!(
+            rec.exited
+                .iter()
+                .map(|e| (e.pid, e.group))
+                .collect::<Vec<_>>(),
+            vec![(101, GROUP_HOST)]
+        );
+        // Reported once: the next sample does not report it again.
+        let mut after = table();
+        after.remove(&101);
+        assert!(s.sample_table(&after, 500_000_000).exited.is_empty());
+    }
+
+    #[test]
     fn a_partly_unreadable_group_withholds_its_sums() {
         let me = std::process::id();
         let mut s = Sampler::new(
@@ -810,6 +895,7 @@ mod tests {
             Box::new(FakeReader {
                 cpu: HashMap::from([(me, 1)]),
                 unreadable: Some(me),
+                exited_mid_read: None,
             }),
         );
         let host = &s.sample(0).groups[GROUP_HOST];

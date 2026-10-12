@@ -98,6 +98,7 @@ fn describe_hr(e: &windows::core::Error) -> String {
     } else {
         String::new()
     };
+    let e = super::hr(e);
     if what.is_empty() {
         format!("{e}{job}")
     } else {
