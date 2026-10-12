@@ -51,7 +51,7 @@ use super::push::{
 };
 use super::ref_scan::CycleRefPin;
 use crate::auth::TenantScope;
-use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+use crate::wedge_diagnostics::spawn_blocking_tracked;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

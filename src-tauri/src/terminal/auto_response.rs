@@ -868,10 +868,8 @@ mod resolve {
         // (`TerminalSession::coord_session_id`, set from
         // `SessionRegistry::register_external`), so the registry can answer.
         //
-        // `crate::auth`, not `qontinui_runner_lib::auth`: this module compiles
-        // into the bin target only, so the lib path would bump the lib crate's
-        // separate counter statics — the same reason `fs_observer` records for
-        // its own attach — and the two crates' `TenantScope` are distinct types.
+        // `crate::auth` is the lib's `auth` (the bin imports it): one
+        // `TenantScope` type and one set of coverage counters for every attach.
         let req = crate::auth::attach_device_auth_for(
             client.post(&url),
             crate::session::session_tenant_scope(coord_session_id),

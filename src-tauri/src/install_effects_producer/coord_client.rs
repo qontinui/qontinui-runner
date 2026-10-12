@@ -1,8 +1,8 @@
 //! Bearer-attached coord POST helpers for the install-effects producer.
 //!
 //! Every coord write attaches the device-JWT bearer via
-//! [`crate::auth::attach_device_auth`] (the bin-target data-plane helper the
-//! rest of the runner's coord writes use), degrading to anonymous when the
+//! [`crate::auth::attach_device_auth`] (the lib's data-plane helper, imported
+//! by the bin, that the rest of the runner's coord writes use), degrading to anonymous when the
 //! runner is unpaired — forward-compat with coord's multiuser Phase-2
 //! enforcement, even though the install routes are anonymous today.
 //!
@@ -60,7 +60,7 @@ pub struct CoordInstallClient {
 
 impl CoordInstallClient {
     /// `scope` is the owning tenant of `repo_path`, resolved by the caller via
-    /// [`crate::repo_detection::tenant_scope_for_path`]. It is required rather
+    /// [`qontinui_runner_lib::repo_tenant::tenant_scope_for_path`]. It is required rather
     /// than defaulted so a new install surface cannot quietly rejoin the
     /// default binding: `/coord/installs/declare` persists a row whose tenant
     /// coord prefers to take from `principal.tenant_id`, i.e. from this bearer.
@@ -181,11 +181,10 @@ impl CoordInstallClient {
         url: String,
         body: &T,
     ) -> Result<serde_json::Value, CoordError> {
-        // Bin-target `crate::auth` (NOT the lib copy) so this producer's coord
-        // writes feed the SAME `DATA_PLANE_TOTAL`/`AUTHED` coverage counters as
-        // the rest of the runner's bin-target data plane (the dogfood auth
-        // signal). Both copies read the same on-disk token, but only one set of
-        // counters is the one operators watch.
+        // `crate::auth` is the lib's `auth` (the bin imports it), so this
+        // producer's coord writes feed the runner's one `DATA_PLANE_TOTAL` /
+        // `AUTHED` coverage counters (the dogfood auth signal) like every other
+        // data-plane attach.
         // Phase 6 — of the three routes this serves, only
         // `/coord/installs/declare` reads a tenant, and it prefers
         // `principal.tenant_id`: this bearer. predict-and-check and verify

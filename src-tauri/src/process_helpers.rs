@@ -6,7 +6,7 @@
 //! transparent passthroughs.
 
 /// Create a `std::process::Command` with `CREATE_NO_WINDOW` on Windows.
-use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+use crate::wedge_diagnostics::spawn_blocking_tracked;
 
 pub fn no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command {
     let is_git = program_is_git(program.as_ref());
@@ -18,7 +18,7 @@ pub fn no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     if is_git {
-        for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+        for (k, v) in crate::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
         }
     }
@@ -37,7 +37,7 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     if is_git {
-        for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+        for (k, v) in crate::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
         }
     }
@@ -956,10 +956,10 @@ pub fn start_detached(
     // per failure (plan `2026-09-23-resource-guard-floors-are-constants-and-
     // the-runners-own-git-spawns-are-ungated` Phase 0).
     let mut child = cmd.spawn().inspect_err(|e| {
-        qontinui_runner_lib::util::resource_exhaustion::note_fd_exhaustion(e);
+        crate::util::resource_exhaustion::note_fd_exhaustion(e);
         report_classified_exhaustion(e, label);
     })?;
-    qontinui_runner_lib::util::resource_exhaustion::note_spawn_succeeded();
+    crate::util::resource_exhaustion::note_spawn_succeeded();
     let pid = child.id();
 
     let deadline = Instant::now() + budget;
@@ -1167,9 +1167,9 @@ fn run_bounded(
     // labelled callers ([`run_probe`], [`output_with_timeout_labeled`]), which
     // know which subsystem failed; this function only knows the program.
     let mut child = cmd.spawn().inspect_err(|e| {
-        qontinui_runner_lib::util::resource_exhaustion::note_fd_exhaustion(e);
+        crate::util::resource_exhaustion::note_fd_exhaustion(e);
     })?;
-    qontinui_runner_lib::util::resource_exhaustion::note_spawn_succeeded();
+    crate::util::resource_exhaustion::note_spawn_succeeded();
     let pid = child.id();
     let tree = ChildTreeGuard::attach_armed(&child);
 
@@ -1379,10 +1379,8 @@ pub fn output_with_timeout_labeled(
 fn report_classified_exhaustion(
     e: &std::io::Error,
     label: &str,
-) -> qontinui_runner_lib::util::resource_exhaustion::SpawnFailure {
-    use qontinui_runner_lib::util::resource_exhaustion::{
-        report_exhaustion, Evidence, SpawnFailure,
-    };
+) -> crate::util::resource_exhaustion::SpawnFailure {
+    use crate::util::resource_exhaustion::{report_exhaustion, Evidence, SpawnFailure};
     let failure = SpawnFailure::classify(e);
     if let Some(kind) = failure.exhaustion {
         report_exhaustion(kind, Evidence::OsCode, failure.os_code, label);
@@ -1413,7 +1411,7 @@ pub enum DegradeReason {
     /// The child could not be spawned at all. Carries the classified OS error,
     /// so `ERROR_COMMITMENT_LIMIT` (the machine is out of commit) is no longer
     /// indistinguishable from `ENOENT` (git is not on PATH).
-    SpawnError(qontinui_runner_lib::util::resource_exhaustion::SpawnFailure),
+    SpawnError(crate::util::resource_exhaustion::SpawnFailure),
     /// The child overran the budget and was killed. `reaped` says whether the
     /// follow-up `wait()` succeeded, so a leaked zombie is observable.
     TimedOut { pid: u32, reaped: bool },
@@ -1528,11 +1526,9 @@ fn run_probe_inner(
             // expected negative answer — and reported through the episode
             // instead of the per-failure line below.
             if let Some(os_code) =
-                qontinui_runner_lib::util::resource_exhaustion::commit_exhaustion_in_stderr(
-                    &o.stderr,
-                )
+                crate::util::resource_exhaustion::commit_exhaustion_in_stderr(&o.stderr)
             {
-                use qontinui_runner_lib::util::resource_exhaustion::{
+                use crate::util::resource_exhaustion::{
                     report_exhaustion, Evidence, ExhaustionKind,
                 };
                 report_exhaustion(
@@ -2968,7 +2964,7 @@ mod prompt_proof_tests {
         ] {
             let cmd = no_window(program);
             let envs = env_of(&cmd);
-            for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+            for (k, v) in crate::git_posture::prompt_proof_git_env() {
                 assert_eq!(
                     envs.iter()
                         .find(|(key, _)| *key == k)
@@ -2986,7 +2982,7 @@ mod prompt_proof_tests {
     fn tokio_no_window_git_is_prompt_proof() {
         let cmd = tokio_no_window("git");
         let envs = env_of(cmd.as_std());
-        for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+        for (k, v) in crate::git_posture::prompt_proof_git_env() {
             assert_eq!(
                 envs.iter()
                     .find(|(key, _)| *key == k)
@@ -3031,8 +3027,8 @@ mod prompt_proof_tests {
     /// added to `non_interactive_git_env` reaches this chokepoint for free.
     #[test]
     fn prompt_proof_subset_is_derived_from_the_one_posture() {
-        let full = qontinui_runner_lib::git_posture::non_interactive_git_env();
-        let subset = qontinui_runner_lib::git_posture::prompt_proof_git_env();
+        let full = crate::git_posture::non_interactive_git_env();
+        let subset = crate::git_posture::prompt_proof_git_env();
         let expected: Vec<_> = full
             .into_iter()
             .filter(|(k, _)| !k.starts_with("GIT_CONFIG_"))

@@ -70,7 +70,7 @@ use tracing::{debug, info, warn};
 
 use self::collectors::Section;
 use self::config::EnvAgentConfig;
-use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+use crate::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Current envelope schema version. Must match the backend's expectation.
 ///

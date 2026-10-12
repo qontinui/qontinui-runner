@@ -177,10 +177,9 @@ async fn post_commit_observation(
     // Attach the device-JWT bearer when one is available (never fatal —
     // unpaired / empty keychain collapses to the anonymous send coord accepts
     // today). Same write-path attach the Ξ_FS observer uses on its push, and it
-    // feeds the data-plane auth-coverage metric. Must be `crate::auth`, not
-    // `qontinui_runner_lib::auth` — this module compiles into the bin target,
-    // and the lib path would bump the lib crate's separate counter statics,
-    // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
+    // feeds the data-plane auth-coverage metric — `crate::auth` is the lib's
+    // `auth` (the bin imports it), so this is the runner's one
+    // `DATA_PLANE_TOTAL/AUTHED` coverage readout.
     // Phase 6 — the observation's own repo names the tenant, and the body
     // declares it. Both halves come off one scope so they cannot disagree (D1).
     let req = crate::auth::attach_device_auth_for(client.post(&url), scope);
@@ -246,7 +245,7 @@ pub async fn forward_commit_event(event: &GitSupervisionEvent) {
     // preserve a value, which `TenantScope::declared_tenant` exists to refuse.
     let scope = match event.payload.get("repo_path").and_then(|v| v.as_str()) {
         Some(p) if !p.is_empty() => {
-            crate::repo_detection::tenant_scope_for_path(std::path::Path::new(p)).await
+            qontinui_runner_lib::repo_tenant::tenant_scope_for_path(std::path::Path::new(p)).await
         }
         _ => crate::auth::TenantScope::Unresolved,
     };

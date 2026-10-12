@@ -50,7 +50,7 @@ mod ai_workflows;
 pub mod api_config;
 mod api_request;
 mod asset_headers;
-mod auth;
+pub(crate) use qontinui_runner_lib::auth;
 mod auto_commit;
 mod automation_stack; // Can this box drive a GUI? — /health `automationStack` + the shared $DISPLAY resolution
 mod backup;

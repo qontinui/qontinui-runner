@@ -462,7 +462,7 @@ pub async fn tick_once() -> Result<(), String> {
         // falls back to the device default only on a single-bound device,
         // where that default IS the owner and dropping it would delete a
         // correct attribution for nothing.
-        let scope = crate::repo_detection::tenant_scope_for_path(&c.canonical_path)
+        let scope = qontinui_runner_lib::repo_tenant::tenant_scope_for_path(&c.canonical_path)
             .await
             .or_device_default(device_default);
         let body = CanonicalDriftRequest {
