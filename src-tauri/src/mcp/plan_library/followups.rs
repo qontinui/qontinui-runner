@@ -233,14 +233,14 @@ pub(super) fn write_correction_entries() -> [(&'static str, Value); 3] {
             EDGE_RESOLUTION,
             Value::from(
                 "Verb, inside the web route's legal-transition table only: open -> fixing | \
-                 already_fixed | dismissed, and fixing -> fixed | open; any other move answers \
-                 409 naming the current state. So a follow-up wrongly moved to `fixing` is \
-                 corrected by moving it back to open, and a wrong closure is corrected by \
-                 REOPENING it: a resting state (`fixed`, `already_fixed`, `dismissed`) may move \
-                 back to open, which needs a non-blank `resolution_note` saying why the \
-                 closure was wrong. Re-posting the same note from the same artifact returns \
-                 that resolved row rather than a new open one. `dismissed` needs a non-blank \
-                 `resolution_note`.",
+                 already_fixed | dismissed; fixing -> fixed | open; and fixed | already_fixed \
+                 | dismissed -> open (with a reason); any other move answers 409 naming the \
+                 current state. So a follow-up wrongly moved to `fixing` is corrected by \
+                 moving it back to open, and a wrong closure is corrected by REOPENING it, \
+                 which needs a non-blank `resolution_note` saying why the closure was wrong \
+                 (a reopen without one answers 422). Re-posting the same note from the same \
+                 artifact returns that resolved row rather than a new open one. `dismissed` \
+                 needs a non-blank `resolution_note`.",
             ),
         ),
         (
@@ -902,11 +902,20 @@ mod tests {
         for claim in [
             "409",
             "REOPENING",
-            "back to open",
+            "fixed | already_fixed | dismissed -> open",
+            "saying why the closure was wrong",
+            "422",
             "dismissed",
             "resolution_note",
         ] {
             assert!(resolution.contains(claim), "omits `{claim}`: {resolution}");
+        }
+        // The retracted claim must not come back: a resting state is reopenable.
+        for retracted in ["TERMINAL", "PERMANENT"] {
+            assert!(
+                !resolution.contains(retracted),
+                "claims `{retracted}`: {resolution}"
+            );
         }
         assert!(entries[EDGE_ANCHORS].as_str().unwrap().contains("REPLACES"));
         assert!(entries[FOLLOWUPS_RECONCILE]
