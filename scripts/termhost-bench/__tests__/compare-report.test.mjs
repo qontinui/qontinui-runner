@@ -224,3 +224,17 @@ test("an unproven build is never one side of a comparison (D12, review round 2 M
   assert.equal(validateResults(doc).valid, true, JSON.stringify(validateResults(doc).errors.slice(0, 3)));
   assert.throws(() => compareBuilds(doc), /no runner\/default baseline rows to compare/);
 });
+
+test("an A/B gate fails on a runner row whose build is unproven, even a measured one (review round 3)", () => {
+  const doc = linuxXvfbResults();
+  const gate = { requireMeasured: ["cpu_pct"], atN: [5], setups: ["runner"], arms: ["focus"] };
+  assert.deepEqual(checkAssertions(doc, { ...gate, abBaseline: true }), [], "proven builds pass");
+  const r = doc.rows.find((x) => x.setup.id === "runner" && x.scenario.n === 5 && x.scenario.arm === "focus");
+  r.setup.build = { state: "unknown", reason: "harness_error", detail: "never proven", role: r.setup.build.role, requested_commit: "b".repeat(40) };
+  r.labels = [...(r.labels ?? []), "unknown_build"];
+  assert.equal(r.kpis.cpu_pct.state, "measured", "the row's numbers are there");
+  assert.deepEqual(checkAssertions(doc, gate), [], "outside an A/B run the gate is unchanged");
+  assert.deepEqual(checkAssertions(doc, { ...gate, abBaseline: true }), [
+    `runner (${r.setup.build.role}) N = 5 focus run 0: the build is unproven (unknown_build); an A/B gate needs both builds proven (D12)`,
+  ]);
+});

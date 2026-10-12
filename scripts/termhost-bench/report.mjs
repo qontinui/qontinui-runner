@@ -112,8 +112,13 @@ export function renderReport(doc) {
  * can quote a reading, and a third-party setup's readings never leave the job (D7).
  *
  * @param {object} doc
+ * `abBaseline`: the run measured a head and a baseline build (`--ab-baseline`).
+ * Then every runner row at a gate N must carry a PROVEN build: a row labelled
+ * `unknown_build` fails the gate, measured or not, because an A/B number from a
+ * build nobody proved is no comparison at all (D12).
+ *
  * @param {{requireMeasured?: string[], atN?: number[], setups?: string[], arms?: string[],
- *   requireRowsN?: number[], roles?: string[]}} a
+ *   requireRowsN?: number[], roles?: string[], abBaseline?: boolean}} a
  * @returns {string[]} failures (empty = the gate holds)
  */
 export function checkAssertions(doc, a) {
@@ -137,6 +142,15 @@ export function checkAssertions(doc, a) {
         if (rows.length === 0) {
           failures.push(`no ${setup} row for N = ${n}, arm ${arm} to check`);
           continue;
+        }
+        if (a.abBaseline && setup === "runner") {
+          for (const r of rows) {
+            if ((r.labels ?? []).includes("unknown_build") || r.setup.build?.state) {
+              failures.push(
+                `runner${r.setup.build?.role ? ` (${r.setup.build.role})` : ""} N = ${n} ${arm} run ${r.scenario.run_index}: the build is unproven (unknown_build); an A/B gate needs both builds proven (D12)`,
+              );
+            }
+          }
         }
         for (const id of a.requireMeasured ?? []) {
           for (const r of rows) {

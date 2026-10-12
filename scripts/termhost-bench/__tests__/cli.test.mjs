@@ -299,3 +299,20 @@ test("the bench job's Doctor step writes its summary when the doctor blocks, the
   assert.match(md, /### termhost-bench doctor \(linux-xvfb\)/);
   assert.match(md, /BLOCKED device\.drain UNKNOWN/);
 });
+
+test("report --ab-baseline fails the gate on an unproven runner build at the gate N (review round 3)", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-cli-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const doc = linuxXvfbResults();
+  const r = doc.rows.find((x) => x.setup.id === "runner" && x.scenario.n === 5 && x.scenario.arm === "focus");
+  r.setup.build = { state: "unknown", reason: "harness_error", detail: "never proven", role: r.setup.build.role };
+  r.labels = [...(r.labels ?? []), "unknown_build"];
+  const file = join(dir, "results.json");
+  writeFileSync(file, JSON.stringify(doc));
+  const gate = ["report", file, "--format", "json", "--setups", "runner", "--arms", "focus", "--require-measured", "cpu_pct", "--at-n", "5"];
+  const err = [];
+  const io = { out: () => {}, err: (x) => err.push(x) };
+  assert.equal(await main(gate, io), 0, "without --ab-baseline the gate is unchanged");
+  assert.equal(await main([...gate, "--ab-baseline", "b".repeat(40)], io), 1);
+  assert.match(err.join(""), /the build is unproven \(unknown_build\)/);
+});

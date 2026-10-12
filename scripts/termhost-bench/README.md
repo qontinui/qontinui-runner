@@ -150,7 +150,9 @@ Two Phase 3 outputs can only come from a scheduled run of the landed
 `linux-xvfb` job, so they arrive after this code lands rather than with it:
 
 - `scripts/termhost-bench/baselines/linux-xvfb.json`, taken from the first
-  scheduled run's results file;
+  scheduled run's results file. It must hold no row labelled `unknown_build`:
+  a baseline from a build nobody proved is no baseline (D12), so drop those
+  rows (or take a later run) before committing it;
 - the `linux-xvfb` report in `qontinui-dev-notes`, rendered from that same run.
 
 Until then there is no Linux baseline to compare against, and `compare` has

@@ -411,7 +411,9 @@ test("a signal during the spawn phase stops the spawn loop, and the arm reads in
 });
 
 test("after the abort the run's sleep still yields a turn of the event loop, on both clocks (review round 2 S1)", async () => {
-  for (const inner of [null, (ms) => new Promise((r) => setTimeout(r, ms))]) {
+  // The virtual clock's timers are unref'd, so a sleep the abort ended leaves
+  // nothing holding the test process open for its nominal 60 s.
+  for (const inner of [null, (ms) => new Promise((r) => setTimeout(r, ms).unref())]) {
     const ac = new AbortController();
     const sleep = abortAwareSleep(ac.signal, inner);
     const t0 = Date.now();

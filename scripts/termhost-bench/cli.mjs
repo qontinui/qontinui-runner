@@ -47,6 +47,7 @@ export const HELP = `termhost-bench — terminal-host performance under N AI ses
   report   <results.json> [--format md|json] [--redact-to <file>]
            [--require-measured <kpi,...> --at-n <n,...>] [--require-rows-n <n,...>]
            [--setups ...] [--arms ...] [--roles head,single]
+           [--ab-baseline <sha>]   (an A/B run: every runner row at --at-n must have a proven build)
   compare  <results.json> [<baseline.json>] [--setup runner] [--variant default] [--format md|json]
 
 run options:
@@ -376,6 +377,7 @@ function cmdReport(positional, flags, io) {
     setups: flags.setups ? LIST(flags.setups) : undefined,
     arms: flags.arms ? LIST(flags.arms) : undefined,
     roles: flags.roles ? LIST(flags.roles) : undefined,
+    abBaseline: Boolean(flags["ab-baseline"]),
   });
   io.out(flags.format === "json" ? `${JSON.stringify({ valid: true, failures }, null, 2)}\n` : renderReport(doc));
   if (failures.length > 0) {
