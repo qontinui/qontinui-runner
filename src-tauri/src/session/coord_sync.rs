@@ -122,10 +122,13 @@
 //! (connect error, timeout) trips the batch abort and counts as outage
 //! evidence, so an unreachable coord stays bounded; a heartbeat answered with
 //! a 5xx does not, because coord's edge answered and other sessions may be
-//! served. And since a heartbeat is superseded by the next one, every pending
-//! heartbeat row of a session except its NEWEST is ACK-dropped before the
-//! chains are built, so the backlog an outage leaves behind costs one request
-//! per session, not one per missed interval. Before 2026-10-11 a run of
+//! served. And since a heartbeat is superseded by the next one, a pending
+//! heartbeat whose session's NEXT pending row is also a heartbeat is
+//! ACK-dropped before the chains are built — each run of consecutive
+//! heartbeats collapses to its newest — so the backlog an outage leaves costs
+//! one request per run, not one per missed interval. A heartbeat is never
+//! superseded across a non-heartbeat row, so one queued before a `state_change`
+//! still goes out even if that row then blocks. Before 2026-10-11 a run of
 //! gateway 502/504s quarantined 12 sessions on merytshost, diverting their
 //! heartbeats to the sidecar until coord's staleness watcher closed the rows.
 //!
@@ -846,6 +849,8 @@ pub(crate) struct SessionOutboxHealth {
     pub last_failure: Option<OutboxFailure>,
     pub retrying_sessions: u64,
     pub quarantined_sessions: u64,
+    /// [`HEARTBEATS_SUPERSEDED`] as of this snapshot.
+    pub heartbeats_superseded: u64,
 }
 
 fn session_outbox_health_cell() -> &'static Mutex<SessionOutboxHealth> {
@@ -899,6 +904,9 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         })),
         "retryingSessions": counted(h.retrying_sessions),
         "quarantinedSessions": counted(h.quarantined_sessions),
+        // Pending heartbeat rows dropped unsent because the session's next
+        // pending row was a newer heartbeat (process lifetime).
+        "heartbeatsSuperseded": counted(h.heartbeats_superseded),
         "observedAt": h.observed_at,
     })
 }
@@ -1097,9 +1105,10 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
     }
 }
 
-/// Pending heartbeat rows the drain ACK-dropped unsent because a NEWER
-/// heartbeat for the same session was also pending (module header, "One
-/// session's failure is that session's problem"). Process-lifetime total.
+/// Pending heartbeat rows the drain ACK-dropped unsent because the session's
+/// NEXT pending row was a newer heartbeat (module header, "One session's
+/// failure is that session's problem"). Process-lifetime total, bumped only
+/// once the ACK has landed; `GET /health` `sessionOutbox.heartbeatsSuperseded`.
 pub(crate) static HEARTBEATS_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
 
 /// Session LIFECYCLE kinds — the rows that define coord's session row itself:
@@ -1582,6 +1591,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             h.oldest_unacked_at = None;
             h.retrying_sessions = 0;
             h.quarantined_sessions = quarantined;
+            h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
         });
         return TickResult::idle();
     }
@@ -1598,19 +1608,25 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .map(|r| ((r.session_id, r.seq), r.recorded_at))
         .collect();
 
-    // A heartbeat is superseded by the next one, so of each session's pending
-    // heartbeats only the NEWEST (highest seq) is worth sending; the older ones
-    // are ACK-dropped by their exact (session, seq) key below. Without this, the
-    // backlog an unreachable-coord outage leaves (one row per heartbeat
-    // interval per session) would all go out in one tick once coord answers
-    // again. Dropping a heartbeat reorders nothing: the remaining rows keep
-    // their seq order.
+    // A heartbeat is superseded by the next one: a pending heartbeat whose
+    // session's NEXT pending row (by seq) is also a heartbeat is ACK-dropped by
+    // its exact (session, seq) key below, so each run of consecutive heartbeats
+    // collapses to its newest. Without this, the backlog an unreachable-coord
+    // outage leaves (one row per heartbeat interval per session) would all go
+    // out in one tick once coord answers again. Never across a non-heartbeat
+    // row: a heartbeat queued before a `state_change` still goes out even if
+    // that row then fails and blocks the chain. Dropping a heartbeat reorders
+    // nothing: the remaining rows keep their seq order.
     let heartbeat_kind = SessionEventKind::Heartbeat.as_str();
-    let mut newest_heartbeat: HashMap<Uuid, i64> = HashMap::new();
-    for rec in pending.iter().filter(|r| r.event_kind == heartbeat_kind) {
-        let newest = newest_heartbeat.entry(rec.session_id).or_insert(rec.seq);
-        *newest = (*newest).max(rec.seq);
-    }
+    let superseded_keys: HashSet<(Uuid, i64)> = pending
+        .windows(2)
+        .filter(|w| {
+            w[0].session_id == w[1].session_id
+                && w[0].event_kind == heartbeat_kind
+                && w[1].event_kind == heartbeat_kind
+        })
+        .map(|w| (w[0].session_id, w[0].seq))
+        .collect();
     let mut superseded: Vec<(Uuid, i64)> = Vec::new();
 
     // Group into per-session chains. `pending()` returns records sorted by
@@ -1625,9 +1641,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             to_quarantine.push(rec);
             continue;
         }
-        if rec.event_kind == heartbeat_kind
-            && newest_heartbeat.get(&rec.session_id) != Some(&rec.seq)
-        {
+        if superseded_keys.contains(&(rec.session_id, rec.seq)) {
             superseded.push((rec.session_id, rec.seq));
             continue;
         }
@@ -1639,16 +1653,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     // Quarantined sessions' rows land in the sidecar, then leave the outbox.
     let mut succeeded: Vec<(Uuid, i64)> = quarantine_rows(inner, state, to_quarantine);
-    if !superseded.is_empty() {
-        let total = HEARTBEATS_SUPERSEDED.fetch_add(superseded.len() as u64, Ordering::Relaxed)
-            + superseded.len() as u64;
-        tracing::debug!(
-            rows = superseded.len(),
-            total,
-            "coord_sync: dropping heartbeat rows superseded by a newer pending heartbeat"
-        );
-        succeeded.extend(superseded);
-    }
+    // Counted only once the ACK lands (below), so a failed ACK — which leaves
+    // the rows pending for the next tick — is never counted twice.
+    let superseded_count = superseded.len() as u64;
+    succeeded.extend(superseded);
 
     // A session still inside its own backoff sits this tick out.
     chains.retain(|chain| {
@@ -1760,6 +1768,16 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                 for key in &succeeded {
                     state.in_sidecar.remove(key);
                 }
+                if superseded_count > 0 {
+                    let total = HEARTBEATS_SUPERSEDED
+                        .fetch_add(superseded_count, Ordering::Relaxed)
+                        + superseded_count;
+                    tracing::debug!(
+                        rows = superseded_count,
+                        total,
+                        "coord_sync: dropped heartbeat rows superseded by a newer pending heartbeat"
+                    );
+                }
             }
             Err(e) => tracing::warn!(error = %e, "coord_sync: ack write failed"),
         }
@@ -1784,6 +1802,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         h.oldest_unacked_at = remaining.iter().min().map(|at| **at);
         h.retrying_sessions = retrying;
         h.quarantined_sessions = quarantined;
+        h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
     });
 
     TickResult {
@@ -4106,6 +4125,10 @@ mod tests {
         /// `PATCH /sessions/:id` for any of these session ids ALWAYS answers
         /// 502 — an overloaded gateway in front of one session's rows.
         poison_patch_ids: Vec<Uuid>,
+        /// `PATCH /sessions/:id` carrying a `state` field for any of these
+        /// session ids answers 502 — a failing `state_change` / `closed`
+        /// while that session's plain heartbeats still go through.
+        poison_state_patch_ids: Vec<Uuid>,
         /// When >0, the next N PATCHes return 500. Each attempt decrements it,
         /// so `budget - remaining` counts how many pushes were actually
         /// issued — which is how the bounded-parallel drain is asserted.
@@ -4261,6 +4284,14 @@ mod tests {
                             return (
                                 AxumStatus::INTERNAL_SERVER_ERROR,
                                 Json(json!({"error": "fake-down"})),
+                            )
+                                .into_response();
+                        }
+                        if g.poison_state_patch_ids.contains(&id) && body.get("state").is_some()
+                        {
+                            return (
+                                AxumStatus::BAD_GATEWAY,
+                                Json(json!({"error": "fake-502"})),
                             )
                                 .into_response();
                         }
@@ -6561,11 +6592,23 @@ mod tests {
         assert!(state.retry.is_empty());
     }
 
-    /// Supersession: of a session's pending heartbeats only the newest is sent;
-    /// the older ones are ACK-dropped unsent. A lifecycle row interleaved among
-    /// them keeps its place — the rows that go out stay in seq order.
+    /// The `(seq, kind)` of every pending row of `session`, in seq order.
+    fn pending_of(outbox: &OutboxWriter, session: Uuid) -> Vec<(i64, String)> {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == session)
+            .map(|r| (r.seq, r.event_kind))
+            .collect()
+    }
+
+    /// Supersession: a run of consecutive pending heartbeats collapses to its
+    /// NEWEST row. Proven on the outbox itself: with the session sitting out its
+    /// own backoff (so nothing is sent), the tick ACK-drops the older rows and
+    /// the one left pending is the highest seq. The next tick sends exactly it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn only_the_newest_pending_heartbeat_of_a_session_is_sent() {
+    async fn a_run_of_pending_heartbeats_collapses_to_its_newest() {
         let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -6578,61 +6621,136 @@ mod tests {
         );
         let m = Uuid::new_v4();
         let s = Uuid::new_v4();
-        // The backlog an outage leaves: N stale heartbeats + the newest.
-        for _ in 0..6 {
-            outbox
-                .record(m, s, SessionEventKind::Heartbeat, json!({}))
-                .unwrap();
-        }
+        // The backlog an outage leaves: a run of heartbeats.
+        let seqs: Vec<i64> = (0..6)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+                    .seq
+            })
+            .collect();
+        let newest = *seqs.iter().max().unwrap();
 
-        // Another session: heartbeat, state_change, heartbeat, heartbeat.
+        let mut state = DrainState::default();
+        state.retry.insert(
+            s,
+            SessionRetry {
+                failures: 1,
+                serving_failures: 0,
+                next_attempt_at: Instant::now() + Duration::from_secs(3600),
+                failed_at_ack_tick: 0,
+            },
+        );
+        let superseded_before = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            pending_of(&outbox, s),
+            vec![(newest, "heartbeat".to_string())],
+            "only the NEWEST heartbeat of the run survives"
+        );
+        assert!(rec.lock().await.patches.is_empty(), "nothing was sent");
+        assert!(
+            HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed) - superseded_before >= 5,
+            "the five superseded rows are counted once their ACK landed"
+        );
+
+        state.retry.get_mut(&s).unwrap().next_attempt_at = Instant::now();
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            rec.lock()
+                .await
+                .patches
+                .iter()
+                .filter(|(id, _)| *id == s)
+                .count(),
+            1
+        );
+        assert!(outbox.pending().unwrap().is_empty());
+    }
+
+    /// A heartbeat is never superseded ACROSS a non-heartbeat row: in
+    /// hb, hb, state_change, hb, hb the heartbeat before the `state_change` is
+    /// still sent even though that `state_change` then fails and blocks the
+    /// chain — liveness is not lost exactly when the session is stuck. Only
+    /// each run collapses (to its newest), and the order is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_is_never_superseded_across_a_state_change() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
         let t = Uuid::new_v4();
-        outbox
-            .record(m, t, SessionEventKind::Heartbeat, json!({}))
-            .unwrap();
-        outbox
+        rec.lock().await.poison_state_patch_ids.push(t);
+        let hb = |outbox: &OutboxWriter| {
+            outbox
+                .record(m, t, SessionEventKind::Heartbeat, json!({}))
+                .unwrap()
+                .seq
+        };
+        hb(&outbox);
+        hb(&outbox);
+        let change = outbox
             .record(
                 m,
                 t,
                 SessionEventKind::StateChange,
                 json!({ "state": "pending_resolution" }),
             )
-            .unwrap();
-        outbox
-            .record(m, t, SessionEventKind::Heartbeat, json!({}))
-            .unwrap();
-        outbox
-            .record(m, t, SessionEventKind::Heartbeat, json!({}))
-            .unwrap();
+            .unwrap()
+            .seq;
+        hb(&outbox);
+        let last = hb(&outbox);
 
-        let superseded_before = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
         let mut state = DrainState::default();
         drain_tick(&coord.inner, &mut state).await;
-
-        let g = rec.lock().await;
+        {
+            let g = rec.lock().await;
+            let sent: Vec<&JsonValue> = g
+                .patches
+                .iter()
+                .filter(|(id, _)| *id == t)
+                .map(|(_, b)| b)
+                .collect();
+            assert_eq!(
+                sent,
+                vec![&json!({ "heartbeat": true })],
+                "the heartbeat before the failing state_change still reached coord"
+            );
+        }
         assert_eq!(
-            g.patches.iter().filter(|(id, _)| *id == s).count(),
-            1,
-            "only the newest heartbeat is sent"
+            pending_of(&outbox, t),
+            vec![
+                (change, "state_change".to_string()),
+                (last, "heartbeat".to_string()),
+            ],
+            "the blocked state_change heads the chain, the trailing run collapsed \
+             to its newest"
         );
-        let t_bodies: Vec<&JsonValue> = g
+
+        // The state_change recovers: it and the newest heartbeat go out, in order.
+        rec.lock().await.poison_state_patch_ids.clear();
+        state.retry.get_mut(&t).unwrap().next_attempt_at = Instant::now();
+        drain_tick(&coord.inner, &mut state).await;
+        let g = rec.lock().await;
+        let sent: Vec<&JsonValue> = g
             .patches
             .iter()
             .filter(|(id, _)| *id == t)
             .map(|(_, b)| b)
             .collect();
-        assert_eq!(t_bodies.len(), 2, "the state_change and one heartbeat");
-        assert_eq!(t_bodies[0]["state"], "pending_resolution");
-        assert_eq!(t_bodies[1], &json!({ "heartbeat": true }));
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[1]["state"], "pending_resolution");
+        assert_eq!(sent[2], &json!({ "heartbeat": true }));
         drop(g);
-        assert!(
-            outbox.pending().unwrap().is_empty(),
-            "the superseded heartbeats are ACKed out of the outbox"
-        );
-        assert!(
-            HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed) - superseded_before >= 7,
-            "5 + 2 superseded rows are counted"
-        );
+        assert!(outbox.pending().unwrap().is_empty());
     }
 
     /// Drive `failing`'s rows of `kind` through a gateway 502 while coord keeps
@@ -7067,6 +7185,7 @@ mod tests {
             }),
             retrying_sessions: 1,
             quarantined_sessions: 0,
+            heartbeats_superseded: 2,
         });
         for key in [
             "pending",
@@ -7075,6 +7194,7 @@ mod tests {
             "lastFailure",
             "retryingSessions",
             "quarantinedSessions",
+            "heartbeatsSuperseded",
             "observedAt",
         ] {
             assert!(
