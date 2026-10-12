@@ -752,4 +752,333 @@ mod tests {
             assert!(!code.glossary_terms().is_empty());
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Census: every close reason a production writer records maps to a code.
+    // -----------------------------------------------------------------------
+
+    /// What one production close-reason write site records.
+    #[derive(Debug)]
+    enum Recorded {
+        /// A string literal, e.g. `record_close(id, "poll-dead")`.
+        Literal(String),
+        /// A `CLOSE_REASON_*` constant, by name.
+        Const(String),
+        /// Anything else — a variable or a call — rendered for the allowlist.
+        Indirect(String),
+        /// A copy of another record's `close_reason`, or `None`: no new value.
+        NotAMint,
+    }
+
+    fn render(e: &syn::Expr) -> String {
+        match e {
+            syn::Expr::Path(p) => p
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::"),
+            syn::Expr::Field(f) => {
+                let member = match &f.member {
+                    syn::Member::Named(i) => i.to_string(),
+                    syn::Member::Unnamed(i) => i.index.to_string(),
+                };
+                format!("{}.{member}", render(&f.base))
+            }
+            syn::Expr::MethodCall(m) => format!("{}.{}()", render(&m.receiver), m.method),
+            syn::Expr::Call(c) => format!("{}(..)", render(&c.func)),
+            syn::Expr::Reference(r) => render(&r.expr),
+            syn::Expr::Paren(p) => render(&p.expr),
+            _ => "<expr>".to_string(),
+        }
+    }
+
+    /// Peel `Some(..)`, `&..`, `.to_string()`, `.into()`, `.to_owned()` and
+    /// `String::from(..)` down to the value actually recorded.
+    fn classify(e: &syn::Expr) -> Recorded {
+        match e {
+            syn::Expr::Reference(r) => classify(&r.expr),
+            syn::Expr::Paren(p) => classify(&p.expr),
+            syn::Expr::MethodCall(m)
+                if m.args.is_empty()
+                    && ["to_string", "into", "to_owned"]
+                        .contains(&m.method.to_string().as_str()) =>
+            {
+                classify(&m.receiver)
+            }
+            syn::Expr::Call(c) if c.args.len() == 1 => {
+                let f = render(&c.func);
+                if f == "Some" || f == "String::from" {
+                    classify(&c.args[0])
+                } else {
+                    Recorded::Indirect(render(e))
+                }
+            }
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => Recorded::Literal(s.value()),
+            syn::Expr::Path(p) => {
+                let name = p
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                // `None`, or a field-init shorthand / variable that carries a
+                // `close_reason` read off another record (a view copying it).
+                if name == "None" || name == "close_reason" {
+                    Recorded::NotAMint
+                } else if name.starts_with("CLOSE_REASON_") {
+                    Recorded::Const(name)
+                } else {
+                    Recorded::Indirect(render(e))
+                }
+            }
+            _ => {
+                let r = render(e);
+                if r.contains("close_reason") {
+                    Recorded::NotAMint
+                } else {
+                    Recorded::Indirect(r)
+                }
+            }
+        }
+    }
+
+    fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|a| {
+            let path = a.path();
+            if path.segments.last().is_some_and(|s| s.ident == "test") {
+                return true;
+            }
+            if path.is_ident("cfg") {
+                if let syn::Meta::List(l) = &a.meta {
+                    let t = l.tokens.to_string();
+                    return t == "test" || (t.contains("test") && !t.contains("not"));
+                }
+            }
+            false
+        })
+    }
+
+    struct CloseWriteCensus {
+        file: String,
+        sites: Vec<(String, Recorded)>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for CloseWriteCensus {
+        fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
+            if !is_test_only(&i.attrs) {
+                syn::visit::visit_item_mod(self, i);
+            }
+        }
+        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+            if !is_test_only(&i.attrs) {
+                syn::visit::visit_item_fn(self, i);
+            }
+        }
+        fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+            if !is_test_only(&i.attrs) {
+                syn::visit::visit_item_impl(self, i);
+            }
+        }
+        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+            if !is_test_only(&i.attrs) {
+                syn::visit::visit_impl_item_fn(self, i);
+            }
+        }
+        fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+            let method = m.method.to_string();
+            if method == "record_close" || method == "record_close_checked" {
+                if let Some(reason) = m.args.last() {
+                    self.sites.push((self.file.clone(), classify(reason)));
+                }
+            }
+            syn::visit::visit_expr_method_call(self, m);
+        }
+        fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+            if let syn::Expr::Field(f) = &*a.left {
+                if matches!(&f.member, syn::Member::Named(n) if n == "close_reason") {
+                    self.sites.push((self.file.clone(), classify(&a.right)));
+                }
+            }
+            syn::visit::visit_expr_assign(self, a);
+        }
+        fn visit_field_value(&mut self, fv: &'ast syn::FieldValue) {
+            if matches!(&fv.member, syn::Member::Named(n) if n == "close_reason") {
+                self.sites.push((self.file.clone(), classify(&fv.expr)));
+            }
+            syn::visit::visit_field_value(self, fv);
+        }
+    }
+
+    /// Every `CLOSE_REASON_*` constant `session_lifecycle_store` declares,
+    /// read from its source so a constant added there without a mapping here
+    /// fails this file's tests.
+    fn declared_close_reason_consts(src: &syn::File) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for item in &src.items {
+            if let syn::Item::Const(c) = item {
+                let name = c.ident.to_string();
+                if name.starts_with("CLOSE_REASON_") {
+                    match &*c.expr {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(s),
+                            ..
+                        }) => out.push((name, s.value())),
+                        _ => panic!("{name} is not a string literal"),
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The census the plan's "an unenumerated reason renders unknown" rule
+    /// rests on: walk every production `.rs` file under `src/` with `syn`,
+    /// skipping `#[cfg(test)]` / `#[test]` items, and find every site that
+    /// RECORDS a close reason — `.record_close(..)` / `.record_close_checked(..)`
+    /// calls, `x.close_reason = ..` assignments and `close_reason: ..` struct
+    /// fields. Each must record a string literal or a `CLOSE_REASON_*`
+    /// constant that maps to a known code; anything else must be one of the
+    /// named forwarding sites below, each of which is covered by its own test.
+    /// A writer that starts recording a new reason without a mapping fails
+    /// here instead of surfacing to an operator as `unknown`.
+    #[test]
+    fn every_close_reason_a_production_writer_records_maps_to_a_known_code() {
+        use syn::visit::Visit;
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let store_path = src_root.join("session/session_lifecycle_store.rs");
+        let store = syn::parse_file(&std::fs::read_to_string(&store_path).unwrap()).unwrap();
+        let consts = declared_close_reason_consts(&store);
+        assert!(!consts.is_empty(), "no CLOSE_REASON_* constants found");
+        for (name, value) in &consts {
+            assert!(
+                code_for_close_reason(value).is_some(),
+                "{name} = {value:?} has no stop code"
+            );
+        }
+
+        // Sites that forward a reason chosen elsewhere. Each forwarded value
+        // is pinned by a test of its own source:
+        // - the store's own `record_close` → `record_close_checked` → field
+        //   assignment chain forwards its caller's `reason`;
+        // - `terminal_session_record_close` forwards the FRONTEND's reason
+        //   (`frontend_close_reasons_are_enumerated`);
+        // - the liveness poll in `main.rs` forwards
+        //   `close_reason_for_dead_shell(..)`
+        //   (`the_dead_shell_close_reasons_are_enumerated`).
+        let forwarders: &[(&str, &str)] = &[
+            ("session/session_lifecycle_store.rs", "reason"),
+            ("commands/terminal.rs", "reason"),
+            ("main.rs", "reason"),
+        ];
+
+        let mut sites = Vec::new();
+        for entry in walkdir::WalkDir::new(&src_root) {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let name = path.file_name().unwrap().to_string_lossy();
+            // Whole-file test modules (declared `#[cfg(test)] mod x;` in
+            // their parent) carry no attribute of their own to skip.
+            if name == "tests.rs"
+                || name.ends_with("_tests.rs")
+                || name == "test_fixtures.rs"
+                || rel.split('/').any(|seg| seg == "tests")
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).unwrap();
+            if !text.contains("close_reason") && !text.contains("record_close") {
+                continue;
+            }
+            let file = syn::parse_file(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            let mut census = CloseWriteCensus {
+                file: rel,
+                sites: Vec::new(),
+            };
+            census.visit_file(&file);
+            sites.extend(census.sites);
+        }
+
+        let mut unmapped = Vec::new();
+        let mut seen_literal_or_const = 0usize;
+        for (file, site) in &sites {
+            match site {
+                Recorded::Literal(v) => {
+                    seen_literal_or_const += 1;
+                    if code_for_close_reason(v).is_none() {
+                        unmapped.push(format!("{file}: literal {v:?}"));
+                    }
+                }
+                Recorded::Const(n) => {
+                    seen_literal_or_const += 1;
+                    match consts.iter().find(|(c, _)| c == n) {
+                        Some((_, v)) if code_for_close_reason(v).is_some() => {}
+                        _ => unmapped.push(format!("{file}: constant {n}")),
+                    }
+                }
+                Recorded::Indirect(expr) => {
+                    if !forwarders.iter().any(|(f, e)| f == file && e == expr) {
+                        unmapped.push(format!("{file}: unrecognised reason expression `{expr}`"));
+                    }
+                }
+                Recorded::NotAMint => {}
+            }
+        }
+        assert!(
+            unmapped.is_empty(),
+            "close reasons recorded with no stop code (add a CLOSE_REASON_* constant and a \
+             code_for_close_reason arm, or name the forwarder):\n{}",
+            unmapped.join("\n")
+        );
+        // Non-vacuity: the census must actually have seen the writers it
+        // exists to check (the poll's two direct constants, the worker
+        // teardown and the store's two supersede paths at least).
+        assert!(
+            seen_literal_or_const >= 5,
+            "census saw only {seen_literal_or_const} sites"
+        );
+        for (f, e) in forwarders {
+            assert!(
+                sites
+                    .iter()
+                    .any(|(file, s)| file == f && matches!(s, Recorded::Indirect(x) if x == e)),
+                "forwarder {f} `{e}` no longer exists — drop it from the list"
+            );
+        }
+    }
+
+    /// The liveness poll's forwarded reason (`close_reason_for_dead_shell`)
+    /// can only produce mapped values.
+    #[test]
+    fn the_dead_shell_close_reasons_are_enumerated() {
+        use crate::session::session_lifecycle_store::{
+            close_reason_for_dead_shell, RESTORE_TIER_FAILED, RESTORE_TIER_RESUMED,
+            RESTORE_TIER_TERMINAL_ONLY,
+        };
+        for tier in [
+            None,
+            Some(RESTORE_TIER_TERMINAL_ONLY),
+            Some(RESTORE_TIER_RESUMED),
+            Some(RESTORE_TIER_FAILED),
+        ] {
+            let reason = close_reason_for_dead_shell(tier);
+            assert!(
+                code_for_close_reason(reason).is_some(),
+                "{tier:?} -> {reason}"
+            );
+        }
+    }
 }

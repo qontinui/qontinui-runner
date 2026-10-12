@@ -267,6 +267,16 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // task-run session — the same capability as `POST /terminals/{id}/write`.
     "GET /sessions/{id}/review",
     "/sessions/{id}/review/*",
+    // Why a session stopped (plan 2026-09-20-the-published-product-works-
+    // without-knowing-a-development-environment-exists, C5). Read-only and no
+    // secret, but it echoes the session's own free-text `finish_reason` (which
+    // can quote local work) and names the exact command that resumes which
+    // conversation under which account wrapper. Under the default
+    // `EnforceDoors` policy a non-door route is only SHADOW-refused to a
+    // browser, so listing it here is what actually keeps a visited web page
+    // from reading it. The webview (FirstParty) and agents (NonBrowser) are
+    // unaffected.
+    "GET /sessions/{id}/stop-reason",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",
