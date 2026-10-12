@@ -3,8 +3,17 @@
 //! The supervisor sets `QONTINUI_INSTANCE_NAME` when spawning non-primary
 //! runners (test runners, themed runners, etc.). This module centralizes the
 //! detection and provides a path-segment helper so per-runner on-disk state
-//! can be isolated without touching shared state (settings.json,
-//! auth_tokens.enc, PostgreSQL).
+//! under the platform app-data dirs can be isolated.
+//!
+//! Two kinds of state are NOT scoped by this helper. Some is shared: the files
+//! that are machine-global by design (`claude-accounts.json`,
+//! `active_instances.json`) and, for supervisor-spawned runners, PostgreSQL.
+//! The rest is redirected instead: `settings.json` by `QONTINUI_CONFIG_DIR`,
+//! and the secure store (`auth_tokens.enc`, `paired_user.json`) by
+//! `QONTINUI_SECURE_STORAGE_DIR`. The supervisor points both at a per-instance
+//! directory for every temp and named runner, and a subject runner's startup
+//! points them inside its instance root. Only a secondary launched without
+//! those overrides resolves the primary's files.
 //!
 //! Primary runner: `data_subdir()` returns `None` — existing paths unchanged.
 //! Secondary:      `data_subdir()` returns `Some("instance-<sanitized>")`.

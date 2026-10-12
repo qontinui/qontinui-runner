@@ -926,7 +926,7 @@ pub async fn redeem_pair_code(
             debug!("redeem_pair_code: runner already at Tier QontinuiAccount — no settings write");
         }
         Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
-            // A secondary must never write the shared settings.json (it would
+            // A secondary must never write the primary's settings.json (it would
             // demote the primary), but THIS process still holds a device JWT
             // and needs Tier 2 to bring its relay online — so apply the tier
             // as the in-memory-only overlay, which is never persisted.

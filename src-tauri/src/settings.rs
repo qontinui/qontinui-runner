@@ -2167,8 +2167,9 @@ mod tier_tests {
     }
 
     /// Env-var overlay must override a migrated Tier 2 down to Local — the
-    /// supervisor-spawned-temp-runner scenario where the shared settings.json
-    /// already inferred QontinuiAccount from the primary's `runner_token`.
+    /// scenario of a secondary that resolves the primary's settings.json (one
+    /// launched without its own `QONTINUI_CONFIG_DIR`), which already inferred
+    /// QontinuiAccount from the primary's `runner_token`.
     #[test]
     fn tier_env_overlay_local_demotes_qontinui_account() {
         let mut s = Settings {
@@ -2218,11 +2219,13 @@ mod tier_tests {
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);
     }
 
-    /// FOOTGUN GUARD: a supervisor-spawned temp/named runner (secondary) must
-    /// NEVER persist a tier/local_user_id migration to the shared
-    /// settings.json — doing so would infer `tier=Local` (no runner_token) and
-    /// clobber the primary's persisted Tier 2 state. Only the primary may
-    /// persist. `should_persist_migration` encodes that decision.
+    /// FOOTGUN GUARD: a named secondary must NEVER persist a tier/local_user_id
+    /// migration. One launched without its own `QONTINUI_CONFIG_DIR` resolves
+    /// the primary's settings.json, where the inferred `tier=Local` (no
+    /// runner_token) would clobber the primary's persisted Tier 2 state. The
+    /// guard stays conservative and refuses every named secondary, per-instance
+    /// config dir or not. Only the primary may persist.
+    /// `should_persist_migration` encodes that decision.
     #[test]
     fn secondary_runner_must_not_persist_migration() {
         let ok = SettingsProvenance::Loaded;
@@ -3068,9 +3071,13 @@ pub struct SessionGuardSettings {
     /// Older runner builds read this field as a plain `usize` with a serde
     /// default. They accept a missing key, but a `null` fails the parse of the
     /// WHOLE `Settings` document — which they then treat as unreadable, losing
-    /// every setting. `settings.json` is shared with secondary, temp and
-    /// rolled-back runners, so the new build must never write a shape an older
-    /// one cannot load: `skip_serializing_if` keeps "unset" as no key at all.
+    /// every setting. An older build does read files this one wrote: a
+    /// rolled-back runner reads the same `settings.json`, and so does a
+    /// secondary launched without its own `QONTINUI_CONFIG_DIR` (supervisor
+    /// temp/named runners and subject runners are pointed at a per-instance
+    /// file, so they do not). The new build must therefore never write a shape
+    /// an older one cannot load: `skip_serializing_if` keeps "unset" as no key
+    /// at all.
     #[serde(
         default,
         deserialize_with = "deserialize_warn_thread_ceiling",
@@ -4310,6 +4317,33 @@ pub(crate) fn get_settings_path() -> Result<PathBuf, String> {
     Ok(dir.join(SETTINGS_FILE))
 }
 
+/// The PLATFORM app config directory — `dirs::config_dir()/com.qontinui.runner`
+/// — **creating nothing**, with the `QONTINUI_CONFIG_DIR` override deliberately
+/// withheld: the platform arm of [`resolve_config_dir_from`], not a second
+/// spelling of it.
+///
+/// It is where a runner launched WITHOUT the override (the primary) keeps its
+/// `settings.json`, and the base the machine-global files and the per-instance
+/// stores `crate::instance::scope_path` scopes hang off. It is NOT this
+/// runner's config dir: a supervisor temp/named runner and a subject runner are
+/// pointed elsewhere by `QONTINUI_CONFIG_DIR`, and [`resolve_config_dir`] is the
+/// only answer to "where does THIS runner keep its settings".
+pub(crate) fn resolve_platform_config_dir() -> Result<PathBuf, String> {
+    resolve_config_dir_from(None, dirs::config_dir()).map(|(dir, _source)| dir)
+}
+
+/// The PRIMARY runner's `settings.json` — [`resolve_platform_config_dir`]
+/// joined with [`SETTINGS_FILE`] — whatever this process's own config dir is.
+///
+/// For the rare caller that must read the primary's file from any instance
+/// (the claude-accounts roster migration seeds from it). Every reader or writer
+/// of THIS runner's settings uses [`resolve_settings_path`] instead: reaching
+/// the primary's file from a secondary is exactly how a backup restore on a
+/// temp runner overwrote the primary's settings.
+pub(crate) fn resolve_primary_settings_path() -> Result<PathBuf, String> {
+    Ok(resolve_platform_config_dir()?.join(SETTINGS_FILE))
+}
+
 // ============================================================================
 // Settings provenance — "unknown" must never collapse into "denied"
 // ============================================================================
@@ -4418,9 +4452,11 @@ static SETTINGS_FAULT: std::sync::RwLock<Option<SettingsFault>> = std::sync::RwL
 /// Apply a tier for the remainder of this process's lifetime WITHOUT touching
 /// any settings file.
 ///
-/// Set by [`crate::commands::auth::set_runner_tier`] on a runner that must not
-/// write the shared `settings.json` (a secondary — any supervisor-launched
-/// temp/named instance; see the FOOTGUN GUARD in [`load_settings_full`]). Before
+/// Set by [`crate::commands::auth::set_runner_tier`] on a runner the settings
+/// write guard refuses ([`crate::instance::shares_primary_settings`] — every
+/// named secondary, because one launched without its own `QONTINUI_CONFIG_DIR`
+/// resolves the PRIMARY's `settings.json`; see the FOOTGUN GUARD in
+/// [`load_settings_full`]). Before
 /// this existed, that branch logged "applying in-memory only" and then applied
 /// NOTHING: the command was a total no-op, `get_runner_tier` kept answering the
 /// old tier, and every tier-dependent state transition (notably the frontend's
@@ -4522,7 +4558,10 @@ static SETTINGS_CACHE: once_cell::sync::Lazy<std::sync::Mutex<HashMap<PathBuf, C
 /// Drop every cached parse. Called after any in-process write so a
 /// read-modify-write never observes its own pre-write document, independent of
 /// filesystem timestamp granularity.
-fn invalidate_settings_cache() {
+///
+/// `pub(crate)` for the in-process writers outside this module that replace the
+/// file wholesale — `backup::restore_backup` is one.
+pub(crate) fn invalidate_settings_cache() {
     if let Ok(mut c) = SETTINGS_CACHE.lock() {
         c.clear();
     }
@@ -4969,11 +5008,17 @@ pub fn load_settings_full() -> LoadedSettings {
 
     // Tier env-var overlay. In-memory only; never persisted. Lets a parent
     // process (notably the supervisor spawning a temp runner) force the
-    // booted runner onto a specific tier without writing to the shared
-    // settings.json — which is keyed off `dirs::config_dir()` and is the
-    // same file for primary + temp + named runners. Persisting tier=Local
-    // for a temp runner would silently strip the primary runner's Tier 2
-    // state, so the only safe override is this in-memory overlay.
+    // booted runner onto a specific tier without writing any settings.json.
+    // Each supervisor-spawned temp/named runner, and each subject runner, has
+    // its own config dir through `QONTINUI_CONFIG_DIR`, so the file it
+    // resolves is its own. A secondary launched WITHOUT that override (an
+    // `InstanceManager` child of the primary inherits none) resolves the
+    // primary's `dirs::config_dir()/com.qontinui.runner/settings.json`, and
+    // persisting tier=Local there would silently strip the primary's Tier 2
+    // state. So would any code that builds the settings path itself instead
+    // of asking `resolve_settings_path`, whatever the override says;
+    // `backup.rs` did until it went through the resolver. An in-memory
+    // overlay is safe whichever file this runner resolves.
     if let Ok(raw) = std::env::var("QONTINUI_RUNNER_TIER") {
         apply_tier_env_overlay(&mut settings, &raw);
     }
@@ -5459,17 +5504,19 @@ pub(crate) fn document_to_persist(
 }
 
 /// Decide whether a pending tier/local_user_id migration may be persisted to
-/// the SHARED settings.json.
+/// the `settings.json` this runner resolves.
 ///
 /// Returns `true` only when ALL THREE hold:
 ///
 /// - there is something to persist (`needs_persist`);
-/// - the runner is the primary (`!is_secondary`) — a secondary (temp or named,
-///   i.e. any supervisor-launched runner with `QONTINUI_INSTANCE_NAME`) must
-///   never write the shared file, because `migrate_tier_in_place` infers
-///   `tier=Local` for it (no `runner_token`), which would silently demote the
-///   primary's persisted Tier 2 state on disk (see the FOOTGUN GUARD comment
-///   in `load_settings_full`);
+/// - the runner cannot be sharing the primary's file (`!is_secondary`, from
+///   [`crate::instance::shares_primary_settings`]) — a named secondary launched
+///   without its own `QONTINUI_CONFIG_DIR` resolves the PRIMARY's
+///   `settings.json`, and `migrate_tier_in_place` infers `tier=Local` for it
+///   (no `runner_token`), so persisting would silently demote the primary's
+///   Tier 2 state on disk. The predicate stays conservative: it refuses every
+///   named secondary, per-instance config dir or not (see the FOOTGUN GUARD
+///   comment in `load_settings_full`);
 /// - the base load was **authoritative** (`provenance.is_authoritative()`) — a
 ///   struct defaulted because the file was unreadable is not the user's state,
 ///   and writing it destroys the real (possibly recoverable) file. This is the
@@ -5817,11 +5864,13 @@ struct CachedPerformance {
 /// spawn (root cause B5). A cached hit costs one `fs::metadata` instead, the
 /// same shape `terminal/transcript.rs` already uses for its file cache.
 ///
-/// The mtime check is not just tidiness. `settings.json` is shared by every
-/// runner instance on the box, so a save from a temp runner (or a hand edit)
-/// must not leave the primary — which policy forbids restarting — serving a
-/// stale `share_terminal_output`. That knob is a privacy declaration; silently
-/// ignoring a change to it would be worse than the file read it saves.
+/// The mtime check is not just tidiness. `settings.json` changes under this
+/// cache — an in-process save, a hand edit, another process that resolves the
+/// same file (a secondary launched without its own `QONTINUI_CONFIG_DIR`, the
+/// `qontinui_profile` bin) — and none of those may leave the primary, which
+/// policy forbids restarting, serving a stale `share_terminal_output`. That
+/// knob is a privacy declaration; silently ignoring a change to it would be
+/// worse than the file read it saves.
 ///
 /// The cell is initialised to `None` with **no work in the initialiser**: the
 /// fill calls [`load_settings_full`], which itself can read the keychain and

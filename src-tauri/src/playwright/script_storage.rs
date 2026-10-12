@@ -164,16 +164,32 @@ impl Default for PlaywrightLibrary {
 // File Operations
 // ============================================================================
 
-/// Get the playwright directory path in the app data directory.
+/// The playwright directory path in the app data directory, **creating
+/// nothing**.
 ///
 /// For secondary runners, the per-runner instance subdirectory is inserted
 /// between `com.qontinui.runner` and `playwright`, so concurrent runners
 /// don't share playwright tests or results.
-fn get_playwright_dir() -> Result<PathBuf, String> {
+fn resolve_playwright_dir() -> Result<PathBuf, String> {
     let base = dirs::config_dir()
         .ok_or("Failed to get config directory")?
         .join("com.qontinui.runner");
-    let app_data_dir = crate::instance::scope_path(&base).join("playwright");
+    Ok(crate::instance::scope_path(&base).join("playwright"))
+}
+
+/// Where the test library lives, **creating nothing** and running no
+/// migration: [`resolve_playwright_dir`] joined with [`TESTS_FILE`].
+///
+/// `backup::get_backup_files` reads and restores exactly this file, through
+/// this resolver rather than a copy of it.
+pub(crate) fn resolve_tests_path() -> Result<PathBuf, String> {
+    Ok(resolve_playwright_dir()?.join(TESTS_FILE))
+}
+
+/// [`resolve_playwright_dir`] plus the `create_dir_all` — for the library's
+/// own load/save and the results directory.
+fn get_playwright_dir() -> Result<PathBuf, String> {
+    let app_data_dir = resolve_playwright_dir()?;
 
     // Create directory if it doesn't exist
     if !app_data_dir.exists() {

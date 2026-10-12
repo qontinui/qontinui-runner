@@ -775,8 +775,9 @@ pub fn parse_tier_value(raw: &str) -> Option<&'static str> {
 }
 
 /// Process-global, in-memory-only tier override — the operator's RUNTIME
-/// choice, set by `commands::auth::set_runner_tier` on a runner that must not
-/// write the shared `settings.json` (a secondary).
+/// choice, set by `commands::auth::set_runner_tier` on a runner the settings
+/// write guard refuses (a secondary, which may resolve the primary's
+/// `settings.json`).
 ///
 /// # Why it lives in the lib and not in `settings.rs`
 ///
