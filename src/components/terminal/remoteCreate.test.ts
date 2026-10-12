@@ -130,6 +130,7 @@ describe("describeRemoteCreateFailure", () => {
     const remedy = r.remedy.join("\n");
     expect(remedy).toContain("settings.json");
     expect(remedy).toContain("remote_create.accept_remote_create");
+    expect(remedy).toContain("Remote session creation");
     expect(remedy).not.toContain("PUT /coord");
   });
 
