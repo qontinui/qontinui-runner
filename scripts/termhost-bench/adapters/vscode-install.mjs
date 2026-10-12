@@ -5,15 +5,17 @@
  * a cache OUTSIDE any repository, verification on every use, and each archive
  * unpacked into its own new directory inside the run directory.
  *
- * Provenance of the pin (read 2026-10-12): the update API's
+ * Provenance of the pin: the update API's
  * `https://update.code.visualstudio.com/api/versions/1.139.1/<platform>/stable`
  * answers each archive's `url` and `sha256hash`; 1.139.1 is the patch release of
- * 1.139, published 2026-09-25 (`timestamp` 1790308685731). Both archives were
- * downloaded and hashed to those values, and the Windows one unpacked (never
- * run) to read its layout: `Code.exe` at the root, the app under
- * `<commit[0:10]>/resources/app`, `product.json` version 1.139.1 at commit
- * 04c0d99f4f…, Electron 43.6.0, and the bundled ConPTY
- * (`node_modules.asar.unpacked/node-pty/build/Release/conpty/{conpty.dll,OpenConsole.exe}`).
+ * 1.139, published 2026-09-25 (`timestamp` 1790308685731).
+ * Observed 2026-10-12, by the implementing session, and true of this pin only:
+ * both archives downloaded and hashed to those values; the Windows ZIP, unpacked
+ * and never run, had `Code.exe` at its root, the app under
+ * `<commit[0:10]>/resources/app` and a `version` file reading 43.6.0 (Electron).
+ * The code below relies on none of that layout beyond `build.exe` and
+ * `build.product`, and it re-proves the version and commit from product.json
+ * on every unpack.
  * To move the pin, re-read that API for the new version and replace the table;
  * the tests check its shape, never the network.
  *
@@ -140,7 +142,7 @@ export function sha256File(path) {
  *   log?: (s: string) => void, timeoutMs?: number}} o
  * @returns {Promise<{path: string, bytes: number, url: string, sha256: string}>}
  */
-export async function downloadVerified({ urls, dest, expected, fetch = globalThis.fetch, log = () => {}, timeoutMs = 15 * 60000 }) {
+export async function downloadVerified({ urls, dest, expected, fetch = globalThis.fetch, log = () => {}, timeoutMs = 15 * 60000, maxBytes = null }) {
   if (!/^[0-9a-f]{64}$/.test(expected ?? "")) throw new TypeError(`expected SHA-256 must be 64 lowercase hex, got ${expected}`);
   mkdirSync(dirname(dest), { recursive: true });
   const errors = [];
@@ -159,9 +161,12 @@ export async function downloadVerified({ urls, dest, expected, fetch = globalThi
       let bytes = 0;
       for await (const chunk of res.body) {
         const buf = Buffer.from(chunk);
+        bytes += buf.length;
+        // Past the pinned size the bytes cannot be the pinned archive: stop
+        // reading (leaving the loop cancels the body) instead of filling the disk.
+        if (Number.isInteger(maxBytes) && bytes > maxBytes) throw new ArchiveIntegrityError({ url, expected, actual: `more than ${maxBytes} bytes`, bytes });
         hash.update(buf);
         await fh.write(buf);
-        bytes += buf.length;
       }
       await fh.close();
       fh = null;
@@ -184,21 +189,27 @@ export async function downloadVerified({ urls, dest, expected, fetch = globalThi
  * The pinned archive in `cacheDir`, downloaded when absent, and verified either
  * way: a cached file whose hash no longer matches is discarded and fetched again.
  *
+ * `verified` is a hash taken earlier in this process (the doctor's check), used
+ * instead of hashing again only while the file's size and mtime are unchanged.
+ *
  * @param {{build: object, cacheDir: string, version?: string, fetch?: typeof fetch,
- *   log?: (s: string) => void, hash?: (p: string) => Promise<string>, exists?: (p: string) => boolean}} o
+ *   log?: (s: string) => void, hash?: (p: string) => Promise<string>, exists?: (p: string) => boolean,
+ *   verified?: {path: string, size: number, mtimeMs: number, sha256: string} | null, stat?: typeof statSync}} o
  * @returns {Promise<{path: string, cached: boolean, sha256: string}>}
  */
-export async function ensureArchive({ build, cacheDir, version = VSCODE_PIN.version, fetch, log = () => {}, hash = sha256File, exists = existsSync }) {
+export async function ensureArchive({ build, cacheDir, version = VSCODE_PIN.version, fetch, log = () => {}, hash = sha256File, exists = existsSync, verified = null, stat = statSync }) {
   const repo = findEnclosingRepo(cacheDir, { exists });
   if (repo) throw new Error(`the archive cache ${cacheDir} is inside the git checkout ${repo}; caches live outside any repository (D5)`);
   const dest = join(cacheDir, version, build.archive);
   if (exists(dest)) {
-    const actual = await hash(dest);
+    const st = stat(dest);
+    const reuse = verified && verified.path === dest && verified.size === st.size && verified.mtimeMs === st.mtimeMs;
+    const actual = reuse ? verified.sha256 : await hash(dest);
     if (actual === build.sha256) return { path: dest, cached: true, sha256: actual };
     log(`vscode: cached ${dest} hashes to ${actual}, not the pinned ${build.sha256}: discarding it`);
     rmSync(dest, { force: true });
   }
-  const r = await downloadVerified({ urls: [build.url, build.fallbackUrl], dest, expected: build.sha256, fetch, log });
+  const r = await downloadVerified({ urls: [build.url, build.fallbackUrl], dest, expected: build.sha256, fetch, log, maxBytes: Number.isInteger(build.bytes) ? build.bytes : null });
   return { path: r.path, cached: false, sha256: r.sha256 };
 }
 

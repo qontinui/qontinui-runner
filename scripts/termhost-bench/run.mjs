@@ -228,6 +228,15 @@ export function rowLabels({ softwareRendered, setup, smoke, paneSizes, geometry,
 }
 
 /**
+ * The log lines for a row's KPI notes. A note can quote a reading; public CI
+ * logs carry these lines, and a third party's readings never leave the job (D7),
+ * so only the runner's notes are logged — every other setup's stay in the file.
+ */
+export function noteLogLines(setupId, where, notes) {
+  return setupId === "runner" ? notes.map((n) => `${where}: ${n}`) : [];
+}
+
+/**
  * The run's sleep: it ends at the abort, and after the abort it still YIELDS (one
  * setImmediate turn) rather than resolving as a bare microtask, so a loop that
  * missed the abort cannot spin without the event loop servicing a second signal
@@ -839,7 +848,7 @@ export async function runUnit(unit, ctx) {
         }),
       );
     }
-    for (const note of computed.notes) log(`unit ${name} arm ${arm}: ${note}`);
+    for (const line of noteLogLines(unit.setup, `unit ${name} arm ${arm}`, computed.notes)) log(line);
     const diagnostics = unit.setup === "runner" ? { ...a.diagnostics, ...unitDiagnostics, ...zoneDiagnostic(a) } : {};
     const kpis = computed.kpis;
     rows.push({

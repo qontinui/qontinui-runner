@@ -11,7 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -217,6 +217,100 @@ test("a VS Code process that survives every signal is reported, not hidden; a ma
   recycled.startKey = "1000";
   await recycled.teardown();
   assert.deepEqual(signalled, [], "PID 100 now belongs to a process started after ours: not a target");
+});
+
+test("a launch whose Code.exe exited before its start key was read claims nothing at teardown, even with a stranger on the PID", async (t) => {
+  const { EventEmitter } = await import("node:events");
+  const P = (pid, ppid, name, startKey) => ({ pid, ppid, name, argv: null, cmdline: name, startKey: String(startKey) });
+  const dir = mkdtempSync(join(tmpdir(), "tb-vsc-exit-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const unitDir = join(dir, "units", "u0");
+  mkdirSync(join(unitDir, "gen"), { recursive: true });
+  const app = join(dir, "app");
+  mkdirSync(app);
+  writeFileSync(join(app, "Code.exe"), "x");
+  // Our Code.exe exits at once; by the first process-table read, Windows has
+  // handed PID 600 to an unrelated process with its own subtree.
+  const stranger = new Map([[600, P(600, 1, "Code.exe", 7000)], [601, P(601, 600, "Code.exe", 7001)]]);
+  let child = null;
+  const signalled = [];
+  const a = new VscodeAdapter({
+    platform: "win32",
+    appPath: app,
+    cacheDir: dir,
+    env: { SystemRoot: "C:\\Windows" },
+    exists: (p) => /powershell\.exe$/i.test(p) || existsSync(p),
+    spawnFn: () => {
+      child = new EventEmitter();
+      child.pid = 600;
+      return child;
+    },
+    list: () => {
+      if (child && !child.exited) {
+        child.exited = true;
+        child.emit("exit", 1, null);
+      }
+      return new Map(stranger);
+    },
+    kill: (pid, sig) => signalled.push([pid, sig]),
+    sleep: async () => {},
+    launchTimeoutMs: 1000,
+    quitTimeoutMs: 10,
+  });
+  await assert.rejects(a.launch({ runDir: dir, unitDir, genDir: join(unitDir, "gen"), genRunId: "r-u0", env: { env: {} } }), /exited/);
+  assert.equal(a.startKey, null, "a key read after our child exited is not ours");
+  const res = await a.teardown();
+  assert.deepEqual(signalled, [], "neither the stranger nor its child is signalled");
+  assert.ok(res.notes.some((n) => /cannot be proven this run's/.test(n)), res.notes.join("; "));
+  // And a recorded key does not license teardown once our child has exited.
+  const b = new VscodeAdapter({ platform: "win32", list: () => new Map(stranger), kill: (pid) => signalled.push([pid]), sleep: async () => {} });
+  b.pid = 600;
+  b.startKey = "7000";
+  b.childExit = { code: 0, signal: null, afterMs: 5 };
+  await b.teardown();
+  assert.deepEqual(signalled, [], "an exited child's PID is never adopted");
+});
+
+test("a live VS Code whose start key was never read is not signalled, and is reported rather than hidden", async () => {
+  const { EventEmitter } = await import("node:events");
+  const signalled = [];
+  const a = new VscodeAdapter({
+    platform: "win32",
+    list: () => new Map([[700, { pid: 700, ppid: 1, name: "Code.exe", argv: null, cmdline: "Code.exe", startKey: "1" }]]),
+    kill: (pid) => signalled.push(pid),
+    sleep: async () => {},
+    quitTimeoutMs: 10,
+  });
+  a.child = new EventEmitter(); // ours, still running; the launch's table read failed
+  a.pid = 700;
+  a.startKey = null;
+  const res = await a.teardown();
+  assert.deepEqual(signalled, []);
+  assert.deepEqual(res.survivors.map((s) => [s.pid, /cannot be proven/.test(s.detail)]), [[700, true]]);
+});
+
+test("VS Code teardown adopts a descendant only through parent links each started before its child", async () => {
+  const P = (pid, ppid, name, startKey) => ({ pid, ppid, name, argv: null, cmdline: name, startKey: String(startKey) });
+  let table = new Map([
+    [100, P(100, 1, "Code.exe", 1000)], // ours
+    [250, P(250, 100, "Code.exe", 2500)], // ours, but its PID was reused: an earlier 250 died
+    [300, P(300, 250, "cmd.exe", 2000)], // the dead 250's child — a stranger whose parent link now points at ours
+  ]);
+  const signalled = [];
+  const a = new VscodeAdapter({
+    platform: "win32",
+    list: () => new Map(table),
+    kill: (pid) => {
+      signalled.push(pid);
+      table = new Map([...table].filter(([p]) => p !== pid));
+    },
+    sleep: async () => {},
+  });
+  a.pid = 100;
+  a.startKey = "1000";
+  await a.teardown();
+  assert.deepEqual(signalled, [250, 100], "the stranger started before the PID it names as its parent: not ours");
+  assert.ok(table.has(300));
 });
 
 test("tmux teardown is kill-server on the PRIVATE socket, and a lingering server is signalled only if it is ours", async (t) => {

@@ -412,8 +412,12 @@ function launchRig(t, { platform = "win32", fakeOpts = {}, hostPid = process.pid
       setTimeout(() => child.emit("exit", earlyExit, null), 20);
       return child;
     }
+    // The simulated workbench runs on the settings file the adapter wrote.
+    const userData = args[args.indexOf("--user-data-dir") + 1];
+    const profile = JSON.parse(readFileSync(join(userData, "User", "settings.json"), "utf8"));
     rig.fake = createFakeVscode({
       ...fakeOpts,
+      settings: { ...profile, ...(fakeOpts.settings ?? {}) },
       onQuit: () => {
         if (!exitOnQuit) return;
         setTimeout(async () => {
@@ -435,11 +439,11 @@ function launchRig(t, { platform = "win32", fakeOpts = {}, hostPid = process.pid
 }
 
 /** An installed app directory for `--vscode-app-path` (nothing in it ever runs). */
-function installedApp(t, platform = "win32") {
+function installedApp(t, platform = "win32", extra = {}) {
   const dir = tmp(t, "tb-vsc-app-");
   writeFileSync(join(dir, platform === "win32" ? "Code.exe" : "code"), "not a binary");
   mkdirSync(join(dir, "04c0d99f4f", "resources", "app"), { recursive: true });
-  writeFileSync(join(dir, "04c0d99f4f", "resources", "app", "product.json"), JSON.stringify({ version: VSCODE_PIN.version, commit: VSCODE_PIN.commit }));
+  writeFileSync(join(dir, "04c0d99f4f", "resources", "app", "product.json"), JSON.stringify({ version: VSCODE_PIN.version, commit: VSCODE_PIN.commit, ...extra }));
   return dir;
 }
 
@@ -455,6 +459,7 @@ function winAdapter(rig, over = {}) {
     sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))),
     launchTimeoutMs: 5000,
     quitTimeoutMs: 1000,
+    paneSettleMs: 0,
     ...over,
   });
 }
@@ -469,7 +474,7 @@ test("end to end (Windows, installed app): isolated launch, D13 sessions, both a
   assert.equal(rig.spawns.length, 1);
   const { args, opts } = rig.spawns[0];
   const p = profileLayout(unitDir);
-  assert.deepEqual(args.slice(0, 6), ["--user-data-dir", p.userData, "--extensions-dir", p.extensions, "--extensionDevelopmentPath", HARNESS_EXTENSION_DIR]);
+  assert.deepEqual(args.slice(0, 8), ["--user-data-dir", p.userData, "--extensions-dir", p.extensions, "--shared-data-dir", p.sharedData, "--extensionDevelopmentPath", HARNESS_EXTENSION_DIR]);
   assert.equal(opts.env.VSCODE_PORTABLE, p.portable);
   assert.equal(opts.env[protocol.CONFIG_ENV], p.config);
   assert.equal(opts.env.ELECTRON_RUN_AS_NODE, undefined);
@@ -497,7 +502,13 @@ test("end to end (Windows, installed app): isolated launch, D13 sessions, both a
   const sees = (ks) => async () => ({ ok: true, sessions: new Map(ks.map((k) => [k, { x: 0, y: 0, w: 160, h: 16 }])), detail: "fake" });
 
   // tiled: five panes in a 3+2 grid.
+  // Each session reports its pane size: a start size, then the host's resize.
+  for (const k of [0, 1, 2, 3, 4]) {
+    const recs = [{ type: "start", session: k, terminal_size: { cols: 80, rows: 30 } }, { type: "resize", t_ns: "1", cols: 70 + k, rows: 20 }];
+    writeFileSync(join(genDir, `gen-${k}.jsonl`), `${recs.map((r) => JSON.stringify(r)).join(String.fromCharCode(10))}${String.fromCharCode(10)}`);
+  }
   const tiled = await a.arrange("tiled", { slots, n: 5, look: sees([0, 1, 2, 3, 4]) });
+  assert.deepEqual(tiled.paneSizes, [0, 1, 2, 3, 4].map((k) => ({ cols: 70 + k, rows: 20 })), "the size each shown session last reported");
   assert.equal(tiled.ok, true, JSON.stringify(tiled));
   assert.deepEqual([tiled.vTarget, tiled.focusSession, tiled.switchable], [5, 0, []]);
   assert.deepEqual(tiled.layout.rows, [3, 2]);
@@ -508,6 +519,7 @@ test("end to end (Windows, installed app): isolated launch, D13 sessions, both a
   assert.equal(focus.ok, true, JSON.stringify(focus));
   assert.deepEqual([focus.vTarget, focus.focusSession, focus.switchable], [1, 0, [0, 1, 2, 3, 4]]);
   assert.equal(rig.fake.state.panel.maximized, true);
+  assert.deepEqual(focus.paneSizes, [{ cols: 70, rows: 20 }]);
   const wrong = await a.arrange("focus", { slots, n: 5, look: sees([0, 3]) });
   assert.deepEqual([wrong.ok, wrong.failure.reason], [false, "sessions_not_rendered"], "two panes on screen is not the focus arm");
 
@@ -688,4 +700,91 @@ test("the doctor's facts: an unsupported platform, the harness extension, the se
   assert.equal(m["setup.vscode_shell"].state, "INOPERATIVE-ON-THIS-MACHINE");
   assert.ok(Object.keys(m).every((id) => id.startsWith("setup.")), "every VS Code fact is a setup.* mechanism, so the public redaction drops it (D7)");
   assert.equal((await new VscodeAdapter({ platform: "linux", arch: "arm64", cacheDir: tmp(t), shell: "/bin/sh" }).check()).mechanisms["setup.vscode"].state, "INOPERATIVE-ON-THIS-MACHINE", "no pinned build for linux-arm64");
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1
+// ---------------------------------------------------------------------------
+
+test("the private profile opens the panel un-maximized, so the focus arm's one toggle always maximizes", () => {
+  assert.equal(vscodeSettings()["workbench.panel.opensMaximized"], "never");
+});
+
+test("an installed build with an install target runs without portable mode, and says so", async (t) => {
+  const { runDir, unitDir, genDir } = unitDirs(t);
+  const rig = launchRig(t);
+  const app = installedApp(t, "win32", { target: "user" });
+  const a = winAdapter(rig, { appPath: app, cacheDir: tmp(t) });
+  assert.match((await a.check()).mechanisms["setup.vscode"].reason, /portable mode OFF \(product target "user"\).*argv\.json/);
+  await a.launch({ runDir, unitDir, genDir, genRunId: "r6-u0", env: { env: {} } });
+  const { args, opts } = rig.spawns[0];
+  const p = profileLayout(unitDir);
+  assert.equal(opts.env.VSCODE_PORTABLE, undefined, "VS Code would ignore it anyway");
+  assert.equal(args[args.indexOf("--shared-data-dir") + 1], p.sharedData, "shared data is kept private explicitly");
+  assert.equal(existsSync(p.argvJson), false, "no portable argv.json is pretended");
+  assert.match(a.describe().app_version, /portable mode off \(product target "user"\)$/);
+  await a.teardown();
+  const plain = launchRig(t);
+  const b = winAdapter(plain, { appPath: installedApp(t), cacheDir: tmp(t) });
+  const u2 = join(runDir, "units", "u001");
+  mkdirSync(join(u2, "gen"), { recursive: true });
+  await b.launch({ runDir, unitDir: u2, genDir: join(u2, "gen"), genRunId: "r6-u1", env: { env: {} } });
+  assert.equal(plain.spawns[0].opts.env.VSCODE_PORTABLE, profileLayout(u2).portable);
+  assert.doesNotMatch(b.describe().app_version, /portable mode off/);
+  await b.teardown();
+});
+
+test("a download is cut off once it passes the pinned size: refused, and the rest is never read", async (t) => {
+  const dir = tmp(t);
+  let pulled = 0;
+  const chunk = Buffer.alloc(1024, 7);
+  const fetch = async () => ({ ok: true, status: 200, body: (async function* () { for (let i = 0; i < 100; i += 1) { pulled += 1; yield chunk; } })() });
+  await assert.rejects(downloadVerified({ urls: ["https://a/big"], dest: join(dir, "v", "a.zip"), expected: "0".repeat(64), fetch, maxBytes: 4096 }), (e) => e instanceof ArchiveIntegrityError && /more than 4096 bytes/.test(e.message));
+  assert.ok(pulled <= 5, `stopped after the pinned size (${pulled} chunks pulled of 100)`);
+  assert.deepEqual(readdirSync(join(dir, "v")), []);
+});
+
+test("a cached archive the doctor just hashed is not hashed again at launch", async (t) => {
+  const { runDir, unitDir, genDir } = unitDirs(t);
+  const bytes = Buffer.from("synthetic archive");
+  const build = { ...VSCODE_PIN.builds["win32-x64"], url: "https://example.invalid/v.zip", fallbackUrl: null, archive: "v.zip", sha256: sha(bytes), bytes: bytes.length };
+  const pin = { ...VSCODE_PIN, builds: { "win32-x64": build } };
+  const cacheDir = tmp(t);
+  mkdirSync(join(cacheDir, VSCODE_PIN.version));
+  writeFileSync(join(cacheDir, VSCODE_PIN.version, "v.zip"), bytes);
+  let hashes = 0;
+  const hash = async (p) => {
+    hashes += 1;
+    return sha(readFileSync(p));
+  };
+  const rig = launchRig(t);
+  const a = winAdapter(rig, { pin, cacheDir, hash, fetch: () => assert.fail("cached"), run: fakeUnpack({ build }) });
+  await a.launch({ runDir, unitDir, genDir, genRunId: "r7-u0", env: { env: {} } });
+  assert.equal(hashes, 1, "check() hashed it; ensureArchive reused that hash");
+  await a.teardown();
+  // A file that changed after the doctor's hash is hashed again.
+  const changed = await ensureArchive({ build, cacheDir, fetch: async () => response(bytes), hash, verified: { path: join(cacheDir, VSCODE_PIN.version, "v.zip"), size: 1, mtimeMs: 0, sha256: build.sha256 } });
+  assert.equal(changed.cached, true);
+  assert.equal(hashes, 2);
+});
+
+test("pane sizes come from what each session reported: the latest resize, else its start size", async () => {
+  const { latestPaneSize } = await import("../adapters/vscode.mjs");
+  assert.deepEqual(latestPaneSize([{ type: "start", terminal_size: { cols: 80, rows: 30 } }]), { cols: 80, rows: 30 });
+  assert.deepEqual(latestPaneSize([{ type: "start", terminal_size: { cols: 80, rows: 30 } }, { type: "resize", cols: 60, rows: 18 }, { type: "marker" }]), { cols: 60, rows: 18 });
+  assert.equal(latestPaneSize([{ type: "start", terminal_size: null }]), null);
+  const { watchResize, resizeRecord } = await import("../generator/ai-session.mjs");
+  const { EventEmitter: E } = await import("node:events");
+  const stdout = new E();
+  const logged = [];
+  let size = { cols: 100, rows: 40 };
+  const stop = watchResize(stdout, (r) => logged.push(r), { nowNs: () => 5n }, () => size);
+  stdout.emit("resize");
+  size = null;
+  stdout.emit("resize");
+  stop();
+  size = { cols: 1, rows: 1 };
+  stdout.emit("resize");
+  assert.deepEqual(logged, [resizeRecord({ cols: 100, rows: 40 }, 5n)]);
+  assert.deepEqual(logged[0], { type: "resize", t_ns: "5", cols: 100, rows: 40 });
 });

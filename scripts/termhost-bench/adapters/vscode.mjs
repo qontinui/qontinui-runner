@@ -10,11 +10,14 @@
  * then only when the launch proves the process tree is this run's own.
  *
  * Isolation (D5): every byte VS Code writes lands in the unit directory.
- *   - Portable mode: `VSCODE_PORTABLE=<unit>/vscode/portable` (the app honours it
- *     when the directory exists and the product has no install `target`, which the
- *     archives do not). Without it VS Code creates `~/.vscode/argv.json` and a
- *     shared-data folder in the user's home on first start.
- *   - `--user-data-dir` and `--extensions-dir` inside that directory,
+ *   - Portable mode: `VSCODE_PORTABLE=<unit>/vscode/portable`. The app honours it
+ *     only when the directory exists and its product.json has no install
+ *     `target`; the pinned archives have none. Without it VS Code reads, and
+ *     creates when absent, `~/.vscode/argv.json` in the user's home. An
+ *     installed build (`--vscode-app-path`) normally HAS a target, so portable
+ *     mode is off there: the adapter records it (doctor reason, `app_version`),
+ *     and the only file outside the unit is that argv.json.
+ *   - `--user-data-dir`, `--extensions-dir` and `--shared-data-dir` inside that directory,
  *     `--disable-workspace-trust`, in-memory secret storage (no keychain write),
  *     no update or experiment fetches, no crash reporter.
  *   - Settings written into the private profile (`vscodeSettings`): telemetry
@@ -56,6 +59,7 @@ import { fileURLToPath } from "node:url";
 
 import { descendantsOf, listProcesses, terminatePid } from "../proc.mjs";
 import { ptyHostCensus, ptyHostImpl } from "../ptyhost.mjs";
+import { readGeneratorLog } from "../sessions.mjs";
 import { assertInside, commandLine } from "../rundir.mjs";
 import { AdapterRefusal } from "./index.mjs";
 import { sessionShellArgv } from "./tmux.mjs";
@@ -123,6 +127,11 @@ export function vscodeSettings({ scrollback = SCROLLBACK_LINES } = {}) {
     "workbench.welcomePage.walkthroughs.openOnInstall": false,
     "security.workspace.trust.enabled": false,
     "window.newWindowDimensions": "maximized",
+    // The focus arm maximizes the panel with a toggle. Under the default
+    // "preserve", a panel hidden while maximized reopens maximized and the toggle
+    // would UN-maximize it; "never" makes every open start un-maximized, so one
+    // toggle always lands maximized.
+    "workbench.panel.opensMaximized": "never",
     "window.restoreWindows": "none",
     // Teardown without a modal dialog (killing an editor terminal that has
     // children asks by default).
@@ -145,6 +154,7 @@ export function profileLayout(unitDir) {
     portable,
     userData: join(portable, "user-data"),
     extensions: join(portable, "extensions"),
+    sharedData: join(portable, "shared-data"),
     settings: join(portable, "user-data", "User", "settings.json"),
     argvJson: join(portable, "argv.json"),
     config: join(base, "harness-config.json"),
@@ -159,15 +169,18 @@ export function profileLayout(unitDir) {
  * The isolated instance's argv. No folder is opened (an empty window); GPU
  * acceleration is never forced either way.
  *
- * @param {{exe: string, userDataDir: string, extensionsDir: string, extensionDir: string, noSandbox?: boolean}} o
+ * @param {{exe: string, userDataDir: string, extensionsDir: string, sharedDataDir?: string | null,
+ *   extensionDir: string, noSandbox?: boolean}} o
  */
-export function vscodeArgv({ exe, userDataDir, extensionsDir, extensionDir, noSandbox = false }) {
+export function vscodeArgv({ exe, userDataDir, extensionsDir, sharedDataDir = null, extensionDir, noSandbox = false }) {
   return [
     exe,
     "--user-data-dir",
     userDataDir,
     "--extensions-dir",
     extensionsDir,
+    // Explicit, so shared data stays private even where portable mode is off.
+    ...(sharedDataDir ? ["--shared-data-dir", sharedDataDir] : []),
     "--extensionDevelopmentPath",
     extensionDir,
     "--disable-workspace-trust",
@@ -211,7 +224,7 @@ export function vscodeEnv(base, { portableDir, configPath, display = null, platf
     if (FOREIGN_ENV.test(k) || FOREIGN_KEYS.has(k)) continue;
     env[k] = v;
   }
-  env.VSCODE_PORTABLE = portableDir;
+  if (portableDir) env.VSCODE_PORTABLE = portableDir;
   env[protocol.CONFIG_ENV] = configPath;
   if (platform === "linux" && display) env.DISPLAY = display;
   return env;
@@ -309,6 +322,21 @@ export function shellFacts(slots, table, platform = process.platform) {
   return null;
 }
 
+/**
+ * The pane size a session last reported (its generator's `resize` records, else
+ * its start record's `terminal_size`), or null. VS Code's stable API exposes no
+ * terminal dimensions (`Terminal.dimensions` is proposed), so the session itself
+ * is asked.
+ */
+export function latestPaneSize(records) {
+  let size = null;
+  for (const r of records) {
+    if (r?.type === "start" && Number.isInteger(r.terminal_size?.cols) && Number.isInteger(r.terminal_size?.rows)) size = { cols: r.terminal_size.cols, rows: r.terminal_size.rows };
+    else if (r?.type === "resize" && Number.isInteger(r.cols) && Number.isInteger(r.rows)) size = { cols: r.cols, rows: r.rows };
+  }
+  return size;
+}
+
 /** A failed call to the harness endpoint. */
 export class HarnessCallError extends Error {
   constructor(message, { status = null, code = null } = {}) {
@@ -395,6 +423,9 @@ export class VscodeAdapter {
     this.launchTimeoutMs = o.launchTimeoutMs ?? 180000;
     this.quitTimeoutMs = o.quitTimeoutMs ?? 20000;
     this.sandboxFn = o.sandbox ?? null;
+    this.hashFn = o.hash ?? null;
+    this.paneSettleMs = o.paneSettleMs ?? 500;
+    this.cacheVerified = null;
     this.pin = o.pin ?? VSCODE_PIN;
     this.app = null;
     this.paths = null;
@@ -446,8 +477,9 @@ export class VscodeAdapter {
     if (this.appPath) {
       try {
         const app = resolveAppPath(this.appPath, { platform: this.platform, exists: this.exists });
-        const v = app.productJson ? readProduct(app.productJson).version : "version unknown";
-        return { state: "OPERATIVE", reason: `installed VS Code ${v} at ${app.exe} ("as configured"; private profile; exclusivity proven at launch)` };
+        const product = app.productJson ? readProduct(app.productJson) : null;
+        const off = product && Object.hasOwn(product, "target") ? `; portable mode OFF (product target "${product.target}"): VS Code reads, and creates when absent, ~/.vscode/argv.json` : "";
+        return { state: "OPERATIVE", reason: `installed VS Code ${product?.version ?? "version unknown"} at ${app.exe} ("as configured"; private profile; exclusivity proven at launch${off})` };
       } catch (e) {
         return { state: "INOPERATIVE-ON-THIS-MACHINE", reason: e.message };
       }
@@ -464,7 +496,10 @@ export class VscodeAdapter {
       };
     }
     try {
-      const actual = await sha256File(cached);
+      const st = statSync(cached);
+      const actual = await (this.hashFn ?? sha256File)(cached);
+      // Handed to the launch's ensureArchive, so a 336 MB archive is hashed once.
+      this.cacheVerified = { path: cached, size: st.size, mtimeMs: st.mtimeMs, sha256: actual };
       return actual === build.sha256
         ? { state: "OPERATIVE", reason: `pinned VS Code ${this.pin.version} cached at ${cached}, SHA-256 verified` }
         : { state: "OPERATIVE", reason: `the cached ${cached} fails SHA-256 (${actual.slice(0, 16)}…); the launch discards it and downloads the pinned archive again` };
@@ -490,7 +525,16 @@ export class VscodeAdapter {
     if (!build) throw new AdapterRefusal("harness_error", `no pinned VS Code build for ${this.platform}-${this.arch}`);
     let archive;
     try {
-      archive = await ensureArchive({ build, cacheDir: this.cacheDir, version: this.pin.version, fetch: this.fetch, log: this.log, exists: this.exists });
+      archive = await ensureArchive({
+        build,
+        cacheDir: this.cacheDir,
+        version: this.pin.version,
+        fetch: this.fetch,
+        log: this.log,
+        exists: this.exists,
+        verified: this.cacheVerified ?? null,
+        ...(this.hashFn ? { hash: this.hashFn } : {}),
+      });
     } catch (e) {
       throw new AdapterRefusal("harness_error", e instanceof ArchiveIntegrityError ? `refusing the VS Code archive: ${e.message}` : e.message);
     }
@@ -521,16 +565,24 @@ export class VscodeAdapter {
     }
     if (this.appPath) {
       const app = resolveAppPath(this.appPath, { platform: this.platform, exists: this.exists });
-      this.app = { ...app, chromeSandbox: null, product: app.productJson ? readProduct(app.productJson) : null, launchMode: "installed_app_path" };
+      const product = app.productJson ? readProduct(app.productJson) : null;
+      // An installed build's product.json names its install `target` (user /
+      // system), and VS Code then ignores VSCODE_PORTABLE: argv.json is read (and
+      // created when absent) in ~/.vscode. Recorded, never hidden.
+      const target = product && Object.hasOwn(product, "target") ? String(product.target) : null;
+      this.app = { ...app, chromeSandbox: null, product, launchMode: "installed_app_path", portable: target === null, target };
+      if (target !== null) this.notes.push(`portable mode is off: the installed build's product target is "${target}", so VS Code reads ~/.vscode/argv.json`);
     } else {
       this.app = await this.installPinned(ctx);
+      this.app.target = this.app.product && Object.hasOwn(this.app.product, "target") ? String(this.app.product.target) : null;
+      this.app.portable = this.app.target === null;
     }
     const p = profileLayout(ctx.unitDir);
     for (const k of Object.keys(p)) assertInside(ctx.runDir, p[k]);
     this.paths = p;
     for (const d of [p.base, p.portable, p.userData, p.extensions, dirname(p.settings)]) mkdirSync(d, { recursive: true });
     writeFileSync(p.settings, `${JSON.stringify(vscodeSettings(), null, 2)}\n`);
-    writeFileSync(p.argvJson, `${JSON.stringify(ARGV_JSON, null, 2)}\n`);
+    if (this.app.portable) writeFileSync(p.argvJson, `${JSON.stringify(ARGV_JSON, null, 2)}\n`);
     const nonce = randomBytes(32).toString("hex");
     const shellPath = sessionShellPath({ platform: this.platform, shell: this.shell, env: this.baseEnv });
     writeFileSync(
@@ -540,8 +592,8 @@ export class VscodeAdapter {
     );
     const sandbox = this.platform === "linux" ? this.sandboxVerdict(this.app.chromeSandbox) : null;
     if (sandbox?.noSandbox) this.notes.push(sandbox.reason);
-    const argv = vscodeArgv({ exe: this.app.exe, userDataDir: p.userData, extensionsDir: p.extensions, extensionDir: HARNESS_EXTENSION_DIR, noSandbox: sandbox?.noSandbox === true });
-    const env = vscodeEnv(this.baseEnv, { portableDir: p.portable, configPath: p.config, display: ctx.env?.env?.DISPLAY ?? null, platform: this.platform });
+    const argv = vscodeArgv({ exe: this.app.exe, userDataDir: p.userData, extensionsDir: p.extensions, sharedDataDir: p.sharedData, extensionDir: HARNESS_EXTENSION_DIR, noSandbox: sandbox?.noSandbox === true });
+    const env = vscodeEnv(this.baseEnv, { portableDir: this.app.portable ? p.portable : null, configPath: p.config, display: ctx.env?.env?.DISPLAY ?? null, platform: this.platform });
     const out = openSync(p.stdout, "a");
     const err = openSync(p.stderr, "a");
     const t0 = Date.now();
@@ -556,7 +608,9 @@ export class VscodeAdapter {
       this.childExit = { code, signal, afterMs: Date.now() - t0 };
     });
     try {
-      this.startKey = this.list().get(this.pid)?.startKey ?? null;
+      const key = this.list().get(this.pid)?.startKey ?? null;
+      // A key read after our child exited may be a stranger's: the PID is free.
+      this.startKey = this.childExit === null ? key : null;
     } catch (e) {
       this.notes.push(`process table unreadable after launch: ${e.message}`);
     }
@@ -691,8 +745,12 @@ export class VscodeAdapter {
         notes.push(`the probe saw ${seen.sessions.size} of ${vTarget} panes right after arranging`);
       }
     }
-    // Pane sizes are not knowable here: Terminal.dimensions is a proposed API.
-    return { ok: true, vTarget, focusSession: order[0], switchable, paneSizes: [], notes, layout: { rows: r.rows ?? [1], groups: r.groups ?? [] } };
+    // Let the host's resize reach the shown sessions, then read the size each reported.
+    await this.sleep(this.paneSettleMs);
+    const shown = arm === "focus" ? [order[0]] : order.slice(0, vTarget);
+    const paneSizes = this.ctx?.genDir ? shown.map((k) => latestPaneSize(readGeneratorLog(this.ctx.genDir, k))).filter(Boolean) : [];
+    if (paneSizes.length < shown.length) notes.push(`pane size known for ${paneSizes.length} of ${shown.length} shown session(s)`);
+    return { ok: true, vTarget, focusSession: order[0], switchable, paneSizes, notes, layout: { rows: r.rows ?? [1], groups: r.groups ?? [] } };
   }
 
   async show(k) {
@@ -766,7 +824,8 @@ export class VscodeAdapter {
     if (!version) return absent("harness_error", "neither the instance nor its product.json named a version");
     const commit = this.app?.product?.commit ? `${this.app.product.commit.slice(0, 12)}, ` : "";
     const electron = this.hello?.process?.electron ? `Electron ${this.hello.process.electron}` : "Electron ?";
-    return `VS Code ${version} (${commit}${electron})`;
+    const portable = this.app && this.app.portable === false ? `; portable mode off (product target "${this.app.target}")` : "";
+    return `VS Code ${version} (${commit}${electron})${portable}`;
   }
 
   describe(slots = new Map()) {
@@ -810,16 +869,31 @@ export class VscodeAdapter {
     const survivors = [];
     const incidents = [];
     let owned = [];
-    let table = null;
+    // The root is claimed only when this run PROVED it: its start key was read
+    // while our child was alive, the process holding the PID now has that same
+    // start key, and our child has not exited (an exited child's PID may already
+    // belong to a stranger — Windows reuses PIDs quickly).
+    let unprovable = null;
     if (Number.isInteger(this.pid)) {
-      try {
-        table = this.list();
-        const root = table.get(this.pid);
-        if (root && (!this.startKey || root.startKey === this.startKey)) {
-          owned = [root, ...descendantsOf(table, this.pid)].map((p) => ({ pid: p.pid, startKey: p.startKey, name: p.name }));
+      if (this.startKey === null || this.startKey === undefined) unprovable = "its start key was never recorded";
+      else if (this.childExit !== null) unprovable = `our child exited (${JSON.stringify(this.childExit)}) before teardown`;
+      if (unprovable) {
+        this.notes.push(`teardown: VS Code pid ${this.pid} cannot be proven this run's (${unprovable}); nothing is signalled`);
+      } else {
+        try {
+          const table = this.list();
+          const root = table.get(this.pid);
+          if (root && root.startKey === this.startKey) {
+            // Parent links outlive their parents on Windows: every descendant must
+            // chain back to the root with each parent started first.
+            const desc = descendantsOf(table, this.pid).filter((p) => isDescendantOf(table, p.pid, this.pid));
+            owned = [root, ...desc].map((p) => ({ pid: p.pid, startKey: p.startKey, name: p.name }));
+          } else {
+            this.notes.push(`teardown: pid ${this.pid} no longer holds the process this run started; nothing is signalled`);
+          }
+        } catch (e) {
+          this.notes.push(`teardown: process table unreadable: ${e.message}`);
         }
-      } catch (e) {
-        this.notes.push(`teardown: process table unreadable: ${e.message}`);
       }
     }
     if (this.client) {
@@ -857,6 +931,9 @@ export class VscodeAdapter {
     }
     if (owned.length > 0) closed.push(`${owned.length - alive.length} of ${owned.length} owned process(es) gone`);
     for (const o of alive) survivors.push({ pid: o.pid, what: `${o.name} pid ${o.pid}`, detail: "survived quit, SIGTERM and SIGKILL" });
+    if (unprovable && this.child && this.childExit === null) {
+      survivors.push({ pid: this.pid, what: `VS Code pid ${this.pid}`, detail: `not signalled: ${unprovable}, so it cannot be proven this run's` });
+    }
     return { closed, survivors, incidents, notes: [...this.notes] };
   }
 }

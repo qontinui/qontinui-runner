@@ -16,7 +16,12 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { vscodeSettings } from "../adapters/vscode.mjs";
 import { createFakeVscode } from "./helpers/fake-vscode.mjs";
+
+/** The simulated workbench runs on the private profile the adapter writes. */
+const PROFILE = vscodeSettings();
+const workbench = (o = {}) => createFakeVscode({ ...o, settings: { ...PROFILE, ...(o.settings ?? {}) } });
 
 const require = createRequire(import.meta.url);
 const protocol = require("../vscode-harness-extension/protocol.js");
@@ -178,7 +183,7 @@ test("the config and control files are validated on read", () => {
 // ---------------------------------------------------------------------------
 
 async function spawned(n, fakeOpts = {}) {
-  const fake = createFakeVscode(fakeOpts);
+  const fake = workbench(fakeOpts);
   const c = controller(fake);
   const r = await c.handle("spawn", { count: n, location: "panel", shellPath: SHELL, shellArgs: ARGS, show: false });
   return { fake, c, ids: r.terminals.map((t) => t.id), r };
@@ -250,10 +255,28 @@ test("focus after tiled: every terminal back in the panel, one editor group, the
 
 test("focus from a maximized panel re-maximizes deterministically (close first, then one toggle)", async () => {
   const { fake, c, ids } = await spawned(3);
-  await c.handle("arrange", { arm: "focus", order: ids });
-  assert.equal(fake.state.panel.maximized, true);
-  await c.handle("arrange", { arm: "focus", order: ids });
-  assert.equal(fake.state.panel.maximized, true, "a second focus arrangement must not toggle it back off");
+  for (const arm of ["focus", "focus", "tiled", "focus", "focus"]) {
+    const r = await c.handle("arrange", { arm, order: ids });
+    assert.equal(r.ok, true, `${arm}: ${r.failures.join("; ")}`);
+    if (arm === "focus") assert.equal(fake.state.panel.maximized, true, "every focus arrangement ends maximized");
+  }
+});
+
+test("under VS Code's default opensMaximized \"preserve\" the focus arm refuses rather than toggle blind", async () => {
+  const { fake, c, ids } = await spawned(3, { settings: { "workbench.panel.opensMaximized": "preserve" } });
+  const r = await c.handle("arrange", { arm: "focus", order: ids });
+  assert.equal(r.ok, false);
+  assert.match(r.failures[0], /opensMaximized is "preserve", not "never"/);
+  assert.equal(PROFILE["workbench.panel.opensMaximized"], "never", "the private profile sets it");
+  // What the guard prevents, in the simulated workbench: preserve reopens a
+  // panel hidden while maximized as maximized, and one toggle un-maximizes it.
+  fake.vscode.window.createTerminal({ name: "x", location: 1 }).show(false);
+  await fake.vscode.commands.executeCommand("workbench.action.toggleMaximizedPanel");
+  await fake.vscode.commands.executeCommand("workbench.action.closePanel");
+  fake.state.panel.active.show(false);
+  assert.equal(fake.state.panel.maximized, true, "preserve reopened it maximized");
+  await fake.vscode.commands.executeCommand("workbench.action.toggleMaximizedPanel");
+  assert.equal(fake.state.panel.maximized, false, "so the blind toggle un-maximizes");
 });
 
 test("tabs not labelled with the terminal's name still verify — as the active terminal editor of its group, with a note", async () => {
@@ -300,7 +323,7 @@ test("show, focus, list, close and an editor-area spawn", async () => {
 
 test("hello reads the terminal settings back with their defaults; quit runs workbench.action.quit", async () => {
   let quit = false;
-  const fake = createFakeVscode({ settings: { "terminal.integrated.scrollback": 10000 }, onQuit: () => (quit = true) });
+  const fake = workbench({ settings: { "terminal.integrated.scrollback": 10000 }, onQuit: () => (quit = true) });
   const c = controller(fake);
   const h = c.hello();
   assert.equal(h.protocol, protocol.PROTOCOL);
@@ -331,7 +354,7 @@ function raw(port, { method = "POST", path = "/rpc", headers = {}, body = "" }) 
 
 async function started(t, fakeOpts = {}) {
   const dir = mkdtempSync(join(tmpdir(), "tb-vsc-ext-"));
-  const fake = createFakeVscode(fakeOpts);
+  const fake = workbench(fakeOpts);
   const cfgPath = join(dir, "harness-config.json");
   writeFileSync(cfgPath, JSON.stringify(config({ controlFile: join(dir, "control.json"), logFile: join(dir, "harness.log") })));
   const h = await startHarness({ vscode: fake.vscode, env: { [protocol.CONFIG_ENV]: cfgPath }, timing: { stepMs: 1500, processIdMs: 500, closeMs: 500 } });
@@ -385,7 +408,11 @@ test("requests execute one at a time: a show that arrives mid-arrangement runs a
   const ids = sp.body.result.terminals.map((x) => x.id);
   const arranging = call("arrange", { arm: "tiled", order: ids });
   // Send the show only once the grid exists: the arrangement is under way.
-  while (!fake.state.commands.some((c) => Array.isArray(c) && c[0] === CMD.setLayout && c[1].orientation === 1)) await new Promise((r) => setTimeout(r, 5));
+  const deadline = Date.now() + 10000;
+  while (!fake.state.commands.some((c) => Array.isArray(c) && c[0] === CMD.setLayout && c[1].orientation === 1)) {
+    assert.ok(Date.now() < deadline, "the arrangement never built its grid within 10 s");
+    await new Promise((r) => setTimeout(r, 5));
+  }
   const shown = await call("show", { id: ids[2] });
   const arranged = await arranging;
   assert.equal(arranged.body.result.ok, true, JSON.stringify(arranged.body));

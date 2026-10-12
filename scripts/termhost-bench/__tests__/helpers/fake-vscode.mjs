@@ -11,8 +11,12 @@
  *     into the ACTIVE editor group, and completes after the command resolves;
  *   - `workbench.action.terminal.moveToTerminalPanel` moves the active terminal
  *     editor to the panel; a group left empty closes (`closeEmptyGroups`);
- *   - closing the panel un-maximizes it first; toggling a hidden panel opens it
- *     maximized; the focus-nth-group commands address GRID order;
+ *   - the panel's maximized state follows `workbench.panel.opensMaximized`
+ *     (`setPanelHidden` / `panelOpensMaximized` in the workbench bundle): hiding a
+ *     maximized panel un-maximizes it but remembers it was maximized, and opening
+ *     it re-maximizes under "always", or under "preserve" (the default) when it was
+ *     last maximized, never under "never"; toggling a hidden panel opens it and
+ *     leaves it maximized; the focus-nth-group commands address GRID order;
  *   - an unknown command rejects, as `executeCommand` does.
  *
  * `faults` breaks one behaviour so the harness's read-backs can be shown to
@@ -29,10 +33,11 @@ export function createFakeVscode({ version = "1.139.1", settings = {}, faults = 
     "terminal.integrated.scrollback": 1000,
     "terminal.integrated.shellIntegration.enabled": true,
     "terminal.integrated.enablePersistentSessions": true,
+    "workbench.panel.opensMaximized": "preserve",
   };
   const newGroup = () => ({ tabs: [], activeTab: null });
   const state = {
-    panel: { visible: false, maximized: false, terminals: [], active: null },
+    panel: { visible: false, maximized: false, wasLastMaximized: false, terminals: [], active: null },
     groups: [newGroup()],
     activeGroup: 0,
     activeTerminal: null,
@@ -47,6 +52,20 @@ export function createFakeVscode({ version = "1.139.1", settings = {}, faults = 
   let pid = firstPid;
   const later = (fn) => setTimeout(fn, asyncMs);
 
+  const setting = (k) => (k in settings ? settings[k] : defaults[k]);
+  /** Open the panel as the workbench does: maximized per opensMaximized. */
+  function openPanel() {
+    if (state.panel.visible) return;
+    const mode = setting("workbench.panel.opensMaximized");
+    state.panel.visible = true;
+    state.panel.maximized = mode === "always" || (mode === "preserve" && state.panel.wasLastMaximized);
+  }
+  function hidePanel() {
+    if (!state.panel.visible) return;
+    state.panel.wasLastMaximized = state.panel.maximized;
+    state.panel.maximized = false;
+    state.panel.visible = false;
+  }
   const groupIndexOf = (t) => state.groups.findIndex((g) => g.tabs.some((tab) => tab.terminal === t));
   const inPanel = (t) => state.panel.terminals.includes(t);
 
@@ -81,7 +100,7 @@ export function createFakeVscode({ version = "1.139.1", settings = {}, faults = 
       show(preserveFocus) {
         t.lastShow = { preserveFocus };
         if (inPanel(t)) {
-          state.panel.visible = true;
+          openPanel();
           state.panel.active = t;
           state.activeTerminal = t;
           return;
@@ -164,6 +183,7 @@ export function createFakeVscode({ version = "1.139.1", settings = {}, faults = 
           if (!t || groupIndexOf(t) < 0) return undefined;
           later(() => {
             removeTab(t);
+            openPanel();
             state.panel.terminals.push(t);
             state.panel.active = t;
             state.activeTerminal = t;
@@ -171,12 +191,16 @@ export function createFakeVscode({ version = "1.139.1", settings = {}, faults = 
           return undefined;
         }
         case "workbench.action.closePanel":
-          state.panel.maximized = false;
-          state.panel.visible = false;
+          hidePanel();
           return undefined;
         case "workbench.action.toggleMaximizedPanel":
-          if (state.panel.visible) state.panel.maximized = !state.panel.maximized;
-          else Object.assign(state.panel, { visible: true, maximized: true });
+          if (state.panel.visible) {
+            state.panel.maximized = !state.panel.maximized;
+          } else {
+            openPanel();
+            state.panel.maximized = true;
+          }
+          state.panel.wasLastMaximized = state.panel.maximized;
           return undefined;
         case "workbench.action.closeSidebar":
           state.sidebar = false;

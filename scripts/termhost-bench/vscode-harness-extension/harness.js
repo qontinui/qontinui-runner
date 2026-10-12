@@ -183,6 +183,7 @@ class HarnessController {
       scrollback: read("scrollback"),
       shellIntegrationEnabled: read("shellIntegration.enabled"),
       enablePersistentSessions: read("enablePersistentSessions"),
+      panelOpensMaximized: this.vscode.workspace.getConfiguration("workbench.panel").get("opensMaximized") ?? null,
     };
   }
 
@@ -312,8 +313,18 @@ class HarnessController {
 
   async arrangeFocus(plan) {
     const failures = [];
+    // No stable API reads the panel's maximized state, so the arrangement is
+    // deterministic only when every open starts un-maximized: then closing the
+    // panel and ONE toggle always lands maximized. Under "preserve" (VS Code's
+    // default) a panel closed while maximized reopens maximized, and the toggle
+    // would un-maximize it — refuse rather than guess.
+    const opens = this.vscode.workspace.getConfiguration("workbench.panel").get("opensMaximized");
+    if (opens !== "never") {
+      failures.push(`workbench.panel.opensMaximized is ${JSON.stringify(opens)}, not "never": the panel's maximized state would be a guess`);
+      return { arm: plan.arm, ok: false, visible: plan.visible, hidden: plan.hidden, focus: plan.focus, groups: [], failures, notes: [] };
+    }
     await this.toPanel(failures);
-    await this.exec(CMD.closePanel); // hidden and, if it was maximized, restored first
+    await this.exec(CMD.closePanel); // hidden; with "never" the next open is un-maximized
     await this.closeChrome();
     const focus = this.require(plan.focus);
     if (!(await this.activate(focus, false))) failures.push(`${focus.id} did not become the active terminal`);

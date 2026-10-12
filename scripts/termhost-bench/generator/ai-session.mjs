@@ -883,6 +883,24 @@ export function restoreConsole(state, { run = spawnSync } = {}) {
   }
 }
 
+/** A `resize` record: the pane size the session now has. */
+export function resizeRecord(size, tNs) {
+  return { type: "resize", t_ns: String(tNs), cols: size.cols, rows: size.rows };
+}
+
+/**
+ * Log a `resize` record whenever `stream` (the session's stdout) reports a new
+ * size. Returns the unsubscribe.
+ */
+export function watchResize(stream, log, clock, sizeOf) {
+  const onResize = () => {
+    const size = sizeOf();
+    if (size) log(resizeRecord(size, clock.nowNs()));
+  };
+  stream.on?.("resize", onResize);
+  return () => stream.off?.("resize", onResize);
+}
+
 function terminalSize() {
   if (!isatty(1)) return null;
   const { columns, rows } = process.stdout;
@@ -927,6 +945,11 @@ async function main(argv) {
     argv: process.argv.slice(1),
   });
   const log = createJsonlLog(join(runDir, `gen-${slot}.jsonl`));
+  // The pane size the host gives this session, as it changes (a host lays a
+  // session out after starting it): `resize` records beside the start record's
+  // `terminal_size`, so a harness can tell whether frames wrapped. Not part of
+  // the deterministic output.
+  const unwatchResize = watchResize(process.stdout, log, clock, terminalSize);
   const control = createControl();
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
     try {
@@ -986,6 +1009,7 @@ async function main(argv) {
     if (raw) stdin.setRawMode(false);
     stdin.pause();
     restoreConsole(consoleState);
+    unwatchResize();
     log.close();
   }
 }
