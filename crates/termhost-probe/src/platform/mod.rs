@@ -340,6 +340,10 @@ pub enum InjectBlock {
     DesktopUnavailable(String),
     /// The check itself failed.
     Unknown(String),
+    /// The keyboard is not in a state where the key types what is intended:
+    /// a modifier held (a Windows-key shortcut would act outside the target)
+    /// or CapsLock on.
+    KeyboardState(String),
 }
 
 impl std::fmt::Display for InjectBlock {
@@ -348,6 +352,7 @@ impl std::fmt::Display for InjectBlock {
             InjectBlock::NotForeground(d) => write!(f, "target not foreground: {d}"),
             InjectBlock::DesktopUnavailable(d) => write!(f, "input desktop unavailable: {d}"),
             InjectBlock::Unknown(d) => write!(f, "foreground check failed: {d}"),
+            InjectBlock::KeyboardState(d) => write!(f, "keyboard state: {d}"),
         }
     }
 }
