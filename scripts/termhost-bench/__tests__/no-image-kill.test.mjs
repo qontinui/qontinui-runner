@@ -219,7 +219,7 @@ test("a VS Code process that survives every signal is reported, not hidden; a ma
   assert.deepEqual(signalled, [], "PID 100 now belongs to a process started after ours: not a target");
 });
 
-test("a launch whose Code.exe exited before its start key was read claims nothing at teardown, even with a stranger on the PID", async (t) => {
+test("a launch whose VS Code exited claims nothing at teardown, even when a stranger on its PID shares its start key", async (t) => {
   const { EventEmitter } = await import("node:events");
   const P = (pid, ppid, name, startKey) => ({ pid, ppid, name, argv: null, cmdline: name, startKey: String(startKey) });
   const dir = mkdtempSync(join(tmpdir(), "tb-vsc-exit-"));
@@ -228,41 +228,48 @@ test("a launch whose Code.exe exited before its start key was read claims nothin
   mkdirSync(join(unitDir, "gen"), { recursive: true });
   const app = join(dir, "app");
   mkdirSync(app);
-  writeFileSync(join(app, "Code.exe"), "x");
-  // Our Code.exe exits at once; by the first process-table read, Windows has
-  // handed PID 600 to an unrelated process with its own subtree.
-  const stranger = new Map([[600, P(600, 1, "Code.exe", 7000)], [601, P(601, 600, "Code.exe", 7001)]]);
+  writeFileSync(join(app, "code"), "x");
+  // A possible ordering: the launch reads OUR live process's start key (the read
+  // is synchronous, so no exit lands during it); our child exits afterwards; and
+  // a stranger takes the PID. On Linux a start key is a clock tick, so a PID
+  // reused within the same tick even carries the same key — only teardown's
+  // "our child exited" guard tells them apart.
+  let table = new Map([[600, P(600, 1, "code", 5000)]]);
   let child = null;
   const signalled = [];
   const a = new VscodeAdapter({
-    platform: "win32",
+    platform: "linux",
     appPath: app,
     cacheDir: dir,
-    env: { SystemRoot: "C:\\Windows" },
-    exists: (p) => /powershell\.exe$/i.test(p) || existsSync(p),
+    shell: "/bin/bash",
+    sandbox: () => ({ state: "OPERATIVE", reason: "fake", noSandbox: false }),
+    exists: (p) => p === "/bin/bash" || existsSync(p),
     spawnFn: () => {
       child = new EventEmitter();
       child.pid = 600;
+      setTimeout(() => {
+        child.emit("exit", 1, null);
+        table = new Map([[600, P(600, 1, "code", 5000)], [601, P(601, 600, "bash", 5001)]]);
+      }, 5);
       return child;
     },
-    list: () => {
-      if (child && !child.exited) {
-        child.exited = true;
-        child.emit("exit", 1, null);
-      }
-      return new Map(stranger);
-    },
+    list: () => new Map(table),
     kill: (pid, sig) => signalled.push([pid, sig]),
-    sleep: async () => {},
-    launchTimeoutMs: 1000,
+    sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 10))),
+    launchTimeoutMs: 2000,
     quitTimeoutMs: 10,
   });
   await assert.rejects(a.launch({ runDir: dir, unitDir, genDir: join(unitDir, "gen"), genRunId: "r-u0", env: { env: {} } }), /exited/);
-  assert.equal(a.startKey, null, "a key read after our child exited is not ours");
+  assert.equal(a.startKey, "5000", "the key was read while our process held the PID");
   const res = await a.teardown();
   assert.deepEqual(signalled, [], "neither the stranger nor its child is signalled");
   assert.ok(res.notes.some((n) => /cannot be proven this run's/.test(n)), res.notes.join("; "));
-  // And a recorded key does not license teardown once our child has exited.
+});
+
+test("a recorded key never licenses teardown after the child exited, whatever now holds the PID", async () => {
+  const P = (pid, ppid, name, startKey) => ({ pid, ppid, name, argv: null, cmdline: name, startKey: String(startKey) });
+  const stranger = new Map([[600, P(600, 1, "Code.exe", 7000)], [601, P(601, 600, "Code.exe", 7001)]]);
+  const signalled = [];
   const b = new VscodeAdapter({ platform: "win32", list: () => new Map(stranger), kill: (pid) => signalled.push([pid]), sleep: async () => {} });
   b.pid = 600;
   b.startKey = "7000";

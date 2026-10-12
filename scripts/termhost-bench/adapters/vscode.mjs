@@ -180,6 +180,11 @@ export function vscodeArgv({ exe, userDataDir, extensionsDir, sharedDataDir = nu
     "--extensions-dir",
     extensionsDir,
     // Explicit, so shared data stays private even where portable mode is off.
+    // An undocumented option (no --help line) in the pinned 1.139.1: its
+    // out/main.js parses "shared-data-dir" as a string argument, and
+    // `appSharedDataHome` returns it ahead of VSCODE_PORTABLE and the home folder
+    // (observed 2026-10-12 in the unpacked archive). A build without it warns
+    // about an unknown option and falls back to those.
     ...(sharedDataDir ? ["--shared-data-dir", sharedDataDir] : []),
     "--extensionDevelopmentPath",
     extensionDir,
@@ -323,16 +328,18 @@ export function shellFacts(slots, table, platform = process.platform) {
 }
 
 /**
- * The pane size a session last reported (its generator's `resize` records, else
- * its start record's `terminal_size`), or null. VS Code's stable API exposes no
- * terminal dimensions (`Terminal.dimensions` is proposed), so the session itself
- * is asked.
+ * The pane size a session last reported through its generator's `resize`
+ * records, or null. VS Code's stable API exposes no terminal dimensions
+ * (`Terminal.dimensions` is proposed), so the session itself is asked. The start
+ * record's `terminal_size` is NOT used: it is the size the session was created
+ * at, before any arrangement, and taking it would let `pane_smaller_than_profile`
+ * be decided by a pane that no longer exists. A session that never resized is an
+ * unknown size, and the arrangement's notes say how many were.
  */
 export function latestPaneSize(records) {
   let size = null;
   for (const r of records) {
-    if (r?.type === "start" && Number.isInteger(r.terminal_size?.cols) && Number.isInteger(r.terminal_size?.rows)) size = { cols: r.terminal_size.cols, rows: r.terminal_size.rows };
-    else if (r?.type === "resize" && Number.isInteger(r.cols) && Number.isInteger(r.rows)) size = { cols: r.cols, rows: r.rows };
+    if (r?.type === "resize" && Number.isInteger(r.cols) && Number.isInteger(r.rows)) size = { cols: r.cols, rows: r.rows };
   }
   return size;
 }
@@ -608,9 +615,12 @@ export class VscodeAdapter {
       this.childExit = { code, signal, afterMs: Date.now() - t0 };
     });
     try {
-      const key = this.list().get(this.pid)?.startKey ?? null;
-      // A key read after our child exited may be a stranger's: the PID is free.
-      this.startKey = this.childExit === null ? key : null;
+      // Read while we hold the child's handle: Windows does not reuse a PID whose
+      // process object is still open, so this key is our process's. (The read is
+      // synchronous, so no exit event can land during it.) What happens to the PID
+      // AFTER our child exits is teardown's guard: it claims nothing once
+      // `childExit` is set.
+      this.startKey = this.list().get(this.pid)?.startKey ?? null;
     } catch (e) {
       this.notes.push(`process table unreadable after launch: ${e.message}`);
     }
@@ -749,7 +759,7 @@ export class VscodeAdapter {
     await this.sleep(this.paneSettleMs);
     const shown = arm === "focus" ? [order[0]] : order.slice(0, vTarget);
     const paneSizes = this.ctx?.genDir ? shown.map((k) => latestPaneSize(readGeneratorLog(this.ctx.genDir, k))).filter(Boolean) : [];
-    if (paneSizes.length < shown.length) notes.push(`pane size known for ${paneSizes.length} of ${shown.length} shown session(s)`);
+    if (paneSizes.length < shown.length) notes.push(`pane size known for ${paneSizes.length} of ${shown.length} shown session(s): the rest never reported a resize`);
     return { ok: true, vTarget, focusSession: order[0], switchable, paneSizes, notes, layout: { rows: r.rows ?? [1], groups: r.groups ?? [] } };
   }
 

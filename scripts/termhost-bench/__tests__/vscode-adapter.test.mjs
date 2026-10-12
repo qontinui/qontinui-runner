@@ -768,9 +768,9 @@ test("a cached archive the doctor just hashed is not hashed again at launch", as
   assert.equal(hashes, 2);
 });
 
-test("pane sizes come from what each session reported: the latest resize, else its start size", async () => {
+test("pane sizes come from the latest resize each session reported; a creation-time size is unknown, not the pane's", async () => {
   const { latestPaneSize } = await import("../adapters/vscode.mjs");
-  assert.deepEqual(latestPaneSize([{ type: "start", terminal_size: { cols: 80, rows: 30 } }]), { cols: 80, rows: 30 });
+  assert.equal(latestPaneSize([{ type: "start", terminal_size: { cols: 80, rows: 30 } }]), null, "the size before any arrangement says nothing about the arranged pane");
   assert.deepEqual(latestPaneSize([{ type: "start", terminal_size: { cols: 80, rows: 30 } }, { type: "resize", cols: 60, rows: 18 }, { type: "marker" }]), { cols: 60, rows: 18 });
   assert.equal(latestPaneSize([{ type: "start", terminal_size: null }]), null);
   const { watchResize, resizeRecord } = await import("../generator/ai-session.mjs");
