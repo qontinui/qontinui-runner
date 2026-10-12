@@ -44,13 +44,14 @@
 //! it as foreign and leaves it byte-for-byte as built here (pinned by
 //! `unknown_term_survives_the_envelope_layer`).
 
+use axum::body::Bytes;
 use axum::extract::Query;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use qontinui_types::glossary::{
     lookup, GlossaryEntry, GlossaryTerm, GLOSSARY, GLOSSARY_CONTENT_SHA256, GLOSSARY_VERSION,
@@ -102,6 +103,9 @@ pub struct GlossaryTermUnknownBody {
     pub refusal: Refusal,
     /// The glossary version that does not define the requested id.
     pub known_version: u32,
+    /// The rendered sentence ([`Refusal::render`]) — the same `message` field
+    /// coord's `GET /coord/glossary` 404 carries, so one reader decodes both.
+    pub message: String,
 }
 
 fn envelope(terms: Vec<&'static GlossaryEntry>) -> GlossaryResponse {
@@ -132,8 +136,10 @@ pub fn unknown_term_refusal(id: &str, observed_at: String) -> GlossaryTermUnknow
         observed_at,
     );
     let refusal = if id.is_empty() {
-        // No discriminator to name: say the id was empty rather than quoting "".
-        base.with_detail(format!(
+        // `discriminator` is the empty id itself — coord's 404 always carries
+        // the id asked for, so a reader never special-cases which door
+        // answered; the detail says plainly that it was empty.
+        base.with_discriminator(String::new()).with_detail(format!(
             "the term id was empty; glossary version {GLOSSARY_VERSION} defines: {known}"
         ))
     } else {
@@ -143,17 +149,33 @@ pub fn unknown_term_refusal(id: &str, observed_at: String) -> GlossaryTermUnknow
             "{shown:?} is not defined by glossary version {GLOSSARY_VERSION}; defined ids: {known}"
         ))
     };
+    let message = refusal.render();
     GlossaryTermUnknownBody {
         refusal,
         known_version: GLOSSARY_VERSION,
+        message,
     }
 }
 
 /// Resolve a query to its response. Pure apart from the timestamp, so the
 /// whole contract is testable without a router.
+/// The whole-glossary `200` body, serialized ONCE per process. Every field is a
+/// constant of this build, and the route is credential-free, so its
+/// per-request cost should not be a table walk plus a serialization.
+static WHOLE_GLOSSARY_JSON: LazyLock<Bytes> = LazyLock::new(|| {
+    Bytes::from(
+        serde_json::to_vec(&envelope(GLOSSARY.iter().collect()))
+            .expect("GlossaryResponse is plain data and always serializes"),
+    )
+});
+
 pub fn answer(term: Option<&str>) -> Response {
     match term {
-        None => Json(envelope(GLOSSARY.iter().collect())).into_response(),
+        None => (
+            [(header::CONTENT_TYPE, "application/json")],
+            WHOLE_GLOSSARY_JSON.clone(),
+        )
+            .into_response(),
         Some(id) => match lookup(id) {
             Some(entry) => Json(envelope(vec![entry])).into_response(),
             None => (
@@ -271,7 +293,7 @@ mod tests {
         let (status, body) = get_path("/glossary?term=").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "glossary_term_unknown");
-        assert!(body.get("discriminator").is_none(), "{body}");
+        assert_eq!(body["discriminator"], "", "{body}");
         assert!(body["detail"]
             .as_str()
             .unwrap()
@@ -314,6 +336,57 @@ mod tests {
             v["discriminator"].as_str().unwrap().chars().count(),
             MAX_ECHOED_ID_CHARS
         );
+    }
+
+    /// The fields coord's `GET /coord/glossary` serves are the fields served
+    /// here (qontinui-coord#3151): the same `200` envelope keys and the same
+    /// `404` refusal keys, so one reader decodes either door.
+    #[tokio::test]
+    async fn the_field_set_matches_the_coord_door() {
+        let (_, whole) = get_path("/glossary").await;
+        let mut keys: Vec<&str> = whole
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["build_id", "content_sha256", "source", "terms", "version"]
+        );
+        let (_, refused) = get_path("/glossary?term=no_such_term").await;
+        for k in [
+            "code",
+            "next_action",
+            "source",
+            "observed_at",
+            "discriminator",
+            "detail",
+            "known_version",
+            "message",
+        ] {
+            assert!(refused.get(k).is_some(), "404 body lacks `{k}`: {refused}");
+        }
+        let decoded: Refusal = serde_json::from_value(refused.clone()).expect("a Refusal");
+        assert_eq!(refused["message"], decoded.render());
+    }
+
+    /// The prebuilt whole-glossary bytes are exactly the envelope the
+    /// `?term=` arm builds, labelled JSON.
+    #[tokio::test]
+    async fn cached_whole_glossary_bytes_equal_the_built_envelope() {
+        let resp = answer(None);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("application/json")
+        );
+        let served = body_json(resp).await;
+        let built = serde_json::to_value(envelope(GLOSSARY.iter().collect())).unwrap();
+        assert_eq!(served, built);
     }
 
     /// Every id the table defines resolves through the route.

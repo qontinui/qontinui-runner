@@ -5619,8 +5619,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_get_prompt_document",
     // The product glossary (plan
     // 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
-    // Phase C2): a read of the table compiled into coord from qontinui-schemas,
-    // added by that phase's coord half on every curated floor
+    // Phase C2, coord half qontinui-coord#3151): a read of the table compiled
+    // into coord from qontinui-schemas, on every SHAPE-derived curated floor
     // (`agent_tool_access::TWIN_READ_TOOLS`) with an anonymous HTTP twin
     // `GET /coord/glossary`. Withholding it here would protect nothing and only
     // answer `-32601` for a definition. Until a coord build serving it is
