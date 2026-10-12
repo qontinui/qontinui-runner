@@ -357,7 +357,7 @@ check "my own Rust commit atop a peer's is still MINE" "mine" "$ATTRIBUTION_STAT
 # `src-tauri/src` file changing. Pinned here because the asymmetry only works
 # while the list stays complete — a narrowed list clears a guilty pusher.
 for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml \
-    crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs vendor/tao-0.35.0/src/lib.rs \
+    crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs crates/pty-holder/src/lib.rs vendor/tao-0.35.0/src/lib.rs \
     src-tauri/.cargo/config.toml .cargo/config.toml src-tauri/.cargo/config .cargo/config \
     rust-toolchain src-tauri/rust-toolchain.toml src-tauri/rust-toolchain; do
     fixture
