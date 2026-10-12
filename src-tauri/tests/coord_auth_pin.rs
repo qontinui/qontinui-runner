@@ -1127,8 +1127,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 42,
-        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 43,
+        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1177,7 +1177,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant \
          Phase 4 then added repo_tenant.rs's fetch_repo_tenants, the cwd resolver's \
          `GET /coord/repos/tenants` read (device: coord answers it over the caller DEVICE's own \
-         bindings and refuses any principal that does not prove a device): 41 + 1 = 42. \
+         bindings and refuses any principal that does not prove a device): 41 + 1 = 42. Plan \
+         2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down Phase 4 then \
+         added mcp/plan_library/followups.rs's single `forward` (work-owed: the follow-up \
+         family's five qontinui-web routes, the same session-less posture as its parent's \
+         forwards): 42 + 1 = 43. \
          Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
