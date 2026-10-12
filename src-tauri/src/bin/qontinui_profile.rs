@@ -1248,8 +1248,8 @@ fn cmd_device_pair(
                     eprintln!(
                         "warning: QONTINUI_INSTANCE_NAME is set, so this is a SECONDARY runner \
                          instance — refusing to write a settings.json that may be the primary's \
-                         (it would demote \
-                         the primary). Run `device pair` from the primary, or set the tier there."
+                         (it could demote the primary). Run `device pair` from the primary, or \
+                         set the tier there."
                     );
                 }
                 Err(e) => {
@@ -1466,7 +1466,7 @@ fn cmd_tier(set: Option<&str>, clear_choice: bool) -> ExitCode {
         Ok(TierWrite::SkippedSecondary) => {
             eprintln!(
                 "QONTINUI_INSTANCE_NAME is set, so this is a SECONDARY runner instance — \
-                 refusing to write a settings.json that may be the primary's (it would \
+                 refusing to write a settings.json that may be the primary's (it could \
                  demote the primary). \
                  Run this from the primary."
             );

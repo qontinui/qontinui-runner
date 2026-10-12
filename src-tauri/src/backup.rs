@@ -70,6 +70,11 @@ pub struct BackupResult {
 pub struct RestoreResult {
     pub success: bool,
     pub files_restored: Vec<String>,
+    /// Files the archive carried that this runner deliberately did NOT
+    /// restore, each with the reason (the machine-global roster on a
+    /// secondary). A skip is not a failure, so it never lands in `errors`
+    /// and never turns `success` false.
+    pub skipped: Vec<String>,
     pub errors: Vec<String>,
     pub backup_version: String,
     pub backup_date: String,
@@ -172,6 +177,17 @@ fn canonicalize_creating_nothing(path: &Path) -> Option<PathBuf> {
 /// Is `dest` inside `base`? Decided before anything is created, so a refused
 /// destination leaves no directory behind (a typo'd `QONTINUI_CONFIG_DIR`
 /// used to be `create_dir_all`ed before this check ran).
+///
+/// Two deliberate behaviour changes follow from canonicalizing BOTH sides:
+///
+/// - A `dest` that is a symlink (or junction) pointing OUTSIDE `base` is
+///   refused. The old check canonicalized only the parent dir and then wrote
+///   through the link to wherever it pointed; a symlinked `settings.json`
+///   aimed at another runner's file is now refused, not followed.
+/// - A RELATIVE `QONTINUI_CONFIG_DIR` whose directory does not exist yet has
+///   no existing ancestor to canonicalize from (the walk stops at the empty
+///   path), so its destinations are refused rather than created relative to
+///   the current directory.
 fn destination_is_within(dest: &Path, base: &Path) -> bool {
     match (
         canonicalize_creating_nothing(dest),
@@ -306,6 +322,7 @@ fn restore_backup_into(data: &[u8], files: Vec<BackupFile>) -> Result<RestoreRes
         ZipArchive::new(cursor).map_err(|e| format!("Failed to open backup archive: {}", e))?;
 
     let mut files_restored = Vec::new();
+    let mut skipped = Vec::new();
     let mut errors = Vec::new();
     let mut manifest: Option<BackupManifest> = None;
 
@@ -347,7 +364,7 @@ fn restore_backup_into(data: &[u8], files: Vec<BackupFile>) -> Result<RestoreRes
             // EVERY instance's settings, the primary's included
             // (`claude_accounts::apply_roster_overlay`). A secondary restoring
             // it would rewrite the primary's account selection, so it is
-            // skipped there, and said so.
+            // skipped there and reported in `skipped`, not `errors`.
             Ok(_) if archive_name == ROSTER_ARCHIVE_NAME && crate::instance::is_secondary() => {
                 let msg = format!(
                     "Skipped {}: it is the machine-global Claude account roster, which a \
@@ -355,7 +372,7 @@ fn restore_backup_into(data: &[u8], files: Vec<BackupFile>) -> Result<RestoreRes
                     archive_name
                 );
                 warn!("{}", msg);
-                errors.push(msg);
+                skipped.push(msg);
             }
             Ok(mut file) => match dest_path {
                 Ok(dest_path) => {
@@ -438,6 +455,7 @@ fn restore_backup_into(data: &[u8], files: Vec<BackupFile>) -> Result<RestoreRes
     let result = RestoreResult {
         success: !files_restored.is_empty() && errors.is_empty(),
         files_restored,
+        skipped,
         errors,
         backup_version,
         backup_date,
@@ -772,40 +790,64 @@ mod tests {
         assert!(restored.files_restored.is_empty(), "{:?}", restored);
         assert!(
             restored
-                .errors
+                .skipped
                 .iter()
                 .any(|e| e.starts_with("Skipped claude-accounts.json")),
-            "the skip must be reported: {:?}",
+            "the skip must be reported in `skipped`: {:?}",
+            restored
+        );
+        assert!(
+            restored.errors.is_empty(),
+            "a skip is not a failure, so it must not land in `errors`: {:?}",
             restored.errors
         );
         assert!(!roster.exists(), "a secondary replaced the roster");
     }
 
-    /// Prompts, Playwright tests and the roster are located by their OWNING
-    /// modules' resolvers, not by copies here. No I/O. (On Windows under this
-    /// fixture the platform dir is unresolvable, so there the results compared
-    /// are the resolvers' errors; Linux and macOS compare real paths.)
+    /// Prompts, Playwright tests and the roster land where their stores keep
+    /// them. The expected paths are built HERE, from the platform config dir
+    /// and the layout each store documents, not by calling the resolvers
+    /// `get_backup_files` calls, so a copy that drifted in either place shows
+    /// up as a mismatch. `instance::scope_path` is shared on purpose: it is the
+    /// per-instance layer below every store, not one of the resolvers.
+    ///
+    /// LIMIT, stated rather than hidden: on Windows under this fixture the
+    /// platform config dir does not resolve at all (the known-folder lookup
+    /// expands the fixture's `USERPROFILE`), so there the test can only check
+    /// that all three entries report an unresolvable path. The path comparison
+    /// runs on Linux and macOS, where the fixture redirects the platform dir.
+    /// No I/O.
     #[test]
-    fn non_settings_files_are_located_by_their_owning_resolvers() {
+    fn non_settings_files_land_where_their_stores_keep_them() {
         let _runner = per_instance_runner();
         let by_name = |name: &str| {
             get_backup_files()
                 .into_iter()
                 .find(|f| f.archive_name == name)
                 .unwrap_or_else(|| panic!("the backup list carries {name}"))
+                .path
         };
-        assert_eq!(
-            by_name("prompts.json").path,
-            crate::prompts::resolve_prompts_path()
+        let (prompts, playwright, roster) = (
+            by_name("prompts.json"),
+            by_name("playwright-tests.json"),
+            by_name(ROSTER_ARCHIVE_NAME),
         );
-        assert_eq!(
-            by_name("playwright-tests.json").path,
-            crate::playwright::resolve_tests_path()
-        );
-        assert_eq!(
-            by_name(ROSTER_ARCHIVE_NAME).path,
-            crate::claude_accounts::claude_accounts_file_path()
-                .ok_or_else(|| "Failed to get config directory".to_string())
-        );
+        match dirs::config_dir() {
+            Some(config) => {
+                let app = config.join("com.qontinui.runner");
+                let scoped = crate::instance::scope_path(&app);
+                assert_eq!(prompts, Ok(scoped.join("prompts.json")));
+                assert_eq!(
+                    playwright,
+                    Ok(scoped.join("playwright").join("playwright-tests.json"))
+                );
+                assert_eq!(roster, Ok(app.join("claude-accounts.json")));
+            }
+            None => {
+                assert!(prompts.is_err(), "{prompts:?}");
+                assert!(playwright.is_err(), "{playwright:?}");
+                assert!(roster.is_err(), "{roster:?}");
+            }
+        }
     }
 }
