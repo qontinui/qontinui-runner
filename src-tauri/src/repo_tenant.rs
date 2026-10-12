@@ -395,12 +395,12 @@ pub fn parse_repo_tenants(body: &serde_json::Value) -> Result<RepoTenantsAnswer,
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoTenantsError {
     pub reason: String,
-    /// `true` for a failure that may clear by itself (transport, timeout, a
-    /// 5xx, an unreadable body). `false` for a standing refusal that a retry
-    /// in this process cannot change: a `404` (this coord predates the door),
-    /// a `403` (this credential does not prove a device — e.g. a session
-    /// running on the anonymous bootstrap credential), a `400` (coord refuses
-    /// the repo spelling).
+    /// `false` ONLY for a `400` — coord refusing the repo spelling, a fact
+    /// about the repo that no retry changes. Everything else may clear: a
+    /// transport error, a timeout, a 5xx, an unreadable body, a `404` (a coord
+    /// that predates the door, or a proxy mid-deploy) and a `403` (a fact
+    /// about the CURRENT credential — a session on the anonymous bootstrap
+    /// credential becomes answerable once the runner's device JWT is back).
     pub transient: bool,
 }
 
@@ -424,9 +424,9 @@ impl RepoTenantsError {
 }
 
 /// Does a non-2xx status describe a standing refusal rather than a blip?
-/// See [`RepoTenantsError::transient`].
+/// See [`RepoTenantsError::transient`]: only `400`.
 fn repo_tenants_status_is_standing(status: u16) -> bool {
-    matches!(status, 400 | 403 | 404)
+    status == 400
 }
 
 /// The `Err` text for a non-2xx from `GET /coord/repos/tenants`. Every such
@@ -597,8 +597,42 @@ static CANONICAL_REPOS: once_cell::sync::Lazy<CanonicalRepoCache> =
 struct KeyCache<K, V> {
     ttl: Duration,
     entries: RwLock<HashMap<K, (Instant, V)>>,
-    /// The in-flight `detect` per key. Removed when it completes.
-    inflight: tokio::sync::Mutex<HashMap<K, std::sync::Arc<tokio::sync::OnceCell<V>>>>,
+    /// The in-flight `detect` per key. A `std` mutex, never held across an
+    /// `.await`, so the [`FlightGuard`] can release an entry from `Drop` —
+    /// which is what makes the removal survive cancellation.
+    inflight: std::sync::Mutex<HashMap<K, Flight<V>>>,
+}
+
+type Flight<V> = std::sync::Arc<tokio::sync::OnceCell<V>>;
+
+/// Removes a key's in-flight entry when a participant of that flight is
+/// done — finished OR cancelled (a caller's budget ran out mid-await), so a
+/// flight can never outlive its participants and be replayed stale later.
+///
+/// The entry goes once the flight has a result, or when the dropping guard is
+/// its last participant (the map's `Arc` plus this guard's). A waiter
+/// cancelled while the leader is still fetching leaves it alone, so the
+/// leader's result is still shared.
+struct FlightGuard<'a, K: std::hash::Hash + Eq, V> {
+    inflight: &'a std::sync::Mutex<HashMap<K, Flight<V>>>,
+    key: Option<K>,
+    flight: Flight<V>,
+}
+
+impl<K: std::hash::Hash + Eq, V> Drop for FlightGuard<'_, K, V> {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else { return };
+        let mut inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ours = inflight
+            .get(&key)
+            .is_some_and(|f| std::sync::Arc::ptr_eq(f, &self.flight));
+        if ours && (self.flight.initialized() || std::sync::Arc::strong_count(&self.flight) <= 2) {
+            inflight.remove(&key);
+        }
+    }
 }
 
 /// The directory-keyed instance of [`KeyCache`].
@@ -612,7 +646,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> KeyCache<K, V> {
         Self {
             ttl,
             entries: RwLock::new(HashMap::new()),
-            inflight: tokio::sync::Mutex::new(HashMap::new()),
+            inflight: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -646,43 +680,48 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> KeyCache<K, V> {
             return hit;
         }
         let flight = {
-            let mut inflight = self.inflight.lock().await;
-            // Re-check under the flight lock: a flight that finished while we
-            // waited has already stored its (cacheable) answer.
-            if let Some(hit) = self.fresh_hit(key, now).await {
-                return hit;
-            }
-            match inflight.get(key) {
-                Some(f) => f.clone(),
-                None => {
-                    let f = std::sync::Arc::new(tokio::sync::OnceCell::new());
-                    inflight.insert(key.to_owned(), f.clone());
-                    f
-                }
-            }
+            let mut inflight = self
+                .inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inflight
+                .entry(key.to_owned())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        // The guard OWNS this participant's only handle on the flight, so its
+        // drop sees the true participant count.
+        let guard = FlightGuard {
+            inflight: &self.inflight,
+            key: Some(key.to_owned()),
+            flight,
         };
         // Exactly one caller's `detect` runs; the rest wait on it. If that
         // caller is cancelled mid-flight (its budget ran out), the OnceCell
         // hands initialisation to the next waiter.
-        let fresh = flight.get_or_init(detect).await.clone();
-        {
-            let mut inflight = self.inflight.lock().await;
-            if inflight
-                .get(key)
-                .is_some_and(|f| std::sync::Arc::ptr_eq(f, &flight))
-            {
-                inflight.remove(key);
-                if cacheable(&fresh) {
-                    let mut entries = self.entries.write().await;
-                    // Prune expired entries on every insert, so directories
-                    // that are never asked about again (every spawn's cwd) do
-                    // not accumulate.
-                    let ttl = self.ttl;
-                    entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ttl);
-                    entries.insert(key.to_owned(), (now, fresh.clone()));
+        let fresh = guard
+            .flight
+            .get_or_init(move || async move {
+                // A flight that finished between our cache miss and joining
+                // has already stored its (cacheable) answer: use it.
+                match self.fresh_hit(key, now).await {
+                    Some(hit) => hit,
+                    None => detect().await,
                 }
-            }
+            })
+            .await
+            .clone();
+        if cacheable(&fresh) {
+            let mut entries = self.entries.write().await;
+            // Prune expired entries on every insert, so directories that are
+            // never asked about again (every spawn's cwd) do not accumulate.
+            let ttl = self.ttl;
+            entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ttl);
+            entries.insert(key.to_owned(), (now, fresh.clone()));
         }
+        // `guard` drops here (or wherever this future is cancelled), AFTER
+        // the cache write, so a caller arriving in between finds the answer.
+        drop(guard);
         fresh
     }
 }
@@ -1889,15 +1928,42 @@ mod tests {
         }
     }
 
-    /// A refusal a retry cannot change (older coord, unproven device,
-    /// refused spelling) is a STANDING unknown; a 5xx or 429 is transient.
+    /// Only a refused repo spelling (400) is a STANDING unknown. A 403 is a
+    /// fact about the current credential and a 404 about the current coord
+    /// build: both can clear, so both stay transient and are never frozen.
     #[test]
     fn standing_refusals_are_not_transient() {
-        for status in [400u16, 403, 404] {
-            assert!(repo_tenants_status_is_standing(status), "{status}");
+        assert!(repo_tenants_status_is_standing(400));
+        for status in [401u16, 403, 404, 429, 500, 502, 503, 504] {
+            assert!(
+                !repo_tenants_status_is_standing(status),
+                "{status} must stay transient"
+            );
         }
-        for status in [401u16, 429, 500, 502, 503, 504] {
-            assert!(!repo_tenants_status_is_standing(status), "{status}");
+    }
+
+    /// The pin the review asked for, end to end through the classifier: a
+    /// 403 (bootstrap credential) and a 404 (older coord) read as TRANSIENT
+    /// unknowns, so nothing freezes or persists them.
+    #[test]
+    fn a_403_and_a_404_classify_as_transient_unknowns() {
+        for (status, code) in [
+            (
+                403u16,
+                serde_json::json!({ "error": "unproven_device_principal" }),
+            ),
+            (
+                403u16,
+                serde_json::json!({ "error": "no_device_principal" }),
+            ),
+            (404u16, serde_json::Value::Null),
+        ] {
+            let e = RepoTenantsError {
+                reason: repo_tenants_refusal(status, &code),
+                transient: !repo_tenants_status_is_standing(status),
+            };
+            let t = classify_cwd_tenant(&slug("acme/pizzeria"), Err(&e), "t0");
+            assert!(t.is_transient(), "{status} {code}: {t:?}");
         }
     }
 
@@ -2214,10 +2280,85 @@ mod tests {
                 "one fetch for the whole burst ({outcome:?})"
             );
             assert!(
-                cache.inflight.lock().await.is_empty(),
+                cache.inflight.lock().unwrap().is_empty(),
                 "the finished flight is removed"
             );
         }
+    }
+
+    /// A sole caller cancelled mid-fetch (its budget ran out) leaves no
+    /// flight behind: the entry is removed by the guard, and the next lookup
+    /// fetches afresh instead of joining an abandoned or stale flight.
+    #[tokio::test]
+    async fn a_cancelled_flight_is_removed_and_the_next_lookup_refetches() {
+        let cache: KeyCache<String, RepoTenantsResult> = KeyCache::new(Duration::from_secs(60));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let now = Instant::now();
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(50),
+            cache.lookup(
+                "acme/x",
+                now,
+                || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok(answer("acme/x", "none", &[]))
+                },
+                repo_tenants_cacheable,
+            ),
+        )
+        .await;
+        assert!(timed_out.is_err(), "the first caller was cancelled");
+        assert!(
+            cache.inflight.lock().unwrap().is_empty(),
+            "a cancelled sole caller leaves no flight behind"
+        );
+        let got = cache
+            .lookup(
+                "acme/x",
+                now,
+                || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(answer("acme/x", "resolved", &[T1]))
+                },
+                repo_tenants_cacheable,
+            )
+            .await;
+        assert_eq!(got, Ok(answer("acme/x", "resolved", &[T1])));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the later lookup re-fetched"
+        );
+        assert!(cache.inflight.lock().unwrap().is_empty());
+    }
+
+    /// A finished flight whose result was NOT cacheable (a failure) is gone
+    /// once its caller returns, so a later caller asks coord again rather
+    /// than being handed the old failure.
+    #[tokio::test]
+    async fn a_finished_failed_flight_is_not_replayed() {
+        let cache: KeyCache<String, RepoTenantsResult> = KeyCache::new(Duration::from_secs(60));
+        let now = Instant::now();
+        let first = cache
+            .lookup(
+                "acme/x",
+                now,
+                || async { Err(RepoTenantsError::transient("503")) },
+                repo_tenants_cacheable,
+            )
+            .await;
+        assert!(first.is_err());
+        assert!(cache.inflight.lock().unwrap().is_empty());
+        let second = cache
+            .lookup(
+                "acme/x",
+                now + Duration::from_secs(1),
+                || async { Ok(answer("acme/x", "none", &[])) },
+                repo_tenants_cacheable,
+            )
+            .await;
+        assert!(second.is_ok(), "the old failure was not replayed");
     }
 
     #[test]
