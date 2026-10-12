@@ -129,6 +129,9 @@ export const REASON_CODES = Object.freeze({
   zero_baseline: "the N = 1 value is 0, so the ratio is undefined",
   too_few_levels: "fewer N levels than the slope needs",
   arm_not_realisable: "the setup cannot realise this arm (D4)",
+  not_applicable_to_arm:
+    "the KPI has no referent in this arm (showing one hidden session is a focus-arm action; the tiled arm shows them together)",
+  single_session: "N = 1: there is no other session to switch to",
   not_applicable_to_setup:
     "the KPI does not describe this setup (e.g. a WSL VM on a non-WSL setup)",
   not_applicable_to_environment: "the KPI does not exist in this environment",

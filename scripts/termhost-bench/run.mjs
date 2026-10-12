@@ -1,0 +1,730 @@
+/**
+ * The termhost-bench run loop (plan `2026-10-11-terminal-page-performance-kpis-across-setups`,
+ * Phase 3): doctor -> for every unit: launch -> spawn N sessions (D13, every one
+ * `--echo`) -> per arm: arrange, warm up, measure (soak / input / switch / spawn
+ * phases, each under its own probe `watch`) -> teardown with read-back -> KPIs from
+ * `probe.jsonl` and the generator logs through `stats.mjs` -> one results file,
+ * validated before it is written.
+ *
+ * A UNIT is one host launch for one (run index, N, setup, variant, build role).
+ * Units run in the order {@link planUnits} gives: per run index, per N (ascending),
+ * per setup, the runner's head and baseline builds back to back — the same-VM
+ * interleaving D11 asks for (A, B, A, B …) at the granularity of a whole level.
+ * Every unit starts its host fresh and spawns its N sessions fresh, so one level's
+ * scrollback, memory and renderer state never leak into the next.
+ *
+ * Safety, checked rather than assumed:
+ *   - D12: the primary runner's `settings.json`, `paired_user.json` and
+ *     `auth_tokens.enc` are digested before the run and re-checked before and after
+ *     every unit and every arm; a change is an incident that STOPS the run.
+ *   - D5/D12 teardown: the stop file ends the generators, the adapter closes what it
+ *     started (with read-back), and any generator still carrying this unit's run id
+ *     is ended by its slot-file PID, identity re-checked; a survivor is an incident.
+ *   - Spawn admission: a resource-guard refusal ends that setup's ladder; the
+ *     levels above it are recorded `unknown(admission_refused)`, never dropped.
+ *   - Every unknown carries its reason; nothing unknown becomes 0.
+ */
+
+import { spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { AdapterRefusal, createAdapter as defaultCreateAdapter } from "./adapters/index.mjs";
+import { gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
+import { environmentSpec } from "./envs/index.mjs";
+import { allUnknown, computeRowKpis, indexGenerators } from "./kpis.mjs";
+import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
+import { NeutralityGuard } from "./neutrality.mjs";
+import * as probeLib from "./probe.mjs";
+import { carriesFlag, listProcesses, terminatePid } from "./proc.mjs";
+import { loadProfile } from "./profile.mjs";
+import { buildDocument, convertProbeIncident, finalizeLadder, incident, redactRunnerOnly, writeResults } from "./results.mjs";
+import { createRunDir, createUnitDir, generatorArgv, generatorRunId, makeRunId } from "./rundir.mjs";
+import { echoCount, readGeneratorLog, readGeneratorLogs, readSlots, slotForHostId, waitForGenerators, waitForNewSlot } from "./sessions.mjs";
+
+const GENERATOR_FLAG = "--termhost-bench-generator";
+
+/** Defaults for the measurement phases. */
+export const RUN_DEFAULTS = Object.freeze({
+  warmupMs: 10000,
+  soakMs: 60000,
+  inputKeys: 120,
+  inputIntervalMs: 100,
+  switchSamples: 20,
+  switchSettleMs: 1200,
+  spawnSamples: 20,
+  spawnTimeoutMs: 30000,
+  profile: "claude-tui",
+  seed: 1,
+});
+
+export class RunAbort extends Error {}
+
+/**
+ * The units of a run, in execution order.
+ *
+ * @param {{setups: string[], ns: number[], runs: number, runnerBuilds?: object[],
+ *   runnerVariants?: string[]}} o
+ * @returns {{index: number, runIndex: number, n: number, setup: string, variant: string,
+ *   role: string, build: object | null}[]}
+ */
+export function planUnits({ setups, ns, runs, runnerBuilds = [{ role: "single" }], runnerVariants = ["default"] }) {
+  const units = [];
+  const levels = [...new Set(ns)].sort((a, b) => a - b);
+  let index = 0;
+  for (let runIndex = 0; runIndex < runs; runIndex += 1) {
+    for (const n of levels) {
+      for (const setup of setups) {
+        const variants = setup === "runner" ? runnerVariants : ["default"];
+        const builds = setup === "runner" ? runnerBuilds : [null];
+        for (const variant of variants) {
+          for (const build of builds) {
+            units.push({ index: index++, runIndex, n, setup, variant, role: build?.role ?? "none", build });
+          }
+        }
+      }
+    }
+  }
+  return units;
+}
+
+/** The real probe driver; tests substitute a fake with the same five calls. */
+export function realProbeDriver({ probePath, envVars = {}, log = () => {} }) {
+  const env = { ...process.env, ...envVars };
+  return {
+    path: probePath,
+    startWatch: (o) =>
+      new probeLib.WatchProcess({
+        probe: probePath,
+        args: probeLib.watchArgs({ ...o, stdinStop: true }),
+        probeJsonl: join(o.runDir, "probe.jsonl"),
+        env,
+        log,
+      }),
+    inject: (o) => probeLib.runProbe({ probe: probePath, args: probeLib.injectArgs(o), env, timeoutMs: o.timeoutMs ?? 120000 }),
+    look: (o) => probeLib.look({ probe: probePath, env, ...o }),
+    activate: (o) => probeLib.activate({ probe: probePath, env, ...o }),
+    readInject: (runDir, offset) => probeLib.readRecordsFrom(join(runDir, "inject.jsonl"), offset).records,
+    injectOffset: (runDir) => probeLib.fileSize(join(runDir, "inject.jsonl")),
+  };
+}
+
+/**
+ * End every generator still carrying `genRunId`: first wait for them to leave on
+ * the stop file, then signal by slot-file PID with the identity re-checked, then
+ * read back the WHOLE process table for anything still carrying the run id.
+ *
+ * @returns {Promise<{ended: number[], survivors: {pid: number, cmdline: string}[]}>}
+ */
+export async function reapGenerators(genDir, genRunId, { list = () => listProcesses(), waitMs = 10000, sleepFn = (ms) => new Promise((r) => setTimeout(r, ms)), kill } = {}) {
+  const mine = (p) => carriesFlag(p, GENERATOR_FLAG, genRunId);
+  const slots = [...readSlots(genDir).values()];
+  const deadline = Date.now() + waitMs;
+  let alive = [];
+  for (;;) {
+    const table = list();
+    alive = slots.filter((s) => table.has(s.pid) && mine(table.get(s.pid)));
+    if (alive.length === 0 || Date.now() >= deadline) break;
+    await sleepFn(250);
+  }
+  const ended = [];
+  for (const signal of ["SIGTERM", "SIGKILL"]) {
+    if (alive.length === 0) break;
+    const table = list();
+    for (const s of alive) {
+      const r = terminatePid(s.pid, { signal, table, expect: mine, ...(kill ? { kill } : {}) });
+      if (r.outcome === "signalled") ended.push(s.pid);
+    }
+    await sleepFn(1500);
+    const after = list();
+    alive = alive.filter((s) => after.has(s.pid) && mine(after.get(s.pid)));
+  }
+  const survivors = [...list().values()].filter(mine).map((p) => ({ pid: p.pid, cmdline: p.cmdline.slice(0, 200) }));
+  return { ended: [...new Set(ended)], survivors };
+}
+
+/** Labels a row carries (Phase 1 ROW_LABELS). */
+export function rowLabels({ softwareRendered, setup, smoke, paneSizes, geometry }) {
+  const labels = [];
+  if (softwareRendered) labels.push("software_rendered");
+  if (setup.id === "runner" && (setup.build === undefined || setup.build?.state)) labels.push("unknown_build");
+  if (smoke) labels.push("assert_only_smoke");
+  if ((paneSizes ?? []).some((p) => p.cols < geometry.cols || p.rows < geometry.rows)) labels.push("pane_smaller_than_profile");
+  return labels;
+}
+
+/** A fallback `setup` object when an adapter could not describe itself. */
+function fallbackSetup(unit, detail) {
+  const absent = { state: "unknown", reason: "harness_error", detail };
+  return {
+    id: unit.setup,
+    variant: unit.variant,
+    app_version: absent,
+    build: unit.setup === "runner" ? absent : { state: "not_applicable", reason: "not_applicable_to_setup" },
+    settings_digest: absent,
+    pty_host_impl: absent,
+    render_backend: absent,
+    pty_holder: absent,
+    launch_mode: unit.setup === "runner" ? "subject_instance_root" : "private_server",
+    session_shell: "unknown",
+    shell_integration: absent,
+  };
+}
+
+/**
+ * Run the bench.
+ *
+ * @param {object} opts normalised CLI options (see cli.mjs)
+ * @param {object} [deps] injection points for tests
+ * @returns {Promise<{doc: object, outPath: string, redactedPath: string | null, runDir: string, stopped: object | null}>}
+ */
+export async function runBench(opts, deps = {}) {
+  const log = deps.log ?? ((s) => process.stderr.write(`termhost-bench: ${s}\n`));
+  const now = deps.now ?? (() => new Date());
+  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const spec = environmentSpec(opts.env);
+  if (spec.notBuilt) throw new RunAbort(spec.notBuilt);
+  const o = { ...RUN_DEFAULTS, ...opts };
+  const { profile, digest: profileDigest } = loadProfile(o.profile);
+  const runId = o.runId ?? makeRunId(now());
+  const runDir = deps.runDir ?? createRunDir({ runId, base: o.workDir });
+  const startedAt = now().toISOString();
+  log(`run ${runId} in ${runDir}`);
+
+  const backgroundLoad = await (deps.sampleBackgroundLoad ?? sampleBackgroundLoad)(1000);
+  const environment = await (deps.startEnvironment ?? spec.start)({ log });
+  let outPath = o.out ?? join(runDir, "results.json");
+  try {
+    const probePath = deps.probePath ?? probeLib.resolveProbeBinary({ explicit: o.probe });
+    const createAdapter = deps.createAdapter ?? defaultCreateAdapter;
+    const adapterOptions = (unit) => adapterOptionsFor(unit, o, log);
+
+    // ---- doctor ------------------------------------------------------------
+    const checkAdapters = [];
+    for (const setup of o.setups) {
+      const unit = planUnits({ setups: [setup], ns: [o.ns[0]], runs: 1, runnerBuilds: o.runnerBuilds, runnerVariants: o.runnerVariants })[0];
+      checkAdapters.push(await createAdapter(setup, adapterOptions(unit)));
+    }
+    const facts = await (deps.gatherDoctorFacts ?? gatherDoctorFacts)({
+      environment: o.env,
+      spec,
+      probePath,
+      adapters: checkAdapters,
+      envVars: environment.env,
+      display: { started: true, detail: environment.display ?? "started" },
+    });
+    const mechanisms = mapDoctor(facts);
+    const capabilities = toCapabilities(mechanisms, now().toISOString());
+    const blocking = blockingMechanisms(mechanisms);
+    if (blocking.length > 0) {
+      throw new RunAbort(`the doctor reports a run cannot start here: ${blocking.map((b) => `${b.id} ${b.state} (${b.reason})`).join("; ")}`);
+    }
+    const probe = deps.probe ?? realProbeDriver({ probePath, envVars: environment.env, log });
+
+    const neutrality = deps.neutrality ?? new NeutralityGuard(o.primaryStatePaths ? { paths: o.primaryStatePaths } : {});
+    neutrality.baseline();
+
+    // ---- units --------------------------------------------------------------
+    const units = planUnits({ setups: o.setups, ns: o.ns, runs: o.runs, runnerBuilds: o.runnerBuilds, runnerVariants: o.runnerVariants });
+    const rows = [];
+    const incidents = [];
+    const ladderEnded = new Map();
+    let stopped = null;
+    const refreshSeen = { hz: null, known: false, source: null };
+    const ctxBase = {
+      runId,
+      runDir,
+      environment,
+      probe,
+      log,
+      sleep,
+      now,
+      capabilities,
+      profile,
+      profileDigest,
+      o,
+      spec,
+      neutrality,
+      refreshSeen,
+      reapGenerators: deps.reapGenerators,
+    };
+
+    for (const unit of units) {
+      if (stopped) break;
+      const subject = `${unit.setup}|${unit.variant}|${unit.role}`;
+      if (ladderEnded.has(subject)) {
+        const why = ladderEnded.get(subject);
+        rows.push(...unknownRows(unit, o, ctxBase, "admission_refused", `the ${subject} ladder ended at N = ${why.n} (${why.detail})`, fallbackSetup(unit, "not launched: ladder ended")));
+        continue;
+      }
+      const pre = neutrality.check(`before unit ${unit.index} (${subject}, N = ${unit.n})`);
+      if (pre.changed) {
+        incidents.push(pre.incident);
+        stopped = pre.incident;
+        break;
+      }
+      const res = await runUnit(unit, { ...ctxBase, createAdapter, adapterOptions });
+      rows.push(...res.rows);
+      incidents.push(...res.incidents);
+      if (res.admission) ladderEnded.set(subject, { n: unit.n, detail: res.admission.detail ?? res.admission.lane });
+      if (res.stop) {
+        stopped = res.stop;
+        break;
+      }
+      const post = neutrality.check(`after unit ${unit.index} (${subject}, N = ${unit.n})`);
+      if (post.changed) {
+        incidents.push(post.incident);
+        stopped = post.incident;
+        break;
+      }
+    }
+
+    if (rows.length === 0) throw new RunAbort(`no row was produced${stopped ? `: ${stopped.detail}` : ""}`);
+    finalizeLadder(rows);
+    const machine = (deps.machineBlock ?? machineBlock)({
+      environment: o.env,
+      screen: environment.screen ? { width: environment.screen.width, height: environment.screen.height, scalePct: environment.screen.scalePct ?? 100 } : null,
+      refresh: refreshSeen,
+      backgroundLoad,
+    });
+    const doc = buildDocument({
+      run: {
+        id: runId,
+        started_at: startedAt,
+        finished_at: now().toISOString(),
+        harness_commit: harnessCommit(o.repoRoot),
+        node_version: process.version,
+        command: o.command ?? ["node", "scripts/termhost-bench/cli.mjs", "run"],
+      },
+      machine,
+      capabilities,
+      rows,
+      incidents,
+    });
+    writeResults(outPath, doc);
+    log(`wrote ${outPath} (${rows.length} rows, ${incidents.length} incidents)`);
+    let redactedPath = null;
+    if (o.redactedOut) {
+      const red = redactRunnerOnly(doc);
+      if (red) {
+        writeResults(o.redactedOut, red);
+        redactedPath = o.redactedOut;
+        log(`wrote the redacted (runner rows only) copy ${redactedPath}`);
+      }
+    }
+    return { doc, outPath, redactedPath, runDir, stopped };
+  } finally {
+    await environment.stop?.();
+  }
+}
+
+/** Adapter construction options for one unit. */
+export function adapterOptionsFor(unit, o, log) {
+  if (unit.setup === "runner") {
+    return {
+      variant: unit.variant,
+      mode: o.runnerMode,
+      build: unit.build,
+      supervisorUrl: o.supervisorUrl,
+      repoRoot: o.repoRoot,
+      extraEnv: o.runnerEnv ?? {},
+      log,
+    };
+  }
+  return { variant: unit.variant, log };
+}
+
+/** The harness checkout's commit, or an honest absence. */
+export function harnessCommit(repoRoot, run = spawnSync) {
+  const res = run("git", ["-C", repoRoot ?? ".", "rev-parse", "HEAD"], { encoding: "utf8", timeout: 10000 });
+  const sha = String(res.stdout ?? "").trim();
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : { state: "unknown", reason: "harness_error", detail: "git rev-parse HEAD failed" };
+}
+
+function scenarioFor(unit, arm, o, ctx, { vTarget, vActual }) {
+  return {
+    profile: ctx.profile.id,
+    profile_calibrated: ctx.profile.calibrated,
+    profile_provenance: ctx.profile.provenance.kind,
+    profile_digest: ctx.profileDigest,
+    n: unit.n,
+    arm,
+    v_target: Math.min(vTarget, unit.n),
+    v_actual: Number.isInteger(vActual) && vActual <= unit.n ? vActual : { state: "unknown", reason: "sessions_not_rendered", detail: vActual === null || vActual === undefined ? "no frame measured V" : `V ${vActual} exceeds N` },
+    warmup_ms: o.warmupMs,
+    soak_ms: o.soakMs,
+    seed: o.seed,
+    run_index: unit.runIndex,
+    run_count: o.runs,
+  };
+}
+
+function defaultVTarget(unit, arm) {
+  return arm === "focus" ? 1 : Math.min(unit.n, 9);
+}
+
+/** Rows for a unit that measured nothing: every KPI unknown with one reason. */
+function unknownRows(unit, o, ctx, reason, detail, setup, extraIncidents = []) {
+  return o.arms.map((arm) => ({
+    setup,
+    scenario: scenarioFor(unit, arm, o, ctx, { vTarget: defaultVTarget(unit, arm), vActual: null }),
+    kpis: allUnknown(reason, { detail, setupId: unit.setup }),
+    diagnostics: {},
+    labels: rowLabels({ softwareRendered: ctx.spec.softwareRendered, setup, smoke: o.smokeSetups?.includes(unit.setup), paneSizes: [], geometry: ctx.profile.geometry }),
+    incidents: extraIncidents,
+  }));
+}
+
+/**
+ * One unit: launch, spawn, every arm, teardown, then KPIs.
+ */
+export async function runUnit(unit, ctx) {
+  const { o, log, probe, sleep } = ctx;
+  const { unitDir, genDir, name } = createUnitDir(ctx.runDir, unit);
+  const genRunId = generatorRunId(ctx.runId, unit.index);
+  const incidents = [];
+  const arms = new Map();
+  let adapter = null;
+  let failure = null;
+  let admission = null;
+  let stop = null;
+  let slotMap = new Map();
+  const baseSessions = new Set();
+  log(`unit ${name}: launching`);
+  try {
+    adapter = await ctx.createAdapter(unit.setup, ctx.adapterOptions(unit));
+    await adapter.launch({ runDir: ctx.runDir, unitDir, genDir, genRunId, runId: ctx.runId, unit, env: ctx.environment });
+    const argv = generatorArgv({ genDir, profile: o.profile, seed: o.seed, genRunId });
+    const spawned = await adapter.spawnSessions(unit.n, argv);
+    if (spawned.admission?.refused) {
+      admission = spawned.admission;
+      failure = { reason: "admission_refused", detail: `resource guard refused at ${admission.n_reached} session(s) (${admission.lane}): ${admission.detail ?? ""}`.trim() };
+      incidents.push(incident("admission_refused", failure.detail, { data: { setup: unit.setup, unit: name, ...admission } }));
+    } else {
+      const ready = await waitForGenerators(genDir, unit.n, { timeoutMs: 60000 + 4000 * unit.n });
+      if (!ready.ok) failure = { reason: "harness_error", detail: ready.detail };
+    }
+    const slots = readSlots(genDir);
+    for (const s of spawned.sessions) {
+      const slot = slotForHostId(slots, adapter.hostIdKey, s.hostId);
+      if (slot !== null) {
+        slotMap.set(slot, s.hostId);
+        baseSessions.add(slot);
+      }
+    }
+    if (!failure && slotMap.size < unit.n) {
+      // A host that exports no terminal id: map by slot order (exact only for N = 1).
+      const missing = [...slots.keys()].filter((k) => !slotMap.has(k)).sort((a, b) => a - b);
+      const unmapped = spawned.sessions.filter((s) => ![...slotMap.values()].includes(s.hostId));
+      unmapped.forEach((s, i) => {
+        if (missing[i] !== undefined) {
+          slotMap.set(missing[i], s.hostId);
+          baseSessions.add(missing[i]);
+        }
+      });
+      if (slotMap.size < unit.n) failure = { reason: "harness_error", detail: `only ${slotMap.size} of ${unit.n} sessions could be matched to a generator slot` };
+    }
+    if (!failure) {
+      for (const arm of o.arms) {
+        const pre = ctx.neutrality.check(`before ${name} arm ${arm}`);
+        if (pre.changed) {
+          incidents.push(pre.incident);
+          stop = pre.incident;
+          break;
+        }
+        arms.set(arm, await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }));
+        const post = ctx.neutrality.check(`after ${name} arm ${arm}`);
+        if (post.changed) {
+          incidents.push(post.incident);
+          stop = post.incident;
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    failure = e instanceof AdapterRefusal ? { reason: e.reason, detail: e.detail } : { reason: "harness_error", detail: e?.stack ? String(e.message) : String(e) };
+    log(`unit ${name}: ${failure.reason}: ${failure.detail}`);
+    if (!(e instanceof AdapterRefusal) || e.reason === "harness_error") {
+      incidents.push(incident("harness_error", `unit ${name}: ${failure.detail}`, { data: { setup: unit.setup, unit: name } }));
+    }
+    if (e instanceof AdapterRefusal && e.incident) incidents.push(e.incident);
+  }
+
+  // ---- teardown (always) ----------------------------------------------------
+  let setup = null;
+  let unitDiagnostics = {};
+  try {
+    writeFileSync(join(genDir, "stop"), "");
+  } catch {
+    // the gen dir exists by construction
+  }
+  try {
+    setup = adapter ? adapter.describe(readSlots(genDir)) : null;
+  } catch (e) {
+    setup = fallbackSetup(unit, `describe() failed: ${e.message}`);
+  }
+  if (adapter) {
+    try {
+      const td = await adapter.teardown();
+      for (const s of td.survivors ?? []) {
+        incidents.push(incident("harness_error", `unit ${name}: teardown left ${s.what ?? `pid ${s.pid}`}: ${s.detail ?? "still running"}`, { data: { setup: unit.setup, unit: name } }));
+      }
+      if (unit.setup === "runner" && typeof adapter.coordReadback === "function") {
+        const rb = await adapter.coordReadback();
+        unitDiagnostics["coord_sessions.readback"] = rb.diagnostic;
+        incidents.push(...rb.incidents.map((i) => ({ ...i, data: { ...(i.data ?? {}), setup: unit.setup, unit: name } })));
+      }
+    } catch (e) {
+      incidents.push(incident("harness_error", `unit ${name}: teardown failed: ${e.message}`, { data: { setup: unit.setup, unit: name } }));
+    }
+  }
+  const reaped = await (ctx.reapGenerators ?? reapGenerators)(genDir, genRunId);
+  if (reaped.survivors.length > 0) {
+    incidents.push(
+      incident("generator_survived_teardown", `unit ${name}: ${reaped.survivors.length} generator(s) carrying ${genRunId} survived teardown: ${reaped.survivors.map((s) => s.pid).join(", ")}`, {
+        data: { setup: unit.setup, unit: name, survivors: reaped.survivors },
+      }),
+    );
+  }
+  setup = setup ?? fallbackSetup(unit, failure?.detail ?? "the adapter could not be created");
+
+  // ---- rows -------------------------------------------------------------------
+  if (failure || arms.size === 0) {
+    const reason = failure?.reason ?? "harness_error";
+    const detail = failure?.detail ?? (stop ? `the run stopped: ${stop.detail}` : "no arm was measured");
+    return { rows: unknownRows(unit, o, ctx, reason, detail, setup, []), incidents, admission, stop };
+  }
+  const gens = indexGenerators(readGeneratorLogs(genDir));
+  const baseGens = new Map([...gens].filter(([s]) => baseSessions.has(s)));
+  const rows = [];
+  for (const arm of o.arms) {
+    const a = arms.get(arm);
+    if (!a) {
+      rows.push(...unknownRows({ ...unit }, { ...o, arms: [arm] }, ctx, "harness_error", "the arm did not run (the run stopped)", setup));
+      continue;
+    }
+    const computed = computeRowKpis({
+      environment: o.env,
+      setupId: unit.setup,
+      n: unit.n,
+      arm,
+      vTarget: a.vTarget,
+      capabilities: ctx.capabilities,
+      gens: baseGens,
+      soak: a.soak,
+      armFailure: a.armFailure,
+      input: a.input,
+      switches: a.switches,
+      spawns: a.spawns ? { ...a.spawns } : null,
+      switchTimeoutMs: 5000,
+      spawnTimeoutMs: o.spawnTimeoutMs,
+    });
+    noteRefresh(ctx.refreshSeen, a.soak);
+    for (const note of computed.notes) log(`unit ${name} arm ${arm}: ${note}`);
+    const diagnostics = unit.setup === "runner" ? { ...a.diagnostics, ...unitDiagnostics, ...zoneDiagnostic(a) } : {};
+    const kpis = computed.kpis;
+    rows.push({
+      setup,
+      scenario: scenarioFor(unit, arm, o, ctx, { vTarget: a.vTarget, vActual: computed.vActual }),
+      kpis,
+      diagnostics,
+      labels: rowLabels({
+        softwareRendered: ctx.spec.softwareRendered,
+        setup,
+        smoke: o.smokeSetups?.includes(unit.setup),
+        paneSizes: a.paneSizes,
+        geometry: ctx.profile.geometry,
+      }),
+      incidents: a.incidents,
+    });
+  }
+  return { rows, incidents, admission, stop };
+}
+
+function zoneDiagnostic(a) {
+  if (!a.layout) return {};
+  return {
+    "zones.layout": { comparable: false, source: "get-zone-view-state + probe marker positions", state: "measured", data: { ...a.layout, notes: a.arrangeNotes ?? [] } },
+  };
+}
+
+function noteRefresh(seen, soak) {
+  if (seen.known || !soak?.records) return;
+  const cap = soak.records.find((r) => r?.type === "capture" && r.refresh_hz !== undefined);
+  if (!cap) return;
+  const assumed = cap.refresh_assumed === true || cap.refresh_known === false || /^assumed/i.test(String(cap.refresh_source ?? ""));
+  seen.hz = typeof cap.refresh_hz === "number" ? cap.refresh_hz : null;
+  seen.source = cap.refresh_source ?? null;
+  seen.known = !assumed && seen.hz > 0;
+}
+
+/**
+ * One arm of one unit: arrange, warm up, then the four measurement phases.
+ */
+export async function runArm(unit, arm, ctx) {
+  const { o, log, probe, sleep, adapter, genDir, unitDir, genRunId, slotMap, name } = ctx;
+  let looks = 0;
+  const target = () => adapter.windowTarget?.() ?? { pid: adapter.processRoots()[0] };
+  const look = () => probe.look({ lookDir: join(unitDir, `look-${arm}-${looks++}`), target: target(), durationMs: 2500 });
+  const arr = await adapter.arrange(arm, { slots: slotMap, n: unit.n, look });
+  const out = {
+    vTarget: arr.vTarget ?? defaultVTarget(unit, arm),
+    armFailure: arr.ok ? null : arr.failure ?? { reason: "harness_error", detail: "arrange failed" },
+    paneSizes: arr.paneSizes ?? [],
+    layout: arr.layout ?? null,
+    arrangeNotes: arr.notes ?? [],
+    incidents: [],
+    soak: null,
+    input: null,
+    switches: null,
+    spawns: null,
+    diagnostics: {},
+  };
+  const act = await probe.activate({ runDir: join(unitDir, "activate"), target: target() });
+  if (!act.ok) out.arrangeNotes.push(`activation: ${act.detail}`);
+  await sleep(o.warmupMs);
+
+  const watchOpts = () => ({ runDir: genDir, target: target(), hostPids: adapter.processRoots(), runId: genRunId, frames: "all" });
+  const probeIncidents = (records, phase) =>
+    records.filter((r) => r?.type === "incident").map((r) => convertProbeIncident(r, { setup: unit.setup, unit: name, phase: `${arm}/${phase}` }));
+
+  // ---- soak -------------------------------------------------------------------
+  log(`unit ${name} arm ${arm}: soak ${o.soakMs} ms`);
+  const soakWatch = probe.startWatch(watchOpts());
+  await soakWatch.ready();
+  await sleep(o.soakMs);
+  const soak = await soakWatch.stop();
+  out.soak = { records: soak.records };
+  out.incidents.push(...probeIncidents(soak.records, "soak"));
+
+  // ---- input (D9) ---------------------------------------------------------------
+  const inputSafe = ctx.capabilities["input.safe"];
+  if (inputSafe?.state !== "OPERATIVE") {
+    out.input = { unavailable: { reason: "input_unsafe", detail: `input.safe is ${inputSafe?.state ?? "UNKNOWN"}: ${inputSafe?.reason ?? "no verdict"}` } };
+  } else if (o.inputKeys <= 0) {
+    out.input = { unavailable: { reason: "insufficient_samples", detail: "the input arm was disabled (--input-keys 0)" } };
+  } else {
+    const f = await adapter.focusObserved();
+    if (!f.ok) {
+      out.input = { unavailable: f.failure ?? { reason: "harness_error", detail: "focusObserved failed" } };
+    } else {
+      const echoBase = echoCount(readGeneratorLog(genDir, f.session));
+      const injectOffset = probe.injectOffset(genDir);
+      const w = probe.startWatch(watchOpts());
+      await w.ready();
+      const res = await probe.inject({
+        runDir: genDir,
+        target: target(),
+        count: o.inputKeys,
+        intervalMs: o.inputIntervalMs,
+        startDelayMs: 300,
+        settleMs: 800,
+        timeoutMs: 60000 + o.inputKeys * (o.inputIntervalMs + 50),
+      });
+      const seg = await w.stop();
+      const injectRecords = probe.readInject(genDir, injectOffset);
+      const injects = injectRecords.filter((r) => r?.type === "inject");
+      const abort = injectRecords.find((r) => r?.type === "inject_abort") ?? null;
+      out.incidents.push(...probeIncidents(seg.records, "input"));
+      out.incidents.push(...probeIncidents(injectRecords, "inject"));
+      if (injects.length === 0) {
+        const reason = abort && /operator|foreign/.test(abort.reason) ? "operator_activity" : "input_unsafe";
+        out.input = { unavailable: { reason, detail: abort ? `inject aborted at key ${abort.index} (${abort.reason}): ${abort.detail}` : `inject sent no key (exit ${res.code}): ${`${res.stdout}${res.stderr}`.slice(-300)}` } };
+      } else {
+        out.input = { records: seg.records, injects, focusSession: f.session, echoBase, abort };
+      }
+      out.focusSession = f.session;
+    }
+  }
+
+  // ---- switch (focus arm) --------------------------------------------------------
+  if (arm === "focus" && unit.n > 1 && o.switchSamples > 0) {
+    const candidates = (arr.switchable ?? []).filter((s) => slotMap.has(s));
+    if (candidates.length < 2) {
+      out.switches = {
+        unavailable: {
+          reason: unit.setup === "runner" ? "zone_unresolved" : "sessions_not_rendered",
+          detail: `only ${candidates.length} session(s) can be shown (resolved zones: ${candidates.join(",") || "none"})`,
+        },
+      };
+    } else {
+      const w = probe.startWatch(watchOpts());
+      await w.ready();
+      const list = [];
+      let current = arr.focusSession;
+      for (let j = 0, c = 0; j < o.switchSamples; j += 1) {
+        let k = candidates[c++ % candidates.length];
+        if (k === current) k = candidates[c++ % candidates.length];
+        const r = await adapter.show(k);
+        if (r.ok) {
+          list.push({ k, tCmdNs: r.tCmdNs });
+          current = k;
+        }
+        await sleep(o.switchSettleMs);
+      }
+      const seg = await w.stop();
+      out.switches = { records: seg.records, list };
+      out.incidents.push(...probeIncidents(seg.records, "switch"));
+      if (arr.focusSession !== undefined && current !== arr.focusSession) await adapter.show(arr.focusSession);
+    }
+  }
+
+  // ---- spawn ---------------------------------------------------------------------
+  if (o.spawnSamples > 0) {
+    const w = probe.startWatch(watchOpts());
+    await w.ready();
+    const list = [];
+    const known = new Set(readSlots(genDir).keys());
+    let refused = null;
+    for (let j = 0; j < o.spawnSamples; j += 1) {
+      const r = await adapter.spawnOne();
+      if (!r.ok) {
+        if (r.admission) {
+          refused = r.admission;
+          break;
+        }
+        continue;
+      }
+      const slot = await waitForNewSlot(genDir, known, { key: adapter.hostIdKey, hostId: r.hostId, tCmdNs: r.tCmdNs, timeoutMs: o.spawnTimeoutMs });
+      if (slot !== null) {
+        known.add(slot);
+        // Let its first marker reach the screen before closing it.
+        const until = Date.now() + Math.min(o.spawnTimeoutMs, 15000);
+        while (Date.now() < until) {
+          if (readGeneratorLog(genDir, slot).some((x) => x?.type === "marker")) break;
+          await sleep(100);
+        }
+        await sleep(800);
+      }
+      list.push({ session: slot, tCmdNs: r.tCmdNs, hostId: r.hostId });
+      await adapter.closeOne(r.hostId);
+      await sleep(300);
+    }
+    const seg = await w.stop();
+    out.spawns = refused && list.length === 0
+      ? { unavailable: { reason: "admission_refused", detail: `the resource guard refused session N + 1 (${refused.lane}): ${refused.detail ?? ""}` } }
+      : { records: seg.records, list };
+    out.incidents.push(...probeIncidents(seg.records, "spawn"));
+    if (refused) out.spawnAdmission = refused;
+  }
+
+  // ---- diagnostics (runner only) ----------------------------------------------
+  if (typeof adapter.diagnostics === "function") {
+    try {
+      const focusSession = out.focusSession ?? arr.focusSession;
+      out.diagnostics = await adapter.diagnostics({
+        focusTerminalId: slotMap.get(focusSession),
+        focusSession,
+        genLogPath: Number.isInteger(focusSession) ? join(genDir, `gen-${focusSession}.jsonl`) : undefined,
+        visibleTerminalIds: [...slotMap.values()],
+      });
+      if (out.spawnAdmission) {
+        out.diagnostics["spawn.admission_n_plus_1"] = { comparable: false, source: "spawnOne", state: "measured", data: out.spawnAdmission };
+      }
+    } catch (e) {
+      out.diagnostics = { "harness.diagnostics": { comparable: false, source: "adapter.diagnostics()", state: "unknown", reason: "harness_error", detail: e.message.slice(0, 300) } };
+    }
+  }
+  return out;
+}
+

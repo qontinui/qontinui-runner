@@ -66,6 +66,8 @@
         "zero_baseline",
         "too_few_levels",
         "arm_not_realisable",
+        "not_applicable_to_arm",
+        "single_session",
         "not_applicable_to_setup",
         "not_applicable_to_environment",
         "not_instrumented",

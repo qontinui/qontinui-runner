@@ -29,7 +29,9 @@ name: termhost-bench probe
 #     session allows (Desktop Duplication in particular) is the image's to
 #     decide, not this repo's.
 #
-# No schedule and no benchmark runs here: those are Phase 3.
+# Phase 3 adds the benchmark itself, the `run-linux-xvfb` job at the end of this
+# file, with its own header; it is what the `schedule` trigger and the
+# `workflow_dispatch` inputs are for.
 #
 # This file lives under `.github/workflows/`, so the PR that adds or edits it
 # needs `ci:gate-change=declared` (see ci-integrity.yml).
@@ -39,8 +41,31 @@ on:
     paths:
       - "crates/termhost-probe/**"
       - "scripts/termhost-bench/**"
+      - "scripts/lib/runner-clients.mjs"
       - ".github/workflows/termhost-bench.yml"
   workflow_dispatch:
+    # Read by `run-linux-xvfb` only. Each is validated before use, and every one
+    # reaches a shell through `env:`, never spliced into a script.
+    inputs:
+      n:
+        description: "N ladder: comma-separated session counts"
+        type: string
+        default: "1,5,15"
+      arms:
+        description: "Arms: focus and/or tiled"
+        type: string
+        default: "focus,tiled"
+      runs:
+        description: "Runs per (N, setup, build)"
+        type: string
+        default: "2"
+      baseline_sha:
+        description: "Baseline commit for the same-VM A/B (empty: the newest main commit at least 7 days old; none: head only)"
+        type: string
+        default: ""
+  # Weekly, Monday 03:17 UTC: the same-VM A/B of main against main a week earlier.
+  schedule:
+    - cron: "17 3 * * 1"
 
 # `pull-requests: read` is required by ./.github/actions/checkout-sibling, which
 # reads the PR's coord dep-edge labels; nothing here writes.
@@ -194,4 +219,354 @@ jobs:
             doctor.jsonl
             selftest-run/
           if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Phase 3: the benchmark on linux-xvfb.
+  #
+  # Builds the runner the way ci.yml's `test` job does (`pnpm run tauri build
+  # --debug --no-bundle`), builds it again at the baseline commit, and runs
+  # `scripts/termhost-bench/cli.mjs run --env linux-xvfb --setups runner,tmux`:
+  # the head and baseline builds interleaved in this one VM (plan D11, so
+  # hosted-VM noise cancels against the same binary class), and tmux as an
+  # assert-only adapter smoke (D7). Each runner is a supervisor-free subject
+  # instance under its own QONTINUI_INSTANCE_ROOT inside the run directory
+  # (D12); the harness's Xvfb display is private to the run.
+  #
+  # Triggers:
+  #   - pull_request (paths above): a smoke run. N = 1, one run, head only.
+  #   - workflow_dispatch: the inputs above (default: the full ladder).
+  #   - schedule: the full ladder against the newest main commit at least seven
+  #     days old.
+  #
+  # Gate (the plan's Phase 3 gate and arming): the full results file is
+  # schema-valid; runner and tmux rows exist for every N of the ladder in every
+  # arm; and every one of them reads `measured` for output_latency_ms, cpu_pct,
+  # memory_mb and producer_stall_pct at N = 15 (at the ladder's top N when a
+  # dispatch leaves 15 out; at N = 1 for the smoke). Head and baseline rows are
+  # both held to it: an A/B against a baseline that cannot be measured compares
+  # nothing.
+  #
+  # What leaves the VM (D7): the runner's own rows only. The full results file,
+  # with tmux's rows, is validated and asserted here and never uploaded. The
+  # artifact and the job summary are rendered from the redacted copy
+  # (`report --redact-to`); the gate's failure lines give a third-party KPI's
+  # state and reason code without its detail text; and the failure-only log
+  # upload takes runner unit directories only. No verdict is drawn yet: the
+  # regression rule arrives with Phase 6, in compare.mjs.
+  #
+  # No rust-cache: ci.yml saves its ~2.6 GB caches from main only, to keep the
+  # repo under its 10 GB cap, and a weekly save from this job would compete with
+  # them. Both builds compile cold, each in its own checkout's target/, so each
+  # exe runs in place beside the resources its build copied next to it.
+  #
+  # UNMEASURED at introduction: no run of this job exists yet. Estimate for the
+  # full ladder: about 75 min for the two cold builds plus about 135 min for 18
+  # units (2 runs x 3 N x {head, baseline, tmux}) of two arms each. 350 min sits
+  # under GitHub's 360-minute ceiling, and the run step's own 230-minute bound
+  # leaves the report and upload steps time to say what happened. Tighten both
+  # once there are runs to measure.
+  # ---------------------------------------------------------------------------
+  run-linux-xvfb:
+    name: termhost-bench run (linux-xvfb, ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      # Full history, blobless: the baseline is resolved from origin/main, and
+      # the runner adapter checks with `git merge-base --is-ancestor` that a
+      # build contains the D12 fix commits before it launches it.
+      - name: Check out the head
+        uses: actions/checkout@v5
+        with:
+          path: head/qontinui-runner
+          fetch-depth: 0
+          filter: blob:none
+
+      # The runner is checked out under a `path:`, so each sibling goes beside
+      # it (`../../qontinui-schemas/rust` from src-tauri), not at the action's
+      # default `$GITHUB_WORKSPACE/../<name>`.
+      - name: Check out sibling qontinui-schemas (head)
+        uses: ./head/qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/head/qontinui-schemas
+
+      - name: Resolve the run's parameters
+        id: params
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_N: ${{ inputs.n }}
+          IN_ARMS: ${{ inputs.arms }}
+          IN_RUNS: ${{ inputs.runs }}
+          IN_BASELINE: ${{ inputs.baseline_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            n=1; arms=focus,tiled; runs=1; baseline=none
+          else
+            n="${IN_N:-1,5,15}"; arms="${IN_ARMS:-focus,tiled}"; runs="${IN_RUNS:-2}"; baseline="${IN_BASELINE:-}"
+          fi
+          [[ "$n" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "::error::n must be comma-separated positive integers, got '$n'"; exit 1; }
+          [[ "$arms" =~ ^(focus|tiled)(,(focus|tiled))*$ ]] || { echo "::error::arms must be focus and/or tiled, got '$arms'"; exit 1; }
+          [[ "$runs" =~ ^[1-9][0-9]*$ ]] || { echo "::error::runs must be a positive integer, got '$runs'"; exit 1; }
+          if [ -z "$baseline" ]; then
+            # This week's main against last week's: the newest first-parent
+            # main commit at least seven days old.
+            baseline="$(git rev-list -1 --first-parent --before='7 days ago' origin/main)"
+            [ -n "$baseline" ] || { echo "::error::no main commit seven days old to use as the baseline"; exit 1; }
+          elif [ "$baseline" != none ]; then
+            [[ "$baseline" =~ ^[0-9a-fA-F]{7,40}$ ]] || { echo "::error::baseline_sha must be a commit sha or 'none', got '$baseline'"; exit 1; }
+            baseline="$(git rev-parse --verify "${baseline}^{commit}")"
+          fi
+          if [[ ",$n," == *",15,"* ]]; then gate_n=15; else gate_n="$(tr ',' '\n' <<<"$n" | sort -n | tail -1)"; fi
+          {
+            echo "n=$n"
+            echo "arms=$arms"
+            echo "runs=$runs"
+            echo "baseline=$baseline"
+            echo "gate_n=$gate_n"
+          } >> "$GITHUB_OUTPUT"
+          echo "N=$n arms=$arms runs=$runs baseline=$baseline gate at N=$gate_n"
+
+      - name: Check out the baseline
+        if: steps.params.outputs.baseline != 'none'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.params.outputs.baseline }}
+          path: baseline/qontinui-runner
+          persist-credentials: false
+
+      # The baseline compiles against the schemas commit ITS pin manifest
+      # records. These events carry no pull request, so no dep-edge declaration
+      # can apply and the action resolves straight to that pin.
+      - name: Check out sibling qontinui-schemas (baseline)
+        if: steps.params.outputs.baseline != 'none'
+        uses: ./head/qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/baseline/qontinui-schemas
+          pin-file: baseline/qontinui-runner/.github/sibling-pins.conf
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      # Node 22, not ci.yml's 20: the harness's backend echo-latency diagnostic
+      # uses the global WebSocket, which Node ships unflagged from 22.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: head/qontinui-runner/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      # ci.yml's Ubuntu build packages (and its 10-minute bound against an apt
+      # hang), plus what the benchmark runs: tmux and xterm (the tmux setup),
+      # Xvfb and a window manager (the environment), a session bus, a monospace
+      # font for xterm, and Mesa's software GL for WebKitGTK.
+      - name: Install build and benchmark dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core \
+            tmux \
+            xterm \
+            xvfb \
+            matchbox-window-manager \
+            dbus \
+            fonts-dejavu-core \
+            libgl1-mesa-dri
+
+      # Same reclaim as ci.yml (see its rationale): two cold debug targets plus
+      # the swapfile do not fit in the image's ~14 GB free.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swapfile (guard against link-time OOM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
+      - name: Build the head runner
+        working-directory: head/qontinui-runner
+        timeout-minutes: 75
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run tauri build --debug --no-bundle
+          test -x target/debug/qontinui-runner
+
+      - name: Build termhost-probe
+        working-directory: head/qontinui-runner
+        timeout-minutes: 20
+        run: cargo build -p termhost-probe
+
+      # The baseline commit's rust-toolchain.toml may pin a channel other than
+      # the head's. Install it explicitly rather than rely on rustup's implicit
+      # install, whose default has changed between rustup releases.
+      - name: Build the baseline runner
+        if: steps.params.outputs.baseline != 'none'
+        working-directory: baseline/qontinui-runner
+        timeout-minutes: 75
+        run: |
+          channel="$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)"
+          if [ -n "$channel" ]; then rustup toolchain install "$channel" --profile minimal; fi
+          pnpm install --frozen-lockfile
+          pnpm run tauri build --debug --no-bundle
+          test -x target/debug/qontinui-runner
+
+      - name: Doctor
+        shell: bash
+        working-directory: head/qontinui-runner
+        run: |
+          set -o pipefail
+          node scripts/termhost-bench/cli.mjs doctor --env linux-xvfb --setups runner,tmux \
+            --runner-mode subject \
+            --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner" \
+            --head-commit "$(git rev-parse HEAD)" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/termhost-probe" \
+            | tee "$RUNNER_TEMP/termhost-bench-doctor.txt"
+          {
+            echo "### termhost-bench doctor (linux-xvfb)"
+            echo '```'
+            cat "$RUNNER_TEMP/termhost-bench-doctor.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A session bus (dbus-run-session), because a desktop session has one and
+      # GTK and WebKitGTK reach for it. WEBKIT_DISABLE_DMABUF_RENDERER, because a
+      # hosted VM has no DRM device for WebKitGTK's DMA-BUF renderer (the rows
+      # are labelled software_rendered either way).
+      - name: Run the benchmark
+        id: run
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 230
+        env:
+          N: ${{ steps.params.outputs.n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          RUNS: ${{ steps.params.outputs.runs }}
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tb-out"
+          args=(run --env linux-xvfb --setups runner,tmux --runner-mode subject
+            --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner"
+            --head-commit "$(git rev-parse HEAD)"
+            --n "$N" --arms "$ARMS" --runs "$RUNS"
+            --smoke-setups tmux
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/termhost-probe"
+            --work-dir "$RUNNER_TEMP/tb" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            --out "$RUNNER_TEMP/tb-out/results.json"
+            --runner-env WEBKIT_DISABLE_DMABUF_RENDERER=1)
+          if [ "$BASELINE" != none ]; then
+            args+=(--ab-baseline "$BASELINE"
+              --baseline-exe "$GITHUB_WORKSPACE/baseline/qontinui-runner/target/debug/qontinui-runner")
+          fi
+          launcher=()
+          if command -v dbus-run-session >/dev/null; then
+            launcher=(dbus-run-session --)
+          else
+            echo "::warning::dbus-run-session not found: running without a session bus"
+          fi
+          "${launcher[@]}" node scripts/termhost-bench/cli.mjs "${args[@]}"
+
+      - name: Validate the results and write the runner-only copy
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-out/results.json"
+          [ -f "$results" ] || { echo "::error::the run wrote no results file"; exit 1; }
+          node scripts/termhost-bench/validate.mjs "$results"
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --redact-to "$RUNNER_TEMP/tb-out/termhost-bench-linux-xvfb-runner.json"
+
+      - name: Assert the gate
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          N: ${{ steps.params.outputs.n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          GATE_N: ${{ steps.params.outputs.gate_n }}
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-out/results.json"
+          [ -f "$results" ] || { echo "::error::the run wrote no results file"; exit 1; }
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --setups runner,tmux --arms "$ARMS" --require-rows-n "$N" \
+            --require-measured output_latency_ms,cpu_pct,memory_mb,producer_stall_pct --at-n "$GATE_N"
+
+      - name: Upload the runner's results (redacted)
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-bench-linux-xvfb-runner
+          path: ${{ runner.temp }}/tb-out/termhost-bench-linux-xvfb-runner.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Job summary (the runner's rows only)
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          redacted="$RUNNER_TEMP/tb-out/termhost-bench-linux-xvfb-runner.json"
+          if [ ! -f "$redacted" ]; then
+            echo "No runner-only results to summarise (see the run and validate steps)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$BASELINE" != none ]; then
+            node scripts/termhost-bench/cli.mjs compare "$redacted" >> "$GITHUB_STEP_SUMMARY" \
+              || echo "compare could not pair head and baseline rows (see the log)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          node scripts/termhost-bench/cli.mjs report "$redacted" >> "$GITHUB_STEP_SUMMARY"
+
+      # Runner unit directories only (`u<k>-runner-...`): their stdout and
+      # stderr, the runner's own log files, and those units' probe and generator
+      # records. tmux's unit directories never leave the VM (D7).
+      - name: Upload runner unit logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-bench-linux-xvfb-runner-logs
+          path: |
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-stdout.log
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-stderr.log
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-root/**/*.log*
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/gen/*.jsonl
+          if-no-files-found: ignore
           retention-days: 14
