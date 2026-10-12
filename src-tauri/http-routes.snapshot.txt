@@ -851,6 +851,7 @@ GET /wrappers/{id} get_wrapper
 GET /wrappers/{id}/credentials list_credentials
 GET /wrappers/{id}/status wrapper_status
 GET /ws/events ws_events_handler
+GET <FOLLOWUPS> list_followups_handler
 GET <ROUTE_PATH> get_github_budget
 GET,POST /ui-bridge/ai/page-summary ui_bridge_page_summary_handler
 MERGE <if: trace_api::routes | Router::new>
@@ -909,6 +910,7 @@ MERGE extraction::routes
 MERGE file_browser::routes
 MERGE file_registry::routes
 MERGE findings_api::routes
+MERGE followups::router
 MERGE forms::routes
 MERGE gated_flow::routes
 MERGE generation_rules_api::routes
@@ -1755,6 +1757,9 @@ POST /wrappers/{id}/dispatch dispatch_handler
 POST /wrappers/{id}/start start_wrapper
 POST /wrappers/{id}/stop stop_wrapper
 POST /wrappers/{id}/update update_wrapper
+POST <EDGE_RESOLUTION> transition_followup_handler
+POST <FOLLOWUPS_MATCH> match_followups_handler
+POST <FOLLOWUPS_RECONCILE> reconcile_followups_handler
 POST,PUT /ui-bridge/control/annotation/{id} ui_bridge_annotations_update_handler
 PUT /check-groups/{id} update_check_group_handler
 PUT /check-groups/{id}/checks set_checks_in_group_handler
@@ -1816,6 +1821,7 @@ PUT /ui-bridge/sdk/annotations/{id} handle_annotation_set
 PUT /unified-workflows/{id} update_unified_workflow
 PUT /unified-workflows/{id}/example-status update_example_status_handler
 PUT /wrappers/{id}/credentials/{name} set_credential
+PUT <EDGE_ANCHORS> replace_anchors_handler
 SERVICE /graphql/ws GraphQLSubscription::new
 UNREAD concat!("/ui-bridge/ai/", $tail)
 UNREAD concat!("/ui-bridge/control/", $tail)
