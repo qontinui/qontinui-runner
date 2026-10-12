@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { KPI_CATALOG, getKpi } from "../kpi-catalog.mjs";
-import { COMPARED_KPIS, compareBuilds, compareStatistic, renderComparison, spreadOf, statesOf, valueOf } from "../compare.mjs";
+import { COMPARED_KPIS, comparableBuild, compareBuilds, compareStatistic, renderComparison, spreadOf, statesOf, valueOf } from "../compare.mjs";
 import { REPORT_KPIS, cell, checkAssertions, prepareReport, renderReport } from "../report.mjs";
 import { measureKpi, unknownKpi } from "../stats.mjs";
 import { validateResults } from "../validate.mjs";
@@ -252,4 +252,20 @@ test("only an UNPROVEN build is left out of a comparison: a third party's not_ap
     if (r.setup.id === "runner") r.setup.build = { state: "unknown", reason: "harness_error", detail: "never proven", role: "baseline", requested_commit: BASE };
   }
   assert.throws(() => compareBuilds(a, b), /no runner\/default baseline rows to compare/);
+});
+
+test("a runner row is comparable only with a proven build: not_applicable is left out there, kept for a third party (review round 5)", () => {
+  const a = abDoc();
+  const b = abDoc();
+  // The second file's baseline rows only (all of them would collide with its head rows).
+  b.rows = b.rows.filter((r) => r.setup.build?.role !== "head");
+  for (const r of b.rows) {
+    if (r.setup.id === "runner") r.setup.build = { state: "not_applicable", reason: "not_applicable_to_setup" };
+  }
+  assert.equal(validateResults(b).valid, true, "the schema accepts the shape, so compare must not rely on it never appearing");
+  assert.throws(() => compareBuilds(a, b), /no runner\/default baseline rows to compare/);
+  assert.equal(comparableBuild(b.rows.find((r) => r.setup.id === "runner")), false);
+  assert.equal(comparableBuild(b.rows.find((r) => r.setup.id === "tmux")), true, "a third party's not_applicable build");
+  assert.equal(comparableBuild(a.rows.find((r) => r.setup.id === "runner")), true, "a proven runner build");
+  assert.equal(comparableBuild({ setup: { id: "tmux", build: { state: "unknown", reason: "harness_error" } } }), false);
 });

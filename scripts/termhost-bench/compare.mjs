@@ -67,6 +67,19 @@ export function statesOf(values) {
 }
 
 /**
+ * Whether a row's build lets it be one side of a comparison (D12). A runner row
+ * needs a PROVEN build — one with no `state` at all: an unproven build
+ * (`unknown`, unprovenBuild's marker) and any absence, `not_applicable` included,
+ * are left out (rowLabels gives every one of those `unknown_build`). A third-party
+ * setup has no build of ours to prove: its `not_applicable` stays comparable, an
+ * `unknown` does not.
+ */
+export function comparableBuild(row) {
+  const state = row.setup.build?.state;
+  return row.setup.id === "runner" ? state === undefined : state !== "unknown";
+}
+
+/**
  * Pair head and baseline rows.
  *
  * @param {object} head results document (or the one holding both builds)
@@ -79,12 +92,9 @@ export function compareBuilds(head, baseline = null, { setup = "runner", variant
       `refusing to compare ${head.machine?.environment} with ${baseline.machine?.environment}: numbers compare only within one environment (D6)`,
     );
   }
-  // A runner build that could not be proven (`unknown`: unprovenBuild's marker, or
-  // an unknown absence) is never one side of a comparison (D12). A third-party
-  // setup's build is `not_applicable` and stays comparable.
   const pick = (doc, roles) =>
     doc.rows.filter(
-      (r) => r.setup.id === setup && r.setup.variant === variant && r.setup.build?.state !== "unknown" && roles.includes(r.setup.build?.role ?? "single"),
+      (r) => r.setup.id === setup && r.setup.variant === variant && comparableBuild(r) && roles.includes(r.setup.build?.role ?? "single"),
     );
   const headRows = baseline ? pick(head, ["head", "single"]) : pick(head, ["head"]);
   const baseRows = baseline ? pick(baseline, ["baseline", "single"]) : pick(head, ["baseline"]);
