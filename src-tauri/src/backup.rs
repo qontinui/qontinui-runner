@@ -181,9 +181,9 @@ fn canonicalize_creating_nothing(path: &Path) -> Option<PathBuf> {
 /// Two deliberate behaviour changes follow from canonicalizing BOTH sides:
 ///
 /// - A `dest` that is a symlink (or junction) pointing OUTSIDE `base` is
-///   refused. The old check canonicalized only the parent dir and then wrote
-///   through the link to wherever it pointed; a symlinked `settings.json`
-///   aimed at another runner's file is now refused, not followed.
+///   refused. The code before this series (`File::create`) followed the
+///   link; a link pointing outside `base` is now refused, and inside `base`
+///   the atomic rename replaces the link rather than following it.
 /// - A RELATIVE `QONTINUI_CONFIG_DIR` whose directory does not exist yet has
 ///   no existing ancestor to canonicalize from (the walk stops at the empty
 ///   path), so its destinations are refused rather than created relative to
