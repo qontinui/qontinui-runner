@@ -7,14 +7,17 @@ name: benchmark-ipc selftest
 # HTTP API. It used to default --runner-url to the PRIMARY runner on :9876,
 # which hosts the operator's live sessions — exactly the instance served policy
 # production-and-cost runner-lifecycle forbids disturbing. It now refuses to run
-# without an explicit --runner-url, and warns when that URL names :9876, the way
-# scripts/perf-harness.mjs refuses PRIMARY_RUNNER_PORT. Every existing Python
-# test in this repo is run by a step that names its file, and nothing discovers
-# new ones, so without this workflow the refusal's test would never run in CI.
+# without an explicit --runner-url, and refuses a URL naming :9876 unless
+# --allow-primary comes with it. The check is modelled on the
+# PRIMARY_RUNNER_PORT refusal in scripts/perf-harness.mjs, but with an override:
+# perf-harness refuses the port outright. Every existing Python test in this
+# repo is run by a step that names its file, and nothing discovers new ones, so
+# without this workflow the refusal's test would never run in CI.
 # Plan 2026-10-11-terminal-page-performance-kpis-across-setups, Phase 6.
 #
 # Hermetic: standard library only — no runner, no network, no httpx — so it runs
-# on `push` to main as well and has a baseline coord can read.
+# on `push` to main as well and has a baseline coord can read. The suite's one
+# httpx case skips when httpx is not installed.
 #
 # NOT a merge gate, like ci-timeout-marker-selftest.yml: it is deliberately
 # absent from the repo ruleset's required contexts. It IS inside
@@ -50,7 +53,7 @@ jobs:
   selftest:
     name: benchmark-ipc selftest
     runs-on: ubuntu-latest
-    # A checkout plus five sub-second unittest cases.
+    # A checkout plus eleven unittest cases, about two seconds in all.
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5

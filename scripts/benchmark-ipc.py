@@ -6,18 +6,25 @@ Measures the round-trip latency of IPC communication between Rust and Python
 by calling various endpoints through the runner's HTTP API.
 
 Usage:
-    python benchmark-ipc.py --runner-url URL [--iterations N] [--warmup N]
+    python benchmark-ipc.py --runner-url URL [--allow-primary] [--iterations N] [--warmup N]
 
 Which runner:
     There is no default target. The old default was the primary runner on
-    port 9876, the runner hosting the operator's live sessions, and a
-    benchmark there loads those sessions while measuring a busy runner. So
-    the script refuses to reach port 9876 implicitly, the way
-    scripts/perf-harness.mjs refuses PRIMARY_RUNNER_PORT. Benchmark a temp
-    runner: spawn one through the dev supervisor
+    port 9876. That runner hosts the operator's live sessions, so a benchmark
+    there loads those sessions and measures a busy runner. Benchmark a temp
+    runner instead: spawn one through the dev supervisor
     (POST http://127.0.0.1:9875/runners/spawn-test, ports 9877-9899) and pass
-    its URL. To benchmark the primary on purpose, name it explicitly:
-    --runner-url http://127.0.0.1:9876.
+    its URL.
+
+    Port 9876 is refused unless --allow-primary comes with it. The refusal is
+    modelled on the PRIMARY_RUNNER_PORT check in scripts/perf-harness.mjs, but
+    with an override: perf-harness refuses the port outright, and this script
+    accepts it when --runner-url names it AND --allow-primary is passed. The
+    URL alone is not enough, because it is the old default typed out.
+
+    Like perf-harness, which runs its check in the RunnerClient constructor,
+    this script runs the check where the HTTP client is built, in
+    run_benchmarks. So every caller is guarded, not only the CLI.
 
 Requirements:
     - The runner at --runner-url must be running.
@@ -56,13 +63,14 @@ class TargetRefused(Exception):
     """The benchmark target was refused before any request was sent."""
 
 
-def resolve_target(runner_url: str | None) -> str:
+def resolve_target(runner_url: str | None, allow_primary: bool = False) -> str:
     """Return the runner base URL to benchmark, or raise ``TargetRefused``.
 
     ``runner_url`` is the operator's ``--runner-url``, or ``None`` when it was
-    not passed. Omitting it would reach the old default, the primary runner,
-    so that is refused. An explicit URL is accepted, port 9876 included: the
-    operator named the port, which is the override.
+    not passed. There is no default target, so ``None`` is refused. A URL that
+    names the primary runner's port is refused unless ``allow_primary`` is also
+    set. The URL alone is the old default typed out, so it does not show that
+    the operator meant the primary.
     """
     if runner_url is None:
         raise TargetRefused(
@@ -72,7 +80,8 @@ def resolve_target(runner_url: str | None) -> str:
             "spawn one through the dev supervisor "
             "(POST http://127.0.0.1:9875/runners/spawn-test) and pass its URL, "
             "e.g. --runner-url http://127.0.0.1:9877. To benchmark the primary on "
-            f"purpose, pass it explicitly: --runner-url http://127.0.0.1:{PRIMARY_RUNNER_PORT}"
+            f"purpose, pass both: --runner-url http://127.0.0.1:{PRIMARY_RUNNER_PORT} "
+            "--allow-primary"
         )
     parts = urlsplit(runner_url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -81,9 +90,16 @@ def resolve_target(runner_url: str | None) -> str:
             "e.g. http://127.0.0.1:9877"
         )
     try:
-        parts.port
+        port = parts.port
     except ValueError as e:
         raise TargetRefused(f"--runner-url {runner_url!r} has an invalid port: {e}") from e
+    if port == PRIMARY_RUNNER_PORT and not allow_primary:
+        raise TargetRefused(
+            f"--runner-url {runner_url!r} names port {PRIMARY_RUNNER_PORT}, the primary "
+            "runner, which hosts live sessions. Benchmark a temp runner instead "
+            "(ports 9877-9899), or pass --allow-primary as well to benchmark the "
+            "primary on purpose."
+        )
     return runner_url
 
 
@@ -277,9 +293,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Runner HTTP API URL to benchmark, e.g. a temp runner at "
-            "http://127.0.0.1:9877. Required: there is no default, and port "
-            f"{PRIMARY_RUNNER_PORT} (the primary runner) is reached only when "
-            "named here explicitly."
+            "http://127.0.0.1:9877. Required: there is no default. A URL naming "
+            f"port {PRIMARY_RUNNER_PORT} (the primary runner) also needs "
+            "--allow-primary."
+        ),
+    )
+    parser.add_argument(
+        "--allow-primary",
+        action="store_true",
+        help=(
+            f"Accept a --runner-url naming port {PRIMARY_RUNNER_PORT}, the primary "
+            "runner. Without this flag that URL is refused, because it is the old "
+            "default typed out."
         ),
     )
     parser.add_argument(
@@ -292,8 +317,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_benchmarks(runner_url: str, iterations: int, warmup: int) -> int:
-    """Run every benchmark against ``runner_url`` and print the report."""
+def run_benchmarks(
+    runner_url: str | None,
+    iterations: int,
+    warmup: int,
+    *,
+    allow_primary: bool = False,
+) -> int:
+    """Benchmark the runner at ``runner_url`` and print the report.
+
+    The target is checked here, where the HTTP client is built, and not only
+    in ``main``. perf-harness.mjs puts its check in the same place, the
+    RunnerClient constructor, so that no code path reaches a runner without
+    it. Raises ``TargetRefused`` before httpx is imported and before any
+    connection is attempted.
+    """
+    target = resolve_target(runner_url, allow_primary)
+    if targets_primary(target):
+        print(
+            f"benchmark-ipc: benchmarking the PRIMARY runner on port {PRIMARY_RUNNER_PORT} "
+            "because --runner-url named it and --allow-primary was passed.",
+            file=sys.stderr,
+        )
+    return _run_benchmarks(target, iterations, warmup)
+
+
+def _run_benchmarks(runner_url: str, iterations: int, warmup: int) -> int:
+    """Send every benchmark request to ``runner_url`` and print the report.
+
+    Private, and unguarded: reach it only through ``run_benchmarks``, which
+    checks the target first.
+    """
     try:
         import httpx
     except ImportError:
@@ -393,17 +447,15 @@ def run_benchmarks(runner_url: str, iterations: int, warmup: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        runner_url = resolve_target(args.runner_url)
+        return run_benchmarks(
+            args.runner_url,
+            args.iterations,
+            args.warmup,
+            allow_primary=args.allow_primary,
+        )
     except TargetRefused as e:
         print(f"benchmark-ipc: {e}", file=sys.stderr)
         return EXIT_TARGET_REFUSED
-    if targets_primary(runner_url):
-        print(
-            f"benchmark-ipc: benchmarking the PRIMARY runner on port {PRIMARY_RUNNER_PORT} "
-            "because --runner-url named it explicitly.",
-            file=sys.stderr,
-        )
-    return run_benchmarks(runner_url, args.iterations, args.warmup)
 
 
 if __name__ == "__main__":
