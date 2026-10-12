@@ -277,3 +277,31 @@ fn an_assumed_refresh_rate_still_cross_checks_with_the_labelled_tolerance() {
         report(&o)
     );
 }
+
+#[test]
+fn one_late_frame_does_not_fail_the_kept_up_check() {
+    // One frame 300 ms late — a hiccup on a loaded CI box — among the run's
+    // frames: the check judges a statistic one frame cannot decide, says
+    // which, and passes.
+    let o = run_with(Faults {
+        one_late_frame_ms: 300,
+        ..Faults::default()
+    });
+    let c = find(&o, "probe_kept_up");
+    assert!(c.gated, "{}", report(&o));
+    assert_eq!(c.passed, Some(true), "{}", report(&o));
+    assert!(c.detail.contains("1 over the bound"), "{}", c.detail);
+    assert!(
+        c.detail.contains("p95") || c.detail.contains("second_largest"),
+        "{}",
+        c.detail
+    );
+    assert_eq!(
+        o.exit_code,
+        0,
+        "{}
+{}",
+        o.summary,
+        report(&o)
+    );
+}

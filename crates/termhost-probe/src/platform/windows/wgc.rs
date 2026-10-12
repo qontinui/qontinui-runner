@@ -64,36 +64,44 @@ impl WgcSource {
             return Err(format!("{target} is not a window"));
         }
         let dev = d3d::create(None)?;
-        let dxgi: IDXGIDevice = dev.device.cast().map_err(|e| format!("IDXGIDevice: {e}"))?;
+        let dxgi: IDXGIDevice = dev
+            .device
+            .cast()
+            .map_err(|e| format!("IDXGIDevice: {}", super::hr(&e)))?;
         // SAFETY: a valid DXGI device in, a WinRT device out.
         let d3d: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
             .and_then(|i| i.cast())
-            .map_err(|e| format!("CreateDirect3D11DeviceFromDXGIDevice: {e}"))?;
+            .map_err(|e| format!("CreateDirect3D11DeviceFromDXGIDevice: {}", super::hr(&e)))?;
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
-            .map_err(|e| format!("IGraphicsCaptureItemInterop: {e}"))?;
+            .map_err(|e| format!("IGraphicsCaptureItemInterop: {}", super::hr(&e)))?;
         // SAFETY: a live HWND (checked above).
-        let item: GraphicsCaptureItem =
-            unsafe { interop.CreateForWindow(h) }.map_err(|e| format!("CreateForWindow: {e}"))?;
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(h) }
+            .map_err(|e| format!("CreateForWindow: {}", super::hr(&e)))?;
         let size = item
             .Size()
-            .map_err(|e| format!("GraphicsCaptureItem.Size: {e}"))?;
+            .map_err(|e| format!("GraphicsCaptureItem.Size: {}", super::hr(&e)))?;
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &d3d,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
             BUFFERS,
             size,
         )
-        .map_err(|e| format!("Direct3D11CaptureFramePool.CreateFreeThreaded: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Direct3D11CaptureFramePool.CreateFreeThreaded: {}",
+                super::hr(&e)
+            )
+        })?;
         let (tx, arrived) = sync_channel::<()>(64);
         let token = pool
             .FrameArrived(&TypedEventHandler::new(move |_, _| {
                 let _ = tx.try_send(());
                 Ok(())
             }))
-            .map_err(|e| format!("FrameArrived: {e}"))?;
+            .map_err(|e| format!("FrameArrived: {}", super::hr(&e)))?;
         let session = pool
             .CreateCaptureSession(&item)
-            .map_err(|e| format!("CreateCaptureSession: {e}"))?;
+            .map_err(|e| format!("CreateCaptureSession: {}", super::hr(&e)))?;
         // Windows 10 2004+; older builds keep capturing the cursor, which the
         // checksum then rejects wherever it covers a marker.
         let _ = session.SetIsCursorCaptureEnabled(false);
@@ -104,7 +112,7 @@ impl WgcSource {
         };
         session
             .StartCapture()
-            .map_err(|e| format!("StartCapture: {e}"))?;
+            .map_err(|e| format!("StartCapture: {}", super::hr(&e)))?;
         Ok(WgcSource {
             target: target.0,
             dev,

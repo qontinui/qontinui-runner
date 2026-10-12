@@ -479,8 +479,15 @@ pub struct ProbeHealth {
     pub scan_ms_p50: Option<f64>,
     pub scan_ms_max: Option<f64>,
     pub lag_ms_p50: Option<f64>,
-    /// The p99 frame lag (the maximum below 100 frames): what `behind` judges.
+    /// The lag `behind` judges: the p95 from 20 frames with a known lag,
+    /// the second-largest below that, a lone frame's own lag — never the
+    /// maximum, so one late frame cannot decide it.
     pub lag_ms_judged: Option<f64>,
+    /// Which statistic `lag_ms_judged` is: `p95`, `second_largest` or
+    /// `only_frame`; `null` with no known lag.
+    pub lag_statistic: Option<&'static str>,
+    /// Frames whose lag exceeded the bound.
+    pub frames_over_bound: u64,
     pub lag_ms_max: Option<f64>,
     /// Above this the probe was not keeping up with the source.
     pub lag_bound_ms: f64,

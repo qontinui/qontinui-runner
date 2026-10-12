@@ -998,3 +998,51 @@ fn an_empty_host_group_is_unknown_not_zero() {
     assert_eq!(host.memory_mb_end, None);
     assert_eq!(host.samples_empty, 30);
 }
+
+/// A model fed `lags_ms` as its primary frames' lags, finished.
+fn health_of(lags_ms: &[u64]) -> crate::records::ProbeHealth {
+    let mut m = Model::new(cfg(), 0);
+    for (i, &lag) in lags_ms.iter().enumerate() {
+        let mut f = frame(SourceId::Wgc, i as u64, 10 + i as u64 * 17, vec![]);
+        f.lag_ns = Some(lag * MS);
+        m.on_frame(f);
+    }
+    m.finish(10_000 * MS).1.probe
+}
+
+#[test]
+fn one_late_frame_does_not_make_the_probe_behind() {
+    // A selftest's ~100 frames, one of them 300 ms late (a scheduler hiccup,
+    // a slow staging copy): judged on the p95, the probe kept up.
+    let mut lags = vec![4u64; 99];
+    lags.push(300);
+    let h = health_of(&lags);
+    assert_eq!(h.behind, Some(false), "{h:?}");
+    assert_eq!(h.lag_statistic, Some("p95"));
+    assert_eq!((h.frames_over_bound, h.lag_ms_max), (1, Some(300.0)));
+    // Six late frames in a hundred are past the p95: behind.
+    let mut lags = vec![4u64; 94];
+    lags.extend([300; 6]);
+    let h = health_of(&lags);
+    assert_eq!(h.behind, Some(true), "{h:?}");
+    assert_eq!(h.frames_over_bound, 6);
+}
+
+#[test]
+fn below_twenty_frames_one_outlier_is_tolerated_and_two_are_not() {
+    let mut lags = vec![4u64; 9];
+    lags.push(300);
+    let h = health_of(&lags);
+    assert_eq!(h.lag_statistic, Some("second_largest"));
+    assert_eq!(h.behind, Some(false), "{h:?}");
+    lags[0] = 200;
+    let h = health_of(&lags);
+    assert_eq!(h.behind, Some(true), "{h:?}");
+    assert_eq!(h.lag_ms_judged, Some(200.0));
+    // A lone frame is judged as it is.
+    let h = health_of(&[80]);
+    assert_eq!(
+        (h.lag_statistic, h.behind),
+        (Some("only_frame"), Some(true))
+    );
+}

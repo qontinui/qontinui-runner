@@ -52,14 +52,21 @@ fn create_one(
 /// output), else a hardware device, else WARP (a GPU-less VM).
 pub fn create(adapter: Option<&IDXGIAdapter1>) -> Result<Device, String> {
     if let Some(a) = adapter {
-        let a: IDXGIAdapter = a.cast().map_err(|e| format!("IDXGIAdapter: {e}"))?;
+        let a: IDXGIAdapter = a
+            .cast()
+            .map_err(|e| format!("IDXGIAdapter: {}", super::hr(&e)))?;
         return create_one(Some(&a), D3D_DRIVER_TYPE_UNKNOWN)
             .map(|(device, context)| Device {
                 device,
                 context,
                 kind: "adapter",
             })
-            .map_err(|e| format!("D3D11CreateDevice on the output's adapter: {e}"));
+            .map_err(|e| {
+                format!(
+                    "D3D11CreateDevice on the output's adapter: {}",
+                    super::hr(&e)
+                )
+            });
     }
     match create_one(None, D3D_DRIVER_TYPE_HARDWARE) {
         Ok((device, context)) => Ok(Device {
@@ -73,7 +80,13 @@ pub fn create(adapter: Option<&IDXGIAdapter1>) -> Result<Device, String> {
                 context,
                 kind: "warp",
             })
-            .map_err(|warp| format!("D3D11CreateDevice: hardware {hw}; WARP {warp}")),
+            .map_err(|warp| {
+                format!(
+                    "D3D11CreateDevice: hardware {}; WARP {}",
+                    super::hr(&hw),
+                    super::hr(&warp)
+                )
+            }),
     }
 }
 

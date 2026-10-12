@@ -144,3 +144,25 @@ impl Host for RealHost {
         window::resolve(spec)
     }
 }
+
+/// A Windows error as the doctor and capture records report it: the HRESULT
+/// in hex, then the system's message — so an `OpenFailed` reason names the
+/// code a hosted run hit, not only its prose.
+pub(crate) fn hr(e: &windows::core::Error) -> String {
+    format!(
+        "HRESULT 0x{:08X} ({})",
+        e.code().0 as u32,
+        e.message().trim()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::core::{Error, HRESULT};
+
+    #[test]
+    fn a_windows_error_names_its_hresult() {
+        let text = super::hr(&Error::from(HRESULT(0x8007_0005_u32 as i32)));
+        assert!(text.starts_with("HRESULT 0x80070005 ("), "{text}");
+    }
+}

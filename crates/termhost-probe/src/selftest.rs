@@ -502,18 +502,23 @@ impl Selftest<'_> {
     /// run with no such placement could not show it kept up.
     fn probe_kept_up(&mut self, primary: SourceId, probe: &ProbeHealth) {
         let source = primary.as_str();
+        // Which statistic was judged, over how many frames, and how many
+        // were late: one late frame never decides it (see ProbeHealth).
+        let judged = format!(
+            "{} lag {:.1} ms over {} frame(s) with a known lag; {} over the bound; max {:.1} ms",
+            probe.lag_statistic.unwrap_or("-"),
+            probe.lag_ms_judged.unwrap_or_default(),
+            probe.frames - probe.frames_lag_unknown,
+            probe.frames_over_bound,
+            probe.lag_ms_max.unwrap_or_default()
+        );
         let detail = match probe.behind {
             Some(false) => format!(
-                "{} {source} frames reached the probe within the {:.0} ms lag bound (judged {:.1} ms, max {:.1} ms; {} frame(s) had no presentation time)",
-                probe.frames,
-                probe.lag_bound_ms,
-                probe.lag_ms_judged.unwrap_or_default(),
-                probe.lag_ms_max.unwrap_or_default(),
-                probe.frames_lag_unknown
+                "{source}: the probe kept within the {:.0} ms lag bound ({judged}; {} frame(s) had no presentation time)",
+                probe.lag_bound_ms, probe.frames_lag_unknown
             ),
             Some(true) => format!(
-                "the probe fell behind {source}: frames reached it up to {:.1} ms after presentation (bound {:.0} ms), so the latencies it measured include its own backlog",
-                probe.lag_ms_judged.unwrap_or_default(),
+                "the probe fell behind {source}: past the {:.0} ms lag bound ({judged}), so the latencies it measured include its own backlog",
                 probe.lag_bound_ms
             ),
             None => format!(

@@ -47,6 +47,9 @@ pub struct Faults {
     pub drop_keys: bool,
     /// The compositor never presents a frame.
     pub capture_dead: bool,
+    /// ONE frame (the fifth) reaches the probe this long after it was
+    /// presented — a scheduler hiccup, not a probe that fell behind.
+    pub one_late_frame_ms: u64,
     /// Every frame reaches the probe this long after it was presented (the
     /// probe is behind its source).
     pub probe_backlog_ms: u64,
@@ -146,6 +149,7 @@ struct FakeCapture {
     id: SourceId,
     desk: Arc<Desktop>,
     last: u64,
+    delivered: u64,
 }
 
 impl CaptureSource for FakeCapture {
@@ -168,8 +172,14 @@ impl CaptureSource for FakeCapture {
                     let c = self.desk.canvas.lock().expect("canvas");
                     let view = c.view();
                     let faults = self.desk.faults;
+                    self.delivered += 1;
+                    let late = if self.delivered == 5 {
+                        faults.one_late_frame_ms
+                    } else {
+                        faults.probe_backlog_ms
+                    };
                     let presented_ns = (!faults.presentation_unknown)
-                        .then(|| now_ns().saturating_sub(faults.probe_backlog_ms * 1_000_000));
+                        .then(|| now_ns().saturating_sub(late * 1_000_000));
                     f(RawFrame {
                         t_ns: present_at + faults.capture_lag_ms * 1_000_000,
                         presented_ns,
@@ -414,6 +424,7 @@ impl Host for FakeHost {
             id: kind,
             desk: self.desk.clone(),
             last: 0,
+            delivered: 0,
         }))
     }
     fn inspector(&mut self, _target: WindowHandle) -> Result<Box<dyn WindowInspector>, String> {

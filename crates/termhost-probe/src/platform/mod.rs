@@ -459,6 +459,11 @@ pub trait ProcessReader: Send {
     fn cpu_ns(&mut self, pid: u32) -> Option<u64>;
     fn memory(&mut self, pid: u32) -> Option<ProcMem>;
     fn gpu(&mut self) -> GpuReading;
+    /// Whether `pid` has exited, asked after a read of it failed; `None`
+    /// leaves it to the sampler's own process table (re-read for that pid).
+    fn gone(&mut self, _pid: u32) -> Option<bool> {
+        None
+    }
 }
 
 /// The display's refresh interval and where it came from.

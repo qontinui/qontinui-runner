@@ -250,6 +250,9 @@ pub struct Model {
     finished: bool,
 }
 
+/// From this many frames with a known lag, `behind` judges their p95.
+pub const LAG_P95_MIN_FRAMES: usize = 20;
+
 /// `inner` lies wholly inside `outer`.
 fn contains(outer: &Rect, inner: &Rect) -> bool {
     outer.intersect(inner).as_ref() == Some(inner)
@@ -725,13 +728,21 @@ impl Model {
         lags.sort_unstable();
         let mut scans = self.scans.clone();
         scans.sort_unstable();
-        let judged = if lags.len() >= 100 {
-            pct_ms(&lags, 99)
-        } else {
-            lags.last().map(|&l| l as f64 / 1e6)
+        // Judged on a statistic one late frame cannot decide: a scheduler
+        // hiccup or one slow staging copy is not a probe that fell behind.
+        // p95 from 20 frames (it tolerates one late frame in 20); below that
+        // the second-largest lag (one outlier tolerated); a lone frame is
+        // judged as it is.
+        let (judged, statistic) = match lags.len() {
+            0 => (None, None),
+            1 => (lags.last().map(|&l| l as f64 / 1e6), Some("only_frame")),
+            n if n < LAG_P95_MIN_FRAMES => (Some(lags[n - 2] as f64 / 1e6), Some("second_largest")),
+            _ => (pct_ms(&lags, 95), Some("p95")),
         };
         let bound_ms = self.cfg.lag_bound_ns as f64 / 1e6;
         ProbeHealth {
+            lag_statistic: statistic,
+            frames_over_bound: lags.iter().filter(|&&l| l > self.cfg.lag_bound_ns).count() as u64,
             frames: lags.len() as u64 + self.lag_unknown,
             frames_lag_unknown: self.lag_unknown,
             scan_ms_p50: pct_ms(&scans, 50),
@@ -781,8 +792,11 @@ impl Model {
             Some((
                 "harness_error",
                 format!(
-                    "the probe fell behind: frames reached it up to {:.1} ms after presentation (bound {:.1} ms), so markers may have appeared only in later frames",
+                    "the probe fell behind: its {} frame lag was {:.1} ms ({} of {} frames over the {:.1} ms bound), so markers may have appeared only in later frames",
+                    probe.lag_statistic.unwrap_or("-"),
                     probe.lag_ms_judged.unwrap_or_default(),
+                    probe.frames_over_bound,
+                    probe.frames - probe.frames_lag_unknown,
                     probe.lag_bound_ms
                 ),
             ))
