@@ -17,6 +17,7 @@ import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { TmuxAdapter } from "../adapters/tmux.mjs";
+import { VscodeAdapter } from "../adapters/vscode.mjs";
 import { terminatePid, terminateTree } from "../proc.mjs";
 import { reapGenerators } from "../run.mjs";
 
@@ -24,7 +25,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const BENCH = join(HERE, "..");
 const SHARED_CLIENTS = join(BENCH, "..", "lib", "runner-clients.mjs");
 
-/** Every harness source file: the bench (minus tests) and the shared clients. */
+/**
+ * Every harness source file: the bench (minus tests) and the shared clients —
+ * ES modules and the CommonJS of the VS Code harness extension alike.
+ */
 function harnessSources() {
   const out = [SHARED_CLIENTS];
   const walk = (dir) => {
@@ -32,7 +36,7 @@ function harnessSources() {
       const p = join(dir, name);
       if (statSync(p).isDirectory()) {
         if (name !== "__tests__" && name !== "profiles") walk(p);
-      } else if (name.endsWith(".mjs")) {
+      } else if (/\.(mjs|cjs|js)$/.test(name)) {
         out.push(p);
       }
     }
@@ -40,6 +44,13 @@ function harnessSources() {
   walk(BENCH);
   return out;
 }
+
+test("the scan reaches the VS Code harness extension and the VS Code adapter", () => {
+  const files = harnessSources().map((f) => relative(BENCH, f).replace(/\\/g, "/"));
+  for (const f of ["vscode-harness-extension/harness.js", "vscode-harness-extension/extension.js", "vscode-harness-extension/protocol.js", "adapters/vscode.mjs", "adapters/vscode-install.mjs"]) {
+    assert.ok(files.includes(f), `${f} is scanned`);
+  }
+});
 
 /** Strip comments so documentation that NAMES a forbidden command does not trip the scan. */
 function code(text) {
@@ -156,6 +167,56 @@ test("a generator that survives every signal is reported, not hidden", async (t)
   const table = new Map([[400, { pid: 400, ppid: 1, name: "node", argv: ["node", "--termhost-bench-generator", "r"], cmdline: "node --termhost-bench-generator r", startKey: "1" }]]);
   const res = await reapGenerators(dir, "r", { list: () => table, kill: () => {}, waitMs: 0, sleepFn: async () => {} });
   assert.deepEqual(res.survivors.map((s) => s.pid), [400]);
+});
+
+test("VS Code teardown ends only the instance it launched — by PID and start key — never the operator's Code.exe or a recycled PID", async () => {
+  const P = (pid, ppid, name, startKey) => ({ pid, ppid, name, argv: null, cmdline: name, startKey: String(startKey) });
+  let table = new Map([
+    [100, P(100, 1, "Code.exe", 1000)], // ours: the main process the adapter spawned
+    [101, P(101, 100, "Code.exe", 1001)], // its GPU process
+    [102, P(102, 100, "Code.exe", 1002)], // its pty host
+    [103, P(103, 102, "OpenConsole.exe", 1003)],
+    [104, P(104, 102, "powershell.exe", 1004)],
+    [200, P(200, 1, "Code.exe", 500)], // the operator's VS Code: same image, never ours
+    [201, P(201, 200, "Code.exe", 501)],
+  ]);
+  let reads = 0;
+  const signalled = [];
+  const adapter = new VscodeAdapter({
+    platform: "win32",
+    list: () => {
+      reads += 1;
+      // After teardown recorded what it owns, PID 104 is recycled by an unrelated process.
+      if (reads === 2) table = new Map([...table].map(([pid, p]) => [pid, pid === 104 ? P(104, 7, "notepad.exe", 9999) : p]));
+      return new Map(table);
+    },
+    kill: (pid, sig) => {
+      signalled.push([pid, sig]);
+      table = new Map([...table].filter(([p]) => p !== pid));
+    },
+    sleep: async () => {},
+  });
+  adapter.pid = 100;
+  adapter.startKey = "1000";
+  const res = await adapter.teardown();
+  assert.deepEqual(signalled.map(([p]) => p), [103, 102, 101, 100], "children first, then the main process, nothing else");
+  assert.ok(table.has(200) && table.has(201), "the operator's Code.exe is untouched");
+  assert.ok(table.has(104) && table.get(104).name === "notepad.exe", "a recycled PID is untouched");
+  assert.deepEqual(res.survivors, []);
+});
+
+test("a VS Code process that survives every signal is reported, not hidden; a main process recycled before teardown is not ours", async () => {
+  const P = (pid, ppid, name, startKey) => ({ pid, ppid, name, argv: null, cmdline: name, startKey: String(startKey) });
+  const stubborn = new VscodeAdapter({ platform: "win32", list: () => new Map([[100, P(100, 1, "Code.exe", 1000)]]), kill: () => {}, sleep: async () => {} });
+  stubborn.pid = 100;
+  stubborn.startKey = "1000";
+  assert.deepEqual((await stubborn.teardown()).survivors.map((s) => s.pid), [100]);
+  const signalled = [];
+  const recycled = new VscodeAdapter({ platform: "win32", list: () => new Map([[100, P(100, 1, "Code.exe", 7777)]]), kill: (pid) => signalled.push(pid), sleep: async () => {} });
+  recycled.pid = 100;
+  recycled.startKey = "1000";
+  await recycled.teardown();
+  assert.deepEqual(signalled, [], "PID 100 now belongs to a process started after ours: not a target");
 });
 
 test("tmux teardown is kill-server on the PRIVATE socket, and a lingering server is signalled only if it is ours", async (t) => {

@@ -59,16 +59,17 @@ function dirs(t) {
 // The interface
 // ---------------------------------------------------------------------------
 
-test("both Phase 3 adapters implement every interface method, and the optional extensions", async () => {
+test("every built adapter (runner, tmux, vscode) implements every interface method, and the optional extensions", async () => {
   const tmux = await createAdapter("tmux", { platform: "linux" });
   const runner = await createAdapter("runner", { mode: "subject", build: { role: "single", commit: null, exe: null }, repoRoot: "." });
-  for (const a of [tmux, runner]) {
+  const vscode = await createAdapter("vscode", { platform: "linux", cacheDir: tmpdir() });
+  for (const a of [tmux, runner, vscode]) {
     for (const m of [...REQUIRED_METHODS, ...OPTIONAL_METHODS]) assert.equal(typeof a[m], "function", `${a.id}.${m}`);
     assert.equal(typeof a.hostIdKey, "string");
   }
   assert.throws(() => assertAdapter({ id: "x", check() {} }), /lacks launch/);
-  await assert.rejects(createAdapter("vscode", {}), /Phase 4/);
   await assert.rejects(createAdapter("windows-terminal", {}), /Phase 5/);
+  await assert.rejects(createAdapter("tmux-wsl", {}), /Phase 5/);
 });
 
 test("row-major order clusters markers by row, then column", () => {

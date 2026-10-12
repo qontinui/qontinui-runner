@@ -69,6 +69,7 @@ import { HttpError, PRIMARY_RUNNER_PORT, RunnerClient, RunnerNotListed, Supervis
 import { ECHO_REGION, MARKER_KINDS, markerOverlay, markerSeq } from "../marker.mjs";
 import { platformDirs } from "../neutrality.mjs";
 import { listProcesses, startKeyCompare, terminatePid, terminateTree } from "../proc.mjs";
+import { ptyHostCensus, ptyHostImpl } from "../ptyhost.mjs";
 import { assertInside, commandLine } from "../rundir.mjs";
 import { unprovenBuild } from "../results.mjs";
 import { percentile } from "../stats.mjs";
@@ -1100,6 +1101,7 @@ export class RunnerAdapter {
   async arrange(arm, actx) {
     this.slots = new Map(actx.slots);
     this.arm = arm;
+    if (this.facts.ptyHostCensus === undefined) this.facts.ptyHostCensus = this.ptyCensusNow();
     await this.restoreZone();
     await sleep(ZONE_SETTLE_MS);
     const state = await this.zoneViewState();
@@ -1274,6 +1276,17 @@ export class RunnerAdapter {
     return [...new Set(roots)];
   }
 
+  /** The ConPTY hosts under the runner's processes while its sessions are live (Windows), or null. */
+  ptyCensusNow() {
+    if (this.platform !== "win32") return null;
+    try {
+      return ptyHostCensus(this.list(), this.processRoots());
+    } catch (e) {
+      this.notes.push(`pty-host census failed: ${e.message}`);
+      return null;
+    }
+  }
+
   /**
    * The window the probe measures: the instance's own process. Never a title — on
    * a workstation "Qontinui" also names the operator's own runner windows (D5).
@@ -1320,7 +1333,7 @@ export class RunnerAdapter {
               "the build's commit could not be proven from the running binary (D12)",
             ),
       settings_digest: this.settingsDigest(),
-      pty_host_impl: this.platform === "win32" ? { state: "unknown", reason: "not_instrumented", detail: "the Windows PTY host census arrives with Phase 4" } : "unix_pty",
+      pty_host_impl: ptyHostImpl({ platform: this.platform, census: this.facts.ptyHostCensus ?? this.ptyCensusNow(), what: "the runner" }),
       render_backend: this.facts.renderBackend ?? { state: "unknown", reason: "harness_error", detail: "not read" },
       pty_holder: this.client ? this.ptyHolderAsRun() : (this.facts.ptyHolder ?? { state: "unknown", reason: "harness_error", detail: "not read" }),
       launch_mode: this.mode === "subject" ? "subject_instance_root" : "supervisor_spawn_test",

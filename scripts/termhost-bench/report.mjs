@@ -111,14 +111,21 @@ export function renderReport(doc) {
  * added for the runner's own rows only: public CI logs carry these lines, a detail
  * can quote a reading, and a third-party setup's readings never leave the job (D7).
  *
- * @param {object} doc
+ * `requireMeasuredIfOperative` adds KPIs to the measured requirement only where
+ * the file's own capabilities report a mechanism OPERATIVE — e.g. the capture KPIs
+ * on a hosted Windows VM whose capture the image decides. Where the mechanism is
+ * not OPERATIVE those KPIs may read unknown (with the reason the validator
+ * already requires); they are never missing.
+ *
  * `abBaseline`: the run measured a head and a baseline build (`--ab-baseline`).
  * Then every runner row at a gate N must carry a PROVEN build: a row labelled
  * `unknown_build` fails the gate, measured or not, because an A/B number from a
  * build nobody proved is no comparison at all (D12).
  *
+ * @param {object} doc
  * @param {{requireMeasured?: string[], atN?: number[], setups?: string[], arms?: string[],
- *   requireRowsN?: number[], roles?: string[], abBaseline?: boolean}} a
+ *   requireRowsN?: number[], roles?: string[], abBaseline?: boolean,
+ *   requireMeasuredIfOperative?: {mechanism: string, kpis: string[]}[]}} a
  * @returns {string[]} failures (empty = the gate holds)
  */
 export function checkAssertions(doc, a) {
@@ -126,6 +133,12 @@ export function checkAssertions(doc, a) {
   const setups = a.setups ?? [...new Set(doc.rows.map((r) => r.setup.id))];
   const arms = a.arms ?? ["focus", "tiled"];
   const roleOk = (r) => !a.roles || a.roles.includes(r.setup.build?.role ?? "-");
+  const required = [...(a.requireMeasured ?? [])];
+  for (const cond of a.requireMeasuredIfOperative ?? []) {
+    if (doc.capabilities?.[cond.mechanism]?.state === "OPERATIVE") {
+      for (const k of cond.kpis) if (!required.includes(k)) required.push(k);
+    }
+  }
   for (const n of a.requireRowsN ?? []) {
     for (const setup of setups) {
       for (const arm of arms) {
@@ -152,7 +165,7 @@ export function checkAssertions(doc, a) {
             }
           }
         }
-        for (const id of a.requireMeasured ?? []) {
+        for (const id of required) {
           for (const r of rows) {
             const v = r.kpis[id];
             if (v?.state !== "measured") {

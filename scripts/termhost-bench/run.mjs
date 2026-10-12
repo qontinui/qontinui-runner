@@ -212,13 +212,18 @@ export async function reapGenerators(genDir, genRunId, { list = () => listProces
   return { ended: [...new Set(ended)], survivors };
 }
 
-/** Labels a row carries (Phase 1 ROW_LABELS). */
-export function rowLabels({ softwareRendered, setup, smoke, paneSizes, geometry }) {
+/**
+ * Labels a row carries (Phase 1 ROW_LABELS). `envLabels` are the ones the
+ * environment declares for this setup (`envs/index.mjs` `setupLabels`, e.g.
+ * D6's `dom_renderer_fallback` on VS Code rows of a linux-xvfb run).
+ */
+export function rowLabels({ softwareRendered, setup, smoke, paneSizes, geometry, envLabels = [] }) {
   const labels = [];
   if (softwareRendered) labels.push("software_rendered");
   if (setup.id === "runner" && (setup.build === undefined || setup.build?.state)) labels.push("unknown_build");
   if (smoke) labels.push("assert_only_smoke");
   if ((paneSizes ?? []).some((p) => p.cols < geometry.cols || p.rows < geometry.rows)) labels.push("pane_smaller_than_profile");
+  for (const l of envLabels) if (!labels.includes(l)) labels.push(l);
   return labels;
 }
 
@@ -567,6 +572,9 @@ export function adapterOptionsFor(unit, o, log) {
       log,
     };
   }
+  if (unit.setup === "vscode") {
+    return { variant: unit.variant, log, appPath: o.vscodeAppPath ?? null, cacheDir: o.vscodeCacheDir ?? null };
+  }
   return { variant: unit.variant, log };
 }
 
@@ -606,7 +614,14 @@ function unknownRows(unit, o, ctx, reason, detail, setup, extraIncidents = []) {
     scenario: scenarioFor(unit, arm, o, ctx, { vTarget: defaultVTarget(unit, arm), vActual: null }),
     kpis: allUnknown(reason, { detail, setupId: unit.setup }),
     diagnostics: {},
-    labels: rowLabels({ softwareRendered: ctx.spec.softwareRendered, setup, smoke: o.smokeSetups?.includes(unit.setup), paneSizes: [], geometry: ctx.profile.geometry }),
+    labels: rowLabels({
+      softwareRendered: ctx.spec.softwareRendered,
+      setup,
+      smoke: o.smokeSetups?.includes(unit.setup),
+      paneSizes: [],
+      geometry: ctx.profile.geometry,
+      envLabels: ctx.spec.setupLabels?.[unit.setup] ?? [],
+    }),
     incidents: extraIncidents,
   }));
 }
@@ -838,6 +853,7 @@ export async function runUnit(unit, ctx) {
         smoke: o.smokeSetups?.includes(unit.setup),
         paneSizes: a.paneSizes,
         geometry: ctx.profile.geometry,
+        envLabels: ctx.spec.setupLabels?.[unit.setup] ?? [],
       }),
       incidents: a.incidents,
     });

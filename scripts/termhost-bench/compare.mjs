@@ -18,6 +18,13 @@
 import { KPI_CATALOG, getKpi } from "./kpi-catalog.mjs";
 import { percentile } from "./stats.mjs";
 
+/**
+ * Row labels that keep a row out of every comparison, and so out of the verdict
+ * Phase 6 draws here: VS Code rows of a linux-xvfb run fell back from WebGL to the
+ * DOM renderer (D6, Phase 4) and describe a configuration no operator runs.
+ */
+export const VERDICT_EXCLUDED_LABELS = Object.freeze(["dom_renderer_fallback"]);
+
 /** The KPIs compared: the host's own, comparable ones. */
 export const COMPARED_KPIS = Object.freeze(
   KPI_CATALOG.filter((k) => k.comparable && k.attribution === "host").map((k) => k.id),
@@ -94,7 +101,12 @@ export function compareBuilds(head, baseline = null, { setup = "runner", variant
   }
   const pick = (doc, roles) =>
     doc.rows.filter(
-      (r) => r.setup.id === setup && r.setup.variant === variant && comparableBuild(r) && roles.includes(r.setup.build?.role ?? "single"),
+      (r) =>
+        r.setup.id === setup &&
+        r.setup.variant === variant &&
+        comparableBuild(r) &&
+        roles.includes(r.setup.build?.role ?? "single") &&
+        !(r.labels ?? []).some((l) => VERDICT_EXCLUDED_LABELS.includes(l)),
     );
   const headRows = baseline ? pick(head, ["head", "single"]) : pick(head, ["head"]);
   const baseRows = baseline ? pick(baseline, ["baseline", "single"]) : pick(head, ["baseline"]);

@@ -1,8 +1,9 @@
 /**
  * The termhost-bench setup-adapter interface (plan
  * `2026-10-11-terminal-page-performance-kpis-across-setups`, Phase 3) and the
- * registry of adapters. One adapter drives one terminal host; Phases 4 and 5 add
- * `vscode`, `windows-terminal` and the `tmux-wsl` variant behind the same calls.
+ * registry of adapters. One adapter drives one terminal host; Phase 4 added
+ * `vscode`, and Phase 5 adds `windows-terminal` and the `tmux-wsl` variant behind
+ * the same calls.
  *
  * The run loop drives one UNIT — one host launch for one (run index, N, setup,
  * variant, build role) — through these methods, in this order:
@@ -135,12 +136,13 @@ export async function createAdapter(setupId, options) {
       const { TmuxAdapter } = await import("./tmux.mjs");
       return assertAdapter(new TmuxAdapter(options));
     }
-    case "vscode":
+    case "vscode": {
+      const { VscodeAdapter } = await import("./vscode.mjs");
+      return assertAdapter(new VscodeAdapter(options));
+    }
     case "windows-terminal":
     case "tmux-wsl":
-      throw new RangeError(
-        `the ${setupId} adapter arrives with ${setupId === "vscode" ? "Phase 4" : "Phase 5"} of the plan`,
-      );
+      throw new RangeError(`the ${setupId} adapter arrives with Phase 5 of the plan`);
     default:
       throw new RangeError(`unknown setup "${setupId}"`);
   }

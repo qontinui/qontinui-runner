@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { compareBuilds, renderComparison } from "./compare.mjs";
 import { blockingMechanisms, doctorNotes, doctorReport, gatherDoctorFacts, mapDoctor, renderDoctor } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
-import { ARMS, SETUP_IDS } from "./kpi-catalog.mjs";
+import { ARMS, KPI_CATALOG, SETUP_IDS } from "./kpi-catalog.mjs";
 import { resolveProbeBinary } from "./probe.mjs";
 import { checkAssertions, prepareReport, renderReport } from "./report.mjs";
 import { InvalidResults } from "./results.mjs";
@@ -46,6 +46,7 @@ export const HELP = `termhost-bench — terminal-host performance under N AI ses
   run      --env linux-xvfb --setups runner,tmux --n 1,5,15 --arms focus,tiled --runs 2
   report   <results.json> [--format md|json] [--redact-to <file>]
            [--require-measured <kpi,...> --at-n <n,...>] [--require-rows-n <n,...>]
+           [--require-measured-if-operative <mechanism>:<kpi,...>]
            [--setups ...] [--arms ...] [--roles head,single]
            [--ab-baseline <sha>]   (an A/B run: every runner row at --at-n must have a proven build)
   compare  <results.json> [<baseline.json>] [--setup runner] [--variant default] [--format md|json]
@@ -73,6 +74,16 @@ runner options (D12):
   --runner-variants <a,b>    default | ghostty | pty-holder (variants need subject mode)
   --runner-env K=V           extra environment for a subject runner (repeatable)
   --supervisor-url <url>     (default http://127.0.0.1:9875)
+
+vscode options (D5):
+  --vscode-cache-dir <dir>   where the pinned archive is cached (outside any repository;
+                             default %LOCALAPPDATA%\\termhost-bench\\cache\\vscode or ~/.cache/termhost-bench/vscode)
+  --vscode-app-path <path>   measure an installed VS Code "as configured" instead of the pinned build
+
+report options:
+  --require-measured-if-operative <mechanism>:<kpi,...>
+                             these KPIs must read measured at --at-n only where the results'
+                             capabilities report <mechanism> OPERATIVE (e.g. capture.wgc:output_latency_ms)
 `;
 
 const LIST = (s) =>
@@ -119,6 +130,9 @@ const FLAGS_WITH_VALUES = new Set([
   "roles",
   "setup",
   "variant",
+  "vscode-app-path",
+  "vscode-cache-dir",
+  "require-measured-if-operative",
 ]);
 const BOOLEAN_FLAGS = new Set(["json", "help"]);
 
@@ -256,6 +270,8 @@ export async function normaliseRunOptions(flags, deps = {}) {
     runnerVariants: variants,
     runnerEnv,
     supervisorUrl,
+    vscodeAppPath: flags["vscode-app-path"] ? resolve(flags["vscode-app-path"]) : null,
+    vscodeCacheDir: flags["vscode-cache-dir"] ? resolve(flags["vscode-cache-dir"]) : null,
     repoRoot: REPO_ROOT,
     command: ["node", relative(REPO_ROOT, fileURLToPath(import.meta.url)).replace(/\\/g, "/"), ...(deps.argv ?? [])],
   };
@@ -279,7 +295,13 @@ async function cmdDoctor(flags, io, deps = {}) {
           setup,
           setup === "runner"
             ? { variant: unit.variant, mode: o?.runnerMode === "supervisor" ? "supervisor" : "subject", build: unit.build ?? { role: "single", commit: null }, supervisorUrl: o?.supervisorUrl, repoRoot: REPO_ROOT }
-            : { variant: "default" },
+            : setup === "vscode"
+              ? {
+                  variant: "default",
+                  appPath: flags["vscode-app-path"] ? resolve(flags["vscode-app-path"]) : null,
+                  cacheDir: flags["vscode-cache-dir"] ? resolve(flags["vscode-cache-dir"]) : null,
+                }
+              : { variant: "default" },
         ),
       );
     } catch (e) {
@@ -344,6 +366,22 @@ async function cmdRun(flags, io, argv, deps = {}) {
   }
 }
 
+/**
+ * `--require-measured-if-operative <mechanism>:<kpi,...>` — KPIs the gate holds
+ * to `measured` only where the results file's capabilities report the mechanism
+ * OPERATIVE (a hosted Windows VM's capture is the image's to decide, plan Phase 2).
+ *
+ * @returns {{mechanism: string, kpis: string[]}}
+ */
+export function parseOperativeRequirement(value) {
+  const m = /^([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+):([a-z0-9_,]+)$/.exec(String(value));
+  if (!m) throw new UsageError(`--require-measured-if-operative takes <mechanism>:<kpi,...>, got ${value}`);
+  const kpis = LIST(m[2]);
+  const unknown = kpis.filter((k) => !KPI_CATALOG.some((c) => c.id === k));
+  if (unknown.length > 0) throw new UsageError(`--require-measured-if-operative names KPIs the catalog does not define: ${unknown.join(", ")}`);
+  return { mechanism: m[1], kpis };
+}
+
 function readDoc(path) {
   try {
     return JSON.parse(readFileSync(resolve(path), "utf8"));
@@ -373,6 +411,7 @@ function cmdReport(positional, flags, io) {
   }
   const failures = checkAssertions(doc, {
     requireMeasured: flags["require-measured"] ? LIST(flags["require-measured"]) : undefined,
+    requireMeasuredIfOperative: flags["require-measured-if-operative"] ? [parseOperativeRequirement(flags["require-measured-if-operative"])] : undefined,
     atN: flags["at-n"] ? LIST(flags["at-n"]).map(Number) : undefined,
     requireRowsN: flags["require-rows-n"] ? LIST(flags["require-rows-n"]).map(Number) : undefined,
     setups: flags.setups ? LIST(flags.setups) : undefined,

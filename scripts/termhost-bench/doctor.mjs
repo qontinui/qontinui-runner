@@ -115,7 +115,7 @@ export function mapDoctor(f) {
  * with its reason instead of stopping the run).
  */
 export function blockingMechanisms(mechanisms) {
-  return ["env.platform", "env.harness", "env.xvfb", "probe.binary", "probe.foreground_safety", "node.version", "device.drain"]
+  return ["env.platform", "env.harness", "env.xvfb", "env.hosted_runner", "probe.binary", "probe.foreground_safety", "node.version", "device.drain"]
     .filter((id) => mechanisms[id] && mechanisms[id].state !== OPERATIVE)
     .map((id) => ({ id, ...mechanisms[id] }));
 }
@@ -212,6 +212,8 @@ export async function gatherDoctorFacts({
   if (canProbe) {
     facts.probeDoctor = doctorFn({ probe: probePath, env: { ...process.env, ...(envVars ?? {}) } });
   }
+  // Verdicts the environment decides itself (e.g. windows-hosted: a GitHub-hosted runner).
+  Object.assign(facts.setupMechanisms, spec.doctorFacts?.(process.env) ?? {});
   for (const a of adapters) {
     try {
       const r = await a.check();

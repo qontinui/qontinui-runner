@@ -312,6 +312,9 @@ command = [
   "scripts/termhost-bench/__tests__/runner-clients.test.mjs",
   "scripts/termhost-bench/__tests__/stats.test.mjs",
   "scripts/termhost-bench/__tests__/validate.test.mjs",
+  "scripts/termhost-bench/__tests__/vscode-adapter.test.mjs",
+  "scripts/termhost-bench/__tests__/vscode-extension.test.mjs",
+  "scripts/termhost-bench/__tests__/windows-hosted.test.mjs",
   "scripts/__tests__/tui-repaint-generator.test.mjs",
 ]
 
