@@ -26,7 +26,7 @@ import { KPI_CATALOG, ROW_LABELS } from "../kpi-catalog.mjs";
 import { machineBlock } from "../machine.mjs";
 import { NeutralityGuard } from "../neutrality.mjs";
 import { checkAssertions } from "../report.mjs";
-import { adapterOptionsFor, noteLogLines, rowLabels, runBench } from "../run.mjs";
+import { adapterOptionsFor, fallbackSetup, noteLogLines, rowLabels, runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
 import { windowsDesktopResults } from "./helpers/results.mjs";
@@ -133,6 +133,13 @@ test("a linux-xvfb run with VS Code labels every VS Code row dom_renderer_fallba
   assert.ok(vsc.length > 0 && tmux.length > 0);
   assert.ok(vsc.every((r) => r.labels.includes("dom_renderer_fallback")), "every VS Code row");
   assert.ok(tmux.every((r) => !r.labels.includes("dom_renderer_fallback")), "and no other setup's");
+});
+
+test("a VS Code unit that never described itself still records the launch mode it was planned with", () => {
+  const unit = { setup: "vscode", variant: "default", build: null };
+  assert.equal(fallbackSetup(unit, "x", {}).launch_mode, "portable_pinned");
+  assert.equal(fallbackSetup(unit, "x", { vscodeAppPath: "C:\\vsc" }).launch_mode, "installed_app_path");
+  assert.equal(fallbackSetup({ setup: "tmux", variant: "default" }, "x", {}).launch_mode, "private_server");
 });
 
 test("KPI notes reach the log for the runner only; a third party's stay in its (never uploaded) results file (D7)", () => {

@@ -266,6 +266,13 @@ export function abortAwareSleep(signal, inner = null) {
     });
 }
 
+/** The launch mode a setup's unit was planned with, from the run's options. */
+function fallbackLaunchMode(setupId, o) {
+  if (setupId === "runner") return o.runnerMode === "supervisor" ? "supervisor_spawn_test" : "subject_instance_root";
+  if (setupId === "vscode") return o.vscodeAppPath ? "installed_app_path" : "portable_pinned";
+  return "private_server";
+}
+
 /**
  * A fallback `setup` object when an adapter could not describe itself (or was
  * never launched). What the plan already knows is kept: the runner build the unit
@@ -292,7 +299,7 @@ export function fallbackSetup(unit, detail, o = {}) {
     pty_host_impl: absent,
     render_backend: absent,
     pty_holder: absent,
-    launch_mode: unit.setup === "runner" ? (o.runnerMode === "supervisor" ? "supervisor_spawn_test" : "subject_instance_root") : "private_server",
+    launch_mode: fallbackLaunchMode(unit.setup, o),
     session_shell: "unknown",
     shell_integration: absent,
   };
