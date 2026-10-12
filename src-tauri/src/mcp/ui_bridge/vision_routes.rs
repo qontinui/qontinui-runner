@@ -738,6 +738,58 @@ fn normalized_to_region(
     })
 }
 
+/// The status [`resolve_crop_region`] answers when the PAGE did not supply
+/// what a crop needs (an element with no usable geometry, a zero-area rect, a
+/// discovery answer with no element list). Non-2xx on the routes that answer
+/// it directly, labelled [`INPUT_MISSING_CODE`] ([`crop_refusal`]); the model
+/// routes turn it into `unknown{input_missing}` instead
+/// ([`capture_and_encode_png`]). Never 404: that would say "not present".
+const INPUT_MISSING_STATUS: StatusCode = StatusCode::UNPROCESSABLE_ENTITY;
+
+/// The `code` an [`INPUT_MISSING_STATUS`] refusal carries, so the envelope
+/// does not derive `INVALID_REQUEST` (the caller's fault) from the status.
+const INPUT_MISSING_CODE: &str = "INPUT_MISSING";
+
+/// A [`resolve_crop_region`] refusal as the direct (non-model) routes answer
+/// it: the status kept, and an input-missing refusal labelled as such.
+fn crop_refusal(code: StatusCode, msg: String) -> HandlerError {
+    let mut body = api_error(msg);
+    if code == INPUT_MISSING_STATUS {
+        body.code = Some(INPUT_MISSING_CODE.to_string());
+    }
+    (code, Json(body))
+}
+
+/// Map what [`lookup_element_normalized_rect`] found for `id` to the rect,
+/// or to the refusal [`resolve_crop_region`] answers. Pure, so each arm is
+/// pinned by a test: only `NotFound` is a 404.
+fn element_rect_or_refusal(
+    id: &str,
+    lookup: super::screenshots::ElementRectLookup,
+) -> Result<crate::vision::types::NormalizedRect, (StatusCode, String)> {
+    use super::screenshots::ElementRectLookup;
+    match lookup {
+        ElementRectLookup::Found(rect) => Ok(rect),
+        ElementRectLookup::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            format!("element_not_found: '{}'", id),
+        )),
+        // The page did not supply what a crop needs: NOT evidence the
+        // element is absent.
+        ElementRectLookup::NoGeometry => Err((
+            INPUT_MISSING_STATUS,
+            format!("element '{}' carries no usable geometry", id),
+        )),
+        ElementRectLookup::NoElementList => Err((
+            INPUT_MISSING_STATUS,
+            format!(
+                "the element discovery answer carried no `elements` list, so '{}' could not be located",
+                id
+            ),
+        )),
+    }
+}
+
 /// Resolve the optional crop region from a [`CaptureRequest`].
 async fn resolve_crop_region(
     state: &Arc<ApiState>,
@@ -760,18 +812,15 @@ async fn resolve_crop_region(
         return Ok(Some(r));
     }
     if let Some(id) = element {
-        let rect = lookup_element_normalized_rect(state, id)
+        let lookup = lookup_element_normalized_rect(state, id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("element_not_found: '{}'", id),
-                )
-            })?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let rect = element_rect_or_refusal(id, lookup)?;
+        // A zero-area rect (a hidden element) is the page not supplying a
+        // croppable region, not a malformed request.
         let region = normalized_to_region(&rect, frame_w, frame_h).ok_or_else(|| {
             (
-                StatusCode::BAD_REQUEST,
+                INPUT_MISSING_STATUS,
                 format!(
                     "element '{}' resolved to zero-area rect (rect=({:.3},{:.3},{:.3},{:.3}), \
                      frame {}x{})",
@@ -1005,7 +1054,7 @@ async fn do_capture(
 
     let crop = resolve_crop_region(state, &req.region, &req.element, frame.width, frame.height)
         .await
-        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+        .map_err(|(code, msg)| crop_refusal(code, msg))?;
 
     let annotations: Vec<Annotation> = req
         .annotations
@@ -1231,7 +1280,7 @@ async fn do_multi_capture(
     for p in misses {
         let crop = resolve_crop_region(state, &p.req.region, &p.req.element, frame_w, frame_h)
             .await
-            .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+            .map_err(|(code, msg)| crop_refusal(code, msg))?;
         let annotations: Vec<Annotation> = p
             .req
             .annotations
@@ -1463,7 +1512,7 @@ async fn produce_intermediate_frame(
 
     let crop = resolve_crop_region(state, &req.region, &req.element, frame.width, frame.height)
         .await
-        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+        .map_err(|(code, msg)| crop_refusal(code, msg))?;
 
     // Build a *frame-only* pipeline: stages stop short of encode.
     // We can't actually call Pipeline::run because it must terminate in an
@@ -1662,7 +1711,7 @@ async fn vision_raw_handler(
 
     let crop = resolve_crop_region(&state, &req.region, &req.element, frame.width, frame.height)
         .await
-        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+        .map_err(|(code, msg)| crop_refusal(code, msg))?;
 
     let pipeline = build_raw_pipeline(crop);
     let bytes = pipeline.run(frame).map_err(|e| {
@@ -1997,15 +2046,15 @@ fn judge_extraction(
 /// the capture, not the model) with `observedAt: null`: no sample was taken.
 pub(super) async fn run_extract(
     client: &OcrClient,
-    captured: Result<CapturedImage, String>,
+    captured: Result<CapturedImage, CaptureUnknown>,
     min_confidence: f64,
 ) -> Observation<ExtractValue> {
     let captured = match captured {
         Ok(c) => c,
-        Err(detail) => {
+        Err(why) => {
             return Observation::unknown(
-                UnknownCode::ProducerFailed,
-                format!("frame capture failed, so there was no image to read: {detail}"),
+                why.code,
+                why.sentence("read"),
                 Provenance::new(
                     runner_producer(EXTRACT_PRODUCER_ID),
                     chrono::Utc::now(),
@@ -2149,16 +2198,16 @@ fn judge_description(
 /// Run the VLM over a captured image and judge the answer.
 pub(super) async fn run_describe(
     client: &VlmClient,
-    captured: Result<CapturedImage, String>,
+    captured: Result<CapturedImage, CaptureUnknown>,
     extra_prompt: Option<&str>,
     max_tokens: u32,
 ) -> Observation<DescribeValue> {
     let captured = match captured {
         Ok(c) => c,
-        Err(detail) => {
+        Err(why) => {
             return Observation::unknown(
-                UnknownCode::ProducerFailed,
-                format!("frame capture failed, so there was no image to describe: {detail}"),
+                why.code,
+                why.sentence("describe"),
                 Provenance::new(
                     runner_producer(DESCRIBE_PRODUCER_ID),
                     chrono::Utc::now(),
@@ -2197,11 +2246,15 @@ async fn capture_for_model(
     region: &Option<RegionRequest>,
     element: &Option<String>,
     target: &Option<String>,
-) -> Result<Result<CapturedImage, String>, HandlerError> {
+) -> Result<Result<CapturedImage, CaptureUnknown>, HandlerError> {
     match capture_and_encode_png(state, region, element, target).await {
         Ok(c) => Ok(Ok(c)),
         Err(CaptureFailure::Request(code, msg)) => Err((code, Json(api_error(msg)))),
-        Err(CaptureFailure::Failed(msg)) => Ok(Err(msg)),
+        Err(CaptureFailure::Failed(msg)) => Ok(Err(msg.into())),
+        Err(CaptureFailure::InputMissing(detail)) => Ok(Err(CaptureUnknown {
+            code: UnknownCode::InputMissing,
+            detail,
+        })),
     }
 }
 
@@ -2318,6 +2371,57 @@ enum CaptureFailure {
     /// A capture was attempted and failed (window gone, device capture HTTP
     /// error, element lookup IPC failure, encode error).
     Failed(String),
+    /// The page did not supply what the crop needs (an element with no
+    /// geometry, no element list): answered `unknown{input_missing}`.
+    InputMissing(String),
+}
+
+/// Classify a [`resolve_crop_region`] refusal for the model routes: the
+/// page-did-not-supply status is an `input_missing` unknown, any other 4xx is
+/// the caller's malformed request (kept non-2xx), anything else a capture
+/// that was attempted and failed.
+fn crop_failure(code: StatusCode, msg: String) -> CaptureFailure {
+    if code == INPUT_MISSING_STATUS {
+        CaptureFailure::InputMissing(msg)
+    } else if code.is_client_error() {
+        CaptureFailure::Request(code, msg)
+    } else {
+        CaptureFailure::Failed(msg)
+    }
+}
+
+/// Why a model route has no image: the [`UnknownCode`] its observation
+/// carries and the detail. A bare `String` converts as `producer_failed` (a
+/// capture that was attempted and failed).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CaptureUnknown {
+    pub(super) code: UnknownCode,
+    pub(super) detail: String,
+}
+
+impl From<String> for CaptureUnknown {
+    fn from(detail: String) -> Self {
+        Self {
+            code: UnknownCode::ProducerFailed,
+            detail,
+        }
+    }
+}
+
+impl CaptureUnknown {
+    /// The observation's unknown detail, naming why there was no image.
+    fn sentence(&self, what: &str) -> String {
+        match self.code {
+            UnknownCode::InputMissing => format!(
+                "the page did not supply what the crop needs, so there was no image to {what}: {}",
+                self.detail
+            ),
+            _ => format!(
+                "frame capture failed, so there was no image to {what}: {}",
+                self.detail
+            ),
+        }
+    }
 }
 
 /// The frame-source projection every observation's `provenance.source`
@@ -2381,13 +2485,7 @@ async fn capture_and_encode_png(
         .map_err(CaptureFailure::Failed)?;
     let crop = resolve_crop_region(state, region_req, element_id, frame.width, frame.height)
         .await
-        .map_err(|(code, msg)| {
-            if code.is_client_error() {
-                CaptureFailure::Request(code, msg)
-            } else {
-                CaptureFailure::Failed(msg)
-            }
-        })?;
+        .map_err(|(code, msg)| crop_failure(code, msg))?;
     let observed_at = frame.source.captured_at;
     let source = frame_source_projection(&frame, target, crop);
     // PNG-only pipeline. No alpha policy here — we want lossless bytes to
@@ -3479,7 +3577,7 @@ async fn vision_baseline_handler(
         frame.height,
     )
     .await
-    .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+    .map_err(|(code, msg)| crop_refusal(code, msg))?;
     let pipeline = build_pipeline(contract, crop, Vec::new(), Vec::new());
     let bytes = pipeline.run(frame).map_err(|e| {
         (
@@ -4880,7 +4978,12 @@ mod observation_tests {
     async fn extract_with_the_window_gone_is_producer_failed_with_null_observed_at() {
         let client = OcrClient::new(closed_port_endpoint(), "paddleocr");
         let v = envelope_wire(
-            &run_extract(&client, Err("Runner window not found".to_string()), 0.5).await,
+            &run_extract(
+                &client,
+                Err("Runner window not found".to_string().into()),
+                0.5,
+            )
+            .await,
         );
         assert_eq!(v["status"], "unknown");
         assert_eq!(v["unknown"]["code"], "producer_failed");
@@ -4889,6 +4992,31 @@ mod observation_tests {
             .is_some_and(|d| d.contains("frame capture failed")));
         assert!(v["provenance"]["observedAt"].is_null());
         assert!(v["provenance"]["source"].is_null());
+        assert_full_provenance(&v);
+    }
+
+    /// An `element` with no geometry on `/vision/extract`: the page did not
+    /// supply what the crop needs, so the answer is `input_missing` (never
+    /// the 404 that would say "not present", never `producer_failed`).
+    #[tokio::test]
+    async fn extract_over_an_element_with_no_geometry_is_input_missing() {
+        let client = OcrClient::new(closed_port_endpoint(), "paddleocr");
+        let v = envelope_wire(
+            &run_extract(
+                &client,
+                Err(CaptureUnknown {
+                    code: UnknownCode::InputMissing,
+                    detail: "element 'save' carries no geometry (no normalizedRect)".into(),
+                }),
+                0.5,
+            )
+            .await,
+        );
+        assert_eq!(v["status"], "unknown");
+        assert_eq!(v["unknown"]["code"], "input_missing");
+        assert!(v["unknown"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("did not supply")));
         assert_full_provenance(&v);
     }
 
@@ -5341,7 +5469,7 @@ mod observation_tests {
         let v = envelope_wire(
             &run_describe(
                 &client,
-                Err("Runner window not found".to_string()),
+                Err("Runner window not found".to_string().into()),
                 None,
                 256,
             )
@@ -5507,5 +5635,123 @@ mod observation_tests {
         );
         let (status, _) = unknown_target_rejection("unknown vision target 'gone'".into());
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod input_missing_crop_tests {
+    use super::*;
+
+    /// An element with no geometry (or no element list) is the page not
+    /// supplying what the crop needs: `input_missing`, never the 404 that
+    /// says "not present". Only a genuinely absent id is a 404.
+    #[test]
+    fn missing_geometry_is_input_missing_not_a_404() {
+        assert!(matches!(
+            crop_failure(INPUT_MISSING_STATUS, "no geometry".into()),
+            CaptureFailure::InputMissing(_)
+        ));
+        assert!(matches!(
+            crop_failure(StatusCode::NOT_FOUND, "element_not_found".into()),
+            CaptureFailure::Request(StatusCode::NOT_FOUND, _)
+        ));
+        assert!(matches!(
+            crop_failure(StatusCode::INTERNAL_SERVER_ERROR, "ipc".into()),
+            CaptureFailure::Failed(_)
+        ));
+        assert_ne!(INPUT_MISSING_STATUS, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_capture_unknown_keeps_its_code_and_a_bare_string_is_producer_failed() {
+        let missing = CaptureUnknown {
+            code: UnknownCode::InputMissing,
+            detail: "element 'x' carries no geometry".into(),
+        };
+        assert_eq!(missing.code, UnknownCode::InputMissing);
+        assert!(missing.sentence("read").contains("did not supply"));
+        let failed: CaptureUnknown = "Runner window not found".to_string().into();
+        assert_eq!(failed.code, UnknownCode::ProducerFailed);
+        assert!(failed.sentence("read").contains("frame capture failed"));
+    }
+}
+
+#[cfg(test)]
+mod crop_refusal_tests {
+    use super::super::screenshots::ElementRectLookup;
+    use super::*;
+
+    /// Only a genuinely absent id is a 404; missing geometry and a missing
+    /// element list are input-missing (422), never "not present".
+    #[test]
+    fn only_an_absent_element_is_a_404() {
+        let (code, _) = element_rect_or_refusal("x", ElementRectLookup::NotFound).unwrap_err();
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        for lookup in [
+            ElementRectLookup::NoGeometry,
+            ElementRectLookup::NoElementList,
+        ] {
+            let (code, msg) = element_rect_or_refusal("x", lookup.clone()).unwrap_err();
+            assert_eq!(code, INPUT_MISSING_STATUS, "{lookup:?}");
+            assert!(!msg.contains("element_not_found"), "{lookup:?}: {msg}");
+        }
+    }
+
+    /// The direct routes label an input-missing refusal `INPUT_MISSING`, so
+    /// the envelope does not call it the caller's invalid request.
+    #[test]
+    fn a_direct_route_labels_input_missing() {
+        let (code, Json(body)) = crop_refusal(INPUT_MISSING_STATUS, "no geometry".into());
+        assert_eq!(code, INPUT_MISSING_STATUS);
+        assert_eq!(body.code.as_deref(), Some(INPUT_MISSING_CODE));
+        let (code, Json(body)) = crop_refusal(StatusCode::NOT_FOUND, "element_not_found".into());
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(body.code, None);
+    }
+
+    /// Every `resolve_crop_region` call site routes its refusal through
+    /// `crop_refusal` (direct routes) or `crop_failure` (model routes) — a
+    /// bare pass-through would answer an input-missing refusal unlabelled.
+    #[test]
+    fn every_crop_region_call_site_classifies_its_refusal() {
+        let src = include_str!("vision_routes.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production half");
+        let mut sites = 0;
+        for after in production.split("resolve_crop_region(").skip(1) {
+            if after.starts_with("\n    state: &Arc<ApiState>") {
+                continue; // the definition itself
+            }
+            let window: String = after.lines().take(10).collect::<Vec<_>>().join("\n");
+            sites += 1;
+            assert!(
+                window.contains("crop_refusal(") || window.contains("crop_failure("),
+                "a resolve_crop_region call does not classify its refusal:\n{window}"
+            );
+        }
+        assert!(sites >= 6, "expected the 6 known call sites, saw {sites}");
+    }
+}
+
+#[cfg(test)]
+mod input_missing_wiring_pins {
+    /// Two mappings with no pure seam, pinned by source: a zero-area element
+    /// rect is input-missing (not the caller's 400), and the model routes map
+    /// `CaptureFailure::InputMissing` to `UnknownCode::InputMissing`.
+    #[test]
+    fn zero_area_and_capture_input_missing_are_wired() {
+        let src = include_str!("vision_routes.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production half");
+        let zero = production
+            .split("normalized_to_region(&rect, frame_w, frame_h).ok_or_else(")
+            .nth(1)
+            .expect("the element rect -> region conversion");
+        let window: String = zero.lines().take(4).collect::<Vec<_>>().join("\n");
+        assert!(window.contains("INPUT_MISSING_STATUS"), "{window}");
+        let cfm = production
+            .split("Err(CaptureFailure::InputMissing(detail)) =>")
+            .nth(1)
+            .expect("capture_for_model's InputMissing arm");
+        let window: String = cfm.lines().take(4).collect::<Vec<_>>().join("\n");
+        assert!(window.contains("UnknownCode::InputMissing"), "{window}");
     }
 }

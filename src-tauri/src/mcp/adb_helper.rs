@@ -82,17 +82,22 @@ pub fn is_adb_serial(s: &str) -> bool {
 ///
 /// Returns an empty vec on error so callers can treat "no devices" uniformly.
 pub async fn list_devices() -> Vec<AdbDeviceInfo> {
-    spawn_blocking_tracked(|| -> Vec<AdbDeviceInfo> {
-        let mut server = ADBServer::new(default_server_addr());
-        let devices = match server.devices_long() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::debug!(error = %e, "adb_client: devices_long failed");
-                return Vec::new();
-            }
-        };
+    try_list_devices().await.unwrap_or_default()
+}
 
-        devices
+/// [`list_devices`], keeping "adb could not be asked" apart from "adb listed
+/// nothing": `Err` when the adb server is unreachable (or the listing task
+/// failed), so a caller that must not render that UNKNOWN as an absence can
+/// tell the two apart.
+pub async fn try_list_devices() -> Result<Vec<AdbDeviceInfo>, String> {
+    spawn_blocking_tracked(|| -> Result<Vec<AdbDeviceInfo>, String> {
+        let mut server = ADBServer::new(default_server_addr());
+        let devices = server.devices_long().map_err(|e| {
+            tracing::debug!(error = %e, "adb_client: devices_long failed");
+            format!("adb devices failed: {e}")
+        })?;
+
+        Ok(devices
             .into_iter()
             .map(|d| {
                 // DeviceLong::Display renders fields; extract via the struct directly
@@ -101,27 +106,30 @@ pub async fn list_devices() -> Vec<AdbDeviceInfo> {
                 let rendered = format!("{d}");
                 parse_device_line(&rendered)
             })
-            .collect()
+            .collect())
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_else(|e| Err(format!("adb listing task failed: {e}")))
 }
 
-/// Whether `serial` is currently listed by the local adb server as a device.
+/// Whether `serial` is currently listed by the local adb server as a device,
+/// with the unknown kept: `Some(true)` listed, `Some(false)` adb answered and
+/// does not list it, `None` adb could not be asked — which is NOT evidence the
+/// device is absent.
 ///
 /// Used by the vision frame-source resolver to distinguish a real adb target
 /// from an arbitrary label that merely *looks* serial-shaped (e.g. `bogus-id`).
-/// A device in the `offline`/`unauthorized` state still counts as "connected"
-/// here — it is a genuine adb target, just not ready; surfacing the adb-side
-/// error is more useful than masking it as "unknown vision target".
-///
-/// Returns `false` when adb is unreachable or the serial is absent.
-pub async fn is_connected_device(serial: &str) -> bool {
+/// A device in the `offline`/`unauthorized` state still counts as listed —
+/// it is a genuine adb target, just not ready.
+pub async fn connected_device_status(serial: &str) -> Option<bool> {
     let serial = serial.trim();
     if serial.is_empty() {
-        return false;
+        return Some(false);
     }
-    list_devices().await.iter().any(|d| d.serial == serial)
+    try_list_devices()
+        .await
+        .ok()
+        .map(|devices| devices.iter().any(|d| d.serial == serial))
 }
 
 fn parse_device_line(line: &str) -> AdbDeviceInfo {

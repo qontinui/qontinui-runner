@@ -2362,10 +2362,7 @@ async fn ws_collect_components(
     out
 }
 
-/// Build a flat 400 error response from a WS dispatch failure. Mirrors the
-/// shape `wrap_ipc_result` produces for inner-failure envelopes so callers
-/// see a consistent error contract regardless of transport.
-/// The answer the component handlers give for a WS-transport app.
+/// The answer the component READ handlers give for a WS-transport app.
 ///
 /// A wrapper's `{success: false, error}` outcome is a FAILED response
 /// ([`crate::mcp::app_dispatch::ws_result_api_response`]), never
@@ -2382,6 +2379,9 @@ fn component_ws_answer(
     }
 }
 
+/// Build a flat 400 error response from a WS dispatch failure. Mirrors the
+/// shape `wrap_ipc_result` produces for inner-failure envelopes so callers
+/// see a consistent error contract regardless of transport.
 fn ws_dispatch_error_response(error_msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
     let detail = classify_transport_error(&error_msg);
     (

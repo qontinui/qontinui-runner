@@ -1213,7 +1213,7 @@ pub async fn ui_bridge_annotations_export_handler(
 pub(super) async fn lookup_element_normalized_rect(
     state: &Arc<ApiState>,
     element_id: &str,
-) -> Result<Option<crate::vision::types::NormalizedRect>, String> {
+) -> Result<ElementRectLookup, String> {
     // Third instance of the same defect (iter 24, item 7), and the worst-formed
     // of them: this asked for `interactive_only` in SNAKE_CASE and outside the
     // `options` object the SDK actually reads, so BOTH halves were no-ops and
@@ -1223,6 +1223,32 @@ pub(super) async fn lookup_element_normalized_rect(
         .await
         .map_err(|e| format!("discover failed: {}", e))?;
 
+    classify_element_rect(&discover_data, element_id)
+}
+
+/// Classify a discover answer for `element_id` (pure, so each arm is tested).
+///
+/// A discover answer that says it FAILED (`success: false`) is a failed
+/// lookup (`Err`, a producer failure), not a page that supplied no element
+/// list; only an answer with no `elements` array at all is `NoElementList`.
+pub(super) fn classify_element_rect(
+    discover_data: &serde_json::Value,
+    element_id: &str,
+) -> Result<ElementRectLookup, String> {
+    // The answer may be enveloped once (`{success, data}`); a failure at
+    // either level is a failed lookup.
+    for level in [Some(discover_data), discover_data.get("data")]
+        .into_iter()
+        .flatten()
+    {
+        if level.get("success") == Some(&serde_json::Value::Bool(false)) {
+            let err = level
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("the discover answer said success=false with no error");
+            return Err(format!("discover failed: {err}"));
+        }
+    }
     let elements_arr = discover_data
         .get("elements")
         .and_then(|v| v.as_array())
@@ -1234,7 +1260,7 @@ pub(super) async fn lookup_element_normalized_rect(
         });
 
     let Some(elements_arr) = elements_arr else {
-        return Ok(None);
+        return Ok(ElementRectLookup::NoElementList);
     };
 
     for el in elements_arr {
@@ -1242,11 +1268,31 @@ pub(super) async fn lookup_element_normalized_rect(
         if id_str != element_id {
             continue;
         }
-        return Ok(extract_normalized_rect_from_element(el));
+        return Ok(match extract_normalized_rect_from_element(el) {
+            Some(rect) => ElementRectLookup::Found(rect),
+            None => ElementRectLookup::NoGeometry,
+        });
     }
 
-    Ok(None)
+    Ok(ElementRectLookup::NotFound)
 }
+
+/// What [`lookup_element_normalized_rect`] found. Three ways to come back
+/// without a rect, and only ONE of them says the element is not there: the
+/// other two are "the page did not supply what a crop needs" (an
+/// `input_missing` unknown), never "not present".
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ElementRectLookup {
+    /// The element is listed and carries a usable normalized rect.
+    Found(crate::vision::types::NormalizedRect),
+    /// The discover answer lists elements, and none has this id.
+    NotFound,
+    /// The element is listed but carries no `normalizedRect` / geometry.
+    NoGeometry,
+    /// The discover answer carried no `elements` array at all.
+    NoElementList,
+}
+
 // ============================================================================
 // Occlusion sweep - `/control/visibility`
 // ============================================================================
@@ -2638,5 +2684,47 @@ mod page_health_observation_tests {
             .map(String::as_str)
             .collect();
         assert_eq!(top, ["provenance", "status", "value"].into_iter().collect());
+    }
+}
+
+#[cfg(test)]
+mod classify_element_rect_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn each_discover_shape_classifies_to_its_own_arm() {
+        assert_eq!(
+            classify_element_rect(&json!({"elements": []}), "x"),
+            Ok(ElementRectLookup::NotFound)
+        );
+        assert_eq!(
+            classify_element_rect(&json!({"elements": [{"id": "x"}]}), "x"),
+            Ok(ElementRectLookup::NoGeometry)
+        );
+        assert_eq!(
+            classify_element_rect(&json!({"data": {"other": 1}}), "x"),
+            Ok(ElementRectLookup::NoElementList)
+        );
+        // A discover that says it failed is a failed lookup, not "no list".
+        let err =
+            classify_element_rect(&json!({"success": false, "error": "boom"}), "x").unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        // ... one envelope down too.
+        let err = classify_element_rect(
+            &json!({"success": true, "data": {"success": false, "error": "inner"}}),
+            "x",
+        )
+        .unwrap_err();
+        assert!(err.contains("inner"), "{err}");
+        // An element with a usable rect is Found.
+        let found = classify_element_rect(
+            &json!({"elements": [{"id": "x", "normalizedRect": {"x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5}}]}),
+            "x",
+        );
+        assert!(
+            matches!(found, Ok(ElementRectLookup::Found(_))),
+            "{found:?}"
+        );
     }
 }

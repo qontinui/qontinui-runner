@@ -150,6 +150,20 @@ impl Dispatched {
         }
     }
 
+    /// The answer to an ACTION in the `{success, data}` envelope shape.
+    ///
+    /// Same as [`Self::into_envelope`], except that the WebSocket arm's bare
+    /// result is read with the strict action reader first
+    /// ([`ws_action_result_envelope`]): a result with no boolean `success`
+    /// (or no result at all) is an INDETERMINATE failure, never the
+    /// `success: true` [`ws_result_envelope`] defaults a READ to.
+    pub fn into_action_envelope(self) -> serde_json::Value {
+        match self {
+            Self::Http(body) => body,
+            Self::Websocket(result) => ws_action_result_envelope(result),
+        }
+    }
+
     /// The body as the transport delivered it, unnormalized.
     pub fn into_raw(self) -> serde_json::Value {
         match self {
@@ -217,6 +231,20 @@ pub fn ws_result_envelope(result: serde_json::Value) -> serde_json::Value {
         }
     }
     env
+}
+
+/// [`ws_result_envelope`] for an ACTION's result.
+///
+/// A read's bare result (an element list, a snapshot) carries no `success`
+/// of its own, so the envelope defaults it to the command-level `true`. An
+/// action's result is an OUTCOME, and an outcome that does not say it
+/// succeeded did not demonstrably succeed: it is normalized by the one strict
+/// action reader ([`crate::mcp::ui_bridge::request::normalize_action_result`])
+/// first, so a `null` result or one with no boolean `success` arrives as
+/// `success: false` with the `INDETERMINATE:` error, never as success.
+pub fn ws_action_result_envelope(result: serde_json::Value) -> serde_json::Value {
+    let (normalized, _) = crate::mcp::ui_bridge::request::normalize_action_result(result);
+    ws_result_envelope(normalized)
 }
 
 /// A reusable wrapper bundling the registry + relay + http client so handlers
@@ -958,6 +986,39 @@ mod tests {
         assert!(ok.get("code").is_none());
         let http = json!({"success": true, "data": {"x": 1}});
         assert_eq!(Dispatched::Http(http.clone()).into_envelope(), http);
+    }
+
+    #[test]
+    fn an_action_result_with_no_outcome_is_never_success() {
+        use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
+        for bare in [
+            serde_json::Value::Null,
+            json!({"elementId": "x"}),
+            json!({"success": "yes"}),
+        ] {
+            for env in [
+                ws_action_result_envelope(bare.clone()),
+                Dispatched::Websocket(bare.clone()).into_action_envelope(),
+            ] {
+                assert_eq!(env["success"], json!(false), "{bare} -> {env}");
+                assert_eq!(
+                    env["error"],
+                    json!(INDETERMINATE_ACTION_ERROR),
+                    "{bare} -> {env}"
+                );
+            }
+        }
+        // An explicit outcome is kept, either way.
+        assert_eq!(
+            ws_action_result_envelope(json!({"success": true}))["success"],
+            json!(true)
+        );
+        let failed = ws_action_result_envelope(json!({"success": false, "error": "nope"}));
+        assert_eq!(failed["success"], json!(false));
+        assert_eq!(failed["error"], json!("nope"));
+        // The HTTP arm's body is the SDK's own envelope, forwarded verbatim.
+        let http = json!({"success": true, "data": {"success": true}});
+        assert_eq!(Dispatched::Http(http.clone()).into_action_envelope(), http);
     }
 
     /// The typed twin: a failed outcome is a failed `ApiResponse` carrying
