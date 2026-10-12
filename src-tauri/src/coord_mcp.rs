@@ -5531,9 +5531,20 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
             // cannot read) restores PENDING: the first proxied call
             // re-resolves it from the persisted workdir, rather than
             // freezing a standing unknown for the life of the key.
+            // A persisted UNKNOWN (standing or not) also restores pending: an
+            // unknown describes the moment it was measured — the credential,
+            // the coord build — not the repo, and a restart is exactly when
+            // that moment has passed.
             let expected = match binding.expected_tenant.clone() {
-                Some(cwd) => crate::coord_mcp_tenant::SessionExpectation::known(cwd, caller_named),
-                None => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
+                Some(cwd)
+                    if !matches!(
+                        cwd,
+                        qontinui_runner_lib::repo_tenant::CwdTenant::Unknown { .. }
+                    ) =>
+                {
+                    crate::coord_mcp_tenant::SessionExpectation::known(cwd, caller_named)
+                }
+                _ => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
             }
             .with_settle_hook(persist_on_settle());
             // Only DEVICE bindings are ever persisted (OQ3), so a restored entry
@@ -18641,6 +18652,44 @@ mod tests {
                 map.remove(n);
             }
         }
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// A persisted UNKNOWN — even a standing one — restores PENDING, so a
+    /// restart re-resolves it instead of freezing a fact about the credential
+    /// or the coord build that measured it (tenant-follows-repo Phase 4
+    /// review W1).
+    #[test]
+    fn a_persisted_unknown_expectation_restores_pending() {
+        use qontinui_runner_lib::repo_tenant::CwdTenant;
+        let _amb = crate::test_env::isolated_ambient();
+        let _serial = restore_forensics_lock();
+        let (store_dir, store) = temp_store("expectation-unknown");
+        let wd = store_dir.join("wd").to_string_lossy().to_string();
+        let nonce = format!("unk-{}", uuid::Uuid::new_v4().simple());
+        store
+            .store_coord_mcp_nonce_sets(
+                &HashMap::from([(
+                    nonce.clone(),
+                    crate::secure_storage::StoredNonceBinding {
+                        workdir: wd.clone(),
+                        expected_tenant: Some(CwdTenant::unknown(
+                            "coord tenants-for-repo unreadable: 403 (unproven_device_principal)",
+                        )),
+                        ..Default::default()
+                    },
+                )]),
+                &HashMap::new(),
+            )
+            .unwrap();
+        restore_proxy_nonces_from(&store);
+        let (exp, _) = session_expectation_for_nonce(&nonce).expect("restored");
+        assert_eq!(
+            exp.settled(),
+            None,
+            "a persisted unknown restores PENDING, never frozen as settled"
+        );
+        NonceRegistry::global().test_live().remove(&nonce);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
