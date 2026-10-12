@@ -175,6 +175,36 @@ pub fn emit_session_state_ex(
     if let Err(e) = app_handle.emit("claude-session-state", &event) {
         warn!("Failed to emit claude-session-state event: {}", e);
     }
+
+    // Also publish on the event_broadcast channel so the backend relay
+    // (`mcp::backend_relay::handle_outbound` → `chat_session_state`) and the
+    // per-run chat SSE stream (`mcp::task_runs`, `chat/session-state`) see
+    // live transitions. Same wire keys as the Tauri event. Skip the
+    // serialization outright when no WS client is attached, as
+    // `mcp::shared::emit_ai_output` does for `ai-output`.
+    if crate::event_system::ws_notification_has_receivers(app_handle) {
+        match session_state_ws_payload(&event) {
+            Ok(json) => crate::event_system::broadcast_ws_notification(
+                app_handle,
+                SESSION_STATE_WS_CHANNEL,
+                &json,
+            ),
+            Err(e) => warn!("Failed to serialize session-state broadcast: {}", e),
+        }
+    }
+}
+
+/// `event_broadcast` channel carrying [`SessionStateEvent`]s. The backend
+/// relay maps it to the `chat_session_state` frame; the chat SSE stream
+/// forwards it as `chat/session-state`.
+pub const SESSION_STATE_WS_CHANNEL: &str = "session-state";
+
+/// The `payload` published on [`SESSION_STATE_WS_CHANNEL`]: the event's own
+/// wire form (`taskRunId`, `sessionId`, `state`, and `resumed` when set).
+pub(crate) fn session_state_ws_payload(
+    event: &SessionStateEvent,
+) -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(event)
 }
 
 /// List recent AI sessions for the sidebar.

@@ -54,8 +54,10 @@
 //!   ENTIRE runner API surface rides this arm: ~60 routes across its domain
 //!   clients. Each one below is a measured call site, not a guess.
 //! * **qontinui-web's own frontend.** `runnerProxyGet`
-//!   (`digital-twin/_lib/runner-relay.ts`) for `useUiBridge`'s three reads,
-//!   and the co-pilot planner's `POST prompt-home/plan`
+//!   (`digital-twin/_lib/runner-relay.ts`) for `useUiBridge`'s three reads
+//!   and `useRunnerApps`'s `GET /apps` app picker (added with plan
+//!   `2026-10-12-digital-twin-runner-panels-end-to-end`), and the co-pilot
+//!   planner's `POST prompt-home/plan`
 //!   (`lib/co-pilot/planClient.ts`).
 //!
 //! Nothing else in the workspace sends an `http_request` frame.
@@ -122,6 +124,12 @@ pub const RELAY_ALLOWED: &[(&str, &str)] = &[
     ("GET", "/health"),
     ("GET", "/status"),
     // -- qontinui-web: digital-twin UI Bridge panel (`useUiBridge`) -----
+    // `GET /apps` is the panel's app picker (`useRunnerApps`). It returns
+    // full `App` records — repo_root, ui_bridge_url, build/start commands —
+    // the same audience that already reads `/task-runs/{id}/output`.
+    // `GET /apps/{app_id}` (and the registry's writes) stay OFF: no client
+    // calls them over this arm.
+    ("GET", "/apps"),
     ("GET", "/apps/{app_id}/spec/list"),
     ("GET", "/apps/{app_id}/spec/graph"),
     ("GET", "/ui-bridge/control/snapshot"),
@@ -465,6 +473,7 @@ pub(crate) mod tests {
             "/graph",
             "/files",
             "/files/write",
+            "/apps/qontinui-web",
             "/task-runs/{id}/generate-workflow",
             "/executor/restart",
             "/agent-worktrees/reclaim",
@@ -586,6 +595,7 @@ pub(crate) mod tests {
         for (method, path) in [
             ("GET", "/health"),
             ("GET", "/status"),
+            ("GET", "/apps"),
             ("GET", "/apps/qontinui-web/spec/list"),
             ("GET", "/apps/qontinui-web/spec/graph"),
             ("GET", "/ui-bridge/control/snapshot"),
