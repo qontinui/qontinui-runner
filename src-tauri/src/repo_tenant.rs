@@ -616,20 +616,30 @@ type Flight<V> = std::sync::Arc<tokio::sync::OnceCell<V>>;
 struct FlightGuard<'a, K: std::hash::Hash + Eq, V> {
     inflight: &'a std::sync::Mutex<HashMap<K, Flight<V>>>,
     key: Option<K>,
-    flight: Flight<V>,
+    /// `Some` until `drop`, which takes it so this participant's handle is
+    /// released while the lock is still held — two participants dropping
+    /// concurrently then see an exact count, and the last one removes.
+    flight: Option<Flight<V>>,
 }
 
 impl<K: std::hash::Hash + Eq, V> Drop for FlightGuard<'_, K, V> {
     fn drop(&mut self) {
-        let Some(key) = self.key.take() else { return };
+        let (Some(key), Some(flight)) = (self.key.take(), self.flight.take()) else {
+            return;
+        };
         let mut inflight = self
             .inflight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ours = inflight
             .get(&key)
-            .is_some_and(|f| std::sync::Arc::ptr_eq(f, &self.flight));
-        if ours && (self.flight.initialized() || std::sync::Arc::strong_count(&self.flight) <= 2) {
+            .is_some_and(|f| std::sync::Arc::ptr_eq(f, &flight));
+        // A FINISHED flight goes even while other participants still hold it:
+        // a late joiner must never be handed its (possibly uncacheable) result.
+        let done = flight.initialized() || std::sync::Arc::strong_count(&flight) <= 2;
+        // Released under the lock, so the next participant's count is exact.
+        drop(flight);
+        if ours && done {
             inflight.remove(&key);
         }
     }
@@ -694,13 +704,18 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> KeyCache<K, V> {
         let guard = FlightGuard {
             inflight: &self.inflight,
             key: Some(key.to_owned()),
-            flight,
+            flight: Some(flight),
+        };
+        // The guard holds the flight until it drops; borrow the cell from it.
+        let Some(cell) = guard.flight.as_deref() else {
+            // Unreachable — the field is only emptied by `drop` — but an
+            // answer without single-flight beats a panic.
+            return detect().await;
         };
         // Exactly one caller's `detect` runs; the rest wait on it. If that
         // caller is cancelled mid-flight (its budget ran out), the OnceCell
         // hands initialisation to the next waiter.
-        let fresh = guard
-            .flight
+        let fresh = cell
             .get_or_init(move || async move {
                 // A flight that finished between our cache miss and joining
                 // has already stored its (cacheable) answer: use it.
@@ -2331,6 +2346,67 @@ mod tests {
             "the later lookup re-fetched"
         );
         assert!(cache.inflight.lock().unwrap().is_empty());
+    }
+
+    /// A leader finishes with a failure while a joined waiter has not yet
+    /// been polled again. The finished flight must leave the in-flight map
+    /// anyway (the `initialized()` half of the guard's check), so a newcomer
+    /// that misses the cache RE-FETCHES rather than being handed the old
+    /// failure. Without that half the waiter's handle keeps the cell alive
+    /// and the newcomer joins it.
+    #[tokio::test]
+    async fn a_finished_flight_is_removed_even_while_a_waiter_still_holds_it() {
+        use futures::FutureExt;
+        let cache: KeyCache<String, RepoTenantsResult> = KeyCache::new(Duration::from_secs(60));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let release = tokio::sync::Notify::new();
+        let now = Instant::now();
+        let mut leader = Box::pin(cache.lookup(
+            "acme/x",
+            now,
+            || async {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                release.notified().await;
+                Err(RepoTenantsError::transient("503"))
+            },
+            repo_tenants_cacheable,
+        ));
+        assert!((&mut leader).now_or_never().is_none(), "leader is fetching");
+        let mut waiter = Box::pin(cache.lookup(
+            "acme/x",
+            now,
+            || async { unreachable!("the waiter joins the leader's flight") },
+            repo_tenants_cacheable,
+        ));
+        assert!(
+            (&mut waiter).now_or_never().is_none(),
+            "waiter joined the flight"
+        );
+        release.notify_one();
+        assert!(leader.await.is_err(), "the leader's fetch failed");
+        // The waiter is still parked holding its handle on the finished cell.
+        assert!(
+            cache.inflight.lock().unwrap().is_empty(),
+            "a finished flight leaves the map even while a waiter holds it"
+        );
+        let newcomer = cache
+            .lookup(
+                "acme/x",
+                now,
+                || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(answer("acme/x", "none", &[]))
+                },
+                repo_tenants_cacheable,
+            )
+            .await;
+        assert!(
+            newcomer.is_ok(),
+            "the newcomer was not handed the old failure"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The parked waiter still gets the result of the flight it joined.
+        assert!(waiter.await.is_err());
     }
 
     /// A finished flight whose result was NOT cacheable (a failure) is gone
