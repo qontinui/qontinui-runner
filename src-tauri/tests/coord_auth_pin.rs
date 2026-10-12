@@ -853,6 +853,11 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("fleet.rs", "device", 4),
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 5),
+    // The plan-library door's follow-up family (plan
+    // `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+    // Phase 4): ONE shared forward for its five qontinui-web routes, with the
+    // same session-less posture and E3 question as its parent's forwards.
+    ("mcp/plan_library/followups.rs", "work-owed", 1),
     ("mcp/probe_executor.rs", "device", 1),
     ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
@@ -959,11 +964,19 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
 /// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
 /// refuses any principal that does not prove a device. So `device` 21 -> 22.
+///
+/// Plan `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+/// Phase 4 adds one: the plan-library door's follow-up family
+/// (`mcp/plan_library/followups.rs`) forwards its five routes to
+/// **qontinui-web** through a single `forward`, with the same session-less,
+/// artifact-keyed posture as its parent's forwards and the same E3 open
+/// question — web derives `organization_id` from the device principal. So
+/// `work-owed` 8 -> 9.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
     ("session-noop", 11),
     ("session-owed", 0),
-    ("work-owed", 8),
+    ("work-owed", 9),
     ("escalated", 2),
 ];
 
@@ -1122,8 +1135,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 43,
-        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 44,
+        "expected 44 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1175,7 +1188,12 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          bindings and refuses any principal that does not prove a device): 41 + 1 = 42. Plan \
          2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state Phase 4 then \
          added agent_runtime's report_session_launched (POST /agents/{{agent_id}}/session, \
-         session-noop): 42 to 43. Found {sites}. A change here \
+         session-noop): 42 to 43. Plan \
+         2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down Phase 4 then \
+         added mcp/plan_library/followups.rs's single `forward` (work-owed: the follow-up \
+         family's five qontinui-web routes, the same session-less posture as its parent's \
+         forwards): 43 + 1 = 44. \
+         Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
