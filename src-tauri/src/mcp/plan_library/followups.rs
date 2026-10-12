@@ -235,10 +235,12 @@ pub(super) fn write_correction_entries() -> [(&'static str, Value); 3] {
                 "Verb, inside the web route's legal-transition table only: open -> fixing | \
                  already_fixed | dismissed, and fixing -> fixed | open; any other move answers \
                  409 naming the current state. So a follow-up wrongly moved to `fixing` is \
-                 corrected by moving it back to open, but `fixed`, `already_fixed` and \
-                 `dismissed` are TERMINAL through this door — a wrong one is PERMANENT, and \
-                 re-posting the same note from the same artifact returns that resolved row \
-                 rather than a new open one. `dismissed` needs a non-blank `resolution_note`.",
+                 corrected by moving it back to open, and a wrong closure is corrected by \
+                 REOPENING it: a resting state (`fixed`, `already_fixed`, `dismissed`) may move \
+                 back to open, which needs a non-blank `resolution_note` saying why the \
+                 closure was wrong. Re-posting the same note from the same artifact returns \
+                 that resolved row rather than a new open one. `dismissed` needs a non-blank \
+                 `resolution_note`.",
             ),
         ),
         (
@@ -876,9 +878,9 @@ mod tests {
         );
     }
 
-    /// Each write door says how a wrong write is corrected — including the
-    /// two answers that are "it cannot be": a terminal resolution is
-    /// PERMANENT, and the reconcile is not a correction target at all.
+    /// Each write door says how a wrong write is corrected: a wrong closure by
+    /// REOPENING it (with a reason), and the reconcile, which is not a
+    /// correction target at all.
     #[test]
     fn every_write_door_states_its_correction_posture() {
         let entries: std::collections::BTreeMap<&str, Value> =
@@ -899,8 +901,8 @@ mod tests {
         let resolution = entries[EDGE_RESOLUTION].as_str().unwrap();
         for claim in [
             "409",
-            "TERMINAL",
-            "PERMANENT",
+            "REOPENING",
+            "back to open",
             "dismissed",
             "resolution_note",
         ] {
