@@ -522,8 +522,10 @@ impl Selftest<'_> {
                 probe.lag_bound_ms
             ),
             None => format!(
-                "none of {source}'s {} frames could be placed against its presentation time, so whether the probe kept up was never established",
-                probe.frames
+                "not performed: {} of {source}'s {} frames could be placed against their presentation time, and a verdict needs {} — whether the probe kept up was never established",
+                probe.frames - probe.frames_lag_unknown,
+                probe.frames,
+                crate::model::LAG_VERDICT_MIN_FRAMES
             ),
         };
         self.check(
