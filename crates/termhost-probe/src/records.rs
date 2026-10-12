@@ -49,7 +49,20 @@
 //!   to scan it) and `lag_ms` (how long after its presentation the probe
 //!   received it); the summary's `probe` block says whether the probe fell
 //!   behind, in which case the KPIs it could have inflated are
-//!   `unknown(harness_error)`; the sampler has a `probe` group.
+//!   `unknown(harness_error)`; the sampler has a `probe` group. On X11 a
+//!   frame's presentation time is its oldest DAMAGE event's server timestamp
+//!   mapped onto the probe clock; `lag_ms` is `null` for a frame whose
+//!   presentation time is not known (X11's first frame, or a server clock the
+//!   probe could not establish), and `probe.behind` is `null` when no frame's
+//!   was — the KPIs it guards are then `unknown(harness_error)` too, because
+//!   a probe that cannot show it kept up has not.
+//! - **A group's `memory_mb_end` is its memory in the LAST sample**, `null`
+//!   unless that sample was whole: a host that crashed, or a launcher that
+//!   handed off and exited, has no end-of-soak value.
+//! - **A generator's process exit names its session** (`sample.exited[]`
+//!   `session`, from its slot file): that session's marker schedule ends
+//!   there, so a generator killed without an `exit` record is a workload
+//!   death, not a host hang.
 //! - **An assumed refresh rate is marked** (`capture.refresh_assumed`,
 //!   `summary.refresh_assumed`), and every KPI counted in refresh intervals is
 //!   then `unknown(refresh_rate_unknown)`.
@@ -183,8 +196,9 @@ pub struct FrameRecord {
     pub rejected: u32,
     /// How long the probe took to scan this frame.
     pub scan_ms: f64,
-    /// How long after the frame's time the probe received it.
-    pub lag_ms: f64,
+    /// How long after the frame's oldest content was presented the probe
+    /// received it; `null` when that presentation time is not known.
+    pub lag_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -287,6 +301,10 @@ pub struct ExitedProcess {
     pub pid: u32,
     pub group: &'static str,
     pub name: String,
+    /// The session whose generator this was (its slot file named the pid):
+    /// that session's marker schedule ends here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -428,9 +446,11 @@ pub struct DoctorRecord {
 #[derive(Clone, Debug, Serialize)]
 pub struct CheckRecord {
     pub check: String,
-    /// Gated: no mechanism it depends on is INOPERATIVE-ON-THIS-MACHINE (or it
-    /// is `--require`d), so a failure — or a check that could not run — fails
-    /// the selftest.
+    /// Gated: every mechanism it depends on gates (`doctor::gates`: OPERATIVE
+    /// or DEGRADED, or UNKNOWN only for a capture source that opened in an
+    /// operative session and produced no frame) — or it is a `--require`
+    /// check — so a failure, or a check that could not run, fails the
+    /// selftest.
     pub gated: bool,
     /// `None` when the check could not run.
     pub passed: Option<bool>,
@@ -451,6 +471,11 @@ pub struct EndRecord {
 pub struct ProbeHealth {
     /// Primary frames processed.
     pub frames: u64,
+    /// Primary frames whose presentation time was not known, so their lag
+    /// could not be measured (X11's first frame; every X11 frame while the
+    /// server clock is not established). The lag figures below cover the
+    /// others.
+    pub frames_lag_unknown: u64,
     pub scan_ms_p50: Option<f64>,
     pub scan_ms_max: Option<f64>,
     pub lag_ms_p50: Option<f64>,
@@ -460,8 +485,10 @@ pub struct ProbeHealth {
     /// Above this the probe was not keeping up with the source.
     pub lag_bound_ms: f64,
     /// The probe fell behind: latency, loss and cadence are
-    /// unknown(harness_error).
-    pub behind: bool,
+    /// unknown(harness_error). `null` when no primary frame's lag was known —
+    /// whether the probe kept up was never established, and those KPIs are
+    /// unknown(harness_error) as well.
+    pub behind: Option<bool>,
 }
 
 /// The summary `watch` writes last.
@@ -522,6 +549,9 @@ pub struct CrosscheckSummary {
 pub struct ProcessSummary {
     pub cpu_pct: KpiValue,
     pub gpu_pct: KpiValue,
+    /// The group's memory in its LAST sample; `null` unless that sample was
+    /// whole. A host that crashed mid-run, or a launcher PID that handed off
+    /// and exited, has no end-of-soak value — an earlier reading is not one.
     pub memory_mb_end: Option<f64>,
     pub samples: u64,
     /// Samples in which the group had no live process.

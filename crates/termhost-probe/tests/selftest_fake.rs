@@ -60,7 +60,7 @@ fn report(o: &SelftestOutcome) -> String {
 /// The gates a working desktop must pass — one per phase, so a selftest that
 /// silently skipped a phase cannot pass this test. (`selftest_window` and
 /// `input_listener` are recorded only when they fail, so they are not here.)
-const KEY_CHECKS: [&str; 11] = [
+const KEY_CHECKS: [&str; 12] = [
     "clock_aligned",
     "process_sampler",
     "selftest_window_foreground",
@@ -72,6 +72,7 @@ const KEY_CHECKS: [&str; 11] = [
     "untagged_injection_aborts",
     "occlusion_reported",
     "os_not_responding_detected",
+    "probe_kept_up",
 ];
 
 #[test]
@@ -181,4 +182,98 @@ fn an_unknown_capture_mechanism_that_works_passes() {
         "{md}"
     );
     assert!(md.contains("| capture.wgc | UNKNOWN |"), "{md}");
+}
+
+#[test]
+fn fails_when_the_probe_falls_behind_its_source() {
+    // Every frame reaches the probe 80 ms after it was presented: past the
+    // 50 ms bound, so the latencies it read include its own backlog.
+    must_fail(
+        Faults {
+            probe_backlog_ms: 80,
+            ..Faults::default()
+        },
+        "probe_kept_up",
+    );
+}
+
+#[test]
+fn a_probe_that_cannot_place_its_frames_in_time_has_not_shown_it_kept_up() {
+    let o = run_with(Faults {
+        presentation_unknown: true,
+        ..Faults::default()
+    });
+    let c = find(&o, "probe_kept_up");
+    assert!(c.gated, "{}", report(&o));
+    assert_eq!(c.passed, None, "never established: {}", report(&o));
+    assert_eq!(o.exit_code, 1, "{}", o.summary);
+}
+
+#[test]
+fn an_unknown_the_environment_decides_is_recorded_not_gated() {
+    // A GPU-less hosted VM where the PDH query errors: UNKNOWN, and not the
+    // probe's fault, so its check is recorded — failing — but not gated.
+    let mut host = FakeHost::new(Faults::default());
+    host.gpu_facts =
+        termhost_probe::doctor::GpuFacts::Failed("PdhCollectQueryData: 0x800007d5".into());
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let c = find(&o, "gpu_counters_sampled");
+    assert!(!c.gated, "{}", report(&o));
+    assert_eq!(c.passed, Some(false), "it really failed: {}", report(&o));
+    assert!(c.detail.starts_with("not gated"), "{}", c.detail);
+    assert_eq!(
+        o.exit_code,
+        0,
+        "{}
+{}",
+        o.summary,
+        report(&o)
+    );
+}
+
+#[test]
+fn a_capture_source_that_never_opened_is_recorded_not_gated() {
+    // The doctor could not open WGC at all (an HRESULT at CreateForWindow):
+    // what the image allows, not a probe regression. Capture really is dead,
+    // and the selftest records it without failing the job.
+    let mut host = FakeHost::new(Faults {
+        capture_dead: true,
+        ..Faults::default()
+    });
+    host.wgc_facts =
+        termhost_probe::doctor::CaptureFacts::OpenFailed("CreateForWindow: 0x80070005".into());
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let c = find(&o, "capture_visible.wgc");
+    assert!(!c.gated, "{}", report(&o));
+    assert_eq!(c.passed, Some(false), "{}", report(&o));
+    assert_eq!(
+        o.exit_code,
+        0,
+        "{}
+{}",
+        o.summary,
+        report(&o)
+    );
+}
+
+#[test]
+fn an_assumed_refresh_rate_still_cross_checks_with_the_labelled_tolerance() {
+    // Two sources, and a display that reports no refresh rate: the
+    // cross-check runs against the assumed interval, says so, and passes.
+    let mut host = FakeHost::new(Faults::default());
+    host.dda = true;
+    host.refresh_assumed = true;
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let c = find(&o, "capture_crosscheck");
+    assert!(c.gated, "{}", report(&o));
+    assert_eq!(c.passed, Some(true), "{}", report(&o));
+    assert!(c.detail.contains("ASSUMED"), "{}", c.detail);
+    assert_eq!(
+        o.exit_code,
+        0,
+        "{}
+{}",
+        o.summary,
+        report(&o)
+    );
 }

@@ -330,8 +330,12 @@ pub fn resolve(spec: &TargetSpec) -> Result<WindowHandle, String> {
     }
 }
 
-/// DWM's composition period. Since Windows 8.1 the call takes no window and
-/// reports the PRIMARY display, so it is used only for a window on it.
+/// DWM's composition period. Microsoft's documentation of
+/// `DwmGetCompositionTimingInfo` says that starting with Windows 8.1 its
+/// `hwnd` parameter must be NULL (any window handle is E_INVALIDARG), so the
+/// timing is system-wide; it does not say which display that timing follows.
+/// The probe therefore uses it only for a window on the primary monitor, and
+/// reads any other window's own monitor (see [`refresh`]).
 fn dwm_refresh() -> Option<Refresh> {
     let mut timing = DWM_TIMING_INFO {
         cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
@@ -348,7 +352,7 @@ fn dwm_refresh() -> Option<Refresh> {
     (20.0..=500.0).contains(&hz).then(|| Refresh {
         hz,
         ns,
-        source: "DwmGetCompositionTimingInfo (primary display)".into(),
+        source: "DwmGetCompositionTimingInfo (window on the primary monitor)".into(),
         assumed: false,
     })
 }

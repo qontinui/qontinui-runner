@@ -93,7 +93,7 @@ fn capture_facts() -> (CaptureFacts, CaptureFacts) {
     let win = match testwin::GdiTestWindow::create(&opts) {
         Ok(w) => w,
         Err(why) => {
-            let f = CaptureFacts::Failed(format!("could not show the probe window: {why}"));
+            let f = CaptureFacts::OpenFailed(format!("could not show the probe window: {why}"));
             return (f.clone(), f);
         }
     };
@@ -101,7 +101,7 @@ fn capture_facts() -> (CaptureFacts, CaptureFacts) {
     std::thread::sleep(Duration::from_millis(150));
     let painted = win.paint(PaintSlot::Output, Some(expect));
     if let Err(why) = painted {
-        let f = CaptureFacts::Failed(format!("could not paint the probe window: {why}"));
+        let f = CaptureFacts::OpenFailed(format!("could not paint the probe window: {why}"));
         return (f.clone(), f);
     }
     let handle = win.handle();
@@ -113,7 +113,7 @@ fn capture_facts() -> (CaptureFacts, CaptureFacts) {
             probe_capture(&mut src, expect, Duration::from_millis(2000))
         }
         Err(why) if why.contains("not supported") => CaptureFacts::Unavailable(why),
-        Err(why) => CaptureFacts::Failed(why),
+        Err(why) => CaptureFacts::OpenFailed(why),
     };
     let dda_facts = match dda::DdaSource::open(handle) {
         Ok(mut src) => {
@@ -124,7 +124,7 @@ fn capture_facts() -> (CaptureFacts, CaptureFacts) {
         Err(why) if why.contains("UNSUPPORTED") || why.contains("E_ACCESSDENIED") => {
             CaptureFacts::Unavailable(why)
         }
-        Err(why) => CaptureFacts::Failed(why),
+        Err(why) => CaptureFacts::OpenFailed(why),
     };
     win.close();
     (wgc_facts, dda_facts)

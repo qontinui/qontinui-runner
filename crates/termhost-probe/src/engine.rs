@@ -64,8 +64,10 @@ fn capture_loop(
     while !stop.load(Ordering::Relaxed) {
         let status = src.next_frame(Duration::from_millis(50), &mut |raw: RawFrame<'_>| {
             index += 1;
-            // The probe's own health: how late the frame reached it, and how
-            // long scanning took (a probe that falls behind inflates latency).
+            // The probe's own health: how late the frame reached it after its
+            // oldest content was presented — unknown, never 0, when the source
+            // cannot say when that was — and how long scanning took (a probe
+            // that falls behind inflates latency).
             let received = now_ns();
             let result = raster::scan(&raw.view, &scan);
             let scan_ns = now_ns().saturating_sub(received);
@@ -95,7 +97,7 @@ fn capture_loop(
                 rejected: result.rejected.len() as u32,
                 missed: raw.missed,
                 scan_ns,
-                lag_ns: received.saturating_sub(raw.t_ns),
+                lag_ns: raw.presented_ns.map(|p| received.saturating_sub(p)),
             }));
         });
         match status {
@@ -347,5 +349,89 @@ impl Drop for Engine {
         for t in std::mem::take(&mut self.threads) {
             let _ = t.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raster::synth::Canvas;
+
+    const MS: u64 = 1_000_000;
+
+    /// Frames stamped when the probe drained them — like X11's — whose
+    /// content was presented `presented_behind_ms` earlier, or at a time the
+    /// source cannot tell.
+    struct Backlogged {
+        presented_behind_ms: Option<u64>,
+        canvas: Canvas,
+    }
+
+    impl CaptureSource for Backlogged {
+        fn id(&self) -> SourceId {
+            SourceId::Synthetic
+        }
+        fn describe(&self) -> String {
+            "backlogged".into()
+        }
+        fn next_frame(
+            &mut self,
+            _timeout: Duration,
+            f: &mut dyn FnMut(RawFrame<'_>),
+        ) -> CaptureStatus {
+            std::thread::sleep(Duration::from_millis(4));
+            let t_ns = now_ns();
+            f(RawFrame {
+                t_ns,
+                presented_ns: self
+                    .presented_behind_ms
+                    .map(|b| t_ns.saturating_sub(b * MS)),
+                view: self.canvas.view(),
+                origin: (0, 0),
+                missed: None,
+                window_size: (8, 8),
+            });
+            CaptureStatus::Frame
+        }
+    }
+
+    fn run(presented_behind_ms: Option<u64>) -> (WatchSummary, Vec<String>) {
+        let mut setup = EngineSetup::new(ModelConfig::new(SourceId::Synthetic, None, 16_666_667));
+        setup.sources = vec![Box::new(Backlogged {
+            presented_behind_ms,
+            canvas: Canvas::new(8, 8, [0, 0, 0]),
+        })];
+        let (sink, lines) = Sink::memory();
+        let t0 = now_ns();
+        let mut engine = Engine::start(setup, sink, t0);
+        engine.pump_until(t0 + 300 * MS);
+        let (summary, _, _) = engine.finish(now_ns());
+        let lines = lines.lock().expect("lines").clone();
+        (summary, lines)
+    }
+
+    #[test]
+    fn a_frames_lag_runs_from_its_presentation_not_from_when_it_was_drained() {
+        // Damage that waited 120 ms in the socket: the frame is stamped when
+        // drained, but the probe was 120 ms behind the screen.
+        let (s, _) = run(Some(120));
+        assert_eq!(s.probe.behind, Some(true), "{:?}", s.probe);
+        assert!(
+            s.probe.lag_ms_max.is_some_and(|l| l >= 120.0),
+            "{:?}",
+            s.probe
+        );
+        assert_eq!(s.output_latency_ms.reason, Some("harness_error"));
+        // A source that cannot say when its frames were presented: lag
+        // unknown, never 0.
+        let (s, lines) = run(None);
+        assert_eq!(s.probe.behind, None, "{:?}", s.probe);
+        assert!(s.probe.frames > 0 && s.probe.frames_lag_unknown == s.probe.frames);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("\"type\":\"frame\"") && l.contains("\"lag_ms\":null")),
+            "a frame record must say its lag is unknown"
+        );
     }
 }

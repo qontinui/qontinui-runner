@@ -48,7 +48,7 @@ fn frame(source: SourceId, index: u64, t_ms: u64, markers: Vec<MarkerObs>) -> Fr
         rejected: 0,
         missed: None,
         scan_ns: 0,
-        lag_ns: 0,
+        lag_ns: Some(0),
     }
 }
 
@@ -82,8 +82,9 @@ struct Timeline<F: Fn(u64) -> bool, S: Fn(u64) -> WindowSample> {
     /// The window shows each marker 12 ms after it is emitted unless frozen.
     frozen: F,
     sample: S,
-    /// How late each frame reaches the probe.
-    lag_ms: u64,
+    /// How late each frame reaches the probe; `None` = the source cannot
+    /// say when its frames were presented.
+    lag_ms: Option<u64>,
 }
 
 /// Feed `[from_ms, to_ms)` of a timeline into `m`: emissions, frames, good
@@ -107,7 +108,7 @@ fn drive<F: Fn(u64) -> bool, S: Fn(u64) -> WindowSample>(
                 t_ms,
                 vec![obs(MarkerKind::Output, 0, seq as u32)],
             );
-            f.lag_ns = tl.lag_ms * MS;
+            f.lag_ns = tl.lag_ms.map(|l| l * MS);
             out.extend(m.on_frame(f));
         }
         if t_ms % 100 == 50 {
@@ -137,7 +138,7 @@ fn run(
         emit: always,
         frozen,
         sample,
-        lag_ms: 0,
+        lag_ms: Some(0),
     };
     let mut out = drive(&mut m, 0, end_ms, &tl);
     let (rest, summary) = m.finish(end_ms * MS);
@@ -215,7 +216,7 @@ fn a_steady_run_has_no_hangs_and_measures_latency() {
     assert_eq!(s.marker_loss.value, Some(0.0));
     assert_eq!(s.v_actual_max, Some(1));
     assert_eq!(s.sessions_seen, vec![0]);
-    assert!(!s.probe.behind);
+    assert_eq!(s.probe.behind, Some(false));
 }
 
 #[test]
@@ -276,7 +277,7 @@ fn a_generator_blocked_inside_its_write_is_seen_as_pending() {
         emit: |t| t < 5_000,
         frozen: |_| false,
         sample: good_sample,
-        lag_ms: 0,
+        lag_ms: Some(0),
     };
     let mut out = drive(&mut m, 0, 20_000, &tl);
     let (rest, s) = m.finish(20_000 * MS);
@@ -299,11 +300,13 @@ fn an_exited_generator_has_nothing_overdue() {
         load: true,
     });
     m.on_gen_exit(0, 4_950 * MS);
+    // The sampler later sees its process gone too: the earlier end stands.
+    m.on_gen_exit(0, 9_000 * MS);
     let tl = Timeline {
         emit: |t| t < 5_000,
         frozen: |_| false,
         sample: good_sample,
-        lag_ms: 0,
+        lag_ms: Some(0),
     };
     let mut out = drive(&mut m, 0, 20_000, &tl);
     out.extend(m.finish(20_000 * MS).0);
@@ -486,7 +489,7 @@ fn late_real_input_amends_the_interval_and_the_hang_it_let_count() {
         emit: always,
         frozen: |t| (5_000..8_000).contains(&t),
         sample: good_sample,
-        lag_ms: 0,
+        lag_ms: Some(0),
     };
     let out = drive(&mut m, 0, 10_000, &tl);
     let hangs = hang_records(&out);
@@ -630,11 +633,11 @@ fn a_probe_that_falls_behind_reports_harness_error() {
             emit: always,
             frozen: |_| false,
             sample: good_sample,
-            lag_ms,
+            lag_ms: Some(lag_ms),
         };
         drive(&mut m, 0, 20_000, &tl);
         let (_, s) = m.finish(20_000 * MS);
-        assert!(s.probe.behind, "{lag_ms}: {:?}", s.probe);
+        assert_eq!(s.probe.behind, Some(true), "{lag_ms}: {:?}", s.probe);
         for k in [&s.output_latency_ms, &s.frame_interval_ms, &s.marker_loss] {
             assert_eq!(k.reason, Some("harness_error"), "{lag_ms}: {k:?}");
         }
@@ -736,29 +739,42 @@ fn what_was_never_measured_is_null_not_zero() {
     assert_eq!(s.crashes, None, "no host group was sampled");
 }
 
-fn host_sample(
+fn whole_host() -> GroupSample {
+    GroupSample {
+        pids: vec![4],
+        cpu_pct: Some(10.0),
+        memory_mb: Some(50.0),
+        ..GroupSample::default()
+    }
+}
+
+fn empty_host() -> GroupSample {
+    GroupSample {
+        note: Some(crate::sampler::NOTE_EMPTY),
+        ..GroupSample::default()
+    }
+}
+
+fn unreadable_host() -> GroupSample {
+    GroupSample {
+        pids: vec![4],
+        unreadable: 1,
+        note: Some(crate::sampler::NOTE_UNREADABLE),
+        ..GroupSample::default()
+    }
+}
+
+fn sample_at(
+    t_ms: u64,
+    host: Option<GroupSample>,
     exited: Vec<crate::records::ExitedProcess>,
-    empty: bool,
 ) -> crate::records::SampleRecord {
     let mut groups = std::collections::BTreeMap::new();
-    groups.insert(
-        crate::sampler::GROUP_HOST,
-        if empty {
-            GroupSample {
-                note: Some(crate::sampler::NOTE_EMPTY),
-                ..GroupSample::default()
-            }
-        } else {
-            GroupSample {
-                pids: vec![4],
-                cpu_pct: Some(10.0),
-                memory_mb: Some(50.0),
-                ..GroupSample::default()
-            }
-        },
-    );
+    if let Some(h) = host {
+        groups.insert(crate::sampler::GROUP_HOST, h);
+    }
     crate::records::SampleRecord {
-        t_ns: Ns(0),
+        t_ns: Ns(t_ms * MS),
         dt_ms: Some(500.0),
         groups,
         gpu: "measured".into(),
@@ -766,26 +782,202 @@ fn host_sample(
     }
 }
 
+fn host_sample(
+    exited: Vec<crate::records::ExitedProcess>,
+    empty: bool,
+) -> crate::records::SampleRecord {
+    sample_at(
+        0,
+        Some(if empty { empty_host() } else { whole_host() }),
+        exited,
+    )
+}
+
+fn exited(pid: u32, group: &'static str, session: Option<u16>) -> crate::records::ExitedProcess {
+    crate::records::ExitedProcess {
+        pid,
+        group,
+        name: format!("pid-{pid}"),
+        session,
+    }
+}
+
 #[test]
 fn host_process_exits_count_as_crashes() {
     let mut m = Model::new(cfg(), 0);
     m.on_process_sample(&host_sample(
-        vec![
-            crate::records::ExitedProcess {
-                pid: 4,
-                group: "host",
-                name: "host.exe".into(),
-            },
-            crate::records::ExitedProcess {
-                pid: 5,
-                group: "workload",
-                name: "node.exe".into(),
-            },
-        ],
+        vec![exited(4, "host", None), exited(5, "workload", None)],
         false,
     ));
     let (_, s) = m.finish(1_000 * MS);
     assert_eq!(s.crashes, Some(1));
+}
+
+#[test]
+fn memory_at_the_end_is_null_unless_the_last_sample_was_whole() {
+    let end = |seq: Vec<GroupSample>| {
+        let mut m = Model::new(cfg(), 0);
+        for (i, g) in seq.into_iter().enumerate() {
+            m.on_process_sample(&sample_at(i as u64 * 500, Some(g), vec![]));
+        }
+        let (_, s) = m.finish(200_000 * MS);
+        s.processes["host"].memory_mb_end
+    };
+    // The orchestrator passed a launcher's PID (wt.exe hands off and exits):
+    // one whole sample of the launcher, then nothing.
+    let mut launcher = vec![whole_host()];
+    launcher.extend((0..29).map(|_| empty_host()));
+    assert_eq!(
+        end(launcher),
+        None,
+        "the launcher's few MB are not the host's end-of-soak memory"
+    );
+    // A host that crashed at minute 1 of 2.
+    let mut crashed: Vec<GroupSample> = (0..120).map(|_| whole_host()).collect();
+    crashed.extend((0..120).map(|_| empty_host()));
+    assert_eq!(
+        end(crashed),
+        None,
+        "a pre-crash reading is not the end value"
+    );
+    // The last sample could not be read whole.
+    assert_eq!(
+        end(vec![whole_host(), whole_host(), unreadable_host()]),
+        None
+    );
+    // A whole last sample is the end value, whatever came before it.
+    assert_eq!(
+        end(vec![empty_host(), unreadable_host(), whole_host()]),
+        Some(50.0)
+    );
+}
+
+#[test]
+fn a_generator_killed_without_an_exit_record_is_not_a_host_hang() {
+    // The generator is killed at 5 s and writes no `exit` record, so the
+    // window (rightly) stops updating. Its schedule alone would keep marker
+    // 50 overdue to the end of the run — a "hang" — until the sampler sees
+    // its process gone (5.2 s) and names its session from the slot file.
+    let mut m = Model::new(cfg(), 0);
+    m.on_gen_start(GenSchedule {
+        session: 0,
+        t0_ns: 0,
+        marker_hz: 10.0,
+        load: true,
+    });
+    let tl = Timeline {
+        emit: |t| t < 5_000,
+        frozen: |_| false,
+        sample: good_sample,
+        lag_ms: Some(0),
+    };
+    let mut out = drive(&mut m, 0, 5_200, &tl);
+    m.on_process_sample(&sample_at(
+        5_200,
+        None,
+        vec![exited(103, "workload", Some(0))],
+    ));
+    out.extend(drive(&mut m, 5_200, 20_000, &tl));
+    let (rest, s) = m.finish(20_000 * MS);
+    out.extend(rest);
+    assert!(hang_records(&out).is_empty(), "{:?}", hang_records(&out));
+    assert_eq!(s.hangs.value, Some(0.0), "{:?}", s.hangs);
+    // Another workload process exiting (a shell) ends no schedule.
+    let mut m = Model::new(cfg(), 0);
+    m.on_gen_start(GenSchedule {
+        session: 0,
+        t0_ns: 0,
+        marker_hz: 10.0,
+        load: true,
+    });
+    let mut out = drive(&mut m, 0, 5_200, &tl);
+    m.on_process_sample(&sample_at(5_200, None, vec![exited(102, "workload", None)]));
+    out.extend(drive(&mut m, 5_200, 20_000, &tl));
+    out.extend(m.finish(20_000 * MS).0);
+    assert_eq!(hang_records(&out).len(), 1, "the generator is still due");
+}
+
+#[test]
+fn a_generator_that_exits_behind_schedule_leaves_nothing_pending() {
+    // A slow host: the generator's writes ran late, and when the stop file
+    // came (5 s) it had written only through marker 40 (due 4.0 s) and
+    // exited. The host showed everything it was given; markers 41.. were
+    // never written, so nothing is pending after the exit.
+    let mut m = Model::new(cfg(), 0);
+    m.on_gen_start(GenSchedule {
+        session: 0,
+        t0_ns: 0,
+        marker_hz: 10.0,
+        load: true,
+    });
+    m.on_gen_exit(0, 5_000 * MS);
+    let tl = Timeline {
+        emit: |t| t <= 4_000,
+        frozen: |_| false,
+        sample: good_sample,
+        lag_ms: Some(0),
+    };
+    let mut out = drive(&mut m, 0, 20_000, &tl);
+    out.extend(m.finish(20_000 * MS).0);
+    assert!(hang_records(&out).is_empty(), "{:?}", hang_records(&out));
+}
+
+#[test]
+fn a_probe_that_cannot_place_its_frames_in_time_has_not_shown_it_kept_up() {
+    // Every frame's presentation time unknown — an X server clock the probe
+    // could not establish.
+    let mut m = Model::new(cfg(), 0);
+    let tl = Timeline {
+        emit: always,
+        frozen: |_| false,
+        sample: good_sample,
+        lag_ms: None,
+    };
+    let out = drive(&mut m, 0, 20_000, &tl);
+    let (_, s) = m.finish(20_000 * MS);
+    assert_eq!(s.probe.behind, None, "{:?}", s.probe);
+    assert!(s.probe.frames > 100, "{:?}", s.probe);
+    assert_eq!(s.probe.frames_lag_unknown, s.probe.frames);
+    assert_eq!(s.probe.lag_ms_max, None, "unknown, not 0");
+    for k in [
+        &s.output_latency_ms,
+        &s.frame_interval_ms,
+        &s.marker_loss,
+        &s.hangs,
+    ] {
+        assert_eq!(k.state, KpiState::Unknown, "{k:?}");
+        assert_eq!(k.reason, Some("harness_error"), "{k:?}");
+    }
+    let frame = out
+        .iter()
+        .find(|r| matches!(r, Record::Frame(_)))
+        .expect("a frame record");
+    assert!(
+        crate::records::to_line(frame).contains("\"lag_ms\":null"),
+        "{}",
+        crate::records::to_line(frame)
+    );
+}
+
+#[test]
+fn lag_is_judged_over_the_frames_whose_presentation_is_known() {
+    // X11's first frame has no damage behind it; every later one does.
+    let mut m = Model::new(cfg(), 0);
+    let mut first = frame(SourceId::Wgc, 0, 1, vec![]);
+    first.lag_ns = None;
+    m.on_frame(first);
+    let tl = Timeline {
+        emit: always,
+        frozen: |_| false,
+        sample: good_sample,
+        lag_ms: Some(5),
+    };
+    drive(&mut m, 0, 20_000, &tl);
+    let (_, s) = m.finish(20_000 * MS);
+    assert_eq!(s.probe.frames_lag_unknown, 1);
+    assert_eq!(s.probe.behind, Some(false), "{:?}", s.probe);
+    assert_eq!(s.probe.lag_ms_max, Some(5.0));
+    assert_eq!(s.output_latency_ms.state, KpiState::Measured);
 }
 
 #[test]

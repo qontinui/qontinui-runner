@@ -4,6 +4,16 @@
 //! root window's framebuffer. The frame time is `CLOCK_MONOTONIC` when the
 //! damage batch was received.
 //!
+//! The probe's own lag is measured against when the damage HAPPENED, not when
+//! it was drained. Every DamageNotify carries the server's millisecond
+//! timestamp of the drawing (the server updates its current time before
+//! stamping the event), and round trips on a private, never-mapped window map
+//! that clock onto the probe's ([`ServerClock`]). A frame's presentation time
+//! is the oldest damage it shows, so damage that queued in the socket while
+//! the probe was busy scanning shows up as lag — and trips the `behind` guard
+//! — instead of vanishing into a frame time taken when the queue was finally
+//! drained.
+//!
 //! The read covers the window's full width over the damaged rows plus a
 //! margin: a host that repaints only the changed cells of a marker (the start
 //! sentinel is the same every time) still has its whole marker re-read.
@@ -18,21 +28,40 @@ use x11rb::connection::Connection;
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
-use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Window};
+use x11rb::protocol::xproto::{
+    AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, ImageFormat, PropMode, Window,
+    WindowClass,
+};
 use x11rb::protocol::Event;
+use x11rb::wrapper::ConnectionExt as _;
 
 use super::x11::{wait_readable, Display};
 use crate::clock::now_ns;
+use crate::platform::common::{oldest_damage_ns, ServerClock};
 use crate::platform::{CaptureSource, CaptureStatus, RawFrame, WindowHandle};
 use crate::raster::{FrameView, PixelFormat, Rect};
 use crate::records::SourceId;
 
 /// Rows re-read above and below a damaged rectangle.
 const MARGIN_ROWS: i32 = 64;
+/// How often the server clock mapping is renewed while capturing.
+const CLOCK_SYNC_EVERY_NS: u64 = 2_000_000_000;
+/// Round trips tried when the source opens.
+const CLOCK_SYNC_TRIES: u32 = 5;
 
 struct Shm {
     seg: u32,
     map: MmapMut,
+}
+
+/// A round trip whose PropertyNotify has not been read yet.
+#[derive(Clone, Copy, Debug)]
+struct SyncBracket {
+    /// The low 16 bits of the ChangeProperty's sequence number, which the
+    /// PropertyNotify it caused carries.
+    sequence: u16,
+    sent_ns: u64,
+    answered_ns: u64,
 }
 
 pub struct X11Source {
@@ -42,8 +71,48 @@ pub struct X11Source {
     format: PixelFormat,
     shm: Option<Shm>,
     shm_note: Option<String>,
-    pending: Vec<Rect>,
+    /// Damaged rectangles not yet read, with each event's server timestamp.
+    pending: Vec<(Rect, u32)>,
     initial: bool,
+    /// DAMAGE timestamps on the probe clock.
+    clock: ServerClock,
+    /// An unmapped input-only window of ours and the property whose
+    /// zero-length appends make the server stamp a PropertyNotify; `None` if
+    /// it could not be created (every frame's lag is then unknown).
+    clock_window: Option<(Window, u32)>,
+    sync: Option<SyncBracket>,
+    next_sync_ns: u64,
+}
+
+/// An unmapped input-only window (never shown, never focused) whose property
+/// changes the server stamps with its current time.
+fn clock_window(d: &Display) -> Result<(Window, u32), String> {
+    let atom = d
+        .conn
+        .intern_atom(false, b"_TERMHOST_PROBE_CLOCK")
+        .map_err(|e| e.to_string())?
+        .reply()
+        .map_err(|e| format!("InternAtom: {e}"))?
+        .atom;
+    let win = d.conn.generate_id().map_err(|e| e.to_string())?;
+    d.conn
+        .create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            win,
+            d.root,
+            -1,
+            -1,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| format!("CreateWindow: {e}"))?;
+    Ok((win, atom))
 }
 
 /// A shared-memory segment of `size` bytes the X server can write into
@@ -139,7 +208,8 @@ impl X11Source {
                 None => (None, Some("MIT-SHM did not answer".into())),
             }
         };
-        Ok(X11Source {
+        let clock_window = clock_window(&d).ok();
+        let mut src = X11Source {
             d,
             target: w,
             damage,
@@ -148,7 +218,23 @@ impl X11Source {
             shm_note,
             pending: Vec::new(),
             initial: true,
-        })
+            clock: ServerClock::default(),
+            clock_window,
+            sync: None,
+            next_sync_ns: 0,
+        };
+        for _ in 0..CLOCK_SYNC_TRIES {
+            src.sync_clock();
+            src.drain()?;
+            if src.clock.is_established() {
+                break;
+            }
+        }
+        // Damage from before the first frame is moot: that frame reads the
+        // whole window, and its queueing time is not the probe's lag.
+        src.pending.clear();
+        src.next_sync_ns = now_ns() + CLOCK_SYNC_EVERY_NS;
+        Ok(src)
     }
 
     /// Why reads go through plain GetImage, if they do.
@@ -156,16 +242,62 @@ impl X11Source {
         self.shm_note.as_deref()
     }
 
+    /// Whether DAMAGE timestamps can be placed on the probe clock (frames
+    /// carry a presentation time, so the probe's lag is measured).
+    pub fn clock_established(&self) -> bool {
+        self.clock.is_established()
+    }
+
+    /// Start one round trip that brackets a server timestamp: a zero-length
+    /// append to the clock window's property, checked — so when this returns
+    /// the server has processed it and the PropertyNotify it caused is queued
+    /// on the connection. [`Self::drain`] reads that event and feeds the
+    /// bracket to the clock.
+    fn sync_clock(&mut self) {
+        let Some((win, atom)) = self.clock_window else {
+            return;
+        };
+        let sent_ns = now_ns();
+        let Ok(cookie) =
+            self.d
+                .conn
+                .change_property8(PropMode::APPEND, win, atom, AtomEnum::STRING, &[])
+        else {
+            return;
+        };
+        let sequence = cookie.sequence_number() as u16;
+        if cookie.check().is_ok() {
+            self.sync = Some(SyncBracket {
+                sequence,
+                sent_ns,
+                answered_ns: now_ns(),
+            });
+        }
+    }
+
     fn drain(&mut self) -> Result<(), String> {
         loop {
             match self.d.conn.poll_for_event() {
                 Ok(Some(Event::DamageNotify(ev))) if ev.damage == self.damage => {
-                    self.pending.push(Rect {
-                        x: i32::from(ev.area.x),
-                        y: i32::from(ev.area.y),
-                        w: u32::from(ev.area.width),
-                        h: u32::from(ev.area.height),
-                    });
+                    self.pending.push((
+                        Rect {
+                            x: i32::from(ev.area.x),
+                            y: i32::from(ev.area.y),
+                            w: u32::from(ev.area.width),
+                            h: u32::from(ev.area.height),
+                        },
+                        ev.timestamp,
+                    ));
+                }
+                Ok(Some(Event::PropertyNotify(ev)))
+                    if self.clock_window == Some((ev.window, ev.atom)) =>
+                {
+                    // Only the event of the round trip in flight: its
+                    // bracket is the one that contains the server's read.
+                    if let Some(b) = self.sync.filter(|b| b.sequence == ev.sequence) {
+                        self.sync = None;
+                        self.clock.observe(b.sent_ns, b.answered_ns, ev.time);
+                    }
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => return Ok(()),
@@ -180,6 +312,7 @@ impl X11Source {
         region: Rect,
         win: Rect,
         t_ns: u64,
+        presented_ns: Option<u64>,
         f: &mut dyn FnMut(RawFrame<'_>),
     ) -> Result<(), String> {
         let (w, h) = (region.w as usize, region.h as usize);
@@ -208,6 +341,7 @@ impl X11Source {
                     FrameView::new(bytes, w, h, w * 4, self.format).map_err(|e| e.to_string())?;
                 f(RawFrame {
                     t_ns,
+                    presented_ns,
                     view,
                     origin,
                     // X11 damage cannot say how many frames were skipped.
@@ -235,6 +369,7 @@ impl X11Source {
                     .map_err(|e| e.to_string())?;
                 f(RawFrame {
                     t_ns,
+                    presented_ns,
                     view,
                     origin,
                     // X11 damage cannot say how many frames were skipped.
@@ -254,14 +389,19 @@ impl CaptureSource for X11Source {
 
     fn describe(&self) -> String {
         format!(
-            "X11 DAMAGE + {} of window 0x{:x} on {}",
+            "X11 DAMAGE + {} of window 0x{:x} on {}; {}",
             if self.shm.is_some() {
                 "MIT-SHM GetImage"
             } else {
                 "GetImage (no shared memory)"
             },
             self.target,
-            self.d.name
+            self.d.name,
+            if self.clock.is_established() {
+                "damage timestamps on the probe clock (frame lag measured)"
+            } else {
+                "the server clock could not be established (frame lag unknown)"
+            }
         )
     }
 
@@ -274,12 +414,19 @@ impl CaptureSource for X11Source {
             return CaptureStatus::Timeout;
         };
         let t_ns;
+        let presented_ns;
         let region = if self.initial {
-            // The window as it is now: the first frame.
+            // The window as it is now: the first frame. When its content was
+            // drawn is not known, so neither is its lag.
             self.initial = false;
             t_ns = now_ns();
+            presented_ns = None;
             Some(visible)
         } else {
+            if now_ns() >= self.next_sync_ns {
+                self.sync_clock();
+                self.next_sync_ns = now_ns() + CLOCK_SYNC_EVERY_NS;
+            }
             if let Err(e) = self.drain() {
                 return CaptureStatus::Ended(e);
             }
@@ -290,11 +437,17 @@ impl CaptureSource for X11Source {
                 }
             }
             t_ns = now_ns();
+            let mut stamps = Vec::new();
             let touched: Vec<Rect> = self
                 .pending
                 .drain(..)
-                .filter_map(|r| r.intersect(&visible))
+                .filter_map(|(r, ms)| {
+                    let on_screen = r.intersect(&visible)?;
+                    stamps.push(ms);
+                    Some(on_screen)
+                })
                 .collect();
+            presented_ns = oldest_damage_ns(&self.clock, &stamps);
             touched
                 .iter()
                 .map(|r| (r.y, r.bottom()))
@@ -312,7 +465,7 @@ impl CaptureSource for X11Source {
         let Some(region) = region else {
             return CaptureStatus::Timeout;
         };
-        match self.read(region, win, t_ns, f) {
+        match self.read(region, win, t_ns, presented_ns, f) {
             Ok(()) => CaptureStatus::Frame,
             Err(e) => CaptureStatus::Lost(e),
         }
@@ -324,6 +477,9 @@ impl Drop for X11Source {
         let _ = self.d.conn.damage_destroy(self.damage);
         if let Some(shm) = &self.shm {
             let _ = self.d.conn.shm_detach(shm.seg);
+        }
+        if let Some((win, _)) = self.clock_window {
+            let _ = self.d.conn.destroy_window(win);
         }
         let _ = self.d.conn.flush();
     }
