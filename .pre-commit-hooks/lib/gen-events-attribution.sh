@@ -244,7 +244,8 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     # vendored crate the root manifest's `[patch.crates-io]` substitutes into
     # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
     # crates were missing until 2026-09-30: an edit to either cleared a guilty
-    # pusher. `gen_events_uncovered_path_deps` below now walks the manifests
+    # pusher. `crates/pty-holder` was missing the same way until 2026-10-12.
+    # `gen_events_uncovered_path_deps` below now walks the manifests
     # and reports any in-repo path dependency no entry covers; the
     # `gen-events-path-deps` pre-commit hook runs it on every Cargo.toml edit,
     # and the attribution self-test runs it too. To look by hand,
