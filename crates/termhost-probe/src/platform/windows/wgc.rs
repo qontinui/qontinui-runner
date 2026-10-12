@@ -152,6 +152,8 @@ impl WgcSource {
                 .read(&self.dev, &tex, (0, 0, w, h), |view| {
                     f(RawFrame {
                         t_ns,
+                        // SystemRelativeTime is when the frame was composed.
+                        presented_ns: Some(t_ns),
                         view,
                         origin: (0, 0),
                         // WGC drops frames silently: it cannot say how many.

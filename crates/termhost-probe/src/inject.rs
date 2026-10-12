@@ -10,6 +10,11 @@
 //!    one, and a listener that stopped hearing the probe would not hear the
 //!    operator either);
 //! 3. the target window is foreground on an interactive, unlocked desktop.
+//!    On X11 that is the keyboard focus. One redirection stays undetected: a
+//!    keyboard grab held by another client takes XTEST's keys whatever the
+//!    focus says, and probing for one would itself disturb the target —
+//!    accepted on the benchmark's private Xvfb, where nothing grabs (see
+//!    `platform::common::x11_focus_verdict`).
 //!
 //! Before anything happens — before `--activate` moves focus, before the
 //! first key — the desktop must have been quiet for a while (`--quiet-ms`),
@@ -212,11 +217,25 @@ fn abort(
     }
 }
 
+/// The first key this injector cannot type, as (index, why).
+fn untypeable(keys: &[char], inj: &dyn KeyInjector) -> Option<(u32, String)> {
+    keys.iter()
+        .enumerate()
+        .find(|(_, &c)| !inj.can_send(c))
+        .map(|(i, &ch)| {
+            (
+                i as u32,
+                format!("key {i} ({ch:?}) cannot be typed here; nothing was sent"),
+            )
+        })
+}
+
 /// Run one arm. `input` should have been subscribed before anything that
 /// precedes the arm (activation): input queued in it aborts the arm before
 /// the first key. `after_key(index, t_inject_ns, injector)` runs after each
 /// key is sent and checked (the selftest uses it to expect echoes and to send
-/// its one untagged key).
+/// its one untagged key). `inject` establishes typeability before it moves
+/// focus; the arm checks it again, for callers that did not.
 pub fn run_arm(
     cfg: &ArmConfig,
     inj: &mut dyn KeyInjector,
@@ -224,14 +243,8 @@ pub fn run_arm(
     sink: &mut Sink,
     mut after_key: impl FnMut(u32, u64, &mut dyn KeyInjector),
 ) -> ArmOutcome {
-    if let Some((i, &ch)) = cfg.keys.iter().enumerate().find(|(_, &c)| !inj.can_send(c)) {
-        return abort(
-            sink,
-            i as u32,
-            AbortReason::UnsupportedKey,
-            format!("key {i} ({ch:?}) cannot be typed here; nothing was sent"),
-            0,
-        );
+    if let Some((i, detail)) = untypeable(&cfg.keys, inj) {
+        return abort(sink, i, AbortReason::UnsupportedKey, detail, 0);
     }
     let start = now_ns() + cfg.start_delay.as_nanos() as u64;
     let interval = cfg.interval.as_nanos() as u64;
@@ -411,6 +424,17 @@ pub fn run_cmd(host: &mut dyn crate::platform::Host, cmd: &InjectCmd) -> anyhow:
             )
         }
     };
+    // Every key must be typeable before anything happens on the desktop: an
+    // arm that moved focus and then refused would have disturbed the
+    // operator's desktop for nothing.
+    if let Some((i, detail)) = untypeable(&cmd.keys, inj.as_ref()) {
+        let _refused = abort(&mut sink, i, AbortReason::UnsupportedKey, detail.clone(), 0);
+        return finish(
+            &mut sink,
+            EXIT_ABORTED,
+            format!("refused (unsupported_key) before any focus change or key: {detail}"),
+        );
+    }
     if let Err((reason, detail)) = await_quiet(&mut sub, cmd.quiet) {
         let _refused = abort(&mut sink, 0, reason, detail.clone(), 0);
         return finish(

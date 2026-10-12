@@ -18,11 +18,14 @@ name: termhost-bench probe
 # Each job runs `doctor --json` first and writes it to the job summary, so an
 # INOPERATIVE mechanism is recorded with its reason rather than silently
 # skipped, and the selftest appends its own summary there (every check, gated
-# or not, and the mechanisms). The selftest gates every check unless a
-# mechanism it depends on is INOPERATIVE-ON-THIS-MACHINE — an UNKNOWN one
-# (the doctor's proof got no frame) gates, so a probe regression turns the job
-# red instead of un-gating the checks — plus every mechanism named by
-# `--require`:
+# or not, and the mechanisms). The selftest gates a check when every
+# mechanism it depends on is OPERATIVE or DEGRADED — or UNKNOWN in the one
+# case a probe regression produces: a capture source that OPENED in an
+# operative interactive session and then delivered no frame, which turns the
+# job red instead of un-gating the checks that would catch the regression.
+# Any other UNKNOWN (a capture source that never opened, a GPU counter query
+# that errored) is the environment's to decide and is recorded, not gated.
+# Every mechanism named by `--require` must be OPERATIVE:
 #   - ubuntu: capture.x11, input.safe and clock.aligned are REQUIRED. Xvfb is a
 #     fully controlled X server, so an inoperative X11 path there is a defect in
 #     the instrument, never an environment limit — and without the requirement

@@ -64,6 +64,14 @@ pub enum TargetSpec {
 pub struct RawFrame<'a> {
     /// Frame time on the probe clock.
     pub t_ns: u64,
+    /// When the OLDEST content this frame shows was presented, on the probe
+    /// clock, known independently of when the probe got to it: `t_ns` itself
+    /// for WGC and Desktop Duplication (their frame time IS the presentation
+    /// time); for X11 the oldest DAMAGE event's server timestamp, mapped onto
+    /// the probe clock. `None` when it is not known (X11's first frame, or a
+    /// server clock not yet established): the frame's lag is then unknown,
+    /// never 0.
+    pub presented_ns: Option<u64>,
     pub view: FrameView<'a>,
     /// Where `view`'s (0, 0) sits in window coordinates, so marker rects are
     /// reported window-relative for every source.

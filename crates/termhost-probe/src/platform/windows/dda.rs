@@ -316,6 +316,9 @@ impl CaptureSource for DdaSource {
                         match self.staging.read(&self.dev, &tex, region, |view| {
                             f(RawFrame {
                                 t_ns,
+                                // LastPresentTime is when the desktop image
+                                // was presented.
+                                presented_ns: Some(t_ns),
                                 view,
                                 origin,
                                 missed: Some(missed),

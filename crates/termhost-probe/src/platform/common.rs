@@ -1,7 +1,8 @@
 //! Platform-independent helpers the Windows and X11 layers share: occlusion
-//! geometry, target selection by title, X11's foreground rule, the GPU counter
-//! instance-name parser, and the doctor's capture probe. All pure or
-//! trait-generic, so they are tested on every platform.
+//! geometry, target selection by title, X11's foreground rule, the X server
+//! clock mapping, the GPU counter instance-name parser, and the doctor's
+//! capture probe. All pure or trait-generic, so they are tested on every
+//! platform.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -93,6 +94,15 @@ pub fn pick_by_title<H: Copy>(matches: &[(H, u64)], text: &str, unique: bool) ->
 /// must agree as well (`active_top` against `target_top`, both top-level
 /// windows); it is never enough on its own, because it goes stale when focus
 /// moves to an override-redirect popup or a client sets the focus itself.
+///
+/// What this rule cannot see: an active keyboard GRAB. A client holding
+/// `GrabKeyboard` receives every key event — XTEST's included — whatever the
+/// focus says, and the core protocol has no query for whether another client
+/// holds a grab; the only probe is attempting a grab of one's own, which
+/// itself sends the focused window FocusOut/FocusIn (a terminal repaints on
+/// those) and so disturbs what is being measured. Undetected, and accepted:
+/// the benchmark's X displays are private Xvfb servers on which no other
+/// client grabs the keyboard.
 pub fn x11_focus_verdict(
     focus_chain: &[u32],
     target: u32,
@@ -107,6 +117,66 @@ pub fn x11_focus_verdict(
         return false;
     }
     active_top.is_none_or(|a| a == target_top)
+}
+
+/// An X server's 32-bit millisecond clock — the timestamps on its events —
+/// mapped onto the probe clock. The mapping comes from round trips that
+/// bracket a server timestamp: the probe reads its clock, makes the server
+/// stamp an event (a zero-length property append yields a PropertyNotify
+/// carrying the server's current time, the ICCCM's way to obtain one), and
+/// reads its clock again once the request has been processed. The server read
+/// its time somewhere inside that bracket, so a mapping is good to half the
+/// bracket's width plus the timestamp's 1 ms truncation; a wider bracket than
+/// [`ServerClock::MAX_BRACKET_NS`] is refused. Nothing is assumed about which
+/// clock the server reads (Xorg and Xvfb read `CLOCK_MONOTONIC`, a remote or
+/// containerised server need not).
+///
+/// Wrap-around (every 49.7 days) is handled by reading a timestamp's distance
+/// from the reference as a signed 32-bit number of milliseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServerClock {
+    /// (probe ns at the bracket's midpoint, the server ms read inside it).
+    reference: Option<(u64, u32)>,
+}
+
+impl ServerClock {
+    /// The widest bracket accepted: the mapping is then good to 3 ms, against
+    /// a 50 ms lag bound.
+    pub const MAX_BRACKET_NS: u64 = 4_000_000;
+
+    /// A round trip sent at `sent_ns` and answered at `answered_ns` (probe
+    /// clock), inside which the server read `server_ms`. Returns whether it
+    /// was accepted; an accepted bracket replaces the previous reference, so
+    /// periodic round trips follow any drift between the two clocks.
+    pub fn observe(&mut self, sent_ns: u64, answered_ns: u64, server_ms: u32) -> bool {
+        let Some(width) = answered_ns.checked_sub(sent_ns) else {
+            return false;
+        };
+        if width > Self::MAX_BRACKET_NS {
+            return false;
+        }
+        self.reference = Some((sent_ns + width / 2, server_ms));
+        true
+    }
+
+    pub fn is_established(&self) -> bool {
+        self.reference.is_some()
+    }
+
+    /// Server timestamp `ms` on the probe clock; `None` until a round trip
+    /// has been accepted.
+    pub fn to_probe_ns(&self, ms: u32) -> Option<u64> {
+        let (probe_ns, server_ms) = self.reference?;
+        let delta_ms = i64::from(ms.wrapping_sub(server_ms) as i32);
+        u64::try_from(i128::from(probe_ns) + i128::from(delta_ms) * 1_000_000).ok()
+    }
+}
+
+/// When the oldest damage in a batch happened, on the probe clock: the
+/// earliest of its events' server timestamps. `None` while the server clock
+/// is not established (or for an empty batch).
+pub fn oldest_damage_ns(clock: &ServerClock, stamps: &[u32]) -> Option<u64> {
+    stamps.iter().filter_map(|&ms| clock.to_probe_ns(ms)).min()
 }
 
 /// Parse a `\GPU Engine(*)` instance name —
@@ -259,6 +329,63 @@ mod tests {
         // PointerRoot / None, or no focus reply at all.
         assert!(!x11_focus_verdict(&[1], 0x50, None, 0x50));
         assert!(!x11_focus_verdict(&[], 0x50, None, 0x50));
+    }
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn server_timestamps_map_through_the_round_trip_midpoint() {
+        let mut c = ServerClock::default();
+        assert!(!c.is_established());
+        assert_eq!(c.to_probe_ns(5_000), None, "nothing before a round trip");
+        // The server read 5000 ms somewhere inside [1000.0, 1000.4] ms.
+        assert!(c.observe(1_000 * MS, 1_000 * MS + 400_000, 5_000));
+        assert!(c.is_established());
+        assert_eq!(c.to_probe_ns(5_000), Some(1_000 * MS + 200_000));
+        assert_eq!(c.to_probe_ns(5_120), Some(1_120 * MS + 200_000));
+        assert_eq!(c.to_probe_ns(4_990), Some(990 * MS + 200_000));
+    }
+
+    #[test]
+    fn server_timestamps_survive_the_32_bit_wrap() {
+        let mut c = ServerClock::default();
+        let near_wrap = u32::MAX - 5;
+        assert!(c.observe(500 * MS, 500 * MS, near_wrap));
+        // 10 ms after the reference, past the wrap; 10 ms before it.
+        assert_eq!(c.to_probe_ns(4), Some(510 * MS));
+        assert_eq!(c.to_probe_ns(u32::MAX - 15), Some(490 * MS));
+    }
+
+    #[test]
+    fn a_wide_or_inverted_round_trip_is_refused_and_a_later_one_wins() {
+        let mut c = ServerClock::default();
+        assert!(
+            !c.observe(0, ServerClock::MAX_BRACKET_NS + 1, 7),
+            "too wide"
+        );
+        assert!(
+            !c.observe(10 * MS, 9 * MS, 7),
+            "answered before it was sent"
+        );
+        assert!(!c.is_established());
+        assert!(c.observe(100 * MS, 102 * MS, 1_000));
+        assert_eq!(c.to_probe_ns(1_000), Some(101 * MS));
+        // The clocks drifted 2 ms apart (the old reference maps 5997 to
+        // 5098 ms): the newer bracket is the reference.
+        assert!(c.observe(5_100 * MS, 5_100 * MS, 5_997));
+        assert_eq!(c.to_probe_ns(5_997), Some(5_100 * MS));
+        // A refused bracket leaves the reference alone.
+        assert!(!c.observe(6_000 * MS, 6_100 * MS, 1));
+        assert_eq!(c.to_probe_ns(5_997), Some(5_100 * MS));
+    }
+
+    #[test]
+    fn a_damage_batch_is_as_old_as_its_oldest_event() {
+        let mut c = ServerClock::default();
+        assert_eq!(oldest_damage_ns(&c, &[10, 20]), None, "no clock yet");
+        assert!(c.observe(1_000 * MS, 1_000 * MS, 1_000));
+        assert_eq!(oldest_damage_ns(&c, &[1_020, 880, 1_005]), Some(880 * MS));
+        assert_eq!(oldest_damage_ns(&c, &[]), None);
     }
 
     #[test]

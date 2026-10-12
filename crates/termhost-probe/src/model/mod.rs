@@ -46,8 +46,9 @@ pub struct FrameObs {
     pub missed: Option<u32>,
     /// How long the probe took to scan the frame.
     pub scan_ns: u64,
-    /// How long after `t_ns` the probe received the frame.
-    pub lag_ns: u64,
+    /// How long after the frame's oldest content was presented the probe
+    /// received it; `None` when the source could not say when that was.
+    pub lag_ns: Option<u64>,
 }
 
 /// The measured window's state at one instant. `None` = could not be
@@ -243,6 +244,8 @@ pub struct Model {
     host_sampled: bool,
     crashes: u64,
     lags: Vec<u64>,
+    /// Primary frames whose lag could not be measured.
+    lag_unknown: u64,
     scans: Vec<u64>,
     finished: bool,
 }
@@ -281,6 +284,7 @@ impl Model {
             host_sampled: false,
             crashes: 0,
             lags: Vec::new(),
+            lag_unknown: 0,
             scans: Vec::new(),
             finished: false,
         }
@@ -343,7 +347,10 @@ impl Model {
                     .filter(|m| m.kind == MarkerKind::Output)
                     .map(|m| m.session),
             );
-            self.lags.push(f.lag_ns);
+            match f.lag_ns {
+                Some(lag) => self.lags.push(lag),
+                None => self.lag_unknown += 1,
+            }
             self.scans.push(f.scan_ns);
         }
         for m in &f.markers {
@@ -396,7 +403,7 @@ impl Model {
                     markers: f.markers,
                     rejected: f.rejected,
                     scan_ms: f.scan_ns as f64 / 1e6,
-                    lag_ms: f.lag_ns as f64 / 1e6,
+                    lag_ms: f.lag_ns.map(|l| l as f64 / 1e6),
                 }),
             );
         }
@@ -448,10 +455,11 @@ impl Model {
         self.schedules.insert(s.session, (s, None));
     }
 
-    /// A generator exited (its `exit` record).
+    /// A generator ended at `t_ns`: its `exit` record, or its process seen
+    /// gone. The earliest report stands.
     pub fn on_gen_exit(&mut self, session: u16, t_ns: u64) {
         if let Some((_, exit)) = self.schedules.get_mut(&session) {
-            *exit = Some(t_ns);
+            *exit = Some(exit.map_or(t_ns, |x| x.min(t_ns)));
         }
     }
 
@@ -474,11 +482,21 @@ impl Model {
             if let Some(gp) = g.gpu_pct {
                 acc.gpu.push(gp);
             }
-            if g.memory_mb.is_some() {
-                acc.memory_end = g.memory_mb;
-            }
+            // The END value is the last sample's, whole or not: after a host
+            // crashed, or a launcher handed off and exited, an earlier
+            // reading is not the end-of-soak memory.
+            acc.memory_end = g.memory_mb;
         }
         self.crashes += s.exited.iter().filter(|e| e.group == GROUP_HOST).count() as u64;
+        // A generator killed without writing its `exit` record (its slot
+        // file named the pid): its schedule ends where its process was seen
+        // gone, so nothing it was due to write is pending after that — a
+        // dead generator is a workload death, never a host hang.
+        for e in &s.exited {
+            if let Some(session) = e.session {
+                self.on_gen_exit(session, s.t_ns.0);
+            }
+        }
     }
 
     /// Visible sessions: the declared set, else every session the primary
@@ -497,14 +515,17 @@ impl Model {
     }
 
     /// When the marker a generator's schedule says is next became due, if
-    /// that was at or before `cutoff` and the generator had not exited by
-    /// then. A generator blocked INSIDE its PTY write (a host that stopped
-    /// draining) logs nothing at all, so only its schedule shows it pending.
-    fn overdue_marker(&self, session: u16, cutoff: u64) -> Option<u64> {
+    /// that was at or before `cutoff` and the generator still existed at `t`
+    /// (the evaluation time). A generator blocked INSIDE its PTY write (a
+    /// host that stopped draining) logs nothing at all, so only its schedule
+    /// shows it pending. Once the generator has ended — its `exit` record, or
+    /// its process seen gone — nothing of its schedule is pending any more:
+    /// it will never write that marker, so waiting for it is not a hang.
+    fn overdue_marker(&self, session: u16, cutoff: u64, t: u64) -> Option<u64> {
         let (sched, exit) = self.schedules.get(&session)?;
         let next = self.last_logged.get(&session).map_or(0, |s| s + 1);
         let due = sched.due_ns(next)?;
-        (due <= cutoff && exit.is_none_or(|x| x > due)).then_some(due)
+        (due <= cutoff && exit.is_none_or(|x| x > t)).then_some(due)
     }
 
     /// The earliest emission among visible sessions' output markers that have
@@ -532,7 +553,7 @@ impl Model {
                     note(tail[0].t_emit_ns);
                 }
             }
-            if let Some(due) = self.overdue_marker(session, cutoff) {
+            if let Some(due) = self.overdue_marker(session, cutoff, t) {
                 note(due);
             }
         }
@@ -711,14 +732,17 @@ impl Model {
         };
         let bound_ms = self.cfg.lag_bound_ns as f64 / 1e6;
         ProbeHealth {
-            frames: lags.len() as u64,
+            frames: lags.len() as u64 + self.lag_unknown,
+            frames_lag_unknown: self.lag_unknown,
             scan_ms_p50: pct_ms(&scans, 50),
             scan_ms_max: scans.last().map(|&s| s as f64 / 1e6),
             lag_ms_p50: pct_ms(&lags, 50),
             lag_ms_judged: judged,
             lag_ms_max: lags.last().map(|&l| l as f64 / 1e6),
             lag_bound_ms: bound_ms,
-            behind: judged.is_some_and(|j| j > bound_ms),
+            // Judged only over frames whose lag is known; with none, whether
+            // the probe kept up was never established.
+            behind: judged.map(|j| j > bound_ms),
         }
     }
 
@@ -738,13 +762,22 @@ impl Model {
 
         let refresh_ns = self.cfg.refresh_ns;
         let probe = self.probe_health();
+        // Frames arrived, but not one could be placed against its
+        // presentation time: the probe cannot show it kept up.
+        let lag_unknown = probe.frames > 0 && probe.behind.is_none();
+        let lag_unknown_detail = || {
+            format!(
+                "no primary frame's presentation time was known ({} frames), so the probe cannot show it kept up with them",
+                probe.frames
+            )
+        };
         // What makes capture-derived KPIs unknown, in precedence order.
         let blocked: Option<(&'static str, String)> = if !self.cfg.capture_available {
             Some((
                 "capture_unavailable",
                 "no capture source able to be primary was opened (Desktop Duplication is the cross-check only)".into(),
             ))
-        } else if probe.behind {
+        } else if probe.behind == Some(true) {
             Some((
                 "harness_error",
                 format!(
@@ -753,6 +786,8 @@ impl Model {
                     probe.lag_bound_ms
                 ),
             ))
+        } else if lag_unknown {
+            Some(("harness_error", lag_unknown_detail()))
         } else {
             None
         };
@@ -810,6 +845,13 @@ impl Model {
                 tally.valid,
                 "no primary capture source, so a window that stopped updating cannot be seen"
                     .to_string(),
+            )
+        } else if lag_unknown {
+            KpiValue::unknown(
+                stats::HANGS,
+                "harness_error",
+                tally.valid,
+                lag_unknown_detail(),
             )
         } else if probe.lag_ms_max.is_some_and(|m| m > hang_lag_limit) {
             KpiValue::unknown(

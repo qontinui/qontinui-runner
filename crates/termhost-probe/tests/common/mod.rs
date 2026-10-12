@@ -47,6 +47,12 @@ pub struct Faults {
     pub drop_keys: bool,
     /// The compositor never presents a frame.
     pub capture_dead: bool,
+    /// Every frame reaches the probe this long after it was presented (the
+    /// probe is behind its source).
+    pub probe_backlog_ms: u64,
+    /// The source cannot say when its frames were presented (an X server
+    /// clock the probe could not establish).
+    pub presentation_unknown: bool,
 }
 
 struct State {
@@ -133,14 +139,18 @@ impl Desktop {
 }
 
 /// The compositor: presents the window on the vsync grid when it changed.
+/// A frame's time is its vsync, and it counts as presented when the fake
+/// delivers it — so the capture thread's wake-up jitter lands in neither the
+/// latencies nor the probe's lag, unless a fault says otherwise.
 struct FakeCapture {
+    id: SourceId,
     desk: Arc<Desktop>,
     last: u64,
 }
 
 impl CaptureSource for FakeCapture {
     fn id(&self) -> SourceId {
-        SourceId::Wgc
+        self.id
     }
     fn describe(&self) -> String {
         "fake compositor".into()
@@ -157,8 +167,12 @@ impl CaptureSource for FakeCapture {
                     self.last = generation;
                     let c = self.desk.canvas.lock().expect("canvas");
                     let view = c.view();
+                    let faults = self.desk.faults;
+                    let presented_ns = (!faults.presentation_unknown)
+                        .then(|| now_ns().saturating_sub(faults.probe_backlog_ms * 1_000_000));
                     f(RawFrame {
-                        t_ns: present_at + self.desk.faults.capture_lag_ms * 1_000_000,
+                        t_ns: present_at + faults.capture_lag_ms * 1_000_000,
+                        presented_ns,
                         view,
                         origin: (0, 0),
                         missed: None,
@@ -328,19 +342,32 @@ pub struct FakeHost {
     pub desk: Arc<Desktop>,
     /// What the doctor's WGC proof reports (a decoded frame by default).
     pub wgc_facts: CaptureFacts,
+    /// What the doctor's GPU counter probe reports (absent by default).
+    pub gpu_facts: GpuFacts,
+    /// A second source, Desktop Duplication, sees the same desktop.
+    pub dda: bool,
+    /// The display reports no refresh rate (60 Hz is assumed).
+    pub refresh_assumed: bool,
     /// Times `activate` was called on the injector.
     pub activations: Arc<AtomicU64>,
+}
+
+fn decoded() -> CaptureFacts {
+    CaptureFacts::Frame {
+        decoded: Ok(Marker::new(MarkerKind::Calibration, 0, 0)),
+        degraded: None,
+        detail: "fake".into(),
+    }
 }
 
 impl FakeHost {
     pub fn new(faults: Faults) -> FakeHost {
         FakeHost {
             desk: Desktop::new(faults),
-            wgc_facts: CaptureFacts::Frame {
-                decoded: Ok(Marker::new(MarkerKind::Calibration, 0, 0)),
-                degraded: None,
-                detail: "fake".into(),
-            },
+            wgc_facts: decoded(),
+            gpu_facts: GpuFacts::Absent("fake".into()),
+            dda: false,
+            refresh_assumed: false,
             activations: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -356,7 +383,11 @@ impl Host for FakeHost {
                 state: Ok("fake interactive desktop".into()),
             },
             wgc: self.wgc_facts.clone(),
-            dda: CaptureFacts::NotApplicable("fake desktop has one source".into()),
+            dda: if self.dda {
+                decoded()
+            } else {
+                CaptureFacts::NotApplicable("fake desktop has one source".into())
+            },
             x11: CaptureFacts::NotApplicable("fake".into()),
             input: InputFacts {
                 supported: Ok(()),
@@ -364,18 +395,23 @@ impl Host for FakeHost {
                 injector: Ok("fake injector".into()),
             },
             clock: ClockFacts::Measured(alignment(1_000, 50_000, 30)),
-            gpu: GpuFacts::Absent("fake".into()),
+            gpu: self.gpu_facts.clone(),
         }
     }
     fn source_kinds(&self) -> Vec<SourceId> {
-        vec![SourceId::Wgc]
+        if self.dda {
+            vec![SourceId::Wgc, SourceId::Dda]
+        } else {
+            vec![SourceId::Wgc]
+        }
     }
     fn open_source(
         &mut self,
-        _kind: SourceId,
+        kind: SourceId,
         _target: WindowHandle,
     ) -> Result<Box<dyn CaptureSource>, String> {
         Ok(Box::new(FakeCapture {
+            id: kind,
             desk: self.desk.clone(),
             last: 0,
         }))
@@ -418,7 +454,7 @@ impl Host for FakeHost {
             hz: 60.0,
             ns: REFRESH_NS,
             source: "fake".into(),
-            assumed: false,
+            assumed: self.refresh_assumed,
         }
     }
     fn process_reader(&mut self) -> Box<dyn ProcessReader> {

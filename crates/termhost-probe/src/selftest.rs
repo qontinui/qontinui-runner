@@ -4,12 +4,16 @@
 //!
 //! On a window of its own, with the same engine `watch` runs:
 //!
-//! 1. the doctor's verdicts. Every check below is GATED — its failure, or
-//!    its failure to run, fails the selftest — unless a mechanism it depends
-//!    on is INOPERATIVE-ON-THIS-MACHINE (a hard dependency is absent). An
-//!    UNKNOWN or DEGRADED mechanism gates: a probe regression that makes the
-//!    doctor's own capture proof fail must turn the selftest red, not quietly
-//!    un-gate the checks that would have caught it;
+//! 1. the doctor's verdicts. A check is GATED — its failure, or its failure
+//!    to run, fails the selftest — when every mechanism it depends on gates
+//!    ([`doctor::gates`]): OPERATIVE and DEGRADED ones do; an
+//!    INOPERATIVE-ON-THIS-MACHINE one never does; an UNKNOWN one only when
+//!    it is a capture source that opened in an OPERATIVE interactive session
+//!    and then produced no frame — so a probe regression that breaks the
+//!    doctor's own capture proof turns the selftest red instead of
+//!    un-gating the checks that would have caught it, while an UNKNOWN the
+//!    environment decides (a source that never opened, a GPU counter query
+//!    that errored) is recorded with its reason and does not fail the job;
 //! 2. clock alignment with Node's `process.hrtime` (a pipe round trip);
 //! 3. the process sampler on the probe's own process;
 //! 4. each operative capture source sees a calibration marker;
@@ -22,7 +26,15 @@
 //! 9. ONE untagged injection is classified as not-ours and aborts the arm;
 //! 10. occluding the window mid-run turns `hangs` into unknown(occluded);
 //! 11. (Windows) a window that stops pumping messages is reported "not
-//!     responding".
+//!     responding";
+//! 12. the probe kept up with its primary source over the whole run (frame
+//!     lag measured against presentation, within the bound), so the latency
+//!     the checks above read was not the probe's own backlog.
+//!
+//! When the display reports no refresh rate, the one-refresh-interval
+//! tolerance of checks 5 and 6 is the assumed 60 Hz interval, and each says
+//! so: a bound on the instrument's error against a schedule the selftest
+//! controls, not a KPI.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,7 +45,7 @@ use serde_json::{json, Value};
 
 use crate::clock::{now_ns, sleep_until_ns};
 use crate::codec::{marker_seq, Marker, MarkerKind};
-use crate::doctor::{self, ClockFacts, State};
+use crate::doctor::{self, ClockFacts, Facts, State};
 use crate::engine::{Engine, EngineSetup};
 use crate::feed::SharedFeed;
 use crate::inject::{letters, run_arm, ArmConfig, ArmOutcome};
@@ -41,7 +53,7 @@ use crate::model::{EmitSource, Emitted, FramesMode, ModelConfig, MonitorPresence
 use crate::platform::{
     Host, InputMonitor, KeyInjector, PaintSlot, Tagging, TestWindow, TestWindowOptions,
 };
-use crate::records::{CheckRecord, DoctorRecord, FileMode, Record, Sink, SourceId};
+use crate::records::{CheckRecord, DoctorRecord, FileMode, ProbeHealth, Record, Sink, SourceId};
 use crate::sampler::{Sampler, SamplerConfig, GROUP_HOST};
 use crate::stats;
 
@@ -144,21 +156,27 @@ struct Selftest<'a> {
     host: &'a mut dyn Host,
     cfg: &'a SelftestConfig,
     out: &'a mut Sink,
+    facts: Facts,
     doctor: DoctorRecord,
     checks: Vec<CheckRecord>,
 }
 
 impl Selftest<'_> {
-    /// Not ruled out on this machine: OPERATIVE, DEGRADED or UNKNOWN. Only an
-    /// INOPERATIVE-ON-THIS-MACHINE mechanism (a hard dependency absent) is
-    /// skipped and un-gates the checks that depend on it.
+    /// Not ruled out on this machine: OPERATIVE, DEGRADED or UNKNOWN — worth
+    /// attempting. Only an INOPERATIVE-ON-THIS-MACHINE mechanism (a hard
+    /// dependency absent) is skipped.
     fn usable(&self, id: &str) -> bool {
         doctor::state_of(&self.doctor, id) != State::Inoperative
     }
 
+    /// Whether checks on `id` gate the selftest ([`doctor::gates`]).
+    fn gating(&self, id: &str) -> bool {
+        doctor::gates(&self.facts, &self.doctor, id)
+    }
+
     fn deps_reason(&self, deps: &[&'static str]) -> String {
         deps.iter()
-            .filter(|d| !self.usable(d))
+            .filter(|d| !self.gating(d))
             .map(|d| {
                 let m = self.doctor.mechanisms.iter().find(|m| m.id == *d);
                 format!(
@@ -179,7 +197,7 @@ impl Selftest<'_> {
         detail: impl Into<String>,
         data: Value,
     ) {
-        let gated = deps.iter().all(|d| self.usable(d));
+        let gated = deps.iter().all(|d| self.gating(d));
         let mut detail = detail.into();
         if !gated {
             detail = format!("not gated — {}. {detail}", self.deps_reason(deps));
@@ -472,7 +490,44 @@ impl Selftest<'_> {
         if self.host.reports_hung_windows() {
             self.os_hung_phase(&mut engine, &win);
         }
-        engine.finish(now_ns());
+        let (summary, _, _) = engine.finish(now_ns());
+        if let Some(p) = primary {
+            self.probe_kept_up(p, &summary.probe);
+        }
+    }
+
+    /// The probe's own health over the run: every latency the checks above
+    /// read assumes the probe saw each frame promptly. A frame it could not
+    /// place against its presentation time proves nothing either way, so a
+    /// run with no such placement could not show it kept up.
+    fn probe_kept_up(&mut self, primary: SourceId, probe: &ProbeHealth) {
+        let source = primary.as_str();
+        let detail = match probe.behind {
+            Some(false) => format!(
+                "{} {source} frames reached the probe within the {:.0} ms lag bound (judged {:.1} ms, max {:.1} ms; {} frame(s) had no presentation time)",
+                probe.frames,
+                probe.lag_bound_ms,
+                probe.lag_ms_judged.unwrap_or_default(),
+                probe.lag_ms_max.unwrap_or_default(),
+                probe.frames_lag_unknown
+            ),
+            Some(true) => format!(
+                "the probe fell behind {source}: frames reached it up to {:.1} ms after presentation (bound {:.0} ms), so the latencies it measured include its own backlog",
+                probe.lag_ms_judged.unwrap_or_default(),
+                probe.lag_bound_ms
+            ),
+            None => format!(
+                "none of {source}'s {} frames could be placed against its presentation time, so whether the probe kept up was never established",
+                probe.frames
+            ),
+        };
+        self.check(
+            "probe_kept_up",
+            &[capture_mechanism(primary)],
+            probe.behind.map(|behind| !behind),
+            detail,
+            serde_json::to_value(probe).unwrap_or(Value::Null),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -584,17 +639,16 @@ impl Selftest<'_> {
         markers: &[Marker],
         refresh: &crate::platform::Refresh,
     ) {
+        // The latency checks' tolerance, labelled the same way when the
+        // display reports no rate: a bound on the instrument's error, not a
+        // KPI (which is why `watch` reports its own cross-check as not
+        // performed then).
         let refresh_ms = refresh.ns as f64 / 1e6;
-        if refresh.assumed {
-            self.check(
-                "capture_crosscheck",
-                &[capture_mechanism(primary), capture_mechanism(secondary)],
-                None,
-                "not performed: the display reports no refresh rate, so agreement within one refresh interval cannot be judged",
-                json!({ "refresh_assumed": true }),
-            );
-            return;
-        }
+        let tolerance = if refresh.assumed {
+            format!("{refresh_ms:.2} ms, ASSUMED: the display reports no refresh rate")
+        } else {
+            format!("one refresh interval, {refresh_ms:.2} ms")
+        };
         let (mut compared, mut disagreed, mut coalesced) = (0u32, 0u32, 0u32);
         let mut max_abs: f64 = 0.0;
         for &m in markers {
@@ -620,11 +674,18 @@ impl Selftest<'_> {
             &[capture_mechanism(primary), capture_mechanism(secondary)],
             Some(compared > 0 && disagreed == 0),
             format!(
-                "{compared} markers seen cleanly by both {} and {}: {disagreed} first appeared more than one refresh interval ({refresh_ms:.2} ms) apart (max |delta| {max_abs:.2} ms; {coalesced} coalesced by the secondary)",
+                "{compared} markers seen cleanly by both {} and {}: {disagreed} first appeared further apart than {tolerance} (max |delta| {max_abs:.2} ms; {coalesced} coalesced by the secondary)",
                 primary.as_str(),
                 secondary.as_str()
             ),
-            json!({ "compared": compared, "disagreed": disagreed, "coalesced": coalesced, "max_abs_delta_ms": max_abs }),
+            json!({
+                "compared": compared,
+                "disagreed": disagreed,
+                "coalesced": coalesced,
+                "max_abs_delta_ms": max_abs,
+                "refresh_ms": refresh_ms,
+                "refresh_assumed": refresh.assumed,
+            }),
         );
     }
 
@@ -961,6 +1022,7 @@ pub fn run(host: &mut dyn Host, cfg: &SelftestConfig, out: &mut Sink) -> Selftes
         host,
         cfg,
         out,
+        facts: facts.clone(),
         doctor: report,
         checks: Vec::new(),
     };
@@ -1036,7 +1098,7 @@ fn md_cell(s: &str) -> String {
 /// (gated or not, with why), and the mechanisms the doctor found.
 pub fn render_markdown(o: &SelftestOutcome, title: &str) -> String {
     let mut s = format!(
-        "### {}\n\n**{}** — {} gated check(s), {} failed; {} not gated (a mechanism they depend on is INOPERATIVE-ON-THIS-MACHINE).\n\n",
+        "### {}\n\n**{}** — {} gated check(s), {} failed; {} not gated (a mechanism they depend on is INOPERATIVE-ON-THIS-MACHINE, or UNKNOWN for a reason the environment decides).\n\n",
         md_cell(title),
         if o.exit_code == 0 { "PASS" } else { "FAIL" },
         o.summary["gated"],
@@ -1084,7 +1146,7 @@ pub fn render_human(o: &SelftestOutcome) -> String {
         s.push_str(&format!("  {tag}  {:<34} {}\n", c.check, c.detail));
     }
     s.push_str(&format!(
-        "\n{} gated check(s), {} failed — exit {}\n(lower-case = not gated: a mechanism it depends on is INOPERATIVE-ON-THIS-MACHINE)\n",
+        "\n{} gated check(s), {} failed — exit {}\n(lower-case = not gated: a mechanism it depends on is INOPERATIVE-ON-THIS-MACHINE, or UNKNOWN for a reason the environment decides)\n",
         o.summary["gated"], o.summary["failed"], o.exit_code
     ));
     s

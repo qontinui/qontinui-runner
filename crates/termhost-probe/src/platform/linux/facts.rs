@@ -88,17 +88,30 @@ fn capture_facts() -> CaptureFacts {
     };
     let win = match X11TestWindow::create(&opts) {
         Ok(w) => w,
-        Err(why) => return CaptureFacts::Failed(format!("could not show the probe window: {why}")),
+        Err(why) => {
+            return CaptureFacts::OpenFailed(format!("could not show the probe window: {why}"))
+        }
     };
     let expect = Marker::new(MarkerKind::Calibration, 0, 0);
     let facts = match X11Source::open(win.handle()) {
         Ok(mut src) => {
-            let note = src.shm_note().map(str::to_string);
             let _ = win.paint(PaintSlot::Output, Some(expect));
-            match probe_capture(&mut src, expect, Duration::from_millis(2000)) {
-                CaptureFacts::Frame { decoded, detail, .. } => CaptureFacts::Frame {
+            let probed = probe_capture(&mut src, expect, Duration::from_millis(2000));
+            let mut reduced: Vec<String> = Vec::new();
+            if let Some(n) = src.shm_note() {
+                reduced.push(format!(
+                    "{n}: reads go through GetImage, copying every frame through the X socket"
+                ));
+            }
+            if !src.clock_established() {
+                reduced.push("the X server clock could not be established, so the probe's frame lag cannot be measured and the KPIs that guard depends on would be unknown(harness_error)".into());
+            }
+            match probed {
+                CaptureFacts::Frame {
+                    decoded, detail, ..
+                } => CaptureFacts::Frame {
                     decoded,
-                    degraded: note.map(|n| format!("{n}: reads go through GetImage, copying every frame through the X socket")),
+                    degraded: (!reduced.is_empty()).then(|| reduced.join("; ")),
                     detail,
                 },
                 other => other,
@@ -107,7 +120,7 @@ fn capture_facts() -> CaptureFacts {
         Err(why) if why.contains("DAMAGE") || why.contains("TrueColor") => {
             CaptureFacts::Unavailable(why)
         }
-        Err(why) => CaptureFacts::Failed(why),
+        Err(why) => CaptureFacts::OpenFailed(why),
     };
     win.close();
     facts

@@ -82,3 +82,25 @@ fn a_quiet_desktop_is_activated_then_typed_into_and_never_rewritten() {
     assert_eq!(again.desk.keys_seen(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_untypeable_key_refuses_before_focus_moves() {
+    // The injector cannot type 'A' (the CLI already refuses it; a platform's
+    // keymap can refuse more). The arm must be refused before `--activate`
+    // moves focus, not after.
+    let dir = run_dir("untypeable");
+    let mut host = FakeHost::new(Faults::default());
+    let mut c = cmd(&dir);
+    c.keys = vec!['a', 'A', 'c'];
+    let code = run_cmd(&mut host, &c).expect("runs");
+    assert_eq!(code, EXIT_ABORTED);
+    assert_eq!(
+        host.activations.load(Ordering::SeqCst),
+        0,
+        "focus must not move for an arm that cannot be typed"
+    );
+    assert_eq!(host.desk.keys_seen(), 0, "nothing was typed");
+    let log = std::fs::read_to_string(dir.join("inject.jsonl")).expect("inject.jsonl");
+    assert!(log.contains("\"reason\":\"unsupported_key\""), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

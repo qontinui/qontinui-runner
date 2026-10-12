@@ -115,9 +115,14 @@ pub enum CaptureFacts {
     /// The API is missing or refused (e.g. `IsSupported` false, duplication
     /// unsupported in this session).
     Unavailable(String),
-    /// Started but failed before a frame (an HRESULT, an X error).
+    /// The API failed to START (an HRESULT or X error opening the source), or
+    /// the probe window it would capture could not be shown — no source ever
+    /// opened. What the environment allows decides this, so the selftest
+    /// records it and does not gate on it.
+    OpenFailed(String),
+    /// The source OPENED, then failed before a frame.
     Failed(String),
-    /// Started, but no frame within the probe's timeout.
+    /// The source OPENED, but no frame within the probe's timeout.
     NoFrame(String),
     /// A frame arrived; the decode of the probe window's calibration marker.
     Frame {
@@ -217,11 +222,11 @@ pub fn capture_verdict(id: &'static str, f: &CaptureFacts, at: &str) -> Mechanis
         CaptureFacts::NoSession(d) => v(id, State::Inoperative, format!("no interactive session to capture: {d}"), at),
         CaptureFacts::Unavailable(d) => v(id, State::Inoperative, d.clone(), at),
         // A probe that got no readable answer decides nothing: the mechanism
-        // may be broken here, or the probe may be. UNKNOWN keeps the
-        // selftest's checks on it gated, so a regression cannot hide as an
-        // "environment limit".
-        CaptureFacts::Failed(d) => v(id, State::Unknown, format!("capture failed before a frame: {d}"), at),
-        CaptureFacts::NoFrame(d) => v(id, State::Unknown, format!("capture started but delivered no frame: {d}"), at),
+        // may be broken here, or the probe may be. Which of these the
+        // selftest gates on is `gates`' call, not the state's.
+        CaptureFacts::OpenFailed(d) => v(id, State::Unknown, format!("the capture source did not open: {d}"), at),
+        CaptureFacts::Failed(d) => v(id, State::Unknown, format!("capture opened but failed before a frame: {d}"), at),
+        CaptureFacts::NoFrame(d) => v(id, State::Unknown, format!("capture opened but delivered no frame: {d}"), at),
         CaptureFacts::Frame {
             decoded: Ok(m),
             degraded: None,
@@ -404,6 +409,39 @@ pub fn state_of(r: &DoctorRecord, id: &str) -> State {
         .map_or(State::Unknown, |m| m.state)
 }
 
+/// Whether the selftest GATES its checks on mechanism `id`: whether such a
+/// check failing, or being unable to run, fails the selftest.
+///
+/// - OPERATIVE and DEGRADED gate. The doctor saw the mechanism work here, or
+///   work reduced — and a capture whose frames arrive but whose marker does
+///   not decode is exactly the decoder regression a selftest exists to catch.
+/// - INOPERATIVE-ON-THIS-MACHINE never gates: a hard dependency is absent.
+/// - UNKNOWN gates in exactly one case: a capture source that OPENED in an
+///   OPERATIVE interactive session and then produced no frame, or failed
+///   before one. The environment demonstrably offers that API there, so the
+///   likeliest cause is the probe, and a probe regression must not pass as an
+///   environment limit. Every other UNKNOWN — a capture source that never
+///   opened, a GPU counter query that errored, a session or clock probe that
+///   could not run — is the environment's to decide: its checks are recorded
+///   with the reason, ungated, and `--require` makes a mechanism mandatory
+///   where a run must have it.
+pub fn gates(f: &Facts, r: &DoctorRecord, id: &str) -> bool {
+    match state_of(r, id) {
+        State::Operative | State::Degraded => true,
+        State::Inoperative => false,
+        State::Unknown => {
+            let capture = match id {
+                CAPTURE_WGC => &f.wgc,
+                CAPTURE_DDA => &f.dda,
+                CAPTURE_X11 => &f.x11,
+                _ => return false,
+            };
+            matches!(capture, CaptureFacts::Failed(_) | CaptureFacts::NoFrame(_))
+                && state_of(r, SESSION_INTERACTIVE) == State::Operative
+        }
+    }
+}
+
 /// A human rendering (without `--json`).
 pub fn render_human(r: &DoctorRecord) -> String {
     let mut s = format!(
@@ -513,6 +551,7 @@ mod tests {
         }
         // The probe got no readable answer: unknown, never inoperative.
         for f in [
+            CaptureFacts::OpenFailed("DuplicateOutput: 0x887A0004".into()),
             CaptureFacts::Failed("0x887A0004".into()),
             CaptureFacts::NoFrame("2000 ms".into()),
         ] {
@@ -576,6 +615,73 @@ mod tests {
             gpu_verdict(&GpuFacts::Absent("no object".into()), AT).state,
             State::Inoperative
         );
+    }
+
+    fn unknown_everywhere() -> Facts {
+        Facts {
+            host: "h".into(),
+            os: "windows".into(),
+            session: ok_session(),
+            wgc: CaptureFacts::NoFrame("no frame within 2000 ms".into()),
+            dda: CaptureFacts::OpenFailed("DuplicateOutput: 0x887A0004".into()),
+            x11: CaptureFacts::NotApplicable("windows".into()),
+            input: InputFacts {
+                supported: Ok(()),
+                listener: Ok("l".into()),
+                injector: Ok("i".into()),
+            },
+            clock: ClockFacts::NoNode("not on PATH".into()),
+            gpu: GpuFacts::Failed("PdhCollectQueryData: 0x800007d5".into()),
+        }
+    }
+
+    #[test]
+    fn only_a_capture_that_opened_in_an_operative_session_gates_while_unknown() {
+        let f = unknown_everywhere();
+        let r = report(&f);
+        for id in [CAPTURE_WGC, CAPTURE_DDA, CLOCK_ALIGNED, COUNTERS_GPU] {
+            assert_eq!(state_of(&r, id), State::Unknown, "{id}");
+        }
+        // The S2 regression guard: WGC opened in an operative session and
+        // produced no frame — the probe is the likeliest cause.
+        assert!(gates(&f, &r, CAPTURE_WGC));
+        // The environment's to decide: a source that never opened, a GPU
+        // counter query that errored, a node that could not run.
+        assert!(!gates(&f, &r, CAPTURE_DDA), "never opened");
+        assert!(!gates(&f, &r, COUNTERS_GPU), "a PDH error");
+        assert!(!gates(&f, &r, CLOCK_ALIGNED), "node could not run");
+        assert!(!gates(&f, &r, CAPTURE_X11), "inoperative");
+        assert!(gates(&f, &r, SESSION_INTERACTIVE), "operative");
+        assert!(gates(&f, &r, INPUT_SAFE), "operative");
+        // Opened, then failed before a frame: gated too.
+        let failed = Facts {
+            wgc: CaptureFacts::Failed("the capture ended".into()),
+            ..f.clone()
+        };
+        assert!(gates(&failed, &report(&failed), CAPTURE_WGC));
+        // ... but not in a session the doctor could not establish.
+        let session_unknown = Facts {
+            session: SessionFacts {
+                supported: Ok(()),
+                state: Err(SessionProblem::Unknown("OpenInputDesktop: 5".into())),
+            },
+            ..f.clone()
+        };
+        assert!(!gates(
+            &session_unknown,
+            &report(&session_unknown),
+            CAPTURE_WGC
+        ));
+        // DEGRADED gates: frames arrive but the marker does not decode.
+        let undecoded = Facts {
+            wgc: CaptureFacts::Frame {
+                decoded: Err("off_palette".into()),
+                degraded: None,
+                detail: String::new(),
+            },
+            ..f.clone()
+        };
+        assert!(gates(&undecoded, &report(&undecoded), CAPTURE_WGC));
     }
 
     #[test]

@@ -20,7 +20,10 @@
 //! A group with no live process, or with a member that could not be read,
 //! reports `null` values and a `note`: a partial sum is not the group's
 //! number, and an empty group's is unknown, not 0. A host process that
-//! disappears mid-run is reported in `exited` (the catalog's `crashes`).
+//! disappears mid-run is reported in `exited` (the catalog's `crashes`); so
+//! is a generator, with the session its slot file names, because a generator
+//! killed without writing its `exit` record must end its session's marker
+//! schedule — otherwise its overdue markers read as a host hang.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -67,11 +70,13 @@ pub struct ProcInfo {
     pub start_time: u64,
 }
 
-/// A generator's slot file: (generator pid, its parent — the session shell).
+/// A generator's slot file: the generator's pid, its parent (the session
+/// shell) and the session index it claimed (`slot`, which its markers carry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
     pub pid: u32,
     pub ppid: u32,
+    pub session: Option<u16>,
 }
 
 fn is_generator(p: &ProcInfo, run_id: Option<&str>) -> bool {
@@ -111,24 +116,35 @@ pub fn parse_slot(text: &str, run_id: Option<&str>) -> Option<Slot> {
     }
     let pid = u32::try_from(v.get("pid")?.as_u64()?).ok()?;
     let ppid = u32::try_from(v.get("ppid")?.as_u64()?).ok()?;
-    Some(Slot { pid, ppid })
+    let session = v
+        .get("slot")
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok());
+    Some(Slot { pid, ppid, session })
 }
 
-/// Every generator slot in `dir` for `run_id`.
+/// Every generator slot in `dir` for `run_id`. A slot whose record does not
+/// carry its index takes it from the file name (`slot-<k>`).
 pub fn read_slots(dir: &Path, run_id: Option<&str>) -> Vec<Slot> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     entries
         .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .and_then(|n| n.strip_prefix("slot-"))
-                .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|e| {
+            let k: u16 = e
+                .file_name()
+                .to_str()?
+                .strip_prefix("slot-")
+                .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))?
+                .parse()
+                .ok()?;
+            let slot = parse_slot(&std::fs::read_to_string(e.path()).ok()?, run_id)?;
+            Some(Slot {
+                session: slot.session.or(Some(k)),
+                ..slot
+            })
         })
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|t| parse_slot(&t, run_id))
         .collect()
 }
 
@@ -233,14 +249,26 @@ pub fn assign_groups(
     groups
 }
 
+/// A process counted in some group at the previous sample.
+#[derive(Clone, Debug)]
+struct Member {
+    group: &'static str,
+    name: String,
+    start_time: u64,
+    /// The session whose generator it is, when a slot file named it.
+    session: Option<u16>,
+}
+
 /// The sampler.
 pub struct Sampler {
     cfg: SamplerConfig,
     sys: System,
     reader: Box<dyn ProcessReader>,
     prev_cpu: HashMap<u32, (u64, u64)>,
-    members: HashMap<u32, (&'static str, String, u64)>,
+    members: HashMap<u32, Member>,
     workload_ids: HashSet<(u32, u64)>,
+    /// Each slot file's generator, by (pid, start time): its session.
+    gen_sessions: HashMap<(u32, u64), u16>,
     last_t: Option<u64>,
 }
 
@@ -253,6 +281,7 @@ impl Sampler {
             prev_cpu: HashMap::new(),
             members: HashMap::new(),
             workload_ids: HashSet::new(),
+            gen_sessions: HashMap::new(),
             last_t: None,
         }
     }
@@ -287,13 +316,23 @@ impl Sampler {
     /// Take one sample at `now_ns`.
     pub fn sample(&mut self, now_ns: u64) -> SampleRecord {
         let table = self.table();
+        self.sample_table(&table, now_ns)
+    }
+
+    /// One sample of an already-read process table.
+    fn sample_table(&mut self, table: &BTreeMap<u32, ProcInfo>, now_ns: u64) -> SampleRecord {
         let slots = self
             .cfg
             .run_dir
             .as_deref()
             .map(|d| read_slots(d, self.cfg.run_id.as_deref()))
             .unwrap_or_default();
-        let groups = assign_groups(&table, &self.cfg, &slots, &mut self.workload_ids);
+        for s in &slots {
+            if let (Some(session), Some(p)) = (s.session, table.get(&s.pid)) {
+                self.gen_sessions.insert((s.pid, p.start_time), session);
+            }
+        }
+        let groups = assign_groups(table, &self.cfg, &slots, &mut self.workload_ids);
         let dt_ns = self.last_t.map(|t| now_ns.saturating_sub(t));
         self.last_t = Some(now_ns);
 
@@ -324,11 +363,12 @@ impl Sampler {
                 let start = table.get(&pid).map_or(0, |p| p.start_time);
                 now_members.insert(
                     pid,
-                    (
-                        name,
-                        table.get(&pid).map(|p| p.name.clone()).unwrap_or_default(),
-                        start,
-                    ),
+                    Member {
+                        group: name,
+                        name: table.get(&pid).map(|p| p.name.clone()).unwrap_or_default(),
+                        start_time: start,
+                        session: self.gen_sessions.get(&(pid, start)).copied(),
+                    },
                 );
                 match self.reader.cpu_ns(pid) {
                     Some(c) => {
@@ -376,13 +416,14 @@ impl Sampler {
         }
 
         let mut exited = Vec::new();
-        for (pid, (group, name, start)) in &self.members {
-            let gone = table.get(pid).is_none_or(|p| p.start_time != *start);
+        for (pid, m) in &self.members {
+            let gone = table.get(pid).is_none_or(|p| p.start_time != m.start_time);
             if gone {
                 exited.push(ExitedProcess {
                     pid: *pid,
-                    group,
-                    name: name.clone(),
+                    group: m.group,
+                    name: m.name.clone(),
+                    session: m.session,
                 });
                 self.prev_cpu.remove(pid);
             }
@@ -546,6 +587,7 @@ mod tests {
         let slots = [Slot {
             pid: 103,
             ppid: 102,
+            session: Some(0),
         }];
         let g = assign_groups(&t, &cfg, &slots, &mut HashSet::new());
         assert_eq!(g[GROUP_WORKLOAD], vec![102, 103]);
@@ -556,7 +598,8 @@ mod tests {
             parse_slot(slot, Some("run-7")),
             Some(Slot {
                 pid: 103,
-                ppid: 102
+                ppid: 102,
+                session: Some(0),
             })
         );
         assert_eq!(parse_slot(slot, Some("run-8")), None, "another run's slot");
@@ -694,6 +737,66 @@ mod tests {
                 "an empty group is unknown, not 0"
             );
         }
+    }
+
+    #[test]
+    fn a_generator_seen_gone_names_its_session_and_a_shell_names_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "termhost-probe-slots-{}-{}",
+            std::process::id(),
+            crate::clock::now_ns()
+        ));
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("slot-0"),
+            r#"{"schema":"termhost-bench/slot/v1","slot":0,"run_id":"run-7","pid":103,"ppid":102}"#,
+        )
+        .expect("slot-0");
+        // A record without its index takes it from the file name.
+        std::fs::write(
+            dir.join("slot-5"),
+            r#"{"schema":"termhost-bench/slot/v1","run_id":"run-7","pid":205,"ppid":204}"#,
+        )
+        .expect("slot-5");
+        let sessions: BTreeSet<(u32, Option<u16>)> = read_slots(&dir, Some("run-7"))
+            .into_iter()
+            .map(|s| (s.pid, s.session))
+            .collect();
+        assert_eq!(sessions, BTreeSet::from([(103, Some(0)), (205, Some(5))]));
+
+        let mut s = Sampler::new(
+            SamplerConfig {
+                host_pids: vec![100],
+                run_id: Some("run-7".into()),
+                run_dir: Some(dir.clone()),
+                ..SamplerConfig::default()
+            },
+            Box::new(FakeReader {
+                cpu: HashMap::new(),
+                unreadable: None,
+            }),
+        );
+        let t = table();
+        assert!(s.sample_table(&t, 0).exited.is_empty());
+        // The generator is killed; its shell lives on.
+        let mut after = t.clone();
+        after.remove(&103);
+        let gone = s.sample_table(&after, 500_000_000).exited;
+        assert_eq!(
+            gone,
+            vec![ExitedProcess {
+                pid: 103,
+                group: GROUP_WORKLOAD,
+                name: "node.exe".into(),
+                session: Some(0),
+            }]
+        );
+        // The shell exits later: workload too, but no generator of a session.
+        after.remove(&102);
+        let gone = s.sample_table(&after, 1_000_000_000).exited;
+        assert_eq!(gone.len(), 1);
+        assert_eq!((gone[0].pid, gone[0].session), (102, None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
