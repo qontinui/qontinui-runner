@@ -19,8 +19,15 @@
 //! 4. each operative capture source sees a calibration marker;
 //! 5. output latency: markers painted at scheduled times behind an artificial
 //!    delay D (0, 50, 200 ms) must be reported as D within one refresh
-//!    interval;
-//! 6. WGC and DDA agree on first appearance within one refresh interval;
+//!    interval — gated for DDA and X11. WGC stamps a later stage (the
+//!    compositor's render of the capture frame), measured on one machine
+//!    class only, so its absolute check is reported but not gated; WGC is
+//!    gated instead against DDA (`wgc_render_offset.d*`: median minus DDA's
+//!    within the declared offset) or, without DDA, against itself
+//!    (`output_latency_slope.wgc`: median minus D steady across delays);
+//! 6. WGC and DDA agree on first appearance: the median (p95 from 20
+//!    markers) of their per-marker gaps' deviation from the expected render
+//!    offset is within one refresh interval;
 //! 7. a 3 s paint freeze with markers pending is reported as a hang;
 //! 8. injected keys round-trip as echo markers, recognised as the probe's own;
 //! 9. ONE untagged injection is classified as not-ours and aborts the arm;
@@ -120,25 +127,68 @@ pub struct SelftestOutcome {
     pub doctor: DoctorRecord,
 }
 
-/// How many compositor refresh intervals a painted marker may take to reach
-/// the moment a source's frame timestamp names. Desktop Duplication's
-/// `LastPresentTime` and an X11 damage read name the composition the paint
-/// first appears in: at most one interval after the paint. WGC's
-/// `SystemRelativeTime` is documented by Microsoft as "the QPC time at which
-/// the compositor rendered the frame" — the render of the CAPTURE frame, a
-/// later stage than the desktop presentation DDA stamps. On the first hosted
-/// run (PR #2177, run 38315983341) WGC trailed DDA by a near-constant offset
-/// at every delay (medians d0 22.33 vs 13.03 ms, d50 68.42 vs 61.42, d200
-/// 219.41 vs 211.53: +9.3, +7.0, +7.9 ms) while the two agreed per marker
-/// within one interval (max |delta| 14.23 ms). An offset that does not grow
-/// with the delay is a pipeline stage, not a scheduling error, so WGC is
-/// allowed one further interval for that stage — and never more: the
-/// cross-check against DDA still holds it to one interval of DDA.
-pub fn latency_stages(kind: SourceId) -> u32 {
+/// How much later WGC's frame times are than Desktop Duplication's, by
+/// design. WGC stamps `SystemRelativeTime`, documented by Microsoft as "the
+/// QPC time at which the compositor rendered the frame" — the render of the
+/// CAPTURE frame, a later stage than the desktop presentation DDA's
+/// `LastPresentTime` stamps. Declared from the one measurement there is: on
+/// the first hosted run (PR #2177, run 38315983341, windows-latest, Basic
+/// Render Driver) WGC trailed DDA at every delay by +9.3, +7.0 and +7.9 ms
+/// (medians d0 22.33 vs 13.03 ms, d50 68.42 vs 61.42, d200 219.41 vs
+/// 211.53). That one run on one machine class is why WGC's ABSOLUTE latency
+/// is reported but not gated, and WGC is instead held to DDA by this offset
+/// (and, without DDA, to itself across delays).
+pub const WGC_RENDER_OFFSET_MS: f64 = 10.0;
+/// The slack around the offset: the measured offsets spread 2.3 ms, and a
+/// regression that adds a frame (an interval, ~16 ms) must still land
+/// outside it.
+pub const WGC_OFFSET_MARGIN_MS: f64 = 4.0;
+
+/// The render-stage offset a source's frame times carry relative to DDA's.
+pub fn render_offset_ms(kind: SourceId) -> f64 {
     match kind {
-        SourceId::Wgc => 2,
-        SourceId::Dda | SourceId::X11 | SourceId::Synthetic => 1,
+        SourceId::Wgc => WGC_RENDER_OFFSET_MS,
+        SourceId::Dda | SourceId::X11 | SourceId::Synthetic => 0.0,
     }
+}
+
+/// Whether, at one delay, WGC's median latency minus DDA's stays within the
+/// declared render offset: no earlier than DDA by more than the margin, no
+/// later than the offset plus the margin.
+pub fn wgc_offset_ok(wgc_median_ms: f64, dda_median_ms: f64) -> bool {
+    let d = wgc_median_ms - dda_median_ms;
+    (-WGC_OFFSET_MARGIN_MS..=WGC_RENDER_OFFSET_MS + WGC_OFFSET_MARGIN_MS).contains(&d)
+}
+
+/// The slope invariant: how far `median(d) - d` moves across the delays. A
+/// fixed pipeline stage moves it by nothing; a source that adds latency as
+/// the delay grows (or only some of the time) moves it. `None` with fewer
+/// than two delays measured.
+pub fn latency_spread_ms(medians: &[(u64, f64)]) -> Option<f64> {
+    if medians.len() < 2 {
+        return None;
+    }
+    let excess = medians.iter().map(|&(d, m)| m - d as f64);
+    let (lo, hi) = excess.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), e| {
+        (lo.min(e), hi.max(e))
+    });
+    Some(hi - lo)
+}
+
+/// The cross-check's statistic over per-marker deviations from the expected
+/// offset: the median below 20 markers, the nearest-rank p95 from 20 — so a
+/// single jittered marker cannot decide it. With its name; `None` with none.
+pub fn crosscheck_statistic(deviations_ms: &mut [f64]) -> Option<(f64, &'static str)> {
+    if deviations_ms.is_empty() {
+        return None;
+    }
+    deviations_ms.sort_by(f64::total_cmp);
+    let n = deviations_ms.len();
+    Some(if n >= 20 {
+        (deviations_ms[stats::nearest_rank(95, n) - 1], "p95")
+    } else {
+        (deviations_ms[stats::nearest_rank(50, n) - 1], "median")
+    })
 }
 
 /// The mechanism a capture source depends on.
@@ -229,6 +279,28 @@ impl Selftest<'_> {
             passed,
             deps: deps.to_vec(),
             detail,
+            data,
+        };
+        self.out.emit(&Record::Check(rec.clone()));
+        self.checks.push(rec);
+    }
+
+    /// A check recorded with its verdict but never gated, and why.
+    fn report_only(
+        &mut self,
+        name: impl Into<String>,
+        deps: &[&'static str],
+        passed: Option<bool>,
+        why: &str,
+        detail: impl Into<String>,
+        data: Value,
+    ) {
+        let rec = CheckRecord {
+            check: name.into(),
+            gated: false,
+            passed,
+            deps: deps.to_vec(),
+            detail: format!("not gated — {why}. {}", detail.into()),
             data,
         };
         self.out.emit(&Record::Check(rec.clone()));
@@ -457,7 +529,7 @@ impl Selftest<'_> {
         let mut seq: u64 = 1;
         let mut latency_markers: Vec<Marker> = Vec::new();
         if let Some(primary) = primary {
-            self.latency_phases(
+            let medians = self.latency_phases(
                 &mut engine,
                 &win,
                 &feed,
@@ -466,6 +538,7 @@ impl Selftest<'_> {
                 &mut seq,
                 &mut latency_markers,
             );
+            self.wgc_relative_checks(&kinds, &medians, refresh.ns as f64 / 1e6);
             if let Some(sec) = secondary {
                 self.crosscheck(&engine, primary, sec, &latency_markers, &refresh);
             }
@@ -568,22 +641,19 @@ impl Selftest<'_> {
         refresh: &crate::platform::Refresh,
         seq: &mut u64,
         all: &mut Vec<Marker>,
-    ) {
-        // The tolerance is one refresh interval per pipeline stage the
-        // source's timestamp names (`latency_stages`). When the display
-        // reports no rate the interval is the assumed 60 Hz one, and the
-        // check says so: a selftest tolerance, not a KPI.
+    ) -> Vec<(SourceId, u64, f64)> {
+        // The tolerance is one refresh interval. When the display reports no
+        // rate it is the assumed 60 Hz interval, and the check says so: a
+        // selftest tolerance, not a KPI. WGC's absolute check is reported but
+        // not gated (see WGC_RENDER_OFFSET_MS); `wgc_relative_checks` gates
+        // WGC against DDA or across delays instead.
         let refresh_ms = refresh.ns as f64 / 1e6;
-        let tolerance_for = |kind: SourceId| -> (f64, String) {
-            let stages = latency_stages(kind);
-            let ms = refresh_ms * f64::from(stages);
-            let what = if refresh.assumed {
-                format!("{ms:.2} ms ({stages} x the ASSUMED {refresh_ms:.2} ms interval: the display reports no refresh rate)")
-            } else {
-                format!("{ms:.2} ms ({stages} refresh interval(s) of {refresh_ms:.2} ms: the stages {}'s timestamp names)", kind.as_str())
-            };
-            (ms, what)
+        let tolerance = if refresh.assumed {
+            format!("{refresh_ms:.2} ms, ASSUMED: the display reports no refresh rate")
+        } else {
+            format!("one refresh interval, {refresh_ms:.2} ms")
         };
+        let mut medians = Vec::new();
         let period = self.cfg.marker_period_ms * MS;
         let k = self.cfg.markers_per_delay;
         for &d in &self.cfg.delays_ms.clone() {
@@ -634,37 +704,107 @@ impl Selftest<'_> {
                 let max = lat.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let med = median(&mut lat);
                 let d_ms = d as f64;
-                let (tolerance_ms, tolerance) = tolerance_for(kind);
+                if let Some(m) = med.filter(|_| observed == k) {
+                    medians.push((kind, d, m));
+                }
                 let ok = observed == k
                     && paint_errors == 0
-                    && med.is_some_and(|m| (m - d_ms).abs() <= tolerance_ms)
+                    && med.is_some_and(|m| (m - d_ms).abs() <= refresh_ms)
                     && min >= d_ms - 1.0;
-                self.check(
-                    format!("output_latency.{}.d{d}", kind.as_str()),
-                    &[capture_mechanism(kind)],
-                    Some(ok),
-                    format!(
+                let name = format!("output_latency.{}.d{d}", kind.as_str());
+                let detail = format!(
                         "delay {d} ms: observed {observed}/{k}, median {} ms, min {} ms, max {} ms; must be within {tolerance} of {d} ms and never before the paint",
                         med.map_or("-".into(), |m| format!("{m:.2}")),
                         if observed > 0 { format!("{min:.2}") } else { "-".into() },
                         if observed > 0 { format!("{max:.2}") } else { "-".into() },
-                    ),
-                    json!({
-                        "delay_ms": d,
-                        "expected": k,
-                        "observed": observed,
-                        "median_ms": med,
-                        "min_ms": (observed > 0).then_some(min),
-                        "max_ms": (observed > 0).then_some(max),
-                        "refresh_ms": refresh_ms,
-                        "tolerance_ms": tolerance_ms,
-                        "stages": latency_stages(kind),
-                        "refresh_assumed": refresh.assumed,
-                        "painter_late_max_ms": lateness.iter().copied().fold(0.0, f64::max),
-                        "paint_errors": paint_errors,
-                    }),
+                    );
+                let data = json!({
+                    "delay_ms": d,
+                    "expected": k,
+                    "observed": observed,
+                    "median_ms": med,
+                    "min_ms": (observed > 0).then_some(min),
+                    "max_ms": (observed > 0).then_some(max),
+                    "refresh_ms": refresh_ms,
+                    "refresh_assumed": refresh.assumed,
+                    "painter_late_max_ms": lateness.iter().copied().fold(0.0, f64::max),
+                    "paint_errors": paint_errors,
+                });
+                if kind == SourceId::Wgc {
+                    self.report_only(
+                        name,
+                        &[capture_mechanism(kind)],
+                        Some(ok),
+                        "WGC stamps the compositor's render of the capture frame, a stage after presentation measured on one machine class only (run 38315983341: +7..9 ms behind DDA); WGC is gated against DDA (wgc_render_offset.*) or across delays (output_latency_slope.wgc) instead",
+                        detail,
+                        data,
+                    );
+                } else {
+                    self.check(name, &[capture_mechanism(kind)], Some(ok), detail, data);
+                }
+            }
+        }
+        medians
+    }
+
+    /// WGC's gated latency checks. With DDA open and gating: per delay, WGC's
+    /// median minus DDA's stays within the declared render offset. Without
+    /// it: WGC's own `median(d) - d` moves by at most one refresh interval
+    /// across the delays.
+    fn wgc_relative_checks(
+        &mut self,
+        kinds: &[SourceId],
+        medians: &[(SourceId, u64, f64)],
+        refresh_ms: f64,
+    ) {
+        if !kinds.contains(&SourceId::Wgc) {
+            return;
+        }
+        let of = |kind: SourceId, d: u64| {
+            medians
+                .iter()
+                .find(|&&(k, dd, _)| k == kind && dd == d)
+                .map(|&(_, _, m)| m)
+        };
+        if kinds.contains(&SourceId::Dda) && self.gating(doctor::CAPTURE_DDA) {
+            for &d in &self.cfg.delays_ms.clone() {
+                let (w, q) = (of(SourceId::Wgc, d), of(SourceId::Dda, d));
+                let passed = w.zip(q).map(|(w, q)| wgc_offset_ok(w, q));
+                self.check(
+                    format!("wgc_render_offset.d{d}"),
+                    &[doctor::CAPTURE_WGC, doctor::CAPTURE_DDA],
+                    passed,
+                    match w.zip(q) {
+                        Some((w, q)) => format!(
+                            "delay {d} ms: WGC median {w:.2} ms minus DDA median {q:.2} ms = {:.2} ms; must lie within -{WGC_OFFSET_MARGIN_MS:.0}..{:.0} ms (the declared {WGC_RENDER_OFFSET_MS:.0} ms render offset plus a {WGC_OFFSET_MARGIN_MS:.0} ms margin)",
+                            w - q,
+                            WGC_RENDER_OFFSET_MS + WGC_OFFSET_MARGIN_MS
+                        ),
+                        None => format!("delay {d} ms: WGC or DDA did not see every marker, so their medians cannot be compared"),
+                    },
+                    json!({ "delay_ms": d, "wgc_median_ms": w, "dda_median_ms": q, "offset_ms": WGC_RENDER_OFFSET_MS, "margin_ms": WGC_OFFSET_MARGIN_MS }),
                 );
             }
+        } else {
+            let wgc: Vec<(u64, f64)> = medians
+                .iter()
+                .filter(|&&(k, _, _)| k == SourceId::Wgc)
+                .map(|&(_, d, m)| (d, m))
+                .collect();
+            let spread = latency_spread_ms(&wgc);
+            self.check(
+                "output_latency_slope.wgc",
+                &[doctor::CAPTURE_WGC],
+                spread.map(|s| wgc.len() == self.cfg.delays_ms.len() && s <= refresh_ms),
+                match spread {
+                    Some(s) => format!(
+                        "no DDA to hold WGC to: WGC's median latency minus the delay moved by {s:.2} ms across delays {:?} ms; must stay within one refresh interval ({refresh_ms:.2} ms) — a fixed render stage moves it by nothing",
+                        wgc.iter().map(|&(d, _)| d).collect::<Vec<_>>()
+                    ),
+                    None => "no DDA to hold WGC to, and fewer than two delays had every marker seen".to_string(),
+                },
+                json!({ "medians": wgc.iter().map(|&(d, m)| json!({"delay_ms": d, "median_ms": m})).collect::<Vec<_>>(), "spread_ms": spread, "refresh_ms": refresh_ms }),
+            );
         }
     }
 
@@ -686,6 +826,12 @@ impl Selftest<'_> {
         } else {
             format!("one refresh interval, {refresh_ms:.2} ms")
         };
+        // Each marker's gap, primary minus secondary, against the gap the two
+        // timestamps' stages put there by design (WGC renders after DDA's
+        // presentation); judged on a statistic one jittered marker cannot
+        // decide.
+        let expected = render_offset_ms(primary) - render_offset_ms(secondary);
+        let mut deviations: Vec<f64> = Vec::new();
         let (mut compared, mut disagreed, mut coalesced) = (0u32, 0u32, 0u32);
         let mut max_abs: f64 = 0.0;
         for &m in markers {
@@ -700,26 +846,39 @@ impl Selftest<'_> {
                 continue;
             }
             compared += 1;
-            let delta = (q.t_ns as f64 - p.t_ns as f64) / 1e6;
-            max_abs = max_abs.max(delta.abs());
-            if delta.abs() > refresh_ms {
+            let gap = (p.t_ns as f64 - q.t_ns as f64) / 1e6;
+            let deviation = (gap - expected).abs();
+            max_abs = max_abs.max(deviation);
+            if deviation > refresh_ms {
                 disagreed += 1;
             }
+            deviations.push(deviation);
         }
+        let stat = crosscheck_statistic(&mut deviations);
         self.check(
             "capture_crosscheck",
             &[capture_mechanism(primary), capture_mechanism(secondary)],
-            Some(compared > 0 && disagreed == 0),
-            format!(
-                "{compared} markers seen cleanly by both {} and {}: {disagreed} first appeared further apart than {tolerance} (max |delta| {max_abs:.2} ms; {coalesced} coalesced by the secondary)",
-                primary.as_str(),
-                secondary.as_str()
-            ),
+            stat.map(|(v, _)| v <= refresh_ms),
+            match stat {
+                Some((v, name)) => format!(
+                    "{compared} markers seen cleanly by both {} and {}: the {name} of their first-appearance gaps' deviation from the expected {expected:.1} ms is {v:.2} ms; must be within {tolerance} ({disagreed} single markers beyond it, max {max_abs:.2} ms; {coalesced} coalesced by the secondary)",
+                    primary.as_str(),
+                    secondary.as_str()
+                ),
+                None => format!(
+                    "no marker was seen cleanly by both {} and {} ({coalesced} coalesced by the secondary)",
+                    primary.as_str(),
+                    secondary.as_str()
+                ),
+            },
             json!({
                 "compared": compared,
                 "disagreed": disagreed,
                 "coalesced": coalesced,
-                "max_abs_delta_ms": max_abs,
+                "expected_gap_ms": expected,
+                "statistic": stat.map(|(_, n)| n),
+                "statistic_ms": stat.map(|(v, _)| v),
+                "max_abs_deviation_ms": max_abs,
                 "refresh_ms": refresh_ms,
                 "refresh_assumed": refresh.assumed,
             }),
@@ -1187,4 +1346,50 @@ pub fn render_human(o: &SelftestOutcome) -> String {
         o.summary["gated"], o.summary["failed"], o.exit_code
     ));
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wgc_is_held_to_dda_by_the_declared_render_offset() {
+        // The measured offsets (run 38315983341) pass.
+        for (w, q) in [(22.33, 13.03), (68.42, 61.42), (219.41, 211.53)] {
+            assert!(wgc_offset_ok(w, q), "{w} - {q}");
+        }
+        // One more frame (an interval, ~16 ms) behind DDA fails, and so does
+        // WGC running well ahead of DDA.
+        assert!(!wgc_offset_ok(38.0, 13.0));
+        assert!(wgc_offset_ok(27.0, 13.0), "the 14 ms edge holds");
+        assert!(!wgc_offset_ok(27.1, 13.0));
+        assert!(!wgc_offset_ok(8.0, 13.0));
+    }
+
+    #[test]
+    fn a_fixed_stage_keeps_the_slope_and_a_growing_one_breaks_it() {
+        assert_eq!(latency_spread_ms(&[(0, 22.0)]), None);
+        let fixed = latency_spread_ms(&[(0, 22.3), (50, 68.4), (200, 219.4)]).expect("three");
+        assert!(fixed < 5.0, "{fixed}");
+        let growing = latency_spread_ms(&[(0, 22.0), (50, 90.0), (200, 260.0)]).expect("three");
+        // Excesses 22, 40 and 60 ms: a 38 ms spread.
+        assert!((growing - 38.0).abs() < 1e-9, "{growing}");
+    }
+
+    #[test]
+    fn one_jittered_marker_does_not_decide_the_crosscheck() {
+        // Ten markers, one 30 ms off: the median is the typical deviation.
+        let mut ten = vec![2.0; 9];
+        ten.push(30.0);
+        assert_eq!(crosscheck_statistic(&mut ten), Some((2.0, "median")));
+        // Sixty markers, two spikes: the p95 stays typical; four spikes
+        // (past 5 %) reach it.
+        let mut sixty = vec![1.5; 58];
+        sixty.extend([30.0, 40.0]);
+        assert_eq!(crosscheck_statistic(&mut sixty), Some((1.5, "p95")));
+        let mut spiky = vec![1.5; 56];
+        spiky.extend([30.0; 4]);
+        assert_eq!(crosscheck_statistic(&mut spiky), Some((30.0, "p95")));
+        assert_eq!(crosscheck_statistic(&mut []), None);
+    }
 }
