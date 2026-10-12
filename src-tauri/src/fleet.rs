@@ -1566,20 +1566,28 @@ fn slow_host_probes() -> SlowHostProbes {
     probes
 }
 
-/// The probed host-fact capability set for the heartbeat.
-///
-/// Plus the credential-presence family — `probes:cred`, `cred:gh`,
-/// `cred:aws-sts` — read from its own cache (see the section header above
-/// [`CRED_PROBES_MARKER`]); that read never blocks on a probe.
+/// The probed host-fact capability set — `os:*`, `runtime:*`, the webview
+/// token. Deliberately WITHOUT the credential-presence family: that one is
+/// joined in [`heartbeat_capabilities`] only, so a caller asking for host facts
+/// (tests among them) can never start a live `gh` / `aws` probe.
 fn host_capabilities() -> Vec<String> {
     let slow = slow_host_probes();
-    let mut caps = build_host_capabilities(
+    build_host_capabilities(
         current_os_label(),
         slow.powershell,
         slow.docker,
         webview_runtime_available(),
         host_mem_total_bytes(),
-    );
+    )
+}
+
+/// The heartbeat's host capability set: [`host_capabilities`] plus the
+/// credential-presence family — `probes:cred`, `cred:gh`, `cred:aws-sts` —
+/// read from its own cache (see the section header above
+/// [`CRED_PROBES_MARKER`]); that read never blocks on a probe. The ONLY caller
+/// of [`cred_capabilities`], and called only by `heartbeat_to_coord`.
+fn heartbeat_capabilities() -> Vec<String> {
+    let mut caps = host_capabilities();
     caps.extend(cred_capabilities());
     caps
 }
@@ -1973,32 +1981,64 @@ fn binary_on_path(name: &str) -> bool {
     find_on_path(name).is_some()
 }
 
-/// The first executable file `name` resolves to across the `PATH` entries,
-/// trying every `PATHEXT` suffix as well as the bare name on Windows.
+/// The first executable file `name` resolves to across the `PATH` entries.
+/// On Windows the `PATHEXT` rule applies — see [`resolve_in_dirs`].
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let exts: Vec<String> = if cfg!(target_os = "windows") {
+    let exts: Option<Vec<String>> = cfg!(target_os = "windows").then(|| {
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
             .split(';')
             .filter(|e| !e.is_empty())
             .map(|e| e.to_string())
             .collect()
-    } else {
-        Vec::new()
+    });
+    resolve_in_dirs(name, std::env::split_paths(&path), exts.as_deref())
+}
+
+/// PATH resolution over `dirs`. `pathext` is `Some` for Windows semantics and
+/// `None` for Unix (a bare name, gated on an execute bit).
+///
+/// Windows: a name that ALREADY ends in a `PATHEXT` extension (`gh.exe`) is
+/// tried as given and nothing else; any other name is tried ONLY with each
+/// `PATHEXT` suffix appended, never bare. An extensionless file sitting beside
+/// `gh.exe` (a Git Bash / MSYS shell script, a stray download) cannot be
+/// spawned by `CreateProcess`, so resolving to it would turn an installed tool
+/// into a spawn failure.
+fn resolve_in_dirs(
+    name: &str,
+    dirs: impl IntoIterator<Item = PathBuf>,
+    pathext: Option<&[String]>,
+) -> Option<PathBuf> {
+    let has_pathext_ext = |exts: &[String]| {
+        let lower = name.to_ascii_lowercase();
+        exts.iter()
+            .any(|e| lower.ends_with(&e.to_ascii_lowercase()))
     };
-    for dir in std::env::split_paths(&path) {
+    for dir in dirs {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        let bare = dir.join(name);
-        if is_executable_file(&bare) {
-            return Some(bare);
-        }
-        for ext in &exts {
-            let candidate = dir.join(format!("{name}{ext}"));
-            if is_executable_file(&candidate) {
-                return Some(candidate);
+        match pathext {
+            None => {
+                let bare = dir.join(name);
+                if is_executable_file(&bare) {
+                    return Some(bare);
+                }
+            }
+            Some(exts) if has_pathext_ext(exts) => {
+                let bare = dir.join(name);
+                if is_executable_file(&bare) {
+                    return Some(bare);
+                }
+            }
+            Some(exts) => {
+                for ext in exts {
+                    let candidate = dir.join(format!("{name}{ext}"));
+                    if is_executable_file(&candidate) {
+                        return Some(candidate);
+                    }
+                }
             }
         }
     }
@@ -2016,7 +2056,7 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 }
 
 /// A regular file (Windows carries executability in the extension, which
-/// `binary_on_path` has already applied via `PATHEXT`).
+/// [`resolve_in_dirs`] has already applied via `PATHEXT`).
 #[cfg(not(unix))]
 fn is_executable_file(p: &std::path::Path) -> bool {
     std::fs::metadata(p).map(|md| md.is_file()).unwrap_or(false)
@@ -2070,7 +2110,8 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// measured. Present even when every probe answered `Unknown`.
 pub(crate) const CRED_PROBES_MARKER: &str = "probes:cred";
 
-/// A stored GitHub CLI login for `github.com` answers `gh auth status`.
+/// A stored GitHub CLI login for `github.com` whose ACTIVE account answers
+/// `gh auth status --active`.
 pub(crate) const CRED_GH_CAPABILITY: &str = "cred:gh";
 
 /// Some AWS identity answers `aws sts get-caller-identity`. Proves an
@@ -2096,9 +2137,9 @@ const CRED_PROBE_WITHHELD_ENV: [&str; 6] = [
 /// budget bounds staleness, never a heartbeat.
 const CRED_PROBE_BUDGET: Duration = Duration::from_secs(10);
 
-/// Upper bound on the bytes read from gh's `hosts.yml`. A real file is a few
-/// hundred bytes; a file that fills the cap without a `github.com:` line is
-/// read as `Unreadable` (cannot tell), never as "no login".
+/// Upper bound on the bytes scanned from gh's `hosts.yml`. A real file is a
+/// few hundred bytes; a file that fills the cap without a `github.com:` line
+/// is read as `Unreadable` (cannot tell), never as "no login".
 const GH_HOSTS_READ_CAP: usize = 256 * 1024;
 
 /// One probe's verdict.
@@ -2219,20 +2260,69 @@ fn gh_hosts_file(env: &CredProbeEnv) -> Option<PathBuf> {
     Some(dir.join("hosts.yml"))
 }
 
+/// The key line the census matches (`grep -q '^github\.com:'`).
+const GH_HOSTS_GITHUB_KEY: &[u8] = b"github.com:";
+
+/// A streaming `^github\.com:` matcher. Its whole state is a match-progress
+/// index into [`GH_HOSTS_GITHUB_KEY`] for the current line and the found bit —
+/// it never stores a byte of the input, so a line carrying an `oauth_token`
+/// passes through it without being kept anywhere.
+#[derive(Debug, Clone, Copy)]
+struct GithubKeyLineMatcher {
+    /// `Some(i)`: the current line's first `i` bytes match the key so far.
+    /// `None`: the current line has already diverged.
+    progress: Option<usize>,
+    found: bool,
+}
+
+impl GithubKeyLineMatcher {
+    const fn new() -> Self {
+        GithubKeyLineMatcher {
+            progress: Some(0),
+            found: false,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        for &b in chunk {
+            if self.found {
+                return;
+            }
+            if b == b'\n' {
+                self.progress = Some(0);
+                continue;
+            }
+            self.progress = match self.progress {
+                Some(i) if GH_HOSTS_GITHUB_KEY[i] == b => {
+                    if i + 1 == GH_HOSTS_GITHUB_KEY.len() {
+                        self.found = true;
+                    }
+                    Some(i + 1)
+                }
+                _ => None,
+            };
+        }
+    }
+}
+
 /// True when some line of `hosts` begins with the `github.com:` key — the
 /// census's `grep -q '^github\.com:'`, and the only fact taken from the file.
 fn hosts_yml_has_github_login(hosts: &[u8]) -> bool {
-    hosts
-        .split(|b| *b == b'\n')
-        .any(|line| line.starts_with(b"github.com:"))
+    let mut m = GithubKeyLineMatcher::new();
+    m.feed(hosts);
+    m.found
 }
 
-/// Read gh's `hosts.yml` IN MEMORY and keep one bit: whether a `github.com`
-/// login is configured. The file can hold an `oauth_token`, so the buffer is
-/// zeroed before it is dropped, nothing from it is logged, and the verdict is
-/// the only thing returned.
+/// Scan gh's `hosts.yml` and keep ONE bit: whether a `github.com` login is
+/// configured. The file can hold an `oauth_token`, so it is never read into a
+/// buffer the probe owns: a [`std::io::BufReader`] streams it through its own
+/// fixed-size internal buffer, each chunk goes through
+/// [`GithubKeyLineMatcher`] (which stores no input byte), and the scan stops
+/// at the first match. Nothing from the file is logged, and the verdict is the
+/// only thing returned. (The BufReader's buffer is ordinary heap memory freed
+/// unzeroed — the guarantee is "never retained or surfaced", not "scrubbed".)
 fn gh_login_config(env: &CredProbeEnv) -> GhLogin {
-    use std::io::Read;
+    use std::io::{BufRead, Read};
     let Some(path) = gh_hosts_file(env) else {
         return GhLogin::Unlocatable;
     };
@@ -2242,17 +2332,31 @@ fn gh_login_config(env: &CredProbeEnv) -> GhLogin {
         // A config dir we cannot search hides the file rather than lacking it.
         Err(_) => return GhLogin::Unreadable,
     };
-    let mut buf = Vec::new();
-    let read = file.take(GH_HOSTS_READ_CAP as u64).read_to_end(&mut buf);
-    let verdict = match read {
-        Ok(_) if hosts_yml_has_github_login(&buf) => GhLogin::Configured,
+    let mut reader = std::io::BufReader::new(file.take(GH_HOSTS_READ_CAP as u64));
+    let mut matcher = GithubKeyLineMatcher::new();
+    let mut scanned = 0usize;
+    loop {
+        let n = match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(chunk) => {
+                matcher.feed(chunk);
+                chunk.len()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return GhLogin::Unreadable,
+        };
+        reader.consume(n);
+        scanned += n;
+        if matcher.found {
+            return GhLogin::Configured;
+        }
+    }
+    if scanned >= GH_HOSTS_READ_CAP {
         // Filled the cap without the line: the line may sit past it.
-        Ok(n) if n >= GH_HOSTS_READ_CAP => GhLogin::Unreadable,
-        Ok(_) => GhLogin::None,
-        Err(_) => GhLogin::Unreadable,
-    };
-    buf.fill(0);
-    verdict
+        GhLogin::Unreadable
+    } else {
+        GhLogin::None
+    }
 }
 
 /// Presence test that never opens the file: `Ok` = present, `NotFound` =
@@ -2305,21 +2409,34 @@ fn cred_probe_command(program: &std::path::Path, args: &[&str]) -> std::process:
 /// [`command_succeeds_within`]: spawns the prepared command (whose stdio
 /// [`cred_probe_command`] has nulled), polls `try_wait` at 25 ms up to
 /// `budget`, then kills. Logs nothing: the caller logs the token and state.
+///
+/// The kill takes the WHOLE process tree, not just the child: `aws` on
+/// Windows is an `aws.cmd` shim that runs the real CLI as a grandchild, and
+/// `Child::kill` alone would leave that grandchild running. The tree is
+/// addressed through [`crate::process_helpers::ChildTreeGuard`] (a
+/// kill-on-close Job Object on Windows, an own process group + `killpg` on
+/// Unix) — armed before the spawn, dropped (= killed) on overrun, and
+/// released on a normal exit exactly as `run_with_timeout` does.
 fn command_exit_within(mut cmd: std::process::Command, budget: Duration) -> ProbeExit {
+    use crate::process_helpers::ChildTreeGuard;
     let started = std::time::Instant::now();
+    ChildTreeGuard::arm(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return ProbeExit::SpawnFailed,
     };
+    let tree = ChildTreeGuard::attach_armed(&child);
     let deadline = started + budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                tree.disarm();
                 return status.code().map_or(ProbeExit::NoCode, ProbeExit::Code);
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
+                    drop(tree);
                     let _ = child.wait();
                     return ProbeExit::TimedOut;
                 }
@@ -2327,6 +2444,7 @@ fn command_exit_within(mut cmd: std::process::Command, budget: Duration) -> Prob
             }
             Err(_) => {
                 let _ = child.kill();
+                drop(tree);
                 let _ = child.wait();
                 return ProbeExit::WaitFailed;
             }
@@ -2334,10 +2452,17 @@ fn command_exit_within(mut cmd: std::process::Command, budget: Duration) -> Prob
     }
 }
 
-/// D2's gh table (census `probe_gh`). `exit` is `None` when gh is not on
+/// D2's gh table (census `probe_gh`), applied to
+/// `gh auth status --active --hostname github.com` ([`GH_AUTH_STATUS_ARGS`]).
+/// `--active` matters: without it gh exits 1 when ANY stored account for the
+/// host has a problem — a stale, inactive second login included — which would
+/// read a working active login as Unknown. `exit` is `None` when gh is not on
 /// PATH. `login` is consulted only on exit 1/4, where gh reports both "not
 /// logged in" and "logged in, token check failed" (invalid token OR GitHub
-/// unreachable): only a definitively-absent login makes that an Absent.
+/// unreachable): only a definitively-absent login makes that an Absent. A gh
+/// too old to know `--active` exits 1 on the unknown flag, which lands in that
+/// same arm and so reads Unknown (configured) or Absent (no login) — never a
+/// false Present.
 fn classify_gh(exit: Option<ProbeExit>, login: impl FnOnce() -> GhLogin) -> CredState {
     match exit {
         None => CredState::Absent,
@@ -2355,6 +2480,13 @@ fn classify_gh(exit: Option<ProbeExit>, login: impl FnOnce() -> GhLogin) -> Cred
 /// configured — a config naming an SSO or process source lands there too.
 /// 254 (credentials rejected), 255 (aws's catch-all, which includes "network
 /// unreachable") and a timeout are Unknown.
+///
+/// **Deliberate difference from the census:** here exit 0 alone is
+/// `Present`. The census additionally checks that stdout is a 12-digit account
+/// id; this probe cannot, because its stdout is the null device by design
+/// (VALUE-FREE — the account id is never read into the runner at all). The
+/// cost is that an aws that exits 0 without printing an account counts as
+/// Present here and not in the census.
 fn classify_aws_sts(exit: Option<ProbeExit>, has_config: impl FnOnce() -> bool) -> CredState {
     match exit {
         None => CredState::Absent,
@@ -2370,33 +2502,51 @@ fn classify_aws_sts(exit: Option<ProbeExit>, has_config: impl FnOnce() -> bool) 
     }
 }
 
+/// The gh probe's arguments. `--active` scopes the verdict to the ACTIVE
+/// account (see [`classify_gh`]).
+const GH_AUTH_STATUS_ARGS: [&str; 5] = ["auth", "status", "--active", "--hostname", "github.com"];
+
+/// The aws probe's arguments. `--query Account --output text` keeps the
+/// census's command line; the output itself goes to the null device unread.
+const AWS_STS_ARGS: [&str; 6] = [
+    "sts",
+    "get-caller-identity",
+    "--query",
+    "Account",
+    "--output",
+    "text",
+];
+
+/// Log that a probe's binary is not on PATH — the token and that state only.
+fn log_cred_binary_not_on_path(token: &str, binary: &str) {
+    debug!("host_capabilities: {token}: `{binary}` not on PATH — state=absent");
+}
+
 fn probe_gh(env: &CredProbeEnv) -> CredState {
-    let exit = env.gh.as_deref().map(|gh| {
-        command_exit_within(
-            cred_probe_command(gh, &["auth", "status", "--hostname", "github.com"]),
+    let exit = match env.gh.as_deref() {
+        Some(gh) => Some(command_exit_within(
+            cred_probe_command(gh, &GH_AUTH_STATUS_ARGS),
             env.budget,
-        )
-    });
+        )),
+        None => {
+            log_cred_binary_not_on_path(CRED_GH_CAPABILITY, "gh");
+            None
+        }
+    };
     classify_gh(exit, || gh_login_config(env))
 }
 
 fn probe_aws_sts(env: &CredProbeEnv) -> CredState {
-    let exit = env.aws.as_deref().map(|aws| {
-        command_exit_within(
-            cred_probe_command(
-                aws,
-                &[
-                    "sts",
-                    "get-caller-identity",
-                    "--query",
-                    "Account",
-                    "--output",
-                    "text",
-                ],
-            ),
+    let exit = match env.aws.as_deref() {
+        Some(aws) => Some(command_exit_within(
+            cred_probe_command(aws, &AWS_STS_ARGS),
             env.budget,
-        )
-    });
+        )),
+        None => {
+            log_cred_binary_not_on_path(CRED_AWS_STS_CAPABILITY, "aws");
+            None
+        }
+    };
     classify_aws_sts(exit, || aws_has_config(env))
 }
 
@@ -2555,6 +2705,14 @@ fn cred_capabilities() -> Vec<String> {
 /// panicking probe cannot wedge every later refresh.
 fn spawn_cred_refresh() {
     use std::sync::atomic::Ordering;
+    // Hermetic-test seam: a unit-test process must never run the operator's
+    // real `gh` / `aws` (a live STS call with real credentials, on a detached
+    // thread that outlives the test). Tests drive the family through
+    // `probe_cred_family` with a hermetic `CredProbeEnv` instead.
+    if cfg!(test) {
+        debug!("host_capabilities: cred probe refresh suppressed under cfg(test)");
+        return;
+    }
     if CRED_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -2808,7 +2966,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     //     turned CI-node mode off is unreachable by any CI filter.
     let ci = crate::settings::get_ci_node_settings();
     let mut capabilities =
-        build_device_capabilities(ci.enabled, &ci.repo_allowlist, &host_capabilities());
+        build_device_capabilities(ci.enabled, &ci.repo_allowlist, &heartbeat_capabilities());
     // Skill capabilities (plan 2026-10-13-coord-expedited-land-lever-for-agents
     // Phase 3b): advertised only when the skill is served AND the bearer this
     // heartbeat presents is a live device JWT.
@@ -8765,15 +8923,14 @@ mod tests {",
         if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
             *g = None;
         }
-        // The `cred` family is excluded: it refreshes on a detached thread,
-        // so two calls can legitimately straddle that refresh landing.
-        let non_cred = |v: Vec<String>| -> Vec<String> {
-            v.into_iter()
-                .filter(|c| !c.starts_with("cred:") && c != CRED_PROBES_MARKER)
-                .collect()
-        };
-        let first = non_cred(host_capabilities());
-        let second = non_cred(host_capabilities());
+        let first = host_capabilities();
+        let second = host_capabilities();
+        assert!(
+            !first
+                .iter()
+                .any(|c| c.starts_with("cred:") || c == CRED_PROBES_MARKER),
+            "host_capabilities must not carry the cred family (heartbeat-only), got {first:?}"
+        );
         assert_eq!(
             first, second,
             "host_capabilities must be cache-stable across consecutive calls"
@@ -8831,6 +8988,76 @@ mod tests {",
             };
             let body =
                 format!("#!/bin/sh\necho {CRED_FAKE_SECRET}\necho {CRED_FAKE_SECRET} >&2\n{tail}");
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    /// A shim that, before printing the fake secret and exiting 0, records
+    /// into `report` (a side file — never its own stdout) its arguments and
+    /// where its stdout/stderr point:
+    ///
+    /// * Linux: `readlink /proc/$$/fd/{1,2}` — the SHELL's fds (`$$`), not
+    ///   readlink's own, whose fd 1 is the redirect into `report`.
+    /// * Windows: a PowerShell helper inherits the `.cmd` shim's std handles
+    ///   and records `GetFileType` + whether `GetConsoleMode` succeeds for
+    ///   each. The null device is `FILE_TYPE_CHAR` (2) with no console mode;
+    ///   an inherited console is 2 WITH a console mode, a pipe is 3, a file 1.
+    #[cfg(any(windows, target_os = "linux"))]
+    fn write_stdio_report_shim(
+        dir: &std::path::Path,
+        name: &str,
+        report: &std::path::Path,
+    ) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let ps1 = dir.join(format!("{name}-stdio.ps1"));
+            std::fs::write(
+                &ps1,
+                r#"param([string]$Out)
+$sig = '[DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int n);
+[DllImport("kernel32.dll")] public static extern uint GetFileType(System.IntPtr h);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr h, out uint m);'
+$k = Add-Type -MemberDefinition $sig -Name StdioProbe -Namespace CredShim -PassThru
+$lines = foreach ($n in @(-11, -12)) {
+  $h = $k::GetStdHandle($n)
+  $m = [uint32]0
+  $c = $k::GetConsoleMode($h, [ref]$m)
+  "type=$($k::GetFileType($h)) console=$c"
+}
+Add-Content -LiteralPath $Out -Value $lines
+"#,
+            )
+            .unwrap();
+            let path = dir.join(format!("{name}.cmd"));
+            let body = format!(
+                "@echo off\r\n\
+                 echo args=%*>>\"{report}\"\r\n\
+                 \"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{ps1}\" \"{report}\"\r\n\
+                 echo {CRED_FAKE_SECRET}\r\n\
+                 echo {CRED_FAKE_SECRET} 1>&2\r\n\
+                 exit /b 0\r\n",
+                report = report.display(),
+                ps1 = ps1.display(),
+            );
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            let report = report.display();
+            let body = format!(
+                "#!/bin/sh\n\
+                 echo \"args=$*\" >>'{report}'\n\
+                 echo \"fd1=$(readlink /proc/$$/fd/1)\" >>'{report}'\n\
+                 echo \"fd2=$(readlink /proc/$$/fd/2)\" >>'{report}'\n\
+                 echo {CRED_FAKE_SECRET}\n\
+                 echo {CRED_FAKE_SECRET} >&2\n\
+                 exit 0\n"
+            );
             std::fs::write(&path, body).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
@@ -9224,14 +9451,28 @@ mod tests {",
         std::fs::create_dir_all(&bin).unwrap();
         plant_gh_hosts(tmp.path(), true);
         let mut env = hermetic_cred_env(tmp.path());
-        env.gh = Some(write_cred_shim(&bin, "gh", Shim::Exit(0)));
+        // The gh shim also reports where its stdout/stderr point, so a
+        // regression from `Stdio::null()` to `inherit()` / a pipe fails here
+        // even though the secret would then only reach the test's own output.
+        let stdio_report = tmp.path().join("gh-stdio-report.txt");
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            env.gh = Some(write_stdio_report_shim(&bin, "gh", &stdio_report));
+            // The Windows report spins up PowerShell + Add-Type.
+            env.budget = Duration::from_secs(90);
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = &stdio_report;
+            env.gh = Some(write_cred_shim(&bin, "gh", Shim::Exit(0)));
+        }
         env.aws = Some(write_cred_shim(&bin, "aws", Shim::Exit(254)));
 
         let (outcome, logs) = capture_cred_logs(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut state = CredFamilyState::new();
                 cred_tick(&mut state, &env, std::time::Instant::now());
-                // Exit 1 with the secret-bearing hosts.yml: the in-memory read.
+                // Exit 1 with the secret-bearing hosts.yml: the streaming scan.
                 env.gh = Some(write_cred_shim(&bin, "gh-again", Shim::Exit(1)));
                 let gh_again = probe_gh(&env);
                 (state, gh_again)
@@ -9260,6 +9501,43 @@ mod tests {",
 
         let (caps, wire) = cred_payload_capabilities(&state);
         assert_eq!(caps, vec!["os:linux", "probes:cred", "cred:gh"]);
+
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let report = std::fs::read_to_string(&stdio_report)
+                .expect("anti-vacuity: the gh shim must have written its stdio report");
+            let lines: Vec<&str> = report.lines().map(str::trim).collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| *l == "args=auth status --active --hostname github.com"),
+                "gh must be probed as `auth status --active --hostname github.com`, got {report:?}"
+            );
+            #[cfg(target_os = "linux")]
+            for fd in ["fd1", "fd2"] {
+                assert!(
+                    lines.contains(&format!("{fd}=/dev/null").as_str()),
+                    "the probe child's {fd} must be the null device, got {report:?}"
+                );
+            }
+            #[cfg(windows)]
+            {
+                let handles: Vec<&&str> = lines.iter().filter(|l| l.starts_with("type=")).collect();
+                assert_eq!(
+                    handles.len(),
+                    2,
+                    "one stdout + one stderr line expected, got {report:?}"
+                );
+                for h in handles {
+                    assert_eq!(
+                        *h, "type=2 console=False",
+                        "the probe child's stdout/stderr must be the NUL device \
+                         (FILE_TYPE_CHAR, no console mode), got {report:?}"
+                    );
+                }
+            }
+        }
+
         assert!(
             logs.contains("cred:gh"),
             "anti-vacuity: the capture must hold the family's own log line, got {logs:?}"
@@ -9377,6 +9655,147 @@ mod tests {",
         assert!(!binary_on_path("qontinui-definitely-not-a-real-binary-xyz"));
         #[cfg(unix)]
         assert!(binary_on_path("sh"), "`sh` must resolve on any unix PATH");
+    }
+
+    /// Windows PATH semantics: an extensionless file beside `gh.cmd` (an MSYS
+    /// shell script `CreateProcess` cannot run) never wins — even when it
+    /// sits in an EARLIER directory; a name already carrying a `PATHEXT`
+    /// extension resolves as given; and Unix semantics stay bare-name.
+    /// Platform-independent: `pathext` selects the semantics.
+    #[test]
+    fn path_resolution_prefers_pathext_and_skips_unspawnable_bare_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let early = tmp.path().join("early");
+        let late = tmp.path().join("late");
+        std::fs::create_dir_all(&early).unwrap();
+        std::fs::create_dir_all(&late).unwrap();
+        let make = |p: PathBuf| {
+            std::fs::write(&p, "x").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            p
+        };
+        let bare_early = make(early.join("gh"));
+        let bare_late = make(late.join("gh"));
+        let cmd_late = make(late.join("gh.cmd"));
+        // Lowercase so the joined candidate names match on a case-sensitive
+        // filesystem too; Windows matches either case.
+        let exts: Vec<String> = [".com", ".exe", ".bat", ".cmd"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let dirs = || vec![early.clone(), late.clone()];
+
+        assert_eq!(
+            resolve_in_dirs("gh", dirs(), Some(&exts)),
+            Some(cmd_late.clone()),
+            "Windows: the bare `gh` files must be skipped for `gh.cmd`"
+        );
+        assert_ne!(
+            resolve_in_dirs("gh", dirs(), Some(&exts)),
+            Some(bare_early.clone())
+        );
+        assert_ne!(resolve_in_dirs("gh", dirs(), Some(&exts)), Some(bare_late));
+        assert_eq!(
+            resolve_in_dirs("gh.cmd", dirs(), Some(&exts)),
+            Some(cmd_late.clone()),
+            "a name with a PATHEXT extension resolves as given"
+        );
+        assert_eq!(
+            resolve_in_dirs("aws", dirs(), Some(&exts)),
+            None,
+            "nothing spawnable is nothing"
+        );
+        assert_eq!(
+            resolve_in_dirs("gh", dirs(), None),
+            Some(bare_early),
+            "Unix semantics: the first bare executable"
+        );
+    }
+
+    /// W2: a probe that overruns its budget is killed TOGETHER WITH its
+    /// grandchildren (a `.cmd` shim's real CLI), not just the direct child.
+    #[test]
+    fn cred_probe_overrun_kills_the_whole_process_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        #[cfg(windows)]
+        let (shim, budget) = {
+            let path = tmp.path().join("aws.cmd");
+            std::fs::write(
+                &path,
+                format!(
+                    "@echo off\r\n\
+                     \"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -Command \"Set-Content -LiteralPath '{}' -Value $PID; Start-Sleep -Seconds 120\"\r\n\
+                     exit /b 0\r\n",
+                    pid_file.display()
+                ),
+            )
+            .unwrap();
+            (path, Duration::from_secs(20))
+        };
+        #[cfg(not(windows))]
+        let (shim, budget) = {
+            use std::os::unix::fs::PermissionsExt;
+            let path = tmp.path().join("aws");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nsleep 120 &\necho $! >'{}'\nwait\n",
+                    pid_file.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (path, Duration::from_secs(2))
+        };
+
+        let exit = command_exit_within(cred_probe_command(&shim, &AWS_STS_ARGS), budget);
+        assert_eq!(exit, ProbeExit::TimedOut);
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("anti-vacuity: the grandchild must have recorded its pid before the kill")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::process_capture::health::pid_alive(pid) && !grandchild_is_zombie(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild pid {pid} survived the probe's overrun kill"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// A killed-but-unreaped process still answers `kill(pid, 0)`; on Linux
+    /// read its state so a zombie awaiting its reaper counts as dead.
+    fn grandchild_is_zombie(_pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string(format!("/proc/{_pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit_once(')')
+                        .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// M2: the gh probe scopes to the ACTIVE account.
+    #[test]
+    fn gh_probe_args_scope_to_the_active_account() {
+        assert_eq!(
+            GH_AUTH_STATUS_ARGS,
+            ["auth", "status", "--active", "--hostname", "github.com"]
+        );
     }
 
     // ---- auto-fresh: refusing to call nothing a build ----
