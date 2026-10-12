@@ -27,9 +27,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageTimeoutW,
     SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, IDC_ARROW, MSG, SMTO_ABORTIFHUNG,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW,
+    WS_CAPTION, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use super::{handle_of, window};
@@ -339,14 +339,7 @@ fn window_thread(
             let _ = ready.send(Err("RegisterClassExW failed".into()));
             return;
         }
-        let (style, mut ex) = if opts.activate {
-            (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, WS_EX_APPWINDOW)
-        } else {
-            (WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
-        };
-        if opts.topmost {
-            ex |= WS_EX_TOPMOST;
-        }
+        let (style, ex) = window_styles(opts.activate, opts.topmost);
         let mut r = RECT {
             left: 0,
             top: 0,
@@ -491,5 +484,51 @@ impl Drop for GdiTestWindow {
             // SAFETY: brushes we created, deleted once after the window is gone.
             let _ = unsafe { DeleteObject(HGDIOBJ(*b as *mut core::ffi::c_void)) };
         }
+    }
+}
+
+/// The window's styles. The selftest's window is an ordinary activatable
+/// application window. The doctor's probe window must never take focus, yet
+/// stay capturable by Windows.Graphics.Capture: `CreateForWindow` refused the
+/// earlier `WS_POPUP` + `WS_EX_TOOLWINDOW` probe with E_INVALIDARG
+/// (0x80070057) on the first hosted run (PR #2177, run 38315983341) while
+/// the selftest's ordinary window opened, which left `capture.wgc` UNKNOWN
+/// and its checks ungated. So it is an ordinary captioned top-level window —
+/// no tool-window style — that never activates (`WS_EX_NOACTIVATE`, shown
+/// with `SW_SHOWNOACTIVATE`).
+fn window_styles(activate: bool, topmost: bool) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
+    let (style, mut ex) = if activate {
+        (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, WS_EX_APPWINDOW)
+    } else {
+        (WS_OVERLAPPED | WS_CAPTION, WS_EX_NOACTIVATE)
+    };
+    if topmost {
+        ex |= WS_EX_TOPMOST;
+    }
+    (style, ex)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_doctors_probe_window_is_capturable_and_never_activates() {
+        use windows::Win32::UI::WindowsAndMessaging::{WS_EX_TOOLWINDOW, WS_POPUP};
+        let (style, ex) = window_styles(false, true);
+        assert!(
+            !ex.contains(WS_EX_TOOLWINDOW),
+            "the probe CreateForWindow refused was a tool window: {ex:?}"
+        );
+        assert!(
+            !style.contains(WS_POPUP) && style.contains(WS_CAPTION),
+            "{style:?}"
+        );
+        assert!(
+            ex.contains(WS_EX_NOACTIVATE) && ex.contains(WS_EX_TOPMOST),
+            "{ex:?}"
+        );
+        let (_, ex) = window_styles(true, false);
+        assert!(ex.contains(WS_EX_APPWINDOW) && !ex.contains(WS_EX_NOACTIVATE));
     }
 }

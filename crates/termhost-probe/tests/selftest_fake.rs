@@ -305,3 +305,29 @@ fn one_late_frame_does_not_fail_the_kept_up_check() {
         report(&o)
     );
 }
+
+#[test]
+fn wgc_is_allowed_its_capture_render_stage_and_dda_is_not() {
+    // WGC stamps the compositor's render of the capture frame, one stage
+    // after the presentation DDA stamps: its latency check allows two
+    // refresh intervals, DDA's one. Both are reported in the check's data.
+    let mut host = FakeHost::new(Faults::default());
+    host.dda = true;
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let tol = |name: &str| {
+        let c = find(&o, name);
+        (c.data["stages"].as_u64(), c.data["tolerance_ms"].as_f64())
+    };
+    let (wgc_stages, wgc_ms) = tol("output_latency.wgc.d0");
+    let (dda_stages, dda_ms) = tol("output_latency.dda.d0");
+    assert_eq!((wgc_stages, dda_stages), (Some(2), Some(1)));
+    assert!((wgc_ms.expect("wgc") - 33.333).abs() < 0.01, "{wgc_ms:?}");
+    assert!((dda_ms.expect("dda") - 16.667).abs() < 0.01, "{dda_ms:?}");
+    assert!(
+        find(&o, "output_latency.wgc.d0")
+            .detail
+            .contains("2 refresh interval(s)"),
+        "{}",
+        report(&o)
+    );
+}

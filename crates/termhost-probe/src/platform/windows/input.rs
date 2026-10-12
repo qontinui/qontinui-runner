@@ -12,15 +12,24 @@
 //!
 //! The injector sends VIRTUAL-KEY presses (`VK_A`..`VK_Z`, `VK_0`..`VK_9`)
 //! with the tag, after checking that the input desktop is the interactive
-//! one and that the target is foreground. Not KEYEVENTF_UNICODE (a VK_PACKET
-//! delivered to the foreground thread): on the first hosted run (PR #2177,
-//! run 38315983341, windows-latest) the Raw Input listener heard NONE of
-//! such a key's events — it had recognised 0 of 2 about a second after the
+//! one and that the target is foreground — and, before every key, that no
+//! modifier is held (Shift, Ctrl, Alt, either Windows key) and CapsLock is
+//! off, and that the plain key types exactly the intended character on the
+//! TARGET thread's keyboard layout.
+//!
+//! Why not KEYEVENTF_UNICODE, as before: on the first hosted run (PR #2177,
+//! run 38315983341, windows-latest) the Raw Input listener heard NONE of a
+//! unicode key's events — it had recognised 0 of 2 about a second after the
 //! key was sent, and the next arm's subscription had received no event of
-//! it either. That is deafness, not latency. A virtual key goes through the
-//! system's keyboard input path, which Raw Input reports for injected input
-//! (`hDevice` NULL, the tag in `ExtraInformation`). The keys are lowercase letters and digits only (as
-//! `--keys` allows), typed unshifted.
+//! it either: deafness, not latency. Virtual keys confirmed the cause on the
+//! next run (run 38318901114, at a9719f5f0): `input_round_trip` injected
+//! 20/20 keys and saw 20/20 echoes — which needs the listener to recognise
+//! both events of every key as the probe's — and `untagged_injection_aborts`
+//! passed, aborting with ForeignInjection at the untagged key. A unicode key
+//! (a VK_PACKET delivered to the foreground thread) does not reach Raw
+//! Input there; a virtual key goes through the system's keyboard input
+//! path, which Raw Input reports for injected input (`hDevice` NULL, the tag
+//! in `ExtraInformation`).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -37,13 +46,15 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, MapVirtualKeyExW, SendInput, VkKeyScanExW,
+    HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+    VK_CAPITAL, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
     RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     PostThreadMessageW, RegisterClassExW, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_QUIT,
@@ -360,11 +371,73 @@ fn virtual_key(ch: char) -> Option<u16> {
     }
 }
 
+/// Whether `VkKeyScanExW`'s answer for a character says it is typed by `vk`
+/// with NO shift state (no Shift, Ctrl, Alt or other layout modifier), so
+/// the plain key produces exactly that character on that layout. On AZERTY
+/// '1' needs Shift; on Czech, digits need Shift; on a Cyrillic or Greek
+/// layout a Latin letter has no key at all (-1): all refused.
+fn layout_types_unshifted(scan: i16, vk: u16) -> bool {
+    let scan = scan as u16;
+    scan != 0xFFFF && scan & 0xFF == vk && scan >> 8 == 0
+}
+
+/// Why the keyboard is not fit to type a plain key: a held modifier (Shift
+/// or CapsLock change the character, Ctrl or Alt make it a shortcut in the
+/// target, a Windows key a SYSTEM shortcut outside it). `held` lists the
+/// modifiers down; `caps` is CapsLock's toggle.
+fn keyboard_block(held: &[&str], caps: bool) -> Option<String> {
+    let mut why: Vec<String> = held.iter().map(|m| format!("{m} is held")).collect();
+    if caps {
+        why.push("CapsLock is on".into());
+    }
+    (!why.is_empty()).then(|| why.join(", "))
+}
+
+/// The keyboard's modifier state now, as `keyboard_block` judges it. Read
+/// with GetAsyncKeyState, so a modifier another program left logically down
+/// counts too — the real-input listener would never see that one.
+fn keyboard_state() -> Option<String> {
+    const MODIFIERS: [(VIRTUAL_KEY, &str); 5] = [
+        (VK_SHIFT, "Shift"),
+        (VK_CONTROL, "Ctrl"),
+        (VK_MENU, "Alt"),
+        (VK_LWIN, "the left Windows key"),
+        (VK_RWIN, "the right Windows key"),
+    ];
+    let held: Vec<&str> = MODIFIERS
+        .iter()
+        // SAFETY: a read of the asynchronous key state.
+        .filter(|(vk, _)| unsafe { GetAsyncKeyState(i32::from(vk.0)) } as u16 & 0x8000 != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    // SAFETY: a read of the toggle state.
+    let caps = unsafe { GetKeyState(i32::from(VK_CAPITAL.0)) } & 1 != 0;
+    keyboard_block(&held, caps)
+}
+
+/// The keyboard layout of the thread that owns `target`.
+fn target_layout(target: WindowHandle) -> HKL {
+    // SAFETY: GetWindowThreadProcessId accepts any window handle, and
+    // GetKeyboardLayout any thread id.
+    unsafe { GetKeyboardLayout(GetWindowThreadProcessId(hwnd(target), None)) }
+}
+
+/// Whether `ch` is typed by its plain virtual key on layout `hkl`.
+fn typeable_on(ch: char, hkl: HKL) -> bool {
+    let Some(vk) = virtual_key(ch) else {
+        return false;
+    };
+    // SAFETY: a pure table lookup in the given layout.
+    layout_types_unshifted(unsafe { VkKeyScanExW(ch as u16, hkl) }, vk)
+}
+
 /// The key-down and key-up events that type `ch`, tagged with `extra`.
 fn key_events(ch: char, extra: usize) -> Option<[INPUT; 2]> {
     let vk = virtual_key(ch)?;
-    // SAFETY: a pure table lookup in the active keyboard layout.
-    let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as u16;
+    // SAFETY: a pure table lookup in the caller's keyboard layout.
+    let scan =
+        unsafe { MapVirtualKeyExW(u32::from(vk), MAPVK_VK_TO_VSC, Some(GetKeyboardLayout(0))) }
+            as u16;
     let event = |up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -395,6 +468,9 @@ impl KeyInjector for Injector {
             }
             Err(why) => return Err(InjectBlock::DesktopUnavailable(why)),
         }
+        if let Some(why) = keyboard_state() {
+            return Err(InjectBlock::KeyboardState(why));
+        }
         if window::is_foreground(hwnd(WindowHandle(self.target))) {
             Ok(())
         } else {
@@ -406,8 +482,9 @@ impl KeyInjector for Injector {
     }
 
     fn can_send(&self, ch: char) -> bool {
-        // A virtual key Raw Input reports: lowercase letters and digits.
-        virtual_key(ch).is_some()
+        // A virtual key (lowercase letters and digits) that types exactly
+        // this character, unshifted, on the TARGET's keyboard layout.
+        typeable_on(ch, target_layout(WindowHandle(self.target)))
     }
 
     fn ledger_ids(&self, _ch: char) -> Vec<u32> {
@@ -420,6 +497,12 @@ impl KeyInjector for Injector {
     }
 
     fn send_char(&mut self, ch: char, tagged: bool) -> Result<(), String> {
+        // Again before every key: the target's layout can change mid-arm.
+        if !typeable_on(ch, target_layout(WindowHandle(self.target))) {
+            return Err(format!(
+                "{ch:?} is not typed by its plain key on the target's keyboard layout (it needs a modifier there, or has no key); nothing was sent"
+            ));
+        }
         let extra = if tagged { self.tagging.tag as usize } else { 0 };
         let Some(inputs) = key_events(ch, extra) else {
             return Err(format!(
@@ -463,6 +546,33 @@ impl KeyInjector for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_plain_unshifted_key_on_the_targets_layout_types_the_character() {
+        // US: 'a' is VK_A (0x41) with no shift state.
+        assert!(layout_types_unshifted(0x0041, 0x41));
+        // AZERTY: '1' is VK_1 WITH Shift (0x0131): refused.
+        assert!(!layout_types_unshifted(0x0131, 0x31));
+        // A Cyrillic layout has no key for 'a': -1.
+        assert!(!layout_types_unshifted(-1, 0x41));
+        // Another key types the character (QWERTZ: 'z' is on VK_Y): refused.
+        assert!(!layout_types_unshifted(0x0059, 0x5A));
+        // AltGr (Ctrl+Alt, shift state 0x06): refused.
+        assert!(!layout_types_unshifted(0x0641, 0x41));
+    }
+
+    #[test]
+    fn a_held_modifier_or_capslock_blocks_the_key() {
+        assert_eq!(keyboard_block(&[], false), None);
+        assert_eq!(
+            keyboard_block(&["the left Windows key"], false).as_deref(),
+            Some("the left Windows key is held")
+        );
+        assert_eq!(
+            keyboard_block(&["Shift", "Ctrl"], true).as_deref(),
+            Some("Shift is held, Ctrl is held, CapsLock is on")
+        );
+    }
 
     #[test]
     fn keys_are_virtual_keys_raw_input_reports_not_unicode_packets() {

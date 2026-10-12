@@ -66,6 +66,9 @@ pub enum AbortReason {
     MonitorDeaf,
     /// A key of the arm cannot be typed on this platform.
     UnsupportedKey,
+    /// A modifier is held or CapsLock is on: the key would not type what is
+    /// intended, or would become a shortcut.
+    KeyboardState,
     SendFailed,
     ForegroundChangedDuringInjection,
     StopRequested,
@@ -82,6 +85,7 @@ impl AbortReason {
             AbortReason::MonitorDown => "monitor_down",
             AbortReason::MonitorDeaf => "monitor_deaf",
             AbortReason::UnsupportedKey => "unsupported_key",
+            AbortReason::KeyboardState => "keyboard_state",
             AbortReason::SendFailed => "send_failed",
             AbortReason::ForegroundChangedDuringInjection => "foreground_changed_during_injection",
             AbortReason::StopRequested => "stop_requested",
@@ -272,6 +276,7 @@ pub fn run_arm(
                 InjectBlock::NotForeground(_) => AbortReason::NotForeground,
                 InjectBlock::DesktopUnavailable(_) => AbortReason::DesktopUnavailable,
                 InjectBlock::Unknown(_) => AbortReason::TargetCheckFailed,
+                InjectBlock::KeyboardState(_) => AbortReason::KeyboardState,
             };
             return abort(sink, i, reason, block.to_string(), sent);
         }
@@ -292,11 +297,23 @@ pub fn run_arm(
         }
         sent += 1;
         if let Err(block) = inj.check_target() {
+            // A modifier that went down while the key was sent is not a
+            // focus change: report it as what it is.
+            let (reason, what) = match &block {
+                InjectBlock::KeyboardState(_) => (
+                    AbortReason::KeyboardState,
+                    "a modifier went down (or CapsLock on) while key {i} was being sent, so it may have typed something else or a shortcut",
+                ),
+                _ => (
+                    AbortReason::ForegroundChangedDuringInjection,
+                    "the foreground changed while key {i} was being sent, so it may have reached another window",
+                ),
+            };
             return abort(
                 sink,
                 i,
-                AbortReason::ForegroundChangedDuringInjection,
-                format!("the foreground changed while key {i} was being sent, so it may have reached another window: {block}"),
+                reason,
+                format!("{}: {block}", what.replace("{i}", &i.to_string())),
                 sent,
             );
         }
@@ -500,6 +517,8 @@ mod tests {
         heard: Arc<AtomicU64>,
         deaf: bool,
         unsupported: Option<char>,
+        /// A modifier is held from this key on (`check_target` refuses).
+        keyboard_held_at: Option<u32>,
         /// The sink's lines at the moment each key was sent.
         lines: Option<Arc<Mutex<Vec<String>>>>,
         seen_at_send: Arc<Mutex<Vec<usize>>>,
@@ -514,6 +533,9 @@ mod tests {
                 .iter()
                 .filter(|(_, t)| *t)
                 .count() as u32;
+            if self.keyboard_held_at.is_some_and(|at| n >= at) {
+                return Err(InjectBlock::KeyboardState("Shift is held".into()));
+            }
             match self.lose_focus_at {
                 Some(at) if n >= at => Err(InjectBlock::NotForeground("another window".into())),
                 _ => Ok(()),
@@ -585,6 +607,7 @@ mod tests {
             heard: Arc::new(AtomicU64::new(0)),
             deaf: false,
             unsupported: None,
+            keyboard_held_at: None,
             lines: None,
             seen_at_send: Arc::new(Mutex::new(Vec::new())),
         };
@@ -746,6 +769,54 @@ mod tests {
             1,
             "no key after the deaf one"
         );
+    }
+
+    #[test]
+    fn a_held_modifier_stops_the_arm_before_the_next_key() {
+        // Shift goes down (another program, or the operator's hand resting
+        // on it) while key 1 is being sent: the check right after that key
+        // stops the arm, reported as the keyboard state — and key 2 is
+        // never sent.
+        let (mut inj, mut sub, _bus, sent) = setup(None);
+        inj.keyboard_held_at = Some(2);
+        let (mut sink, lines) = Sink::memory();
+        let out = run_arm(&cfg(6), &mut inj, &mut sub, &mut sink, |_, _, _| {});
+        assert!(
+            matches!(
+                out,
+                ArmOutcome::Aborted {
+                    index: 1,
+                    reason: AbortReason::KeyboardState,
+                    sent: 2,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(sent.lock().expect("sent").len(), 2);
+        assert!(lines
+            .lock()
+            .expect("lines")
+            .iter()
+            .any(|l| l.contains("\"reason\":\"keyboard_state\"")));
+        // Held before the first key: nothing at all is sent.
+        let (mut inj, mut sub, _bus, sent) = setup(None);
+        inj.keyboard_held_at = Some(0);
+        let (mut sink, _) = Sink::memory();
+        let out = run_arm(&cfg(3), &mut inj, &mut sub, &mut sink, |_, _, _| {});
+        assert!(
+            matches!(
+                out,
+                ArmOutcome::Aborted {
+                    index: 0,
+                    reason: AbortReason::KeyboardState,
+                    sent: 0,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert!(sent.lock().expect("sent").is_empty());
     }
 
     #[test]

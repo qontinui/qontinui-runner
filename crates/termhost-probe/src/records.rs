@@ -56,6 +56,13 @@
 //!   probe could not establish), and `probe.behind` is `null` when no frame's
 //!   was — the KPIs it guards are then `unknown(harness_error)` too, because
 //!   a probe that cannot show it kept up has not.
+//! - **What a frame time means depends on the source.** WGC (the Windows
+//!   primary) stamps `SystemRelativeTime`, documented as the time the
+//!   compositor RENDERED the capture frame; Desktop Duplication stamps the
+//!   desktop's presentation. On the first hosted run WGC trailed DDA by a
+//!   near-constant 7-9 ms at every delay, so Windows output latencies carry
+//!   that stage: compare setups measured by the same source, never a WGC
+//!   number with a DDA or X11 one.
 //! - **A group's `memory_mb_end` is its memory in the LAST sample**, `null`
 //!   unless that sample was whole: a host that crashed, or a launcher that
 //!   handed off and exited, has no end-of-soak value.

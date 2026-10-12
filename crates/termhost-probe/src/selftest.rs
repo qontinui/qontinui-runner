@@ -120,6 +120,27 @@ pub struct SelftestOutcome {
     pub doctor: DoctorRecord,
 }
 
+/// How many compositor refresh intervals a painted marker may take to reach
+/// the moment a source's frame timestamp names. Desktop Duplication's
+/// `LastPresentTime` and an X11 damage read name the composition the paint
+/// first appears in: at most one interval after the paint. WGC's
+/// `SystemRelativeTime` is documented by Microsoft as "the QPC time at which
+/// the compositor rendered the frame" — the render of the CAPTURE frame, a
+/// later stage than the desktop presentation DDA stamps. On the first hosted
+/// run (PR #2177, run 38315983341) WGC trailed DDA by a near-constant offset
+/// at every delay (medians d0 22.33 vs 13.03 ms, d50 68.42 vs 61.42, d200
+/// 219.41 vs 211.53: +9.3, +7.0, +7.9 ms) while the two agreed per marker
+/// within one interval (max |delta| 14.23 ms). An offset that does not grow
+/// with the delay is a pipeline stage, not a scheduling error, so WGC is
+/// allowed one further interval for that stage — and never more: the
+/// cross-check against DDA still holds it to one interval of DDA.
+pub fn latency_stages(kind: SourceId) -> u32 {
+    match kind {
+        SourceId::Wgc => 2,
+        SourceId::Dda | SourceId::X11 | SourceId::Synthetic => 1,
+    }
+}
+
 /// The mechanism a capture source depends on.
 pub fn capture_mechanism(kind: SourceId) -> &'static str {
     match kind {
@@ -548,14 +569,20 @@ impl Selftest<'_> {
         seq: &mut u64,
         all: &mut Vec<Marker>,
     ) {
-        // The tolerance is one refresh interval. When the display reports no
-        // rate it is the assumed 60 Hz interval, and the check says so: a
-        // selftest tolerance, not a KPI.
+        // The tolerance is one refresh interval per pipeline stage the
+        // source's timestamp names (`latency_stages`). When the display
+        // reports no rate the interval is the assumed 60 Hz one, and the
+        // check says so: a selftest tolerance, not a KPI.
         let refresh_ms = refresh.ns as f64 / 1e6;
-        let tolerance = if refresh.assumed {
-            format!("{refresh_ms:.2} ms, ASSUMED: the display reports no refresh rate")
-        } else {
-            format!("one refresh interval, {refresh_ms:.2} ms")
+        let tolerance_for = |kind: SourceId| -> (f64, String) {
+            let stages = latency_stages(kind);
+            let ms = refresh_ms * f64::from(stages);
+            let what = if refresh.assumed {
+                format!("{ms:.2} ms ({stages} x the ASSUMED {refresh_ms:.2} ms interval: the display reports no refresh rate)")
+            } else {
+                format!("{ms:.2} ms ({stages} refresh interval(s) of {refresh_ms:.2} ms: the stages {}'s timestamp names)", kind.as_str())
+            };
+            (ms, what)
         };
         let period = self.cfg.marker_period_ms * MS;
         let k = self.cfg.markers_per_delay;
@@ -607,9 +634,10 @@ impl Selftest<'_> {
                 let max = lat.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let med = median(&mut lat);
                 let d_ms = d as f64;
+                let (tolerance_ms, tolerance) = tolerance_for(kind);
                 let ok = observed == k
                     && paint_errors == 0
-                    && med.is_some_and(|m| (m - d_ms).abs() <= refresh_ms)
+                    && med.is_some_and(|m| (m - d_ms).abs() <= tolerance_ms)
                     && min >= d_ms - 1.0;
                 self.check(
                     format!("output_latency.{}.d{d}", kind.as_str()),
@@ -629,6 +657,8 @@ impl Selftest<'_> {
                         "min_ms": (observed > 0).then_some(min),
                         "max_ms": (observed > 0).then_some(max),
                         "refresh_ms": refresh_ms,
+                        "tolerance_ms": tolerance_ms,
+                        "stages": latency_stages(kind),
                         "refresh_assumed": refresh.assumed,
                         "painter_late_max_ms": lateness.iter().copied().fold(0.0, f64::max),
                         "paint_errors": paint_errors,
