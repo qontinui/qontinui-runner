@@ -898,12 +898,205 @@ impl RefresherState {
     }
 }
 
+/// How long `start_refresher` waits for the isolated runtime to report the
+/// supervisor handle before it falls back to the caller's runtime.
+const ISOLATED_RUNTIME_START_WAIT: Duration = Duration::from_secs(10);
+
+/// How long the isolated runtime gives its task to exit on its own after
+/// shutdown, before it cancels whatever remains. It is longer than
+/// `RefresherState::stop`'s 3 s join, so within that window a graceful exit is
+/// not cut short by the runtime going away.
+const ISOLATED_RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Start `start` on a DEDICATED OS thread that owns its own tokio runtime, and
+/// with it its own BLOCKING POOL, then return the `JoinHandle` that `start`
+/// produced. `start` runs inside that runtime's context. Every `tokio::spawn`
+/// and `spawn_blocking` made by what it spawns lands on the private runtime,
+/// never on the shared one.
+///
+/// Why the refresher needs this (dossier `runner-coord-credential-stranded`,
+/// device c79a07d5, 2026-10-10 to 2026-10-12, runner build f6182b0cf):
+/// - The refresher keeps the device JWT alive only by self-refreshing inside
+///   the 80-minute window before `exp`, polled every 5 minutes.
+/// - Each iteration first awaits `spawn_blocking_tracked(read_sweep_inputs)`
+///   on the process-wide blocking pool. The Cognito refresh and the
+///   credential writes also run there.
+/// - That pool was exhausted at the time: `session::reconcile` logged "blocking
+///   pool exhausted?" at 23:05 local on 10-10 and repeatedly through 10-11.
+/// - Refresher iterations stalled for 81 min, 108 min and 3 h 14 min in those
+///   windows. Each stall was longer than the 80-minute window, so the JWT
+///   expired and its slot was cleared for decoded expiry.
+/// - The recovery requests in those windows failed with "error sending
+///   request". Their cause is NOT established, and this change does not claim
+///   to fix them. reqwest already resolves DNS asynchronously (`hickory-dns`,
+///   `Cargo.toml`), so it is not DNS queueing behind the pool.
+///
+/// A private runtime makes the credential-keeping loop independent of whatever
+/// else saturates the shared pool. The precedent is the fleet heartbeat's
+/// dedicated runtime in `main.rs` (`fleet-hb-rt`), isolated for the same
+/// starvation reason. A multi-thread runtime with one worker is used, not
+/// `current_thread`, so a `block_in_place` anywhere downstream cannot panic.
+/// Its blocking pool keeps tokio's default ceiling; it is not capped, so the
+/// 512 that `wedge_diagnostics` reads every pool against stays true for it.
+///
+/// The runtime runs until `shutdown_rx` reads `true`. The task `start` returned
+/// then gets up to [`ISOLATED_RUNTIME_SHUTDOWN_GRACE`] to exit on its own (the
+/// refresher loop watches the same signal), and only then is the runtime shut
+/// down. The handle handed back is a wrapper that completes when that task
+/// does, so within `stop`'s 3 s window `RefresherState::stop` joins the real
+/// exit, not a cancellation. Waiting for the handle never blocks a runtime worker: the
+/// hand-off is a `oneshot`, awaited.
+///
+/// Returns `Err` with a reason when the thread or runtime cannot be created,
+/// or when the handle does not come back within `wait` before `start` has
+/// begun. The caller then falls back to its own runtime, as before this
+/// change. Exactly one of "the isolated thread runs `start`" and "the caller
+/// falls back" happens, never both.
+pub(crate) async fn spawn_on_isolated_runtime<F>(
+    os_thread_name: &str,
+    runtime_thread_name: &'static str,
+    wait: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+    start: F,
+) -> Result<tokio::task::JoinHandle<()>, String>
+where
+    F: FnOnce() -> tokio::task::JoinHandle<()> + Send + 'static,
+{
+    // One owner decides whether `start` runs. The isolated thread claims it
+    // (PENDING -> STARTED) just before calling it. The caller abandons it
+    // (PENDING -> ABANDONED) when `wait` runs out. Only one of the two
+    // compare-and-swaps can win.
+    const PENDING: u8 = 0;
+    const STARTED: u8 = 1;
+    const ABANDONED: u8 = 2;
+    let claim = Arc::new(std::sync::atomic::AtomicU8::new(PENDING));
+    let thread_claim = Arc::clone(&claim);
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<tokio::task::JoinHandle<()>>();
+    std::thread::Builder::new()
+        .name(os_thread_name.to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name(runtime_thread_name)
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    warn!("isolated runtime {runtime_thread_name}: build failed: {e}");
+                    // Dropping `tx` tells the caller to fall back.
+                    return;
+                }
+            };
+            if thread_claim
+                .compare_exchange(
+                    PENDING,
+                    STARTED,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                // The caller gave up and started its own copy. Do not start
+                // a second one.
+                return;
+            }
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let outer = {
+                let _guard = rt.enter();
+                let inner = start();
+                tokio::spawn(async move {
+                    let _ = inner.await;
+                    let _ = done_tx.send(());
+                })
+            };
+            let _ = tx.send(outer);
+            // Keep the runtime alive until shutdown. Then let the task exit on
+            // its own, bounded by the grace period, before the runtime goes
+            // away. `shutdown_timeout` cancels whatever is still running.
+            rt.block_on(async move {
+                let _ = shutdown_rx.wait_for(|stop| *stop).await;
+                let _ = tokio::time::timeout(ISOLATED_RUNTIME_SHUTDOWN_GRACE, done_rx).await;
+            });
+            rt.shutdown_timeout(ISOLATED_RUNTIME_SHUTDOWN_GRACE);
+        })
+        .map_err(|e| format!("OS thread spawn failed: {e}"))?;
+    match tokio::time::timeout(wait, &mut rx).await {
+        Ok(Ok(handle)) => Ok(handle),
+        Ok(Err(_)) => Err("the isolated runtime thread ended without a handle".to_string()),
+        Err(_) => match claim.compare_exchange(
+            PENDING,
+            ABANDONED,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            // Abandoned before `start` ran, so the caller may safely fall back.
+            Ok(_) => Err(format!(
+                "no handle from the isolated runtime within {wait:?}"
+            )),
+            // `start` already claimed the run and its handle is on the way.
+            // Falling back now would start a second copy, so wait for it. This
+            // wait is no longer bounded by `wait`, but `start` only spawns a
+            // task, so it is short.
+            Err(_) => rx
+                .await
+                .map_err(|_| "the isolated runtime thread ended without a handle".to_string()),
+        },
+    }
+}
+
 /// Spawn the refresher task. Returns the state handle so the caller can
 /// stop / kick it. Used by `auto_start_device_jwt_refresher`.
-pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
+///
+/// The task runs on its OWN runtime and blocking pool
+/// ([`spawn_on_isolated_runtime`]), so an exhausted process-wide blocking pool
+/// cannot stall token refresh past the expiry window. If that runtime cannot be
+/// started, the task runs on the caller's runtime instead, and a warning says so.
+pub async fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (kick_tx, kick_rx) = watch::channel(0u64);
 
+    let isolated = {
+        let api_state = api_state.clone();
+        let shutdown_for_loop = shutdown_rx.clone();
+        let kick_rx = kick_rx.clone();
+        spawn_on_isolated_runtime(
+            "djwt-refresher",
+            "djwt-rt",
+            ISOLATED_RUNTIME_START_WAIT,
+            shutdown_rx.clone(),
+            move || spawn_supervised_refresher(api_state, shutdown_for_loop, kick_rx),
+        )
+        .await
+    };
+    let task_handle = match isolated {
+        Ok(handle) => {
+            info!("Device-JWT refresher running on its own runtime (djwt-rt)");
+            handle
+        }
+        Err(reason) => {
+            warn!(
+                "device_jwt_refresher: could not start the isolated runtime ({reason}) — \
+                 running on the shared runtime, where an exhausted blocking pool can stall \
+                 token refresh"
+            );
+            spawn_supervised_refresher(api_state, shutdown_rx, kick_rx)
+        }
+    };
+
+    Arc::new(RefresherState {
+        shutdown_tx,
+        kick_tx,
+        task_handle: Mutex::new(Some(task_handle)),
+    })
+}
+
+/// Spawn the supervised refresher loop on the CURRENT runtime context.
+fn spawn_supervised_refresher(
+    api_state: Arc<ApiState>,
+    shutdown_rx: watch::Receiver<bool>,
+    kick_rx: watch::Receiver<u64>,
+) -> tokio::task::JoinHandle<()> {
     // SUPERVISOR. `refresher_loop` is a long-lived task that should only RETURN
     // on a shutdown signal. Spawned bare it had the same fatal flaw the relay
     // had: a single panic in its directly-awaited path would unwind the task
@@ -916,25 +1109,15 @@ pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
     // `kick_device_jwt_refresher` keeps working across respawns.
     let mut kick_rx_loop = kick_rx;
     let shutdown_rx_loop = shutdown_rx.clone();
-    let task_handle = crate::mcp::task_supervisor::spawn_supervised(
-        "Device-JWT refresher",
-        shutdown_rx,
-        move || {
-            // Consume any kick delivered between respawns so the fresh loop
-            // doesn't immediately fire on an already-handled kick.
-            kick_rx_loop.borrow_and_update();
-            refresher_loop(
-                api_state.clone(),
-                shutdown_rx_loop.clone(),
-                kick_rx_loop.clone(),
-            )
-        },
-    );
-
-    Arc::new(RefresherState {
-        shutdown_tx,
-        kick_tx,
-        task_handle: Mutex::new(Some(task_handle)),
+    crate::mcp::task_supervisor::spawn_supervised("Device-JWT refresher", shutdown_rx, move || {
+        // Consume any kick delivered between respawns so the fresh loop
+        // doesn't immediately fire on an already-handled kick.
+        kick_rx_loop.borrow_and_update();
+        refresher_loop(
+            api_state.clone(),
+            shutdown_rx_loop.clone(),
+            kick_rx_loop.clone(),
+        )
     })
 }
 
@@ -5854,7 +6037,7 @@ pub mod commands {
         }
 
         info!("Starting device-JWT refresher");
-        let state = start_refresher(api_state);
+        let state = start_refresher(api_state).await;
         *guard = Some(state);
     }
 
@@ -12768,5 +12951,181 @@ mod device_machine_key_exchange_tests {
             None,
             "the foreign tenant's slot must not be seeded either"
         );
+    }
+}
+
+#[cfg(test)]
+mod isolated_runtime_tests {
+    use super::spawn_on_isolated_runtime;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    /// A caller runtime whose ONLY blocking thread is held until the returned
+    /// sender is dropped. This makes the pool deterministically saturated for
+    /// as long as the test needs, with no timing guess.
+    fn saturated_caller() -> (tokio::runtime::Runtime, std::sync::mpsc::Sender<()>) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        rt.spawn_blocking(move || {
+            let _ = held_tx.send(());
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        (rt, release_tx)
+    }
+
+    /// The property the fix exists for, proved in both directions so the test
+    /// cannot pass by accident. The caller runtime's only blocking thread is
+    /// held.
+    /// - Control: a task on the caller runtime that needs `spawn_blocking` does
+    ///   NOT finish within 400 ms. The saturation is real.
+    /// - Fix: the same work started through `spawn_on_isolated_runtime` DOES
+    ///   finish while the caller's pool is still held.
+    #[test]
+    fn isolated_runtime_does_blocking_work_while_the_callers_pool_is_saturated() {
+        let (caller, release) = saturated_caller();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        caller.block_on(async {
+            let control = tokio::spawn(async { tokio::task::spawn_blocking(|| 7u8).await });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(400), control)
+                    .await
+                    .is_err(),
+                "control: the caller's pool must be saturated for this test to mean anything"
+            );
+
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<u8>();
+            let handle = spawn_on_isolated_runtime(
+                "djwt-test",
+                "djwt-test-rt",
+                Duration::from_secs(30),
+                stop_rx,
+                move || {
+                    tokio::spawn(async move {
+                        let v = tokio::task::spawn_blocking(|| 42u8).await.unwrap();
+                        let _ = done_tx.send(v);
+                    })
+                },
+            )
+            .await
+            .expect("the isolated runtime starts");
+            let value = tokio::time::timeout(Duration::from_secs(30), done_rx)
+                .await
+                .expect("the isolated task finishes while the caller's pool is still held")
+                .unwrap();
+            assert_eq!(value, 42, "the isolated task did its blocking work");
+            assert!(
+                tokio::time::timeout(Duration::from_secs(30), handle)
+                    .await
+                    .is_ok_and(|r| r.is_ok()),
+                "the returned handle names the task that ran"
+            );
+        });
+        let _ = stop_tx.send(true);
+        drop(release);
+    }
+
+    /// The started task runs on the isolated runtime's threads, which are
+    /// named by `runtime_thread_name`. Signalling shutdown ends the runtime's
+    /// OS thread instead of leaking it.
+    #[test]
+    fn the_started_task_runs_on_the_named_isolated_runtime_and_shutdown_ends_it() {
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        // A task that never ends on its own, holding a value whose Drop
+        // reports. Only a runtime shutdown drops it, so a report after
+        // `stop_tx` proves the shutdown happened.
+        struct ReportOnDrop(std::sync::mpsc::Sender<()>);
+        impl Drop for ReportOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel::<()>();
+        caller.block_on(async {
+            let (name_tx, name_rx) = tokio::sync::oneshot::channel::<String>();
+            let handle = spawn_on_isolated_runtime(
+                "djwt-test-2",
+                "djwt-test2-rt",
+                Duration::from_secs(30),
+                stop_rx,
+                move || {
+                    let guard = ReportOnDrop(dropped_tx);
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        std::future::pending::<()>().await;
+                    });
+                    tokio::spawn(async move {
+                        let name = std::thread::current().name().unwrap_or("").to_string();
+                        let _ = name_tx.send(name);
+                    })
+                },
+            )
+            .await
+            .expect("the isolated runtime starts");
+            let name = tokio::time::timeout(Duration::from_secs(30), name_rx)
+                .await
+                .expect("the task ran")
+                .unwrap();
+            assert_eq!(name, "djwt-test2-rt");
+            assert!(tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .is_ok_and(|r| r.is_ok()));
+        });
+        assert!(
+            dropped_rx.try_recv().is_err(),
+            "nothing may be torn down before shutdown is signalled"
+        );
+        let _ = stop_tx.send(true);
+        assert!(
+            dropped_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "signalling shutdown ends the isolated runtime and drops its tasks"
+        );
+    }
+
+    /// If the caller gives up waiting, `start` must never run afterwards.
+    /// Otherwise the caller's fallback and a late isolated start would be two
+    /// refreshers. A zero wait forces the abandon path. If the caller wins, the
+    /// flag must stay unset. If the isolated thread claimed first, the handle
+    /// came back and `start` ran exactly once. Both outcomes are correct.
+    #[test]
+    fn an_abandoned_isolated_start_never_runs_start() {
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&started);
+        let result = caller.block_on(spawn_on_isolated_runtime(
+            "djwt-test-3",
+            "djwt-test3-rt",
+            Duration::ZERO,
+            stop_rx,
+            move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async {})
+            },
+        ));
+        match result {
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(500));
+                assert!(
+                    !started.load(std::sync::atomic::Ordering::SeqCst),
+                    "start ran after the caller abandoned it"
+                );
+            }
+            Ok(_) => assert!(started.load(std::sync::atomic::Ordering::SeqCst)),
+        }
+        let _ = stop_tx.send(true);
     }
 }
