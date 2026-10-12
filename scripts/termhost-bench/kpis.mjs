@@ -209,16 +209,21 @@ export function captureInfo(seg) {
   return { opened, failed, primary, refreshHz, refreshSource, refreshKnown };
 }
 
+/** Below this many frames with a known lag the probe gives no `behind` verdict (`model::LAG_VERDICT_MIN_FRAMES`). */
+export const LAG_VERDICT_MIN_FRAMES = 10;
+
 /**
  * The probe's verdict on its own health over a watch: when it fell behind its
  * source, every first appearance may be late, so latency, loss and cadence it
  * could have distorted are unknown(harness_error) — the probe's rule
  * (`records.rs` `ProbeHealth`), applied here to the KPIs the harness times itself.
  *
- * `behind` is null when frames arrived but not one's presentation time was known
- * (X11's first frame; every X11 frame while the server clock is not established):
- * whether the probe kept up was never established, so that is harness_error too —
- * the probe applies the same rule to its own KPIs. A null is never read as false.
+ * `behind` is null when frames arrived but fewer than {@link LAG_VERDICT_MIN_FRAMES}
+ * of them had a known presentation time (X11's first frame has none, nor does any
+ * X11 frame while the server clock is not established): whether the probe kept up
+ * was never established, so that is harness_error too — the probe applies the same
+ * rule to its own KPIs. A null is never read as false. `lag_statistic` (`p95` or
+ * `second_largest`) is null then as well.
  *
  * @returns {{reason: string, detail: string} | null}
  */
@@ -234,7 +239,9 @@ export function probeHealthGate(seg) {
   if (p.behind !== false && Number(p.frames ?? 0) > 0) {
     return {
       reason: "harness_error",
-      detail: `the probe could not show it kept up with its capture source: no primary frame's presentation time was known (${p.frames_lag_unknown ?? "?"} of ${p.frames} frame(s) without one)`,
+      detail: `the probe could not show it kept up with its capture source: only ${
+        Number.isInteger(p.frames_lag_unknown) ? p.frames - p.frames_lag_unknown : "?"
+      } of ${p.frames} primary frame(s) had a known presentation time (a verdict needs ${LAG_VERDICT_MIN_FRAMES})`,
     };
   }
   return null;

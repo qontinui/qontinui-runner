@@ -282,7 +282,7 @@ function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, r
   let blocked = null;
   if (captureFailed) blocked = ["capture_unavailable", "no capture source able to be primary was opened"];
   else if (behind) blocked = ["harness_error", "the probe fell behind: frames reached it up to 250.0 ms after presentation (bound 100.0 ms)"];
-  else if (behind === null && frames.length > 0) blocked = ["harness_error", `no primary frame's presentation time was known (${frames.length} frames), so the probe cannot show it kept up with them`];
+  else if (behind === null && frames.length > 0) blocked = ["harness_error", `only 0 of ${frames.length} primary frames had a known presentation time (a verdict needs 10), so the probe cannot show it kept up with them`];
   const gate = (id, refreshDependent, value) => {
     if (blocked) return unknownKpi(id, blocked[0], { n: value.n ?? 0, detail: blocked[1] });
     if (refreshDependent && refreshAssumed) return unknownKpi(id, "refresh_rate_unknown", { n: value.n ?? 0, detail: "the display reported no refresh rate (16.67 ms assumed)" });
@@ -355,7 +355,8 @@ function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, r
       lag_ms_judged: frames.length && behind !== null ? (behind ? 250 : 2) : null,
       lag_ms_max: frames.length && behind !== null ? (behind ? 250 : 2) : null,
       lag_bound_ms: 100,
-      lag_statistic: frames.length && behind !== null ? (frames.length >= 20 ? "p95" : frames.length >= 2 ? "second_largest" : "only_frame") : null,
+      // The probe's floor: no verdict below 10 frames with a known lag.
+      lag_statistic: frames.length >= 10 && behind !== null ? (frames.length >= 20 ? "p95" : "second_largest") : null,
       frames_over_bound: behind === true ? frames.length : 0,
       behind: frames.length ? behind : null,
     },

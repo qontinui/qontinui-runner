@@ -593,3 +593,17 @@ test("amended interval and hang records: the last record per interval index and 
   assert.deepEqual(seg.intervals.map((r) => [r.index, r.valid]), [[0, false], [1, true]]);
   assert.deepEqual(seg.hangs.map((h) => h.valid), [false]);
 });
+
+test("a probe with too few known lags for a verdict: harness_error naming the count, and no statistic is claimed (Phase 2 round 4)", () => {
+  const soak = watchSegment({ t0: T0, durationMs: 2000, behind: false });
+  const few = (patch) => indexProbeSegment(soak.map((r) => (r.type === "summary" ? { ...r, probe: { ...r.probe, ...patch } } : r)));
+  const frames = soak.find((r) => r.type === "summary").probe.frames;
+  // 115 of 120 frames without a known lag: the probe gives no verdict.
+  const g = probeHealthGate(few({ behind: null, lag_statistic: null, lag_ms_judged: null, frames_lag_unknown: frames - 5 }));
+  assert.equal(g.reason, "harness_error");
+  assert.equal(g.detail, `the probe could not show it kept up with its capture source: only 5 of ${frames} primary frame(s) had a known presentation time (a verdict needs 10)`);
+  // A behind verdict whose statistic is not named reads without one, never "as the null".
+  const b = probeHealthGate(few({ behind: true, lag_statistic: null, lag_ms_judged: 250, frames_over_bound: 12 }));
+  assert.equal(b.detail, "the probe fell behind its capture source (frame lag 250 ms judged, bound 100 ms, 12 frame(s) over it), so first appearances may be late");
+  assert.match(probeHealthGate(few({ behind: true, lag_statistic: "second_largest", lag_ms_judged: 250 })).detail, /judged as the second_largest,/);
+});
