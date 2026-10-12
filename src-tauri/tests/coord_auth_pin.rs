@@ -845,6 +845,11 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("fleet.rs", "device", 4),
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 5),
+    // The plan-library door's follow-up family (plan
+    // `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+    // Phase 4): ONE shared forward for its five qontinui-web routes, with the
+    // same session-less posture and E3 question as its parent's forwards.
+    ("mcp/plan_library/followups.rs", "work-owed", 1),
     ("mcp/probe_executor.rs", "device", 1),
     ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
@@ -951,11 +956,19 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
 /// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
 /// refuses any principal that does not prove a device. So `device` 21 -> 22.
+///
+/// Plan `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+/// Phase 4 adds one: the plan-library door's follow-up family
+/// (`mcp/plan_library/followups.rs`) forwards its five routes to
+/// **qontinui-web** through a single `forward`, with the same session-less,
+/// artifact-keyed posture as its parent's forwards and the same E3 open
+/// question — web derives `organization_id` from the device principal. So
+/// `work-owed` 8 -> 9.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
     ("session-noop", 10),
     ("session-owed", 0),
-    ("work-owed", 8),
+    ("work-owed", 9),
     ("escalated", 2),
 ];
 
