@@ -9088,9 +9088,9 @@ mod tests {",
     ///
     /// Enters exactly where the population enters: the capability vector
     /// `heartbeat_to_coord` puts on the register payload is
-    /// `build_device_capabilities(ci.enabled, &ci.repo_allowlist,
-    /// &heartbeat_capabilities())`, and this test assembles that same
-    /// expression (CI-node off and on) with the family cache seeded as a
+    /// `heartbeat_device_capabilities(ci.enabled, &ci.repo_allowlist)`, and
+    /// this test calls that same function (CI-node off and on) with the
+    /// family cache seeded as a
     /// finished probe run would leave it. It never runs a probe: the cache is
     /// seeded by value, and the background refresh is suppressed under
     /// `cfg(test)`. The prior cache state is restored on every exit.
