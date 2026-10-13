@@ -131,21 +131,24 @@ pub struct SelftestOutcome {
 /// design. WGC stamps `SystemRelativeTime`, documented by Microsoft as "the
 /// QPC time at which the compositor rendered the frame" — the render of the
 /// CAPTURE frame, a later stage than the desktop presentation DDA's
-/// `LastPresentTime` stamps. Declared from the one measurement there is: on
-/// the first hosted run (PR #2177, run 38315983341, windows-latest, Basic
-/// Render Driver) WGC trailed DDA at every delay by +9.3, +7.0 and +7.9 ms
-/// (medians d0 22.33 vs 13.03 ms, d50 68.42 vs 61.42, d200 219.41 vs
-/// 211.53). That one run on one machine class is why WGC's ABSOLUTE latency
-/// is reported but not gated, and WGC is instead held to DDA by this offset
-/// (and, without DDA, to itself across delays) — the offset band gating
-/// only on displays inside the measured class (`WGC_OFFSET_CLASS_MS`).
+/// `LastPresentTime` stamps. Declared from the hosted measurements, both
+/// windows-latest (PR #2177): run 38315983341 measured WGC +7.0..9.3 ms
+/// behind DDA (medians d0 22.33 vs 13.03 ms, d50 68.42 vs 61.42, d200 219.41
+/// vs 211.53), and run 38328964774 +4.5..6.7 ms (+4.5, +6.4, +6.7) — 4.5 to
+/// 9.3 ms combined. The centre stays at 10 ms, keeping headroom above the
+/// largest offset seen. That this is one machine class only is why WGC's
+/// ABSOLUTE latency is reported but not gated, and WGC is instead held to
+/// DDA by this offset (and, without DDA, to itself across delays) — the
+/// offset band gating only on displays inside the measured class
+/// (`WGC_OFFSET_CLASS_MS`).
 pub const WGC_RENDER_OFFSET_MS: f64 = 10.0;
-/// The slack around the offset: the measured offsets spread 2.3 ms. It is
+/// The slack around the offset: the band then runs from 4 ms below zero up
+/// to 14 ms, around the 4.5-9.3 ms measured. It is
 /// capped at half the refresh interval (`wgc_offset_margin_ms`), so a
 /// regression that adds one frame always lands outside the band.
 pub const WGC_OFFSET_MARGIN_MS: f64 = 4.0;
-/// The refresh intervals the offset was measured on (that run: 15.625 ms,
-/// 64 Hz). The band's milliseconds are only known to mean "the same render
+/// The refresh intervals the offset was measured on (those runs' display:
+/// 15.625 ms, 64 Hz). The band's milliseconds are only known to mean "the same render
 /// stage" there: at 144 Hz a one-frame regression could fit inside it, and a
 /// real-GPU 60 Hz box may phase-lock to a larger offset. Elsewhere — or with
 /// an assumed rate — the offset check is reported, not gated.

@@ -26,11 +26,11 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageTimeoutW,
-    SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, IDC_ARROW, MSG, SHOW_WINDOW_CMD,
-    SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT,
-    WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED,
-    WS_SYSMENU,
+    SetWindowPos, ShowWindow, TranslateMessage, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MSG,
+    SET_WINDOW_POS_FLAGS, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use super::{handle_of, window};
@@ -387,7 +387,7 @@ fn window_thread(
         )
         .unwrap_or_default();
         shared.occluder.store(occ.0 as isize, Ordering::Relaxed);
-        let _ = ShowWindow(main, show_command(opts.activate));
+        show_window(main, opts.activate, opts.topmost);
         let _ = UpdateWindow(main);
         let _ = ready.send(Ok(GetCurrentThreadId()));
         let mut msg = MSG::default();
@@ -484,7 +484,7 @@ impl Drop for GdiTestWindow {
 /// The window's styles — ONE construction for the selftest's window and the
 /// doctor's capture probe, so the doctor proves WGC on the same kind of
 /// window the selftest then measures. Only the show command differs
-/// (`show_command`): the doctor's probe, which also runs on operator
+/// (`show_window`): the doctor's probe, which also runs on operator
 /// machines, is shown without activation and never asked to take focus.
 ///
 /// Why it is no longer a separate, "never-activating" design: on the hosted
@@ -505,13 +505,27 @@ fn window_styles(topmost: bool) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
     (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, ex)
 }
 
-/// How the window is first shown: activated for the selftest, which must be
-/// foreground; without activation for the doctor's probe.
-fn show_command(activate: bool) -> SHOW_WINDOW_CMD {
-    if activate {
-        SW_SHOW
-    } else {
-        SW_SHOWNOACTIVATE
+/// The flags that show the doctor's probe without activating it.
+const PROBE_SHOW: SET_WINDOW_POS_FLAGS =
+    SET_WINDOW_POS_FLAGS(SWP_SHOWWINDOW.0 | SWP_NOACTIVATE.0 | SWP_NOMOVE.0 | SWP_NOSIZE.0);
+
+/// Show the window the first time. The selftest's window, which must be
+/// foreground, with `ShowWindow(SW_SHOW)`. The doctor's probe — D9: it must
+/// never take the operator's focus — with `SetWindowPos(SWP_SHOWWINDOW |
+/// SWP_NOACTIVATE | ...)`, NOT `ShowWindow`: the docs say `nCmdShow` "is
+/// ignored the first time an application calls ShowWindow, if the program
+/// that launched the application provides a STARTUPINFO structure", and the
+/// probe is usually that first call — a launcher passing
+/// `STARTF_USESHOWWINDOW` could otherwise have it shown activated.
+fn show_window(main: HWND, activate: bool, topmost: bool) {
+    // SAFETY: our own window, on its own thread.
+    unsafe {
+        if activate {
+            let _ = ShowWindow(main, SW_SHOW);
+        } else {
+            let after = if topmost { HWND_TOPMOST } else { HWND_TOP };
+            let _ = SetWindowPos(main, Some(after), 0, 0, 0, 0, PROBE_SHOW);
+        }
     }
 }
 
@@ -524,17 +538,76 @@ mod tests {
         use windows::Win32::UI::WindowsAndMessaging::{WS_EX_TOOLWINDOW, WS_POPUP};
         // One construction: `window_styles` takes no activation parameter,
         // so the doctor's probe (never activated) and the selftest's window
-        // can differ only in how they are first shown (`show_command`).
+        // can differ only in how they are first shown (`show_window`).
         let (style, ex) = window_styles(true);
         assert_eq!(style, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU);
         assert_eq!(ex, WS_EX_APPWINDOW | WS_EX_TOPMOST);
         assert!(!ex.contains(WS_EX_NOACTIVATE) && !ex.contains(WS_EX_TOOLWINDOW));
         assert!(!style.contains(WS_POPUP));
+        assert!(PROBE_SHOW.contains(SWP_NOACTIVATE) && PROBE_SHOW.contains(SWP_SHOWWINDOW));
+    }
+
+    fn opts(title: &str, activate: bool, topmost: bool) -> TestWindowOptions {
+        TestWindowOptions {
+            title: title.into(),
+            x: 40,
+            y: 40,
+            client_w: 0,
+            client_h: 0,
+            activate,
+            topmost,
+            cell_w: 12,
+            cell_h: 20,
+            echo_session: 0,
+        }
+    }
+
+    fn foreground() -> isize {
+        // SAFETY: GetForegroundWindow has no preconditions.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize
+    }
+
+    /// D9 for the doctor's probe, on a real desktop: a window this test owns
+    /// is foreground (so the process HAS foreground rights), the probe is
+    /// shown through the doctor's path, and the foreground must not move.
+    /// The positive control — an activated window of ours DOES take it —
+    /// proves the check can fail in the same run. Ignored by default: it
+    /// moves the foreground, so it runs only on a hosted desktop (the
+    /// termhost-bench workflow's windows job), never on a desktop in use.
+    #[test]
+    #[ignore = "moves the foreground: hosted desktops only (termhost-bench.yml windows job)"]
+    fn desktop_the_doctors_probe_never_takes_the_foreground() {
+        let owner = GdiTestWindow::create(&opts("termhost-probe d9 owner", true, false))
+            .expect("the owner window");
         assert_eq!(
-            show_command(false),
-            SW_SHOWNOACTIVATE,
-            "the doctor never takes focus"
+            owner.activate(),
+            Ok(true),
+            "precondition: our window is foreground"
         );
-        assert_eq!(show_command(true), SW_SHOW);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let before = foreground();
+        assert_eq!(before, owner.handle().0 as isize, "precondition");
+        let probe = GdiTestWindow::create(&opts("termhost-probe doctor", false, true))
+            .expect("the probe window");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let during = foreground();
+        probe.close();
+        assert_eq!(
+            during, before,
+            "the doctor's probe took the foreground (D9)"
+        );
+        // Positive control: activating a window of ours does move it.
+        let control = GdiTestWindow::create(&opts("termhost-probe d9 control", true, false))
+            .expect("the control window");
+        let _ = control.activate();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let moved = foreground();
+        control.close();
+        owner.close();
+        assert_eq!(
+            moved,
+            control.handle().0 as isize,
+            "the control must take the foreground"
+        );
     }
 }

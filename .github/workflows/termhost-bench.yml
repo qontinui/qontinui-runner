@@ -233,6 +233,11 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Tests that move the foreground (ignored by default, because they must
+      # never run on a desktop someone is using): D9 for the doctor's probe.
+      - name: Desktop tests (foreground-moving)
+        run: cargo test -p termhost-probe --lib -- --ignored desktop_
+
       - name: Selftest
         shell: bash
         run: >-
