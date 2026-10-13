@@ -63,6 +63,7 @@ import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
+import { requestSessionSearchOpen, sessionSearchPaletteStore } from "../sessionSearchPaletteStore";
 import { MAXIMIZE_IN_TMUX_ERROR } from "../zone-grid/maximizeActions";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
@@ -1460,6 +1461,33 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const wasOpen = workflowGen.showSidebar;
       workflowGen.setShowSidebar(true);
       return ok(stateEffect("opened", "the sessions sidebar", !wasOpen));
+    },
+  });
+
+  // 19b. /sessions.find — open the session search palette (Chrome's tab
+  // search; plan 2026-10-13-session-manager-chrome-style-tab-organization-
+  // and-operator-search, Phase 4). Same store Ctrl+Shift+Space toggles; the
+  // store knows whether a palette is mounted, so a missing one is reported
+  // rather than claimed opened.
+  useCommandAction({
+    id: "terminal.sessions-find",
+    slash: "/sessions.find",
+    aliases: ["/find-session"],
+    label: "Find a session",
+    description:
+      "Open the session search palette over live, previous and recently-closed sessions, " +
+      "including transcript text. Same as Ctrl+Shift+Space.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^find\s+session$/i, /^search\s+sessions$/i],
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOpen = sessionSearchPaletteStore.isOpen();
+      if (!requestSessionSearchOpen()) {
+        return fail(
+          "no-palette",
+          "The session search palette is not mounted on this page — open the Session Manager first.",
+        );
+      }
+      return ok(stateEffect("opened", "the session search palette", !wasOpen));
     },
   });
 
