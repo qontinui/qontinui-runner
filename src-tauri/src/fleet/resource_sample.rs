@@ -1881,7 +1881,8 @@ mod tests {
     }
 
     fn fake_sys(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("qontinui-cputemp-{name}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("qontinui-cputemp-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1933,7 +1934,10 @@ mod tests {
         assert_eq!(j["cpu_temp_c"], 71.5);
         let w = ResourceSample::empty(Lane::Wsl, Some("Ubuntu".into()));
         assert_eq!(w.cpu_temp_c, None);
-        assert!(serde_json::to_value(&w).unwrap().get("cpu_temp_c").is_none());
+        assert!(serde_json::to_value(&w)
+            .unwrap()
+            .get("cpu_temp_c")
+            .is_none());
     }
 
     #[test]
