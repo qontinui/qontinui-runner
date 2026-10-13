@@ -265,23 +265,23 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
 }
 
 /// Whether the skill `name` is in the fleet corpus this runner SERVES into
-/// sessions. The canonical rung only refreshes skills the embedded bundle
-/// already names (`canonical_corpus::bundled_skill_names`), so the bundle is
-/// what decides; a fleet skill reaches it from `qontinui-claude-config` through
-/// `scripts/fleet-bundle-sync.sh` and a rebuild. The canonical arm is checked
-/// as well so a future canonical-only skill is not missed.
+/// sessions: the embedded bundle. The canonical rung only refreshes the BODIES
+/// of skills the bundle already names (`canonical_corpus::bundled_skill_names`,
+/// `SkillSource::choose`), so the bundle alone decides which skills a session
+/// receives — and therefore which skills this runner may advertise.
+///
+/// A NEW fleet skill does not reach the bundle automatically:
+/// `scripts/fleet-bundle-sync.sh` in qontinui-claude-config only carries files
+/// the runner already bundles. Adding one is its own runner PR that vendors the
+/// skill directory byte-identical to qontinui-claude-config's copy (plan
+/// `2026-10-13-coord-expedited-land-lever-for-agents`, Phase 6).
 ///
 /// NOT consulted: the account layer (`agent_skills` overrides), whose read is a
 /// network fetch — an account-supplied skill of this name is served but not
 /// advertised. That under-advertises (coord counts the review `unreviewed`),
-/// never over-advertises. Cheap: a lock and a map lookup, or a directory lookup
-/// in the binary — the heartbeat calls it every tick.
+/// never over-advertises. Cheap — a directory lookup in the binary — because
+/// the heartbeat calls it every tick.
 pub(crate) fn skill_is_served(name: &str) -> bool {
-    if let Some(c) = crate::canonical_corpus::latest() {
-        if c.skills.skills.contains_key(name) {
-            return true;
-        }
-    }
     FLEET_SKILLS.get_dir(name).is_some()
 }
 
@@ -638,6 +638,9 @@ fn apply_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    use crate::agent_skills::tests::{bundle, skill_unit};
+    use crate::agent_skills::{AgentSkillSource, ResolvedSkill};
+
     /// `skill_is_served` reads the real embedded bundle (plan
     /// 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b).
     #[test]
@@ -645,8 +648,6 @@ mod tests {
         assert!(skill_is_served("page-health"));
         assert!(!skill_is_served("no-such-skill-for-this-test"));
     }
-    use crate::agent_skills::tests::{bundle, skill_unit};
-    use crate::agent_skills::{AgentSkillSource, ResolvedSkill};
 
     #[test]
     fn provisions_every_embedded_skill_into_dir() {
