@@ -161,6 +161,8 @@ export const INCIDENT_KINDS = Object.freeze({
   capture_lost: "the capture source was lost mid-run (e.g. DXGI ACCESS_LOST on a desktop switch)",
   operator_input: "real operator input was detected and the input arm aborted (D9)",
   host_crashed: "a host process exited during the run",
+  pane_stalled:
+    "a displayed session's output marker never advanced in a soak while its generator kept writing: the pane stopped repainting",
   harness_error: "an internal harness failure",
 });
 

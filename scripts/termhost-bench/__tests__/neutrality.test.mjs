@@ -103,9 +103,10 @@ test("D12 fixture: the primary's settings.json changing mid-run produces an inci
           clock,
           variant: o.variant,
           calls,
-          // A concurrent writer rewrites the primary's settings during the first runner arm.
+          // A concurrent writer rewrites the primary's settings during the first runner
+          // arm measured (tiled: it measures before focus).
           onArrange: (arm, unit) => {
-            if (setup === "runner" && unit === 0 && arm === "focus") writeFileSync(settings, '{"terminal": {"pty_holder": true}}');
+            if (setup === "runner" && unit === 0 && arm === "tiled") writeFileSync(settings, '{"terminal": {"pty_holder": true}}');
           },
         });
         return current;
@@ -130,8 +131,10 @@ test("D12 fixture: the primary's settings.json changing mid-run produces an inci
   assert.deepEqual(calls.filter((c) => c[0] === "teardown").map((c) => c[1]), [0]);
   // The file is still written, valid, with the stop recorded beside the rows.
   assert.equal(validateResults(res.doc).valid, true);
-  const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
-  assert.equal(tiled.kpis.output_latency_ms.state, "unknown");
+  // The arm measured after the change (focus: tiled measures first) never ran.
+  const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
+  assert.equal(focus.kpis.output_latency_ms.state, "unknown");
+  assert.match(focus.kpis.output_latency_ms.detail, /the run stopped/);
 });
 
 test("the guard's verdict: watching is OPERATIVE, nothing-to-protect says so, and watching nothing beside a primary is UNKNOWN (review S7)", () => {

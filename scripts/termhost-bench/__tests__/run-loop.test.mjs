@@ -19,12 +19,13 @@ import { NeutralityGuard } from "../neutrality.mjs";
 import { InvalidResults, convertProbeIncident, redactRunnerOnly } from "../results.mjs";
 import { AdapterRefusal } from "../adapters/index.mjs";
 import { RunnerAdapter } from "../adapters/runner.mjs";
-import { RunAbort, RunFailed, abortAwareSleep, planUnits, runBench } from "../run.mjs";
+import { RunAbort, RunFailed, abortAwareSleep, measureOrder, planUnits, runBench } from "../run.mjs";
+import { stallSegment } from "./helpers/bench-fixtures.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
 
 /** A run on fakes; returns the result and every adapter call. */
-async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null, adapterHook = null } = {}) {
+async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null, adapterHook = null, wrapProbe = null } = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "tb-run-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   mkdirSync(join(tmp, "primary"), { recursive: true });
@@ -55,7 +56,7 @@ async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = 
       adapterHook?.(current, setup);
       return current;
     },
-    probe: fakeProbe({ clock, current: () => current }),
+    probe: (wrapProbe ?? ((x) => x))(fakeProbe({ clock, current: () => current })),
     gatherDoctorFacts: async () => facts,
     sampleBackgroundLoad: async () => ({ cpu_pct: 1, memory_used_mb: 100, sampled_ms: 1 }),
     machineBlock: (o) => machineBlock({ ...o, gpu: { state: "unknown", reason: "not_instrumented", detail: "test" } }),
@@ -119,8 +120,9 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
   for (const labels of probe.labels.values()) {
     // Every arm measures before ANY arm spawns: a spawn changes the runner's layout,
     // and the tiled soak run after the focus arm's spawns saw no session at all
-    // (CI run 38345475088).
-    assert.deepEqual(labels, ["focus-soak", "focus-switch", "tiled-soak", "focus-spawn", "tiled-spawn"].filter((l) => labels.includes(l)));
+    // (CI run 38345475088). And tiled measures before focus: after the focus arm's
+    // maximize + restore the restored pane stopped repainting (CI run 38351621760).
+    assert.deepEqual(labels, ["tiled-soak", "focus-soak", "focus-switch", "focus-spawn", "tiled-spawn"].filter((l) => labels.includes(l)));
     assert.equal(new Set(labels).size, labels.length);
     assert.ok(labels.includes("focus-soak") && labels.includes("tiled-soak"));
   }
@@ -304,7 +306,7 @@ test("SIGINT ends the unit in progress and writes the completed units as a parti
     opts: { ns: [1, 5] },
     deps: { signals },
     onArrange: (arm, unit, settings, ctx) => {
-      if (unit === 1 && arm === "focus") {
+      if (unit === 1 && arm === "tiled") { // the first arm measured
         signals.emit("SIGINT", "SIGINT");
         const out = join(ctx.tmp, "results.json");
         atSignal = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : null;
@@ -509,4 +511,57 @@ test("a signal while waiting for a spawned session's first marker ends that wait
   });
   assert.ok(signalAt !== null && closedAt !== null);
   assert.ok(closedAt - signalAt < 1000, `the marker wait ended ${closedAt - signalAt} ms after the signal, not at its 4 s deadline`);
+});
+
+test("tiled measures before focus whatever order the arms are given in; rows keep the given order (ci run 38351621760)", () => {
+  assert.deepEqual(measureOrder(["focus", "tiled"]), ["tiled", "focus"]);
+  assert.deepEqual(measureOrder(["tiled", "focus"]), ["tiled", "focus"]);
+  assert.deepEqual(measureOrder(["focus"]), ["focus"]);
+});
+
+test("a stalled pane in a soak becomes a pane_stalled incident on its row and names itself in the KPI (ci run 38351621760)", async (t) => {
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"] },
+    // The tiled soak's records as the stalled pane in CI recorded them.
+    wrapProbe: (inner) => ({
+      ...inner,
+      startWatch(o) {
+        const w = inner.startWatch(o);
+        if (o.label !== "tiled-soak") return w;
+        return { ...w, stop: async () => {
+          const seg = await w.stop();
+          return { ...seg, records: stallSegment(seg.records) };
+        } };
+      },
+    }),
+  });
+  const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
+  assert.equal(tiled.kpis.output_latency_ms.reason, "insufficient_samples");
+  assert.match(tiled.kpis.output_latency_ms.detail, /the pane stopped repainting: session 0 stayed at seq/);
+  assert.ok(tiled.incidents.some((i) => i.kind === "pane_stalled" && /session 0's output marker stayed at seq \d+/.test(i.detail)), JSON.stringify(tiled.incidents));
+  const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
+  assert.ok(!focus.incidents.some((i) => i.kind === "pane_stalled"));
+  assert.equal(validateResults(res.doc).valid, true);
+});
+
+test("the spawn pass measures new sessions even when its arrangement shows no earlier one (ci run 38351621760)", async (t) => {
+  const seen = new Map();
+  const { res } = await fakeRun(t, {
+    opts: { ns: [5], setups: ["runner"] },
+    adapterHook: (a) => {
+      const arrange = a.arrange.bind(a);
+      a.arrange = async (arm, actx) => {
+        const r = await arrange(arm, actx);
+        seen.set(arm, (seen.get(arm) ?? 0) + 1);
+        // The spawn pass's tiled arrangement shows no earlier session.
+        if (arm === "tiled" && seen.get(arm) === 2) return { ...r, ok: false, failure: { reason: "sessions_not_rendered", detail: "after restore-zone the probe saw no session marker" } };
+        return r;
+      };
+    },
+  });
+  assert.equal(seen.get("tiled"), 2, "measured once, arranged again for its spawn pass");
+  const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
+  assert.equal(tiled.kpis.spawn_latency_ms.n, 2, JSON.stringify(tiled.kpis.spawn_latency_ms));
+  assert.notEqual(tiled.kpis.spawn_latency_ms.reason, "sessions_not_rendered");
+  assert.equal(tiled.kpis.output_latency_ms.state, "measured", "the measure pass is untouched");
 });

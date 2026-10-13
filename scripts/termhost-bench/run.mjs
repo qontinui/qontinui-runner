@@ -609,7 +609,10 @@ export async function runUnit(unit, ctx) {
       if (slotMap.size < unit.n) failure = { reason: "harness_error", detail: `only ${slotMap.size} of ${unit.n} sessions could be matched to a generator slot` };
     }
     if (!failure) {
-      for (const arm of o.arms) {
+      // The tiled arm measures first: it is the layout an operator gets, and the
+      // focus arm's maximize changes it. Measured after a maximize + restore,
+      // the runner's restored pane stopped repainting (CI run 38351621760).
+      for (const arm of measureOrder(o.arms)) {
         if (ctx.aborted?.()) break;
         const pre = ctx.neutrality.check(`before ${name} arm ${arm}`);
         if (pre.changed) {
@@ -644,7 +647,10 @@ export async function runUnit(unit, ctx) {
         if (!measured || ctx.aborted?.()) continue;
         try {
           const sp = await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }, { only: "spawn" });
-          measured.spawns = sp.armFailure ? { unavailable: sp.armFailure } : sp.spawns;
+          // A spawn measures the NEW session's first marker, so an arrangement that
+          // shows no earlier session does not void it; it is noted, not fatal.
+          measured.spawns = sp.spawns ?? (sp.armFailure ? { unavailable: sp.armFailure } : null);
+          if (sp.armFailure) measured.arrangeNotes.push(`spawn pass arrange: ${sp.armFailure.reason}: ${sp.armFailure.detail}`);
           if (sp.spawnAdmission) {
             measured.spawnAdmission = sp.spawnAdmission;
             measured.diagnostics = { ...measured.diagnostics, ...sp.diagnostics };
@@ -753,6 +759,15 @@ export async function runUnit(unit, ctx) {
       spawnTimeoutMs: o.spawnTimeoutMs,
     });
     noteRefresh(ctx.refreshSeen, a.soak);
+    for (const st of computed.stalls ?? []) {
+      a.incidents.push(
+        incident(
+          "pane_stalled",
+          `unit ${name} arm ${arm}: session ${st.session}'s output marker stayed at seq ${st.seq ?? "?"} in ${st.frames} frame(s) of the soak while its generator wrote ${st.emitted}: the pane stopped repainting`,
+          { data: { setup: unit.setup, unit: name, arm, session: st.session } },
+        ),
+      );
+    }
     for (const note of computed.notes) log(`unit ${name} arm ${arm}: ${note}`);
     const diagnostics = unit.setup === "runner" ? { ...a.diagnostics, ...unitDiagnostics, ...zoneDiagnostic(a) } : {};
     const kpis = computed.kpis;
@@ -794,6 +809,14 @@ function noteRefresh(seen, soak) {
 /**
  * One arm of one unit: arrange, warm up, then the four measurement phases.
  */
+/**
+ * The order the arms are MEASURED in: tiled before focus, whatever order they
+ * were given in (rows keep the given order).
+ */
+export function measureOrder(arms) {
+  return [...arms].sort((a, b) => (a === "tiled" ? 0 : 1) - (b === "tiled" ? 0 : 1));
+}
+
 /**
  * One arm of a unit: arrange, then its phases. `only` splits the arm into two
  * passes — `measure` (soak, input, switch, diagnostics) and `spawn` — so runUnit

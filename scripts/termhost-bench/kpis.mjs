@@ -521,6 +521,40 @@ export function generatorExits(seg) {
   return [...out].sort((a, b) => a - b);
 }
 
+/** A stall needs at least this many frames showing the frozen marker. */
+export const STALL_MIN_FRAMES = 10;
+/** ... and at least this many output markers written by its generator meanwhile. */
+export const STALL_MIN_EMITTED = 20;
+
+/**
+ * Displayed sessions whose pane stopped repainting: the probe saw the session's
+ * output marker on screen in many frames, but it never advanced (at most one
+ * first appearance in the window) while the session's generator kept writing
+ * markers. The window-level hang rule cannot see this — other content keeps
+ * producing frames — and marker loss, which would read ~100 %, is counted in
+ * refresh intervals and so is unknown on a display that reports no refresh rate
+ * (Xvfb). Found in CI run 38351621760: a tiled soak showed seq 641 for 60 s while
+ * the generator wrote 1890 markers.
+ *
+ * @returns {{session: number, seq: number | null, frames: number, emitted: number}[]}
+ */
+export function paneStalls(seg, gens, win, visible) {
+  if (!seg || !win) return [];
+  const inWin = (t) => t !== null && t >= win.t0 && t <= win.t1;
+  const out = [];
+  for (const session of [...visible].sort((a, b) => a - b)) {
+    const appearances = seg.firstSeen.filter((fs) => fs.kind === "output" && fs.session === session && inWin(toNs(fs.t_ns))).length;
+    if (appearances > 1) continue;
+    const showing = seg.frames.filter((f) => inWin(toNs(f.t_ns)) && (f.markers ?? []).some((m) => m.kind === "output" && m.session === session));
+    const g = gens?.get?.(session);
+    const emitted = (g?.markers ?? []).filter((m) => m.kind === "output" && inWin(typeof m.tEmit === "bigint" ? m.tEmit : null)).length;
+    if (showing.length < STALL_MIN_FRAMES || emitted < STALL_MIN_EMITTED) continue;
+    const last = showing.at(-1).markers.find((m) => m.kind === "output" && m.session === session);
+    out.push({ session, seq: Number.isInteger(last?.seq) ? last.seq : null, frames: showing.length, emitted });
+  }
+  return out;
+}
+
 /** Host processes alive at the first sample that exited during the window. */
 export function hostExits(seg) {
   if (seg.samples.length === 0) return { monitored: 0, crashed: [], transient: 0 };
@@ -719,6 +753,15 @@ export function computeRowKpis(p) {
       set(id, fromProbe(id, summary[id], { what: `the soak watch's ${id}` }));
     }
   }
+  // A pane that stopped repainting: say so, instead of a bare sample shortfall.
+  const stalls = captureGate ? [] : paneStalls(seg, p.gens, win, visible);
+  if (stalls.length > 0) {
+    const what = stalls.map((x) => `session ${x.session} stayed at seq ${x.seq ?? "?"} in ${x.frames} frame(s) while its generator wrote ${x.emitted} marker(s)`).join("; ");
+    notes.push(`output_latency_ms: pane stalled: ${what}`);
+    if (kpis.output_latency_ms.state !== "measured") {
+      kpis.output_latency_ms = { ...kpis.output_latency_ms, detail: `the pane stopped repainting: ${what}` };
+    }
+  }
   if (kpis.output_latency_ms.state === "measured") {
     // Which displayed sessions contributed: a session whose output marker never
     // first-appeared in the window gave no latency sample.
@@ -823,7 +866,7 @@ export function computeRowKpis(p) {
     ordered[k.id] = kpis[k.id];
   }
   const unattached = attachNotes(ordered, notes);
-  return { kpis: ordered, vActual: va, notes: unattached, sessionsSeen: [...visible].sort((a, b) => a - b) };
+  return { kpis: ordered, vActual: va, notes: unattached, sessionsSeen: [...visible].sort((a, b) => a - b), stalls };
 }
 
 /**

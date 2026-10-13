@@ -20,6 +20,7 @@ import {
   computeRowKpis,
   fromProbe,
   generatorExits,
+  paneStalls,
   generatorWindow,
   indexGenerators,
   indexProbeSegment,
@@ -31,7 +32,7 @@ import {
   seqAtOrAfter,
 } from "../kpis.mjs";
 import { measureKpi } from "../stats.mjs";
-import { MS, genLog, operativeCapabilities, watchSegment } from "./helpers/bench-fixtures.mjs";
+import { MS, genLog, operativeCapabilities, stallSegment, watchSegment } from "./helpers/bench-fixtures.mjs";
 
 const T0 = 1_000_000_000_000n;
 const SOAK_MS = 40_000;
@@ -628,4 +629,24 @@ test("every inject abort reason the probe writes has an explicit catalog mapping
   const probe = [...src.matchAll(/^\s*AbortReason::\w+ => "([a-z_]+)",\r?$/gm)].map((m) => m[1]).sort();
   assert.ok(probe.includes("keyboard_state"), "the probe writes keyboard_state");
   assert.deepEqual(Object.keys(INJECT_ABORT_REASONS).sort(), probe);
+});
+
+test("a pane that stopped repainting is named, not left as a bare sample shortfall (ci run 38351621760)", () => {
+  const healthy = computeRowKpis(focusFixture());
+  assert.deepEqual(healthy.stalls, [], "a pane whose marker advances is not stalled");
+  const f = focusFixture();
+  const stalled = computeRowKpis({ ...f, soak: { records: stallSegment(f.soak.records) } });
+  assert.equal(stalled.stalls.length, 1);
+  assert.equal(stalled.stalls[0].session, 0);
+  assert.ok(stalled.stalls[0].frames >= 10 && stalled.stalls[0].emitted >= 20, JSON.stringify(stalled.stalls[0]));
+  assertUnknown(stalled.kpis.output_latency_ms, "insufficient_samples");
+  assert.match(stalled.kpis.output_latency_ms.detail, /^the pane stopped repainting: session 0 stayed at seq \d+ in \d+ frame\(s\) while its generator wrote \d+ marker\(s\)$/);
+  // Too few frames, or too few emitted markers, is no evidence of a stall.
+  const seg = indexProbeSegment(stallSegment(f.soak.records));
+  const full = { t0: BigInt(seg.frames[0].t_ns), t1: BigInt(seg.frames.at(-1).t_ns) };
+  assert.equal(paneStalls(seg, f.gens, full, new Set([0])).length, 1);
+  const sparse = { ...seg, frames: seg.frames.filter((_, i) => i % Math.ceil(seg.frames.length / 6) === 0).slice(0, 6) };
+  assert.deepEqual(paneStalls(sparse, f.gens, full, new Set([0])), [], "six frames are too few to call it");
+  const brief = { t0: full.t0, t1: full.t0 + 500n * MS };
+  assert.deepEqual(paneStalls(seg, f.gens, brief, new Set([0])), [], "half a second holds too few emitted markers");
 });
