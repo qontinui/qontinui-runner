@@ -101,7 +101,8 @@
  *      `actions: read`, a 5xx): that is the main-red arm going dark, and it
  *      is loud for the same reason the rate arm is.
  *   1  the read could not be taken as an observation (network failure,
- *      non-2xx, non-JSON, `history_read: failed`, or an unrecognised body),
+ *      non-2xx, non-JSON, `history_read: failed`, or an unrecognised body) —
+ *      after ONE retry when the failure was server-side (`isRetryableRead`),
  *      or any `gh` call — label, list, create, edit, reopen — failed. Loud on
  *      purpose; nothing is filed on that path.
  *   2  CLI usage error.
@@ -144,6 +145,17 @@ export const MAX_TITLE_LEN = 250;
 /// server-side at ~60 s; a client bound above that lets coord report its own
 /// verdict instead of this script guessing at one.
 const REQUEST_TIMEOUT_MS = 120_000;
+
+/// Wait before the ONE retry of a read that failed server-side. coord's read
+/// is I/O-bound on a cold buffer cache: measured 2026-10-05 (plan
+/// `2026-09-28-coord-test-flakiness-history-read-still-hits-the-statement-timeout`),
+/// five cold calls failed `57014` at ~60 s and the calls right after them,
+/// against the cache the failures had warmed, went 7/7 `ok` in 3-5 s. So a
+/// second attempt is a real second observation, not a re-roll of the same
+/// dice. One retry, not a loop: a read that fails twice is still UNKNOWN and
+/// still exits 1. Two bounded reads plus this wait stay inside the job's
+/// 10-minute `timeout-minutes`.
+export const RETRY_BACKOFF_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Pure half — unit-tested in scripts/__tests__/ci-flake-escalate.test.mjs
@@ -208,6 +220,51 @@ export function classifyFlakinessResponse(body) {
         reason: `unrecognised history_read token ${JSON.stringify(read)}`,
       };
   }
+}
+
+/**
+ * Whether a `readFlakiness` result failed SERVER-SIDE, and so earns the one
+ * retry. Retryable: coord's own `history_read: failed` (its statement timed
+ * out or its pool could not serve it), a 5xx (the ALB's 502/504 included),
+ * and a transport failure or client-side abort. NOT retryable: a 4xx (the
+ * request itself is wrong and will be wrong again), a 2xx body that is not
+ * JSON, and every readable verdict (`ok`, `thin`, an unrecognised token).
+ * A retry never changes what a failure MEANS — a second failure is still
+ * UNKNOWN and still exits 1.
+ */
+export function isRetryableRead(read) {
+  if (!read || typeof read !== "object") return false;
+  if (read.error !== undefined) return read.retryable === true;
+  const body = read.body;
+  return (
+    !!body && typeof body === "object" && !Array.isArray(body) && body.history_read === "failed"
+  );
+}
+
+/**
+ * Take the read, and take it ONCE more after `backoffMs` when the first one
+ * failed server-side ({@link isRetryableRead}). Returns the LAST read, with
+ * `attempts` and — when it retried — `firstFailure`. The first failure is
+ * reported through `onRetry` at the moment it happens. `readOnce` and `sleep` are injected so the policy is unit-testable.
+ */
+export async function readWithOneRetry(
+  readOnce,
+  { backoffMs = RETRY_BACKOFF_MS, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onRetry } = {},
+) {
+  const first = await readOnce();
+  if (!isRetryableRead(first)) return { ...first, attempts: 1 };
+  if (onRetry) onRetry(first);
+  await sleep(backoffMs);
+  const second = await readOnce();
+  return { ...second, attempts: 2, firstFailure: first };
+}
+
+/** One line naming why a read failed, for the retry warning. */
+export function describeReadFailure(read) {
+  if (read?.error !== undefined) return read.error;
+  const err = read?.body?.history_read_error;
+  const code = err && typeof err === "object" ? err.pg_code : undefined;
+  return `history_read=failed after ${read?.ms ?? "?"}ms${code ? ` (pg_code ${code})` : ""}`;
 }
 
 /**
@@ -578,6 +635,7 @@ async function readFlakiness(base, repo, window) {
     if (!res.ok) {
       return {
         error: `non-2xx from ${url} after ${ms}ms: HTTP ${res.status} ${text.slice(0, 300)}`,
+        retryable: res.status >= 500,
       };
     }
     try {
@@ -592,6 +650,7 @@ async function readFlakiness(base, repo, window) {
       error: aborted
         ? `request to ${url} ABORTED by the client after ${ms}ms (REQUEST_TIMEOUT_MS=${REQUEST_TIMEOUT_MS})`
         : `request to ${url} failed after ${ms}ms: ${err.message}`,
+      retryable: true,
     };
   } finally {
     clearTimeout(timer);
@@ -824,27 +883,40 @@ async function main(argv) {
     return 2;
   }
 
-  const readAt = new Date().toISOString();
+  // Re-stamped after the coord read, so a retried read is dated by the
+  // attempt whose answer is used, not by the failed one.
+  let readAt = new Date().toISOString();
   let verdict = { kind: "skipped", priors: {}, minK: undefined, window: undefined };
   let rateEscalations = [];
   if (rateArm) {
     const base = (process.env.COORD_HTTP_URL || DEFAULT_COORD_URL).replace(/\/+$/, "");
-    const read = await readFlakiness(base, repo, window);
+    const read = await readWithOneRetry(() => readFlakiness(base, repo, window), {
+      onRetry: (first) =>
+        warn(
+          `flakiness read failed server-side (${describeReadFailure(first)}); retrying ONCE in ` +
+            `${RETRY_BACKOFF_MS}ms. A second failure is still UNKNOWN and still fails this run.`,
+        ),
+    });
+    readAt = new Date().toISOString();
+    const attempts = `${read.attempts} attempt(s)`;
     if (read.error) {
       error(
-        `flakiness read UNKNOWN — ${read.error}. Filing nothing: an unreadable rail is not a clean one.`,
+        `flakiness read UNKNOWN after ${attempts} — ${read.error}. Filing nothing: an unreadable ` +
+          `rail is not a clean one.`,
       );
       return 1;
     }
     verdict = classifyFlakinessResponse(read.body);
     info(
       `POST ${base}${FLAKINESS_PATH} (repo=${repo}) -> ${verdict.kind} in ${read.ms}ms ` +
+        `(${attempts}) ` +
         `(${verdict.reason}; ${Object.keys(verdict.priors).length} scored test(s), ` +
         `min_k=${verdict.minK ?? "?"}, window=${verdict.window ?? "?"})`,
     );
     if (verdict.kind === "failed") {
       error(
-        `coord could not serve a flake history for ${repo} after ${read.ms}ms — ${verdict.reason}. ` +
+        `coord could not serve a flake history for ${repo} after ${read.ms}ms on the last of ` +
+          `${attempts} — ${verdict.reason}. ` +
           `Filing nothing: this is UNKNOWN, not "no flaky tests". A read that fails server-side ` +
           `is a coord-side condition (see the header of scripts/ci-flake-escalate.mjs, and plan ` +
           `2026-09-28-coord-test-flakiness-history-read-still-hits-the-statement-timeout in ` +

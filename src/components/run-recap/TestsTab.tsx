@@ -12,7 +12,7 @@
  * - Error messages and stack traces
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   CheckCircle2,
   XCircle,
@@ -41,6 +41,9 @@ import type {
   SnapshotAssertOutputData,
   SnapshotAssertionResult,
 } from "@/types/aiData";
+
+/** The largest page the Playwright results command serves. */
+const PLAYWRIGHT_RECAP_PAGE_SIZE = 1000;
 
 interface TestsTabProps {
   taskRunId: string;
@@ -80,7 +83,20 @@ interface IterationResults {
 }
 
 export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
-  const { data: playwrightResults } = useTaskRunPlaywrightResults(taskRunId);
+  // The recap lists EVERY test, so walk the cursor to exhaustion rather
+  // than rendering the first page as if it were the run.
+  const {
+    data: playwrightResults,
+    hasNextPage: playwrightHasMore,
+    isFetchingNextPage: playwrightFetching,
+    isFetchNextPageError: playwrightPageFailed,
+    fetchNextPage: fetchMorePlaywright,
+  } = useTaskRunPlaywrightResults(taskRunId, PLAYWRIGHT_RECAP_PAGE_SIZE);
+  useEffect(() => {
+    if (playwrightHasMore && !playwrightFetching && !playwrightPageFailed) {
+      void fetchMorePlaywright();
+    }
+  }, [playwrightHasMore, playwrightFetching, playwrightPageFailed, fetchMorePlaywright]);
   const { data: verificationResults } = useTaskRunVerificationResults(taskRunId);
   const [expandedTests, setExpandedTests] = useState<Set<string>>(new Set());
   const [expandedIterations, setExpandedIterations] = useState<Set<number>>(new Set([0])); // First iteration expanded by default
@@ -111,7 +127,7 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
 
   // Convert playwright results to test results
   const playwrightTests: TestResult[] =
-    playwrightResults?.results?.map((r, i) => ({
+    playwrightResults?.rows.map((r, i) => ({
       id: r.id || `playwright-${i}`,
       name: r.test_name || r.spec_file || `Playwright Test ${i + 1}`,
       status: (r.status === "passed" ? "passed" : r.status === "skipped" ? "skipped" : "failed") as

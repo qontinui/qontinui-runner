@@ -16,9 +16,13 @@ import {
   FLAKE_LABEL,
   MAIN_RED_CAP,
   MAX_TITLE_LEN,
+  RETRY_BACKOFF_MS,
   TITLE_PREFIX,
   applyAction,
   classifyFlakinessResponse,
+  describeReadFailure,
+  isRetryableRead,
+  readWithOneRetry,
   ensureLabel,
   fetchRunJobs,
   issueTitle,
@@ -860,4 +864,75 @@ test("a test id with shell metacharacters reaches gh as one argv entry, unchange
   const { calls, gh } = recorder({ "issue create": "u" });
   applyAction({ action: "create", title: issueTitle(id) }, "BODY", "o/r", gh);
   assert.equal(calls[0].args[3], `${TITLE_PREFIX}${id}`);
+});
+
+// ---------------------------------------------------------------------------
+// One retry on a server-side read failure — never a pretended success
+// ---------------------------------------------------------------------------
+
+const FAILED_READ = {
+  body: { history_read: "failed", priors: {}, history_read_error: { pg_code: "57014" } },
+  ms: 60961,
+};
+const OK_READ = { body: { history_read: "ok", priors: LIVE_PRIORS }, ms: 4200 };
+
+test("server-side failures are retryable; client errors and readable verdicts are not", () => {
+  assert.equal(isRetryableRead(FAILED_READ), true);
+  assert.equal(isRetryableRead({ error: "HTTP 502", retryable: true }), true);
+  assert.equal(isRetryableRead({ error: "ABORTED", retryable: true }), true);
+  assert.equal(isRetryableRead({ error: "HTTP 422", retryable: false }), false);
+  assert.equal(isRetryableRead({ error: "non-JSON body" }), false);
+  assert.equal(isRetryableRead(OK_READ), false);
+  assert.equal(isRetryableRead({ body: { history_read: "thin", priors: {} } }), false);
+  assert.equal(isRetryableRead({ body: { history_read: "bogus", priors: {} } }), false);
+  assert.equal(isRetryableRead(undefined), false);
+});
+
+test("a server-side failure is retried exactly once, after the backoff", async () => {
+  const reads = [FAILED_READ, OK_READ];
+  const slept = [];
+  const retried = [];
+  const read = await readWithOneRetry(async () => reads.shift(), {
+    sleep: async (ms) => slept.push(ms),
+    onRetry: (first) => retried.push(first),
+  });
+  assert.deepEqual(slept, [RETRY_BACKOFF_MS]);
+  assert.equal(retried.length, 1);
+  assert.equal(read.attempts, 2);
+  assert.equal(read.body.history_read, "ok");
+  assert.equal(read.firstFailure, FAILED_READ);
+});
+
+test("a second failure is returned as a failure — the retry never turns it green", async () => {
+  let calls = 0;
+  const read = await readWithOneRetry(
+    async () => {
+      calls += 1;
+      return FAILED_READ;
+    },
+    { sleep: async () => {} },
+  );
+  assert.equal(calls, 2, "one retry, not a loop");
+  assert.equal(read.attempts, 2);
+  assert.equal(classifyFlakinessResponse(read.body).kind, "failed");
+});
+
+test("a success, a thin read, or a client error is not retried", async () => {
+  for (const first of [OK_READ, { body: { history_read: "thin", priors: {} } }, { error: "HTTP 400", retryable: false }]) {
+    let calls = 0;
+    const read = await readWithOneRetry(
+      async () => {
+        calls += 1;
+        return first;
+      },
+      { sleep: async () => assert.fail("must not sleep") },
+    );
+    assert.equal(calls, 1);
+    assert.equal(read.attempts, 1);
+  }
+});
+
+test("the retry warning names the SQLSTATE or the transport error", () => {
+  assert.match(describeReadFailure(FAILED_READ), /60961ms.*57014/);
+  assert.equal(describeReadFailure({ error: "HTTP 502 from coord" }), "HTTP 502 from coord");
 });

@@ -522,6 +522,16 @@ pub(crate) fn tenant_verdict(
     }
 }
 
+/// The `structuredContent` key a verdict notice is written under — the
+/// `io.qontinui/` reverse-DNS namespace coord's `_meta["io.qontinui/answered_by"]`
+/// stamp already uses, so it cannot collide with a field any coord tool emits.
+///
+/// Caveat: a tool that declares an `outputSchema` with
+/// `additionalProperties: false` would make a strict client reject this extra
+/// key. Whether any coord tool does is UNMEASURED here; if one does, this key
+/// must move into `_meta` for that tool instead.
+pub(crate) const TENANT_NOTICE_KEY: &str = "io.qontinui/tenant_notice";
+
 /// The text block appended for a verdict, or `None` for one that is silent.
 pub(crate) fn verdict_notice(
     verdict: &TenantVerdict,
@@ -658,9 +668,13 @@ pub(crate) fn apply_tenant_verdict(
         };
         let answered = AnsweredBy::from_result(result);
         let verdict = tenant_verdict(expected, answered.as_ref(), caller_named);
-        // A result with no `content` array has nowhere to carry a notice, so
-        // it must not spend the once-per-nonce one either.
-        let appendable = result.get("content").is_some_and(|c| c.is_array());
+        // A result with neither a `content` array nor an object
+        // `structuredContent` has nowhere to carry a notice, so it must not
+        // spend the once-per-nonce one either.
+        let appendable = result.get("content").is_some_and(|c| c.is_array())
+            || result
+                .get("structuredContent")
+                .is_some_and(|c| c.is_object());
         let append = appendable
             && match &verdict {
                 TenantVerdict::Mismatch { .. } => true,
@@ -673,12 +687,28 @@ pub(crate) fn apply_tenant_verdict(
                 TenantVerdict::Agree { .. } | TenantVerdict::NoRepo => false,
             };
         if append {
-            if let (Some(text), Some(content)) = (
-                verdict_notice(&verdict, answered.as_ref()),
-                result.get_mut("content").and_then(|c| c.as_array_mut()),
-            ) {
-                content.push(serde_json::json!({ "type": "text", "text": text }));
-                changed = true;
+            if let Some(text) = verdict_notice(&verdict, answered.as_ref()) {
+                if let Some(content) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    content.push(serde_json::json!({ "type": "text", "text": text }));
+                    changed = true;
+                }
+                // MEASURED 2026-10-05 (Claude Code 2.1.289, headless `claude -p`
+                // against a stub server): when a result carries
+                // `structuredContent`, Claude Code shows the model ONLY that
+                // JSON and drops every `content` block — and coord emits
+                // `structuredContent` on every success. So the notice rides in
+                // it too, or Claude Code never shows it. `content` keeps its
+                // copy for harnesses that read the text blocks.
+                if let Some(structured) = result
+                    .get_mut("structuredContent")
+                    .and_then(|c| c.as_object_mut())
+                {
+                    structured.insert(
+                        TENANT_NOTICE_KEY.to_string(),
+                        serde_json::Value::String(text),
+                    );
+                    changed = true;
+                }
             }
         }
         verdicts.push(ObservedVerdict { verdict, answered });
@@ -1478,5 +1508,99 @@ mod tests {
             .resolve(Some("relative/dir"))
             .await;
         assert!(matches!(rel, CwdTenant::Unknown { .. }), "{rel:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // structuredContent carries the notice (Claude Code shows the model only
+    // `structuredContent` when it is present — measured 2026-10-05).
+    // -----------------------------------------------------------------------
+
+    /// `stamped_body(...)` with a `structuredContent` value spliced in.
+    fn stamped_with_structured(tenant: Uuid, slug: &str, structured: &str) -> bytes::Bytes {
+        let body = stamped_body(tenant, slug);
+        let spliced = body.replacen(
+            "\"isError\":false,",
+            &format!("\"isError\":false,\"structuredContent\":{structured},"),
+            1,
+        );
+        assert_ne!(spliced, body, "fixture splice must apply");
+        bytes::Bytes::from(spliced)
+    }
+
+    fn result_of(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(body).unwrap()["result"].clone()
+    }
+
+    #[test]
+    fn a_mismatch_notice_rides_in_an_object_structured_content_too() {
+        let (a, b) = (t(0xA1), t(0xB2));
+        let req = call("coord_memory_search");
+        let body = stamped_with_structured(a, "pizzeria", r#"{"hits":[],"count":0}"#);
+        let mut never = || -> bool { panic!("a mismatch does not spend the once-notice") };
+        let (out, verdicts) = apply_tenant_verdict(&req, body, &resolved(b), None, &mut never);
+        assert_eq!(verdicts[0].verdict.label(), "mismatch");
+        let result = result_of(&out);
+        let notice = result["structuredContent"][TENANT_NOTICE_KEY]
+            .as_str()
+            .expect("the notice is in structuredContent");
+        assert!(notice.starts_with("TENANT MISMATCH:"), "{notice}");
+        // The tool's own fields are untouched…
+        assert_eq!(result["structuredContent"]["count"], 0);
+        assert!(result["structuredContent"]["hits"].is_array());
+        // …and `content` still carries its copy for other harnesses.
+        let tx = texts(&out);
+        assert_eq!(tx.len(), 2);
+        assert_eq!(tx[1], notice);
+    }
+
+    #[test]
+    fn an_unverified_notice_rides_in_structured_content_when_content_is_absent() {
+        let req = call("coord_orient");
+        let body = bytes::Bytes::from(
+            r#"{"jsonrpc":"2.0","id":7,"result":{"structuredContent":{"you":[]},"isError":false}}"#,
+        );
+        let mut first = || true;
+        let (out, verdicts) = apply_tenant_verdict(&req, body, &resolved(t(1)), None, &mut first);
+        assert_eq!(verdicts[0].verdict.label(), "answer_unstamped");
+        let result = result_of(&out);
+        assert!(result["structuredContent"][TENANT_NOTICE_KEY]
+            .as_str()
+            .is_some_and(|n| n.starts_with("TENANT UNVERIFIED:")));
+        assert!(
+            result.get("content").is_none(),
+            "no content array is invented"
+        );
+    }
+
+    #[test]
+    fn a_non_object_structured_content_is_left_alone() {
+        let (a, b) = (t(0xA1), t(0xB2));
+        let req = call("coord_memory_search");
+        let body = stamped_with_structured(a, "pizzeria", "[1,2]");
+        let mut never = || -> bool { panic!("a mismatch does not spend the once-notice") };
+        let (out, _) = apply_tenant_verdict(&req, body, &resolved(b), None, &mut never);
+        let result = result_of(&out);
+        assert_eq!(result["structuredContent"], serde_json::json!([1, 2]));
+        assert_eq!(texts(&out).len(), 2, "content still carries the notice");
+    }
+
+    #[test]
+    fn agree_with_structured_content_stays_byte_identical() {
+        let a = t(0xA1);
+        let req = call("coord_orient");
+        let body = stamped_with_structured(a, "pizzeria", r#"{"you":[]}"#);
+        let mut never = || -> bool { panic!("an agreeing answer must not ask for a notice") };
+        let (out, _) = apply_tenant_verdict(&req, body.clone(), &resolved(a), None, &mut never);
+        assert_eq!(out, body);
+        assert_eq!(out.as_ptr(), body.as_ptr());
+    }
+
+    #[test]
+    fn a_result_with_no_carrier_does_not_spend_the_once_notice() {
+        let req = call("coord_orient");
+        let body = bytes::Bytes::from(r#"{"jsonrpc":"2.0","id":7,"result":{"isError":false}}"#);
+        let mut never = || -> bool { panic!("nowhere to carry a notice — must not claim it") };
+        let (out, _) = apply_tenant_verdict(&req, body.clone(), &resolved(t(1)), None, &mut never);
+        assert_eq!(out, body);
     }
 }
