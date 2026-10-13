@@ -27,7 +27,7 @@ vi.mock("@/lib/instance-storage", () => ({
 }));
 
 import { hooksHarness as harness } from "@/lib/__test-helpers__/hooks-harness";
-import { useZoneLayout } from "./useZoneLayout";
+import { FLOW_GRID_ID, useZoneLayout } from "./useZoneLayout";
 
 /** What the page threads besides the tab ids: liveness and session keys. */
 interface TabFacts {
@@ -133,6 +133,7 @@ describe("persisted work mode", () => {
       focusedZone: 0,
       workMode: "tmux",
       mru: ["b", "a"],
+      mruSessionKeys: {},
       gridSnapshot: {
         layoutId: "split",
         assignments: { 0: "a", 1: "b" },
@@ -268,6 +269,9 @@ describe("swaps, closes and the MRU", () => {
     const render = inTmux(["a", "b", "c", "d"]);
     render().assignTabToZone(0, "c");
     render().assignTabToZone(0, "b");
+    // b is on screen (a render shows it) before it closes: a tab swapped to
+    // and gone within one render was never shown, so the MRU never holds it.
+    expect(render().shownTabId).toBe("b");
     expect(view(render(["a", "c", "d"]))).toStrictEqual({
       workMode: "tmux",
       layoutId: "single",
@@ -647,5 +651,157 @@ describe("a malformed persisted snapshot", () => {
     expect(r.gridView.layoutId).toBe("single");
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0][0])).toContain("gridSnapshot");
+  });
+});
+
+describe("entering tmux from a maximized zone", () => {
+  it("shows the maximized zone's tab, not the focused zone's", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b", 2: "c" }, 0), ["a", "b", "c"]);
+    render().setMaximizedZone(2);
+    render().enterTmuxMode();
+    expect(render().shownTabId).toBe("c");
+  });
+});
+
+describe("entering tmux keeps the panes the grid had mounted warm", () => {
+  it("seeds the MRU with the shown tab, then the mounted tabs, then the other zones", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b", 2: "c", 3: "d" }, 0), [
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+    ]);
+    // A scrolled flow grid mounts only the zones near the viewport (here d and
+    // c), plus the parked unzoned tab e.
+    render().reportMountedTabs(new Set(["d", "c", "e"]));
+    render().enterTmuxMode();
+    expect(render().mru).toStrictEqual(["a", "c", "d", "e", "b"]);
+  });
+
+  it("without a report it is plain zone order", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b", 2: "c" }, 1), ["a", "b", "c"]);
+    render().enterTmuxMode();
+    expect(render().mru).toStrictEqual(["b", "a", "c"]);
+  });
+});
+
+describe("replacing a tab in place (restart-in-zone)", () => {
+  it("tmux: the new tab is shown, keeps the old one's grid zone, and returns to it", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b", 2: "c" }, 2), ["a", "b", "c"]);
+    render().enterTmuxMode();
+    render().assignTabToZone(0, "b");
+    render().assignTabToZone(0, "c");
+    // The replacement exists before the old pane is retired.
+    render(["a", "b", "c", "n"]).replaceTab("c", "n");
+    const r = render(["a", "b", "n"]);
+    expect(r.shownTabId).toBe("n");
+    expect(r.cosmeticZoneFor(0)).toBe(2);
+    expect(r.gridView.assignments).toStrictEqual({ 0: "a", 1: "b", 2: "n" });
+    expect(r.mru).toStrictEqual(["n", "b", "a"]);
+    r.exitTmuxMode();
+    const after = render();
+    expect(after.layoutId).toBe("quad");
+    expect(after.assignments).toStrictEqual({ 0: "a", 1: "b", 2: "n" });
+    expect(after.focusedZone).toBe(2);
+  });
+
+  it("grid: the new tab takes the old one's zone", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b" }, 1), ["a", "b"]);
+    render(["a", "b", "n"]).replaceTab("b", "n");
+    expect(render(["a", "n"]).assignments).toStrictEqual({ 0: "a", 1: "n" });
+  });
+});
+
+describe("tmux mode survives a runner restart", () => {
+  it("the session shown before the restart is shown again, and the MRU keeps its order", () => {
+    const keys = { a: "sess-a", b: "sess-b", c: "sess-c" };
+    const render = mount(grid("quad", { 0: "a", 1: "b", 2: "c" }), ["a", "b", "c"], { keys });
+    render().enterTmuxMode();
+    render().assignTabToZone(0, "c");
+    render().assignTabToZone(0, "b");
+    expect(render().mru).toStrictEqual(["b", "c", "a"]);
+
+    // The runner restarts: the page reloads what it persisted, and every
+    // session cold-resumes into a new tab, in an order that is not the MRU's.
+    const persisted = storage.written.at(-1);
+    const restarted = mount(persisted, ["a2", "c2", "b2"], {
+      keys: { a2: "sess-a", c2: "sess-c", b2: "sess-b" },
+    });
+    const r = restarted();
+    expect(r.workMode).toBe("tmux");
+    expect(r.shownTabId).toBe("b2");
+    expect(r.mru).toStrictEqual(["b2", "c2", "a2"]);
+  });
+
+  it("a session whose tab appears after the others is still the one shown", () => {
+    const keys = { a: "sess-a", b: "sess-b" };
+    const render = mount(grid("split", { 0: "a", 1: "b" }), ["a", "b"], { keys });
+    render().enterTmuxMode();
+    render().assignTabToZone(0, "b");
+    expect(render().shownTabId).toBe("b");
+    const persisted = storage.written.at(-1);
+
+    // a resumes first; b's tab arrives a render later.
+    const restarted = mount(persisted, ["a2"], { keys: { a2: "sess-a" } });
+    expect(restarted().shownTabId).toBe("a2");
+    const r = restarted(["a2", "b2"], { keys: { a2: "sess-a", b2: "sess-b" } });
+    expect(r.shownTabId).toBe("b2");
+  });
+
+  it("an operator swap before the session resumes is not undone by it", () => {
+    const keys = { a: "sess-a", b: "sess-b" };
+    const render = mount(grid("split", { 0: "a", 1: "b" }), ["a", "b"], { keys });
+    render().enterTmuxMode();
+    render().assignTabToZone(0, "b");
+    expect(render().shownTabId).toBe("b");
+    const persisted = storage.written.at(-1);
+
+    const restarted = mount(persisted, ["a2", "x"], { keys: { a2: "sess-a" } });
+    restarted().assignTabToZone(0, "x");
+    const r = restarted(["a2", "x", "b2"], { keys: { a2: "sess-a", b2: "sess-b" } });
+    expect(r.shownTabId).toBe("x");
+  });
+
+  it("re-keys the grid snapshot onto the session's live tab, not its exited tombstone", () => {
+    const keys = { a: "sess-a", b: "sess-b" };
+    const render = mount(grid("split", { 0: "a", 1: "b" }), ["a", "b"], { keys });
+    render().enterTmuxMode();
+    // The old tab of a's session lingers as an exited tombstone, created
+    // before the live tab the session resumed into.
+    const r = render(["a-dead", "b2", "a-live"], {
+      alive: ["b2", "a-live"],
+      keys: { "a-dead": "sess-a", b2: "sess-b", "a-live": "sess-a" },
+    });
+    expect(r.gridView.assignments).toStrictEqual({ 0: "a-live", 1: "b2" });
+  });
+});
+
+describe("a persisted snapshot's layout id", () => {
+  it("one the page cannot lay out makes the snapshot malformed, with a warning", () => {
+    const r = mount(
+      {
+        ...grid("single", { 0: "a" }),
+        workMode: "tmux",
+        gridSnapshot: { layoutId: "hexagon", assignments: { 0: "a", 1: "b" }, focusedZone: 0 },
+      },
+      ["a", "b"],
+    )();
+    expect(r.gridView.layoutId).toBe("single");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("gridSnapshot");
+  });
+
+  it("the flow grid is one the page can lay out", () => {
+    const r = mount(
+      {
+        ...grid("single", { 0: "a" }),
+        workMode: "tmux",
+        gridSnapshot: { layoutId: FLOW_GRID_ID, assignments: { 0: "a", 1: "b" }, focusedZone: 1 },
+      },
+      ["a", "b"],
+    )();
+    expect(r.gridView.layoutId).toBe(FLOW_GRID_ID);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

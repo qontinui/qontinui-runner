@@ -32,6 +32,10 @@ const rec = vi.hoisted(() => ({
 const page = vi.hoisted(() => ({
   zoneLayout: {} as Record<string, unknown>,
   tabs: [] as unknown[],
+  /** The flow grid's near-viewport tab ids, as the virtualization hook serves them. */
+  near: new Set<string>(),
+  /** What the grid last reported to `useZoneLayout().reportMountedTabs`. */
+  reportedMounted: null as ReadonlySet<string> | null,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve(null)) }));
@@ -44,6 +48,17 @@ vi.mock("@/lib/instance-storage", () => ({
     getItem: () => null,
     setItem: () => {},
   },
+}));
+// jsdom has no IntersectionObserver: the flow grid's near-viewport set is the
+// test's to set, as a scrolled grid would report it.
+vi.mock("./useZoneVirtualization", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./useZoneVirtualization")>()),
+  useZoneVirtualization: () => ({
+    nearViewport: page.near,
+    registerCell: () => {},
+    unregisterCell: () => {},
+    cellFor: () => null,
+  }),
 }));
 vi.mock("./useLiveClaudeSessionNames", () => ({ useLiveClaudeSessionNames: () => new Map() }));
 
@@ -148,13 +163,17 @@ vi.mock("./useTerminalWindowActions", () => ({
 }));
 
 import { ZoneGrid } from "./ZoneGrid";
-import { TMUX_WARM_TAB_LIMIT } from "./terminalWorkMode";
+import { mruOnEnter, TMUX_WARM_TAB_LIMIT } from "./terminalWorkMode";
+import { synthesizeFlowGrid, type LayoutPreset } from "./useZoneLayout";
 
 function pty(id: string): TerminalTab {
   return { id, title: `session ${id}`, pid: 1, isAlive: true, exitCode: null };
 }
 
 const noop = () => {};
+const reportMountedTabs = (mounted: ReadonlySet<string>) => {
+  page.reportedMounted = mounted;
+};
 
 let container: HTMLDivElement;
 let root: Root;
@@ -174,7 +193,7 @@ function gridLayout(columns: number) {
  */
 function renderGridPage(
   tabs: TerminalTab[],
-  layout: ReturnType<typeof gridLayout>,
+  layout: LayoutPreset,
   assignments: Record<number, string>,
   maximizedZone: number | null = null,
 ) {
@@ -195,6 +214,7 @@ function renderGridPage(
     shownTabId: null,
     mru: [],
     cosmeticZoneFor: (zoneIdx: number) => zoneIdx,
+    reportMountedTabs,
   };
   const onZoneClick = () => {};
   act(() => {
@@ -229,6 +249,7 @@ function renderTmuxPage(
     shownTabId: shown,
     mru,
     cosmeticZoneFor: () => null,
+    reportMountedTabs,
   };
   // A fresh callback per render: the context is mocked rather than provided,
   // so this is what tells the memoised grid that its inputs moved (the page
@@ -249,6 +270,8 @@ beforeEach(() => {
   rec.unmounts.length = 0;
   rec.instances.clear();
   rec.visible.clear();
+  page.near = new Set();
+  page.reportedMounted = null;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -429,5 +452,28 @@ describe("ZoneGrid DOM order", () => {
     expect(container.querySelector("[data-pane='a']")).toBe(paneA);
     expect(rec.unmounts).toEqual([]);
     for (const id of ["a", "b"]) expect(rec.instances.get(id)).toBe(before.get(id));
+  });
+});
+
+describe("ZoneGrid: entering tmux from a scrolled flow grid", () => {
+  it("unmounts none of the panes near the viewport", () => {
+    const tabs = Array.from({ length: 20 }, (_, i) => pty(`t${i}`));
+    const ids = tabs.map((t) => t.id);
+    const assignments = Object.fromEntries(ids.map((id, zone) => [zone, id]));
+    const nearIds = ids.slice(10, 16);
+    page.near = new Set(nearIds);
+
+    // The flow grid mounts only the zones near the viewport (10–15).
+    renderGridPage(tabs, synthesizeFlowGrid(tabs.length), assignments);
+    expect([...rec.mounts].sort()).toEqual([...nearIds].sort());
+    expect(page.reportedMounted).toEqual(new Set(nearIds));
+
+    // Enter tmux on zone 12, seeding the MRU exactly as `enterTmuxMode` does.
+    const mru = mruOnEnter("t12", assignments, [], ids, page.reportedMounted ?? undefined);
+    renderTmuxPage(tabs, "t12", mru);
+
+    expect(visiblePanes()).toEqual(["t12"]);
+    expect(rec.unmounts).toEqual([]);
+    for (const id of nearIds) expect(rec.mounts.filter((m) => m === id)).toHaveLength(1);
   });
 });

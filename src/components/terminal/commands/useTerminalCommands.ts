@@ -63,6 +63,7 @@ import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
+import { MAXIMIZE_IN_TMUX_ERROR } from "../zone-grid/maximizeActions";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import { describeThrown } from "@/lib/utils";
@@ -930,6 +931,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     paramSchema: SCHEMA.maximize,
     patterns: [/^maximize(?:\s+(?<zone>\d+))?$/i, /^fullscreen(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      // tmux work mode already shows one session at full size and the layout
+      // ignores maximize there: refuse by name, exactly as the UI Bridge
+      // maximize actions do, rather than report a change nothing made.
+      if (zoneLayout.workMode === "tmux") return fail("tmux-mode", MAXIMIZE_IN_TMUX_ERROR);
       const zone = resolveZone(args);
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
       if (zone.kind === "out-of-range") return fail("out-of-range");

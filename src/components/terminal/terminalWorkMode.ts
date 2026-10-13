@@ -19,6 +19,7 @@
  */
 
 import type { ZoneAssignments } from "./useZoneLayout";
+import { MAX_WEBGL_PANES } from "./backends/webglContextLru";
 
 export type TerminalWorkMode = "grid" | "tmux";
 
@@ -118,23 +119,38 @@ export function shownTabOnEnter(
 /**
  * The MRU on entering tmux mode. The sessions that were on screen in the grid
  * a moment ago are the most recently seen ones, so they follow the shown tab
- * (in zone order) ahead of whatever an earlier tmux visit left in the list.
- * That ordering is also what keeps them mounted across the switch
- * ({@link tmuxMountedTabIds} keeps the MRU head warm), and it makes "close the
- * shown session" fall back to a session the operator just had on screen.
+ * ahead of whatever an earlier tmux visit left in the list.
+ *
+ * Among them, the ones whose terminals were MOUNTED at entry (`mountedAtEntry`)
+ * come first — in zone order, then any mounted unzoned tab in creation order —
+ * and only then the remaining zones in zone order. In a preset grid every zoned
+ * tab is mounted, so this is plain zone order. In a scrolled flow grid only
+ * the zones near the viewport are mounted; seeding the MRU in bare zone order
+ * would make zones 0..N the warm set ({@link tmuxMountedTabIds} keeps the MRU
+ * head warm), so entering tmux would unmount the panes the operator was just
+ * looking at and cold-mount ones scrolled far away. The ordering also makes
+ * "close the shown session" fall back to a session the operator just had on
+ * screen. `mountedAtEntry` omitted: plain zone order.
  */
 export function mruOnEnter(
   shown: string | null,
   assignments: ZoneAssignments,
   mru: readonly string[],
   tabIds: readonly string[],
+  mountedAtEntry?: ReadonlySet<string>,
 ): string[] {
   const present = new Set(tabIds);
   const zoned = Object.keys(assignments)
     .map(Number)
     .sort((a, b) => a - b)
     .map((z) => assignments[z]);
-  const ordered = [...(shown === null ? [] : [shown]), ...zoned, ...mru];
+  const mounted = mountedAtEntry
+    ? [
+        ...zoned.filter((id) => mountedAtEntry.has(id)),
+        ...tabIds.filter((id) => mountedAtEntry.has(id)),
+      ]
+    : [];
+  const ordered = [...(shown === null ? [] : [shown]), ...mounted, ...zoned, ...mru];
   const out: string[] = [];
   for (const id of ordered) {
     if (present.has(id) && !out.includes(id)) out.push(id);
@@ -150,30 +166,52 @@ export function mruOnEnter(
  * of sessions would mount an xterm parser for every one of them at once — the
  * exact OOM the flow grid's virtualization exists to prevent (incident #535).
  *
- * Eight matches `MAX_WEBGL_PANES`, the WebGL context cap
- * (`backends/webglContextLru.ts`): a warm pane past that cap would be a Canvas
- * pane anyway, so a larger bound buys memory cost without the fast renderer.
- * Within the bound a swap is a prop flip; past it, a ring replay.
+ * The shown pane plus the warm ones fill exactly `MAX_WEBGL_PANES`, the WebGL
+ * context cap (`backends/webglContextLru.ts`): every mounted pane can hold a
+ * context, and a larger bound would only add panes that run on Canvas anyway —
+ * memory cost without the fast renderer. Within the bound a swap is a prop
+ * flip; past it, a ring replay.
  */
-export const TMUX_WARM_TAB_LIMIT = 8;
+export const TMUX_WARM_TAB_LIMIT = MAX_WEBGL_PANES - 1;
+
+/** The tab facts the warm set reads: plan and worker tabs never mount a pane. */
+export interface MountableTab {
+  id: string;
+  type?: string;
+  sessionBacked?: boolean;
+}
+
+/**
+ * Can this tab hold a mounted terminal pane off screen? A plan tab (rendered
+ * by its viewer, no PTY) and a Conductor worker tab (`sessionBacked`, no PTY)
+ * cannot — `classifyTabs` never parks them — so they never take a warm slot.
+ * An exited PTY tab can: its pane still mounts, showing how the session ended.
+ */
+function holdsWarmPane(tab: MountableTab): boolean {
+  return tab.type !== "plan" && !tab.sessionBacked;
+}
 
 /**
  * The tabs tmux mode keeps mounted: the shown tab plus the
- * {@link TMUX_WARM_TAB_LIMIT} most recently shown other tabs that still exist.
+ * {@link TMUX_WARM_TAB_LIMIT} most recently shown other tabs that still exist
+ * and can hold a pane. A plan or worker tab in the MRU is skipped rather than
+ * counted, so it never pushes a PTY tab out of the warm set while mounting
+ * nothing itself.
  */
 export function tmuxMountedTabIds(
   shownTabId: string | null,
   mru: readonly string[],
-  tabIds: readonly string[],
+  tabs: readonly MountableTab[],
   limit: number = TMUX_WARM_TAB_LIMIT,
 ): Set<string> {
-  const present = new Set(tabIds);
+  const byId = new Map(tabs.map((t) => [t.id, t] as const));
   const mounted = new Set<string>();
-  if (shownTabId !== null && present.has(shownTabId)) mounted.add(shownTabId);
+  if (shownTabId !== null && byId.has(shownTabId)) mounted.add(shownTabId);
   let warm = 0;
   for (const id of mru) {
     if (warm >= limit) break;
-    if (id === shownTabId || !present.has(id) || mounted.has(id)) continue;
+    const tab = byId.get(id);
+    if (id === shownTabId || tab === undefined || mounted.has(id) || !holdsWarmPane(tab)) continue;
     mounted.add(id);
     warm++;
   }
@@ -266,19 +304,49 @@ function parseZoneStringMap(raw: unknown): Record<number, string> | null {
 /**
  * Read a persisted grid snapshot; anything not shaped like one is `null`. A
  * focused zone must be a non-negative integer — a fractional or negative one
- * names no zone, and restoring it would focus nothing. A snapshot saved before
- * `sessionKeys` existed reads with none (its zones still match by tab id).
+ * names no zone, and restoring it would focus nothing. The layout id must be
+ * one the page can lay out (`isKnownLayoutId`: a preset or the flow grid) — an
+ * unknown one would restore as `single` and fold every other zone's session
+ * out of the grid, so the snapshot is malformed rather than half-honoured. A
+ * snapshot saved before `sessionKeys` existed reads with none (its zones still
+ * match by tab id).
  */
-export function parseGridSnapshot(raw: unknown): GridSnapshot | null {
+export function parseGridSnapshot(
+  raw: unknown,
+  isKnownLayoutId: (layoutId: string) => boolean,
+): GridSnapshot | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  if (typeof r.layoutId !== "string") return null;
+  if (typeof r.layoutId !== "string" || !isKnownLayoutId(r.layoutId)) return null;
   if (!Number.isInteger(r.focusedZone) || (r.focusedZone as number) < 0) return null;
   const assignments = parseZoneStringMap(r.assignments);
   if (assignments === null) return null;
   const sessionKeys = r.sessionKeys === undefined ? {} : parseZoneStringMap(r.sessionKeys);
   if (sessionKeys === null) return null;
   return { layoutId: r.layoutId, assignments, focusedZone: r.focusedZone as number, sessionKeys };
+}
+
+/**
+ * The tab each durable session key runs in now. When two tabs carry one key —
+ * a session's exited tombstone beside the live tab it was resumed into — the
+ * LIVE tab wins, so a re-key never points a zone at a dead pane while the
+ * session is running next to it. Within the same liveness the first tab in
+ * creation (`tabIds`) order wins.
+ */
+export function tabsBySessionKey(
+  tabIds: readonly string[],
+  sessionKeyOf: SessionKeyOf,
+  alive: AliveTabs = null,
+): Map<string, string> {
+  const isLive = (id: string) => alive === null || alive.has(id);
+  const byKey = new Map<string, string>();
+  for (const id of tabIds) {
+    const key = sessionKeyOf(id);
+    if (!key) continue;
+    const held = byKey.get(key);
+    if (held === undefined || (!isLive(held) && isLive(id))) byKey.set(key, id);
+  }
+  return byKey;
 }
 
 /** The durable keys of the sessions in `assignments`, zone by zone. */
@@ -306,19 +374,18 @@ export function sessionKeysFor(
  *   - a zone whose tab is gone with no such match is left as it is, so a
  *     session that resumes later can still claim it.
  *
- * Returns `snapshot` itself when nothing changed.
+ * The tab a session key resolves to is {@link tabsBySessionKey}'s: a live tab
+ * over an exited one carrying the same key. Returns `snapshot` itself when
+ * nothing changed.
  */
 export function rekeyGridSnapshot(
   snapshot: GridSnapshot,
   tabIds: readonly string[],
   sessionKeyOf: SessionKeyOf,
+  alive: AliveTabs = null,
 ): GridSnapshot {
   const present = new Set(tabIds);
-  const tabByKey = new Map<string, string>();
-  for (const id of tabIds) {
-    const key = sessionKeyOf(id);
-    if (key && !tabByKey.has(key)) tabByKey.set(key, id);
-  }
+  const tabByKey = tabsBySessionKey(tabIds, sessionKeyOf, alive);
   const held = new Set(Object.values(snapshot.assignments).filter((id) => present.has(id)));
   const assignments: ZoneAssignments = { ...snapshot.assignments };
   const sessionKeys: Record<number, string> = { ...snapshot.sessionKeys };
@@ -401,8 +468,9 @@ export function restoreGridSnapshot(
   liveTabIds: readonly string[],
   zoneCount: number,
   sessionKeyOf: SessionKeyOf = () => undefined,
+  alive: AliveTabs = null,
 ): GridSnapshot {
-  const snapshot = rekeyGridSnapshot(saved, liveTabIds, sessionKeyOf);
+  const snapshot = rekeyGridSnapshot(saved, liveTabIds, sessionKeyOf, alive);
   const live = new Set(liveTabIds);
   const assignments: ZoneAssignments = {};
   const placed = new Set<string>();
@@ -423,4 +491,115 @@ export function restoreGridSnapshot(
     focusedZone: snapshot.focusedZone < zoneCount ? snapshot.focusedZone : 0,
     sessionKeys: sessionKeysFor(assignments, sessionKeyOf),
   };
+}
+
+/**
+ * tmux mode's MRU across a runner restart. The MRU names tabs by TAB id, and a
+ * restart cold-resumes every session into a new tab, so `keys` records the
+ * durable session key of each MRU entry that has one (persisted beside the
+ * MRU). This brings both up to date with the tabs that exist now, exactly as
+ * {@link rekeyGridSnapshot} does for the grid:
+ *
+ *   - an entry whose tab still exists keeps it, and records that tab's key if
+ *     it has gained one since;
+ *   - an entry whose tab is gone but whose recorded session now runs in another
+ *     tab ({@link tabsBySessionKey}: live before exited) is re-pointed at that
+ *     tab IN PLACE, keeping its recency — unless the tab is already further up
+ *     the list, where the newer entry stands;
+ *   - an entry whose tab is gone with no such match stays, so a session that
+ *     resumes later can still claim its place.
+ *
+ * `keys` comes back holding exactly the entries of the returned MRU that have
+ * a key. Both are returned as given (same identity) when nothing changed.
+ */
+export function rekeyMru(
+  mru: readonly string[],
+  keys: Readonly<Record<string, string>>,
+  tabIds: readonly string[],
+  sessionKeyOf: SessionKeyOf,
+  alive: AliveTabs = null,
+): { mru: string[]; keys: Record<string, string> } {
+  const present = new Set(tabIds);
+  const tabByKey = tabsBySessionKey(tabIds, sessionKeyOf, alive);
+  const nextMru: string[] = [];
+  const nextKeys: Record<string, string> = {};
+  for (const id of mru) {
+    const recorded = keys[id];
+    const successor =
+      !present.has(id) && recorded !== undefined ? tabByKey.get(recorded) : undefined;
+    const entry = successor ?? id;
+    if (nextMru.includes(entry)) continue;
+    nextMru.push(entry);
+    const key = (present.has(entry) ? sessionKeyOf(entry) : undefined) ?? recorded;
+    if (key !== undefined) nextKeys[entry] = key;
+  }
+  const mruSame = nextMru.length === mru.length && nextMru.every((id, i) => id === mru[i]);
+  const keyIds = Object.keys(nextKeys);
+  const keysSame =
+    keyIds.length === Object.keys(keys).length && keyIds.every((id) => keys[id] === nextKeys[id]);
+  return {
+    mru: mruSame ? (mru as string[]) : nextMru,
+    keys: keysSame ? (keys as Record<string, string>) : nextKeys,
+  };
+}
+
+/**
+ * A pane replaced in place (restart-in-zone: a fresh terminal takes over a
+ * finished one's place). Every zone holding `oldId` now holds `newId`, and
+ * `newId` leaves any OTHER zone the creation-order fill may already have given
+ * it, so it is never on screen twice. Zones keep their indices — the labels,
+ * notes and pins keyed by them stay with the pane. Returns `assignments`
+ * itself when `oldId` is in no zone.
+ */
+export function replaceTabInAssignments(
+  assignments: ZoneAssignments,
+  oldId: string,
+  newId: string,
+): ZoneAssignments {
+  if (!Object.values(assignments).includes(oldId)) return assignments;
+  const next: ZoneAssignments = {};
+  for (const [zone, id] of Object.entries(assignments)) {
+    if (id === oldId) next[Number(zone)] = newId;
+    else if (id !== newId) next[Number(zone)] = id;
+  }
+  return next;
+}
+
+/**
+ * {@link replaceTabInAssignments} for the grid tmux mode returns to: the
+ * replaced pane's grid zone now holds the new tab. The zone's recorded session
+ * key was the OLD session's, which the replacement does not continue, so it is
+ * replaced by the new tab's key (`newKey`) or dropped. Returns `snapshot`
+ * itself when `oldId` is in no zone of it.
+ */
+export function replaceTabInGridSnapshot(
+  snapshot: GridSnapshot,
+  oldId: string,
+  newId: string,
+  newKey: string | undefined,
+): GridSnapshot {
+  const assignments = replaceTabInAssignments(snapshot.assignments, oldId, newId);
+  if (assignments === snapshot.assignments) return snapshot;
+  const sessionKeys: Record<number, string> = {};
+  for (const [zone, id] of Object.entries(assignments)) {
+    const z = Number(zone);
+    const key = id === newId ? newKey : snapshot.sessionKeys[z];
+    if (key !== undefined) sessionKeys[z] = key;
+  }
+  return { ...snapshot, assignments, sessionKeys };
+}
+
+/**
+ * {@link replaceTabInAssignments} for the MRU: `newId` takes `oldId`'s place
+ * (its recency), and any other occurrence of `newId` goes. Returns `mru`
+ * itself when `oldId` is not in it.
+ */
+export function replaceTabInMru(mru: readonly string[], oldId: string, newId: string): string[] {
+  if (!mru.includes(oldId)) return mru as string[];
+  const out: string[] = [];
+  for (const id of mru) {
+    const entry = id === oldId ? newId : id;
+    if (!out.includes(entry)) out.push(entry);
+  }
+  return out;
 }
