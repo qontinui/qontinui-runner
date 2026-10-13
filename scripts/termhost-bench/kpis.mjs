@@ -521,67 +521,134 @@ export function generatorExits(seg) {
   return [...out].sort((a, b) => a - b);
 }
 
-/** The KPIs read off the soak's markers, which a stalled pane makes unmeasurable. */
+/** The KPIs read off the soak's markers, which a pane wedged to the end of the window makes unmeasurable. */
 export const STALL_VOIDED_KPIS = Object.freeze(["output_latency_ms", "marker_loss", "marker_skipped"]);
 
 /** A stall: a displayed marker that did not advance for at least this long ... */
 export const STALL_MIN_MS = 2000;
 /** ... while its generator wrote at least this many output markers. */
 export const STALL_MIN_EMITTED = 20;
+/**
+ * A run of a still marker ends where the session's marker was absent from the
+ * primary frames for longer than this: frames kept arriving without it (the pane
+ * was hidden, scrolled away or covered), so the same sequence shown after the gap
+ * is a redisplay of old content, not evidence the pane kept failing to repaint.
+ * Fixed rather than one marker period: at `marker_hz` 10 a period is 100 ms, less
+ * than a partial (band) read takes to come round a 3x3 grid again, which would
+ * split every run. 1 s is under half {@link STALL_MIN_MS}, so a hidden stretch
+ * can never be bridged into a stall. Stretches with no frame at all do not end a
+ * run: a frozen screen produces none.
+ */
+export const STALL_HIDDEN_GAP_MS = 1000;
+/** Probe interval classes that rule a stretch out (`model/intervals.rs`): not foreground / visible / cloaked / minimized / occluded, or real input. */
+export const STALL_EXCLUDING_CLASSES = Object.freeze(["occluded", "operator_activity"]);
 
 /**
- * Panes that stopped repainting, as the LONGEST run of frames in which a displayed
- * session's output marker did not advance while its generator kept writing: at
- * least {@link STALL_MIN_MS} between the first and last frame showing that
- * sequence, with at least {@link STALL_MIN_EMITTED} output markers written in
- * between. A whole-soak freeze is the run that never ends; a pane that froze
- * half way (the flow-control wedge class) is the run that starts there — its
- * first half's samples would otherwise let output latency read `measured`.
+ * The spans of the probe's closed intervals whose own verdict excludes them for
+ * visibility (not foreground, not visible, cloaked, minimized, occluded) or for
+ * operator activity (real or foreign input). This reads the probe's
+ * `exclusion_class`, the verdict its hang and marker-loss rules apply through
+ * `span_valid`; it does not re-derive it from the counters.
+ *
+ * @returns {{a: bigint, b: bigint, cls: string}[]}
+ */
+export function excludedSpans(seg) {
+  const out = [];
+  for (const r of seg?.intervals ?? []) {
+    if (r.valid !== false || !STALL_EXCLUDING_CLASSES.includes(r.exclusion_class)) continue;
+    const a = toNs(r.t_start_ns);
+    const b = toNs(r.t_end_ns);
+    if (a !== null && b !== null) out.push({ a, b, cls: r.exclusion_class });
+  }
+  return out;
+}
+
+/**
+ * Panes that did not repaint: a run of primary frames in which a displayed
+ * session's output marker stayed at one sequence while its generator kept writing
+ * — at least {@link STALL_MIN_MS} between the run's first and last frame, with at
+ * least {@link STALL_MIN_EMITTED} output markers emitted in (first, last]. A run
+ * does not qualify when it overlaps an interval the probe excluded
+ * ({@link excludedSpans}), and it ends where the marker was hidden for longer than
+ * {@link STALL_HIDDEN_GAP_MS}.
+ *
+ * One entry per session:
+ * - `recovered: false` — the WEDGE: a qualifying run that reaches the last primary
+ *   frame in the window showing that session's marker (frozen for the whole soak,
+ *   or from part-way to its end). Its marker KPIs are unknown(pane_stalled):
+ *   measured from the live part, they would hide the wedge. Reported even when an
+ *   earlier recovered hitch was longer.
+ * - `recovered: true` — otherwise the LONGEST qualifying run, after which the
+ *   marker advanced again: a hitch. The KPIs stay measured (a hitch is exactly
+ *   what they must show); the hitch is reported beside them.
  *
  * Neither the window-level hang rule (other content keeps producing frames) nor
- * marker loss (counted in refresh intervals, unknown on Xvfb) sees this. Found in
- * CI run 38351621760: a tiled soak showed seq 641 for 60 s while the generator
+ * marker loss (counted in refresh intervals, unknown on Xvfb) sees a wedge. Found
+ * in CI run 38351621760: a tiled soak showed seq 641 for 60 s while the generator
  * wrote 1890 markers.
  *
- * @returns {{session: number, seq: number | null, ms: number, frames: number, emitted: number}[]}
+ * The caller runs this only while clock.aligned is OPERATIVE: it compares the
+ * generators' emission times with the probe's frame times.
+ *
+ * @returns {{session: number, seq: number, ms: number, frames: number, emitted: number, recovered: boolean}[]}
  */
 export function paneStalls(seg, gens, win, visible) {
   if (!seg || !win) return [];
-  const inWin = (t) => t !== null && t >= win.t0 && t <= win.t1;
+  const primary = captureInfo(seg).primary;
+  if (!primary) return [];
+  const frames = primaryFrames(seg, primary, win);
+  const excluded = excludedSpans(seg);
+  const gapNs = BigInt(STALL_HIDDEN_GAP_MS) * NS_PER_MS;
   const out = [];
   for (const session of [...visible].sort((a, b) => a - b)) {
     const emits = (gens?.get?.(session)?.markers ?? [])
       .filter((m) => m.kind === "output" && typeof m.tEmit === "bigint")
       .map((m) => m.tEmit);
+    // Each frame showing the marker, and whether it follows a hidden stretch.
     const shown = [];
-    for (const f of seg.frames) {
-      const t = toNs(f.t_ns);
-      if (!inWin(t)) continue;
+    let missedSince = false;
+    for (const f of frames) {
       const m = (f.markers ?? []).find((x) => x.kind === "output" && x.session === session);
-      if (m && Number.isInteger(m.seq)) shown.push({ t, seq: m.seq });
+      if (!m || !Number.isInteger(m.seq)) {
+        missedSince = true;
+        continue;
+      }
+      const prev = shown.at(-1);
+      shown.push({ t: f.t, seq: m.seq, afterGap: Boolean(prev) && missedSince && f.t - prev.t > gapNs });
+      missedSince = false;
     }
-    shown.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
-    let best = null;
+    let longest = null;
+    let wedge = null;
     for (let i = 0; i < shown.length; ) {
       let j = i;
-      while (j + 1 < shown.length && shown[j + 1].seq === shown[i].seq) j += 1;
+      while (j + 1 < shown.length && shown[j + 1].seq === shown[i].seq && !shown[j + 1].afterGap) j += 1;
       const t0 = shown[i].t;
       const t1 = shown[j].t;
       const ms = Number(t1 - t0) / 1e6;
       const emitted = emits.filter((t) => t > t0 && t <= t1).length;
-      if (ms >= STALL_MIN_MS && emitted >= STALL_MIN_EMITTED && (!best || ms > best.ms)) {
-        best = { session, seq: shown[i].seq, ms: Math.round(ms), frames: j - i + 1, emitted };
+      const clear = !excluded.some((x) => x.a < t1 && x.b > t0);
+      if (ms >= STALL_MIN_MS && emitted >= STALL_MIN_EMITTED && clear) {
+        const run = { session, seq: shown[i].seq, ms: Math.round(ms), frames: j - i + 1, emitted, recovered: j < shown.length - 1, rawMs: ms };
+        if (!run.recovered) wedge = run;
+        else if (!longest || ms > longest.rawMs) longest = run;
       }
       i = j + 1;
     }
-    if (best) out.push(best);
+    const pick = wedge ?? longest;
+    if (pick) {
+      const { rawMs: _raw, ...rest } = pick;
+      out.push(rest);
+    }
   }
   return out;
 }
 
-/** "session S stayed at seq Q for D ms (F frame(s)) while its generator wrote M marker(s)" */
+/** "session S stayed at seq Q for D ms (F frame(s)) while its generator wrote M marker(s)[, then advanced again]" */
 export function describeStall(x) {
-  return `session ${x.session} stayed at seq ${x.seq ?? "?"} for ${x.ms} ms (${x.frames} frame(s)) while its generator wrote ${x.emitted} marker(s)`;
+  return (
+    `session ${x.session} stayed at seq ${x.seq ?? "?"} for ${x.ms} ms (${x.frames} frame(s)) while its generator wrote ${x.emitted} marker(s)` +
+    (x.recovered ? ", then advanced again" : "")
+  );
 }
 
 /** Host processes alive at the first sample that exited during the window. */
@@ -631,7 +698,7 @@ function stateOf(capabilities, id) {
  * emission, a harness command) with a time the probe took, unless the doctor
  * showed the two share a timebase; null when the KPI may be computed.
  */
-function clockGate(p, id) {
+export function clockGate(p, id) {
   if (stateOf(p.capabilities, "clock.aligned") === "OPERATIVE") return null;
   return unknownKpi(id, "clock_unaligned", {
     detail: `clock.aligned is ${stateOf(p.capabilities, "clock.aligned")}: ${p.capabilities?.["clock.aligned"]?.reason ?? "no doctor verdict"}`,
@@ -782,15 +849,32 @@ export function computeRowKpis(p) {
       set(id, fromProbe(id, summary[id], { what: `the soak watch's ${id}` }));
     }
   }
-  // A pane that stopped repainting, for the whole soak or part of it: the
-  // per-marker KPIs are unknown(pane_stalled), never measured from the live part.
-  const stalls = captureGate ? [] : paneStalls(seg, p.gens, win, visible);
-  if (stalls.length > 0) {
-    const what = stalls.map(describeStall).join("; ");
+  // Panes that did not repaint (paneStalls). The rule compares the generators'
+  // emission times with the probe's frame times, so it runs only on an aligned
+  // clock (and output_latency_ms already reads clock_unaligned otherwise).
+  const stalls = captureGate || clockGate(p, "output_latency_ms") ? [] : paneStalls(seg, p.gens, win, visible);
+  // A wedge (frozen to the end of the soak) leaves the per-marker KPIs measured
+  // from the live part only: they become unknown(pane_stalled). A reason the KPI
+  // already had is kept — only a bare sample shortfall, which the wedge explains,
+  // is replaced — and the wedge is noted on it instead.
+  const wedged = stalls.filter((x) => !x.recovered);
+  if (wedged.length > 0) {
+    const what = wedged.map(describeStall).join("; ");
     notes.push(`pane stalled: ${what}`);
     for (const id of STALL_VOIDED_KPIS) {
-      set(id, unknownKpi(id, "pane_stalled", { n: kpis[id]?.n ?? 0, detail: `the pane stopped repainting: ${what}` }));
+      const cur = kpis[id];
+      if (cur.state === "measured" || cur.reason === "insufficient_samples") {
+        set(id, unknownKpi(id, "pane_stalled", { n: cur.n ?? 0, detail: `the pane stopped repainting: ${what}` }));
+      } else {
+        notes.push(`${id}: the pane stopped repainting: ${what}`);
+      }
     }
+  }
+  // A hitch the pane recovered from is what these KPIs exist to show: they stay
+  // measured, and the hitch is named beside them.
+  const hitches = stalls.filter((x) => x.recovered);
+  if (hitches.length > 0) {
+    notes.push(`output_latency_ms: pane hitch, recovered (the marker KPIs stay measured): ${hitches.map(describeStall).join("; ")}`);
   }
   if (kpis.output_latency_ms.state === "measured") {
     // Which displayed sessions contributed: a session whose output marker never

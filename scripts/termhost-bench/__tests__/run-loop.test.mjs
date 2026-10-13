@@ -82,7 +82,14 @@ test("units interleave head and baseline per run index and N (D11)", () => {
 });
 
 test("a run writes a schema-valid file: one row per unit and arm, every KPI present", async (t) => {
-  const { res, calls, probe } = await fakeRun(t);
+  // The focus arm's restore check is on (the runner adapter restores its zone),
+  // so its watch's place in the order is pinned too.
+  const { res, calls, probe } = await fakeRun(t, {
+    opts: { restoreCheckMs: 4000 },
+    adapterHook: (a, setup) => {
+      if (setup === "runner") a.restoreZone = async () => ({ maximizedZone: null });
+    },
+  });
   assert.equal(validateResults(res.doc).valid, true, JSON.stringify(validateResults(res.doc).errors.slice(0, 5)));
   assert.equal(res.doc.rows.length, 2 * 2 * 2, "2 setups x 2 levels x 2 arms");
   assert.equal(res.stopped, null);
@@ -121,11 +128,15 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
     // Every arm measures before ANY arm spawns: a spawn changes the runner's layout,
     // and the tiled soak run after the focus arm's spawns saw no session at all
     // (CI run 38345475088). And tiled measures before focus, the layout an operator
-    // gets before any harness maximize.
-    assert.deepEqual(labels, ["tiled-soak", "focus-soak", "focus-switch", "focus-spawn", "tiled-spawn"].filter((l) => labels.includes(l)));
+    // gets before any harness maximize. The restore check follows the focus arm's
+    // measure phases and precedes every spawn.
+    assert.deepEqual(labels, ["tiled-soak", "focus-soak", "focus-switch", "focus-restore-check", "focus-spawn", "tiled-spawn"].filter((l) => labels.includes(l)));
     assert.equal(new Set(labels).size, labels.length);
     assert.ok(labels.includes("focus-soak") && labels.includes("tiled-soak"));
   }
+  const withCheck = [...probe.labels.values()].filter((l) => l.includes("focus-restore-check"));
+  assert.equal(withCheck.length, 2, "one restore check per runner unit");
+  for (const labels of withCheck) assert.ok(labels.includes("focus-soak") && labels.includes("focus-spawn"), labels.join(","));
 });
 
 test("the redacted copy keeps the runner's rows only and still validates", async (t) => {
@@ -601,3 +612,79 @@ test("after the focus arm, a restore-zone check records a frozen restored pane a
   const clean = (await run(false)).res;
   assert.ok(!clean.doc.rows.some((r) => r.incidents.some((i) => i.kind === "pane_stalled")));
 });
+
+test("a restore that does not take, or a check that saw nothing, is recorded as UNKNOWN, never clean (review r10 SF6/SF7)", async (t) => {
+  const stuck = (
+    await fakeRun(t, {
+      opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
+      adapterHook: (a) => {
+        a.restoreZone = async () => ({ maximizedZone: 0 });
+      },
+    })
+  ).res;
+  const f1 = stuck.doc.rows.find((r) => r.scenario.arm === "focus");
+  assert.ok(f1.incidents.some((i) => i.kind === "harness_error" && /restore-zone did not take \(maximized zone 0\); restore check UNKNOWN/.test(i.detail)), JSON.stringify(f1.incidents));
+  assert.ok(!f1.incidents.some((i) => /restored pane/.test(i.detail)), "no claim about a restored pane");
+  const blind = (
+    await fakeRun(t, {
+      opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
+      adapterHook: (a) => {
+        a.restoreZone = async () => ({ maximizedZone: null });
+      },
+      wrapProbe: (inner) => ({
+        ...inner,
+        startWatch(o) {
+          const w = inner.startWatch(o);
+          if (o.label !== "focus-restore-check") return w;
+          return { ...w, stop: async () => {
+            const seg = await w.stop();
+            return { ...seg, records: seg.records.filter((r) => r.type !== "summary") };
+          } };
+        },
+      }),
+    })
+  ).res;
+  const f2 = blind.doc.rows.find((r) => r.scenario.arm === "focus");
+  assert.ok(f2.incidents.some((i) => i.kind === "harness_error" && /restore check UNKNOWN: its watch wrote no summary; this is not a clean result/.test(i.detail)), JSON.stringify(f2.incidents));
+  assert.equal(validateResults(blind.doc).valid, true);
+});
+
+test("a recovered hitch in a soak is a pane_stalled incident that says so, and voids nothing (review r10 MF1)", async (t) => {
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"] },
+    wrapProbe: (inner) => ({
+      ...inner,
+      startWatch(o) {
+        const w = inner.startWatch(o);
+        if (o.label !== "tiled-soak") return w;
+        return { ...w, stop: async () => {
+          const seg = await w.stop();
+          return { ...seg, records: freezeWindow(seg.records, 10_000, 12_500) };
+        } };
+      },
+    }),
+  });
+  const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
+  assert.equal(tiled.kpis.output_latency_ms.state, "measured", JSON.stringify(tiled.kpis.output_latency_ms));
+  const inc = tiled.incidents.filter((i) => i.kind === "pane_stalled");
+  assert.equal(inc.length, 1, JSON.stringify(tiled.incidents));
+  assert.match(inc[0].detail, /soak: session 0 stayed at seq \d+ for \d+ ms .*, then advanced again: a hitch the pane recovered from; its marker KPIs stay measured$/);
+  assert.equal(inc[0].data.recovered, true);
+  assert.equal(validateResults(res.doc).valid, true);
+});
+
+/** Freeze every output marker shown between `fromMs` and `toMs` into the watch at the sequence shown then. */
+function freezeWindow(records, fromMs, toMs) {
+  const start = BigInt(records.find((r) => r.type === "start").t0_ns) + 5_000_000n;
+  const a = start + BigInt(fromMs) * 1_000_000n;
+  const b = start + BigInt(toMs) * 1_000_000n;
+  const frozen = new Map();
+  return records.map((r) => {
+    if (r.type !== "frame" || BigInt(r.t_ns) < a || BigInt(r.t_ns) > b) return r;
+    return { ...r, markers: r.markers.map((m) => {
+      if (m.kind !== "output") return m;
+      if (!frozen.has(m.session)) frozen.set(m.session, m.seq);
+      return { ...m, seq: frozen.get(m.session) };
+    }) };
+  });
+}

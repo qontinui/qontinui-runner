@@ -83,6 +83,8 @@ export const MAX_SPAWN_COUNT = 24;
 /** The UI Bridge components and actions the adapter drives. */
 export const LAUNCH_MENU = "terminal-launch-menu";
 export const TERMINAL_PAGE = "terminal-page";
+/** How long the zone layout is given to repaint after a restore-zone before it is looked at. */
+export const ZONE_SETTLE_MS = 500;
 
 /** The resource-guard dialog's decline labels (`resourceGuardCopy.ts`), and what is never clicked. */
 export const DECLINE_LABELS = Object.freeze(["Don't start", "Start none"]);
@@ -1099,7 +1101,7 @@ export class RunnerAdapter {
     this.slots = new Map(actx.slots);
     this.arm = arm;
     await this.restoreZone();
-    await sleep(500);
+    await sleep(ZONE_SETTLE_MS);
     const state = await this.zoneViewState();
     const seen = await actx.look();
     if (!seen.ok) {

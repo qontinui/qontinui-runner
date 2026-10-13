@@ -30,11 +30,11 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { AdapterRefusal, createAdapter as defaultCreateAdapter } from "./adapters/index.mjs";
-import { isPortListening } from "./adapters/runner.mjs";
+import { ZONE_SETTLE_MS, isPortListening } from "./adapters/runner.mjs";
 import { PRIMARY_RUNNER_PORT } from "../lib/runner-clients.mjs";
 import { doctorNotes, gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
-import { allUnknown, computeRowKpis, describeStall, indexGenerators, indexProbeSegment, injectAbortReason, paneStalls, segmentWindow } from "./kpis.mjs";
+import { allUnknown, captureInfo, clockGate, computeRowKpis, describeStall, indexGenerators, indexProbeSegment, injectAbortReason, paneStalls, segmentWindow } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
 import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
@@ -761,12 +761,13 @@ export async function runUnit(unit, ctx) {
     });
     noteRefresh(ctx.refreshSeen, a.soak);
     for (const st of computed.stalls ?? []) {
+      const verdict = st.recovered
+        ? "a hitch the pane recovered from; its marker KPIs stay measured"
+        : "the pane stopped repainting to the end of the soak; its marker KPIs are unknown(pane_stalled)";
       a.incidents.push(
-        incident(
-          "pane_stalled",
-          `unit ${name} arm ${arm}: soak: ${describeStall(st)}: the pane stopped repainting`,
-          { data: { setup: unit.setup, unit: name, arm, session: st.session } },
-        ),
+        incident("pane_stalled", `unit ${name} arm ${arm}: soak: ${describeStall(st)}: ${verdict}`, {
+          data: { setup: unit.setup, unit: name, arm, session: st.session, recovered: st.recovered },
+        }),
       );
     }
     for (const note of computed.notes) log(`unit ${name} arm ${arm}: ${note}`);
@@ -1026,33 +1027,6 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
     if (refused) out.spawnAdmission = refused;
   }
 
-  // ---- restore check (focus arm, runner) ---------------------------------------
-  // A regression check that gates nothing: restore the maximized zone and watch a
-  // few seconds for a pane that stopped repainting. In CI run 38351621760 the pane
-  // was found frozen after restore-zone (it had already wedged late in the focus
-  // soak: seq 639 for its last ~12 s); the runner fix for that wedge is separate,
-  // and this keeps the restore path observable in every scheduled run.
-  if (measure && arm === "focus" && o.restoreCheckMs > 0 && typeof adapter.restoreZone === "function" && !interrupted()) {
-    try {
-      await adapter.restoreZone();
-      const w = await startPhaseWatch("restore-check");
-      await sleep(o.restoreCheckMs);
-      const seg = await stopPhaseWatch(w, "restore-check");
-      const idx = indexProbeSegment(seg.records ?? []);
-      const gens = indexGenerators(readGeneratorLogs(genDir));
-      const visible = new Set(Array.isArray(idx.summary?.sessions_seen) ? idx.summary.sessions_seen : []);
-      for (const st of paneStalls(idx, gens, segmentWindow(idx), visible)) {
-        out.incidents.push(
-          incident("pane_stalled", `unit ${name} arm ${arm}: after restore-zone: ${describeStall(st)}: the restored pane is not repainting`, {
-            data: { setup: unit.setup, unit: name, arm, phase: "focus/restore-check", session: st.session },
-          }),
-        );
-      }
-    } catch (e) {
-      out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: restore check: ${e.message}`, { data: { setup: unit.setup, unit: name, phase: "focus/restore-check" } }));
-    }
-  }
-
   // A signal that arrived at any point in this arm cut a phase short: the arm's
   // measurements are not the ones its row would claim.
   if (interrupted()) out.interrupted = true;
@@ -1073,6 +1047,58 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
   }
   if (out.spawnAdmission) {
     out.diagnostics["spawn.admission_n_plus_1"] = { comparable: false, source: "spawnOne", state: "measured", data: out.spawnAdmission };
+  }
+
+  // ---- restore check (focus arm, runner) ---------------------------------------
+  // A regression check that gates nothing: restore the maximized zone and watch a
+  // few seconds for a pane that does not repaint. CI run 38351621760 found the pane
+  // frozen after restore-zone; this keeps the restore path observable in every
+  // scheduled run. It runs after the diagnostics, which read the focus layout.
+  if (measure && arm === "focus" && o.restoreCheckMs > 0 && typeof adapter.restoreZone === "function" && !interrupted()) {
+    const data = { setup: unit.setup, unit: name, arm, phase: "focus/restore-check" };
+    // A check that could not look is UNKNOWN, and says so: never a silent clean.
+    const unknownCheck = (why) =>
+      out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: restore check UNKNOWN: ${why}; this is not a clean result`, { data }));
+    try {
+      // Emission times (node) against frame times (probe): only on an aligned clock.
+      const clock = clockGate({ capabilities: ctx.capabilities }, "output_latency_ms");
+      if (clock) {
+        unknownCheck(clock.detail);
+      } else {
+        const restored = await adapter.restoreZone();
+        if (restored?.maximizedZone !== null) {
+          const zone = restored?.maximizedZone === undefined ? "no maximizedZone in its result" : `maximized zone ${restored.maximizedZone}`;
+          out.incidents.push(
+            incident("harness_error", `unit ${name} arm ${arm}: restore-zone did not take (${zone}); restore check UNKNOWN: nothing was watched`, { data }),
+          );
+        } else {
+          await sleep(ZONE_SETTLE_MS);
+          const w = await startPhaseWatch("restore-check");
+          await sleep(o.restoreCheckMs);
+          const seg = await stopPhaseWatch(w, "restore-check");
+          const idx = indexProbeSegment(seg.records ?? []);
+          const win = segmentWindow(idx);
+          const visible = new Set(Array.isArray(idx.summary?.sessions_seen) ? idx.summary.sessions_seen.filter(Number.isInteger) : []);
+          if (!idx.summary) unknownCheck("its watch wrote no summary");
+          else if (!win) unknownCheck("its watch has no measurement window");
+          else if (!captureInfo(idx).primary) unknownCheck("no primary capture source opened");
+          else if (visible.size === 0) unknownCheck("the probe saw no session's marker on screen");
+          else {
+            const gens = indexGenerators(readGeneratorLogs(genDir));
+            for (const st of paneStalls(idx, gens, win, visible)) {
+              const verdict = st.recovered ? "a hitch the restored pane recovered from" : "the restored pane is not repainting";
+              out.incidents.push(
+                incident("pane_stalled", `unit ${name} arm ${arm}: after restore-zone: ${describeStall(st)}: ${verdict}`, {
+                  data: { ...data, session: st.session, recovered: st.recovered },
+                }),
+              );
+            }
+          }
+        }
+      }
+    } catch (e) {
+      out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: restore check UNKNOWN: ${e.message}`, { data }));
+    }
   }
   return out;
 }

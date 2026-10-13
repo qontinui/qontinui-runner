@@ -19,8 +19,10 @@ import {
   captureInfo,
   computeRowKpis,
   fromProbe,
+  STALL_HIDDEN_GAP_MS,
   STALL_MIN_EMITTED,
   STALL_MIN_MS,
+  STALL_VOIDED_KPIS,
   describeStall,
   generatorExits,
   paneStalls,
@@ -634,7 +636,29 @@ test("every inject abort reason the probe writes has an explicit catalog mapping
   assert.deepEqual(Object.keys(INJECT_ABORT_REASONS).sort(), probe);
 });
 
-test("a pane that stopped repainting, for the whole soak or half of it, voids the per-marker KPIs (ci run 38351621760, review r9 SF)", () => {
+/**
+ * A soak's raw records with every primary frame between `fromMs` and `toMs` into
+ * the watch (`toMs` null = to the end) showing session 0's output marker frozen at
+ * the sequence it showed at `fromMs`. After `toMs` the frames are the fixture's
+ * own, so the marker advances again: a hitch the pane recovered from.
+ */
+function freezeFrames(records, fromMs, toMs = null) {
+  const start = BigInt(records.find((r) => r.type === "start").t0_ns) + 5n * MS;
+  const a = start + BigInt(fromMs) * MS;
+  const b = toMs === null ? null : start + BigInt(toMs) * MS;
+  let seq = null;
+  return records.map((r) => {
+    if (r.type !== "frame") return r;
+    const t = BigInt(r.t_ns);
+    if (t < a || (b !== null && t > b)) return r;
+    const m = r.markers.find((x) => x.kind === "output" && x.session === 0);
+    if (!m) return r;
+    seq ??= m.seq;
+    return { ...r, markers: r.markers.map((x) => (x.kind === "output" && x.session === 0 ? { ...x, seq } : x)) };
+  });
+}
+
+test("a pane frozen to the end of the soak, whole or from half way, voids the per-marker KPIs (ci run 38351621760, review r9 SF)", () => {
   const healthy = computeRowKpis(focusFixture());
   assert.deepEqual(healthy.stalls, [], "a pane whose marker advances is not stalled");
   assert.equal(healthy.kpis.output_latency_ms.state, "measured");
@@ -643,13 +667,15 @@ test("a pane that stopped repainting, for the whole soak or half of it, voids th
   const whole = computeRowKpis({ ...f, soak: { records: stallSegment(f.soak.records) } });
   assert.equal(whole.stalls.length, 1);
   assert.equal(whole.stalls[0].session, 0);
+  assert.equal(whole.stalls[0].recovered, false);
   assert.ok(whole.stalls[0].ms > SOAK_MS - 1000, JSON.stringify(whole.stalls[0]));
-  // Frozen half way: the first half's samples would read measured; they must not.
+  // Frozen half way to the end: the first half's samples would read measured; they must not.
   const half = computeRowKpis({ ...f, soak: { records: stallSegment(f.soak.records, { fromMs: SOAK_MS / 2 }) } });
   assert.equal(half.stalls.length, 1, "a partial freeze is found");
+  assert.equal(half.stalls[0].recovered, false, "frozen to the end is a wedge");
   assert.ok(Math.abs(half.stalls[0].ms - SOAK_MS / 2) < 1000, JSON.stringify(half.stalls[0]));
   for (const r of [whole, half]) {
-    for (const id of ["output_latency_ms", "marker_loss", "marker_skipped"]) {
+    for (const id of STALL_VOIDED_KPIS) {
       assertUnknown(r.kpis[id], "pane_stalled");
       assert.match(r.kpis[id].detail, /^the pane stopped repainting: session 0 stayed at seq \d+ for \d+ ms \(\d+ frame\(s\)\) while its generator wrote \d+ marker\(s\)$/);
     }
@@ -657,36 +683,214 @@ test("a pane that stopped repainting, for the whole soak or half of it, voids th
   }
 });
 
-test("the stall rule's boundaries: two seconds and twenty markers written, however many appearances came before (review r9 nit 1)", () => {
+test("a hitch the pane recovers from keeps the marker KPIs measured and is still reported (review r10 MF1)", () => {
+  const f = focusFixture();
+  const healthy = computeRowKpis(f);
+  // A 2.3 s freeze at 10-12.3 s of the 40 s soak, then the marker advances again.
+  const r = computeRowKpis({ ...f, soak: { records: freezeFrames(f.soak.records, 10_000, 12_300) } });
+  assert.equal(r.stalls.length, 1, "the hitch is reported");
+  assert.equal(r.stalls[0].recovered, true, JSON.stringify(r.stalls[0]));
+  // The fixture shows a sequence for up to one marker period (100 ms) before and after.
+  assert.ok(Math.abs(r.stalls[0].ms - 2300) <= 100, JSON.stringify(r.stalls[0]));
+  for (const id of STALL_VOIDED_KPIS) {
+    assert.equal(r.kpis[id].state, healthy.kpis[id].state, `${id} keeps its state`);
+    assert.notEqual(r.kpis[id].reason, "pane_stalled", `${id}: ${JSON.stringify(r.kpis[id])}`);
+  }
+  assert.equal(r.kpis.output_latency_ms.state, "measured");
+  assert.ok(
+    (r.kpis.output_latency_ms.notes ?? []).some((n) => /^pane hitch, recovered .*session 0 stayed at seq \d+ for \d+ ms .*, then advanced again$/.test(n)),
+    JSON.stringify(r.kpis.output_latency_ms.notes),
+  );
+  assert.match(describeStall(r.stalls[0]), /, then advanced again$/);
+  // A wedge at the end is reported (and voids) even when an earlier hitch was longer.
+  const both = computeRowKpis({ ...f, soak: { records: freezeFrames(freezeFrames(f.soak.records, 5_000, 9_000), SOAK_MS - 2_600) } });
+  assert.equal(both.stalls.length, 1);
+  assert.equal(both.stalls[0].recovered, false, JSON.stringify(both.stalls[0]));
+  assertUnknown(both.kpis.output_latency_ms, "pane_stalled");
+});
+
+test("the stall rule does not run on an unaligned clock, and never overwrites another reason (review r10 SF2)", () => {
+  const caps = { "clock.aligned": { state: "UNKNOWN", reason: "node not found" } };
+  const f = focusFixture({ caps });
+  const r = computeRowKpis({ ...f, soak: { records: stallSegment(f.soak.records, { fromMs: SOAK_MS / 2 }) } });
+  assert.deepEqual(r.stalls, [], "emission times cannot be set against frame times");
+  assertUnknown(r.kpis.output_latency_ms, "clock_unaligned");
+  for (const id of STALL_VOIDED_KPIS) assert.notEqual(r.kpis[id].reason, "pane_stalled", id);
+  // An aligned clock, but a KPI that is already unknown for another reason: the
+  // wedge is noted on it, the reason stays.
+  const g = focusFixture();
+  const refusing = withSummary({ ...g, soak: { records: stallSegment(g.soak.records, { fromMs: SOAK_MS / 2 }) } }, {
+    marker_loss: { state: "unknown", unit: "%", n: 0, reason: "refresh_rate_unknown" },
+  });
+  const w = computeRowKpis(refusing);
+  assert.equal(w.stalls.length, 1);
+  assertUnknown(w.kpis.marker_loss, "refresh_rate_unknown");
+  assert.ok((w.kpis.marker_loss.notes ?? []).some((n) => /^the pane stopped repainting: session 0/.test(n)), JSON.stringify(w.kpis.marker_loss));
+  assertUnknown(w.kpis.output_latency_ms, "pane_stalled");
+});
+
+/** A probe segment for paneStalls alone: x11 primary, the given frames and intervals. */
+function synthSeg(frames, intervals = []) {
+  return {
+    captures: [{ type: "capture", source: "x11", state: "started" }],
+    summary: { primary: "x11" },
+    frames,
+    intervals,
+    firstSeen: [],
+  };
+}
+const at = (ms) => T0 + BigInt(ms) * MS;
+/** A frame at `ms` showing session 0's output marker at `seq` (null = not shown). */
+const fr = (ms, seq, source = "x11") => ({ source, t_ns: String(at(ms)), markers: seq === null ? [] : [{ kind: "output", session: 0, seq }] });
+/** Session 0's generator, with output markers emitted at these ms. */
+const gensAt = (msList) => new Map([[0, { markers: msList.map((ms, i) => ({ kind: "output", seq: 10_000 + i, tEmit: at(ms) })) }]]);
+/** Emission times every `step` ms over [a, b]. */
+const every = (a, b, step) => Array.from({ length: Math.floor((b - a) / step) + 1 }, (_, i) => a + i * step);
+const WIN = { t0: at(0), t1: at(60_000) };
+const V0 = new Set([0]);
+/** Advancing frames (one seq per 100 ms) before `fromMs`, `seq` 500 still over [fromMs, toMs], advancing after when `recover`. */
+function runFrames(fromMs, toMs, { recover = true, step = 100 } = {}) {
+  const out = [];
+  for (let t = 0, s = 1; t < fromMs; t += 100, s += 1) out.push(fr(t, s));
+  for (let t = fromMs; t < toMs; t += step) out.push(fr(t, 500));
+  out.push(fr(toMs, 500));
+  if (recover) for (let t = toMs + 100, s = 501; t <= toMs + 1000; t += 100, s += 1) out.push(fr(t, s));
+  return out;
+}
+
+test("the stall rule's boundaries: 2 s, 20 markers, the emission window's edges (review r10 SF5)", () => {
+  const dense = gensAt(every(0, 20_000, 10));
+  // 1990 ms still is no stall; 2000 and 2010 ms are.
+  assert.deepEqual(paneStalls(synthSeg(runFrames(1000, 2990)), dense, WIN, V0), [], "1990 ms");
+  assert.equal(paneStalls(synthSeg(runFrames(1000, 3000)), dense, WIN, V0).length, 1, "2000 ms exactly");
+  const st = paneStalls(synthSeg(runFrames(1000, 3010)), dense, WIN, V0);
+  assert.equal(st.length, 1, "2010 ms");
+  assert.deepEqual(st[0], { session: 0, seq: 500, ms: 2010, frames: 22, emitted: 201, recovered: true });
+  assert.ok(STALL_MIN_MS === 2000 && STALL_MIN_EMITTED === 20);
+  // 19 markers emitted in the run is no stall; 20 is.
+  const run = synthSeg(runFrames(1000, 3500));
+  assert.deepEqual(paneStalls(run, gensAt(every(1100, 1100 + 18 * 100, 100)), WIN, V0), [], "19 emitted");
+  assert.equal(paneStalls(run, gensAt(every(1100, 1100 + 19 * 100, 100)), WIN, V0).length, 1, "20 emitted");
+  // The emission window is (first frame, last frame]: one marker exactly at the
+  // run's last frame counts, one exactly at its first does not.
+  const inside19 = every(1100, 1100 + 18 * 100, 100); // 1100..2900, strictly inside (1000, 3500)
+  assert.equal(inside19.length, 19);
+  assert.equal(paneStalls(run, gensAt([...inside19, 3500]), WIN, V0)[0]?.emitted, 20, "an emission at t1 counts (t <= t1)");
+  assert.deepEqual(paneStalls(run, gensAt([1000, ...inside19]), WIN, V0), [], "an emission at t0 does not (t > t0)");
+});
+
+test("the stall rule picks the longest of several hitches, and a wedge over any of them (review r10 SF5)", () => {
+  const dense = gensAt(every(0, 30_000, 10));
+  // Three recovered runs: 2.5 s, 3.5 s, 2.2 s.
+  const frames = [];
+  let t = 0;
+  let s = 1;
+  const advance = (ms) => {
+    for (const end = t + ms; t < end; t += 100) frames.push(fr(t, s++));
+  };
+  const still = (ms) => {
+    const seq = s++;
+    for (const end = t + ms; t <= end; t += 100) frames.push(fr(t, seq));
+    return seq;
+  };
+  advance(1000);
+  still(2500);
+  advance(1000);
+  const longest = still(3500);
+  advance(1000);
+  still(2200);
+  advance(1000);
+  const st = paneStalls(synthSeg(frames), dense, WIN, V0);
+  assert.equal(st.length, 1);
+  assert.equal(st[0].seq, longest, JSON.stringify(st[0]));
+  assert.equal(st[0].ms, 3500);
+  assert.equal(st[0].recovered, true);
+  // The same, then frozen 2.4 s to the last frame: the wedge is the one reported.
+  const wedgeSeq = still(2400);
+  const w = paneStalls(synthSeg(frames), dense, WIN, V0);
+  assert.equal(w[0].seq, wedgeSeq);
+  assert.equal(w[0].recovered, false);
+});
+
+test("the stall rule reads primary frames inside the window only, in time order (review r10 SF4/SF5)", () => {
+  const dense = gensAt(every(0, 20_000, 10));
+  // Frames outside the window are ignored: a 3 s run of which 1.5 s is in the window.
+  const frames = runFrames(1000, 4000, { recover: false });
+  assert.equal(paneStalls(synthSeg(frames), dense, WIN, V0).length, 1, "the whole run qualifies");
+  assert.deepEqual(paneStalls(synthSeg(frames), dense, { t0: at(2500), t1: WIN.t1 }, V0), [], "frames before t0 are ignored");
+  assert.deepEqual(paneStalls(synthSeg(frames), dense, { t0: WIN.t0, t1: at(2500) }, V0), [], "frames after t1 are ignored");
+  // Only the primary source: a cross-check source (dda) showing an old marker is not the pane.
+  // The primary source shows seq 5 then seq 6 with no frame between (a still screen
+  // is no evidence either way); dda shows seq 7 for 4 s in that stretch.
+  const primaryOnly = [fr(0, 4), fr(400, 5), fr(4600, 6), fr(5000, 7)];
+  const ddaStill = every(500, 4500, 100).map((t) => fr(t, 7, "dda"));
+  assert.deepEqual(paneStalls(synthSeg([...primaryOnly, ...ddaStill]), dense, WIN, V0), [], "a dda frame is not a primary frame");
+  assert.equal(paneStalls(synthSeg([...primaryOnly, ...ddaStill.map((x) => ({ ...x, source: "x11" }))]), dense, WIN, V0).length, 1, "the same frames as primary are a stall");
+  // Unsorted input reads the same as sorted.
+  const sorted = paneStalls(synthSeg(runFrames(1000, 3010)), dense, WIN, V0);
+  const shuffled = runFrames(1000, 3010).map((x, i) => ({ x, k: (i * 7919) % 101 })).sort((a, b) => a.k - b.k).map((o) => o.x);
+  assert.deepEqual(paneStalls(synthSeg(shuffled), dense, WIN, V0), sorted);
+  assert.equal(sorted.length, 1);
+});
+
+test("a run touching an interval the probe excluded for visibility or input does not qualify (review r10 SF3)", () => {
+  const dense = gensAt(every(0, 20_000, 10));
+  const frames = runFrames(1000, 3500);
+  const iv = (a, b, cls) => ({ type: "interval", index: 0, t_start_ns: String(at(a)), t_end_ns: String(at(b)), valid: cls === null, exclusion_class: cls });
+  assert.equal(paneStalls(synthSeg(frames, [iv(1500, 2000, null)]), dense, WIN, V0).length, 1, "a valid interval");
+  assert.deepEqual(paneStalls(synthSeg(frames, [iv(1500, 2000, "occluded")]), dense, WIN, V0), [], "occluded / not foreground / cloaked / minimized");
+  assert.deepEqual(paneStalls(synthSeg(frames, [iv(3000, 3500, "operator_activity")]), dense, WIN, V0), [], "real input");
+  assert.equal(paneStalls(synthSeg(frames, [iv(4000, 4500, "occluded")]), dense, WIN, V0).length, 1, "an excluded interval the run does not touch");
+  assert.equal(paneStalls(synthSeg(frames, [iv(1500, 2000, "harness_error")]), dense, WIN, V0).length, 1, "a harness-class interval (no input monitor on Xvfb) rules nothing out");
+});
+
+test("a marker hidden for longer than the gap and shown again is a redisplay, not a stall (review r10 nit)", () => {
+  const dense = gensAt(every(0, 20_000, 10));
+  const before = Array.from({ length: 10 }, (_, i) => fr(i * 100, i + 1));
+  const still = (a, b) => every(a, b, 100).map((t) => fr(t, 500));
+  const after = Array.from({ length: 5 }, (_, i) => fr(4600 + i * 100, 501 + i));
+  // Shown 1.0-1.4 s, hidden 1.5-2.9 s (frames without it), the same seq again 3.0-4.5 s.
+  const hidden = [...before, ...still(1000, 1400), ...every(1500, 2900, 100).map((t) => fr(t, null)), ...still(3000, 4500), ...after];
+  assert.ok(3000 - 1400 > STALL_HIDDEN_GAP_MS);
+  assert.deepEqual(paneStalls(synthSeg(hidden), dense, WIN, V0), [], "the run ends where the marker was hidden");
+  // No frame at all in the same stretch (a still screen) does not end the run.
+  const silent = [...before, ...still(1000, 1400), ...still(3000, 4500), ...after];
+  const st = paneStalls(synthSeg(silent), dense, WIN, V0);
+  assert.equal(st.length, 1);
+  assert.equal(st[0].ms, 3500);
+  // A brief absence (a partial read that skipped the pane) does not end it either.
+  const brief = [...before, ...still(1000, 2000), fr(2050, null), ...still(2100, 3500), ...after];
+  assert.equal(paneStalls(synthSeg(brief), dense, WIN, V0).length, 1);
+});
+
+test("the stall rule counts any number of earlier appearances (review r9 nit 1)", () => {
   const f = focusFixture();
   const seg = indexProbeSegment(f.soak.records);
   const t0 = BigInt(seg.frames[0].t_ns);
   const win = { t0, t1: BigInt(seg.frames.at(-1).t_ns) };
-  const frozenSeg = (fromMs, toMs) => {
-    const a = t0 + BigInt(fromMs) * MS;
-    const b = t0 + BigInt(toMs) * MS;
-    let seq = null;
-    return { ...seg, frames: seg.frames.map((fr) => {
+  const a = t0 + 150n * MS;
+  const b = t0 + 2650n * MS;
+  let seq = null;
+  const two = {
+    ...seg,
+    frames: seg.frames.map((fr) => {
       const t = BigInt(fr.t_ns);
       if (t < a || t > b) return fr;
-      const m = fr.markers.find((x) => x.kind === "output");
+      const m = fr.markers.find((x) => x.kind === "output" && x.session === 0);
       seq ??= m?.seq;
-      return { ...fr, markers: fr.markers.map((x) => (x.kind === "output" ? { ...x, seq } : x)) };
-    }) };
+      return { ...fr, markers: fr.markers.map((x) => (x.kind === "output" && x.session === 0 ? { ...x, seq } : x)) };
+    }),
   };
-  // Exactly two appearances before it, then frozen for 2.5 s: stalled.
-  const two = frozenSeg(150, 2650);
-  const shownBefore = new Set(two.frames.filter((fr) => BigInt(fr.t_ns) < t0 + 150n * MS).flatMap((fr) => fr.markers.map((m) => m.seq)));
-  assert.ok(shownBefore.size >= 2, `appearances before the freeze: ${shownBefore.size}`);
+  // Session 0's OUTPUT marker showed at least two sequences before the freeze.
+  const shownBefore = new Set(
+    two.frames
+      .filter((fr) => BigInt(fr.t_ns) < a)
+      .flatMap((fr) => fr.markers.filter((m) => m.kind === "output" && m.session === 0).map((m) => m.seq)),
+  );
+  assert.ok(shownBefore.size >= 2, `session 0 output seqs before the freeze: ${[...shownBefore]}`);
   const st = paneStalls(two, f.gens, win, new Set([0]));
   assert.equal(st.length, 1);
+  assert.equal(st[0].recovered, true);
   assert.ok(st[0].ms >= STALL_MIN_MS && st[0].emitted >= STALL_MIN_EMITTED, JSON.stringify(st[0]));
-  // 1.5 s frozen is under the bar — even with plenty written meanwhile (40 extra markers).
-  const busy = new Map([[0, { ...f.gens.get(0), markers: [...f.gens.get(0).markers, ...Array.from({ length: 40 }, (_, k) => ({ kind: "output", seq: 9000 + k, tEmit: t0 + BigInt(200 + k * 30) * MS }))] }]]);
-  assert.ok(paneStalls(frozenSeg(150, 1650), busy, win, new Set([0])).length === 0, "1.5 s is no stall");
-  assert.equal(paneStalls(frozenSeg(150, 2650), busy, win, new Set([0])).length, 1, "2.5 s with the same writes is");
-  // 2.5 s frozen while the generator wrote fewer than twenty markers is no stall either.
-  const quiet = new Map([[0, { ...f.gens.get(0), markers: f.gens.get(0).markers.filter((m) => m.tEmit < t0 + 150n * MS || m.tEmit > t0 + 2650n * MS || Number(m.seq) % 10 === 0) }]]);
-  assert.deepEqual(paneStalls(two, quiet, win, new Set([0])), [], "a generator that wrote little explains a still marker");
   assert.equal(describeStall({ session: 3, seq: 7, ms: 2500, frames: 150, emitted: 25 }), "session 3 stayed at seq 7 for 2500 ms (150 frame(s)) while its generator wrote 25 marker(s)");
 });
