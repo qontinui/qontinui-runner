@@ -4231,12 +4231,25 @@ impl TerminalSession {
 
     /// Reset flow control counters so a reconnecting frontend doesn't hit backpressure.
     ///
-    /// Over-ack tolerance: render callbacks for writes issued BEFORE this
-    /// reset may still ack afterwards, briefly pushing `bytes_acked` above
-    /// `bytes_sent`. The gate computes the gap with `saturating_sub`, so the
-    /// skew reads as gap 0 — a bounded, one-shot blind margin (at most the
-    /// pre-reset in-flight bytes) before backpressure re-engages. This is
-    /// intentional; do not "fix" the saturating_sub.
+    /// Over-ack tolerance: the frontend acks every byte it RECEIVES, once
+    /// (`ackedWriteQueue.ts`), so bytes sent BEFORE this reset can still be
+    /// acked after it. Those bytes include render callbacks for writes already
+    /// in flight, plus chunks the pane buffered or held and writes only after
+    /// the reset (the mount drain, a resync's held frames). Either way
+    /// `bytes_acked` can briefly exceed `bytes_sent`. The gate computes the gap
+    /// with `saturating_sub`, so the skew reads as gap 0. That is a one-shot
+    /// blind margin before backpressure re-engages. It is bounded by the
+    /// pre-reset gap, i.e. the bytes sent and not yet acked at the reset. That
+    /// gap is at most [`FLOW_HIGH_WATERMARK`] plus one emitted chunk, because
+    /// the gate admits a chunk only while the gap is at or under the High
+    /// watermark. One chunk is at most one coalesced sync frame
+    /// ([`SYNC_FLUSH_BYTE_CAP`] plus the 8 KiB read that tipped it over).
+    /// A focused pane can also ack a background-tier window flushed on its way
+    /// back to `focused`, which was never counted as sent. That adds at most one
+    /// held window (`BACKGROUND_HOLD_BYTE_CAP`) to the same one-shot margin.
+    /// This is intentional; do not "fix" the saturating_sub. An under-ack is
+    /// the dangerous direction: an unacked remainder above
+    /// [`FLOW_LOW_WATERMARK`] keeps a paused gate shut forever.
     pub fn reset_flow_control(&self) {
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         self.bytes_acked.store(sent, Ordering::Relaxed);

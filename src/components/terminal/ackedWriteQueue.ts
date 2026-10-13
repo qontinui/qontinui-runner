@@ -27,10 +27,20 @@
  * The rule this module enforces: every chunk the pane receives (any route but
  * "drop") is acked in full exactly once. The written part is acked when its
  * render callback fires. A chunk with nothing left to write is acked as
- * settled-without-write, in order with the writes around it. Bytes emitted
- * before a reset and acked after it read as a briefly NEGATIVE gap, which the
- * runner saturates to 0. That is the bounded, documented blind margin on
- * `TerminalSession::reset_flow_control`, not a leak.
+ * settled-without-write, in order with the writes around it.
+ *
+ * This deliberately OVER-acks across a reset. Some bytes were sent before a
+ * reset (the mount's or a resync's ring read) but are written after it: a
+ * chunk buffered during mount, a frame held during a resync, a write still in
+ * flight. They are acked after the reset, so the runner's acked count passes
+ * its sent count and the gap saturates to 0. The blind margin that leaves is
+ * bounded by the pre-reset gap, which is at most FLOW_HIGH_WATERMARK plus one
+ * emitted chunk (one sync frame, under SYNC_FLUSH_BYTE_CAP + 8 KiB). The margin
+ * is one-shot, since the next reset sets acked = sent again. A visible pane
+ * acking a background window that was flushed uncounted on its way back to
+ * `focused` adds at most one hold window. `TerminalSession::reset_flow_control`
+ * documents the same bound, and `ackedWriteQueue.test.ts` pins it. Over-acking
+ * costs a bounded delay before backpressure. Under-acking costs a frozen pane.
  *
  * Leaf module (no xterm / Tauri imports), so vitest can drive it, for the same
  * reason as `flowControl.ts`.
@@ -76,6 +86,7 @@ export class AckedWriteQueue {
       this.byteLen += s.length;
     }
     if (receivedBytes > 0) this.ackLen += receivedBytes;
+    this.sendAck(this.acks.onSettledWithoutWrite(receivedBytes));
   }
 
   /** True when there is nothing to write AND nothing to ack. */

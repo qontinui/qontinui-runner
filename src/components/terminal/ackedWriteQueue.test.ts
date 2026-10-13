@@ -1,7 +1,7 @@
 /**
  * The termhost-bench freeze (CI run 38351621760, qontinui-runner PR #2181): a
- * visible pane stopped repainting while its PTY kept flowing. It froze at the
- * first large repaint burst, and froze again after `restore-zone` remounted it.
+ * visible pane stopped repainting while its PTY kept flowing. It froze at a
+ * large repaint burst, and froze again after `restore-zone` remounted it.
  *
  * Mechanism: the runner's emission gate (`EmissionGate` in
  * `src-tauri/src/terminal/session.rs`) pauses once `sent − acked` exceeds
@@ -12,114 +12,37 @@
  * pane acked everything it rendered, the gap settled at the remainder, which
  * was above 5 000, and the runner never sent another byte.
  *
- * `RunnerGate` below mirrors the Rust gate's hysteresis and counters. The
- * scenarios drive `AckedWriteQueue` exactly as `TerminalInstance` does, and
- * assert the property that matters: once the pane has rendered everything it
- * received, the gate can reopen. The last suite pins the wiring. Every
- * live-output path in `TerminalInstance` goes through the queue, because the
- * component cannot be mounted under the runner's `environment: "node"`. See
- * `TerminalInstance.test.tsx`.
+ * `RunnerGate` (`__fixtures__/runnerGateModel.ts`) mirrors the Rust gate. The
+ * scenarios drive `AckedWriteQueue` the way `PaneOutputStream` does. They
+ * assert two properties: once the pane has rendered everything it received,
+ * the gate can reopen; and the over-ack this queue deliberately does across a
+ * reset stays inside the bound `reset_flow_control` documents. The routing and
+ * the reconnect path are covered in `paneOutputStream.test.ts`.
  */
 
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { describe, it, expect } from "vitest";
 import { AckedWriteQueue, type RenderedWriteSink } from "./ackedWriteQueue";
 import { RenderAckAccumulator } from "./flowControl";
-import { drainHeldChunks, type OffsetChunk } from "./scrollbackReplay";
+import { drainHeldChunks } from "./scrollbackReplay";
+import {
+  FLOW_HIGH_WATERMARK,
+  FLOW_LOW_WATERMARK,
+  RunnerGate,
+  chunk,
+  paneWriter,
+} from "./__fixtures__/runnerGateModel";
 
-/** `FLOW_HIGH_WATERMARK` / `FLOW_LOW_WATERMARK` in `src-tauri/src/terminal/session.rs`. */
-const FLOW_HIGH_WATERMARK = 100_000;
-const FLOW_LOW_WATERMARK = 5_000;
-
-/** The runner side: `EmissionGate` + `TerminalSession::{ack, reset_flow_control}`. */
-class RunnerGate {
-  sent = 0;
-  acked = 0;
-  paused = false;
-  emissionSkipped = false;
-  resumeMarkers = 0;
-
-  get gap(): number {
-    return Math.max(0, this.sent - this.acked);
-  }
-
-  /** `EmissionGate::should_emit` + the reader's `bytes_sent` bookkeeping. */
-  tryEmit(len: number): boolean {
-    if (this.paused) {
-      if (this.gap <= FLOW_LOW_WATERMARK) this.paused = false;
-    } else if (this.gap > FLOW_HIGH_WATERMARK) {
-      this.paused = true;
-    }
-    if (this.paused) {
-      this.emissionSkipped = true;
-      return false;
-    }
-    this.sent += len;
-    return true;
-  }
-
-  ack(bytes: number): void {
-    this.acked += bytes;
-    if (this.gap <= FLOW_LOW_WATERMARK && this.emissionSkipped) {
-      this.emissionSkipped = false;
-      this.resumeMarkers += 1;
-    }
-  }
-
-  /** `reset_flow_control` — what `terminal_get_scrollback` does before snapshotting. */
-  reset(): void {
-    this.acked = this.sent;
-    this.emissionSkipped = false;
-  }
-}
-
-/** An xterm stand-in: writes queue up, `renderAll` fires their callbacks in order. */
-class FakeSink implements RenderedWriteSink {
-  written: number[] = [];
-  private pending: Array<() => void> = [];
-  write(data: Uint8Array, onRendered: () => void): void {
-    this.written.push(data.length);
-    this.pending.push(onRendered);
-  }
-  renderAll(): void {
-    const cbs = this.pending;
-    this.pending = [];
-    for (const cb of cbs) cb();
-  }
-}
-
-function pane(gate: RunnerGate) {
-  const acks = new RenderAckAccumulator();
-  const queue = new AckedWriteQueue(acks, (n) => {
-    if (n > 0) gate.ack(n);
-  });
-  const sink = new FakeSink();
-  return {
-    acks,
-    queue,
-    sink,
-    /** Render everything, then let the 250 ms floor timer drain the remainder. */
-    settle() {
-      queue.flush(sink);
-      sink.renderAll();
-      const rest = acks.flush();
-      if (rest > 0) gate.ack(rest);
-    },
-  };
-}
-
-const chunk = (offset: number, len: number): OffsetChunk => ({
-  bytes: new Uint8Array(len).fill(0x41),
-  offset,
-});
+/** `SYNC_FLUSH_BYTE_CAP` (session.rs) plus the 8 KiB read that can tip a frame over it. */
+const MAX_EMISSION = 256 * 1024 + 8 * 1024;
+/** `BACKGROUND_HOLD_BYTE_CAP` (visibility.rs). */
+const BACKGROUND_HOLD_BYTE_CAP = 256 * 1024;
 
 /**
  * A repaint burst, as the pane sees it: each chunk the gate admits is staged
  * and flushed, but the renderer lags, so nothing renders until the burst ends.
  * That is what drives the gap past the High watermark.
  */
-function burst(gate: RunnerGate, p: ReturnType<typeof pane>, from: number, chunks: number) {
+function burst(gate: RunnerGate, p: ReturnType<typeof paneWriter>, from: number, chunks: number) {
   let offset = from;
   for (let i = 0; i < chunks; i++) {
     const c = chunk(offset, 40_000);
@@ -132,12 +55,19 @@ function burst(gate: RunnerGate, p: ReturnType<typeof pane>, from: number, chunk
   return offset;
 }
 
+/** Bytes the gate admits (counted sends, nothing rendered) before it pauses again. */
+function admittedUntilPause(gate: RunnerGate, chunkLen: number): number {
+  let admitted = 0;
+  for (let i = 0; i < 1_000 && gate.tryEmit(chunkLen); i++) admitted += chunkLen;
+  return admitted;
+}
+
 describe("AckedWriteQueue — a remounted pane can always reopen the emission gate", () => {
   it("acks the bytes the mount drain trims and the bytes it buffered before ready", () => {
     const gate = new RunnerGate();
     gate.sent = 2_000_000; // a long-lived session
     gate.acked = gate.sent;
-    const p = pane(gate);
+    const p = paneWriter(gate);
 
     // The new pane mounts (maximize or restore-zone). Its ring read resets the
     // counters and snapshots the ring through offset 1_000_000.
@@ -145,7 +75,7 @@ describe("AckedWriteQueue — a remounted pane can always reopen the emission ga
     const replayedThrough = 1_000_000;
     // Emitted AFTER the reset: one coalesced sync frame wholly tee'd into the
     // ring before the snapshot, then a chunk past it. Both arrive before the
-    // backend is ready and are buffered as `pendingBytes`.
+    // backend is ready and are buffered.
     const pendingBytes = [chunk(replayedThrough - 9_000, 9_000), chunk(replayedThrough, 6_000)];
     for (const c of pendingBytes) expect(gate.tryEmit(c.bytes.length)).toBe(true);
 
@@ -169,7 +99,7 @@ describe("AckedWriteQueue — a remounted pane can always reopen the emission ga
 
   it("acks a held frame that a resync's ring snapshot already covered", () => {
     const gate = new RunnerGate();
-    const p = pane(gate);
+    const p = paneWriter(gate);
 
     // A resync's ring fetch resets the counters while a burst is in flight.
     gate.reset();
@@ -194,7 +124,7 @@ describe("AckedWriteQueue — a remounted pane can always reopen the emission ga
 
   it("settles a fully-replayed chunk even when nothing is left to write", () => {
     const gate = new RunnerGate();
-    const p = pane(gate);
+    const p = paneWriter(gate);
     gate.tryEmit(12_000);
     p.queue.stageChunk(chunk(0, 12_000), 50_000);
     expect(p.queue.isEmpty).toBe(false);
@@ -204,10 +134,61 @@ describe("AckedWriteQueue — a remounted pane can always reopen the emission ga
   });
 });
 
+describe("AckedWriteQueue — the over-ack across a reset is bounded", () => {
+  it("a chunk sent before a reset and written after it over-acks by at most the pre-reset gap", () => {
+    const gate = new RunnerGate();
+    const p = paneWriter(gate);
+
+    // Before the reset: the gate admits chunks while the gap is <= High. The
+    // pane received them, but they are still buffered/held, so nothing is acked.
+    let offset = 0;
+    while (gate.tryEmit(40_000)) {
+      p.queue.stageChunk(chunk(offset, 40_000), 0);
+      offset += 40_000;
+    }
+    const preResetGap = gate.gap;
+    expect(preResetGap).toBeLessThanOrEqual(FLOW_HIGH_WATERMARK + MAX_EMISSION);
+
+    // A ring read resets the counters; the pane writes and acks those chunks after it.
+    gate.reset();
+    p.settle();
+    const overAck = gate.acked - gate.sent;
+    expect(overAck).toBeGreaterThan(0); // acked passed sent: the documented skew
+    expect(overAck).toBeLessThanOrEqual(preResetGap);
+
+    // Backpressure re-engages within High + the over-ack + one chunk.
+    const admitted = admittedUntilPause(gate, 40_000);
+    expect(gate.paused).toBe(true);
+    expect(admitted).toBeLessThanOrEqual(FLOW_HIGH_WATERMARK + overAck + 40_000);
+  });
+
+  it("a background window sent uncounted and acked by a now-visible pane stays inside one hold window", () => {
+    const gate = new RunnerGate();
+    const p = paneWriter(gate);
+
+    // The pane comes back to `focused`. The runner flushes the background hold
+    // on the tier edge, and that send is not counted. The pane is visible again,
+    // so it writes and acks the window.
+    const window = chunk(0, 200_000);
+    expect(gate.sendUncounted(window.bytes.length)).toBe(true);
+    p.queue.stageChunk(window, 0);
+    p.settle();
+    const overAck = gate.acked - gate.sent;
+    expect(overAck).toBe(window.bytes.length);
+    expect(overAck).toBeLessThanOrEqual(BACKGROUND_HOLD_BYTE_CAP);
+
+    // Gap saturates at 0 and backpressure still re-engages, within the bound.
+    expect(gate.gap).toBe(0);
+    const admitted = admittedUntilPause(gate, 40_000);
+    expect(gate.paused).toBe(true);
+    expect(admitted).toBeLessThanOrEqual(FLOW_HIGH_WATERMARK + overAck + 40_000);
+  });
+});
+
 describe("AckedWriteQueue — coalescing", () => {
   it("writes everything staged as one write and acks the received total once", () => {
     const gate = new RunnerGate();
-    const p = pane(gate);
+    const p = paneWriter(gate);
     p.queue.stageChunk(chunk(0, 3_000), 0);
     p.queue.stageChunk(chunk(3_000, 4_000), 5_000); // 2_000 replayed, 2_000 written
     p.queue.flush(p.sink);
@@ -220,7 +201,7 @@ describe("AckedWriteQueue — coalescing", () => {
 
   it("drops staged bytes when the pane is gone (its unmount resets the runner)", () => {
     const gate = new RunnerGate();
-    const p = pane(gate);
+    const p = paneWriter(gate);
     p.queue.stageChunk(chunk(0, 8_000), 0);
     p.queue.flush(null);
     expect(p.queue.isEmpty).toBe(true);
@@ -240,25 +221,5 @@ describe("AckedWriteQueue — coalescing", () => {
     expect(() => queue.flush(boom)).toThrow("renderer gone");
     expect(acks.outstanding).toBe(0);
     expect(gate.acked).toBe(6_000);
-  });
-});
-
-describe("TerminalInstance routes every received byte through the acked queue", () => {
-  const source = readFileSync(resolve(__dirname, "TerminalInstance.tsx"), "utf8");
-
-  it("never trims a live chunk outside the queue", () => {
-    // A bare `trimReplayedChunk` in the component is exactly the shape that
-    // wrote the unreplayed suffix and forgot the trimmed prefix's ack.
-    expect(source).not.toMatch(/\btrimReplayedChunk\s*\(/);
-  });
-
-  it("stages live, buffered and leftover held chunks with stageChunk", () => {
-    expect(source).toContain("ackQueue.stageChunk({ bytes, offset }, replayedThrough)");
-    expect(source).toContain("ackQueue.stageChunk(buffered, replayedThrough)");
-    expect(source).toContain("ackQueue.stageChunk(c, replayedThrough)");
-  });
-
-  it("acks a resync drain by what it consumed, not by what it wrote", () => {
-    expect(source).toContain("ackQueue.stage(drained.writable, drained.receivedBytes)");
   });
 });
