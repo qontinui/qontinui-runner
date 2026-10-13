@@ -1804,11 +1804,41 @@ pub(crate) fn coord_device_token_for(
 /// post-upgrade migration banner has been visible >5min and the operator
 /// asks the refresher to try again immediately. Idempotent — if no
 /// refresher is registered yet, this is a no-op.
+///
+/// `await_conclusion: true` is the credential banner's "Retry refresh now"
+/// (plan `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover`
+/// D5): the command then waits — at most [`KICK_AWAIT_CONCLUSION_TIMEOUT`] —
+/// for the kicked pass to conclude, and returns `{ concluded, posture }`, where
+/// `posture` is the `get_coord_credential_posture` object that pass left
+/// behind. Before this the button returned `Ok(())` whatever happened, so a
+/// retry that could never work looked like success. `concluded: false` means
+/// the pass is still running (or no refresher is registered) — UNKNOWN.
+///
+/// Without it (every other caller: the re-pair CTA, the tenant switch) the
+/// kick stays fire-and-forget and the posture is the current one, with
+/// `concluded: false`.
 #[tauri::command]
-pub async fn kick_device_jwt_refresher_cmd() -> Result<(), String> {
-    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
-    Ok(())
+pub async fn kick_device_jwt_refresher_cmd(
+    await_conclusion: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    use crate::mcp::device_jwt_refresher::commands as refresher;
+    if await_conclusion == Some(true) {
+        let outcome =
+            refresher::kick_device_jwt_refresher_and_wait(KICK_AWAIT_CONCLUSION_TIMEOUT).await;
+        return Ok(outcome.to_json());
+    }
+    refresher::kick_device_jwt_refresher().await;
+    Ok(refresher::KickOutcome {
+        concluded: false,
+        posture: crate::mcp::device_jwt_refresher::coord_credential_posture(),
+    }
+    .to_json())
 }
+
+/// The bound on `kick_device_jwt_refresher_cmd`'s wait. One pass is a handful
+/// of HTTP calls with 10–30 s client timeouts each, so this covers the common
+/// case without leaving the button spinning on a wedged backend.
+const KICK_AWAIT_CONCLUSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Read the runner's current coord-credential POSTURE.
 ///
