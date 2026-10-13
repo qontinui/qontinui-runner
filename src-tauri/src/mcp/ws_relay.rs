@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 
 use super::app_discovery::DiscoveredApp;
 use super::app_registry::{AppRegistry, AppTransport};
-use super::command_relay::{CommandRelay, CommandResponse};
+use super::command_relay::{CommandRelay, CommandResponse, WrapperFailure};
 use super::origin_guard::{NormOrigin, RequesterPrincipal};
 use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState, RULE_R6};
 use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
@@ -377,8 +377,13 @@ enum InboundFrame {
         success: Option<bool>,
         #[serde(default)]
         result: Option<serde_json::Value>,
+        /// RAW, read by [`WrapperFailure::from_wire`]: a bare string, or the
+        /// `{code, message, retryable}` object ui-bridge-wrapper's
+        /// `LiveSessionTransport` sends. Typed as a string, this field made
+        /// serde reject every structured failure frame whole, so the command
+        /// it answered sat until the 30 s timeout (coord finding `fb3fb468`).
         #[serde(default)]
-        error: Option<String>,
+        error: Option<serde_json::Value>,
     },
     /// Push-based change event (DOM mutations etc.). For v1 we log + discard.
     #[serde(rename_all = "camelCase")]
@@ -850,28 +855,15 @@ async fn handle_inbound_text(
             result,
             error,
         }) => {
-            let outcome = relay
-                .resolve(
-                    conn_id,
-                    mode,
-                    CommandResponse {
-                        command_id: command_id.clone(),
-                        success: success.unwrap_or_else(|| error.is_none()),
-                        result,
-                        error,
-                    },
-                )
+            let error = error.and_then(WrapperFailure::from_wire);
+            let response = CommandResponse {
+                command_id,
+                success: success.unwrap_or_else(|| error.is_none()),
+                result,
+                error,
+            };
+            resolve_inbound_response(app_id, conn_id, mode, principal, binding, relay, response)
                 .await;
-            if outcome.not_yours {
-                // Counted on `/health` under R3 — `meter` returns the refusal
-                // in `enforce`, and there is no frame to send it in.
-                let _ = binding.meter(mode, principal, WS_ROUTE, Refusal::command_not_yours());
-            } else if !outcome.matched {
-                debug!(
-                    "[ws-relay] orphan response from '{}' for command_id={}",
-                    app_id, command_id
-                );
-            }
         }
         Ok(InboundFrame::ChangeEvent { event }) => {
             // Phase 1: log and discard. Phase 2 will wire this into the
@@ -883,7 +875,72 @@ async fn handle_inbound_text(
         }
         Err(e) => {
             warn!("[ws-relay] invalid inbound frame from '{}': {}", app_id, e);
+            // A response frame that names its command still ANSWERS it, even
+            // when another field is unreadable: resolve that command now with
+            // a typed failure instead of leaving it to the 30 s timeout,
+            // which would report a wrapper that answered in a millisecond as
+            // one that never answered (coord finding `fb3fb468`).
+            if let Some(command_id) = unreadable_response_command_id(text) {
+                let response = CommandResponse {
+                    command_id,
+                    success: false,
+                    result: None,
+                    error: Some(WrapperFailure {
+                        code: Some(MALFORMED_RESPONSE_FRAME.to_string()),
+                        message: format!(
+                            "the wrapper answered this command, but the runner could not \
+                             read its response frame: {e}"
+                        ),
+                        retryable: None,
+                    }),
+                };
+                resolve_inbound_response(
+                    app_id, conn_id, mode, principal, binding, relay, response,
+                )
+                .await;
+            }
         }
+    }
+}
+
+/// `code` of the failure a command resolves with when the wrapper's
+/// response frame named the command but could not be read.
+const MALFORMED_RESPONSE_FRAME: &str = "MALFORMED_RESPONSE_FRAME";
+
+/// The `commandId` of a frame that failed to parse as an [`InboundFrame`] but
+/// is still recognisably a `response`: a JSON object with `type: "response"`
+/// and a string `commandId`. `None` for anything else, which stays dropped.
+fn unreadable_response_command_id(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("type")?.as_str()? != "response" {
+        return None;
+    }
+    let command_id = value.get("commandId")?.as_str()?;
+    (!command_id.is_empty()).then(|| command_id.to_string())
+}
+
+/// Hand an inbound response to the relay under R3's connection binding: the
+/// one path every `response` frame takes, readable or not.
+async fn resolve_inbound_response(
+    app_id: &str,
+    conn_id: u64,
+    mode: BindingMode,
+    principal: &Principal,
+    binding: &Arc<RelayBinding>,
+    relay: &Arc<CommandRelay>,
+    response: CommandResponse,
+) {
+    let command_id = response.command_id.clone();
+    let outcome = relay.resolve(conn_id, mode, response).await;
+    if outcome.not_yours {
+        // Counted on `/health` under R3 — `meter` returns the refusal
+        // in `enforce`, and there is no frame to send it in.
+        let _ = binding.meter(mode, principal, WS_ROUTE, Refusal::command_not_yours());
+    } else if !outcome.matched {
+        debug!(
+            "[ws-relay] orphan response from '{}' for command_id={}",
+            app_id, command_id
+        );
     }
 }
 
@@ -1025,5 +1082,196 @@ mod tests {
         assert_eq!(guard.active_url.as_deref(), Some("http://other"));
         // Our synthetic entry should still be removed even if active_url moved on.
         assert!(!guard.connections.contains_key("ws-app://wapp"));
+    }
+
+    // ------------------------------------------------------------------
+    // Inbound `response` frames (coord finding fb3fb468)
+    // ------------------------------------------------------------------
+
+    use crate::mcp::command_relay::CommandRelayError;
+    use crate::mcp::relay_binding::BindingConfig;
+
+    /// The relay timeout these tests run under. A frame the runner fails to
+    /// read leaves its command pending until this fires, so every test below
+    /// waits only [`ANSWERED_WITHIN`] — a fraction of it — for an answer.
+    const RELAY_TIMEOUT: Duration = Duration::from_secs(20);
+    const ANSWERED_WITHIN: Duration = Duration::from_secs(5);
+
+    /// Dispatch `action` to a test-registered wrapper, feed the frame
+    /// `respond(command_id)` builds through the REAL inbound parser
+    /// ([`handle_inbound_text`]), and return how the dispatch resolved.
+    /// Panics when it did not resolve within [`ANSWERED_WITHIN`]: a frame
+    /// the runner dropped surfaces only at the relay timeout.
+    async fn dispatch_answered_by(
+        action: &str,
+        respond: impl FnOnce(&str) -> String,
+    ) -> Result<CommandResponse, CommandRelayError> {
+        let ws = WsConnectionManager::new();
+        let (conn_id, mut outbound_rx) = ws.test_register("wrapper").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), RELAY_TIMEOUT);
+
+        let relay_task = relay.clone();
+        let action = action.to_string();
+        let dispatch = tokio::spawn(async move {
+            relay_task
+                .dispatch("wrapper", &action, serde_json::json!({}))
+                .await
+        });
+        let frame: serde_json::Value =
+            serde_json::from_str(&outbound_rx.recv().await.expect("command frame")).unwrap();
+        let command_id = frame["commandId"].as_str().expect("commandId").to_string();
+
+        handle_inbound_text(
+            "wrapper",
+            conn_id,
+            BindingMode::Enforce,
+            &Principal::OperatorTrust {
+                class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+            },
+            &RelayBinding::new(BindingConfig::default()),
+            &relay,
+            &respond(&command_id),
+        )
+        .await;
+
+        tokio::time::timeout(ANSWERED_WITHIN, dispatch)
+            .await
+            .expect("the dispatch must resolve when the wrapper answers, not at the relay timeout")
+            .expect("dispatch task")
+    }
+
+    /// ui-bridge-wrapper's `LiveSessionTransport` refuses an action it has no
+    /// handler for with a STRUCTURED error — this frame is its shape verbatim
+    /// (`packages/ui-bridge-wrapper/src/transports/live.ts`). The command it
+    /// answers resolves at once, carrying the wrapper's code and
+    /// retryability, instead of reading as a 30 s timeout.
+    #[tokio::test]
+    async fn a_structured_failure_frame_resolves_its_command_at_once_with_the_code() {
+        let got = dispatch_answered_by("findMedia", |id| {
+            serde_json::json!({
+                "type": "response",
+                "commandId": id,
+                "success": false,
+                "error": {
+                    "code": "NO_HANDLER",
+                    "message": "No handler registered for action 'findMedia'",
+                    "retryable": false
+                }
+            })
+            .to_string()
+        })
+        .await;
+        match got {
+            Err(CommandRelayError::WrapperError(failure)) => {
+                assert_eq!(failure.code.as_deref(), Some("NO_HANDLER"));
+                assert_eq!(
+                    failure.message,
+                    "No handler registered for action 'findMedia'"
+                );
+                assert_eq!(failure.retryable, Some(false));
+            }
+            other => panic!("expected the wrapper's coded failure, got {other:?}"),
+        }
+    }
+
+    /// A bare-string error — the shape this frame has always accepted — still
+    /// resolves as a message-only failure.
+    #[tokio::test]
+    async fn a_string_error_frame_still_resolves_as_a_message_only_failure() {
+        let got = dispatch_answered_by("click", |id| {
+            serde_json::json!({
+                "type": "response",
+                "commandId": id,
+                "success": false,
+                "error": "element not found"
+            })
+            .to_string()
+        })
+        .await;
+        match got {
+            Err(CommandRelayError::WrapperError(failure)) => {
+                assert_eq!(failure, WrapperFailure::message_only("element not found"));
+            }
+            other => panic!("expected a message-only failure, got {other:?}"),
+        }
+    }
+
+    /// `success` is inferred from the error when the wrapper omits it, and a
+    /// success frame is untouched by the error reader.
+    #[tokio::test]
+    async fn success_is_inferred_from_the_error_and_results_pass_through() {
+        let got = dispatch_answered_by("ping", |id| {
+            serde_json::json!({ "type": "response", "commandId": id, "result": "pong" }).to_string()
+        })
+        .await
+        .expect("no error and no success flag reads as success");
+        assert!(got.success);
+        assert_eq!(got.result, Some(serde_json::json!("pong")));
+        assert_eq!(got.error, None);
+
+        let got = dispatch_answered_by("ping", |id| {
+            serde_json::json!({
+                "type": "response",
+                "commandId": id,
+                "error": { "code": "HANDLER_ERROR", "message": "boom" }
+            })
+            .to_string()
+        })
+        .await;
+        assert!(
+            matches!(
+                got,
+                Err(CommandRelayError::WrapperError(ref f))
+                    if f.code.as_deref() == Some("HANDLER_ERROR")
+            ),
+            "an error with no success flag reads as a failure: {got:?}"
+        );
+    }
+
+    /// A response frame that names its command but carries a field the
+    /// runner cannot read still ANSWERS that command: it resolves with a
+    /// typed `MALFORMED_RESPONSE_FRAME` failure, not a 30 s timeout.
+    #[tokio::test]
+    async fn an_unreadable_response_frame_resolves_its_command_with_a_typed_failure() {
+        let got = dispatch_answered_by("click", |id| {
+            serde_json::json!({ "type": "response", "commandId": id, "success": "no" }).to_string()
+        })
+        .await;
+        match got {
+            Err(CommandRelayError::WrapperError(failure)) => {
+                assert_eq!(failure.code.as_deref(), Some(MALFORMED_RESPONSE_FRAME));
+                assert!(
+                    failure
+                        .message
+                        .contains("could not read its response frame"),
+                    "{}",
+                    failure.message
+                );
+                assert_eq!(failure.retryable, None, "retryability is UNKNOWN here");
+            }
+            other => panic!("expected MALFORMED_RESPONSE_FRAME, got {other:?}"),
+        }
+    }
+
+    /// Only a recognisable `response` with a string `commandId` is salvaged;
+    /// every other unreadable frame stays dropped.
+    #[test]
+    fn only_a_response_naming_its_command_is_salvaged() {
+        assert_eq!(
+            unreadable_response_command_id(
+                r#"{"type":"response","commandId":"c-1","success":"x"}"#
+            ),
+            Some("c-1".to_string())
+        );
+        for text in [
+            "not json",
+            r#"["response"]"#,
+            r#"{"type":"changeEvent","commandId":"c-1"}"#,
+            r#"{"type":"response"}"#,
+            r#"{"type":"response","commandId":7}"#,
+            r#"{"type":"response","commandId":""}"#,
+        ] {
+            assert_eq!(unreadable_response_command_id(text), None, "{text}");
+        }
     }
 }
