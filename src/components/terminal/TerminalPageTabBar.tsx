@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { Plus, X, Shuffle, SquareArrowOutUpRight } from "lucide-react";
 import { keyboardReorderTarget, type TerminalPageConfig } from "./useTerminalPages";
+import { SESSION_ORG_DRAG_MIME, decodeSessionOrgDrag, isSessionOrgDrag } from "./sessionOrgDrag";
 
 /**
  * Sentinel `dragOverId` value for the drop zone AFTER the last tab (the
@@ -23,6 +24,11 @@ interface TerminalPageTabBarProps {
    */
   onReorderPage?: (sourceId: string, targetId: string | null) => void;
   onReorganize?: () => void;
+  /**
+   * A Session Manager row or group was dropped on a page tab: move its live
+   * terminal tabs (`tabIds`) to that page.
+   */
+  onDropSessionTabs?: (pageId: string, tabIds: string[]) => void;
   /** Open a new pop-out OS window (same process) hosting its own terminals. */
   onPopOut?: () => void;
   /** Detach an entire page (all its terminals + layout) into its own window. */
@@ -43,6 +49,7 @@ export function TerminalPageTabBar({
   onRenamePage,
   onReorderPage,
   onReorganize,
+  onDropSessionTabs,
   onPopOut,
   onPopOutPage,
   isPinned,
@@ -156,6 +163,14 @@ export function TerminalPageTabBar({
               setDragOverId(null);
             }}
             onDragOver={(e) => {
+              // A session dragged out of the Session Manager onto this page.
+              if (onDropSessionTabs && isSessionOrgDrag(e.dataTransfer.types)) {
+                if (isActive) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                if (dragOverId !== page.id) setDragOverId(page.id);
+                return;
+              }
               if (!onReorderPage || !draggedId || draggedId === page.id) return;
               e.preventDefault();
               e.dataTransfer.dropEffect = "move";
@@ -166,6 +181,16 @@ export function TerminalPageTabBar({
             }}
             onDrop={(e) => {
               e.preventDefault();
+              const sessionDrag = decodeSessionOrgDrag(
+                e.dataTransfer.getData(SESSION_ORG_DRAG_MIME),
+              );
+              if (sessionDrag) {
+                setDragOverId(null);
+                if (onDropSessionTabs && !isActive && sessionDrag.tabIds.length > 0) {
+                  onDropSessionTabs(page.id, sessionDrag.tabIds);
+                }
+                return;
+              }
               const sourceId = draggedId ?? e.dataTransfer.getData("text/plain");
               setDraggedId(null);
               setDragOverId(null);

@@ -81,6 +81,11 @@ export interface SessionLifecycleInfo {
   restoreTier: string | null;
   /** `null` ⇒ never reported (unknown), not `false`. */
   bypassPermissions: boolean | null;
+  /** The work-axis finished marker (`/finish-session`), epoch ms; `null` =
+   * not marked finished. Orthogonal to `state`. */
+  finishedAt: number | null;
+  /** Free text recorded with `finishedAt`. */
+  finishReason: string | null;
 }
 
 /** One PR this session authored (attributed by the `Session-Id:` trailer). */

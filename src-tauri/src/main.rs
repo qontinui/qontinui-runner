@@ -3395,6 +3395,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // `useSessionPrs.ts` was deleted when this dropdown subsumed it)
             // and has been deleted rather than deprecated.
             commands::session_info::session_info_get,
+            // Plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search
+            // Phase 4: the Session Manager's query facts — one batched info
+            // listing (the Tauri twin of `GET /control/sessions/info`), the
+            // transcript full-text search behind `text:`, and coord's PR CI
+            // state behind `is:closable`.
+            commands::session_info_list::session_info_list,
+            commands::transcript_search::transcript_search,
+            commands::pr_ci_state::coord_pr_ci_states,
+            // Plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search
+            // Phase 3: the Session Manager's Close (through graceful_exit only)
+            // and Move to page.
+            commands::session_close::terminal_graceful_close,
+            commands::session_close::terminal_set_page,
             commands::session_org::session_org_get,
             commands::session_org::session_org_apply,
             // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 —
