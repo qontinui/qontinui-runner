@@ -596,12 +596,23 @@ mod tests {
             during, before,
             "the doctor's probe took the foreground (D9)"
         );
-        // Positive control: activating a window of ours does move it.
+        // Positive control: the selftest's own activating show (a plain
+        // create, ShowWindow(SW_SHOW)) moves the foreground — so the
+        // assertion above could have failed. Should a plain show not move
+        // it on some runner, the explicit activation below still proves the
+        // check can see a foreground change; the line printed says which.
         let control = GdiTestWindow::create(&opts("termhost-probe d9 control", true, false))
             .expect("the control window");
-        let _ = control.activate();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let moved = foreground();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut moved = foreground();
+        if moved == control.handle().0 as isize {
+            eprintln!("positive control: a plain activating show moved the foreground");
+        } else {
+            let _ = control.activate();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            moved = foreground();
+            eprintln!("positive control: a plain show did not move it; explicit activation did");
+        }
         control.close();
         owner.close();
         assert_eq!(

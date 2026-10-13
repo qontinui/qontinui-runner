@@ -119,6 +119,53 @@ pub fn x11_focus_verdict(
     active_top.is_none_or(|a| a == target_top)
 }
 
+/// What the foreground did while the doctor's probe window was up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForegroundFinding {
+    /// Unchanged throughout, and never one of ours.
+    Clean,
+    /// A D9 violation: the foreground was the probe or another window of
+    /// this process at some sample.
+    ProbeTookIt(String),
+    /// The foreground moved, but never to a window of ours: the operator (or
+    /// another program) switched windows. Not a violation.
+    ChangedNotByProbe(String),
+}
+
+/// Judge the foreground samples taken around and during the probe: `before`
+/// its creation, `during` (right after creation, and after each capture
+/// probe), `after` it closed. A before/after comparison alone misses a
+/// transient steal — Windows re-activates the previous window when the
+/// stealer is destroyed — and blames the probe for an operator's click, so
+/// the samples taken WHILE it was up decide, by whose window was foreground
+/// (`ours`: the probe or any other window of this process).
+pub fn foreground_finding(
+    before: usize,
+    during: &[usize],
+    after: usize,
+    ours: impl Fn(usize) -> bool,
+) -> ForegroundFinding {
+    let fmt = |v: &[usize]| {
+        v.iter()
+            .map(|h| format!("0x{h:x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if during.iter().any(|&h| h != 0 && ours(h)) || (after != 0 && ours(after)) {
+        return ForegroundFinding::ProbeTookIt(format!(
+            "a window of this process was foreground while the doctor's probe window was up (before 0x{before:x}; during {}; after 0x{after:x}); the probe must never take focus",
+            fmt(during)
+        ));
+    }
+    if during.iter().any(|&h| h != before) || after != before {
+        return ForegroundFinding::ChangedNotByProbe(format!(
+            "foreground changed (not by the probe): before 0x{before:x}; during {}; after 0x{after:x} — never a window of this process",
+            fmt(during)
+        ));
+    }
+    ForegroundFinding::Clean
+}
+
 /// An X server's 32-bit millisecond clock — the timestamps on its events —
 /// mapped onto the probe clock. The mapping comes from round trips that
 /// bracket a server timestamp: the probe reads its clock, makes the server
@@ -329,6 +376,38 @@ mod tests {
         // PointerRoot / None, or no focus reply at all.
         assert!(!x11_focus_verdict(&[1], 0x50, None, 0x50));
         assert!(!x11_focus_verdict(&[], 0x50, None, 0x50));
+    }
+
+    #[test]
+    fn only_a_window_of_ours_in_the_foreground_is_a_d9_violation() {
+        let ours = |h: usize| h == 0x77 || h == 0x78;
+        // Untouched.
+        assert_eq!(
+            foreground_finding(0x10, &[0x10, 0x10], 0x10, ours),
+            ForegroundFinding::Clean
+        );
+        // A transient steal: the probe (0x77) was foreground mid-run and
+        // Windows re-activated the previous window when it was destroyed —
+        // before == after, and it is still a violation.
+        assert!(matches!(
+            foreground_finding(0x10, &[0x10, 0x77], 0x10, ours),
+            ForegroundFinding::ProbeTookIt(_)
+        ));
+        // Another window of this process counts as ours too.
+        assert!(matches!(
+            foreground_finding(0x10, &[0x78], 0x10, ours),
+            ForegroundFinding::ProbeTookIt(_)
+        ));
+        // The operator clicked elsewhere: changed, but not by the probe.
+        match foreground_finding(0x10, &[0x10, 0x20], 0x20, ours) {
+            ForegroundFinding::ChangedNotByProbe(why) => {
+                assert!(
+                    why.starts_with("foreground changed (not by the probe)"),
+                    "{why}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     const MS: u64 = 1_000_000;

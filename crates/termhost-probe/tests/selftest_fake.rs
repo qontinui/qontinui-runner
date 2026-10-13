@@ -387,3 +387,22 @@ fn without_dda_a_constant_wgc_regression_is_reported_not_gated() {
     assert!(!abs.gated && abs.passed == Some(false), "{}", report(&o));
     assert_eq!(o.exit_code, 0, "{}\n{}", o.summary, report(&o));
 }
+
+#[test]
+fn a_doctor_violation_fails_the_selftest() {
+    let mut host = FakeHost::new(Faults::default());
+    host.foreground_violation = Some("the probe was foreground".into());
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let c = find(&o, "doctor_no_violations");
+    assert!(c.gated && c.passed == Some(false), "{}", report(&o));
+    assert!(
+        c.detail.contains("D9: the probe was foreground"),
+        "{}",
+        c.detail
+    );
+    assert_eq!(o.exit_code, 1, "{}", o.summary);
+    // Without one the check passes (and gates).
+    let o = run_with(Faults::default());
+    let c = find(&o, "doctor_no_violations");
+    assert!(c.gated && c.passed == Some(true), "{}", report(&o));
+}

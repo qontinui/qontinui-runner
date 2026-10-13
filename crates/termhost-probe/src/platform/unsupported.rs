@@ -70,6 +70,7 @@ impl Host for RealHost {
             ),
             gpu: GpuFacts::NotApplicable(WHY.into()),
             foreground_violation: None,
+            foreground_note: None,
         }
     }
     fn source_kinds(&self) -> Vec<SourceId> {

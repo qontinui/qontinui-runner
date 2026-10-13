@@ -49,6 +49,7 @@ pub fn gather(node: &str) -> Facts {
                 clock,
                 gpu,
                 foreground_violation: None,
+                foreground_note: None,
             }
         }
     };
@@ -77,6 +78,7 @@ pub fn gather(node: &str) -> Facts {
         clock,
         gpu,
         foreground_violation: None,
+        foreground_note: None,
     }
 }
 

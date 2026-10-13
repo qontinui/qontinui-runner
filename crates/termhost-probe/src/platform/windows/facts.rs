@@ -14,7 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::{dda, input, process, session, testwin, wgc};
 use crate::codec::{Marker, MarkerKind};
 use crate::doctor::{CaptureFacts, ClockFacts, Facts, GpuFacts, InputFacts};
-use crate::platform::common::probe_capture;
+use crate::platform::common::{foreground_finding, probe_capture, ForegroundFinding};
 use crate::platform::{PaintSlot, Tagging, TestWindow, TestWindowOptions};
 
 fn work_area_origin() -> (i32, i32) {
@@ -58,28 +58,30 @@ pub fn gather(node: &str) -> Facts {
     };
     drop(listener);
 
-    let (wgc_facts, dda_facts, foreground_violation) = match &session.state {
+    let (wgc_facts, dda_facts, foreground_violation, foreground_note) = match &session.state {
         Err(problem) => {
             let why = format!("{problem:?}");
             (
                 CaptureFacts::NoSession(why.clone()),
                 CaptureFacts::NoSession(why),
                 None,
+                None,
             )
         }
         Ok(_) => {
-            // D9 around the probe window: the foreground before it is
-            // created and after it closes. A change is recorded, never
-            // repaired (moving focus back would be a second intrusion).
+            // D9 around and DURING the probe window: whose window was
+            // foreground (`foreground_finding`). A finding is recorded,
+            // never repaired (moving focus back would be a second
+            // intrusion).
             let before = foreground();
-            let (wgc, dda) = capture_facts();
+            let mut during = Vec::new();
+            let (wgc, dda) = capture_facts(&mut during);
             let after = foreground();
-            let violation = (before != after).then(|| {
-                format!(
-                    "the foreground window changed while the doctor's probe window was up (0x{before:x} before, 0x{after:x} after); the probe must never take focus"
-                )
-            });
-            (wgc, dda, violation)
+            match foreground_finding(before, &during, after, of_this_process) {
+                ForegroundFinding::Clean => (wgc, dda, None, None),
+                ForegroundFinding::ProbeTookIt(v) => (wgc, dda, Some(v), None),
+                ForegroundFinding::ChangedNotByProbe(n) => (wgc, dda, None, Some(n)),
+            }
         }
     };
     Facts {
@@ -93,6 +95,7 @@ pub fn gather(node: &str) -> Facts {
         clock,
         gpu,
         foreground_violation,
+        foreground_note,
     }
 }
 
@@ -102,7 +105,23 @@ fn foreground() -> usize {
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as usize
 }
 
-fn capture_facts() -> (CaptureFacts, CaptureFacts) {
+/// Whether `h` is a window of this process (the probe, or any other).
+fn of_this_process(h: usize) -> bool {
+    let mut pid = 0u32;
+    // SAFETY: GetWindowThreadProcessId accepts any window handle.
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+            windows::Win32::Foundation::HWND(h as *mut core::ffi::c_void),
+            Some(&mut pid),
+        )
+    };
+    pid == std::process::id()
+}
+
+/// Capture the doctor's probe window with WGC and DDA, sampling the
+/// foreground into `during` right after the window is created and after
+/// each capture probe.
+fn capture_facts(during: &mut Vec<usize>) -> (CaptureFacts, CaptureFacts) {
     let (x, y) = work_area_origin();
     let opts = TestWindowOptions {
         title: "termhost-probe doctor".into(),
@@ -123,6 +142,7 @@ fn capture_facts() -> (CaptureFacts, CaptureFacts) {
             return (f.clone(), f);
         }
     };
+    during.push(foreground());
     let expect = Marker::new(MarkerKind::Calibration, 0, 0);
     std::thread::sleep(Duration::from_millis(150));
     let painted = win.paint(PaintSlot::Output, Some(expect));
@@ -141,6 +161,7 @@ fn capture_facts() -> (CaptureFacts, CaptureFacts) {
         Err(why) if why.contains("not supported") => CaptureFacts::Unavailable(why),
         Err(why) => CaptureFacts::OpenFailed(why),
     };
+    during.push(foreground());
     let dda_facts = match dda::DdaSource::open(handle) {
         Ok(mut src) => {
             let _ = win.paint(PaintSlot::Output, None);
@@ -152,6 +173,7 @@ fn capture_facts() -> (CaptureFacts, CaptureFacts) {
         }
         Err(why) => CaptureFacts::OpenFailed(why),
     };
+    during.push(foreground());
     win.close();
     (wgc_facts, dda_facts)
 }

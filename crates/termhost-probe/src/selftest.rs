@@ -341,6 +341,26 @@ impl Selftest<'_> {
         }
     }
 
+    /// The doctor's own probes must not break a safety rule (a D9 focus
+    /// steal by its probe window). Gated: a violation fails the selftest.
+    fn doctor_violations(&mut self) {
+        let violations = self.doctor.violations.clone();
+        self.check(
+            "doctor_no_violations",
+            &[],
+            Some(violations.is_empty()),
+            if violations.is_empty() {
+                "the doctor's probes broke no safety rule".to_string()
+            } else {
+                format!(
+                    "the doctor's probes broke a safety rule: {}",
+                    violations.join("; ")
+                )
+            },
+            json!({ "violations": violations }),
+        );
+    }
+
     fn required(&mut self) {
         for id in self.cfg.require.clone() {
             let state = doctor::state_of(&self.doctor, &id);
@@ -1260,6 +1280,7 @@ pub fn run(host: &mut dyn Host, cfg: &SelftestConfig, out: &mut Sink) -> Selftes
         checks: Vec::new(),
     };
     st.required();
+    st.doctor_violations();
     st.clock(&facts.clock);
     st.sampler();
     let any_capture = [

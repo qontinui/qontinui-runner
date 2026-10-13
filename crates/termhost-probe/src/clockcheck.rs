@@ -275,4 +275,26 @@ rl.on('close',()=>process.exit(0));process.stdout.write('ready\\n');},2500);";
             other => panic!("expected a failed round trip: {other:?}"),
         }
     }
+
+    #[test]
+    fn a_node_that_speaks_before_ready_is_a_failed_round_trip() {
+        let script = "process.stdout.write('hello\\nready\\n');setInterval(()=>{},1000);";
+        let facts = round_trip_with(
+            "node",
+            script,
+            8,
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        );
+        match facts {
+            ClockFacts::Failed(why) => {
+                assert!(
+                    why.contains("did not report ready (it said \"hello\")"),
+                    "{why}"
+                )
+            }
+            ClockFacts::NoNode(why) => eprintln!("node not runnable here ({why}); not exercised"),
+            other => panic!("expected a failed round trip: {other:?}"),
+        }
+    }
 }

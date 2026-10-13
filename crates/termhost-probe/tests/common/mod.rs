@@ -378,6 +378,8 @@ pub struct FakeHost {
     pub refresh_assumed: bool,
     /// The refresh interval the display reports (60 Hz by default).
     pub refresh_ns: u64,
+    /// A D9 violation the doctor's facts report.
+    pub foreground_violation: Option<String>,
     /// Times `activate` was called on the injector.
     pub activations: Arc<AtomicU64>,
 }
@@ -399,6 +401,7 @@ impl FakeHost {
             dda: false,
             refresh_assumed: false,
             refresh_ns: REFRESH_NS,
+            foreground_violation: None,
             activations: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -427,7 +430,8 @@ impl Host for FakeHost {
             },
             clock: ClockFacts::Measured(alignment(1_000, 50_000, 30)),
             gpu: self.gpu_facts.clone(),
-            foreground_violation: None,
+            foreground_violation: self.foreground_violation.clone(),
+            foreground_note: None,
         }
     }
     fn source_kinds(&self) -> Vec<SourceId> {
