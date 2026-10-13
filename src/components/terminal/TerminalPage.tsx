@@ -141,6 +141,8 @@ interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
   onNavigateToActive?: () => void;
   onSessionCountChange?: (count: number) => void;
+  /** The Terminal pages — the Session Manager's Move to page targets. */
+  pages?: readonly { id: string; name: string }[];
 }
 
 export function TerminalPage(props: TerminalPageProps) {
@@ -169,6 +171,7 @@ function TerminalPageInner({
   onNavigateToBuilder: _onNavigateToBuilder,
   onNavigateToActive: _onNavigateToActive,
   onSessionCountChange,
+  pages,
 }: TerminalPageProps) {
   // The page root, handed to every global-chord listener this page owns so
   // they can tell "the terminal is on screen" from "the terminal is mounted
@@ -1230,6 +1233,12 @@ function TerminalPageInner({
     configDir: string,
     context?: string,
     tenantId?: string,
+    /**
+     * Session Manager "New session in group": the working dir to spawn in,
+     * and a callback with each launched tab's pinned Claude session id (the
+     * key the group files it under).
+     */
+    placement?: { workingDir?: string; onPinned?: (claudeSessionId: string) => void },
   ): Promise<string[]> => {
     const totalTabs = tabs.length + count;
     const layoutId = pickLayout(totalTabs);
@@ -1242,7 +1251,7 @@ function TerminalPageInner({
     const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
     const createdTabIds: string[] = [];
     for (let i = 0; i < count; i++) {
-      const tabId = await createAndAssignTerminal(label, undefined, spawnTenant);
+      const tabId = await createAndAssignTerminal(label, placement?.workingDir, spawnTenant);
       if (tabId) createdTabIds.push(tabId);
     }
     // Tabs that actually received a launch command. A build failure disposes
@@ -1278,6 +1287,7 @@ function TerminalPageInner({
           updateTab(tabId, { claudeSessionId: pinnedSessionId, claudeConfigDir: configDir });
           rememberSessionId(tabId, pinnedSessionId, configDir);
           recordSessionOpen(tabId, pinnedSessionId, configDir, "authoritative");
+          placement?.onPinned?.(pinnedSessionId);
         } else {
           // Custom launch command (an alias that may drop the runner's
           // `--session-id` pin) — the id is unknown up front, so fall back to
@@ -1588,6 +1598,14 @@ function TerminalPageInner({
               sessionLockStates={sessionLockStates}
               onResumePastSession={handleResumePastSession}
               onScreenTabId={zoneLayout.shownTabId}
+              pages={pages}
+              currentPageId={pageId}
+              onNewSessionInGroup={({ workingDir, configDir, onPinned }) =>
+                void handleLaunchAiSession(1, configDir, undefined, undefined, {
+                  workingDir,
+                  onPinned,
+                })
+              }
             />
           )}
 

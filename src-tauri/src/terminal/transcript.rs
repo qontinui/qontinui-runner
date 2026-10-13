@@ -681,8 +681,15 @@ pub fn read_session(
     if !file_path.exists() {
         return Err(format!("Session file not found: {:?}", file_path));
     }
+    read_transcript_file(&file_path)
+}
 
-    let content = fs::read_to_string(&file_path)
+/// [`read_session`] addressed by the transcript's own path — for a caller that
+/// enumerated the files itself (`transcript_search` walks
+/// [`crate::session::reconcile::DiskTranscriptIndex::transcript_files`]) and
+/// has no project path to re-encode.
+pub fn read_transcript_file(file_path: &Path) -> Result<Vec<TranscriptMessage>, String> {
+    let content = fs::read_to_string(file_path)
         .map_err(|e| format!("Failed to read session file {:?}: {}", file_path, e))?;
 
     let mut messages = Vec::new();

@@ -820,6 +820,8 @@ const PageSessionScope = memo(function PageSessionScope({
     onCloseSessionTab: terminalManager.closeTerminal,
     visibleTabIds,
     tabLockStates,
+    pageId,
+    windowLabel: myWindowLabel,
   });
 
   const workflowGen = useWorkflowGeneration({
