@@ -376,6 +376,9 @@ pub trait KeyInjector: Send {
     fn heard(&self) -> u64;
     /// Try once to make the target foreground (`--activate`).
     fn activate(&mut self) -> Result<(), String>;
+    /// An arm is about to start: read whatever is read once per arm (the
+    /// Windows injector's CapsLock toggle).
+    fn begin_arm(&mut self) {}
     fn describe(&self) -> String;
 }
 

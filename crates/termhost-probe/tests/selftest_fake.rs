@@ -352,3 +352,38 @@ fn without_dda_wgc_is_held_to_its_own_slope() {
     assert_eq!(c.passed, Some(false), "{}", report(&o));
     assert_eq!(o.exit_code, 1, "{}", o.summary);
 }
+
+#[test]
+fn outside_the_measured_refresh_class_the_offset_band_is_reported_not_gated() {
+    // 144 Hz: the band's milliseconds are not known to mean the same stage.
+    let mut host = FakeHost::new(Faults::default());
+    host.dda = true;
+    host.refresh_ns = 6_944_444;
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let c = find(&o, "wgc_render_offset.d0");
+    assert!(!c.gated, "{}", report(&o));
+    assert!(c.detail.contains("outside the class"), "{}", c.detail);
+    assert_eq!(c.data["in_measured_class"], false);
+    // At the default 60 Hz it gates (and passes: the fake's WGC frames sit
+    // at the declared offset).
+    let o = with_dda(Faults::default());
+    let c = find(&o, "wgc_render_offset.d0");
+    assert!(c.gated && c.passed == Some(true), "{}", report(&o));
+    assert_eq!(c.data["in_measured_class"], true);
+}
+
+#[test]
+fn without_dda_a_constant_wgc_regression_is_reported_not_gated() {
+    // WGC gains a constant 40 ms on every frame: its slope is unchanged, so
+    // nothing gated sees it — the absolute checks report it, ungated.
+    let o = run_with(Faults {
+        wgc_extra_ms: 40,
+        ..Faults::default()
+    });
+    let slope = find(&o, "output_latency_slope.wgc");
+    assert!(slope.gated && slope.passed == Some(true), "{}", report(&o));
+    assert!(slope.detail.contains("CONSTANT"), "{}", slope.detail);
+    let abs = find(&o, "output_latency.wgc.d0");
+    assert!(!abs.gated && abs.passed == Some(false), "{}", report(&o));
+    assert_eq!(o.exit_code, 0, "{}\n{}", o.summary, report(&o));
+}

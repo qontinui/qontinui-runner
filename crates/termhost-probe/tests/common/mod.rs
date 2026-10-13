@@ -184,6 +184,13 @@ impl CaptureSource for FakeCapture {
                     };
                     let presented_ns = (!faults.presentation_unknown)
                         .then(|| now_ns().saturating_sub(late * 1_000_000));
+                    // WGC stamps the compositor's render of the capture
+                    // frame: its declared offset after DDA's presentation.
+                    let stage_ns = if self.id == SourceId::Wgc {
+                        (termhost_probe::selftest::WGC_RENDER_OFFSET_MS * 1e6) as u64
+                    } else {
+                        0
+                    };
                     let extra = if self.id == SourceId::Wgc
                         && self.delivered > faults.wgc_extra_from_frame
                     {
@@ -192,7 +199,7 @@ impl CaptureSource for FakeCapture {
                         0
                     };
                     f(RawFrame {
-                        t_ns: present_at + (faults.capture_lag_ms + extra) * 1_000_000,
+                        t_ns: present_at + stage_ns + (faults.capture_lag_ms + extra) * 1_000_000,
                         presented_ns,
                         view,
                         origin: (0, 0),
@@ -369,6 +376,8 @@ pub struct FakeHost {
     pub dda: bool,
     /// The display reports no refresh rate (60 Hz is assumed).
     pub refresh_assumed: bool,
+    /// The refresh interval the display reports (60 Hz by default).
+    pub refresh_ns: u64,
     /// Times `activate` was called on the injector.
     pub activations: Arc<AtomicU64>,
 }
@@ -389,6 +398,7 @@ impl FakeHost {
             gpu_facts: GpuFacts::Absent("fake".into()),
             dda: false,
             refresh_assumed: false,
+            refresh_ns: REFRESH_NS,
             activations: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -473,8 +483,8 @@ impl Host for FakeHost {
     }
     fn refresh(&mut self, _target: WindowHandle) -> Refresh {
         Refresh {
-            hz: 60.0,
-            ns: REFRESH_NS,
+            hz: 1e9 / self.refresh_ns as f64,
+            ns: self.refresh_ns,
             source: "fake".into(),
             assumed: self.refresh_assumed,
         }
