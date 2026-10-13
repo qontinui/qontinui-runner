@@ -646,36 +646,57 @@ impl PassOutput {
 /// [`PASS_BOUND`] keep their meaning. It is the same remedy, for the same
 /// reason, as `mcp_api::serve_on_dedicated_runtime`, and fails open the same
 /// way: no runtime -> the shared one, as before.
-#[expect(
-    clippy::disallowed_types,
-    reason = "process-lived OnceLock static, never dropped, so outside the drop-from-async panic class — same shape as mcp_api's API_RUNTIME"
-)]
-static REFRESHER_RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+///
+/// The runtime is built on, and OWNED by, its own OS thread
+/// (`jwt-refresher-rt-owner`), which parks in `block_on(pending)` forever; only
+/// its [`tokio::runtime::Handle`] is kept. So the runtime is never named,
+/// stored or dropped anywhere — the drop-from-async panic class the
+/// `clippy.toml` `disallowed-types` gate guards against cannot arise.
+static REFRESHER_RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Handle>> =
     std::sync::OnceLock::new();
 
 fn refresher_runtime() -> Option<tokio::runtime::Handle> {
     REFRESHER_RUNTIME
         .get_or_init(|| {
-            match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .thread_name("jwt-refresher-rt")
-                .build()
-            {
-                Ok(rt) => Some(rt),
+            let (tx, rx) = std::sync::mpsc::channel::<Result<tokio::runtime::Handle, String>>();
+            let spawned = std::thread::Builder::new()
+                .name("jwt-refresher-rt-owner".to_string())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .enable_all()
+                        .thread_name("jwt-refresher-rt")
+                        .build()
+                    {
+                        Ok(rt) => {
+                            let _ = tx.send(Ok(rt.handle().clone()));
+                            // Own the runtime for the process's lifetime.
+                            rt.block_on(std::future::pending::<()>());
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e.to_string()));
+                        }
+                    }
+                });
+            let built = match spawned {
+                Ok(_) => rx
+                    .recv()
+                    .map_err(|e| format!("owner thread exited: {e}"))
+                    .and_then(|r| r),
+                Err(e) => Err(format!("owner thread spawn failed: {e}")),
+            };
+            match built {
+                Ok(h) => Some(h),
                 Err(e) => {
                     warn!(
                         error = %e,
-                        "device_jwt_refresher: could not build its dedicated runtime — running \
-                         on the shared app runtime, where a starved worker pool delays \
-                         its refreshes"
+                        "device_jwt_refresher: could not build its dedicated runtime — running                          on the shared app runtime, where a starved worker pool delays                          its refreshes"
                     );
                     None
                 }
             }
         })
-        .as_ref()
-        .map(|rt| rt.handle().clone())
+        .clone()
 }
 
 /// Run `f` with the refresher's runtime ENTERED, so any `tokio::spawn` inside it
