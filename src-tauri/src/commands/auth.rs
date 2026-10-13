@@ -823,7 +823,24 @@ pub(crate) async fn get_access_token_for_websocket_impl() -> Result<String, AppE
     info!("Getting access token for WebSocket");
 
     let auth_manager = AuthManager::new();
+    let posture = crate::mcp::device_jwt_refresher::coord_credential_posture();
+    let access_token = websocket_token_from(&auth_manager, posture.as_ref())?;
 
+    info!("Access token retrieved for WebSocket");
+    Ok(access_token)
+}
+
+/// The store half of [`get_access_token_for_websocket_impl`] (everything after
+/// the tier gate), with the posture injected so it is testable.
+///
+/// This door reads the legacy slot directly rather than through
+/// [`coord_device_token_for`], so it applies the expiry guard itself: a
+/// past-`exp` JWT is refused with [`DEVICE_TOKEN_EXPIRED`] instead of being
+/// handed out as success.
+pub(crate) fn websocket_token_from(
+    auth_manager: &AuthManager,
+    posture: Option<&crate::mcp::device_jwt_refresher::CoordCredentialStatus>,
+) -> Result<String, AppError> {
     // Check authentication
     if !auth_manager.has_tokens() {
         return Err(AppError::AuthError(
@@ -833,8 +850,7 @@ pub(crate) async fn get_access_token_for_websocket_impl() -> Result<String, AppE
 
     // Get access token
     let access_token = auth_manager.get_access_token()?;
-
-    info!("Access token retrieved for WebSocket");
+    refuse_expired_device_token(&access_token, None, posture).map_err(AppError::AuthError)?;
     Ok(access_token)
 }
 
@@ -1611,7 +1627,14 @@ pub fn device_jwt_present() -> Result<bool, String> {
 ///   (`pair::persist_pairing`, `pair::reconcile`, and the refresher's Cognito
 ///   pair, device self-refresh and device-machine-key exchange paths) stores a
 ///   coord-minted device token, and Cognito's own tokens live in the separate
-///   OAuth slots. This arm stays a PROBE: it does not check `exp`.
+///   OAuth slots. A JWT past its `exp` is REFUSED with [`DEVICE_TOKEN_EXPIRED`]
+///   ([`refuse_expired_device_token`]) rather than handed out as success.
+/// - **Expired, either arm** — `Err` starting [`DEVICE_TOKEN_EXPIRED`], naming
+///   the `exp`, the `coordCredential` posture and its cta. On the tenant arm a
+///   selector miss is this refusal (not `Ok(None)`) when the published posture
+///   says t's credential is `expired` / `unrefreshable`, because the refresher
+///   clears an expired slot and `None` would tell the caller to re-pair a device
+///   that is still paired.
 /// - **`tenant_id: None` on a runner holding credentials for more than one
 ///   tenant** (same definition; an unreadable input is an error, not a count) —
 ///   REFUSED with [`DEVICE_TOKEN_TENANT_REQUIRED`]. Which tenant the default slot
@@ -1644,7 +1667,14 @@ pub fn get_coord_device_token(tenant_id: Option<String>) -> Result<Option<String
     let held = crate::auth::HeldDeviceTenants::read(&am);
     coord_device_token_for(&am, tenant, &held, device_token_door_default_slot_enabled()).map_err(
         |e| {
-            error!("get_coord_device_token: {e}");
+            // An expired credential is the caller's (and the operator's) problem,
+            // not the runner failing — and consumers probe this door hundreds of
+            // times a day while it lasts, so it is a warning, not an error.
+            if e.starts_with(DEVICE_TOKEN_EXPIRED) {
+                warn!("get_coord_device_token: {e}");
+            } else {
+                error!("get_coord_device_token: {e}");
+            }
             e
         },
     )
@@ -1661,6 +1691,110 @@ pub(crate) const DEVICE_TOKEN_TENANT_REQUIRED: &str = "get_coord_device_token:te
 
 /// Stable prefix of the refusal a malformed `tenant_id` gets.
 pub(crate) const DEVICE_TOKEN_TENANT_INVALID: &str = "get_coord_device_token:tenant_invalid";
+
+/// Stable prefix of the refusal a caller gets when the device token this
+/// runner holds (or held) for what was asked has EXPIRED (plan
+/// `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
+/// Phase 1). Distinct from `Ok(None)`, which every caller reads as "unpaired":
+/// an expired credential's remedy is a sign-in, never a re-pair of a device
+/// that is still paired. The invoke door answers it with 401.
+pub(crate) const DEVICE_TOKEN_EXPIRED: &str = "DEVICE_TOKEN_EXPIRED";
+
+type PostureRef<'a> = Option<&'a crate::mcp::device_jwt_refresher::CoordCredentialStatus>;
+
+/// `coordCredential posture=<p>, cta=<c>` for a refusal message, from the
+/// runner's published posture. No published posture is UNKNOWN, said as such.
+fn posture_clause(posture: PostureRef<'_>) -> String {
+    match posture {
+        Some(s) => format!(
+            "coordCredential posture={}{}, cta={}",
+            s.posture.as_str(),
+            s.tenant_id
+                .as_deref()
+                .map(|t| format!(" (tenant {t})"))
+                .unwrap_or_default(),
+            s.posture.cta().unwrap_or("none")
+        ),
+        None => "coordCredential posture=unknown (no refresher pass has concluded yet), \
+                 cta=unknown"
+            .to_string(),
+    }
+}
+
+/// THE expiry guard every mint door applies before handing a device token out
+/// as success.
+///
+/// Built on [`crate::auth::jwt_is_expired`] — the skew-aware predicate (its
+/// `EXPIRY_LEEWAY_SECS`) — so there is one definition of "expired" and no
+/// second `exp` decode. An opaque (non-JWT) token is never "expired" by that
+/// predicate, so it passes unchanged. On expiry the `Err` starts with
+/// [`DEVICE_TOKEN_EXPIRED`] and names the `exp`, the current posture and its
+/// cta; it never carries the token.
+pub(crate) fn refuse_expired_device_token(
+    token: &str,
+    tenant: Option<uuid::Uuid>,
+    posture: PostureRef<'_>,
+) -> Result<(), String> {
+    if !crate::auth::jwt_is_expired(token) {
+        return Ok(());
+    }
+    Err(expired_refusal(
+        tenant,
+        crate::auth::decode_jwt_exp(token),
+        posture,
+    ))
+}
+
+/// The [`DEVICE_TOKEN_EXPIRED`] refusal text, shared by the token guard and the
+/// tenant arm's posture-backed verdict (where no token is left to decode).
+fn expired_refusal(
+    tenant: Option<uuid::Uuid>,
+    exp: Option<i64>,
+    posture: PostureRef<'_>,
+) -> String {
+    let whose = tenant
+        .map(|t| format!(" for tenant {t}"))
+        .unwrap_or_else(|| " in its default slot".to_string());
+    let when = match exp {
+        Some(exp) => {
+            let iso = chrono::DateTime::<chrono::Utc>::from_timestamp(exp, 0)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "unrepresentable".to_string());
+            format!("expired at exp {exp} ({iso})")
+        }
+        None => "has expired (its exp is no longer readable)".to_string(),
+    };
+    format!(
+        "{DEVICE_TOKEN_EXPIRED}: the coord device token this runner holds{whose} {when}; \
+         {}. The runner is still PAIRED — sign in to the runner to restore its credential; \
+         do not re-pair",
+        posture_clause(posture)
+    )
+}
+
+/// Does the published posture say tenant `t`'s credential is expired or
+/// unrefreshable? Posture survives the refresher's clear of an expired slot,
+/// which a raw slot read does not — so this is what tells "expired" apart from
+/// "never paired" once the token itself is gone.
+///
+/// The posture must be ATTRIBUTABLE and about `t`: its `tenantId` names `t`, or
+/// it carries no tenant (the legacy default slot) and `t` is the default
+/// binding. Anything else is not evidence about `t`.
+fn posture_says_tenant_expired(
+    posture: PostureRef<'_>,
+    t: uuid::Uuid,
+    default_tenant: Option<uuid::Uuid>,
+) -> bool {
+    use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+    let Some(s) = posture else { return false };
+    if !s.attributable || !matches!(s.posture, P::Expired | P::Unrefreshable) {
+        return false;
+    }
+    match s.tenant_id.as_deref() {
+        Some(raw) => uuid::Uuid::parse_str(raw.trim()).ok() == Some(t),
+        None => default_tenant == Some(t),
+    }
+}
 
 fn device_token_door_default_slot_enabled() -> bool {
     device_token_door_default_slot_enabled_from(
@@ -1686,12 +1820,26 @@ pub(crate) fn parse_device_token_tenant(raw: Option<&str>) -> Result<Option<uuid
     }
 }
 
-/// Pure-over-injected-parts core of [`get_coord_device_token`].
+/// Pure-over-injected-parts core of [`get_coord_device_token`], reading the
+/// runner's published `coordCredential` posture.
 pub(crate) fn coord_device_token_for(
     am: &AuthManager,
     tenant: Option<uuid::Uuid>,
     held: &crate::auth::HeldDeviceTenants,
     default_slot_switch: bool,
+) -> Result<Option<String>, String> {
+    let posture = crate::mcp::device_jwt_refresher::coord_credential_posture();
+    coord_device_token_with_posture(am, tenant, held, default_slot_switch, posture.as_ref())
+}
+
+/// [`coord_device_token_for`] with the posture injected, so a test states it
+/// rather than racing the process-global posture cell.
+pub(crate) fn coord_device_token_with_posture(
+    am: &AuthManager,
+    tenant: Option<uuid::Uuid>,
+    held: &crate::auth::HeldDeviceTenants,
+    default_slot_switch: bool,
+    posture: PostureRef<'_>,
 ) -> Result<Option<String>, String> {
     use crate::secure_storage::StoredTokenRead;
 
@@ -1757,6 +1905,14 @@ pub(crate) fn coord_device_token_for(
         // the slot store was READ. An unreadable store is UNKNOWN — the same
         // no-downgrade rule as below.
         return match &held.slots {
+            // The selector refuses an expired slot and the refresher CLEARS one,
+            // so a miss alone cannot tell "expired" from "never paired". The
+            // posture can: an expired / unrefreshable posture about t is
+            // `DEVICE_TOKEN_EXPIRED`, never the `None` every caller reads as
+            // "pair this device".
+            Ok(_) if posture_says_tenant_expired(posture, t, default_tenant) => Err(
+                expired_refusal(Some(t), posture.and_then(|s| s.exp), posture),
+            ),
             Ok(_) => Ok(None),
             Err(e) => Err(format!(
                 "Could not read the credential store, so whether this runner holds a device \
@@ -1789,7 +1945,12 @@ pub(crate) fn coord_device_token_for(
     }
 
     match am.probe_access_token() {
-        StoredTokenRead::Present(token) if crate::auth::looks_like_jwt(&token) => Ok(Some(token)),
+        StoredTokenRead::Present(token) if crate::auth::looks_like_jwt(&token) => {
+            // A shape check alone handed out a JWT ~12 h past expiry as success
+            // (2026-10-07 spaceship outage).
+            refuse_expired_device_token(&token, None, posture)?;
+            Ok(Some(token))
+        }
         StoredTokenRead::Present(_) | StoredTokenRead::Absent => Ok(None),
         StoredTokenRead::Unreadable(e) => Err(format!(
             "Could not read the credential store, so this runner's device token is \
@@ -2134,6 +2295,20 @@ mod tests {
 mod device_token_door_tests {
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    /// Shadows the production wrapper for this module: the door with NO
+    /// published posture. The wrapper reads a process-global cell that the
+    /// refresher's tests publish into on parallel threads, so an assertion
+    /// about a tenant-arm `Ok(None)` would race them. A test that is about the
+    /// posture calls [`coord_device_token_with_posture`] and states it.
+    fn coord_device_token_for(
+        am: &AuthManager,
+        tenant: Option<uuid::Uuid>,
+        held: &crate::auth::HeldDeviceTenants,
+        default_slot_switch: bool,
+    ) -> Result<Option<String>, String> {
+        coord_device_token_with_posture(am, tenant, held, default_slot_switch, None)
+    }
 
     fn tenant(n: u128) -> uuid::Uuid {
         uuid::Uuid::from_u128(n)
@@ -2516,5 +2691,208 @@ mod device_token_door_tests {
         assert!(e.starts_with(DEVICE_TOKEN_TENANT_INVALID), "{e}");
         let t = tenant(0xB2);
         assert_eq!(parse_device_token_tenant(Some(&t.to_string())), Ok(Some(t)));
+    }
+
+    // ---- DEVICE_TOKEN_EXPIRED (plan 2026-10-09-runner-credential-expires-when-
+    // coord-is-down-across-its-only-refresh-window, Phase 1) ----
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    /// A device JWT for `tenant` with an explicit `exp`.
+    fn jwt_with_exp(tenant: uuid::Uuid, exp: i64) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"sub_type": "device", "tenant_id": tenant, "exp": exp}).to_string(),
+        );
+        format!("{header}.{payload}.sig")
+    }
+
+    fn status(
+        posture: crate::mcp::device_jwt_refresher::CoordCredentialPosture,
+        tenant: Option<uuid::Uuid>,
+        exp: Option<i64>,
+    ) -> crate::mcp::device_jwt_refresher::CoordCredentialStatus {
+        crate::mcp::device_jwt_refresher::CoordCredentialStatus {
+            posture,
+            tenant_id: tenant.map(|t| t.to_string()),
+            exp,
+            last_ok_at: None,
+            last_401_at: None,
+            last_refresh_outcome: Some("cleared".into()),
+            since: now(),
+            observed_at_unix: now(),
+            attributable: true,
+            composed_reason: None,
+            pinned_tenant: false,
+            detail: None,
+        }
+    }
+
+    fn assert_expired_refusal(err: &str, token: &str) {
+        assert!(err.starts_with(DEVICE_TOKEN_EXPIRED), "{err}");
+        assert!(!err.contains(token), "a refusal never carries the token");
+        assert!(err.contains("PAIRED"), "names the remedy honestly: {err}");
+    }
+
+    /// The 2026-10-07 shape: the legacy slot holds a JWT ~12 h past `exp`. The
+    /// door used to answer it as success on a shape check.
+    #[test]
+    fn the_legacy_arm_refuses_a_past_exp_token() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let _amb = crate::test_env::isolated_ambient();
+        let a = tenant(0xA1);
+        let am = hermetic_auth_manager();
+        let exp = now() - 12 * 3_600;
+        let dead = jwt_with_exp(a, exp);
+        am.store_tokens(&dead, "").unwrap();
+
+        let posture = status(P::Unrefreshable, Some(a), Some(exp));
+        let err =
+            coord_device_token_with_posture(&am, None, &held(&am, Some(a)), false, Some(&posture))
+                .expect_err("an expired legacy token is refused, never Ok(Some)");
+        assert_expired_refusal(&err, &dead);
+        assert!(err.contains(&exp.to_string()), "names the exp: {err}");
+        assert!(err.contains("posture=unrefreshable"), "{err}");
+        assert!(err.contains("cta=re_pair"), "{err}");
+
+        // No posture yet is UNKNOWN, said as such — and still refused.
+        let err = coord_device_token_with_posture(&am, None, &held(&am, Some(a)), false, None)
+            .expect_err("refused without a posture too");
+        assert_expired_refusal(&err, &dead);
+        assert!(err.contains("posture=unknown"), "{err}");
+    }
+
+    /// The second mint door reads the same slot without going through
+    /// `coord_device_token_for`, so it carries the guard itself.
+    #[test]
+    fn the_websocket_door_refuses_the_same_slot() {
+        let _amb = crate::test_env::isolated_ambient();
+        let a = tenant(0xA1);
+        let am = hermetic_auth_manager();
+        let dead = jwt_with_exp(a, now() - 12 * 3_600);
+        am.store_tokens(&dead, "").unwrap();
+        let err = websocket_token_from(&am, None)
+            .expect_err("an expired token is refused by the websocket door")
+            .to_string();
+        assert!(err.contains(DEVICE_TOKEN_EXPIRED), "{err}");
+        assert!(!err.contains(&dead), "a refusal never carries the token");
+
+        let live = jwt_with_exp(a, now() + 3_600);
+        am.store_tokens(&live, "").unwrap();
+        assert_eq!(websocket_token_from(&am, None).unwrap(), live);
+    }
+
+    /// Tenant arm: the refresher has CLEARED t's expired slot, so there is no
+    /// token left to decode. The posture survives the clear and decides —
+    /// `DEVICE_TOKEN_EXPIRED`, not the `None` that reads as "unpaired".
+    #[test]
+    fn the_tenant_arm_reads_an_expired_posture_as_expired_not_unpaired() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = hermetic_auth_manager();
+        // Slot store readable and empty: nothing to select.
+        assert!(am.try_list_tenant_device_jwt_tenants().unwrap().is_empty());
+        let held = held(&am, Some(a));
+        let exp = now() - 600;
+
+        for p in [P::Unrefreshable, P::Expired] {
+            let posture = status(p, Some(a), Some(exp));
+            let err = coord_device_token_with_posture(&am, Some(a), &held, false, Some(&posture))
+                .expect_err("an expired posture about t is DEVICE_TOKEN_EXPIRED");
+            assert!(err.starts_with(DEVICE_TOKEN_EXPIRED), "{err}");
+            assert!(err.contains(&a.to_string()), "{err}");
+            assert!(err.contains(&exp.to_string()), "{err}");
+            assert!(err.contains(&format!("posture={}", p.as_str())), "{err}");
+        }
+        // A tenant-less posture is the legacy default slot: about t only when t
+        // is the default binding.
+        let legacy = status(P::Unrefreshable, None, None);
+        let err = coord_device_token_with_posture(&am, Some(a), &held, false, Some(&legacy))
+            .expect_err("the default binding's legacy-slot posture is about a");
+        assert!(err.starts_with(DEVICE_TOKEN_EXPIRED), "{err}");
+        assert_eq!(
+            coord_device_token_with_posture(&am, Some(b), &held, false, Some(&legacy)),
+            Ok(None),
+            "a legacy-slot posture says nothing about a non-default tenant"
+        );
+    }
+
+    /// Never paired (no posture, or a posture that is not about t, or one that
+    /// is not an expiry) keeps `Ok(None)`.
+    #[test]
+    fn a_never_paired_tenant_keeps_none() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = hermetic_auth_manager();
+        let held = held(&am, Some(a));
+        assert_eq!(
+            coord_device_token_with_posture(&am, Some(a), &held, false, None),
+            Ok(None)
+        );
+        let about_b = status(P::Unrefreshable, Some(b), None);
+        assert_eq!(
+            coord_device_token_with_posture(&am, Some(a), &held, false, Some(&about_b)),
+            Ok(None)
+        );
+        for p in [P::Absent, P::Live, P::Expiring] {
+            let s = status(p, Some(a), None);
+            assert_eq!(
+                coord_device_token_with_posture(&am, Some(a), &held, false, Some(&s)),
+                Ok(None),
+                "{p:?} is not an expiry"
+            );
+        }
+        let mut unattributable = status(P::Unrefreshable, Some(a), None);
+        unattributable.attributable = false;
+        assert_eq!(
+            coord_device_token_with_posture(&am, Some(a), &held, false, Some(&unattributable)),
+            Ok(None),
+            "an unattributable posture is not evidence about a"
+        );
+    }
+
+    /// Future `exp` and an `exp` inside the skew leeway are both still served;
+    /// an opaque token's behaviour is unchanged.
+    #[test]
+    fn live_and_within_leeway_tokens_are_served_and_opaque_is_unchanged() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let _amb = crate::test_env::isolated_ambient();
+        let a = tenant(0xA1);
+        let am = hermetic_auth_manager();
+        // Even beside an alarming posture: the token, not the posture, decides
+        // on the legacy arm.
+        let posture = status(P::Expired, Some(a), None);
+
+        let live = jwt_with_exp(a, now() + 3_600);
+        am.store_tokens(&live, "").unwrap();
+        assert_eq!(
+            coord_device_token_with_posture(&am, None, &held(&am, Some(a)), false, Some(&posture)),
+            Ok(Some(live.clone()))
+        );
+
+        // 10 s past exp is inside the 30 s leeway: not yet "expired".
+        let leeway = jwt_with_exp(a, now() - 10);
+        assert!(!crate::auth::jwt_is_expired(&leeway));
+        am.store_tokens(&leeway, "").unwrap();
+        assert_eq!(
+            coord_device_token_with_posture(&am, None, &held(&am, Some(a)), false, None),
+            Ok(Some(leeway.clone()))
+        );
+        assert_eq!(refuse_expired_device_token(&leeway, None, None), Ok(()));
+
+        // Opaque: the guard never calls it expired, the legacy arm still reads
+        // it as no JWT, and the websocket door still hands it out.
+        let opaque = "qontinui_runner_opaque";
+        assert_eq!(refuse_expired_device_token(opaque, None, None), Ok(()));
+        am.store_tokens(opaque, "").unwrap();
+        assert_eq!(
+            coord_device_token_with_posture(&am, None, &held(&am, None), false, None),
+            Ok(None)
+        );
+        assert_eq!(websocket_token_from(&am, None).unwrap(), opaque);
     }
 }
