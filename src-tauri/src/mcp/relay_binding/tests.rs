@@ -72,6 +72,16 @@ async fn spawn(config: BindingConfig) -> Server {
 /// `EnforceDoors`). R7 claims its refusal holds in EVERY route policy, so its
 /// test exercises more than one.
 async fn spawn_with_policy(policy: Option<&str>, config: BindingConfig) -> Server {
+    spawn_routed(policy, config, relay_router).await
+}
+
+/// [`spawn_with_policy`] serving the router `routes` builds instead of
+/// [`relay_router`].
+async fn spawn_routed(
+    policy: Option<&str>,
+    config: BindingConfig,
+    routes: fn(RelayState) -> Router,
+) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let bound = Arc::new(AtomicU16::new(port));
@@ -84,7 +94,7 @@ async fn spawn_with_policy(policy: Option<&str>, config: BindingConfig) -> Serve
         Arc::new(|| Arc::new(Vec::<NormOrigin>::new())),
     ));
     let relay = RelayState::standalone(config);
-    let router: Router = relay_router(relay.clone());
+    let router: Router = routes(relay.clone());
     let router = origin_guard::apply(router, guard);
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
@@ -2448,4 +2458,118 @@ fn counters_are_per_instance() {
     assert_eq!(a.counters.get("R6").would_refuse, 1);
     assert_eq!(b.counters.get("R1"), RuleCount::default());
     assert_eq!(a.health_json()["rules"]["R1"]["refused"], 1);
+}
+
+// ===========================================================================
+// coord finding fb3fb468 — a wrapper's failure frame, through the relay's doors
+// ===========================================================================
+
+/// The door a wrapper app's frames come in through: one call into the
+/// production upgrade handler. [`relay_router`] mounts the handler by name;
+/// this spells the entry as a CALL so a static reader of the test (the arming
+/// record's prove step) can see which door the test enters through.
+async fn wrapper_frames_door(
+    ws: axum::extract::WebSocketUpgrade,
+    state: State<RelayState>,
+    principal: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
+) -> axum::response::Response {
+    axum::response::IntoResponse::into_response(
+        crate::mcp::ws_relay::ws_upgrade_handler(ws, state, principal).await,
+    )
+}
+
+/// The door an agent's command comes in through, spelled the same way.
+async fn agent_dispatch_door(
+    state: State<RelayState>,
+    app_id: axum::extract::Path<String>,
+    body: Json<crate::mcp::app_discovery::AppDispatchRequest>,
+) -> (
+    axum::http::StatusCode,
+    Json<crate::mcp::types::ApiResponse<Value>>,
+) {
+    crate::mcp::app_discovery::dispatch_to_app(state, app_id, body).await
+}
+
+/// Just those two doors, at their production route patterns.
+fn relay_doors(relay: RelayState) -> Router {
+    Router::new()
+        .route("/ui-bridge/ws", any(wrapper_frames_door))
+        .route(
+            "/ui-bridge/apps/{app_id}/dispatch",
+            post(agent_dispatch_door),
+        )
+        .with_state(relay)
+}
+
+/// A Node wrapper registered over the socket, and an agent's command already
+/// delivered to it: `(server, wrapper, the agent's pending call, commandId)`.
+async fn a_command_in_flight_to_a_wrapper(
+) -> (Server, Ws, tokio::task::JoinHandle<(u16, Value)>, String) {
+    let s = spawn_routed(None, BindingConfig::default(), relay_doors).await;
+    let (mut wrapper, ack) = s.ws_register(None, "node-app").await;
+    assert_eq!(ack["type"], "registered", "{ack}");
+    let agent = s.app_dispatch("node-app");
+    let command = wrapper
+        .recv()
+        .await
+        .expect("the wrapper receives the agent's command");
+    let command_id = command["commandId"]
+        .as_str()
+        .expect("the command frame carries its commandId")
+        .to_string();
+    (s, wrapper, agent, command_id)
+}
+
+/// fb3fb468, over the wire. A wrapper that cannot run a command answers with
+/// ui-bridge's structured failure object, `{code, message, retryable}` — the
+/// shape ui-bridge-wrapper's live transport sends. The agent that sent the
+/// command is answered AT ONCE, with that code and that retry verdict. Before
+/// the fix the runner could not read the frame and dropped it, and the agent
+/// sat out the whole relay timeout for an answer that had already arrived.
+#[tokio::test]
+async fn a_wrappers_failure_frame_answers_the_agent_at_once_with_its_code() {
+    let (_s, mut wrapper, agent, command_id) = a_command_in_flight_to_a_wrapper().await;
+    wrapper
+        .send(json!({
+            "type": "response",
+            "commandId": command_id,
+            "success": false,
+            "error": {
+                "code": "NO_HANDLER",
+                "message": "No handler registered for action 'getControlSnapshot'",
+                "retryable": false,
+            },
+        }))
+        .await;
+
+    let (status, body) = tokio::time::timeout(PROMPT, agent)
+        .await
+        .expect("the agent is answered when the wrapper answers, not at the relay timeout")
+        .unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(code(&body), Some("NO_HANDLER"), "{body}");
+    assert_eq!(body["hint"]["retryable"], false, "{body}");
+}
+
+/// fb3fb468's other half. A response frame the runner cannot read, but which
+/// names its command, fails THAT command at once with
+/// `MALFORMED_RESPONSE_FRAME` — instead of being dropped while the agent sits
+/// out the relay timeout.
+#[tokio::test]
+async fn an_unreadable_response_frame_answers_the_agent_at_once_as_malformed() {
+    let (_s, mut wrapper, agent, command_id) = a_command_in_flight_to_a_wrapper().await;
+    wrapper
+        .send(json!({
+            "type": "response",
+            "commandId": command_id,
+            "success": "no",
+        }))
+        .await;
+
+    let (status, body) = tokio::time::timeout(PROMPT, agent)
+        .await
+        .expect("the agent is answered when the wrapper answers, not at the relay timeout")
+        .unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(code(&body), Some("MALFORMED_RESPONSE_FRAME"), "{body}");
 }
