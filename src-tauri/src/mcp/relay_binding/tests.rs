@@ -2486,19 +2486,23 @@ async fn agent_dispatch_door(
     crate::mcp::app_discovery::dispatch_to_app(state, app_id, body).await
 }
 
-/// Just those two doors, at their production route patterns.
+/// Those two doors at their production route patterns, plus the HTTP register
+/// route an HTTP-transport app registers through.
 fn relay_doors(relay: RelayState) -> Router {
+    use crate::mcp::app_discovery::register_app;
     Router::new()
         .route("/ui-bridge/ws", any(wrapper_frames_door))
         .route(
             "/ui-bridge/apps/{app_id}/dispatch",
             post(agent_dispatch_door),
         )
+        .route("/ui-bridge/apps/register", post(register_app))
         .with_state(relay)
 }
 
-/// A Node wrapper registered over the socket, and an agent's command already
-/// delivered to it: `(server, wrapper, the agent's pending call, commandId)`.
+/// A wrapper client — a tokio-tungstenite socket registered as `node-app` —
+/// and an agent's command already delivered to it: `(server, wrapper, the
+/// agent's pending call, commandId)`.
 async fn a_command_in_flight_to_a_wrapper(
 ) -> (Server, Ws, tokio::task::JoinHandle<(u16, Value)>, String) {
     let s = spawn_routed(None, BindingConfig::default(), relay_doors).await;
@@ -2519,9 +2523,10 @@ async fn a_command_in_flight_to_a_wrapper(
 /// fb3fb468, over the wire. A wrapper that cannot run a command answers with
 /// ui-bridge's structured failure object, `{code, message, retryable}` — the
 /// shape ui-bridge-wrapper's live transport sends. The agent that sent the
-/// command is answered AT ONCE, with that code and that retry verdict. Before
-/// the fix the runner could not read the frame and dropped it, and the agent
-/// sat out the whole relay timeout for an answer that had already arrived.
+/// command is answered AT ONCE, with that code and that retry verdict, as the
+/// app's own failure. Before the fix the runner could not read the frame and
+/// dropped it, and the agent sat out the whole relay timeout for an answer
+/// that had already arrived.
 #[tokio::test]
 async fn a_wrappers_failure_frame_answers_the_agent_at_once_with_its_code() {
     let (_s, mut wrapper, agent, command_id) = a_command_in_flight_to_a_wrapper().await;
@@ -2544,15 +2549,17 @@ async fn a_wrappers_failure_frame_answers_the_agent_at_once_with_its_code() {
         .unwrap();
     assert_eq!(status, 502, "{body}");
     assert_eq!(code(&body), Some("NO_HANDLER"), "{body}");
+    assert_eq!(body["hint"]["failure_origin"], "app", "{body}");
     assert_eq!(body["hint"]["retryable"], false, "{body}");
 }
 
 /// fb3fb468's other half. A response frame the runner cannot read, but which
-/// names its command, fails THAT command at once with
-/// `MALFORMED_RESPONSE_FRAME` — instead of being dropped while the agent sits
-/// out the relay timeout.
+/// names its command, settles THAT command at once instead of being dropped
+/// while the agent sits out the relay timeout. It is not the app's own
+/// failure — what the app reported is unknown — so nothing lands in the
+/// app-code slot, the origin is `transport` and retryability is `null`.
 #[tokio::test]
-async fn an_unreadable_response_frame_answers_the_agent_at_once_as_malformed() {
+async fn an_unreadable_response_frame_answers_the_agent_at_once_not_as_the_apps_failure() {
     let (_s, mut wrapper, agent, command_id) = a_command_in_flight_to_a_wrapper().await;
     wrapper
         .send(json!({
@@ -2567,5 +2574,66 @@ async fn an_unreadable_response_frame_answers_the_agent_at_once_as_malformed() {
         .expect("the agent is answered when the wrapper answers, not at the relay timeout")
         .unwrap();
     assert_eq!(status, 502, "{body}");
-    assert_eq!(code(&body), Some("MALFORMED_RESPONSE_FRAME"), "{body}");
+    assert_eq!(
+        code(&body),
+        None,
+        "nothing lands in the app-code slot: {body}"
+    );
+    assert_eq!(body["hint"]["failure_origin"], "transport", "{body}");
+    assert_eq!(body["hint"]["retryable"], Value::Null, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("could not be read")),
+        "{body}"
+    );
+}
+
+/// The HTTP twin: an HTTP-transport app that answers its dispatch with
+/// `{success:false, error, code}` reaches the agent through the same door
+/// with its own code, as the app's failure, and retryability `null` — the
+/// app did not say.
+#[tokio::test]
+async fn an_http_apps_failure_answers_the_agent_with_its_code() {
+    let s = spawn_routed(None, BindingConfig::default(), relay_doors).await;
+    let app = Router::new().route(
+        "/dispatch",
+        post(|| async {
+            Json(json!({
+                "success": false,
+                "error": "No handler registered for action 'getControlSnapshot'",
+                "code": "NO_HANDLER",
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "http-app", "appName": "HTTP app", "appType": "web",
+                    "transport": "http",
+                    "baseUrl": format!("http://127.0.0.1:{app_port}") }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = tokio::time::timeout(PROMPT, s.app_dispatch("http-app"))
+        .await
+        .expect("the agent is answered when the app answers")
+        .unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(code(&body), Some("NO_HANDLER"), "{body}");
+    assert_eq!(body["hint"]["failure_origin"], "app", "{body}");
+    assert_eq!(body["hint"]["retryable"], Value::Null, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("No handler registered")),
+        "{body}"
+    );
 }

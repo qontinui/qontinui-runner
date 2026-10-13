@@ -521,7 +521,9 @@ fn app_code_from_body(body: &str) -> Option<String> {
 ///
 /// `failure_origin` is `"app"` when the app itself answered with a failure
 /// ([`DispatchError::AppAnswered`], or a wrapper `WrapperError` over the
-/// relay) and `"transport"` for everything else. `code` is the app's own code
+/// relay) and `"transport"` for everything else — including a response frame
+/// the relay could not read (`UnreadableResponse`), whose outcome is unknown
+/// and which is never the app's own failure. `code` is the app's own code
 /// when the error carries one — for a WebSocket wrapper, the `code` of its
 /// structured failure frame (`NO_HANDLER`, `HANDLER_ERROR`, …) — else
 /// [`SDK_DISPATCH_FAILED`]. `retryable` is the wrapper's own retry verdict when
@@ -8476,8 +8478,9 @@ mod tests {
     /// A WebSocket wrapper's STRUCTURED failure (coord finding `fb3fb468`):
     /// the refusal hands on the wrapper's own code and retry verdict instead
     /// of the generic `SDK_DISPATCH_FAILED`, and is labelled app-answered.
-    /// `discover` is the route the finding measured falling back to the
-    /// runner's own webview on exactly this error.
+    /// The route is only the refusal's label. Phase 1 measured the IPC
+    /// fallback on the 30 s TIMEOUT, not on this error, and `handle_discover`
+    /// is gated only by runner#2119, not by this change.
     #[test]
     fn refusal_hands_on_a_websocket_wrappers_code_and_retry_verdict() {
         let err = DispatchError::WebSocket(CommandRelayError::WrapperError(
@@ -8487,7 +8490,7 @@ mod tests {
                 retryable: Some(false),
             },
         ));
-        let refusal = ipc_fallback_refusal(&err, "discover")
+        let refusal = ipc_fallback_refusal(&err, "element action")
             .expect("a wrapper's refusal must never fall back to the runner's UI");
         assert_eq!(refusal["success"], serde_json::json!(false));
         assert_eq!(refusal["code"], serde_json::json!("NO_HANDLER"));
@@ -8499,17 +8502,37 @@ mod tests {
                 .is_some_and(|d| d.contains("NO_HANDLER: No handler registered for action 'find'")),
             "{refusal}"
         );
-        assert!(
-            refusal["error"].as_str().is_some_and(
-                |e| e.starts_with("NO_HANDLER: discover: the connected SDK app answered")
-            )
-        );
+        assert!(refusal["error"].as_str().is_some_and(
+            |e| e.starts_with("NO_HANDLER: element action: the connected SDK app answered")
+        ));
 
         // A failure that did not say whether a retry helps reads UNKNOWN.
         let unsaid = DispatchError::WebSocket(CommandRelayError::WrapperError("boom".into()));
-        let refusal = ipc_fallback_refusal(&unsaid, "discover").expect("refused");
+        let refusal = ipc_fallback_refusal(&unsaid, "element action").expect("refused");
         assert_eq!(refusal["retryable"], serde_json::Value::Null);
         assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
+    }
+
+    /// A response frame the relay could not read is NOT the app's failure
+    /// (coord finding `fb3fb468`): the refusal labels it transport-origin,
+    /// keeps it out of the app-code slot, and reads its retryability as
+    /// unknown — `null`.
+    #[test]
+    fn an_unreadable_response_is_refused_as_transport_not_as_the_apps_failure() {
+        let err = DispatchError::WebSocket(CommandRelayError::UnreadableResponse(
+            "invalid type: string \"no\", expected a boolean".into(),
+        ));
+        let refusal = ipc_fallback_refusal(&err, "element action")
+            .expect("an app that answered must never be retried on the runner's UI");
+        assert_eq!(refusal["failure_origin"], serde_json::json!("transport"));
+        assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
+        assert_eq!(refusal["retryable"], serde_json::Value::Null);
+        assert!(
+            refusal["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("could not be read")),
+            "{refusal}"
+        );
     }
 
     #[test]
