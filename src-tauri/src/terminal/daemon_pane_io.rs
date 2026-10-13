@@ -51,6 +51,28 @@
 //! itself: the pump probes the holder (handshake, then lock). A dead holder
 //! (lock free) settles at once; a live one is reattached at the last offset.
 //!
+//! # Reattaching a fresh consumer (Phase 2b, plan D14)
+//!
+//! [`DaemonPaneIo::attach_existing`] is the attach of a consumer with NO mode
+//! state of its own — a restarted runner's new `Grid` and xterm, which derive
+//! every mode only from the bytes they are fed, and the replay is a capped
+//! ring tail. It asks the holder for the restore envelope: a synthetic
+//! PREAMBLE (screen buffer, title) before the tail and a POSTAMBLE (input
+//! modes, keypad, kitty flags, cursor visibility) at the attach-time end of the
+//! stream, so a `?2004h` that left the ring an hour ago still reaches the new
+//! `Grid`. Synthetic bytes go in through [`PaneOutput::push_local`] — they are
+//! displayed, but they never advance the stream offset and so never touch the
+//! splice's gap arithmetic. The reply's `cwd` and `title` metadata are kept
+//! ([`DaemonPaneIo::restored`]) for the session record
+//! ([`DaemonPaneIo::session_identity`]). Then the size NUDGE: the consumer has
+//! already fit itself and passed its size, and the pane sends the PTY rows+1 ×
+//! cols+1 and, [`NUDGE_DELAY`] later, the true size — a resize to the size the
+//! PTY already has raises no `SIGWINCH`, and a restart reattaches at exactly
+//! that size, so without the detour a TUI would not repaint until a keystroke.
+//! The pump's own reattaches (a dropped connection) and a fresh spawn's first
+//! attach ask for none of this: their consumer's state is continuous, or sees
+//! the stream from its first byte.
+//!
 //! # Close semantics
 //!
 //! `kill` sends `kill`: closing a tab still ends its process tree, exactly as
@@ -73,7 +95,7 @@ use qontinui_pty_holder::client::{
     connect, probe, ConnectError, Event, InputStream, Probe, ShutdownHandle, StreamReader,
     StreamWriter,
 };
-use qontinui_pty_holder::protocol::{ExitReply, Reply, Request};
+use qontinui_pty_holder::protocol::{ExitReply, Reply, Request, RestoreMeta};
 use qontinui_pty_holder::terminate::{terminate_verified_holder, Termination};
 use qontinui_runner_lib::pty_holder::spawn::{
     pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, Unprotected,
@@ -167,6 +189,18 @@ pub const KILL_SETTLE_MAX: Duration = Duration::from_secs(
 /// Bound on the kill a `Drop` without `release` sends, and on its wait for the
 /// exit report.
 pub const DROP_KILL_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long after the oversize step of a reattach's size nudge the true size
+/// follows (shpool's `REATTACH_RESIZE_DELAY`): long enough that the child sees
+/// two size changes rather than one coalesced no-op.
+pub const NUDGE_DELAY: Duration = Duration::from_millis(50);
+
+/// The oversize step of a size nudge: one more row and column, or one fewer
+/// where one more does not fit in a `u16`.
+pub fn nudge_size(cols: u16, rows: u16) -> (u16, u16) {
+    let bump = |n: u16| n.checked_add(1).unwrap_or(n - 1);
+    (bump(cols), bump(rows))
+}
 
 /// `wait`'s answer for a signal death: `LocalPty`'s "non-success is 1".
 pub const SIGNAL_EXIT_CODE: i32 = 1;
@@ -683,6 +717,8 @@ impl HolderLink for HolderConn {
 /// latest size and the latest pause state matter.
 #[derive(Debug, Default)]
 struct ControlPending {
+    /// A size nudge to perform first: (true cols, true rows).
+    nudge: Option<(u16, u16)>,
     resize: Option<(u16, u16)>,
     paused: Option<bool>,
     closed: bool,
@@ -718,6 +754,28 @@ impl ControlQueue {
         self.cv.notify_all();
     }
 
+    /// Queue a size nudge ending at `cols` × `rows` (see the module docs).
+    fn nudge(&self, cols: u16, rows: u16) {
+        self.lock().nudge = Some((cols, rows));
+        self.cv.notify_all();
+    }
+
+    /// Sleep `d`, cut short when the queue is closed.
+    fn pause_unless_closed(&self, d: Duration) {
+        let end = Instant::now() + d;
+        let mut p = self.lock();
+        while !p.closed {
+            let now = Instant::now();
+            if now >= end {
+                return;
+            }
+            p = match self.cv.wait_timeout(p, end - now) {
+                Ok((g, _)) => g,
+                Err(e) => e.into_inner().0,
+            };
+        }
+    }
+
     fn close(&self) {
         self.lock().closed = true;
         self.cv.notify_all();
@@ -727,13 +785,13 @@ impl ControlQueue {
     /// queue is closed or the pane has settled.
     fn run(&self, link: &dyn HolderLink, out: &PaneOutput, key: &str) {
         loop {
-            let (resize, paused) = {
+            let (nudge, resize, paused) = {
                 let mut p = self.lock();
                 loop {
                     if p.closed || out.is_finished() {
                         return;
                     }
-                    if p.resize.is_some() || p.paused.is_some() {
+                    if p.nudge.is_some() || p.resize.is_some() || p.paused.is_some() {
                         break;
                     }
                     // No timeout: every path that settles the pane also closes
@@ -744,8 +802,35 @@ impl ControlQueue {
                         Err(e) => e.into_inner(),
                     };
                 }
-                (p.resize.take(), p.paused.take())
+                // A nudge goes alone: whatever else is pending is sent after
+                // it, on the next turn.
+                match p.nudge.take() {
+                    Some(n) => (Some(n), None, None),
+                    None => (None, p.resize.take(), p.paused.take()),
+                }
             };
+            if let Some((cols, rows)) = nudge {
+                let (over_cols, over_rows) = nudge_size(cols, rows);
+                let over = HolderControl::Resize {
+                    cols: over_cols,
+                    rows: over_rows,
+                };
+                match link.control(over, WRITE_DEADLINE) {
+                    Ok(()) => {
+                        self.pause_unless_closed(NUDGE_DELAY);
+                        // The true size — unless a newer resize was asked for
+                        // meanwhile, which wins (and still differs from the
+                        // oversize, so the child sees a change either way).
+                        self.lock().resize.get_or_insert((cols, rows));
+                    }
+                    Err(e) => {
+                        debug!(pane = %key, error = %e, "pty holder: size nudge not delivered; retrying");
+                        self.lock().nudge.get_or_insert((cols, rows));
+                        std::thread::sleep(CONTROL_POLL);
+                    }
+                }
+                continue;
+            }
             let mut failed = false;
             if let Some((cols, rows)) = resize {
                 if let Err(e) = link.control(HolderControl::Resize { cols, rows }, WRITE_DEADLINE) {
@@ -804,6 +889,9 @@ pub struct DaemonPaneIo {
     /// connection starts unpaused).
     paused: Arc<AtomicBool>,
     unprotected: Option<Unprotected>,
+    /// The holder's restore metadata, when this pane attached with a restore
+    /// ([`Self::attach_existing`]) and the holder could answer one.
+    restored: Option<RestoreMeta>,
     /// How long after a `kill` the pane keeps its connection open for the
     /// holder's `exit` report before it detaches and records the exit as
     /// unknown. [`KILL_SETTLE_MAX`] in production; a test shortens it.
@@ -884,12 +972,22 @@ impl DaemonPaneIo {
         pane_id: &PaneId,
         unprotected: Option<Unprotected>,
     ) -> Result<Self, String> {
-        Self::attach(pane_dir, pane_id, FRESH_SPAWN_FROM_OFFSET, unprotected)
+        Self::attach(
+            pane_dir,
+            pane_id,
+            FRESH_SPAWN_FROM_OFFSET,
+            unprotected,
+            None,
+        )
     }
 
-    /// Reattach to a holder that is already serving `pane_id` — after a
-    /// detach, or (Phase 3+) after a runner restart. `from_offset` is the
-    /// first byte the caller has not seen (`None`: the ring's tail).
+    /// Reattach a FRESH consumer to a holder that is already serving
+    /// `pane_id` — after a runner restart (Phase 3+), or any attach whose
+    /// consumer starts with no mode state. `from_offset` is the first byte the
+    /// caller has not seen (`None`: the ring's tail); `cols` × `rows` is the
+    /// consumer's size, ALREADY FIT (D10's "fit, then ask"). The attach asks
+    /// for the restore envelope, and the size is then nudged (see the module
+    /// docs) so the child repaints even when it did not change.
     ///
     /// This side did not watch that holder's spawn; its child spec was built,
     /// like every holder spec, through [`ScrubbedCommand::to_holder_spec`] by
@@ -899,21 +997,41 @@ impl DaemonPaneIo {
         pane_dir: &Path,
         pane_id: &PaneId,
         from_offset: Option<u64>,
+        cols: u16,
+        rows: u16,
     ) -> Result<Self, String> {
-        Self::attach(pane_dir, pane_id, from_offset, None)
+        Self::attach(pane_dir, pane_id, from_offset, None, Some((cols, rows)))
     }
 
+    /// `restore_at`: `Some(consumer size)` for a fresh consumer — ask for the
+    /// restore envelope and nudge to that size; `None` for one that needs
+    /// neither (a fresh spawn's first attach sees the stream from byte 0).
     fn attach(
         pane_dir: &Path,
         pane_id: &PaneId,
         from_offset: Option<u64>,
         unprotected: Option<Unprotected>,
+        restore_at: Option<(u16, u16)>,
     ) -> Result<Self, String> {
         let deadline = Instant::now() + ATTACH_DEADLINE;
         let stream = connect(pane_dir, pane_id, deadline)
-            .and_then(|c| c.attach(from_offset, deadline))
+            .and_then(|c| match restore_at {
+                Some(_) => c.attach_restoring(from_offset, deadline),
+                None => c.attach(from_offset, deadline),
+            })
             .map_err(|e| format!("PTY holder {pane_id}: attach failed: {e}"))?;
-        let info = stream.info;
+        let info = stream.info.clone();
+        if restore_at.is_some() && info.restore.is_none() {
+            // An older holder (protocol < 3): the tail is replayed bare, so a
+            // mode it set before the tail is unknown to this consumer.
+            warn!(
+                pane = %pane_id,
+                version = stream.hello_ack.version,
+                "pty holder: the holder cannot send a restore envelope at this protocol \
+                 version — modes set before the replayed tail (bracketed paste, alternate \
+                 screen, mouse) are not restored"
+            );
+        }
         if let Some(asked) = from_offset {
             if info.start_offset != asked {
                 warn!(
@@ -946,8 +1064,9 @@ impl DaemonPaneIo {
         conn.install(stream.writer);
         let control = Arc::new(ControlQueue::new());
         let detached = Arc::new(AtomicBool::new(false));
-        let cols = Arc::new(AtomicU16::new(info.cols));
-        let rows = Arc::new(AtomicU16::new(info.rows));
+        let (want_cols, want_rows) = restore_at.unwrap_or((info.cols, info.rows));
+        let cols = Arc::new(AtomicU16::new(want_cols.max(1)));
+        let rows = Arc::new(AtomicU16::new(want_rows.max(1)));
         let paused = Arc::new(AtomicBool::new(false));
         {
             let (control, link, out, key) =
@@ -978,6 +1097,9 @@ impl DaemonPaneIo {
             control.close();
             return Err(format!("Failed to spawn pty holder pump thread: {e}"));
         }
+        if restore_at.is_some() {
+            control.nudge(cols.load(Ordering::Relaxed), rows.load(Ordering::Relaxed));
+        }
         Ok(Self {
             pane_id: pane_id.clone(),
             holder_pid,
@@ -994,6 +1116,7 @@ impl DaemonPaneIo {
             rows,
             paused,
             unprotected,
+            restored: info.restore,
             kill_settle: KILL_SETTLE_MAX,
         })
     }
@@ -1022,6 +1145,21 @@ impl DaemonPaneIo {
         self.unprotected.as_ref()
     }
 
+    /// The holder's restore metadata (`cwd`, `title`), when this pane was
+    /// attached with [`Self::attach_existing`] and the holder could answer.
+    pub fn restored(&self) -> Option<&RestoreMeta> {
+        self.restored.as_ref()
+    }
+
+    /// The `(title, cwd)` a session built around this pane records
+    /// (`TerminalSession::spawn_with_io`): the holder's restore metadata where
+    /// it has it. A missing title is the pane id — the one name this pane
+    /// certainly has; a missing cwd is `""`, the session layer's "unknown",
+    /// never a guessed directory.
+    pub fn session_identity(&self) -> (String, String) {
+        session_identity_from(self.restored.as_ref(), &self.pane_id)
+    }
+
     pub fn dims(&self) -> (u16, u16) {
         (
             self.cols.load(Ordering::Relaxed),
@@ -1047,6 +1185,34 @@ impl DaemonPaneIo {
             link: self.link.clone(),
         }
     }
+}
+
+/// [`DaemonPaneIo::session_identity`], over its inputs.
+fn session_identity_from(restored: Option<&RestoreMeta>, pane_id: &PaneId) -> (String, String) {
+    let title = restored
+        .and_then(|r| r.title.clone())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| pane_id.to_string());
+    let cwd = restored.and_then(|r| r.cwd.clone()).unwrap_or_default();
+    (title, cwd)
+}
+
+/// Reattach a FRESH consumer to the holder already serving terminal
+/// `terminal_id` in this runner instance's pane directory — the
+/// [`DaemonPaneIo::attach_existing`] a session-building door calls
+/// (`TerminalManager::adopt_holder_pane`). Blocking work stays off the async
+/// workers, as for a spawn.
+pub fn reattach_holder_pane(
+    terminal_id: &str,
+    from_offset: Option<u64>,
+    cols: u16,
+    rows: u16,
+) -> Result<DaemonPaneIo, String> {
+    let pane_dir = runner_pane_dir()?;
+    let pane_id = PaneId::new(terminal_id).map_err(|e| e.to_string())?;
+    off_the_async_workers(|| {
+        DaemonPaneIo::attach_existing(&pane_dir, &pane_id, from_offset, cols, rows)
+    })
 }
 
 /// Everything a detach touches, cloneable onto another thread.
@@ -1162,6 +1328,10 @@ impl PumpCtx {
                         from_offset,
                         to_offset,
                     })) => self.out.note_lost(from_offset, to_offset),
+                    // The restore envelope (asked for only by a fresh
+                    // consumer's attach): displayed, never counted — the
+                    // stream offset stays the holder's (plan D14).
+                    Ok(Some(Event::Synthetic { bytes, .. })) => self.out.push_local(&bytes),
                     Ok(Some(Event::Exit(exit))) => {
                         info!(pane = %self.key, holder_pid = self.holder_pid, child_pid = self.child_pid, ?exit, "pty holder: pane process exited");
                         self.out.settle(exit_result(exit));
@@ -1651,8 +1821,81 @@ mod tests {
             rows: Arc::new(AtomicU16::new(24)),
             paused: Arc::new(AtomicBool::new(false)),
             unprotected: None,
+            restored: None,
             kill_settle: KILL_SETTLE_MAX,
         }
+    }
+
+    /// Phase 2b test (5), runner half: a size nudge sends the PTY one row and
+    /// column more, then — after [`NUDGE_DELAY`] — the true size, so a
+    /// reattach at an UNCHANGED size still changes the child's size twice.
+    #[test]
+    fn pty_holder_attach_nudge_oversizes_then_restores_the_true_size() {
+        let (link, pane) = recorded_pane();
+        let started = Instant::now();
+        pane.control.nudge(80, 24);
+        let true_size = HolderControl::Resize { cols: 80, rows: 24 };
+        link.saw(true_size);
+        assert!(
+            started.elapsed() >= NUDGE_DELAY,
+            "the true size follows the oversize after the delay, not at once"
+        );
+        assert_eq!(
+            link.controls(),
+            vec![HolderControl::Resize { cols: 81, rows: 25 }, true_size]
+        );
+        assert_eq!(nudge_size(u16::MAX, 1), (u16::MAX - 1, 2));
+        pane.release(Duration::from_millis(50)).unwrap();
+    }
+
+    /// A resize asked for during the nudge's delay wins over the true size the
+    /// nudge would have restored (it is newer), and is still a change.
+    #[test]
+    fn pty_holder_attach_resize_during_a_nudge_wins() {
+        let (link, pane) = recorded_pane();
+        pane.control.nudge(80, 24);
+        link.saw(HolderControl::Resize { cols: 81, rows: 25 });
+        pane.resize(120, 40).unwrap();
+        link.saw(HolderControl::Resize {
+            cols: 120,
+            rows: 40,
+        });
+        std::thread::sleep(NUDGE_DELAY * 3);
+        assert!(
+            !link
+                .controls()
+                .contains(&HolderControl::Resize { cols: 80, rows: 24 }),
+            "a stale true size never overrides a newer resize: {:?}",
+            link.controls()
+        );
+        pane.release(Duration::from_millis(50)).unwrap();
+    }
+
+    /// The session record of a reattached pane: the holder's metadata where it
+    /// has it; the pane id and `""` (unknown) where it does not.
+    #[test]
+    fn pty_holder_attach_session_identity_uses_the_restore_metadata() {
+        let id = PaneId::new("pane-7").unwrap();
+        let meta = RestoreMeta {
+            cwd: Some("/work".into()),
+            title: Some("\u{2733} Claude Code".into()),
+        };
+        assert_eq!(
+            session_identity_from(Some(&meta), &id),
+            ("\u{2733} Claude Code".to_string(), "/work".to_string())
+        );
+        let empty = RestoreMeta {
+            cwd: None,
+            title: Some(String::new()),
+        };
+        assert_eq!(
+            session_identity_from(Some(&empty), &id),
+            ("pane-7".to_string(), String::new())
+        );
+        assert_eq!(
+            session_identity_from(None, &id),
+            ("pane-7".to_string(), String::new())
+        );
     }
 
     /// The setting OFF (the default) yields `LocalPty`; ON yields the holder.
@@ -2421,8 +2664,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             assert!(alive(child_pid), "detach must leave the child running");
 
-            let second =
-                Arc::new(DaemonPaneIo::attach_existing(&dir, &id, Some(offset)).expect("reattach"));
+            let second = Arc::new(
+                DaemonPaneIo::attach_existing(&dir, &id, Some(offset), 80, 24).expect("reattach"),
+            );
             assert_eq!(second.child_pid(), child_pid, "the SAME child");
             assert_eq!(
                 second.stream_offset(),
@@ -2447,8 +2691,14 @@ mod tests {
                 fallback_reason: None,
             };
             let third = Arc::new(
-                DaemonPaneIo::attach(&dir, &id, Some(second.stream_offset()), Some(why.clone()))
-                    .expect("reattach again"),
+                DaemonPaneIo::attach(
+                    &dir,
+                    &id,
+                    Some(second.stream_offset()),
+                    Some(why.clone()),
+                    None,
+                )
+                .expect("reattach again"),
             );
             assert_eq!(third.unprotected(), Some(&why));
             let (c3, t3) = drain(&third);
@@ -2639,6 +2889,313 @@ mod tests {
             }
             let _ = paster.join();
             pane.release(Duration::from_secs(1)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ---- Phase 2b: the attach restore payload (plan D14) -------------
+
+        /// More output than the holder's ring holds, so every mode the child
+        /// set before it has LEFT the ring — the case D14 exists for.
+        const PAST_THE_RING: usize = qontinui_pty_holder::spec::DEFAULT_RING_CAPACITY + 512 * 1024;
+
+        /// The fresh-consumer tail an `attach(None)` replays.
+        const TAIL: usize = qontinui_pty_holder::protocol::ATTACH_TAIL_BYTES as usize;
+
+        /// `sh` that runs `prefix`, then writes [`PAST_THE_RING`] bytes of
+        /// `x`, then `suffix`, then idles in `cat` (which a `kill` ends).
+        fn past_the_ring(prefix: &str, suffix: &str) -> String {
+            format!(
+                "stty -echo; printf '{prefix}'; head -c {PAST_THE_RING} /dev/zero | tr '\\0' x; \
+                 printf '{suffix}'; exec cat"
+            )
+        }
+
+        /// Spawn `script` in a holder at 80×24, let the first pane consume its
+        /// output until `marker`, then DETACH it (the holder and child keep
+        /// running) — the state a runner restart leaves behind.
+        fn spawn_then_detach(tag: &str, script: &str, marker: &[u8]) -> (PathBuf, PaneId) {
+            let dir = pane_dir(tag);
+            let id = PaneId::new(tag).unwrap();
+            let first = Arc::new(
+                DaemonPaneIo::spawn(&holder(), &dir, &id, &sh(script), 80, 24)
+                    .expect("spawn + attach"),
+            );
+            let (c, t) = drain(&first);
+            until(&c, Duration::from_secs(60), |c| contains(c, marker));
+            first.release(Duration::from_secs(2)).unwrap();
+            t.join().unwrap();
+            (dir, id)
+        }
+
+        /// Reattach a FRESH consumer (a restarted runner's) at 80×24 and
+        /// collect until `done`.
+        fn reattach_fresh(
+            dir: &Path,
+            id: &PaneId,
+            done: impl Fn(&[u8]) -> bool,
+        ) -> (Arc<DaemonPaneIo>, Vec<u8>) {
+            let pane = Arc::new(
+                DaemonPaneIo::attach_existing(dir, id, None, 80, 24).expect("fresh reattach"),
+            );
+            let (c, t) = drain(&pane);
+            until(&c, Duration::from_secs(20), done);
+            // Everything after `done` that is already on its way.
+            std::thread::sleep(Duration::from_millis(200));
+            let bytes = c.lock().unwrap().clone();
+            pane.kill(Duration::from_secs(2)).unwrap();
+            let _ = wait_within(&pane, Duration::from_secs(10));
+            t.join().unwrap();
+            (pane, bytes)
+        }
+
+        /// The DRAFT's attach (no envelope): the bare ring tail a fresh
+        /// consumer would have been fed, and the stream end it reached.
+        fn bare_tail(dir: &Path, id: &PaneId) -> (Vec<u8>, u64) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut s = connect(dir, id, deadline)
+                .and_then(|c| c.attach(None, deadline))
+                .expect("bare attach");
+            let end = s.info.end_offset;
+            let mut bytes = Vec::new();
+            let mut next = s.info.start_offset;
+            while next < end {
+                match s.reader.next_event(Some(deadline)).expect("bare read") {
+                    Some(Event::Output { offset, bytes: b }) => {
+                        assert_eq!(offset, next, "the bare tail is contiguous");
+                        next += b.len() as u64;
+                        bytes.extend_from_slice(&b);
+                    }
+                    Some(Event::Synthetic { .. }) => panic!("a bare attach got a synthetic frame"),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            (bytes, end)
+        }
+
+        fn grid_of(bytes: &[u8]) -> crate::terminal::grid::Grid {
+            let mut grid = crate::terminal::grid::Grid::new(80, 24);
+            let mut parser = vte::Parser::new();
+            grid.feed(&mut parser, bytes);
+            grid
+        }
+
+        /// Characters a consumer would print while on the PRIMARY screen.
+        fn prints_on_primary(bytes: &[u8]) -> usize {
+            struct Screens {
+                alt: bool,
+                primary_prints: usize,
+            }
+            impl vte::Perform for Screens {
+                fn print(&mut self, _c: char) {
+                    if !self.alt {
+                        self.primary_prints += 1;
+                    }
+                }
+                fn csi_dispatch(
+                    &mut self,
+                    params: &vte::Params,
+                    intermediates: &[u8],
+                    _ignore: bool,
+                    action: char,
+                ) {
+                    if intermediates == b"?" && matches!(action, 'h' | 'l') {
+                        for p in params.iter().flatten() {
+                            if matches!(*p, 47 | 1047 | 1049) {
+                                self.alt = action == 'h';
+                            }
+                        }
+                    }
+                }
+            }
+            let mut s = Screens {
+                alt: false,
+                primary_prints: 0,
+            };
+            vte::Parser::new().advance(&mut s, bytes);
+            s.primary_prints
+        }
+
+        fn count(hay: &[u8], needle: &[u8]) -> usize {
+            hay.windows(needle.len()).filter(|w| *w == needle).count()
+        }
+
+        fn after<'a>(hay: &'a [u8], marker: &[u8]) -> &'a [u8] {
+            let at = hay
+                .windows(marker.len())
+                .position(|w| w == marker)
+                .expect("marker present");
+            &hay[at + marker.len()..]
+        }
+
+        /// Phase 2b test (1): the child sets bracketed paste, then writes more
+        /// than a ring's worth. A fresh consumer reattached into a new `Grid`
+        /// serves `bracketed_paste() == true` — and the restored title. The
+        /// draft's bare tail does not: that is the failure this test pins.
+        #[test]
+        fn pty_holder_attach_restores_bracketed_paste_past_the_ring() {
+            let script = past_the_ring("\\033]2;restored-title\\007\\033[?2004h", "DONE");
+            let (dir, id) = spawn_then_detach("bp", &script, b"DONE");
+
+            let (bare, _) = bare_tail(&dir, &id);
+            assert!(
+                !grid_of(&bare).bracketed_paste(),
+                "the ?2004h has left the ring: the bare tail alone cannot restore it"
+            );
+
+            let (pane, got) = reattach_fresh(&dir, &id, |c| {
+                contains(c, b"DONE") && contains(after(c, b"DONE"), b"\x1b[?2004h")
+            });
+            let grid = grid_of(&got);
+            assert!(grid.bracketed_paste(), "the postamble restored DEC 2004");
+            assert_eq!(
+                grid.title(),
+                Some("restored-title"),
+                "the preamble restored the title"
+            );
+            assert_eq!(
+                pane.restored().and_then(|r| r.title.as_deref()),
+                Some("restored-title"),
+                "the title is also attach metadata"
+            );
+            assert_eq!(
+                pane.restored().and_then(|r| r.cwd.as_deref()),
+                Some("/tmp"),
+                "no OSC 7 was emitted: the cwd is the child's spawn directory"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Phase 2b test (2): the same for `?1049h` — the reattached consumer
+        /// is on the alternate screen, and the tail never landed on the
+        /// primary one (the preamble selected the buffer BEFORE the first tail
+        /// byte). The draft's bare tail prints every byte onto the primary
+        /// screen.
+        #[test]
+        fn pty_holder_attach_restores_the_alternate_screen_before_the_tail() {
+            let script = past_the_ring("\\033[?1049h", "DONE");
+            let (dir, id) = spawn_then_detach("alt", &script, b"DONE");
+
+            let (bare, _) = bare_tail(&dir, &id);
+            assert!(
+                prints_on_primary(&bare) >= TAIL - 4,
+                "the bare tail lands on the primary screen"
+            );
+
+            let (_pane, got) = reattach_fresh(&dir, &id, |c| contains(c, b"DONE"));
+            assert!(got.starts_with(b"\x1b[?1049h"), "the preamble comes first");
+            assert_eq!(
+                prints_on_primary(&got),
+                0,
+                "no tail byte landed on the primary screen"
+            );
+            assert!(grid_of(&got).snapshot().alt_screen);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Phase 2b test (3): the synthesized bytes never contain `?2026`, and
+        /// a tail that ENDS inside an open `?2026h` still emits within
+        /// `SYNC_FLUSH_TIME_CAP` through the reader's `SyncFrameCoalescer` — the
+        /// postamble opens no block and closes none, so the bound that already
+        /// covers an unclosed block covers this one.
+        #[test]
+        fn pty_holder_attach_tail_inside_an_open_2026_still_emits_within_the_cap() {
+            use crate::terminal::session::{SyncFrameCoalescer, SYNC_FLUSH_TIME_CAP};
+            let script = past_the_ring("\\033[?2004h", "\\033[?2026hFRAME");
+            let (dir, id) = spawn_then_detach("sync", &script, b"FRAME");
+
+            let (_pane, got) = reattach_fresh(&dir, &id, |c| {
+                contains(c, b"FRAME") && contains(after(c, b"FRAME"), b"\x1b[?2004h")
+            });
+            assert_eq!(
+                count(&got, b"\x1b[?2026"),
+                1,
+                "only the child's own ?2026h: nothing synthesized opens or closes a block"
+            );
+
+            // The session reader's pipeline: feed the grid, then the coalescer
+            // with the grid's post-feed sync state, one read at a time.
+            let mut grid = crate::terminal::grid::Grid::new(80, 24);
+            let mut parser = vte::Parser::new();
+            let mut coalescer = SyncFrameCoalescer::new();
+            let mut emitted: Vec<u8> = Vec::new();
+            let mut offset = 0u64;
+            for read in got.chunks(16 * 1024) {
+                grid.feed(&mut parser, read);
+                coalescer.feed(read, offset, grid.sync_output(), |d, _| {
+                    emitted.extend_from_slice(d)
+                });
+                offset += read.len() as u64;
+            }
+            assert!(!contains(&emitted, b"FRAME"), "the open block is held");
+            let held_since = Instant::now();
+            while !contains(&emitted, b"FRAME") {
+                assert!(
+                    held_since.elapsed() < SYNC_FLUSH_TIME_CAP + Duration::from_millis(250),
+                    "the held frame did not flush within SYNC_FLUSH_TIME_CAP"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+                coalescer.flush_if_timed_out(|d, _| emitted.extend_from_slice(d));
+            }
+            assert!(contains(after(&emitted, b"FRAME"), b"\x1b[?2004h"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Phase 2b test (4): synthetic frames are displayed but leave the
+        /// stream offset alone and raise no loss marker — the pane's offset
+        /// ends exactly at the holder's, and the bytes delivered are the tail
+        /// plus exactly the synthesized ones.
+        #[test]
+        fn pty_holder_attach_synthetic_frames_leave_the_offset_alone() {
+            let script = past_the_ring("\\033[?2004h\\033[?1049h", "DONE");
+            let (dir, id) = spawn_then_detach("off", &script, b"DONE");
+            let (_, end) = bare_tail(&dir, &id);
+
+            let pane = Arc::new(
+                DaemonPaneIo::attach_existing(&dir, &id, None, 80, 24).expect("fresh reattach"),
+            );
+            let start = end - TAIL as u64;
+            assert_eq!(
+                pane.stream_offset(),
+                start,
+                "the tail starts where the holder said"
+            );
+            let (c, t) = drain(&pane);
+            let synthetic = b"\x1b[?1049h".len() + b"\x1b[?2004h".len();
+            until(&c, Duration::from_secs(20), |c| c.len() >= TAIL + synthetic);
+            std::thread::sleep(Duration::from_millis(200));
+            let got = c.lock().unwrap().clone();
+            assert_eq!(
+                pane.stream_offset(),
+                end,
+                "the offset counts stream bytes only — the synthetic ones moved it nowhere"
+            );
+            assert_eq!(
+                got.len(),
+                TAIL + synthetic,
+                "the tail plus exactly the envelope"
+            );
+            assert!(got.starts_with(b"\x1b[?1049h") && got.ends_with(b"DONE\x1b[?2004h"));
+            assert!(
+                !contains(&got, b"were lost here"),
+                "no loss marker: nothing was lost"
+            );
+            pane.kill(Duration::from_secs(2)).unwrap();
+            let _ = wait_within(&pane, Duration::from_secs(10));
+            t.join().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Phase 2b test (5): a reattach at the size the PTY ALREADY has still
+        /// delivers a size change to the child (a same-size resize raises no
+        /// `SIGWINCH`): the child's WINCH trap fires and reads the true size.
+        #[test]
+        fn pty_holder_attach_at_an_unchanged_size_still_resizes_the_child() {
+            let script = "stty -echo; trap 'printf \"WINCH:%s;\" \"$(stty size)\"' WINCH; \
+                          printf READY; while :; do sleep 0.05; done";
+            let (dir, id) = spawn_then_detach("winch", script, b"READY");
+            let (_pane, got) = reattach_fresh(&dir, &id, |c| contains(c, b"WINCH:24 80;"));
+            assert!(contains(&got, b"WINCH:24 80;"), "ends at the true size");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

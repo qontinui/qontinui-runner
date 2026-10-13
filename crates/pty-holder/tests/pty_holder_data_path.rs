@@ -15,9 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use qontinui_pty_holder::client::{connect, AttachedStream, ConnectError, Event, InputStream};
+use qontinui_pty_holder::client::{
+    connect, connect_with_versions, AttachedStream, ConnectError, Event, InputStream,
+};
+use qontinui_pty_holder::frame::SyntheticPart;
 use qontinui_pty_holder::pane::PaneId;
-use qontinui_pty_holder::protocol::{ExitReply, Reply};
+use qontinui_pty_holder::protocol::{ExitReply, Reply, RestoreMeta};
 use qontinui_pty_holder::spec::{write_spec, ChildSpec};
 
 const BIN: &str = env!("CARGO_BIN_EXE_qontinui-pty-holder");
@@ -863,4 +866,132 @@ fn pty_holder_data_path_spec_is_consumed() {
     let h = start("spec", sh("exec sleep 3600"));
     assert!(!h.dir.join("p1.spec").exists());
     assert!(Path::new(&h.dir).join("p1.lock").exists());
+}
+
+/// A small-ring pane that set bracketed paste and a title, then wrote far more
+/// than its ring holds, then went idle in `cat` — and the stream end once it
+/// is idle.
+fn moded_past_its_ring(tag: &str) -> (Holder, u64) {
+    let mut spec = sh(
+        "stty -echo; printf '\\033[?2004h\\033]2;T\\007'; head -c 20000 /dev/zero | tr '\\0' y; \
+         printf END; exec cat",
+    );
+    spec.ring_capacity = Some(4096);
+    let h = start(tag, spec);
+    let mut s = attach(&h, None);
+    let mut next = s.info.start_offset;
+    let mut seen = Vec::new();
+    let end = Instant::now() + Duration::from_secs(10);
+    while !contains(&seen, b"END") {
+        assert!(Instant::now() < end, "child never wrote END");
+        if let Some(Event::Output { offset, bytes }) = s.reader.next_event(Some(end)).unwrap() {
+            next = offset + bytes.len() as u64;
+            seen.extend_from_slice(&bytes);
+        }
+    }
+    (h, next)
+}
+
+/// Phase 2b, holder side: a restoring attach gets the metadata, then the
+/// PREAMBLE anchored at the tail's first byte before any output, then the
+/// tail, then the POSTAMBLE anchored exactly at the attach-time end — before
+/// any byte produced after the attach. Synthetic bytes are never `Output`, so
+/// the output offsets stay contiguous straight through them.
+#[test]
+fn pty_holder_attach_envelope_brackets_the_tail_at_its_anchors() {
+    let (h, end) = moded_past_its_ring("env");
+    let mut s = connect(&h.dir, &pid("p1"), soon())
+        .expect("handshake")
+        .attach_restoring(None, soon())
+        .expect("restoring attach");
+    assert_eq!(s.hello_ack.version, 3);
+    assert_eq!(s.info.end_offset, end);
+    assert_eq!(s.info.start_offset, end - 4096, "the whole small ring");
+    assert_eq!(
+        s.info.restore,
+        Some(RestoreMeta {
+            cwd: Some("/tmp".into()),
+            title: Some("T".into()),
+        })
+    );
+    // Output produced AFTER the attach, which must follow the postamble.
+    input_of(&h).input(b"after\n", soon()).unwrap();
+    let start = s.info.start_offset;
+    // Every event in wire order: output as (offset, len), synthetic as
+    // (part, anchor, bytes).
+    enum Seen {
+        Out(u64, u64),
+        Syn(SyntheticPart, u64, Vec<u8>),
+    }
+    let mut seen = Vec::new();
+    let mut bytes = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !contains(&bytes, b"after") {
+        match s.reader.next_event(Some(deadline)).unwrap().expect("event") {
+            Event::Output { offset, bytes: b } => {
+                seen.push(Seen::Out(offset, b.len() as u64));
+                bytes.extend_from_slice(&b);
+            }
+            Event::Synthetic {
+                part,
+                anchor,
+                bytes: b,
+            } => seen.push(Seen::Syn(part, anchor, b)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // The preamble first, anchored at the tail's first byte.
+    match seen.first() {
+        Some(Seen::Syn(SyntheticPart::Preamble, at, b)) => {
+            assert_eq!(*at, start);
+            assert_eq!(b, b"\x1b]2;T\x07");
+        }
+        _ => panic!("the preamble must be the first frame after `attached`"),
+    }
+    // Output contiguous from `start` to exactly `end`, then the postamble,
+    // then the post-attach output.
+    let mut next = start;
+    let mut postamble_seen = false;
+    for e in &seen[1..] {
+        match e {
+            Seen::Out(offset, len) => {
+                assert_eq!(*offset, next, "contiguous through the synthetic frames");
+                assert!(
+                    postamble_seen || offset + len <= end,
+                    "no byte past the anchor precedes the postamble"
+                );
+                next = offset + len;
+            }
+            Seen::Syn(part, at, b) => {
+                assert_eq!(*part, SyntheticPart::Postamble);
+                assert!(!postamble_seen, "one postamble");
+                assert_eq!((*at, next), (end, end), "exactly at the attach-time end");
+                assert_eq!(b, b"\x1b[?2004h");
+                postamble_seen = true;
+            }
+        }
+    }
+    assert!(postamble_seen && next > end);
+}
+
+/// A runner that negotiates version 2 gets no envelope and no metadata, even
+/// through `attach_restoring` — the v2 wire is unchanged.
+#[test]
+fn pty_holder_attach_restore_needs_version_3() {
+    let (h, end) = moded_past_its_ring("v2");
+    let mut s = connect_with_versions(&h.dir, &pid("p1"), soon(), &[1, 2])
+        .expect("handshake")
+        .attach_restoring(None, soon())
+        .expect("attach");
+    assert_eq!(s.hello_ack.version, 2);
+    assert_eq!(s.info.restore, None);
+    let start = s.info.start_offset;
+    let c = collect_until(&mut s, start, Duration::from_secs(10), |c| c.next >= end);
+    assert!(
+        !c.events
+            .iter()
+            .any(|e| matches!(e, Event::Synthetic { .. })),
+        "{:?}",
+        c.events
+    );
 }

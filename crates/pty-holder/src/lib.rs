@@ -31,6 +31,8 @@
 //! - [`transport`] — Unix socket / Windows named pipe, OS-level authorization (D5).
 //! - [`spec`] — the child spec, delivered as a consumed 0600 file.
 //! - [`ring`] — the bounded output ring with absolute offsets.
+//! - [`modes`] — the terminal-mode tracker behind an attach's restore
+//!   envelope (Phase 2b, D14); [`metadata`] — its cwd/title as reply strings.
 //! - [`pty`] — the PTY, the child, and when the holder may exit.
 //! - [`startup`] — fd closing, `SIGCHLD`, `setsid`, stdio: the holder's first
 //!   acts.
@@ -43,6 +45,8 @@
 pub mod client;
 pub mod frame;
 pub mod lock;
+pub mod metadata;
+pub mod modes;
 pub mod pane;
 pub mod protocol;
 pub mod pty;

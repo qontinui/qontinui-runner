@@ -34,6 +34,22 @@
 //!   `exit` frame — then it marks the exit delivered, which lets the holder
 //!   exit (`crate::pty::Pane::wait_for_end`).
 //!
+//! ## The restore envelope (protocol version 3, plan D14)
+//!
+//! An `attach {restore: true}` on a version-3 connection is answered with
+//! `restore {cwd, title}` metadata in `attached`, and — unless the consumer
+//! will see the stream from its very first byte, when there is nothing to
+//! restore — the tail is bracketed by two synthetic frames computed under the
+//! pane lock from `crate::modes::ModeTracker`, so they agree with the ring:
+//!
+//! - the PREAMBLE (state at the first byte the connection will be sent) is
+//!   written right after `attached`, before the pump exists, so it precedes
+//!   every output frame;
+//! - the POSTAMBLE (state at the attach-time end of the stream) is held by the
+//!   pump and sent the moment its offset reaches that end — output frames are
+//!   cut at the anchor so the postamble lands exactly there, before any byte
+//!   produced after the attach and before the `exit`.
+//!
 //! `pause` stops the pump's SENDING only; the PTY read never pauses. A pump
 //! whose client stops reading for [`PUMP_WRITE_TIMEOUT`] drops the connection
 //! (the client reattaches at its last offset), so a wedged client cannot pin
@@ -47,13 +63,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::frame::{output_payload, read_frame, write_frame, KIND_CONTROL, KIND_DATA, KIND_OUTPUT};
+use crate::frame::{
+    output_payload, read_frame, synthetic_payload, write_frame, SyntheticPart, KIND_CONTROL,
+    KIND_DATA, KIND_OUTPUT, KIND_SYNTHETIC,
+};
 use crate::lock::{LockRecord, PaneLock, TryLock};
 use crate::pane::{lock_path, log_path, prepare_private_dir, PaneId};
 use crate::protocol::{
     holder_build, negotiate, parse_request, to_payload, AttachedReply, CensusReply, ExitReply,
     HelloAck, RejectReason, Reply, Request, ATTACH_TAIL_BYTES, DATA_PATH_VERSION,
-    PROTOCOL_VERSIONS,
+    PROTOCOL_VERSIONS, RESTORE_VERSION,
 };
 use crate::pty::Pane;
 use crate::transport::{self, Conn, DeadlineIo, Listener};
@@ -373,8 +392,12 @@ pub(crate) enum Action {
     Reply(Reply),
     /// Send `rejected` and close.
     Reject(RejectReason, String),
-    /// Start streaming from this offset (`None`: a fresh attach).
-    Attach(Option<u64>),
+    /// Start streaming from `from` (`None`: a fresh attach); `restore` asks
+    /// for the envelope, and is only ever true at version 3 or later.
+    Attach {
+        from: Option<u64>,
+        restore: bool,
+    },
     /// Write these bytes to the child.
     Input(Vec<u8>),
     Resize {
@@ -512,7 +535,7 @@ pub(crate) fn serve_conn_with(
         // refused the same way (only the dispatch unit tests run without one).
         let needs_pane = matches!(
             action,
-            Action::Attach(_) | Action::Input(_) | Action::Resize { .. } | Action::Kill
+            Action::Attach { .. } | Action::Input(_) | Action::Resize { .. } | Action::Kill
         );
         let pane = match (needs_pane, pane) {
             (true, None) => {
@@ -542,12 +565,12 @@ pub(crate) fn serve_conn_with(
                 reject(&writer, reason, &detail);
                 break;
             }
-            Action::Attach(from) => {
+            Action::Attach { from, restore } => {
                 let Some(pane) = pane else { break };
                 let ConnState::Negotiated(v) = state else {
                     break;
                 };
-                if start_attach(pane, &writer, &flow, from).is_err() {
+                if start_attach(pane, &writer, &flow, from, restore).is_err() {
                     break;
                 }
                 state = ConnState::Attached(v);
@@ -633,16 +656,17 @@ fn ok(verb: &str) -> Reply {
     }
 }
 
-/// Answer `attach` and start this connection's pump. The `attached` reply is
-/// written BEFORE the pump exists, so it is always the first frame of the
-/// stream.
+/// Answer `attach` and start this connection's pump. The `attached` reply —
+/// and, for a restoring attach, the preamble — is written BEFORE the pump
+/// exists, so they are always the first frames of the stream.
 fn start_attach(
     pane: &Arc<Pane>,
     writer: &Arc<Mutex<Conn>>,
     flow: &Arc<ConnFlow>,
     from: Option<u64>,
+    restore: bool,
 ) -> io::Result<()> {
-    let reply = {
+    let (reply, envelope) = {
         let st = pane.lock_state();
         let ring_start = st.ring.start_offset();
         let end = st.ring.end_offset();
@@ -650,26 +674,68 @@ fn start_attach(
             None => end.saturating_sub(ATTACH_TAIL_BYTES).max(ring_start),
             Some(x) => x.min(end),
         };
-        AttachedReply {
+        // The first byte this connection will actually be sent: past a loss,
+        // the stream resumes at the ring's start.
+        let first_sent = start.max(ring_start);
+        // A consumer that is sent the stream from its first byte rebuilds
+        // every mode itself; anything later needs the envelope.
+        let envelope = (restore && first_sent > 0).then(|| st.modes.envelope(first_sent));
+        let meta = restore.then(|| {
+            crate::metadata::restore_meta(st.modes.cwd(), pane.spawn_cwd(), st.modes.title())
+        });
+        let reply = AttachedReply {
             start_offset: start,
             ring_start_offset: ring_start,
             end_offset: end,
             child_pid: pane.child_pid(),
             cols: st.size.0,
             rows: st.size.1,
-        }
+            restore: meta,
+        };
+        (reply, envelope)
     };
     let next = reply.start_offset;
     send_reply(writer, &Reply::Attached(reply))?;
+    let mut postamble = None;
+    if let Some(env) = envelope {
+        if !env.preamble.is_empty() {
+            send_synthetic(
+                writer,
+                SyntheticPart::Preamble,
+                env.preamble_at,
+                &env.preamble,
+                REPLY_WRITE_TIMEOUT,
+            )?;
+        }
+        if !env.postamble.is_empty() {
+            postamble = Some((env.postamble_at, env.postamble));
+        }
+    }
     let (pane, writer, flow) = (Arc::clone(pane), Arc::clone(writer), Arc::clone(flow));
     std::thread::Builder::new()
         .name("pty-holder-pump".into())
-        .spawn(move || pump(&pane, &writer, &flow, next))?;
+        .spawn(move || pump(&pane, &writer, &flow, next, postamble))?;
     Ok(())
+}
+
+fn send_synthetic(
+    writer: &Mutex<Conn>,
+    part: SyntheticPart,
+    anchor: u64,
+    bytes: &[u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    send_frame(
+        writer,
+        KIND_SYNTHETIC,
+        &synthetic_payload(part, anchor, bytes),
+        timeout,
+    )
 }
 
 /// What a pump does next.
 enum PumpStep {
+    Postamble,
     Lost { from: u64, to: u64 },
     Output { from: u64, bytes: Vec<u8> },
     Exit(ExitReply),
@@ -677,7 +743,17 @@ enum PumpStep {
 }
 
 /// Stream the pane's output to one connection from absolute offset `next`.
-fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64) {
+/// `postamble` — `(anchor, bytes)` — is sent the moment `next` reaches the
+/// anchor; until then output is cut at the anchor so nothing produced after
+/// the attach precedes it. It is tiny and not output, so a paused connection
+/// still gets it, as it gets the `exit`.
+fn pump(
+    pane: &Arc<Pane>,
+    writer: &Mutex<Conn>,
+    flow: &ConnFlow,
+    mut next: u64,
+    mut postamble: Option<(u64, Vec<u8>)>,
+) {
     loop {
         let step = {
             let mut st = pane.lock_state();
@@ -687,6 +763,9 @@ fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64) 
                 }
                 let start = st.ring.start_offset();
                 let end = st.ring.end_offset();
+                if postamble.as_ref().is_some_and(|(at, _)| next >= *at) {
+                    break PumpStep::Postamble;
+                }
                 if !flow.paused.load(Ordering::SeqCst) {
                     if next < start {
                         break PumpStep::Lost {
@@ -695,7 +774,11 @@ fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64) 
                         };
                     }
                     if next < end {
-                        let (from, bytes) = st.ring.slice_from(next, MAX_OUTPUT_CHUNK);
+                        let max = match &postamble {
+                            Some((at, _)) => MAX_OUTPUT_CHUNK.min((at - next) as usize),
+                            None => MAX_OUTPUT_CHUNK,
+                        };
+                        let (from, bytes) = st.ring.slice_from(next, max);
                         break PumpStep::Output { from, bytes };
                     }
                 }
@@ -711,6 +794,16 @@ fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64) 
         };
         let sent = match step {
             PumpStep::Stop => return,
+            PumpStep::Postamble => match postamble.take() {
+                Some((at, bytes)) => send_synthetic(
+                    writer,
+                    SyntheticPart::Postamble,
+                    at,
+                    &bytes,
+                    PUMP_WRITE_TIMEOUT,
+                ),
+                None => Ok(()),
+            },
             PumpStep::Lost { from, to } => {
                 next = to;
                 to_payload(&Reply::OutputLost {
@@ -805,9 +898,18 @@ fn handle_request(state: &mut ConnState, req: Request, info: &HolderInfo) -> Act
             Action::Reply(Reply::Pong)
         }
         // Version 2 verbs: the data path.
-        (Negotiated(v), Request::Attach { from_offset }) if v >= DATA_PATH_VERSION => {
-            Action::Attach(from_offset)
-        }
+        (
+            Negotiated(v),
+            Request::Attach {
+                from_offset,
+                restore,
+            },
+        ) if v >= DATA_PATH_VERSION => Action::Attach {
+            from: from_offset,
+            // A version-2 connection never gets the envelope, whatever a
+            // confused client put in the field.
+            restore: restore && v >= RESTORE_VERSION,
+        },
         (Attached(_), Request::Attach { .. } | Request::OpenInput) => Action::Reject(
             RejectReason::AlreadyAttached,
             "this connection is already attached".into(),
@@ -1101,11 +1203,16 @@ mod tests {
             handle_request(
                 &mut s,
                 Request::Attach {
-                    from_offset: Some(5)
+                    from_offset: Some(5),
+                    restore: true,
                 },
                 &i
             ),
-            Action::Attach(Some(5))
+            Action::Attach {
+                from: Some(5),
+                restore: false,
+            },
+            "a version-2 connection never gets the restore envelope"
         );
         // The serve loop moves the state on a successful attach.
         let mut s = ConnState::Attached(2);
@@ -1131,7 +1238,14 @@ mod tests {
             Action::Reply(Reply::Pong)
         );
         assert!(matches!(
-            handle_request(&mut s, Request::Attach { from_offset: None }, &i),
+            handle_request(
+                &mut s,
+                Request::Attach {
+                    from_offset: None,
+                    restore: false,
+                },
+                &i
+            ),
             Action::Reject(RejectReason::AlreadyAttached, _)
         ));
         assert_eq!(handle_request(&mut s, Request::Detach, &i), Action::Detach);
@@ -1141,7 +1255,10 @@ mod tests {
         handle_request(&mut s, Request::Hello { versions: vec![1] }, &i);
         assert_eq!(s, ConnState::Negotiated(1));
         for req in [
-            Request::Attach { from_offset: None },
+            Request::Attach {
+                from_offset: None,
+                restore: false,
+            },
             Request::Resize { cols: 1, rows: 1 },
             Request::Kill,
             Request::Detach,
@@ -1206,7 +1323,13 @@ mod tests {
             handle_request(&mut s, Request::Resize { cols: 2, rows: 2 }, &i),
             Action::Resize { cols: 2, rows: 2 }
         );
-        for req in [Request::Attach { from_offset: None }, Request::OpenInput] {
+        for req in [
+            Request::Attach {
+                from_offset: None,
+                restore: false,
+            },
+            Request::OpenInput,
+        ] {
             assert!(matches!(
                 handle_request(&mut s, req, &i),
                 Action::Reject(RejectReason::AlreadyAttached, _)
@@ -1217,6 +1340,36 @@ mod tests {
             Action::Reject(RejectReason::NotAttached, _)
         ));
         assert_eq!(handle_request(&mut s, Request::Detach, &i), Action::Detach);
+    }
+
+    /// Version 3: `restore` reaches the attach action only on a connection
+    /// that negotiated it.
+    #[test]
+    fn pty_holder_attach_restore_is_honoured_from_version_3() {
+        let i = info();
+        let mut s = ConnState::AwaitHello;
+        handle_request(
+            &mut s,
+            Request::Hello {
+                versions: vec![2, 3],
+            },
+            &i,
+        );
+        assert_eq!(s, ConnState::Negotiated(RESTORE_VERSION));
+        assert_eq!(
+            handle_request(
+                &mut s,
+                Request::Attach {
+                    from_offset: None,
+                    restore: true,
+                },
+                &i
+            ),
+            Action::Attach {
+                from: None,
+                restore: true,
+            }
+        );
     }
 
     #[test]
