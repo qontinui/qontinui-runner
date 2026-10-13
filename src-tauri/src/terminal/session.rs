@@ -1586,9 +1586,12 @@ pub enum CreateError {
     /// Refused before any child process existed (resource gate, PTY open,
     /// identity seam, trust gate, the spawn call itself failing).
     BeforeChild(String),
-    /// A child was spawned and the session around it could not be built; the
-    /// child was killed before this error was returned (best-effort: a kill
-    /// that could not be confirmed is logged).
+    /// A child was spawned — or MAY have been — and the session around it
+    /// could not be built; the child was killed before this error was returned
+    /// (best-effort: a kill that could not be confirmed is logged). A failed
+    /// PTY-holder spawn lands here too: the holder can have started the child
+    /// before its attach or ready line failed, and its teardown does not
+    /// always confirm the child's kill, so "nothing ran" is not provable.
     ChildKilled(String),
 }
 
@@ -1900,7 +1903,9 @@ impl TerminalSession {
             None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
                 &id, sealed, cols, rows,
             )
-            .map_err(CreateError::BeforeChild)?,
+            // Not `BeforeChild`: a holder may have run the child before it
+            // failed (see `CreateError::ChildKilled`).
+            .map_err(CreateError::ChildKilled)?,
         };
 
         // From here a child EXISTS: a failure to build the session around it
