@@ -2051,9 +2051,13 @@ mod page_health_forward_tests {
             "the runner sampled nothing"
         );
         assert_eq!(data["provenance"]["source"]["request"], "pageHealth");
-        let text = body.to_string();
+        // `unknown.detail` may quote a parse error naming the severities, so
+        // scan everything else.
+        let mut rest = data.clone();
+        rest["unknown"]["detail"] = serde_json::Value::Null;
+        let text = rest.to_string();
         assert!(
-            !text.contains("CRITICAL") && !text.contains("WARNING"),
+            !text.contains("CRITICAL") && !text.contains("WARNING") && !text.contains("summary"),
             "no verdict over a page nobody looked at: {text}"
         );
     }
