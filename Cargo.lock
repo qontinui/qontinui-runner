@@ -6773,6 +6773,7 @@ dependencies = [
  "qontinui-runner-win32",
  "serde",
  "serde_json",
+ "vte",
  "windows-sys 0.59.0",
 ]
 

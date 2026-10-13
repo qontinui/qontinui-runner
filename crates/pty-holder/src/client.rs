@@ -37,13 +37,14 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::frame::{
-    parse_output, read_frame, write_frame, Frame, KIND_CONTROL, KIND_DATA, KIND_OUTPUT,
+    parse_output, parse_synthetic, read_frame, write_frame, Frame, SyntheticPart, KIND_CONTROL,
+    KIND_DATA, KIND_OUTPUT, KIND_SYNTHETIC,
 };
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{check_private_dir, lock_path, PaneId};
 use crate::protocol::{
     parse_reply, to_payload, AttachedReply, CensusReply, ExitReply, HelloAck, Reply, Request,
-    DATA_PATH_VERSION, PROTOCOL_VERSIONS,
+    DATA_PATH_VERSION, PROTOCOL_VERSIONS, RESTORE_VERSION,
 };
 use crate::transport::{self, remaining, Conn, DeadlineIo};
 
@@ -298,9 +299,40 @@ impl Client {
     /// `from_offset: None` is a fresh consumer (the ring's last
     /// `ATTACH_TAIL_BYTES`); `Some(n)` resumes at the first byte the caller has
     /// not seen. Consumes the client: the connection now belongs to the stream.
+    ///
+    /// No restore envelope: for a consumer that keeps its own mode state
+    /// across the reattach (a dropped connection, a resume after a detach in
+    /// the same process). A consumer starting from nothing uses
+    /// [`Client::attach_restoring`].
     pub fn attach(
+        self,
+        from_offset: Option<u64>,
+        deadline: Instant,
+    ) -> Result<AttachedStream, ConnectError> {
+        self.attach_with(from_offset, false, deadline)
+    }
+
+    /// [`Client::attach`] for a consumer with NO mode state of its own — a
+    /// restarted runner's fresh `Grid` and xterm (plan D14). At protocol
+    /// version 3 the holder answers with `restore` metadata
+    /// ([`AttachedStream::info`]`.restore`) and brackets the tail with
+    /// [`Event::Synthetic`] preamble/postamble frames. A holder that
+    /// negotiated less is not asked (it could not answer); then
+    /// `info.restore` is `None` and no synthetic frame arrives — which is how
+    /// the caller learns the restore was unavailable.
+    pub fn attach_restoring(
+        self,
+        from_offset: Option<u64>,
+        deadline: Instant,
+    ) -> Result<AttachedStream, ConnectError> {
+        let restore = self.ack.version >= RESTORE_VERSION;
+        self.attach_with(from_offset, restore, deadline)
+    }
+
+    fn attach_with(
         mut self,
         from_offset: Option<u64>,
+        restore: bool,
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
         self.check()?;
@@ -310,7 +342,11 @@ impl Client {
                 self.ack.version
             )));
         }
-        let info = match self.request(&Request::Attach { from_offset }, deadline)? {
+        let request = Request::Attach {
+            from_offset,
+            restore,
+        };
+        let info = match self.request(&request, deadline)? {
             Reply::Attached(a) => a,
             other => {
                 return Err(ConnectError::Protocol(format!(
@@ -349,6 +385,16 @@ pub enum Event {
     Lost { from_offset: u64, to_offset: u64 },
     /// The child exited; the last frame of the stream.
     Exit(ExitReply),
+    /// Bytes the HOLDER synthesized for a restoring attach (protocol version
+    /// 3): display them where `anchor` says, but never count them as stream
+    /// bytes — they advance no offset (plan D14). A preamble precedes every
+    /// output event; a postamble arrives exactly when the stream reaches its
+    /// anchor.
+    Synthetic {
+        part: SyntheticPart,
+        anchor: u64,
+        bytes: Vec<u8>,
+    },
     /// Any other reply — `ok {verb}` to a writer-side request, `pong`,
     /// `census_reply`, or a `rejected` (after which the holder closes).
     Reply(Reply),
@@ -385,6 +431,15 @@ impl StreamReader {
                 })?;
                 Ok(Some(Event::Output {
                     offset,
+                    bytes: bytes.to_vec(),
+                }))
+            }
+            KIND_SYNTHETIC => {
+                let (part, anchor, bytes) = parse_synthetic(&frame.payload)
+                    .ok_or_else(|| ConnectError::Protocol("malformed synthetic frame".into()))?;
+                Ok(Some(Event::Synthetic {
+                    part,
+                    anchor,
                     bytes: bytes.to_vec(),
                 }))
             }
