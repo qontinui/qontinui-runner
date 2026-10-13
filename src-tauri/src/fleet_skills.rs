@@ -264,10 +264,18 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
     }
 }
 
-/// Whether the skill `name` is in the corpus this runner SERVES: the canonical
-/// `qontinui-claude-config` snapshot when one has loaded, else the embedded
-/// bundle. Cheap (a lock and a map lookup, or a directory lookup in the
-/// binary) — the heartbeat calls it every tick.
+/// Whether the skill `name` is in the fleet corpus this runner SERVES into
+/// sessions. The canonical rung only refreshes skills the embedded bundle
+/// already names (`canonical_corpus::bundled_skill_names`), so the bundle is
+/// what decides; a fleet skill reaches it from `qontinui-claude-config` through
+/// `scripts/fleet-bundle-sync.sh` and a rebuild. The canonical arm is checked
+/// as well so a future canonical-only skill is not missed.
+///
+/// NOT consulted: the account layer (`agent_skills` overrides), whose read is a
+/// network fetch — an account-supplied skill of this name is served but not
+/// advertised. That under-advertises (coord counts the review `unreviewed`),
+/// never over-advertises. Cheap: a lock and a map lookup, or a directory lookup
+/// in the binary — the heartbeat calls it every tick.
 pub(crate) fn skill_is_served(name: &str) -> bool {
     if let Some(c) = crate::canonical_corpus::latest() {
         if c.skills.skills.contains_key(name) {
@@ -629,6 +637,14 @@ fn apply_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `skill_is_served` reads the real embedded bundle (plan
+    /// 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b).
+    #[test]
+    fn skill_is_served_reads_the_embedded_bundle() {
+        assert!(skill_is_served("page-health"));
+        assert!(!skill_is_served("no-such-skill-for-this-test"));
+    }
     use crate::agent_skills::tests::{bundle, skill_unit};
     use crate::agent_skills::{AgentSkillSource, ResolvedSkill};
 

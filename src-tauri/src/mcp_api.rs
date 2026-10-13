@@ -18120,6 +18120,28 @@ mod coord_mcp_body_gate_tests {
         // A deliberate exclusion with no sanctioned door keeps the generic text.
         let d = super::coord_mcp_refusal_cause("coord_create_pr", None);
         assert!(d.remedy.contains("/mcp directly"), "{}", d.remedy);
+        // Every door row names a tool that IS deliberately excluded.
+        for (tool, _) in super::COORD_MCP_DELIBERATE_EXCLUSION_DOORS {
+            assert!(
+                COORD_MCP_DELIBERATE_EXCLUSIONS.binary_search(tool).is_ok(),
+                "{tool} has a door row but is not a deliberate exclusion"
+            );
+        }
+        // The trunk-policy source parser reads both new names exactly once.
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("parses");
+        assert_eq!(
+            parsed.allowed.iter().filter(|t| *t == "coord_expedited_land_status").count(),
+            1
+        );
+        assert_eq!(
+            parsed
+                .deliberate
+                .iter()
+                .filter(|t| *t == "coord_request_expedited_land")
+                .count(),
+            1
+        );
     }
 
     /// (b) No trunk read ⇒ `unknown` with a reason, never a confident default.
