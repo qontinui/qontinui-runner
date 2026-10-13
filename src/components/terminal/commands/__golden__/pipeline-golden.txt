@@ -31,7 +31,7 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 2696
+# tier: golden   inputs: 3176
 
 /analyze	literal	terminal.analyze	[]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
 /analyze "1 gmail fix the bug"	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
@@ -555,6 +555,56 @@
 /mute 1 gmail fix the bug --tenant	literal	terminal.mute	[]	unbound	-
 /mute 3 best	literal	terminal.mute	[]	unbound	-
 /mute 3 best --tenant	literal	terminal.mute	[]	unbound	-
+/my prompt view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/my prompt view "1 gmail fix the bug"	none	-	null	none	-
+/my prompt view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/my prompt view "3 best"	none	-	null	none	-
+/my prompt view "3 best" --tenant	none	-	null	none	-
+/my prompt view --tenant	none	-	null	none	-
+/my prompt view 1 gmail fix the bug	none	-	null	none	-
+/my prompt view 1 gmail fix the bug --tenant	none	-	null	none	-
+/my prompt view 3 best	none	-	null	none	-
+/my prompt view 3 best --tenant	none	-	null	none	-
+/my prompt-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/my prompt-view "1 gmail fix the bug"	none	-	null	none	-
+/my prompt-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/my prompt-view "3 best"	none	-	null	none	-
+/my prompt-view "3 best" --tenant	none	-	null	none	-
+/my prompt-view --tenant	none	-	null	none	-
+/my prompt-view 1 gmail fix the bug	none	-	null	none	-
+/my prompt-view 1 gmail fix the bug --tenant	none	-	null	none	-
+/my prompt-view 3 best	none	-	null	none	-
+/my prompt-view 3 best --tenant	none	-	null	none	-
+/my prompts view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/my prompts view "1 gmail fix the bug"	none	-	null	none	-
+/my prompts view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/my prompts view "3 best"	none	-	null	none	-
+/my prompts view "3 best" --tenant	none	-	null	none	-
+/my prompts view --tenant	none	-	null	none	-
+/my prompts view 1 gmail fix the bug	none	-	null	none	-
+/my prompts view 1 gmail fix the bug --tenant	none	-	null	none	-
+/my prompts view 3 best	none	-	null	none	-
+/my prompts view 3 best --tenant	none	-	null	none	-
+/my prompts-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/my prompts-view "1 gmail fix the bug"	none	-	null	none	-
+/my prompts-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/my prompts-view "3 best"	none	-	null	none	-
+/my prompts-view "3 best" --tenant	none	-	null	none	-
+/my prompts-view --tenant	none	-	null	none	-
+/my prompts-view 1 gmail fix the bug	none	-	null	none	-
+/my prompts-view 1 gmail fix the bug --tenant	none	-	null	none	-
+/my prompts-view 3 best	none	-	null	none	-
+/my prompts-view 3 best --tenant	none	-	null	none	-
+/my-prompts	literal	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/my-prompts "1 gmail fix the bug"	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/my-prompts "1 gmail fix the bug" --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/my-prompts "3 best"	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/my-prompts "3 best" --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/my-prompts --tenant	literal	terminal.toggle-prompts-view	[["state","--tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/my-prompts 1 gmail fix the bug	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/my-prompts 1 gmail fix the bug --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/my-prompts 3 best	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/my-prompts 3 best --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
 /next session	pattern	terminal.focus	[["target","next"]]	ok	ok /focus ✓ focused 1 zone
 /next session --tenant	none	-	null	none	-
 /notifications	pattern	terminal.toggle-desktop-notify	[]	ok	ok /desktop-notify ✓ enabled desktop notifications
@@ -643,6 +693,22 @@
 /prompt library 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
 /prompt library 3 best	literal	terminal.prompt	[]	unbound	-
 /prompt library 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+/prompt view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompt view "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound	-
+/prompt view "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound	-
+/prompt view "3 best"	literal	terminal.prompt	[]	unbound	-
+/prompt view "3 best" --tenant	literal	terminal.prompt	[]	unbound	-
+/prompt view --tenant	literal	terminal.prompt	[]	unbound	-
+/prompt view 1 gmail fix the bug	literal	terminal.prompt	[]	unbound	-
+/prompt view 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
+/prompt view 3 best	literal	terminal.prompt	[]	unbound	-
+/prompt view 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+/prompt view off	pattern	terminal.toggle-prompts-view	[["state","off"]]	ok	ok /prompts-view ✓ hidden prompts in all sessions
+/prompt view off --tenant	literal	terminal.prompt	[]	unbound	-
+/prompt view on	pattern	terminal.toggle-prompts-view	[["state","on"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompt view on --tenant	literal	terminal.prompt	[]	unbound	-
+/prompt view toggle	pattern	terminal.toggle-prompts-view	[["state","toggle"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompt view toggle --tenant	literal	terminal.prompt	[]	unbound	-
 /prompt-library	pattern	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
 /prompt-library "1 gmail fix the bug"	none	-	null	none	-
 /prompt-library "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -653,6 +719,22 @@
 /prompt-library 1 gmail fix the bug --tenant	none	-	null	none	-
 /prompt-library 3 best	none	-	null	none	-
 /prompt-library 3 best --tenant	none	-	null	none	-
+/prompt-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompt-view "1 gmail fix the bug"	none	-	null	none	-
+/prompt-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prompt-view "3 best"	none	-	null	none	-
+/prompt-view "3 best" --tenant	none	-	null	none	-
+/prompt-view --tenant	none	-	null	none	-
+/prompt-view 1 gmail fix the bug	none	-	null	none	-
+/prompt-view 1 gmail fix the bug --tenant	none	-	null	none	-
+/prompt-view 3 best	none	-	null	none	-
+/prompt-view 3 best --tenant	none	-	null	none	-
+/prompt-view off	pattern	terminal.toggle-prompts-view	[["state","off"]]	ok	ok /prompts-view ✓ hidden prompts in all sessions
+/prompt-view off --tenant	none	-	null	none	-
+/prompt-view on	pattern	terminal.toggle-prompts-view	[["state","on"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompt-view on --tenant	none	-	null	none	-
+/prompt-view toggle	pattern	terminal.toggle-prompts-view	[["state","toggle"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompt-view toggle --tenant	none	-	null	none	-
 /prompts	pattern	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
 /prompts "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound	-
 /prompts "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound	-
@@ -663,6 +745,38 @@
 /prompts 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
 /prompts 3 best	literal	terminal.prompt	[]	unbound	-
 /prompts 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompts view "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound	-
+/prompts view "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts view "3 best"	literal	terminal.prompt	[]	unbound	-
+/prompts view "3 best" --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts view --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts view 1 gmail fix the bug	literal	terminal.prompt	[]	unbound	-
+/prompts view 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts view 3 best	literal	terminal.prompt	[]	unbound	-
+/prompts view 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts view off	pattern	terminal.toggle-prompts-view	[["state","off"]]	ok	ok /prompts-view ✓ hidden prompts in all sessions
+/prompts view off --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts view on	pattern	terminal.toggle-prompts-view	[["state","on"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompts view on --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts view toggle	pattern	terminal.toggle-prompts-view	[["state","toggle"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompts view toggle --tenant	literal	terminal.prompt	[]	unbound	-
+/prompts-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompts-view "1 gmail fix the bug"	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view "1 gmail fix the bug" --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view "3 best"	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view "3 best" --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view --tenant	literal	terminal.toggle-prompts-view	[["state","--tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view 1 gmail fix the bug	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view 1 gmail fix the bug --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view 3 best	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view 3 best --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view off	pattern	terminal.toggle-prompts-view	[["state","off"]]	ok	ok /prompts-view ✓ hidden prompts in all sessions
+/prompts-view off --tenant	literal	terminal.toggle-prompts-view	[["state","off --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view on	pattern	terminal.toggle-prompts-view	[["state","on"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompts-view on --tenant	literal	terminal.toggle-prompts-view	[["state","on --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/prompts-view toggle	pattern	terminal.toggle-prompts-view	[["state","toggle"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/prompts-view toggle --tenant	literal	terminal.toggle-prompts-view	[["state","toggle --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
 /quad layout	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 /quad layout --tenant	none	-	null	none	-
 /refresh plan	pattern	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
@@ -849,6 +963,38 @@
 /shortcuts 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound	-
 /shortcuts 3 best	literal	terminal.show-shortcuts	[]	unbound	-
 /shortcuts 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound	-
+/show prompt	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt --tenant	none	-	null	none	-
+/show prompt all	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt all --tenant	none	-	null	none	-
+/show prompt all session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt all session --tenant	none	-	null	none	-
+/show prompt all sessions	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt all sessions --tenant	none	-	null	none	-
+/show prompt every	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt every --tenant	none	-	null	none	-
+/show prompt every session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt every session --tenant	none	-	null	none	-
+/show prompt every sessions	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt every sessions --tenant	none	-	null	none	-
+/show prompt in all	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt in all --tenant	none	-	null	none	-
+/show prompt in all session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt in all session --tenant	none	-	null	none	-
+/show prompt in all sessions	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt in all sessions --tenant	none	-	null	none	-
+/show prompt in every	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt in every --tenant	none	-	null	none	-
+/show prompt in every session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt in every session --tenant	none	-	null	none	-
+/show prompt in every sessions	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt in every sessions --tenant	none	-	null	none	-
+/show prompt-view	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt-view --tenant	none	-	null	none	-
+/show prompt-view all	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt-view all --tenant	none	-	null	none	-
+/show prompt-view all session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/show prompt-view all session --tenant	none	-	null	none	-
 /single layout	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
 /single layout --tenant	none	-	null	none	-
 /six-pack layout	pattern	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
@@ -1091,6 +1237,86 @@
 /toggle focus-mode 1 gmail fix the bug --tenant	none	-	null	none	-
 /toggle focus-mode 3 best	none	-	null	none	-
 /toggle focus-mode 3 best --tenant	none	-	null	none	-
+/toggle my prompt view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle my prompt view "1 gmail fix the bug"	none	-	null	none	-
+/toggle my prompt view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/toggle my prompt view "3 best"	none	-	null	none	-
+/toggle my prompt view "3 best" --tenant	none	-	null	none	-
+/toggle my prompt view --tenant	none	-	null	none	-
+/toggle my prompt view 1 gmail fix the bug	none	-	null	none	-
+/toggle my prompt view 1 gmail fix the bug --tenant	none	-	null	none	-
+/toggle my prompt view 3 best	none	-	null	none	-
+/toggle my prompt view 3 best --tenant	none	-	null	none	-
+/toggle my prompt-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle my prompt-view "1 gmail fix the bug"	none	-	null	none	-
+/toggle my prompt-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/toggle my prompt-view "3 best"	none	-	null	none	-
+/toggle my prompt-view "3 best" --tenant	none	-	null	none	-
+/toggle my prompt-view --tenant	none	-	null	none	-
+/toggle my prompt-view 1 gmail fix the bug	none	-	null	none	-
+/toggle my prompt-view 1 gmail fix the bug --tenant	none	-	null	none	-
+/toggle my prompt-view 3 best	none	-	null	none	-
+/toggle my prompt-view 3 best --tenant	none	-	null	none	-
+/toggle my prompts view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle my prompts view "1 gmail fix the bug"	none	-	null	none	-
+/toggle my prompts view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/toggle my prompts view "3 best"	none	-	null	none	-
+/toggle my prompts view "3 best" --tenant	none	-	null	none	-
+/toggle my prompts view --tenant	none	-	null	none	-
+/toggle my prompts view 1 gmail fix the bug	none	-	null	none	-
+/toggle my prompts view 1 gmail fix the bug --tenant	none	-	null	none	-
+/toggle my prompts view 3 best	none	-	null	none	-
+/toggle my prompts view 3 best --tenant	none	-	null	none	-
+/toggle my prompts-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle my prompts-view "1 gmail fix the bug"	none	-	null	none	-
+/toggle my prompts-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/toggle my prompts-view "3 best"	none	-	null	none	-
+/toggle my prompts-view "3 best" --tenant	none	-	null	none	-
+/toggle my prompts-view --tenant	none	-	null	none	-
+/toggle my prompts-view 1 gmail fix the bug	none	-	null	none	-
+/toggle my prompts-view 1 gmail fix the bug --tenant	none	-	null	none	-
+/toggle my prompts-view 3 best	none	-	null	none	-
+/toggle my prompts-view 3 best --tenant	none	-	null	none	-
+/toggle prompt view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle prompt view "1 gmail fix the bug"	none	-	null	none	-
+/toggle prompt view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/toggle prompt view "3 best"	none	-	null	none	-
+/toggle prompt view "3 best" --tenant	none	-	null	none	-
+/toggle prompt view --tenant	none	-	null	none	-
+/toggle prompt view 1 gmail fix the bug	none	-	null	none	-
+/toggle prompt view 1 gmail fix the bug --tenant	none	-	null	none	-
+/toggle prompt view 3 best	none	-	null	none	-
+/toggle prompt view 3 best --tenant	none	-	null	none	-
+/toggle prompt-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle prompt-view "1 gmail fix the bug"	none	-	null	none	-
+/toggle prompt-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/toggle prompt-view "3 best"	none	-	null	none	-
+/toggle prompt-view "3 best" --tenant	none	-	null	none	-
+/toggle prompt-view --tenant	none	-	null	none	-
+/toggle prompt-view 1 gmail fix the bug	none	-	null	none	-
+/toggle prompt-view 1 gmail fix the bug --tenant	none	-	null	none	-
+/toggle prompt-view 3 best	none	-	null	none	-
+/toggle prompt-view 3 best --tenant	none	-	null	none	-
+/toggle prompts view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle prompts view "1 gmail fix the bug"	none	-	null	none	-
+/toggle prompts view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/toggle prompts view "3 best"	none	-	null	none	-
+/toggle prompts view "3 best" --tenant	none	-	null	none	-
+/toggle prompts view --tenant	none	-	null	none	-
+/toggle prompts view 1 gmail fix the bug	none	-	null	none	-
+/toggle prompts view 1 gmail fix the bug --tenant	none	-	null	none	-
+/toggle prompts view 3 best	none	-	null	none	-
+/toggle prompts view 3 best --tenant	none	-	null	none	-
+/toggle prompts-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle prompts-view "1 gmail fix the bug"	none	-	null	none	-
+/toggle prompts-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+/toggle prompts-view "3 best"	none	-	null	none	-
+/toggle prompts-view "3 best" --tenant	none	-	null	none	-
+/toggle prompts-view --tenant	none	-	null	none	-
+/toggle prompts-view 1 gmail fix the bug	none	-	null	none	-
+/toggle prompts-view 1 gmail fix the bug --tenant	none	-	null	none	-
+/toggle prompts-view 3 best	none	-	null	none	-
+/toggle prompts-view 3 best --tenant	none	-	null	none	-
 /toggle sessions	pattern	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
 /toggle sessions "1 gmail fix the bug"	none	-	null	none	-
 /toggle sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -1171,6 +1397,16 @@
 /toggle-notifications 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound	-
 /toggle-notifications 3 best	literal	terminal.toggle-desktop-notify	[]	unbound	-
 /toggle-notifications 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound	-
+/toggle-prompts	literal	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+/toggle-prompts "1 gmail fix the bug"	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/toggle-prompts "1 gmail fix the bug" --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/toggle-prompts "3 best"	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/toggle-prompts "3 best" --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/toggle-prompts --tenant	literal	terminal.toggle-prompts-view	[["state","--tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/toggle-prompts 1 gmail fix the bug	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/toggle-prompts 1 gmail fix the bug --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/toggle-prompts 3 best	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+/toggle-prompts 3 best --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
 /toggle-sessions	literal	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
 /toggle-sessions "1 gmail fix the bug"	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
 /toggle-sessions "1 gmail fix the bug" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
@@ -1743,6 +1979,56 @@ mute 1 gmail fix the bug	literal	terminal.mute	[]	unbound	-
 mute 1 gmail fix the bug --tenant	literal	terminal.mute	[]	unbound	-
 mute 3 best	literal	terminal.mute	[]	unbound	-
 mute 3 best --tenant	literal	terminal.mute	[]	unbound	-
+my prompt view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+my prompt view "1 gmail fix the bug"	none	-	null	none	-
+my prompt view "1 gmail fix the bug" --tenant	none	-	null	none	-
+my prompt view "3 best"	none	-	null	none	-
+my prompt view "3 best" --tenant	none	-	null	none	-
+my prompt view --tenant	none	-	null	none	-
+my prompt view 1 gmail fix the bug	none	-	null	none	-
+my prompt view 1 gmail fix the bug --tenant	none	-	null	none	-
+my prompt view 3 best	none	-	null	none	-
+my prompt view 3 best --tenant	none	-	null	none	-
+my prompt-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+my prompt-view "1 gmail fix the bug"	none	-	null	none	-
+my prompt-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+my prompt-view "3 best"	none	-	null	none	-
+my prompt-view "3 best" --tenant	none	-	null	none	-
+my prompt-view --tenant	none	-	null	none	-
+my prompt-view 1 gmail fix the bug	none	-	null	none	-
+my prompt-view 1 gmail fix the bug --tenant	none	-	null	none	-
+my prompt-view 3 best	none	-	null	none	-
+my prompt-view 3 best --tenant	none	-	null	none	-
+my prompts view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+my prompts view "1 gmail fix the bug"	none	-	null	none	-
+my prompts view "1 gmail fix the bug" --tenant	none	-	null	none	-
+my prompts view "3 best"	none	-	null	none	-
+my prompts view "3 best" --tenant	none	-	null	none	-
+my prompts view --tenant	none	-	null	none	-
+my prompts view 1 gmail fix the bug	none	-	null	none	-
+my prompts view 1 gmail fix the bug --tenant	none	-	null	none	-
+my prompts view 3 best	none	-	null	none	-
+my prompts view 3 best --tenant	none	-	null	none	-
+my prompts-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+my prompts-view "1 gmail fix the bug"	none	-	null	none	-
+my prompts-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+my prompts-view "3 best"	none	-	null	none	-
+my prompts-view "3 best" --tenant	none	-	null	none	-
+my prompts-view --tenant	none	-	null	none	-
+my prompts-view 1 gmail fix the bug	none	-	null	none	-
+my prompts-view 1 gmail fix the bug --tenant	none	-	null	none	-
+my prompts-view 3 best	none	-	null	none	-
+my prompts-view 3 best --tenant	none	-	null	none	-
+my-prompts	literal	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+my-prompts "1 gmail fix the bug"	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+my-prompts "1 gmail fix the bug" --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+my-prompts "3 best"	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+my-prompts "3 best" --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+my-prompts --tenant	literal	terminal.toggle-prompts-view	[["state","--tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+my-prompts 1 gmail fix the bug	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+my-prompts 1 gmail fix the bug --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+my-prompts 3 best	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+my-prompts 3 best --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
 next session	pattern	terminal.focus	[["target","next"]]	ok	ok /focus ✓ focused 1 zone
 next session --tenant	none	-	null	none	-
 notifications	pattern	terminal.toggle-desktop-notify	[]	ok	ok /desktop-notify ✓ enabled desktop notifications
@@ -1831,6 +2117,22 @@ prompt library 1 gmail fix the bug	literal	terminal.prompt	[]	unbound	-
 prompt library 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
 prompt library 3 best	literal	terminal.prompt	[]	unbound	-
 prompt library 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+prompt view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompt view "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound	-
+prompt view "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound	-
+prompt view "3 best"	literal	terminal.prompt	[]	unbound	-
+prompt view "3 best" --tenant	literal	terminal.prompt	[]	unbound	-
+prompt view --tenant	literal	terminal.prompt	[]	unbound	-
+prompt view 1 gmail fix the bug	literal	terminal.prompt	[]	unbound	-
+prompt view 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
+prompt view 3 best	literal	terminal.prompt	[]	unbound	-
+prompt view 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+prompt view off	pattern	terminal.toggle-prompts-view	[["state","off"]]	ok	ok /prompts-view ✓ hidden prompts in all sessions
+prompt view off --tenant	literal	terminal.prompt	[]	unbound	-
+prompt view on	pattern	terminal.toggle-prompts-view	[["state","on"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompt view on --tenant	literal	terminal.prompt	[]	unbound	-
+prompt view toggle	pattern	terminal.toggle-prompts-view	[["state","toggle"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompt view toggle --tenant	literal	terminal.prompt	[]	unbound	-
 prompt-library	pattern	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
 prompt-library "1 gmail fix the bug"	none	-	null	none	-
 prompt-library "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -1841,6 +2143,22 @@ prompt-library 1 gmail fix the bug	none	-	null	none	-
 prompt-library 1 gmail fix the bug --tenant	none	-	null	none	-
 prompt-library 3 best	none	-	null	none	-
 prompt-library 3 best --tenant	none	-	null	none	-
+prompt-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompt-view "1 gmail fix the bug"	none	-	null	none	-
+prompt-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+prompt-view "3 best"	none	-	null	none	-
+prompt-view "3 best" --tenant	none	-	null	none	-
+prompt-view --tenant	none	-	null	none	-
+prompt-view 1 gmail fix the bug	none	-	null	none	-
+prompt-view 1 gmail fix the bug --tenant	none	-	null	none	-
+prompt-view 3 best	none	-	null	none	-
+prompt-view 3 best --tenant	none	-	null	none	-
+prompt-view off	pattern	terminal.toggle-prompts-view	[["state","off"]]	ok	ok /prompts-view ✓ hidden prompts in all sessions
+prompt-view off --tenant	none	-	null	none	-
+prompt-view on	pattern	terminal.toggle-prompts-view	[["state","on"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompt-view on --tenant	none	-	null	none	-
+prompt-view toggle	pattern	terminal.toggle-prompts-view	[["state","toggle"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompt-view toggle --tenant	none	-	null	none	-
 prompts	pattern	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
 prompts "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound	-
 prompts "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound	-
@@ -1851,6 +2169,38 @@ prompts 1 gmail fix the bug	literal	terminal.prompt	[]	unbound	-
 prompts 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
 prompts 3 best	literal	terminal.prompt	[]	unbound	-
 prompts 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+prompts view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompts view "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound	-
+prompts view "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound	-
+prompts view "3 best"	literal	terminal.prompt	[]	unbound	-
+prompts view "3 best" --tenant	literal	terminal.prompt	[]	unbound	-
+prompts view --tenant	literal	terminal.prompt	[]	unbound	-
+prompts view 1 gmail fix the bug	literal	terminal.prompt	[]	unbound	-
+prompts view 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
+prompts view 3 best	literal	terminal.prompt	[]	unbound	-
+prompts view 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+prompts view off	pattern	terminal.toggle-prompts-view	[["state","off"]]	ok	ok /prompts-view ✓ hidden prompts in all sessions
+prompts view off --tenant	literal	terminal.prompt	[]	unbound	-
+prompts view on	pattern	terminal.toggle-prompts-view	[["state","on"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompts view on --tenant	literal	terminal.prompt	[]	unbound	-
+prompts view toggle	pattern	terminal.toggle-prompts-view	[["state","toggle"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompts view toggle --tenant	literal	terminal.prompt	[]	unbound	-
+prompts-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompts-view "1 gmail fix the bug"	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view "1 gmail fix the bug" --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view "3 best"	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view "3 best" --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view --tenant	literal	terminal.toggle-prompts-view	[["state","--tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view 1 gmail fix the bug	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view 1 gmail fix the bug --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view 3 best	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view 3 best --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view off	pattern	terminal.toggle-prompts-view	[["state","off"]]	ok	ok /prompts-view ✓ hidden prompts in all sessions
+prompts-view off --tenant	literal	terminal.toggle-prompts-view	[["state","off --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view on	pattern	terminal.toggle-prompts-view	[["state","on"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompts-view on --tenant	literal	terminal.toggle-prompts-view	[["state","on --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+prompts-view toggle	pattern	terminal.toggle-prompts-view	[["state","toggle"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+prompts-view toggle --tenant	literal	terminal.toggle-prompts-view	[["state","toggle --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
 quad layout	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 quad layout --tenant	none	-	null	none	-
 refresh plan	pattern	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
@@ -2037,6 +2387,38 @@ shortcuts 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound	-
 shortcuts 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound	-
 shortcuts 3 best	literal	terminal.show-shortcuts	[]	unbound	-
 shortcuts 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound	-
+show prompt	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt --tenant	none	-	null	none	-
+show prompt all	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt all --tenant	none	-	null	none	-
+show prompt all session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt all session --tenant	none	-	null	none	-
+show prompt all sessions	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt all sessions --tenant	none	-	null	none	-
+show prompt every	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt every --tenant	none	-	null	none	-
+show prompt every session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt every session --tenant	none	-	null	none	-
+show prompt every sessions	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt every sessions --tenant	none	-	null	none	-
+show prompt in all	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt in all --tenant	none	-	null	none	-
+show prompt in all session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt in all session --tenant	none	-	null	none	-
+show prompt in all sessions	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt in all sessions --tenant	none	-	null	none	-
+show prompt in every	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt in every --tenant	none	-	null	none	-
+show prompt in every session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt in every session --tenant	none	-	null	none	-
+show prompt in every sessions	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt in every sessions --tenant	none	-	null	none	-
+show prompt-view	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt-view --tenant	none	-	null	none	-
+show prompt-view all	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt-view all --tenant	none	-	null	none	-
+show prompt-view all session	pattern	terminal.toggle-prompts-view	[["state","show"]]	ok	ok /prompts-view ✓ shown prompts in all sessions
+show prompt-view all session --tenant	none	-	null	none	-
 single layout	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
 single layout --tenant	none	-	null	none	-
 six-pack layout	pattern	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
@@ -2279,6 +2661,86 @@ toggle focus-mode 1 gmail fix the bug	none	-	null	none	-
 toggle focus-mode 1 gmail fix the bug --tenant	none	-	null	none	-
 toggle focus-mode 3 best	none	-	null	none	-
 toggle focus-mode 3 best --tenant	none	-	null	none	-
+toggle my prompt view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle my prompt view "1 gmail fix the bug"	none	-	null	none	-
+toggle my prompt view "1 gmail fix the bug" --tenant	none	-	null	none	-
+toggle my prompt view "3 best"	none	-	null	none	-
+toggle my prompt view "3 best" --tenant	none	-	null	none	-
+toggle my prompt view --tenant	none	-	null	none	-
+toggle my prompt view 1 gmail fix the bug	none	-	null	none	-
+toggle my prompt view 1 gmail fix the bug --tenant	none	-	null	none	-
+toggle my prompt view 3 best	none	-	null	none	-
+toggle my prompt view 3 best --tenant	none	-	null	none	-
+toggle my prompt-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle my prompt-view "1 gmail fix the bug"	none	-	null	none	-
+toggle my prompt-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+toggle my prompt-view "3 best"	none	-	null	none	-
+toggle my prompt-view "3 best" --tenant	none	-	null	none	-
+toggle my prompt-view --tenant	none	-	null	none	-
+toggle my prompt-view 1 gmail fix the bug	none	-	null	none	-
+toggle my prompt-view 1 gmail fix the bug --tenant	none	-	null	none	-
+toggle my prompt-view 3 best	none	-	null	none	-
+toggle my prompt-view 3 best --tenant	none	-	null	none	-
+toggle my prompts view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle my prompts view "1 gmail fix the bug"	none	-	null	none	-
+toggle my prompts view "1 gmail fix the bug" --tenant	none	-	null	none	-
+toggle my prompts view "3 best"	none	-	null	none	-
+toggle my prompts view "3 best" --tenant	none	-	null	none	-
+toggle my prompts view --tenant	none	-	null	none	-
+toggle my prompts view 1 gmail fix the bug	none	-	null	none	-
+toggle my prompts view 1 gmail fix the bug --tenant	none	-	null	none	-
+toggle my prompts view 3 best	none	-	null	none	-
+toggle my prompts view 3 best --tenant	none	-	null	none	-
+toggle my prompts-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle my prompts-view "1 gmail fix the bug"	none	-	null	none	-
+toggle my prompts-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+toggle my prompts-view "3 best"	none	-	null	none	-
+toggle my prompts-view "3 best" --tenant	none	-	null	none	-
+toggle my prompts-view --tenant	none	-	null	none	-
+toggle my prompts-view 1 gmail fix the bug	none	-	null	none	-
+toggle my prompts-view 1 gmail fix the bug --tenant	none	-	null	none	-
+toggle my prompts-view 3 best	none	-	null	none	-
+toggle my prompts-view 3 best --tenant	none	-	null	none	-
+toggle prompt view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle prompt view "1 gmail fix the bug"	none	-	null	none	-
+toggle prompt view "1 gmail fix the bug" --tenant	none	-	null	none	-
+toggle prompt view "3 best"	none	-	null	none	-
+toggle prompt view "3 best" --tenant	none	-	null	none	-
+toggle prompt view --tenant	none	-	null	none	-
+toggle prompt view 1 gmail fix the bug	none	-	null	none	-
+toggle prompt view 1 gmail fix the bug --tenant	none	-	null	none	-
+toggle prompt view 3 best	none	-	null	none	-
+toggle prompt view 3 best --tenant	none	-	null	none	-
+toggle prompt-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle prompt-view "1 gmail fix the bug"	none	-	null	none	-
+toggle prompt-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+toggle prompt-view "3 best"	none	-	null	none	-
+toggle prompt-view "3 best" --tenant	none	-	null	none	-
+toggle prompt-view --tenant	none	-	null	none	-
+toggle prompt-view 1 gmail fix the bug	none	-	null	none	-
+toggle prompt-view 1 gmail fix the bug --tenant	none	-	null	none	-
+toggle prompt-view 3 best	none	-	null	none	-
+toggle prompt-view 3 best --tenant	none	-	null	none	-
+toggle prompts view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle prompts view "1 gmail fix the bug"	none	-	null	none	-
+toggle prompts view "1 gmail fix the bug" --tenant	none	-	null	none	-
+toggle prompts view "3 best"	none	-	null	none	-
+toggle prompts view "3 best" --tenant	none	-	null	none	-
+toggle prompts view --tenant	none	-	null	none	-
+toggle prompts view 1 gmail fix the bug	none	-	null	none	-
+toggle prompts view 1 gmail fix the bug --tenant	none	-	null	none	-
+toggle prompts view 3 best	none	-	null	none	-
+toggle prompts view 3 best --tenant	none	-	null	none	-
+toggle prompts-view	pattern	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle prompts-view "1 gmail fix the bug"	none	-	null	none	-
+toggle prompts-view "1 gmail fix the bug" --tenant	none	-	null	none	-
+toggle prompts-view "3 best"	none	-	null	none	-
+toggle prompts-view "3 best" --tenant	none	-	null	none	-
+toggle prompts-view --tenant	none	-	null	none	-
+toggle prompts-view 1 gmail fix the bug	none	-	null	none	-
+toggle prompts-view 1 gmail fix the bug --tenant	none	-	null	none	-
+toggle prompts-view 3 best	none	-	null	none	-
+toggle prompts-view 3 best --tenant	none	-	null	none	-
 toggle sessions	pattern	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
 toggle sessions "1 gmail fix the bug"	none	-	null	none	-
 toggle sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -2359,6 +2821,16 @@ toggle-notifications 1 gmail fix the bug	literal	terminal.toggle-desktop-notify	
 toggle-notifications 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound	-
 toggle-notifications 3 best	literal	terminal.toggle-desktop-notify	[]	unbound	-
 toggle-notifications 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound	-
+toggle-prompts	literal	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+toggle-prompts "1 gmail fix the bug"	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+toggle-prompts "1 gmail fix the bug" --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+toggle-prompts "3 best"	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+toggle-prompts "3 best" --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+toggle-prompts --tenant	literal	terminal.toggle-prompts-view	[["state","--tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+toggle-prompts 1 gmail fix the bug	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+toggle-prompts 1 gmail fix the bug --tenant	literal	terminal.toggle-prompts-view	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+toggle-prompts 3 best	literal	terminal.toggle-prompts-view	[["state","3 best"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
+toggle-prompts 3 best --tenant	literal	terminal.toggle-prompts-view	[["state","3 best --tenant"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
 toggle-sessions	literal	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
 toggle-sessions "1 gmail fix the bug"	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
 toggle-sessions "1 gmail fix the bug" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
@@ -2557,6 +3029,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.toggle-focus-mode [bool] do the thing	ai	terminal.toggle-focus-mode	[]	refused	error /focus-mode: "count" must be text or a number (got true/false)
 «ai» terminal.toggle-focus-mode [empty] do the thing	ai	terminal.toggle-focus-mode	[]	ok	ok /focus-mode ✓ enabled focus mode
 «ai» terminal.toggle-focus-mode [valid] do the thing	ai	terminal.toggle-focus-mode	[]	ok	ok /focus-mode ✓ enabled focus mode
+«ai» terminal.toggle-prompts-view [alien] do the thing	ai	terminal.toggle-prompts-view	[["nonsense","x"]]	refused	error /prompts-view: takes no argument named "nonsense"
+«ai» terminal.toggle-prompts-view [bool] do the thing	ai	terminal.toggle-prompts-view	[]	refused	error /prompts-view: "state" must be text or a number (got true/false)
+«ai» terminal.toggle-prompts-view [empty] do the thing	ai	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+«ai» terminal.toggle-prompts-view [valid] do the thing	ai	terminal.toggle-prompts-view	[["state","idle"]]	error:invalid-args	error /prompts-view: state must be one of: on, off, toggle
 «ai» terminal.toggle-sessions-sidebar [alien] do the thing	ai	terminal.toggle-sessions-sidebar	[["nonsense","x"]]	refused	error /sessions: takes no arguments (got "nonsense")
 «ai» terminal.toggle-sessions-sidebar [bool] do the thing	ai	terminal.toggle-sessions-sidebar	[]	refused	error /sessions: "count" must be text or a number (got true/false)
 «ai» terminal.toggle-sessions-sidebar [empty] do the thing	ai	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
@@ -2717,6 +3193,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.toggle-focus-mode [bool]	direct	terminal.toggle-focus-mode	[["count",true]]	threw	error /focus-mode: "count" must be text or a number (got true/false)
 «direct» terminal.toggle-focus-mode [empty]	direct	terminal.toggle-focus-mode	[]	ok	ok /focus-mode ✓ enabled focus mode
 «direct» terminal.toggle-focus-mode [valid]	direct	terminal.toggle-focus-mode	[]	ok	ok /focus-mode ✓ enabled focus mode
+«direct» terminal.toggle-prompts-view [alien]	direct	terminal.toggle-prompts-view	[["nonsense","x"]]	threw	error /prompts-view: takes no argument named "nonsense"
+«direct» terminal.toggle-prompts-view [bool]	direct	terminal.toggle-prompts-view	[["state",true]]	threw	error /prompts-view: "state" must be text or a number (got true/false)
+«direct» terminal.toggle-prompts-view [empty]	direct	terminal.toggle-prompts-view	[]	ok	ok /prompts-view ✓ shown prompts in all sessions
+«direct» terminal.toggle-prompts-view [valid]	direct	terminal.toggle-prompts-view	[["state","idle"]]	threw	error /prompts-view: state must be one of: on, off, toggle
 «direct» terminal.toggle-sessions-sidebar [alien]	direct	terminal.toggle-sessions-sidebar	[["nonsense","x"]]	threw	error /sessions: takes no arguments (got "nonsense")
 «direct» terminal.toggle-sessions-sidebar [bool]	direct	terminal.toggle-sessions-sidebar	[["count",true]]	threw	error /sessions: "count" must be text or a number (got true/false)
 «direct» terminal.toggle-sessions-sidebar [empty]	direct	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar

@@ -62,6 +62,7 @@ import { BatchActions } from "./BatchActions";
 import { MinimapToggle } from "./MinimapToggle";
 import { PruneTerminalsButton } from "./PruneTerminalsButton";
 import { usePrunePlan } from "./usePrunePlan";
+import { PromptsViewToggle } from "./PromptsViewToggle";
 import {
   countLiveTabs,
   countTabsInState,
@@ -490,6 +491,11 @@ export function StatusStrip() {
           sessions), so gating on the wrong one yields a button that toggles
           a widget which never renders, or a visible widget with no button. */}
       {zoneLayout.isMultiZone && <MinimapToggle />}
+
+      {/* Global prompts-view switch — every session, every page tab. Not
+          gated on zone count: a single maximized session has a prompts
+          column too. */}
+      <PromptsViewToggle />
 
       {/* "Keep AI" — close the non-AI windows and compact the grid. Renders
           nothing when that would change nothing. */}

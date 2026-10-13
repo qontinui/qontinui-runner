@@ -64,6 +64,7 @@ import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import type { ApprovalReport } from "../approveAll";
+import { getPromptsViewGlobal, setPromptsViewForAll } from "../promptsViewGlobal";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -1834,6 +1835,46 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     patterns: [/^prompts?$/i, /^prompt[- ]library$/i],
     handler: async (): Promise<CommandResult<EffectReport>> => {
       return ok(stateEffect("opened", "the prompt library", ctx.openPromptModal().changed));
+    },
+  });
+
+  // 33c. /prompts-view [on|off] — the operator's-prompts panel in EVERY
+  // session on every page tab. Same as the Prompts toggle in the status
+  // strip. Not `/prompts`: that is already the prompt library's alias.
+  useCommandAction({
+    id: "terminal.toggle-prompts-view",
+    slash: "/prompts-view",
+    aliases: ["/my-prompts", "/toggle-prompts"],
+    label: "Toggle prompts view in all sessions",
+    description:
+      "Show or hide the panel listing your own prompts in every session on " +
+      "every page tab. With no argument it toggles; `on` / `off` set it. " +
+      "Clears any per-session show/hide choices. Same as the Prompts toggle " +
+      "in the status strip.",
+    paramSchema: { state: 'string (optional) — one of "on", "off", "toggle"' },
+    patterns: [
+      /^(?:toggle\s+)?(?:my\s+)?prompts?[- ]view(?:\s+(?<state>on|off|toggle))?$/i,
+      /^(?<state>show|hide)\s+(?:my\s+)?prompts?(?:[- ]view)?(?:\s+(?:in\s+)?(?:all|every)(?:\s+sessions?)?)?$/i,
+    ],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
+      const raw = textArg(args, "state").trim().toLowerCase();
+      const wasOn = getPromptsViewGlobal().enabled;
+      let target: boolean;
+      if (raw === "" || raw === "toggle") target = !wasOn;
+      else if (raw === "on" || raw === "show") target = true;
+      else if (raw === "off" || raw === "hide") target = false;
+      else return fail("invalid-args", "state must be one of: on, off, toggle");
+      if (!setPromptsViewForAll(target)) {
+        return fail(
+          "save-failed",
+          "Could not save the prompts-view setting (storage unavailable).",
+        );
+      }
+      // Always a change, even when the default was already `target`: the
+      // epoch bump discards every per-session show/hide, so sessions the
+      // operator closed one by one re-open. Reporting that as a no-op would
+      // tell them nothing happened when panels just appeared.
+      return ok(stateEffect(target ? "shown" : "hidden", "prompts in all sessions", true));
     },
   });
 
