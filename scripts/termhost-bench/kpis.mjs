@@ -529,26 +529,43 @@ export const STALL_MIN_MS = 2000;
 /** ... while its generator wrote at least this many output markers. */
 export const STALL_MIN_EMITTED = 20;
 /**
- * A run of a still marker ends where the session's marker was absent from the
- * primary frames for longer than this: frames kept arriving without it (the pane
- * was hidden, scrolled away or covered), so the same sequence shown after the gap
- * is a redisplay of old content, not evidence the pane kept failing to repaint.
+ * A stretch of still marker (a "piece") ends where the session's marker was
+ * absent from the primary frames for longer than this, measured from the FIRST
+ * frame that lacked it to the next frame that shows it: frames kept arriving
+ * without it (the pane was hidden, scrolled away or covered). The hidden time is
+ * not counted toward a stall's duration. Pieces that show the same sequence on
+ * either side of such a gap are still one stall (see {@link paneStalls}).
+ *
  * Fixed rather than one marker period: at `marker_hz` 10 a period is 100 ms, less
  * than a partial (band) read takes to come round a 3x3 grid again, which would
- * split every run. 1 s is under half {@link STALL_MIN_MS}, so a hidden stretch
- * can never be bridged into a stall. Stretches with no frame at all do not end a
- * run: a frozen screen produces none.
+ * split every piece. 900 ms is strictly under half {@link STALL_MIN_MS}, so the
+ * absence a piece may still contain is always shorter than the time it was seen.
+ * A stretch with no frame at all does not end a piece: a frozen screen produces
+ * none.
  */
-export const STALL_HIDDEN_GAP_MS = 1000;
+export const STALL_HIDDEN_GAP_MS = 900;
 /** Probe interval classes that rule a stretch out (`model/intervals.rs`): not foreground / visible / cloaked / minimized / occluded, or real input. */
 export const STALL_EXCLUDING_CLASSES = Object.freeze(["occluded", "operator_activity"]);
 
 /**
- * The spans of the probe's closed intervals whose own verdict excludes them for
- * visibility (not foreground, not visible, cloaked, minimized, occluded) or for
- * operator activity (real or foreign input). This reads the probe's
- * `exclusion_class`, the verdict its hang and marker-loss rules apply through
- * `span_valid`; it does not re-derive it from the counters.
+ * The spans of the probe's closed intervals whose own verdict (`valid: false`
+ * with an `exclusion_class`) excludes them for visibility (not foreground, not
+ * visible, cloaked, minimized, occluded) or for operator activity (real or
+ * foreign input). It reads that verdict rather than re-deriving it from the
+ * counters.
+ *
+ * It deliberately differs from the probe's `span_valid`, which treats every
+ * interval that is not positively valid as invalid. Here only the two classes
+ * above rule a stretch out:
+ * - `harness_error` intervals are NOT excluded: that class includes an absent
+ *   input monitor and an unknown window state, the standing condition on Xvfb,
+ *   where excluding them would switch the stall rule off in CI, the place it was
+ *   found;
+ * - a `partial` trailing interval is NOT excluded: it is merely short, and a
+ *   wedge runs to the end of the window by definition;
+ * - a MISSING interval (none recorded for a stretch) is NOT excluded: nothing
+ *   says the pane was hidden or the operator was typing then.
+ * A record whose `valid` is not exactly `false` is not excluded either.
  *
  * @returns {{a: bigint, b: bigint, cls: string}[]}
  */
@@ -563,24 +580,35 @@ export function excludedSpans(seg) {
   return out;
 }
 
+/** Is marker seq `m` strictly after `s`, mod the marker counter? (A backwards or equal seq is not.) */
+function seqAdvanced(m, s) {
+  return m !== s && seqAtOrAfter(m, s);
+}
+
 /**
- * Panes that did not repaint: a run of primary frames in which a displayed
- * session's output marker stayed at one sequence while its generator kept writing
- * — at least {@link STALL_MIN_MS} between the run's first and last frame, with at
- * least {@link STALL_MIN_EMITTED} output markers emitted in (first, last]. A run
- * does not qualify when it overlaps an interval the probe excluded
- * ({@link excludedSpans}), and it ends where the marker was hidden for longer than
- * {@link STALL_HIDDEN_GAP_MS}.
+ * Panes that did not repaint, per displayed session.
  *
- * One entry per session:
- * - `recovered: false` — the WEDGE: a qualifying run that reaches the last primary
- *   frame in the window showing that session's marker (frozen for the whole soak,
- *   or from part-way to its end). Its marker KPIs are unknown(pane_stalled):
- *   measured from the live part, they would hide the wedge. Reported even when an
- *   earlier recovered hitch was longer.
- * - `recovered: true` — otherwise the LONGEST qualifying run, after which the
- *   marker advanced again: a hitch. The KPIs stay measured (a hitch is exactly
- *   what they must show); the hitch is reported beside them.
+ * The session's primary frames inside the window are cut into PIECES: stretches
+ * that show one output-marker sequence, ended by a different sequence, by the
+ * marker being hidden for over {@link STALL_HIDDEN_GAP_MS}, or by an interval the
+ * probe excluded ({@link excludedSpans}; frames inside one are dropped). Pieces
+ * that show the SAME sequence one after another, across a hidden stretch or an
+ * excluded interval, form one STILL RUN: a frozen pane covered for a while and
+ * shown again is still frozen. A still run's `ms` is the time it was SEEN (the
+ * sum of its pieces' spans; hidden and excluded time are not counted) and
+ * `emitted` the generator's output markers emitted within those pieces
+ * ((first, last] frame of each). It qualifies at >= {@link STALL_MIN_MS} and
+ * >= {@link STALL_MIN_EMITTED}.
+ *
+ * A qualifying run is `recovered` iff a LATER frame shows the session's marker
+ * at a sequence after the run's (mod the counter); a backwards sequence is not
+ * recovery. Per session the result holds:
+ * - the WEDGE, `recovered: false`, if any (the longest): frozen for the whole
+ *   soak, or from part-way to its end. Its marker KPIs are unknown(pane_stalled):
+ *   measured from the live part, they would hide it;
+ * - the longest HITCH, `recovered: true`, if any: the KPIs stay measured (a hitch
+ *   is exactly what they must show) and it is reported beside them.
+ * Entries are in time order (session, then start).
  *
  * Neither the window-level hang rule (other content keeps producing frames) nor
  * marker loss (counted in refresh intervals, unknown on Xvfb) sees a wedge. Found
@@ -596,49 +624,71 @@ export function paneStalls(seg, gens, win, visible) {
   if (!seg || !win) return [];
   const primary = captureInfo(seg).primary;
   if (!primary) return [];
-  const frames = primaryFrames(seg, primary, win);
   const excluded = excludedSpans(seg);
+  const inExcluded = (t) => excluded.some((x) => t >= x.a && t <= x.b);
+  const frames = primaryFrames(seg, primary, win);
   const gapNs = BigInt(STALL_HIDDEN_GAP_MS) * NS_PER_MS;
   const out = [];
   for (const session of [...visible].sort((a, b) => a - b)) {
     const emits = (gens?.get?.(session)?.markers ?? [])
       .filter((m) => m.kind === "output" && typeof m.tEmit === "bigint")
       .map((m) => m.tEmit);
-    // Each frame showing the marker, and whether it follows a hidden stretch.
-    const shown = [];
-    let missedSince = false;
+    // Pieces: {seq, t0, t1, frames}, in time order.
+    const pieces = [];
+    let piece = null;
+    let missingSince = null;
     for (const f of frames) {
-      const m = (f.markers ?? []).find((x) => x.kind === "output" && x.session === session);
-      if (!m || !Number.isInteger(m.seq)) {
-        missedSince = true;
+      if (inExcluded(f.t)) {
+        piece = null;
+        missingSince = null;
         continue;
       }
-      const prev = shown.at(-1);
-      shown.push({ t: f.t, seq: m.seq, afterGap: Boolean(prev) && missedSince && f.t - prev.t > gapNs });
-      missedSince = false;
-    }
-    let longest = null;
-    let wedge = null;
-    for (let i = 0; i < shown.length; ) {
-      let j = i;
-      while (j + 1 < shown.length && shown[j + 1].seq === shown[i].seq && !shown[j + 1].afterGap) j += 1;
-      const t0 = shown[i].t;
-      const t1 = shown[j].t;
-      const ms = Number(t1 - t0) / 1e6;
-      const emitted = emits.filter((t) => t > t0 && t <= t1).length;
-      const clear = !excluded.some((x) => x.a < t1 && x.b > t0);
-      if (ms >= STALL_MIN_MS && emitted >= STALL_MIN_EMITTED && clear) {
-        const run = { session, seq: shown[i].seq, ms: Math.round(ms), frames: j - i + 1, emitted, recovered: j < shown.length - 1, rawMs: ms };
-        if (!run.recovered) wedge = run;
-        else if (!longest || ms > longest.rawMs) longest = run;
+      const m = (f.markers ?? []).find((x) => x.kind === "output" && x.session === session);
+      if (!m || !Number.isInteger(m.seq)) {
+        missingSince ??= f.t;
+        continue;
       }
-      i = j + 1;
+      const hidden = missingSince !== null && f.t - missingSince > gapNs;
+      missingSince = null;
+      if (piece && piece.seq === m.seq && !hidden) {
+        piece.t1 = f.t;
+        piece.frames += 1;
+      } else {
+        piece = { seq: m.seq, t0: f.t, t1: f.t, frames: 1 };
+        pieces.push(piece);
+      }
     }
-    const pick = wedge ?? longest;
-    if (pick) {
-      const { rawMs: _raw, ...rest } = pick;
-      out.push(rest);
+    // Still runs: consecutive pieces with the same seq.
+    const runs = [];
+    for (const p of pieces) {
+      const last = runs.at(-1);
+      if (last && last.seq === p.seq) last.pieces.push(p);
+      else runs.push({ seq: p.seq, pieces: [p] });
     }
+    let wedge = null;
+    let hitch = null;
+    runs.forEach((run, k) => {
+      const ns = run.pieces.reduce((acc, p) => acc + (p.t1 - p.t0), 0n);
+      const ms = Number(ns) / 1e6;
+      const emitted = emits.filter((t) => run.pieces.some((p) => t > p.t0 && t <= p.t1)).length;
+      if (ms < STALL_MIN_MS || emitted < STALL_MIN_EMITTED) return;
+      const recovered = runs.slice(k + 1).some((later) => seqAdvanced(later.seq, run.seq));
+      const entry = {
+        session,
+        seq: run.seq,
+        ms: Math.round(ms),
+        frames: run.pieces.reduce((acc, p) => acc + p.frames, 0),
+        emitted,
+        recovered,
+        rawMs: ms,
+        start: run.pieces[0].t0,
+      };
+      if (!recovered) {
+        if (!wedge || ms > wedge.rawMs) wedge = entry;
+      } else if (!hitch || ms > hitch.rawMs) hitch = entry;
+    });
+    const picked = [hitch, wedge].filter(Boolean).sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+    for (const { rawMs: _raw, start: _start, ...rest } of picked) out.push(rest);
   }
   return out;
 }

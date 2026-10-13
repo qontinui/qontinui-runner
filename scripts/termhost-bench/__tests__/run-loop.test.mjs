@@ -25,7 +25,7 @@ import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
 
 /** A run on fakes; returns the result and every adapter call. */
-async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null, adapterHook = null, wrapProbe = null } = {}) {
+async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null, adapterHook = null, wrapProbe = null, wrapSleep = null } = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "tb-run-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   mkdirSync(join(tmp, "primary"), { recursive: true });
@@ -36,7 +36,7 @@ async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = 
   let current = null;
   const deps = {
     log: () => {},
-    sleep: clock.sleep,
+    sleep: wrapSleep ? wrapSleep(clock.sleep) : clock.sleep,
     startEnvironment: async () => ({ env: { DISPLAY: ":99" }, screen: { width: 1920, height: 1080, scalePct: 100 }, display: ":99", stop: async () => calls.push(["env.stop"]) }),
     probePath: "fake-probe",
     createAdapter: async (setup, o) => {
@@ -87,7 +87,7 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
   const { res, calls, probe } = await fakeRun(t, {
     opts: { restoreCheckMs: 4000 },
     adapterHook: (a, setup) => {
-      if (setup === "runner") a.restoreZone = async () => ({ maximizedZone: null });
+      if (setup === "runner") realZoneView(a);
     },
   });
   assert.equal(validateResults(res.doc).valid, true, JSON.stringify(validateResults(res.doc).errors.slice(0, 5)));
@@ -578,75 +578,163 @@ test("the spawn pass measures new sessions even when its arrangement shows no ea
 });
 
 
-test("after the focus arm, a restore-zone check records a frozen restored pane as an incident, gating nothing (review r9 nit 2)", async (t) => {
-  const restores = [];
-  const run = (freeze) =>
-    fakeRun(t, {
-      opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
-      adapterHook: (a) => {
-        a.restoreZone = async () => {
-          restores.push(a.unit.index);
-          return { maximizedZone: null };
-        };
-      },
-      wrapProbe: (inner) => ({
-        ...inner,
-        startWatch(o) {
-          const w = inner.startWatch(o);
-          if (!freeze || o.label !== "focus-restore-check") return w;
-          return { ...w, stop: async () => {
-            const seg = await w.stop();
-            return { ...seg, records: stallSegment(seg.records) };
-          } };
-        },
-      }),
-    });
-  const frozen = (await run(true)).res;
-  assert.ok(restores.length > 0, "the check restored the zone");
-  const focus = frozen.doc.rows.find((r) => r.scenario.arm === "focus");
-  const inc = focus.incidents.filter((i) => i.kind === "pane_stalled");
-  assert.equal(inc.length, 1, JSON.stringify(focus.incidents));
-  assert.match(inc[0].detail, /arm focus: after restore-zone: session 0 stayed at seq \d+ for \d+ ms .*the restored pane is not repainting/);
-  assert.equal(focus.kpis.output_latency_ms.state, "measured", "it gates nothing: the focus soak is unaffected");
-  assert.equal(validateResults(frozen.doc).valid, true);
-  const clean = (await run(false)).res;
-  assert.ok(!clean.doc.rows.some((r) => r.incidents.some((i) => i.kind === "pane_stalled")));
+/**
+ * Give a fake runner adapter the zone view TerminalPage.tsx's handlers have:
+ * restore-zone ALWAYS answers `maximizedZone: null` (buildMaximizeResult), with
+ * `changed: false` when nothing was maximized; get-zone-view-state reads the
+ * state back. The focus arm leaves zone 0 maximized unless `maximized` says not.
+ */
+function realZoneView(a, { maximized = 0, viewAfter, events = null, throwOnRestore = null } = {}) {
+  let current = maximized;
+  a.restoreZone = async () => {
+    events?.push("restore");
+    if (throwOnRestore) throw new Error(throwOnRestore);
+    const previous = current;
+    current = null;
+    return { maximizedZone: null, previousMaximizedZone: previous, zoneCount: 4, changed: previous !== null };
+  };
+  a.zoneViewState = async () => {
+    events?.push("view");
+    return { maximizedZone: viewAfter === undefined ? current : viewAfter, zoneCount: 4, layoutId: "quad" };
+  };
+}
+
+/** The restore-check watch's records, rewritten by `edit`. */
+const editRestoreWatch = (edit) => (inner) => ({
+  ...inner,
+  startWatch(o) {
+    const w = inner.startWatch(o);
+    if (o.label !== "focus-restore-check") return w;
+    return { ...w, stop: async () => {
+      const seg = await w.stop();
+      return { ...seg, records: edit(seg.records) };
+    } };
+  },
 });
 
-test("a restore that does not take, or a check that saw nothing, is recorded as UNKNOWN, never clean (review r10 SF6/SF7)", async (t) => {
-  const stuck = (
-    await fakeRun(t, {
-      opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
-      adapterHook: (a) => {
-        a.restoreZone = async () => ({ maximizedZone: 0 });
+/** One runner unit at N = 1 with a restore check; returns the focus row and the logs. */
+async function restoreRun(t, { zone = {}, wrapProbe = null, facts, deps = {}, adapterHook = null, wrapSleep = null } = {}) {
+  const logs = [];
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
+    adapterHook: (a, setup) => {
+      realZoneView(a, zone);
+      adapterHook?.(a, setup);
+    },
+    wrapProbe,
+    facts,
+    wrapSleep,
+    deps: { log: (m) => logs.push(String(m)), ...deps },
+  });
+  assert.equal(validateResults(res.doc).valid, true, JSON.stringify(validateResults(res.doc).errors?.slice(0, 3)));
+  return { res, focus: res.doc.rows.find((r) => r.scenario.arm === "focus"), logs };
+}
+const unknownIncident = (row, re) =>
+  row.incidents.some((i) => i.kind === "harness_error" && /restore check UNKNOWN: /.test(i.detail) && re.test(i.detail) && /this is not a clean result$/.test(i.detail));
+const check = (row) => row.diagnostics["focus.restore_check"];
+
+test("after the focus arm, a restore-zone check records a frozen restored pane as an incident, gating nothing (review r9 nit 2)", async (t) => {
+  const frozen = await restoreRun(t, { wrapProbe: editRestoreWatch((r) => stallSegment(r)) });
+  const inc = frozen.focus.incidents.filter((i) => i.kind === "pane_stalled");
+  assert.equal(inc.length, 1, JSON.stringify(frozen.focus.incidents));
+  assert.match(inc[0].detail, /arm focus: after restore-zone: session 0 stayed at seq \d+ for \d+ ms .*: the restored pane is not repainting$/);
+  assert.equal(frozen.focus.kpis.output_latency_ms.state, "measured", "it gates nothing: the focus soak is unaffected");
+  assert.equal(check(frozen.focus).state, "measured");
+  assert.equal(check(frozen.focus).data.outcome, "not repainting");
+  // A clean check says so, positively.
+  const clean = await restoreRun(t);
+  assert.ok(!clean.res.doc.rows.some((r) => r.incidents.some((i) => i.kind === "pane_stalled" || /restore check/.test(i.detail))));
+  assert.equal(check(clean.focus).state, "measured");
+  assert.match(check(clean.focus).notes[0], /^restore check: observed, clean \(\d+ primary frame\(s\), 1 session\(s\): 0=\d+\)$/);
+  assert.ok(clean.logs.some((l) => /restore check: observed, clean/.test(l)));
+});
+
+test("a hitch the restored pane recovers from is reported as recovered (review r11 SF4)", async (t) => {
+  const { focus } = await restoreRun(t, { wrapProbe: editRestoreWatch((r) => freezeWindow(r, 500, 3000)) });
+  const inc = focus.incidents.filter((i) => i.kind === "pane_stalled");
+  assert.equal(inc.length, 1, JSON.stringify(focus.incidents));
+  assert.match(inc[0].detail, /after restore-zone: .*, then advanced again: a hitch the restored pane recovered from$/);
+  assert.equal(inc[0].data.recovered, true);
+  assert.equal(check(focus).data.outcome, "recovered from a hitch");
+});
+
+test("the restore check settles BEFORE its watch, after reading the restore back (review r11 SF4)", async (t) => {
+  const events = [];
+  await restoreRun(t, {
+    zone: { events },
+    wrapSleep: (inner) => async (ms) => {
+      events.push(`sleep:${ms}`);
+      return inner(ms);
+    },
+    wrapProbe: (inner) => ({
+      ...inner,
+      startWatch(o) {
+        events.push(`watch:${o.label}`);
+        return inner.startWatch(o);
       },
-    })
-  ).res;
-  const f1 = stuck.doc.rows.find((r) => r.scenario.arm === "focus");
-  assert.ok(f1.incidents.some((i) => i.kind === "harness_error" && /restore-zone did not take \(maximized zone 0\); restore check UNKNOWN/.test(i.detail)), JSON.stringify(f1.incidents));
-  assert.ok(!f1.incidents.some((i) => /restored pane/.test(i.detail)), "no claim about a restored pane");
-  const blind = (
-    await fakeRun(t, {
-      opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
-      adapterHook: (a) => {
-        a.restoreZone = async () => ({ maximizedZone: null });
-      },
-      wrapProbe: (inner) => ({
-        ...inner,
-        startWatch(o) {
-          const w = inner.startWatch(o);
-          if (o.label !== "focus-restore-check") return w;
-          return { ...w, stop: async () => {
-            const seg = await w.stop();
-            return { ...seg, records: seg.records.filter((r) => r.type !== "summary") };
-          } };
+    }),
+  });
+  const from = events.indexOf("restore");
+  assert.ok(from >= 0, events.join(","));
+  assert.deepEqual(events.slice(from, from + 5), ["restore", "sleep:500", "view", "watch:focus-restore-check", "sleep:4000"]);
+});
+
+test("every restore-check path that could not look is UNKNOWN, never clean (review r10 SF6/SF7, r11 SF1/SF2/SF4)", async (t) => {
+  const cases = [
+    ["nothing was maximized (changed: false)", { zone: { maximized: null } }, /changed: false \(nothing was maximized\)/],
+    ["no changed field", { adapterHook: (a) => { a.restoreZone = async () => ({ maximizedZone: null }); } }, /carries no changed field/],
+    ["the view still reads maximized", { zone: { viewAfter: 2 } }, /zone view state reads maximized zone 2/],
+    ["the view cannot be read back", { adapterHook: (a) => { delete a.zoneViewState; } }, /cannot read the zone view state back/],
+    ["no summary", { wrapProbe: editRestoreWatch((rs) => rs.filter((r) => r.type !== "summary")) }, /its watch wrote no summary/],
+    ["no window", { wrapProbe: editRestoreWatch((rs) => rs.map((r) => (r.type === "summary" ? { ...r, t_end_ns: r.t_start_ns } : r))) }, /no measurement window/],
+    ["no primary source", { wrapProbe: editRestoreWatch((rs) => rs.map((r) => (r.type === "capture" ? { ...r, state: "failed" } : r))) }, /no primary capture source opened/],
+    ["no session seen", { wrapProbe: editRestoreWatch((rs) => rs.map((r) => (r.type === "summary" ? { ...r, sessions_seen: [] } : r))) }, /saw no session's marker/],
+    ["too few frames (a frozen screen writes none)", { wrapProbe: editRestoreWatch((rs) => { let n = 0; return rs.filter((r) => r.type !== "frame" || n++ < 5); }) }, /too few primary frames to judge \(session 0: 5; the check needs 10 each\)/],
+    ["the restore threw", { zone: { throwOnRestore: "UI Bridge action failed: boom" } }, /UNKNOWN: UI Bridge action failed: boom/],
+    [
+      "the focus arm failed",
+      {
+        adapterHook: (a) => {
+          const base = a.arrange.bind(a);
+          a.arrange = async (arm, actx) => (arm === "focus" ? { ok: false, failure: { reason: "zone_unresolved", detail: "fake" } } : base(arm, actx));
         },
-      }),
-    })
-  ).res;
-  const f2 = blind.doc.rows.find((r) => r.scenario.arm === "focus");
-  assert.ok(f2.incidents.some((i) => i.kind === "harness_error" && /restore check UNKNOWN: its watch wrote no summary; this is not a clean result/.test(i.detail)), JSON.stringify(f2.incidents));
-  assert.equal(validateResults(blind.doc).valid, true);
+      },
+      /the focus arm failed \(zone_unresolved\)/,
+    ],
+  ];
+  for (const [what, o, re] of cases) {
+    const { focus } = await restoreRun(t, o);
+    assert.ok(unknownIncident(focus, re), `${what}: ${JSON.stringify(focus.incidents)}`);
+    assert.equal(check(focus).state, "unknown", what);
+    assert.match(check(focus).detail, re, what);
+    assert.ok(!focus.incidents.some((i) => i.kind === "pane_stalled"), what);
+  }
+  // An unaligned clock: emission times cannot be set against frame times.
+  const facts = healthyFacts();
+  facts.probeDoctor.record.mechanisms = facts.probeDoctor.record.mechanisms.map((m) => (m.id === "clock.aligned" ? { ...m, state: "UNKNOWN", reason: "node not found" } : m));
+  const unaligned = await restoreRun(t, { facts, wrapProbe: editRestoreWatch((r) => stallSegment(r)) });
+  assert.ok(unknownIncident(unaligned.focus, /clock\.aligned is UNKNOWN/), JSON.stringify(unaligned.focus.incidents));
+  assert.ok(!unaligned.focus.incidents.some((i) => i.kind === "pane_stalled"));
+});
+
+test("a signal during the restore check's watch makes it UNKNOWN, not clean (review r11 SF2)", async (t) => {
+  const signals = new EventEmitter();
+  const logs = [];
+  await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
+    adapterHook: (a) => realZoneView(a),
+    deps: { signals, log: (m) => logs.push(String(m)) },
+    wrapProbe: (inner) => ({
+      ...inner,
+      startWatch(o) {
+        const w = inner.startWatch(o);
+        if (o.label === "focus-restore-check") signals.emit("SIGINT", "SIGINT");
+        return w;
+      },
+    }),
+  });
+  assert.ok(logs.some((l) => /restore check UNKNOWN: the run was interrupted during its watch; this is not a clean result/.test(l)), logs.filter((l) => /restore/.test(l)).join("\n"));
+  assert.ok(!logs.some((l) => /restore check: observed/.test(l)));
 });
 
 test("a recovered hitch in a soak is a pane_stalled incident that says so, and voids nothing (review r10 MF1)", async (t) => {

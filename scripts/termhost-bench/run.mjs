@@ -34,7 +34,7 @@ import { ZONE_SETTLE_MS, isPortListening } from "./adapters/runner.mjs";
 import { PRIMARY_RUNNER_PORT } from "../lib/runner-clients.mjs";
 import { doctorNotes, gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
-import { allUnknown, captureInfo, clockGate, computeRowKpis, describeStall, indexGenerators, indexProbeSegment, injectAbortReason, paneStalls, segmentWindow } from "./kpis.mjs";
+import { allUnknown, captureInfo, clockGate, computeRowKpis, describeStall, indexGenerators, indexProbeSegment, injectAbortReason, paneStalls, primaryFrames, segmentWindow } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
 import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
@@ -47,6 +47,9 @@ import { echoCount, readGeneratorLog, readGeneratorLogs, readSlots, slotForHostI
 const GENERATOR_FLAG = "--termhost-bench-generator";
 
 /** Defaults for the measurement phases. */
+/** The restore check judges a session only from at least this many primary frames showing its marker. */
+export const RESTORE_CHECK_MIN_FRAMES = 10;
+
 export const RUN_DEFAULTS = Object.freeze({
   warmupMs: 10000,
   soakMs: 60000,
@@ -1054,52 +1057,89 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
   // few seconds for a pane that does not repaint. CI run 38351621760 found the pane
   // frozen after restore-zone; this keeps the restore path observable in every
   // scheduled run. It runs after the diagnostics, which read the focus layout.
-  if (measure && arm === "focus" && o.restoreCheckMs > 0 && typeof adapter.restoreZone === "function" && !interrupted()) {
-    const data = { setup: unit.setup, unit: name, arm, phase: "focus/restore-check" };
-    // A check that could not look is UNKNOWN, and says so: never a silent clean.
-    const unknownCheck = (why) =>
-      out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: restore check UNKNOWN: ${why}; this is not a clean result`, { data }));
-    try {
-      // Emission times (node) against frame times (probe): only on an aligned clock.
-      const clock = clockGate({ capabilities: ctx.capabilities }, "output_latency_ms");
-      if (clock) {
-        unknownCheck(clock.detail);
-      } else {
-        const restored = await adapter.restoreZone();
-        if (restored?.maximizedZone !== null) {
-          const zone = restored?.maximizedZone === undefined ? "no maximizedZone in its result" : `maximized zone ${restored.maximizedZone}`;
-          out.incidents.push(
-            incident("harness_error", `unit ${name} arm ${arm}: restore-zone did not take (${zone}); restore check UNKNOWN: nothing was watched`, { data }),
-          );
-        } else {
-          await sleep(ZONE_SETTLE_MS);
-          const w = await startPhaseWatch("restore-check");
-          await sleep(o.restoreCheckMs);
-          const seg = await stopPhaseWatch(w, "restore-check");
-          const idx = indexProbeSegment(seg.records ?? []);
-          const win = segmentWindow(idx);
-          const visible = new Set(Array.isArray(idx.summary?.sessions_seen) ? idx.summary.sessions_seen.filter(Number.isInteger) : []);
-          if (!idx.summary) unknownCheck("its watch wrote no summary");
-          else if (!win) unknownCheck("its watch has no measurement window");
-          else if (!captureInfo(idx).primary) unknownCheck("no primary capture source opened");
-          else if (visible.size === 0) unknownCheck("the probe saw no session's marker on screen");
-          else {
-            const gens = indexGenerators(readGeneratorLogs(genDir));
-            for (const st of paneStalls(idx, gens, win, visible)) {
-              const verdict = st.recovered ? "a hitch the restored pane recovered from" : "the restored pane is not repainting";
-              out.incidents.push(
-                incident("pane_stalled", `unit ${name} arm ${arm}: after restore-zone: ${describeStall(st)}: ${verdict}`, {
-                  data: { ...data, session: st.session, recovered: st.recovered },
-                }),
-              );
-            }
-          }
-        }
-      }
-    } catch (e) {
-      out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: restore check UNKNOWN: ${e.message}`, { data }));
-    }
+  // Its outcome is the `focus.restore_check` diagnostic: measured (observed, with
+  // what was seen) or unknown with why — never an absence that reads as clean.
+  if (measure && arm === "focus" && o.restoreCheckMs > 0 && typeof adapter.restoreZone === "function") {
+    out.diagnostics["focus.restore_check"] = await restoreCheck();
   }
   return out;
+
+  async function restoreCheck() {
+    const source = "restore-zone + a watch of the restored layout";
+    const data = { setup: unit.setup, unit: name, arm, phase: "focus/restore-check" };
+    // A check that could not look is UNKNOWN, and says so: never a silent clean.
+    const unknownCheck = (why) => {
+      const detail = `restore check UNKNOWN: ${why}; this is not a clean result`;
+      out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: ${detail}`, { data }));
+      log(`unit ${name} arm ${arm}: ${detail}`);
+      return { comparable: false, source, state: "unknown", reason: "harness_error", detail };
+    };
+    try {
+      if (interrupted()) return unknownCheck("the run was interrupted before it");
+      if (out.armFailure) return unknownCheck(`the focus arm failed (${out.armFailure.reason}), so no zone was maximized to restore`);
+      // Emission times (node) against frame times (probe): only on an aligned clock.
+      const clock = clockGate({ capabilities: ctx.capabilities }, "output_latency_ms");
+      if (clock) return unknownCheck(clock.detail);
+      // restore-zone ALWAYS answers maximizedZone: null (TerminalPage.tsx); its
+      // `changed` says whether anything was maximized, and the layout is read back.
+      const restored = await adapter.restoreZone();
+      if (restored?.changed !== true) {
+        return unknownCheck(
+          restored?.changed === false
+            ? "restore-zone reported changed: false (nothing was maximized), so there is no restored pane"
+            : "restore-zone's result carries no changed field",
+        );
+      }
+      await sleep(ZONE_SETTLE_MS);
+      if (typeof adapter.zoneViewState !== "function") return unknownCheck("the adapter cannot read the zone view state back");
+      const view = await adapter.zoneViewState();
+      if (view?.maximizedZone !== null) {
+        return unknownCheck(`after restore-zone the zone view state reads ${view?.maximizedZone === undefined ? "no maximizedZone" : `maximized zone ${view.maximizedZone}`}`);
+      }
+      const w = await startPhaseWatch("restore-check");
+      await sleep(o.restoreCheckMs);
+      const seg = await stopPhaseWatch(w, "restore-check");
+      if (interrupted()) return unknownCheck("the run was interrupted during its watch");
+      const idx = indexProbeSegment(seg.records ?? []);
+      const win = segmentWindow(idx);
+      if (!idx.summary) return unknownCheck("its watch wrote no summary");
+      if (!win) return unknownCheck("its watch has no measurement window");
+      const primary = captureInfo(idx).primary;
+      if (!primary) return unknownCheck("no primary capture source opened");
+      const visible = new Set(Array.isArray(idx.summary.sessions_seen) ? idx.summary.sessions_seen.filter(Number.isInteger) : []);
+      if (visible.size === 0) return unknownCheck("the probe saw no session's marker on screen");
+      // A whole screen that froze writes (almost) no frames, and an empty stall
+      // list over them would read as clean: each session must have been seen.
+      const frames = primaryFrames(idx, primary, win);
+      const seen = [...visible].sort((x, y) => x - y).map((k) => [k, frames.filter((f) => (f.markers ?? []).some((m) => m.kind === "output" && m.session === k)).length]);
+      const thin = seen.filter(([, n]) => n < RESTORE_CHECK_MIN_FRAMES);
+      if (thin.length > 0) {
+        return unknownCheck(`too few primary frames to judge (${thin.map(([k, n]) => `session ${k}: ${n}`).join(", ")}; the check needs ${RESTORE_CHECK_MIN_FRAMES} each)`);
+      }
+      const gens = indexGenerators(readGeneratorLogs(genDir));
+      const stalls = paneStalls(idx, gens, win, visible);
+      for (const st of stalls) {
+        const verdict = st.recovered ? "a hitch the restored pane recovered from" : "the restored pane is not repainting";
+        out.incidents.push(
+          incident("pane_stalled", `unit ${name} arm ${arm}: after restore-zone: ${describeStall(st)}: ${verdict}`, {
+            data: { ...data, session: st.session, recovered: st.recovered },
+          }),
+        );
+      }
+      const wedged = stalls.filter((x) => !x.recovered).length;
+      const outcome = wedged > 0 ? "not repainting" : stalls.length > 0 ? "recovered from a hitch" : "clean";
+      const note = `restore check: observed, ${outcome} (${frames.length} primary frame(s), ${visible.size} session(s): ${seen.map(([k, n]) => `${k}=${n}`).join(", ")})`;
+      log(`unit ${name} arm ${arm}: ${note}`);
+      return {
+        comparable: false,
+        source,
+        state: "measured",
+        data: { outcome, frames: frames.length, sessions: [...visible].sort((x, y) => x - y), stalls },
+        notes: [note],
+      };
+    } catch (e) {
+      return unknownCheck(e.message);
+    }
+  }
 }
 
