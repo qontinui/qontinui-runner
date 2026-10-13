@@ -5,7 +5,7 @@
 //! while the runner is idle, this loop checks the stored JWT's `exp`
 //! every [`REFRESH_CHECK_INTERVAL`] and re-pairs (via
 //! `qontinui_runner_lib::pair::pair_with_auth_token`) once we're within
-//! TTL/3 of expiry. The new JWT is persisted to the same encrypted
+//! TTL/2 of expiry ([`crate::auth::REFRESH_BEFORE_EXPIRY_SECS`]). The new JWT is persisted to the same encrypted
 //! `auth_tokens.enc` slot the backend relay reads, and the relay is
 //! kicked so it reconnects with the fresh credential.
 //!
@@ -142,8 +142,33 @@ fn warn_tenant_mismatch_once(expected: uuid::Uuid, returned: Option<uuid::Uuid>)
 }
 
 /// How often the loop wakes to check whether the JWT is approaching
-/// expiry. 5 minutes is plenty given the refresh threshold is 80 min.
+/// expiry. 5 minutes is plenty given the refresh threshold is 120 min — and a
+/// pass that ends a refresh attempt on a TRANSIENT failure does not wait this
+/// long (see [`wait_after_pass`]).
 const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Outer bound on ONE refresher pass (everything between two waits).
+///
+/// Every HTTP call a pass makes already carries its own client timeout (5-30 s),
+/// so this bound is not about any one request. It is the backstop for the
+/// awaits that have none — a blocking-pool hop queued behind a saturated pool,
+/// a store lock, a notify — so a pass that wedges is ABANDONED, logged with the
+/// stage it was stuck in ([`PassStage`]), and retried, instead of silently
+/// eating the refresh window. Plan
+/// `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
+/// Phase 2 step 2. Sized well above a legitimate worst-case pass (a few slots x
+/// 10 s refresh + re-derive, then the legacy arm's self-refresh, pair-cli and
+/// machine-key exchange) and well below the 120-minute window.
+///
+/// The bound is only as good as the runtime's timer, which is why the loop
+/// runs on its own runtime ([`refresher_runtime`]): on the shared app runtime a
+/// starved worker pool delays THIS timer exactly as it delays everything else.
+const PASS_BOUND: Duration = Duration::from_secs(180);
+
+/// Ceiling on how long a coord `Retry-After` may park the loop. Coord's refresh
+/// route has no rate limit today; this exists so a malformed or hostile header
+/// cannot park the refresher past the credential's own lifetime.
+const RATE_LIMIT_WAIT_CAP: Duration = Duration::from_secs(60 * 60);
 
 /// Floor of the transient-failure backoff. When a Cognito refresh fails
 /// transiently (network/5xx/429) we retry far sooner than the 5m steady
@@ -155,6 +180,351 @@ const TRANSIENT_BACKOFF_MIN: Duration = Duration::from_secs(15);
 /// [`REFRESH_CHECK_INTERVAL`] so even a long outage retries every 2 min (fast
 /// recovery) without hot-looping on a persistent error.
 const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// WHY a refresh attempt left the existing credential in place — the cause a
+/// `KeptExisting` used to throw away.
+///
+/// It exists for one decision: how soon to try again. A transport failure or a
+/// 5xx says coord was unreachable or unwell, so the next attempt should come on
+/// the transient backoff (15-120 s) rather than the 5-minute cadence — the
+/// difference between catching coord's return inside the refresh window and
+/// sleeping through it (2026-10-07: coord unreachable across the whole 80-minute
+/// window, the credential expired, ~32 h dark). A 429 carries its own answer in
+/// `Retry-After` and must never be put on the 15 s retry. Everything else
+/// (404, an undecodable body, an empty token, a persist failure, a tenant
+/// mismatch, no client) says nothing that a faster retry would fix.
+///
+/// None of these ever authorises a CLEAR — that stays gated on
+/// [`SlotClearCause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeptExistingCause {
+    /// The request never produced an HTTP status: DNS, connect, TLS, timeout,
+    /// a reset mid-body.
+    Transport,
+    /// Coord answered 5xx.
+    Upstream5xx,
+    /// Coord answered 429. `retry_after` is the parsed delta-seconds
+    /// `Retry-After`, `None` when absent or not in delta-seconds form.
+    RateLimited { retry_after: Option<Duration> },
+    /// Any other non-success — nothing a faster retry would change.
+    Other,
+}
+
+/// Parse an HTTP `Retry-After` header in its delta-seconds form. The HTTP-date
+/// form (and anything else) is `None`; the caller then falls back to the steady
+/// cadence rather than guessing.
+pub(crate) fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    value?.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Classify a non-success refresh status that is NOT a credential rejection.
+pub(crate) fn kept_existing_cause_for_status(
+    status: u16,
+    retry_after: Option<&str>,
+) -> KeptExistingCause {
+    match status {
+        429 => KeptExistingCause::RateLimited {
+            retry_after: parse_retry_after(retry_after),
+        },
+        500..=599 => KeptExistingCause::Upstream5xx,
+        _ => KeptExistingCause::Other,
+    }
+}
+
+/// The `Retry-After` header of a response, as text.
+fn retry_after_header(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Classify a reqwest error from SENDING a refresh request or READING its body.
+/// A decode error is a malformed answer (`Other`); everything else — connect,
+/// timeout, a body cut off mid-read — is transport.
+fn kept_existing_cause_for_reqwest(e: &reqwest::Error) -> KeptExistingCause {
+    if e.is_decode() {
+        KeptExistingCause::Other
+    } else {
+        KeptExistingCause::Transport
+    }
+}
+
+/// What the refresh attempts of one pass say about WHEN to try again.
+/// Derived from the pass's [`KeptExistingCause`]s by [`pass_retry_hint`] and
+/// applied to the pass's own wait by [`wait_after_pass`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassRetryHint {
+    /// Nothing failed in a way a sooner retry would help.
+    None,
+    /// A refresh inside its window failed on transport or a 5xx — retry on the
+    /// transient backoff.
+    Transient,
+    /// Coord rate-limited a refresh — wait what it asked (or the steady cadence
+    /// when it did not say).
+    RateLimited(Option<Duration>),
+}
+
+/// Fold a pass's kept-existing causes into one hint.
+///
+/// Only refresh ATTEMPTS produce a cause, and the pass attempts a slot only
+/// when its `exp` is inside the refresh window ([`plan_tenant_slot`]) and the
+/// legacy self-refresh only when the legacy JWT is (the `Pair` decision) — so a
+/// `Transport`/`Upstream5xx` here is always a credential inside its window.
+///
+/// Rate limiting outranks a transient failure (every attempt goes to the same
+/// coord, so a sooner retry would be the 429's own victim); among several
+/// `Retry-After`s the longest wins.
+pub(crate) fn pass_retry_hint(
+    causes: impl IntoIterator<Item = KeptExistingCause>,
+) -> PassRetryHint {
+    causes
+        .into_iter()
+        .fold(PassRetryHint::None, fold_retry_hint)
+}
+
+/// One step of [`pass_retry_hint`] — also used to add the legacy self-refresh's
+/// cause to the slot pass's hint.
+pub(crate) fn fold_retry_hint(hint: PassRetryHint, cause: KeptExistingCause) -> PassRetryHint {
+    match (hint, cause) {
+        (PassRetryHint::RateLimited(a), KeptExistingCause::RateLimited { retry_after: b }) => {
+            PassRetryHint::RateLimited(match (a, b) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            })
+        }
+        (_, KeptExistingCause::RateLimited { retry_after }) => {
+            PassRetryHint::RateLimited(retry_after)
+        }
+        (PassRetryHint::RateLimited(a), _) => PassRetryHint::RateLimited(a),
+        (_, KeptExistingCause::Transport | KeptExistingCause::Upstream5xx) => {
+            PassRetryHint::Transient
+        }
+        (h, KeptExistingCause::Other) => h,
+    }
+}
+
+/// The wait after a pass, once its retry hint is applied.
+///
+/// `base` is what the pass's own decision arm chose (`None` = block until a
+/// kick). The hint can only SHORTEN a transient wait, and only set a
+/// rate-limited one:
+///
+/// - `Transient` -> `min(base, transient_backoff(n))`, `n` growing across
+///   consecutive transient passes (15 s, 30 s, 60 s, 120 s, 120 s ...) so a long
+///   outage is retried every two minutes without hot-looping.
+/// - `RateLimited(ra)` -> `ra` (or [`REFRESH_CHECK_INTERVAL`] when coord did not
+///   say), clamped to `[TRANSIENT_BACKOFF_MIN, RATE_LIMIT_WAIT_CAP]` — never
+///   the 15 s ladder.
+/// - `None` -> `base`, and the transient ladder resets.
+///
+/// The ladder lives in its OWN counter (`consecutive_pass_transient`), not the
+/// Cognito one: [`plan_refresh_wait`] resets that one on every non-transient
+/// Cognito class, which would pin this ladder at its 15 s floor for the whole
+/// outage.
+pub(crate) fn wait_after_pass(
+    base: Option<Duration>,
+    hint: PassRetryHint,
+    state: &mut RefreshBackoff,
+) -> Option<Duration> {
+    match hint {
+        PassRetryHint::None => {
+            state.consecutive_pass_transient = 0;
+            base
+        }
+        PassRetryHint::Transient => {
+            let w = transient_backoff(state.consecutive_pass_transient);
+            state.consecutive_pass_transient = state.consecutive_pass_transient.saturating_add(1);
+            Some(base.map_or(w, |b| b.min(w)))
+        }
+        PassRetryHint::RateLimited(ra) => Some(
+            ra.unwrap_or(REFRESH_CHECK_INTERVAL)
+                .clamp(TRANSIENT_BACKOFF_MIN, RATE_LIMIT_WAIT_CAP),
+        ),
+    }
+}
+
+/// Where a refresher pass is. Recorded before every await that can stall, so
+/// a pass abandoned by [`PASS_BOUND`] names the stage it was stuck in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PassStage {
+    Start = 0,
+    HealBindingStore,
+    ReadNeedsRefresh,
+    ReadSweepInputs,
+    BindingGaps,
+    TenantSlotPass,
+    LegacyPosture,
+    PublishStatus,
+    SelfRefresh,
+    CognitoRefresh,
+    PairCli,
+    MachineKeyExchange,
+    KickRelay,
+}
+
+impl PassStage {
+    const ALL: [PassStage; 13] = [
+        PassStage::Start,
+        PassStage::HealBindingStore,
+        PassStage::ReadNeedsRefresh,
+        PassStage::ReadSweepInputs,
+        PassStage::BindingGaps,
+        PassStage::TenantSlotPass,
+        PassStage::LegacyPosture,
+        PassStage::PublishStatus,
+        PassStage::SelfRefresh,
+        PassStage::CognitoRefresh,
+        PassStage::PairCli,
+        PassStage::MachineKeyExchange,
+        PassStage::KickRelay,
+    ];
+
+    /// Stable token for the abandoned-pass warning.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PassStage::Start => "start",
+            PassStage::HealBindingStore => "heal-binding-store",
+            PassStage::ReadNeedsRefresh => "read-needs-refresh",
+            PassStage::ReadSweepInputs => "read-sweep-inputs",
+            PassStage::BindingGaps => "binding-gaps",
+            PassStage::TenantSlotPass => "tenant-slot-pass",
+            PassStage::LegacyPosture => "legacy-posture",
+            PassStage::PublishStatus => "publish-status",
+            PassStage::SelfRefresh => "self-refresh",
+            PassStage::CognitoRefresh => "cognito-refresh",
+            PassStage::PairCli => "pair-cli",
+            PassStage::MachineKeyExchange => "machine-key-exchange",
+            PassStage::KickRelay => "kick-relay",
+        }
+    }
+}
+
+/// The current [`PassStage`], readable after the pass future is dropped.
+#[derive(Debug, Default)]
+pub(crate) struct PassStageCell(std::sync::atomic::AtomicU8);
+
+impl PassStageCell {
+    pub(crate) fn set(&self, stage: PassStage) {
+        self.0
+            .store(stage as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(&self) -> PassStage {
+        let raw = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        PassStage::ALL
+            .get(usize::from(raw))
+            .copied()
+            .unwrap_or(PassStage::Start)
+    }
+}
+
+/// The warning an abandoned pass logs. Factored out so the test can pin that
+/// it names the stage.
+pub(crate) fn abandoned_pass_message(bound: Duration, stage: PassStage) -> String {
+    format!(
+        "device_jwt_refresher: pass ABANDONED after {}s stuck in stage `{}` — an await \
+         with no timeout of its own did not return. The credential was NOT renewed this \
+         pass; retrying on the transient backoff.",
+        bound.as_secs(),
+        stage.as_str()
+    )
+}
+
+/// Run one pass under `bound`. `Err(stage)` — and a warning naming it — when
+/// the pass did not finish; the pass future is dropped at that point, so
+/// nothing it was awaiting keeps the loop.
+pub(crate) async fn run_bounded_pass<T>(
+    bound: Duration,
+    stage: &PassStageCell,
+    pass: impl std::future::Future<Output = T>,
+) -> Result<T, PassStage> {
+    match tokio::time::timeout(bound, pass).await {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            let st = stage.get();
+            warn!("{}", abandoned_pass_message(bound, st));
+            Err(st)
+        }
+    }
+}
+
+/// How a pass ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassEnd {
+    /// Sleep this long (a kick or shutdown still wakes the loop early).
+    Wait(Duration),
+    /// Block until a kick or shutdown (wrong tier, no tenant slots).
+    UntilKick,
+}
+
+/// What a pass hands back to the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PassOutput {
+    pub end: PassEnd,
+    pub hint: PassRetryHint,
+}
+
+impl PassOutput {
+    fn new(end: PassEnd, hint: PassRetryHint) -> Self {
+        Self { end, hint }
+    }
+}
+
+/// The refresher's OWN runtime: one worker plus its own timer and blocking
+/// pool, on threads named `jwt-refresher-rt`.
+///
+/// ## Why (plan 2026-10-09-…-only-refresh-window, Phase 2 step 1)
+///
+/// The ~55-minute pass gap on spaceship (2026-10-07 00:35:23 -> 01:30:17 local)
+/// was not an await inside the refresher. Every task on the shared app runtime
+/// slipped by the same order at the same time: the relay's 2 s reconnect sleep
+/// took 14 min (00:40:52 -> 00:55:04), its 20 s `tokio::time::timeout` fired
+/// after 11 min (00:55:04 -> 01:06:18), the drain heartbeat reported "not
+/// ticking", and a pair-cli 401 the web backend stamped at ~01:41:56 reached the
+/// refresher's own log line at 02:00:41 — its spawn_blocking body had returned,
+/// the awaiting task was simply not polled. Meanwhile everything off that
+/// runtime kept time: the health monitor's OS threads logged every 3 min to the
+/// second, and the API on `mcp-api-rt` stayed live. The refresher shared the
+/// app runtime, so its timer and its wakeups starved with everything else
+/// there, through the whole refresh window.
+///
+/// A credential refresher that only runs when the busiest runtime in the
+/// process is healthy cannot keep a credential alive through the incidents
+/// that matter. On its own runtime its 5-minute cadence, its backoff and its
+/// [`PASS_BOUND`] keep their meaning. It is the same remedy, for the same
+/// reason, as `mcp_api::serve_on_dedicated_runtime`, and fails open the same
+/// way: no runtime -> the shared one, as before.
+#[expect(
+    clippy::disallowed_types,
+    reason = "process-lived OnceLock static, never dropped, so outside the drop-from-async panic class — same shape as mcp_api's API_RUNTIME"
+)]
+static REFRESHER_RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+    std::sync::OnceLock::new();
+
+fn refresher_runtime() -> Option<tokio::runtime::Handle> {
+    REFRESHER_RUNTIME
+        .get_or_init(|| {
+            match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("jwt-refresher-rt")
+                .build()
+            {
+                Ok(rt) => Some(rt),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "device_jwt_refresher: could not build its dedicated runtime — running                          on the shared app runtime, where a starved worker pool delays its                          refreshes"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+        .map(|rt| rt.handle().clone())
+}
 
 /// Classification of a Cognito-bearer refresh attempt, used to drive the loop's
 /// backoff + credential-dark notification. Produced by [`refresh_cognito_bearer`].
@@ -187,6 +557,10 @@ pub(crate) struct RefreshBackoff {
     /// dark episode. Reset on recovery so we notify once per transition, not
     /// every 5m tick.
     dark_notified: bool,
+    /// Consecutive passes whose refresh attempts ended on a transient cause —
+    /// drives [`wait_after_pass`]'s ladder. Separate from
+    /// `consecutive_transient` (the Cognito ladder) on purpose; see there.
+    consecutive_pass_transient: u32,
 }
 
 /// What the loop should do after a Cognito-bearer attempt this tick: how long
@@ -916,6 +1290,11 @@ pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
     // `kick_device_jwt_refresher` keeps working across respawns.
     let mut kick_rx_loop = kick_rx;
     let shutdown_rx_loop = shutdown_rx.clone();
+    // On the refresher's OWN runtime (see [`refresher_runtime`]): entering it
+    // makes the supervisor's `tokio::spawn` land there. The returned
+    // `JoinHandle` is awaitable from any runtime, so `stop()` is unchanged.
+    let refresher_rt = refresher_runtime();
+    let _on_refresher_runtime = refresher_rt.as_ref().map(|h| h.enter());
     let task_handle = crate::mcp::task_supervisor::spawn_supervised(
         "Device-JWT refresher",
         shutdown_rx,
@@ -1165,20 +1544,23 @@ struct DeviceRefreshResponse {
 /// INDEFINITELY: as long as it holds a currently-valid device-JWT it re-mints
 /// from itself, never hitting the ~30-day Cognito refresh-token ceiling.
 ///
-/// Returns `Some(new_jwt)` on success — the new JWT is ALREADY persisted to the
-/// `access_token` slot, so the caller treats it exactly like a successful Cognito
-/// re-mint (wake the relay, publish healthy, steady wait) and SKIPS the Cognito
-/// path for the tick.
+/// Returns [`SelfRefreshOutcome::Refreshed`] on success — the new JWT is
+/// ALREADY persisted to the `access_token` slot, so the caller treats it exactly
+/// like a successful Cognito re-mint (wake the relay, publish healthy, steady
+/// wait) and SKIPS the Cognito path for the tick.
 ///
-/// Returns `None` — so the caller FALLS BACK to the Cognito pair-cli path — when:
-///   - no device-JWT is held, or it's opaque/undecodable, or already expired
-///     (self-refresh needs a currently-valid bearer; coord would 401 an expired
-///     one, and an absent/expired JWT is precisely the Cognito-recovery case),
-///   - coord returns ANY non-2xx (incl. 404 when the route isn't deployed yet —
-///     ORDERING SAFETY: a runner talking to an old coord without this route
-///     simply falls back to Cognito, so the runner half can ship before/without
-///     the coord half), OR
-///   - the network call fails or the body fails to decode.
+/// Otherwise the caller FALLS BACK to the Cognito pair-cli path, and the outcome
+/// says why:
+///   - [`SelfRefreshOutcome::NotAttempted`] — no device-JWT is held, or it's
+///     opaque/undecodable, or already expired (self-refresh needs a
+///     currently-valid bearer; coord would 401 an expired one, and an
+///     absent/expired JWT is precisely the Cognito-recovery case). No request.
+///   - [`SelfRefreshOutcome::KeptExisting`] — a request was made and did not
+///     yield a persisted JWT: ANY non-2xx (incl. 404 when the route isn't
+///     deployed yet — ORDERING SAFETY: a runner talking to an old coord without
+///     this route simply falls back to Cognito), a network failure, an
+///     undecodable body, or a refused persist. Its [`KeptExistingCause`] feeds
+///     the pass's next-wake decision ([`pass_retry_hint`]).
 ///
 /// REPLACE-not-REVOKE: on ANY failure the existing JWT is left UNTOUCHED. A
 /// self-refresh miss means "try Cognito", NEVER "go credential-dark".
@@ -1186,20 +1568,24 @@ pub(crate) async fn try_device_self_refresh(
     auth_manager: &crate::auth::AuthManager,
     coord_base: &str,
     device_id: &str,
-) -> Option<String> {
+) -> SelfRefreshOutcome {
     // Precondition: a currently-valid (future-exp) device-JWT must be held —
     // coord authenticates this request with THAT bearer. An absent/opaque/
     // already-expired JWT cannot self-refresh, so hand off to Cognito.
-    let current = auth_manager
+    let Some(current) = auth_manager
         .get_access_token()
         .ok()
-        .filter(|t| !t.trim().is_empty())?;
+        .filter(|t| !t.trim().is_empty())
+    else {
+        return SelfRefreshOutcome::NotAttempted;
+    };
     match auth_manager.access_token_exp() {
         // Future exp → self-refreshable (even if within the refresh threshold).
         Some(exp) if chrono::Utc::now().timestamp() < exp => {}
         // Absent/opaque exp, or already expired → Cognito fallback.
-        _ => return None,
+        _ => return SelfRefreshOutcome::NotAttempted,
     }
+    let kept = |cause| SelfRefreshOutcome::KeptExisting { cause };
 
     let url = format!(
         "{}/devices/{}/refresh-token",
@@ -1217,7 +1603,7 @@ pub(crate) async fn try_device_self_refresh(
                  — falling back to Cognito",
                 crate::util::error_chain::error_chain(&e)
             );
-            return None;
+            return kept(KeptExistingCause::Other);
         }
     };
     let resp = {
@@ -1244,7 +1630,7 @@ pub(crate) async fn try_device_self_refresh(
                     crate::util::egress_context::EgressClient::DeviceJwtRefresher
                 )
             );
-            return None;
+            return kept(kept_existing_cause_for_reqwest(&e));
         }
     };
     if !resp.status().is_success() {
@@ -1255,7 +1641,11 @@ pub(crate) async fn try_device_self_refresh(
              — falling back to Cognito (existing JWT preserved)",
             resp.status()
         );
-        return None;
+        let retry_after = retry_after_header(&resp);
+        return kept(kept_existing_cause_for_status(
+            resp.status().as_u16(),
+            retry_after.as_deref(),
+        ));
     }
     let body: DeviceRefreshResponse = match resp.json().await {
         Ok(b) => b,
@@ -1264,7 +1654,7 @@ pub(crate) async fn try_device_self_refresh(
                 "device_jwt_refresher: device self-refresh body decode failed: {e} \
                  — falling back to Cognito"
             );
-            return None;
+            return kept(kept_existing_cause_for_reqwest(&e));
         }
     };
     if body.token.trim().is_empty() {
@@ -1272,7 +1662,7 @@ pub(crate) async fn try_device_self_refresh(
             "device_jwt_refresher: device self-refresh returned an empty token \
              — falling back to Cognito"
         );
-        return None;
+        return kept(KeptExistingCause::Other);
     }
     // Persist into the access_token slot (refresh-token slot stays empty — the
     // device-JWT lifecycle is coord-owned, not an OAuth refresh chain). Guarded
@@ -1294,7 +1684,7 @@ pub(crate) async fn try_device_self_refresh(
                 "device_jwt_refresher: device-JWT self-refreshed login-independently (len={})",
                 body.token.len()
             );
-            Some(body.token)
+            SelfRefreshOutcome::Refreshed(body.token)
         }
         Err(e) => {
             if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
@@ -1312,7 +1702,39 @@ pub(crate) async fn try_device_self_refresh(
                      — falling back to Cognito (existing JWT preserved)"
                 );
             }
-            None
+            kept(KeptExistingCause::Other)
+        }
+    }
+}
+
+/// Outcome of [`try_device_self_refresh`]. Typed (it used to be an
+/// `Option<String>`) so a transport failure is no longer indistinguishable
+/// from "nothing to present" — the first must shorten the next wake, the
+/// second must not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SelfRefreshOutcome {
+    /// Coord re-minted and the new JWT is persisted in the `access_token` slot.
+    Refreshed(String),
+    /// No currently-valid device JWT to present — no request was made.
+    NotAttempted,
+    /// A request was made and the existing JWT was left in place.
+    KeptExisting { cause: KeptExistingCause },
+}
+
+impl SelfRefreshOutcome {
+    /// The re-minted JWT, iff the self-refresh succeeded.
+    pub(crate) fn token(&self) -> Option<&str> {
+        match self {
+            SelfRefreshOutcome::Refreshed(t) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The kept-existing cause, iff a request was made and failed.
+    pub(crate) fn kept_existing_cause(&self) -> Option<KeptExistingCause> {
+        match self {
+            SelfRefreshOutcome::KeptExisting { cause } => Some(*cause),
+            _ => None,
         }
     }
 }
@@ -1373,7 +1795,7 @@ pub(crate) fn plan_tenant_slot(exp: Option<i64>, now: i64) -> TenantSlotPlan {
         None => TenantSlotPlan::ClearAndRederive,
         // Already expired — coord would 401 the presented bearer.
         Some(e) if now >= e => TenantSlotPlan::ClearAndRederive,
-        // Within TTL/3 of expiry — refresh now.
+        // Within TTL/2 of expiry — refresh now.
         Some(e) if now + crate::auth::REFRESH_BEFORE_EXPIRY_SECS >= e => TenantSlotPlan::Refresh,
         // Comfortably fresh.
         Some(_) => TenantSlotPlan::SkipFresh,
@@ -1437,7 +1859,20 @@ pub(crate) enum TenantSlotOutcome {
     /// HTTP status (5xx, 404, 429), an undecodable body, an empty token, or a
     /// persist error. The existing slot value is left UNTOUCHED
     /// (REPLACE-not-REVOKE), and the pass CONTINUES with the remaining slots.
-    KeptExisting,
+    ///
+    /// `cause` decides how soon the loop tries again ([`pass_retry_hint`]);
+    /// it never authorises a clear.
+    KeptExisting { cause: KeptExistingCause },
+}
+
+impl TenantSlotOutcome {
+    /// The kept-existing cause, iff this slot's refresh attempt failed.
+    pub(crate) fn kept_existing_cause(self) -> Option<KeptExistingCause> {
+        match self {
+            TenantSlotOutcome::KeptExisting { cause } => Some(cause),
+            _ => None,
+        }
+    }
 }
 
 /// Does this refresh status mean coord REJECTED the credential we presented?
@@ -4261,7 +4696,7 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
         TenantSlotOutcome::SkippedFresh => "skipped-fresh",
         TenantSlotOutcome::SkippedNoToken => "skipped-no-token",
         TenantSlotOutcome::Cleared { .. } => "cleared",
-        TenantSlotOutcome::KeptExisting => "kept-existing",
+        TenantSlotOutcome::KeptExisting { .. } => "kept-existing",
     }
     .to_string()
 }
@@ -4328,7 +4763,9 @@ async fn clear_and_rederive_tenant_slot(
             "device_jwt_refresher: tenant {tenant} slot clear FAILED ({e}) — slot left \
              as-is ({evidence})"
         );
-        return TenantSlotOutcome::KeptExisting;
+        return TenantSlotOutcome::KeptExisting {
+            cause: KeptExistingCause::Other,
+        };
     }
     match cause {
         SlotClearCause::DecodedExpiry => CLEARED_ON_EXPIRY_TOTAL.fetch_add(1, Ordering::Relaxed),
@@ -4558,7 +4995,9 @@ pub(crate) async fn refresh_tenant_slots(
             TenantSlotPlan::Refresh => {}
         }
         let Some(client) = client.as_ref() else {
-            let o = TenantSlotOutcome::KeptExisting;
+            let o = TenantSlotOutcome::KeptExisting {
+                cause: KeptExistingCause::Other,
+            };
             health.push(health_row(&tenant, o, "no HTTP client".to_string()));
             outcomes.push((tenant, o));
             continue;
@@ -4574,8 +5013,17 @@ pub(crate) async fn refresh_tenant_slots(
                 // UNKNOWN, never a rejection: the slot is left exactly as it
                 // was. Pinned by
                 // `slot_refresh_never_clears_on_transport_error`.
-                warn!("device_jwt_refresher: tenant {tenant} slot refresh request failed: {e}");
-                let o = TenantSlotOutcome::KeptExisting;
+                //
+                // The full chain: the bare `{e}` printed only reqwest's
+                // outermost "error sending request for url (...)", which could
+                // not tell a timeout from a refused connect (2026-10-07 01:30).
+                warn!(
+                    "device_jwt_refresher: tenant {tenant} slot refresh request failed: {}",
+                    crate::util::error_chain::error_chain(&e)
+                );
+                let o = TenantSlotOutcome::KeptExisting {
+                    cause: kept_existing_cause_for_reqwest(&e),
+                };
                 health.push(health_row(
                     &tenant,
                     o,
@@ -4611,7 +5059,10 @@ pub(crate) async fn refresh_tenant_slots(
                 "device_jwt_refresher: tenant {tenant} slot refresh got HTTP {status} \
                  (not a credential rejection — existing slot JWT preserved)"
             );
-            let o = TenantSlotOutcome::KeptExisting;
+            let retry_after = retry_after_header(&resp);
+            let o = TenantSlotOutcome::KeptExisting {
+                cause: kept_existing_cause_for_status(status.as_u16(), retry_after.as_deref()),
+            };
             health.push(health_row(
                 &tenant,
                 o,
@@ -4624,7 +5075,9 @@ pub(crate) async fn refresh_tenant_slots(
             Ok(b) => b,
             Err(e) => {
                 warn!("device_jwt_refresher: tenant {tenant} slot refresh body decode failed: {e}");
-                let o = TenantSlotOutcome::KeptExisting;
+                let o = TenantSlotOutcome::KeptExisting {
+                    cause: kept_existing_cause_for_reqwest(&e),
+                };
                 health.push(health_row(&tenant, o, format!("body decode failed ({e})")));
                 outcomes.push((tenant, o));
                 continue;
@@ -4632,7 +5085,9 @@ pub(crate) async fn refresh_tenant_slots(
         };
         if body.token.trim().is_empty() {
             warn!("device_jwt_refresher: tenant {tenant} slot refresh returned an empty token");
-            let o = TenantSlotOutcome::KeptExisting;
+            let o = TenantSlotOutcome::KeptExisting {
+                cause: KeptExistingCause::Other,
+            };
             health.push(health_row(
                 &tenant,
                 o,
@@ -4658,7 +5113,9 @@ pub(crate) async fn refresh_tenant_slots(
             }
             Err(e) => {
                 warn!("device_jwt_refresher: tenant {tenant} slot persist failed: {e}");
-                let o = TenantSlotOutcome::KeptExisting;
+                let o = TenantSlotOutcome::KeptExisting {
+                    cause: KeptExistingCause::Other,
+                };
                 health.push(health_row(&tenant, o, format!("persist failed ({e})")));
                 outcomes.push((tenant, o));
             }
@@ -5209,7 +5666,12 @@ async fn refresher_loop(
     // `Arc` so the eviction sweep's input read can move a handle onto the
     // blocking pool; every `&auth_manager` below deref-coerces unchanged.
     let auth_manager = std::sync::Arc::new(crate::auth::AuthManager::new());
-    info!("Device-JWT refresher started (check interval = 5m, threshold = 80m)");
+    info!(
+        "Device-JWT refresher started (check interval = {}m, threshold = {}m, pass bound = {}s)",
+        REFRESH_CHECK_INTERVAL.as_secs() / 60,
+        crate::auth::REFRESH_BEFORE_EXPIRY_SECS / 60,
+        PASS_BOUND.as_secs()
+    );
 
     // Phase 2: carries the transient-failure backoff + the credential-dark
     // notify-once dedup across iterations.
@@ -5225,583 +5687,615 @@ async fn refresher_loop(
             return;
         }
 
-        // Heal a vanished `paired_user.json` from valid per-tenant slots
-        // BEFORE anything below reads it, so the tier (`device_is_paired`),
-        // the sweep inputs and the Pair arm's `user_id` read all see the
-        // rewritten file instead of idling "not paired yet".
-        heal_vanished_binding_store().await;
-
-        // Snapshot settings + needs-refresh decision once per iteration.
-        let settings_snapshot = settings::load_settings();
-        let needs_refresh_result = auth_manager.device_jwt_needs_refresh();
-        let needs_refresh = match needs_refresh_result {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("device_jwt_refresher: device_jwt_needs_refresh failed: {e}");
-                // Sleep before retrying to avoid a hot-loop on persistent error.
-                if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
+        // ONE outer bound per pass (plan 2026-10-09-…-only-refresh-window
+        // Phase 2 step 2). A pass that wedges on an untimed await is abandoned
+        // and logged with its stage instead of eating the refresh window.
+        let stage = PassStageCell::default();
+        let pass = run_bounded_pass(
+            PASS_BOUND,
+            &stage,
+            refresher_pass(
+                &api_state,
+                &auth_manager,
+                &mut backoff,
+                &mut sweep_join_failures,
+                &stage,
+            ),
+        )
+        .await;
+        let wait = match pass {
+            Ok(PassOutput { end, hint }) => {
+                let base = match end {
+                    PassEnd::Wait(d) => Some(d),
+                    PassEnd::UntilKick => None,
+                };
+                wait_after_pass(base, hint, &mut backoff)
+            }
+            // Abandoned: whatever it was stuck on, the credential was not
+            // renewed — retry on the transient ceiling, not the 5 m cadence.
+            Err(_stage) => Some(TRANSIENT_BACKOFF_MAX),
+        };
+        match wait {
+            Some(d) => {
+                if wait_with_signals(d, &mut shutdown_rx, &mut kick_rx).await {
+                    info!("Device-JWT refresher shutting down");
                     return;
                 }
-                continue;
             }
-        };
-
-        let decision = next_action(settings_snapshot.tier, needs_refresh);
-
-        // Session-scoped multi-tenant Phase 8a (plan 2026-07-02, D4): the
-        // per-tenant device-JWT slot pass is the SHIPPED behavior (the
-        // Phase-1 `QONTINUI_MULTI_TENANT_JWT` flag is retired). Every slot
-        // self-refreshes with ITS OWN claim, independently of the legacy
-        // `access_token` slot's own staleness/decision below; the
-        // machine.json tenant-precedence chain (`resolve_pair_tenant_id`)
-        // only ever feeds the DEFAULT slot's Cognito pair path. Placed
-        // before the decision match so the Idle arm (legacy JWT fresh)
-        // still ticks the tenant slots each cadence/kick. Runners with no
-        // tenant slots (never paired post-8a) skip in one storage read.
-        // Every input the eviction sweep needs — the slot store,
-        // `paired_user.json` and `machine.json` — is read in ONE blocking-pool
-        // hop, then composed on this side. The pin, and the credential
-        // selector's verdict for it (read in the same hop), also feed the
-        // POSTURE (see [`PosturePinInputs`]): a pinned tenant the forwarder
-        // would refuse must be published under its own name, never skipped.
-        //
-        // The slot read is the UN-COLLAPSED one, because the sweep below is
-        // destructive: an unreadable store must not read as "no tenant slots"
-        // there. The BRANCH choice keeps its historical collapse — an
-        // unreadable store takes the legacy arm, which does its own tri-state
-        // `probe_access_token()` — so only the eviction's failure direction
-        // differs.
-        //
-        // A JOIN failure is not that case: nothing at all was read, so neither
-        // branch is honest — the legacy arm would publish a legacy-only posture
-        // over a multi-tenant box. Skip the whole pass and try again next
-        // cadence (or kick).
-        let auth_for_sweep = std::sync::Arc::clone(&auth_manager);
-        let sweep_inputs = match spawn_blocking_tracked(move || read_sweep_inputs(&auth_for_sweep))
-            .await
-        {
-            Ok(inputs) => {
-                sweep_join_failures = 0;
-                inputs
-            }
-            Err(join_err) => {
-                sweep_join_failures = sweep_join_failures.saturating_add(1);
-                if should_warn_sweep_join_failure(sweep_join_failures) {
-                    warn!(
-                        "device_jwt_refresher: credential-store read task failed \
-                         ({join_err}; {sweep_join_failures} consecutive) — skipping this \
-                         pass rather than deriving a posture from nothing"
-                    );
-                }
-                if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
-                    return;
-                }
-                continue;
-            }
-        };
-        let has_tenant_slots = sweep_inputs
-            .tenant_slots
-            .as_ref()
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-        let writable = writable_slot_keys_from(&sweep_inputs);
-        // D2's residual (Phase 3): the pass below walks the slots that EXIST,
-        // so a tenant bound with NO slot is structurally invisible to it.
-        // Composed here, from the SAME blocking-pool read, and published
-        // BEFORE the pass so the health snapshot it publishes carries this
-        // pass's answer.
-        let gap_report = binding_gaps_from(&sweep_inputs);
-        publish_binding_gaps(gap_report.clone());
-        // D3 (Phase 4, as revised by the route-around review): act on that
-        // report by ASKING the operator once per tenant per lapse — never by
-        // minting. The ask is driven by the act-grade twin of the report (a
-        // sidecar inside BINDING_GAP_ASK_MAX_AGE_SECS), is persisted, and is
-        // read back by the UI through `get_binding_gap_asks`; the event below
-        // is only a nudge. A lapse that closes because a slot now exists
-        // resets that tenant's stale rejection streak.
-        let slots_now = sweep_inputs
-            .tenant_slots
-            .as_ref()
-            .ok()
-            .map(|v| v.as_slice());
-        let gap_actions = ask_bound_tenant_gaps(
-            &ask_gaps_from(&sweep_inputs),
-            slots_now,
-            binding_gap_ask_account(
-                sweep_inputs.legacy_slot_present,
-                slots_now,
-                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
-            )
-            .as_deref(),
-            chrono::Utc::now().timestamp(),
-        );
-        settle_binding_gap_actions(Some(&api_state.app_handle), &gap_actions);
-        // Retire every upstream-verdict bucket this runner can no longer write
-        // (a re-pair or an unpair), BEFORE the posture is derived from what is
-        // left. Runs in BOTH branches because a re-pair can happen from either
-        // shape, and it is the IMPOSSIBILITY half of retiring an orphan's
-        // evidence — the half that replaced a guessed clock.
-        sweep_unwritable_upstream_buckets(writable);
-        if has_tenant_slots {
-            let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.trim().to_string())
-                .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
-            match mt_device_id {
-                Some(did) => {
-                    let (coord_base, _coord_base_source) =
-                        crate::coord_mcp::coord_base_url_with_source();
-                    // The web-backend base, resolved exactly as the Cognito
-                    // pair path below resolves it — the device-machine-key
-                    // exchange lives there, and Phase 2's re-derive needs it.
-                    // Empty simply disables re-derivation for the pass.
-                    let (slot_web_base, _slot_web_arm) = resolve_pair_base(&settings_snapshot);
-                    let outcomes = refresh_tenant_slots(
-                        &auth_manager,
-                        &coord_base,
-                        &slot_web_base,
-                        &did,
-                        Some(&api_state.app_handle),
-                        sweep_inputs.posture_pin_inputs(),
-                    )
-                    .await;
-                    if !outcomes.is_empty() {
-                        let refreshed = outcomes
-                            .iter()
-                            .filter(|(_, o)| *o == TenantSlotOutcome::Refreshed)
-                            .count();
-                        info!(
-                            "device_jwt_refresher: multi-tenant slot pass — {refreshed}/{} \
-                             refreshed ({outcomes:?})",
-                            outcomes.len()
-                        );
-                    }
-                }
-                None => warn!(
-                    "device_jwt_refresher: tenant device-JWT slots present but no device_id \
-                     (QONTINUI_MACHINE_ID unset, machine.json unreadable) — skipping \
-                     tenant-slot pass"
-                ),
-            }
-        } else {
-            // No per-tenant slot exists on this runner, so the slot pass never
-            // runs and never publishes. The coord credential is then the
-            // LEGACY `access_token` slot, and a runner holding a dead one (or
-            // none at all) is exactly the silent case this posture exists to
-            // end — a never-paired runner must read `absent`, not UNKNOWN
-            // forever. Derived from the same pure ladder; no pass outcome
-            // exists, so the derivation sees `None` and speaks from `exp`.
-            //
-            // Read through the TRI-STATE probe, not `get_access_token`: that
-            // returns `Err` both for a never-paired runner and for a
-            // present-but-undecryptable store, and collapsing the two would
-            // fire a "you have no coord credential" banner at a paired runner
-            // whose store merely failed to decrypt this tick.
-            let obs = match auth_manager.probe_access_token() {
-                crate::secure_storage::StoredTokenRead::Present(t) => {
-                    SlotObservation::observed(None, Some(t.as_str()))
-                }
-                crate::secure_storage::StoredTokenRead::Absent => {
-                    SlotObservation::observed(None, None)
-                }
-                crate::secure_storage::StoredTokenRead::Unreadable(_) => {
-                    SlotObservation::unreadable(None)
-                }
-            };
-            if let Some(transition) = derive_and_publish_posture(
-                &[obs],
-                sweep_inputs.posture_pin_inputs(),
-                chrono::Utc::now().timestamp(),
-            ) {
-                notify_posture_transition(Some(&api_state.app_handle), transition);
-            }
-        }
-
-        match decision {
-            Decision::IdleWrongTier => {
-                // Phase 1b: publish the credential-dark signal so coord's
-                // fleet `evaluate()` lights up a device-scoped alert. Best-
-                // effort — never blocks the idle wait below.
-                publish_coord_credential_status(
-                    &auth_manager,
-                    &coord_credential_health(decision, None),
-                )
-                .await;
-                // Phase 8a: with tenant slots held, a wrong-tier idle must
-                // NOT park indefinitely — the slot pass above only runs per
-                // loop iteration, so an unbounded block would starve slot
-                // refreshes until a kick that may never come. Bounded wait
-                // instead (kick/shutdown still wake early). Slot-less
-                // runners keep the historical block-until-kick behavior.
-                if let Some(wait) = idle_wrong_tier_wait(has_tenant_slots) {
-                    if wait_with_signals(wait, &mut shutdown_rx, &mut kick_rx).await {
-                        info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
-                        return;
-                    }
-                    continue;
-                }
-                // Nothing to do until tier changes. Block on shutdown or
-                // kick (set_runner_tier kicks us on every transition).
+            None => {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
                         return;
                     }
-                    _ = kick_rx.changed() => continue,
+                    _ = kick_rx.changed() => {}
                 }
             }
-            Decision::Idle => {
-                // Phase 1b: a fresh JWT → publish ok so any stale alert self-
-                // clears on coord's next firing-set reconcile.
-                publish_coord_credential_status(
-                    &auth_manager,
-                    &coord_credential_health(decision, None),
+        }
+    }
+}
+
+/// ONE refresher pass: heal, read, the tenant-slot pass, then the legacy
+/// decision arm. Returns how long to wait before the next pass and the retry
+/// hint its refresh attempts produced; the loop ([`refresher_loop`]) owns the
+/// waiting, so a pass can be bounded ([`run_bounded_pass`]) without the bound
+/// ever cutting a sleep short.
+///
+/// `stage` is updated before every await that can stall, so an abandoned pass
+/// names where it was stuck.
+async fn refresher_pass(
+    api_state: &Arc<ApiState>,
+    auth_manager: &std::sync::Arc<crate::auth::AuthManager>,
+    backoff: &mut RefreshBackoff,
+    sweep_join_failures: &mut u32,
+    stage: &PassStageCell,
+) -> PassOutput {
+    let mut hint = PassRetryHint::None;
+
+    // Heal a vanished `paired_user.json` from valid per-tenant slots
+    // BEFORE anything below reads it, so the tier (`device_is_paired`),
+    // the sweep inputs and the Pair arm's `user_id` read all see the
+    // rewritten file instead of idling "not paired yet".
+    stage.set(PassStage::HealBindingStore);
+    heal_vanished_binding_store().await;
+
+    // Snapshot settings + needs-refresh decision once per iteration.
+    stage.set(PassStage::ReadNeedsRefresh);
+    let settings_snapshot = settings::load_settings();
+    let needs_refresh_result = auth_manager.device_jwt_needs_refresh();
+    let needs_refresh = match needs_refresh_result {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("device_jwt_refresher: device_jwt_needs_refresh failed: {e}");
+            // Sleep before retrying to avoid a hot-loop on persistent error.
+            return PassOutput::new(PassEnd::Wait(REFRESH_CHECK_INTERVAL), hint);
+        }
+    };
+
+    let decision = next_action(settings_snapshot.tier, needs_refresh);
+
+    // Session-scoped multi-tenant Phase 8a (plan 2026-07-02, D4): the
+    // per-tenant device-JWT slot pass is the SHIPPED behavior (the
+    // Phase-1 `QONTINUI_MULTI_TENANT_JWT` flag is retired). Every slot
+    // self-refreshes with ITS OWN claim, independently of the legacy
+    // `access_token` slot's own staleness/decision below; the
+    // machine.json tenant-precedence chain (`resolve_pair_tenant_id`)
+    // only ever feeds the DEFAULT slot's Cognito pair path. Placed
+    // before the decision match so the Idle arm (legacy JWT fresh)
+    // still ticks the tenant slots each cadence/kick. Runners with no
+    // tenant slots (never paired post-8a) skip in one storage read.
+    // Every input the eviction sweep needs — the slot store,
+    // `paired_user.json` and `machine.json` — is read in ONE blocking-pool
+    // hop, then composed on this side. The pin, and the credential
+    // selector's verdict for it (read in the same hop), also feed the
+    // POSTURE (see [`PosturePinInputs`]): a pinned tenant the forwarder
+    // would refuse must be published under its own name, never skipped.
+    //
+    // The slot read is the UN-COLLAPSED one, because the sweep below is
+    // destructive: an unreadable store must not read as "no tenant slots"
+    // there. The BRANCH choice keeps its historical collapse — an
+    // unreadable store takes the legacy arm, which does its own tri-state
+    // `probe_access_token()` — so only the eviction's failure direction
+    // differs.
+    //
+    // A JOIN failure is not that case: nothing at all was read, so neither
+    // branch is honest — the legacy arm would publish a legacy-only posture
+    // over a multi-tenant box. Skip the whole pass and try again next
+    // cadence (or kick).
+    stage.set(PassStage::ReadSweepInputs);
+    let auth_for_sweep = std::sync::Arc::clone(auth_manager);
+    let sweep_inputs =
+        match spawn_blocking_tracked(move || read_sweep_inputs(&auth_for_sweep)).await {
+            Ok(inputs) => {
+                *sweep_join_failures = 0;
+                inputs
+            }
+            Err(join_err) => {
+                *sweep_join_failures = sweep_join_failures.saturating_add(1);
+                if should_warn_sweep_join_failure(*sweep_join_failures) {
+                    warn!(
+                        "device_jwt_refresher: credential-store read task failed \
+                     ({join_err}; {sweep_join_failures} consecutive) — skipping this \
+                     pass rather than deriving a posture from nothing"
+                    );
+                }
+                return PassOutput::new(PassEnd::Wait(REFRESH_CHECK_INTERVAL), hint);
+            }
+        };
+    let has_tenant_slots = sweep_inputs
+        .tenant_slots
+        .as_ref()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let writable = writable_slot_keys_from(&sweep_inputs);
+    // D2's residual (Phase 3): the pass below walks the slots that EXIST,
+    // so a tenant bound with NO slot is structurally invisible to it.
+    // Composed here, from the SAME blocking-pool read, and published
+    // BEFORE the pass so the health snapshot it publishes carries this
+    // pass's answer.
+    stage.set(PassStage::BindingGaps);
+    let gap_report = binding_gaps_from(&sweep_inputs);
+    publish_binding_gaps(gap_report.clone());
+    // D3 (Phase 4, as revised by the route-around review): act on that
+    // report by ASKING the operator once per tenant per lapse — never by
+    // minting. The ask is driven by the act-grade twin of the report (a
+    // sidecar inside BINDING_GAP_ASK_MAX_AGE_SECS), is persisted, and is
+    // read back by the UI through `get_binding_gap_asks`; the event below
+    // is only a nudge. A lapse that closes because a slot now exists
+    // resets that tenant's stale rejection streak.
+    let slots_now = sweep_inputs
+        .tenant_slots
+        .as_ref()
+        .ok()
+        .map(|v| v.as_slice());
+    let gap_actions = ask_bound_tenant_gaps(
+        &ask_gaps_from(&sweep_inputs),
+        slots_now,
+        binding_gap_ask_account(
+            sweep_inputs.legacy_slot_present,
+            slots_now,
+            qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
+        )
+        .as_deref(),
+        chrono::Utc::now().timestamp(),
+    );
+    settle_binding_gap_actions(Some(&api_state.app_handle), &gap_actions);
+    // Retire every upstream-verdict bucket this runner can no longer write
+    // (a re-pair or an unpair), BEFORE the posture is derived from what is
+    // left. Runs in BOTH branches because a re-pair can happen from either
+    // shape, and it is the IMPOSSIBILITY half of retiring an orphan's
+    // evidence — the half that replaced a guessed clock.
+    sweep_unwritable_upstream_buckets(writable);
+    if has_tenant_slots {
+        let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+        match mt_device_id {
+            Some(did) => {
+                let (coord_base, _coord_base_source) =
+                    crate::coord_mcp::coord_base_url_with_source();
+                // The web-backend base, resolved exactly as the Cognito
+                // pair path below resolves it — the device-machine-key
+                // exchange lives there, and Phase 2's re-derive needs it.
+                // Empty simply disables re-derivation for the pass.
+                let (slot_web_base, _slot_web_arm) = resolve_pair_base(&settings_snapshot);
+                stage.set(PassStage::TenantSlotPass);
+                let outcomes = refresh_tenant_slots(
+                    auth_manager,
+                    &coord_base,
+                    &slot_web_base,
+                    &did,
+                    Some(&api_state.app_handle),
+                    sweep_inputs.posture_pin_inputs(),
                 )
                 .await;
-                // JWT is fresh — sleep until next check or wake on kick.
-                if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
-                    return;
+                // Phase 2 step 3 (plan 2026-10-09-…-only-refresh-window):
+                // the slot pass's causes are carried OUT to the wait — they
+                // used to be discarded right here, so a slot inside its
+                // window that failed on transport waited a flat 300 s.
+                hint =
+                    pass_retry_hint(outcomes.iter().filter_map(|(_, o)| o.kept_existing_cause()));
+                if !outcomes.is_empty() {
+                    let refreshed = outcomes
+                        .iter()
+                        .filter(|(_, o)| *o == TenantSlotOutcome::Refreshed)
+                        .count();
+                    info!(
+                        "device_jwt_refresher: multi-tenant slot pass — {refreshed}/{} \
+                         refreshed ({outcomes:?})",
+                        outcomes.len()
+                    );
                 }
-                continue;
             }
-            Decision::Pair => {
-                // Phase 4a: PREFER a login-independent DEVICE self-refresh. When
-                // the runner still holds a currently-valid device-JWT, re-mint it
-                // by presenting that JWT to coord's
-                // `POST /devices/:id/refresh-token` (NO Cognito touched) — this
-                // keeps a continuously-running runner autonomous past the ~30-day
-                // Cognito refresh-token ceiling. Only when no valid device-JWT is
-                // held (expired/absent), OR coord doesn't support the route yet
-                // (404 → fall through, ordering-safe), do we run the Cognito
-                // pair-cli path below. device_id: env override first (multi-
-                // instance / test), else machine.json — same resolution as the
-                // status publisher.
-                let self_refresh_device_id = std::env::var("QONTINUI_MACHINE_ID")
+            None => warn!(
+                "device_jwt_refresher: tenant device-JWT slots present but no device_id \
+                 (QONTINUI_MACHINE_ID unset, machine.json unreadable) — skipping \
+                 tenant-slot pass"
+            ),
+        }
+    } else {
+        // No per-tenant slot exists on this runner, so the slot pass never
+        // runs and never publishes. The coord credential is then the
+        // LEGACY `access_token` slot, and a runner holding a dead one (or
+        // none at all) is exactly the silent case this posture exists to
+        // end — a never-paired runner must read `absent`, not UNKNOWN
+        // forever. Derived from the same pure ladder; no pass outcome
+        // exists, so the derivation sees `None` and speaks from `exp`.
+        //
+        // Read through the TRI-STATE probe, not `get_access_token`: that
+        // returns `Err` both for a never-paired runner and for a
+        // present-but-undecryptable store, and collapsing the two would
+        // fire a "you have no coord credential" banner at a paired runner
+        // whose store merely failed to decrypt this tick.
+        stage.set(PassStage::LegacyPosture);
+        let obs = match auth_manager.probe_access_token() {
+            crate::secure_storage::StoredTokenRead::Present(t) => {
+                SlotObservation::observed(None, Some(t.as_str()))
+            }
+            crate::secure_storage::StoredTokenRead::Absent => SlotObservation::observed(None, None),
+            crate::secure_storage::StoredTokenRead::Unreadable(_) => {
+                SlotObservation::unreadable(None)
+            }
+        };
+        if let Some(transition) = derive_and_publish_posture(
+            &[obs],
+            sweep_inputs.posture_pin_inputs(),
+            chrono::Utc::now().timestamp(),
+        ) {
+            notify_posture_transition(Some(&api_state.app_handle), transition);
+        }
+    }
+
+    match decision {
+        Decision::IdleWrongTier => {
+            stage.set(PassStage::PublishStatus);
+            // Phase 1b: publish the credential-dark signal so coord's
+            // fleet `evaluate()` lights up a device-scoped alert. Best-
+            // effort — never blocks the idle wait below.
+            publish_coord_credential_status(auth_manager, &coord_credential_health(decision, None))
+                .await;
+            // Phase 8a: with tenant slots held, a wrong-tier idle must
+            // NOT park indefinitely — the slot pass above only runs per
+            // loop iteration, so an unbounded block would starve slot
+            // refreshes until a kick that may never come. Bounded wait
+            // instead (kick/shutdown still wake early). Slot-less
+            // runners keep the historical block-until-kick behavior.
+            if let Some(wait) = idle_wrong_tier_wait(has_tenant_slots) {
+                return PassOutput::new(PassEnd::Wait(wait), hint);
+            }
+            // Nothing to do until tier changes. Block on shutdown or
+            // kick (set_runner_tier kicks us on every transition).
+            PassOutput::new(PassEnd::UntilKick, hint)
+        }
+        Decision::Idle => {
+            stage.set(PassStage::PublishStatus);
+            // Phase 1b: a fresh JWT → publish ok so any stale alert self-
+            // clears on coord's next firing-set reconcile.
+            publish_coord_credential_status(auth_manager, &coord_credential_health(decision, None))
+                .await;
+            // JWT is fresh — sleep until next check or wake on kick.
+            PassOutput::new(PassEnd::Wait(REFRESH_CHECK_INTERVAL), hint)
+        }
+        Decision::Pair => {
+            // Phase 4a: PREFER a login-independent DEVICE self-refresh. When
+            // the runner still holds a currently-valid device-JWT, re-mint it
+            // by presenting that JWT to coord's
+            // `POST /devices/:id/refresh-token` (NO Cognito touched) — this
+            // keeps a continuously-running runner autonomous past the ~30-day
+            // Cognito refresh-token ceiling. Only when no valid device-JWT is
+            // held (expired/absent), OR coord doesn't support the route yet
+            // (404 → fall through, ordering-safe), do we run the Cognito
+            // pair-cli path below. device_id: env override first (multi-
+            // instance / test), else machine.json — same resolution as the
+            // status publisher.
+            let self_refresh_device_id = std::env::var("QONTINUI_MACHINE_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+            if let Some(did) = self_refresh_device_id {
+                let (coord_base, _coord_base_source) =
+                    crate::coord_mcp::coord_base_url_with_source();
+                stage.set(PassStage::SelfRefresh);
+                let self_refresh = try_device_self_refresh(auth_manager, &coord_base, &did).await;
+                if let Some(cause) = self_refresh.kept_existing_cause() {
+                    hint = fold_retry_hint(hint, cause);
+                }
+                if let SelfRefreshOutcome::Refreshed(new_jwt) = self_refresh {
+                    info!(
+                        "device_jwt_refresher: device-JWT self-refreshed (len={}) \
+                         — Cognito path skipped this tick",
+                        new_jwt.len()
+                    );
+                    // Same downstream handling as a successful Cognito re-mint:
+                    // wake the relay so it reconnects with the new JWT, publish
+                    // healthy, reset backoff, and fall to the steady cadence.
+                    stage.set(PassStage::KickRelay);
+                    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                    stage.set(PassStage::PublishStatus);
+                    publish_coord_credential_status(
+                        auth_manager,
+                        &coord_credential_health(decision, Some(PairProgress::Healthy)),
+                    )
+                    .await;
+                    // A healthy tick: reset transient backoff + emit "resumed"
+                    // if we were previously credential-dark.
+                    let action = plan_refresh_wait(backoff, RefreshClass::Ok);
+                    if action.notify_recovered {
+                        emit_credential_dark(&api_state.app_handle, false);
+                    }
+                    return PassOutput::new(PassEnd::Wait(action.wait), hint);
+                }
+            }
+
+            // The web backend's pair-cli endpoint gates on the user
+            // bearer (`Authorization: Bearer <user-token>`). Phase 5
+            // (unified-Cognito-identity): when the runner was signed in
+            // via Cognito, the bearer is the Cognito **access token** —
+            // refreshed first if it's stale (so the re-bind presents a
+            // valid user token). For legacy/local-login installs there's
+            // no Cognito session, so we fall back to the device-JWT slot
+            // bearer (the historical Phase-2 source).
+            // Phase 2: classify the Cognito refresh so we can back off on a
+            // transient blip and fire the credential-dark notification on a
+            // dead refresh token (`invalid_grant`) instead of silently
+            // stalling. `refresh_class` drives the wait + notification at
+            // each exit below.
+            stage.set(PassStage::CognitoRefresh);
+            let (cognito_bearer, refresh_class) = refresh_cognito_bearer(auth_manager).await;
+            let bearer_token = match cognito_bearer {
+                Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+                _ => match auth_manager.get_access_token() {
+                    Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    _ => {
+                        warn!(
+                            "device_jwt_refresher: no Cognito session and access_token slot \
+                             empty — user must sign in to Qontinui before the refresher can pair"
+                        );
+                        // Phase 1b: credential-dark (not signed in).
+                        stage.set(PassStage::PublishStatus);
+                        publish_coord_credential_status(
+                            auth_manager,
+                            &coord_credential_health(decision, Some(PairProgress::BailNoBearer)),
+                        )
+                        .await;
+                        // Phase 2: if the refresh token is dead
+                        // (`invalid_grant`) and we also have no device-JWT
+                        // bearer, fire the credential-dark notification +
+                        // back off per classification; otherwise (no session)
+                        // fall to the steady cadence.
+                        let action = plan_refresh_wait(backoff, refresh_class);
+                        if action.notify_dark {
+                            emit_credential_dark(&api_state.app_handle, true);
+                        }
+                        return PassOutput::new(PassEnd::Wait(action.wait), hint);
+                    }
+                },
+            };
+            // The base a device JWT is MINTED against must be the base the
+            // relay DIALS, or the runner presents a credential to a backend
+            // that never issued it.
+            //
+            // `api_config` refuses a LOOPBACK persisted `backend_url` on a
+            // RELEASE build (see `api_config::resolve_api_base_url`), so on
+            // such a runner the relay dials the release default. Reading the
+            // persisted field raw here would leave this loop minting against
+            // `127.0.0.1:8000` while the relay talks to production — the
+            // prod/local device-JWT split the persisted rung was introduced
+            // to close (plan 2026-07-08), re-opened pointing the other way.
+            //
+            // So a refused value defers to `get_api_base_url()` — the one
+            // authority — rather than to a second copy of rung 4 here. The
+            // two can then not disagree by construction. A runner whose
+            // persisted value is honoured (every debug build, and every
+            // release build pointed at a real remote backend) takes the
+            // same path it always did.
+            let (pair_base, pair_base_arm) = resolve_pair_base(&settings_snapshot);
+            if pair_base.is_empty() {
+                warn!("device_jwt_refresher: backend_url empty — cannot pair");
+                return PassOutput::new(PassEnd::Wait(REFRESH_CHECK_INTERVAL), hint);
+            }
+
+            // Resolve device_id + user_id from disk. Phase 5 split:
+            // these reads live here (operator-facing files) so the
+            // factored `try_refresh_once` stays hermetic + testable.
+            let device_id = match qontinui_runner_lib::pair::read_device_id_from_disk() {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "device_jwt_refresher: machine.json unreadable: {e} \
+                         — run `qontinui_profile device init` to create it"
+                    );
+                    return PassOutput::new(PassEnd::Wait(REFRESH_CHECK_INTERVAL), hint);
+                }
+            };
+            let user_id = match qontinui_runner_lib::pair::read_paired_user_id_from_disk() {
+                Some(u) => u,
+                None => {
+                    // No paired-user record — and this tick's heal did
+                    // not rebuild one. Two different states reach here
+                    // (plan 2026-09-29-…-no-coord-credential Phase 3):
+                    // (a) no usable credential at all — a runner that has
+                    // not completed a pairing, the historical meaning;
+                    // (b) a usable per-tenant slot that the heal refused
+                    // to point a default binding at. Reporting (b) as (a)
+                    // was the 2026-09-28 "no coord credential" misreport.
+                    let progress = unpaired_bail_progress_from_cell();
+                    match &progress {
+                        PairProgress::BailNoDefaultBinding {
+                            usable_tenants,
+                            refusal,
+                        } => warn!(
+                            "device_jwt_refresher: paired_user.json names no default \
+                             binding, but valid per-tenant coord credential(s) exist for \
+                             {usable_tenants:?} — the self-heal refused ({refusal}); \
+                             sign in to re-pair (refresher idling until kick)"
+                        ),
+                        _ => warn!(
+                            "device_jwt_refresher: paired_user.json missing — \
+                             runner not paired yet (refresher idling until kick)"
+                        ),
+                    }
+                    // Phase 1b: not paired → credential-dark.
+                    stage.set(PassStage::PublishStatus);
+                    publish_coord_credential_status(
+                        auth_manager,
+                        &coord_credential_health(decision, Some(progress)),
+                    )
+                    .await;
+                    return PassOutput::new(PassEnd::Wait(REFRESH_CHECK_INTERVAL), hint);
+                }
+            };
+
+            // Phase 1b: resolve the tenant ONCE up front so the post-outcome
+            // health mapping can distinguish "no tenant resolved" (gate-
+            // blocking config) from "tenant fine, the mint just failed"
+            // (degraded). `try_refresh_once` re-resolves internally; the two
+            // resolutions agree because both call `resolve_active_tenant_id`
+            // + the same OAuth/outgoing-JWT fallback chain.
+            let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
+            let outgoing_jwt = auth_manager.get_access_token().ok();
+            let resolved_tenant =
+                resolve_pair_tenant_id(&bearer_token, outgoing_jwt.as_deref(), machine_tenant);
+            let tenant_resolved = resolved_tenant.is_some();
+
+            // Phase 5.2: try_refresh_once encapsulates the
+            // pair-cli HTTP call + JWT persistence. It preserves
+            // the existing JWT on any non-2xx outcome.
+            stage.set(PassStage::PairCli);
+            let outcome = try_refresh_once(
+                auth_manager,
+                &pair_base,
+                &bearer_token,
+                &device_id,
+                &user_id,
+                machine_tenant,
+                pair_base_arm,
+            )
+            .await;
+            let progress = match &outcome {
+                RefreshOutcome::Replaced { new_jwt } => {
+                    info!(
+                        "device_jwt_refresher: device-JWT refreshed (len={})",
+                        new_jwt.len()
+                    );
+                    // Wake the relay so it reconnects with the new JWT.
+                    stage.set(PassStage::KickRelay);
+                    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                    PairProgress::Healthy
+                }
+                RefreshOutcome::KeptExisting | RefreshOutcome::PersistFailed(_) => {
+                    if let RefreshOutcome::PersistFailed(e) = &outcome {
+                        warn!("device_jwt_refresher: persist new JWT failed: {e}");
+                    }
+                    // The mint did NOT advance the slot. Classify why:
+                    //   - no tenant resolvable → gate-blocking config red,
+                    //   - tenant fine but the slot JWT is now expired/absent
+                    //     → degraded "credential-dark" red,
+                    //   - tenant fine and the slot JWT is still valid →
+                    //     healthy (a transient coord 5xx we'll retry).
+                    if !tenant_resolved {
+                        PairProgress::BailNoTenant
+                    } else if slot_jwt_is_expired_or_absent(auth_manager) {
+                        PairProgress::BailRefreshFailedExpired
+                    } else {
+                        PairProgress::Healthy
+                    }
+                }
+                // D3: terminal for the tick — see `PairProgress::BailTenantMismatch`.
+                // Deliberately NOT `PersistFailed`'s arm: that path still falls
+                // through to the dmk-exchange fallback below, which this must not.
+                RefreshOutcome::TenantMismatch { expected, returned } => {
+                    warn_tenant_mismatch_once(*expected, *returned);
+                    PairProgress::BailTenantMismatch {
+                        expected: *expected,
+                        returned: *returned,
+                    }
+                }
+            };
+
+            // Phase 4b: FINAL cold-start fallback. Self-refresh (4a) AND the
+            // Cognito pair-cli path have BOTH failed to advance the slot this
+            // tick. If a device machine key (`dmk_`) is stored, exchange it
+            // with web for a fresh device JWT — this recovers a runner offline
+            // past both the device-JWT TTL and the Cognito refresh-token window
+            // (>30d) with no user session. On success: same healthy-tick
+            // handling as the other re-mints (kick relay, publish healthy,
+            // reset backoff, emit "resumed" if we were dark, continue). On
+            // None: fall through to the existing bail.
+            // REPLACE-not-REVOKE: a miss never clears the existing JWT.
+            //
+            // D3: gated on the SPECIFIC bail reasons this fallback answers —
+            // NOT a blanket "anything but Healthy". `BailTenantMismatch` is
+            // deliberately excluded: coord already minted for the wrong
+            // tenant once this tick, and a dmk exchange mints from the SAME
+            // `coord.devices.tenant_id` column that wrong mint may have just
+            // overwritten, so falling through here would repeat the incident
+            // this plan closes rather than recover from it.
+            if matches!(
+                progress,
+                PairProgress::BailNoTenant | PairProgress::BailRefreshFailedExpired
+            ) {
+                let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.trim().to_string())
                     .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
-                if let Some(did) = self_refresh_device_id {
-                    let (coord_base, _coord_base_source) =
-                        crate::coord_mcp::coord_base_url_with_source();
-                    if let Some(new_jwt) =
-                        try_device_self_refresh(&auth_manager, &coord_base, &did).await
+                if let Some(did) = dmk_device_id {
+                    stage.set(PassStage::MachineKeyExchange);
+                    if let Some(new_jwt) = try_device_machine_key_exchange(
+                        auth_manager,
+                        &pair_base,
+                        &did,
+                        resolved_tenant.map(|(t, _)| t),
+                    )
+                    .await
                     {
                         info!(
-                            "device_jwt_refresher: device-JWT self-refreshed (len={}) \
-                             — Cognito path skipped this tick",
+                            "device_jwt_refresher: device JWT recovered via \
+                             device-machine-key exchange (len={}) — self-refresh + \
+                             Cognito both failed this tick",
                             new_jwt.len()
                         );
-                        // Same downstream handling as a successful Cognito re-mint:
-                        // wake the relay so it reconnects with the new JWT, publish
-                        // healthy, reset backoff, and fall to the steady cadence.
+                        stage.set(PassStage::KickRelay);
                         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                        stage.set(PassStage::PublishStatus);
                         publish_coord_credential_status(
-                            &auth_manager,
+                            auth_manager,
                             &coord_credential_health(decision, Some(PairProgress::Healthy)),
                         )
                         .await;
-                        // A healthy tick: reset transient backoff + emit "resumed"
-                        // if we were previously credential-dark.
-                        let action = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
+                        let action = plan_refresh_wait(backoff, RefreshClass::Ok);
                         if action.notify_recovered {
                             emit_credential_dark(&api_state.app_handle, false);
                         }
-                        if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
-                            return;
-                        }
-                        continue;
+                        return PassOutput::new(PassEnd::Wait(action.wait), hint);
                     }
                 }
-
-                // The web backend's pair-cli endpoint gates on the user
-                // bearer (`Authorization: Bearer <user-token>`). Phase 5
-                // (unified-Cognito-identity): when the runner was signed in
-                // via Cognito, the bearer is the Cognito **access token** —
-                // refreshed first if it's stale (so the re-bind presents a
-                // valid user token). For legacy/local-login installs there's
-                // no Cognito session, so we fall back to the device-JWT slot
-                // bearer (the historical Phase-2 source).
-                // Phase 2: classify the Cognito refresh so we can back off on a
-                // transient blip and fire the credential-dark notification on a
-                // dead refresh token (`invalid_grant`) instead of silently
-                // stalling. `refresh_class` drives the wait + notification at
-                // each exit below.
-                let (cognito_bearer, refresh_class) = refresh_cognito_bearer(&auth_manager).await;
-                let bearer_token = match cognito_bearer {
-                    Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-                    _ => match auth_manager.get_access_token() {
-                        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-                        _ => {
-                            warn!(
-                                "device_jwt_refresher: no Cognito session and access_token slot \
-                                 empty — user must sign in to Qontinui before the refresher can pair"
-                            );
-                            // Phase 1b: credential-dark (not signed in).
-                            publish_coord_credential_status(
-                                &auth_manager,
-                                &coord_credential_health(
-                                    decision,
-                                    Some(PairProgress::BailNoBearer),
-                                ),
-                            )
-                            .await;
-                            // Phase 2: if the refresh token is dead
-                            // (`invalid_grant`) and we also have no device-JWT
-                            // bearer, fire the credential-dark notification +
-                            // back off per classification; otherwise (no session)
-                            // fall to the steady cadence.
-                            let action = plan_refresh_wait(&mut backoff, refresh_class);
-                            if action.notify_dark {
-                                emit_credential_dark(&api_state.app_handle, true);
-                            }
-                            if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                    },
-                };
-                // The base a device JWT is MINTED against must be the base the
-                // relay DIALS, or the runner presents a credential to a backend
-                // that never issued it.
-                //
-                // `api_config` refuses a LOOPBACK persisted `backend_url` on a
-                // RELEASE build (see `api_config::resolve_api_base_url`), so on
-                // such a runner the relay dials the release default. Reading the
-                // persisted field raw here would leave this loop minting against
-                // `127.0.0.1:8000` while the relay talks to production — the
-                // prod/local device-JWT split the persisted rung was introduced
-                // to close (plan 2026-07-08), re-opened pointing the other way.
-                //
-                // So a refused value defers to `get_api_base_url()` — the one
-                // authority — rather than to a second copy of rung 4 here. The
-                // two can then not disagree by construction. A runner whose
-                // persisted value is honoured (every debug build, and every
-                // release build pointed at a real remote backend) takes the
-                // same path it always did.
-                let (pair_base, pair_base_arm) = resolve_pair_base(&settings_snapshot);
-                if pair_base.is_empty() {
-                    warn!("device_jwt_refresher: backend_url empty — cannot pair");
-                    if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
-                        .await
-                    {
-                        return;
-                    }
-                    continue;
-                }
-
-                // Resolve device_id + user_id from disk. Phase 5 split:
-                // these reads live here (operator-facing files) so the
-                // factored `try_refresh_once` stays hermetic + testable.
-                let device_id = match qontinui_runner_lib::pair::read_device_id_from_disk() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!(
-                            "device_jwt_refresher: machine.json unreadable: {e} \
-                             — run `qontinui_profile device init` to create it"
-                        );
-                        if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
-                            .await
-                        {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-                let user_id = match qontinui_runner_lib::pair::read_paired_user_id_from_disk() {
-                    Some(u) => u,
-                    None => {
-                        // No paired-user record — and this tick's heal did
-                        // not rebuild one. Two different states reach here
-                        // (plan 2026-09-29-…-no-coord-credential Phase 3):
-                        // (a) no usable credential at all — a runner that has
-                        // not completed a pairing, the historical meaning;
-                        // (b) a usable per-tenant slot that the heal refused
-                        // to point a default binding at. Reporting (b) as (a)
-                        // was the 2026-09-28 "no coord credential" misreport.
-                        let progress = unpaired_bail_progress_from_cell();
-                        match &progress {
-                            PairProgress::BailNoDefaultBinding {
-                                usable_tenants,
-                                refusal,
-                            } => warn!(
-                                "device_jwt_refresher: paired_user.json names no default \
-                                 binding, but valid per-tenant coord credential(s) exist for \
-                                 {usable_tenants:?} — the self-heal refused ({refusal}); \
-                                 sign in to re-pair (refresher idling until kick)"
-                            ),
-                            _ => warn!(
-                                "device_jwt_refresher: paired_user.json missing — \
-                                 runner not paired yet (refresher idling until kick)"
-                            ),
-                        }
-                        // Phase 1b: not paired → credential-dark.
-                        publish_coord_credential_status(
-                            &auth_manager,
-                            &coord_credential_health(decision, Some(progress)),
-                        )
-                        .await;
-                        if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
-                            .await
-                        {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-
-                // Phase 1b: resolve the tenant ONCE up front so the post-outcome
-                // health mapping can distinguish "no tenant resolved" (gate-
-                // blocking config) from "tenant fine, the mint just failed"
-                // (degraded). `try_refresh_once` re-resolves internally; the two
-                // resolutions agree because both call `resolve_active_tenant_id`
-                // + the same OAuth/outgoing-JWT fallback chain.
-                let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
-                let outgoing_jwt = auth_manager.get_access_token().ok();
-                let resolved_tenant =
-                    resolve_pair_tenant_id(&bearer_token, outgoing_jwt.as_deref(), machine_tenant);
-                let tenant_resolved = resolved_tenant.is_some();
-
-                // Phase 5.2: try_refresh_once encapsulates the
-                // pair-cli HTTP call + JWT persistence. It preserves
-                // the existing JWT on any non-2xx outcome.
-                let outcome = try_refresh_once(
-                    &auth_manager,
-                    &pair_base,
-                    &bearer_token,
-                    &device_id,
-                    &user_id,
-                    machine_tenant,
-                    pair_base_arm,
-                )
-                .await;
-                let progress = match &outcome {
-                    RefreshOutcome::Replaced { new_jwt } => {
-                        info!(
-                            "device_jwt_refresher: device-JWT refreshed (len={})",
-                            new_jwt.len()
-                        );
-                        // Wake the relay so it reconnects with the new JWT.
-                        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-                        PairProgress::Healthy
-                    }
-                    RefreshOutcome::KeptExisting | RefreshOutcome::PersistFailed(_) => {
-                        if let RefreshOutcome::PersistFailed(e) = &outcome {
-                            warn!("device_jwt_refresher: persist new JWT failed: {e}");
-                        }
-                        // The mint did NOT advance the slot. Classify why:
-                        //   - no tenant resolvable → gate-blocking config red,
-                        //   - tenant fine but the slot JWT is now expired/absent
-                        //     → degraded "credential-dark" red,
-                        //   - tenant fine and the slot JWT is still valid →
-                        //     healthy (a transient coord 5xx we'll retry).
-                        if !tenant_resolved {
-                            PairProgress::BailNoTenant
-                        } else if slot_jwt_is_expired_or_absent(&auth_manager) {
-                            PairProgress::BailRefreshFailedExpired
-                        } else {
-                            PairProgress::Healthy
-                        }
-                    }
-                    // D3: terminal for the tick — see `PairProgress::BailTenantMismatch`.
-                    // Deliberately NOT `PersistFailed`'s arm: that path still falls
-                    // through to the dmk-exchange fallback below, which this must not.
-                    RefreshOutcome::TenantMismatch { expected, returned } => {
-                        warn_tenant_mismatch_once(*expected, *returned);
-                        PairProgress::BailTenantMismatch {
-                            expected: *expected,
-                            returned: *returned,
-                        }
-                    }
-                };
-
-                // Phase 4b: FINAL cold-start fallback. Self-refresh (4a) AND the
-                // Cognito pair-cli path have BOTH failed to advance the slot this
-                // tick. If a device machine key (`dmk_`) is stored, exchange it
-                // with web for a fresh device JWT — this recovers a runner offline
-                // past both the device-JWT TTL and the Cognito refresh-token window
-                // (>30d) with no user session. On success: same healthy-tick
-                // handling as the other re-mints (kick relay, publish healthy,
-                // reset backoff, emit "resumed" if we were dark, continue). On
-                // None: fall through to the existing bail.
-                // REPLACE-not-REVOKE: a miss never clears the existing JWT.
-                //
-                // D3: gated on the SPECIFIC bail reasons this fallback answers —
-                // NOT a blanket "anything but Healthy". `BailTenantMismatch` is
-                // deliberately excluded: coord already minted for the wrong
-                // tenant once this tick, and a dmk exchange mints from the SAME
-                // `coord.devices.tenant_id` column that wrong mint may have just
-                // overwritten, so falling through here would repeat the incident
-                // this plan closes rather than recover from it.
-                if matches!(
-                    progress,
-                    PairProgress::BailNoTenant | PairProgress::BailRefreshFailedExpired
-                ) {
-                    let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.trim().to_string())
-                        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
-                    if let Some(did) = dmk_device_id {
-                        if let Some(new_jwt) = try_device_machine_key_exchange(
-                            &auth_manager,
-                            &pair_base,
-                            &did,
-                            resolved_tenant.map(|(t, _)| t),
-                        )
-                        .await
-                        {
-                            info!(
-                                "device_jwt_refresher: device JWT recovered via \
-                                 device-machine-key exchange (len={}) — self-refresh + \
-                                 Cognito both failed this tick",
-                                new_jwt.len()
-                            );
-                            crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-                            publish_coord_credential_status(
-                                &auth_manager,
-                                &coord_credential_health(decision, Some(PairProgress::Healthy)),
-                            )
-                            .await;
-                            let action = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
-                            if action.notify_recovered {
-                                emit_credential_dark(&api_state.app_handle, false);
-                            }
-                            if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                publish_coord_credential_status(
-                    &auth_manager,
-                    &coord_credential_health(decision, Some(progress)),
-                )
-                .await;
-
-                // Phase 2: drive the wait + credential-dark notification off the
-                // Cognito-refresh classification. Transient → shortened backoff
-                // (autonomy self-recovers fast once connectivity returns); Hard
-                // (`invalid_grant`) → steady cadence + notify-once; Ok → steady
-                // cadence, emitting "resumed" if we were previously dark.
-                let action = plan_refresh_wait(&mut backoff, refresh_class);
-                if action.notify_dark {
-                    emit_credential_dark(&api_state.app_handle, true);
-                }
-                if action.notify_recovered {
-                    emit_credential_dark(&api_state.app_handle, false);
-                }
-                if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
-                    return;
-                }
-                continue;
             }
+
+            stage.set(PassStage::PublishStatus);
+            publish_coord_credential_status(
+                auth_manager,
+                &coord_credential_health(decision, Some(progress)),
+            )
+            .await;
+
+            // Phase 2: drive the wait + credential-dark notification off the
+            // Cognito-refresh classification. Transient → shortened backoff
+            // (autonomy self-recovers fast once connectivity returns); Hard
+            // (`invalid_grant`) → steady cadence + notify-once; Ok → steady
+            // cadence, emitting "resumed" if we were previously dark.
+            let action = plan_refresh_wait(backoff, refresh_class);
+            if action.notify_dark {
+                emit_credential_dark(&api_state.app_handle, true);
+            }
+            if action.notify_recovered {
+                emit_credential_dark(&api_state.app_handle, false);
+            }
+            PassOutput::new(PassEnd::Wait(action.wait), hint)
         }
     }
 }
@@ -6442,6 +6936,9 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_handles_coord_401_without_clearing_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // Setup: AuthManager holds a valid-shape (not-yet-expired) JWT.
         // Run: mock web backend returns 401 on pair-cli.
         // Assert: access_token slot STILL holds the original JWT (not
@@ -6476,6 +6973,9 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_handles_coord_503_without_clearing_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // Same as 401 but with a 503 — coord overloaded / down. We
         // MUST NOT punish the runner by clearing its JWT for a
         // transient server error.
@@ -6500,6 +7000,9 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_handles_coord_200_replaces_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // Setup: AuthManager holds the OLD JWT.
         // Run: mock web backend returns canonical 200 with a NEW JWT.
         // Assert: outcome is Replaced with the NEW JWT, and the
@@ -6545,6 +7048,9 @@ mod try_refresh_once_tests {
     /// fixes: the old behaviour stored whatever coord returned.
     #[tokio::test]
     async fn refresher_refuses_a_mismatched_tenant_and_preserves_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         let mgr = test_auth_manager("refuses_mismatched_tenant");
         let old_jwt = synth_jwt_with_tenant(
             chrono::Utc::now().timestamp() + 30 * 60,
@@ -6615,6 +7121,9 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_uses_outgoing_jwt_tenant_when_oauth_claim_absent() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // PROD BUG REGRESSION: the OAuth/runner bearer carries NO tenant_id
         // (the operator's Cognito token) but the OUTGOING device-JWT — the one
         // we're about to replace — still carries its own tenant_id claim. The
@@ -6672,6 +7181,9 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_keeps_existing_when_no_tenant_source_at_all() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // BEHAVIOR PRESERVED: OAuth bearer has no tenant claim, the persisted
         // device-JWT has no tenant claim, AND the caller-injected
         // `machine_tenant` is `None`. (`try_refresh_once` no longer reads
@@ -6711,6 +7223,9 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_uses_machine_tenant_when_no_jwt_claims() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // Fallback 3: OAuth bearer + persisted device-JWT both lack a tenant
         // claim, but the caller-injected `machine_tenant`
         // (machine.json::active_tenant_id in prod) supplies one → the refresh
@@ -6880,6 +7395,9 @@ mod device_self_refresh_tests {
 
     #[tokio::test]
     async fn self_refresh_preferred_when_valid_device_jwt_held() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // A currently-valid (future-exp) device-JWT is held → self-refresh
         // re-mints from it (presenting it as the bearer), stores the new token,
         // and returns Some. The caller uses this to SKIP the Cognito path
@@ -6894,7 +7412,7 @@ mod device_self_refresh_tests {
 
         let got = try_device_self_refresh(&mgr, &base, DID).await;
         assert_eq!(
-            got.as_deref(),
+            got.token(),
             Some(new_jwt.as_str()),
             "self-refresh must return the new JWT"
         );
@@ -6916,6 +7434,9 @@ mod device_self_refresh_tests {
 
     #[tokio::test]
     async fn falls_back_to_cognito_when_device_jwt_expired() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // An already-expired device-JWT cannot self-refresh (coord would 401 the
         // bearer, and this IS the Cognito-recovery case). Return None WITHOUT
         // touching coord so the caller falls back to the Cognito path.
@@ -6929,7 +7450,10 @@ mod device_self_refresh_tests {
         );
 
         let got = try_device_self_refresh(&mgr, &base, DID).await;
-        assert!(got.is_none(), "expired JWT → None (Cognito fallback)");
+        assert!(
+            got == SelfRefreshOutcome::NotAttempted,
+            "expired JWT → None (Cognito fallback)"
+        );
         assert_eq!(
             *cap.hits.lock().unwrap(),
             0,
@@ -6941,6 +7465,9 @@ mod device_self_refresh_tests {
 
     #[tokio::test]
     async fn falls_back_to_cognito_when_device_jwt_absent() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // No device-JWT held at all → None without hitting coord.
         let mgr = test_auth_manager("fallback_when_absent");
         let (base, cap, _shutdown) = spawn_mock(
@@ -6948,7 +7475,10 @@ mod device_self_refresh_tests {
             serde_json::json!({ "token": "x" }).to_string(),
         );
         let got = try_device_self_refresh(&mgr, &base, DID).await;
-        assert!(got.is_none(), "absent JWT → None (Cognito fallback)");
+        assert!(
+            got == SelfRefreshOutcome::NotAttempted,
+            "absent JWT → None (Cognito fallback)"
+        );
         assert_eq!(
             *cap.hits.lock().unwrap(),
             0,
@@ -6962,6 +7492,9 @@ mod device_self_refresh_tests {
     /// caller falls back to Cognito exactly as any other self-refresh miss.
     #[tokio::test]
     async fn self_refresh_refuses_a_mismatched_tenant_and_preserves_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         let mgr = test_auth_manager("refuses_mismatched_tenant");
         let existing = synth_jwt_with_tenant(
             "11111111-2222-4333-8444-555555555561",
@@ -6977,7 +7510,10 @@ mod device_self_refresh_tests {
         let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
         let got = try_device_self_refresh(&mgr, &base, DID).await;
-        assert!(got.is_none(), "a mismatched tenant must be refused");
+        assert!(
+            got.kept_existing_cause() == Some(KeptExistingCause::Other),
+            "a mismatched tenant must be refused"
+        );
         assert_eq!(*cap.hits.lock().unwrap(), 1, "coord was still hit once");
         assert_eq!(
             mgr.get_access_token().unwrap(),
@@ -6988,6 +7524,9 @@ mod device_self_refresh_tests {
 
     #[tokio::test]
     async fn self_refresh_404_returns_none_and_preserves_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // ORDERING SAFETY + REPLACE-not-REVOKE: a coord that hasn't deployed the
         // route yet 404s → None (fall back to Cognito) and the existing JWT is
         // left UNTOUCHED. This is what lets the runner half ship before the coord
@@ -7002,7 +7541,10 @@ mod device_self_refresh_tests {
         );
 
         let got = try_device_self_refresh(&mgr, &base, DID).await;
-        assert!(got.is_none(), "404 → None (Cognito fallback)");
+        assert!(
+            got.kept_existing_cause() == Some(KeptExistingCause::Other),
+            "404 → None (Cognito fallback)"
+        );
         assert_eq!(
             *cap.hits.lock().unwrap(),
             1,
@@ -7015,8 +7557,63 @@ mod device_self_refresh_tests {
         );
     }
 
+    /// Phase 2 step 3: a 5xx is no longer an anonymous `None` — it is
+    /// `Upstream5xx`, which puts the next pass on the transient backoff.
+    #[tokio::test]
+    async fn self_refresh_5xx_is_typed_upstream_and_preserves_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
+        let mgr = test_auth_manager("resp_503_typed");
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        mgr.store_tokens(&existing, "").expect("store");
+        let (base, cap, _shutdown) = spawn_mock(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"down"}"#.to_string(),
+        );
+
+        let got = try_device_self_refresh(&mgr, &base, DID).await;
+        assert_eq!(
+            got,
+            SelfRefreshOutcome::KeptExisting {
+                cause: KeptExistingCause::Upstream5xx
+            }
+        );
+        assert_eq!(*cap.hits.lock().unwrap(), 1);
+        assert_eq!(mgr.get_access_token().unwrap(), existing);
+    }
+
+    /// Coord unreachable: `Transport`, existing JWT untouched.
+    #[tokio::test]
+    async fn self_refresh_transport_failure_is_typed_transport() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
+        let mgr = test_auth_manager("transport_typed");
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        mgr.store_tokens(&existing, "").expect("store");
+        let dead_base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = l.local_addr().expect("addr").port();
+            drop(l);
+            format!("http://127.0.0.1:{port}")
+        };
+
+        let got = try_device_self_refresh(&mgr, &dead_base, DID).await;
+        assert_eq!(
+            got,
+            SelfRefreshOutcome::KeptExisting {
+                cause: KeptExistingCause::Transport
+            }
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), existing);
+    }
+
     #[tokio::test]
     async fn self_refresh_401_returns_none_and_preserves_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // A 401 (stale/rejected bearer) → None + existing JWT preserved. The
         // caller falls back to Cognito; the runner is never punished by a cleared
         // slot for a single non-2xx.
@@ -7030,7 +7627,7 @@ mod device_self_refresh_tests {
         );
 
         let got = try_device_self_refresh(&mgr, &base, DID).await;
-        assert!(got.is_none());
+        assert_eq!(got.kept_existing_cause(), Some(KeptExistingCause::Other));
         assert_eq!(
             mgr.get_access_token().unwrap(),
             existing,
@@ -7117,7 +7714,8 @@ mod tenant_slot_refresh_tests {
         State(s): State<MockState>,
         Path(_device_id): Path<String>,
         h: HeaderMap,
-    ) -> (StatusCode, String) {
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
         let bearer = h
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -7133,15 +7731,19 @@ mod tenant_slot_refresh_tests {
             .find(|(b, _)| *b == bearer)
             .map(|(_, st)| *st);
         if let Some(code) = forced {
-            return (
-                StatusCode::from_u16(code).expect("valid status"),
-                r#"{"error":"forced"}"#.to_string(),
-            );
+            let status = StatusCode::from_u16(code).expect("valid status");
+            let body = r#"{"error":"forced"}"#.to_string();
+            // A forced 429 says how long to back off, as coord would.
+            if code == 429 {
+                return (status, [(axum::http::header::RETRY_AFTER, "42")], body).into_response();
+            }
+            return (status, body).into_response();
         }
         (
             StatusCode::OK,
             serde_json::json!({ "token": format!("{bearer}.refreshed") }).to_string(),
         )
+            .into_response()
     }
 
     struct MockCapture {
@@ -7251,7 +7853,7 @@ mod tenant_slot_refresh_tests {
             plan_tenant_slot(Some(now), now),
             TenantSlotPlan::ClearAndRederive
         );
-        // Future exp within TTL/3 → refresh.
+        // Future exp within TTL/2 → refresh.
         assert_eq!(
             plan_tenant_slot(Some(now + 30 * 60), now),
             TenantSlotPlan::Refresh
@@ -7263,6 +7865,16 @@ mod tenant_slot_refresh_tests {
         // Comfortably fresh → skip.
         assert_eq!(
             plan_tenant_slot(Some(now + 3 * 60 * 60), now),
+            TenantSlotPlan::SkipFresh
+        );
+        // The TTL/2 boundary: 100 min left is inside the window (it was
+        // outside under TTL/3); one second past the threshold is not.
+        assert_eq!(
+            plan_tenant_slot(Some(now + 100 * 60), now),
+            TenantSlotPlan::Refresh
+        );
+        assert_eq!(
+            plan_tenant_slot(Some(now + crate::auth::REFRESH_BEFORE_EXPIRY_SECS + 1), now),
             TenantSlotPlan::SkipFresh
         );
     }
@@ -7335,7 +7947,12 @@ mod tenant_slot_refresh_tests {
         assert_eq!(
             outcomes,
             vec![
-                (ta, TenantSlotOutcome::KeptExisting),
+                (
+                    ta,
+                    TenantSlotOutcome::KeptExisting {
+                        cause: KeptExistingCause::Upstream5xx
+                    }
+                ),
                 (tb, TenantSlotOutcome::Refreshed)
             ],
             "A fails, B still refreshes — no abort"
@@ -7495,6 +8112,67 @@ mod tenant_slot_refresh_tests {
         assert_eq!(mgr.get_tenant_device_jwt(&ta).unwrap(), None);
     }
 
+    /// Phase 2 step 3: a 429 on a slot refresh is `RateLimited` carrying the
+    /// parsed `Retry-After`, never a clear and never a transient retry.
+    #[tokio::test]
+    async fn coord_429_is_rate_limited_with_retry_after_and_keeps_the_slot() {
+        let _serialised = health_lock();
+        let mgr = test_auth_manager("multi_slot_429_keeps");
+        let ta = tenant(0);
+        let now = chrono::Utc::now().timestamp();
+        let jwt = synth_jwt(now + 30 * 60, "rate-limited");
+        mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
+
+        let (base, _cap, _shutdown) = spawn_mock(vec![(jwt.clone(), 429)]);
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
+
+        let expected = KeptExistingCause::RateLimited {
+            retry_after: Some(Duration::from_secs(42)),
+        };
+        assert_eq!(
+            outcomes,
+            vec![(ta, TenantSlotOutcome::KeptExisting { cause: expected })]
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(jwt.as_str()),
+            "a 429 says nothing about the credential"
+        );
+        // And the pass's wait honours it rather than the 15 s retry.
+        let hint = pass_retry_hint(outcomes.iter().filter_map(|(_, o)| o.kept_existing_cause()));
+        let mut state = RefreshBackoff::default();
+        let wait = wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state);
+        assert_eq!(wait, Some(Duration::from_secs(42)));
+    }
+
+    /// End to end through a real pass: coord down while the slot is inside its
+    /// window -> the next wake is on the transient backoff, not 300 s.
+    #[tokio::test]
+    async fn a_slot_inside_its_window_failing_on_transport_wakes_on_the_transient_backoff() {
+        let _serialised = health_lock();
+        let mgr = test_auth_manager("multi_slot_transport_backoff");
+        let ta = tenant(0);
+        let now = chrono::Utc::now().timestamp();
+        // 100 minutes left: inside the TTL/2 window, OUTSIDE the old TTL/3 one.
+        let jwt = synth_jwt(now + 100 * 60, "outage-in-window");
+        mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
+        let dead_base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = l.local_addr().expect("addr").port();
+            drop(l);
+            format!("http://127.0.0.1:{port}")
+        };
+        let outcomes =
+            refresh_tenant_slots(&mgr, &dead_base, "", DID, None, PosturePinInputs::UNPINNED).await;
+        let hint = pass_retry_hint(outcomes.iter().filter_map(|(_, o)| o.kept_existing_cause()));
+        assert_eq!(hint, PassRetryHint::Transient);
+        let mut state = RefreshBackoff::default();
+        let wait = wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state).expect("a wait");
+        assert!(wait <= TRANSIENT_BACKOFF_MAX, "{wait:?}");
+        assert_eq!(wait, TRANSIENT_BACKOFF_MIN);
+    }
+
     /// THE SAFEGUARD, half one: coord being UNWELL is not coord rejecting the
     /// credential. A 503 must leave the slot exactly as it found it — the same
     /// posture the legacy path already pins in
@@ -7512,7 +8190,15 @@ mod tenant_slot_refresh_tests {
         let outcomes =
             refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
-        assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::KeptExisting)]);
+        assert_eq!(
+            outcomes,
+            vec![(
+                ta,
+                TenantSlotOutcome::KeptExisting {
+                    cause: KeptExistingCause::Upstream5xx
+                }
+            )]
+        );
         assert_eq!(
             mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
             Some(jwt.as_str()),
@@ -7568,7 +8254,12 @@ mod tenant_slot_refresh_tests {
 
         assert_eq!(
             outcomes,
-            vec![(ta, TenantSlotOutcome::KeptExisting)],
+            vec![(
+                ta,
+                TenantSlotOutcome::KeptExisting {
+                    cause: KeptExistingCause::Transport
+                }
+            )],
             "a transport error is UNKNOWN — it may never be read as a rejection"
         );
         assert_eq!(
@@ -7886,7 +8577,15 @@ mod tenant_slot_refresh_tests {
             PosturePinInputs::UNPINNED,
         )
         .await;
-        assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::KeptExisting)]);
+        assert_eq!(
+            outcomes,
+            vec![(
+                ta,
+                TenantSlotOutcome::KeptExisting {
+                    cause: KeptExistingCause::Transport
+                }
+            )]
+        );
 
         let transitions = recorded_posture_transitions();
         assert_eq!(
@@ -9443,7 +10142,9 @@ mod tenant_slot_refresh_tests {
             exp: Some(now - 60),
             present: true,
             unknown: false,
-            outcome: Some(TenantSlotOutcome::KeptExisting),
+            outcome: Some(TenantSlotOutcome::KeptExisting {
+                cause: KeptExistingCause::Other,
+            }),
         };
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
@@ -12629,6 +13330,9 @@ mod device_machine_key_exchange_tests {
 
     #[tokio::test]
     async fn exchange_recovers_device_jwt_from_stored_dmk() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // The >30-day cold-start: the slot holds an EXPIRED device JWT (4a +
         // Cognito already failed), but a dmk_ is stored → the exchange mints a
         // fresh device JWT, stores it, and returns it. The dmk_ must ride the
@@ -12666,6 +13370,9 @@ mod device_machine_key_exchange_tests {
 
     #[tokio::test]
     async fn exchange_returns_none_when_no_dmk_stored() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // No dmk_ → the recovery path is unavailable: return None WITHOUT any
         // HTTP call, so the loop falls through to the credential-dark bail.
         let expired = synth_jwt(chrono::Utc::now().timestamp() - 60);
@@ -12689,6 +13396,9 @@ mod device_machine_key_exchange_tests {
 
     #[tokio::test]
     async fn exchange_403_returns_none_and_preserves_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // REPLACE-not-REVOKE: a revoked/expired/mismatched dmk_ → web 403 →
         // None and the existing JWT is left UNTOUCHED (never cleared).
         let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
@@ -12709,6 +13419,9 @@ mod device_machine_key_exchange_tests {
 
     #[tokio::test]
     async fn exchange_503_returns_none_and_preserves_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         // Web's COORD_ADMIN_SECRET unset (the deployment prerequisite) surfaces
         // as 503 → None, JWT preserved. A transient/config error never punishes
         // the runner by clearing its slot.
@@ -12737,6 +13450,9 @@ mod device_machine_key_exchange_tests {
     /// names: the dmk exchange used to call `store_tokens` unconditionally.
     #[tokio::test]
     async fn exchange_refuses_a_foreign_tenant_and_preserves_jwt() {
+        // The legacy mint paths retire the PROCESS-GLOBAL upstream rejection
+        // streaks; serialise with every test that asserts on them.
+        let _serialised = super::posture_test_lock();
         let expected = uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555560").unwrap();
         let foreign = uuid::Uuid::parse_str("22222222-3333-4444-5555-666666666670").unwrap();
         let existing = synth_jwt(chrono::Utc::now().timestamp() - 60); // expired, cold-start
@@ -12768,5 +13484,280 @@ mod device_machine_key_exchange_tests {
             None,
             "the foreign tenant's slot must not be seeded either"
         );
+    }
+}
+
+#[cfg(test)]
+mod refresh_window_outage_tests {
+    //! Plan `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
+    //! Phase 2: the typed kept-existing cause driving the next wake, the outer
+    //! per-pass bound, and the TTL/2 `Expiring` band.
+
+    use super::*;
+
+    fn rl(secs: u64) -> KeptExistingCause {
+        KeptExistingCause::RateLimited {
+            retry_after: Some(Duration::from_secs(secs)),
+        }
+    }
+
+    #[test]
+    fn status_and_retry_after_classify() {
+        assert_eq!(
+            kept_existing_cause_for_status(500, None),
+            KeptExistingCause::Upstream5xx
+        );
+        assert_eq!(
+            kept_existing_cause_for_status(503, None),
+            KeptExistingCause::Upstream5xx
+        );
+        assert_eq!(
+            kept_existing_cause_for_status(404, None),
+            KeptExistingCause::Other
+        );
+        assert_eq!(kept_existing_cause_for_status(429, Some(" 90 ")), rl(90));
+        assert_eq!(
+            kept_existing_cause_for_status(429, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            KeptExistingCause::RateLimited { retry_after: None },
+            "the HTTP-date form is not guessed at"
+        );
+        assert_eq!(parse_retry_after(None), None);
+        assert_eq!(parse_retry_after(Some("-5")), None);
+    }
+
+    #[test]
+    fn transport_and_5xx_wake_on_the_transient_backoff() {
+        for cause in [KeptExistingCause::Transport, KeptExistingCause::Upstream5xx] {
+            let mut state = RefreshBackoff::default();
+            let hint = pass_retry_hint([cause]);
+            assert_eq!(hint, PassRetryHint::Transient);
+            let w = wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state).unwrap();
+            assert!(
+                w <= TRANSIENT_BACKOFF_MAX && w >= TRANSIENT_BACKOFF_MIN,
+                "{cause:?}: {w:?}"
+            );
+            assert!(w < REFRESH_CHECK_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn a_long_outage_climbs_the_ladder_and_pins_at_the_ceiling() {
+        let mut state = RefreshBackoff::default();
+        let waits: Vec<u64> = (0..6)
+            .map(|_| {
+                wait_after_pass(
+                    Some(REFRESH_CHECK_INTERVAL),
+                    PassRetryHint::Transient,
+                    &mut state,
+                )
+                .unwrap()
+                .as_secs()
+            })
+            .collect();
+        assert_eq!(waits, vec![15, 30, 60, 120, 120, 120]);
+        // Recovery resets the ladder.
+        assert_eq!(
+            wait_after_pass(
+                Some(REFRESH_CHECK_INTERVAL),
+                PassRetryHint::None,
+                &mut state
+            ),
+            Some(REFRESH_CHECK_INTERVAL)
+        );
+        assert_eq!(
+            wait_after_pass(
+                Some(REFRESH_CHECK_INTERVAL),
+                PassRetryHint::Transient,
+                &mut state
+            ),
+            Some(TRANSIENT_BACKOFF_MIN)
+        );
+    }
+
+    /// The ladder must survive the Cognito classifier resetting ITS counter on
+    /// every pass (a no-Cognito box reports `NoSession` each time).
+    #[test]
+    fn the_pass_ladder_is_independent_of_the_cognito_ladder() {
+        let mut state = RefreshBackoff::default();
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let action = plan_refresh_wait(&mut state, RefreshClass::NoSession);
+            waits.push(
+                wait_after_pass(Some(action.wait), PassRetryHint::Transient, &mut state)
+                    .unwrap()
+                    .as_secs(),
+            );
+        }
+        assert_eq!(waits, vec![15, 30, 60]);
+    }
+
+    #[test]
+    fn a_transient_hint_never_lengthens_a_shorter_base() {
+        let mut state = RefreshBackoff {
+            consecutive_pass_transient: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            wait_after_pass(
+                Some(Duration::from_secs(20)),
+                PassRetryHint::Transient,
+                &mut state
+            ),
+            Some(Duration::from_secs(20))
+        );
+        // A block-until-kick with a transient hint still retries.
+        let mut state = RefreshBackoff::default();
+        assert_eq!(
+            wait_after_pass(None, PassRetryHint::Transient, &mut state),
+            Some(TRANSIENT_BACKOFF_MIN)
+        );
+    }
+
+    #[test]
+    fn rate_limited_honours_retry_after_and_never_takes_the_15s_retry() {
+        for ra in [20u64, 42, 300, 900] {
+            let mut state = RefreshBackoff::default();
+            let w = wait_after_pass(
+                Some(REFRESH_CHECK_INTERVAL),
+                pass_retry_hint([rl(ra)]),
+                &mut state,
+            )
+            .unwrap();
+            assert!(w >= Duration::from_secs(ra), "retry_after={ra}: {w:?}");
+        }
+        // No Retry-After: the steady cadence, not the transient floor.
+        let mut state = RefreshBackoff::default();
+        assert_eq!(
+            wait_after_pass(
+                Some(REFRESH_CHECK_INTERVAL),
+                pass_retry_hint([KeptExistingCause::RateLimited { retry_after: None }]),
+                &mut state,
+            ),
+            Some(REFRESH_CHECK_INTERVAL)
+        );
+        // A tiny Retry-After is still never below the transient floor, and a
+        // huge one is capped.
+        let mut state = RefreshBackoff::default();
+        assert_eq!(
+            wait_after_pass(None, pass_retry_hint([rl(1)]), &mut state),
+            Some(TRANSIENT_BACKOFF_MIN)
+        );
+        assert_eq!(
+            wait_after_pass(None, pass_retry_hint([rl(10 * 24 * 3600)]), &mut state),
+            Some(RATE_LIMIT_WAIT_CAP)
+        );
+    }
+
+    #[test]
+    fn rate_limiting_outranks_transient_and_the_longest_retry_after_wins() {
+        assert_eq!(
+            pass_retry_hint([KeptExistingCause::Transport, rl(30)]),
+            PassRetryHint::RateLimited(Some(Duration::from_secs(30)))
+        );
+        assert_eq!(
+            pass_retry_hint([rl(30), KeptExistingCause::Upstream5xx]),
+            PassRetryHint::RateLimited(Some(Duration::from_secs(30)))
+        );
+        assert_eq!(
+            pass_retry_hint([rl(30), rl(90), rl(60)]),
+            PassRetryHint::RateLimited(Some(Duration::from_secs(90)))
+        );
+        assert_eq!(
+            pass_retry_hint([KeptExistingCause::Other, KeptExistingCause::Upstream5xx]),
+            PassRetryHint::Transient
+        );
+    }
+
+    #[test]
+    fn other_keeps_the_steady_cadence() {
+        let mut state = RefreshBackoff::default();
+        let hint = pass_retry_hint([KeptExistingCause::Other]);
+        assert_eq!(hint, PassRetryHint::None);
+        assert_eq!(
+            wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(pass_retry_hint([]), PassRetryHint::None);
+    }
+
+    /// Step 2: a pass stuck on an await that never answers ends within the
+    /// outer bound, and reports the stage it was stuck in.
+    #[tokio::test]
+    async fn a_pass_that_never_answers_is_abandoned_within_the_bound_naming_its_stage() {
+        let stage = PassStageCell::default();
+        let bound = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let got = run_bounded_pass(bound, &stage, async {
+            stage.set(PassStage::ReadSweepInputs);
+            stage.set(PassStage::SelfRefresh);
+            std::future::pending::<PassOutput>().await
+        })
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(got, Err(PassStage::SelfRefresh));
+        assert!(elapsed >= bound, "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "bounded: {elapsed:?}");
+        let msg = abandoned_pass_message(bound, PassStage::SelfRefresh);
+        assert!(msg.contains("`self-refresh`"), "{msg}");
+        assert!(msg.contains("ABANDONED"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_finishes_inside_the_bound_is_returned_untouched() {
+        let stage = PassStageCell::default();
+        let out = PassOutput::new(PassEnd::UntilKick, PassRetryHint::Transient);
+        let got = run_bounded_pass(Duration::from_secs(5), &stage, async { out }).await;
+        assert_eq!(got, Ok(out));
+    }
+
+    #[test]
+    fn every_stage_round_trips_through_the_cell() {
+        let cell = PassStageCell::default();
+        assert_eq!(cell.get(), PassStage::Start);
+        for st in PassStage::ALL {
+            cell.set(st);
+            assert_eq!(cell.get(), st);
+        }
+        let names: std::collections::HashSet<_> =
+            PassStage::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            PassStage::ALL.len(),
+            "stage tokens are distinct"
+        );
+    }
+
+    /// Step 4: the `Expiring` band is keyed to the (now TTL/2) refresh
+    /// threshold, and entering it is amber WITHOUT a toast.
+    #[test]
+    fn the_expiring_band_starts_at_the_ttl_over_two_threshold() {
+        let now = 1_900_000_000i64;
+        let obs = |exp: i64| SlotObservation {
+            tenant_id: Some("t".to_string()),
+            exp: Some(exp),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        };
+        let at = |exp| derive_coord_credential_posture(&obs(exp), UpstreamSignal::default(), now);
+        let t = crate::auth::REFRESH_BEFORE_EXPIRY_SECS;
+        assert_eq!(at(now + t + 1), CoordCredentialPosture::Live);
+        assert_eq!(at(now + t), CoordCredentialPosture::Expiring);
+        assert_eq!(
+            at(now + 100 * 60),
+            CoordCredentialPosture::Expiring,
+            "100 min left was `live` under TTL/3"
+        );
+        assert_eq!(at(now + 3 * 60 * 60), CoordCredentialPosture::Live);
+        // Amber without a toast: live -> expiring does not notify, and
+        // expiring -> live (a refresh) does not either.
+        assert!(!should_notify_posture(
+            Some(CoordCredentialPosture::Live),
+            CoordCredentialPosture::Expiring
+        ));
+        assert!(!should_notify_posture(
+            Some(CoordCredentialPosture::Expiring),
+            CoordCredentialPosture::Live
+        ));
     }
 }
