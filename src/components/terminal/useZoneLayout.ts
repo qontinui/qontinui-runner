@@ -932,12 +932,14 @@ export function useZoneLayout(
   // shown id naming no tab is not recorded: it is a tab a runner restart took
   // away, already in the MRU, and the re-key above (or the reconcile) is
   // about to show its successor — pushing it would put a dead entry at the
-  // head that the re-key has already moved past.
+  // head that the re-key has already moved past. Nor is it marked recorded:
+  // a tab assigned to zone 0 before it appears in `tabIds` is recorded on the
+  // render it arrives.
   const shownTabId = workMode === "tmux" ? (assignments[0] ?? null) : null;
   const [recordedShownTabId, setRecordedShownTabId] = useState<string | null>(null);
-  if (shownTabId !== recordedShownTabId) {
+  if (shownTabId !== recordedShownTabId && (shownTabId === null || tabIds.includes(shownTabId))) {
     setRecordedShownTabId(shownTabId);
-    if (shownTabId !== null && tabIds.includes(shownTabId)) {
+    if (shownTabId !== null) {
       setMru((prev) => pushMru(prev, shownTabId));
     }
   }
@@ -1167,6 +1169,10 @@ export function useZoneLayout(
    */
   const replaceTab = useCallback((oldId: string, newId: string) => {
     if (oldId === newId) return;
+    // In tmux only zone 0 is on screen, so a restart is an operator choice of
+    // what is shown: a session still pending from a runner restart must not
+    // take the screen back from it.
+    if (workModeRef.current === "tmux") setPendingShownKey(null);
     const newKey = tabFactsRef.current.sessionKeyByTab?.get(newId);
     setAssignments((prev) => replaceTabInAssignments(prev, oldId, newId));
     setGridSnapshot((prev) =>
