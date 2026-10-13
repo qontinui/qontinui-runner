@@ -354,6 +354,7 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fake coord `POST /sessions/:id/output` that counts requests and
