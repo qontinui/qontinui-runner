@@ -157,6 +157,11 @@ pub fn refresh_in_offset_class(refresh_ms: f64, assumed: bool) -> bool {
 }
 
 /// The band's margin at this refresh interval: `min(4 ms, refresh / 2)`.
+/// Inside the measured class (14-17.5 ms) refresh / 2 is at least 7 ms, so
+/// the margin there is always 4 ms, and the one-frame guarantee — a whole
+/// added interval lands outside offset + margin — comes from the class
+/// bounds, not from the cap. The cap only matters for a band evaluated
+/// outside the class, where the check is reported, not gated.
 pub fn wgc_offset_margin_ms(refresh_ms: f64) -> f64 {
     WGC_OFFSET_MARGIN_MS.min(refresh_ms / 2.0)
 }
