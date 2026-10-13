@@ -13598,7 +13598,7 @@ mod default_slot_recovery_tests {
     }
 
     fn setup(name: &str, slot: Option<&str>, dmk: Option<&str>) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_default_slot_recovery");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_default_slot_recovery");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
