@@ -264,6 +264,19 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
     }
 }
 
+/// Whether the skill `name` is in the corpus this runner SERVES: the canonical
+/// `qontinui-claude-config` snapshot when one has loaded, else the embedded
+/// bundle. Cheap (a lock and a map lookup, or a directory lookup in the
+/// binary) — the heartbeat calls it every tick.
+pub(crate) fn skill_is_served(name: &str) -> bool {
+    if let Some(c) = crate::canonical_corpus::latest() {
+        if c.skills.skills.contains_key(name) {
+            return true;
+        }
+    }
+    FLEET_SKILLS.get_dir(name).is_some()
+}
+
 /// Number of embedded SKILLS — immediate subdirectories of [`FLEET_SKILLS`],
 /// one per skill.
 pub(crate) fn embedded_skill_count() -> usize {
