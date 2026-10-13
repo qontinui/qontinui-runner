@@ -848,7 +848,6 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("mcp/probe_executor.rs", "device", 1),
     ("repo_tenant.rs", "device", 1),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
-    ("session/handoff.rs", "escalated", 1),
 ];
 
 /// Totals across the whole table, asserted independently of the per-file rows
@@ -945,12 +944,20 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// stating seam: its bearer follows the binding set's source
 /// (`LocalBindingSet::bearer_scope` — the default's own per-tenant slot when
 /// the set came from those slots), so `device` 22 -> 21.
+///
+/// Plan `2026-10-10-remote-create-residuals-followups` Phase 4 then retired
+/// `session/handoff.rs`'s `escalated` site: `close_source` no longer sends the
+/// operator-admin `DELETE /sessions/:id` but coord's device-authed
+/// `POST /sessions/:id/handoff/complete`, presenting the SOURCE session's
+/// tenant slot through `attach_device_auth_for` — the call was what was wrong,
+/// so it moved onto the stating seam and is no longer scanned. So `escalated`
+/// 2 -> 1.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 21),
     ("session-noop", 10),
     ("session-owed", 0),
     ("work-owed", 8),
-    ("escalated", 2),
+    ("escalated", 1),
 ];
 
 /// Extract the kind from `coord-tenant-scope(<kind>):`.
@@ -1108,8 +1115,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 41,
-        "expected 41 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 40,
+        "expected 40 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1154,7 +1161,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          never either side's literal. Plan \
          2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential \
          (review finding 1) then moved fleet.rs's register heartbeat onto the stating seam \
-         (its bearer follows the binding set's source): 42 - 1 = 41. Found {sites}. A change here \
+         (its bearer follows the binding set's source): 42 - 1 = 41. Plan \
+         2026-10-10-remote-create-residuals-followups Phase 4 then moved session/handoff.rs's \
+         escalated close_source onto the stating seam (coord's device-authed handoff-complete \
+         door under the source session's tenant slot, replacing the operator-admin DELETE): \
+         41 - 1 = 40. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
