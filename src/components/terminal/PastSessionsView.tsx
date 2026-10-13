@@ -2,9 +2,9 @@ import { useMemo, useState, useCallback } from "react";
 import { TerminalSquare, Copy, Check, RefreshCw, Layers, AlertTriangle } from "lucide-react";
 import { usePastSessions, type PastSession } from "./usePastSessions";
 import {
-  refreshLiveClaudeSessionNames,
-  useLiveClaudeSessionNames,
-} from "./useLiveClaudeSessionNames";
+  refreshLiveClaudeSessions,
+  useLiveClaudeSessions,
+} from "./useLiveClaudeSessions";
 import { instanceStorage } from "@/lib/instance-storage";
 
 /**
@@ -230,7 +230,7 @@ export const UNNAMED_PAST_SESSION = "(unnamed session)";
  * Headline name for one past-session card.
  *
  * `registryNames` is the live `sessionId → window name` map from
- * {@link useLiveClaudeSessionNames}, and the precedence is deliberately
+ * {@link useLiveClaudeSessions}, and the precedence is deliberately
  * asymmetric between live and closed rows:
  *
  * - **Live, operator-named** → the registry name wins. `resumeName` is scraped
@@ -437,7 +437,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
   const { sessions, loading, error, refresh: refreshSessions } = usePastSessions();
   // Live window names, for the subset of these rows whose process is still
   // running. Closed rows are always a miss and keep their `resumeName`.
-  const registryNames = useLiveClaudeSessionNames();
+  const registryNames = useLiveClaudeSessions().names;
 
   // Hide FINISHED sessions by default — the whole point of the marker is that a
   // finished session is one nobody needs to look at again. The toggle keeps them
@@ -470,7 +470,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
   // clicks Refresh precisely because they just renamed something.
   const refresh = useCallback(() => {
     refreshSessions();
-    void refreshLiveClaudeSessionNames();
+    void refreshLiveClaudeSessions();
   }, [refreshSessions]);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
 

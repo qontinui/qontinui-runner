@@ -2,10 +2,11 @@
 /**
  * The Session Manager panel's cards, entered where the page enters them: the
  * REAL `SessionManagerPanel` rendered in React with the props `TerminalPage`
- * hands it, its real `SessionCard` children included. In tmux work mode only
- * the shown tab sits in a zone, so every other running session of this window
- * must NOT read "Active in zone" (plan `2026-10-11-runner-terminal-tmux-work-mode`,
- * Bug 3) — its card says it is off screen. Grid mode keeps the old wording.
+ * hands it, its real `SessionCard` children included. Each card shows its
+ * row's two status words — activity and location — as text and as
+ * `data-session-activity` / `data-session-location` (plan
+ * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+ * Phase 1), so a hidden running session reads "Hidden here", never "in zone".
  *
  * The panel's IO-bound siblings (steward, worktrees, fleet picker, past
  * sessions) are stubbed: they are not what this test observes.
@@ -23,6 +24,12 @@ vi.mock("./FleetSessionPicker", () => ({ FleetSessionPicker: () => null }));
 vi.mock("./PastSessionsView", () => ({ PastSessionsView: () => null }));
 
 import { SessionManagerPanel } from "./SessionManagerPanel";
+import {
+  SESSION_ACTIVITIES,
+  injectedStatus,
+  type SessionActivity,
+  type SessionLocation,
+} from "./sessionStatusModel";
 import type { UnifiedSession, UseSessionManagerReturn } from "./useSessionManager";
 
 let container: HTMLDivElement;
@@ -46,7 +53,12 @@ afterEach(() => {
 });
 
 /** A running tab-sourced row of this window, keyed by its tab id. */
-function runningTabRow(tabId: string, title: string): UnifiedSession {
+function runningTabRow(
+  tabId: string,
+  title: string,
+  location: SessionLocation = "hidden-here",
+  activity: SessionActivity = "working",
+): UnifiedSession {
   return {
     source: "tab",
     _transcript: null,
@@ -62,7 +74,7 @@ function runningTabRow(tabId: string, title: string): UnifiedSession {
     messageCount: 0,
     lastModified: "",
     hasPlans: false,
-    liveStatus: "active-in-zone",
+    status: injectedStatus(location, activity),
     zoneTabId: tabId,
     zoneIndex: null,
     remoteDeviceLabel: null,
@@ -72,8 +84,6 @@ function runningTabRow(tabId: string, title: string): UnifiedSession {
     lastMessageTimestamp: "",
     lastMessagePreview: "",
     workSummaryHint: "",
-    likelyFrozen: false,
-    isOrphaned: false,
   };
 }
 
@@ -84,6 +94,7 @@ function managerOver(
     closableTabId?: (s: UnifiedSession) => string | null;
     closeSession?: (s: UnifiedSession) => void;
   } = {},
+  extra: { unidentifiedCount?: number | null } = {},
 ): UseSessionManagerReturn {
   const noop = () => {};
   return {
@@ -112,7 +123,7 @@ function managerOver(
     closeSession: close.closeSession ?? noop,
     selectedIds: new Set<string>(),
     toggleSelect: noop,
-    selectAllFrozen: noop,
+    selectAllVisible: noop,
     clearSelection: noop,
     bulkResume: noop,
     pinnedIds: new Set<string>(),
@@ -121,58 +132,89 @@ function managerOver(
     setSessionLabel: noop,
     allAccounts: [],
     savedConfigDirs: [],
-    frozenCount: 0,
+    activityCounts: Object.fromEntries(
+      SESSION_ACTIVITIES.map((a) => [a, sessions.filter((s) => s.status.activity === a).length]),
+    ),
+    noOutputCount: 0,
     needsInputCount: 0,
-    activeCount: sessions.length,
+    unidentifiedCount: extra.unidentifiedCount === undefined ? 0 : extra.unidentifiedCount,
   } as unknown as UseSessionManagerReturn;
 }
 
-/** The `data-session-status` each rendered card carries, by its row title. */
-function cardStatuses(): Record<string, string | null> {
-  const out: Record<string, string | null> = {};
-  for (const card of Array.from(container.querySelectorAll("[data-session-status]"))) {
+/** The status attributes each rendered card carries, by its row title. */
+function cardStatuses(): Record<string, [string | null, string | null]> {
+  const out: Record<string, [string | null, string | null]> = {};
+  for (const card of Array.from(container.querySelectorAll("[data-session-location]"))) {
     const title = card.textContent ?? "";
     const key = title.includes("shown-shell")
       ? "shown"
       : title.includes("hidden-shell")
         ? "hidden"
         : title;
-    out[key] = card.getAttribute("data-session-status");
+    out[key] = [
+      card.getAttribute("data-session-location"),
+      card.getAttribute("data-session-activity"),
+    ];
   }
   return out;
 }
 
-describe("SessionManagerPanel — tmux mode off-screen wording", () => {
-  it("in tmux mode a running session that is not on screen reads off screen, not in zone", () => {
+describe("SessionManagerPanel — two-axis status on every card", () => {
+  it("a hidden running session reads 'Hidden here', the shown one 'On screen'", () => {
     const rows = [
-      runningTabRow("tab-shown", "shown-shell"),
-      runningTabRow("tab-hidden", "hidden-shell"),
+      runningTabRow("tab-shown", "shown-shell", "on-screen"),
+      runningTabRow("tab-hidden", "hidden-shell", "hidden-here"),
     ];
-    // The page mounts the panel as JSX; calling the component from a wrapper
-    // component renders the same tree (its hooks belong to the wrapper).
     function Page() {
       return SessionManagerPanel({
         manager: managerOver(rows),
         selectedSessionId: null,
         onScreenTabId: "tab-shown",
-        workMode: "tmux",
       });
     }
     act(() => root.render(createElement(Page)));
 
-    const statuses = cardStatuses();
-    expect(statuses.hidden).toBe("active-off-screen");
-    expect(statuses.shown).toBe("active-in-zone");
-    // Only the shown session's card carries the "on screen" marker.
-    const onScreenCards = Array.from(container.querySelectorAll("[data-session-status]")).filter(
-      (card) => (card.textContent ?? "").includes("on screen"),
+    expect(cardStatuses()).toEqual({
+      shown: ["on-screen", "working"],
+      hidden: ["hidden-here", "working"],
+    });
+    // The words are rendered, not only the attributes (never color alone).
+    const words = Array.from(container.querySelectorAll("[data-testid='session-card-status']")).map(
+      (el) => el.textContent,
     );
-    expect(onScreenCards.map((card) => card.textContent?.includes("shown-shell"))).toEqual([true]);
-    // The status dot's tooltip is the card's label.
-    const labels = Array.from(container.querySelectorAll("[data-session-status] [title]")).map(
-      (el) => el.getAttribute("title"),
-    );
-    expect(labels).toContain("Active, off screen");
+    expect(words).toEqual(["Working·On screen", "Working·Hidden here"]);
+    // No card carries the retired single-axis attribute.
+    expect(container.querySelector("[data-session-status]")).toBeNull();
+  });
+
+  it("groups by the activity word from the one label table", () => {
+    const rows = [
+      runningTabRow("tab-a", "a-shell", "hidden-here", "needs-you"),
+      runningTabRow("tab-b", "b-shell", "hidden-here", "idle-at-prompt"),
+    ];
+    function Page() {
+      return SessionManagerPanel({ manager: managerOver(rows), selectedSessionId: null });
+    }
+    act(() => root.render(createElement(Page)));
+    const text = container.textContent ?? "";
+    expect(text).toContain("Needs you(1)");
+    expect(text).toContain("Idle at prompt(1)");
+  });
+
+  it("reports unidentified Claude processes as a count, and UNKNOWN as unknown — never zero", () => {
+    const rows = [runningTabRow("tab-a", "a-shell")];
+    function Page({ n }: { n: number | null }) {
+      return SessionManagerPanel({
+        manager: managerOver(rows, {}, { unidentifiedCount: n }),
+        selectedSessionId: null,
+      });
+    }
+    act(() => root.render(createElement(Page, { n: 3 })));
+    expect(container.textContent).toContain("3 unidentified Claude processes");
+    act(() => root.render(createElement(Page, { n: null })));
+    expect(container.textContent).toContain("Unidentified Claude processes: unknown");
+    act(() => root.render(createElement(Page, { n: 0 })));
+    expect(container.textContent).not.toContain("nidentified");
   });
 });
 
@@ -189,7 +231,6 @@ describe("SessionManagerPanel — closing a session from its row", () => {
         }),
         selectedSessionId: null,
         onScreenTabId: "tab-b",
-        workMode: "tmux",
       });
     }
     act(() => root.render(createElement(Page)));

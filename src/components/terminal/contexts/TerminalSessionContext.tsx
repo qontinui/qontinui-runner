@@ -105,7 +105,8 @@ import { useTranscriptSessions } from "../useTranscriptSessions";
 import { useSessionManager } from "../useSessionManager";
 import { deriveSyntheticTabs } from "../syntheticTabs";
 import { planTabReveal } from "../tabReveal";
-import { rightPanelModeAfterRowSelect } from "../sessionManagerLiveRows";
+import { rightPanelModeAfterRowSelect, visibleTabIdsForLayout } from "../sessionManagerLiveRows";
+import { useHotField } from "../useTerminalHotStore";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
 import { TerminalOutputCoalescer, base64ToBytes } from "../terminalOutputTap";
 import { noteDecode, transportClockStart } from "../transportStats";
@@ -736,6 +737,20 @@ const PageSessionScope = memo(function PageSessionScope({
   // anyway via the upstream sessionStates dep).
   const desktopNotifyFlag = instanceStorage.getItem("zone-desktop-notify") === "true";
 
+  // The `On screen` / `Hidden here` split of each row's location axis.
+  const visibleTabIds = useMemo(
+    () =>
+      visibleTabIdsForLayout({
+        workMode: zoneLayout.workMode,
+        shownTabId: zoneLayout.shownTabId,
+        assignments: zoneLayout.assignments,
+        maximizedZone: zoneLayout.maximizedZone,
+      }),
+    [zoneLayout.workMode, zoneLayout.shownTabId, zoneLayout.assignments, zoneLayout.maximizedZone],
+  );
+  // Feeds the `Waiting on lock` activity.
+  const tabLockStates = useHotField(pageId, "lockStates");
+
   const sessionManager = useSessionManager({
     // Synthetic tabs included so `tabSessionMap` correlation places tab-backed
     // injected fakes (idle / error / completed) in the right StatusStrip
@@ -788,6 +803,8 @@ const PageSessionScope = memo(function PageSessionScope({
       rightPanelModeSetterRef.current((mode) => rightPanelModeAfterRowSelect(source, mode));
     },
     onCloseSessionTab: terminalManager.closeTerminal,
+    visibleTabIds,
+    tabLockStates,
   });
 
   const workflowGen = useWorkflowGeneration({

@@ -86,6 +86,7 @@ function makeLiveRow(
     startedAt: 1784712055852,
     updatedAt: 1784770342016,
     resumeCommand: `clg --resume ${claudeSessionId}`,
+    runnerManaged: true,
   };
 }
 

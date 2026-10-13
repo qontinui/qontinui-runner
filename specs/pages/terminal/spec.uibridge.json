@@ -1161,10 +1161,29 @@
             "label": "Tab-sourced live session row",
             "type": "search"
           }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "An off-screen live session row reads its location as hidden here (two-axis status), not a single-axis status.",
+          "enabled": true,
+          "id": "tmux-session-manager-navigator-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "attributes": {
+                "data-session-location": "hidden-here"
+              }
+            },
+            "label": "Hidden-here session row",
+            "type": "search"
+          }
         }
       ],
       "category": "element-presence",
-      "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their state chips so a hidden session needing input is visible from the list; a running off-screen row reads `data-session-status=\"active-off-screen\"` (\"Active, off screen\") where grid mode reads `active-in-zone`, and a tab-sourced row is never `frozen` (an idle, silent shell is not stuck). Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
+      "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their status words so a hidden session needing you is visible from the list. Every row carries its two-axis status (plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, D2) as `data-session-location` (`on-screen` | `hidden-here` | `outside-runner` | `other-device` | `not-running` | `unknown`) and `data-session-activity` (`needs-you` | `waiting-on-lock` | `working` | `idle-at-prompt` | `no-output-mid-tool` | `finished` | `exited` | `exited-error` | `unknown`), rendered as words (`data-testid=\"session-card-status\"`): the on-screen row reads `on-screen`, a running off-screen row `hidden-here`, and a tab-sourced row's silence reads `idle-at-prompt` (an idle shell is not stuck). Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
       "id": "tmux-session-manager-navigator",
       "name": "tmux Session Manager Lists Every Live Session",
       "source": "ai-generated"
@@ -1586,7 +1605,7 @@
         ]
       },
       {
-        "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their state chips so a hidden session needing input is visible from the list; a running off-screen row reads `data-session-status=\"active-off-screen\"` (\"Active, off screen\") where grid mode reads `active-in-zone`, and a tab-sourced row is never `frozen` (an idle, silent shell is not stuck). Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
+        "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their status words so a hidden session needing you is visible from the list. Every row carries its two-axis status (plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, D2) as `data-session-location` (`on-screen` | `hidden-here` | `outside-runner` | `other-device` | `not-running` | `unknown`) and `data-session-activity` (`needs-you` | `waiting-on-lock` | `working` | `idle-at-prompt` | `no-output-mid-tool` | `finished` | `exited` | `exited-error` | `unknown`), rendered as words (`data-testid=\"session-card-status\"`): the on-screen row reads `on-screen`, a running off-screen row `hidden-here`, and a tab-sourced row's silence reads `idle-at-prompt` (an idle shell is not stuck). Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
         "elements": [
           {
             "id": "terminal.session-manager-view-live"

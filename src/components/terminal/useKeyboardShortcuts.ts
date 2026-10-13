@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout";
 import { stepShownTab, type LayoutRequestSource, type TerminalWorkMode } from "./terminalWorkMode";
 import type { UIAction } from "./useUIState";
@@ -14,6 +14,8 @@ import {
   matchesDigitChord,
 } from "@/lib/globalChords";
 import { isSurfaceVisible } from "@/lib/surfaceVisible";
+import { nextWithActivity } from "./sessionStatusModel";
+import type { UnifiedSession } from "./useSessionManager";
 
 /**
  * `Ctrl+Shift+L`'s target: the preset after `gridLayoutId`, wrapping. `null`
@@ -102,12 +104,11 @@ interface UseKeyboardShortcutsParams {
     setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
   };
   sessionManager?: {
-    frozenCount: number;
+    noOutputCount: number;
     needsInputCount: number;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    sessions: Array<any>;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    resumeSession: (session: any) => void;
+    sessions: readonly UnifiedSession[];
+    /** The card-body click: focus the session's tab, else its transcript. */
+    openSession: (session: UnifiedSession) => void;
   };
   /**
    * The terminal page's root element. Every chord below is inert while
@@ -152,6 +153,8 @@ export function useKeyboardShortcuts({
   sessionManager,
   surfaceRef,
 }: UseKeyboardShortcutsParams) {
+  // Ctrl+Shift+J's cycle position: the last session it opened.
+  const lastNoOutputJumpRef = useRef<string | null>(null);
   useEffect(() => {
     // tmux mode's swap: the same assignment a session-manager click makes
     // (`planTabReveal` → zone 0 under the pinned `single` layout), so the
@@ -446,22 +449,24 @@ export function useKeyboardShortcuts({
         workflowGen.setShowSidebar((v) => !v);
         return;
       }
-      // Ctrl+Shift+J: Jump to next frozen session (resume first frozen)
+      // Ctrl+Shift+J: open the next session reading "No output (mid-tool)" —
+      // alive, silent, its last transcript record a pending tool step. It
+      // OPENS the session (focuses its tab) rather than resuming it: such a
+      // session is still running, and a resume would fork it.
       if (isCtrlShiftChord(e, "j")) {
         e.preventDefault();
         if (sessionManager) {
-          // Transcript rows only: a tab-sourced row is a live tab with
-          // nothing to resume (`sessionManagerLiveRows.ts`).
-          const frozen = sessionManager.sessions.find(
-            (s: { liveStatus: string; source: string }) =>
-              s.source === "transcript" && s.liveStatus === "frozen",
+          const next = nextWithActivity(
+            sessionManager.sessions,
+            "no-output-mid-tool",
+            lastNoOutputJumpRef.current,
           );
-          if (frozen) {
-            // Pass the full session object (includes _transcript) to resumeSession
-            sessionManager.resumeSession(frozen);
+          if (next) {
+            lastNoOutputJumpRef.current = next.sessionId;
+            sessionManager.openSession(next);
             addHistoryEvent(
-              "Resume frozen",
-              `Session ${frozen.sessionId?.slice(0, 8) ?? ""}`,
+              "Open silent session",
+              `Session ${next.sessionId.slice(0, 8)}`,
               undefined,
               "#f7768e",
             );
