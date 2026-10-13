@@ -656,16 +656,15 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                 }
             },
             "ai": {
-                "description": "AI-powered search, assertions, semantic snapshots, NL actions",
+                "description": "AI-powered search, assertions, semantic snapshots, NL actions, and a pixel diff of two base64 images",
+                // `image-diff` is the one live route of the retired `media`
+                // category; the `/ai/media/*` family it sat beside never
+                // returned an image fact and was deleted (plan
+                // 2026-10-13-image-generation-and-visual-judgment D6). Image
+                // capture and analysis live under `/ui-bridge/vision/*`.
                 "endpoints": ["find", "search", "execute", "assert", "assert-batch", "snapshot", "summary",
                     "semantic-search", "diff", "execute-with-diff", "bookmarks", "scoped-diff",
-                    "summarize-diff", "categorize-last-diff"]
-            },
-            "media": {
-                "description": "Media element discovery, audits, and analysis",
-                "endpoints": ["media/find", "media/audit/accessibility", "media/audit/performance",
-                    "media/snapshot", "media/analyze", "media/analyze/batch", "media/analyze/page", "media/compare",
-                    "image-diff"]
+                    "summarize-diff", "categorize-last-diff", "image-diff"]
             },
             "stateMachine": {
                 "description": "State discovery, activation, transitions, navigation",
