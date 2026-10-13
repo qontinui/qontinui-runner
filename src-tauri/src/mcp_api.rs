@@ -5603,6 +5603,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_expectation_checkin",
     "coord_expectation_close",
     "coord_expectation_register",
+    // Plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b: the
+    // READ-BACK of an expedited-land request. A read — it reports a request's
+    // state, refusal and land sha, and lands nothing. Its write twin,
+    // `coord_request_expedited_land`, is a DELIBERATE exclusion (below).
+    "coord_expedited_land_status",
     "coord_explain_isolation_decision",
     "coord_explain_pr_close",
     "coord_explain_ref_event",
@@ -5780,10 +5785,37 @@ const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
     "coord_pr_merge_profile",
     "coord_pr_merge_verdict",
     "coord_push_to_branch",
+    // Plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b. Merge
+    // authority, withheld on purpose: through this proxy a call carries the
+    // runner's PAIRED-DEVICE JWT, which passes coord's possession check, and
+    // coord's caller-session check is advisory — so a leaked session nonce
+    // would reach a land lever. Merge tools are owed their own argument, not a
+    // sweep. Sessions use the device-JWT HTTP twin instead
+    // (`COORD_MCP_DELIBERATE_EXCLUSION_DOORS`), which the -32601 names.
+    "coord_request_expedited_land",
     "coord_request_merge",
     "coord_request_policy",
     "coord_reserve_resource",
 ];
+
+/// For a deliberate exclusion that HAS a sanctioned door elsewhere, the door a
+/// `-32601` names instead of the generic "reach coord's /mcp directly". A
+/// mechanical pointer, not authority: coord enforces its own checks on that
+/// door (`security-and-autonomy` content trigger 6 — the denial names an
+/// alternative path, deliberately).
+const COORD_MCP_DELIBERATE_EXCLUSION_DOORS: &[(&str, &str)] = &[(
+    "coord_request_expedited_land",
+    "POST /pr-merge/repos/:repo/pulls/:number/agent/expedite on coord with a device JWT and \
+     your session id as X-Coord-Caller-Session (the expedited-land HTTP twin)",
+)];
+
+/// The sanctioned alternative door for a deliberately-excluded tool, if any.
+fn coord_mcp_deliberate_exclusion_door(name: &str) -> Option<&'static str> {
+    COORD_MCP_DELIBERATE_EXCLUSION_DOORS
+        .iter()
+        .find(|(t, _)| *t == name)
+        .map(|(_, door)| *door)
+}
 
 /// Deliberately-excluded FAMILIES by prefix. `coord_onboard` is deliberately
 /// short of a trailing underscore so it covers both the `coord_onboard_*` calls
@@ -6525,11 +6557,17 @@ fn coord_mcp_refusal_cause(
             in_deliberate_exclusions,
             trunk_sha: trunk.map(|t| t.trunk_sha.clone()),
             trunk_source: trunk.map(|t| t.source),
-            remedy: format!(
-                "none — {tool} is withheld on purpose (COORD_MCP_DELIBERATE_EXCLUSIONS); do \
-                 not \"fix\" it. Reach coord's /mcp directly with a device JWT if the call \
-                 is genuinely yours to make."
-            ),
+            remedy: match coord_mcp_deliberate_exclusion_door(tool) {
+                Some(door) => format!(
+                    "none — {tool} is withheld on purpose (COORD_MCP_DELIBERATE_EXCLUSIONS); do \
+                     not \"fix\" it. Use {door}."
+                ),
+                None => format!(
+                    "none — {tool} is withheld on purpose (COORD_MCP_DELIBERATE_EXCLUSIONS); do \
+                     not \"fix\" it. Reach coord's /mcp directly with a device JWT if the call \
+                     is genuinely yours to make."
+                ),
+            },
         };
     }
     let Some(trunk) = trunk else {
@@ -18055,6 +18093,33 @@ mod coord_mcp_body_gate_tests {
         // The prefix family counts as deliberate too.
         let d = super::coord_mcp_refusal_cause("coord_onboarding_doctor", None);
         assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+    }
+
+    /// T-no-proxy-door (plan 2026-10-13-coord-expedited-land-lever-for-agents,
+    /// Phase 3b): the proxy masks the expedited-land REQUEST as `deliberate`,
+    /// never `drift`, and its -32601 names the HTTP twin; the READ-BACK is
+    /// allowed.
+    #[test]
+    fn expedited_land_request_is_deliberate_and_status_is_allowed() {
+        assert!(!super::coord_mcp_tool_is_allowed("coord_request_expedited_land"));
+        assert!(super::coord_mcp_withholding_is_deliberate(
+            "coord_request_expedited_land"
+        ));
+        let d = super::coord_mcp_refusal_cause("coord_request_expedited_land", None);
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+        assert!(
+            d.remedy.contains("/pr-merge/repos/:repo/pulls/:number/agent/expedite")
+                && d.remedy.contains("X-Coord-Caller-Session"),
+            "{}",
+            d.remedy
+        );
+        assert!(super::coord_mcp_tool_is_allowed("coord_expedited_land_status"));
+        assert!(!super::coord_mcp_withholding_is_deliberate(
+            "coord_expedited_land_status"
+        ));
+        // A deliberate exclusion with no sanctioned door keeps the generic text.
+        let d = super::coord_mcp_refusal_cause("coord_create_pr", None);
+        assert!(d.remedy.contains("/mcp directly"), "{}", d.remedy);
     }
 
     /// (b) No trunk read ⇒ `unknown` with a reason, never a confident default.
