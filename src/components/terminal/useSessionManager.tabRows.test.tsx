@@ -161,12 +161,12 @@ describe("useSessionManager — closing a session from its row", () => {
 
   const shell: TerminalTab = { id: "tab-x", title: "bash", pid: 9, isAlive: true, exitCode: null };
 
-  it("closes the row's live tab through the page's close path", () => {
+  it("force-closes the row's live tab through the page's close path", () => {
     const close = vi.fn();
     const manager = mountManager([shell], close);
     const row = manager.sessions.find((s) => s.zoneTabId === "tab-x")!;
     expect(manager.closableTabId(row)).toBe("tab-x");
-    act(() => manager.closeSession(row));
+    act(() => void manager.forceCloseSessions([row]));
     expect(close.mock.calls).toEqual([["tab-x"]]);
   });
 
@@ -176,7 +176,7 @@ describe("useSessionManager — closing a session from its row", () => {
     const row = manager.sessions.find((s) => s.zoneTabId === "tab-x")!;
     const transcriptOnly = { ...row, source: "transcript" as const, zoneTabId: null };
     expect(manager.closableTabId(transcriptOnly as typeof row)).toBeNull();
-    act(() => manager.closeSession(transcriptOnly as typeof row));
+    act(() => void manager.forceCloseSessions([transcriptOnly as typeof row]));
     expect(close).not.toHaveBeenCalled();
     expect(mountManager([shell]).closableTabId(row)).toBeNull();
   });

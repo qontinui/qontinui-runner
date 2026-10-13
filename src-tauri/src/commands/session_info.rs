@@ -27,7 +27,8 @@
 //! ([`project_session_info`], [`project_prs`], [`prs_unavailable`]), so the
 //! projection unit-tests without a Tauri handle, a live disk or PG — the idiom
 //! [`crate::install_effects_producer::project_restore_health`] established. The
-//! Tauri command and the HTTP twin (`GET /control/sessions/info`) are both thin
+//! Tauri commands and the HTTP twin (`GET /control/sessions/info`, via
+//! `super::session_info_list`) are all thin
 //! shells over the same functions, so the rendered and raw read paths cannot
 //! drift (D5).
 
@@ -272,6 +273,16 @@ pub struct SessionLifecycleInfo {
     pub restore_status: String,
     /// `None` ⇒ never reported (unknown), not `false`.
     pub bypass_permissions: Option<bool>,
+    /// The WORK-axis finished marker (`/finish-session`), Unix millis; `None`
+    /// = not marked finished. Orthogonal to `state`: an `open` session can be
+    /// finished and a `closed` one usually is not. The Session Manager's
+    /// `Finished` activity and `is:finished` / `is:closable` read it from here
+    /// (plan
+    /// `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+    /// Phases 1 and 4).
+    pub finished_at: Option<i64>,
+    /// Free text recorded with [`Self::finished_at`].
+    pub finish_reason: Option<String>,
 }
 
 /// One PR this session authored (attributed by the `Session-Id:` git trailer).
@@ -1008,33 +1019,8 @@ impl SessionInfoEnvelope {
     }
 }
 
-/// Response body of `GET /control/sessions/info` — every OPEN session's
-/// projection.
-///
-/// Carries its own `status`/`reason` so a runner that cannot reach its
-/// lifecycle store says so, instead of returning `sessions: []` (which reads
-/// identically to "this runner has zero sessions" — the silent empty this whole
-/// plan exists to remove).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionsInfoResponse {
-    /// [`STATUS_OK`] | [`STATUS_UNAVAILABLE`].
-    pub status: String,
-    /// REQUIRED whenever `status != "ok"`.
-    pub reason: Option<String>,
-    pub sessions: Vec<SessionInfoEnvelope>,
-}
-
-impl SessionsInfoResponse {
-    /// Degraded listing — empty WITH a reason, never a bare empty.
-    pub fn unavailable(reason: &str) -> Self {
-        Self {
-            status: STATUS_UNAVAILABLE.to_string(),
-            reason: Some(reason.to_string()),
-            sessions: Vec::new(),
-        }
-    }
-}
+// The batched listing (`GET /control/sessions/info` and the `session_info_list`
+// Tauri twin) lives in `super::session_info_list`, over [`build_session_info`].
 
 /// Normalize a stored/live `name_source` into the wire vocabulary.
 ///
@@ -1241,6 +1227,8 @@ pub fn project_session_info(
                 restore_tier: rec.restore_tier.clone(),
                 restore_pending_at: rec.restore_pending_at,
                 bypass_permissions: rec.bypass_permissions,
+                finished_at: rec.finished_at,
+                finish_reason: non_empty(rec.finish_reason.as_ref()),
             },
             prs,
             tenancy,
@@ -2248,13 +2236,6 @@ mod tests {
         assert!(!env.available);
         assert_eq!(env.reason.as_deref(), Some("session_not_found"));
         assert!(env.body.is_none());
-        let listing = SessionsInfoResponse::unavailable("lifecycle_store_unavailable");
-        assert_eq!(listing.status, STATUS_UNAVAILABLE);
-        assert_eq!(
-            listing.reason.as_deref(),
-            Some("lifecycle_store_unavailable")
-        );
-        assert!(listing.sessions.is_empty());
     }
 
     #[test]
