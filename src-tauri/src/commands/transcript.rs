@@ -185,7 +185,8 @@ fn scan_state() -> &'static StdMutex<ScanState> {
 const SCAN_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Upper bound on the per-mount digest batch (`transcript_session_digests`).
-/// Higher than the scan bound because it reads up to 100 file tails, and it is
+/// Higher than the scan bound because it reads one file tail per requested id
+/// (the frontend asks in chunks of up to 100), and it is
 /// still an *upper* bound, not a latency target.
 const DIGEST_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -852,13 +853,21 @@ pub async fn transcript_get_latest(
     })
 }
 
-/// Compute lightweight digests for recent sessions (frozen detection + work summary hints).
+/// Compute lightweight digests (last-record kind + work summary hint) for the
+/// sessions the caller names, reading only the tail of each JSONL file.
 ///
-/// Takes the most recent N sessions (default 50) and returns a digest for each,
-/// reading only the tail of each JSONL file for efficiency.
+/// Requested BY ID, not "the most recent N": the Session Manager asks for every
+/// session that is running somewhere plus the rows it is rendering, so the cost
+/// scales with live sessions rather than with every transcript on disk, and the
+/// 51st or 200th live session gets its digest like the first. The old
+/// `max_sessions` form clamped to 100 and truncated with no offset, so every
+/// session past the cut silently lost its status (plan
+/// `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+/// Phase 1). The frontend chunks its request (≤100 ids per call); an id with
+/// no transcript on disk simply gets no digest, which it renders as `Unknown`.
 #[tauri::command]
 pub async fn transcript_session_digests(
-    max_sessions: Option<usize>,
+    session_ids: Vec<String>,
 ) -> Result<CommandResponse, String> {
     let project_paths = collect_workspace_project_paths();
     let config_dirs = transcript::find_claude_config_dirs();
@@ -874,21 +883,20 @@ pub async fn transcript_session_digests(
     // this runs once per tab ON MOUNT, so six tabs previously meant six more
     // full scans stacked on top of the poll bursts during startup — the
     // busiest moment the runner has.
-    let mut all_sessions = collect_all_sessions_cached(&project_paths, &config_dirs).await;
-    let limit = max_sessions.unwrap_or(50).min(100);
-    all_sessions.truncate(limit);
+    let all_sessions = collect_all_sessions_cached(&project_paths, &config_dirs).await;
+    let requested = sessions_by_id(all_sessions, &session_ids);
 
-    // Digest computation reads the TAIL OF EVERY session file (up to `limit`),
-    // so it is blocking I/O and must not run on an async worker.
+    // Digest computation reads the TAIL OF EVERY requested session file, so it
+    // is blocking I/O and must not run on an async worker.
     //
-    // Bounded for the same reason the scan is (Item 1's audit): this runs once
-    // per tab ON MOUNT and touches up to 100 files, so it is a real
+    // Bounded for the same reason the scan is (Item 1's audit): this runs on
+    // every Session Manager poll and touches one file per id, so it is a real
     // blocking-pool consumer on the same request-path family. An exhausted pool
     // means the `spawn_blocking` future never resolves, and the bound has to be
     // one the sick runtime cannot disable — `off_runtime::deadline`, never
     // `tokio::time::timeout`.
     let digest_task =
-        spawn_blocking_tracked(move || transcript::session_digests_batch(&all_sessions));
+        spawn_blocking_tracked(move || transcript::session_digests_batch(&requested));
     let digest_bound = crate::off_runtime::deadline(DIGEST_WAIT_TIMEOUT);
     let digests = tokio::select! {
         joined = digest_task => match joined {
@@ -919,6 +927,19 @@ pub async fn transcript_session_digests(
         message: Some(format!("Computed {} session digests", digests.len())),
         data: Some(serde_json::to_value(&digests).unwrap_or_default()),
     })
+}
+
+/// The sessions among `all` whose id is in `ids`, in `all`'s order. No cap: the
+/// set is exactly what was asked for, so nothing past an arbitrary cut loses
+/// its digest. An id with no transcript is absent from the result.
+fn sessions_by_id(
+    all: Vec<transcript::TranscriptSession>,
+    ids: &[String],
+) -> Vec<transcript::TranscriptSession> {
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    all.into_iter()
+        .filter(|s| wanted.contains(s.session_id.as_str()))
+        .collect()
 }
 
 /// The last COMPLETED external-process enumeration, kept so a shed call can
@@ -1568,6 +1589,32 @@ mod tests {
         st.in_flight.clear();
     }
 
+    /// Phase 1 (plan 2026-10-13-session-manager-…): digests are requested BY
+    /// ID with no cap, so the 51st and the 200th live session get one like the
+    /// first. The old `max_sessions` form truncated at 50 (max 100) with no
+    /// offset; every session past the cut silently lost its status.
+    #[test]
+    fn sessions_by_id_returns_every_requested_session_with_no_cap() {
+        let all: Vec<_> = (0..250).map(|i| fake_session(&format!("s-{i}"))).collect();
+        let ids: Vec<String> = (0..200).map(|i| format!("s-{i}")).collect();
+        let picked = sessions_by_id(all, &ids);
+        assert_eq!(picked.len(), 200);
+        assert!(picked.iter().any(|s| s.session_id == "s-50"), "the 51st session");
+        assert!(picked.iter().any(|s| s.session_id == "s-199"), "the 200th session");
+        assert!(!picked.iter().any(|s| s.session_id == "s-200"), "an unrequested one");
+    }
+
+    /// An id with no transcript is absent (the frontend renders it `Unknown`),
+    /// and an empty request reads nothing.
+    #[test]
+    fn sessions_by_id_skips_unknown_ids_and_empty_requests() {
+        let all = vec![fake_session("a"), fake_session("b")];
+        let picked = sessions_by_id(all.clone(), &["b".to_string(), "zzz".to_string()]);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].session_id, "b");
+        assert!(sessions_by_id(all, &[]).is_empty());
+    }
+
     fn fake_session(id: &str) -> transcript::TranscriptSession {
         transcript::TranscriptSession {
             session_id: id.to_string(),
@@ -1579,7 +1626,8 @@ mod tests {
             first_message_preview: None,
             has_plans: false,
             display_name: String::new(),
-            injected_live_status: None,
+            injected_location: None,
+            injected_activity: None,
             injected_tab: None,
             resume_name: None,
         }
