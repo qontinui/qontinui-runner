@@ -2364,3 +2364,48 @@ fn counters_are_per_instance() {
     assert_eq!(b.counters.get("R1"), RuleCount::default());
     assert_eq!(a.health_json()["rules"]["R1"]["refused"], 1);
 }
+
+/// DIAG ONLY (never merged): repeat the 50-claim burst and print exactly what
+/// a socket that got no reply text saw instead.
+#[tokio::test]
+async fn zz_diag_concurrent_claims_burst() {
+    let mut bad = Vec::new();
+    let mut total = 0;
+    for round in 0..40 {
+        let s = Arc::new(spawn(BindingConfig::default()).await);
+        let (_holder, _ack) = s.ws_register(Some(GOOD), "app").await;
+        let mut hs = Vec::new();
+        for _ in 0..50 {
+            let s = s.clone();
+            hs.push(tokio::spawn(async move {
+                let mut ws = s.ws_open(Some(EVIL)).await;
+                ws.send(json!({"type":"register","transport":"websocket","appId":"app",
+                    "appName":"x","appType":"wrapper","origin":EVIL,"pageUrl":format!("{EVIL}/page")})).await;
+                let t0 = tokio::time::Instant::now();
+                let mut seen = Vec::new();
+                loop {
+                    match tokio::time::timeout(PROMPT, ws.stream.next()).await {
+                        Ok(Some(Ok(WsMessage::Text(t)))) => {
+                            if seen.is_empty() { return (ws, None); }
+                            seen.push(format!("Text({t})"));
+                            break;
+                        }
+                        Ok(Some(other)) => seen.push(format!("{other:?}")),
+                        Ok(None) => { seen.push("EOF".into()); break; }
+                        Err(_) => { seen.push("TIMEOUT".into()); break; }
+                    }
+                }
+                (ws, Some(format!("after {:?}: {}", t0.elapsed(), seen.join(" | "))))
+            }));
+        }
+        let mut socks = Vec::new();
+        for h in hs {
+            total += 1;
+            let (ws, r) = h.await.unwrap();
+            socks.push(ws);
+            if let Some(r) = r { bad.push(format!("round {round}: {r}")); }
+        }
+    }
+    for b in &bad { println!("DIAG BAD {b}"); }
+    println!("DIAG SUMMARY bad={}/{}", bad.len(), total);
+}

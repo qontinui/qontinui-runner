@@ -1,0 +1,43 @@
+name: zz diag relay (throwaway)
+on:
+  push:
+    branches: ['diag/**']
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0, filter: "blob:none" }
+      - uses: ./.github/actions/checkout-sibling
+      - uses: ./.github/actions/checkout-sibling
+        with: { repo: qontinui/qontinui-web }
+      - uses: ./.github/actions/checkout-sibling
+        with: { repo: qontinui/ui-bridge }
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.33.2 }
+      - uses: actions/setup-node@v5
+        with: { node-version: "20", cache: "pnpm", cache-dependency-path: pnpm-lock.yaml }
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.95.0" }
+      - uses: al-cheb/configure-pagefile-action@v1.4
+        with: { minimum-size: 32GB, maximum-size: 32GB, disk-root: "D:" }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: ". -> target", save-if: false }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - name: build test binary
+        shell: bash
+        run: cargo test --manifest-path src-tauri/Cargo.toml --bin qontinui-runner --no-run 2>&1 | tail -5
+      - name: run diag (quiet box, then under 6-way load)
+        shell: bash
+        run: |
+          set +e
+          for i in 1 2 3; do cargo test --manifest-path src-tauri/Cargo.toml --bin qontinui-runner -- --exact mcp::relay_binding::tests::zz_diag_concurrent_claims_burst --nocapture 2>&1 | grep -E "DIAG|test result"; done
+          for w in 1 2 3 4 5 6; do (cargo test --manifest-path src-tauri/Cargo.toml --bin qontinui-runner -- mcp:: --nocapture 2>&1 | grep -E "DIAG|test result: " > load_$w.txt) & done; wait
+          cat load_*.txt
+          exit 0
