@@ -66,6 +66,17 @@ export function mountOwnerCount(classification: TabClassification): 0 | 1 {
 }
 
 /**
+ * The tabs a classification mounts a pane owner for (`mountOwnerCount` 1) —
+ * what `ZoneGrid` reports to `useZoneLayout().reportMountedTabs`, so entering
+ * tmux keeps the panes the grid had mounted warm.
+ */
+export function mountedTabIds(classification: ReadonlyMap<string, TabClassification>): Set<string> {
+  const out = new Set<string>();
+  for (const [tabId, c] of classification) if (mountOwnerCount(c) === 1) out.add(tabId);
+  return out;
+}
+
+/**
  * Pure, centralized classification of every tab for one render pass. Factored
  * out of `ZoneGrid`'s memo so the exactly-one-or-zero-owner invariant is unit
  * testable without an `IntersectionObserver` (jsdom lacks it).
