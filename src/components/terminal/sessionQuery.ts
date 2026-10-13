@@ -903,6 +903,16 @@ export function toggleToken(query: string, token: string): string {
 }
 
 /**
+ * The value of the first positive top-level `field:` term, or `null` — what a
+ * picker shows as selected. A query joined by a top-level `OR` has none.
+ */
+export function topLevelFieldValue(query: string, field: string): string | null {
+  const name = field.toLowerCase();
+  const tok = findTopLevel(query, (t) => t.kind === "field" && t.name === name);
+  return tok && tok.kind === "field" ? tok.value : null;
+}
+
+/**
  * Set the single value of `field:` — the account / group pickers. Removes
  * every top-level positive `field:` term, then appends `field:value` (or
  * nothing when `value` is null). A query joined by a top-level `OR` has no
