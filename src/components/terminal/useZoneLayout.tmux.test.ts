@@ -252,6 +252,15 @@ describe("swaps, closes and the MRU", () => {
     expect(inTmux(["a", "b", "c", "d"])().mru).toStrictEqual(["a", "b", "c", "d"]);
   });
 
+  it("a tab shown before it reaches the tab list is recorded when it arrives", () => {
+    const render = inTmux(["a", "b"]);
+    render().assignTabToZone(0, "c");
+    expect(render().mru).toStrictEqual(["a", "b"]);
+    const r = render(["a", "b", "c"]);
+    expect(r.shownTabId).toBe("c");
+    expect(r.mru).toStrictEqual(["c", "a", "b"]);
+  });
+
   it("each swap into zone 0 is recorded newest-first", () => {
     const render = inTmux(["a", "b", "c", "d"]);
     render().assignTabToZone(0, "c");
@@ -704,6 +713,27 @@ describe("replacing a tab in place (restart-in-zone)", () => {
     expect(after.layoutId).toBe("quad");
     expect(after.assignments).toStrictEqual({ 0: "a", 1: "b", 2: "n" });
     expect(after.focusedZone).toBe(2);
+  });
+
+  it("restarting the shown pane keeps it on screen when a session resumes later", () => {
+    // Persisted before a runner restart: s was shown. After it, s is still
+    // resuming, so the reconcile shows x and s's session is pending.
+    const render = mount(
+      {
+        layoutId: "single",
+        assignments: { 0: "s" },
+        focusedZone: 0,
+        workMode: "tmux",
+        mru: ["s", "x"],
+        mruSessionKeys: { s: "sess-s" },
+      },
+      ["x"],
+    );
+    expect(render().shownTabId).toBe("x");
+    render(["x", "y"]).replaceTab("x", "y");
+    expect(render(["y"]).shownTabId).toBe("y");
+    const r = render(["y", "s2"], { keys: { s2: "sess-s" } });
+    expect(r.shownTabId).toBe("y");
   });
 
   it("grid: the new tab takes the old one's zone", () => {
