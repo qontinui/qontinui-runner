@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { TerminalSquare, X, CheckSquare, History, Radio, Server } from "lucide-react";
 import { SessionManagerHeader } from "./SessionManagerHeader";
 import { StewardControl } from "./StewardControl";
@@ -7,10 +7,22 @@ import { WorktreesPanel } from "../worktrees/WorktreesPanel";
 import { PastSessionsView } from "./PastSessionsView";
 import { FleetSessionPicker } from "./FleetSessionPicker";
 import { isRowOnScreen } from "./sessionManagerLiveRows";
-import { SESSION_STATUS_LABELS } from "./sessionStatusModel";
+import { groupSessions, type SessionSection } from "./sessionGrouping";
+import { SessionGroupHeader } from "./SessionGroupHeader";
+import { GroupMenuItems, type MenuPage } from "./SessionOrgMenus";
+import { SessionCloseDialog } from "./SessionCloseDialog";
+import { SessionGroupSuggestionsDialog } from "./SessionGroupSuggestionsDialog";
+import { SessionRail } from "./SessionRail";
+import { sessionOrgControlAttrs } from "./sessionOrgControls";
+import { RAIL_WIDTH, useSessionPanelLayout } from "./sessionPanelLayout";
+import { useSessionPanelOrg, type NewSessionInGroupRequest } from "./useSessionPanelOrg";
+import { memberOf } from "./useSessionOrg";
+import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import type { PastSession } from "./usePastSessions";
 import type { UseSessionManagerReturn, UnifiedSession } from "./useSessionManager";
 import type { LockState } from "./useFileLockTracking";
+
+export type { NewSessionInGroupRequest } from "./useSessionPanelOrg";
 
 interface SessionManagerPanelProps {
   manager: UseSessionManagerReturn;
@@ -40,6 +52,11 @@ interface SessionManagerPanelProps {
    * shown session from the hidden ones at a glance.
    */
   onScreenTabId?: string | null;
+  /** The Terminal pages, for Move to page; the current one is excluded. */
+  pages?: readonly MenuPage[];
+  currentPageId?: string;
+  /** Spawn an AI session for "New session in group"; absent = not offered. */
+  onNewSessionInGroup?: (request: NewSessionInGroupRequest) => void;
 }
 
 /** UI-Bridge ids for the panel's own controls. */
@@ -48,60 +65,9 @@ export const SESSION_MANAGER_PANEL_IDS = {
   unidentified: "terminal.session-manager-unidentified",
 } as const;
 
-/** Group sessions by the current groupBy mode. Returns [groupKey, sessions][] */
-function groupSessions(
-  sessions: UnifiedSession[],
-  groupBy: "status" | "account" | "project" | "date",
-): [string, UnifiedSession[]][] {
-  const groups = new Map<string, UnifiedSession[]>();
-
-  for (const session of sessions) {
-    let key: string;
-    switch (groupBy) {
-      case "status":
-        // The same word the card's dot carries — one label table for both.
-        key = SESSION_STATUS_LABELS.activity[session.status.activity];
-        break;
-      case "account":
-        key = session.accountLabel;
-        break;
-      case "project":
-        key = session.projectLabel || "Unknown";
-        break;
-      case "date":
-        key = formatDateGroupKey(session.lastModified);
-        break;
-      default:
-        key = "Other";
-    }
-
-    const list = groups.get(key);
-    if (list) {
-      list.push(session);
-    } else {
-      groups.set(key, [session]);
-    }
-  }
-
-  return Array.from(groups.entries());
-}
-
-function formatDateGroupKey(iso: string): string {
-  if (!iso) return "Unknown";
-  try {
-    const d = new Date(iso);
-    const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const target = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-    const diff = (today.getTime() - target.getTime()) / 86400000;
-
-    if (diff === 0) return "Today";
-    if (diff === 1) return "Yesterday";
-    if (diff < 7) return "This Week";
-    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  } catch {
-    return "Unknown";
-  }
+/** The rows a section renders, in order — what the rail mirrors. */
+function visibleRows(sections: readonly SessionSection<UnifiedSession>[]): UnifiedSession[] {
+  return sections.flatMap((s) => s.sessions);
 }
 
 export function SessionManagerPanel({
@@ -111,6 +77,9 @@ export function SessionManagerPanel({
   sessionLockStates,
   onResumePastSession,
   onScreenTabId = null,
+  pages = [],
+  currentPageId = "default",
+  onNewSessionInGroup,
 }: SessionManagerPanelProps) {
   const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
@@ -133,16 +102,15 @@ export function SessionManagerPanel({
     viewTranscript,
     copySessionId,
     closableTabId,
-    closeSession,
+    closeSessions,
+    forceCloseSessions,
     selectedIds,
     toggleSelect,
     selectAllVisible,
     clearSelection,
     bulkResume,
-    pinnedIds,
-    togglePin,
-    sessionLabels,
-    setSessionLabel,
+    org,
+    sessionKeyOf,
     allAccounts,
     activityCounts,
     unidentifiedCount,
@@ -150,8 +118,15 @@ export function SessionManagerPanel({
   const selectableVisible = sessions.filter((s) => s.source === "transcript").length;
 
   const selectionMode = selectedIds.size > 0;
+  const { windowLabel } = useWindowAssignments();
+  const { layout, setWidth, toggleRail } = useSessionPanelLayout(windowLabel);
+  const knownOrg = org.phase === "known" ? org.org : null;
 
-  const groups = useMemo(() => groupSessions(sessions, groupBy), [sessions, groupBy]);
+  const sections = useMemo(
+    () => groupSessions({ sessions, groupBy, org, keyOf: sessionKeyOf }),
+    [sessions, groupBy, org, sessionKeyOf],
+  );
+  const groupLens = groupBy === "groups";
 
   /**
    * Cross-link target from `SessionCard`: the worktree path of the session
@@ -160,8 +135,145 @@ export function SessionManagerPanel({
    */
   const [worktreeFocus, setWorktreeFocus] = useState<string | null>(null);
 
+  const {
+    apply,
+    otherPages,
+    groupColorOf,
+    groupRows,
+    groupTabIds,
+    moveNotice,
+    dismissMoveNotice,
+    moveToPage,
+    orgMenu,
+    drag,
+    closeRequest,
+    requestClose,
+    requestCloseGroup,
+    dismissClose,
+    closeTargets,
+    rowsOf,
+    renamingGroupId,
+    setRenamingGroupId,
+    newSessionFor,
+    suggestions,
+    openSuggestions,
+    applySuggestionOps,
+    closeSuggestions,
+  } = useSessionPanelOrg({
+    manager,
+    pages,
+    currentPageId,
+    onNewSessionInGroup,
+    groupLens,
+  });
+
+  // ── Resize ───────────────────────────────────────────────────────────────
+
+  const startResize = useCallback(
+    (e: ReactMouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startWidth = layout.width;
+      const onMove = (ev: MouseEvent) => setWidth(startWidth + ev.clientX - startX);
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    },
+    [layout.width, setWidth],
+  );
+
+  if (layout.rail && view === "live") {
+    return (
+      <SessionRail
+        sessions={visibleRows(sections)}
+        groupColorOf={groupColorOf}
+        selectedSessionId={selectedSessionId}
+        onOpen={openSession}
+        onExpand={toggleRail}
+        width={RAIL_WIDTH}
+      />
+    );
+  }
+
+  /** Every section header but a group's (that one is a `SessionGroupHeader`). */
+  const renderSectionHeader = (section: SessionSection<UnifiedSession>) => {
+    switch (section.kind) {
+      case "ungrouped":
+        return (
+          <div
+            {...sessionOrgControlAttrs("ungroupedSection")}
+            data-session-count={section.sessions.length}
+            onDragOver={drag.ungrouped.over}
+            onDragLeave={drag.ungrouped.leave}
+            onDrop={drag.ungrouped.drop}
+            className={`flex items-center gap-2 px-3 pt-3 pb-1 ${
+              drag.hover?.kind === "ungrouped" ? "bg-brand-primary/10" : ""
+            }`}
+            title="Sessions in no group. Drop a session here to take it out of its group."
+          >
+            <span className="text-[10px] font-medium text-[#565f89]">
+              {section.title}
+              <span className="ml-1 text-[#414868]">({section.sessions.length})</span>
+            </span>
+            <div className="flex-1 h-px bg-[#2a2d3d]" />
+          </div>
+        );
+      case "pinned":
+        return (
+          <div
+            {...sessionOrgControlAttrs("pinnedSection")}
+            data-session-count={section.sessions.length}
+            className="flex items-center gap-2 px-3 pt-2 pb-1"
+          >
+            <span className="text-[10px] font-medium text-[#565f89]">
+              {section.title}
+              <span className="ml-1 text-[#414868]">({section.sessions.length})</span>
+            </span>
+            <div className="flex-1 h-px bg-[#2a2d3d]" />
+          </div>
+        );
+      case "org-unavailable":
+        return (
+          <div
+            data-org-phase={org.phase}
+            className="px-3 pt-2 pb-1 text-[10px] text-[#565f89] truncate"
+            title={section.title}
+          >
+            {section.title}
+          </div>
+        );
+      case "group":
+        return null;
+      case "lens":
+        return sections.length > 1 ? (
+          <div className="flex items-center gap-2 px-3 pt-3 pb-1">
+            <div className="flex-1 h-px bg-[#2a2d3d]" />
+            <span className="text-[10px] font-medium text-[#565f89] whitespace-nowrap">
+              {section.title}
+              <span className="ml-1 text-[#414868]">({section.sessions.length})</span>
+            </span>
+            <div className="flex-1 h-px bg-[#2a2d3d]" />
+          </div>
+        ) : null;
+    }
+  };
+
+  // The group lens shows its groups (empty ones included) even when no row
+  // matches; the other lenses fall back to the empty-state line.
+  const showSections = sessions.length > 0 || (groupLens && knownOrg !== null);
+
   return (
-    <div className="w-[340px] h-full flex flex-col border-r border-[#2a2d3d] bg-[#13141f] shrink-0">
+    <div
+      style={{ width: view === "live" ? layout.width : undefined }}
+      data-session-panel-mode="full"
+      data-panel-width={layout.width}
+      className={`relative h-full flex flex-col border-r border-[#2a2d3d] bg-[#13141f] shrink-0 ${
+        view === "live" ? "" : "w-[340px]"
+      }`}
+    >
       {/*
         Live | Previous view toggle.
 
@@ -225,149 +337,267 @@ export function SessionManagerPanel({
         <PastSessionsView onResumePastSession={onResumePastSession} />
       ) : (
         <>
-      <StewardControl />
-      <SessionManagerHeader
-        loading={loading}
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-        statusFilter={statusFilter}
-        onStatusFilterChange={setStatusFilter}
-        accountFilter={accountFilter}
-        onAccountFilterChange={setAccountFilter}
-        groupBy={groupBy}
-        onGroupByChange={setGroupBy}
-        sortBy={sortBy}
-        onSortByChange={setSortBy}
-        accountUsage={accountUsage}
-        accounts={allAccounts}
-        onRefresh={refresh}
-        activityCounts={activityCounts}
-        totalCount={sessions.length}
-      />
+          <StewardControl />
+          <SessionManagerHeader
+            loading={loading}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
+            statusFilter={statusFilter}
+            onStatusFilterChange={setStatusFilter}
+            accountFilter={accountFilter}
+            onAccountFilterChange={setAccountFilter}
+            groupBy={groupBy}
+            onGroupByChange={setGroupBy}
+            sortBy={sortBy}
+            onSortByChange={setSortBy}
+            accountUsage={accountUsage}
+            accounts={allAccounts}
+            onRefresh={refresh}
+            activityCounts={activityCounts}
+            totalCount={sessions.length}
+            onToggleRail={toggleRail}
+            onSuggestGroups={groupLens && knownOrg ? () => void openSuggestions() : undefined}
+            orgStatus={
+              org.phase === "known"
+                ? (org.lastError ?? (org.pending > 0 ? `saving ${org.pending}…` : null))
+                : null
+            }
+          />
 
-      {/* Unmanaged `claude` processes with no registry row: counted, never
+          {/* Unmanaged `claude` processes with no registry row: counted, never
           attributed to a session. UNKNOWN (scan or registry unread) says so
           rather than reading as zero. */}
-      {unidentifiedCount !== 0 && (
-        <div
-          data-ui-bridge-content={SESSION_MANAGER_PANEL_IDS.unidentified}
-          data-unidentified-count={unidentifiedCount === null ? "unknown" : String(unidentifiedCount)}
-          className="px-3 py-1 text-[10px] text-[#565f89] border-b border-[#2a2d3d]"
-          title="Claude processes running outside this runner that report no session id — they are not matched to any row"
-        >
-          {unidentifiedCount === null
-            ? "Unidentified Claude processes: unknown (process scan or registry not read)"
-            : `${unidentifiedCount} unidentified Claude process${unidentifiedCount === 1 ? "" : "es"}`}
-        </div>
-      )}
-
-      {/* Bulk action bar */}
-      {selectionMode && (
-        <div className="flex items-center gap-2 px-3 py-1.5 bg-[#7aa2f7]/5 border-b border-[#2a2d3d]">
-          <span className="text-[10px] text-[#7aa2f7] font-medium">
-            {selectedIds.size} selected
-          </span>
-          <div className="flex-1" />
-          <button
-            onClick={bulkResume}
-            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-[#9ece6a]/15 text-[#9ece6a] hover:bg-[#9ece6a]/25 transition-colors"
-            title="Resume all selected sessions"
-          >
-            <TerminalSquare className="w-3 h-3" />
-            Resume {selectedIds.size}
-          </button>
-          <button
-            onClick={clearSelection}
-            className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
-            title="Clear selection"
-          >
-            <X className="w-3 h-3" />
-          </button>
-        </div>
-      )}
-
-      {/* Select what the filter shows */}
-      {!selectionMode && selectableVisible > 1 && (
-        <div className="flex items-center px-3 py-1 border-b border-[#2a2d3d]">
-          <button
-            data-ui-bridge-id={SESSION_MANAGER_PANEL_IDS.selectVisible}
-            onClick={selectAllVisible}
-            className="flex items-center gap-1 text-[10px] text-[#7aa2f7]/70 hover:text-[#7aa2f7] transition-colors"
-            title="Select every session the current filter shows"
-          >
-            <CheckSquare className="w-3 h-3" />
-            Select all {selectableVisible} shown
-          </button>
-        </div>
-      )}
-
-      {/* Session list */}
-      <div className="flex-1 overflow-y-auto scrollbar-dark">
-        {loading && sessions.length === 0 ? (
-          <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
-            <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />
-            Loading sessions...
-          </div>
-        ) : sessions.length === 0 ? (
-          <div className="px-3 py-8 text-center text-[#565f89] text-xs">
-            {searchQuery || statusFilter !== "all" || accountFilter !== "all"
-              ? "No sessions match filters"
-              : "No sessions found"}
-          </div>
-        ) : (
-          groups.map(([groupKey, groupSessions]) => (
-            <div key={groupKey}>
-              {/* Group header */}
-              {groups.length > 1 && (
-                <div className="flex items-center gap-2 px-3 pt-3 pb-1">
-                  <div className="flex-1 h-px bg-[#2a2d3d]" />
-                  <span className="text-[10px] font-medium text-[#565f89] whitespace-nowrap">
-                    {groupKey}
-                    <span className="ml-1 text-[#414868]">({groupSessions.length})</span>
-                  </span>
-                  <div className="flex-1 h-px bg-[#2a2d3d]" />
-                </div>
-              )}
-
-              {/* Session cards */}
-              {groupSessions.map((session) => (
-                <SessionCard
-                  key={session.sessionId}
-                  session={session}
-                  isSelected={session.sessionId === selectedSessionId}
-                  isChecked={selectedIds.has(session.sessionId)}
-                  selectionMode={selectionMode}
-                  isPinned={pinnedIds.has(session.sessionId)}
-                  sessionLabel={sessionLabels[session.sessionId] ?? null}
-                  fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
-                  lockState={sessionLockStates?.get(session.sessionId)}
-                  onResume={resumeSession}
-                  onOpen={openSession}
-                  onViewTranscript={viewTranscript}
-                  onCopyId={copySessionId}
-                  onToggleSelect={toggleSelect}
-                  onTogglePin={togglePin}
-                  onSetLabel={setSessionLabel}
-                  onAfterPromote={refresh}
-                  onOpenWorktrees={setWorktreeFocus}
-                  isOnScreen={isRowOnScreen(session, onScreenTabId)}
-                  onClose={closableTabId(session) !== null ? closeSession : undefined}
-                />
-              ))}
+          {unidentifiedCount !== 0 && (
+            <div
+              data-ui-bridge-content={SESSION_MANAGER_PANEL_IDS.unidentified}
+              data-unidentified-count={
+                unidentifiedCount === null ? "unknown" : String(unidentifiedCount)
+              }
+              className="px-3 py-1 text-[10px] text-[#565f89] border-b border-[#2a2d3d]"
+              title="Claude processes running outside this runner that report no session id — they are not matched to any row"
+            >
+              {unidentifiedCount === null
+                ? "Unidentified Claude processes: unknown (process scan or registry not read)"
+                : `${unidentifiedCount} unidentified Claude process${unidentifiedCount === 1 ? "" : "es"}`}
             </div>
-          ))
-        )}
-      </div>
+          )}
 
-      {/*
+          {moveNotice && (
+            <div
+              data-testid="session-move-notice"
+              className="flex items-center gap-2 px-3 py-1 text-[10px] text-[#a9b1d6] border-b border-[#2a2d3d]"
+            >
+              <span className="flex-1 truncate" title={moveNotice}>
+                {moveNotice}
+              </span>
+              <button
+                onClick={dismissMoveNotice}
+                aria-label="Dismiss"
+                className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5]"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+
+          {/* Bulk action bar */}
+          {selectionMode && (
+            <div className="flex items-center gap-2 px-3 py-1.5 bg-[#7aa2f7]/5 border-b border-[#2a2d3d]">
+              <span className="text-[10px] text-[#7aa2f7] font-medium">
+                {selectedIds.size} selected
+              </span>
+              <div className="flex-1" />
+              <button
+                onClick={bulkResume}
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-[#9ece6a]/15 text-[#9ece6a] hover:bg-[#9ece6a]/25 transition-colors"
+                title="Resume all selected sessions"
+              >
+                <TerminalSquare className="w-3 h-3" />
+                Resume {selectedIds.size}
+              </button>
+              <button
+                onClick={clearSelection}
+                className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
+                title="Clear selection"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+
+          {/* Select what the filter shows */}
+          {!selectionMode && selectableVisible > 1 && (
+            <div className="flex items-center px-3 py-1 border-b border-[#2a2d3d]">
+              <button
+                data-ui-bridge-id={SESSION_MANAGER_PANEL_IDS.selectVisible}
+                onClick={selectAllVisible}
+                className="flex items-center gap-1 text-[10px] text-[#7aa2f7]/70 hover:text-[#7aa2f7] transition-colors"
+                title="Select every session the current filter shows"
+              >
+                <CheckSquare className="w-3 h-3" />
+                Select all {selectableVisible} shown
+              </button>
+            </div>
+          )}
+
+          {/* Session list */}
+          <div className="flex-1 overflow-y-auto scrollbar-dark" data-group-by={groupBy}>
+            {loading && sessions.length === 0 && !showSections ? (
+              <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
+                <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />
+                Loading sessions...
+              </div>
+            ) : !showSections ? (
+              <div className="px-3 py-8 text-center text-[#565f89] text-xs">
+                {searchQuery || statusFilter !== "all" || accountFilter !== "all"
+                  ? "No sessions match filters"
+                  : "No sessions found"}
+              </div>
+            ) : (
+              sections.map((section) => {
+                const group = section.kind === "group" ? section.group : null;
+                const newSession = group ? newSessionFor(group.id) : null;
+                const liveTabCount = group ? groupTabIds(group.id).length : 0;
+                return (
+                  <div key={section.key} data-section-kind={section.kind}>
+                    {section.kind === "group" && group && newSession ? (
+                      <SessionGroupHeader
+                        group={group}
+                        shownCount={section.shownCount}
+                        memberCount={section.memberCount}
+                        needsYouCount={section.needsYouCount}
+                        renaming={renamingGroupId === group.id}
+                        onStartRename={() => setRenamingGroupId(group.id)}
+                        onRename={(title) => {
+                          setRenamingGroupId(null);
+                          if (title !== group.title)
+                            apply([{ op: "renameGroup", groupId: group.id, title }]);
+                        }}
+                        onCancelRename={() => setRenamingGroupId(null)}
+                        onToggleCollapse={() =>
+                          apply([
+                            {
+                              op: "setGroupCollapsed",
+                              groupId: group.id,
+                              collapsed: !group.collapsed,
+                            },
+                          ])
+                        }
+                        renderMenu={(close) => (
+                          <GroupMenuItems
+                            group={group}
+                            pages={otherPages}
+                            liveTabCount={liveTabCount}
+                            onNewSession={newSession.run}
+                            newSessionUnavailable={newSession.reason}
+                            onStartRename={() => setRenamingGroupId(group.id)}
+                            onApply={apply}
+                            onMoveToPage={(pageId) => moveToPage(groupRows(group.id), pageId)}
+                            onCloseGroup={() => requestCloseGroup(group)}
+                            close={close}
+                          />
+                        )}
+                        onDragStart={(e) => drag.groupHeader.start(group.id, e)}
+                        onDragEnd={drag.groupHeader.end}
+                        onDragOver={(e) => drag.groupHeader.over(group.id, e)}
+                        onDragLeave={drag.groupHeader.leave}
+                        onDrop={(e) => drag.groupHeader.drop(group.id, e)}
+                        dropIndicator={
+                          drag.hover?.kind === "group" && drag.hover.groupId === group.id
+                            ? drag.hover.mode
+                            : null
+                        }
+                      />
+                    ) : (
+                      renderSectionHeader(section)
+                    )}
+                    {section.sessions.map((session) => (
+                      <SessionCard
+                        key={session.sessionId}
+                        session={session}
+                        isSelected={session.sessionId === selectedSessionId}
+                        isChecked={selectedIds.has(session.sessionId)}
+                        selectionMode={selectionMode}
+                        orgMember={memberOf(org, sessionKeyOf(session))}
+                        groupColor={groupColorOf(session)}
+                        compact={section.kind === "pinned"}
+                        sessionKey={sessionKeyOf(session)}
+                        orgMenu={orgMenu}
+                        drag={drag.card}
+                        dropBefore={
+                          drag.hover?.kind === "row" && drag.hover.sessionId === session.sessionId
+                        }
+                        fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
+                        lockState={sessionLockStates?.get(session.sessionId)}
+                        onResume={resumeSession}
+                        onOpen={openSession}
+                        onViewTranscript={viewTranscript}
+                        onCopyId={copySessionId}
+                        onToggleSelect={toggleSelect}
+                        onAfterPromote={refresh}
+                        onOpenWorktrees={setWorktreeFocus}
+                        isOnScreen={isRowOnScreen(session, onScreenTabId)}
+                        onClose={closableTabId(session) !== null ? requestClose : undefined}
+                      />
+                    ))}
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {closeRequest && (
+            <SessionCloseDialog
+              heading={closeRequest.heading}
+              targets={closeTargets}
+              onClose={(ids) => closeSessions(rowsOf(ids))}
+              onForceClose={(ids) => forceCloseSessions(rowsOf(ids))}
+              onDismiss={dismissClose}
+            />
+          )}
+
+          {suggestions && suggestions.note && (
+            <div
+              className="px-3 py-1 text-[10px] text-[#565f89] border-t border-[#2a2d3d]"
+              title={suggestions.note}
+            >
+              Suggestions by repo only — {suggestions.note}
+            </div>
+          )}
+          <SessionGroupSuggestionsDialog
+            open={suggestions !== null}
+            suggestions={suggestions?.list ?? []}
+            onApply={applySuggestionOps}
+            onClose={closeSuggestions}
+          />
+
+          {/*
         Worktrees panel — sibling of the session list. The on-demand,
         human-consented cleanup trigger (plan
         `2026-07-19-worktree-cleanup-lifecycle-tracking` Phase 4). Collapsed
         by default so it costs nothing until asked for; `SessionCard`'s
         worktree affordance opens it focused on that session's worktree.
       */}
-      <WorktreesPanel defaultOpen={worktreeFocus !== null} highlightPath={worktreeFocus} />
+          <WorktreesPanel defaultOpen={worktreeFocus !== null} highlightPath={worktreeFocus} />
         </>
+      )}
+
+      {view === "live" && (
+        <div
+          {...sessionOrgControlAttrs("resizeHandle")}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the Session Manager"
+          aria-valuenow={layout.width}
+          tabIndex={0}
+          onMouseDown={startResize}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") setWidth(layout.width - 16);
+            else if (e.key === "ArrowRight") setWidth(layout.width + 16);
+          }}
+          className="absolute top-0 right-0 h-full w-1 cursor-col-resize hover:bg-brand-primary/40 focus:bg-brand-primary/40 focus:outline-none"
+          title="Drag to resize (← / → with focus)"
+        />
       )}
     </div>
   );

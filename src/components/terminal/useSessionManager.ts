@@ -12,11 +12,18 @@
  *
  * Each row's two-axis status (location × activity) is classified by the pure
  * `sessionStatusModel`. Provides search, filter, sort, grouping, and actions.
+ *
+ * Organization (groups, pins, tags, mute, snooze, recently closed) is the
+ * runner's session-org store, read through `useSessionOrg` — never this
+ * webview's localStorage (plan
+ * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+ * D3). Each row's store key is {@link UseSessionManagerReturn.sessionKeyOf}.
  */
 
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
+import { describeThrown } from "@/lib/utils";
 import { resolvePort } from "@/lib/runner-api";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { TerminalTab } from "./useTerminalManager";
@@ -47,6 +54,17 @@ import {
   type SessionStatus,
   type StatusTabInput,
 } from "./sessionStatusModel";
+import { useSessionOrg, memberOf, sessionKeyFor, type SessionOrgView } from "./useSessionOrg";
+import type { SessionOrgOp } from "./sessionOrgTypes";
+import { parseGroupBy, type SessionGroupBy } from "./sessionGrouping";
+import {
+  closeSessionsGracefully,
+  forceCloseSessions as forceCloseItems,
+  type CloseItem,
+  type CloseItemResult,
+} from "./sessionClose";
+
+export type { SessionGroupBy } from "./sessionGrouping";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -304,7 +322,6 @@ export interface TabSessionRow extends UnifiedSessionFields {
 
 export type UnifiedSession = TranscriptSessionRow | TabSessionRow;
 
-export type SessionGroupBy = "status" | "account" | "project" | "date";
 export type SessionSortBy = "recent" | "oldest" | "messages" | "staleness";
 
 export interface UseSessionManagerParams {
@@ -340,10 +357,30 @@ export interface UseSessionManagerParams {
   visibleTabIds: ReadonlySet<string>;
   /** Per-tab file-lock state (`useHotField(pageId, "lockStates")`). */
   tabLockStates?: Readonly<Record<string, LockState | undefined>>;
+  /**
+   * This page and window — the pane identity a tab with no Claude session id
+   * is organized under (`sessionKeyFor`), and the window the lens is
+   * persisted for. Default: the default page in the main window.
+   */
+  pageId?: string;
+  windowLabel?: string;
+}
+
+/** One session's Move-to-page outcome. */
+export interface MoveToPageResult {
+  sessionId: string;
+  ok: boolean;
+  detail: string;
 }
 
 export interface UseSessionManagerReturn {
+  /** The rows the filters and sort select, in display order. */
   sessions: UnifiedSession[];
+  /**
+   * Every Live row, unfiltered — what a close confirmation re-reads while it
+   * is open and what the `session-org` bridge addresses by id.
+   */
+  allSessions: UnifiedSession[];
   loading: boolean;
   accountUsage: AccountUsageInfo[];
   launchCommands: Record<string, string>;
@@ -380,8 +417,21 @@ export interface UseSessionManagerReturn {
    * none in this window (a transcript-only row) — its card offers no close.
    */
   closableTabId: (session: UnifiedSession) => string | null;
-  /** Close the row's live terminal tab (no-op when it has none). */
-  closeSession: (session: UnifiedSession) => void;
+  /**
+   * Close the rows' sessions the D7 way — `graceful_exit`, per-item outcome,
+   * never a kill — and record each one that closed as recently closed.
+   */
+  closeSessions: (sessions: readonly UnifiedSession[]) => Promise<CloseItemResult[]>;
+  /**
+   * Force close: the page's plain close, which kills the pane tree. Its own,
+   * separately confirmed action; records each closed session the same way.
+   */
+  forceCloseSessions: (sessions: readonly UnifiedSession[]) => CloseItemResult[];
+  /** Move the rows' live tabs to another Terminal page. */
+  moveSessionsToPage: (
+    sessions: readonly UnifiedSession[],
+    pageId: string,
+  ) => Promise<MoveToPageResult[]>;
 
   // Multi-select & bulk actions
   selectedIds: Set<string>;
@@ -391,11 +441,16 @@ export interface UseSessionManagerReturn {
   clearSelection: () => void;
   bulkResume: () => void;
 
-  // Pinning & labeling
-  pinnedIds: Set<string>;
-  togglePin: (sessionId: string) => void;
-  sessionLabels: Record<string, string>;
-  setSessionLabel: (sessionId: string, label: string | null) => void;
+  // Organization (the runner's session-org store)
+  /** The store as this window sees it: loading, unknown, or known. */
+  org: SessionOrgView;
+  /**
+   * Apply org ops. A refusal or transport failure lands on
+   * `org.lastError`; the returned promise never rejects.
+   */
+  applyOrg: (ops: SessionOrgOp[]) => Promise<void>;
+  /** A row's organization-store key (`sessionKeyFor`). */
+  sessionKeyOf: (session: UnifiedSession) => string;
 
   // Derived
   allAccounts: string[];
@@ -512,6 +567,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     onCloseSessionTab,
     visibleTabIds,
     tabLockStates,
+    pageId = "default",
+    windowLabel = "main",
   } = params;
 
   // Account usage state
@@ -537,8 +594,10 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   const [accountFilter, setAccountFilter] = useState<string | "all">(
     () => instanceStorage.getItem(`${STORAGE_PREFIX}account-filter`) || "all",
   );
-  const [groupBy, setGroupBy] = useState<SessionGroupBy>(
-    () => (instanceStorage.getItem(`${STORAGE_PREFIX}group-by`) as SessionGroupBy) || "status",
+  // The lens is persisted per WINDOW; "My groups" when nothing is stored.
+  const groupByKey = `${STORAGE_PREFIX}group-by:${windowLabel}`;
+  const [groupBy, setGroupBy] = useState<SessionGroupBy>(() =>
+    parseGroupBy(instanceStorage.getItem(groupByKey)),
   );
   const [sortBy, setSortBy] = useState<SessionSortBy>(
     () => (instanceStorage.getItem(`${STORAGE_PREFIX}sort-by`) as SessionSortBy) || "recent",
@@ -552,59 +611,34 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     instanceStorage.setItem(`${STORAGE_PREFIX}account-filter`, accountFilter);
   }, [accountFilter]);
   useEffect(() => {
-    instanceStorage.setItem(`${STORAGE_PREFIX}group-by`, groupBy);
-  }, [groupBy]);
+    instanceStorage.setItem(groupByKey, groupBy);
+  }, [groupByKey, groupBy]);
   useEffect(() => {
     instanceStorage.setItem(`${STORAGE_PREFIX}sort-by`, sortBy);
   }, [sortBy]);
 
-  // ── Pinning (persisted) ───────────────────────────────────────────────────
+  // ── Organization (the runner's session-org store) ────────────────────────
 
-  const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
-    try {
-      const stored = instanceStorage.getItem(`${STORAGE_PREFIX}pinned`);
-      return stored ? new Set(JSON.parse(stored) as string[]) : new Set();
-    } catch {
-      return new Set();
-    }
-  });
+  const { view: org, apply: applyOrgRaw, importLegacyKeys } = useSessionOrg();
 
-  const togglePin = useCallback((sessionId: string) => {
-    setPinnedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(sessionId)) {
-        next.delete(sessionId);
-      } else {
-        next.add(sessionId);
+  // The one-time import of the retired `session-manager-pinned` /
+  // `session-manager-labels` localStorage keys; the client runs it at most
+  // once per webview and deletes the keys after.
+  useEffect(() => {
+    void importLegacyKeys();
+  }, [importLegacyKeys]);
+
+  const applyOrg = useCallback(
+    async (ops: SessionOrgOp[]) => {
+      if (ops.length === 0) return;
+      try {
+        await applyOrgRaw(ops);
+      } catch {
+        // Surfaced as `org.lastError` by the client; the org is re-read.
       }
-      instanceStorage.setItem(`${STORAGE_PREFIX}pinned`, JSON.stringify([...next]));
-      return next;
-    });
-  }, []);
-
-  // ── Labeling (persisted) ──────────────────────────────────────────────────
-
-  const [sessionLabels, setSessionLabels] = useState<Record<string, string>>(() => {
-    try {
-      const stored = instanceStorage.getItem(`${STORAGE_PREFIX}labels`);
-      return stored ? (JSON.parse(stored) as Record<string, string>) : {};
-    } catch {
-      return {};
-    }
-  });
-
-  const setSessionLabel = useCallback((sessionId: string, label: string | null) => {
-    setSessionLabels((prev) => {
-      const next = { ...prev };
-      if (label) {
-        next[sessionId] = label;
-      } else {
-        delete next[sessionId];
-      }
-      instanceStorage.setItem(`${STORAGE_PREFIX}labels`, JSON.stringify(next));
-      return next;
-    });
-  }, []);
+    },
+    [applyOrgRaw],
+  );
 
   // ── Fetch account usage (every 5 minutes) ─────────────────────────────────
 
@@ -780,6 +814,23 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   const tabsById = useMemo(() => new Map(tabs.map((t) => [t.id, t])), [tabs]);
 
+  // The store key: the Claude session id when the row has one — a transcript
+  // row's own id, a tab row's tab's — else the tab's window-aware pane key.
+  const sessionKeyOf = useCallback(
+    (session: Pick<UnifiedSession, "source" | "sessionId">): string => {
+      if (session.source === "transcript") return session.sessionId;
+      const tab = tabsById.get(session.sessionId);
+      return sessionKeyFor(tab?.claudeSessionId ?? null, {
+        pageId,
+        title: tab?.spawnName ?? tab?.title ?? session.sessionId,
+        workingDir: tab?.workingDir ?? "",
+        windowLabel,
+        remoteDeviceId: tab?.remote?.deviceId,
+      });
+    },
+    [tabsById, pageId, windowLabel],
+  );
+
   const tabInputFor = useCallback(
     (row: UnclassifiedSession): StatusTabInput | null => {
       const tab = row.zoneTabId ? tabsById.get(row.zoneTabId) : undefined;
@@ -953,17 +1004,15 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       });
     }
 
-    // Pinned sessions always float to the top
-    if (pinnedIds.size > 0) {
-      sorted.sort((a, b) => {
-        const aPinned = pinnedIds.has(a.sessionId) ? 0 : 1;
-        const bPinned = pinnedIds.has(b.sessionId) ? 0 : 1;
-        return aPinned - bPinned;
-      });
+    // Pinned sessions always float to the top (the "My groups" lens gives
+    // them their own section instead).
+    if (org.phase === "known") {
+      const pinned = (s: UnifiedSession) => (memberOf(org, sessionKeyOf(s))?.pinned ? 0 : 1);
+      sorted.sort((a, b) => pinned(a) - pinned(b));
     }
 
     return sorted;
-  }, [allSessions, statusFilter, accountFilter, searchQuery, sortBy, groupBy, pinnedIds]);
+  }, [allSessions, statusFilter, accountFilter, searchQuery, sortBy, groupBy, org, sessionKeyOf]);
 
   // ── Derived ─────────────────────────────────────────────────────────────────
 
@@ -1077,12 +1126,70 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     [tabs, onCloseSessionTab],
   );
 
-  const closeSession = useCallback(
-    (session: UnifiedSession) => {
-      const tabId = closableTabId(session);
-      if (tabId) onCloseSessionTab?.(tabId);
-    },
-    [closableTabId, onCloseSessionTab],
+  const closeItemOf = useCallback(
+    (session: UnifiedSession): CloseItem => ({
+      sessionId: session.sessionId,
+      title: session.registryName || session.resumeName || session.displayName,
+      tabId: closableTabId(session),
+      sessionKey: sessionKeyOf(session),
+      resumeCmd:
+        session.source === "transcript" && !isInjectedSession(session)
+          ? `claude --resume ${session.sessionId}`
+          : null,
+    }),
+    [closableTabId, sessionKeyOf],
+  );
+
+  const closeEffects = useMemo(
+    () => ({
+      gracefulClose: (tabId: string) =>
+        invoke<unknown>("terminal_graceful_close", { terminalId: tabId }),
+      forceClose: (tabId: string) => onCloseSessionTab?.(tabId),
+      // The runner already closed this tab; the page's close path drops it
+      // from the window and records the durable close (its own
+      // `terminal_close` then finds nothing left to kill).
+      dropTab: (tabId: string) => onCloseSessionTab?.(tabId),
+      recordClosed: (ops: SessionOrgOp[]) => void applyOrg(ops),
+    }),
+    [onCloseSessionTab, applyOrg],
+  );
+
+  const closeSessions = useCallback(
+    (rows: readonly UnifiedSession[]) =>
+      closeSessionsGracefully(rows.map(closeItemOf), closeEffects),
+    [closeItemOf, closeEffects],
+  );
+
+  const forceCloseSessions = useCallback(
+    (rows: readonly UnifiedSession[]) => forceCloseItems(rows.map(closeItemOf), closeEffects),
+    [closeItemOf, closeEffects],
+  );
+
+  const moveSessionsToPage = useCallback(
+    (rows: readonly UnifiedSession[], targetPageId: string) =>
+      Promise.all(
+        rows.map(async (session): Promise<MoveToPageResult> => {
+          const tabId = liveTabIdForSession(session, tabs);
+          if (!tabId) {
+            return {
+              sessionId: session.sessionId,
+              ok: false,
+              detail: "not moved: it has no live tab in this window",
+            };
+          }
+          try {
+            await invoke("terminal_set_page", { terminalId: tabId, pageId: targetPageId });
+            return { sessionId: session.sessionId, ok: true, detail: "moved" };
+          } catch (e) {
+            return {
+              sessionId: session.sessionId,
+              ok: false,
+              detail: `not moved: ${describeThrown(e, "terminal_set_page failed")}`,
+            };
+          }
+        }),
+      ),
+    [tabs],
   );
 
   // ── Multi-select & bulk actions ──────────────────────────────────────────
@@ -1139,6 +1246,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   return {
     sessions,
+    allSessions,
     loading: sessionsLoading || digestsLoading,
     accountUsage,
     launchCommands,
@@ -1160,16 +1268,17 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     openSession,
     copySessionId,
     closableTabId,
-    closeSession,
+    closeSessions,
+    forceCloseSessions,
+    moveSessionsToPage,
     selectedIds,
     toggleSelect,
     selectAllVisible,
     clearSelection,
     bulkResume,
-    pinnedIds,
-    togglePin,
-    sessionLabels,
-    setSessionLabel,
+    org,
+    applyOrg,
+    sessionKeyOf,
     allAccounts,
     savedConfigDirs,
     activityCounts,
