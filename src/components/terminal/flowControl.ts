@@ -56,6 +56,24 @@ export class RenderAckAccumulator {
   }
 
   /**
+   * `bytes` the runner sent were settled WITHOUT a render: the pane received
+   * them, but they were already in its buffer via a scrollback-ring replay, so
+   * nothing was written. They still count toward the runner's unacked gap
+   * (`bytes_sent − bytes_acked`), so they must be acked like rendered bytes —
+   * an unacked remainder above the runner's Low watermark keeps a paused
+   * emission gate shut forever, because nothing else is ever sent to ack.
+   * Returns the ack amount to send now, exactly like {@link onRendered}.
+   */
+  onSettledWithoutWrite(bytes: number): number {
+    if (bytes <= 0) return 0;
+    this.pendingAck += bytes;
+    if (this.pendingAck >= this.ackSize) {
+      return this.flush();
+    }
+    return 0;
+  }
+
+  /**
    * The backend finished rendering `bytes` (its `onRendered` callback). Moves
    * them out of in-flight and into the pending-ack accumulator. Returns the
    * ack amount to send now (>0) when the accumulator has crossed AckSize,

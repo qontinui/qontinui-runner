@@ -48,7 +48,6 @@ import {
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
 import {
-  trimReplayedChunk,
   isEmissionGap,
   resyncSliceStart,
   drainHeldChunks,
@@ -59,6 +58,7 @@ import {
 } from "./scrollbackReplay";
 import { REMOTE_HISTORY_EVENT, type RemoteHistoryDetail } from "./remoteTabs";
 import { RenderAckAccumulator, ACK_FLOOR_INTERVAL_MS } from "./flowControl";
+import { AckedWriteQueue } from "./ackedWriteQueue";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import {
   registerTerminalOutputHandler,
@@ -587,49 +587,25 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         if (bytes <= 0) return;
         invoke("terminal_ack", { terminalId, bytesAcked: bytes }).catch(() => {});
       };
-      // Phase 4 — write coalescing. Per `terminal-output` event we trim the
-      // chunk against the ring-replay boundary and stage the unreplayed suffix
-      // here; a microtask flush concatenates everything staged into a SINGLE
+      // Phase 4 — write coalescing. Per `terminal-output` event the chunk is
+      // staged in `ackQueue`, which trims it against the ring-replay boundary;
+      // a microtask flush concatenates everything staged into a SINGLE
       // `backend.write()`. xterm's own RenderDebouncer then batches one reflow
-      // per frame — we add no rAF loop around xterm. The render-ack callback
-      // fires once for the whole coalesced write and accounts its full length.
-      let coalesceQueue: Uint8Array[] = [];
-      let coalesceLen = 0;
+      // per frame — we add no rAF loop around xterm. The queue owes the runner
+      // an ack for every byte it RECEIVED, trimmed prefix included, not just the
+      // bytes it wrote: an unacked remainder above the runner's Low watermark
+      // wedges a paused emission gate for good (see `ackedWriteQueue.ts`).
+      const ackQueue = new AckedWriteQueue(renderAck, sendAck);
       let flushScheduled = false;
       const flushCoalesced = () => {
         flushScheduled = false;
-        if (coalesceLen === 0) return;
-        const b = backendRef.current;
-        if (!b) {
-          coalesceQueue = [];
-          coalesceLen = 0;
-          return;
-        }
-        let merged: Uint8Array;
-        if (coalesceQueue.length === 1) {
-          merged = coalesceQueue[0];
-        } else {
-          merged = new Uint8Array(coalesceLen);
-          let at = 0;
-          for (const c of coalesceQueue) {
-            merged.set(c, at);
-            at += c.length;
-          }
-        }
-        const writtenLen = merged.length;
-        coalesceQueue = [];
-        coalesceLen = 0;
-        renderAck.onWriteIssued(writtenLen);
+        if (ackQueue.isEmpty) return;
         try {
-          b.write(merged, () => {
-            sendAck(renderAck.onRendered(writtenLen));
-          });
+          ackQueue.flush(backendRef.current);
         } catch (e) {
+          // The queue already settled the ack the failed write's render
+          // callback would have sent, so backpressure can't wedge on it.
           console.error(`[Terminal ${terminalId}] write error:`, e);
-          // The render callback won't fire for a failed write — settle the
-          // in-flight bytes so the accumulator and reader backpressure don't
-          // wedge on a permanently-unrendered chunk.
-          sendAck(renderAck.onRendered(writtenLen));
         }
       };
       const scheduleFlush = () => {
@@ -788,11 +764,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             const drained = drainHeldChunks(resyncPending, writtenThrough, replayedThrough);
             resyncPending = drained.reheld;
             writtenThrough = drained.writtenThrough;
-            for (const w of drained.writable) {
-              coalesceQueue.push(w);
-              coalesceLen += w.length;
-            }
-            if (drained.writable.length > 0) scheduleFlush();
+            // Ack every consumed held byte, the part the ring just replayed
+            // included: a held sync frame can sit wholly inside the snapshot.
+            ackQueue.stage(drained.writable, drained.receivedBytes);
+            if (!ackQueue.isEmpty) scheduleFlush();
             if (covered && drained.reheld.length === 0) {
               caughtUp = true;
               return;
@@ -810,16 +785,12 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           const rest = resyncPending;
           resyncPending = [];
           for (const c of rest) {
-            const slice = trimReplayedChunk(c, replayedThrough);
-            if (slice && slice.length > 0) {
-              coalesceQueue.push(slice);
-              coalesceLen += slice.length;
-              scheduleFlush();
-            }
+            ackQueue.stageChunk(c, replayedThrough);
             if (c.offset !== undefined) {
               writtenThrough = Math.max(writtenThrough, c.offset + c.bytes.length);
             }
           }
+          if (!ackQueue.isEmpty) scheduleFlush();
           // A request that arrived mid-pass ran against a stale ring snapshot;
           // run exactly one more pass to cover what it could not see. That
           // pass is the retry, so don't declare the gap unrecovered yet.
@@ -1027,27 +998,21 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         }
         // A chunk emitted before the ring snapshot can still be DELIVERED
         // after the replay (event delivery and invoke responses are not
-        // mutually ordered) — trim it to its unreplayed suffix so the
-        // boundary bytes aren't written twice. ack bookkeeping below stays on
-        // the full chunk: the content reached the terminal either way (via
-        // the ring), only the duplicate write is skipped.
+        // mutually ordered) — `stageChunk` trims it to its unreplayed suffix
+        // so the boundary bytes aren't written twice. The ack stays on the
+        // FULL chunk: the content reached the terminal either way (via the
+        // ring), only the duplicate write is skipped.
         //
         // Session-state tracking is NOT fed from here anymore — the global
         // `terminal-output` tap in `TerminalSessionContext` decodes + feeds
         // `handleOutput` independently of this instance's mount state (Phase 2
         // of the flow-grid virtualization plan). This handler is now purely
         // the xterm write/render path.
-        const unreplayed = trimReplayedChunk({ bytes, offset }, replayedThrough);
-        if (unreplayed && unreplayed.length > 0) {
-          // Phase 4: stage the unreplayed suffix and flush once per microtask
-          // into a single coalesced backend.write() (offset-dedup already
-          // applied above, before coalescing). The render-ack accounts the
-          // coalesced length when its completion callback fires. Length
-          // guard: zero-length resume-marker events carry only an offset.
-          coalesceQueue.push(unreplayed);
-          coalesceLen += unreplayed.length;
-          scheduleFlush();
-        }
+        // Phase 4: stage and flush once per microtask into a single coalesced
+        // backend.write(). Zero-length resume-marker events carry only an
+        // offset, so they stage nothing.
+        ackQueue.stageChunk({ bytes, offset }, replayedThrough);
+        if (!ackQueue.isEmpty) scheduleFlush();
         if (offset !== undefined) {
           writtenThrough = Math.max(writtenThrough, offset + bytes.length);
         }
@@ -1484,21 +1449,20 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
 
         for (const buffered of pendingBytes) {
           // Drop/trim the part of each buffered chunk the ring replay above
-          // already wrote (ack bookkeeping stays on the full chunk).
-          const slice = trimReplayedChunk(buffered, replayedThrough);
-          if (slice) {
-            try {
-              backend.write(slice);
-            } catch (e) {
-              console.error(`[Terminal ${terminalId}] drain write error:`, e);
-            }
-          }
+          // already wrote, and owe an ack for the WHOLE chunk. The runner
+          // counted every one of these bytes as sent; writing them with no
+          // render callback (as this drain used to) left them on its books
+          // after every remount, until a burst wedged the emission gate.
+          ackQueue.stageChunk(buffered, replayedThrough);
           if (buffered.offset !== undefined) {
             writtenThrough = Math.max(writtenThrough, buffered.offset + buffered.bytes.length);
           }
           bytesReceivedRef.current += buffered.bytes.length;
         }
         pendingBytes = [];
+        // Synchronously, so the drained bytes land right behind the ring
+        // replay and ahead of any live chunk.
+        flushCoalesced();
         backendReady = true;
 
         // Wait for the container to have non-zero dimensions before
