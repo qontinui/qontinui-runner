@@ -215,7 +215,7 @@ jobs:
         run: |
           cargo test -p termhost-probe --lib -- --ignored --exact \
             platform::windows::testwin::tests::desktop_the_doctors_probe_never_takes_the_foreground \
-            2>&1 | tee desktop-tests.log
+            --nocapture 2>&1 | tee desktop-tests.log
           grep -q "test result: ok. 1 passed" desktop-tests.log
 
       - name: Selftest
