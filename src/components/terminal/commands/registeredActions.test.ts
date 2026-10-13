@@ -167,7 +167,7 @@ const err = (r: CommandResult): string => (r.ok ? "OK" : `${r.code}: ${r.message
 
 describe("registered actions — the cost/destruction declarations are not empty", () => {
   it("registers the whole set", () => {
-    expect(getAll().length).toBe(41);
+    expect(getAll().length).toBe(42);
   });
 
   /**
