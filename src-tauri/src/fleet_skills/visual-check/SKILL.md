@@ -115,7 +115,7 @@ its three states:
 | `status` | Meaning | What to report |
 |---|---|---|
 | `measured` | The model looked and saw something; `value` holds it | The text / caption, with its age (below) |
-| `absent` | The model looked, with **full coverage**, and saw no text (it returned no blocks, or only whitespace-only / duplicate ones) | "No text in this region" — a real statement about the page |
+| `absent` | (`extract` only — `describe` never answers `absent`) The model looked, with **full coverage**, and saw no text (it returned no blocks, or only whitespace-only / duplicate ones) | "No text in this region" — a real statement about the page |
 | `unknown` | The producer **could not look**; `unknown.code` says why | "Could not read the screen: `<code>`" — **never** "the page is empty", **never** "the page is broken" |
 
 An `unknown` is not a clean page and not a broken page. It says nothing about
@@ -256,10 +256,26 @@ the OUTER observation `unknown` with the matching code.
 
 | `unknown.code` | Cause | Next action |
 |---|---|---|
-| `producer_failed` | The producer OR its capture failed — `unknown.detail` says which: *"frame capture failed …"* (window gone, device served no screenshot) or *"OCR/VLM call to model …"* (endpoint unreachable, timed out, non-2xx) | Capture: confirm the runner window / device (`GET http://127.0.0.1:9876/health`). Model: check `QONTINUI_VISION_*_ENDPOINT` (llama-swap `http://127.0.0.1:8100`); fall back to `discover` for text |
+| `producer_failed` | The producer OR its capture failed — `unknown.detail` says which: *"frame capture failed …"* (window gone, device served no screenshot) or *"OCR/VLM call to model …"* (no answer from the endpoint, timed out, non-2xx) | Capture: confirm the runner window / device (`GET http://127.0.0.1:9876/health`). Model: check `QONTINUI_VISION_*_ENDPOINT` (llama-swap `http://127.0.0.1:8100`); fall back to `discover` for text |
 | `model_reply_unparseable` | The model answered with something that is not the requested JSON | Retry with `"force": true`; if it persists the model alias is wrong for the task |
 | `below_confidence_floor` | The model saw text and scored all of it under `minConfidence` | Retry with a lower `minConfidence`, or a tighter `region` / `element` |
-| any other code | See the contract table in `qontinui-schemas/rust-vision-core/src/observation.rs` | Report the code verbatim; do not infer a page state |
+| `app_unreachable` | The bridge / app serving the target could not be reached | Re-list the targets and confirm the app is up before retrying |
+| `capability_unavailable_in_build` | The build answering this URL does not serve this route (e.g. an SDK-only bridge with no runner) | Call the runner's `:9876` route instead |
+| `stale_input` | The input the producer read is known to be stale | Re-capture (`"force": true`) before reading |
+| `producer_not_run` | The producer did not run — nothing to look at yet | Wait for the page to load, then retry |
+| `needs_multi_frame_input` | The question needs two frames | Use `vision/diff` over two captures |
+| `input_missing` | Not emitted by these two routes: a bad `region` / `element` is answered as an HTTP 400 / 404, not an observation | Fix the request — but see the `element_not_found` caveat below before calling an element absent |
+
+**`element_not_found` (404) does not prove the element is absent.** On this
+build the same 404 also answers an element that IS present but carries no
+layout rect, and a `discover` reply that carried no element list at all; a 400
+naming a zero-area rect is a present-but-hidden element. Re-check with
+`discover` before reporting an element missing.
+
+The codes are the closed `UnknownCode` set
+(`qontinui-schemas/rust-vision-core/src/observation.rs`); the first three rows
+are the ones these two routes emit today. A code outside the table is a contract
+break — report it verbatim as UNKNOWN and do not infer a page state.
 
 ## Cache Behavior — quote the age
 
@@ -271,7 +287,12 @@ that changed on its own** (async load, poll, timer). So when
 `provenance.cache.hit` is `true`, **always quote `provenance.observedAt` (when
 the pixels were sampled) and `provenance.cache.storedAt`** in your report: the
 answer is about the page as it was then, and may be stale. Only `measured` and
-`absent` answers are cached; an `unknown` is never served from cache.
+`absent` answers are cached; an outer `unknown` is never served from cache. A
+`measured` describe whose inner `structured` is `unknown` IS cached and replayed,
+so retrying a `model_reply_unparseable` twin needs `"force": true`; retrying an
+outer `unknown` does not. The cache is also consulted **before** the `target` is
+resolved, so a `target` that has since gone away can still get a cached
+`measured` answer (`cache.hit: true`) instead of the 404 — check the age.
 
 Force a fresh call by passing `"force": true`.
 
@@ -284,29 +305,26 @@ For most "what does this look like" questions, run both in sequence:
 EXTRACT=$(curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/extract \
   -H "Content-Type: application/json" -d '{}')
 
-# 2. Read the status FIRST. An unknown is "could not look", never "empty".
-case "$(echo "$EXTRACT" | jq -r '.data.status')" in
-  measured) echo "TEXT BLOCKS:"; echo "$EXTRACT" | jq -r '.data.value.aggregateText' ;;
-  absent)   echo "NO TEXT (the model looked with full coverage)" ;;
-  unknown)  echo "COULD NOT READ: $(echo "$EXTRACT" | jq -r '.data.unknown.code') — $(echo "$EXTRACT" | jq -r '.data.unknown.detail')" ;;
-  *)        echo "UNRECOGNISED REPLY (no status): $EXTRACT" ;;
-esac
-# Age: quote it whenever the answer came from the cache.
-echo "$EXTRACT" | jq -r 'if .data.provenance.cache.hit then "CACHED: observedAt=\(.data.provenance.observedAt) storedAt=\(.data.provenance.cache.storedAt)" else empty end'
+# 2. Read the status FIRST. An unknown is "could not look", never "empty";
+#    and quote the age whenever the answer came from the cache.
+echo "$EXTRACT" | jq -r '.data as $o
+  | (if $o.status == "measured" then "TEXT BLOCKS:\n\($o.value.aggregateText)"
+     elif $o.status == "absent" then "NO TEXT (the model looked with full coverage)"
+     elif $o.status == "unknown" then "COULD NOT READ: \($o.unknown.code) — \($o.unknown.detail)"
+     else "UNRECOGNISED REPLY (no status): \(tojson)" end),
+    (if $o.provenance.cache.hit == true then "CACHED: observedAt=\($o.provenance.observedAt) storedAt=\($o.provenance.cache.storedAt)" else empty end)'  # envelope-ok: branches on .data.status first; a reply with no status renders UNRECOGNISED, never a default
 
 # 3. If the text alone is insufficient, get a VLM caption (slower)
 DESCRIBE=$(curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/describe \
   -H "Content-Type: application/json" -d '{"maxTokens": 256}')
-case "$(echo "$DESCRIBE" | jq -r '.data.status')" in
-  measured)
-    if [ "$(echo "$DESCRIBE" | jq -r '.data.value.structured.status')" = measured ]; then
-      echo "STRUCTURED:"; echo "$DESCRIBE" | jq '.data.value.structured.value'
-    else
-      echo "CAPTION:"; echo "$DESCRIBE" | jq -r '.data.value.description'
-    fi ;;
-  unknown) echo "COULD NOT DESCRIBE: $(echo "$DESCRIBE" | jq -r '.data.unknown.code')" ;;
-  *)       echo "UNRECOGNISED REPLY (no status): $DESCRIBE" ;;
-esac
+echo "$DESCRIBE" | jq -r '.data as $o
+  | (if $o.status == "measured" then
+       (if $o.value.structured.status == "measured" then "STRUCTURED:\n\($o.value.structured.value)"
+        else "CAPTION (structured twin: \($o.value.structured.status // "missing")):\n\($o.value.description)" end)
+     elif $o.status == "absent" then "NOTHING DESCRIBED (the model looked and reported nothing)"
+     elif $o.status == "unknown" then "COULD NOT DESCRIBE: \($o.unknown.code) — \($o.unknown.detail)"
+     else "UNRECOGNISED REPLY (no status): \(tojson)" end),
+    (if $o.provenance.cache.hit == true then "CACHED: observedAt=\($o.provenance.observedAt) storedAt=\($o.provenance.cache.storedAt)" else empty end)'  # envelope-ok: branches on .data.status first; a reply with no status renders UNRECOGNISED, never a default
 ```
 
 The OCR alone usually answers "is the right text on screen?" The VLM
@@ -332,7 +350,8 @@ startup.
 If the model isn't reachable, the endpoint answers `status: "unknown"` with
 `unknown.code: "producer_failed"` and the underlying error in `unknown.detail`
 (HTTP 200 — a non-2xx now means only a malformed request, such as a region
-outside the frame or an element id that does not resolve). Callers should fall
+outside the frame or an `element` the runner could not place — see the
+`element_not_found` caveat above). Callers should fall
 back to `vision/capture` + their own model, or to `discover` for a pixel-free
 structural snapshot.
 

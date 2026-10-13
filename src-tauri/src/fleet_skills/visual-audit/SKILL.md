@@ -103,7 +103,15 @@ refusal to answer. The one next action per `code`:
 | `needs_multi_frame_input` | The question needs two frames (`animation_settled`, `dynamic`) — use `vision/diff` over two captures |
 | `producer_failed` | The producer OR its capture failed — `frame.unknown.detail` names the capture ("frame capture failed: …"); confirm the window / device |
 | `below_confidence_floor` | OCR text fell under the floor — re-extract with a lower `minConfidence` |
-| any other code | Report it verbatim as UNKNOWN; do not infer a page state |
+| `model_reply_unparseable` | A model reply could not be parsed — retry the producing call with `"force": true` |
+| `app_unreachable` | The bridge / app behind the target could not be reached — re-list the targets and confirm the app is up |
+| `capability_unavailable_in_build` | The answering build does not serve this route (an SDK bridge with no runner) — call the runner's `:9876` route |
+| `producer_not_run` | The producer did not run — nothing registered yet; wait for the page to hydrate, then re-run |
+| `stale_input` | The input is known to be stale — re-capture the snapshot / frame, then re-run |
+
+These are the nine members of the closed `UnknownCode` set
+(`qontinui-schemas/rust-vision-core/src/observation.rs`). A code outside it is a
+contract break: report it verbatim as UNKNOWN and do not infer a page state.
 
 A snapshot whose elements carry no geometry makes `layout` answer `Blocked`
 rather than returning `[]`. That is the whole point: a `layout` result that
@@ -185,7 +193,9 @@ SNAP=$(curl -sS "http://<device-ip>:8087/ui-bridge/control/discover" | jq '.data
 curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"layout", snapshot:$s, target:"<device-id>"}')" \
-  | jq '.data.findings[]'
+  | jq '. as $r | $r.data | if (.verdict | type) != "object" then {verdict: "UNRECOGNISED (no verdict object)", raw: $r}
+               elif .verdict.state == "blocked" then {verdict: "UNKNOWN (blocked)", code: .verdict.code, reason: .verdict.reason}
+               else {verdict: .verdict.state, frame: .frame.status, frameCode: .frame.unknown.code, findings} end'  # envelope-ok: branches on .data.verdict.state first; a reply with no verdict renders UNRECOGNISED, never a default
 
 # assert + baseline take `target` the same way
 curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
@@ -484,33 +494,48 @@ curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
       --stats > /tmp/snapshot.json
 SNAP=$(cat /tmp/snapshot.json)
 
+# Read `verdict.state` FIRST: `blocked` is UNKNOWN (never clean, never broken),
+# and its findings list answers nothing. Info findings are dropped for brevity.
+# -sS, not -fsS, below: a non-2xx body must reach jq and print, not vanish.
+AN_JQ='. as $r | $r.data | if (.verdict | type) != "object" then {verdict: "UNRECOGNISED (no verdict object)", raw: $r}
+    elif .verdict.state == "blocked"
+    then {verdict: "UNKNOWN (blocked)", code: .verdict.code, reason: .verdict.reason}
+    else {verdict: .verdict.state, code: .verdict.code, frame: .frame.status, frameCode: .frame.unknown.code,
+          findings: [.findings[]? | select(.severity != "info")]} end'  # envelope-ok: branches on .data.verdict.state first; a reply with no verdict renders UNRECOGNISED, never a default
+
 # 1. Layout analyzer — catches the overlap bugs the plan was designed for
-curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"layout",snapshot:$s}')" \
-  | jq '.data.findings[] | select(.severity != "info")'
+  | jq "$AN_JQ"
 
 # 2. Elements analyzer — sub-24×24 targets + empty-snapshot smells
-curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"elements",snapshot:$s}')" \
-  | jq '.data.findings[]'
+  | jq "$AN_JQ"
 
 # 3. Contrast — only meaningful when snapshot supplies fg_color + bg_color
-curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"color",snapshot:$s}')" \
-  | jq '.data.findings[]'
+  | jq "$AN_JQ"
 
 # 4. A default assertion bundle for every interactive page
-curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{
         snapshot: $s,
         assertions: [
           { "type": "no_clipping" }
         ]
-      }')" | jq '.data | {outcome, outcomeCounts}'
+      }')" | jq '. as $r | $r.data
+        | if .outcome == null then {outcome: "UNRECOGNISED (no outcome)", raw: $r}
+          elif .outcome == "unknown" then {outcome: "UNKNOWN (unverified)", outcomeCounts,
+               codes: [.results[]? | select(.outcome == "unknown") | .code] | unique,
+               frame: .frame.status, frameCode: .frame.unknown.code}
+          else {outcome, outcomeCounts, frame: .frame.status, frameCode: .frame.unknown.code} end'  # envelope-ok: branches on .data.outcome first; a reply with no outcome renders UNRECOGNISED, never a pass
+# `outcome: "unknown"` is UNVERIFIED — never a pass, never a failure.
 ```
 
 The terminal-tab overlap bug that triggered the whole Phase 6 design

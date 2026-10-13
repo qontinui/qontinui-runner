@@ -162,7 +162,17 @@ report the frame as a `frame` observation. Rules for reading any of them:
   observation at all but a 404; `producer_not_run` → nothing registered yet — wait
   for the page to hydrate; `below_confidence_floor` → lower `minConfidence`;
   `model_reply_unparseable` → retry with `"force": true`;
-  `needs_multi_frame_input` → use `vision/diff` over two captures.
+  `needs_multi_frame_input` → use `vision/diff` over two captures;
+  `stale_input` → the producer only had an old sample (the web relay's cached
+  snapshot) — re-run once the page answers; `capability_unavailable_in_build`
+  → the answering build does not serve the route — call the runner's `:9876`
+  route. Those nine are the whole closed `UnknownCode` set
+  (`qontinui-schemas/rust-vision-core/src/observation.rs`); anything else is a
+  contract break — report it verbatim as UNKNOWN.
+- **Name the producer from `provenance.producer.id`** (`runner/page-health`,
+  `sdk/page-health`, `sdk-server/page-health`, `sdk-native/page-health`,
+  `runner/vision-extract`, …), never from the URL you called:
+  which producer answers a route is a property of the build behind it.
 - **When `provenance.cache.hit` is `true`, quote `provenance.observedAt` and
   `provenance.cache.storedAt`**: the answer describes the page as it was then.
   The cache key (`provenance.cache.keyInputs`) cannot see a page that changed
@@ -174,7 +184,10 @@ report the frame as a `frame` observation. Rules for reading any of them:
 ```bash
 curl -s -X POST http://127.0.0.1:9876/ui-bridge/control/page-health \
   -H "Content-Type: application/json" -d '{}' \
-  | jq '.data | {status, code: .unknown.code, summary: .value.summary, coverage: .provenance.coverage}'
+  | jq '. as $r | $r.data | if .status == "measured" then {status, producer: .provenance.producer.id, summary: (.value.summary // .value.status), coverage: .provenance.coverage}
+               elif .status == "unknown" then {status: "UNKNOWN", producer: .provenance.producer.id, code: .unknown.code, detail: .unknown.detail}
+               elif .status == "absent" then {status, producer: .provenance.producer.id}
+               else {status: "UNRECOGNISED (no status key: an error reply or a pre-envelope build)", raw: $r} end'  # envelope-ok: branches on .data.status first; a reply with no status renders UNRECOGNISED, never a default
 ```
 
 ## Injected mode for pre-auth pages
@@ -226,7 +239,7 @@ export UIB_LOGIN_PASSWORD=$(aws ssm get-parameter --region eu-central-1 --name /
 $LOGIN_WEB --url "https://qontinui.io/login?next=%2Fdigital-twin" --success /digital-twin --email "$EMAIL" --expect-text "Delivery"
 ```
 
-**Pull creds from SSM (`eu-central-1`), NOT the `QONTINUI_TEST_*` env vars** — the env vars are frequently stale (the same `josh@qontinui.io` failed via a stale env password but logged in fine with `/qontinui/operator/password`). `MSYS_NO_PATHCONV=1` is mandatory for the `aws ssm` reads in Git Bash — but it ALSO un-converts the bin's own path args, so pass `--screenshot`/`--storage-state-out` as a **Windows path** (`'D:\…\out.png'`) or it silently writes to `D:\d\…` (drive-root resolution of the leading `/`; the JSON echoes your path so it looks fine). Prefer a `?next=<urlencoded-path>` `--url` so `--success` (pathname-only match) asserts the exact page — the default landing is `/admin/coord/fleet` (not `/dashboard`), so matching only `/dashboard` makes a *successful* login look like a timeout. A real bad-cred failure shows `"Incorrect username or password."` on the Cognito page (don't retry-loop → lockout). Dismiss the per-session UI Bridge **consent modal** with `--post-login-click "[data-testid='co-pilot-consent-allow']"`. For repeat multi-step driving, capture `--storage-state-out auth.json` once and replay via `ui-bridge-inject --storage-state auth.json` (no re-login — **mind the wrapper ≥ 0.7.0 + headless ≥ 0.4.0 replay floor above**); the relay also accepts a **coord device-JWT** as `Authorization: Bearer` for an already-registered authed tab. Full detail in the `/ui-bridge` command's "Authenticated Web Pages" section + `qontinui-dev-notes/plans/2026-06-05-ui-bridge-authed-web-drive-harness.md`.
+**Pull creds from SSM (`eu-central-1`), NOT the `QONTINUI_TEST_*` env vars** — the env vars are frequently stale (the same `josh@qontinui.io` failed via a stale env password but logged in fine with `/qontinui/operator/password`). `MSYS_NO_PATHCONV=1` is mandatory for the `aws ssm` reads in Git Bash — but it ALSO un-converts the bin's own path args, so pass `--screenshot`/`--storage-state-out` as a **Windows path** (`'D:\…\out.png'`) or it silently writes to `D:\d\…` (drive-root resolution of the leading `/`; the JSON echoes your path so it looks fine). Prefer a `?next=<urlencoded-path>` `--url` so `--success` (pathname-only match) asserts the exact page — the default landing is `/admin/coord/fleet` (not `/dashboard`), so matching only `/dashboard` makes a *successful* login look like a timeout. A real bad-cred failure shows `"Incorrect username or password."` on the Cognito page (don't retry-loop → lockout). Dismiss the per-session UI Bridge **consent modal** with `--post-login-click "[data-testid='co-pilot-consent-allow']"`. For repeat multi-step driving, capture `--storage-state-out auth.json` once and replay via `ui-bridge-inject --storage-state auth.json` (no re-login — **mind the wrapper ≥ 0.7.0 + headless ≥ 0.4.0 replay floor above**); the relay also accepts a **coord device-JWT** as `Authorization: Bearer` for an already-registered authed tab. Full detail in the `/ui-bridge` command's "Authenticated Web Pages" section + Qontinui's plan `2026-06-05-ui-bridge-authed-web-drive-harness`.
 
 ### Multi-step driving: act by id, wait for registration, script in JS (don't reinvent these)
 
