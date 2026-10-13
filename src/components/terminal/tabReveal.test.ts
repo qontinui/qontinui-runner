@@ -105,7 +105,7 @@ describe("planTabReveal under tmux mode's pinned `single` layout", () => {
 });
 
 describe("liveTabIdForSession — which card clicks go to a terminal", () => {
-  const real = { injected_live_status: null, injected_tab: null };
+  const real = { injected_location: null, injected_activity: null, injected_tab: null };
   const tabs = [
     { id: "t-live", isAlive: true },
     { id: "t-dead", isAlive: false },
@@ -140,7 +140,11 @@ describe("liveTabIdForSession — which card clicks go to a terminal", () => {
       liveTabIdForSession(
         {
           zoneTabId: "t-live",
-          _transcript: { injected_live_status: "frozen", injected_tab: null },
+          _transcript: {
+            injected_location: "hidden-here",
+            injected_activity: "no-output-mid-tool",
+            injected_tab: null,
+          },
         },
         tabs,
       ),
