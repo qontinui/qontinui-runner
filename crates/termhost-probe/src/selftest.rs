@@ -137,12 +137,29 @@ pub struct SelftestOutcome {
 /// (medians d0 22.33 vs 13.03 ms, d50 68.42 vs 61.42, d200 219.41 vs
 /// 211.53). That one run on one machine class is why WGC's ABSOLUTE latency
 /// is reported but not gated, and WGC is instead held to DDA by this offset
-/// (and, without DDA, to itself across delays).
+/// (and, without DDA, to itself across delays) — the offset band gating
+/// only on displays inside the measured class (`WGC_OFFSET_CLASS_MS`).
 pub const WGC_RENDER_OFFSET_MS: f64 = 10.0;
-/// The slack around the offset: the measured offsets spread 2.3 ms, and a
-/// regression that adds a frame (an interval, ~16 ms) must still land
-/// outside it.
+/// The slack around the offset: the measured offsets spread 2.3 ms. It is
+/// capped at half the refresh interval (`wgc_offset_margin_ms`), so a
+/// regression that adds one frame always lands outside the band.
 pub const WGC_OFFSET_MARGIN_MS: f64 = 4.0;
+/// The refresh intervals the offset was measured on (that run: 15.625 ms,
+/// 64 Hz). The band's milliseconds are only known to mean "the same render
+/// stage" there: at 144 Hz a one-frame regression could fit inside it, and a
+/// real-GPU 60 Hz box may phase-lock to a larger offset. Elsewhere — or with
+/// an assumed rate — the offset check is reported, not gated.
+pub const WGC_OFFSET_CLASS_MS: (f64, f64) = (14.0, 17.5);
+
+/// Whether the display's refresh interval lies in the measured class.
+pub fn refresh_in_offset_class(refresh_ms: f64, assumed: bool) -> bool {
+    !assumed && (WGC_OFFSET_CLASS_MS.0..=WGC_OFFSET_CLASS_MS.1).contains(&refresh_ms)
+}
+
+/// The band's margin at this refresh interval: `min(4 ms, refresh / 2)`.
+pub fn wgc_offset_margin_ms(refresh_ms: f64) -> f64 {
+    WGC_OFFSET_MARGIN_MS.min(refresh_ms / 2.0)
+}
 
 /// The render-stage offset a source's frame times carry relative to DDA's.
 pub fn render_offset_ms(kind: SourceId) -> f64 {
@@ -152,18 +169,19 @@ pub fn render_offset_ms(kind: SourceId) -> f64 {
     }
 }
 
-/// Whether, at one delay, WGC's median latency minus DDA's stays within the
-/// declared render offset: no earlier than DDA by more than the margin, no
-/// later than the offset plus the margin.
-pub fn wgc_offset_ok(wgc_median_ms: f64, dda_median_ms: f64) -> bool {
+/// Whether, at one delay, WGC's median latency minus DDA's lies from
+/// `margin` below zero up to the declared render offset plus `margin`.
+pub fn wgc_offset_ok(wgc_median_ms: f64, dda_median_ms: f64, margin_ms: f64) -> bool {
     let d = wgc_median_ms - dda_median_ms;
-    (-WGC_OFFSET_MARGIN_MS..=WGC_RENDER_OFFSET_MS + WGC_OFFSET_MARGIN_MS).contains(&d)
+    (-margin_ms..=WGC_RENDER_OFFSET_MS + margin_ms).contains(&d)
 }
 
 /// The slope invariant: how far `median(d) - d` moves across the delays. A
 /// fixed pipeline stage moves it by nothing; a source that adds latency as
-/// the delay grows (or only some of the time) moves it. `None` with fewer
-/// than two delays measured.
+/// the delay grows (or only some of the time) moves it. A CONSTANT added
+/// latency moves it by nothing either, so without DDA such a regression is
+/// only reported (by the ungated absolute checks), never gated. `None` with
+/// fewer than two delays measured.
 pub fn latency_spread_ms(medians: &[(u64, f64)]) -> Option<f64> {
     if medians.len() < 2 {
         return None;
@@ -538,7 +556,7 @@ impl Selftest<'_> {
                 &mut seq,
                 &mut latency_markers,
             );
-            self.wgc_relative_checks(&kinds, &medians, refresh.ns as f64 / 1e6);
+            self.wgc_relative_checks(&kinds, &medians, &refresh);
             if let Some(sec) = secondary {
                 self.crosscheck(&engine, primary, sec, &latency_markers, &refresh);
             }
@@ -755,8 +773,9 @@ impl Selftest<'_> {
         &mut self,
         kinds: &[SourceId],
         medians: &[(SourceId, u64, f64)],
-        refresh_ms: f64,
+        refresh: &crate::platform::Refresh,
     ) {
+        let refresh_ms = refresh.ns as f64 / 1e6;
         if !kinds.contains(&SourceId::Wgc) {
             return;
         }
@@ -767,23 +786,33 @@ impl Selftest<'_> {
                 .map(|&(_, _, m)| m)
         };
         if kinds.contains(&SourceId::Dda) && self.gating(doctor::CAPTURE_DDA) {
+            let margin = wgc_offset_margin_ms(refresh_ms);
+            let in_class = refresh_in_offset_class(refresh_ms, refresh.assumed);
             for &d in &self.cfg.delays_ms.clone() {
                 let (w, q) = (of(SourceId::Wgc, d), of(SourceId::Dda, d));
-                let passed = w.zip(q).map(|(w, q)| wgc_offset_ok(w, q));
-                self.check(
-                    format!("wgc_render_offset.d{d}"),
-                    &[doctor::CAPTURE_WGC, doctor::CAPTURE_DDA],
-                    passed,
-                    match w.zip(q) {
-                        Some((w, q)) => format!(
-                            "delay {d} ms: WGC median {w:.2} ms minus DDA median {q:.2} ms = {:.2} ms; must lie within -{WGC_OFFSET_MARGIN_MS:.0}..{:.0} ms (the declared {WGC_RENDER_OFFSET_MS:.0} ms render offset plus a {WGC_OFFSET_MARGIN_MS:.0} ms margin)",
-                            w - q,
-                            WGC_RENDER_OFFSET_MS + WGC_OFFSET_MARGIN_MS
-                        ),
-                        None => format!("delay {d} ms: WGC or DDA did not see every marker, so their medians cannot be compared"),
-                    },
-                    json!({ "delay_ms": d, "wgc_median_ms": w, "dda_median_ms": q, "offset_ms": WGC_RENDER_OFFSET_MS, "margin_ms": WGC_OFFSET_MARGIN_MS }),
-                );
+                let passed = w.zip(q).map(|(w, q)| wgc_offset_ok(w, q, margin));
+                let name = format!("wgc_render_offset.d{d}");
+                let deps = [doctor::CAPTURE_WGC, doctor::CAPTURE_DDA];
+                let detail = match w.zip(q) {
+                    Some((w, q)) => format!(
+                        "delay {d} ms: WGC median {w:.2} ms minus DDA median {q:.2} ms = {:.2} ms; must lie from {margin:.1} ms below zero up to {:.1} ms (the declared {WGC_RENDER_OFFSET_MS:.0} ms render offset plus a {margin:.1} ms margin)",
+                        w - q,
+                        WGC_RENDER_OFFSET_MS + margin
+                    ),
+                    None => format!("delay {d} ms: WGC or DDA did not see every marker, so their medians cannot be compared"),
+                };
+                let data = json!({ "delay_ms": d, "wgc_median_ms": w, "dda_median_ms": q, "offset_ms": WGC_RENDER_OFFSET_MS, "margin_ms": margin, "refresh_ms": refresh_ms, "in_measured_class": in_class });
+                if in_class {
+                    self.check(name, &deps, passed, detail, data);
+                } else {
+                    let why = format!(
+                        "the display's refresh interval ({refresh_ms:.2} ms{}) is outside the class the render offset was measured on ({:.1}-{:.1} ms, run 38315983341), where its milliseconds are not known to mean the same stage",
+                        if refresh.assumed { ", ASSUMED" } else { "" },
+                        WGC_OFFSET_CLASS_MS.0,
+                        WGC_OFFSET_CLASS_MS.1
+                    );
+                    self.report_only(name, &deps, passed, &why, detail, data);
+                }
             }
         } else {
             let wgc: Vec<(u64, f64)> = medians
@@ -798,7 +827,7 @@ impl Selftest<'_> {
                 spread.map(|s| wgc.len() == self.cfg.delays_ms.len() && s <= refresh_ms),
                 match spread {
                     Some(s) => format!(
-                        "no DDA to hold WGC to: WGC's median latency minus the delay moved by {s:.2} ms across delays {:?} ms; must stay within one refresh interval ({refresh_ms:.2} ms) — a fixed render stage moves it by nothing",
+                        "no DDA to hold WGC to: WGC's median latency minus the delay moved by {s:.2} ms across delays {:?} ms; must stay within one refresh interval ({refresh_ms:.2} ms) — a fixed render stage moves it by nothing, and so does a CONSTANT added latency, which without DDA is reported (output_latency.wgc.*), not gated",
                         wgc.iter().map(|&(d, _)| d).collect::<Vec<_>>()
                     ),
                     None => "no DDA to hold WGC to, and fewer than two delays had every marker seen".to_string(),
@@ -1354,16 +1383,32 @@ mod tests {
 
     #[test]
     fn wgc_is_held_to_dda_by_the_declared_render_offset() {
+        let m = wgc_offset_margin_ms(15.625);
+        assert_eq!(m, 4.0);
         // The measured offsets (run 38315983341) pass.
         for (w, q) in [(22.33, 13.03), (68.42, 61.42), (219.41, 211.53)] {
-            assert!(wgc_offset_ok(w, q), "{w} - {q}");
+            assert!(wgc_offset_ok(w, q, m), "{w} - {q}");
         }
         // One more frame (an interval, ~16 ms) behind DDA fails, and so does
         // WGC running well ahead of DDA.
-        assert!(!wgc_offset_ok(38.0, 13.0));
-        assert!(wgc_offset_ok(27.0, 13.0), "the 14 ms edge holds");
-        assert!(!wgc_offset_ok(27.1, 13.0));
-        assert!(!wgc_offset_ok(8.0, 13.0));
+        assert!(!wgc_offset_ok(38.0, 13.0, m));
+        assert!(wgc_offset_ok(27.0, 13.0, m), "the 14 ms edge holds");
+        assert!(!wgc_offset_ok(27.1, 13.0, m));
+        assert!(!wgc_offset_ok(8.0, 13.0, m));
+    }
+
+    #[test]
+    fn the_offset_band_gates_only_inside_the_measured_refresh_class() {
+        assert!(refresh_in_offset_class(15.625, false), "the measured 64 Hz");
+        assert!(refresh_in_offset_class(16.667, false), "60 Hz");
+        assert!(!refresh_in_offset_class(16.667, true), "an assumed rate");
+        assert!(!refresh_in_offset_class(6.944, false), "144 Hz");
+        assert!(!refresh_in_offset_class(33.333, false), "30 Hz");
+        // The margin never lets one frame inside the band: at 144 Hz it is
+        // half an interval, so offset + one frame lies outside.
+        let m = wgc_offset_margin_ms(6.944);
+        assert!((m - 3.472).abs() < 1e-9, "{m}");
+        assert!(!wgc_offset_ok(13.0 + WGC_RENDER_OFFSET_MS + 6.944, 13.0, m));
     }
 
     #[test]

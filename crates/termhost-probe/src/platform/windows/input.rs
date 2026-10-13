@@ -347,6 +347,9 @@ pub fn thread_desktop() -> Result<String, String> {
 pub struct Injector {
     target: u64,
     tagging: Tagging,
+    /// CapsLock's toggle as the target's input thread saw it at arm start;
+    /// `Err` = it could not be read.
+    caps: Option<Result<bool, String>>,
 }
 
 impl Injector {
@@ -360,6 +363,7 @@ impl Injector {
         Ok(Injector {
             target: target.0,
             tagging,
+            caps: None,
         })
     }
 }
@@ -388,10 +392,12 @@ fn layout_types_unshifted(scan: i16, vk: u16) -> bool {
 /// or CapsLock change the character, Ctrl or Alt make it a shortcut in the
 /// target, a Windows key a SYSTEM shortcut outside it). `held` lists the
 /// modifiers down; `caps` is CapsLock's toggle.
-fn keyboard_block(held: &[&str], caps: bool) -> Option<String> {
+fn keyboard_block(held: &[&str], caps: &Result<bool, String>) -> Option<String> {
     let mut why: Vec<String> = held.iter().map(|m| format!("{m} is held")).collect();
-    if caps {
-        why.push("CapsLock is on".into());
+    match caps {
+        Ok(true) => why.push("CapsLock is on".into()),
+        Ok(false) => {}
+        Err(e) => why.push(format!("CapsLock's state is UNKNOWN ({e})")),
     }
     (!why.is_empty()).then(|| why.join(", "))
 }
@@ -399,10 +405,10 @@ fn keyboard_block(held: &[&str], caps: bool) -> Option<String> {
 /// The keyboard's modifier state now, as `keyboard_block` judges it. The
 /// modifiers are read with GetAsyncKeyState, so a modifier another program
 /// left logically down counts too — the real-input listener would never see
-/// that one. CapsLock's TOGGLE has no asynchronous read: GetKeyState answers
-/// from the calling thread's input state, which on a background thread can
-/// be stale, so it is read while attached to the target's input thread.
-fn keyboard_state(target_thread: u32) -> Option<String> {
+/// that one. CapsLock's TOGGLE has no asynchronous read (GetKeyState answers
+/// from a thread's own input state): it is read once per arm, attached to
+/// the target's input thread (`caps_lock_on`), and passed in.
+fn keyboard_state(caps: &Result<bool, String>) -> Option<String> {
     const MODIFIERS: [(VIRTUAL_KEY, &str); 5] = [
         (VK_SHIFT, "Shift"),
         (VK_CONTROL, "Ctrl"),
@@ -416,23 +422,33 @@ fn keyboard_state(target_thread: u32) -> Option<String> {
         .filter(|(vk, _)| unsafe { GetAsyncKeyState(i32::from(vk.0)) } as u16 & 0x8000 != 0)
         .map(|(_, name)| *name)
         .collect();
-    keyboard_block(&held, caps_lock_on(target_thread))
+    keyboard_block(&held, caps)
 }
 
-/// CapsLock's toggle as the target's input thread sees it.
-fn caps_lock_on(target_thread: u32) -> bool {
-    // SAFETY: attaching this thread's input state to the target's for one
-    // GetKeyState read, then detaching; a failed attach reads our own state.
+/// CapsLock's toggle as the target's input thread sees it: our own state
+/// when the target IS this thread, else read while attached to its input
+/// state. An attach that fails (UIPI refuses a more privileged target) is
+/// UNKNOWN — never "off" — so the arm refuses rather than guessing.
+fn caps_lock_on(target_thread: u32) -> Result<bool, String> {
+    // SAFETY: GetKeyState reads this thread's input state; attaching it to
+    // the target's for one read, then detaching.
     unsafe {
         let me = GetCurrentThreadId();
-        let attached = target_thread != 0
-            && target_thread != me
-            && AttachThreadInput(me, target_thread, true).as_bool();
-        let caps = GetKeyState(i32::from(VK_CAPITAL.0)) & 1 != 0;
-        if attached {
-            let _ = AttachThreadInput(me, target_thread, false);
+        if target_thread == 0 {
+            return Err("the target's input thread is not known".into());
         }
-        caps
+        if target_thread == me {
+            return Ok(GetKeyState(i32::from(VK_CAPITAL.0)) & 1 != 0);
+        }
+        if !AttachThreadInput(me, target_thread, true).as_bool() {
+            return Err(format!(
+                "could not attach to the target's input thread {target_thread}: {:?}",
+                GetLastError()
+            ));
+        }
+        let caps = GetKeyState(i32::from(VK_CAPITAL.0)) & 1 != 0;
+        let _ = AttachThreadInput(me, target_thread, false);
+        Ok(caps)
     }
 }
 
@@ -511,7 +527,11 @@ impl KeyInjector for Injector {
             }
             Err(why) => return Err(InjectBlock::DesktopUnavailable(why)),
         }
-        if let Some(why) = keyboard_state(target_thread(WindowHandle(self.target))) {
+        let caps = self
+            .caps
+            .get_or_insert_with(|| caps_lock_on(target_thread(WindowHandle(self.target))))
+            .clone();
+        if let Some(why) = keyboard_state(&caps) {
             return Err(InjectBlock::KeyboardState(why));
         }
         if window::is_foreground(hwnd(WindowHandle(self.target))) {
@@ -567,6 +587,10 @@ impl KeyInjector for Injector {
         Ok(())
     }
 
+    fn begin_arm(&mut self) {
+        self.caps = Some(caps_lock_on(target_thread(WindowHandle(self.target))));
+    }
+
     fn activate(&mut self) -> Result<(), String> {
         if window::activate(hwnd(WindowHandle(self.target))) {
             Ok(())
@@ -609,15 +633,63 @@ mod tests {
 
     #[test]
     fn a_held_modifier_or_capslock_blocks_the_key() {
-        assert_eq!(keyboard_block(&[], false), None);
+        assert_eq!(keyboard_block(&[], &Ok(false)), None);
         assert_eq!(
-            keyboard_block(&["the left Windows key"], false).as_deref(),
+            keyboard_block(&["the left Windows key"], &Ok(false)).as_deref(),
             Some("the left Windows key is held")
         );
         assert_eq!(
-            keyboard_block(&["Shift", "Ctrl"], true).as_deref(),
+            keyboard_block(&["Shift", "Ctrl"], &Ok(true)).as_deref(),
             Some("Shift is held, Ctrl is held, CapsLock is on")
         );
+        // A state that could not be read refuses the key: never "off".
+        assert_eq!(
+            keyboard_block(&[], &Err("UIPI".into())).as_deref(),
+            Some("CapsLock's state is UNKNOWN (UIPI)")
+        );
+    }
+
+    #[test]
+    fn the_target_thread_of_our_own_window_is_this_thread() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_OVERLAPPED,
+        };
+        // SAFETY: a hidden STATIC window owned by this test thread.
+        let h = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("termhost-probe target-thread test"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                10,
+                10,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("a window");
+        let tid = target_thread(super::super::handle_of(h));
+        // SAFETY: our own window.
+        let _ = unsafe { DestroyWindow(h) };
+        // SAFETY: reads this thread's id.
+        assert_eq!(tid, unsafe { GetCurrentThreadId() });
+    }
+
+    #[test]
+    fn capslock_on_our_own_thread_is_our_own_key_state() {
+        // SAFETY: reads of this thread's id and key state.
+        let (me, own) = unsafe {
+            (
+                GetCurrentThreadId(),
+                GetKeyState(i32::from(VK_CAPITAL.0)) & 1 != 0,
+            )
+        };
+        assert_eq!(caps_lock_on(me), Ok(own));
+        assert!(caps_lock_on(0).is_err(), "no thread: UNKNOWN, not off");
     }
 
     #[test]

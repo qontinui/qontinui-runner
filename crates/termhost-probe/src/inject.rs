@@ -250,6 +250,7 @@ pub fn run_arm(
     if let Some((i, detail)) = untypeable(&cfg.keys, inj) {
         return abort(sink, i, AbortReason::UnsupportedKey, detail, 0);
     }
+    inj.begin_arm();
     let start = now_ns() + cfg.start_delay.as_nanos() as u64;
     let interval = cfg.interval.as_nanos() as u64;
     let mut sent = 0u32;
