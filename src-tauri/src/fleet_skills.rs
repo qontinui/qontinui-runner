@@ -877,10 +877,10 @@ mod tests {
         // dead pointer everywhere else.
         //
         // The maintainers' plans repo name is NOT listed here: no bundled body
-        // names it since qontinui-claude-config#1387 (design plans are cited by
+        // names it since qontinui-claude-config#1768 (design plans are cited by
         // slug only), and the ratchet that keeps it so is that repo's check #71
-        // over the canonical `.claude/skills/`, which this bundle is a byte copy
-        // of (check #33).
+        // over the canonical `.claude/skills/`, which this bundle mirrors (drift
+        // from it is reported by check #33).
         const FORBIDDEN: &[&str] = &[
             "D:/qontinui-root",
             "D:\\qontinui-root",
