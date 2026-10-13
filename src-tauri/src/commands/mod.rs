@@ -224,6 +224,7 @@ pub mod path_settings; // get/save settings.paths (plans/prompts/workspace/dev-l
 pub mod performance_metrics; // Performance metrics dashboard
 pub mod performance_settings; // Operator-tunable performance caps (many-sessions plan Phase 8)
 pub mod playwright_settings;
+pub mod pr_ci_state; // `coord_pr_ci_states`: batched PR CI state from coord's PR twin for the Session Manager's is:closable (plan 2026-10-13-…-operator-search Phase 4)
 pub mod project_logs;
 pub mod project_preview; // Projects dashboard §7.1 — the per-project Preview webview window
 pub mod rag;
@@ -241,8 +242,10 @@ pub mod scripted_output_settings; // get/save the ScriptedOutputSettings (provid
 pub mod security_settings;
 pub mod self_healing_settings;
 pub mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive Tauri commands
+pub mod session_close; // Session Manager tab doors: terminal_graceful_close (D7 close through graceful_exit, never a kill) + terminal_set_page (plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, Phase 3)
 pub mod session_identity; // Plan 2026-07-17-universal-coord-device-identity §6 — the persistent identity-shim PATH opt-in (delivery gate)
 pub mod session_info; // One-shot session-identity projection (durable record ⨝ live registry ⨝ PR ledger) for the zone-header session-info dropdown
+pub mod session_info_list; // Batched session-info listing (`session_info_list` + `GET /control/sessions/info`) with per-working-dir branch, plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search Phase 4
 pub mod session_org; // Session Manager organization store commands: session_org_get / session_org_apply (plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, Phase 2)
 pub mod setup_discovery; // Native (pure-Rust) setup-wizard discovery — no Python interpreter needed
 pub mod setup_wizard; // First-launch setup wizard commands
@@ -265,6 +268,7 @@ pub mod testing;
 pub mod tiered_info;
 pub mod token_analytics;
 pub mod transcript; // Claude Code transcript import and standalone workflow generation
+pub mod transcript_search; // `transcript_search`: full-text search over session transcripts (the Session Manager's `text:` term, plan 2026-10-13-…-operator-search Phase 4)
 pub mod ui_bridge; // UI Bridge for AI-driven UI automation
 pub mod ui_bridge_baselines; // UI Bridge visual regression baseline CRUD
 pub mod usage_probe_cache; // Single-flight + TTL coalescing for the per-account usage probe

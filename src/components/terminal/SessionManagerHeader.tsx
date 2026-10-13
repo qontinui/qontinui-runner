@@ -18,11 +18,13 @@
  * `data-ui-bridge-content` (the SDK's opt-in semantic-content selector) rather
  * than a hook — there is nothing to drive on them, only text to assert.
  */
-import { RefreshCw, Search, Filter } from "lucide-react";
+import { RefreshCw, Search, Filter, PanelLeftClose, Sparkles } from "lucide-react";
 import { useUIElement, type StandardAction } from "@qontinui/ui-bridge";
 
 import type { SessionGroupBy, SessionSortBy, AccountUsageInfo } from "./useSessionManager";
 import { ACTIVITY_DOT, SESSION_STATUS_LABELS, type SessionActivity } from "./sessionStatusModel";
+import { parseGroupBy } from "./sessionGrouping";
+import { SESSION_ORG_CONTROLS, sessionOrgControlAttrs } from "./sessionOrgControls";
 
 interface SessionManagerHeaderProps {
   loading: boolean;
@@ -43,6 +45,15 @@ interface SessionManagerHeaderProps {
   /** Rows per activity — each chip's count. */
   activityCounts: Readonly<Record<SessionActivity, number>>;
   totalCount: number;
+  /** Collapse the panel to its rail (icons only). */
+  onToggleRail?: () => void;
+  /** Open "Suggest groups"; offered only in the "My groups" lens. */
+  onSuggestGroups?: () => void;
+  /**
+   * The org store's in-flight or refused state ("saving 1…", "refused: …"),
+   * so an organization click acknowledges itself; `null` when settled.
+   */
+  orgStatus?: string | null;
 }
 
 const ACCOUNT_COLORS: Record<string, string> = {
@@ -220,7 +231,20 @@ export function SessionManagerHeader({
   onRefresh,
   activityCounts,
   totalCount,
+  onToggleRail,
+  onSuggestGroups,
+  orgStatus = null,
 }: SessionManagerHeaderProps) {
+  const { ref: railRef } = useUIElement({
+    id: SESSION_ORG_CONTROLS.railToggle.id,
+    type: "button",
+    label: "Collapse the Session Manager to a rail",
+  });
+  const { ref: suggestRef } = useUIElement({
+    id: SESSION_ORG_CONTROLS.suggestGroups.id,
+    type: "button",
+    label: "Suggest groups",
+  });
   const { ref: rootRef } = useUIElement({
     id: SESSION_MANAGER_HEADER_IDS.root,
     type: "generic",
@@ -284,18 +308,54 @@ export function SessionManagerHeader({
             {totalCount}
           </span>
         </div>
-        <button
-          ref={refreshRef}
-          data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.refresh}
-          onClick={onRefresh}
-          disabled={loading}
-          className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors"
-          title="Refresh sessions"
-          aria-label="Refresh sessions"
-        >
-          <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
-        </button>
+        <div className="flex items-center gap-0.5">
+          {onSuggestGroups && (
+            <button
+              ref={suggestRef}
+              {...sessionOrgControlAttrs("suggestGroups")}
+              onClick={onSuggestGroups}
+              className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
+              title="Suggest groups for ungrouped sessions by plan, pull request, branch or repo"
+            >
+              <Sparkles className="w-3 h-3" />
+              Suggest groups
+            </button>
+          )}
+          <button
+            ref={refreshRef}
+            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.refresh}
+            onClick={onRefresh}
+            disabled={loading}
+            className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors"
+            title="Refresh sessions"
+            aria-label="Refresh sessions"
+          >
+            <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
+          </button>
+          {onToggleRail && (
+            <button
+              ref={railRef}
+              {...sessionOrgControlAttrs("railToggle")}
+              onClick={onToggleRail}
+              aria-pressed={false}
+              className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors"
+              title="Collapse to a rail (status dots only)"
+              aria-label="Collapse the Session Manager to a rail"
+            >
+              <PanelLeftClose className="w-3 h-3" />
+            </button>
+          )}
+        </div>
       </div>
+      {orgStatus && (
+        <div
+          data-testid="session-org-status"
+          className="px-3 pb-1 text-[10px] text-[#565f89] truncate"
+          title={orgStatus}
+        >
+          Groups: {orgStatus}
+        </div>
+      )}
 
       {/* Account usage chips */}
       {accountUsage.length > 0 && (
@@ -402,11 +462,10 @@ export function SessionManagerHeader({
             data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.groupBy}
             aria-label="Group sessions by"
             value={groupBy}
-            onChange={(e) =>
-              onGroupByChange(e.target.value as "status" | "account" | "project" | "date")
-            }
+            onChange={(e) => onGroupByChange(parseGroupBy(e.target.value))}
             className="text-[10px] bg-[#1a1b26] border border-[#2a2d3d] rounded px-1 py-0.5 text-[#a9b1d6] focus:outline-none focus:border-[#7aa2f7]/50"
           >
+            <option value="groups">My groups</option>
             <option value="status">Status</option>
             <option value="account">Account</option>
             <option value="project">Project</option>

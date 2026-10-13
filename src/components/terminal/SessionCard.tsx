@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useRef, useCallback } from "react";
+import { memo, useState, useEffect, useRef, useCallback, type DragEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIElement } from "@qontinui/ui-bridge";
 import {
@@ -8,7 +8,8 @@ import {
   AlertTriangle,
   FileWarning,
   Pin,
-  Tag,
+  BellOff,
+  Clock,
   GitBranch,
   GitCommit,
   Loader2,
@@ -26,6 +27,9 @@ import { isInjectedSession } from "./syntheticTabs";
 import { DURABLE_TOOLTIP } from "./sessionDurability";
 import { useNow1Hz } from "./useNow1Hz";
 import { describeThrown } from "@/lib/utils";
+import type { MemberOrg, SessionGroup, SessionOrgOp } from "./sessionOrgTypes";
+import { sessionOrgControlAttrs } from "./sessionOrgControls";
+import { SessionOrgMenuItems, type MenuPage } from "./SessionOrgMenus";
 import {
   ACTIVITY_DOT,
   activityText,
@@ -60,8 +64,30 @@ interface SessionCardProps {
   isSelected: boolean;
   isChecked: boolean;
   selectionMode: boolean;
-  isPinned: boolean;
-  sessionLabel: string | null;
+  /**
+   * The row's organization (pin, tags, mute, snooze) from the runner's
+   * session-org store; `null` when it has none or the store is not known.
+   */
+  orgMember: MemberOrg | null;
+  /**
+   * The left bar's color: the session's GROUP color as a CSS value (D4 —
+   * status lives in the dot and its word). `null` = not in a group.
+   */
+  groupColor?: string | null;
+  /** The Pinned section's compact row: name and status words only. */
+  compact?: boolean;
+  /** The row's organization-store key — what the org menu's ops name. */
+  sessionKey?: string;
+  /**
+   * What the context menu's organization items need (group, pin, page,
+   * mute, snooze, tags). One object shared by every card, so the memo holds.
+   * Absent when the org is not known — the menu then offers none.
+   */
+  orgMenu?: SessionCardOrgMenu;
+  /** Native drag wiring, shared by every card (reorder, groups, page tabs). */
+  drag?: SessionCardDrag;
+  /** A drop here would land ABOVE this row — draw the insertion line. */
+  dropBefore?: boolean;
   /** Number of files this session shares with other sessions (0 = no conflicts) */
   fileConflictCount?: number;
   /**
@@ -76,8 +102,6 @@ interface SessionCardProps {
   onViewTranscript: (session: UnifiedSession) => void;
   onCopyId: (session: UnifiedSession) => void;
   onToggleSelect: (sessionId: string) => void;
-  onTogglePin: (sessionId: string) => void;
-  onSetLabel: (sessionId: string, label: string | null) => void;
   /** Optional: notify parent that the session list should refresh after a promotion. */
   onAfterPromote?: () => void;
   /**
@@ -101,6 +125,34 @@ interface SessionCardProps {
    * offers no close.
    */
   onClose?: (session: UnifiedSession) => void;
+}
+
+/** The panel's drag handlers; each names the row it fires on. */
+export interface SessionCardDrag {
+  start: (session: UnifiedSession, e: DragEvent<HTMLDivElement>) => void;
+  end: () => void;
+  over: (session: UnifiedSession, e: DragEvent<HTMLDivElement>) => void;
+  drop: (session: UnifiedSession, e: DragEvent<HTMLDivElement>) => void;
+}
+
+/** The organization menu's shared inputs. */
+export interface SessionCardOrgMenu {
+  groups: readonly SessionGroup[];
+  /** Pages other than this one. */
+  pages: readonly MenuPage[];
+  apply: (ops: SessionOrgOp[]) => void;
+  moveToPage: (session: UnifiedSession, pageId: string) => void;
+}
+
+/** "Snoozed until 14:05" when `until` is still ahead of `now`; else null. */
+export function snoozeLabel(until: number | null, now: number = Date.now()): string | null {
+  if (until === null || until <= now) return null;
+  const d = new Date(until);
+  const sameDay = new Date(now).toDateString() === d.toDateString();
+  const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return sameDay
+    ? `Snoozed until ${time}`
+    : `Snoozed until ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${time}`;
 }
 
 /**
@@ -337,8 +389,13 @@ function SessionCardInner({
   isSelected,
   isChecked,
   selectionMode,
-  isPinned,
-  sessionLabel,
+  orgMember,
+  groupColor = null,
+  compact = false,
+  sessionKey,
+  orgMenu,
+  drag,
+  dropBefore = false,
   fileConflictCount = 0,
   lockState,
   onResume,
@@ -346,8 +403,6 @@ function SessionCardInner({
   onViewTranscript,
   onCopyId,
   onToggleSelect,
-  onTogglePin,
-  onSetLabel,
   onAfterPromote,
   onOpenWorktrees,
   isOnScreen = false,
@@ -366,9 +421,11 @@ function SessionCardInner({
 
   // Context menu
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const [labelInput, setLabelInput] = useState("");
-  const [showLabelInput, setShowLabelInput] = useState(false);
   const contextRef = useRef<HTMLDivElement>(null);
+  const closeMenu = useCallback(() => setContextMenu(null), []);
+  const isPinned = orgMember?.pinned ?? false;
+  const tags = orgMember?.tags ?? [];
+  const snoozed = snoozeLabel(orgMember?.snoozedUntil ?? null);
 
   // ── Promote to worktree state ────────────────────────────────────────────
   // The promote command takes a few seconds (kill the current PTY, create
@@ -523,7 +580,6 @@ function SessionCardInner({
     const handler = (e: MouseEvent) => {
       if (contextRef.current && !contextRef.current.contains(e.target as Node)) {
         setContextMenu(null);
-        setShowLabelInput(false);
       }
     };
     document.addEventListener("mousedown", handler);
@@ -557,17 +613,19 @@ function SessionCardInner({
   return (
     <div
       onContextMenu={handleContextMenu}
-      // The left bar no longer encodes status — the dot and its word do (D4;
-      // a later phase gives the bar to the session's group color).
+      draggable={drag !== undefined}
+      onDragStart={drag ? (e) => drag.start(session, e) : undefined}
+      onDragEnd={drag?.end}
+      onDragOver={drag ? (e) => drag.over(session, e) : undefined}
+      onDrop={drag ? (e) => drag.drop(session, e) : undefined}
+      data-session-group-color={groupColor ?? "none"}
+      // The left bar is the session's GROUP color (D4); status is the dot and
+      // its word. Selection and on-screen keep their background tint.
+      style={{ borderLeftColor: groupColor ?? "transparent" }}
       className={`
-        group relative border-l-2 transition-colors
-        ${
-          isOnScreen
-            ? "border-l-brand-primary bg-brand-primary/10"
-            : isSelected
-              ? "border-l-[#7aa2f7] bg-[#7aa2f7]/5"
-              : "border-l-transparent hover:bg-[#1a1b26]"
-        }
+        group relative border-l-[3px] transition-colors
+        ${dropBefore ? "border-t-2 border-t-brand-primary" : ""}
+        ${isOnScreen ? "bg-brand-primary/10" : isSelected ? "bg-[#7aa2f7]/5" : "hover:bg-[#1a1b26]"}
       `}
     >
       <button
@@ -589,7 +647,7 @@ function SessionCardInner({
         // stated separately here; the tooltip is unchanged visually.
         aria-label={cardName}
         onClick={() => onOpen(session)}
-        className="w-full text-left px-3 py-2 pr-20"
+        className={`w-full text-left px-3 pr-20 ${compact ? "py-1" : "py-2"}`}
         title={sessionCardTooltip(session)}
       >
         {/* Row 1: Status dot + Name + Account badge */}
@@ -669,10 +727,34 @@ function SessionCardInner({
               <RotateCcw className="w-3 h-3 text-[#565f89]" />
             </span>
           )}
-          {isPinned && <Pin className="w-3 h-3 text-[#e0af68] shrink-0" />}
-          {sessionLabel && (
-            <span className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#73daca]/10 text-[#73daca] truncate max-w-[60px]">
-              {sessionLabel}
+          {isPinned && (
+            <span className="shrink-0 inline-flex" title="Pinned">
+              <Pin className="w-3 h-3 text-[#e0af68]" aria-label="Pinned" />
+            </span>
+          )}
+          {orgMember?.muted && (
+            <span className="shrink-0 inline-flex" title="Muted: no needs-input toast or sound">
+              <BellOff className="w-3 h-3 text-[#565f89]" aria-label="Muted" />
+            </span>
+          )}
+          {snoozed && (
+            <span className="shrink-0 inline-flex" title={snoozed}>
+              <Clock className="w-3 h-3 text-[#565f89]" aria-label={snoozed} />
+            </span>
+          )}
+          {tags.slice(0, 2).map((tag) => (
+            <span
+              key={tag}
+              data-session-tag={tag}
+              className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#73daca]/10 text-[#73daca] truncate max-w-[60px]"
+              title={`Tag: ${tag}`}
+            >
+              {tag}
+            </span>
+          ))}
+          {tags.length > 2 && (
+            <span className="text-[9px] text-[#565f89] shrink-0" title={`Tags: ${tags.join(", ")}`}>
+              +{tags.length - 2}
             </span>
           )}
         </div>
@@ -691,24 +773,26 @@ function SessionCardInner({
           <span className="truncate text-[#565f89]">{statusInfo.locationLabel}</span>
         </div>
 
-        {/* Row 3: Meta info */}
-        <div className="flex items-center gap-1 text-[10px] text-[#414868] ml-3.5">
-          <span>{formatTimeAgo(session.lastModified)}</span>
-          <span>&middot;</span>
-          {/* A tab-sourced row has no transcript, so no message count. */}
-          <span>{session.source === "tab" ? "terminal" : `${session.messageCount} msgs`}</span>
-          {durationLabel && (
-            <>
-              <span>&middot;</span>
-              <span title="Session duration">{durationLabel}</span>
-            </>
-          )}
-          <span>&middot;</span>
-          <span className="truncate">{session.projectLabel}</span>
-        </div>
+        {/* Row 3: Meta info (not on a compact pinned row) */}
+        {!compact && (
+          <div className="flex items-center gap-1 text-[10px] text-[#414868] ml-3.5">
+            <span>{formatTimeAgo(session.lastModified)}</span>
+            <span>&middot;</span>
+            {/* A tab-sourced row has no transcript, so no message count. */}
+            <span>{session.source === "tab" ? "terminal" : `${session.messageCount} msgs`}</span>
+            {durationLabel && (
+              <>
+                <span>&middot;</span>
+                <span title="Session duration">{durationLabel}</span>
+              </>
+            )}
+            <span>&middot;</span>
+            <span className="truncate">{session.projectLabel}</span>
+          </div>
+        )}
 
         {/* Row 4: Work summary hint (only while the session may be running) */}
-        {session.workSummaryHint && mayBeRunning && (
+        {!compact && session.workSummaryHint && mayBeRunning && (
           <div className="mt-1 ml-3.5 text-[10px] text-[#565f89] truncate leading-tight">
             {session.lastMessagePreview || session.workSummaryHint}
           </div>
@@ -915,144 +999,117 @@ function SessionCardInner({
           className="fixed z-50 py-1 min-w-[160px] bg-[#1a1b26] border border-[#2a2d3d] rounded-md shadow-xl"
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
-          {showLabelInput ? (
-            <div className="px-2 py-1">
-              <input
-                autoFocus
-                value={labelInput}
-                onChange={(e) => setLabelInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    onSetLabel(session.sessionId, labelInput.trim() || null);
-                    setContextMenu(null);
-                    setShowLabelInput(false);
-                    setLabelInput("");
-                  } else if (e.key === "Escape") {
-                    setShowLabelInput(false);
-                    setLabelInput("");
-                  }
-                }}
-                placeholder="Enter label..."
-                className="w-full px-2 py-1 text-xs bg-[#13141f] border border-[#2a2d3d] rounded text-[#a9b1d6] placeholder-[#414868] focus:outline-none focus:border-[#7aa2f7]/50"
-              />
-            </div>
-          ) : (
-            <>
-              {actions.resume && (
-                <button
-                  onClick={() => {
-                    onResume(session);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-                >
-                  <TerminalSquare className="w-3 h-3 text-[#9ece6a]" /> Resume
-                </button>
-              )}
-              {actions.viewTranscript && (
-                <button
-                  onClick={() => {
-                    onViewTranscript(session);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-                >
-                  <Eye className="w-3 h-3 text-[#7aa2f7]" /> View Transcript
-                </button>
-              )}
-              {actions.copySessionId && (
-                <button
-                  onClick={() => {
-                    onCopyId(session);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-                >
-                  <Copy className="w-3 h-3" /> Copy Session ID
-                </button>
-              )}
-              {canPromote && !promoted && (
-                <button
-                  onClick={(e) => {
-                    setContextMenu(null);
-                    void handlePromote(e);
-                  }}
-                  disabled={promoteState.kind === "loading"}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
-                >
-                  {promoteState.kind === "loading" ? (
-                    <Loader2 className="w-3 h-3 text-[#7aa2f7] animate-spin" />
-                  ) : (
-                    <GitBranch className="w-3 h-3 text-[#7aa2f7]" />
-                  )}
-                  Promote to Worktree
-                </button>
-              )}
-              {canCommit && (
-                <button
-                  onClick={(e) => {
-                    setContextMenu(null);
-                    void handleCommit(e);
-                  }}
-                  disabled={commitState.kind === "loading"}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
-                >
-                  {commitState.kind === "loading" ? (
-                    <Loader2 className="w-3 h-3 text-[#9ece6a] animate-spin" />
-                  ) : (
-                    <GitCommit className="w-3 h-3 text-[#9ece6a]" />
-                  )}
-                  Commit Progress
-                </button>
-              )}
-              {actions.resume && <div className="my-1 h-px bg-[#2a2d3d]" />}
+          <>
+            {actions.resume && (
               <button
                 onClick={() => {
-                  onTogglePin(session.sessionId);
+                  onResume(session);
                   setContextMenu(null);
                 }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
-                <Pin className={`w-3 h-3 ${isPinned ? "text-[#e0af68]" : ""}`} />
-                {isPinned ? "Unpin" : "Pin to Top"}
+                <TerminalSquare className="w-3 h-3 text-[#9ece6a]" /> Resume
               </button>
+            )}
+            {actions.viewTranscript && (
               <button
                 onClick={() => {
-                  setShowLabelInput(true);
-                  setLabelInput(sessionLabel ?? "");
+                  onViewTranscript(session);
+                  setContextMenu(null);
                 }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
-                <Tag className="w-3 h-3 text-[#73daca]" />
-                {sessionLabel ? "Edit Label" : "Add Label"}
+                <Eye className="w-3 h-3 text-[#7aa2f7]" /> View Transcript
               </button>
-              {!selectionMode && actions.bulkSelect && (
+            )}
+            {actions.copySessionId && (
+              <button
+                onClick={() => {
+                  onCopyId(session);
+                  setContextMenu(null);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+              >
+                <Copy className="w-3 h-3" /> Copy Session ID
+              </button>
+            )}
+            {canPromote && !promoted && (
+              <button
+                onClick={(e) => {
+                  setContextMenu(null);
+                  void handlePromote(e);
+                }}
+                disabled={promoteState.kind === "loading"}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
+              >
+                {promoteState.kind === "loading" ? (
+                  <Loader2 className="w-3 h-3 text-[#7aa2f7] animate-spin" />
+                ) : (
+                  <GitBranch className="w-3 h-3 text-[#7aa2f7]" />
+                )}
+                Promote to Worktree
+              </button>
+            )}
+            {canCommit && (
+              <button
+                onClick={(e) => {
+                  setContextMenu(null);
+                  void handleCommit(e);
+                }}
+                disabled={commitState.kind === "loading"}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
+              >
+                {commitState.kind === "loading" ? (
+                  <Loader2 className="w-3 h-3 text-[#9ece6a] animate-spin" />
+                ) : (
+                  <GitCommit className="w-3 h-3 text-[#9ece6a]" />
+                )}
+                Commit Progress
+              </button>
+            )}
+            {orgMenu && sessionKey && (
+              <>
+                <div className="my-1 h-px bg-[#2a2d3d]" />
+                <SessionOrgMenuItems
+                  sessionId={session.sessionId}
+                  sessionKey={sessionKey}
+                  member={orgMember}
+                  groups={orgMenu.groups}
+                  pages={orgMenu.pages}
+                  hasLiveTab={onClose !== undefined}
+                  onApply={orgMenu.apply}
+                  onMoveToPage={(pageId) => orgMenu.moveToPage(session, pageId)}
+                  close={closeMenu}
+                />
+              </>
+            )}
+            {!selectionMode && actions.bulkSelect && (
+              <button
+                onClick={() => {
+                  onToggleSelect(session.sessionId);
+                  setContextMenu(null);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+              >
+                <Copy className="w-3 h-3" /> Select for Bulk
+              </button>
+            )}
+            {onClose && (
+              <>
+                <div className="my-1 h-px bg-[#2a2d3d]" />
                 <button
+                  {...sessionOrgControlAttrs("sessionMenuClose", session.sessionId)}
                   onClick={() => {
-                    onToggleSelect(session.sessionId);
                     setContextMenu(null);
+                    onClose(session);
                   }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#f7768e] hover:bg-[#2a2d3d] transition-colors"
                 >
-                  <Copy className="w-3 h-3" /> Select for Bulk
+                  <X className="w-3 h-3" /> Close…
                 </button>
-              )}
-              {onClose && (
-                <>
-                  <div className="my-1 h-px bg-[#2a2d3d]" />
-                  <button
-                    onClick={() => {
-                      setContextMenu(null);
-                      onClose(session);
-                    }}
-                    className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#f7768e] hover:bg-[#2a2d3d] transition-colors"
-                  >
-                    <X className="w-3 h-3" /> Close Session
-                  </button>
-                </>
-              )}
-            </>
-          )}
+              </>
+            )}
+          </>
         </div>
       )}
     </div>

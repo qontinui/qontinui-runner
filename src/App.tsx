@@ -842,6 +842,18 @@ function AppContent() {
                       onReorganize={() => setShowReorganize(true)}
                       onCloseEmptyPages={terminalPages.closeEmptyPages}
                       emptyPageCount={terminalPages.emptyPageCount}
+                      onDropSessionTabs={(pageId, tabIds) => {
+                        // A session row or group dragged out of the Session
+                        // Manager: move its live tabs to this page.
+                        for (const terminalId of tabIds) {
+                          void invoke("terminal_set_page", { terminalId, pageId }).catch((err) =>
+                            console.error(
+                              `Failed to move terminal ${terminalId} to ${pageId}:`,
+                              err,
+                            ),
+                          );
+                        }
+                      }}
                       isPinned={terminalPages.isPinned}
                       onPopOut={() => {
                         // Open a new pop-out OS window (same process) that hosts its
@@ -918,6 +930,7 @@ function AppContent() {
                               onNavigateToBuilder={navigateToBuilder}
                               onNavigateToActive={navigateToActive}
                               onSessionCountChange={setTerminalSessionCount}
+                              pages={terminalPages.visiblePages}
                             />
                           </TerminalPageProvider>
                         </TerminalSessionProvider>
