@@ -34,7 +34,22 @@ import { ZONE_SETTLE_MS, isPortListening } from "./adapters/runner.mjs";
 import { PRIMARY_RUNNER_PORT } from "../lib/runner-clients.mjs";
 import { doctorNotes, gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
-import { allUnknown, captureInfo, clockGate, computeRowKpis, describeStall, indexGenerators, indexProbeSegment, injectAbortReason, paneStalls, primaryFrames, segmentWindow } from "./kpis.mjs";
+import {
+  allUnknown,
+  captureInfo,
+  clockGate,
+  computeRowKpis,
+  describeStall,
+  indexGenerators,
+  indexProbeSegment,
+  injectAbortReason,
+  nsToMs,
+  paneStalls,
+  primaryFrames,
+  segmentWindow,
+  stallCoverage,
+  STALL_MIN_MS,
+} from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
 import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
@@ -47,7 +62,7 @@ import { echoCount, readGeneratorLog, readGeneratorLogs, readSlots, slotForHostI
 const GENERATOR_FLAG = "--termhost-bench-generator";
 
 /** Defaults for the measurement phases. */
-/** The restore check judges a session only from at least this many primary frames showing its marker. */
+/** The restore check judges a session only from at least this many kept primary frames showing its marker (with STALL_MIN_MS of span, near the watch end). */
 export const RESTORE_CHECK_MIN_FRAMES = 10;
 
 export const RUN_DEFAULTS = Object.freeze({
@@ -766,7 +781,7 @@ export async function runUnit(unit, ctx) {
     for (const st of computed.stalls ?? []) {
       const verdict = st.recovered
         ? "a hitch the pane recovered from; its marker KPIs stay measured"
-        : "the pane stopped repainting to the end of the soak; its marker KPIs are unknown(pane_stalled)";
+        : "the pane did not repaint after that; its marker KPIs are unknown(pane_stalled)";
       a.incidents.push(
         incident("pane_stalled", `unit ${name} arm ${arm}: soak: ${describeStall(st)}: ${verdict}`, {
           data: { setup: unit.setup, unit: name, arm, session: st.session, recovered: st.recovered },
@@ -1106,20 +1121,16 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       if (!win) return unknownCheck("its watch has no measurement window");
       const primary = captureInfo(idx).primary;
       if (!primary) return unknownCheck("no primary capture source opened");
-      const visible = new Set(Array.isArray(idx.summary.sessions_seen) ? idx.summary.sessions_seen.filter(Number.isInteger) : []);
-      if (visible.size === 0) return unknownCheck("the probe saw no session's marker on screen");
-      // A whole screen that froze writes (almost) no frames, and an empty stall
-      // list over them would read as clean: each session must have been seen.
-      const frames = primaryFrames(idx, primary, win);
-      const seen = [...visible].sort((x, y) => x - y).map((k) => [k, frames.filter((f) => (f.markers ?? []).some((m) => m.kind === "output" && m.session === k)).length]);
-      const thin = seen.filter(([, n]) => n < RESTORE_CHECK_MIN_FRAMES);
-      if (thin.length > 0) {
-        return unknownCheck(`too few primary frames to judge (${thin.map(([k, n]) => `session ${k}: ${n}`).join(", ")}; the check needs ${RESTORE_CHECK_MIN_FRAMES} each)`);
-      }
+      // The restored (tiled) layout should show the arm's sessions — the tiled
+      // arm's V target of them — whatever the probe reported seeing: a pane that
+      // came back blank is absent from sessions_seen, and must not pass unjudged.
+      const expected = [...slotMap.keys()].filter(Number.isInteger).sort((x, y) => x - y);
+      const need = defaultVTarget(unit, "tiled");
+      if (expected.length === 0) return unknownCheck("the arm has no session to expect on screen");
       const gens = indexGenerators(readGeneratorLogs(genDir));
-      const stalls = paneStalls(idx, gens, win, visible);
+      const stalls = paneStalls(idx, gens, win, new Set(expected));
       for (const st of stalls) {
-        const verdict = st.recovered ? "a hitch the restored pane recovered from" : "the restored pane is not repainting";
+        const verdict = st.recovered ? "a hitch the restored pane recovered from" : "the restored pane did not repaint";
         out.incidents.push(
           incident("pane_stalled", `unit ${name} arm ${arm}: after restore-zone: ${describeStall(st)}: ${verdict}`, {
             data: { ...data, session: st.session, recovered: st.recovered },
@@ -1127,14 +1138,38 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
         );
       }
       const wedged = stalls.filter((x) => !x.recovered).length;
+      // An empty stall list proves nothing about a session the rule barely saw:
+      // a clean verdict needs each judged session's KEPT frames (outside excluded
+      // intervals) to number RESTORE_CHECK_MIN_FRAMES, span STALL_MIN_MS, and reach
+      // within STALL_MIN_MS of the watch's end. A frozen screen that stops sending
+      // frames fails the last two (and, frozen, is a wedge above).
+      const cov = stallCoverage(idx, win, expected);
+      const windowMs = nsToMs(win.t1 - win.t0);
+      const judged = expected.filter((k) => {
+        const c = cov.get(k);
+        return c.frames >= RESTORE_CHECK_MIN_FRAMES && c.lastMs - c.firstMs >= STALL_MIN_MS && windowMs - c.lastMs <= STALL_MIN_MS;
+      });
+      const seen = expected
+        .map((k) => {
+          const c = cov.get(k);
+          return c.frames === 0 ? `${k}: no kept frame` : `${k}: ${c.frames} kept frame(s) at +${Math.round(c.firstMs)}..+${Math.round(c.lastMs)} ms`;
+        })
+        .join(", ");
+      if (wedged === 0 && judged.length < need) {
+        return unknownCheck(
+          `${judged.length} of the ${need} session(s) the restored layout should show could be judged ` +
+            `(>= ${RESTORE_CHECK_MIN_FRAMES} kept frames spanning >= ${STALL_MIN_MS} ms and reaching within ${STALL_MIN_MS} ms of the end of a ${Math.round(windowMs)} ms watch; ${seen})`,
+        );
+      }
       const outcome = wedged > 0 ? "not repainting" : stalls.length > 0 ? "recovered from a hitch" : "clean";
-      const note = `restore check: observed, ${outcome} (${frames.length} primary frame(s), ${visible.size} session(s): ${seen.map(([k, n]) => `${k}=${n}`).join(", ")})`;
+      const total = primaryFrames(idx, primary, win).length;
+      const note = `restore check: observed, ${outcome} (${total} primary frame(s); ${seen})`;
       log(`unit ${name} arm ${arm}: ${note}`);
       return {
         comparable: false,
         source,
         state: "measured",
-        data: { outcome, frames: frames.length, sessions: [...visible].sort((x, y) => x - y), stalls },
+        data: { outcome, frames: total, sessions: expected, judged, stalls },
         notes: [note],
       };
     } catch (e) {

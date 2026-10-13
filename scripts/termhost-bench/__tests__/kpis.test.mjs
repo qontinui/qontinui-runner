@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { KPI_IDS } from "../kpi-catalog.mjs";
+import { SEQ_MODULUS } from "../marker.mjs";
 import {
   attachNotes,
   captureInfo,
@@ -25,6 +26,7 @@ import {
   STALL_VOIDED_KPIS,
   describeStall,
   excludedSpans,
+  stallCoverage,
   generatorExits,
   paneStalls,
   generatorWindow,
@@ -678,9 +680,11 @@ test("a pane frozen to the end of the soak, whole or from half way, voids the pe
   for (const r of [whole, half]) {
     for (const id of STALL_VOIDED_KPIS) {
       assertUnknown(r.kpis[id], "pane_stalled");
-      assert.match(r.kpis[id].detail, /^the pane stopped repainting: session 0 stayed at seq \d+ for \d+ ms \(\d+ frame\(s\)\) while its generator wrote \d+ marker\(s\)$/);
+      assert.match(r.kpis[id].detail, /^pane stalled: session 0 stayed at seq \d+ for \d+ ms \(\d+ frame\(s\), last shown at \+\d+ ms(, then no frame for \d+ ms)?\) while its generator wrote \d+ marker\(s\), and did not advance in any later frame$/);
     }
     assert.equal(r.kpis.frame_interval_ms.state, "measured", "the window's own cadence is not the pane's");
+    assert.ok((r.kpis.output_latency_ms.notes ?? []).some((n) => /^pane stalled: session 0 /.test(n)), "the wedge note carries its KPI id");
+    assert.ok(!r.notes.some((n) => /pane stalled/.test(n)), "no unattached copy");
   }
 });
 
@@ -726,7 +730,7 @@ test("the stall rule does not run on an unaligned clock, and never overwrites an
   const w = computeRowKpis(refusing);
   assert.equal(w.stalls.length, 1);
   assertUnknown(w.kpis.marker_loss, "refresh_rate_unknown");
-  assert.ok((w.kpis.marker_loss.notes ?? []).some((n) => /^the pane stopped repainting: session 0/.test(n)), JSON.stringify(w.kpis.marker_loss));
+  assert.ok((w.kpis.marker_loss.notes ?? []).some((n) => /^pane stalled: session 0/.test(n)), JSON.stringify(w.kpis.marker_loss));
   assertUnknown(w.kpis.output_latency_ms, "pane_stalled");
 });
 
@@ -748,6 +752,14 @@ const gensAt = (msList) => new Map([[0, { markers: msList.map((ms, i) => ({ kind
 /** Emission times every `step` ms over [a, b]. */
 const every = (a, b, step) => Array.from({ length: Math.floor((b - a) / step) + 1 }, (_, i) => a + i * step);
 const WIN = { t0: at(0), t1: at(60_000) };
+/**
+ * paneStalls over a synthetic segment. With `WIN`, the window ends at the last
+ * frame, so no frameless tail is read into it (that has its own tests).
+ */
+const paneStallsAt = (seg, gens, win, vis) => {
+  const last = seg.frames.reduce((m, f) => (BigInt(f.t_ns) > m ? BigInt(f.t_ns) : m), WIN.t0 + 1n);
+  return paneStalls(seg, gens, win === WIN ? { t0: WIN.t0, t1: last } : win, vis);
+};
 const V0 = new Set([0]);
 /** Advancing frames (one seq per 100 ms) before `fromMs`, `seq` 500 still over [fromMs, toMs], advancing after when `recover`. */
 function runFrames(fromMs, toMs, { recover = true, step = 100 } = {}) {
@@ -762,11 +774,11 @@ function runFrames(fromMs, toMs, { recover = true, step = 100 } = {}) {
 test("the stall rule's boundaries: 2 s, 20 markers, the emission window's edges (review r10 SF5)", () => {
   const dense = gensAt(every(0, 20_000, 10));
   // 1990 ms still is no stall; 2000 and 2010 ms are.
-  assert.deepEqual(paneStalls(synthSeg(runFrames(1000, 2990)), dense, WIN, V0), [], "1990 ms");
-  assert.equal(paneStalls(synthSeg(runFrames(1000, 3000)), dense, WIN, V0).length, 1, "2000 ms exactly");
-  const st = paneStalls(synthSeg(runFrames(1000, 3010)), dense, WIN, V0);
+  assert.deepEqual(paneStallsAt(synthSeg(runFrames(1000, 2990)), dense, WIN, V0), [], "1990 ms");
+  assert.equal(paneStallsAt(synthSeg(runFrames(1000, 3000)), dense, WIN, V0).length, 1, "2000 ms exactly");
+  const st = paneStallsAt(synthSeg(runFrames(1000, 3010)), dense, WIN, V0);
   assert.equal(st.length, 1, "2010 ms");
-  assert.deepEqual(st[0], { session: 0, seq: 500, ms: 2010, frames: 22, emitted: 201, recovered: true });
+  assert.deepEqual(st[0], { session: 0, seq: 500, ms: 2010, frames: 22, emitted: 201, recovered: true, lastShownMs: 3010, framelessMs: 0 });
   assert.ok(STALL_MIN_MS === 2000 && STALL_MIN_EMITTED === 20);
   // 19 markers emitted in the run is no stall; 20 is.
   const run = synthSeg(runFrames(1000, 3500));
@@ -801,14 +813,14 @@ test("the stall rule picks the longest of several hitches, and a wedge over any 
   advance(1000);
   still(2200);
   advance(1000);
-  const st = paneStalls(synthSeg(frames), dense, WIN, V0);
+  const st = paneStallsAt(synthSeg(frames), dense, WIN, V0);
   assert.equal(st.length, 1);
   assert.equal(st[0].seq, longest, JSON.stringify(st[0]));
   assert.equal(st[0].ms, 3500);
   assert.equal(st[0].recovered, true);
   // The same, then frozen 2.4 s to the last frame: the wedge AND the longest hitch, in time order.
   const wedgeSeq = still(2400);
-  const w = paneStalls(synthSeg(frames), dense, WIN, V0);
+  const w = paneStallsAt(synthSeg(frames), dense, WIN, V0);
   assert.deepEqual(w.map((x) => [x.seq, x.recovered]), [[longest, true], [wedgeSeq, false]]);
 });
 
@@ -816,20 +828,20 @@ test("the stall rule reads primary frames inside the window only, in time order 
   const dense = gensAt(every(0, 20_000, 10));
   // Frames outside the window are ignored: a 3 s run of which 1.5 s is in the window.
   const frames = runFrames(1000, 4000, { recover: false });
-  assert.equal(paneStalls(synthSeg(frames), dense, WIN, V0).length, 1, "the whole run qualifies");
-  assert.deepEqual(paneStalls(synthSeg(frames), dense, { t0: at(2500), t1: WIN.t1 }, V0), [], "frames before t0 are ignored");
-  assert.deepEqual(paneStalls(synthSeg(frames), dense, { t0: WIN.t0, t1: at(2500) }, V0), [], "frames after t1 are ignored");
+  assert.equal(paneStallsAt(synthSeg(frames), dense, WIN, V0).length, 1, "the whole run qualifies");
+  assert.deepEqual(paneStallsAt(synthSeg(frames), dense, { t0: at(2500), t1: at(4000) }, V0), [], "frames before t0 are ignored");
+  assert.deepEqual(paneStallsAt(synthSeg(frames), dense, { t0: WIN.t0, t1: at(2500) }, V0), [], "frames after t1 are ignored");
   // Only the primary source: a cross-check source (dda) showing an old marker is not the pane.
   // The primary source shows seq 5 then seq 6 with no frame between (a still screen
   // is no evidence either way); dda shows seq 7 for 4 s in that stretch.
   const primaryOnly = [fr(0, 4), fr(400, 5), fr(4600, 6), fr(5000, 7)];
   const ddaStill = every(500, 4500, 100).map((t) => fr(t, 7, "dda"));
-  assert.deepEqual(paneStalls(synthSeg([...primaryOnly, ...ddaStill]), dense, WIN, V0), [], "a dda frame is not a primary frame");
-  assert.equal(paneStalls(synthSeg([...primaryOnly, ...ddaStill.map((x) => ({ ...x, source: "x11" }))]), dense, WIN, V0).length, 1, "the same frames as primary are a stall");
+  assert.deepEqual(paneStallsAt(synthSeg([...primaryOnly, ...ddaStill]), dense, WIN, V0), [], "a dda frame is not a primary frame");
+  assert.equal(paneStallsAt(synthSeg([...primaryOnly, ...ddaStill.map((x) => ({ ...x, source: "x11" }))]), dense, WIN, V0).length, 1, "the same frames as primary are a stall");
   // Unsorted input reads the same as sorted.
-  const sorted = paneStalls(synthSeg(runFrames(1000, 3010)), dense, WIN, V0);
+  const sorted = paneStallsAt(synthSeg(runFrames(1000, 3010)), dense, WIN, V0);
   const shuffled = runFrames(1000, 3010).map((x, i) => ({ x, k: (i * 7919) % 101 })).sort((a, b) => a.k - b.k).map((o) => o.x);
-  assert.deepEqual(paneStalls(synthSeg(shuffled), dense, WIN, V0), sorted);
+  assert.deepEqual(paneStallsAt(synthSeg(shuffled), dense, WIN, V0), sorted);
   assert.equal(sorted.length, 1);
 });
 
@@ -837,11 +849,11 @@ test("time inside an interval the probe excluded for visibility or input does no
   const dense = gensAt(every(0, 20_000, 10));
   const frames = runFrames(1000, 3500);
   const iv = (a, b, cls) => ({ type: "interval", index: 0, t_start_ns: String(at(a)), t_end_ns: String(at(b)), valid: cls === null, exclusion_class: cls });
-  assert.equal(paneStalls(synthSeg(frames, [iv(1500, 2000, null)]), dense, WIN, V0).length, 1, "a valid interval");
-  assert.deepEqual(paneStalls(synthSeg(frames, [iv(1500, 2000, "occluded")]), dense, WIN, V0), [], "occluded / not foreground / cloaked / minimized");
-  assert.deepEqual(paneStalls(synthSeg(frames, [iv(3000, 3500, "operator_activity")]), dense, WIN, V0), [], "real input");
-  assert.equal(paneStalls(synthSeg(frames, [iv(4000, 4500, "occluded")]), dense, WIN, V0).length, 1, "an excluded interval the run does not touch");
-  assert.equal(paneStalls(synthSeg(frames, [iv(1500, 2000, "harness_error")]), dense, WIN, V0).length, 1, "a harness-class interval (no input monitor on Xvfb) rules nothing out");
+  assert.equal(paneStallsAt(synthSeg(frames, [iv(1500, 2000, null)]), dense, WIN, V0).length, 1, "a valid interval");
+  assert.deepEqual(paneStallsAt(synthSeg(frames, [iv(1500, 2000, "occluded")]), dense, WIN, V0), [], "occluded / not foreground / cloaked / minimized");
+  assert.deepEqual(paneStallsAt(synthSeg(frames, [iv(3000, 3500, "operator_activity")]), dense, WIN, V0), [], "real input");
+  assert.equal(paneStallsAt(synthSeg(frames, [iv(4000, 4500, "occluded")]), dense, WIN, V0).length, 1, "an excluded interval the run does not touch");
+  assert.equal(paneStallsAt(synthSeg(frames, [iv(1500, 2000, "harness_error")]), dense, WIN, V0).length, 1, "a harness-class interval (no input monitor on Xvfb) rules nothing out");
 });
 
 test("a marker hidden for longer than the gap and shown again is a redisplay, not a stall (review r10 nit)", () => {
@@ -852,15 +864,15 @@ test("a marker hidden for longer than the gap and shown again is a redisplay, no
   // Shown 1.0-1.4 s, hidden 1.5-2.9 s (frames without it), the same seq again 3.0-4.5 s.
   const hidden = [...before, ...still(1000, 1400), ...every(1500, 2900, 100).map((t) => fr(t, null)), ...still(3000, 4500), ...after];
   assert.ok(3000 - 1400 > STALL_HIDDEN_GAP_MS);
-  assert.deepEqual(paneStalls(synthSeg(hidden), dense, WIN, V0), [], "the run ends where the marker was hidden");
+  assert.deepEqual(paneStallsAt(synthSeg(hidden), dense, WIN, V0), [], "the run ends where the marker was hidden");
   // No frame at all in the same stretch (a still screen) does not end the run.
   const silent = [...before, ...still(1000, 1400), ...still(3000, 4500), ...after];
-  const st = paneStalls(synthSeg(silent), dense, WIN, V0);
+  const st = paneStallsAt(synthSeg(silent), dense, WIN, V0);
   assert.equal(st.length, 1);
   assert.equal(st[0].ms, 3500);
   // A brief absence (a partial read that skipped the pane) does not end it either.
   const brief = [...before, ...still(1000, 2000), fr(2050, null), ...still(2100, 3500), ...after];
-  assert.equal(paneStalls(synthSeg(brief), dense, WIN, V0).length, 1);
+  assert.equal(paneStallsAt(synthSeg(brief), dense, WIN, V0).length, 1);
 });
 
 test("the stall rule counts any number of earlier appearances (review r9 nit 1)", () => {
@@ -892,7 +904,14 @@ test("the stall rule counts any number of earlier appearances (review r9 nit 1)"
   assert.equal(st.length, 1);
   assert.equal(st[0].recovered, true);
   assert.ok(st[0].ms >= STALL_MIN_MS && st[0].emitted >= STALL_MIN_EMITTED, JSON.stringify(st[0]));
-  assert.equal(describeStall({ session: 3, seq: 7, ms: 2500, frames: 150, emitted: 25 }), "session 3 stayed at seq 7 for 2500 ms (150 frame(s)) while its generator wrote 25 marker(s)");
+  assert.equal(
+    describeStall({ session: 3, seq: 7, ms: 2500, frames: 150, emitted: 25, recovered: true, lastShownMs: 4000, framelessMs: 0 }),
+    "session 3 stayed at seq 7 for 2500 ms (150 frame(s), last shown at +4000 ms) while its generator wrote 25 marker(s), then advanced again",
+  );
+  assert.equal(
+    describeStall({ session: 3, seq: 7, ms: 2500, frames: 150, emitted: 25, recovered: false, lastShownMs: 1000, framelessMs: 1500 }),
+    "session 3 stayed at seq 7 for 2500 ms (150 frame(s), last shown at +1000 ms, then no frame for 1500 ms) while its generator wrote 25 marker(s), and did not advance in any later frame",
+  );
 });
 
 test("a frozen pane hidden for a while and shown again at the same seq is still a wedge (review r11 MF1, repro A)", () => {
@@ -905,18 +924,18 @@ test("a frozen pane hidden for a while and shown again at the same seq is still 
     ...every(3600, 5000, 100).map((t) => fr(t, null)),
     ...every(5100, 5500, 100).map((t) => fr(t, 500)),
   ];
-  const st = paneStalls(synthSeg(frames), dense, WIN, V0);
+  const st = paneStallsAt(synthSeg(frames), dense, WIN, V0);
   assert.equal(st.length, 1, JSON.stringify(st));
   assert.equal(st[0].seq, 500);
   assert.equal(st[0].recovered, false, "no later frame advanced past 500");
   assert.equal(st[0].ms, 2900, "seen 2.5 s + 0.4 s; the hidden 1.6 s is not counted");
   // A BACKWARDS seq after the run is no recovery either.
   const back = [...before, ...every(1000, 3500, 100).map((t) => fr(t, 500)), ...every(3600, 4000, 100).map((t) => fr(t, 400))];
-  const b = paneStalls(synthSeg(back), dense, WIN, V0);
+  const b = paneStallsAt(synthSeg(back), dense, WIN, V0);
   assert.deepEqual(b.map((x) => [x.seq, x.recovered]), [[500, false]]);
   // A forward seq after the gap is.
   const fwd = [...before, ...every(1000, 3500, 100).map((t) => fr(t, 500)), ...every(3600, 5000, 100).map((t) => fr(t, null)), fr(5100, 501)];
-  assert.deepEqual(paneStalls(synthSeg(fwd), dense, WIN, V0).map((x) => x.recovered), [true]);
+  assert.deepEqual(paneStallsAt(synthSeg(fwd), dense, WIN, V0).map((x) => x.recovered), [true]);
 });
 
 test("absence is measured from the first frame lacking the marker: one band frame after a still screen does not split a stall (review r11 SF3, repro B)", () => {
@@ -924,7 +943,7 @@ test("absence is measured from the first frame lacking the marker: one band fram
   const before = Array.from({ length: 10 }, (_, i) => fr(i * 100, i + 1));
   // seq 500 at 1.0-1.5 s, no frames 1.5-3.0 s, one frame at 3.0 s without it, 500 again 3.05-4.0 s, then it advances.
   const frames = [...before, ...every(1000, 1500, 100).map((t) => fr(t, 500)), fr(3000, null), ...every(3050, 4000, 50).map((t) => fr(t, 500)), fr(4100, 501)];
-  const st = paneStalls(synthSeg(frames), dense, WIN, V0);
+  const st = paneStallsAt(synthSeg(frames), dense, WIN, V0);
   assert.equal(st.length, 1, JSON.stringify(st));
   assert.equal(st[0].ms, 3000);
   assert.equal(st[0].recovered, true);
@@ -943,7 +962,7 @@ test("a hidden stretch just over the gap is not bridged into a stall (review r11
     ...every(2010, 3050, 10).map((t) => fr(t, 500)),
     fr(3100, 501),
   ];
-  assert.deepEqual(paneStalls(synthSeg(frames), dense, WIN, V0), [], "seen 1.09 s; 950 ms hidden is not counted");
+  assert.deepEqual(paneStallsAt(synthSeg(frames), dense, WIN, V0), [], "seen 1.09 s; 950 ms hidden is not counted");
 });
 
 test("an excluded interval inside a wedge splits it; the pieces are still the wedge (review r11 nit)", () => {
@@ -951,10 +970,10 @@ test("an excluded interval inside a wedge splits it; the pieces are still the we
   const before = Array.from({ length: 10 }, (_, i) => fr(i * 100, i + 1));
   const frames = [...before, ...every(1000, 8000, 100).map((t) => fr(t, 500))];
   const iv = { type: "interval", index: 4, t_start_ns: String(at(2000)), t_end_ns: String(at(2500)), valid: false, exclusion_class: "occluded" };
-  const st = paneStalls(synthSeg(frames, [iv]), dense, WIN, V0);
+  const st = paneStallsAt(synthSeg(frames, [iv]), dense, WIN, V0);
   assert.equal(st.length, 1, JSON.stringify(st));
   assert.equal(st[0].recovered, false);
-  assert.equal(st[0].ms, 900 + 5400, "1.0-1.9 s and 2.6-8.0 s; the excluded 0.5 s and its edges are not counted");
+  assert.equal(st[0].ms, 900 + 5500, "1.0-1.9 s and 2.5-8.0 s: the span [2.0, 2.5) is half-open, so the frame at 2.5 s is kept");
 });
 
 test("excludedSpans keeps only intervals the probe marked valid: false with a visibility or input class", () => {
@@ -984,8 +1003,94 @@ test("markers emitted while the pane was hidden do not count toward a stall (rev
   ];
   // 8 emitted in each seen piece, 30 while hidden.
   const gens = gensAt([...every(1100, 1800, 100), ...every(2300, 3750, 50).slice(0, 30), ...every(4200, 4900, 100)]);
-  assert.deepEqual(paneStalls(synthSeg(frames), gens, WIN, V0), [], "16 seen emissions are under 20");
+  assert.deepEqual(paneStallsAt(synthSeg(frames), gens, WIN, V0), [], "16 seen emissions are under 20");
   // The same with 10 per seen piece qualifies, so the 2.1 s is not the reason.
   const enough = gensAt([...every(1100, 2000, 100), ...every(4200, 5000, 100).slice(0, 9), 5000]);
-  assert.equal(paneStalls(synthSeg(frames), enough, WIN, V0).length, 1);
+  assert.equal(paneStallsAt(synthSeg(frames), enough, WIN, V0).length, 1);
+});
+
+/** The reviewer's repro frames (review r12, repro.mjs): advancing 0-0.9 s. */
+const r12Before = every(0, 900, 100).map((t, i) => fr(t, i + 1));
+const r12Gens = (sessions) => new Map(sessions.map((k) => [k, { markers: every(0, 20000, 10).map((ms, i) => ({ kind: "output", seq: i, tEmit: at(ms) })) }]));
+const ivx = (a, b, cls) => ({ type: "interval", t_start_ns: String(at(a)), t_end_ns: String(at(b)), valid: false, exclusion_class: cls });
+const winTo = (ms) => ({ t0: at(0), t1: at(ms) });
+
+test("R1: an excluded interval with no frames in it ends the piece; its time and emissions are not counted (review r12 MF4)", () => {
+  const frames = [...r12Before, ...every(1000, 1900, 100).map((t) => fr(t, 500)), ...every(5000, 5900, 100).map((t) => fr(t, 500)), fr(6000, 501)];
+  const st = paneStalls(synthSeg(frames), r12Gens([0]), winTo(6000), V0);
+  assert.equal(st[0]?.ms, 4900, "without the interval, the frameless 3.1 s is still time");
+  assert.deepEqual(paneStalls(synthSeg(frames, [ivx(1950, 4950, "occluded")]), r12Gens([0]), winTo(6000), V0), [], "seen 0.9 s + 0.9 s");
+});
+
+test("R2: an advanced seq inside an excluded interval is still proof of repaint (review r12 SF5)", () => {
+  const frames = [...r12Before, ...every(1000, 4000, 100).map((t) => fr(t, 500)), ...every(4100, 5000, 100).map((t, i) => fr(t, 501 + i))];
+  const st = paneStalls(synthSeg(frames, [ivx(4050, 5001, "operator_activity")]), r12Gens([0]), winTo(5000), V0);
+  assert.deepEqual(st.map((x) => [x.seq, x.recovered]), [[500, true]]);
+});
+
+test("R3: a seq that wraps the marker counter is recovery (review r12)", () => {
+  const frames = [...every(1000, 4000, 100).map((t) => fr(t, SEQ_MODULUS - 1)), fr(4100, 0)];
+  const st = paneStalls(synthSeg(frames), r12Gens([0]), winTo(4100), V0);
+  assert.deepEqual(st.map((x) => [x.seq, x.recovered]), [[SEQ_MODULUS - 1, true]]);
+});
+
+test("R4: a marker never shown again is a wedge, and says when it was last seen, not that it froze to the end (review r12 SF6)", () => {
+  const frames = [...r12Before, ...every(1000, 3500, 100).map((t) => fr(t, 500)), ...every(3600, 20000, 100).map((t) => fr(t, null))];
+  const st = paneStalls(synthSeg(frames), r12Gens([0]), winTo(20000), V0);
+  assert.equal(st.length, 1);
+  assert.deepEqual([st[0].recovered, st[0].lastShownMs, st[0].framelessMs, st[0].ms], [false, 3500, 0, 2500]);
+  assert.match(describeStall(st[0]), /last shown at \+3500 ms\) .*, and did not advance in any later frame$/);
+});
+
+test("R5/R6/R7: several sessions, a single frame, an excluded span at the run's trailing edge (review r12)", () => {
+  const multi = every(0, 5000, 100).map((t, i) => ({ source: "x11", t_ns: String(at(t)), markers: [{ kind: "output", session: 0, seq: i }, { kind: "output", session: 2, seq: 77 }] }));
+  assert.deepEqual(paneStalls(synthSeg(multi), r12Gens([0, 1, 2]), winTo(5000), new Set([0, 1, 2])).map((x) => [x.session, x.recovered]), [[2, false]], "session 1 never shown gives no stall, session 0 none");
+  // One frame and a window ending 0.5 s later: too short. The same frame and nothing for 4 s: still, by the frameless rule.
+  assert.deepEqual(paneStalls(synthSeg([fr(1000, 5)]), r12Gens([0]), winTo(1500), V0), []);
+  const one = paneStalls(synthSeg([fr(1000, 5)]), r12Gens([0]), winTo(5000), V0);
+  assert.deepEqual(one.map((x) => [x.recovered, x.ms, x.framelessMs]), [[false, 4000, 4000]]);
+  // [2950, 3000) ends at the last frame: the frame at 3.0 s is kept, the gap before it is cut.
+  const trail = [...r12Before, ...every(1000, 3000, 100).map((t) => fr(t, 500))];
+  assert.deepEqual(paneStalls(synthSeg(trail, [ivx(2950, 3000, "occluded")]), r12Gens([0]), winTo(3000), V0), [], "seen 1.9 s");
+  assert.equal(paneStalls(synthSeg(trail), r12Gens([0]), winTo(3000), V0).length, 1, "2.0 s without the span");
+});
+
+test("a pane frozen when the screen stops sending frames is a wedge: the frameless tail is still time, outside excluded spans (review r12 MF1)", () => {
+  const frames = [...r12Before, ...every(1000, 1500, 100).map((t) => fr(t, 500))];
+  const st = paneStalls(synthSeg(frames), r12Gens([0]), winTo(4000), V0);
+  assert.deepEqual(st.map((x) => [x.recovered, x.ms, x.framelessMs, x.lastShownMs]), [[false, 3000, 2500, 1500]]);
+  assert.equal(st[0].emitted, 50 + 250, "emissions in (1.0, 1.5] and (1.5, 4.0], one per 10 ms");
+  // An excluded span inside the tail is not counted.
+  assert.deepEqual(paneStalls(synthSeg(frames, [ivx(2000, 3500, "occluded")]), r12Gens([0]), winTo(4000), V0), [], "0.5 s + 1.0 s");
+  // A later frame of any kind ends the tail: the screen did send something.
+  assert.deepEqual(paneStalls(synthSeg([...frames, fr(3900, null)]), r12Gens([0]), winTo(4000), V0), []);
+  // A soak whose screen froze at 0.6 s and sent nothing after: its marker KPIs are voided.
+  const f = focusFixture();
+  const records = stallSegment(f.soak.records);
+  const t0 = BigInt(records.find((r) => r.type === "start").t0_ns) + 5n * MS;
+  const cut = records.filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= t0 + 600n * MS);
+  const r = computeRowKpis({ ...f, soak: { records: cut } });
+  assert.deepEqual(r.stalls.map((x) => x.recovered), [false], JSON.stringify(r.stalls));
+  assert.ok(r.stalls[0].framelessMs > SOAK_MS - 1000);
+  for (const id of STALL_VOIDED_KPIS) assert.notEqual(r.kpis[id].state, "measured", id);
+});
+
+test("excluded spans are half-open: a frame at a span's start is dropped, one at its end is kept (review r12 nit)", () => {
+  const frames = [fr(1000, 1), fr(2000, 2), fr(2500, 3)];
+  const cov = stallCoverage(synthSeg(frames, [ivx(1000, 2000, "occluded")]), winTo(3000), [0]);
+  assert.deepEqual(cov.get(0), { frames: 2, firstMs: 2000, lastMs: 2500 });
+  assert.deepEqual(excludedSpans({ intervals: [ivx(1000, 1000, "occluded")] }), [], "an empty span excludes nothing");
+});
+
+test("a frameless tail counts only the markers emitted outside excluded spans (review r12 MF1)", () => {
+  const frames = [...r12Before, ...every(1000, 1500, 100).map((t) => fr(t, 500))];
+  const span = [ivx(2000, 5000, "occluded")];
+  // Seen: 0.5 s of frames + (1.5-2.0 s and 5.0-6.0 s) of tail = 2.0 s.
+  const emitsAt = (outside) => gensAt([...every(1100, 1500, 100), ...outside, ...every(2100, 4900, 100)]);
+  const few = emitsAt([...every(1600, 1900, 100), ...every(5100, 5600, 100)]); // 5 + 4 + 6 = 15 outside the span, 29 inside
+  assert.deepEqual(paneStalls(synthSeg(frames, span), few, winTo(6000), V0), [], "15 seen emissions are under 20");
+  // 5 + 4 + 11 outside the span (5.05-5.95 s and one at the window's end), 29 inside: a stall.
+  const enough = emitsAt([...every(1600, 1900, 100), ...every(5050, 5950, 100), 6000]);
+  const st = paneStalls(synthSeg(frames, span), enough, winTo(6000), V0);
+  assert.deepEqual(st.map((x) => [x.ms, x.recovered, x.emitted]), [[2000, false, 5 + 4 + 11]]);
 });

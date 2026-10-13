@@ -548,8 +548,13 @@ test("a stalled pane in a soak becomes a pane_stalled incident on its row and na
   });
   const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
   assert.equal(tiled.kpis.output_latency_ms.reason, "pane_stalled");
-  assert.match(tiled.kpis.output_latency_ms.detail, /the pane stopped repainting: session 0 stayed at seq \d+ for \d+ ms/);
-  assert.ok(tiled.incidents.some((i) => i.kind === "pane_stalled" && /arm tiled: soak: session 0 stayed at seq \d+ for \d+ ms/.test(i.detail)), JSON.stringify(tiled.incidents));
+  assert.match(tiled.kpis.output_latency_ms.detail, /^pane stalled: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame$/);
+  assert.ok(
+    tiled.incidents.some(
+      (i) => i.kind === "pane_stalled" && /arm tiled: soak: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame: the pane did not repaint after that; its marker KPIs are unknown\(pane_stalled\)$/.test(i.detail),
+    ),
+    JSON.stringify(tiled.incidents),
+  );
   const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
   assert.ok(!focus.incidents.some((i) => i.kind === "pane_stalled"));
   assert.equal(validateResults(res.doc).valid, true);
@@ -591,6 +596,8 @@ function realZoneView(a, { maximized = 0, viewAfter, events = null, throwOnResto
     if (throwOnRestore) throw new Error(throwOnRestore);
     const previous = current;
     current = null;
+    // The tiled layout is back: the probe sees every session again.
+    a.visibleSet = new Set([...(a.slots?.keys() ?? [])].sort((x, y) => x - y).slice(0, 9));
     return { maximizedZone: null, previousMaximizedZone: previous, zoneCount: 4, changed: previous !== null };
   };
   a.zoneViewState = async () => {
@@ -613,10 +620,10 @@ const editRestoreWatch = (edit) => (inner) => ({
 });
 
 /** One runner unit at N = 1 with a restore check; returns the focus row and the logs. */
-async function restoreRun(t, { zone = {}, wrapProbe = null, facts, deps = {}, adapterHook = null, wrapSleep = null } = {}) {
+async function restoreRun(t, { zone = {}, wrapProbe = null, facts, deps = {}, adapterHook = null, wrapSleep = null, n = 1, restoreCheckMs = 4000 } = {}) {
   const logs = [];
   const { res } = await fakeRun(t, {
-    opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
+    opts: { ns: [n], setups: ["runner"], restoreCheckMs },
     adapterHook: (a, setup) => {
       realZoneView(a, zone);
       adapterHook?.(a, setup);
@@ -637,7 +644,7 @@ test("after the focus arm, a restore-zone check records a frozen restored pane a
   const frozen = await restoreRun(t, { wrapProbe: editRestoreWatch((r) => stallSegment(r)) });
   const inc = frozen.focus.incidents.filter((i) => i.kind === "pane_stalled");
   assert.equal(inc.length, 1, JSON.stringify(frozen.focus.incidents));
-  assert.match(inc[0].detail, /arm focus: after restore-zone: session 0 stayed at seq \d+ for \d+ ms .*: the restored pane is not repainting$/);
+  assert.match(inc[0].detail, /arm focus: after restore-zone: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame: the restored pane did not repaint$/);
   assert.equal(frozen.focus.kpis.output_latency_ms.state, "measured", "it gates nothing: the focus soak is unaffected");
   assert.equal(check(frozen.focus).state, "measured");
   assert.equal(check(frozen.focus).data.outcome, "not repainting");
@@ -645,7 +652,7 @@ test("after the focus arm, a restore-zone check records a frozen restored pane a
   const clean = await restoreRun(t);
   assert.ok(!clean.res.doc.rows.some((r) => r.incidents.some((i) => i.kind === "pane_stalled" || /restore check/.test(i.detail))));
   assert.equal(check(clean.focus).state, "measured");
-  assert.match(check(clean.focus).notes[0], /^restore check: observed, clean \(\d+ primary frame\(s\), 1 session\(s\): 0=\d+\)$/);
+  assert.match(check(clean.focus).notes[0], /^restore check: observed, clean \(\d+ primary frame\(s\); 0: \d+ kept frame\(s\) at \+\d+\.\.\+\d+ ms\)$/);
   assert.ok(clean.logs.some((l) => /restore check: observed, clean/.test(l)));
 });
 
@@ -688,8 +695,21 @@ test("every restore-check path that could not look is UNKNOWN, never clean (revi
     ["no summary", { wrapProbe: editRestoreWatch((rs) => rs.filter((r) => r.type !== "summary")) }, /its watch wrote no summary/],
     ["no window", { wrapProbe: editRestoreWatch((rs) => rs.map((r) => (r.type === "summary" ? { ...r, t_end_ns: r.t_start_ns } : r))) }, /no measurement window/],
     ["no primary source", { wrapProbe: editRestoreWatch((rs) => rs.map((r) => (r.type === "capture" ? { ...r, state: "failed" } : r))) }, /no primary capture source opened/],
-    ["no session seen", { wrapProbe: editRestoreWatch((rs) => rs.map((r) => (r.type === "summary" ? { ...r, sessions_seen: [] } : r))) }, /saw no session's marker/],
-    ["too few frames (a frozen screen writes none)", { wrapProbe: editRestoreWatch((rs) => { let n = 0; return rs.filter((r) => r.type !== "frame" || n++ < 5); }) }, /too few primary frames to judge \(session 0: 5; the check needs 10 each\)/],
+    [
+      "frames only in the watch's last second (too short a span to judge)",
+      { wrapProbe: editRestoreWatch((rs) => { const end = BigInt(rs.find((r) => r.type === "summary").t_end_ns); return rs.filter((r) => r.type !== "frame" || BigInt(r.t_ns) > end - 1_000_000_000n); }) },
+      /0 of the 1 session\(s\) the restored layout should show could be judged/,
+    ],
+    [
+      "every frame inside an operator_activity interval (none kept)",
+      {
+        wrapProbe: editRestoreWatch((rs) => {
+          const sum = rs.find((r) => r.type === "summary");
+          return [...rs, { type: "interval", index: 99, t_start_ns: rs.find((r) => r.type === "start").t0_ns, t_end_ns: String(BigInt(sum.t_end_ns) + 1n), valid: false, exclusion_class: "operator_activity" }];
+        }),
+      },
+      /0 of the 1 session\(s\) .*0: no kept frame/,
+    ],
     ["the restore threw", { zone: { throwOnRestore: "UI Bridge action failed: boom" } }, /UNKNOWN: UI Bridge action failed: boom/],
     [
       "the focus arm failed",
@@ -776,3 +796,84 @@ function freezeWindow(records, fromMs, toMs) {
     }) };
   });
 }
+
+test("a restored pane that came back blank is judged, not skipped: N = 2 (review r12 MF2)", async (t) => {
+  const clean = await restoreRun(t, { n: 2 });
+  assert.equal(check(clean.focus).state, "measured", JSON.stringify(check(clean.focus)));
+  assert.deepEqual(check(clean.focus).data.judged, [0, 1]);
+  assert.match(check(clean.focus).notes[0], /^restore check: observed, clean \(\d+ primary frame\(s\); 0: \d+ kept frame\(s\) at .*, 1: \d+ kept frame\(s\) at /);
+  // Session 1 absent from every frame and from sessions_seen.
+  const blank = await restoreRun(t, {
+    n: 2,
+    wrapProbe: editRestoreWatch((rs) =>
+      rs
+        .filter((r) => !(r.type === "first_seen" && r.session === 1))
+        .map((r) =>
+          r.type === "frame"
+            ? { ...r, markers: (r.markers ?? []).filter((m) => m.session !== 1) }
+            : r.type === "summary"
+              ? { ...r, sessions_seen: (r.sessions_seen ?? []).filter((k) => k !== 1) }
+              : r,
+        ),
+    ),
+  });
+  assert.ok(unknownIncident(blank.focus, /1 of the 2 session\(s\) the restored layout should show could be judged .*1: no kept frame/), JSON.stringify(blank.focus.incidents));
+  assert.equal(check(blank.focus).state, "unknown");
+});
+
+test("a restored pane that froze and then the screen sent no frame is not clean (review r12 MF1)", async (t) => {
+  const { focus } = await restoreRun(t, {
+    wrapProbe: editRestoreWatch((rs) => {
+      const s = stallSegment(rs);
+      const t0 = BigInt(s.find((r) => r.type === "start").t0_ns);
+      return s.filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= t0 + 600_000_000n);
+    }),
+  });
+  assert.equal(check(focus).data?.outcome, "not repainting", JSON.stringify(check(focus)));
+  const inc = focus.incidents.filter((i) => i.kind === "pane_stalled");
+  assert.equal(inc.length, 1);
+  assert.match(inc[0].detail, /then no frame for \d+ ms\) .*did not advance in any later frame: the restored pane did not repaint$/);
+});
+
+test("a signal before the restore check makes it UNKNOWN (review r12 SF7)", async (t) => {
+  const signals = new EventEmitter();
+  const logs = [];
+  const restores = [];
+  await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
+    adapterHook: (a) => {
+      realZoneView(a, { events: restores });
+      // Diagnostics run after each arm's measure phases; tiled measures first,
+      // so the second call is the focus arm's, just before its restore check.
+      let calls = 0;
+      a.diagnostics = async () => {
+        if (calls++ === 1) signals.emit("SIGINT", "SIGINT");
+        return {};
+      };
+    },
+    deps: { signals, log: (m) => logs.push(String(m)) },
+  });
+  assert.ok(logs.some((l) => /restore check UNKNOWN: the run was interrupted before it; this is not a clean result/.test(l)), logs.slice(-15).join("\n"));
+  assert.deepEqual(restores, [], "nothing was restored");
+});
+
+test("a clean restore verdict needs ten kept frames per session, reaching near the watch's end (review r12 MF1)", async (t) => {
+  // Seen 0-2.5 s of a 6 s watch, then frames without the marker: wide enough, but not near the end.
+  const early = await restoreRun(t, {
+    restoreCheckMs: 6000,
+    wrapProbe: editRestoreWatch((rs) => {
+      const t0 = BigInt(rs.find((r) => r.type === "start").t0_ns);
+      return rs.map((r) => (r.type === "frame" && BigInt(r.t_ns) > t0 + 2_500_000_000n ? { ...r, markers: [] } : r));
+    }),
+  });
+  assert.ok(unknownIncident(early.focus, /0 of the 1 session\(s\) the restored layout should show could be judged .*0: \d+ kept frame\(s\) at \+\d+\.\.\+2\d{3} ms\)/), JSON.stringify(early.focus.incidents));
+  assert.equal(check(early.focus).state, "unknown");
+  // One frame per half second over the whole watch: span and end are fine, eight frames are too few.
+  const sparse = await restoreRun(t, {
+    wrapProbe: editRestoreWatch((rs) => {
+      let k = 0;
+      return rs.filter((r) => r.type !== "frame" || k++ % 30 === 0);
+    }),
+  });
+  assert.ok(unknownIncident(sparse.focus, /0 of the 1 session\(s\) .*0: [1-9] kept frame\(s\)/), JSON.stringify(sparse.focus.incidents));
+});

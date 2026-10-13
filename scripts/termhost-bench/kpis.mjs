@@ -530,11 +530,12 @@ export const STALL_MIN_MS = 2000;
 export const STALL_MIN_EMITTED = 20;
 /**
  * A stretch of still marker (a "piece") ends where the session's marker was
- * absent from the primary frames for longer than this, measured from the FIRST
- * frame that lacked it to the next frame that shows it: frames kept arriving
- * without it (the pane was hidden, scrolled away or covered). The hidden time is
- * not counted toward a stall's duration. Pieces that show the same sequence on
- * either side of such a gap are still one stall (see {@link paneStalls}).
+ * absent from the kept primary frames for longer than this, measured from the
+ * FIRST frame that lacked it to the next frame that shows it: frames kept
+ * arriving without it (the pane was hidden, scrolled away or covered). The hidden
+ * time is not counted toward a stall's duration. Pieces that show the same
+ * sequence on either side of such a gap are still one stall (see
+ * {@link paneStalls}).
  *
  * Fixed rather than one marker period: at `marker_hz` 10 a period is 100 ms, less
  * than a partial (band) read takes to come round a 3x3 grid again, which would
@@ -552,7 +553,8 @@ export const STALL_EXCLUDING_CLASSES = Object.freeze(["occluded", "operator_acti
  * with an `exclusion_class`) excludes them for visibility (not foreground, not
  * visible, cloaked, minimized, occluded) or for operator activity (real or
  * foreign input). It reads that verdict rather than re-deriving it from the
- * counters.
+ * counters. Each span is half-open, `[a, b)`, like the probe's contiguous
+ * interval slices: a frame at an interval's end belongs to the next one.
  *
  * It deliberately differs from the probe's `span_valid`, which treats every
  * interval that is not positively valid as invalid. Here only the two classes
@@ -575,9 +577,24 @@ export function excludedSpans(seg) {
     if (r.valid !== false || !STALL_EXCLUDING_CLASSES.includes(r.exclusion_class)) continue;
     const a = toNs(r.t_start_ns);
     const b = toNs(r.t_end_ns);
-    if (a !== null && b !== null) out.push({ a, b, cls: r.exclusion_class });
+    if (a !== null && b !== null && b > a) out.push({ a, b, cls: r.exclusion_class });
   }
   return out;
+}
+
+/** Is `t` inside one of the half-open spans? */
+const inSpans = (spans, t) => spans.some((x) => t >= x.a && t < x.b);
+/** Does a span lie (even in part) strictly between two frames at `p` < `q`? */
+const spanBetween = (spans, p, q) => spans.some((x) => x.a < q && x.b > p);
+/** Nanoseconds of [p, q] not inside any span. */
+function unexcludedNs(spans, p, q) {
+  let ns = q - p;
+  for (const x of spans) {
+    const lo = x.a > p ? x.a : p;
+    const hi = x.b < q ? x.b : q;
+    if (hi > lo) ns -= hi - lo;
+  }
+  return ns > 0n ? ns : 0n;
 }
 
 /** Is marker seq `m` strictly after `s`, mod the marker counter? (A backwards or equal seq is not.) */
@@ -586,29 +603,73 @@ function seqAdvanced(m, s) {
 }
 
 /**
+ * The primary frames inside the window, and those of them KEPT by the stall rule
+ * (outside every {@link excludedSpans} span). Null without a primary source.
+ */
+export function stallFrames(seg, win) {
+  if (!seg || !win) return null;
+  const primary = captureInfo(seg).primary;
+  if (!primary) return null;
+  const spans = excludedSpans(seg);
+  const all = primaryFrames(seg, primary, win);
+  return { all, kept: all.filter((f) => !inSpans(spans, f.t)), spans };
+}
+
+/**
+ * How well the stall rule could see each session: its kept primary frames that
+ * show the session's output marker, and the first and last of them in ms from
+ * the window's start. A session the rule saw in few frames, over a short span, or
+ * not near the window's end, gives an empty stall list that proves nothing.
+ *
+ * @returns {Map<number, {frames: number, firstMs: number | null, lastMs: number | null}> | null}
+ */
+export function stallCoverage(seg, win, sessions) {
+  const sf = stallFrames(seg, win);
+  if (!sf) return null;
+  const out = new Map();
+  for (const k of sessions) {
+    const shown = sf.kept.filter((f) => (f.markers ?? []).some((m) => m.kind === "output" && m.session === k));
+    out.set(k, {
+      frames: shown.length,
+      firstMs: shown.length > 0 ? nsToMs(shown[0].t - win.t0) : null,
+      lastMs: shown.length > 0 ? nsToMs(shown.at(-1).t - win.t0) : null,
+    });
+  }
+  return out;
+}
+
+/**
  * Panes that did not repaint, per displayed session.
  *
- * The session's primary frames inside the window are cut into PIECES: stretches
- * that show one output-marker sequence, ended by a different sequence, by the
- * marker being hidden for over {@link STALL_HIDDEN_GAP_MS}, or by an interval the
- * probe excluded ({@link excludedSpans}; frames inside one are dropped). Pieces
- * that show the SAME sequence one after another, across a hidden stretch or an
- * excluded interval, form one STILL RUN: a frozen pane covered for a while and
- * shown again is still frozen. A still run's `ms` is the time it was SEEN (the
- * sum of its pieces' spans; hidden and excluded time are not counted) and
- * `emitted` the generator's output markers emitted within those pieces
- * ((first, last] frame of each). It qualifies at >= {@link STALL_MIN_MS} and
+ * The rule reads the KEPT primary frames inside the window ({@link stallFrames}:
+ * frames inside an excluded interval are dropped) and cuts them into PIECES:
+ * stretches that show one output-marker sequence, ended by a different sequence,
+ * by the marker being hidden for over {@link STALL_HIDDEN_GAP_MS}, or by an
+ * excluded interval lying between two kept frames (with or without frames in it).
+ * Pieces that show the SAME sequence one after another form one STILL RUN: a
+ * frozen pane covered for a while and shown again is still frozen.
+ *
+ * A run's `ms` is the time it was SEEN: the sum of its pieces' spans, plus — when
+ * its last frame is the last primary frame in the window, so no later frame
+ * contradicts it — the frameless stretch from there to the window's end
+ * (`framelessMs`; a frozen whole screen produces no frames). Hidden and excluded
+ * time are never counted. `emitted` counts the generator's output markers emitted
+ * within that same seen time ((first, last] of each piece, then the frameless
+ * stretch outside excluded spans). It qualifies at >= {@link STALL_MIN_MS} and
  * >= {@link STALL_MIN_EMITTED}.
  *
- * A qualifying run is `recovered` iff a LATER frame shows the session's marker
- * at a sequence after the run's (mod the counter); a backwards sequence is not
- * recovery. Per session the result holds:
- * - the WEDGE, `recovered: false`, if any (the longest): frozen for the whole
- *   soak, or from part-way to its end. Its marker KPIs are unknown(pane_stalled):
- *   measured from the live part, they would hide it;
+ * A qualifying run is `recovered` iff ANY later primary frame in the window —
+ * kept or inside an excluded interval, since a repaint proves itself whatever the
+ * interval — shows the session's marker at a sequence after the run's (mod the
+ * counter). Equal or backwards is not recovery. Otherwise the marker did not
+ * advance in any later frame: the run reached the window's end still, or the
+ * marker was never shown again. Per session the result holds:
+ * - that WEDGE, `recovered: false`, if any (the longest): its marker KPIs are
+ *   unknown(pane_stalled), since measured from the live part they would hide it;
  * - the longest HITCH, `recovered: true`, if any: the KPIs stay measured (a hitch
  *   is exactly what they must show) and it is reported beside them.
- * Entries are in time order (session, then start).
+ * Entries are in time order (session, then start). `lastShownMs` is when the
+ * run's sequence was last seen, in ms from the window's start.
  *
  * Neither the window-level hang rule (other content keeps producing frames) nor
  * marker loss (counted in refresh intervals, unknown on Xvfb) sees a wedge. Found
@@ -618,33 +679,34 @@ function seqAdvanced(m, s) {
  * The caller runs this only while clock.aligned is OPERATIVE: it compares the
  * generators' emission times with the probe's frame times.
  *
- * @returns {{session: number, seq: number, ms: number, frames: number, emitted: number, recovered: boolean}[]}
+ * @returns {{session: number, seq: number, ms: number, frames: number, emitted: number,
+ *   recovered: boolean, lastShownMs: number, framelessMs: number}[]}
  */
 export function paneStalls(seg, gens, win, visible) {
-  if (!seg || !win) return [];
-  const primary = captureInfo(seg).primary;
-  if (!primary) return [];
-  const excluded = excludedSpans(seg);
-  const inExcluded = (t) => excluded.some((x) => t >= x.a && t <= x.b);
-  const frames = primaryFrames(seg, primary, win);
+  const sf = stallFrames(seg, win);
+  if (!sf) return [];
+  const { all, kept, spans } = sf;
   const gapNs = BigInt(STALL_HIDDEN_GAP_MS) * NS_PER_MS;
+  const lastFrameT = all.length > 0 ? all.at(-1).t : null;
   const out = [];
   for (const session of [...visible].sort((a, b) => a - b)) {
     const emits = (gens?.get?.(session)?.markers ?? [])
       .filter((m) => m.kind === "output" && typeof m.tEmit === "bigint")
       .map((m) => m.tEmit);
+    const markerOf = (f) => (f.markers ?? []).find((x) => x.kind === "output" && x.session === session && Number.isInteger(x.seq));
     // Pieces: {seq, t0, t1, frames}, in time order.
     const pieces = [];
     let piece = null;
     let missingSince = null;
-    for (const f of frames) {
-      if (inExcluded(f.t)) {
+    let prevT = null;
+    for (const f of kept) {
+      if (prevT !== null && spanBetween(spans, prevT, f.t)) {
         piece = null;
         missingSince = null;
-        continue;
       }
-      const m = (f.markers ?? []).find((x) => x.kind === "output" && x.session === session);
-      if (!m || !Number.isInteger(m.seq)) {
+      prevT = f.t;
+      const m = markerOf(f);
+      if (!m) {
         missingSince ??= f.t;
         continue;
       }
@@ -667,12 +729,17 @@ export function paneStalls(seg, gens, win, visible) {
     }
     let wedge = null;
     let hitch = null;
-    runs.forEach((run, k) => {
-      const ns = run.pieces.reduce((acc, p) => acc + (p.t1 - p.t0), 0n);
+    for (const run of runs) {
+      const end = run.pieces.at(-1).t1;
+      // No later primary frame at all: the screen sent nothing more, nothing contradicts the still marker.
+      const frameless = end === lastFrameT ? unexcludedNs(spans, end, win.t1) : 0n;
+      const ns = run.pieces.reduce((acc, p) => acc + (p.t1 - p.t0), 0n) + frameless;
       const ms = Number(ns) / 1e6;
-      const emitted = emits.filter((t) => run.pieces.some((p) => t > p.t0 && t <= p.t1)).length;
-      if (ms < STALL_MIN_MS || emitted < STALL_MIN_EMITTED) return;
-      const recovered = runs.slice(k + 1).some((later) => seqAdvanced(later.seq, run.seq));
+      const emitted = emits.filter(
+        (t) => run.pieces.some((p) => t > p.t0 && t <= p.t1) || (frameless > 0n && t > end && t <= win.t1 && !inSpans(spans, t)),
+      ).length;
+      if (ms < STALL_MIN_MS || emitted < STALL_MIN_EMITTED) continue;
+      const recovered = all.some((f) => f.t > end && (f.markers ?? []).some((m) => m.kind === "output" && m.session === session && Number.isInteger(m.seq) && seqAdvanced(m.seq, run.seq)));
       const entry = {
         session,
         seq: run.seq,
@@ -680,24 +747,32 @@ export function paneStalls(seg, gens, win, visible) {
         frames: run.pieces.reduce((acc, p) => acc + p.frames, 0),
         emitted,
         recovered,
+        lastShownMs: Math.round(nsToMs(end - win.t0)),
+        framelessMs: Math.round(Number(frameless) / 1e6),
         rawMs: ms,
         start: run.pieces[0].t0,
       };
       if (!recovered) {
         if (!wedge || ms > wedge.rawMs) wedge = entry;
       } else if (!hitch || ms > hitch.rawMs) hitch = entry;
-    });
+    }
     const picked = [hitch, wedge].filter(Boolean).sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
     for (const { rawMs: _raw, start: _start, ...rest } of picked) out.push(rest);
   }
   return out;
 }
 
-/** "session S stayed at seq Q for D ms (F frame(s)) while its generator wrote M marker(s)[, then advanced again]" */
+/**
+ * What was observed: "session S stayed at seq Q for D ms (F frame(s), last shown
+ * at +L ms[, then no frame for X ms]) while its generator wrote M marker(s)", then
+ * ", then advanced again" or ", and did not advance in any later frame".
+ */
 export function describeStall(x) {
+  const frameless = x.framelessMs > 0 ? `, then no frame for ${x.framelessMs} ms` : "";
   return (
-    `session ${x.session} stayed at seq ${x.seq ?? "?"} for ${x.ms} ms (${x.frames} frame(s)) while its generator wrote ${x.emitted} marker(s)` +
-    (x.recovered ? ", then advanced again" : "")
+    `session ${x.session} stayed at seq ${x.seq ?? "?"} for ${x.ms} ms (${x.frames} frame(s), last shown at +${x.lastShownMs ?? "?"} ms${frameless}) ` +
+    `while its generator wrote ${x.emitted} marker(s)` +
+    (x.recovered ? ", then advanced again" : ", and did not advance in any later frame")
   );
 }
 
@@ -910,13 +985,13 @@ export function computeRowKpis(p) {
   const wedged = stalls.filter((x) => !x.recovered);
   if (wedged.length > 0) {
     const what = wedged.map(describeStall).join("; ");
-    notes.push(`pane stalled: ${what}`);
+    notes.push(`output_latency_ms: pane stalled: ${what}`);
     for (const id of STALL_VOIDED_KPIS) {
       const cur = kpis[id];
       if (cur.state === "measured" || cur.reason === "insufficient_samples") {
-        set(id, unknownKpi(id, "pane_stalled", { n: cur.n ?? 0, detail: `the pane stopped repainting: ${what}` }));
+        set(id, unknownKpi(id, "pane_stalled", { n: cur.n ?? 0, detail: `pane stalled: ${what}` }));
       } else {
-        notes.push(`${id}: the pane stopped repainting: ${what}`);
+        notes.push(`${id}: pane stalled: ${what}`);
       }
     }
   }
