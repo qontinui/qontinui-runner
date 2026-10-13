@@ -178,7 +178,9 @@ export function CommandPalette({
         });
       }
 
-      if (state === "completed" || state === "error") {
+      // Never offered for a remote tab: a restart would detach it and start a
+      // local shell in its place (`remoteParity.ts`, row `restart`).
+      if ((state === "completed" || state === "error") && tab?.remote == null) {
         list.push({
           id: `restart-${z}`,
           label: `Restart zone ${z + 1}: ${name}`,

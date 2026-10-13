@@ -68,6 +68,8 @@ export interface TransitionTab {
   id: string;
   title: string;
   exitCode?: number | null;
+  /** Present on a REMOTE tab (any non-nullish value). Only its presence is read. */
+  remote?: unknown;
 }
 
 export interface EvaluateTransitionsInput {
@@ -161,10 +163,15 @@ export function matchesApprovalPattern(
  * interactive shell — the alternative would be to never restart those, which
  * is the common case. A non-zero code is a failure the operator should see,
  * so it is deliberately NOT restarted; `error`-state panes are excluded by the
- * caller's state predicate for the same reason.
+ * caller's state predicate for the same reason. A remote tab is never eligible.
  */
 export function isRestartable(tab: TransitionTab | undefined): boolean {
   if (!tab) return false;
+  // Never a remote tab. A remote process that exits 0 leaves its ended tab in
+  // the zone with exit code 0 (`RemotePaneIo::wait` returns the target's
+  // code), which reads as a clean exit, and a restart would replace the remote
+  // tab with a LOCAL shell (`remoteParity.ts`, row `restart`).
+  if (tab.remote != null) return false;
   return tab.exitCode === 0 || tab.exitCode === null || tab.exitCode === undefined;
 }
 
