@@ -927,6 +927,19 @@ pub fn runner_restart_report_on_close(
     runner_restart_unreported_report(&rec, current_boot_ms)
 }
 
+/// `true` when a closed record carries a gate whose outcome something other
+/// than this record already owns. Either this process bound it, so its exit
+/// hook or reaper reports it, or D2's decision holds, so the close observer
+/// reported it or the process that bound it owned it. See
+/// [`SessionLifecycleStore::release_gate_identity`].
+fn gate_outcome_is_owned(rec: &TerminalSessionRecord, current_boot_ms: i64) -> bool {
+    if rec.gate_id.is_none() {
+        return false;
+    }
+    rec.gate_bound_boot_ms.is_some_and(|b| b >= current_boot_ms)
+        || runner_restart_unreported_report(rec, current_boot_ms).is_some()
+}
+
 /// See [`TerminalSessionRecord::spawn_device_default`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2285,6 +2298,62 @@ impl SessionLifecycleStore {
                 rec: Box::new(changed),
             }],
         );
+    }
+
+    /// Drop a CLOSED record's gate identity (`gate_id`,
+    /// `gate_consuming_device_id`, `gate_bound_boot_ms`) before an operator
+    /// resume reopens it, but ONLY when the gate's outcome is already owned
+    /// elsewhere.
+    ///
+    /// The fields are sticky in [`Self::record_open`], so a gate-less reopen
+    /// would otherwise keep them. A later non-restorable close of the reopened
+    /// row would then report `runner_restart` a second time for a gate that is
+    /// already settled.
+    ///
+    /// The gate is released only in two cases:
+    /// - it was bound by THIS process (`gate_bound_boot_ms >= current_boot_ms`),
+    ///   because this process's exit hook or reaper owns the outcome;
+    /// - [`runner_restart_unreported_report`] says `Some` for the closed row.
+    ///   That means either the close observer reported it, or the earlier
+    ///   process that bound it owned it. The observer's post is
+    ///   fire-and-forget, so releasing also gives up the accidental retry
+    ///   that a duplicate report would have been. That covers a dropped
+    ///   observer POST, and an earlier process that crashed between its own
+    ///   close and its exit-hook report. That trade-off is accepted.
+    ///
+    /// Every other gate is kept, and a missing boot stamp keeps it too. The
+    /// usual case is a prior-generation `poll-dead` close, which nothing has
+    /// reported yet. Keeping it lets D2 report it when the reopened row next
+    /// closes non-restorably. Because only an already-owned gate is ever
+    /// dropped, a spawn that fails after this call loses nothing.
+    ///
+    /// Returns `true` only when it removed something. An open, absent or
+    /// gate-less record, or one whose gate is still unreported, is left
+    /// untouched and nothing is written.
+    pub fn release_gate_identity(&self, claude_session_id: &str, current_boot_ms: i64) -> bool {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on release_gate_identity");
+                return false;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.state == "closed" && gate_outcome_is_owned(rec, current_boot_ms) => {
+                rec.gate_id = None;
+                rec.gate_consuming_device_id = None;
+                rec.gate_bound_boot_ms = None;
+                rec.clone()
+            }
+            _ => return false,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
     }
 
     /// Mark a session FINISHED, or unmark it — the WORK axis, orthogonal to
@@ -10083,6 +10152,75 @@ mod gate_continuation_tests {
         // Closed → nothing.
         s.record_close(&csid, "no-terminal");
         assert_eq!(s.adopt_restored_gate(&csid, 300), None);
+    }
+
+    /// The resume door's reopen is not a continuation. `release_gate_identity`
+    /// strips a closed record's gate only when its outcome is already owned.
+    /// A reported prior-generation gate is dropped, so a gate-less reopen is
+    /// not reported twice. An unreported one (`poll-dead`) is kept and is
+    /// still reported by D2. An open record is never touched.
+    #[test]
+    fn release_gate_identity_drops_only_an_owned_gate() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        // A prior-generation gate (bound at boot 100; this boot is 200).
+        s.record_open(gate_row(100));
+        s.mark_restore_pending(&csid);
+        // Open: a live continuation keeps its gate.
+        assert!(!s.release_gate_identity(&csid, 200));
+        // Closed non-restorably: D2 reported it, so it is released.
+        s.record_close(&csid, "no-terminal");
+        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), 200).is_some());
+        assert!(s.release_gate_identity(&csid, 200));
+        let after = s.get(&csid).unwrap();
+        assert_eq!(after.gate_id, None);
+        assert_eq!(after.gate_consuming_device_id, None);
+        assert_eq!(after.gate_bound_boot_ms, None);
+        assert!(!s.release_gate_identity(&csid, 200));
+        assert!(!s.release_gate_identity("absent", 200));
+        // The door's gate-less reopen. It sets no new restore marker, and
+        // production's follow-on adoption step is skipped here because the
+        // row's demoted `terminal-only` tier refuses it anyway. The sticky
+        // merge no longer carries the gate in.
+        s.record_open(old_row());
+        assert_eq!(s.get(&csid).unwrap().state, "open");
+        assert_eq!(s.get(&csid).unwrap().gate_id, None);
+        // And its next non-restorable close reports nothing a second time.
+        s.record_close(&csid, "no-terminal");
+        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), 200).is_none());
+
+        // A prior-generation `poll-dead` gate is UNREPORTED: kept.
+        let mut pd = gate_row(100);
+        pd.claude_session_id = "pd".to_string();
+        s.record_open(pd);
+        s.record_close("pd", "poll-dead");
+        assert!(!s.release_gate_identity("pd", 200));
+        assert_eq!(s.get("pd").unwrap().gate_id.as_deref(), Some(GATE));
+        // ...and after the door's gate-less reopen, D2 still reports it on the
+        // next non-restorable close.
+        let mut reopen = old_row();
+        reopen.claude_session_id = "pd".to_string();
+        s.record_open(reopen);
+        assert_eq!(s.get("pd").unwrap().gate_id.as_deref(), Some(GATE));
+        s.record_close("pd", "no-terminal");
+        assert!(runner_restart_unreported_report(&s.get("pd").unwrap(), 200).is_some());
+
+        // A gate bound by THIS process is owned by its exit hook: released
+        // whatever the close reason.
+        let mut own = gate_row(200);
+        own.claude_session_id = "own".to_string();
+        s.record_open(own);
+        s.record_close("own", "poll-dead");
+        assert!(s.release_gate_identity("own", 200));
+        assert_eq!(s.get("own").unwrap().gate_id, None);
+
+        // A missing boot stamp is UNKNOWN: kept.
+        let mut unstamped = gate_row(100);
+        unstamped.claude_session_id = "unstamped".to_string();
+        unstamped.gate_bound_boot_ms = None;
+        s.record_open(unstamped);
+        s.record_close("unstamped", "no-terminal");
+        assert!(!s.release_gate_identity("unstamped", 200));
     }
 
     /// Review of the rebase, item 2: a terminal-only restore of a gate record
