@@ -4,9 +4,9 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 178
-#   guarded: 23
-#   literal: 55
+# total: 182
+#   guarded: 25
+#   literal: 57
 #   registry: 43
 #   delegated: 9
 #   builtin: 15
@@ -57,6 +57,10 @@ src/components/settings/Settings.tsx:169	literal	component	reset	schema=no	arity
 src/components/settings/Settings.tsx:191	guarded	component	switch-tab	schema=yes	arity=-	effect=write
 src/components/settings/Settings.tsx:223	literal	component	list-tabs	schema=no	arity=0	effect=read
 src/components/terminal/CommandBar.selection.test.ts:39	fixture	free	-	schema=no	arity=0	effect=-
+src/components/terminal/SessionGroupSuggestionsDialog.tsx:111	literal	component	list-suggestions	schema=no	arity=0	effect=read
+src/components/terminal/SessionGroupSuggestionsDialog.tsx:126	guarded	component	accept-suggestion	schema=yes	arity=-	effect=write
+src/components/terminal/SessionGroupSuggestionsDialog.tsx:138	guarded	component	dismiss-suggestion	schema=yes	arity=-	effect=write
+src/components/terminal/SessionGroupSuggestionsDialog.tsx:150	literal	component	accept-all	schema=no	arity=0	effect=write
 src/components/terminal/TerminalBridgeProxies.tsx:227	literal	element	focus	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:249	literal	element	blur	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:269	guarded	element	sendKeys	schema=no	arity=-	effect=destructive
