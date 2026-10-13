@@ -116,84 +116,99 @@ async fn spawn_app() -> (u16, Seen) {
 /// A forward proxy on 127.0.0.1, set through `HTTP_PROXY`. It records the
 /// target authority and the `Authorization` of every request head it receives.
 /// - A request for `stand_in` is answered by the proxy itself, as a healthy app.
-/// - Any other loopback destination is spliced straight through, so a test
-///   running alongside, whose client was built while `HTTP_PROXY` pointed
-///   here, still reaches its own server.
+/// - Any other loopback destination is spliced straight through.
 /// - Anything else is refused with 502, so the proxy never dials off the
 ///   machine.
-async fn spawn_proxy(stand_in: String) -> (u16, Seen) {
+///
+/// `HTTP_PROXY` is process-global, so a test running alongside may build a
+/// client while it points here and keep using that client after this test
+/// ends. The proxy therefore runs on its own thread and runtime and lives for
+/// the rest of the test process, splicing that test's loopback traffic to its
+/// own server instead of resetting it.
+fn spawn_proxy(stand_in: String) -> (u16, Seen) {
     let seen: Seen = Arc::default();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
     let seen_by_proxy = seen.clone();
-    tokio::spawn(async move {
-        while let Ok((mut client, _)) = listener.accept().await {
-            let seen = seen_by_proxy.clone();
-            let stand_in = stand_in.clone();
-            tokio::spawn(async move {
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                while !head.ends_with(b"\r\n\r\n") {
-                    if client.read(&mut byte).await.unwrap_or(0) == 0 {
-                        return;
-                    }
-                    head.push(byte[0]);
-                }
-                let text = String::from_utf8_lossy(&head).into_owned();
-                let target = text
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .and_then(|uri| url::Url::parse(uri).ok());
-                let host = target
-                    .as_ref()
-                    .and_then(|t| t.host_str())
-                    .unwrap_or_default()
-                    .trim_matches(['[', ']'])
-                    .to_string();
-                let port = target
-                    .as_ref()
-                    .and_then(url::Url::port_or_known_default)
-                    .unwrap_or(80);
-                let authority = format!("{host}:{port}");
-                let authorization = text.lines().find_map(|line| {
-                    line.split_once(':')
-                        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
-                        .map(|(_, value)| value.trim().to_string())
-                });
-                seen.lock()
-                    .unwrap()
-                    .push((authority.clone(), authorization));
-                if authority == stand_in {
-                    let reply = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                         content-length: {}\r\nconnection: close\r\n\r\n{HEALTH}",
-                        HEALTH.len()
-                    );
-                    let _ = client.write_all(reply.as_bytes()).await;
-                    return;
-                }
-                let loopback = host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback());
-                if loopback {
-                    if let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await {
-                        if upstream.write_all(&head).await.is_ok() {
-                            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-                        }
-                        return;
-                    }
-                }
-                let _ = client
-                    .write_all(
-                        b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                    )
-                    .await;
-            });
-        }
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the proxy's own runtime");
+        runtime.block_on(proxy_loop(listener, stand_in, seen_by_proxy));
     });
     (port, seen)
+}
+
+/// [`spawn_proxy`]'s accept loop.
+async fn proxy_loop(listener: std::net::TcpListener, stand_in: String, seen: Seen) {
+    let listener = TcpListener::from_std(listener).expect("a non-blocking std listener");
+    while let Ok((mut client, _)) = listener.accept().await {
+        let seen = seen.clone();
+        let stand_in = stand_in.clone();
+        tokio::spawn(async move {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if client.read(&mut byte).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let target = text
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|uri| url::Url::parse(uri).ok());
+            let host = target
+                .as_ref()
+                .and_then(|t| t.host_str())
+                .unwrap_or_default()
+                .trim_matches(['[', ']'])
+                .to_string();
+            let port = target
+                .as_ref()
+                .and_then(url::Url::port_or_known_default)
+                .unwrap_or(80);
+            let authority = format!("{host}:{port}");
+            let authorization = text.lines().find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.trim().to_string())
+            });
+            seen.lock()
+                .unwrap()
+                .push((authority.clone(), authorization));
+            if authority == stand_in {
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{HEALTH}",
+                    HEALTH.len()
+                );
+                let _ = client.write_all(reply.as_bytes()).await;
+                return;
+            }
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback());
+            if loopback {
+                if let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await {
+                    if upstream.write_all(&head).await.is_ok() {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    }
+                    return;
+                }
+            }
+            let _ = client
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+        });
+    }
 }
 
 /// The `Authorization` of every request a recorder saw for `authority`.
@@ -241,7 +256,7 @@ async fn the_handshake_never_hands_the_stored_bearer_to_a_foreign_host() {
 #[tokio::test]
 async fn a_foreign_host_behind_a_proxy_never_receives_the_stored_bearer() {
     let _door = door();
-    let (proxy_port, seen) = spawn_proxy("foreign.invalid:80".to_string()).await;
+    let (proxy_port, seen) = spawn_proxy("foreign.invalid:80".to_string());
     let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
     std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"));
     let _ = connect_sdk_app(
@@ -277,7 +292,7 @@ async fn a_foreign_host_behind_a_proxy_never_receives_the_stored_bearer() {
 async fn a_configured_proxy_never_sees_a_loopback_connect() {
     let _door = door();
     let (app_port, app_seen) = spawn_app().await;
-    let (proxy_port, proxy_seen) = spawn_proxy(String::new()).await;
+    let (proxy_port, proxy_seen) = spawn_proxy(String::new());
     let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
     let relay = format!("127.0.0.1:{app_port}");
     std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"));
