@@ -17,6 +17,7 @@ import {
   PROBE_MECHANISMS,
   UNKNOWN,
   blockingMechanisms,
+  doctorNotes,
   doctorReport,
   mapDoctor,
   renderDoctor,
@@ -193,4 +194,19 @@ test("a D9 violation the probe's doctor recorded blocks the run; none recorded i
   assert.equal(empty["probe.foreground_safety"].state, OPERATIVE);
   const unanswered = mapDoctor({ ...facts, probeDoctor: { record: null, error: "no answer" } });
   assert.equal(unanswered["probe.foreground_safety"].state, UNKNOWN, "no record is never 'no violation'");
+});
+
+test("the probe doctor's notes are shown in the doctor report and never block a run, unlike its violations (Phase 2 doctor notes)", () => {
+  const facts = healthyFacts();
+  const note = "the foreground moved to a window this process did not create (before 0x10; after 0x30): recorded, not a violation";
+  const noted = { ...facts, probeDoctor: { ...facts.probeDoctor, record: { ...facts.probeDoctor.record, notes: [note] } } };
+  const m = mapDoctor(noted);
+  assert.deepEqual(blockingMechanisms(m), [], "a note blocks nothing");
+  assert.equal(m["probe.foreground_safety"].state, OPERATIVE);
+  assert.deepEqual(doctorNotes(noted), [note]);
+  const report = doctorReport(m, { environment: "linux-xvfb", checkedAt: "2026-10-13T00:00:00Z", notes: doctorNotes(noted) });
+  assert.deepEqual(report.notes, [note]);
+  assert.match(renderDoctor(report), /NOTES \(informational: not the probe's doing, and never a reason to block a run\):\n {2}the foreground moved to a window this process did not create/);
+  assert.deepEqual(doctorNotes(facts), [], "no notes recorded: none shown");
+  assert.doesNotMatch(renderDoctor(doctorReport(mapDoctor(facts), { environment: "linux-xvfb" })), /NOTES/);
 });

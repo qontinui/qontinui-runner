@@ -316,3 +316,15 @@ test("report --ab-baseline fails the gate on an unproven runner build at the gat
   assert.equal(await main([...gate, "--ab-baseline", "b".repeat(40)], io), 1);
   assert.match(err.join(""), /the build is unproven \(unknown_build\)/);
 });
+
+test("doctor --json carries the probe doctor's notes and still exits 0 (Phase 2 doctor notes)", async () => {
+  const facts = healthyFacts();
+  const note = "the foreground moved to a window this process did not create";
+  const out = [];
+  const code = await main(["doctor", "--env", "linux-xvfb", "--setups", "tmux", "--json"], { out: (x) => out.push(x), err: () => {} }, {
+    gatherDoctorFacts: async () => ({ ...facts, probeDoctor: { ...facts.probeDoctor, record: { ...facts.probeDoctor.record, notes: [note] } } }),
+    startEnvironment: async () => ({ env: {}, display: ":99", stop: async () => {} }),
+  });
+  assert.equal(code, 0, "a note never blocks");
+  assert.deepEqual(JSON.parse(out.join("")).notes, [note]);
+});

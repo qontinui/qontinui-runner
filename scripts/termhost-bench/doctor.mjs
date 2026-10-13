@@ -121,12 +121,26 @@ export function blockingMechanisms(mechanisms) {
 }
 
 /**
- * The doctor report (`--json`): capability-doctor's shape.
+ * The probe doctor's `notes`: observations that are NOT violations — a foreground
+ * change the probe did not cause (the operator switched windows while the doctor's
+ * probe was up). Informational: shown in the doctor report, never a verdict, and
+ * never a reason to block a run (unlike `violations`, probe.foreground_safety).
+ *
+ * @returns {string[]}
+ */
+export function doctorNotes(facts) {
+  const notes = facts?.probeDoctor?.record?.notes;
+  return Array.isArray(notes) ? notes.map(String) : [];
+}
+
+/**
+ * The doctor report (`--json`): capability-doctor's shape, plus the probe
+ * doctor's informational `notes`.
  *
  * @param {Record<string, {state: string, reason: string}>} mechanisms
- * @param {{environment: string, checkedAt?: string}} o
+ * @param {{environment: string, checkedAt?: string, notes?: string[]}} o
  */
-export function doctorReport(mechanisms, { environment, checkedAt = new Date().toISOString() }) {
+export function doctorReport(mechanisms, { environment, checkedAt = new Date().toISOString(), notes = [] }) {
   const list = Object.entries(mechanisms).map(([id, x]) => ({ id, state: x.state, reason: x.reason }));
   const count = (s) => list.filter((x) => x.state === s).length;
   return {
@@ -136,6 +150,7 @@ export function doctorReport(mechanisms, { environment, checkedAt = new Date().t
     environment,
     checked_at: checkedAt,
     mechanisms: list,
+    notes: [...notes],
     summary: { operative: count(OPERATIVE), degraded: count(DEGRADED), inoperative: count(INOPERATIVE), unknown: count(UNKNOWN) },
   };
 }
@@ -149,6 +164,10 @@ export function toCapabilities(mechanisms, checkedAt = new Date().toISOString())
 export function renderDoctor(report) {
   const lines = [`termhost-bench doctor: ${report.host} (${report.os}), environment ${report.environment}, at ${report.checked_at}`, "", "MECHANISMS:"];
   for (const m of report.mechanisms) lines.push(`  ${m.id.padEnd(22)} ${m.state.padEnd(28)} ${m.reason}`);
+  if ((report.notes ?? []).length > 0) {
+    lines.push("", "NOTES (informational: not the probe's doing, and never a reason to block a run):");
+    for (const n of report.notes) lines.push(`  ${n}`);
+  }
   const s = report.summary;
   lines.push("", `SUMMARY: ${s.inoperative} INOPERATIVE-ON-THIS-MACHINE, ${s.degraded} DEGRADED, ${s.operative} OPERATIVE, ${s.unknown} UNKNOWN (of ${report.mechanisms.length} mechanisms)`);
   return `${lines.join("\n")}\n`;

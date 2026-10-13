@@ -25,7 +25,7 @@ import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { compareBuilds, renderComparison } from "./compare.mjs";
-import { blockingMechanisms, doctorReport, gatherDoctorFacts, mapDoctor, renderDoctor } from "./doctor.mjs";
+import { blockingMechanisms, doctorNotes, doctorReport, gatherDoctorFacts, mapDoctor, renderDoctor } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
 import { ARMS, SETUP_IDS } from "./kpi-catalog.mjs";
 import { resolveProbeBinary } from "./probe.mjs";
@@ -307,7 +307,7 @@ async function cmdDoctor(flags, io, deps = {}) {
       display,
     });
     const mechanisms = mapDoctor(facts);
-    const report = doctorReport(mechanisms, { environment: env });
+    const report = doctorReport(mechanisms, { environment: env, notes: doctorNotes(facts) });
     io.out(flags.json ? `${JSON.stringify(report)}\n` : renderDoctor(report));
     const blocking = blockingMechanisms(mechanisms);
     if (blocking.length > 0) {

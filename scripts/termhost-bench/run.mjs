@@ -32,7 +32,7 @@ import { join } from "node:path";
 import { AdapterRefusal, createAdapter as defaultCreateAdapter } from "./adapters/index.mjs";
 import { isPortListening } from "./adapters/runner.mjs";
 import { PRIMARY_RUNNER_PORT } from "../lib/runner-clients.mjs";
-import { gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
+import { doctorNotes, gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
 import { allUnknown, computeRowKpis, indexGenerators, injectAbortReason } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
@@ -326,6 +326,8 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
       display: { started: true, detail: environment.display ?? "started" },
     });
     const mechanisms = mapDoctor(facts);
+    // Informational only: a foreground change the probe did not cause never blocks.
+    for (const n of doctorNotes(facts)) log(`doctor note (informational): ${n}`);
     const capabilities = toCapabilities(mechanisms, now().toISOString());
     const blocking = blockingMechanisms(mechanisms);
     if (blocking.length > 0) {
