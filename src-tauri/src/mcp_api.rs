@@ -5604,8 +5604,8 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` Phase 3) is the
 /// read-only twin of `GET /coord/fleet/dispatch-roles`: every machine of the
 /// caller's tenant with its dispatch role, the lane verdicts composing role and
-/// drain, and the role suggestion. That PR (head `9da84247`, OPEN as of
-/// 2026-10-08) grants it on coord's `READ_ONLY_TOOLS`, `MERGER_TOOLS` and
+/// drain, and the role suggestion. That PR (head `fbfc8adf4`, OPEN as of
+/// 2026-10-13) grants it on coord's `READ_ONLY_TOOLS`, `MERGER_TOOLS` and
 /// `DEVICE_DEFAULT_TOOLS` beside `coord_fleet_drain_status`, for the same
 /// reason: a session that cannot see a machine's role reads a bench or CI node
 /// as an idle workhorse. Its WRITE (`PUT /coord/fleet/dispatch-role`) is
