@@ -365,7 +365,8 @@ async fn spawn_member_terminal(
         }
         (LaunchFailure::LeaveForReclaim, Some(_)) => {
             warn!(run_id = %req.run_id, index = req.index, error = %err,
-                "fanout: a member's child was spawned and then killed — its worktree is \
+                "fanout: a member's child was (or may have been) spawned before the launch \
+                 failed — its worktree is \
                  left for the reclaim engine, not handed back");
         }
         (_, None) => {}

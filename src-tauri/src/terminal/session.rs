@@ -1603,7 +1603,7 @@ impl CreateError {
         }
     }
 
-    /// Whether a child process existed at any point.
+    /// Whether a child process existed, or may have existed, at any point.
     pub fn child_spawned(&self) -> bool {
         matches!(self, CreateError::ChildKilled(_))
     }
