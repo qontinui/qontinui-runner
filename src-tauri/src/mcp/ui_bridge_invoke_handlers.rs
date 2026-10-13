@@ -298,15 +298,26 @@ async fn in_process_get_access_token_for_websocket(
         .map(Value::String)
         .map_err(|e| {
             let e = e.to_string();
-            // The same expiry refusal `get_coord_device_token` answers 401 —
-            // carried inside `AppError::AuthError`'s Display, so matched by
-            // containment rather than prefix.
-            if e.contains(crate::commands::auth::DEVICE_TOKEN_EXPIRED) {
-                in_process_device_token_expired(COMMAND, &e)
-            } else {
-                in_process_command_failed(COMMAND, e)
+            match websocket_error_status(&e) {
+                StatusCode::UNAUTHORIZED => in_process_device_token_expired(COMMAND, &e),
+                _ => in_process_command_failed(COMMAND, e),
             }
         })
+}
+
+/// The HTTP status a `get_access_token_for_websocket` error maps to: the same
+/// expiry refusal `get_coord_device_token` answers 401, else the door's 500.
+///
+/// The refusal reaches this door wrapped in `AppError::AuthError`, whose
+/// Display prefixes `"Authentication error: "`, so the typed prefix is matched
+/// right after that wrapper (or bare), not anywhere in the text.
+fn websocket_error_status(err: &str) -> StatusCode {
+    let inner = err.strip_prefix("Authentication error: ").unwrap_or(err);
+    if inner.starts_with(crate::commands::auth::DEVICE_TOKEN_EXPIRED) {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 /// 401 for a mint door whose credential has EXPIRED (`DEVICE_TOKEN_EXPIRED`,
@@ -1453,6 +1464,44 @@ mod coord_device_token_arg_tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(!body.success);
         assert!(body.error.unwrap().contains(&err));
+    }
+
+    /// The websocket door's status, driven by the REAL refusal as the door
+    /// produces it — the guard's text wrapped in `AppError::AuthError` — so a
+    /// change to either the wrapper's Display or the prefix breaks this test
+    /// rather than silently demoting the door to 500.
+    #[test]
+    fn the_websocket_door_maps_the_real_expired_refusal_to_401() {
+        use axum::http::StatusCode;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let exp = chrono::Utc::now().timestamp() - 3_600;
+        let dead = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string())
+        );
+        let refusal = crate::commands::auth::refuse_expired_device_token(&dead, None, None)
+            .expect_err("a past-exp JWT is refused");
+        let wire = crate::error::AppError::AuthError(refusal).to_string();
+        assert_eq!(
+            super::websocket_error_status(&wire),
+            StatusCode::UNAUTHORIZED,
+            "{wire}"
+        );
+        // Every other door failure keeps its 500 — including one that merely
+        // MENTIONS the prefix mid-text.
+        for other in [
+            crate::error::AppError::AuthError("Not authenticated. Please log in first.".into())
+                .to_string(),
+            "store unreadable (DEVICE_TOKEN_EXPIRED unknown)".to_string(),
+            "Tier 0/1 runner".to_string(),
+        ] {
+            assert_eq!(
+                super::websocket_error_status(&other),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{other}"
+            );
+        }
     }
 
     #[test]
