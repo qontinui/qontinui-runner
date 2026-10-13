@@ -20,9 +20,9 @@
 //! - **Postamble** — inserted exactly at the attach-time end of the stream; the
 //!   state THERE: input modes (`?1`, `?1000`–`?1006`, `?2004`), keypad mode
 //!   (`DECKPAM` / `DECKPNM`), the kitty keyboard flag stack, and cursor
-//!   visibility (`?25`). After the tail, not before (shpool's order), because a
-//!   tail that begins mid-escape-sequence can garble mode state and the
-//!   postamble is what corrects it.
+//!   visibility (`?25`). After the tail, not before, because a tail that begins
+//!   mid-escape-sequence can garble mode state and the postamble is what
+//!   corrects it.
 //!
 //! Rules (D14 and Risk 8):
 //!
@@ -46,14 +46,32 @@
 //! # Offsets
 //!
 //! The tracker is fed every byte the ring is, in order, so its byte count is
-//! the ring's `end_offset`. Bytes are parsed ONE AT A TIME so every change is
-//! stamped with the exact absolute offset at which it takes effect (one past
-//! the byte that completed its sequence) — the preamble needs the state at an
-//! arbitrary offset inside the ring, and a change attributed to the end of the
-//! 16 KiB read that carried it would put a tail on the wrong buffer whenever a
-//! switch fell inside the read that also holds the tail's first byte. Screen
-//! and title changes are logged with their offsets back to the ring's start
-//! ([`ModeTracker::forget_before`]); older ones are folded into a base state.
+//! the ring's `end_offset`. Every screen or title change is stamped with the
+//! exact absolute offset at which it takes effect (one past the byte that
+//! completed its sequence): the preamble needs the state at an arbitrary
+//! offset inside the ring, and a change attributed to the end of the 16 KiB
+//! read that carried it would put a tail on the wrong buffer whenever a switch
+//! fell inside the read that also holds the tail's first byte. The parser runs
+//! over whole runs of bytes and stops right after such a change
+//! (`vte::Parser::advance_until_terminated`), so exactness costs nothing on
+//! the bytes in between. Screen and title changes are kept in two SEPARATE
+//! logs with their offsets back to the ring's start
+//! ([`ModeTracker::forget_before`]): titles churn (spinner titles), buffer
+//! switches are rare, and a shared bound would let title churn push a buffer
+//! switch that is still inside the ring out of the log.
+//!
+//! # Memory
+//!
+//! `vte` 0.15 with its default `std` feature buffers an OSC string in an
+//! UNBOUNDED `Vec` (its fixed-size `ArrayVec` buffer exists only without
+//! `std`, and cargo unifies features across the workspace, so this crate
+//! cannot opt out). A pane that opens an OSC and never terminates it
+//! (`printf '\e]0;'; yes`) would grow that buffer at PTY speed. So the tracker
+//! counts the bytes since the last byte that ends an OSC in `vte`
+//! (`BEL`, `CAN`, `SUB`, `ESC` — `vte` 0.15 does not end an OSC on the C1
+//! `ST`, 0x9C, so neither does this count) and, past
+//! [`MAX_UNTERMINATED_BYTES`], replaces the parser with a fresh one: the
+//! runaway OSC is dropped and parsing continues from the ground state.
 //!
 //! DATA-PATH module: `source_guard` bans text decoding here. Title and cwd are
 //! kept as BYTES; turning them into attach-reply strings is `metadata`'s job.
@@ -71,22 +89,35 @@ pub const POSTAMBLE_DEC_MODES: &[u16] = &[1, 1000, 1001, 1002, 1003, 1004, 1005,
 /// any of them reset returns to the primary one.
 pub const SCREEN_MODES: &[u16] = &[47, 1047, 1049];
 
-/// Kitty keyboard flag stack depth per screen (kitty's own bound): a push past
-/// it drops the oldest entry.
+/// Kitty keyboard flag stack depth per screen, base entry included — a bound
+/// of this tracker's choosing, so a hostile stream cannot grow the stack. A
+/// push past it drops the oldest PUSHED entry; the base is never dropped.
 pub const KITTY_STACK_MAX: usize = 8;
 
-/// Longest window title kept, in bytes; a longer one is cut at this length.
-/// `vte` already caps an OSC at 1 KiB, so this is a second fence, not the
-/// first.
+/// Longest window title kept, in bytes; a longer one is cut at the last whole
+/// UTF-8 character that fits.
 pub const MAX_TITLE_BYTES: usize = 1024;
 
-/// Most screen/title changes logged between the ring's start and its end. Past
-/// it the oldest are folded into the base early, which makes the preamble for a
-/// tail starting before the folded changes APPROXIMATE (it reads the base,
-/// which is newer than the tail's start). A pane switching buffers or titles
-/// more than this often per ring of output is not a pane anyone resumes from
-/// that far back; the bound keeps a hostile stream from growing the log.
-pub const MAX_PREAMBLE_LOG: usize = 4096;
+/// Bytes the parser may consume without seeing a byte that ends an OSC before
+/// it is replaced with a fresh one (see "Memory" in the module docs). Large
+/// enough for any real title or a percent-encoded `OSC 7` path; the parser's
+/// OSC buffer is bounded by this plus one feed slice ([`FEED_SLICE`]).
+pub const MAX_UNTERMINATED_BYTES: usize = 16 * 1024;
+
+/// The tracker parses its input in slices of at most this many bytes, so the
+/// unterminated-run check runs at least this often whatever one call feeds.
+pub const FEED_SLICE: usize = 4 * 1024;
+
+/// Most screen-buffer changes kept between the ring's start and its end. Past
+/// it the oldest fold into the base early, which makes the preamble for a tail
+/// starting before them approximate (it reads the base, which is newer). Real
+/// panes switch buffers a handful of times per session.
+pub const MAX_SCREEN_LOG: usize = 65_536;
+
+/// Most title changes kept between the ring's start and its end, with the
+/// same early folding as [`MAX_SCREEN_LOG`] — applied to the title only, never
+/// to the screen. At most [`MAX_TITLE_BYTES`] each, so at most 1 MiB.
+pub const MAX_TITLE_LOG: usize = 1024;
 
 /// Which buffer the pane is drawing on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,21 +138,7 @@ pub struct PreambleState {
     pub title: Option<Vec<u8>>,
 }
 
-/// One logged change to the preamble state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PreambleChange {
-    Screen(Screen),
-    Title(Vec<u8>),
-}
-
 impl PreambleState {
-    fn apply(&mut self, change: &PreambleChange) {
-        match change {
-            PreambleChange::Screen(s) => self.screen = *s,
-            PreambleChange::Title(t) => self.title = Some(t.clone()),
-        }
-    }
-
     /// The preamble bytes for this state: screen selection first, then the
     /// title. Empty when there is nothing to restore.
     pub fn bytes(&self) -> Vec<u8> {
@@ -135,6 +152,61 @@ impl PreambleState {
             out.push(0x07);
         }
         out
+    }
+}
+
+/// Values of one preamble field over stream offsets: a base (the value before
+/// the first logged change) and the changes, oldest first, each with the
+/// offset it takes effect at.
+#[derive(Debug)]
+struct ChangeLog<T> {
+    base: T,
+    changes: VecDeque<(u64, T)>,
+    cap: usize,
+}
+
+impl<T> ChangeLog<T> {
+    fn new(base: T, cap: usize) -> Self {
+        ChangeLog {
+            base,
+            changes: VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Record `value` from offset `at` on. A second change at the SAME offset
+    /// (two in one sequence) replaces the first in place.
+    fn push(&mut self, at: u64, value: T) {
+        match self.changes.back_mut() {
+            Some((last_at, last)) if *last_at == at => *last = value,
+            _ => self.changes.push_back((at, value)),
+        }
+        while self.changes.len() > self.cap {
+            self.fold_oldest();
+        }
+    }
+
+    fn fold_oldest(&mut self) {
+        if let Some((_, value)) = self.changes.pop_front() {
+            self.base = value;
+        }
+    }
+
+    /// Fold every change in effect at or before `offset` into the base.
+    fn forget_before(&mut self, offset: u64) {
+        while self.changes.front().is_some_and(|(at, _)| *at <= offset) {
+            self.fold_oldest();
+        }
+    }
+
+    /// The value in effect at `offset`: the last change at or before it, else
+    /// the base. Only that one value is touched.
+    fn at(&self, offset: u64) -> &T {
+        let after = self.changes.partition_point(|(at, _)| *at <= offset);
+        match after.checked_sub(1).and_then(|i| self.changes.get(i)) {
+            Some((_, value)) => value,
+            None => &self.base,
+        }
     }
 }
 
@@ -159,7 +231,8 @@ impl Default for KittyStack {
 impl KittyStack {
     fn push(&mut self, flags: u32) {
         if self.entries.len() >= KITTY_STACK_MAX {
-            self.entries.remove(0);
+            // The oldest PUSHED entry; index 0 is the base.
+            self.entries.remove(1);
         }
         self.entries.push(flags);
         self.touched = true;
@@ -217,14 +290,15 @@ struct Modes {
     keypad: Option<(bool, u64)>,
     /// Kitty stacks: [primary, alternate].
     kitty: [KittyStack; 2],
-    preamble: PreambleState,
+    screen: Screen,
+    title: Option<Vec<u8>>,
     /// The last `OSC 7` working directory, percent-decoded path bytes.
     cwd: Option<Vec<u8>>,
 }
 
 impl Modes {
     fn kitty_mut(&mut self) -> &mut KittyStack {
-        let i = usize::from(self.preamble.screen != Screen::Primary);
+        let i = usize::from(self.screen != Screen::Primary);
         &mut self.kitty[i]
     }
 
@@ -243,10 +317,17 @@ impl Modes {
         }
         changes.sort_by_key(|(seq, _)| *seq);
         let mut out: Vec<u8> = changes.into_iter().flat_map(|(_, b)| b).collect();
-        let i = usize::from(self.preamble.screen != Screen::Primary);
+        let i = usize::from(self.screen != Screen::Primary);
         self.kitty[i].restore_bytes(&mut out);
         out
     }
+}
+
+/// A screen or title change seen by the performer, waiting for its offset.
+#[derive(Debug)]
+enum PendingChange {
+    Screen(Screen),
+    Title(Vec<u8>),
 }
 
 /// See the module docs.
@@ -257,19 +338,21 @@ pub struct ModeTracker {
     fed: u64,
     /// Monotonic change counter for last-change ordering.
     seq: u64,
-    /// The preamble state at `base_at`.
-    base: PreambleState,
-    base_at: u64,
-    /// Screen/title changes after `base_at`: (offset they take effect at, change).
-    log: VecDeque<(u64, PreambleChange)>,
+    /// Bytes parsed since the last byte that ends an OSC (see "Memory").
+    unterminated: usize,
+    /// How often the parser was replaced for a runaway OSC.
+    parser_resets: u64,
+    screens: ChangeLog<Screen>,
+    titles: ChangeLog<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for ModeTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModeTracker")
             .field("fed", &self.fed)
-            .field("base_at", &self.base_at)
-            .field("log_len", &self.log.len())
+            .field("screen_changes", &self.screens.changes.len())
+            .field("title_changes", &self.titles.changes.len())
+            .field("parser_resets", &self.parser_resets)
             .finish_non_exhaustive()
     }
 }
@@ -292,6 +375,11 @@ pub struct Envelope {
     pub postamble_at: u64,
 }
 
+/// Whether `b` ends an OSC string in `vte` 0.15 (`advance_osc_string`).
+fn ends_osc(b: u8) -> bool {
+    matches!(b, 0x07 | 0x18 | 0x1a | 0x1b)
+}
+
 impl ModeTracker {
     pub fn new() -> Self {
         ModeTracker {
@@ -299,35 +387,57 @@ impl ModeTracker {
             modes: Modes::default(),
             fed: 0,
             seq: 0,
-            base: PreambleState::default(),
-            base_at: 0,
-            log: VecDeque::new(),
+            unterminated: 0,
+            parser_resets: 0,
+            screens: ChangeLog::new(Screen::Primary, MAX_SCREEN_LOG),
+            titles: ChangeLog::new(None, MAX_TITLE_LOG),
         }
     }
 
     /// Parse `bytes`, which follow everything fed so far.
     pub fn feed(&mut self, bytes: &[u8]) {
-        let ModeTracker {
-            parser,
-            modes,
-            fed,
-            seq,
-            log,
-            ..
-        } = self;
-        let mut perf = Recorder {
-            modes,
-            seq,
-            log,
-            at: 0,
-        };
-        for b in bytes {
-            *fed += 1;
-            perf.at = *fed;
-            parser.advance(&mut perf, std::slice::from_ref(b));
+        for slice in bytes.chunks(FEED_SLICE) {
+            self.feed_slice(slice);
+            self.unterminated = match slice.iter().rposition(|&b| ends_osc(b)) {
+                Some(i) => slice.len() - i - 1,
+                None => self.unterminated.saturating_add(slice.len()),
+            };
+            if self.unterminated > MAX_UNTERMINATED_BYTES {
+                // A runaway OSC (or a long run of plain text, for which a
+                // fresh ground-state parser changes nothing): drop whatever
+                // the parser is buffering.
+                self.parser = vte::Parser::new();
+                self.unterminated = 0;
+                self.parser_resets += 1;
+            }
         }
-        while self.log.len() > MAX_PREAMBLE_LOG {
-            self.fold_oldest();
+    }
+
+    /// Parse one slice, stopping after every byte that completed a screen or
+    /// title change so it can be stamped with its exact offset.
+    fn feed_slice(&mut self, mut bytes: &[u8]) {
+        let mut pending = Vec::new();
+        while !bytes.is_empty() {
+            let mut perf = Recorder {
+                modes: &mut self.modes,
+                seq: &mut self.seq,
+                pending: &mut pending,
+            };
+            let n = self
+                .parser
+                .advance_until_terminated(&mut perf, bytes)
+                .min(bytes.len());
+            self.fed += n as u64;
+            for change in pending.drain(..) {
+                match change {
+                    PendingChange::Screen(s) => self.screens.push(self.fed, s),
+                    PendingChange::Title(t) => self.titles.push(self.fed, Some(t)),
+                }
+            }
+            if n == 0 {
+                break;
+            }
+            bytes = &bytes[n..];
         }
     }
 
@@ -336,37 +446,28 @@ impl ModeTracker {
         self.fed
     }
 
-    fn fold_oldest(&mut self) {
-        if let Some((at, change)) = self.log.pop_front() {
-            self.base.apply(&change);
-            self.base_at = at;
-        }
+    /// How often a runaway OSC made the tracker replace its parser.
+    pub fn parser_resets(&self) -> u64 {
+        self.parser_resets
     }
 
     /// Fold every change that takes effect at or before `offset` into the
-    /// base. Called with the ring's start offset after each push: no tail can
+    /// bases. Called with the ring's start offset after each push: no tail can
     /// begin before it.
     pub fn forget_before(&mut self, offset: u64) {
-        while self.log.front().is_some_and(|(at, _)| *at <= offset) {
-            self.fold_oldest();
-        }
-        if offset > self.base_at {
-            self.base_at = offset.min(self.fed);
-        }
+        let offset = offset.min(self.fed);
+        self.screens.forget_before(offset);
+        self.titles.forget_before(offset);
     }
 
     /// The preamble state for a tail whose first byte is at absolute `offset`:
-    /// every change that took effect at or before it. An offset older than the
-    /// base (see [`MAX_PREAMBLE_LOG`]) reads the base.
+    /// the screen and the title in effect there. An offset older than a log's
+    /// base (see [`MAX_SCREEN_LOG`], [`MAX_TITLE_LOG`]) reads that base.
     pub fn preamble_state_at(&self, offset: u64) -> PreambleState {
-        let mut st = self.base.clone();
-        for (at, change) in &self.log {
-            if *at > offset {
-                break;
-            }
-            st.apply(change);
+        PreambleState {
+            screen: *self.screens.at(offset),
+            title: self.titles.at(offset).clone(),
         }
-        st
     }
 
     /// The postamble for the newest state (the stream position [`Self::fed`]).
@@ -387,7 +488,7 @@ impl ModeTracker {
 
     /// The newest title (raw bytes, control bytes removed).
     pub fn title(&self) -> Option<&[u8]> {
-        self.modes.preamble.title.as_deref()
+        self.modes.title.as_deref()
     }
 
     /// The newest `OSC 7` working directory (percent-decoded path bytes).
@@ -396,13 +497,13 @@ impl ModeTracker {
     }
 }
 
-/// The `vte` performer: records changes, stamped with `at`.
+/// The `vte` performer. Postamble state changes in place; a screen or title
+/// change is also queued for its offset and STOPS the parse right after the
+/// byte that completed it (`terminated`).
 struct Recorder<'a> {
     modes: &'a mut Modes,
     seq: &'a mut u64,
-    log: &'a mut VecDeque<(u64, PreambleChange)>,
-    /// The offset the current byte's changes take effect at.
-    at: u64,
+    pending: &'a mut Vec<PendingChange>,
 }
 
 impl Recorder<'_> {
@@ -411,9 +512,9 @@ impl Recorder<'_> {
         *self.seq
     }
 
-    fn change_preamble(&mut self, change: PreambleChange) {
-        self.modes.preamble.apply(&change);
-        self.log.push_back((self.at, change));
+    fn change_screen(&mut self, screen: Screen) {
+        self.modes.screen = screen;
+        self.pending.push(PendingChange::Screen(screen));
     }
 
     fn set_dec(&mut self, mode: u16, set: bool) {
@@ -423,8 +524,8 @@ impl Recorder<'_> {
             } else {
                 Screen::Primary
             };
-            if screen != self.modes.preamble.screen {
-                self.change_preamble(PreambleChange::Screen(screen));
+            if screen != self.modes.screen {
+                self.change_screen(screen);
             }
         } else if POSTAMBLE_DEC_MODES.contains(&mode) {
             let seq = self.next_seq();
@@ -439,8 +540,8 @@ impl Recorder<'_> {
         self.modes.dec.clear();
         self.modes.keypad = None;
         self.modes.kitty = Default::default();
-        if self.modes.preamble.screen != Screen::Primary {
-            self.change_preamble(PreambleChange::Screen(Screen::Primary));
+        if self.modes.screen != Screen::Primary {
+            self.change_screen(Screen::Primary);
         }
     }
 
@@ -455,6 +556,13 @@ impl Recorder<'_> {
 }
 
 /// Join an OSC's parameters after the first with the `;` that `vte` split on.
+///
+/// `vte` 0.15 keeps at most 16 OSC parameters (`MAX_OSC_PARAMS`) and drops
+/// everything after the 16th `;`. A title is parameters 1.. of `OSC 2`, so a
+/// title containing 15 or more `;` reaches this function cut at its 15th, and
+/// nothing after that cut is recoverable from `vte`'s dispatch. A limit
+/// accepted rather than worked around: it costs only the tail of an absurd
+/// title.
 fn osc_payload(params: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     for (i, p) in params.iter().skip(1).enumerate() {
@@ -510,7 +618,25 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
+/// Cut `bytes` to at most `max`, never inside a UTF-8 sequence: when the
+/// first byte cut off is a continuation byte (0x80–0xBF), the cut moves back
+/// to the start of its character. Byte arithmetic only — no decoding.
+fn truncate_at_char_boundary(bytes: &mut Vec<u8>, max: usize) {
+    if bytes.len() <= max {
+        return;
+    }
+    let mut cut = max;
+    while cut > 0 && bytes.get(cut).is_some_and(|b| (0x80..=0xbf).contains(b)) {
+        cut -= 1;
+    }
+    bytes.truncate(cut);
+}
+
 impl vte::Perform for Recorder<'_> {
+    fn terminated(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
@@ -576,9 +702,10 @@ impl vte::Perform for Recorder<'_> {
                     .into_iter()
                     .filter(|&b| b >= 0x20 && b != 0x7f)
                     .collect();
-                title.truncate(MAX_TITLE_BYTES);
-                if self.modes.preamble.title.as_deref() != Some(&title[..]) {
-                    self.change_preamble(PreambleChange::Title(title));
+                truncate_at_char_boundary(&mut title, MAX_TITLE_BYTES);
+                if self.modes.title.as_deref() != Some(&title[..]) {
+                    self.modes.title = Some(title.clone());
+                    self.pending.push(PendingChange::Title(title));
                 }
             }
             Some(&b"7") if params.len() >= 2 => {
@@ -763,17 +890,107 @@ mod tests {
         assert_eq!(t.postamble(), b"\x1b[?2004h".to_vec());
     }
 
-    /// The log is bounded.
+    /// The title log is bounded, and the newest title still wins.
     #[test]
-    fn pty_holder_attach_preamble_log_is_bounded() {
+    fn pty_holder_attach_title_log_is_bounded() {
         let mut t = ModeTracker::new();
-        for i in 0..(MAX_PREAMBLE_LOG + 100) {
+        for i in 0..(MAX_TITLE_LOG + 100) {
             t.feed(format!("\x1b]2;{i}\x07").as_bytes());
         }
-        assert!(t.log.len() <= MAX_PREAMBLE_LOG);
+        assert!(t.titles.changes.len() <= MAX_TITLE_LOG);
         assert_eq!(
             t.preamble_state_at(t.fed()).title,
-            Some(format!("{}", MAX_PREAMBLE_LOG + 99).into_bytes())
+            Some(format!("{}", MAX_TITLE_LOG + 99).into_bytes())
         );
+    }
+
+    /// Review defect 4: title churn (a spinner title) must never push an
+    /// in-ring buffer switch out of reach — screens and titles are separate
+    /// logs. With one shared log, 3× its bound of titles folded the `?1049h`
+    /// into the base and the offset before it read as the alternate screen.
+    #[test]
+    fn pty_holder_attach_title_churn_keeps_an_in_ring_screen_switch() {
+        let mut t = ModeTracker::new();
+        t.feed(b"aaaa\x1b[?1049h");
+        let entered_at = t.fed();
+        for i in 0..(MAX_TITLE_LOG * 3) {
+            t.feed(format!("\x1b]2;spin {i}\x07").as_bytes());
+        }
+        assert_eq!(t.preamble_state_at(entered_at - 1).screen, Screen::Primary);
+        assert_eq!(
+            t.preamble_state_at(entered_at).screen,
+            Screen::Alternate(1049)
+        );
+        assert_eq!(t.preamble_state_at(t.fed()).screen, Screen::Alternate(1049));
+    }
+
+    /// Review defect 1: an OSC that is never terminated does not grow the
+    /// parser without bound. `vte`'s OSC buffer itself is private, so the test
+    /// pins the mechanism that bounds it: across 8 MiB of unterminated OSC the
+    /// run counter never exceeds its limit by more than one feed slice, the
+    /// parser is replaced again and again, and the tracker recovers — a later
+    /// `?2004h` is still tracked and no title was invented from the junk.
+    #[test]
+    fn pty_holder_attach_unterminated_osc_is_bounded() {
+        let mut t = ModeTracker::new();
+        t.feed(b"\x1b]0;");
+        let junk = b"y\n".repeat(64 * 1024);
+        for _ in 0..64 {
+            t.feed(&junk);
+            assert!(t.unterminated <= MAX_UNTERMINATED_BYTES + FEED_SLICE);
+        }
+        assert!(
+            t.parser_resets() >= (8 * 1024 * 1024 / (MAX_UNTERMINATED_BYTES + FEED_SLICE)) as u64,
+            "resets: {}",
+            t.parser_resets()
+        );
+        t.feed(b"\x07\x1b[?2004h");
+        assert_eq!(t.postamble(), b"\x1b[?2004h".to_vec());
+        assert_eq!(t.title(), None);
+        // An ordinary title shorter than the bound is untouched by the check.
+        let long = "t".repeat(MAX_TITLE_BYTES);
+        t.feed(format!("\x1b]2;{long}\x07").as_bytes());
+        assert_eq!(t.title(), Some(long.as_bytes()));
+    }
+
+    /// Nit: a title cut at [`MAX_TITLE_BYTES`] never ends inside a UTF-8
+    /// character.
+    #[test]
+    fn pty_holder_attach_title_truncation_keeps_whole_characters() {
+        let mut title = "a".repeat(MAX_TITLE_BYTES - 1).into_bytes();
+        title.extend_from_slice("\u{e9}tail".as_bytes());
+        let mut stream = b"\x1b]2;".to_vec();
+        stream.extend_from_slice(&title);
+        stream.push(0x07);
+        let t = fed(&stream);
+        assert_eq!(t.title(), Some("a".repeat(MAX_TITLE_BYTES - 1).as_bytes()));
+        let mut b = "\u{2733}\u{2733}".as_bytes().to_vec();
+        truncate_at_char_boundary(&mut b, 4);
+        assert_eq!(b, "\u{2733}".as_bytes());
+    }
+
+    /// Nit: a push at the stack bound drops the oldest PUSHED entry, never the
+    /// base.
+    #[test]
+    fn pty_holder_attach_kitty_stack_bound_keeps_the_base() {
+        let mut stream = b"\x1b[=5u".to_vec();
+        for f in 1..=9 {
+            stream.extend_from_slice(format!("\x1b[>{f}u").as_bytes());
+        }
+        let t = fed(&stream);
+        let mut want = b"\x1b[<8u\x1b[=5;1u".to_vec();
+        for f in 3..=9 {
+            want.extend_from_slice(format!("\x1b[>{f}u").as_bytes());
+        }
+        assert_eq!(t.postamble(), want);
+    }
+
+    /// The `vte` OSC parameter limit, documented on `osc_payload`: a title with
+    /// 15 or more `;` is cut at its 15th.
+    #[test]
+    fn pty_holder_attach_title_semicolon_limit_matches_vte() {
+        let parts: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
+        let t = fed(format!("\x1b]2;{}\x07", parts.join(";")).as_bytes());
+        assert_eq!(t.title(), Some(parts[..15].join(";").as_bytes()));
     }
 }

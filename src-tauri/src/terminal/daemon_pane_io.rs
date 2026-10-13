@@ -95,6 +95,7 @@ use qontinui_pty_holder::client::{
     connect, probe, ConnectError, Event, InputStream, Probe, ShutdownHandle, StreamReader,
     StreamWriter,
 };
+use qontinui_pty_holder::frame::SyntheticPart;
 use qontinui_pty_holder::protocol::{ExitReply, Reply, Request, RestoreMeta};
 use qontinui_pty_holder::terminate::{terminate_verified_holder, Termination};
 use qontinui_runner_lib::pty_holder::spawn::{
@@ -191,8 +192,8 @@ pub const KILL_SETTLE_MAX: Duration = Duration::from_secs(
 pub const DROP_KILL_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long after the oversize step of a reattach's size nudge the true size
-/// follows (shpool's `REATTACH_RESIZE_DELAY`): long enough that the child sees
-/// two size changes rather than one coalesced no-op.
+/// follows: long enough that the child is sent two size changes rather than
+/// one coalesced no-op.
 pub const NUDGE_DELAY: Duration = Duration::from_millis(50);
 
 /// The oversize step of a size nudge: one more row and column, or one fewer
@@ -912,6 +913,47 @@ struct PumpCtx {
     cols: Arc<AtomicU16>,
     rows: Arc<AtomicU16>,
     paused: Arc<AtomicBool>,
+    /// `Some` when the first attach asked for the restore envelope and the
+    /// holder answered it; the pump carries it across reattaches.
+    restore: Option<RestoreProgress>,
+}
+
+/// Where a restoring attach's envelope stands (plan D14).
+///
+/// The postamble is the holder's PER-CONNECTION state: a connection that drops
+/// before the stream reaches its anchor takes it along. So while one is owed
+/// the pump reattaches WITH a restore — the new connection's postamble then
+/// describes the newer end, which is still right for this consumer. That
+/// attach's preamble, though, is shown only if this pane has displayed nothing
+/// of the first one's yet: re-applying a `?1049h` would clear an alternate
+/// screen that already holds the tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoreProgress {
+    postamble_owed: bool,
+    /// Neither a preamble nor any output delivered yet.
+    awaiting_preamble: bool,
+}
+
+impl RestoreProgress {
+    fn new() -> Self {
+        RestoreProgress {
+            postamble_owed: true,
+            awaiting_preamble: true,
+        }
+    }
+
+    /// Whether a preamble that just arrived is the one this consumer needs.
+    fn take_preamble(&mut self) -> bool {
+        std::mem::replace(&mut self.awaiting_preamble, false)
+    }
+
+    fn saw_output(&mut self) {
+        self.awaiting_preamble = false;
+    }
+
+    fn saw_postamble(&mut self) {
+        self.postamble_owed = false;
+    }
 }
 
 /// How the pump's connection ended.
@@ -1089,6 +1131,7 @@ impl DaemonPaneIo {
             cols: cols.clone(),
             rows: rows.clone(),
             paused: paused.clone(),
+            restore: (restore_at.is_some() && info.restore.is_some()).then(RestoreProgress::new),
         };
         if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-holder-pump-{}", ctx.key))
@@ -1318,31 +1361,15 @@ impl PumpCtx {
     fn pump(self, mut reader: StreamReader) {
         let mut outage: Option<Outage> = None;
         let mut attached_at = Instant::now();
+        let mut restore = self.restore;
         loop {
             let ended = loop {
                 match reader.next_event(None) {
-                    Ok(Some(Event::Output { offset, bytes })) => {
-                        self.out.splice(offset, &bytes);
+                    Ok(Some(event)) => {
+                        if self.on_event(event, &mut restore) {
+                            return;
+                        }
                     }
-                    Ok(Some(Event::Lost {
-                        from_offset,
-                        to_offset,
-                    })) => self.out.note_lost(from_offset, to_offset),
-                    // The restore envelope (asked for only by a fresh
-                    // consumer's attach): displayed, never counted — the
-                    // stream offset stays the holder's (plan D14).
-                    Ok(Some(Event::Synthetic { bytes, .. })) => self.out.push_local(&bytes),
-                    Ok(Some(Event::Exit(exit))) => {
-                        info!(pane = %self.key, holder_pid = self.holder_pid, child_pid = self.child_pid, ?exit, "pty holder: pane process exited");
-                        self.out.settle(exit_result(exit));
-                        self.control.close();
-                        self.conn.close();
-                        return;
-                    }
-                    Ok(Some(Event::Reply(Reply::Rejected { reason, detail }))) => {
-                        warn!(pane = %self.key, ?reason, %detail, "pty holder: request rejected; the holder closes this connection");
-                    }
-                    Ok(Some(Event::Reply(_))) => {}
                     Ok(None) => break "end of stream".to_string(),
                     Err(e) => break e.to_string(),
                 }
@@ -1352,7 +1379,7 @@ impl PumpCtx {
                 outage = None;
             }
             let current = outage.get_or_insert_with(Outage::new);
-            match self.reconnect(&ended, current) {
+            match self.reconnect(&ended, current, &mut restore) {
                 Reconnect::Again(r) => {
                     reader = r;
                     attached_at = Instant::now();
@@ -1365,6 +1392,54 @@ impl PumpCtx {
         }
     }
 
+    /// One holder event into the pane. `true` when the pane has settled and
+    /// the pump is done.
+    fn on_event(&self, event: Event, restore: &mut Option<RestoreProgress>) -> bool {
+        match event {
+            Event::Output { offset, bytes } => {
+                if let Some(r) = restore.as_mut() {
+                    r.saw_output();
+                }
+                self.out.splice(offset, &bytes);
+            }
+            Event::Lost {
+                from_offset,
+                to_offset,
+            } => self.out.note_lost(from_offset, to_offset),
+            // The restore envelope: displayed, never counted — the stream
+            // offset stays the holder's (plan D14).
+            Event::Synthetic { part, bytes, .. } => {
+                let show = match (part, restore.as_mut()) {
+                    (SyntheticPart::Preamble, Some(r)) => r.take_preamble(),
+                    (SyntheticPart::Postamble, Some(r)) => {
+                        r.saw_postamble();
+                        true
+                    }
+                    // The client refuses synthetic frames on a connection
+                    // that did not ask; a restoring one always has progress.
+                    (_, None) => false,
+                };
+                if show {
+                    self.out.push_local(&bytes);
+                } else {
+                    debug!(pane = %self.key, ?part, "pty holder: a reattach's preamble dropped — this pane already shows the first one's");
+                }
+            }
+            Event::Exit(exit) => {
+                info!(pane = %self.key, holder_pid = self.holder_pid, child_pid = self.child_pid, ?exit, "pty holder: pane process exited");
+                self.out.settle(exit_result(exit));
+                self.control.close();
+                self.conn.close();
+                return true;
+            }
+            Event::Reply(Reply::Rejected { reason, detail }) => {
+                warn!(pane = %self.key, ?reason, %detail, "pty holder: request rejected; the holder closes this connection");
+            }
+            Event::Reply(_) => {}
+        }
+        false
+    }
+
     fn done(&self) -> bool {
         self.detached.load(Ordering::Acquire) || self.out.is_finished()
     }
@@ -1372,7 +1447,12 @@ impl PumpCtx {
     /// The connection ended with no `exit`. Decide from the holder's own
     /// liveness — the answered handshake and the lock (`client::probe`) —
     /// never from the closed socket alone.
-    fn reconnect(&self, ended: &str, outage: &mut Outage) -> Reconnect {
+    fn reconnect(
+        &self,
+        ended: &str,
+        outage: &mut Outage,
+        restore: &mut Option<RestoreProgress>,
+    ) -> Reconnect {
         let mut last = String::new();
         loop {
             let pause = outage.backoff();
@@ -1391,10 +1471,22 @@ impl PumpCtx {
                 Probe::Healthy { .. } => {
                     let deadline = Instant::now() + ATTACH_DEADLINE;
                     let from = self.out.offset();
-                    match connect(&self.pane_dir, &self.pane_id, deadline)
-                        .and_then(|c| c.attach(Some(from), deadline))
-                    {
+                    let restoring = restore.is_some_and(|r| r.postamble_owed);
+                    if restoring {
+                        info!(pane = %self.key, holder_pid = self.holder_pid, from, "pty holder: the connection dropped before the restore postamble arrived — reattaching WITH a restore");
+                    }
+                    match connect(&self.pane_dir, &self.pane_id, deadline).and_then(|c| {
+                        if restoring {
+                            c.attach_restoring(Some(from), deadline)
+                        } else {
+                            c.attach(Some(from), deadline)
+                        }
+                    }) {
                         Ok(stream) => {
+                            if restoring && stream.info.restore.is_none() {
+                                warn!(pane = %self.key, holder_pid = self.holder_pid, "pty holder: the reattach could not ask for a restore — the owed postamble is lost; modes set before the replayed tail may be wrong");
+                                *restore = None;
+                            }
                             self.conn.install(stream.writer);
                             // N4: a detach that raced this reattach must not
                             // leave the new connection open. Checked AFTER
@@ -1869,6 +1961,99 @@ mod tests {
             link.controls()
         );
         pane.release(Duration::from_millis(50)).unwrap();
+    }
+
+    /// A pump over nothing (no holder, no stream) for `on_event` tests.
+    fn bare_pump(out: Arc<PaneOutput>, restore: Option<RestoreProgress>) -> PumpCtx {
+        let pane_id = PaneId::new("t-pump").unwrap();
+        PumpCtx {
+            pane_dir: PathBuf::from("/nonexistent-pane-dir"),
+            conn: Arc::new(HolderConn::new(
+                Path::new("/nonexistent-pane-dir"),
+                &pane_id,
+            )),
+            pane_id,
+            key: "t-pump".into(),
+            holder_pid: 100,
+            child_pid: 101,
+            out,
+            control: Arc::new(ControlQueue::new()),
+            detached: Arc::new(AtomicBool::new(false)),
+            cols: Arc::new(AtomicU16::new(80)),
+            rows: Arc::new(AtomicU16::new(24)),
+            paused: Arc::new(AtomicBool::new(false)),
+            restore,
+        }
+    }
+
+    fn synthetic(part: SyntheticPart, bytes: &[u8]) -> Event {
+        Event::Synthetic {
+            part,
+            anchor: 0,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// Review defect 2: a restoring connection that drops before its
+    /// postamble leaves one OWED, so the pump's reattach asks for a restore
+    /// again — and that reattach's preamble is dropped once this pane already
+    /// shows the first one's (a second `?1049h` would clear the alternate
+    /// screen holding the tail). Synthetic bytes never move the offset.
+    #[test]
+    fn pty_holder_attach_owed_postamble_survives_a_dropped_connection() {
+        let out = Arc::new(PaneOutput::new(
+            "t-pump",
+            Vec::new(),
+            0,
+            holder_lost_output_marker,
+        ));
+        let pump = bare_pump(out.clone(), Some(RestoreProgress::new()));
+        let mut restore = pump.restore;
+        // First connection: preamble, some tail — then it drops.
+        assert!(!pump.on_event(
+            synthetic(SyntheticPart::Preamble, b"\x1b[?1049h"),
+            &mut restore
+        ));
+        pump.on_event(
+            Event::Output {
+                offset: 0,
+                bytes: b"tail".to_vec(),
+            },
+            &mut restore,
+        );
+        assert!(
+            restore.is_some_and(|r| r.postamble_owed),
+            "dropped before the postamble: the reattach must ask for a restore"
+        );
+        // The reattach's envelope: its preamble is dropped, its postamble shown.
+        pump.on_event(
+            synthetic(SyntheticPart::Preamble, b"\x1b[?1049h"),
+            &mut restore,
+        );
+        pump.on_event(
+            synthetic(SyntheticPart::Postamble, b"\x1b[?2004h"),
+            &mut restore,
+        );
+        assert!(
+            !restore.is_some_and(|r| r.postamble_owed),
+            "delivered: nothing owed"
+        );
+        assert_eq!(out.offset(), 4, "only stream bytes move the offset");
+        out.settle(Ok(0));
+        let mut got = Vec::new();
+        out.take_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"\x1b[?1049htail\x1b[?2004h".to_vec());
+    }
+
+    /// A reattach that arrives before ANYTHING of the first connection was
+    /// shown keeps its preamble — that is the one this consumer needs.
+    #[test]
+    fn pty_holder_attach_reattach_before_anything_shown_keeps_its_preamble() {
+        let mut p = RestoreProgress::new();
+        assert!(p.take_preamble());
+        let mut p = RestoreProgress::new();
+        p.saw_output();
+        assert!(!p.take_preamble());
     }
 
     /// The session record of a reattached pane: the holder's metadata where it
@@ -3097,7 +3282,9 @@ mod tests {
         /// a tail that ENDS inside an open `?2026h` still emits within
         /// `SYNC_FLUSH_TIME_CAP` through the reader's `SyncFrameCoalescer` — the
         /// postamble opens no block and closes none, so the bound that already
-        /// covers an unclosed block covers this one.
+        /// covers an unclosed block covers this one. The "never `?2026`" half
+        /// also passed on the first draft of this phase (its postamble never
+        /// carried one either): it is a regression guard, not a reproduction.
         #[test]
         fn pty_holder_attach_tail_inside_an_open_2026_still_emits_within_the_cap() {
             use crate::terminal::session::{SyncFrameCoalescer, SYNC_FLUSH_TIME_CAP};
