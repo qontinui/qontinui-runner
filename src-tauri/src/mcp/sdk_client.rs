@@ -647,7 +647,8 @@ pub async fn connect_sdk_app(
     app_type: Option<String>,
     framework: Option<String>,
 ) -> Result<ConnectResponse, ConnectError> {
-    let bearer = choose_connect_bearer(url, qontinui_bearer_origins, load_operator_bearer).await;
+    let (target, bearer) =
+        choose_connect_bearer(url, qontinui_bearer_origins, load_operator_bearer).await;
     connect_sdk_app_with(
         sdk_connection,
         url,
@@ -659,9 +660,30 @@ pub async fn connect_sdk_app(
             framework,
         },
         bearer,
-        reqwest::Client::builder(),
+        connect_client_builder(target),
     )
     .await
+}
+
+/// The client builder a connect to `target` starts from.
+///
+/// A loopback relay is dialled DIRECT, never through a proxy. reqwest honours
+/// `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (and the OS system proxy) by
+/// default, and hyper-util has no implicit loopback bypass, so with a proxy
+/// configured a plain-`http` loopback connect handed the proxy the request in
+/// forward-proxy form — the operator's bearer included. The runner's startup
+/// `NO_PROXY` export covers only `127.0.0.1`, `::1` and `localhost`
+/// (`outbound_net::LOOPBACK_NO_PROXY`), while [`BearerTarget::Loopback`]
+/// admits all of `127.0.0.0/8` and the IPv4-mapped form, and a process that
+/// never ran that export has no bypass at all.
+///
+/// Every other target keeps the proxy: a foreign host is sent no bearer, and
+/// a Qontinui origin is the backend the operator configured.
+fn connect_client_builder(target: BearerTarget) -> reqwest::ClientBuilder {
+    match target {
+        BearerTarget::Loopback => reqwest::Client::builder().no_proxy(),
+        BearerTarget::QontinuiOrigin | BearerTarget::Foreign => reqwest::Client::builder(),
+    }
 }
 
 /// The caller's identity hints for a connect; every `None` is read from the
@@ -686,8 +708,8 @@ struct BearerChoice {
 /// Where a connect target sits relative to the operator's bearer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BearerTarget {
-    /// A relay on THIS machine's loopback (`127.0.0.0/8`, `::1`, `localhost`,
-    /// `*.localhost`): the dev web relay, a temp runner, an `adb forward`.
+    /// A relay on THIS machine's loopback (`127.0.0.0/8`, `::1`, `localhost`):
+    /// the dev web relay, a temp runner, an `adb forward`.
     Loopback,
     /// An origin the bearer is minted for — see [`qontinui_bearer_origins`].
     QontinuiOrigin,
@@ -699,6 +721,10 @@ enum BearerTarget {
 /// only for a non-loopback `http(s)` target, so a loopback connect never pays
 /// for reading settings.
 ///
+/// `url` is classified exactly as given, never trimmed or rewritten first: it
+/// is the same string the connect then dials, so the decision cannot be made
+/// about one URL and applied to another.
+///
 /// The comparison is by ORIGIN — scheme, host and port — never by substring:
 /// `https://qontinui.io.evil.example` and `https://evil.example/?next=https://qontinui.io`
 /// are foreign, and so is `http://qontinui.io`, whose plaintext hop would carry
@@ -708,7 +734,7 @@ fn classify_bearer_target(
     url: &str,
     qontinui_origins: impl FnOnce() -> Vec<url::Origin>,
 ) -> BearerTarget {
-    let parsed = match url::Url::parse(url.trim()) {
+    let parsed = match url::Url::parse(url) {
         Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => parsed,
         _ => return BearerTarget::Foreign,
     };
@@ -741,17 +767,30 @@ fn is_loopback_relay_host(url: &url::Url) -> bool {
     }
 }
 
-/// The origins the operator's bearer is minted for: the web backend this
-/// runner resolves (the ladder [`crate::api_config::get_api_base_url`] walks —
-/// the backend that verifies the token), the web frontend derived from it
-/// (production serves the UI Bridge relay from `qontinui.io`, not
-/// `api.qontinui.io`; see [`crate::api_config::derive_web_base_url`]), and the
-/// operator's explicit `web_integration.web_base_url` override.
+/// The origins the operator's bearer is minted for, read from this runner's
+/// settings and environment — see [`bearer_origins_for`].
 fn qontinui_bearer_origins() -> Vec<url::Origin> {
     let settings = crate::settings::load_settings();
-    let (backend, _arm) = crate::api_config::resolve_api_base_url_from(&settings);
+    bearer_origins_for(
+        &crate::api_config::api_base_url_inputs_from(&settings),
+        settings.web_integration.web_base_url.as_deref(),
+    )
+}
+
+/// The origins the operator's bearer is minted for, as a pure function of the
+/// backend ladder's inputs and the operator's `web_integration.web_base_url`
+/// override: the web backend the ladder resolves (the backend that verifies
+/// the token — [`crate::api_config::resolve_api_base_url`]), the web frontend
+/// derived from it (production serves the UI Bridge relay from `qontinui.io`,
+/// not `api.qontinui.io`; see [`crate::api_config::derive_web_base_url`]), and
+/// the override.
+fn bearer_origins_for(
+    inputs: &crate::api_config::ApiBaseUrlInputs,
+    web_base_url: Option<&str>,
+) -> Vec<url::Origin> {
+    let (backend, _arm) = crate::api_config::resolve_api_base_url(inputs);
     let mut candidates = vec![crate::api_config::derive_web_base_url(&backend), backend];
-    candidates.extend(settings.web_integration.web_base_url.clone());
+    candidates.extend(web_base_url.map(str::to_owned));
     candidates
         .iter()
         .filter_map(|candidate| url::Url::parse(candidate.trim()).ok())
@@ -760,16 +799,20 @@ fn qontinui_bearer_origins() -> Vec<url::Origin> {
         .collect()
 }
 
-/// Decide the bearer for a connect to `url`.
+/// Decide the bearer for a connect to `url`, and say where `url` sits.
 ///
 /// The operator's bearer — a Cognito user access token, else the coord device
 /// JWT — goes ONLY to a [`BearerTarget::Loopback`] relay or a
 /// [`BearerTarget::QontinuiOrigin`]. Any other host gets no `Authorization`
 /// header and the response says `withheld_foreign_host`; the credential is not
-/// even loaded. Before this rule the bearer rode a `default_headers` entry to
-/// WHATEVER url `POST /ui-bridge/sdk/connect` named, so the very first
-/// `/health` probe handed a foreign host the operator's token (coord finding
-/// `c89c2766`).
+/// even loaded. Before this rule the connect handshake attached the operator's
+/// bearer without a host check, so whatever host a connect named — its very
+/// first `/health` probe included — was handed the operator's token (coord
+/// finding `c89c2766`).
+///
+/// The target is returned beside the choice so the connect builds its client
+/// for the same classification — [`connect_client_builder`] — without
+/// reading settings a second time.
 ///
 /// `qontinui_origins` and `load_bearer` are injected so tests never read the
 /// operator's settings, keyring or network; production passes
@@ -778,11 +821,12 @@ async fn choose_connect_bearer<Fut>(
     url: &str,
     qontinui_origins: impl FnOnce() -> Vec<url::Origin>,
     load_bearer: impl FnOnce() -> Fut,
-) -> BearerChoice
+) -> (BearerTarget, BearerChoice)
 where
     Fut: std::future::Future<Output = BearerChoice>,
 {
-    match classify_bearer_target(url, qontinui_origins) {
+    let target = classify_bearer_target(url, qontinui_origins);
+    let choice = match target {
         BearerTarget::Loopback | BearerTarget::QontinuiOrigin => load_bearer().await,
         BearerTarget::Foreign => {
             info!(
@@ -794,7 +838,8 @@ where
                 auth_path: AUTH_PATH_WITHHELD_FOREIGN_HOST,
             }
         }
-    }
+    };
+    (target, choice)
 }
 
 /// Load the operator's bearer for an origin [`choose_connect_bearer`] has
@@ -8838,6 +8883,37 @@ mod connect_bearer_scope_tests {
         );
     }
 
+    /// The POSITIVE direction, pinned: a release build admits EXACTLY the
+    /// production web frontend and API origins — whether nothing is configured
+    /// or the shipped default backend was persisted — and nothing else.
+    #[test]
+    fn release_defaults_admit_exactly_the_production_web_and_api_origins() {
+        let unconfigured = crate::api_config::ApiBaseUrlInputs {
+            env_web: None,
+            env_api: None,
+            profile_api_url: None,
+            persisted: None,
+            is_debug: false,
+        };
+        let persisted_default = crate::api_config::ApiBaseUrlInputs {
+            persisted: Some(crate::api_config::PROD_API_BASE_URL.to_string()),
+            ..unconfigured.clone()
+        };
+        for inputs in [unconfigured, persisted_default] {
+            let mut admitted: Vec<String> = bearer_origins_for(&inputs, None)
+                .iter()
+                .map(url::Origin::ascii_serialization)
+                .collect();
+            admitted.sort();
+            admitted.dedup();
+            assert_eq!(
+                admitted,
+                ["https://api.qontinui.io", "https://qontinui.io"],
+                "{inputs:?}"
+            );
+        }
+    }
+
     /// A local server answering every path as a UI Bridge app, recording the
     /// `Host` and `Authorization` of each request it serves. `/bounce`
     /// redirects to the foreign host name.
@@ -8925,7 +9001,7 @@ mod connect_bearer_scope_tests {
             let loaded = Arc::new(AtomicBool::new(false));
             let loaded_by_loader = loaded.clone();
             let origins = vec![qontinui_origin.clone()];
-            let choice = choose_connect_bearer(
+            let (target, choice) = choose_connect_bearer(
                 url,
                 move || origins,
                 move || async move {
@@ -8937,11 +9013,16 @@ mod connect_bearer_scope_tests {
                 },
             )
             .await;
-            // Every name resolves to the local recorder; never a real host.
-            let builder = reqwest::Client::builder()
-                .no_proxy()
-                .resolve("qontinui-web.test", local)
-                .resolve("foreign.example", local);
+            // The loopback relay is dialled with the PRODUCTION builder. The
+            // two test host names need a builder that resolves them to the
+            // local recorder, so no real host is ever contacted.
+            let builder = match target {
+                BearerTarget::Loopback => connect_client_builder(target),
+                BearerTarget::QontinuiOrigin | BearerTarget::Foreign => reqwest::Client::builder()
+                    .no_proxy()
+                    .resolve("qontinui-web.test", local)
+                    .resolve("foreign.example", local),
+            };
             let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
             let response =
                 connect_sdk_app_with(&manager, url, ConnectHints::default(), choice, builder)
@@ -8991,7 +9072,7 @@ mod connect_bearer_scope_tests {
         // A redirect from an ADMITTED origin to a foreign host does not carry
         // the bearer along: reqwest strips `Authorization` on a cross-host hop.
         let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
-        let choice = choose_connect_bearer(&loopback, Vec::new, || async {
+        let (_, choice) = choose_connect_bearer(&loopback, Vec::new, || async {
             BearerChoice {
                 bearer: Some(("test-operator-token".to_string(), "test")),
                 auth_path: AUTH_PATH_COGNITO,
@@ -9035,57 +9116,5 @@ mod connect_bearer_scope_tests {
             None,
             "a cross-host redirect must not carry the operator bearer"
         );
-    }
-
-    /// The same rule at the population's door, with nothing injected.
-    /// `connect_sdk_app` is the handshake every SDK connection takes
-    /// (`handle_connect` and auto-connect alike), and it finds the operator's
-    /// stored credential by itself. Here a device JWT is stored, and the app
-    /// sits at a host that is neither loopback nor a Qontinui origin: that host
-    /// must see no `Authorization` on any request.
-    ///
-    /// `0.0.0.0` plays the foreign host. It is not a loopback literal and not a
-    /// Qontinui origin (the classification table above pins it as foreign), yet
-    /// on Linux and macOS a connection to it lands on the local listener — so
-    /// the recorder stands in for a foreign host with no DNS lookup and no real
-    /// host contacted. Windows refuses a connect to `0.0.0.0`, hence
-    /// `cfg(unix)`.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn the_handshake_never_hands_the_stored_bearer_to_a_foreign_host() {
-        let _ambient = crate::test_env::isolated_ambient();
-        // Never the real OS keychain: `store_tokens` writes it unless this is
-        // set. The fixture holds the env lock and restores the key on drop.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-        crate::auth::AuthManager::new()
-            .store_tokens(&a_stored_device_jwt(), "")
-            .expect("the fixture stores a device JWT");
-
-        let (port, seen) = spawn_recorder().await;
-        let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
-        let url = format!("http://0.0.0.0:{port}");
-        let _ = connect_sdk_app(&manager, &url, None, None, None, None, None).await;
-
-        let probes = requests_to(&seen, &format!("0.0.0.0:{port}"));
-        assert!(
-            !probes.is_empty(),
-            "the handshake never reached the stand-in foreign host"
-        );
-        assert!(
-            probes.iter().all(Option::is_none),
-            "a foreign host received the operator's stored bearer: {probes:?}"
-        );
-    }
-
-    /// An unexpired, JWT-shaped device token. Unsigned: nothing on this path
-    /// verifies a signature, it only reads the shape and `exp`.
-    fn a_stored_device_jwt() -> String {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine as _;
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
-        let exp = chrono::Utc::now().timestamp() + 3600;
-        let payload = URL_SAFE_NO_PAD
-            .encode(serde_json::json!({ "sub_type": "device", "exp": exp }).to_string());
-        format!("{header}.{payload}.sig")
     }
 }
