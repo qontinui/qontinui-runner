@@ -26,10 +26,11 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageTimeoutW,
-    SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, IDC_ARROW, MSG, SMTO_ABORTIFHUNG,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW,
-    WS_CAPTION, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU,
+    SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, IDC_ARROW, MSG, SHOW_WINDOW_CMD,
+    SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT,
+    WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED,
+    WS_SYSMENU,
 };
 
 use super::{handle_of, window};
@@ -339,7 +340,7 @@ fn window_thread(
             let _ = ready.send(Err("RegisterClassExW failed".into()));
             return;
         }
-        let (style, ex) = window_styles(opts.activate, opts.topmost);
+        let (style, ex) = window_styles(opts.topmost);
         let mut r = RECT {
             left: 0,
             top: 0,
@@ -386,14 +387,7 @@ fn window_thread(
         )
         .unwrap_or_default();
         shared.occluder.store(occ.0 as isize, Ordering::Relaxed);
-        let _ = ShowWindow(
-            main,
-            if opts.activate {
-                SW_SHOW
-            } else {
-                SW_SHOWNOACTIVATE
-            },
-        );
+        let _ = ShowWindow(main, show_command(opts.activate));
         let _ = UpdateWindow(main);
         let _ = ready.send(Ok(GetCurrentThreadId()));
         let mut msg = MSG::default();
@@ -487,25 +481,38 @@ impl Drop for GdiTestWindow {
     }
 }
 
-/// The window's styles. The selftest's window is an ordinary activatable
-/// application window. The doctor's probe window must never take focus, yet
-/// stay capturable by Windows.Graphics.Capture: `CreateForWindow` refused the
-/// earlier `WS_POPUP` + `WS_EX_TOOLWINDOW` probe with E_INVALIDARG
-/// (0x80070057) on the first hosted run (PR #2177, run 38315983341) while
-/// the selftest's ordinary window opened, which left `capture.wgc` UNKNOWN
-/// and its checks ungated. So it is an ordinary captioned top-level window —
-/// no tool-window style — that never activates (`WS_EX_NOACTIVATE`, shown
-/// with `SW_SHOWNOACTIVATE`).
-fn window_styles(activate: bool, topmost: bool) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
-    let (style, mut ex) = if activate {
-        (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, WS_EX_APPWINDOW)
-    } else {
-        (WS_OVERLAPPED | WS_CAPTION, WS_EX_NOACTIVATE)
-    };
+/// The window's styles — ONE construction for the selftest's window and the
+/// doctor's capture probe, so the doctor proves WGC on the same kind of
+/// window the selftest then measures. Only the show command differs
+/// (`show_command`): the doctor's probe, which also runs on operator
+/// machines, is shown without activation and never asked to take focus.
+///
+/// Why it is no longer a separate, "never-activating" design: on the hosted
+/// runs (PR #2177, runs 38315983341 and 38327513555) `CreateForWindow`
+/// refused the doctor's probe with E_INVALIDARG (0x80070057, "Could not
+/// capture the given window") — first as a `WS_POPUP` + `WS_EX_TOOLWINDOW`
+/// window, then as a captioned `WS_EX_NOACTIVATE` window without
+/// `WS_EX_APPWINDOW` — while it captured the selftest's ordinary
+/// application window in the same runs. Which of the remaining differences
+/// WGC objects to (`WS_EX_NOACTIVATE`, the missing `WS_EX_APPWINDOW` or
+/// `WS_SYSMENU`) is not established; sharing the construction removes all
+/// of them, and the next windows-latest run shows whether that was enough.
+fn window_styles(topmost: bool) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
+    let mut ex = WS_EX_APPWINDOW;
     if topmost {
         ex |= WS_EX_TOPMOST;
     }
-    (style, ex)
+    (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, ex)
+}
+
+/// How the window is first shown: activated for the selftest, which must be
+/// foreground; without activation for the doctor's probe.
+fn show_command(activate: bool) -> SHOW_WINDOW_CMD {
+    if activate {
+        SW_SHOW
+    } else {
+        SW_SHOWNOACTIVATE
+    }
 }
 
 #[cfg(test)]
@@ -513,22 +520,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_doctors_probe_window_is_capturable_and_never_activates() {
+    fn the_doctor_and_the_selftest_build_the_same_window() {
         use windows::Win32::UI::WindowsAndMessaging::{WS_EX_TOOLWINDOW, WS_POPUP};
-        let (style, ex) = window_styles(false, true);
-        assert!(
-            !ex.contains(WS_EX_TOOLWINDOW),
-            "the probe CreateForWindow refused was a tool window: {ex:?}"
+        // One construction: `window_styles` takes no activation parameter,
+        // so the doctor's probe (never activated) and the selftest's window
+        // can differ only in how they are first shown (`show_command`).
+        let (style, ex) = window_styles(true);
+        assert_eq!(style, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU);
+        assert_eq!(ex, WS_EX_APPWINDOW | WS_EX_TOPMOST);
+        assert!(!ex.contains(WS_EX_NOACTIVATE) && !ex.contains(WS_EX_TOOLWINDOW));
+        assert!(!style.contains(WS_POPUP));
+        assert_eq!(
+            show_command(false),
+            SW_SHOWNOACTIVATE,
+            "the doctor never takes focus"
         );
-        assert!(
-            !style.contains(WS_POPUP) && style.contains(WS_CAPTION),
-            "{style:?}"
-        );
-        assert!(
-            ex.contains(WS_EX_NOACTIVATE) && ex.contains(WS_EX_TOPMOST),
-            "{ex:?}"
-        );
-        let (_, ex) = window_styles(true, false);
-        assert!(ex.contains(WS_EX_APPWINDOW) && !ex.contains(WS_EX_NOACTIVATE));
+        assert_eq!(show_command(true), SW_SHOW);
     }
 }
