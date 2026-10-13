@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, ThreadKind, UpdateKind};
 
 use crate::platform::{GpuReading, ProcessReader};
 use crate::records::{ExitedProcess, GroupSample, Ns, SampleRecord};
@@ -111,6 +111,12 @@ fn is_compositor(p: &ProcInfo, display: Option<&str>) -> bool {
             Some(d) => p.cmd.iter().any(|a| a == d),
             None => true,
         }
+}
+
+/// Whether a sysinfo entry is a process rather than one of a process's
+/// threads (Linux lists those too). A kernel thread is a process of its own.
+fn is_process(kind: Option<ThreadKind>) -> bool {
+    kind != Some(ThreadKind::Userland)
 }
 
 /// Parse one `slot-<k>` file (Phase 1's `termhost-bench/slot/v1`); `None` for
@@ -303,6 +309,14 @@ impl Sampler {
         self.sys
             .processes()
             .iter()
+            // sysinfo lists every Linux THREAD (`/proc/<pid>/task/<tid>`) as a
+            // process whose parent is its own process. Counted as members, a
+            // host's threads multiplied its memory (each reads the whole
+            // process's smaps_rollup: 109 GB for one runner in CI run
+            // 38345475088), stretched a 500 ms sample to ~4 s with their reads,
+            // and reported each exiting thread as a host crash. A process is
+            // a process, not its threads.
+            .filter(|(_, p)| is_process(p.thread_kind()))
             .map(|(pid, p)| {
                 (
                     pid.as_u32(),
@@ -966,6 +980,50 @@ mod tests {
         let host = &rec.groups[GROUP_HOST];
         assert_eq!(host.note, Some(NOTE_UNREADABLE), "{host:?}");
         assert!(rec.exited.is_empty(), "{:?}", rec.exited);
+    }
+
+    #[test]
+    fn a_thread_is_not_a_process_member() {
+        assert!(is_process(None));
+        assert!(is_process(Some(ThreadKind::Kernel)));
+        assert!(!is_process(Some(ThreadKind::Userland)));
+    }
+
+    /// On Linux the real table: this process's own threads (it has at least
+    /// the one spawned here) must not appear as processes beside it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_process_table_lists_no_threads() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let me = std::process::id();
+        let tids: Vec<u32> = std::fs::read_dir(format!("/proc/{me}/task"))
+            .expect("/proc/self/task")
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .filter(|&t| t != me)
+            .collect();
+        assert!(!tids.is_empty(), "the spawned thread has a tid");
+        let mut s = Sampler::new(
+            SamplerConfig::default(),
+            Box::new(FakeReader {
+                cpu: HashMap::new(),
+                unreadable: None,
+                exited_mid_read: None,
+            }),
+        );
+        let table = s.table();
+        assert!(table.contains_key(&me), "this process is listed");
+        for t in &tids {
+            assert!(
+                !table.contains_key(t),
+                "thread {t} of {me} is listed as a process"
+            );
+        }
+        let _ = tx.send(());
+        worker.join().expect("worker");
     }
 
     #[test]

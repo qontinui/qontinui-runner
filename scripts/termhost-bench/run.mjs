@@ -620,7 +620,7 @@ export async function runUnit(unit, ctx) {
         // One arm's failure is that arm's alone: the arms that measured keep their
         // rows, and the failed one carries its own reason.
         try {
-          arms.set(arm, await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }));
+          arms.set(arm, await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }, { only: "measure" }));
         } catch (e) {
           const f = e instanceof AdapterRefusal ? { reason: e.reason, detail: e.detail } : { reason: "harness_error", detail: e?.message ?? String(e) };
           armErrors.set(arm, f);
@@ -631,6 +631,33 @@ export async function runUnit(unit, ctx) {
           if (e instanceof AdapterRefusal && e.incident) incidents.push(e.incident);
         }
         const post = ctx.neutrality.check(`after ${name} arm ${arm}`);
+        if (post.changed) {
+          incidents.push(post.incident);
+          stop = post.incident;
+          break;
+        }
+      }
+      // Each arm's spawn phase, only after EVERY arm has measured: spawned sessions
+      // change the runner's layout, which a later arm's soak would otherwise watch.
+      for (const arm of o.spawnSamples > 0 && !stop ? o.arms : []) {
+        const measured = arms.get(arm);
+        if (!measured || ctx.aborted?.()) continue;
+        try {
+          const sp = await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }, { only: "spawn" });
+          measured.spawns = sp.armFailure ? { unavailable: sp.armFailure } : sp.spawns;
+          if (sp.spawnAdmission) {
+            measured.spawnAdmission = sp.spawnAdmission;
+            measured.diagnostics = { ...measured.diagnostics, ...sp.diagnostics };
+          }
+          measured.incidents.push(...sp.incidents);
+          if (sp.interrupted) measured.interrupted = true;
+        } catch (e) {
+          const f = e instanceof AdapterRefusal ? { reason: e.reason, detail: e.detail } : { reason: "harness_error", detail: e?.message ?? String(e) };
+          measured.spawns = { unavailable: f };
+          log(`unit ${name} arm ${arm} spawn: ${f.reason}: ${f.detail}`);
+          incidents.push(incident("harness_error", `unit ${name} arm ${arm} spawn: ${f.detail}`, { data: { setup: unit.setup, unit: name, arm } }));
+        }
+        const post = ctx.neutrality.check(`after ${name} arm ${arm} spawn`);
         if (post.changed) {
           incidents.push(post.incident);
           stop = post.incident;
@@ -767,11 +794,23 @@ function noteRefresh(seen, soak) {
 /**
  * One arm of one unit: arrange, warm up, then the four measurement phases.
  */
-export async function runArm(unit, arm, ctx) {
+/**
+ * One arm of a unit: arrange, then its phases. `only` splits the arm into two
+ * passes — `measure` (soak, input, switch, diagnostics) and `spawn` — so runUnit
+ * can measure every arm before any arm spawns: a spawned session changes the
+ * runner's zone layout, and an arm measured after a spawn phase watched that
+ * damage instead of its own layout (CI run 38345475088: the tiled soak, run after
+ * the focus arm's spawns, saw no session at all). Omitted, the arm runs whole.
+ *
+ * @param {{only?: "measure" | "spawn"}} [pass]
+ */
+export async function runArm(unit, arm, ctx, { only } = {}) {
   const { o, log, probe, sleep, adapter, genDir, unitDir, genRunId, slotMap, name } = ctx;
+  const measure = only !== "spawn";
+  const spawnPass = only !== "measure";
   let looks = 0;
   const target = () => adapter.windowTarget?.() ?? { pid: adapter.processRoots()[0] };
-  const look = () => probe.look({ lookDir: join(unitDir, `look-${arm}-${looks++}`), target: target(), durationMs: 2500 });
+  const look = () => probe.look({ lookDir: join(unitDir, `look-${arm}${only === "spawn" ? "-spawn" : ""}-${looks++}`), target: target(), durationMs: 2500 });
   const arr = await adapter.arrange(arm, { slots: slotMap, n: unit.n, look });
   const out = {
     vTarget: arr.vTarget ?? defaultVTarget(unit, arm),
@@ -786,7 +825,7 @@ export async function runArm(unit, arm, ctx) {
     spawns: null,
     diagnostics: {},
   };
-  const act = await probe.activate({ runDir: join(unitDir, `activate-${arm}`), target: target() });
+  const act = await probe.activate({ runDir: join(unitDir, `activate-${arm}${only === "spawn" ? "-spawn" : ""}`), target: target() });
   if (!act.ok) out.arrangeNotes.push(`activation: ${act.detail}`);
   await sleep(o.warmupMs);
 
@@ -822,18 +861,22 @@ export async function runArm(unit, arm, ctx) {
   };
 
   // ---- soak -------------------------------------------------------------------
-  log(`unit ${name} arm ${arm}: soak ${o.soakMs} ms`);
-  const soakWatch = await startPhaseWatch("soak");
-  await sleep(o.soakMs);
-  const soak = await stopPhaseWatch(soakWatch, "soak");
-  out.soak = { records: soak.records };
+  if (measure) {
+    log(`unit ${name} arm ${arm}: soak ${o.soakMs} ms`);
+    const soakWatch = await startPhaseWatch("soak");
+    await sleep(o.soakMs);
+    const soak = await stopPhaseWatch(soakWatch, "soak");
+    out.soak = { records: soak.records };
+  }
   const interrupted = () => ctx.aborted?.() === true;
   // A soak a signal cut short measured a shorter window than its row will say.
   if (interrupted()) out.interrupted = true;
 
   // ---- input (D9) ---------------------------------------------------------------
   const inputSafe = ctx.capabilities["input.safe"];
-  if (interrupted()) {
+  if (!measure) {
+    // the spawn pass: this arm's input was measured in its measure pass
+  } else if (interrupted()) {
     out.input = { unavailable: { reason: "harness_error", detail: "the run was interrupted before the input phase" } };
   } else if (inputSafe?.state !== "OPERATIVE") {
     out.input = { unavailable: { reason: "input_unsafe", detail: `input.safe is ${inputSafe?.state ?? "UNKNOWN"}: ${inputSafe?.reason ?? "no verdict"}` } };
@@ -883,7 +926,9 @@ export async function runArm(unit, arm, ctx) {
   }
 
   // ---- switch (focus arm) --------------------------------------------------------
-  if (interrupted()) {
+  if (!measure) {
+    // the spawn pass
+  } else if (interrupted()) {
     if (arm === "focus" && unit.n > 1) out.switches = { unavailable: { reason: "harness_error", detail: "the run was interrupted before the switch phase" } };
   } else if (arm === "focus" && unit.n > 1 && o.switchSamples > 0) {
     const candidates = (arr.switchable ?? []).filter((s) => slotMap.has(s));
@@ -916,7 +961,9 @@ export async function runArm(unit, arm, ctx) {
   }
 
   // ---- spawn ---------------------------------------------------------------------
-  if (interrupted()) {
+  if (!spawnPass) {
+    // the measure pass: runUnit runs this arm's spawn phase after every arm measured
+  } else if (interrupted()) {
     out.spawns = { unavailable: { reason: "harness_error", detail: "the run was interrupted before the spawn phase" } };
   } else if (o.spawnSamples > 0) {
     const w = await startPhaseWatch("spawn");
@@ -960,7 +1007,7 @@ export async function runArm(unit, arm, ctx) {
   if (interrupted()) out.interrupted = true;
 
   // ---- diagnostics (runner only) ----------------------------------------------
-  if (typeof adapter.diagnostics === "function") {
+  if (measure && typeof adapter.diagnostics === "function") {
     try {
       const focusSession = out.focusSession ?? arr.focusSession;
       out.diagnostics = await adapter.diagnostics({
@@ -969,12 +1016,12 @@ export async function runArm(unit, arm, ctx) {
         genLogPath: Number.isInteger(focusSession) ? join(genDir, `gen-${focusSession}.jsonl`) : undefined,
         visibleTerminalIds: [...slotMap.values()],
       });
-      if (out.spawnAdmission) {
-        out.diagnostics["spawn.admission_n_plus_1"] = { comparable: false, source: "spawnOne", state: "measured", data: out.spawnAdmission };
-      }
     } catch (e) {
       out.diagnostics = { "harness.diagnostics": { comparable: false, source: "adapter.diagnostics()", state: "unknown", reason: "harness_error", detail: e.message.slice(0, 300) } };
     }
+  }
+  if (out.spawnAdmission) {
+    out.diagnostics["spawn.admission_n_plus_1"] = { comparable: false, source: "spawnOne", state: "measured", data: out.spawnAdmission };
   }
   return out;
 }

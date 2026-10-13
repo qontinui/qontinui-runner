@@ -516,10 +516,15 @@ jobs:
           pnpm run tauri build --debug --no-bundle
           test -x target/debug/qontinui-runner
 
-      - name: Build termhost-probe
+      # RELEASE, unlike the probe jobs' debug build: the benchmark scans every
+      # 1920x1080 X11 frame, and the debug scanner took 113 ms per frame (p50,
+      # p95 167 ms) in CI run 38345475088 — over twice the frame budget, so the
+      # probe fell behind (192 of 473 frames over its lag bound) and every
+      # capture KPI read harness_error.
+      - name: Build termhost-probe (release)
         working-directory: head/qontinui-runner
         timeout-minutes: 20
-        run: cargo build -p termhost-probe
+        run: cargo build --release -p termhost-probe
 
       # The baseline commit's rust-toolchain.toml may pin a channel other than
       # the head's. Install it explicitly rather than rely on rustup's implicit
@@ -547,7 +552,7 @@ jobs:
             --runner-mode subject \
             --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner" \
             --head-commit "$(git rev-parse HEAD)" \
-            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/termhost-probe" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe" \
             | tee "$RUNNER_TEMP/termhost-bench-doctor.txt" || rc=$?
           {
             echo "### termhost-bench doctor (linux-xvfb)"
@@ -580,7 +585,7 @@ jobs:
             --head-commit "$(git rev-parse HEAD)"
             --n "$N" --arms "$ARMS" --runs "$RUNS"
             --smoke-setups tmux
-            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/termhost-probe"
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe"
             --work-dir "$RUNNER_TEMP/tb" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
             --out "$RUNNER_TEMP/tb-out/results.json"
             --runner-env WEBKIT_DISABLE_DMABUF_RENDERER=1)

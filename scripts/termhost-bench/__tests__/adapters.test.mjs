@@ -38,6 +38,7 @@ import {
   refusalLane,
   spawnTestBody,
   subjectContractProblems,
+  actionResult,
   subjectEnv,
   ROOT_CONFINED_ENV_KEYS,
 } from "../adapters/runner.mjs";
@@ -340,7 +341,8 @@ function fakeClient(over = {}) {
         for (let i = 0; i < params.count; i += 1) terminals.push(`t${created++}`);
         return { success: true, tab_ids: terminals.slice(-params.count) };
       }
-      if (action === "get-zone-view-state") return { maximizedZone: null, zoneCount: terminals.length, layoutId: "quad" };
+      // The real route's shape: the SDK's action envelope, the handler's value in `result`.
+      if (action === "get-zone-view-state") return { success: true, result: { maximizedZone: null, zoneCount: terminals.length, layoutId: "quad" }, durationMs: 1 };
       return {};
     },
     async elementAction(id, action) {
@@ -948,4 +950,29 @@ test("a subject launch the contract refuses is never spawned, and a subject that
   const why = a.refusalLogText();
   assert.match(why, / — the runner exited \{"code":78,"signal":null\}/);
   assert.match(why, / — stderr: qontinui-runner: refusing to start under QONTINUI_INSTANCE_ROOT=\/r: it contains the machine-global directory \/r\/xdg\/data$/);
+});
+
+test("a component action's value is its envelope's `result`: the zone view state is read, not lost (ci run 38345475088)", async (t) => {
+  assert.deepEqual(actionResult({ success: true, result: { zoneCount: 4, layoutId: "quad" }, durationMs: 2 }), { zoneCount: 4, layoutId: "quad" });
+  assert.deepEqual(actionResult({ zoneCount: 1 }), { zoneCount: 1 }, "an already-flat value passes through");
+  assert.throws(() => actionResult({ success: false, result: null, error: "Action not found" }), /Action not found/);
+  const client = fakeClient();
+  const a = subjectAdapter(t, client);
+  client.terminals.push("t0");
+  const look = async () => ({ ok: true, sessions: new Map([[0, { x: 10, y: 40, w: 160, h: 16 }]]), detail: "fake" });
+  const r = await a.arrange("tiled", { slots: new Map([[0, "t0"]]), n: 1, look });
+  assert.equal(r.ok, true);
+  assert.equal(r.layout.layoutId, "quad");
+  assert.equal(r.layout.zoneCount, 1);
+});
+
+test("a tiled arrange that shows no session fails as sessions_not_rendered, naming the layout, instead of soaking an empty page (ci run 38345475088)", async (t) => {
+  const client = fakeClient();
+  const a = subjectAdapter(t, client);
+  client.terminals.push("t0");
+  const look = async () => ({ ok: true, sessions: new Map(), detail: "fake: no marker" });
+  const r = await a.arrange("tiled", { slots: new Map([[0, "t0"]]), n: 1, look });
+  assert.equal(r.ok, false);
+  assert.equal(r.failure.reason, "sessions_not_rendered");
+  assert.match(r.failure.detail, /after restore-zone the probe saw no session marker \(layout quad, 1 zone\(s\), maximized zone none; fake: no marker\)/);
 });

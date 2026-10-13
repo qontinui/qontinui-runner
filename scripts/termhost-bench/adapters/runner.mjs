@@ -267,6 +267,21 @@ export function subjectEnv({ base, root, port, instanceName, platform = process.
   return Object.assign(env, extra);
 }
 
+/**
+ * A UI Bridge component action's own return value. The runner's route answers
+ * `ApiResponse{data}`, and `data` is the SDK's action envelope
+ * (`executeComponentAction`: `{success, result, durationMs, …}`), so the handler's
+ * return is `.result`. Read flat, `get-zone-view-state` had no `zoneCount` or
+ * `layoutId` at all (CI run 38345475088 recorded both as null).
+ */
+export function actionResult(v) {
+  if (v && typeof v === "object" && "success" in v && "result" in v) {
+    if (v.success === false) throw new Error(`UI Bridge action failed: ${v.error ?? JSON.stringify(v).slice(0, 200)}`);
+    return v.result;
+  }
+  return v;
+}
+
 /** Where a subject's own XDG directories live: beside its root, in the unit dir. */
 export function subjectXdgDir(root) {
   return join(dirname(root), "runner-xdg");
@@ -1019,15 +1034,15 @@ export class RunnerAdapter {
   }
 
   async zoneViewState() {
-    return this.client.componentAction(TERMINAL_PAGE, "get-zone-view-state", {}, 20000);
+    return actionResult(await this.client.componentAction(TERMINAL_PAGE, "get-zone-view-state", {}, 20000));
   }
 
   async restoreZone() {
-    return this.client.componentAction(TERMINAL_PAGE, "restore-zone", {}, 20000);
+    return actionResult(await this.client.componentAction(TERMINAL_PAGE, "restore-zone", {}, 20000));
   }
 
   async maximizeZone(zoneIndex) {
-    return this.client.componentAction(TERMINAL_PAGE, "maximize-zone", { zoneIndex }, 20000);
+    return actionResult(await this.client.componentAction(TERMINAL_PAGE, "maximize-zone", { zoneIndex }, 20000));
   }
 
   /**
@@ -1096,6 +1111,19 @@ export class RunnerAdapter {
     const layout = { layoutId: state?.layoutId ?? null, zoneCount: state?.zoneCount ?? null, zoneMapping: zones.method };
     if (arm === "tiled") {
       this.focusSession = visibleOrder[0] ?? null;
+      if (visibleOrder.length === 0) {
+        // Nothing to measure: say so here, with the layout the runner reports,
+        // rather than soaking a page that shows no session.
+        return {
+          ok: false,
+          vTarget: Math.min(actx.n, 9),
+          layout,
+          failure: {
+            reason: "sessions_not_rendered",
+            detail: `after restore-zone the probe saw no session marker (layout ${layout.layoutId ?? "unknown"}, ${layout.zoneCount ?? "unknown"} zone(s), maximized zone ${state?.maximizedZone === undefined ? "unknown" : (state.maximizedZone ?? "none")}; ${seen.detail})`,
+          },
+        };
+      }
       return {
         ok: true,
         vTarget: Math.min(actx.n, 9),

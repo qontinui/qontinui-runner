@@ -97,6 +97,11 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
   assert.equal(runnerN5Focus.kpis.input_latency_ms.reason, "input_unsafe", "input.safe is not OPERATIVE in the fake doctor");
   assert.equal(runnerN5Focus.scenario.v_target, 1);
   assert.equal(runnerN5Focus.scenario.v_actual, 1);
+  // The spawn pass, run after every arm measured, still lands in its arm's row.
+  for (const arm of ["focus", "tiled"]) {
+    const sp = res.doc.rows.find((r) => r.setup.id === "runner" && r.scenario.n === 5 && r.scenario.arm === arm).kpis.spawn_latency_ms;
+    assert.equal(sp.n, 2, `${arm}: both spawn samples reached the row (${JSON.stringify(sp)})`);
+  }
   const runnerTiled = res.doc.rows.find((r) => r.setup.id === "runner" && r.scenario.n === 5 && r.scenario.arm === "tiled");
   assert.equal(runnerTiled.scenario.v_target, 5);
   assert.equal(runnerTiled.kpis.switch_latency_ms.reason, "not_applicable_to_arm");
@@ -112,7 +117,10 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
   // run file is set aside under a distinct name (records.rs: one run per file).
   assert.equal(probe.labels.size, 4, "one gen dir per unit");
   for (const labels of probe.labels.values()) {
-    assert.deepEqual(labels, ["focus-soak", "focus-switch", "focus-spawn", "tiled-soak", "tiled-spawn"].filter((l) => labels.includes(l)));
+    // Every arm measures before ANY arm spawns: a spawn changes the runner's layout,
+    // and the tiled soak run after the focus arm's spawns saw no session at all
+    // (CI run 38345475088).
+    assert.deepEqual(labels, ["focus-soak", "focus-switch", "tiled-soak", "focus-spawn", "tiled-spawn"].filter((l) => labels.includes(l)));
     assert.equal(new Set(labels).size, labels.length);
     assert.ok(labels.includes("focus-soak") && labels.includes("tiled-soak"));
   }
