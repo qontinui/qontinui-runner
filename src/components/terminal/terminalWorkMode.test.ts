@@ -12,6 +12,11 @@ import {
   mruOnEnter,
   placeInGridSnapshot,
   rekeyGridSnapshot,
+  rekeyMru,
+  replaceTabInAssignments,
+  replaceTabInGridSnapshot,
+  replaceTabInMru,
+  tabsBySessionKey,
   tmuxMountedTabIds,
   nextShownAfterClose,
   parseGridSnapshot,
@@ -192,14 +197,18 @@ describe("reconcileTmuxAssignments", () => {
 });
 
 describe("parseGridSnapshot", () => {
+  const known = (id: string) => ["quad", "single"].includes(id);
   it("reads a well-formed snapshot", () => {
     expect(
-      parseGridSnapshot({
-        layoutId: "quad",
-        assignments: { 0: "a", 3: "b" },
-        focusedZone: 3,
-        sessionKeys: { 3: "sess-b" },
-      }),
+      parseGridSnapshot(
+        {
+          layoutId: "quad",
+          assignments: { 0: "a", 3: "b" },
+          focusedZone: 3,
+          sessionKeys: { 3: "sess-b" },
+        },
+        known,
+      ),
     ).toStrictEqual({
       layoutId: "quad",
       assignments: { 0: "a", 3: "b" },
@@ -210,34 +219,45 @@ describe("parseGridSnapshot", () => {
 
   it("a snapshot saved before session keys existed reads with none", () => {
     expect(
-      parseGridSnapshot({ layoutId: "quad", assignments: { 0: "a" }, focusedZone: 0 }),
+      parseGridSnapshot({ layoutId: "quad", assignments: { 0: "a" }, focusedZone: 0 }, known),
     ).toStrictEqual({ layoutId: "quad", assignments: { 0: "a" }, focusedZone: 0, sessionKeys: {} });
   });
 
   it("anything malformed is null", () => {
-    expect(parseGridSnapshot(undefined)).toBeNull();
-    expect(parseGridSnapshot(null)).toBeNull();
-    expect(parseGridSnapshot("quad")).toBeNull();
-    expect(parseGridSnapshot({ layoutId: "quad", assignments: {} })).toBeNull();
+    expect(parseGridSnapshot(undefined, known)).toBeNull();
+    expect(parseGridSnapshot(null, known)).toBeNull();
+    expect(parseGridSnapshot("quad", known)).toBeNull();
+    expect(parseGridSnapshot({ layoutId: "quad", assignments: {} }, known)).toBeNull();
     expect(
-      parseGridSnapshot({ layoutId: "quad", assignments: { x: "a" }, focusedZone: 0 }),
+      parseGridSnapshot({ layoutId: "quad", assignments: { x: "a" }, focusedZone: 0 }, known),
     ).toBeNull();
     expect(
-      parseGridSnapshot({ layoutId: "quad", assignments: { 0: 5 }, focusedZone: 0 }),
+      parseGridSnapshot({ layoutId: "quad", assignments: { 0: 5 }, focusedZone: 0 }, known),
     ).toBeNull();
     expect(
-      parseGridSnapshot({
-        layoutId: "quad",
-        assignments: { 0: "a" },
-        focusedZone: 0,
-        sessionKeys: { 0: 7 },
-      }),
+      parseGridSnapshot(
+        {
+          layoutId: "quad",
+          assignments: { 0: "a" },
+          focusedZone: 0,
+          sessionKeys: { 0: 7 },
+        },
+        known,
+      ),
     ).toBeNull();
+  });
+
+  it("a layout id the page cannot lay out is malformed", () => {
+    const snapshot = { layoutId: "bogus", assignments: { 0: "a" }, focusedZone: 0 };
+    expect(parseGridSnapshot(snapshot, known)).toBeNull();
+    expect(parseGridSnapshot({ ...snapshot, layoutId: 7 }, () => true)).toBeNull();
   });
 
   it("a focused zone that is not a non-negative integer is malformed", () => {
     for (const focusedZone of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "2"]) {
-      expect(parseGridSnapshot({ layoutId: "quad", assignments: {}, focusedZone })).toBeNull();
+      expect(
+        parseGridSnapshot({ layoutId: "quad", assignments: {}, focusedZone }, known),
+      ).toBeNull();
     }
   });
 });
@@ -355,6 +375,103 @@ describe("rekeyGridSnapshot", () => {
   it("leaves a zone whose session has not come back as it was", () => {
     expect(rekeyGridSnapshot(base, ["b"], () => undefined)).toBe(base);
   });
+
+  it("re-points at the session's live tab, never its exited tombstone", () => {
+    // a-dead (created first) is the exited tab; a2 is where the session runs now.
+    const keyOf = (id: string) => ({ "a-dead": "sess-a", a2: "sess-a" })[id];
+    const next = rekeyGridSnapshot(base, ["a-dead", "b", "a2"], keyOf, new Set(["b", "a2"]));
+    expect(next.assignments).toStrictEqual({ 0: "a2", 1: "b" });
+  });
+});
+
+describe("tabsBySessionKey", () => {
+  const keyOf = (id: string) => ({ x1: "k", x2: "k", x3: "k", y: "j" })[id];
+
+  it("prefers a live tab over an exited one, whatever their order", () => {
+    expect(tabsBySessionKey(["x1", "x2", "y"], keyOf, new Set(["x2", "y"])).get("k")).toBe("x2");
+  });
+
+  it("breaks a tie between equally live tabs by creation order", () => {
+    expect(tabsBySessionKey(["x1", "x2", "x3"], keyOf, new Set(["x2", "x3"])).get("k")).toBe("x2");
+    expect(tabsBySessionKey(["x1", "x2"], keyOf, new Set()).get("k")).toBe("x1");
+    expect(tabsBySessionKey(["x3", "x1"], keyOf).get("k")).toBe("x3");
+  });
+});
+
+describe("rekeyMru", () => {
+  it("returns both inputs as given when nothing moved", () => {
+    const mru = ["a", "b"];
+    const keys = { a: "sess-a" };
+    const out = rekeyMru(mru, keys, ["a", "b"], (id) => ({ a: "sess-a" })[id]);
+    expect(out.mru).toBe(mru);
+    expect(out.keys).toBe(keys);
+  });
+
+  it("records the key of an entry whose tab gained one", () => {
+    const out = rekeyMru(["a", "b"], {}, ["a", "b"], (id) => ({ b: "sess-b" })[id]);
+    expect(out.keys).toStrictEqual({ b: "sess-b" });
+  });
+
+  it("re-points each gone entry at its session's new tab, keeping its place", () => {
+    const keys = { a: "sess-a", b: "sess-b", c: "sess-c" };
+    const keyOf = (id: string) => ({ c2: "sess-c", a2: "sess-a" })[id];
+    expect(rekeyMru(["b", "a", "c"], keys, ["c2", "x", "a2"], keyOf)).toStrictEqual({
+      mru: ["b", "a2", "c2"],
+      keys: { b: "sess-b", a2: "sess-a", c2: "sess-c" },
+    });
+  });
+
+  it("keeps a newer entry where a re-pointed one would duplicate it", () => {
+    const out = rekeyMru(["a2", "a"], { a: "sess-a" }, ["a2"], (id) => ({ a2: "sess-a" })[id]);
+    expect(out.mru).toStrictEqual(["a2"]);
+  });
+
+  it("re-points at the live tab, not an exited one with the same key", () => {
+    const keyOf = (id: string) => ({ dead: "sess-a", live: "sess-a" })[id];
+    const out = rekeyMru(["a"], { a: "sess-a" }, ["dead", "live"], keyOf, new Set(["live"]));
+    expect(out.mru).toStrictEqual(["live"]);
+  });
+});
+
+describe("replacing a tab in place", () => {
+  it("assignments: the new tab takes the old one's zone, and leaves any other", () => {
+    expect(replaceTabInAssignments({ 0: "x", 2: "old", 3: "new" }, "old", "new")).toStrictEqual({
+      0: "x",
+      2: "new",
+    });
+    const same = { 0: "a" };
+    expect(replaceTabInAssignments(same, "old", "new")).toBe(same);
+  });
+
+  it("grid snapshot: same zone, the old session's key replaced by the new tab's", () => {
+    const snapshot = {
+      layoutId: "quad",
+      assignments: { 0: "a", 2: "old" },
+      focusedZone: 2,
+      sessionKeys: { 0: "sess-a", 2: "sess-old" },
+    };
+    expect(replaceTabInGridSnapshot(snapshot, "old", "new", undefined)).toStrictEqual({
+      ...snapshot,
+      assignments: { 0: "a", 2: "new" },
+      sessionKeys: { 0: "sess-a" },
+    });
+    expect(replaceTabInGridSnapshot(snapshot, "old", "new", "sess-new").sessionKeys).toStrictEqual({
+      0: "sess-a",
+      2: "sess-new",
+    });
+    expect(replaceTabInGridSnapshot(snapshot, "zzz", "new", undefined)).toBe(snapshot);
+  });
+
+  it("MRU: the new tab takes the old one's recency", () => {
+    expect(replaceTabInMru(["new", "a", "old", "b"], "old", "new")).toStrictEqual([
+      "new",
+      "a",
+      "b",
+    ]);
+    expect(replaceTabInMru(["a", "old"], "old", "new")).toStrictEqual(["a", "new"]);
+    const same = ["a"];
+    expect(replaceTabInMru(same, "old", "new")).toBe(same);
+  });
 });
 
 describe("placeInGridSnapshot and gridZoneOfTab", () => {
@@ -395,11 +512,25 @@ describe("mruOnEnter", () => {
   it("drops ids that are not tabs any more", () => {
     expect(mruOnEnter("a", { 0: "a", 1: "gone" }, ["old"], ["a"])).toEqual(["a"]);
   });
+
+  it("puts the tabs mounted at entry ahead of the other zones", () => {
+    const assignments = { 0: "z0", 1: "z1", 2: "z2", 3: "z3" };
+    const tabs = ["z0", "z1", "z2", "z3", "parked"];
+    expect(mruOnEnter("z2", assignments, [], tabs, new Set(["z3", "z2", "parked"]))).toEqual([
+      "z2",
+      "z3",
+      "parked",
+      "z0",
+      "z1",
+    ]);
+  });
 });
 
 describe("tmuxMountedTabIds", () => {
+  const ptys = (ids: string[]) => ids.map((id) => ({ id }));
+
   it("is the shown tab plus the most recently shown others, up to the limit", () => {
-    const tabs = ["a", "b", "c", "d", "e"];
+    const tabs = ptys(["a", "b", "c", "d", "e"]);
     expect([...tmuxMountedTabIds("a", ["a", "c", "b", "e", "d"], tabs, 2)]).toEqual([
       "a",
       "c",
@@ -408,12 +539,28 @@ describe("tmuxMountedTabIds", () => {
   });
 
   it("skips MRU entries that are no longer tabs", () => {
-    expect([...tmuxMountedTabIds("a", ["gone", "b"], ["a", "b"], 1)]).toEqual(["a", "b"]);
+    expect([...tmuxMountedTabIds("a", ["gone", "b"], ptys(["a", "b"]), 1)]).toEqual(["a", "b"]);
   });
 
-  it("defaults to the WebGL cap", () => {
-    const tabs = Array.from({ length: 20 }, (_, i) => `t${i}`);
-    expect(tmuxMountedTabIds("t0", tabs, tabs).size).toBe(TMUX_WARM_TAB_LIMIT + 1);
-    expect(TMUX_WARM_TAB_LIMIT).toBe(MAX_WEBGL_PANES);
+  it("shown plus warm fills the WebGL cap exactly", () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `t${i}`);
+    expect(tmuxMountedTabIds("t0", ids, ptys(ids)).size).toBe(MAX_WEBGL_PANES);
+    expect(TMUX_WARM_TAB_LIMIT).toBe(MAX_WEBGL_PANES - 1);
+  });
+
+  it("skips plan and worker tabs in the MRU rather than counting them warm", () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `t${i}`);
+    const tabs = [
+      ...ptys(ids),
+      { id: "plan", type: "plan" },
+      { id: "worker", sessionBacked: true },
+    ];
+    // The MRU names the plan and worker tabs among the most recent.
+    const mru = ["t0", "plan", "t1", "worker", ...ids.slice(2)];
+    const mounted = tmuxMountedTabIds("t0", mru, tabs);
+    expect(mounted.size).toBe(MAX_WEBGL_PANES);
+    expect(mounted.has("plan")).toBe(false);
+    expect(mounted.has("worker")).toBe(false);
+    expect([...mounted]).toEqual(ids.slice(0, MAX_WEBGL_PANES));
   });
 });
