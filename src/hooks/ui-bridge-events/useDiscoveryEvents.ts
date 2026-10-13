@@ -1,11 +1,13 @@
 import { useCallback } from "react";
 import type { BridgeSnapshot } from "@qontinui/ui-bridge";
+import { getGlobalRegistry } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal, toFindRequest } from "./utils";
 import { createLogger } from "@/lib/logger";
 import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
 import { describeThrown } from "@/lib/utils";
+import { readPageHealth } from "./pageHealth";
 
 const logger = createLogger("UIBridgeDiscoveryEvents");
 
@@ -115,7 +117,8 @@ export function toFindArmRequest(payload: object): Record<string, unknown> {
 }
 
 /**
- * Handles: discover, find, get_snapshot, get_modal_context, get_component_state,
+ * Handles: discover, find, get_snapshot, get_modal_context, pageHealth,
+ *          get_component_state,
  *          get_states, get_active_states, get_state_snapshot, get_state,
  *          activate_state, deactivate_state, get_state_groups,
  *          activate_state_group, deactivate_state_group, get_transitions,
@@ -255,6 +258,21 @@ export function useDiscoveryEvents(
             type,
             success: true,
             data: readModalContext(currentBridge),
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "pageHealth": {
+          // The SDK's page-health producer (`sdk/page-health`), run here in
+          // the app. `POST /ui-bridge/control/page-health` forwards to this
+          // case and parses the answer strictly; the runner keeps no analyzer
+          // of its own. See `readPageHealth`.
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: readPageHealth(() => getGlobalRegistry().createSnapshot()),
             timestamp: Date.now(),
           });
           return true;
