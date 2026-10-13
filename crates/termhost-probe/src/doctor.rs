@@ -188,6 +188,10 @@ pub struct Facts {
     /// probe must never take the operator's focus. `None` = unchanged, or
     /// not measured on this platform.
     pub foreground_violation: Option<String>,
+    /// The foreground moved during the doctor's probe, but never to a window
+    /// of this process (the operator switched windows): recorded, not a
+    /// violation.
+    pub foreground_note: Option<String>,
 }
 
 fn v(id: &'static str, state: State, reason: impl Into<String>, at: &str) -> MechanismVerdict {
@@ -408,6 +412,7 @@ pub fn report(f: &Facts) -> DoctorRecord {
             .iter()
             .map(|v| format!("D9: {v}"))
             .collect(),
+        notes: f.foreground_note.iter().cloned().collect(),
     }
 }
 
@@ -474,6 +479,18 @@ pub fn render_human(r: &DoctorRecord) -> String {
         r.summary.unknown,
         r.mechanisms.len()
     ));
+    if !r.violations.is_empty() {
+        s.push_str("\nVIOLATIONS (the doctor's own probes broke a safety rule):\n");
+        for v in &r.violations {
+            s.push_str(&format!("  {v}\n"));
+        }
+    }
+    if !r.notes.is_empty() {
+        s.push_str("\nNOTES:\n");
+        for n in &r.notes {
+            s.push_str(&format!("  {n}\n"));
+        }
+    }
     s.push_str(&format!(
         "Marker decoder: codec v{} pixel rules from marker-golden.json (see `codec` in --json).\n",
         spec().version
@@ -643,6 +660,7 @@ mod tests {
             clock: ClockFacts::NoNode("not on PATH".into()),
             gpu: GpuFacts::Failed("PdhCollectQueryData: 0x800007d5".into()),
             foreground_violation: None,
+            foreground_note: None,
         }
     }
 
@@ -699,12 +717,18 @@ mod tests {
     fn a_foreground_change_around_the_probe_is_a_recorded_d9_violation() {
         let f = Facts {
             foreground_violation: Some("0x10 before, 0x20 after".into()),
+            foreground_note: None,
             ..unknown_everywhere()
         };
         let r = report(&f);
         assert_eq!(
             r.violations,
             vec!["D9: 0x10 before, 0x20 after".to_string()]
+        );
+        let human = render_human(&r);
+        assert!(
+            human.contains("VIOLATIONS") && human.contains("D9: 0x10 before"),
+            "{human}"
         );
         let line = crate::records::to_line(&crate::records::Record::Doctor(r));
         assert!(line.contains("\"violations\":[\"D9: "), "{line}");
@@ -727,6 +751,7 @@ mod tests {
             clock: ClockFacts::NoNode("n".into()),
             gpu: GpuFacts::Instances(3),
             foreground_violation: None,
+            foreground_note: None,
         };
         let r = report(&f);
         let ids: Vec<&str> = r.mechanisms.iter().map(|m| m.id).collect();

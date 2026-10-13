@@ -452,6 +452,10 @@ pub struct DoctorRecord {
     /// foreground change around its probe window). Recorded, not repaired.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<String>,
+    /// Observations that are not violations (the operator switched windows
+    /// while the doctor's probe was up).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
