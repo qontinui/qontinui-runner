@@ -19,6 +19,9 @@ import {
   captureInfo,
   computeRowKpis,
   fromProbe,
+  STALL_MIN_EMITTED,
+  STALL_MIN_MS,
+  describeStall,
   generatorExits,
   paneStalls,
   generatorWindow,
@@ -631,22 +634,59 @@ test("every inject abort reason the probe writes has an explicit catalog mapping
   assert.deepEqual(Object.keys(INJECT_ABORT_REASONS).sort(), probe);
 });
 
-test("a pane that stopped repainting is named, not left as a bare sample shortfall (ci run 38351621760)", () => {
+test("a pane that stopped repainting, for the whole soak or half of it, voids the per-marker KPIs (ci run 38351621760, review r9 SF)", () => {
   const healthy = computeRowKpis(focusFixture());
   assert.deepEqual(healthy.stalls, [], "a pane whose marker advances is not stalled");
+  assert.equal(healthy.kpis.output_latency_ms.state, "measured");
   const f = focusFixture();
-  const stalled = computeRowKpis({ ...f, soak: { records: stallSegment(f.soak.records) } });
-  assert.equal(stalled.stalls.length, 1);
-  assert.equal(stalled.stalls[0].session, 0);
-  assert.ok(stalled.stalls[0].frames >= 10 && stalled.stalls[0].emitted >= 20, JSON.stringify(stalled.stalls[0]));
-  assertUnknown(stalled.kpis.output_latency_ms, "insufficient_samples");
-  assert.match(stalled.kpis.output_latency_ms.detail, /^the pane stopped repainting: session 0 stayed at seq \d+ in \d+ frame\(s\) while its generator wrote \d+ marker\(s\)$/);
-  // Too few frames, or too few emitted markers, is no evidence of a stall.
-  const seg = indexProbeSegment(stallSegment(f.soak.records));
-  const full = { t0: BigInt(seg.frames[0].t_ns), t1: BigInt(seg.frames.at(-1).t_ns) };
-  assert.equal(paneStalls(seg, f.gens, full, new Set([0])).length, 1);
-  const sparse = { ...seg, frames: seg.frames.filter((_, i) => i % Math.ceil(seg.frames.length / 6) === 0).slice(0, 6) };
-  assert.deepEqual(paneStalls(sparse, f.gens, full, new Set([0])), [], "six frames are too few to call it");
-  const brief = { t0: full.t0, t1: full.t0 + 500n * MS };
-  assert.deepEqual(paneStalls(seg, f.gens, brief, new Set([0])), [], "half a second holds too few emitted markers");
+  // The whole soak frozen.
+  const whole = computeRowKpis({ ...f, soak: { records: stallSegment(f.soak.records) } });
+  assert.equal(whole.stalls.length, 1);
+  assert.equal(whole.stalls[0].session, 0);
+  assert.ok(whole.stalls[0].ms > SOAK_MS - 1000, JSON.stringify(whole.stalls[0]));
+  // Frozen half way: the first half's samples would read measured; they must not.
+  const half = computeRowKpis({ ...f, soak: { records: stallSegment(f.soak.records, { fromMs: SOAK_MS / 2 }) } });
+  assert.equal(half.stalls.length, 1, "a partial freeze is found");
+  assert.ok(Math.abs(half.stalls[0].ms - SOAK_MS / 2) < 1000, JSON.stringify(half.stalls[0]));
+  for (const r of [whole, half]) {
+    for (const id of ["output_latency_ms", "marker_loss", "marker_skipped"]) {
+      assertUnknown(r.kpis[id], "pane_stalled");
+      assert.match(r.kpis[id].detail, /^the pane stopped repainting: session 0 stayed at seq \d+ for \d+ ms \(\d+ frame\(s\)\) while its generator wrote \d+ marker\(s\)$/);
+    }
+    assert.equal(r.kpis.frame_interval_ms.state, "measured", "the window's own cadence is not the pane's");
+  }
+});
+
+test("the stall rule's boundaries: two seconds and twenty markers written, however many appearances came before (review r9 nit 1)", () => {
+  const f = focusFixture();
+  const seg = indexProbeSegment(f.soak.records);
+  const t0 = BigInt(seg.frames[0].t_ns);
+  const win = { t0, t1: BigInt(seg.frames.at(-1).t_ns) };
+  const frozenSeg = (fromMs, toMs) => {
+    const a = t0 + BigInt(fromMs) * MS;
+    const b = t0 + BigInt(toMs) * MS;
+    let seq = null;
+    return { ...seg, frames: seg.frames.map((fr) => {
+      const t = BigInt(fr.t_ns);
+      if (t < a || t > b) return fr;
+      const m = fr.markers.find((x) => x.kind === "output");
+      seq ??= m?.seq;
+      return { ...fr, markers: fr.markers.map((x) => (x.kind === "output" ? { ...x, seq } : x)) };
+    }) };
+  };
+  // Exactly two appearances before it, then frozen for 2.5 s: stalled.
+  const two = frozenSeg(150, 2650);
+  const shownBefore = new Set(two.frames.filter((fr) => BigInt(fr.t_ns) < t0 + 150n * MS).flatMap((fr) => fr.markers.map((m) => m.seq)));
+  assert.ok(shownBefore.size >= 2, `appearances before the freeze: ${shownBefore.size}`);
+  const st = paneStalls(two, f.gens, win, new Set([0]));
+  assert.equal(st.length, 1);
+  assert.ok(st[0].ms >= STALL_MIN_MS && st[0].emitted >= STALL_MIN_EMITTED, JSON.stringify(st[0]));
+  // 1.5 s frozen is under the bar — even with plenty written meanwhile (40 extra markers).
+  const busy = new Map([[0, { ...f.gens.get(0), markers: [...f.gens.get(0).markers, ...Array.from({ length: 40 }, (_, k) => ({ kind: "output", seq: 9000 + k, tEmit: t0 + BigInt(200 + k * 30) * MS }))] }]]);
+  assert.ok(paneStalls(frozenSeg(150, 1650), busy, win, new Set([0])).length === 0, "1.5 s is no stall");
+  assert.equal(paneStalls(frozenSeg(150, 2650), busy, win, new Set([0])).length, 1, "2.5 s with the same writes is");
+  // 2.5 s frozen while the generator wrote fewer than twenty markers is no stall either.
+  const quiet = new Map([[0, { ...f.gens.get(0), markers: f.gens.get(0).markers.filter((m) => m.tEmit < t0 + 150n * MS || m.tEmit > t0 + 2650n * MS || Number(m.seq) % 10 === 0) }]]);
+  assert.deepEqual(paneStalls(two, quiet, win, new Set([0])), [], "a generator that wrote little explains a still marker");
+  assert.equal(describeStall({ session: 3, seq: 7, ms: 2500, frames: 150, emitted: 25 }), "session 3 stayed at seq 7 for 2500 ms (150 frame(s)) while its generator wrote 25 marker(s)");
 });

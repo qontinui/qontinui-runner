@@ -119,6 +119,8 @@ export const REASON_CODES = Object.freeze({
   input_unsafe: "the D9 input safeguard could not be established; nothing was typed",
   zone_unresolved: "the runner focus arm could not resolve the session's zone",
   pane_not_mounted: "the focused pane refused keyboard focus (TERMINAL_NO_MOUNTED_VIEW)",
+  pane_stalled:
+    "a displayed session's output marker stopped advancing for a stretch of the soak while its generator kept writing: the pane stopped repainting",
   device_drained: "the device is drained, or its drain state is unknown",
   admission_refused: "the runner's spawn-time resource guard refused sessions at this N",
   host_crashed: "a host process exited during the run",

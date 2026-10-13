@@ -521,38 +521,67 @@ export function generatorExits(seg) {
   return [...out].sort((a, b) => a - b);
 }
 
-/** A stall needs at least this many frames showing the frozen marker. */
-export const STALL_MIN_FRAMES = 10;
-/** ... and at least this many output markers written by its generator meanwhile. */
+/** The KPIs read off the soak's markers, which a stalled pane makes unmeasurable. */
+export const STALL_VOIDED_KPIS = Object.freeze(["output_latency_ms", "marker_loss", "marker_skipped"]);
+
+/** A stall: a displayed marker that did not advance for at least this long ... */
+export const STALL_MIN_MS = 2000;
+/** ... while its generator wrote at least this many output markers. */
 export const STALL_MIN_EMITTED = 20;
 
 /**
- * Displayed sessions whose pane stopped repainting: the probe saw the session's
- * output marker on screen in many frames, but it never advanced (at most one
- * first appearance in the window) while the session's generator kept writing
- * markers. The window-level hang rule cannot see this — other content keeps
- * producing frames — and marker loss, which would read ~100 %, is counted in
- * refresh intervals and so is unknown on a display that reports no refresh rate
- * (Xvfb). Found in CI run 38351621760: a tiled soak showed seq 641 for 60 s while
- * the generator wrote 1890 markers.
+ * Panes that stopped repainting, as the LONGEST run of frames in which a displayed
+ * session's output marker did not advance while its generator kept writing: at
+ * least {@link STALL_MIN_MS} between the first and last frame showing that
+ * sequence, with at least {@link STALL_MIN_EMITTED} output markers written in
+ * between. A whole-soak freeze is the run that never ends; a pane that froze
+ * half way (the flow-control wedge class) is the run that starts there — its
+ * first half's samples would otherwise let output latency read `measured`.
  *
- * @returns {{session: number, seq: number | null, frames: number, emitted: number}[]}
+ * Neither the window-level hang rule (other content keeps producing frames) nor
+ * marker loss (counted in refresh intervals, unknown on Xvfb) sees this. Found in
+ * CI run 38351621760: a tiled soak showed seq 641 for 60 s while the generator
+ * wrote 1890 markers.
+ *
+ * @returns {{session: number, seq: number | null, ms: number, frames: number, emitted: number}[]}
  */
 export function paneStalls(seg, gens, win, visible) {
   if (!seg || !win) return [];
   const inWin = (t) => t !== null && t >= win.t0 && t <= win.t1;
   const out = [];
   for (const session of [...visible].sort((a, b) => a - b)) {
-    const appearances = seg.firstSeen.filter((fs) => fs.kind === "output" && fs.session === session && inWin(toNs(fs.t_ns))).length;
-    if (appearances > 1) continue;
-    const showing = seg.frames.filter((f) => inWin(toNs(f.t_ns)) && (f.markers ?? []).some((m) => m.kind === "output" && m.session === session));
-    const g = gens?.get?.(session);
-    const emitted = (g?.markers ?? []).filter((m) => m.kind === "output" && inWin(typeof m.tEmit === "bigint" ? m.tEmit : null)).length;
-    if (showing.length < STALL_MIN_FRAMES || emitted < STALL_MIN_EMITTED) continue;
-    const last = showing.at(-1).markers.find((m) => m.kind === "output" && m.session === session);
-    out.push({ session, seq: Number.isInteger(last?.seq) ? last.seq : null, frames: showing.length, emitted });
+    const emits = (gens?.get?.(session)?.markers ?? [])
+      .filter((m) => m.kind === "output" && typeof m.tEmit === "bigint")
+      .map((m) => m.tEmit);
+    const shown = [];
+    for (const f of seg.frames) {
+      const t = toNs(f.t_ns);
+      if (!inWin(t)) continue;
+      const m = (f.markers ?? []).find((x) => x.kind === "output" && x.session === session);
+      if (m && Number.isInteger(m.seq)) shown.push({ t, seq: m.seq });
+    }
+    shown.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
+    let best = null;
+    for (let i = 0; i < shown.length; ) {
+      let j = i;
+      while (j + 1 < shown.length && shown[j + 1].seq === shown[i].seq) j += 1;
+      const t0 = shown[i].t;
+      const t1 = shown[j].t;
+      const ms = Number(t1 - t0) / 1e6;
+      const emitted = emits.filter((t) => t > t0 && t <= t1).length;
+      if (ms >= STALL_MIN_MS && emitted >= STALL_MIN_EMITTED && (!best || ms > best.ms)) {
+        best = { session, seq: shown[i].seq, ms: Math.round(ms), frames: j - i + 1, emitted };
+      }
+      i = j + 1;
+    }
+    if (best) out.push(best);
   }
   return out;
+}
+
+/** "session S stayed at seq Q for D ms (F frame(s)) while its generator wrote M marker(s)" */
+export function describeStall(x) {
+  return `session ${x.session} stayed at seq ${x.seq ?? "?"} for ${x.ms} ms (${x.frames} frame(s)) while its generator wrote ${x.emitted} marker(s)`;
 }
 
 /** Host processes alive at the first sample that exited during the window. */
@@ -753,13 +782,14 @@ export function computeRowKpis(p) {
       set(id, fromProbe(id, summary[id], { what: `the soak watch's ${id}` }));
     }
   }
-  // A pane that stopped repainting: say so, instead of a bare sample shortfall.
+  // A pane that stopped repainting, for the whole soak or part of it: the
+  // per-marker KPIs are unknown(pane_stalled), never measured from the live part.
   const stalls = captureGate ? [] : paneStalls(seg, p.gens, win, visible);
   if (stalls.length > 0) {
-    const what = stalls.map((x) => `session ${x.session} stayed at seq ${x.seq ?? "?"} in ${x.frames} frame(s) while its generator wrote ${x.emitted} marker(s)`).join("; ");
-    notes.push(`output_latency_ms: pane stalled: ${what}`);
-    if (kpis.output_latency_ms.state !== "measured") {
-      kpis.output_latency_ms = { ...kpis.output_latency_ms, detail: `the pane stopped repainting: ${what}` };
+    const what = stalls.map(describeStall).join("; ");
+    notes.push(`pane stalled: ${what}`);
+    for (const id of STALL_VOIDED_KPIS) {
+      set(id, unknownKpi(id, "pane_stalled", { n: kpis[id]?.n ?? 0, detail: `the pane stopped repainting: ${what}` }));
     }
   }
   if (kpis.output_latency_ms.state === "measured") {

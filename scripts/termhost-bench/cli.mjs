@@ -244,6 +244,7 @@ export async function normaliseRunOptions(flags, deps = {}) {
     switchSettleMs: RUN_DEFAULTS.switchSettleMs,
     spawnSamples: int(flags, "spawn-samples", RUN_DEFAULTS.spawnSamples),
     spawnTimeoutMs: RUN_DEFAULTS.spawnTimeoutMs,
+    restoreCheckMs: RUN_DEFAULTS.restoreCheckMs,
     out: flags.out ? resolve(flags.out) : undefined,
     redactedOut: flags["redacted-out"] ? resolve(flags["redacted-out"]) : undefined,
     smokeSetups: flags["smoke-setups"] ? LIST(flags["smoke-setups"]) : [],

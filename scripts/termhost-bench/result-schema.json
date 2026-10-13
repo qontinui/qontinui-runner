@@ -57,6 +57,7 @@
         "input_unsafe",
         "zone_unresolved",
         "pane_not_mounted",
+        "pane_stalled",
         "device_drained",
         "admission_refused",
         "host_crashed",

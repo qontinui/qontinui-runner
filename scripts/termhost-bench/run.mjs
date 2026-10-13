@@ -34,7 +34,7 @@ import { isPortListening } from "./adapters/runner.mjs";
 import { PRIMARY_RUNNER_PORT } from "../lib/runner-clients.mjs";
 import { doctorNotes, gatherDoctorFacts, mapDoctor, toCapabilities, blockingMechanisms } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
-import { allUnknown, computeRowKpis, indexGenerators, injectAbortReason } from "./kpis.mjs";
+import { allUnknown, computeRowKpis, describeStall, indexGenerators, indexProbeSegment, injectAbortReason, paneStalls, segmentWindow } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
 import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
@@ -56,6 +56,8 @@ export const RUN_DEFAULTS = Object.freeze({
   switchSettleMs: 1200,
   spawnSamples: 20,
   spawnTimeoutMs: 30000,
+  // The focus arm's restore-after-maximize regression check (gates nothing).
+  restoreCheckMs: 5000,
   profile: "claude-tui",
   seed: 1,
 });
@@ -610,8 +612,7 @@ export async function runUnit(unit, ctx) {
     }
     if (!failure) {
       // The tiled arm measures first: it is the layout an operator gets, and the
-      // focus arm's maximize changes it. Measured after a maximize + restore,
-      // the runner's restored pane stopped repainting (CI run 38351621760).
+      // focus arm's maximize (and any restore after it) changes it.
       for (const arm of measureOrder(o.arms)) {
         if (ctx.aborted?.()) break;
         const pre = ctx.neutrality.check(`before ${name} arm ${arm}`);
@@ -763,7 +764,7 @@ export async function runUnit(unit, ctx) {
       a.incidents.push(
         incident(
           "pane_stalled",
-          `unit ${name} arm ${arm}: session ${st.session}'s output marker stayed at seq ${st.seq ?? "?"} in ${st.frames} frame(s) of the soak while its generator wrote ${st.emitted}: the pane stopped repainting`,
+          `unit ${name} arm ${arm}: soak: ${describeStall(st)}: the pane stopped repainting`,
           { data: { setup: unit.setup, unit: name, arm, session: st.session } },
         ),
       );
@@ -1023,6 +1024,33 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       ? { unavailable: { reason: "admission_refused", detail: `the resource guard refused session N + 1 (${refused.lane}): ${refused.detail ?? ""}` } }
       : { records: seg.records, list };
     if (refused) out.spawnAdmission = refused;
+  }
+
+  // ---- restore check (focus arm, runner) ---------------------------------------
+  // A regression check that gates nothing: restore the maximized zone and watch a
+  // few seconds for a pane that stopped repainting. In CI run 38351621760 the pane
+  // was found frozen after restore-zone (it had already wedged late in the focus
+  // soak: seq 639 for its last ~12 s); the runner fix for that wedge is separate,
+  // and this keeps the restore path observable in every scheduled run.
+  if (measure && arm === "focus" && o.restoreCheckMs > 0 && typeof adapter.restoreZone === "function" && !interrupted()) {
+    try {
+      await adapter.restoreZone();
+      const w = await startPhaseWatch("restore-check");
+      await sleep(o.restoreCheckMs);
+      const seg = await stopPhaseWatch(w, "restore-check");
+      const idx = indexProbeSegment(seg.records ?? []);
+      const gens = indexGenerators(readGeneratorLogs(genDir));
+      const visible = new Set(Array.isArray(idx.summary?.sessions_seen) ? idx.summary.sessions_seen : []);
+      for (const st of paneStalls(idx, gens, segmentWindow(idx), visible)) {
+        out.incidents.push(
+          incident("pane_stalled", `unit ${name} arm ${arm}: after restore-zone: ${describeStall(st)}: the restored pane is not repainting`, {
+            data: { setup: unit.setup, unit: name, arm, phase: "focus/restore-check", session: st.session },
+          }),
+        );
+      }
+    } catch (e) {
+      out.incidents.push(incident("harness_error", `unit ${name} arm ${arm}: restore check: ${e.message}`, { data: { setup: unit.setup, unit: name, phase: "focus/restore-check" } }));
+    }
   }
 
   // A signal that arrived at any point in this arm cut a phase short: the arm's
