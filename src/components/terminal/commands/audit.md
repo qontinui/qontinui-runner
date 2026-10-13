@@ -50,7 +50,7 @@ Ranked by estimated frequency in a typical multi-AI session work day.
 | Findings / File-ownership / Sessions-sidebar toggles | All set-once-and-keep-open in their respective workflows. |
 | Auto-approve / auto-restart configuration | Preference-set. |
 | Reorganize pages (AI) | Page-level, weekly cadence at most. |
-| Resume frozen session (`Ctrl+Shift+J`) | Rare unless an operator routinely freezes/resumes — not the common path. |
+| Open the next "No output (mid-tool)" session (`Ctrl+Shift+J`) | Rare — only when a session goes silent mid-tool. |
 | View-mode cycle (`Ctrl+Shift+M`) | Three-state visual density toggle; rarely re-cycled. |
 | Resume / Sessions sidebar toggle (`Ctrl+Shift+B`) | Mode switch, not per-action. |
 | Export / Sort zones / Doc finder / Metrics / History / Shortcuts help | All discoverable-on-demand from palette; no need to ship them in default chrome. |

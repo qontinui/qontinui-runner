@@ -1,13 +1,17 @@
 /**
  * Core hook for the Session Manager panel.
  *
- * Merges four data sources into a unified session view:
+ * Merges its data sources into a unified session view:
  * 1. Transcript sessions on disk (all accounts)
  * 2. Active PTY tabs in the current Runner window
- * 3. Session digests (frozen detection + work summary hints)
- * 4. Claude Code's own live-session registry (the real window name)
+ * 3. Claude Code's own live-session registry (window name, pid, self-reported
+ *    status, and whether this runner owns the process)
+ * 4. The external `claude`-process scan (can a tab-less session be running?)
+ * 5. Transcript tail digests, requested by session id
+ * 6. The work-axis finished marker
  *
- * Provides search, filter, sort, grouping, and actions.
+ * Each row's two-axis status (location × activity) is classified by the pure
+ * `sessionStatusModel`. Provides search, filter, sort, grouping, and actions.
  */
 
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
@@ -18,56 +22,33 @@ import type { TranscriptSession } from "./useTranscriptSessions";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState } from "./useZoneLayout";
 import type { CommandResponse } from "./types";
-import { isInjectedSession } from "./syntheticTabs";
+import type { LockState } from "./useFileLockTracking";
+import { injectedStatusOf, isInjectedSession, isInjectedStatus } from "./syntheticTabs";
 import {
   extractAccountLabel,
   extractProjectLabel,
   mergeLiveRows,
-  tabLiveStatus,
+  type UnclassifiedSession,
 } from "./sessionManagerLiveRows";
-import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
+import { refreshLiveClaudeSessions, useLiveClaudeSessions } from "./useLiveClaudeSessions";
+import { refreshExternalClaudeScan, useExternalClaudeScan } from "./useExternalClaudeScan";
+import { finishedFor, refreshFinishedMarkers, useFinishedMarkers } from "./useFinishedMarkers";
+import { digestRequestIds, useSessionDigests } from "./useSessionDigests";
+import { computeStatusCounts } from "./sessionCounts";
+import {
+  ACTIVITY_PRIORITY,
+  SESSION_ACTIVITIES,
+  classifyLocation,
+  classifySession,
+  countUnidentified,
+  parseActivityFilter,
+  type RegistryRead,
+  type SessionActivity,
+  type SessionStatus,
+  type StatusTabInput,
+} from "./sessionStatusModel";
 
 // ── Types ────────────────────────────────────────────────────────────────────
-
-export type SessionLiveStatus =
-  | "active-in-zone"
-  | "active-external"
-  | "frozen"
-  | "needs-input"
-  | "completed"
-  | "error"
-  | "dormant";
-
-export interface SessionDigest {
-  session_id: string;
-  config_dir: string;
-  project_path: string;
-  last_message_type: string;
-  last_message_timestamp: string;
-  last_message_preview: string;
-  last_assistant_had_tool_use: boolean;
-  likely_frozen: boolean;
-  work_summary_hint: string;
-}
-
-export interface ExternalClaudeProcess {
-  pid: number;
-  working_directory: string | null;
-}
-
-/**
- * `transcript_find_external_processes`' `data` on success.
- *
- * `stale: true` means the runner skipped the enumeration under memory pressure
- * (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated,
- * Phase 3) and returned its last COMPLETE result, observed at
- * `observed_at_ms` — a labelled previous answer, never an empty list.
- */
-export interface ExternalProcessesResult {
-  processes: ExternalClaudeProcess[];
-  stale: boolean;
-  observed_at_ms: number;
-}
 
 export interface AccountUsageInfo {
   config_dir: string;
@@ -258,7 +239,7 @@ export interface UnifiedSessionFields {
   resumeName: string | null;
   /**
    * The name Claude Code itself is showing in this session's window right now,
-   * read from its live-session registry via {@link useLiveClaudeSessionNames}.
+   * read from its live-session registry via {@link useLiveClaudeSessions}.
    *
    * **Outranks every other name field** — it is the string the operator is
    * literally looking at, whereas `resumeName` is transcript-derived and matched
@@ -275,8 +256,14 @@ export interface UnifiedSessionFields {
   lastModified: string;
   hasPlans: boolean;
 
-  // Live status
-  liveStatus: SessionLiveStatus;
+  /**
+   * Where the session's process is and what it is doing — the two axes of
+   * `sessionStatusModel` (plan
+   * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+   * D2). Classified per row from the tab, the live-session registry, the
+   * external scan, the transcript digest and the finished marker.
+   */
+  status: SessionStatus;
   zoneTabId: string | null;
   zoneIndex: number | null;
   /**
@@ -294,15 +281,6 @@ export interface UnifiedSessionFields {
   lastMessageTimestamp: string;
   lastMessagePreview: string;
   workSummaryHint: string;
-  likelyFrozen: boolean;
-  /**
-   * True when this session has NO live PTY in the current window (it isn't
-   * open in any zone) — i.e. it's an orphaned transcript that can simply be
-   * resumed, as opposed to a genuinely stuck *live* session. Drives the
-   * "click to resume" copy instead of a "looks stuck" warning. Only
-   * meaningful when `liveStatus === "frozen"`.
-   */
-  isOrphaned: boolean;
 }
 
 /** A row projected from a Claude transcript (`message_count > 0`). */
@@ -353,6 +331,15 @@ export interface UseSessionManagerParams {
    * row a hidden session could be closed only by showing it first.
    */
   onCloseSessionTab?: (tabId: string) => void;
+  /**
+   * The tabs whose pane is showing right now — the `On screen` vs `Hidden
+   * here` split. In tmux mode that is the shown tab; in grid mode, the zoned
+   * tabs (only the maximized one while a zone is maximized). See
+   * `visibleTabIdsForLayout`.
+   */
+  visibleTabIds: ReadonlySet<string>;
+  /** Per-tab file-lock state (`useHotField(pageId, "lockStates")`). */
+  tabLockStates?: Readonly<Record<string, LockState | undefined>>;
 }
 
 export interface UseSessionManagerReturn {
@@ -367,8 +354,9 @@ export interface UseSessionManagerReturn {
   // Filters
   searchQuery: string;
   setSearchQuery: (q: string) => void;
-  statusFilter: SessionLiveStatus | "all";
-  setStatusFilter: (f: SessionLiveStatus | "all") => void;
+  /** Filter on the activity axis. */
+  statusFilter: SessionActivity | "all";
+  setStatusFilter: (f: SessionActivity | "all") => void;
   accountFilter: string | "all";
   setAccountFilter: (f: string | "all") => void;
   groupBy: SessionGroupBy;
@@ -398,7 +386,8 @@ export interface UseSessionManagerReturn {
   // Multi-select & bulk actions
   selectedIds: Set<string>;
   toggleSelect: (sessionId: string) => void;
-  selectAllFrozen: () => void;
+  /** Select every visible (filtered) row that can be bulk-selected. */
+  selectAllVisible: () => void;
   clearSelection: () => void;
   bulkResume: () => void;
 
@@ -419,18 +408,29 @@ export interface UseSessionManagerReturn {
   savedConfigDirs: string[];
 
   // Stats
-  frozenCount: number;
+  /** Rows per activity, over every row (the header's filter chips). */
+  activityCounts: Readonly<Record<SessionActivity, number>>;
+  /** Rows reading `No output (mid-tool)` — the Ctrl+Shift+J cycle. */
+  noOutputCount: number;
+  /** Rows reading `Needs you`. */
   needsInputCount: number;
-  activeCount: number;
+  /**
+   * Live unmanaged `claude` processes with no registry row — counted, never
+   * attributed to a session. `null` = UNKNOWN (the scan or the registry read
+   * did not answer), never rendered as zero.
+   */
+  unidentifiedCount: number | null;
   // Session-model counts for the Terminal-page StatusStrip (Claude
-  // sessions, not PTY tabs). See `statusCounts` for the bucketing.
+  // sessions, not PTY tabs). See `computeStatusCounts` for the bucketing.
   claudeSessionCount: number;
   workingCount: number;
-  /** The `active-external` share of `workingCount` — see {@link StatusCounts}. */
-  externalWorkingCount: number;
+  /** The `Outside runner` share of `workingCount` — see {@link StatusCounts}. */
+  outsideWorkingCount: number;
   idleCount: number;
   completedCount: number;
   errorCount: number;
+  /** Rows counted live whose activity is `Unknown`. */
+  unknownCount: number;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -448,99 +448,6 @@ function computeDuration(
   } catch {
     return null;
   }
-}
-
-/** Status priority for sorting (lower = more urgent). */
-const STATUS_PRIORITY: Record<SessionLiveStatus, number> = {
-  frozen: 0,
-  "needs-input": 1,
-  "active-in-zone": 2,
-  "active-external": 3,
-  error: 4,
-  completed: 5,
-  dormant: 6,
-};
-
-/** Counts surfaced to the Terminal-page StatusStrip pills. */
-export interface StatusCounts {
-  claudeSessionCount: number;
-  /** Both running flavors: `active-in-zone` + `active-external`. */
-  workingCount: number;
-  /**
-   * The `active-external` share of `workingCount` — running `claude`
-   * processes with no tab in this window. Carried separately so the strip can
-   * headline the page-scoped count and report the rest as `+M external`
-   * (see `splitWorking`).
-   */
-  externalWorkingCount: number;
-  idleCount: number;
-  completedCount: number;
-  errorCount: number;
-}
-
-/** Minimal shape `computeStatusCounts` needs from a {@link UnifiedSession}. */
-export interface StatusCountsInput {
-  liveStatus: SessionLiveStatus;
-  isOrphaned: boolean;
-}
-
-/**
- * Pure bucketing for the Terminal-page StatusStrip. Counts only the
- * *live / actively-managed* Claude sessions, dropping dormant historical
- * transcripts and orphaned (tab-less) `frozen` transcripts. Extracted as a
- * pure function so the bucketing rules are unit-testable without mounting the
- * hook. See the long-form rationale on the `statusCounts` memo below.
- *
- * - `dormant` → excluded (the bulk historical over-count).
- * - orphaned `frozen` (`isOrphaned`) → excluded (resumable historical session).
- * - tab-backed `frozen` → counts as `idle`.
- * - `active-in-zone` / `active-external` → `working`.
- * - `needs-input` / `error` / `completed` → their own bucket, all counted in
- *   the total.
- */
-export function computeStatusCounts(sessions: readonly StatusCountsInput[]): StatusCounts {
-  const counts: Record<SessionLiveStatus, number> = {
-    "active-in-zone": 0,
-    "active-external": 0,
-    frozen: 0,
-    "needs-input": 0,
-    completed: 0,
-    error: 0,
-    dormant: 0,
-  };
-  // Live frozen = a stale session still open as a tab in this window.
-  // Orphaned frozen (no tab) is a resumable historical transcript → excluded.
-  let liveFrozen = 0;
-  for (const s of sessions) {
-    // Drop dormant historical transcripts and orphaned (tab-less) frozen
-    // transcripts — they are not actively-managed sessions.
-    if (s.liveStatus === "dormant") continue;
-    if (s.liveStatus === "frozen" && s.isOrphaned) continue;
-    counts[s.liveStatus]++;
-    if (s.liveStatus === "frozen") liveFrozen++;
-  }
-  // working = both running flavors (in-zone + external).
-  const workingCount = counts["active-in-zone"] + counts["active-external"];
-  // idle = genuinely-live-but-paused sessions, i.e. a stale tab still open
-  // in this window (live `frozen`). Orphaned/dormant historical transcripts
-  // were already excluded above, so this no longer balloons.
-  const idleCount = liveFrozen;
-  const completedCount = counts.completed;
-  const errorCount = counts.error;
-  const needsInputLive = counts["needs-input"];
-  // Total = the live managed set: working + idle + needs-input + error +
-  // completed. Equivalently the count of sessions that survived the
-  // dormant/orphan filter above. Reconciles with the per-bucket pills.
-  const claudeSessionCount =
-    workingCount + idleCount + needsInputLive + errorCount + completedCount;
-  return {
-    claudeSessionCount,
-    workingCount,
-    externalWorkingCount: counts["active-external"],
-    idleCount,
-    completedCount,
-    errorCount,
-  };
 }
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
@@ -603,12 +510,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     onSelectSession,
     onFocusSessionTab,
     onCloseSessionTab,
+    visibleTabIds,
+    tabLockStates,
   } = params;
-
-  // Digest state
-  const [digests, setDigests] = useState<Record<string, SessionDigest>>({});
-  const [digestsLoading, setDigestsLoading] = useState(false);
-  const digestsLoadedRef = useRef(false);
 
   // Account usage state
   const [accountUsage, setAccountUsage] = useState<AccountUsageInfo[]>([]);
@@ -622,16 +526,13 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   // Active file locks (for Launch Menu visibility)
   const [fileLocks, setFileLocks] = useState<FileLockInfo[]>([]);
 
-  // External process state
-  const [externalProcessCount, setExternalProcessCount] = useState(0);
-
   // Filter/sort state (persisted across restarts)
   const STORAGE_PREFIX = "session-manager-";
   const [searchQuery, setSearchQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<SessionLiveStatus | "all">(
-    () =>
-      (instanceStorage.getItem(`${STORAGE_PREFIX}status-filter`) as SessionLiveStatus | "all") ||
-      "all",
+  // A value persisted under the retired single-axis enum (`frozen`,
+  // `active-in-zone`, …) is not an activity and reads as "all".
+  const [statusFilter, setStatusFilter] = useState<SessionActivity | "all">(() =>
+    parseActivityFilter(instanceStorage.getItem(`${STORAGE_PREFIX}status-filter`)),
   );
   const [accountFilter, setAccountFilter] = useState<string | "all">(
     () => instanceStorage.getItem(`${STORAGE_PREFIX}account-filter`) || "all",
@@ -704,37 +605,6 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       return next;
     });
   }, []);
-
-  // ── Fetch digests ──────────────────────────────────────────────────────────
-
-  const fetchDigests = useCallback(async () => {
-    setDigestsLoading(true);
-    try {
-      const result = await invoke<CommandResponse>("transcript_session_digests", {
-        maxSessions: 50,
-      });
-      if (result.success && result.data) {
-        const digestList = result.data as SessionDigest[];
-        const map: Record<string, SessionDigest> = {};
-        for (const d of digestList) {
-          map[d.session_id] = d;
-        }
-        setDigests(map);
-      }
-    } catch {
-      // Silently fail — digests are optional enrichment
-    } finally {
-      setDigestsLoading(false);
-    }
-  }, []);
-
-  // Load digests on mount
-  useEffect(() => {
-    if (!digestsLoadedRef.current) {
-      digestsLoadedRef.current = true;
-      fetchDigests();
-    }
-  }, [fetchDigests]);
 
   // ── Fetch account usage (every 5 minutes) ─────────────────────────────────
 
@@ -841,59 +711,6 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     };
   }, [fetchFileLocks]);
 
-  // ── Detect external Claude processes (every 30s) ────────────────────────────
-
-  const fetchExternalProcesses = useCallback(async () => {
-    try {
-      const result = await invoke<CommandResponse>("transcript_find_external_processes");
-      if (result.success && result.data) {
-        // A `stale` result is the runner's previous complete enumeration,
-        // returned because it shed the scan under memory pressure. Using its
-        // count is the same "keep the last known count" the degraded arm below
-        // does — the cached list IS the last known answer, re-filtered by the
-        // runner against its current managed PIDs — so no new state is needed
-        // to stay honest; what must never happen is reading it as zero.
-        const { processes } = result.data as ExternalProcessesResult;
-        setExternalProcessCount(processes.length);
-      }
-      // On `success: false` the backend is telling us the enumeration DEGRADED
-      // (its WMI/`ps` probe was killed at its budget) — that is UNKNOWN, not
-      // zero. Deliberately keep the last known count rather than writing one:
-      // every reader below is a heuristic that treats a low count as "no
-      // external activity", so writing 0 here would turn "could not look" into
-      // a definite negative, which is the conflation this whole change set
-      // exists to remove. Keeping the previous value is the least-wrong option
-      // available to a consumer that has nowhere to render UNKNOWN.
-    } catch {
-      // Transport failure — same reasoning: assert nothing.
-    }
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    // Defer via microtask so the effect body itself doesn't synchronously
-    // trigger setState inside fetchExternalProcesses.
-    void Promise.resolve().then(() => {
-      if (!cancelled) void fetchExternalProcesses();
-    });
-    const interval = setInterval(fetchExternalProcesses, 30 * 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [fetchExternalProcesses]);
-
-  // ── Live "now" tick for time-based status thresholds ───────────────────────
-  // Used by allSessions below to compute "active-external" vs "frozen" based
-  // on how recently a session was modified. Keeping this as state (rather than
-  // calling Date.now() during render) preserves the live-update semantics while
-  // satisfying react-hooks/purity.
-  const [now, setNow] = useState<number>(() => Date.now());
-  useEffect(() => {
-    const interval = setInterval(() => setNow(Date.now()), 30 * 1000);
-    return () => clearInterval(interval);
-  }, []);
-
   // ── Build tab lookup for live status correlation ───────────────────────────
 
   const tabSessionMap = useMemo(() => {
@@ -906,102 +723,23 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     return map;
   }, [tabs]);
 
-  // ── Claude Code's live window names (every 30s) ────────────────────────────
-  // `sessionId → window name`, operator-named live sessions only. A miss is
-  // meaningful: it means the registry has nothing better than the transcript
-  // name we already show (session closed, or `nameSource: "derived"`).
+  // ── Claude Code's live-session registry, the external scan, the finished
+  // marker (all webview-wide stores, polled once for every page scope) ──────
 
-  const registryNames = useLiveClaudeSessionNames();
+  const liveRegistry = useLiveClaudeSessions();
+  const registryNames = liveRegistry.names;
+  const externalScan = useExternalClaudeScan();
+  const finishedMarkers = useFinishedMarkers();
 
-  // ── Merge into UnifiedSession[] ────────────────────────────────────────────
+  // ── Merge into rows (status classified below) ────────────────────────────
 
-  const transcriptRows = useMemo((): TranscriptSessionRow[] => {
+  const transcriptRowsBase = useMemo((): UnclassifiedSession[] => {
     return transcriptSessions
       .filter((s) => s.message_count > 0)
-      .map((s): TranscriptSessionRow => {
-        const tab = tabSessionMap.get(s.session_id);
-        const digest = digests[s.session_id];
-
-        // Compute live status
-        let liveStatus: SessionLiveStatus = "dormant";
-        let zoneTabId: string | null = null;
-
-        // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
-        // injected fakes (from the runner's debug-only
-        // `/ui-bridge/test/inject-session` route) carry an explicit
-        // `injected_live_status` so SessionCard's `canPromote` / `canCommit`
-        // predicates can fire without a real PTY tab being open. The
-        // override short-circuits the tab/digest correlation below — real
-        // transcripts never set the field so this branch is a no-op for
-        // them.
-        if (s.injected_live_status) {
-          liveStatus = s.injected_live_status as SessionLiveStatus;
-          return {
-            source: "transcript",
-            sessionId: s.session_id,
-            accountLabel: extractAccountLabel(s.config_dir),
-            configDir: s.config_dir,
-            projectPath: s.project_path,
-            projectLabel: extractProjectLabel(s.project_path),
-            displayName: s.display_name,
-            resumeName: s.resume_name ?? null,
-            registryName: registryNames.get(s.session_id) ?? null,
-            firstMessagePreview: s.first_message_preview,
-            messageCount: s.message_count,
-            lastModified: s.last_modified,
-            hasPlans: s.has_plans,
-            liveStatus,
-            zoneTabId: null,
-            zoneIndex: null,
-            remoteDeviceLabel: null,
-            startedAt: s.started_at ?? null,
-            durationMs: computeDuration(s.started_at, s.last_modified),
-            lastMessageType: "",
-            lastMessageTimestamp: s.last_modified,
-            lastMessagePreview: "",
-            workSummaryHint: "",
-            likelyFrozen: liveStatus === "frozen",
-            // Injected fakes carry no real PTY tab — treat a frozen inject as
-            // orphaned so the resume affordance shows in debug demos.
-            isOrphaned: liveStatus === "frozen",
-            _transcript: s,
-          };
-        }
-
-        if (tab) {
-          zoneTabId = tab.id;
-          liveStatus = tabLiveStatus(tab.id, sessionStates, staleTabs);
-        } else if (digest?.likely_frozen) {
-          // If external processes are running and session was modified very recently,
-          // it's likely active externally rather than frozen
-          if (externalProcessCount > 0) {
-            try {
-              const age = now - new Date(s.last_modified).getTime();
-              if (age < 10 * 60 * 1000) {
-                // Modified within last 10 minutes — likely active externally
-                liveStatus = "active-external";
-              } else {
-                liveStatus = "frozen";
-              }
-            } catch {
-              liveStatus = "frozen";
-            }
-          } else {
-            liveStatus = "frozen";
-          }
-        } else if (externalProcessCount > 0 && !tab) {
-          // Check if this non-frozen session might be running externally
-          try {
-            const age = now - new Date(s.last_modified).getTime();
-            if (age < 2 * 60 * 1000) {
-              // Very recently modified (within 2 min) and not in a zone — likely external
-              liveStatus = "active-external";
-            }
-          } catch {
-            // Keep dormant
-          }
-        }
-
+      .map((s): UnclassifiedSession => {
+        // Injected fakes state their status outright (see `statusForRow`), so
+        // they carry no tab: a short-circuit fake has no real PTY in any zone.
+        const tab = isInjectedStatus(s) ? undefined : tabSessionMap.get(s.session_id);
         return {
           source: "transcript",
           sessionId: s.session_id,
@@ -1016,42 +754,138 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           messageCount: s.message_count,
           lastModified: s.last_modified,
           hasPlans: s.has_plans,
-          liveStatus,
-          zoneTabId,
+          zoneTabId: tab?.id ?? null,
           zoneIndex: null, // Could be enriched from zone assignments
           remoteDeviceLabel: null,
           startedAt: s.started_at ?? null,
           durationMs: computeDuration(s.started_at, s.last_modified),
-          lastMessageType: digest?.last_message_type ?? "",
-          lastMessageTimestamp: digest?.last_message_timestamp ?? s.last_modified,
-          lastMessagePreview: digest?.last_message_preview ?? "",
-          workSummaryHint: digest?.work_summary_hint ?? "",
-          likelyFrozen: digest?.likely_frozen ?? false,
-          // "frozen" reached without a live PTY tab in this window means the
-          // transcript is merely orphaned (resumable), not a stuck live run.
-          // The `if (tab)` branch above is the only one that sets `frozen`
-          // *with* a live tab (a genuinely stale/stuck session).
-          isOrphaned: liveStatus === "frozen" && !tab,
+          lastMessageType: "",
+          lastMessageTimestamp: s.last_modified,
+          lastMessagePreview: "",
+          workSummaryHint: "",
           _transcript: s,
         };
       });
-  }, [
-    transcriptSessions,
-    tabSessionMap,
-    sessionStates,
-    staleTabs,
-    digests,
-    externalProcessCount,
-    registryNames,
-    now,
-  ]);
+  }, [transcriptSessions, tabSessionMap, registryNames]);
 
   // Every live tab gets a row (plan 2026-10-11-runner-terminal-tmux-work-mode,
   // D5): its transcript row when it has one, else a tab-sourced row. In tmux
   // mode the panel is the only way to reach an off-screen session.
+  const mergedRows = useMemo(
+    () => mergeLiveRows(transcriptRowsBase, { tabs, registryNames }),
+    [transcriptRowsBase, tabs, registryNames],
+  );
+
+  // ── Status inputs per row ────────────────────────────────────────────────
+
+  const tabsById = useMemo(() => new Map(tabs.map((t) => [t.id, t])), [tabs]);
+
+  const tabInputFor = useCallback(
+    (row: UnclassifiedSession): StatusTabInput | null => {
+      const tab = row.zoneTabId ? tabsById.get(row.zoneTabId) : undefined;
+      if (!tab) return null;
+      return {
+        alive: tab.isAlive,
+        visible: visibleTabIds.has(tab.id),
+        exitCode: tab.exitCode,
+        state: sessionStates[tab.id],
+        silent: staleTabs.has(tab.id),
+        lockWaiting: tabLockStates?.[tab.id]?.kind === "waiting",
+      };
+    },
+    [tabsById, visibleTabIds, sessionStates, staleTabs, tabLockStates],
+  );
+
+  const registryFor = useCallback(
+    (row: UnclassifiedSession): RegistryRead => {
+      if (liveRegistry.read !== "ok") return { kind: liveRegistry.read };
+      // A tab-sourced row is keyed by its TAB id; its Claude session id, when
+      // the tab has one, is the registry key.
+      const claudeId =
+        row.source === "transcript"
+          ? row.sessionId
+          : (tabsById.get(row.sessionId)?.claudeSessionId ?? null);
+      return {
+        kind: "ok",
+        match: claudeId ? (liveRegistry.bySessionId.get(claudeId) ?? null) : null,
+      };
+    },
+    [liveRegistry, tabsById],
+  );
+
+  // The location axis first: it decides which sessions get a digest (every
+  // one that may be running, however many — no 50-row cap).
+  const digestIds = useMemo(
+    () =>
+      digestRequestIds(
+        mergedRows
+          .filter((r) => r.source === "transcript" && !isInjectedStatus(r._transcript))
+          .map((r) => ({
+            sessionId: r.sessionId,
+            lastModified: r.lastModified,
+            location: classifyLocation({
+              tab: tabInputFor(r),
+              registry: registryFor(r),
+              externalScan: externalScan.state,
+            }).value,
+          })),
+      ),
+    [mergedRows, tabInputFor, registryFor, externalScan.state],
+  );
+  const {
+    digests,
+    loading: digestsLoading,
+    refresh: refreshDigests,
+  } = useSessionDigests(digestIds);
+
+  // ── Classify ─────────────────────────────────────────────────────────────
+
   const allSessions = useMemo(
-    (): UnifiedSession[] => mergeLiveRows(transcriptRows, { tabs, sessionStates, registryNames }),
-    [transcriptRows, tabs, sessionStates, registryNames],
+    (): UnifiedSession[] =>
+      mergedRows.map((row): UnifiedSession => {
+        if (row.source === "transcript") {
+          const injected = injectedStatusOf(row._transcript);
+          if (injected) return { ...row, status: injected };
+          const digest = digests[row.sessionId];
+          return {
+            ...row,
+            lastMessageType: digest?.last_message_type ?? "",
+            lastMessageTimestamp: digest?.last_message_timestamp ?? row.lastModified,
+            lastMessagePreview: digest?.last_message_preview ?? "",
+            workSummaryHint: digest?.work_summary_hint ?? "",
+            status: classifySession({
+              tab: tabInputFor(row),
+              registry: registryFor(row),
+              externalScan: externalScan.state,
+              digest: digest
+                ? {
+                    lastMessageType: digest.last_message_type,
+                    lastAssistantHadToolUse: digest.last_assistant_had_tool_use,
+                    lastMessageTimestamp: digest.last_message_timestamp,
+                  }
+                : null,
+              finished: finishedFor(finishedMarkers, row.sessionId),
+            }),
+          };
+        }
+        const claudeId = tabsById.get(row.sessionId)?.claudeSessionId ?? null;
+        return {
+          ...row,
+          status: classifySession({
+            tab: tabInputFor(row),
+            registry: registryFor(row),
+            externalScan: externalScan.state,
+            digest: "not-applicable",
+            finished: claudeId ? finishedFor(finishedMarkers, claudeId) : null,
+          }),
+        };
+      }),
+    [mergedRows, digests, tabInputFor, registryFor, externalScan.state, finishedMarkers, tabsById],
+  );
+
+  const transcriptRows = useMemo(
+    () => allSessions.filter((s): s is TranscriptSessionRow => s.source === "transcript"),
+    [allSessions],
   );
 
   // ── Filter and sort ────────────────────────────────────────────────────────
@@ -1061,7 +895,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
     // Status filter
     if (statusFilter !== "all") {
-      filtered = filtered.filter((s) => s.liveStatus === statusFilter);
+      filtered = filtered.filter((s) => s.status.activity === statusFilter);
     }
 
     // Account filter
@@ -1099,10 +933,10 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         sorted.sort((a, b) => b.messageCount - a.messageCount);
         break;
       case "staleness":
-        // Sort by status priority (frozen first), then by recency
+        // Sort by activity priority (Needs you first), then by recency
         sorted.sort((a, b) => {
-          const pa = STATUS_PRIORITY[a.liveStatus] ?? 5;
-          const pb = STATUS_PRIORITY[b.liveStatus] ?? 5;
+          const pa = ACTIVITY_PRIORITY[a.status.activity];
+          const pb = ACTIVITY_PRIORITY[b.status.activity];
           if (pa !== pb) return pa - pb;
           return b.lastModified.localeCompare(a.lastModified);
         });
@@ -1112,8 +946,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     // When grouping by status, always apply status priority as primary sort
     if (groupBy === "status") {
       sorted.sort((a, b) => {
-        const pa = STATUS_PRIORITY[a.liveStatus] ?? 5;
-        const pb = STATUS_PRIORITY[b.liveStatus] ?? 5;
+        const pa = ACTIVITY_PRIORITY[a.status.activity];
+        const pb = ACTIVITY_PRIORITY[b.status.activity];
         if (pa !== pb) return pa - pb;
         return b.lastModified.localeCompare(a.lastModified);
       });
@@ -1143,91 +977,56 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   // ── Stats ──────────────────────────────────────────────────────────────────
 
-  // Frozen counts transcript rows only: it drives "select all frozen" bulk
-  // resume and the "may need resume" notification, and a tab-sourced row has
-  // nothing to resume. The needs-input / active pills count every live row, so
-  // a hidden plain shell waiting on input shows up in them.
-  const frozenCount = useMemo(
-    () => transcriptRows.filter((s) => s.liveStatus === "frozen").length,
-    [transcriptRows],
-  );
-  const needsInputCount = useMemo(
-    () => allSessions.filter((s) => s.liveStatus === "needs-input").length,
-    [allSessions],
-  );
-  const activeCount = useMemo(
-    () => allSessions.filter((s) => s.liveStatus === "active-in-zone").length,
-    [allSessions],
+  const activityCounts = useMemo(() => {
+    const counts = Object.fromEntries(SESSION_ACTIVITIES.map((a) => [a, 0])) as Record<
+      SessionActivity,
+      number
+    >;
+    for (const s of allSessions) counts[s.status.activity]++;
+    return counts;
+  }, [allSessions]);
+  const noOutputCount = activityCounts["no-output-mid-tool"];
+  const needsInputCount = activityCounts["needs-you"];
+
+  const unidentifiedCount = useMemo(
+    () => countUnidentified(externalScan, liveRegistry.read === "ok" ? liveRegistry.pids : null),
+    [externalScan, liveRegistry],
   );
 
-  // Per-status breakdown for the Terminal-page StatusStrip pills.
-  //
-  // CRITICAL SCOPE: the strip must count only the *live / actively-managed*
-  // Claude sessions the operator currently has open — NOT every historical
-  // on-disk transcript. `allSessions` is built from `transcriptSessions`
-  // (`transcript_list_sessions` returns EVERY `.jsonl` with message_count > 0
-  // across all accounts — hundreds on a long-lived machine), so
-  // `allSessions.length` is the wrong total: it counts dormant historical
-  // transcripts that aren't running. The operator's "18 sessions / 14 idle"
-  // complaint (and a fresh runner's "438 sessions / 436 idle") is exactly
-  // this over-count — the inflation is the `dormant` bucket (every never-
-  // reopened transcript defaults to `dormant`) plus orphaned `frozen`
-  // transcripts (a `likely_frozen` digest with NO live PTY tab in this
-  // window — `isOrphaned`, i.e. a resumable historical session, not a stuck
-  // live one).
-  //
-  // A session is LIVE — and thus counted by the strip — iff it is NOT a
-  // historical/dormant transcript. Concretely it is dropped when:
-  //   - `liveStatus === "dormant"` — the default for a transcript with no
-  //     live PTY tab in this window and no recent external activity (every
-  //     never-reopened on-disk transcript), i.e. the bulk over-count; OR
-  //   - it is an orphaned `frozen` transcript (`isOrphaned` — a `likely_frozen`
-  //     digest with NO live tab: a resumable historical session, not a stuck
-  //     live one).
-  // Everything that survives is genuinely live: `active-in-zone` /
-  // `active-external` (running), `needs-input` / `error` / `completed`
-  // (always tab-backed — only the `if (tab)` branch sets them), and
-  // tab-backed (non-orphaned) `frozen` (a stale tab still open here →
-  // "idle"). This is status-semantic rather than keyed on the raw
-  // `zoneTabId` pointer so debug-injected fixtures (which carry an explicit
-  // `injected_live_status` but no real tab) are still counted when their
-  // status is a live one — matching what the operator sees rendered.
-  //
-  // Buckets are mapped explicitly over the 7 SessionLiveStatus values so
-  // adding a new status forces a compile-time decision here rather than
-  // silently dropping it.
-  //
-  // Transcript rows only: the strip counts Claude sessions, and a tab-sourced
-  // row (a plain shell, a session before its first message) is a PTY tab.
+  // Per-bucket breakdown for the Terminal-page StatusStrip pills — Claude
+  // sessions only (transcript rows; a tab-sourced row is a PTY tab), and only
+  // the ones that may be running. See `computeStatusCounts`.
   const statusCounts = useMemo(() => computeStatusCounts(transcriptRows), [transcriptRows]);
 
-  // ── Desktop notifications for frozen sessions ──────────────────────────────
+  // ── Desktop notification for sessions that went silent mid-tool ──────────
 
-  const prevFrozenCountRef = useRef(0);
+  const prevNoOutputCountRef = useRef(0);
   useEffect(() => {
     if (
       desktopNotify &&
-      frozenCount > prevFrozenCountRef.current &&
-      prevFrozenCountRef.current >= 0 &&
+      noOutputCount > prevNoOutputCountRef.current &&
       document.hidden &&
       "Notification" in window &&
       Notification.permission === "granted"
     ) {
-      const newFrozen = frozenCount - prevFrozenCountRef.current;
+      const added = noOutputCount - prevNoOutputCountRef.current;
       new Notification("Session Manager", {
-        body: `${newFrozen} session${newFrozen > 1 ? "s" : ""} appear${newFrozen === 1 ? "s" : ""} frozen and may need resume`,
-        tag: "session-manager-frozen",
+        body: `${added} session${added > 1 ? "s have" : " has"} produced no output mid-tool`,
+        tag: "session-manager-no-output",
       });
     }
-    prevFrozenCountRef.current = frozenCount;
-  }, [frozenCount, desktopNotify]);
+    prevNoOutputCountRef.current = noOutputCount;
+  }, [noOutputCount, desktopNotify]);
 
   // ── Actions ────────────────────────────────────────────────────────────────
 
   const refresh = useCallback(() => {
     onRefreshSessions();
-    fetchDigests();
-  }, [onRefreshSessions, fetchDigests]);
+    refreshDigests();
+    void refreshLiveClaudeSessions();
+    void refreshExternalClaudeScan();
+    void refreshFinishedMarkers();
+  }, [onRefreshSessions, refreshDigests]);
 
   const resumeSession = useCallback(
     (session: UnifiedSession) => {
@@ -1302,12 +1101,13 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     });
   }, []);
 
-  const selectAllFrozen = useCallback(() => {
-    const frozenIds = transcriptRows
-      .filter((s) => s.liveStatus === "frozen")
-      .map((s) => s.sessionId);
-    setSelectedIds(new Set(frozenIds));
-  }, [transcriptRows]);
+  // Selects what the filter shows: every visible transcript row (a tab-sourced
+  // row has nothing to bulk-resume).
+  const selectAllVisible = useCallback(() => {
+    setSelectedIds(
+      new Set(sessions.filter((s) => s.source === "transcript").map((s) => s.sessionId)),
+    );
+  }, [sessions]);
 
   const clearSelection = useCallback(() => {
     setSelectedIds(new Set());
@@ -1363,7 +1163,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     closeSession,
     selectedIds,
     toggleSelect,
-    selectAllFrozen,
+    selectAllVisible,
     clearSelection,
     bulkResume,
     pinnedIds,
@@ -1372,15 +1172,17 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     setSessionLabel,
     allAccounts,
     savedConfigDirs,
-    frozenCount,
+    activityCounts,
+    noOutputCount,
     needsInputCount,
-    activeCount,
+    unidentifiedCount,
     // Session-model counts for the StatusStrip (excludes PTY-only tabs).
     claudeSessionCount: statusCounts.claudeSessionCount,
     workingCount: statusCounts.workingCount,
-    externalWorkingCount: statusCounts.externalWorkingCount,
+    outsideWorkingCount: statusCounts.outsideWorkingCount,
     idleCount: statusCounts.idleCount,
     completedCount: statusCounts.completedCount,
     errorCount: statusCounts.errorCount,
+    unknownCount: statusCounts.unknownCount,
   };
 }
