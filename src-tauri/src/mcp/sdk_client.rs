@@ -9036,4 +9036,56 @@ mod connect_bearer_scope_tests {
             "a cross-host redirect must not carry the operator bearer"
         );
     }
+
+    /// The same rule at the population's door, with nothing injected.
+    /// `connect_sdk_app` is the handshake every SDK connection takes
+    /// (`handle_connect` and auto-connect alike), and it finds the operator's
+    /// stored credential by itself. Here a device JWT is stored, and the app
+    /// sits at a host that is neither loopback nor a Qontinui origin: that host
+    /// must see no `Authorization` on any request.
+    ///
+    /// `0.0.0.0` plays the foreign host. It is not a loopback literal and not a
+    /// Qontinui origin (the classification table above pins it as foreign), yet
+    /// on Linux and macOS a connection to it lands on the local listener — so
+    /// the recorder stands in for a foreign host with no DNS lookup and no real
+    /// host contacted. Windows refuses a connect to `0.0.0.0`, hence
+    /// `cfg(unix)`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_handshake_never_hands_the_stored_bearer_to_a_foreign_host() {
+        let _ambient = crate::test_env::isolated_ambient();
+        // Never the real OS keychain: `store_tokens` writes it unless this is
+        // set. The fixture holds the env lock and restores the key on drop.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        crate::auth::AuthManager::new()
+            .store_tokens(&a_stored_device_jwt(), "")
+            .expect("the fixture stores a device JWT");
+
+        let (port, seen) = spawn_recorder().await;
+        let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
+        let url = format!("http://0.0.0.0:{port}");
+        let _ = connect_sdk_app(&manager, &url, None, None, None, None, None).await;
+
+        let probes = requests_to(&seen, &format!("0.0.0.0:{port}"));
+        assert!(
+            !probes.is_empty(),
+            "the handshake never reached the stand-in foreign host"
+        );
+        assert!(
+            probes.iter().all(Option::is_none),
+            "a foreign host received the operator's stored bearer: {probes:?}"
+        );
+    }
+
+    /// An unexpired, JWT-shaped device token. Unsigned: nothing on this path
+    /// verifies a signature, it only reads the shape and `exp`.
+    fn a_stored_device_jwt() -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let payload = URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "sub_type": "device", "exp": exp }).to_string());
+        format!("{header}.{payload}.sig")
+    }
 }
