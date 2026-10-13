@@ -73,6 +73,7 @@ const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
       { keys: "Ctrl+Shift+L", description: "Cycle through layout presets" },
       { keys: "Ctrl+Shift+Y", description: "Toggle work mode (grid / tmux)" },
       { keys: "Ctrl+Shift+B", description: "Toggle session manager" },
+      { keys: "Ctrl+Shift+Space", description: "Find a session (live, previous, closed)" },
       { keys: "Ctrl+Shift+A", description: "Toggle auto-focus on needs-input" },
       { keys: "Ctrl+Shift+S", description: "Toggle sound notification" },
       { keys: "Ctrl+Shift+D", description: "Toggle focus mode (dim non-focused zones)" },

@@ -242,6 +242,10 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
   "components/terminal/FilePathLinkProvider.ts":
     "xterm link provider: Ctrl/Cmd must be held for a path to be clickable. Not a " +
     "chord — a hover/click modifier, with no key field read at all.",
+  "components/terminal/SessionSearchPalette.tsx":
+    "palette input: Enter opens the picked session, Shift+Enter opens it in a new zone. " +
+    "ELEMENT-scoped `onKeyDown` on the focused input; the palette's GLOBAL chord " +
+    "(Ctrl+Shift+Space) is routed through the table from sessionSearchPaletteStore.ts.",
   "components/terminal/TerminalFindBar.tsx":
     "F3 / Shift+F3 pick the find direction. Shift-only, and `matchesChord` cannot " +
     "express a shift-only chord — see keyClaimScan.ts::CONTROL_TAGS.",
@@ -2718,11 +2722,13 @@ describe("hand-rolled chord claims", () => {
         },
       ]),
     ).toEqual([]);
-    // And the two live files this describes are in the tree right now.
+    // And the live files this describes are in the tree right now — the two
+    // above plus `terminal/sessionSearchPaletteStore.ts`, whose
+    // Ctrl+Shift+Space listener routes through `GLOBAL_CHORDS.sessionSearch`.
     const ungraded = LISTENER_GRADES.filter((g) => g.globalListener && g.scan === null).map(
       (g) => g.rel,
     );
-    expect(ungraded.length, "the ungraded-listener case must be LIVE, not hypothetical").toBe(2);
+    expect(ungraded.length, "the ungraded-listener case must be LIVE, not hypothetical").toBe(3);
   });
 
   it("reaches a claimant registered through `onkeydown` — the D9 prefilter", () => {
