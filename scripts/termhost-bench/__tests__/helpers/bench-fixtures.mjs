@@ -373,28 +373,32 @@ export function operativeCapabilities(overrides = {}) {
 
 /**
  * A watch segment whose pane stopped repainting, as CI run 38351621760 recorded
- * it: every frame still shows each session's output marker, but frozen at the
- * first frame's sequence; one first appearance per session; and the probe's own
- * output latency is then unknown(insufficient_samples).
+ * it: from `fromMs` into the watch (0 = the whole watch), every frame still shows
+ * each session's output marker, but frozen at the sequence it showed then; no
+ * first appearance after it. A whole-watch freeze also leaves the probe's own
+ * output latency unknown(insufficient_samples); a partial one leaves it measured
+ * from the live part — which is the case the harness must not report as measured.
+ *
+ * @param {object[]} records a watchSegment()'s records
+ * @param {{fromMs?: number}} [o]
  */
-export function stallSegment(records) {
+export function stallSegment(records, { fromMs = 0 } = {}) {
+  const start = BigInt(records.find((r) => r.type === "start").t0_ns) + 5n * MS;
+  const from = start + BigInt(fromMs) * MS;
   const frozen = new Map();
   const out = [];
-  const firstKept = new Set();
   for (const r of records) {
-    if (r.type === "frame") {
+    const t = r.t_ns !== undefined ? BigInt(r.t_ns) : null;
+    if (r.type === "frame" && t !== null && t >= from) {
       const markers = (r.markers ?? []).map((m) => {
         if (m.kind !== "output") return m;
         if (!frozen.has(m.session)) frozen.set(m.session, m.seq);
         return { ...m, seq: frozen.get(m.session) };
       });
       out.push({ ...r, markers });
-    } else if (r.type === "first_seen") {
-      if (r.kind === "output" && !firstKept.has(r.session)) {
-        firstKept.add(r.session);
-        out.push(r);
-      }
-    } else if (r.type === "summary") {
+    } else if (r.type === "first_seen" && t !== null && t >= from) {
+      continue;
+    } else if (r.type === "summary" && fromMs === 0) {
       out.push({ ...r, output_latency_ms: { state: "unknown", unit: "ms", n: 0, reason: "insufficient_samples" } });
     } else {
       out.push(r);

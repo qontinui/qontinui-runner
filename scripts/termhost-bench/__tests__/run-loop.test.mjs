@@ -120,8 +120,8 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
   for (const labels of probe.labels.values()) {
     // Every arm measures before ANY arm spawns: a spawn changes the runner's layout,
     // and the tiled soak run after the focus arm's spawns saw no session at all
-    // (CI run 38345475088). And tiled measures before focus: after the focus arm's
-    // maximize + restore the restored pane stopped repainting (CI run 38351621760).
+    // (CI run 38345475088). And tiled measures before focus, the layout an operator
+    // gets before any harness maximize.
     assert.deepEqual(labels, ["tiled-soak", "focus-soak", "focus-switch", "focus-spawn", "tiled-spawn"].filter((l) => labels.includes(l)));
     assert.equal(new Set(labels).size, labels.length);
     assert.ok(labels.includes("focus-soak") && labels.includes("tiled-soak"));
@@ -536,9 +536,9 @@ test("a stalled pane in a soak becomes a pane_stalled incident on its row and na
     }),
   });
   const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
-  assert.equal(tiled.kpis.output_latency_ms.reason, "insufficient_samples");
-  assert.match(tiled.kpis.output_latency_ms.detail, /the pane stopped repainting: session 0 stayed at seq/);
-  assert.ok(tiled.incidents.some((i) => i.kind === "pane_stalled" && /session 0's output marker stayed at seq \d+/.test(i.detail)), JSON.stringify(tiled.incidents));
+  assert.equal(tiled.kpis.output_latency_ms.reason, "pane_stalled");
+  assert.match(tiled.kpis.output_latency_ms.detail, /the pane stopped repainting: session 0 stayed at seq \d+ for \d+ ms/);
+  assert.ok(tiled.incidents.some((i) => i.kind === "pane_stalled" && /arm tiled: soak: session 0 stayed at seq \d+ for \d+ ms/.test(i.detail)), JSON.stringify(tiled.incidents));
   const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
   assert.ok(!focus.incidents.some((i) => i.kind === "pane_stalled"));
   assert.equal(validateResults(res.doc).valid, true);
@@ -564,4 +564,40 @@ test("the spawn pass measures new sessions even when its arrangement shows no ea
   assert.equal(tiled.kpis.spawn_latency_ms.n, 2, JSON.stringify(tiled.kpis.spawn_latency_ms));
   assert.notEqual(tiled.kpis.spawn_latency_ms.reason, "sessions_not_rendered");
   assert.equal(tiled.kpis.output_latency_ms.state, "measured", "the measure pass is untouched");
+});
+
+
+test("after the focus arm, a restore-zone check records a frozen restored pane as an incident, gating nothing (review r9 nit 2)", async (t) => {
+  const restores = [];
+  const run = (freeze) =>
+    fakeRun(t, {
+      opts: { ns: [1], setups: ["runner"], restoreCheckMs: 4000 },
+      adapterHook: (a) => {
+        a.restoreZone = async () => {
+          restores.push(a.unit.index);
+          return { maximizedZone: null };
+        };
+      },
+      wrapProbe: (inner) => ({
+        ...inner,
+        startWatch(o) {
+          const w = inner.startWatch(o);
+          if (!freeze || o.label !== "focus-restore-check") return w;
+          return { ...w, stop: async () => {
+            const seg = await w.stop();
+            return { ...seg, records: stallSegment(seg.records) };
+          } };
+        },
+      }),
+    });
+  const frozen = (await run(true)).res;
+  assert.ok(restores.length > 0, "the check restored the zone");
+  const focus = frozen.doc.rows.find((r) => r.scenario.arm === "focus");
+  const inc = focus.incidents.filter((i) => i.kind === "pane_stalled");
+  assert.equal(inc.length, 1, JSON.stringify(focus.incidents));
+  assert.match(inc[0].detail, /arm focus: after restore-zone: session 0 stayed at seq \d+ for \d+ ms .*the restored pane is not repainting/);
+  assert.equal(focus.kpis.output_latency_ms.state, "measured", "it gates nothing: the focus soak is unaffected");
+  assert.equal(validateResults(frozen.doc).valid, true);
+  const clean = (await run(false)).res;
+  assert.ok(!clean.doc.rows.some((r) => r.incidents.some((i) => i.kind === "pane_stalled")));
 });
