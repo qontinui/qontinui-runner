@@ -18101,19 +18101,24 @@ mod coord_mcp_body_gate_tests {
     /// allowed.
     #[test]
     fn expedited_land_request_is_deliberate_and_status_is_allowed() {
-        assert!(!super::coord_mcp_tool_is_allowed("coord_request_expedited_land"));
+        assert!(!super::coord_mcp_tool_is_allowed(
+            "coord_request_expedited_land"
+        ));
         assert!(super::coord_mcp_withholding_is_deliberate(
             "coord_request_expedited_land"
         ));
         let d = super::coord_mcp_refusal_cause("coord_request_expedited_land", None);
         assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
         assert!(
-            d.remedy.contains("/pr-merge/repos/:repo/pulls/:number/agent/expedite")
+            d.remedy
+                .contains("/pr-merge/repos/:repo/pulls/:number/agent/expedite")
                 && d.remedy.contains("X-Coord-Caller-Session"),
             "{}",
             d.remedy
         );
-        assert!(super::coord_mcp_tool_is_allowed("coord_expedited_land_status"));
+        assert!(super::coord_mcp_tool_is_allowed(
+            "coord_expedited_land_status"
+        ));
         assert!(!super::coord_mcp_withholding_is_deliberate(
             "coord_expedited_land_status"
         ));
@@ -18131,7 +18136,11 @@ mod coord_mcp_body_gate_tests {
         let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
             .expect("parses");
         assert_eq!(
-            parsed.allowed.iter().filter(|t| *t == "coord_expedited_land_status").count(),
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| *t == "coord_expedited_land_status")
+                .count(),
             1
         );
         assert_eq!(
