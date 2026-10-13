@@ -239,6 +239,11 @@ mod tests {
 rl.on('line',()=>process.stdout.write(process.hrtime.bigint().toString()+'\\n'));\
 rl.on('close',()=>process.exit(0));process.stdout.write('ready\\n');},2500);";
 
+    // Every test that needs node to START gives it the production
+    // allowance (NODE_STARTUP): a cold node under the parallel test load has
+    // taken over 10 s (PR #2181, run 38341619507). Only the never-ready test
+    // keeps a short one, because the timeout is its subject.
+
     /// A node that starts but never reports ready.
     const NEVER_READY: &str = "setInterval(()=>{},1000);";
 
@@ -248,8 +253,9 @@ rl.on('close',()=>process.exit(0));process.stdout.write('ready\\n');},2500);";
             "node",
             SLOW_START,
             12,
-            Duration::from_secs(20),
-            Duration::from_secs(1),
+            NODE_STARTUP,
+            // Under the 2.5 s start, so a start-up that shared it would fail.
+            Duration::from_secs(2),
         );
         match facts {
             ClockFacts::Measured(a) => assert!(a.aligned, "{a:?}"),
@@ -279,13 +285,7 @@ rl.on('close',()=>process.exit(0));process.stdout.write('ready\\n');},2500);";
     #[test]
     fn a_node_that_speaks_before_ready_is_a_failed_round_trip() {
         let script = "process.stdout.write('hello\\nready\\n');setInterval(()=>{},1000);";
-        let facts = round_trip_with(
-            "node",
-            script,
-            8,
-            Duration::from_secs(10),
-            Duration::from_secs(1),
-        );
+        let facts = round_trip_with("node", script, 8, NODE_STARTUP, Duration::from_secs(1));
         match facts {
             ClockFacts::Failed(why) => {
                 assert!(
