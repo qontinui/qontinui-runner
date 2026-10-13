@@ -830,15 +830,17 @@ jobs:
           toolchain: "1.95.0"
 
       # First, so the VS Code smoke (which needs only the probe) still runs when
-      # a runner build fails.
-      - name: Build termhost-probe
+      # a runner build fails. RELEASE, as in run-linux-xvfb: the benchmark scans
+      # every full-screen frame, and a debug scanner fell behind its capture source
+      # there (CI run 38345475088). The probe jobs above keep their debug build.
+      - name: Build termhost-probe (release)
         id: probe
         shell: bash
         working-directory: head/qontinui-runner
         timeout-minutes: 20
         run: |
-          cargo build -p termhost-probe
-          test -f target/debug/termhost-probe.exe
+          cargo build --release -p termhost-probe
+          test -f target/release/termhost-probe.exe
 
       - name: Build the head runner
         id: build_head
@@ -888,7 +890,7 @@ jobs:
             --runner-mode subject \
             --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner.exe" \
             --head-commit "$(git rev-parse HEAD)" \
-            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/termhost-probe.exe" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe" \
             --vscode-cache-dir "$RUNNER_TEMP/termhost-cache" \
             | tee "$RUNNER_TEMP/termhost-bench-doctor.txt"
           {
@@ -915,7 +917,7 @@ jobs:
             --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner.exe"
             --head-commit "$(git rev-parse HEAD)"
             --n "$N" --arms "$ARMS" --runs "$RUNS"
-            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/termhost-probe.exe"
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe"
             --work-dir "$RUNNER_TEMP/tb" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
             --out "$RUNNER_TEMP/tb-out/results.json")
           if [ "$BASELINE" != none ]; then
@@ -1005,7 +1007,7 @@ jobs:
           node scripts/termhost-bench/cli.mjs run --env windows-hosted --setups vscode \
             --n "$N" --arms "$ARMS" --runs 1 --smoke-setups vscode \
             --vscode-cache-dir "$RUNNER_TEMP/termhost-cache" \
-            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/termhost-probe.exe" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe" \
             --work-dir "$RUNNER_TEMP/tb-vscode" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-vsc" \
             --out "$RUNNER_TEMP/tb-vscode-out/results.json"
 
