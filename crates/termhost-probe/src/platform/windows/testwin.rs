@@ -237,6 +237,15 @@ pub struct GdiTestWindow {
 }
 
 impl GdiTestWindow {
+    /// Every window this test window created — itself and its occluder: the
+    /// windows the doctor's D9 check counts as the probe's.
+    pub fn created_windows(&self) -> [usize; 2] {
+        [
+            self.handle().0 as usize,
+            self.shared.occluder.load(Ordering::Relaxed) as usize,
+        ]
+    }
+
     pub fn create(opts: &TestWindowOptions) -> Result<GdiTestWindow, String> {
         let need_w = PAD * 2 + opts.cell_w * CELLS as u32;
         let need_h = PAD * 3 + opts.cell_h * 2;

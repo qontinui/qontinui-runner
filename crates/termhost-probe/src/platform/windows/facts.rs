@@ -75,9 +75,10 @@ pub fn gather(node: &str) -> Facts {
             // intrusion).
             let before = foreground();
             let mut during = Vec::new();
-            let (wgc, dda) = capture_facts(&mut during);
+            let mut created = Vec::new();
+            let (wgc, dda) = capture_facts(&mut during, &mut created);
             let after = foreground();
-            match foreground_finding(before, &during, after, of_this_process) {
+            match foreground_finding(before, &during, after, |h| created.contains(&h)) {
                 ForegroundFinding::Clean => (wgc, dda, None, None),
                 ForegroundFinding::ProbeTookIt(v) => (wgc, dda, Some(v), None),
                 ForegroundFinding::ChangedNotByProbe(n) => (wgc, dda, None, Some(n)),
@@ -105,23 +106,14 @@ fn foreground() -> usize {
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as usize
 }
 
-/// Whether `h` is a window of this process (the probe, or any other).
-fn of_this_process(h: usize) -> bool {
-    let mut pid = 0u32;
-    // SAFETY: GetWindowThreadProcessId accepts any window handle.
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-            windows::Win32::Foundation::HWND(h as *mut core::ffi::c_void),
-            Some(&mut pid),
-        )
-    };
-    pid == std::process::id()
-}
-
 /// Capture the doctor's probe window with WGC and DDA, sampling the
 /// foreground into `during` right after the window is created and after
-/// each capture probe.
-fn capture_facts(during: &mut Vec<usize>) -> (CaptureFacts, CaptureFacts) {
+/// each capture probe, and naming the windows the probe created in
+/// `created`.
+fn capture_facts(
+    during: &mut Vec<usize>,
+    created: &mut Vec<usize>,
+) -> (CaptureFacts, CaptureFacts) {
     let (x, y) = work_area_origin();
     let opts = TestWindowOptions {
         title: "termhost-probe doctor".into(),
@@ -142,6 +134,7 @@ fn capture_facts(during: &mut Vec<usize>) -> (CaptureFacts, CaptureFacts) {
             return (f.clone(), f);
         }
     };
+    created.extend(win.created_windows());
     during.push(foreground());
     let expect = Marker::new(MarkerKind::Calibration, 0, 0);
     std::thread::sleep(Duration::from_millis(150));

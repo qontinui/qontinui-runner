@@ -124,11 +124,11 @@ pub fn x11_focus_verdict(
 pub enum ForegroundFinding {
     /// Unchanged throughout, and never one of ours.
     Clean,
-    /// A D9 violation: the foreground was the probe or another window of
-    /// this process at some sample.
+    /// A D9 violation: at some sample the foreground had MOVED to a window
+    /// the probe created.
     ProbeTookIt(String),
-    /// The foreground moved, but never to a window of ours: the operator (or
-    /// another program) switched windows. Not a violation.
+    /// The foreground moved, but never to a window the probe created: the
+    /// operator (or another program) switched windows. Not a violation.
     ChangedNotByProbe(String),
 }
 
@@ -137,8 +137,12 @@ pub enum ForegroundFinding {
 /// probe), `after` it closed. A before/after comparison alone misses a
 /// transient steal — Windows re-activates the previous window when the
 /// stealer is destroyed — and blames the probe for an operator's click, so
-/// the samples taken WHILE it was up decide, by whose window was foreground
-/// (`ours`: the probe or any other window of this process).
+/// the samples taken WHILE it was up decide, by whose window was foreground.
+/// `ours` names the windows the probe CREATED (its window and occluder), not
+/// the whole process: a probe run in its own console owns that console, which
+/// is foreground from the start. And a sample counts only as a CHANGE — a
+/// window of ours that was already foreground before the probe (`before`)
+/// was not taken by it.
 pub fn foreground_finding(
     before: usize,
     during: &[usize],
@@ -151,15 +155,16 @@ pub fn foreground_finding(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    if during.iter().any(|&h| h != 0 && ours(h)) || (after != 0 && ours(after)) {
+    let taken = |h: usize| h != 0 && h != before && ours(h);
+    if during.iter().any(|&h| taken(h)) || taken(after) {
         return ForegroundFinding::ProbeTookIt(format!(
-            "a window of this process was foreground while the doctor's probe window was up (before 0x{before:x}; during {}; after 0x{after:x}); the probe must never take focus",
+            "the foreground moved to a window the doctor's probe created (before 0x{before:x}; during {}; after 0x{after:x}); the probe must never take focus",
             fmt(during)
         ));
     }
     if during.iter().any(|&h| h != before) || after != before {
         return ForegroundFinding::ChangedNotByProbe(format!(
-            "foreground changed (not by the probe): before 0x{before:x}; during {}; after 0x{after:x} — never a window of this process",
+            "foreground changed (not by the probe): before 0x{before:x}; during {}; after 0x{after:x} — never to a window the probe created",
             fmt(during)
         ));
     }
@@ -393,11 +398,17 @@ mod tests {
             foreground_finding(0x10, &[0x10, 0x77], 0x10, ours),
             ForegroundFinding::ProbeTookIt(_)
         ));
-        // Another window of this process counts as ours too.
+        // The probe's other window (its occluder) counts too.
         assert!(matches!(
             foreground_finding(0x10, &[0x78], 0x10, ours),
             ForegroundFinding::ProbeTookIt(_)
         ));
+        // A console that was ours from the start (the probe run with its own
+        // console window) and stayed foreground: nothing was taken.
+        assert_eq!(
+            foreground_finding(0x77, &[0x77, 0x77], 0x77, ours),
+            ForegroundFinding::Clean
+        );
         // The operator clicked elsewhere: changed, but not by the probe.
         match foreground_finding(0x10, &[0x10, 0x20], 0x20, ours) {
             ForegroundFinding::ChangedNotByProbe(why) => {
