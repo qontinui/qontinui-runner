@@ -358,7 +358,10 @@ impl Client {
         Ok(AttachedStream {
             info,
             hello_ack: self.ack,
-            reader: StreamReader { conn: self.conn },
+            reader: StreamReader {
+                conn: self.conn,
+                restoring: restore,
+            },
             writer: StreamWriter { conn: writer },
         })
     }
@@ -404,6 +407,10 @@ pub enum Event {
 #[derive(Debug)]
 pub struct StreamReader {
     conn: Conn,
+    /// This connection asked for the restore envelope. A synthetic frame on
+    /// one that did not is a protocol error, never displayed: those bytes
+    /// would land in a consumer whose own mode state is already right.
+    restoring: bool,
 }
 
 impl StreamReader {
@@ -434,6 +441,9 @@ impl StreamReader {
                     bytes: bytes.to_vec(),
                 }))
             }
+            KIND_SYNTHETIC if !self.restoring => Err(ConnectError::Protocol(
+                "a synthetic frame on a connection that did not ask for a restore".into(),
+            )),
             KIND_SYNTHETIC => {
                 let (part, anchor, bytes) = parse_synthetic(&frame.payload)
                     .ok_or_else(|| ConnectError::Protocol("malformed synthetic frame".into()))?;
@@ -839,4 +849,48 @@ pub fn census_with_versions(
     }
     rows.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::synthetic_payload;
+
+    /// A reader over one end of a socketpair, and the other end to write to.
+    #[cfg(unix)]
+    fn reader_pair(restoring: bool) -> (StreamReader, std::os::unix::net::UnixStream) {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        (
+            StreamReader {
+                conn: Conn::from_stream(ours),
+                restoring,
+            },
+            theirs,
+        )
+    }
+
+    /// Nit from review: a synthetic frame is accepted only on a connection
+    /// that asked for the restore envelope — elsewhere it is a protocol error,
+    /// never bytes handed to a consumer whose state is already right.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_attach_synthetic_frames_only_on_a_restoring_connection() {
+        let frame = synthetic_payload(SyntheticPart::Postamble, 7, b"\x1b[?2004h");
+        let soon = Some(Instant::now() + Duration::from_secs(5));
+
+        let (mut r, mut w) = reader_pair(false);
+        write_frame(&mut w, KIND_SYNTHETIC, &frame).unwrap();
+        assert!(matches!(r.next_event(soon), Err(ConnectError::Protocol(_))));
+
+        let (mut r, mut w) = reader_pair(true);
+        write_frame(&mut w, KIND_SYNTHETIC, &frame).unwrap();
+        assert_eq!(
+            r.next_event(soon).unwrap(),
+            Some(Event::Synthetic {
+                part: SyntheticPart::Postamble,
+                anchor: 7,
+                bytes: b"\x1b[?2004h".to_vec(),
+            })
+        );
+    }
 }

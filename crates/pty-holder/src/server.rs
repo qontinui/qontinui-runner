@@ -37,18 +37,17 @@
 //! ## The restore envelope (protocol version 3, plan D14)
 //!
 //! An `attach {restore: true}` on a version-3 connection is answered with
-//! `restore {cwd, title}` metadata in `attached`, and — unless the consumer
-//! will see the stream from its very first byte, when there is nothing to
-//! restore — the tail is bracketed by two synthetic frames computed under the
-//! pane lock from `crate::modes::ModeTracker`, so they agree with the ring:
+//! `restore {cwd, title}` metadata in `attached`, and the tail is bracketed by
+//! two synthetic frames — ALWAYS both, empty or not, so a client can tell a
+//! delivered postamble from one lost with the connection. The pump computes
+//! them from one look at `crate::modes::ModeTracker` under the pane lock:
 //!
-//! - the PREAMBLE (state at the first byte the connection will be sent) is
-//!   written right after `attached`, before the pump exists, so it precedes
-//!   every output frame;
-//! - the POSTAMBLE (state at the attach-time end of the stream) is held by the
-//!   pump and sent the moment its offset reaches that end — output frames are
-//!   cut at the anchor so the postamble lands exactly there, before any byte
-//!   produced after the attach and before the `exit`.
+//! - the PREAMBLE (state at the first byte the connection can still be sent)
+//!   is the pump's first frame, before any output;
+//! - the POSTAMBLE (state at the stream's end at that moment) is held and sent
+//!   the moment the stream reaches that end — output frames are cut at the
+//!   anchor, and a loss report that would jump past it is preceded by it — so
+//!   it lands before any byte produced later and before the `exit`.
 //!
 //! `pause` stops the pump's SENDING only; the PTY read never pauses. A pump
 //! whose client stops reading for [`PUMP_WRITE_TIMEOUT`] drops the connection
@@ -666,7 +665,7 @@ fn start_attach(
     from: Option<u64>,
     restore: bool,
 ) -> io::Result<()> {
-    let (reply, envelope) = {
+    let reply = {
         let st = pane.lock_state();
         let ring_start = st.ring.start_offset();
         let end = st.ring.end_offset();
@@ -674,16 +673,10 @@ fn start_attach(
             None => end.saturating_sub(ATTACH_TAIL_BYTES).max(ring_start),
             Some(x) => x.min(end),
         };
-        // The first byte this connection will actually be sent: past a loss,
-        // the stream resumes at the ring's start.
-        let first_sent = start.max(ring_start);
-        // A consumer that is sent the stream from its first byte rebuilds
-        // every mode itself; anything later needs the envelope.
-        let envelope = (restore && first_sent > 0).then(|| st.modes.envelope(first_sent));
         let meta = restore.then(|| {
             crate::metadata::restore_meta(st.modes.cwd(), pane.spawn_cwd(), st.modes.title())
         });
-        let reply = AttachedReply {
+        AttachedReply {
             start_offset: start,
             ring_start_offset: ring_start,
             end_offset: end,
@@ -691,30 +684,14 @@ fn start_attach(
             cols: st.size.0,
             rows: st.size.1,
             restore: meta,
-        };
-        (reply, envelope)
+        }
     };
     let next = reply.start_offset;
     send_reply(writer, &Reply::Attached(reply))?;
-    let mut postamble = None;
-    if let Some(env) = envelope {
-        if !env.preamble.is_empty() {
-            send_synthetic(
-                writer,
-                SyntheticPart::Preamble,
-                env.preamble_at,
-                &env.preamble,
-                REPLY_WRITE_TIMEOUT,
-            )?;
-        }
-        if !env.postamble.is_empty() {
-            postamble = Some((env.postamble_at, env.postamble));
-        }
-    }
     let (pane, writer, flow) = (Arc::clone(pane), Arc::clone(writer), Arc::clone(flow));
     std::thread::Builder::new()
         .name("pty-holder-pump".into())
-        .spawn(move || pump(&pane, &writer, &flow, next, postamble))?;
+        .spawn(move || pump(&pane, &writer, &flow, next, restore))?;
     Ok(())
 }
 
@@ -733,7 +710,80 @@ fn send_synthetic(
     )
 }
 
-/// What a pump does next.
+/// What a pump does next, decided under the pane lock by [`decide`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Stop,
+    /// Send the held postamble now.
+    Postamble,
+    Lost {
+        from: u64,
+        to: u64,
+    },
+    /// Send up to `max` ring bytes from `from`.
+    Output {
+        from: u64,
+        max: usize,
+    },
+    Exit,
+    Wait,
+}
+
+/// Everything [`decide`] reads, as one value so the rule is testable without
+/// a pane.
+#[derive(Debug, Clone, Copy)]
+struct PumpView {
+    closed: bool,
+    paused: bool,
+    /// The connection's next stream offset.
+    next: u64,
+    ring_start: u64,
+    ring_end: u64,
+    /// The anchor of a postamble still to be sent.
+    postamble_at: Option<u64>,
+    exited: bool,
+}
+
+/// The pump's rule. The postamble goes out the moment the stream reaches its
+/// anchor — and also BEFORE a loss report that would carry the stream past
+/// it: sent after, it would land behind bytes newer than the state it
+/// describes (a stale `?2004h` after the pane's own later `?2004l`). Output is
+/// cut at a pending anchor, so nothing produced after the attach precedes the
+/// postamble. The postamble and the `exit` are not output: a paused connection
+/// still gets them, and the postamble always precedes the `exit`.
+fn decide(v: PumpView) -> Decision {
+    if v.closed {
+        return Decision::Stop;
+    }
+    if let Some(at) = v.postamble_at {
+        let reached = v.next >= at;
+        let loss_crosses = !v.paused && v.next < v.ring_start && at <= v.ring_start;
+        if reached || loss_crosses {
+            return Decision::Postamble;
+        }
+    }
+    if !v.paused {
+        if v.next < v.ring_start {
+            return Decision::Lost {
+                from: v.next,
+                to: v.ring_start,
+            };
+        }
+        if v.next < v.ring_end {
+            let max = match v.postamble_at {
+                Some(at) => MAX_OUTPUT_CHUNK.min((at - v.next) as usize),
+                None => MAX_OUTPUT_CHUNK,
+            };
+            return Decision::Output { from: v.next, max };
+        }
+    }
+    if v.exited && v.next >= v.ring_end {
+        return Decision::Exit;
+    }
+    Decision::Wait
+}
+
+/// What a pump sends next.
 enum PumpStep {
     Postamble,
     Lost { from: u64, to: u64 },
@@ -743,51 +793,67 @@ enum PumpStep {
 }
 
 /// Stream the pane's output to one connection from absolute offset `next`.
-/// `postamble` — `(anchor, bytes)` — is sent the moment `next` reaches the
-/// anchor; until then output is cut at the anchor so nothing produced after
-/// the attach precedes it. It is tiny and not output, so a paused connection
-/// still gets it, as it gets the `exit`.
-fn pump(
-    pane: &Arc<Pane>,
-    writer: &Mutex<Conn>,
-    flow: &ConnFlow,
-    mut next: u64,
-    mut postamble: Option<(u64, Vec<u8>)>,
-) {
+///
+/// With `restore` (a version-3 `attach {restore: true}`), the pump first sends
+/// the PREAMBLE and holds the POSTAMBLE, both from one look at the mode
+/// tracker under the pane lock — the preamble for the first byte this
+/// connection can still be sent (`max(next, ring start)`), the postamble
+/// anchored at the stream's end at that moment. Both frames are ALWAYS sent
+/// when asked for, empty or not, so a client can tell "delivered" from "lost
+/// with the connection". The ring may roll between that look and the
+/// preamble's write (the lock is not held across I/O); the pump then reports
+/// the rolled-past bytes as `output_lost` after the preamble, exactly as for a
+/// client too slow to keep up — the preamble still names the position the
+/// stream resumed from, never a byte the client is later sent as if it were
+/// the first.
+fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64, restore: bool) {
+    let mut postamble: Option<(u64, Vec<u8>)> = None;
+    if restore {
+        let env = {
+            let st = pane.lock_state();
+            st.modes.envelope(next.max(st.ring.start_offset()))
+        };
+        let sent = send_synthetic(
+            writer,
+            SyntheticPart::Preamble,
+            env.preamble_at,
+            &env.preamble,
+            PUMP_WRITE_TIMEOUT,
+        );
+        if sent.is_err() {
+            flow.closed.store(true, Ordering::SeqCst);
+            writer.lock().unwrap_or_else(|p| p.into_inner()).shutdown();
+            return;
+        }
+        postamble = Some((env.postamble_at, env.postamble));
+    }
     loop {
         let step = {
             let mut st = pane.lock_state();
             loop {
-                if flow.closed.load(Ordering::SeqCst) {
-                    break PumpStep::Stop;
-                }
-                let start = st.ring.start_offset();
-                let end = st.ring.end_offset();
-                if postamble.as_ref().is_some_and(|(at, _)| next >= *at) {
-                    break PumpStep::Postamble;
-                }
-                if !flow.paused.load(Ordering::SeqCst) {
-                    if next < start {
-                        break PumpStep::Lost {
-                            from: next,
-                            to: start,
-                        };
-                    }
-                    if next < end {
-                        let max = match &postamble {
-                            Some((at, _)) => MAX_OUTPUT_CHUNK.min((at - next) as usize),
-                            None => MAX_OUTPUT_CHUNK,
-                        };
-                        let (from, bytes) = st.ring.slice_from(next, max);
+                let view = PumpView {
+                    closed: flow.closed.load(Ordering::SeqCst),
+                    paused: flow.paused.load(Ordering::SeqCst),
+                    next,
+                    ring_start: st.ring.start_offset(),
+                    ring_end: st.ring.end_offset(),
+                    postamble_at: postamble.as_ref().map(|(at, _)| *at),
+                    exited: st.exit.is_some(),
+                };
+                match decide(view) {
+                    Decision::Stop => break PumpStep::Stop,
+                    Decision::Postamble => break PumpStep::Postamble,
+                    Decision::Lost { from, to } => break PumpStep::Lost { from, to },
+                    Decision::Output { from, max } => {
+                        let (from, bytes) = st.ring.slice_from(from, max);
                         break PumpStep::Output { from, bytes };
                     }
-                }
-                // The exit is not output: it is sent once everything before it
-                // is, paused or not.
-                if let Some(exit) = st.exit {
-                    if next >= end {
-                        break PumpStep::Exit(exit);
+                    Decision::Exit => {
+                        if let Some(exit) = st.exit {
+                            break PumpStep::Exit(exit);
+                        }
                     }
+                    Decision::Wait => {}
                 }
                 st = pane.wait_changed(st, PUMP_POLL);
             }
@@ -1370,6 +1436,49 @@ mod tests {
                 restore: true,
             }
         );
+    }
+
+    fn view(next: u64, ring_start: u64, ring_end: u64, postamble_at: Option<u64>) -> PumpView {
+        PumpView {
+            closed: false,
+            paused: false,
+            next,
+            ring_start,
+            ring_end,
+            postamble_at,
+            exited: false,
+        }
+    }
+
+    /// Review defect 3: a loss report that would carry the stream past the
+    /// postamble's anchor is PRECEDED by the postamble — sent after, the stale
+    /// attach-time state would land behind newer bytes. The old rule (send the
+    /// postamble only once `next >= anchor`) answered `Lost` here.
+    #[test]
+    fn pty_holder_attach_postamble_precedes_a_loss_that_crosses_its_anchor() {
+        assert_eq!(decide(view(10, 50, 100, Some(30))), Decision::Postamble);
+        assert_eq!(decide(view(10, 50, 100, Some(50))), Decision::Postamble);
+        // A loss that stops short of the anchor is reported first.
+        assert_eq!(
+            decide(view(10, 20, 100, Some(30))),
+            Decision::Lost { from: 10, to: 20 }
+        );
+        // Output is cut at the anchor; at the anchor the postamble goes.
+        assert_eq!(
+            decide(view(25, 20, 100, Some(30))),
+            Decision::Output { from: 25, max: 5 }
+        );
+        assert_eq!(decide(view(30, 20, 100, Some(30))), Decision::Postamble);
+        // Paused: no loss is reported, so nothing crosses yet — but a reached
+        // anchor still sends, and the postamble precedes the exit.
+        let mut v = view(10, 50, 100, Some(30));
+        v.paused = true;
+        assert_eq!(decide(v), Decision::Wait);
+        let mut v = view(100, 50, 100, Some(100));
+        v.exited = true;
+        assert_eq!(decide(v), Decision::Postamble);
+        v.postamble_at = None;
+        assert_eq!(decide(v), Decision::Exit);
     }
 
     #[test]
