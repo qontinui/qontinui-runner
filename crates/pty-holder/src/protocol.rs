@@ -62,11 +62,12 @@
 //!   carry `restore: true`, asked by a consumer that is starting from nothing
 //!   (a restarted runner's fresh `Grid` and xterm). The holder then answers
 //!   `attached` with `restore {cwd, title}` metadata, and brackets the replayed
-//!   tail with two `KIND_SYNTHETIC` frames (`crate::frame`): a PREAMBLE
-//!   (screen buffer, title — the state at the tail's first byte) sent before
-//!   the first output frame, and a POSTAMBLE (input modes, keypad, kitty
-//!   flags, cursor visibility — the state at the attach-time end of the
-//!   stream) sent exactly when the stream reaches that offset. Synthetic bytes
+//!   tail with two `KIND_SYNTHETIC` frames (`crate::frame`), ALWAYS both,
+//!   possibly empty: a PREAMBLE (screen buffer, title — the state at the first
+//!   byte the connection can be sent) before the first output frame, and a
+//!   POSTAMBLE (input modes, keypad, kitty flags, cursor visibility — the
+//!   state at the stream's end when the attach was served) exactly when the
+//!   stream reaches that offset, or before a loss report that would pass it. Synthetic bytes
 //!   are not stream bytes: they carry an anchor offset but never advance one.
 //!   A holder sends neither unless the connection negotiated version 3 AND
 //!   asked; at version 2 the field is absent and nothing changes on the wire.
