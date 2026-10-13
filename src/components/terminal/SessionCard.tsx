@@ -24,8 +24,19 @@ import type { LockState } from "./useFileLockTracking";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
 import { DURABLE_TOOLTIP } from "./sessionDurability";
+import { useNow1Hz } from "./useNow1Hz";
 import { describeThrown } from "@/lib/utils";
-import { sessionCardStatus, type SessionCardStatus } from "./sessionManagerLiveRows";
+import {
+  ACTIVITY_DOT,
+  activityText,
+  isLiveInThisRunner,
+  isPossiblyLive,
+  locationText,
+  SESSION_STATUS_LABELS,
+  type SessionActivity,
+  type SessionLocation,
+  type SessionStatus,
+} from "./sessionStatusModel";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -84,12 +95,6 @@ interface SessionCardProps {
    */
   isOnScreen?: boolean;
   /**
-   * tmux work mode: this row's session is open in this window but not the one
-   * on screen. A running one reads "Active, off screen", not "Active in zone"
-   * — tmux zones only the shown session.
-   */
-  isOffScreen?: boolean;
-  /**
    * Close this row's terminal tab — the page's close path, the same one the
    * zone's close button takes. Absent when the row has no live tab in this
    * window (a transcript-only row has nothing to close), and the card then
@@ -98,34 +103,55 @@ interface SessionCardProps {
   onClose?: (session: UnifiedSession) => void;
 }
 
-const STATUS_DOT: Record<SessionCardStatus, { color: string; pulse: boolean; label: string }> = {
-  "active-in-zone": { color: "#9ece6a", pulse: true, label: "Active in zone" },
-  "active-off-screen": { color: "#9ece6a", pulse: true, label: "Active, off screen" },
-  "active-external": { color: "#73daca", pulse: true, label: "Active externally" },
-  frozen: { color: "#f7768e", pulse: false, label: "Frozen" },
-  "needs-input": { color: "#e0af68", pulse: true, label: "Needs input" },
-  completed: { color: "#565f89", pulse: false, label: "Completed" },
-  error: { color: "#f7768e", pulse: false, label: "Error" },
-  dormant: { color: "#414868", pulse: false, label: "Dormant" },
-};
+/**
+ * The activity word. Only `No output 12m (mid-tool)` carries a duration that
+ * moves, so only that one subscribes to the shared 1 Hz tick — a list of
+ * hundreds of cards does not re-render every second.
+ */
+function ActivityWord({ status }: { status: SessionStatus }) {
+  return status.activity === "no-output-mid-tool" ? (
+    <TickingActivityWord status={status} />
+  ) : (
+    <>{activityText(status, 0)}</>
+  );
+}
+
+function TickingActivityWord({ status }: { status: SessionStatus }) {
+  return <>{activityText(status, useNow1Hz())}</>;
+}
+
+/** What a card shows for its status: two words, a dot, and why. */
+export interface SessionCardStatusDisplay {
+  location: SessionLocation;
+  activity: SessionActivity;
+  locationLabel: string;
+  activityLabel: string;
+  color: string;
+  pulse: boolean;
+  /** Which source decided each axis — the words' tooltip. */
+  reason: string;
+}
 
 /**
- * The status chip a card shows: its key (`data-session-status`), dot color,
- * pulse and label. `isOffScreen` is tmux mode's "open here, not on screen"
- * (`isRowOffScreen`), which turns "Active in zone" into "Active, off screen".
- * An orphaned "frozen" session has no live PTY in this window — it's simply
- * not running here, so its chip is relabelled away from the alarming "Frozen"
- * to a neutral, resumable read (color muted to match).
+ * The status a card shows: the activity word and the location word, each its
+ * own `data-session-*` attribute, plus the dot's color. The word is the
+ * signal; the color only repeats it (D2: never color alone).
+ *
+ * `activityLabel` carries an exit code but not the moving `No output` duration
+ * — the rendered word ticks that itself ({@link ActivityWord}).
  */
-export function sessionCardStatusInfo(
-  session: Pick<UnifiedSession, "liveStatus" | "isOrphaned">,
-  isOffScreen: boolean,
-): { status: SessionCardStatus; color: string; pulse: boolean; label: string } {
-  const status = sessionCardStatus(session.liveStatus, isOffScreen);
-  if (session.liveStatus === "frozen" && session.isOrphaned) {
-    return { status, color: "#565f89", pulse: false, label: "Not running" };
-  }
-  return { status, ...STATUS_DOT[status] };
+export function sessionCardStatusDisplay(status: SessionStatus): SessionCardStatusDisplay {
+  return {
+    location: status.location,
+    activity: status.activity,
+    locationLabel: locationText(status),
+    activityLabel:
+      status.activity === "no-output-mid-tool"
+        ? SESSION_STATUS_LABELS.activity["no-output-mid-tool"]
+        : activityText(status, 0),
+    ...ACTIVITY_DOT[status.activity],
+    reason: status.reason,
+  };
 }
 
 const ACCOUNT_BADGE_COLORS: Record<string, { bg: string; text: string }> = {
@@ -257,16 +283,14 @@ export interface SessionCardActions {
  * first message, a remote session tab) has no transcript, so view transcript,
  * copy session id, resume and bulk select do not apply, and nothing backs
  * promote or commit (both key on a Claude session id the row does not carry).
- * Promote and commit additionally need a session that is live in this runner.
+ * Promote and commit additionally need a session that is live in this runner
+ * (`On screen` / `Hidden here`, not exited).
  */
 export function sessionCardActions(
-  session: Pick<UnifiedSession, "source" | "liveStatus">,
+  session: Pick<UnifiedSession, "source" | "status">,
 ): SessionCardActions {
   const transcript = session.source === "transcript";
-  const liveHere =
-    session.liveStatus === "active-in-zone" ||
-    session.liveStatus === "needs-input" ||
-    session.liveStatus === "frozen";
+  const liveHere = isLiveInThisRunner(session.status);
   return {
     resume: transcript,
     viewTranscript: transcript,
@@ -327,12 +351,16 @@ function SessionCardInner({
   onAfterPromote,
   onOpenWorktrees,
   isOnScreen = false,
-  isOffScreen = false,
   onClose,
 }: SessionCardProps) {
   const actions = sessionCardActions(session);
-  const statusInfo = sessionCardStatusInfo(session, isOffScreen);
-  const cardStatus = statusInfo.status;
+  const statusInfo = sessionCardStatusDisplay(session.status);
+  // "Still running somewhere" for the live-only affordances below: a process
+  // that may be up (an UNKNOWN placement included) and has not exited.
+  const mayBeRunning =
+    isPossiblyLive(session.status.location) &&
+    session.status.activity !== "exited" &&
+    session.status.activity !== "exited-error";
   const accountBadge = ACCOUNT_BADGE_COLORS[session.accountLabel];
   const durationLabel = formatDuration(session.durationMs);
 
@@ -356,8 +384,8 @@ function SessionCardInner({
   // Promotion is only meaningful for sessions that are actually live in this
   // runner — promote_session_to_worktree looks the session up in
   // SessionManager by task_run_id, which equals the claude session id for
-  // this runner's live PTYs. External / dormant / completed sessions can't
-  // be promoted from this UI (the backend would just 404).
+  // this runner's live PTYs. Outside-runner / not-running / exited sessions
+  // can't be promoted from this UI (the backend would just 404).
   const canPromote = actions.promote;
 
   // Hide the button entirely once the promotion has succeeded — the parent
@@ -529,6 +557,8 @@ function SessionCardInner({
   return (
     <div
       onContextMenu={handleContextMenu}
+      // The left bar no longer encodes status — the dot and its word do (D4;
+      // a later phase gives the bar to the session's group color).
       className={`
         group relative border-l-2 transition-colors
         ${
@@ -536,15 +566,7 @@ function SessionCardInner({
             ? "border-l-brand-primary bg-brand-primary/10"
             : isSelected
               ? "border-l-[#7aa2f7] bg-[#7aa2f7]/5"
-              : session.liveStatus === "frozen"
-                ? "border-l-[#f7768e]/50 hover:bg-[#1a1b26]"
-                : session.liveStatus === "needs-input"
-                  ? "border-l-[#e0af68]/50 hover:bg-[#1a1b26]"
-                  : session.liveStatus === "active-in-zone"
-                    ? "border-l-[#9ece6a]/50 hover:bg-[#1a1b26]"
-                    : session.liveStatus === "active-external"
-                      ? "border-l-[#73daca]/50 hover:bg-[#1a1b26]"
-                      : "border-l-transparent hover:bg-[#1a1b26]"
+              : "border-l-transparent hover:bg-[#1a1b26]"
         }
       `}
     >
@@ -556,7 +578,8 @@ function SessionCardInner({
         // its rendered text.
         data-session-id={session.sessionId}
         data-session-title={cardName}
-        data-session-status={cardStatus}
+        data-session-location={statusInfo.location}
+        data-session-activity={statusInfo.activity}
         data-session-account={session.accountLabel}
         data-session-source={session.source}
         data-session-on-screen={isOnScreen ? "true" : "false"}
@@ -586,7 +609,7 @@ function SessionCardInner({
           <span
             className={`w-2 h-2 rounded-full shrink-0 ${statusInfo.pulse ? "animate-pulse" : ""}`}
             style={{ backgroundColor: statusInfo.color }}
-            title={statusInfo.label}
+            title={`${statusInfo.activityLabel} · ${statusInfo.locationLabel}`}
           />
           <span className="text-xs text-[#a9b1d6] truncate flex-1">{sessionCardName(session)}</span>
           {isOnScreen && (
@@ -637,17 +660,15 @@ function SessionCardInner({
               the deliberate counterpart to the "ephemeral" marker on
               non-durable interactive PTY tabs — which is why a tab-sourced
               row (a plain shell, nothing to resume) never carries it. */}
-          {actions.resume &&
-            session.liveStatus !== "dormant" &&
-            session.liveStatus !== "completed" && (
-              <span
-                className="shrink-0 inline-flex"
-                title={DURABLE_TOOLTIP}
-                aria-label={`Durable session: ${DURABLE_TOOLTIP}`}
-              >
-                <RotateCcw className="w-3 h-3 text-[#565f89]" />
-              </span>
-            )}
+          {actions.resume && mayBeRunning && (
+            <span
+              className="shrink-0 inline-flex"
+              title={DURABLE_TOOLTIP}
+              aria-label={`Durable session: ${DURABLE_TOOLTIP}`}
+            >
+              <RotateCcw className="w-3 h-3 text-[#565f89]" />
+            </span>
+          )}
           {isPinned && <Pin className="w-3 h-3 text-[#e0af68] shrink-0" />}
           {sessionLabel && (
             <span className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#73daca]/10 text-[#73daca] truncate max-w-[60px]">
@@ -656,7 +677,21 @@ function SessionCardInner({
           )}
         </div>
 
-        {/* Row 2: Meta info */}
+        {/* Row 2: Status words — activity, then location. Each carries the
+            source that decided it in its tooltip. */}
+        <div
+          data-testid="session-card-status"
+          className="flex items-center gap-1 text-[10px] ml-3.5 min-w-0"
+          title={statusInfo.reason}
+        >
+          <span className="shrink-0 font-medium" style={{ color: statusInfo.color }}>
+            <ActivityWord status={session.status} />
+          </span>
+          <span className="text-[#414868]">&middot;</span>
+          <span className="truncate text-[#565f89]">{statusInfo.locationLabel}</span>
+        </div>
+
+        {/* Row 3: Meta info */}
         <div className="flex items-center gap-1 text-[10px] text-[#414868] ml-3.5">
           <span>{formatTimeAgo(session.lastModified)}</span>
           <span>&middot;</span>
@@ -672,32 +707,12 @@ function SessionCardInner({
           <span className="truncate">{session.projectLabel}</span>
         </div>
 
-        {/* Row 3: Work summary hint (only for frozen/needs-input/active) */}
-        {session.workSummaryHint &&
-          session.liveStatus !== "dormant" &&
-          session.liveStatus !== "completed" && (
-            <div className="mt-1 ml-3.5 text-[10px] text-[#565f89] truncate leading-tight">
-              {session.lastMessagePreview || session.workSummaryHint}
-            </div>
-          )}
-
-        {/* Frozen / orphaned badge.
-            - Orphaned (no live PTY in this window): the transcript just isn't
-              open anywhere — it's resumable, not failed. Neutral copy + color.
-            - Genuinely stuck live session (a stale in-zone tab): keep the
-              warning treatment. */}
-        {session.liveStatus === "frozen" &&
-          (session.isOrphaned ? (
-            <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#565f89]">
-              <TerminalSquare className="w-3 h-3" />
-              <span>Not open in a window — click Resume to continue</span>
-            </div>
-          ) : (
-            <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#f7768e]/80">
-              <AlertTriangle className="w-3 h-3" />
-              <span>Session appears stuck — may need resume</span>
-            </div>
-          ))}
+        {/* Row 4: Work summary hint (only while the session may be running) */}
+        {session.workSummaryHint && mayBeRunning && (
+          <div className="mt-1 ml-3.5 text-[10px] text-[#565f89] truncate leading-tight">
+            {session.lastMessagePreview || session.workSummaryHint}
+          </div>
+        )}
 
         {/* File-lock waiting subtitle — sourced from useFileLockTracking
             via `sessionLockStates`. Same orange color convention as the

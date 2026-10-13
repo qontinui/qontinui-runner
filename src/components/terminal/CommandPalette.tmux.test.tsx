@@ -14,7 +14,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/instance-storage", () => ({
   instanceStorage: { getJSON: (_key: string, fallback: unknown) => fallback, setJSON: () => {} },
 }));
-vi.mock("./useLiveClaudeSessionNames", () => ({ useLiveClaudeSessionNames: () => new Map() }));
+vi.mock("./useLiveClaudeSessions", () => ({
+  useLiveClaudeSessions: () => ({
+    read: "ok",
+    bySessionId: new Map(),
+    names: new Map(),
+    pids: new Set(),
+  }),
+}));
 // A stable snapshot: `useSyncExternalStore` re-reads it every render.
 const noActions = vi.hoisted(() => [] as unknown[]);
 vi.mock("./commands", () => ({

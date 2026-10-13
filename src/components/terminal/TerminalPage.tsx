@@ -1164,10 +1164,10 @@ function TerminalPageInner({
     terminalRefs: terminalRefs.current,
     workflowGen,
     sessionManager: {
-      frozenCount: sessionManager.frozenCount,
+      noOutputCount: sessionManager.noOutputCount,
       needsInputCount: sessionManager.needsInputCount,
       sessions: sessionManager.sessions,
-      resumeSession: sessionManager.resumeSession,
+      openSession: sessionManager.openSession,
     },
     // App.tsx keeps this page mounted behind a `hidden` div on every other
     // tab, so the hook's `window` listener outlives the page's visibility.
@@ -1588,7 +1588,6 @@ function TerminalPageInner({
               sessionLockStates={sessionLockStates}
               onResumePastSession={handleResumePastSession}
               onScreenTabId={zoneLayout.shownTabId}
-              workMode={zoneLayout.workMode}
             />
           )}
 

@@ -12,7 +12,7 @@
  * the header root carries the panel's COUNTS and current FILTER state as
  * `data-*` attributes — `ElementState.dataset` projects them, so
  * `GET /control/element/terminal.session-manager-header` answers "how many
- * frozen sessions, and what is filtered right now" in one read.
+ * sessions need you, and what is filtered right now" in one read.
  *
  * The account-usage chips are the one non-interactive surface, so they use
  * `data-ui-bridge-content` (the SDK's opt-in semantic-content selector) rather
@@ -21,19 +21,16 @@
 import { RefreshCw, Search, Filter } from "lucide-react";
 import { useUIElement, type StandardAction } from "@qontinui/ui-bridge";
 
-import type {
-  SessionLiveStatus,
-  SessionGroupBy,
-  SessionSortBy,
-  AccountUsageInfo,
-} from "./useSessionManager";
+import type { SessionGroupBy, SessionSortBy, AccountUsageInfo } from "./useSessionManager";
+import { ACTIVITY_DOT, SESSION_STATUS_LABELS, type SessionActivity } from "./sessionStatusModel";
 
 interface SessionManagerHeaderProps {
   loading: boolean;
   searchQuery: string;
   onSearchChange: (q: string) => void;
-  statusFilter: SessionLiveStatus | "all";
-  onStatusFilterChange: (f: SessionLiveStatus | "all") => void;
+  /** The activity-axis filter. */
+  statusFilter: SessionActivity | "all";
+  onStatusFilterChange: (f: SessionActivity | "all") => void;
   accountFilter: string | "all";
   onAccountFilterChange: (f: string | "all") => void;
   groupBy: SessionGroupBy;
@@ -43,9 +40,8 @@ interface SessionManagerHeaderProps {
   accountUsage: AccountUsageInfo[];
   accounts: string[];
   onRefresh: () => void;
-  frozenCount: number;
-  needsInputCount: number;
-  activeCount: number;
+  /** Rows per activity — each chip's count. */
+  activityCounts: Readonly<Record<SessionActivity, number>>;
   totalCount: number;
 }
 
@@ -64,13 +60,84 @@ export const SESSION_MANAGER_HEADER_IDS = {
   root: "terminal.session-manager-header",
   refresh: "terminal.session-manager-refresh",
   search: "terminal.session-manager-search",
-  filterFrozen: "terminal.session-manager-filter-frozen",
-  filterNeedsInput: "terminal.session-manager-filter-needs-input",
-  filterActive: "terminal.session-manager-filter-active",
+  filterNoOutput: "terminal.session-manager-filter-no-output",
+  filterNeedsYou: "terminal.session-manager-filter-needs-you",
+  filterWorking: "terminal.session-manager-filter-working",
   filterClear: "terminal.session-manager-filter-clear",
   groupBy: "terminal.session-manager-group-by",
   sortBy: "terminal.session-manager-sort-by",
 } as const;
+
+/**
+ * The activity quick-filter chips, in display order: what needs the operator,
+ * then what went silent mid-tool, then what is running. Each chip's word is
+ * the label table's, so it reads exactly as the cards it filters.
+ */
+const ACTIVITY_CHIPS: readonly {
+  activity: SessionActivity;
+  id: string;
+  ariaLabel: string;
+}[] = [
+  {
+    activity: "needs-you",
+    id: SESSION_MANAGER_HEADER_IDS.filterNeedsYou,
+    ariaLabel: "Filter sessions that need you",
+  },
+  {
+    activity: "no-output-mid-tool",
+    id: SESSION_MANAGER_HEADER_IDS.filterNoOutput,
+    ariaLabel: "Filter sessions with no output mid-tool",
+  },
+  {
+    activity: "working",
+    id: SESSION_MANAGER_HEADER_IDS.filterWorking,
+    ariaLabel: "Filter working sessions",
+  },
+];
+
+/**
+ * One activity filter chip. Its own component so the `useUIElement` call is a
+ * plain unconditional hook per chip. Hidden at zero, so the header root's
+ * `data-*` counts — not the chip's presence — are what a driver reads.
+ */
+function ActivityFilterChip({
+  activity,
+  id,
+  ariaLabel,
+  count,
+  active,
+  onToggle,
+}: {
+  activity: SessionActivity;
+  id: string;
+  ariaLabel: string;
+  count: number;
+  active: boolean;
+  onToggle: () => void;
+}) {
+  const { ref } = useUIElement({ id, type: "button", label: ariaLabel });
+  if (count === 0) return null;
+  const color = ACTIVITY_DOT[activity].color;
+  return (
+    <button
+      ref={ref}
+      data-ui-bridge-id={id}
+      data-activity={activity}
+      aria-pressed={active}
+      aria-label={ariaLabel}
+      onClick={onToggle}
+      className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors border"
+      style={{
+        color,
+        backgroundColor: active ? `${color}33` : "#1a1b26",
+        borderColor: active ? `${color}4d` : "#2a2d3d",
+      }}
+    >
+      <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: color }} />
+      {count} {SESSION_STATUS_LABELS.activity[activity]}
+    </button>
+  );
+}
 
 /** Per-account filter button id — one per rendered account. */
 export function sessionManagerAccountFilterId(account: string): string {
@@ -151,9 +218,7 @@ export function SessionManagerHeader({
   accountUsage,
   accounts,
   onRefresh,
-  frozenCount,
-  needsInputCount,
-  activeCount,
+  activityCounts,
   totalCount,
 }: SessionManagerHeaderProps) {
   const { ref: rootRef } = useUIElement({
@@ -171,21 +236,6 @@ export function SessionManagerHeader({
     type: "input",
     label: "Search sessions",
     actions: SEARCH_INPUT_ACTIONS,
-  });
-  const { ref: filterFrozenRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.filterFrozen,
-    type: "button",
-    label: "Filter frozen sessions",
-  });
-  const { ref: filterNeedsInputRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.filterNeedsInput,
-    type: "button",
-    label: "Filter sessions needing input",
-  });
-  const { ref: filterActiveRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.filterActive,
-    type: "button",
-    label: "Filter active sessions",
   });
   const { ref: filterClearRef } = useUIElement({
     id: SESSION_MANAGER_HEADER_IDS.filterClear,
@@ -209,12 +259,13 @@ export function SessionManagerHeader({
       data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.root}
       // Counts + live filter state, projected into `ElementState.dataset` so a
       // driver reads them in one call instead of scraping the chip labels
-      // (which self-hide at zero — a scrape cannot distinguish "no frozen
-      // sessions" from "chip not rendered").
+      // (which self-hide at zero — a scrape cannot distinguish "no session
+      // needs you" from "chip not rendered").
       data-total-count={totalCount}
-      data-frozen-count={frozenCount}
-      data-needs-input-count={needsInputCount}
-      data-active-count={activeCount}
+      data-needs-you-count={activityCounts["needs-you"]}
+      data-no-output-count={activityCounts["no-output-mid-tool"]}
+      data-working-count={activityCounts.working}
+      data-unknown-count={activityCounts.unknown}
       data-status-filter={statusFilter}
       data-account-filter={accountFilter}
       data-group-by={groupBy}
@@ -287,58 +338,17 @@ export function SessionManagerHeader({
 
       {/* Status quick-filter chips */}
       <div className="flex items-center gap-1 px-3 pb-1.5">
-        {frozenCount > 0 && (
-          <button
-            ref={filterFrozenRef}
-            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.filterFrozen}
-            aria-pressed={statusFilter === "frozen"}
-            onClick={() => onStatusFilterChange(statusFilter === "frozen" ? "all" : "frozen")}
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-              statusFilter === "frozen"
-                ? "bg-[#f7768e]/20 text-[#f7768e] border border-[#f7768e]/30"
-                : "bg-[#1a1b26] text-[#f7768e]/70 border border-[#2a2d3d] hover:bg-[#f7768e]/10"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-[#f7768e]" />
-            {frozenCount} frozen
-          </button>
-        )}
-        {needsInputCount > 0 && (
-          <button
-            ref={filterNeedsInputRef}
-            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.filterNeedsInput}
-            aria-pressed={statusFilter === "needs-input"}
-            onClick={() =>
-              onStatusFilterChange(statusFilter === "needs-input" ? "all" : "needs-input")
+        {ACTIVITY_CHIPS.map((chip) => (
+          <ActivityFilterChip
+            key={chip.activity}
+            {...chip}
+            count={activityCounts[chip.activity]}
+            active={statusFilter === chip.activity}
+            onToggle={() =>
+              onStatusFilterChange(statusFilter === chip.activity ? "all" : chip.activity)
             }
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-              statusFilter === "needs-input"
-                ? "bg-[#e0af68]/20 text-[#e0af68] border border-[#e0af68]/30"
-                : "bg-[#1a1b26] text-[#e0af68]/70 border border-[#2a2d3d] hover:bg-[#e0af68]/10"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-[#e0af68]" />
-            {needsInputCount} input
-          </button>
-        )}
-        {activeCount > 0 && (
-          <button
-            ref={filterActiveRef}
-            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.filterActive}
-            aria-pressed={statusFilter === "active-in-zone"}
-            onClick={() =>
-              onStatusFilterChange(statusFilter === "active-in-zone" ? "all" : "active-in-zone")
-            }
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-              statusFilter === "active-in-zone"
-                ? "bg-[#9ece6a]/20 text-[#9ece6a] border border-[#9ece6a]/30"
-                : "bg-[#1a1b26] text-[#9ece6a]/70 border border-[#2a2d3d] hover:bg-[#9ece6a]/10"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-[#9ece6a]" />
-            {activeCount} active
-          </button>
-        )}
+          />
+        ))}
         {statusFilter !== "all" && (
           <button
             ref={filterClearRef}
