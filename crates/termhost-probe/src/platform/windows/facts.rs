@@ -53,15 +53,29 @@ pub fn gather(node: &str) -> Facts {
     };
     drop(listener);
 
-    let (wgc_facts, dda_facts) = match &session.state {
+    let (wgc_facts, dda_facts, foreground_violation) = match &session.state {
         Err(problem) => {
             let why = format!("{problem:?}");
             (
                 CaptureFacts::NoSession(why.clone()),
                 CaptureFacts::NoSession(why),
+                None,
             )
         }
-        Ok(_) => capture_facts(),
+        Ok(_) => {
+            // D9 around the probe window: the foreground before it is
+            // created and after it closes. A change is recorded, never
+            // repaired (moving focus back would be a second intrusion).
+            let before = foreground();
+            let (wgc, dda) = capture_facts();
+            let after = foreground();
+            let violation = (before != after).then(|| {
+                format!(
+                    "the foreground window changed while the doctor's probe window was up (0x{before:x} before, 0x{after:x} after); the probe must never take focus"
+                )
+            });
+            (wgc, dda, violation)
+        }
     };
     Facts {
         host,
@@ -73,7 +87,14 @@ pub fn gather(node: &str) -> Facts {
         input: input_facts,
         clock,
         gpu,
+        foreground_violation,
     }
+}
+
+/// The foreground window's handle (0 = none).
+fn foreground() -> usize {
+    // SAFETY: GetForegroundWindow has no preconditions.
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as usize
 }
 
 fn capture_facts() -> (CaptureFacts, CaptureFacts) {

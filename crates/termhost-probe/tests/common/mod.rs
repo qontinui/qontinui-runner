@@ -427,6 +427,7 @@ impl Host for FakeHost {
             },
             clock: ClockFacts::Measured(alignment(1_000, 50_000, 30)),
             gpu: self.gpu_facts.clone(),
+            foreground_violation: None,
         }
     }
     fn source_kinds(&self) -> Vec<SourceId> {

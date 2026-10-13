@@ -64,6 +64,7 @@ impl Host for RealHost {
             },
             clock: crate::clockcheck::node_round_trip(node, 40, Duration::from_secs(10)),
             gpu: GpuFacts::NotApplicable(WHY.into()),
+            foreground_violation: None,
         }
     }
     fn source_kinds(&self) -> Vec<SourceId> {

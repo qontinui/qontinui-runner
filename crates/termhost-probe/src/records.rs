@@ -448,6 +448,10 @@ pub struct DoctorRecord {
     pub codec: CodecSpec,
     pub mechanisms: Vec<MechanismVerdict>,
     pub summary: DoctorSummary,
+    /// Safety rules the doctor's own probes were seen to break (a D9
+    /// foreground change around its probe window). Recorded, not repaired.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub violations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

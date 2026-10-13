@@ -183,6 +183,11 @@ pub struct Facts {
     pub input: InputFacts,
     pub clock: ClockFacts,
     pub gpu: GpuFacts,
+    /// D9: the foreground window changed between just before the doctor's
+    /// probe window was created and just after it closed (Windows) — the
+    /// probe must never take the operator's focus. `None` = unchanged, or
+    /// not measured on this platform.
+    pub foreground_violation: Option<String>,
 }
 
 fn v(id: &'static str, state: State, reason: impl Into<String>, at: &str) -> MechanismVerdict {
@@ -398,6 +403,11 @@ pub fn report(f: &Facts) -> DoctorRecord {
         codec: spec().clone(),
         mechanisms,
         summary,
+        violations: f
+            .foreground_violation
+            .iter()
+            .map(|v| format!("D9: {v}"))
+            .collect(),
     }
 }
 
@@ -632,6 +642,7 @@ mod tests {
             },
             clock: ClockFacts::NoNode("not on PATH".into()),
             gpu: GpuFacts::Failed("PdhCollectQueryData: 0x800007d5".into()),
+            foreground_violation: None,
         }
     }
 
@@ -685,6 +696,21 @@ mod tests {
     }
 
     #[test]
+    fn a_foreground_change_around_the_probe_is_a_recorded_d9_violation() {
+        let f = Facts {
+            foreground_violation: Some("0x10 before, 0x20 after".into()),
+            ..unknown_everywhere()
+        };
+        let r = report(&f);
+        assert_eq!(
+            r.violations,
+            vec!["D9: 0x10 before, 0x20 after".to_string()]
+        );
+        let line = crate::records::to_line(&crate::records::Record::Doctor(r));
+        assert!(line.contains("\"violations\":[\"D9: "), "{line}");
+    }
+
+    #[test]
     fn the_report_lists_every_mechanism_once_and_counts_them() {
         let f = Facts {
             host: "h".into(),
@@ -700,6 +726,7 @@ mod tests {
             },
             clock: ClockFacts::NoNode("n".into()),
             gpu: GpuFacts::Instances(3),
+            foreground_violation: None,
         };
         let r = report(&f);
         let ids: Vec<&str> = r.mechanisms.iter().map(|m| m.id).collect();
@@ -714,6 +741,7 @@ mod tests {
             ),
             (3, 2, 2, 0)
         );
+        assert!(r.violations.is_empty());
         let line = crate::records::to_line(&crate::records::Record::Doctor(r));
         assert!(line.contains("\"INOPERATIVE-ON-THIS-MACHINE\""));
     }
