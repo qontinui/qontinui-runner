@@ -1297,6 +1297,11 @@ impl AuthManager {
     /// refresher loop deciding "should I pair again?". Coord re-verifies
     /// the JWT on every WS handshake; a forged exp at most causes one
     /// extra pair call.
+    ///
+    /// This is a REFRESH-SCHEDULING predicate, not a liveness one: it is true
+    /// for the last [`REFRESH_BEFORE_EXPIRY_SECS`] of a perfectly valid JWT.
+    /// "Does this runner hold a usable device JWT?" is
+    /// [`Self::device_jwt_is_live`].
     pub fn device_jwt_needs_refresh(&self) -> Result<bool> {
         let token = match self.get_access_token() {
             Ok(t) => t,
@@ -1414,6 +1419,28 @@ impl AuthManager {
     /// storage as every other credential.
     pub fn get_device_machine_key(&self) -> Result<Option<String>> {
         self.secure_storage.get_device_machine_key()
+    }
+
+    /// `Ok(true)` iff the access_token slot holds a decodable device JWT that
+    /// has not EXPIRED (with [`EXPIRY_LEEWAY_SECS`] of skew) — the same test
+    /// [`slot_jwt_is_usable`] applies to tenant slots. `Ok(false)` for an
+    /// absent, opaque or expired token; `Err` when the store cannot be read
+    /// (UNKNOWN, never "no credential").
+    ///
+    /// Keyed on actual expiry, NOT on the refresh threshold: a JWT inside its
+    /// refresh window still authenticates, and during a coord outage that window
+    /// is two hours long (plan
+    /// `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`).
+    /// The provisioning gate and the UI-Bridge session surface ask this.
+    pub fn device_jwt_is_live(&self) -> Result<bool> {
+        use crate::secure_storage::StoredTokenRead;
+        match self.probe_access_token() {
+            StoredTokenRead::Present(t) => Ok(slot_jwt_is_usable(&t)),
+            StoredTokenRead::Absent => Ok(false),
+            StoredTokenRead::Unreadable(e) => {
+                Err(anyhow::anyhow!("credential store unreadable: {e}"))
+            }
+        }
     }
 
     /// `true` iff the Cognito access token is missing OR within
@@ -5775,6 +5802,27 @@ mod device_jwt_tests {
             !mgr.device_jwt_needs_refresh().unwrap(),
             "JWT with >120min until expiry must NOT report needs-refresh"
         );
+    }
+
+    /// Liveness is NOT the refresh threshold: a JWT 100 minutes from expiry is
+    /// inside the TTL/2 refresh window and still LIVE; only a past-`exp`,
+    /// opaque or absent token is not.
+    #[test]
+    fn device_jwt_is_live_keys_on_expiry_not_the_refresh_threshold() {
+        let mgr = create_test_auth_manager("device_jwt_is_live_expiry");
+        let now = chrono::Utc::now().timestamp();
+        assert!(!mgr.device_jwt_is_live().unwrap(), "absent is not live");
+        mgr.store_tokens(&synth_jwt(now + 100 * 60), "").unwrap();
+        assert!(mgr.device_jwt_needs_refresh().unwrap());
+        assert!(
+            mgr.device_jwt_is_live().unwrap(),
+            "inside the refresh window is still live"
+        );
+        mgr.store_tokens(&synth_jwt(now - 120), "").unwrap();
+        assert!(!mgr.device_jwt_is_live().unwrap(), "expired is not live");
+        mgr.store_tokens("qontinui_runner_legacy_opaque", "")
+            .unwrap();
+        assert!(!mgr.device_jwt_is_live().unwrap(), "opaque is not live");
     }
 
     #[test]

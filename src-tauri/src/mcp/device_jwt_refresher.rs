@@ -151,10 +151,21 @@ const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 ///
 /// Every HTTP call a pass makes already carries its own client timeout (5-30 s),
 /// so this bound is not about any one request. It is the backstop for the
-/// awaits that have none — a blocking-pool hop queued behind a saturated pool,
-/// a store lock, a notify — so a pass that wedges is ABANDONED, logged with the
-/// stage it was stuck in ([`PassStage`]), and retried, instead of silently
-/// eating the refresh window. Plan
+/// AWAITS that have none — a blocking-pool hop queued behind a saturated pool
+/// (every store read and write here is such a hop), a notify — so a pass that
+/// wedges on one is ABANDONED, logged with the stage it was stuck in
+/// ([`PassStage`]), and retried, instead of silently eating the refresh window.
+///
+/// What it CANNOT bound: synchronous code running on the refresher's own worker
+/// thread. A timer only fires when a worker gets back to the scheduler, and this
+/// runtime has one worker, so a sync call that blocks it blocks the bound too.
+/// The per-pass reads that touch the credential store or settings — the
+/// settings + needs-refresh snapshot, the legacy-slot probe, the tenant-slot
+/// reads, the self-refresh precondition, every store write — therefore run on
+/// the blocking pool. What is still synchronous on the worker is small file
+/// I/O (`machine.json`'s device id, the pair-arm id reads) and the pair arm's
+/// legacy-token reads, each bounded by the store's own `STORE_LOCK_TIMEOUT`
+/// rather than by this constant. Plan
 /// `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
 /// Phase 2 step 2. Sized well above a legitimate worst-case pass (a few slots x
 /// 10 s refresh + re-derive, then the legacy arm's self-refresh, pair-cli and
@@ -165,10 +176,17 @@ const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 /// starved worker pool delays THIS timer exactly as it delays everything else.
 const PASS_BOUND: Duration = Duration::from_secs(180);
 
-/// Ceiling on how long a coord `Retry-After` may park the loop. Coord's refresh
-/// route has no rate limit today; this exists so a malformed or hostile header
-/// cannot park the refresher past the credential's own lifetime.
+/// Absolute ceiling on how long a coord `Retry-After` may park the loop. Coord's
+/// refresh route has no rate limit today; this caps a malformed or hostile
+/// header. It is NOT what keeps the credential alive — [`wait_after_pass`]
+/// additionally clamps a rate-limited wait to end [`RATE_LIMIT_EXPIRY_MARGIN`]
+/// before the earliest rate-limited credential's own `exp`.
 const RATE_LIMIT_WAIT_CAP: Duration = Duration::from_secs(60 * 60);
+
+/// How long before a rate-limited credential's `exp` the loop must be awake to
+/// try once more, whatever `Retry-After` said: two minutes is one transient
+/// ladder ceiling, enough for a last attempt to complete.
+const RATE_LIMIT_EXPIRY_MARGIN: Duration = Duration::from_secs(120);
 
 /// Floor of the transient-failure backoff. When a Cognito refresh fails
 /// transiently (network/5xx/429) we retry far sooner than the 5m steady
@@ -203,28 +221,48 @@ pub(crate) enum KeptExistingCause {
     Transport,
     /// Coord answered 5xx.
     Upstream5xx,
-    /// Coord answered 429. `retry_after` is the parsed delta-seconds
-    /// `Retry-After`, `None` when absent or not in delta-seconds form.
-    RateLimited { retry_after: Option<Duration> },
+    /// Coord answered 429. `retry_after` is the parsed `Retry-After` (either
+    /// form, see [`parse_retry_after`]), `None` when absent or unparseable.
+    /// `credential_exp` is the decoded `exp` of the credential that was being
+    /// refreshed, so the wait can never outlast it.
+    RateLimited {
+        retry_after: Option<Duration>,
+        credential_exp: Option<i64>,
+    },
     /// Any other non-success — nothing a faster retry would change.
     Other,
 }
 
-/// Parse an HTTP `Retry-After` header in its delta-seconds form. The HTTP-date
-/// form (and anything else) is `None`; the caller then falls back to the steady
+/// Parse an HTTP `Retry-After` header (RFC 9110 §10.2.3): delta-seconds, or an
+/// HTTP-date measured against `now` (unix seconds; a date in the past is a zero
+/// wait). Anything else is `None`, and the caller falls back to the steady
 /// cadence rather than guessing.
+pub(crate) fn parse_retry_after_at(value: Option<&str>, now: i64) -> Option<Duration> {
+    let v = value?.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") is an RFC 2822 date.
+    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?.timestamp();
+    Some(Duration::from_secs(u64::try_from(at - now).unwrap_or(0)))
+}
+
+/// [`parse_retry_after_at`] against the wall clock.
 pub(crate) fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
-    value?.trim().parse::<u64>().ok().map(Duration::from_secs)
+    parse_retry_after_at(value, chrono::Utc::now().timestamp())
 }
 
 /// Classify a non-success refresh status that is NOT a credential rejection.
+/// `credential_exp` is the decoded `exp` of the credential being refreshed.
 pub(crate) fn kept_existing_cause_for_status(
     status: u16,
     retry_after: Option<&str>,
+    credential_exp: Option<i64>,
 ) -> KeptExistingCause {
     match status {
         429 => KeptExistingCause::RateLimited {
             retry_after: parse_retry_after(retry_after),
+            credential_exp,
         },
         500..=599 => KeptExistingCause::Upstream5xx,
         _ => KeptExistingCause::Other,
@@ -240,10 +278,11 @@ fn retry_after_header(resp: &reqwest::Response) -> Option<String> {
 }
 
 /// Classify a reqwest error from SENDING a refresh request or READING its body.
-/// A decode error is a malformed answer (`Other`); everything else — connect,
+/// A decode error is a malformed answer and a builder error a malformed request
+/// (`Other` — retrying sooner changes neither); everything else — connect,
 /// timeout, a body cut off mid-read — is transport.
 fn kept_existing_cause_for_reqwest(e: &reqwest::Error) -> KeptExistingCause {
-    if e.is_decode() {
+    if e.is_decode() || e.is_builder() {
         KeptExistingCause::Other
     } else {
         KeptExistingCause::Transport
@@ -261,8 +300,12 @@ pub(crate) enum PassRetryHint {
     /// transient backoff.
     Transient,
     /// Coord rate-limited a refresh — wait what it asked (or the steady cadence
-    /// when it did not say).
-    RateLimited(Option<Duration>),
+    /// when it did not say), but never past `deadline`: the earliest `exp` among
+    /// the rate-limited credentials.
+    RateLimited {
+        retry_after: Option<Duration>,
+        deadline: Option<i64>,
+    },
 }
 
 /// Fold a pass's kept-existing causes into one hint.
@@ -286,17 +329,45 @@ pub(crate) fn pass_retry_hint(
 /// One step of [`pass_retry_hint`] — also used to add the legacy self-refresh's
 /// cause to the slot pass's hint.
 pub(crate) fn fold_retry_hint(hint: PassRetryHint, cause: KeptExistingCause) -> PassRetryHint {
+    // The longest Retry-After and the EARLIEST deadline: honour what coord asked
+    // of every attempt, and outlive none of the credentials.
+    fn max_opt(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    fn min_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
     match (hint, cause) {
-        (PassRetryHint::RateLimited(a), KeptExistingCause::RateLimited { retry_after: b }) => {
-            PassRetryHint::RateLimited(match (a, b) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            })
-        }
-        (_, KeptExistingCause::RateLimited { retry_after }) => {
-            PassRetryHint::RateLimited(retry_after)
-        }
-        (PassRetryHint::RateLimited(a), _) => PassRetryHint::RateLimited(a),
+        (
+            PassRetryHint::RateLimited {
+                retry_after: a,
+                deadline: da,
+            },
+            KeptExistingCause::RateLimited {
+                retry_after: b,
+                credential_exp: db,
+            },
+        ) => PassRetryHint::RateLimited {
+            retry_after: max_opt(a, b),
+            deadline: min_opt(da, db),
+        },
+        (
+            _,
+            KeptExistingCause::RateLimited {
+                retry_after,
+                credential_exp,
+            },
+        ) => PassRetryHint::RateLimited {
+            retry_after,
+            deadline: credential_exp,
+        },
+        (h @ PassRetryHint::RateLimited { .. }, _) => h,
         (_, KeptExistingCause::Transport | KeptExistingCause::Upstream5xx) => {
             PassRetryHint::Transient
         }
@@ -313,9 +384,15 @@ pub(crate) fn fold_retry_hint(hint: PassRetryHint, cause: KeptExistingCause) -> 
 /// - `Transient` -> `min(base, transient_backoff(n))`, `n` growing across
 ///   consecutive transient passes (15 s, 30 s, 60 s, 120 s, 120 s ...) so a long
 ///   outage is retried every two minutes without hot-looping.
-/// - `RateLimited(ra)` -> `ra` (or [`REFRESH_CHECK_INTERVAL`] when coord did not
-///   say), clamped to `[TRANSIENT_BACKOFF_MIN, RATE_LIMIT_WAIT_CAP]` — never
-///   the 15 s ladder.
+/// - `RateLimited { retry_after, deadline }` -> `retry_after` (or
+///   [`REFRESH_CHECK_INTERVAL`] when coord did not say), clamped to
+///   `[TRANSIENT_BACKOFF_MIN, RATE_LIMIT_WAIT_CAP]` — never the 15 s ladder. A
+///   `Retry-After` under 15 s is therefore waited as 15 s. Then, when the
+///   rate-limited credential's `exp` is known, cut to end
+///   [`RATE_LIMIT_EXPIRY_MARGIN`] before it (never below 15 s): a 3600 s
+///   `Retry-After` on a credential with 25 min left wakes at ~23 min, not after
+///   the credential is dead. Honouring coord is worth less than keeping the
+///   credential alive.
 /// - `None` -> `base`, and the transient ladder resets.
 ///
 /// The ladder lives in its OWN counter (`consecutive_pass_transient`), not the
@@ -326,6 +403,7 @@ pub(crate) fn wait_after_pass(
     base: Option<Duration>,
     hint: PassRetryHint,
     state: &mut RefreshBackoff,
+    now: i64,
 ) -> Option<Duration> {
     match hint {
         PassRetryHint::None => {
@@ -337,10 +415,43 @@ pub(crate) fn wait_after_pass(
             state.consecutive_pass_transient = state.consecutive_pass_transient.saturating_add(1);
             Some(base.map_or(w, |b| b.min(w)))
         }
-        PassRetryHint::RateLimited(ra) => Some(
-            ra.unwrap_or(REFRESH_CHECK_INTERVAL)
-                .clamp(TRANSIENT_BACKOFF_MIN, RATE_LIMIT_WAIT_CAP),
-        ),
+        PassRetryHint::RateLimited {
+            retry_after,
+            deadline,
+        } => {
+            let asked = retry_after
+                .unwrap_or(REFRESH_CHECK_INTERVAL)
+                .clamp(TRANSIENT_BACKOFF_MIN, RATE_LIMIT_WAIT_CAP);
+            let wait = match deadline {
+                Some(exp) => {
+                    let room = exp - now - RATE_LIMIT_EXPIRY_MARGIN.as_secs() as i64;
+                    let room = Duration::from_secs(u64::try_from(room).unwrap_or(0));
+                    asked.min(room.max(TRANSIENT_BACKOFF_MIN))
+                }
+                None => asked,
+            };
+            Some(wait)
+        }
+    }
+}
+
+/// The wait after a pass RESULT — the loop's `match`, factored out so its
+/// abandoned arm is tested: an abandoned pass renewed nothing, so it retries on
+/// the transient ceiling, not the 5-minute cadence.
+pub(crate) fn wait_for_pass_result(
+    result: Result<PassOutput, PassStage>,
+    state: &mut RefreshBackoff,
+    now: i64,
+) -> Option<Duration> {
+    match result {
+        Ok(PassOutput { end, hint }) => {
+            let base = match end {
+                PassEnd::Wait(d) => Some(d),
+                PassEnd::UntilKick => None,
+            };
+            wait_after_pass(base, hint, state, now)
+        }
+        Err(_stage) => Some(TRANSIENT_BACKOFF_MAX),
     }
 }
 
@@ -516,7 +627,9 @@ fn refresher_runtime() -> Option<tokio::runtime::Handle> {
                 Err(e) => {
                     warn!(
                         error = %e,
-                        "device_jwt_refresher: could not build its dedicated runtime — running                          on the shared app runtime, where a starved worker pool delays its                          refreshes"
+                        "device_jwt_refresher: could not build its dedicated runtime — running \
+                         on the shared app runtime, where a starved worker pool delays \
+                         its refreshes"
                     );
                     None
                 }
@@ -524,6 +637,15 @@ fn refresher_runtime() -> Option<tokio::runtime::Handle> {
         })
         .as_ref()
         .map(|rt| rt.handle().clone())
+}
+
+/// Run `f` with the refresher's runtime ENTERED, so any `tokio::spawn` inside it
+/// lands on `jwt-refresher-rt` (or, if that runtime could not be built, on the
+/// caller's). [`start_refresher`] spawns the supervised loop through this.
+pub(crate) fn on_refresher_runtime<R>(f: impl FnOnce() -> R) -> R {
+    let handle = refresher_runtime();
+    let _entered = handle.as_ref().map(|h| h.enter());
+    f()
 }
 
 /// Classification of a Cognito-bearer refresh attempt, used to drive the loop's
@@ -1293,22 +1415,22 @@ pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
     // On the refresher's OWN runtime (see [`refresher_runtime`]): entering it
     // makes the supervisor's `tokio::spawn` land there. The returned
     // `JoinHandle` is awaitable from any runtime, so `stop()` is unchanged.
-    let refresher_rt = refresher_runtime();
-    let _on_refresher_runtime = refresher_rt.as_ref().map(|h| h.enter());
-    let task_handle = crate::mcp::task_supervisor::spawn_supervised(
-        "Device-JWT refresher",
-        shutdown_rx,
-        move || {
-            // Consume any kick delivered between respawns so the fresh loop
-            // doesn't immediately fire on an already-handled kick.
-            kick_rx_loop.borrow_and_update();
-            refresher_loop(
-                api_state.clone(),
-                shutdown_rx_loop.clone(),
-                kick_rx_loop.clone(),
-            )
-        },
-    );
+    let task_handle = on_refresher_runtime(|| {
+        crate::mcp::task_supervisor::spawn_supervised(
+            "Device-JWT refresher",
+            shutdown_rx,
+            move || {
+                // Consume any kick delivered between respawns so the fresh loop
+                // doesn't immediately fire on an already-handled kick.
+                kick_rx_loop.borrow_and_update();
+                refresher_loop(
+                    api_state.clone(),
+                    shutdown_rx_loop.clone(),
+                    kick_rx_loop.clone(),
+                )
+            },
+        )
+    });
 
     Arc::new(RefresherState {
         shutdown_tx,
@@ -1497,21 +1619,21 @@ pub(crate) async fn try_refresh_once(
     // owned by coord, not by an OAuth refresh chain). Guarded by the
     // tenant we just asked pair-cli to mint for — see `RefreshOutcome::TenantMismatch`.
     let token_for_store = resp.token.clone();
+    // M1: a NEW credential is in the slot — and, via the mirror, in its
+    // tenant's slot — so every rejection coord recorded against the old one is
+    // spent. Without this the streak survives replacement and `dark` latches on
+    // a working token. Retired INSIDE the blocking write, so a pass abandoned
+    // at this await cannot persist the credential and skip the retirement.
     match store_write_off_runtime(auth_manager, move |m| {
-        m.store_tokens_expecting(&token_for_store, "", Some(tenant_id))
+        m.store_tokens_expecting(&token_for_store, "", Some(tenant_id))?;
+        retire_rejection_streaks_after_legacy_mint(&token_for_store);
+        Ok(())
     })
     .await
     {
-        Ok(()) => {
-            // M1: a NEW credential is in the slot — and, via the mirror, in
-            // its tenant's slot — so every rejection coord recorded against
-            // the old one is spent. Without this the streak survives
-            // replacement and `dark` latches on a working token.
-            retire_rejection_streaks_after_legacy_mint(&resp.token);
-            RefreshOutcome::Replaced {
-                new_jwt: resp.token,
-            }
-        }
+        Ok(()) => RefreshOutcome::Replaced {
+            new_jwt: resp.token,
+        },
         Err(e) => {
             if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
                 DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
@@ -1572,14 +1694,18 @@ pub(crate) async fn try_device_self_refresh(
     // Precondition: a currently-valid (future-exp) device-JWT must be held —
     // coord authenticates this request with THAT bearer. An absent/opaque/
     // already-expired JWT cannot self-refresh, so hand off to Cognito.
-    let Some(current) = auth_manager
-        .get_access_token()
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-    else {
+    // Read on the blocking pool: the store read may wait on the store lock,
+    // and on the refresher's one-worker runtime that would stall its timer.
+    let mgr = auth_manager.clone();
+    let read = spawn_blocking_tracked(move || {
+        let token = mgr.get_access_token().ok().filter(|t| !t.trim().is_empty());
+        (token, mgr.access_token_exp())
+    })
+    .await;
+    let Ok((Some(current), current_exp)) = read else {
         return SelfRefreshOutcome::NotAttempted;
     };
-    match auth_manager.access_token_exp() {
+    match current_exp {
         // Future exp → self-refreshable (even if within the refresh threshold).
         Some(exp) if chrono::Utc::now().timestamp() < exp => {}
         // Absent/opaque exp, or already expired → Cognito fallback.
@@ -1645,6 +1771,7 @@ pub(crate) async fn try_device_self_refresh(
         return kept(kept_existing_cause_for_status(
             resp.status().as_u16(),
             retry_after.as_deref(),
+            current_exp,
         ));
     }
     let body: DeviceRefreshResponse = match resp.json().await {
@@ -1671,21 +1798,21 @@ pub(crate) async fn try_device_self_refresh(
     // bug or a stale slot, never a legitimate answer to THIS request.
     let expected_tenant = crate::auth::jwt_tenant_claim(&current);
     let token_for_store = body.token.clone();
+    // M1: the old credential's rejections are spent evidence — for the default
+    // bucket and for the tenant slot the mirror just wrote. Retired and logged
+    // INSIDE the blocking write: cancellation-safe under PASS_BOUND.
     match store_write_off_runtime(auth_manager, move |m| {
-        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)?;
+        retire_rejection_streaks_after_legacy_mint(&token_for_store);
+        info!(
+            "device_jwt_refresher: device-JWT self-refreshed login-independently (len={})",
+            token_for_store.len()
+        );
+        Ok(())
     })
     .await
     {
-        Ok(()) => {
-            // M1: the old credential's rejections are spent evidence — for the
-            // default bucket and for the tenant slot the mirror just wrote.
-            retire_rejection_streaks_after_legacy_mint(&body.token);
-            info!(
-                "device_jwt_refresher: device-JWT self-refreshed login-independently (len={})",
-                body.token.len()
-            );
-            SelfRefreshOutcome::Refreshed(body.token)
-        }
+        Ok(()) => SelfRefreshOutcome::Refreshed(body.token),
         Err(e) => {
             if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
                 DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
@@ -4754,6 +4881,43 @@ async fn clear_and_rederive_tenant_slot(
     cause: SlotClearCause,
     evidence: &str,
 ) -> TenantSlotOutcome {
+    // ONE non-cancellable unit. The clear itself completes on the blocking pool
+    // even if the pass is dropped at its await, so everything that must follow
+    // a clear — the counters, the forensics row, the CLEARED warning, the
+    // re-derive — must not be droppable either. A spawned task outlives the
+    // `JoinHandle` dropped with an abandoned pass (PASS_BOUND); before this, a
+    // slot could vanish with no forensic line at all.
+    let (mgr, t, web, did, ev) = (
+        auth_manager.clone(),
+        *tenant,
+        web_base.to_string(),
+        device_id.to_string(),
+        evidence.to_string(),
+    );
+    match tokio::spawn(async move {
+        clear_and_rederive_tenant_slot_unit(&mgr, &t, &web, &did, cause, &ev).await
+    })
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("device_jwt_refresher: tenant {tenant} slot clear task failed: {e}");
+            TenantSlotOutcome::KeptExisting {
+                cause: KeptExistingCause::Other,
+            }
+        }
+    }
+}
+
+/// The body of [`clear_and_rederive_tenant_slot`], run as its own task.
+async fn clear_and_rederive_tenant_slot_unit(
+    auth_manager: &crate::auth::AuthManager,
+    tenant: &uuid::Uuid,
+    web_base: &str,
+    device_id: &str,
+    cause: SlotClearCause,
+    evidence: &str,
+) -> TenantSlotOutcome {
     use std::sync::atomic::Ordering;
     let t = *tenant;
     if let Err(e) =
@@ -4882,7 +5046,32 @@ pub(crate) async fn refresh_tenant_slots(
     app: Option<&tauri::AppHandle>,
     pins: PosturePinInputs,
 ) -> Vec<(uuid::Uuid, TenantSlotOutcome)> {
-    let tenants = auth_manager.list_tenant_device_jwt_tenants();
+    // Every slot read for this pass in ONE blocking-pool hop: a store read may
+    // wait on the store lock, and on the refresher's one-worker runtime that
+    // would stall the very timer PASS_BOUND relies on.
+    let mgr = auth_manager.clone();
+    let reads: Vec<(uuid::Uuid, Result<Option<String>, String>)> =
+        match spawn_blocking_tracked(move || {
+            mgr.list_tenant_device_jwt_tenants()
+                .into_iter()
+                .map(|t| {
+                    let v = mgr.get_tenant_device_jwt(&t).map_err(|e| e.to_string());
+                    (t, v)
+                })
+                .collect()
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "device_jwt_refresher: tenant-slot read task failed ({e}) — no slot \
+                     judged this pass"
+                );
+                Vec::new()
+            }
+        };
+    let tenants: Vec<uuid::Uuid> = reads.iter().map(|(t, _)| *t).collect();
     let mut outcomes = Vec::with_capacity(tenants.len());
     if tenants.is_empty() {
         return outcomes;
@@ -4917,9 +5106,9 @@ pub(crate) async fn refresh_tenant_slots(
     };
     let now = chrono::Utc::now().timestamp();
     if boot_pass {
-        let boot_obs: Vec<SlotObservation> = tenants
+        let boot_obs: Vec<SlotObservation> = reads
             .iter()
-            .map(|t| match auth_manager.get_tenant_device_jwt(t) {
+            .map(|(t, v)| match v {
                 Ok(v) => SlotObservation::observed(Some(t.to_string()), v.as_deref()),
                 Err(_) => SlotObservation::unreadable(Some(t.to_string())),
             })
@@ -4928,8 +5117,8 @@ pub(crate) async fn refresh_tenant_slots(
             notify_posture_transition(app, transition);
         }
     }
-    for tenant in tenants {
-        let token = match auth_manager.get_tenant_device_jwt(&tenant) {
+    for (tenant, read) in reads {
+        let token = match read {
             Ok(Some(t)) if !t.trim().is_empty() => t.trim().to_string(),
             Ok(_) => {
                 // Empty slot: nothing to refresh, and nothing to clear.
@@ -5061,7 +5250,7 @@ pub(crate) async fn refresh_tenant_slots(
             );
             let retry_after = retry_after_header(&resp);
             let o = TenantSlotOutcome::KeptExisting {
-                cause: kept_existing_cause_for_status(status.as_u16(), retry_after.as_deref()),
+                cause: kept_existing_cause_for_status(status.as_u16(), retry_after.as_deref(), exp),
             };
             health.push(health_row(
                 &tenant,
@@ -5097,16 +5286,22 @@ pub(crate) async fn refresh_tenant_slots(
             continue;
         }
         let (t, token) = (tenant, body.token.clone());
-        match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &token))
-            .await
+        // Persist, the M1 streak reset ([`reset_upstream_rejections_for`]) and
+        // the log line are ONE unit on the blocking pool: a pass abandoned at
+        // this await must not leave a fresh credential behind a stale streak
+        // (`dark(upstream_rejected)` over a live slot until its next refresh).
+        match store_write_off_runtime(auth_manager, move |m| {
+            m.store_tenant_device_jwt(&t, &token)?;
+            reset_upstream_rejections_for(Some(t));
+            info!(
+                "device_jwt_refresher: tenant {t} device-JWT slot refreshed (len={})",
+                token.len()
+            );
+            Ok(())
+        })
+        .await
         {
             Ok(()) => {
-                info!(
-                    "device_jwt_refresher: tenant {tenant} device-JWT slot refreshed (len={})",
-                    body.token.len()
-                );
-                // M1 — see [`reset_upstream_rejections_for`].
-                reset_upstream_rejections_for(Some(tenant));
                 let o = TenantSlotOutcome::Refreshed;
                 health.push(health_row(&tenant, o, "refreshed".to_string()));
                 outcomes.push((tenant, o));
@@ -5306,22 +5501,22 @@ pub(crate) async fn try_device_machine_key_exchange(
     // the doc comment above for why a mismatch here is exactly the incident
     // this exchange path was found to bypass.
     let token_for_store = body.token.clone();
+    // M1: the old credential's rejections are spent evidence — for the default
+    // bucket and for the tenant slot the mirror just wrote. Retired and logged
+    // INSIDE the blocking write: cancellation-safe under PASS_BOUND.
     match store_write_off_runtime(auth_manager, move |m| {
-        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)?;
+        retire_rejection_streaks_after_legacy_mint(&token_for_store);
+        info!(
+            "device_jwt_refresher: device JWT re-minted via device-machine-key \
+             exchange (len={})",
+            token_for_store.len()
+        );
+        Ok(())
     })
     .await
     {
-        Ok(()) => {
-            // M1: the old credential's rejections are spent evidence — for the
-            // default bucket and for the tenant slot the mirror just wrote.
-            retire_rejection_streaks_after_legacy_mint(&body.token);
-            info!(
-                "device_jwt_refresher: device JWT re-minted via device-machine-key \
-                 exchange (len={})",
-                body.token.len()
-            );
-            Some(body.token)
-        }
+        Ok(()) => Some(body.token),
         Err(e) => {
             if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
                 DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
@@ -5395,24 +5590,30 @@ pub(crate) async fn refresh_cognito_bearer(
     if auth_manager.cognito_token_needs_refresh() {
         info!("device_jwt_refresher: Cognito access token stale — refreshing first");
         let rt = refresh_token.clone();
-        let refreshed =
-            spawn_blocking_tracked(move || qontinui_runner_lib::cognito::refresh_tokens(&rt)).await;
+        let mgr = auth_manager.clone();
+        // The grant AND its persist are one unit on the blocking pool: a pass
+        // abandoned at this await (PASS_BOUND) must not lose a minted response.
+        let refreshed = spawn_blocking_tracked(move || {
+            let resp = match qontinui_runner_lib::cognito::refresh_tokens(&rt) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+            let expires_at = chrono::Utc::now().timestamp() + resp.expires_in;
+            // Cognito omits refresh_token on the refresh grant — keep the
+            // existing one.
+            let new_refresh = resp.refresh_token.clone().unwrap_or(rt);
+            if let Err(e) =
+                mgr.store_oauth_tokens(&resp.access_token, &resp.id_token, &new_refresh, expires_at)
+            {
+                warn!("device_jwt_refresher: persist refreshed Cognito tokens failed: {e}");
+            } else {
+                info!("device_jwt_refresher: Cognito access token refreshed");
+            }
+            Ok(resp)
+        })
+        .await;
         match refreshed {
             Ok(Ok(resp)) => {
-                let expires_at = chrono::Utc::now().timestamp() + resp.expires_in;
-                // Cognito omits refresh_token on the refresh grant — keep the
-                // existing one.
-                let new_refresh = resp.refresh_token.unwrap_or(refresh_token);
-                if let Err(e) = auth_manager.store_oauth_tokens(
-                    &resp.access_token,
-                    &resp.id_token,
-                    &new_refresh,
-                    expires_at,
-                ) {
-                    warn!("device_jwt_refresher: persist refreshed Cognito tokens failed: {e}");
-                } else {
-                    info!("device_jwt_refresher: Cognito access token refreshed");
-                }
                 return (Some(resp.access_token), RefreshClass::Ok);
             }
             Ok(Err(e)) => {
@@ -5703,18 +5904,7 @@ async fn refresher_loop(
             ),
         )
         .await;
-        let wait = match pass {
-            Ok(PassOutput { end, hint }) => {
-                let base = match end {
-                    PassEnd::Wait(d) => Some(d),
-                    PassEnd::UntilKick => None,
-                };
-                wait_after_pass(base, hint, &mut backoff)
-            }
-            // Abandoned: whatever it was stuck on, the credential was not
-            // renewed — retry on the transient ceiling, not the 5 m cadence.
-            Err(_stage) => Some(TRANSIENT_BACKOFF_MAX),
-        };
+        let wait = wait_for_pass_result(pass, &mut backoff, chrono::Utc::now().timestamp());
         match wait {
             Some(d) => {
                 if wait_with_signals(d, &mut shutdown_rx, &mut kick_rx).await {
@@ -5733,6 +5923,53 @@ async fn refresher_loop(
             }
         }
     }
+}
+
+/// The tenant-slot stage of a pass: refresh every slot, log the pass, and fold
+/// the slots' kept-existing causes into the pass's retry hint.
+///
+/// Phase 2 step 3 (plan 2026-10-09-…-only-refresh-window): those causes used to
+/// be discarded right here, so a slot inside its window that failed on transport
+/// waited a flat 300 s.
+pub(crate) async fn tenant_slot_stage(
+    auth_manager: &crate::auth::AuthManager,
+    coord_base: &str,
+    web_base: &str,
+    device_id: &str,
+    app: Option<&tauri::AppHandle>,
+    pins: PosturePinInputs,
+) -> (Vec<(uuid::Uuid, TenantSlotOutcome)>, PassRetryHint) {
+    let outcomes =
+        refresh_tenant_slots(auth_manager, coord_base, web_base, device_id, app, pins).await;
+    let hint = pass_retry_hint(outcomes.iter().filter_map(|(_, o)| o.kept_existing_cause()));
+    if !outcomes.is_empty() {
+        let refreshed = outcomes
+            .iter()
+            .filter(|(_, o)| *o == TenantSlotOutcome::Refreshed)
+            .count();
+        info!(
+            "device_jwt_refresher: multi-tenant slot pass — {refreshed}/{} \
+             refreshed ({outcomes:?})",
+            outcomes.len()
+        );
+    }
+    (outcomes, hint)
+}
+
+/// The legacy arm's self-refresh, with its kept-existing cause folded into the
+/// hint the slot stage produced.
+pub(crate) async fn legacy_self_refresh_stage(
+    auth_manager: &crate::auth::AuthManager,
+    coord_base: &str,
+    device_id: &str,
+    hint: PassRetryHint,
+) -> (SelfRefreshOutcome, PassRetryHint) {
+    let outcome = try_device_self_refresh(auth_manager, coord_base, device_id).await;
+    let hint = match outcome.kept_existing_cause() {
+        Some(cause) => fold_retry_hint(hint, cause),
+        None => hint,
+    };
+    (outcome, hint)
 }
 
 /// ONE refresher pass: heal, read, the tenant-slot pass, then the legacy
@@ -5761,8 +5998,16 @@ async fn refresher_pass(
 
     // Snapshot settings + needs-refresh decision once per iteration.
     stage.set(PassStage::ReadNeedsRefresh);
-    let settings_snapshot = settings::load_settings();
-    let needs_refresh_result = auth_manager.device_jwt_needs_refresh();
+    // Off the worker: both read files, and the token read may wait on the store
+    // lock (see PASS_BOUND for why that matters on this runtime).
+    let mgr = std::sync::Arc::clone(auth_manager);
+    let Ok((settings_snapshot, needs_refresh_result)) =
+        spawn_blocking_tracked(move || (settings::load_settings(), mgr.device_jwt_needs_refresh()))
+            .await
+    else {
+        warn!("device_jwt_refresher: settings/needs-refresh read task failed — skipping pass");
+        return PassOutput::new(PassEnd::Wait(REFRESH_CHECK_INTERVAL), hint);
+    };
     let needs_refresh = match needs_refresh_result {
         Ok(b) => b,
         Err(e) => {
@@ -5882,7 +6127,7 @@ async fn refresher_pass(
                 // Empty simply disables re-derivation for the pass.
                 let (slot_web_base, _slot_web_arm) = resolve_pair_base(&settings_snapshot);
                 stage.set(PassStage::TenantSlotPass);
-                let outcomes = refresh_tenant_slots(
+                hint = tenant_slot_stage(
                     auth_manager,
                     &coord_base,
                     &slot_web_base,
@@ -5890,24 +6135,8 @@ async fn refresher_pass(
                     Some(&api_state.app_handle),
                     sweep_inputs.posture_pin_inputs(),
                 )
-                .await;
-                // Phase 2 step 3 (plan 2026-10-09-…-only-refresh-window):
-                // the slot pass's causes are carried OUT to the wait — they
-                // used to be discarded right here, so a slot inside its
-                // window that failed on transport waited a flat 300 s.
-                hint =
-                    pass_retry_hint(outcomes.iter().filter_map(|(_, o)| o.kept_existing_cause()));
-                if !outcomes.is_empty() {
-                    let refreshed = outcomes
-                        .iter()
-                        .filter(|(_, o)| *o == TenantSlotOutcome::Refreshed)
-                        .count();
-                    info!(
-                        "device_jwt_refresher: multi-tenant slot pass — {refreshed}/{} \
-                         refreshed ({outcomes:?})",
-                        outcomes.len()
-                    );
-                }
+                .await
+                .1;
             }
             None => warn!(
                 "device_jwt_refresher: tenant device-JWT slots present but no device_id \
@@ -5930,7 +6159,15 @@ async fn refresher_pass(
         // fire a "you have no coord credential" banner at a paired runner
         // whose store merely failed to decrypt this tick.
         stage.set(PassStage::LegacyPosture);
-        let obs = match auth_manager.probe_access_token() {
+        let mgr = std::sync::Arc::clone(auth_manager);
+        let probe = spawn_blocking_tracked(move || mgr.probe_access_token())
+            .await
+            .unwrap_or_else(|e| {
+                crate::secure_storage::StoredTokenRead::Unreadable(format!(
+                    "probe task failed: {e}"
+                ))
+            });
+        let obs = match probe {
             crate::secure_storage::StoredTokenRead::Present(t) => {
                 SlotObservation::observed(None, Some(t.as_str()))
             }
@@ -5999,10 +6236,9 @@ async fn refresher_pass(
                 let (coord_base, _coord_base_source) =
                     crate::coord_mcp::coord_base_url_with_source();
                 stage.set(PassStage::SelfRefresh);
-                let self_refresh = try_device_self_refresh(auth_manager, &coord_base, &did).await;
-                if let Some(cause) = self_refresh.kept_existing_cause() {
-                    hint = fold_retry_hint(hint, cause);
-                }
+                let (self_refresh, folded) =
+                    legacy_self_refresh_stage(auth_manager, &coord_base, &did, hint).await;
+                hint = folded;
                 if let SelfRefreshOutcome::Refreshed(new_jwt) = self_refresh {
                     info!(
                         "device_jwt_refresher: device-JWT self-refreshed (len={}) \
@@ -6364,6 +6600,20 @@ pub mod commands {
     }
 }
 
+/// A base URL whose listener ACCEPTS and immediately DROPS every connection, so
+/// a request to it fails at the transport layer with no HTTP status. Used
+/// instead of bind-0-then-drop, whose freed port another test can grab.
+#[cfg(test)]
+pub(crate) fn accept_and_drop_base() -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = l.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for conn in l.incoming() {
+            drop(conn);
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7452,7 +7702,7 @@ mod device_self_refresh_tests {
         let got = try_device_self_refresh(&mgr, &base, DID).await;
         assert!(
             got == SelfRefreshOutcome::NotAttempted,
-            "expired JWT → None (Cognito fallback)"
+            "expired JWT → NotAttempted (Cognito fallback)"
         );
         assert_eq!(
             *cap.hits.lock().unwrap(),
@@ -7477,7 +7727,7 @@ mod device_self_refresh_tests {
         let got = try_device_self_refresh(&mgr, &base, DID).await;
         assert!(
             got == SelfRefreshOutcome::NotAttempted,
-            "absent JWT → None (Cognito fallback)"
+            "absent JWT → NotAttempted (Cognito fallback)"
         );
         assert_eq!(
             *cap.hits.lock().unwrap(),
@@ -7543,7 +7793,7 @@ mod device_self_refresh_tests {
         let got = try_device_self_refresh(&mgr, &base, DID).await;
         assert!(
             got.kept_existing_cause() == Some(KeptExistingCause::Other),
-            "404 → None (Cognito fallback)"
+            "404 → KeptExisting {{ Other }} (Cognito fallback)"
         );
         assert_eq!(
             *cap.hits.lock().unwrap(),
@@ -7583,6 +7833,33 @@ mod device_self_refresh_tests {
         assert_eq!(mgr.get_access_token().unwrap(), existing);
     }
 
+    /// The pass's WIRED self-refresh stage ([`legacy_self_refresh_stage`]): a
+    /// 5xx folds into the hint the slot stage produced. Deleting the fold
+    /// fails this test.
+    #[tokio::test]
+    async fn the_self_refresh_stage_folds_its_cause_into_the_pass_hint() {
+        let _serialised = super::posture_test_lock();
+        let mgr = test_auth_manager("stage_folds_cause");
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        mgr.store_tokens(&existing, "").expect("store");
+        let (base, _cap, _shutdown) =
+            spawn_mock(StatusCode::BAD_GATEWAY, r#"{"error":"down"}"#.to_string());
+        let (outcome, hint) =
+            legacy_self_refresh_stage(&mgr, &base, DID, PassRetryHint::None).await;
+        assert_eq!(
+            outcome.kept_existing_cause(),
+            Some(KeptExistingCause::Upstream5xx)
+        );
+        assert_eq!(hint, PassRetryHint::Transient);
+        // A rate-limited slot earlier in the pass still wins.
+        let limited = PassRetryHint::RateLimited {
+            retry_after: Some(Duration::from_secs(90)),
+            deadline: None,
+        };
+        let (_, hint) = legacy_self_refresh_stage(&mgr, &base, DID, limited).await;
+        assert_eq!(hint, limited);
+    }
+
     /// Coord unreachable: `Transport`, existing JWT untouched.
     #[tokio::test]
     async fn self_refresh_transport_failure_is_typed_transport() {
@@ -7592,12 +7869,7 @@ mod device_self_refresh_tests {
         let mgr = test_auth_manager("transport_typed");
         let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
         mgr.store_tokens(&existing, "").expect("store");
-        let dead_base = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let port = l.local_addr().expect("addr").port();
-            drop(l);
-            format!("http://127.0.0.1:{port}")
-        };
+        let dead_base = accept_and_drop_base();
 
         let got = try_device_self_refresh(&mgr, &dead_base, DID).await;
         assert_eq!(
@@ -8129,6 +8401,7 @@ mod tenant_slot_refresh_tests {
 
         let expected = KeptExistingCause::RateLimited {
             retry_after: Some(Duration::from_secs(42)),
+            credential_exp: Some(now + 30 * 60),
         };
         assert_eq!(
             outcomes,
@@ -8142,14 +8415,16 @@ mod tenant_slot_refresh_tests {
         // And the pass's wait honours it rather than the 15 s retry.
         let hint = pass_retry_hint(outcomes.iter().filter_map(|(_, o)| o.kept_existing_cause()));
         let mut state = RefreshBackoff::default();
-        let wait = wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state);
+        let wait = wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state, now);
         assert_eq!(wait, Some(Duration::from_secs(42)));
     }
 
-    /// End to end through a real pass: coord down while the slot is inside its
-    /// window -> the next wake is on the transient backoff, not 300 s.
+    /// The pass's WIRED slot stage ([`tenant_slot_stage`], what `refresher_pass`
+    /// calls): coord down while the slot is inside its window -> the stage hands
+    /// back a `Transient` hint, and the next wake is on the transient backoff,
+    /// not 300 s. Deleting the hint fold inside the stage fails this test.
     #[tokio::test]
-    async fn a_slot_inside_its_window_failing_on_transport_wakes_on_the_transient_backoff() {
+    async fn the_slot_stage_returns_a_transient_hint_for_a_slot_failing_on_transport_in_window() {
         let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_transport_backoff");
         let ta = tenant(0);
@@ -8157,20 +8432,66 @@ mod tenant_slot_refresh_tests {
         // 100 minutes left: inside the TTL/2 window, OUTSIDE the old TTL/3 one.
         let jwt = synth_jwt(now + 100 * 60, "outage-in-window");
         mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
-        let dead_base = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let port = l.local_addr().expect("addr").port();
-            drop(l);
-            format!("http://127.0.0.1:{port}")
-        };
-        let outcomes =
-            refresh_tenant_slots(&mgr, &dead_base, "", DID, None, PosturePinInputs::UNPINNED).await;
-        let hint = pass_retry_hint(outcomes.iter().filter_map(|(_, o)| o.kept_existing_cause()));
+        let dead_base = accept_and_drop_base();
+        let (outcomes, hint) =
+            tenant_slot_stage(&mgr, &dead_base, "", DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(
+            outcomes,
+            vec![(
+                ta,
+                TenantSlotOutcome::KeptExisting {
+                    cause: KeptExistingCause::Transport
+                }
+            )]
+        );
         assert_eq!(hint, PassRetryHint::Transient);
         let mut state = RefreshBackoff::default();
-        let wait = wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state).expect("a wait");
-        assert!(wait <= TRANSIENT_BACKOFF_MAX, "{wait:?}");
+        let wait =
+            wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state, now).expect("a wait");
         assert_eq!(wait, TRANSIENT_BACKOFF_MIN);
+    }
+
+    /// Review item 1: a pass dropped at the clear's await (what PASS_BOUND does
+    /// to a wedged pass) still completes the clear AND its bookkeeping — the
+    /// counter, the forensics row, the CLEARED warning. Before the clear ran as
+    /// its own task, the blocking write finished but everything after the await
+    /// was dropped, so a slot vanished with no forensic trace.
+    #[tokio::test]
+    async fn a_clear_whose_pass_is_dropped_still_counts_and_logs_the_clear() {
+        use std::sync::atomic::Ordering;
+        let _serialised = health_lock();
+        let mgr = test_auth_manager("clear_cancel_safe");
+        let ta = tenant(0);
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_tenant_device_jwt(&ta, &synth_jwt(now - 60, "dead"))
+            .expect("slot a");
+        let before = CLEARED_ON_EXPIRY_TOTAL.load(Ordering::Relaxed);
+
+        // Poll exactly once, then drop: the clear's write is now on the
+        // blocking pool and the caller is gone.
+        let fut = clear_and_rederive_tenant_slot(
+            &mgr,
+            &ta,
+            "",
+            DID,
+            SlotClearCause::DecodedExpiry,
+            "test: decoded exp in the past",
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(fut).is_none(),
+            "the clear must still be in flight when its caller is dropped"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while CLEARED_ON_EXPIRY_TOTAL.load(Ordering::Relaxed) == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the clear's bookkeeping never ran after its caller was dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(CLEARED_ON_EXPIRY_TOTAL.load(Ordering::Relaxed), before + 1);
+        assert_eq!(mgr.get_tenant_device_jwt(&ta).unwrap(), None);
     }
 
     /// THE SAFEGUARD, half one: coord being UNWELL is not coord rejecting the
@@ -8233,15 +8554,10 @@ mod tenant_slot_refresh_tests {
         let jwt = synth_jwt(now + 30 * 60, "unreachable");
         mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
 
-        // A port with nothing bound: the connect fails at the transport layer,
+        // A listener that accepts and drops: the request fails at the transport layer,
         // with no HTTP status of any kind. `web_base` is deliberately the same
         // dead base, so even a stray re-derive attempt could not succeed.
-        let dead_base = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let port = l.local_addr().expect("addr").port();
-            drop(l);
-            format!("http://127.0.0.1:{port}")
-        };
+        let dead_base = accept_and_drop_base();
         let outcomes = refresh_tenant_slots(
             &mgr,
             &dead_base,
@@ -8562,12 +8878,7 @@ mod tenant_slot_refresh_tests {
         let jwt = synth_jwt(now + 30 * 60, "unreachable");
         mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
 
-        let dead_base = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let port = l.local_addr().expect("addr").port();
-            drop(l);
-            format!("http://127.0.0.1:{port}")
-        };
+        let dead_base = accept_and_drop_base();
         let outcomes = refresh_tenant_slots(
             &mgr,
             &dead_base,
@@ -13491,47 +13802,73 @@ mod device_machine_key_exchange_tests {
 mod refresh_window_outage_tests {
     //! Plan `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
     //! Phase 2: the typed kept-existing cause driving the next wake, the outer
-    //! per-pass bound, and the TTL/2 `Expiring` band.
+    //! per-pass bound, the dedicated runtime, and the TTL/2 `Expiring` band.
 
     use super::*;
+
+    const NOW: i64 = 1_900_000_000;
 
     fn rl(secs: u64) -> KeptExistingCause {
         KeptExistingCause::RateLimited {
             retry_after: Some(Duration::from_secs(secs)),
+            credential_exp: None,
         }
+    }
+
+    fn wait(base: Option<Duration>, hint: PassRetryHint) -> Option<Duration> {
+        wait_after_pass(base, hint, &mut RefreshBackoff::default(), NOW)
     }
 
     #[test]
     fn status_and_retry_after_classify() {
         assert_eq!(
-            kept_existing_cause_for_status(500, None),
+            kept_existing_cause_for_status(500, None, None),
             KeptExistingCause::Upstream5xx
         );
         assert_eq!(
-            kept_existing_cause_for_status(503, None),
+            kept_existing_cause_for_status(503, None, None),
             KeptExistingCause::Upstream5xx
         );
         assert_eq!(
-            kept_existing_cause_for_status(404, None),
+            kept_existing_cause_for_status(404, None, None),
             KeptExistingCause::Other
         );
-        assert_eq!(kept_existing_cause_for_status(429, Some(" 90 ")), rl(90));
         assert_eq!(
-            kept_existing_cause_for_status(429, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
-            KeptExistingCause::RateLimited { retry_after: None },
-            "the HTTP-date form is not guessed at"
+            kept_existing_cause_for_status(429, Some(" 90 "), Some(NOW + 600)),
+            KeptExistingCause::RateLimited {
+                retry_after: Some(Duration::from_secs(90)),
+                credential_exp: Some(NOW + 600),
+            }
         );
         assert_eq!(parse_retry_after(None), None);
         assert_eq!(parse_retry_after(Some("-5")), None);
+        assert_eq!(parse_retry_after(Some("soon")), None);
+    }
+
+    /// The HTTP-date form of `Retry-After` (RFC 9110 §10.2.3) is honoured, and a
+    /// date already past is a zero wait.
+    #[test]
+    fn retry_after_http_date_is_honoured() {
+        let date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let at = chrono::DateTime::parse_from_rfc2822(date)
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            parse_retry_after_at(Some(date), at - 90),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_retry_after_at(Some(date), at + 30),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
     fn transport_and_5xx_wake_on_the_transient_backoff() {
         for cause in [KeptExistingCause::Transport, KeptExistingCause::Upstream5xx] {
-            let mut state = RefreshBackoff::default();
             let hint = pass_retry_hint([cause]);
             assert_eq!(hint, PassRetryHint::Transient);
-            let w = wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state).unwrap();
+            let w = wait(Some(REFRESH_CHECK_INTERVAL), hint).unwrap();
             assert!(
                 w <= TRANSIENT_BACKOFF_MAX && w >= TRANSIENT_BACKOFF_MIN,
                 "{cause:?}: {w:?}"
@@ -13549,6 +13886,7 @@ mod refresh_window_outage_tests {
                     Some(REFRESH_CHECK_INTERVAL),
                     PassRetryHint::Transient,
                     &mut state,
+                    NOW,
                 )
                 .unwrap()
                 .as_secs()
@@ -13560,7 +13898,8 @@ mod refresh_window_outage_tests {
             wait_after_pass(
                 Some(REFRESH_CHECK_INTERVAL),
                 PassRetryHint::None,
-                &mut state
+                &mut state,
+                NOW
             ),
             Some(REFRESH_CHECK_INTERVAL)
         );
@@ -13568,7 +13907,8 @@ mod refresh_window_outage_tests {
             wait_after_pass(
                 Some(REFRESH_CHECK_INTERVAL),
                 PassRetryHint::Transient,
-                &mut state
+                &mut state,
+                NOW
             ),
             Some(TRANSIENT_BACKOFF_MIN)
         );
@@ -13583,7 +13923,7 @@ mod refresh_window_outage_tests {
         for _ in 0..3 {
             let action = plan_refresh_wait(&mut state, RefreshClass::NoSession);
             waits.push(
-                wait_after_pass(Some(action.wait), PassRetryHint::Transient, &mut state)
+                wait_after_pass(Some(action.wait), PassRetryHint::Transient, &mut state, NOW)
                     .unwrap()
                     .as_secs(),
             );
@@ -13601,14 +13941,14 @@ mod refresh_window_outage_tests {
             wait_after_pass(
                 Some(Duration::from_secs(20)),
                 PassRetryHint::Transient,
-                &mut state
+                &mut state,
+                NOW
             ),
             Some(Duration::from_secs(20))
         );
         // A block-until-kick with a transient hint still retries.
-        let mut state = RefreshBackoff::default();
         assert_eq!(
-            wait_after_pass(None, PassRetryHint::Transient, &mut state),
+            wait(None, PassRetryHint::Transient),
             Some(TRANSIENT_BACKOFF_MIN)
         );
     }
@@ -13616,52 +13956,88 @@ mod refresh_window_outage_tests {
     #[test]
     fn rate_limited_honours_retry_after_and_never_takes_the_15s_retry() {
         for ra in [20u64, 42, 300, 900] {
-            let mut state = RefreshBackoff::default();
-            let w = wait_after_pass(
-                Some(REFRESH_CHECK_INTERVAL),
-                pass_retry_hint([rl(ra)]),
-                &mut state,
-            )
-            .unwrap();
+            let w = wait(Some(REFRESH_CHECK_INTERVAL), pass_retry_hint([rl(ra)])).unwrap();
             assert!(w >= Duration::from_secs(ra), "retry_after={ra}: {w:?}");
         }
         // No Retry-After: the steady cadence, not the transient floor.
-        let mut state = RefreshBackoff::default();
         assert_eq!(
-            wait_after_pass(
+            wait(
                 Some(REFRESH_CHECK_INTERVAL),
-                pass_retry_hint([KeptExistingCause::RateLimited { retry_after: None }]),
-                &mut state,
+                pass_retry_hint([KeptExistingCause::RateLimited {
+                    retry_after: None,
+                    credential_exp: None,
+                }]),
             ),
             Some(REFRESH_CHECK_INTERVAL)
         );
-        // A tiny Retry-After is still never below the transient floor, and a
-        // huge one is capped.
-        let mut state = RefreshBackoff::default();
+        // A Retry-After under 15 s is waited as 15 s; a huge one is capped.
         assert_eq!(
-            wait_after_pass(None, pass_retry_hint([rl(1)]), &mut state),
+            wait(None, pass_retry_hint([rl(1)])),
             Some(TRANSIENT_BACKOFF_MIN)
         );
         assert_eq!(
-            wait_after_pass(None, pass_retry_hint([rl(10 * 24 * 3600)]), &mut state),
+            wait(None, pass_retry_hint([rl(10 * 24 * 3600)])),
             Some(RATE_LIMIT_WAIT_CAP)
+        );
+    }
+
+    /// Review item 3: a long `Retry-After` never parks the loop past the
+    /// rate-limited credential's own lifetime.
+    #[test]
+    fn a_rate_limited_wait_ends_before_the_credential_expires() {
+        let exp = NOW + 25 * 60;
+        let hint = pass_retry_hint([KeptExistingCause::RateLimited {
+            retry_after: Some(Duration::from_secs(3600)),
+            credential_exp: Some(exp),
+        }]);
+        let w = wait(Some(REFRESH_CHECK_INTERVAL), hint).unwrap();
+        assert_eq!(w, Duration::from_secs(25 * 60) - RATE_LIMIT_EXPIRY_MARGIN);
+        assert!(NOW + (w.as_secs() as i64) < exp);
+        // A credential already inside the margin still gets one 15 s retry.
+        let hint = pass_retry_hint([KeptExistingCause::RateLimited {
+            retry_after: Some(Duration::from_secs(3600)),
+            credential_exp: Some(NOW + 30),
+        }]);
+        assert_eq!(wait(None, hint), Some(TRANSIENT_BACKOFF_MIN));
+        // Several rate-limited credentials: the EARLIEST one bounds the wait.
+        let hint = pass_retry_hint([
+            KeptExistingCause::RateLimited {
+                retry_after: Some(Duration::from_secs(3600)),
+                credential_exp: Some(NOW + 50 * 60),
+            },
+            KeptExistingCause::RateLimited {
+                retry_after: Some(Duration::from_secs(60)),
+                credential_exp: Some(NOW + 20 * 60),
+            },
+        ]);
+        assert_eq!(
+            hint,
+            PassRetryHint::RateLimited {
+                retry_after: Some(Duration::from_secs(3600)),
+                deadline: Some(NOW + 20 * 60),
+            }
+        );
+        assert_eq!(
+            wait(None, hint),
+            Some(Duration::from_secs(20 * 60) - RATE_LIMIT_EXPIRY_MARGIN)
         );
     }
 
     #[test]
     fn rate_limiting_outranks_transient_and_the_longest_retry_after_wins() {
+        let limited = |s| PassRetryHint::RateLimited {
+            retry_after: Some(Duration::from_secs(s)),
+            deadline: None,
+        };
         assert_eq!(
             pass_retry_hint([KeptExistingCause::Transport, rl(30)]),
-            PassRetryHint::RateLimited(Some(Duration::from_secs(30)))
+            limited(30)
         );
         assert_eq!(
             pass_retry_hint([rl(30), KeptExistingCause::Upstream5xx]),
-            PassRetryHint::RateLimited(Some(Duration::from_secs(30)))
+            limited(30)
         );
-        assert_eq!(
-            pass_retry_hint([rl(30), rl(90), rl(60)]),
-            PassRetryHint::RateLimited(Some(Duration::from_secs(90)))
-        );
+        assert_eq!(pass_retry_hint([rl(30), rl(90), rl(60)]), limited(90));
         assert_eq!(
             pass_retry_hint([KeptExistingCause::Other, KeptExistingCause::Upstream5xx]),
             PassRetryHint::Transient
@@ -13670,20 +14046,21 @@ mod refresh_window_outage_tests {
 
     #[test]
     fn other_keeps_the_steady_cadence() {
-        let mut state = RefreshBackoff::default();
         let hint = pass_retry_hint([KeptExistingCause::Other]);
         assert_eq!(hint, PassRetryHint::None);
         assert_eq!(
-            wait_after_pass(Some(REFRESH_CHECK_INTERVAL), hint, &mut state),
+            wait(Some(REFRESH_CHECK_INTERVAL), hint),
             Some(Duration::from_secs(300))
         );
         assert_eq!(pass_retry_hint([]), PassRetryHint::None);
     }
 
-    /// Step 2: a pass stuck on an await that never answers ends within the
-    /// outer bound, and reports the stage it was stuck in.
+    /// The bounding mechanism in isolation: `run_bounded_pass` abandons a
+    /// future that never answers within the bound and names the stage it was
+    /// in. (That the loop USES it, and what it does with the result, is
+    /// `the_loop_retries_an_abandoned_pass_on_the_transient_ceiling`.)
     #[tokio::test]
-    async fn a_pass_that_never_answers_is_abandoned_within_the_bound_naming_its_stage() {
+    async fn run_bounded_pass_abandons_a_pending_future_and_names_its_stage() {
         let stage = PassStageCell::default();
         let bound = Duration::from_millis(200);
         let started = std::time::Instant::now();
@@ -13702,12 +14079,54 @@ mod refresh_window_outage_tests {
         assert!(msg.contains("ABANDONED"), "{msg}");
     }
 
+    /// The loop's `match` on a pass result (`wait_for_pass_result`, which
+    /// `refresher_loop` calls): an abandoned pass retries on the transient
+    /// ceiling; a finished one gets its own wait with its hint applied.
+    #[test]
+    fn the_loop_retries_an_abandoned_pass_on_the_transient_ceiling() {
+        let mut state = RefreshBackoff::default();
+        assert_eq!(
+            wait_for_pass_result(Err(PassStage::PairCli), &mut state, NOW),
+            Some(TRANSIENT_BACKOFF_MAX)
+        );
+        assert_eq!(
+            wait_for_pass_result(
+                Ok(PassOutput::new(PassEnd::UntilKick, PassRetryHint::None)),
+                &mut state,
+                NOW
+            ),
+            None
+        );
+        assert_eq!(
+            wait_for_pass_result(
+                Ok(PassOutput::new(
+                    PassEnd::Wait(REFRESH_CHECK_INTERVAL),
+                    PassRetryHint::Transient
+                )),
+                &mut state,
+                NOW
+            ),
+            Some(TRANSIENT_BACKOFF_MIN)
+        );
+    }
+
     #[tokio::test]
     async fn a_pass_that_finishes_inside_the_bound_is_returned_untouched() {
         let stage = PassStageCell::default();
         let out = PassOutput::new(PassEnd::UntilKick, PassRetryHint::Transient);
         let got = run_bounded_pass(Duration::from_secs(5), &stage, async { out }).await;
         assert_eq!(got, Ok(out));
+    }
+
+    /// What `start_refresher` spawns through `on_refresher_runtime` runs on the
+    /// refresher's OWN runtime, not the caller's.
+    #[tokio::test]
+    async fn a_task_spawned_on_the_refresher_runtime_runs_on_jwt_refresher_rt() {
+        let handle = on_refresher_runtime(|| {
+            tokio::spawn(async { std::thread::current().name().map(str::to_string) })
+        });
+        let name = handle.await.expect("task ran");
+        assert_eq!(name.as_deref(), Some("jwt-refresher-rt"));
     }
 
     #[test]
@@ -13731,7 +14150,7 @@ mod refresh_window_outage_tests {
     /// threshold, and entering it is amber WITHOUT a toast.
     #[test]
     fn the_expiring_band_starts_at_the_ttl_over_two_threshold() {
-        let now = 1_900_000_000i64;
+        let now = NOW;
         let obs = |exp: i64| SlotObservation {
             tenant_id: Some("t".to_string()),
             exp: Some(exp),
