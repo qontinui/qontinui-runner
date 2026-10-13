@@ -9074,6 +9074,76 @@ mod tests {",
         eprintln!("host_capabilities() on this host = {first:?}");
     }
 
+    /// ARMING test at the heartbeat seam (plan
+    /// 2026-10-09-coord-knows-which-box-holds-which-credential, Phase 2).
+    ///
+    /// Enters exactly where the population enters: the capability vector
+    /// `heartbeat_to_coord` puts on the register payload is
+    /// `build_device_capabilities(ci.enabled, &ci.repo_allowlist,
+    /// &heartbeat_capabilities())`, and this test assembles that same
+    /// expression (CI-node off and on) with the family cache seeded as a
+    /// finished probe run would leave it. It never runs a probe: the cache is
+    /// seeded by value, and the background refresh is suppressed under
+    /// `cfg(test)`. The prior cache state is restored on every exit.
+    #[test]
+    fn heartbeat_payload_capabilities_carry_seeded_cred_tokens() {
+        let _serial = CRED_FAMILY_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<CredFamilyState>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    *CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = prior;
+                }
+            }
+        }
+        let now = std::time::Instant::now();
+        let mut memos = std::collections::BTreeMap::new();
+        for token in [CRED_GH_CAPABILITY, CRED_AWS_STS_CAPABILITY] {
+            memos.insert(
+                token,
+                CredMemo {
+                    present: true,
+                    unknown_since: None,
+                },
+            );
+        }
+        let seeded = CredFamilyState {
+            ran_at: Some(now),
+            memos,
+        };
+        let _restore = {
+            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            Restore(Some(std::mem::replace(&mut *g, seeded)))
+        };
+
+        for (ci_enabled, allowlist) in [
+            (false, Vec::<String>::new()),
+            (true, vec!["qontinui-runner".to_string()]),
+        ] {
+            let payload_caps =
+                build_device_capabilities(ci_enabled, &allowlist, &heartbeat_capabilities());
+            for token in [
+                CRED_PROBES_MARKER,
+                CRED_GH_CAPABILITY,
+                CRED_AWS_STS_CAPABILITY,
+            ] {
+                assert!(
+                    payload_caps.iter().any(|c| c == token),
+                    "the heartbeat payload's capabilities (ci_node={ci_enabled}) must carry \
+                     `{token}` from a seeded cred cache, got {payload_caps:?}"
+                );
+            }
+            assert!(
+                payload_caps
+                    .iter()
+                    .any(|c| c == &format!("os:{}", current_os_label())),
+                "the host facts must still ride beside the cred family, got {payload_caps:?}"
+            );
+        }
+    }
+
     // ── Credential-presence family (plan
     //    2026-10-09-coord-knows-which-box-holds-which-credential, Phase 2) ──
 
