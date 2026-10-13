@@ -41,7 +41,6 @@
     "ghostty-web": "^0.4.0",
     "graphql": "^16.13.2",
     "graphql-ws": "^6.0.7",
-    "html2canvas": "^1.4.1",
     "html5-qrcode": "^2.3.8",
     "js-yaml": "^4.2.0",
     "lucide-react": "^1.7.0",
