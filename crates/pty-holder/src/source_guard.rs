@@ -37,11 +37,16 @@ const GUARDED: &[(&str, &str)] = &[
     ("spawn.rs", include_str!("spawn.rs")),
     // Review round 2: out-of-band termination of a verified holder.
     ("terminate.rs", include_str!("terminate.rs")),
+    // Phase 2b: the mode tracker parses every output byte.
+    ("modes.rs", include_str!("modes.rs")),
 ];
 
 /// Files deliberately outside the guard: this file (it must spell the banned
-/// tokens) and `lib.rs` (module declarations and docs only).
-const EXEMPT: &[&str] = &["source_guard.rs", "lib.rs"];
+/// tokens), `lib.rs` (module declarations and docs only), and `metadata.rs` —
+/// the one place a short metadata value (an attach reply's cwd and title, Phase
+/// 2b) becomes a JSON string. It never sees stream bytes, and it is strict:
+/// non-UTF-8 is `None`, never lossy.
+const EXEMPT: &[&str] = &["source_guard.rs", "lib.rs", "metadata.rs"];
 
 /// Remove `//` and (nested) `/* */` comments, keeping string and char
 /// literals intact so a `"//"` inside a string is not mistaken for a comment.

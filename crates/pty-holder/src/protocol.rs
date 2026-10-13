@@ -58,6 +58,18 @@
 //!   - `kill` ends the child (SIGHUP to its process group, SIGKILL after a
 //!     grace; Windows: terminate). `detach` closes this connection only; the
 //!     child keeps running and a later client can attach and resume.
+//! - **3** (Phase 2b, plan D14) — the ATTACH RESTORE PAYLOAD. `attach` may
+//!   carry `restore: true`, asked by a consumer that is starting from nothing
+//!   (a restarted runner's fresh `Grid` and xterm). The holder then answers
+//!   `attached` with `restore {cwd, title}` metadata, and brackets the replayed
+//!   tail with two `KIND_SYNTHETIC` frames (`crate::frame`): a PREAMBLE
+//!   (screen buffer, title — the state at the tail's first byte) sent before
+//!   the first output frame, and a POSTAMBLE (input modes, keypad, kitty
+//!   flags, cursor visibility — the state at the attach-time end of the
+//!   stream) sent exactly when the stream reaches that offset. Synthetic bytes
+//!   are not stream bytes: they carry an anchor offset but never advance one.
+//!   A holder sends neither unless the connection negotiated version 3 AND
+//!   asked; at version 2 the field is absent and nothing changes on the wire.
 //!
 //! A build only ever ADDS a version at the top of [`PROTOCOL_VERSIONS`]; the
 //! version a build emits never moves backwards (D15).
@@ -67,10 +79,13 @@ use serde::{Deserialize, Serialize};
 /// Every protocol version THIS build speaks, ascending. A build only ever adds
 /// to this list at the top; a version is dropped only when no holder that needs
 /// it can still exist (D15: holders age out with their pane).
-pub const PROTOCOL_VERSIONS: &[u32] = &[1, 2];
+pub const PROTOCOL_VERSIONS: &[u32] = &[1, 2, 3];
 
 /// The first version that carries the data path (attach, input, output, exit).
 pub const DATA_PATH_VERSION: u32 = 2;
+
+/// The first version that carries the attach restore payload (plan D14).
+pub const RESTORE_VERSION: u32 = 3;
 
 /// The highest version in both lists, or `None`.
 pub fn negotiate(offered: &[u32], supported: &[u32]) -> Option<u32> {
@@ -122,7 +137,16 @@ pub enum Request {
     /// `from_offset: None` is a fresh consumer: it gets the ring's last
     /// [`ATTACH_TAIL_BYTES`]. `Some(n)` resumes at absolute offset `n` — the
     /// first byte the consumer has NOT yet seen. Answered `attached`.
-    Attach { from_offset: Option<u64> },
+    ///
+    /// `restore` (version 3) asks for the restore envelope — metadata in the
+    /// reply plus synthetic preamble/postamble frames — for a consumer with no
+    /// mode state of its own. Omitted from the wire when false, so a version-2
+    /// attach is byte-identical to what a version-2 runner sends.
+    Attach {
+        from_offset: Option<u64>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        restore: bool,
+    },
     /// Version 2. Resize the PTY. Answered `ok`.
     Resize { cols: u16, rows: u16 },
     /// Version 2, attached only. Withhold output frames (never the PTY read).
@@ -162,6 +186,10 @@ impl Request {
     }
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// How much of the ring a FRESH attach (`from_offset: None`) is sent — the
 /// same 64 KiB the remote path ships (`REMOTE_ATTACH_TAIL_BYTES`,
 /// `mcp/remote_terminal.rs`), so a local and a remote pane open alike.
@@ -184,6 +212,24 @@ pub struct AttachedReply {
     pub child_pid: u32,
     pub cols: u16,
     pub rows: u16,
+    /// Version 3, present exactly when the attach asked for `restore` and the
+    /// holder honoured it. Absent — never `null` — otherwise, so the version-2
+    /// reply keeps its exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<RestoreMeta>,
+}
+
+/// `attached.restore` — version 3. Pane metadata for a consumer rebuilding its
+/// session record (plan D14: cwd travels as metadata, never as display bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreMeta {
+    /// The pane's working directory: the last `OSC 7` it reported, else the
+    /// directory its child was started in. `None` when neither is known as
+    /// UTF-8.
+    pub cwd: Option<String>,
+    /// The last title the pane set (`OSC 0` / `OSC 2`), `None` when it never
+    /// set one (or it is not UTF-8).
+    pub title: Option<String>,
 }
 
 /// `exit` — version 2. The child exited and every byte it produced before
@@ -481,12 +527,16 @@ mod tests {
     fn pty_holder_wire_shape_v2_data_path() {
         let cases: Vec<(Vec<u8>, &str)> = vec![
             (
-                frame_of(&Request::Attach { from_offset: None }),
+                frame_of(&Request::Attach {
+                    from_offset: None,
+                    restore: false,
+                }),
                 r#"{"type":"attach","from_offset":null}"#,
             ),
             (
                 frame_of(&Request::Attach {
                     from_offset: Some(4096),
+                    restore: false,
                 }),
                 r#"{"type":"attach","from_offset":4096}"#,
             ),
@@ -510,6 +560,7 @@ mod tests {
                     child_pid: 4243,
                     cols: 80,
                     rows: 24,
+                    restore: None,
                 })),
                 r#"{"type":"attached","start_offset":10,"ring_start_offset":5,"end_offset":99,"child_pid":4243,"cols":80,"rows":24}"#,
             ),
@@ -555,7 +606,59 @@ mod tests {
         );
         assert_eq!(
             parse_request(br#"{"type":"attach","from_offset":null}"#).unwrap(),
-            Request::Attach { from_offset: None }
+            Request::Attach {
+                from_offset: None,
+                restore: false,
+            }
+        );
+    }
+
+    /// WIRE SHAPE — the version-3 restore additions, byte for byte, and the
+    /// version-2 shapes they must not disturb: a `restore: false` attach and a
+    /// reply without restore metadata serialize exactly as version 2 did.
+    #[test]
+    fn pty_holder_attach_wire_shape_v3_restore() {
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (
+                frame_of(&Request::Attach {
+                    from_offset: None,
+                    restore: true,
+                }),
+                r#"{"type":"attach","from_offset":null,"restore":true}"#,
+            ),
+            (
+                frame_of(&Request::Attach {
+                    from_offset: Some(7),
+                    restore: false,
+                }),
+                r#"{"type":"attach","from_offset":7}"#,
+            ),
+            (
+                frame_of(&Reply::Attached(AttachedReply {
+                    start_offset: 10,
+                    ring_start_offset: 5,
+                    end_offset: 99,
+                    child_pid: 4243,
+                    cols: 80,
+                    rows: 24,
+                    restore: Some(RestoreMeta {
+                        cwd: Some("/tmp".into()),
+                        title: None,
+                    }),
+                })),
+                r#"{"type":"attached","start_offset":10,"ring_start_offset":5,"end_offset":99,"child_pid":4243,"cols":80,"rows":24,"restore":{"cwd":"/tmp","title":null}}"#,
+            ),
+        ];
+        for (got, json) in cases {
+            assert_eq!(got, expected(json), "v3 restore message moved: {json}");
+        }
+        // A version-2 runner's attach (no field) parses as no restore.
+        assert_eq!(
+            parse_request(br#"{"type":"attach","from_offset":null}"#).unwrap(),
+            Request::Attach {
+                from_offset: None,
+                restore: false,
+            }
         );
     }
 
@@ -565,6 +668,12 @@ mod tests {
         assert!(PROTOCOL_VERSIONS.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(PROTOCOL_VERSIONS.first(), Some(&1), "v1 is still spoken");
         assert!(PROTOCOL_VERSIONS.contains(&DATA_PATH_VERSION));
+        assert!(PROTOCOL_VERSIONS.contains(&RESTORE_VERSION));
+        // A Phase 2 runner (offers [1, 2]) still negotiates the data path.
+        assert_eq!(
+            negotiate(&[1, 2], PROTOCOL_VERSIONS),
+            Some(DATA_PATH_VERSION)
+        );
         // A Phase 1 runner (offers only [1]) still negotiates with this holder.
         assert_eq!(negotiate(&[1], PROTOCOL_VERSIONS), Some(1));
     }
@@ -625,6 +734,7 @@ mod tests {
                 "ping" => Request::Ping,
                 "attach" => Request::Attach {
                     from_offset: Some(3),
+                    restore: true,
                 },
                 "resize" => Request::Resize { cols: 80, rows: 24 },
                 "pause" => Request::Pause,
