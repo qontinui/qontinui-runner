@@ -5094,19 +5094,23 @@ async fn clear_and_rederive_tenant_slot_unit(
 
 /// Map a [`SlotClearAttempt`] to the slot's pass outcome and health evidence.
 /// A slot changed under the pass is `KeptExisting { Other }` — not a clear —
-/// and its snapshot observation is demoted to UNKNOWN so the posture does not
-/// speak from a value the store no longer holds.
+/// and is recorded in `changed` so the concluded posture RE-READS it and
+/// observes the value another writer stored (like a healed slot), rather than
+/// speaking from the dead snapshot. Demoting it to UNKNOWN instead made a
+/// pinned tenant with a fresh credential publish `absent`/`dark`, a false
+/// "no coord credential" banner. The rejection streak recorded against the
+/// replaced value is spent evidence ([`reset_upstream_rejections_for`]).
 fn settle_clear_attempt(
     attempt: SlotClearAttempt,
     evidence: String,
-    slot_seen: &mut [(uuid::Uuid, Option<i64>, bool, bool)],
+    tenant: uuid::Uuid,
+    changed: &mut Vec<uuid::Uuid>,
 ) -> (TenantSlotOutcome, String) {
     match attempt {
         SlotClearAttempt::Done(o) => (o, evidence),
         SlotClearAttempt::ChangedUnderUs => {
-            if let Some(last) = slot_seen.last_mut() {
-                last.3 = true;
-            }
+            changed.push(tenant);
+            reset_upstream_rejections_for(Some(tenant));
             (
                 TenantSlotOutcome::KeptExisting {
                     cause: KeptExistingCause::Other,
@@ -5201,6 +5205,9 @@ pub(crate) async fn refresh_tenant_slots(
     // this pass looked at it — `(tenant, exp, present, unknown)`, pushed
     // exactly once per slot in the same order as `outcomes`, so the two zip
     // into the posture's observations at the end of the pass.
+    // Slots another writer replaced after this pass judged them (see
+    // `settle_clear_attempt`); the concluded posture re-reads them.
+    let mut changed_under_us: Vec<uuid::Uuid> = Vec::new();
     let mut slot_seen: Vec<(uuid::Uuid, Option<i64>, bool, bool)> =
         Vec::with_capacity(tenants.len());
     // DD2 — "Boot is a transition". On the FIRST pass of the process, publish
@@ -5300,7 +5307,8 @@ pub(crate) async fn refresh_tenant_slots(
                     &evidence,
                 )
                 .await;
-                let (o, evidence) = settle_clear_attempt(attempt, evidence, &mut slot_seen);
+                let (o, evidence) =
+                    settle_clear_attempt(attempt, evidence, tenant, &mut changed_under_us);
                 health.push(health_row(&tenant, o, evidence));
                 outcomes.push((tenant, o));
                 continue;
@@ -5365,7 +5373,8 @@ pub(crate) async fn refresh_tenant_slots(
                     &evidence,
                 )
                 .await;
-                let (o, evidence) = settle_clear_attempt(attempt, evidence, &mut slot_seen);
+                let (o, evidence) =
+                    settle_clear_attempt(attempt, evidence, tenant, &mut changed_under_us);
                 health.push(health_row(&tenant, o, evidence));
                 outcomes.push((tenant, o));
                 continue;
@@ -5481,39 +5490,74 @@ pub(crate) async fn refresh_tenant_slots(
     // The pass's CONCLUDED posture: each slot as found, refined with what the
     // pass did about it. Published once per pass; a change fires the banner.
     debug_assert_eq!(slot_seen.len(), outcomes.len());
+    // M8 — `slot_seen` recorded the exp the slot held BEFORE this pass acted on
+    // it. A HEALED slot publishes `live` beside that old, already-past `exp`,
+    // which reads as a contradiction on `/health` and in the heartbeat bag; a
+    // slot CHANGED UNDER the pass holds a value this pass never saw at all. Both
+    // are re-read — in ONE blocking-pool hop, so every slot read of the pass is
+    // off the refresher's worker (PASS_BOUND).
+    let is_healed = |o: &TenantSlotOutcome| {
+        matches!(
+            o,
+            TenantSlotOutcome::Refreshed
+                | TenantSlotOutcome::Cleared {
+                    rederived: true,
+                    ..
+                }
+        )
+    };
+    let reread: Vec<uuid::Uuid> = outcomes
+        .iter()
+        .filter(|(t, o)| is_healed(o) || changed_under_us.contains(t))
+        .map(|(t, _)| *t)
+        .collect();
+    let reread: std::collections::HashMap<uuid::Uuid, Result<Option<String>, String>> =
+        if reread.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let mgr = auth_manager.clone();
+            match spawn_blocking_tracked(move || {
+                reread
+                    .into_iter()
+                    .map(|t| {
+                        let v = mgr.get_tenant_device_jwt(&t).map_err(|e| e.to_string());
+                        (t, v)
+                    })
+                    .collect()
+            })
+            .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("device_jwt_refresher: slot re-read task failed ({e})");
+                    std::collections::HashMap::new()
+                }
+            }
+        };
     let observations: Vec<SlotObservation> = slot_seen
         .iter()
         .zip(outcomes.iter())
         .map(|((tid, exp, present, unknown), (_, o))| {
-            // M8 — `slot_seen` recorded the exp the slot held BEFORE this pass
-            // acted on it. A HEALED slot publishes `live` beside that old,
-            // already-past `exp`, which reads as a contradiction on `/health`
-            // and in the heartbeat bag. Re-read the decoded exp for exactly
-            // the two outcomes that replaced the credential; an unreadable
-            // re-read nulls it (UNKNOWN) rather than keeping the stale value.
-            let healed = matches!(
-                o,
-                TenantSlotOutcome::Refreshed
-                    | TenantSlotOutcome::Cleared {
-                        rederived: true,
-                        ..
-                    }
-            );
-            let (exp, present) = if healed {
-                match auth_manager.get_tenant_device_jwt(tid) {
-                    Ok(Some(t)) if !t.trim().is_empty() => {
-                        (crate::auth::decode_jwt_exp(t.trim()), true)
-                    }
-                    _ => (None, *present),
-                }
-            } else {
-                (*exp, *present)
+            let fresh = reread.get(tid).map(|r| match r {
+                Ok(Some(t)) if !t.trim().is_empty() => Ok(Some(t.trim().to_string())),
+                Ok(_) => Ok(None),
+                Err(e) => Err(e.clone()),
+            });
+            let (exp, present, unknown) = match fresh {
+                // Healed: the new credential's exp; an unreadable re-read nulls
+                // it (UNKNOWN exp) rather than keeping the stale value.
+                Some(Ok(Some(t))) => (crate::auth::decode_jwt_exp(&t), true, *unknown),
+                Some(_) if is_healed(o) => (None, *present, *unknown),
+                // Changed under the pass: observe whatever the store holds now.
+                Some(Ok(None)) => (None, false, false),
+                Some(Err(_)) | None if changed_under_us.contains(tid) => (None, false, true),
+                _ => (*exp, *present, *unknown),
             };
             SlotObservation {
                 tenant_id: Some(tid.to_string()),
                 exp,
                 present,
-                unknown: *unknown,
+                unknown,
                 outcome: Some(*o),
             }
         })
@@ -6138,7 +6182,21 @@ pub(crate) async fn legacy_self_refresh_stage(
         SelfRefreshOutcome::KeptExisting {
             cause,
             credential_exp,
-        } => (fold_retry_hint(hint, *cause), *credential_exp),
+        } => {
+            // Only a retry-worthy failure bounds a 429 wait — the same set
+            // `tenant_slot_stage` folds. An `Other` failure says nothing a
+            // sooner retry would fix.
+            let retryable = matches!(
+                cause,
+                KeptExistingCause::Transport
+                    | KeptExistingCause::Upstream5xx
+                    | KeptExistingCause::RateLimited { .. }
+            );
+            (
+                fold_retry_hint(hint, *cause),
+                credential_exp.filter(|_| retryable),
+            )
+        }
         _ => (hint, None),
     };
     let hint = with_unrenewed_deadline(hint, min_exp(unrenewed_exp, legacy_exp));
@@ -8655,9 +8713,15 @@ mod tenant_slot_refresh_tests {
             before_rej
         );
 
-        // And the pass maps it to a kept-existing, never a clear.
-        let mut seen = vec![(ta, Some(now - 60), true, false)];
-        let (o, ev) = settle_clear_attempt(SlotClearAttempt::ChangedUnderUs, "e".into(), &mut seen);
+        // And the pass maps it to a kept-existing, never a clear, and marks
+        // the slot for a re-read.
+        let mut changed = Vec::new();
+        let (o, ev) = settle_clear_attempt(
+            SlotClearAttempt::ChangedUnderUs,
+            "e".into(),
+            ta,
+            &mut changed,
+        );
         assert_eq!(
             o,
             TenantSlotOutcome::KeptExisting {
@@ -8665,10 +8729,110 @@ mod tenant_slot_refresh_tests {
             }
         );
         assert!(ev.contains("NOT cleared"), "{ev}");
-        assert!(
-            seen[0].3,
-            "the stale snapshot no longer speaks for the posture"
+        assert_eq!(changed, vec![ta]);
+    }
+
+    /// Round-3 SHOULD-FIX, end to end through a real pass: slot B (PINNED, dead
+    /// in the snapshot, carrying a rejection streak) is replaced with a fresh
+    /// 4 h credential by another writer WHILE the pass is refreshing slot A.
+    /// The pass must not clear it, and its concluded posture must observe the
+    /// fresh value: `live`, never `absent`/`dark`, and no non-answering notify.
+    #[tokio::test]
+    async fn a_pinned_slot_replaced_under_the_pass_publishes_live() {
+        use crate::session::tenant_pin::TenantPin;
+        use axum::{extract::State as St, http::HeaderMap as Hm, routing::post as p};
+        let _serialised = health_lock();
+        reset_posture();
+        let mgr = test_auth_manager("pinned_slot_replaced_under_pass");
+        let (ta, tb) = (tenant(0), tenant(1));
+        let now = chrono::Utc::now().timestamp();
+        let jwt_a = synth_jwt(now + 30 * 60, "a-in-window");
+        let dead_b = synth_jwt(now - 60, "b-dead");
+        let fresh_b = synth_jwt(now + 4 * 60 * 60, "b-fresh");
+        mgr.store_tenant_device_jwt(&ta, &jwt_a).expect("slot a");
+        mgr.store_tenant_device_jwt(&tb, &dead_b).expect("slot b");
+        // Not a boot pass: a live posture is already published, so the only
+        // transitions recorded are this pass's.
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(tb),
+            pin_served: slot_absent(),
+        };
+        let _ = derive_and_publish_posture(&[live_slot(tb, now)], PosturePinInputs::UNPINNED, now);
+        let transitions_before = recorded_posture_transitions().len();
+        // The pinned slot's dead snapshot carries a rejection streak, recorded
+        // AFTER the live seed so the seed itself is not dark.
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(tb), true, 401, br#"{"code":"token_expired"}"#);
+        }
+
+        // Coord mock: refreshing A is when "another writer" stores fresh B.
+        #[derive(Clone)]
+        struct Hook {
+            mgr: crate::auth::AuthManager,
+            tb: uuid::Uuid,
+            fresh_b: String,
+        }
+        async fn refresh(St(h): St<Hook>, hm: Hm) -> String {
+            h.mgr
+                .store_tenant_device_jwt(&h.tb, &h.fresh_b)
+                .expect("the other writer");
+            let bearer = hm
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or("")
+                .to_string();
+            serde_json::json!({ "token": format!("{bearer}.refreshed") }).to_string()
+        }
+        let hook = Hook {
+            mgr: mgr.clone(),
+            tb,
+            fresh_b: fresh_b.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let app = axum::Router::new()
+            .route("/devices/{device_id}/refresh-token", p(refresh))
+            .with_state(hook);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None, pins).await;
+        assert_eq!(
+            outcomes,
+            vec![
+                (ta, TenantSlotOutcome::Refreshed),
+                (
+                    tb,
+                    TenantSlotOutcome::KeptExisting {
+                        cause: KeptExistingCause::Other
+                    }
+                )
+            ]
         );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tb).unwrap().as_deref(),
+            Some(fresh_b.as_str()),
+            "the fresh credential survives the pass"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(
+            published.posture,
+            CoordCredentialPosture::Live,
+            "{published:?}"
+        );
+        let after = recorded_posture_transitions();
+        assert!(
+            after[transitions_before..]
+                .iter()
+                .all(|t| t.to.can_answer() && !transition_notifies(*t)),
+            "no non-answering transition and no notify: {:?}",
+            &after[transitions_before..]
+        );
+        reset_posture();
     }
 
     /// Nit (a): a 429 on one slot must not park the loop past a DIFFERENT
