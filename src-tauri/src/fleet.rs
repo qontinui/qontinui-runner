@@ -7709,7 +7709,10 @@ mod tests {",
             vec![EXPEDITE_REVIEW_CAPABILITY.to_string()]
         );
         assert!(skill_capabilities(true, false).is_empty(), "no live JWT");
-        assert!(skill_capabilities(false, true).is_empty(), "skill not served");
+        assert!(
+            skill_capabilities(false, true).is_empty(),
+            "skill not served"
+        );
         assert!(skill_capabilities(false, false).is_empty());
         assert_eq!(EXPEDITE_REVIEW_CAPABILITY, "skill:expedite-review");
     }
