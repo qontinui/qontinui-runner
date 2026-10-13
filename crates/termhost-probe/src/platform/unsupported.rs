@@ -62,7 +62,12 @@ impl Host for RealHost {
                 listener: Err(WHY.into()),
                 injector: Err(WHY.into()),
             },
-            clock: crate::clockcheck::node_round_trip(node, 40, Duration::from_secs(10)),
+            clock: crate::clockcheck::node_round_trip(
+                node,
+                40,
+                crate::clockcheck::NODE_STARTUP,
+                Duration::from_secs(10),
+            ),
             gpu: GpuFacts::NotApplicable(WHY.into()),
             foreground_violation: None,
         }

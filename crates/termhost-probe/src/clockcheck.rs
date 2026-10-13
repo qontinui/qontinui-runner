@@ -4,6 +4,14 @@
 //! node's reading lies inside [send, receive], so its offset from the midpoint
 //! is at most half the round trip; the shortest round trip bounds it tightest.
 //! Every wait is bounded and the child is always reaped.
+//!
+//! Node's START-UP has its own allowance, apart from the round trips' budget:
+//! node prints `ready` once it is listening, and only then does the budget
+//! start. A cold node on a loaded box (the parallel test suite, an operator's
+//! machine mid-build) once spent the whole 10 s budget starting, and its
+//! first request "got no answer" (windows-latest, run 38330571657, attempt
+//! 1). A node that never reports ready, or never answers, is still a FAILED
+//! round trip (UNKNOWN), never "not aligned".
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -13,21 +21,42 @@ use std::time::{Duration, Instant};
 use crate::clock::now_ns;
 use crate::doctor::{alignment, ClockFacts};
 
-/// The answering side: one hrtime reading per request line.
+/// The answering side: `ready` once listening, then one hrtime reading per
+/// request line.
 const NODE_SCRIPT: &str = "const rl=require('readline').createInterface({input:process.stdin});\
 rl.on('line',()=>process.stdout.write(process.hrtime.bigint().toString()+'\\n'));\
-rl.on('close',()=>process.exit(0));";
+rl.on('close',()=>process.exit(0));process.stdout.write('ready\\n');";
+
+/// How long node may take to start and report ready, apart from the round
+/// trips' budget.
+pub const NODE_STARTUP: Duration = Duration::from_secs(30);
 
 /// Round trips discarded while node warms up (JIT, first pipe writes).
 const WARMUP: usize = 5;
 
 /// Measure with `node` (a command on PATH or a path). `rounds` includes the
-/// warm-up; the whole check is bounded by `budget`.
-pub fn node_round_trip(node: &str, rounds: usize, budget: Duration) -> ClockFacts {
-    let started = Instant::now();
+/// warm-up; node may take up to `startup` to report ready, and the round
+/// trips after that are bounded by `budget`.
+pub fn node_round_trip(
+    node: &str,
+    rounds: usize,
+    startup: Duration,
+    budget: Duration,
+) -> ClockFacts {
+    round_trip_with(node, NODE_SCRIPT, rounds, startup, budget)
+}
+
+/// `node_round_trip` with the answering script given (tests: a slow starter).
+fn round_trip_with(
+    node: &str,
+    script: &str,
+    rounds: usize,
+    startup: Duration,
+    budget: Duration,
+) -> ClockFacts {
     let mut child = match Command::new(node)
         .arg("-e")
-        .arg(NODE_SCRIPT)
+        .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -36,7 +65,7 @@ pub fn node_round_trip(node: &str, rounds: usize, budget: Duration) -> ClockFact
         Ok(c) => c,
         Err(e) => return ClockFacts::NoNode(format!("`{node}` did not start: {e}")),
     };
-    let result = exchange(&mut child, rounds, budget, started);
+    let result = exchange(&mut child, rounds, startup, budget);
     reap(&mut child);
     result
 }
@@ -58,7 +87,7 @@ fn reap(child: &mut Child) {
     }
 }
 
-fn exchange(child: &mut Child, rounds: usize, budget: Duration, started: Instant) -> ClockFacts {
+fn exchange(child: &mut Child, rounds: usize, startup: Duration, budget: Duration) -> ClockFacts {
     let Some(stdout) = child.stdout.take() else {
         return ClockFacts::Failed("node stdout was not captured".into());
     };
@@ -82,6 +111,23 @@ fn exchange(child: &mut Child, rounds: usize, budget: Duration, started: Instant
             }
         }
     });
+    // Start-up first, on its own allowance; the budget starts once node
+    // reports ready.
+    match rx.recv_timeout(startup) {
+        Ok((line, _)) if line == "ready" => {}
+        Ok((line, _)) => {
+            return ClockFacts::Failed(format!(
+                "node started but did not report ready (it said {line:?})"
+            ))
+        }
+        Err(_) => {
+            return ClockFacts::Failed(format!(
+                "node ran but did not report ready within its {} ms start-up allowance",
+                startup.as_millis()
+            ))
+        }
+    }
+    let started = Instant::now();
     let mut samples: Vec<(i64, u64)> = Vec::new();
     for k in 0..rounds {
         let left = budget.saturating_sub(started.elapsed());
@@ -96,7 +142,7 @@ fn exchange(child: &mut Child, rounds: usize, budget: Duration, started: Instant
             Ok(v) => v,
             Err(_) => {
                 return ClockFacts::Failed(format!(
-                    "node gave no answer to request {k} within the {} ms budget",
+                    "node was ready but gave no answer to request {k} within the {} ms budget",
                     budget.as_millis()
                 ))
             }
@@ -153,6 +199,7 @@ mod tests {
             "termhost-probe-no-such-node-binary",
             10,
             Duration::from_secs(2),
+            Duration::from_secs(2),
         );
         assert!(matches!(facts, ClockFacts::NoNode(_)), "{facts:?}");
     }
@@ -162,7 +209,7 @@ mod tests {
         // cargo (which runs these tests, and names itself in $CARGO) is not an
         // hrtime server, so the exchange must fail — not hang — and reap it.
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let facts = node_round_trip(&cargo, 8, Duration::from_secs(3));
+        let facts = node_round_trip(&cargo, 8, Duration::from_secs(3), Duration::from_secs(3));
         assert!(
             matches!(facts, ClockFacts::Failed(_) | ClockFacts::NoNode(_)),
             "{facts:?}"
@@ -173,7 +220,7 @@ mod tests {
     fn node_shares_the_probe_timebase_where_node_exists() {
         // The real check `doctor` and `selftest` run. Both CI legs have node;
         // a machine without it reports NoNode, which is not this test's subject.
-        match node_round_trip("node", 40, Duration::from_secs(10)) {
+        match node_round_trip("node", 40, NODE_STARTUP, Duration::from_secs(10)) {
             ClockFacts::Measured(a) => assert!(
                 a.aligned,
                 "process.hrtime is not on the probe timebase: {a:?}"
@@ -182,6 +229,50 @@ mod tests {
                 eprintln!("node not runnable here ({why}); alignment not exercised")
             }
             ClockFacts::Failed(why) => panic!("node ran but the round trip failed: {why}"),
+        }
+    }
+
+    /// A node that takes 2.5 s to start — longer than the 1 s budget for the
+    /// round trips — then answers properly.
+    const SLOW_START: &str =
+        "setTimeout(()=>{const rl=require('readline').createInterface({input:process.stdin});\
+rl.on('line',()=>process.stdout.write(process.hrtime.bigint().toString()+'\\n'));\
+rl.on('close',()=>process.exit(0));process.stdout.write('ready\\n');},2500);";
+
+    /// A node that starts but never reports ready.
+    const NEVER_READY: &str = "setInterval(()=>{},1000);";
+
+    #[test]
+    fn a_slow_starting_node_gets_its_start_up_allowance_not_a_failed_round_trip() {
+        let facts = round_trip_with(
+            "node",
+            SLOW_START,
+            12,
+            Duration::from_secs(20),
+            Duration::from_secs(1),
+        );
+        match facts {
+            ClockFacts::Measured(a) => assert!(a.aligned, "{a:?}"),
+            ClockFacts::NoNode(why) => eprintln!("node not runnable here ({why}); not exercised"),
+            ClockFacts::Failed(why) => {
+                panic!("a slow start was read as a failed round trip: {why}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_node_that_never_reports_ready_is_a_failed_round_trip_not_misalignment() {
+        let facts = round_trip_with(
+            "node",
+            NEVER_READY,
+            8,
+            Duration::from_millis(1500),
+            Duration::from_secs(1),
+        );
+        match facts {
+            ClockFacts::Failed(why) => assert!(why.contains("did not report ready"), "{why}"),
+            ClockFacts::NoNode(why) => eprintln!("node not runnable here ({why}); not exercised"),
+            other => panic!("expected a failed round trip: {other:?}"),
         }
     }
 }

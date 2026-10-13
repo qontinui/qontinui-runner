@@ -39,7 +39,12 @@ pub fn gather(node: &str) -> Facts {
     let host = sysinfo::System::host_name().unwrap_or_else(|| "unknown-host".into());
     let os = sysinfo::System::long_os_version().unwrap_or_else(|| "Windows".into());
     let session = session::session_facts();
-    let clock: ClockFacts = crate::clockcheck::node_round_trip(node, 40, Duration::from_secs(10));
+    let clock: ClockFacts = crate::clockcheck::node_round_trip(
+        node,
+        40,
+        crate::clockcheck::NODE_STARTUP,
+        Duration::from_secs(10),
+    );
     let gpu = match process::gpu_instances() {
         Ok(n) => GpuFacts::Instances(n),
         Err(why) if why.contains("does not exist") => GpuFacts::Absent(why),
