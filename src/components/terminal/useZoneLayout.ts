@@ -11,9 +11,14 @@ import {
   pushMru,
   reconcileTmuxAssignments,
   rekeyGridSnapshot,
+  rekeyMru,
+  replaceTabInAssignments,
+  replaceTabInGridSnapshot,
+  replaceTabInMru,
   restoreGridSnapshot,
   sessionKeysFor,
   shownTabOnEnter,
+  tabsBySessionKey,
   type GridSnapshot,
   type LayoutRequestSource,
   type SessionKeyOf,
@@ -241,6 +246,14 @@ export function flowGridSlotCount(tabIds: readonly string[], assignments: ZoneAs
 }
 
 /**
+ * Is `layoutId` one the page can lay out: a static preset or the synthesized
+ * flow grid. Anything else would silently resolve to `single`.
+ */
+export function isKnownLayoutId(layoutId: string): boolean {
+  return layoutId === FLOW_GRID_ID || LAYOUT_PRESETS.some((l) => l.id === layoutId);
+}
+
+/**
  * Resolve a layout id to a concrete preset: the static preset table UNION the
  * on-demand flow-grid synthesis. `FLOW_GRID_ID` synthesizes a preset sized to
  * `tabCount`; any other id is looked up in `LAYOUT_PRESETS`, falling back to the
@@ -376,6 +389,12 @@ interface PersistedState {
   workMode?: TerminalWorkMode;
   /** tmux mode's most-recently-shown tab ids, newest first. */
   mru?: string[];
+  /**
+   * The durable session key (`claudeSessionId`) of each MRU entry that has one
+   * — the MRU head is the shown tab — so the shown session and the MRU follow
+   * their sessions into the new tabs a runner restart resumes them in.
+   */
+  mruSessionKeys?: Record<string, string>;
   /** The grid to restore when tmux mode exits (`null` in grid mode). */
   gridSnapshot?: GridSnapshot | null;
   // NOTE: older builds persisted a `pinned` latch here that suppressed
@@ -413,6 +432,7 @@ function loadPersistedState(pageId: string, windowLabel?: string): PersistedStat
 function loadWorkModeState(persisted: PersistedState | null): {
   workMode: TerminalWorkMode;
   mru: string[];
+  mruSessionKeys: Record<string, string>;
   gridSnapshot: GridSnapshot | null;
 } {
   const raw = persisted?.workMode as unknown;
@@ -423,7 +443,7 @@ function loadWorkModeState(persisted: PersistedState | null): {
     );
   }
   const rawSnapshot = persisted?.gridSnapshot as unknown;
-  const gridSnapshot = parseGridSnapshot(rawSnapshot);
+  const gridSnapshot = parseGridSnapshot(rawSnapshot, isKnownLayoutId);
   if (gridSnapshot === null && rawSnapshot !== undefined && rawSnapshot !== null) {
     // Unreadable is not "no snapshot" silently: exiting tmux will fall back to
     // `pickLayout(tabCount)`, and the log says why the grid was re-dealt.
@@ -434,8 +454,19 @@ function loadWorkModeState(persisted: PersistedState | null): {
   return {
     workMode: mode,
     mru: parseMru(persisted?.mru),
+    mruSessionKeys: parseMruSessionKeys(persisted?.mruSessionKeys),
     gridSnapshot,
   };
+}
+
+/** Read persisted MRU session keys: a tab-id → string map, anything else is empty. */
+function parseMruSessionKeys(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [tabId, sessionKey] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof sessionKey === "string") out[tabId] = sessionKey;
+  }
+  return out;
 }
 
 function persistState(pageId: string, windowLabel: string | undefined, state: PersistedState) {
@@ -694,6 +725,23 @@ export function useZoneLayout(
    */
   const [workMode, setWorkMode] = useState<TerminalWorkMode>(initialMode.workMode);
   const [mru, setMru] = useState<string[]>(initialMode.mru);
+  const [mruSessionKeys, setMruSessionKeys] = useState<Record<string, string>>(
+    initialMode.mruSessionKeys,
+  );
+  /**
+   * The session that was on screen when a tmux page was last persisted, by its
+   * durable key, until that session is on screen again. A runner restart
+   * resumes it into a new tab, possibly after other tabs have arrived and the
+   * reconcile has shown one of them for want of anything else; the moment the
+   * session's new tab appears it is shown again. Cleared by any operator swap
+   * (and by entering or leaving the mode), so it never takes the screen from a
+   * session the operator chose.
+   */
+  const [pendingShownKey, setPendingShownKey] = useState<string | null>(() => {
+    const shownBefore = persistedState?.assignments?.[0];
+    if (initialMode.workMode !== "tmux" || !shownBefore) return null;
+    return initialMode.mruSessionKeys[shownBefore] ?? null;
+  });
   const [gridSnapshot, setGridSnapshot] = useState<GridSnapshot | null>(initialMode.gridSnapshot);
   const [layoutId, setLayoutIdState] = useState<string>(
     initialMode.workMode === "tmux" ? "single" : (persistedState?.layoutId ?? "single"),
@@ -771,10 +819,28 @@ export function useZoneLayout(
   // state updater: `applyLayout`'s focus clamp (which sizes the flow-grid the
   // same way), the tmux enter/exit transitions, and the reconcile effect's MRU
   // read. Handlers and effects run after the commit this effect mirrors.
-  const committedRef = useRef({ layoutId, assignments, focusedZone, mru, gridSnapshot });
+  const committedRef = useRef({
+    layoutId,
+    assignments,
+    focusedZone,
+    maximizedZone,
+    mru,
+    gridSnapshot,
+  });
   useEffect(() => {
-    committedRef.current = { layoutId, assignments, focusedZone, mru, gridSnapshot };
-  }, [layoutId, assignments, focusedZone, mru, gridSnapshot]);
+    committedRef.current = { layoutId, assignments, focusedZone, maximizedZone, mru, gridSnapshot };
+  }, [layoutId, assignments, focusedZone, maximizedZone, mru, gridSnapshot]);
+
+  /**
+   * The tabs whose terminals the grid has mounted, as `ZoneGrid` last reported
+   * them (`reportMountedTabs`). Entering tmux keeps exactly these warm first
+   * (`mruOnEnter`), so a switch from a scrolled flow grid unmounts nothing the
+   * operator was looking at. `null` until a grid reports.
+   */
+  const mountedTabsRef = useRef<ReadonlySet<string> | null>(null);
+  const reportMountedTabs = useCallback((tabIdsMounted: ReadonlySet<string>) => {
+    mountedTabsRef.current = tabIdsMounted;
+  }, []);
 
   // Persist on changes.
   useEffect(() => {
@@ -784,9 +850,20 @@ export function useZoneLayout(
       focusedZone,
       workMode,
       mru,
+      mruSessionKeys,
       gridSnapshot,
     });
-  }, [pageId, windowLabel, layoutId, assignments, focusedZone, workMode, mru, gridSnapshot]);
+  }, [
+    pageId,
+    windowLabel,
+    layoutId,
+    assignments,
+    focusedZone,
+    workMode,
+    mru,
+    mruSessionKeys,
+    gridSnapshot,
+  ]);
 
   // Reconcile assignments with the live tabs. Grid: auto-assign tabs to empty
   // zones in creation order. tmux: keep zone 0 = the shown tab, and when it is
@@ -806,24 +883,44 @@ export function useZoneLayout(
     );
   }, [tabIds, layout.zones.length, workMode]);
 
-  // tmux mode: keep the grid snapshot pointing at the tabs that exist now. A
-  // runner restart cold-resumes every session into a NEW tab id, and a Claude
-  // session binds its id only after its tab exists; re-keying by session id
-  // is what lets the snapshot's zones — and the labels, notes and pins keyed
-  // by them — follow their sessions (`rekeyGridSnapshot`). Adjusted during
-  // render, like the MRU below, so the snapshot never lags the tab list.
+  // tmux mode: keep the grid snapshot, the MRU and the shown session pointing
+  // at the tabs that exist now. A runner restart cold-resumes every session
+  // into a NEW tab id, and a Claude session binds its id only after its tab
+  // exists; re-keying by session id is what lets the snapshot's zones — and
+  // the labels, notes and pins keyed by them — follow their sessions
+  // (`rekeyGridSnapshot`), the MRU keep its order (`rekeyMru`), and the
+  // session shown before the restart come back on screen (`pendingShownKey`).
+  // Adjusted during render, like the MRU below, so none of it lags the tab list.
   const [rekeyedFor, setRekeyedFor] = useState<{
     tabIds: string[];
     keys: ReadonlyMap<string, string> | undefined;
+    alive: ReadonlySet<string> | undefined;
+    mru: string[];
   } | null>(null);
   if (
     workMode === "tmux" &&
-    gridSnapshot !== null &&
-    (rekeyedFor?.tabIds !== tabIds || rekeyedFor?.keys !== sessionKeyByTab)
+    (rekeyedFor?.tabIds !== tabIds ||
+      rekeyedFor?.keys !== sessionKeyByTab ||
+      rekeyedFor?.alive !== liveTabIds ||
+      rekeyedFor?.mru !== mru)
   ) {
-    setRekeyedFor({ tabIds, keys: sessionKeyByTab });
-    const rekeyed = rekeyGridSnapshot(gridSnapshot, tabIds, (id) => sessionKeyByTab?.get(id));
-    if (rekeyed !== gridSnapshot) setGridSnapshot(rekeyed);
+    setRekeyedFor({ tabIds, keys: sessionKeyByTab, alive: liveTabIds, mru });
+    const keyOf = (id: string) => sessionKeyByTab?.get(id);
+    const alive = liveTabIds ?? null;
+    if (gridSnapshot !== null) {
+      const rekeyed = rekeyGridSnapshot(gridSnapshot, tabIds, keyOf, alive);
+      if (rekeyed !== gridSnapshot) setGridSnapshot(rekeyed);
+    }
+    const rekeyedMru = rekeyMru(mru, mruSessionKeys, tabIds, keyOf, alive);
+    if (rekeyedMru.mru !== mru) setMru(rekeyedMru.mru);
+    if (rekeyedMru.keys !== mruSessionKeys) setMruSessionKeys(rekeyedMru.keys);
+    if (pendingShownKey !== null) {
+      const successor = tabsBySessionKey(tabIds, keyOf, alive).get(pendingShownKey);
+      if (successor !== undefined) {
+        setPendingShownKey(null);
+        if (assignments[0] !== successor) setAssignments({ 0: successor });
+      }
+    }
   }
 
   // tmux mode's shown tab, and the ONE place the MRU is maintained: every swap
@@ -831,11 +928,18 @@ export function useZoneLayout(
   // Bridge) is a change of zone 0, so recording it here covers them all.
   // Adjusted during render (React's "state from a changed value" pattern)
   // rather than in an effect, so the MRU never lags the screen by a commit.
+  // An updater, so it lands on top of a re-key made in this same render. A
+  // shown id naming no tab is not recorded: it is a tab a runner restart took
+  // away, already in the MRU, and the re-key above (or the reconcile) is
+  // about to show its successor — pushing it would put a dead entry at the
+  // head that the re-key has already moved past.
   const shownTabId = workMode === "tmux" ? (assignments[0] ?? null) : null;
   const [recordedShownTabId, setRecordedShownTabId] = useState<string | null>(null);
   if (shownTabId !== recordedShownTabId) {
     setRecordedShownTabId(shownTabId);
-    if (shownTabId !== null) setMru(pushMru(mru, shownTabId));
+    if (shownTabId !== null && tabIds.includes(shownTabId)) {
+      setMru((prev) => pushMru(prev, shownTabId));
+    }
   }
 
   // Closing the maximized terminal returns to the grid. Otherwise the
@@ -909,9 +1013,10 @@ export function useZoneLayout(
 
   /**
    * Enter tmux mode: save the current grid as the snapshot to return to, pin
-   * the layout to `single`, un-maximize, and show the focused zone's tab (or
-   * the most recently shown live tab, else the first live tab). No-op when
-   * already in tmux.
+   * the layout to `single`, un-maximize, and show the tab the operator was
+   * looking at — the maximized zone's when a zone is maximized (it is the only
+   * one on screen), else the focused zone's — or the most recently shown live
+   * tab, else the first live tab. No-op when already in tmux.
    */
   const enterTmuxMode = useCallback(() => {
     if (workModeRef.current === "tmux") return;
@@ -919,7 +1024,7 @@ export function useZoneLayout(
     const committed = committedRef.current;
     const shown = shownTabOnEnter(
       committed.assignments,
-      committed.focusedZone,
+      committed.maximizedZone ?? committed.focusedZone,
       committed.mru,
       tabIds,
       tabFactsRef.current.liveTabIds ?? null,
@@ -930,7 +1035,16 @@ export function useZoneLayout(
       focusedZone: committed.focusedZone,
       sessionKeys: sessionKeysFor(committed.assignments, sessionKeyOf),
     });
-    setMru(mruOnEnter(shown, committed.assignments, committed.mru, tabIds));
+    setMru(
+      mruOnEnter(
+        shown,
+        committed.assignments,
+        committed.mru,
+        tabIds,
+        mountedTabsRef.current ?? undefined,
+      ),
+    );
+    setPendingShownKey(null);
     setWorkMode("tmux");
     setLayoutIdState("single");
     setMaximizedZone(null);
@@ -959,6 +1073,7 @@ export function useZoneLayout(
             resolveLayout(snapshot.layoutId, flowGridSlotCount(tabIds, snapshot.assignments)).zones
               .length,
             sessionKeyOf,
+            tabFactsRef.current.liveTabIds ?? null,
           )
         : (() => {
             const fallbackId = pickLayout(tabIds.length);
@@ -984,6 +1099,7 @@ export function useZoneLayout(
       }
       setWorkMode("grid");
       setGridSnapshot(null);
+      setPendingShownKey(null);
       setLayoutIdState(next.layoutId);
       setAssignments(next.assignments);
       setFocusedZone(next.focusedZone);
@@ -1037,7 +1153,32 @@ export function useZoneLayout(
    */
   const showSpawnedTab = useCallback((tabId: string) => {
     if (workModeRef.current !== "tmux") return;
+    setPendingShownKey(null);
     setAssignments((prev) => (prev[0] === tabId ? prev : { 0: tabId }));
+  }, []);
+
+  /**
+   * A pane replaced in place by a new tab (restart-in-zone). The new tab takes
+   * the old one's place everywhere a place is kept: its zone in the live
+   * assignments (zone 0 in tmux), its zone in the grid snapshot tmux returns
+   * to — the zone whose label, notes and pin are the pane's — and its MRU
+   * recency. The old tab's session key goes with it. Identical to
+   * `assignTabToZone(zone, newId)` in grid mode, where the snapshot is `null`.
+   */
+  const replaceTab = useCallback((oldId: string, newId: string) => {
+    if (oldId === newId) return;
+    const newKey = tabFactsRef.current.sessionKeyByTab?.get(newId);
+    setAssignments((prev) => replaceTabInAssignments(prev, oldId, newId));
+    setGridSnapshot((prev) =>
+      prev === null ? prev : replaceTabInGridSnapshot(prev, oldId, newId, newKey),
+    );
+    setMru((prev) => replaceTabInMru(prev, oldId, newId));
+    setMruSessionKeys((prev) => {
+      if (!(oldId in prev)) return prev;
+      const next = { ...prev };
+      delete next[oldId];
+      return next;
+    });
   }, []);
 
   /**
@@ -1105,7 +1246,12 @@ export function useZoneLayout(
     // tmux mode renders zone 0 only: assigning there is a swap (the MRU effect
     // records it); any other zone does not exist on screen, so the tab stays
     // off-screen and live rather than holding an index nothing renders.
-    if (workModeRef.current === "tmux" && zoneIndex !== 0) return;
+    if (workModeRef.current === "tmux") {
+      if (zoneIndex !== 0) return;
+      // An operator swap: the session shown before a restart no longer
+      // reclaims the screen when it resumes.
+      setPendingShownKey(null);
+    }
     // Reserve the zone so the creation-order auto-fill can't steal it while the
     // tab is mid-creation (restore path). Cleared in the setter below once the
     // zone holds its intended tab.
@@ -1331,6 +1477,8 @@ export function useZoneLayout(
     shownTabId,
     mru,
     showSpawnedTab,
+    replaceTab,
+    reportMountedTabs,
     gridView,
     cosmeticZoneFor,
     revealRequest,

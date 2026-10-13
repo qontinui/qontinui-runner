@@ -19,7 +19,7 @@ import {
   useUIStateCx,
 } from "./contexts";
 import { toggleZonePanel } from "./promptsPanelLayout";
-import { classifyTabs } from "./classifyTabs";
+import { classifyTabs, mountedTabIds } from "./classifyTabs";
 import { useZoneVirtualization } from "./useZoneVirtualization";
 import {
   scrollCellIntoView,
@@ -619,22 +619,23 @@ function ZoneGridInner({
   const shownTabId = zoneLayout.shownTabId;
   const mru = zoneLayout.mru;
   // tmux keeps the shown tab and the most recently shown few mounted; every
-  // other off-screen tab mounts when it is shown (`TMUX_WARM_TAB_LIMIT`).
+  // other off-screen tab mounts when it is shown (`TMUX_WARM_TAB_LIMIT`). Plan
+  // and worker tabs mount no pane, so they take no warm slot.
   const tmuxMounted = useMemo(
-    () =>
-      isTmux
-        ? tmuxMountedTabIds(
-            shownTabId,
-            mru,
-            tabs.map((t) => t.id),
-          )
-        : undefined,
+    () => (isTmux ? tmuxMountedTabIds(shownTabId, mru, tabs) : undefined),
     [isTmux, shownTabId, mru, tabs],
   );
   const tabClassification = useMemo(
     () => classifyTabs(tabs, assignments, isFlowMode, nearViewport, workMode, tmuxMounted),
     [tabs, assignments, isFlowMode, nearViewport, workMode, tmuxMounted],
   );
+  // Tell the layout which panes are mounted, so entering tmux keeps exactly
+  // these warm (`mruOnEnter`): in a scrolled flow grid they are the zones near
+  // the viewport, not zones 0..N.
+  const reportMountedTabs = zoneLayout.reportMountedTabs;
+  useEffect(() => {
+    reportMountedTabs(mountedTabIds(tabClassification));
+  }, [reportMountedTabs, tabClassification]);
 
   // The props every zone cell of this render shares, built once for both work
   // modes (`buildZoneCells` adds tmux's viewport overrides), so the tmux pane

@@ -81,6 +81,16 @@ export function ZoneHoverActions({ zoneIdx, labelZone, onExportZone }: ZoneHover
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showLabelInput, setShowLabelInput] = useState(false);
   const [labelDraft, setLabelDraft] = useState("");
+  // The popover edits ONE zone's label. When the zone it edits changes under
+  // it — a keyboard swap in tmux mode shows another session, whose cosmetics
+  // are another grid zone — the draft belongs to the zone it was opened for,
+  // and an Enter would write it onto the new session's label. Close it instead
+  // (adjusted during render, so no frame shows the popover over the new zone).
+  const [labelInputZone, setLabelInputZone] = useState(labelZone);
+  if (labelInputZone !== labelZone) {
+    setLabelInputZone(labelZone);
+    setShowLabelInput(false);
+  }
   const [showWindowMenu, setShowWindowMenu] = useState(false);
   const [windowList, setWindowList] = useState<RunnerWindowRecord[]>([]);
 

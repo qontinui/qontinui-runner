@@ -7,12 +7,14 @@
  * did to them and what it reported.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const calls = vi.hoisted(() => [] as Array<{ name: string; args: unknown[] }>);
 const recorder = vi.hoisted(() => (name: string) => (...args: unknown[]) => {
   calls.push({ name, args });
 });
+/** The page's work mode, as the mocked zone layout serves it. */
+const page = vi.hoisted(() => ({ workMode: "grid" as "grid" | "tmux" }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: async () => ({}) }));
 vi.mock("@/lib/instance-storage", () => ({
@@ -48,7 +50,10 @@ vi.mock("../contexts", () => ({
       layoutId: "quad",
       maximizedZone: null,
       assignments: { 0: "tab-a", 1: "tab-b" },
-      workMode: "grid",
+      get workMode() {
+        return page.workMode;
+      },
+      toggleMaximize: recorder("zone.toggleMaximize"),
       enterTmuxMode: recorder("zone.enterTmuxMode"),
       exitTmuxMode: recorder("zone.exitTmuxMode"),
       setLayoutId: recorder("zone.setLayoutId"),
@@ -67,6 +72,12 @@ vi.mock("../contexts", () => ({
 
 import { runRegistryAction } from "./uibridge";
 import { useTerminalCommands } from "./useTerminalCommands";
+import { MAXIMIZE_IN_TMUX_ERROR } from "../zone-grid/maximizeActions";
+
+beforeEach(() => {
+  calls.length = 0;
+  page.workMode = "grid";
+});
 
 describe("/terminal.mode, registered by the page", () => {
   it("toggles a grid page into tmux mode and opens the session manager", async () => {
@@ -81,5 +92,26 @@ describe("/terminal.mode, registered by the page", () => {
       ["zone.enterTmuxMode"],
       ["workflow.setShowSidebar", true],
     ]);
+  });
+});
+
+describe("/maximize, registered by the page", () => {
+  it("maximizes the named zone in grid mode", async () => {
+    useTerminalCommands({} as never);
+
+    const result = await runRegistryAction("terminal.maximize", { zone: 2 }, "hotkey");
+
+    expect(result.ok).toBe(true);
+    expect(calls.map((c) => [c.name, ...c.args])).toEqual([["zone.toggleMaximize", 1]]);
+  });
+
+  it("refuses in tmux mode with the UI Bridge actions' refusal, changing nothing", async () => {
+    page.workMode = "tmux";
+    useTerminalCommands({} as never);
+
+    const result = await runRegistryAction("terminal.maximize", { zone: 2 }, "hotkey");
+
+    expect(result).toStrictEqual({ ok: false, code: "tmux-mode", message: MAXIMIZE_IN_TMUX_ERROR });
+    expect(calls).toEqual([]);
   });
 });
