@@ -10,7 +10,8 @@
  * activity is never covered by an earlier tick).
  *
  * Close is the graceful path (`terminal_graceful_close`); Force close (the
- * kill) is a separate button that leads to its own confirmation. After either
+ * kill) is a separate button that leads to its own confirmation, which keeps
+ * the same second-tick requirement — a kill is never the way around it. After either
  * runs, the dialog lists each session's outcome — closed, not closed with the
  * reason, or unknown — and never one "done" for a partial batch (served
  * policy `ux-priorities` `an-action-must-acknowledge-itself`).
@@ -165,7 +166,7 @@ export function SessionCloseDialog({
                 context is lost and the transcript&apos;s last turn may not be written.
               </span>
             </div>
-            <TargetList targets={closable} ticks={null} onToggle={toggleTick} />
+            <TargetList targets={closable} ticks={ticks} onToggle={toggleTick} />
             <div className="flex justify-end gap-2 px-3 py-2 border-t border-[#2a2d3d]">
               <button
                 {...sessionOrgControlAttrs("closeCancel")}
@@ -177,7 +178,12 @@ export function SessionCloseDialog({
               <button
                 {...sessionOrgControlAttrs("forceCloseConfirm")}
                 onClick={runForce}
-                disabled={closable.length === 0}
+                disabled={!canClose}
+                title={
+                  unticked.length > 0
+                    ? `Tick the ${unticked.length} session${unticked.length === 1 ? "" : "s"} still marked above`
+                    : undefined
+                }
                 className="px-2 py-0.5 rounded text-[11px] bg-[#f7768e]/20 text-[#f7768e] hover:bg-[#f7768e]/30 disabled:opacity-40"
               >
                 Force close {closable.length}
@@ -243,8 +249,7 @@ function TargetList({
   disabled = false,
 }: {
   targets: readonly CloseTarget[];
-  /** `null` = no tick column (the Force close confirmation). */
-  ticks: ReadonlySet<string> | null;
+  ticks: ReadonlySet<string>;
   onToggle: (key: string) => void;
   disabled?: boolean;
 }) {
@@ -271,7 +276,7 @@ function TargetList({
                 no live tab in this window — nothing to close
               </span>
             )}
-            {ticks && risky && (
+            {risky && (
               <label className="flex items-center gap-1 mt-0.5 text-[10px] text-[#e0af68]">
                 <input
                   type="checkbox"
