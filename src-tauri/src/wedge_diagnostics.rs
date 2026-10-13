@@ -106,6 +106,8 @@ struct LaneTable {
     /// change nothing called `set` and Tauri built its own, unnamed and one
     /// worker per CPU), the dedicated multi-thread `fleet-pub-rt` built in
     /// `main.rs` for the tree publisher / census / reclaim callers, the
+    /// dedicated multi-thread `djwt-rt` the device-JWT refresher runs on
+    /// (`mcp::device_jwt_refresher::spawn_on_isolated_runtime`), the
     /// `fleet-hb-rt` current-thread runtime, and a further set of short-lived
     /// `new_current_thread` runtimes — `cognito-rt`, `pg-boot-rt`,
     /// `pg-stop-rt`, `online-learn-rt`, `envagent-rt`, `pair-rt`,
