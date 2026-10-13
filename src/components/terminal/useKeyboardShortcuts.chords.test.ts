@@ -95,6 +95,28 @@ describe("useKeyboardShortcuts — chord matching", () => {
     ).toBe(false);
   });
 
+  it("keeps the session search chord (Ctrl+Shift+Space) off every inline chord", () => {
+    // Plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search
+    // Phase 4: Chrome's tab search is Ctrl+Shift+A, which the terminal already
+    // claims inline, so the palette takes the free Ctrl+Shift+Space.
+    const inline = [...SOURCE.matchAll(/isCtrlShiftChord\(e, "([^"]+)"\)/g)].map((m) =>
+      m[1].toLowerCase(),
+    );
+    expect(inline).toContain("a");
+    expect(GLOBAL_CHORDS.sessionSearch).toEqual({ key: " ", shift: true, meta: false });
+    expect(inline).not.toContain(" ");
+    const others = Object.entries(GLOBAL_CHORDS)
+      .filter(([name]) => name !== "sessionSearch")
+      .map(([, c]) => c);
+    expect(others).not.toContainEqual(GLOBAL_CHORDS.sessionSearch);
+    expect(
+      matchesChord({ key: " ", ctrlKey: true, shiftKey: true }, GLOBAL_CHORDS.sessionSearch),
+    ).toBe(true);
+    expect(
+      matchesChord({ key: " ", ctrlKey: true, shiftKey: false }, GLOBAL_CHORDS.sessionSearch),
+    ).toBe(false);
+  });
+
   it("still matches when CapsLock lowercased the key (the actual failure)", () => {
     expect(isCtrlShiftChord({ key: "b", ctrlKey: true, shiftKey: true }, "b")).toBe(true);
     expect(isCtrlShiftChord({ key: "B", ctrlKey: true, shiftKey: true }, "b")).toBe(true);
