@@ -1187,11 +1187,33 @@ async fn dispatch_to_app_inner(
             StatusCode::NOT_FOUND,
             ApiResponse::error("app not registered"),
         ),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            ApiResponse::error(e.to_user_message()),
-        ),
+        Err(e) => (StatusCode::BAD_GATEWAY, app_failure_response(&e)),
     }
+}
+
+/// The `{success:false}` body for a dispatch that failed after reaching the
+/// app. When the APP answered with its own failure, its machine-readable
+/// `code` is handed on in `code`, and a WebSocket wrapper's retry verdict in
+/// `hint.retryable` — so a caller can branch on `NO_HANDLER` instead of
+/// parsing prose (coord finding `fb3fb468`). Every other failure keeps the
+/// message alone.
+fn app_failure_response(err: &DispatchError) -> ApiResponse<serde_json::Value> {
+    use crate::mcp::command_relay::CommandRelayError;
+    let (code, retryable) = match err {
+        DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
+            (failure.code.clone(), failure.retryable)
+        }
+        DispatchError::AppAnswered { code, .. } => (code.clone(), None),
+        _ => (None, None),
+    };
+    let mut body = match code {
+        Some(code) => ApiResponse::error_with_code(err.to_user_message(), code),
+        None => ApiResponse::error(err.to_user_message()),
+    };
+    if let Some(retryable) = retryable {
+        body.hint = Some(serde_json::json!({ "retryable": retryable }));
+    }
+    body
 }
 
 /// `POST /ui-bridge/apps/:appId/dispatch` — transport-agnostic dispatch.
@@ -1660,6 +1682,79 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.success);
         assert_eq!(body.data, Some(serde_json::json!({"ok": true})));
+    }
+
+    /// A WebSocket wrapper's structured refusal reaches the HTTP caller with
+    /// the wrapper's own `code` and retry verdict (coord finding `fb3fb468`);
+    /// a bare-string refusal keeps the message alone.
+    #[tokio::test]
+    async fn dispatch_to_app_inner_hands_on_the_wrappers_failure_code() {
+        use crate::mcp::app_dispatch::AppDispatcher;
+        use crate::mcp::command_relay::{CommandRelay, CommandResponse, WrapperFailure};
+        use crate::mcp::ws_relay::WsConnectionManager;
+        use std::time::Duration;
+
+        for (failure, want_code, want_hint) in [
+            (
+                WrapperFailure {
+                    code: Some("NO_HANDLER".into()),
+                    message: "No handler registered for action 'doThing'".into(),
+                    retryable: Some(false),
+                },
+                Some("NO_HANDLER"),
+                Some(serde_json::json!({ "retryable": false })),
+            ),
+            (WrapperFailure::message_only("boom"), None, None),
+        ] {
+            let registry = AppRegistry::new();
+            let ws = WsConnectionManager::new();
+            let (conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+            registry
+                .upsert(
+                    sample_app("wapp"),
+                    None,
+                    AppTransport::Websocket,
+                    Some(1),
+                    None,
+                )
+                .await;
+            let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(20));
+            let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+            let req = AppDispatchRequest {
+                action: "doThing".into(),
+                params: serde_json::json!({}),
+            };
+            let registry_for_task = registry.clone();
+            let dispatcher_for_task = dispatcher.clone();
+            let handle = tokio::spawn(async move {
+                dispatch_to_app_inner(&registry_for_task, &dispatcher_for_task, "wapp", &req).await
+            });
+            let frame: serde_json::Value =
+                serde_json::from_str(&outbound_rx.recv().await.expect("outbound frame")).unwrap();
+            relay
+                .resolve(
+                    conn_id,
+                    crate::mcp::relay_binding::BindingMode::Enforce,
+                    CommandResponse {
+                        command_id: frame["commandId"].as_str().unwrap().to_string(),
+                        success: false,
+                        result: None,
+                        error: Some(failure.clone()),
+                    },
+                )
+                .await;
+
+            let (status, body) = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("answered at once, not at the relay timeout")
+                .unwrap();
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(!body.success);
+            assert_eq!(body.code.as_deref(), want_code, "{failure:?}");
+            assert_eq!(body.hint, want_hint, "{failure:?}");
+            let error = body.error.as_deref().unwrap_or_default();
+            assert!(error.contains(&failure.message), "{error}");
+        }
     }
 
     #[tokio::test]
