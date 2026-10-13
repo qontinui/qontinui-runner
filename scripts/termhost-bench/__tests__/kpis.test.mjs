@@ -23,6 +23,7 @@ import {
   generatorWindow,
   indexGenerators,
   indexProbeSegment,
+  INJECT_ABORT_REASONS,
   injectAbortReason,
   parseJsonl,
   LAG_VERDICT_MIN_FRAMES,
@@ -423,6 +424,7 @@ test("an inject abort names its catalog reason; an arm aborted part-way reports 
   assert.equal(injectAbortReason("foreign_injection"), "operator_activity");
   assert.equal(injectAbortReason("unsupported_key"), "harness_error");
   assert.equal(injectAbortReason("send_failed"), "harness_error");
+  assert.equal(injectAbortReason("keyboard_state"), "input_unsafe", "a held modifier or CapsLock: nothing safe to type (Phase 2 keyboard safety)");
   for (const r of ["not_foreground", "desktop_unavailable", "monitor_down", "monitor_deaf", "foreground_changed_during_injection", "something_new"]) {
     assert.equal(injectAbortReason(r), "input_unsafe", r);
   }
@@ -619,4 +621,11 @@ test("LAG_VERDICT_MIN_FRAMES is the probe's own constant, read from its source (
   const found = [...src.matchAll(/^pub const LAG_VERDICT_MIN_FRAMES: usize = (\d+);\r?$/gm)];
   assert.equal(found.length, 1, "exactly one definition of the probe's constant");
   assert.equal(LAG_VERDICT_MIN_FRAMES, Number(found[0][1]));
+});
+
+test("every inject abort reason the probe writes has an explicit catalog mapping, read from its source", () => {
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "crates", "termhost-probe", "src", "inject.rs"), "utf8");
+  const probe = [...src.matchAll(/^\s*AbortReason::\w+ => "([a-z_]+)",\r?$/gm)].map((m) => m[1]).sort();
+  assert.ok(probe.includes("keyboard_state"), "the probe writes keyboard_state");
+  assert.deepEqual(Object.keys(INJECT_ABORT_REASONS).sort(), probe);
 });

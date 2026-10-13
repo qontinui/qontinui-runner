@@ -947,13 +947,37 @@ function computeProcessKpis(p, seg, win, set, notes) {
  * Real input or another injector is the operator's activity; a key the platform
  * cannot type, a send that failed or a target check that errored is the
  * harness's; everything else — no foreground, no desktop, a listener that is down
- * or deaf, a foreground that changed mid-arm — means the D9 safeguard could not be
- * established.
+ * or deaf, a foreground that changed mid-arm, a held modifier or CapsLock
+ * (`keyboard_state`) — means the D9 safeguard could not be established.
+ */
+export const INJECT_ABORT_REASONS = Object.freeze({
+  // Real input, or someone else's injection.
+  operator_input: "operator_activity",
+  foreign_injection: "operator_activity",
+  // The harness's own failure.
+  unsupported_key: "harness_error",
+  send_failed: "harness_error",
+  target_check_failed: "harness_error",
+  stop_requested: "harness_error",
+  // The D9 safeguard refused (or could not establish) the conditions to type.
+  not_foreground: "input_unsafe",
+  desktop_unavailable: "input_unsafe",
+  monitor_down: "input_unsafe",
+  monitor_deaf: "input_unsafe",
+  foreground_changed_during_injection: "input_unsafe",
+  // A modifier held, or CapsLock on: a key would not type what is meant, or would
+  // become a shortcut, so the arm stops before it (Phase 2's keyboard safety).
+  keyboard_state: "input_unsafe",
+});
+
+/**
+ * The catalog reason for an `inject_abort` record's reason. Every reason the probe
+ * writes (`inject.rs` `AbortReason::as_str`) is listed in INJECT_ABORT_REASONS (a
+ * test reads the Rust source to keep the two equal); a reason the table does not
+ * know is input_unsafe, the conservative reading.
  */
 export function injectAbortReason(reason) {
-  if (reason === "operator_input" || reason === "foreign_injection") return "operator_activity";
-  if (["unsupported_key", "send_failed", "target_check_failed", "stop_requested"].includes(reason)) return "harness_error";
-  return "input_unsafe";
+  return Object.hasOwn(INJECT_ABORT_REASONS, reason) ? INJECT_ABORT_REASONS[reason] : "input_unsafe";
 }
 
 /**
