@@ -6,14 +6,10 @@ import { SessionCard } from "./SessionCard";
 import { WorktreesPanel } from "../worktrees/WorktreesPanel";
 import { PastSessionsView } from "./PastSessionsView";
 import { FleetSessionPicker } from "./FleetSessionPicker";
-import { isRowOffScreen, isRowOnScreen } from "./sessionManagerLiveRows";
-import type { TerminalWorkMode } from "./terminalWorkMode";
+import { isRowOnScreen } from "./sessionManagerLiveRows";
+import { SESSION_STATUS_LABELS } from "./sessionStatusModel";
 import type { PastSession } from "./usePastSessions";
-import type {
-  UseSessionManagerReturn,
-  UnifiedSession,
-  SessionLiveStatus,
-} from "./useSessionManager";
+import type { UseSessionManagerReturn, UnifiedSession } from "./useSessionManager";
 import type { LockState } from "./useFileLockTracking";
 
 interface SessionManagerPanelProps {
@@ -44,23 +40,13 @@ interface SessionManagerPanelProps {
    * shown session from the hidden ones at a glance.
    */
   onScreenTabId?: string | null;
-  /**
-   * The page's work mode. In tmux mode every other row of this window is off
-   * screen, and its card says so rather than "in zone".
-   */
-  workMode?: TerminalWorkMode;
 }
 
-/** Human-readable status group labels. */
-const STATUS_GROUP_LABELS: Record<SessionLiveStatus, string> = {
-  frozen: "Frozen",
-  "needs-input": "Needs Input",
-  "active-in-zone": "Active",
-  "active-external": "Active (External)",
-  error: "Error",
-  completed: "Completed",
-  dormant: "Recent",
-};
+/** UI-Bridge ids for the panel's own controls. */
+export const SESSION_MANAGER_PANEL_IDS = {
+  selectVisible: "terminal.session-manager-select-visible",
+  unidentified: "terminal.session-manager-unidentified",
+} as const;
 
 /** Group sessions by the current groupBy mode. Returns [groupKey, sessions][] */
 function groupSessions(
@@ -73,7 +59,8 @@ function groupSessions(
     let key: string;
     switch (groupBy) {
       case "status":
-        key = STATUS_GROUP_LABELS[session.liveStatus] || session.liveStatus;
+        // The same word the card's dot carries — one label table for both.
+        key = SESSION_STATUS_LABELS.activity[session.status.activity];
         break;
       case "account":
         key = session.accountLabel;
@@ -124,7 +111,6 @@ export function SessionManagerPanel({
   sessionLockStates,
   onResumePastSession,
   onScreenTabId = null,
-  workMode = "grid",
 }: SessionManagerPanelProps) {
   const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
@@ -150,7 +136,7 @@ export function SessionManagerPanel({
     closeSession,
     selectedIds,
     toggleSelect,
-    selectAllFrozen,
+    selectAllVisible,
     clearSelection,
     bulkResume,
     pinnedIds,
@@ -158,10 +144,10 @@ export function SessionManagerPanel({
     sessionLabels,
     setSessionLabel,
     allAccounts,
-    frozenCount,
-    needsInputCount,
-    activeCount,
+    activityCounts,
+    unidentifiedCount,
   } = manager;
+  const selectableVisible = sessions.filter((s) => s.source === "transcript").length;
 
   const selectionMode = selectedIds.size > 0;
 
@@ -255,11 +241,25 @@ export function SessionManagerPanel({
         accountUsage={accountUsage}
         accounts={allAccounts}
         onRefresh={refresh}
-        frozenCount={frozenCount}
-        needsInputCount={needsInputCount}
-        activeCount={activeCount}
+        activityCounts={activityCounts}
         totalCount={sessions.length}
       />
+
+      {/* Unmanaged `claude` processes with no registry row: counted, never
+          attributed to a session. UNKNOWN (scan or registry unread) says so
+          rather than reading as zero. */}
+      {unidentifiedCount !== 0 && (
+        <div
+          data-ui-bridge-content={SESSION_MANAGER_PANEL_IDS.unidentified}
+          data-unidentified-count={unidentifiedCount === null ? "unknown" : String(unidentifiedCount)}
+          className="px-3 py-1 text-[10px] text-[#565f89] border-b border-[#2a2d3d]"
+          title="Claude processes running outside this runner that report no session id — they are not matched to any row"
+        >
+          {unidentifiedCount === null
+            ? "Unidentified Claude processes: unknown (process scan or registry not read)"
+            : `${unidentifiedCount} unidentified Claude process${unidentifiedCount === 1 ? "" : "es"}`}
+        </div>
+      )}
 
       {/* Bulk action bar */}
       {selectionMode && (
@@ -286,15 +286,17 @@ export function SessionManagerPanel({
         </div>
       )}
 
-      {/* Select all frozen shortcut */}
-      {!selectionMode && frozenCount > 1 && (
+      {/* Select what the filter shows */}
+      {!selectionMode && selectableVisible > 1 && (
         <div className="flex items-center px-3 py-1 border-b border-[#2a2d3d]">
           <button
-            onClick={selectAllFrozen}
-            className="flex items-center gap-1 text-[10px] text-[#f7768e]/70 hover:text-[#f7768e] transition-colors"
+            data-ui-bridge-id={SESSION_MANAGER_PANEL_IDS.selectVisible}
+            onClick={selectAllVisible}
+            className="flex items-center gap-1 text-[10px] text-[#7aa2f7]/70 hover:text-[#7aa2f7] transition-colors"
+            title="Select every session the current filter shows"
           >
             <CheckSquare className="w-3 h-3" />
-            Select all {frozenCount} frozen sessions
+            Select all {selectableVisible} shown
           </button>
         </div>
       )}
@@ -350,7 +352,6 @@ export function SessionManagerPanel({
                   onOpenWorktrees={setWorktreeFocus}
                   isOnScreen={isRowOnScreen(session, onScreenTabId)}
                   onClose={closableTabId(session) !== null ? closeSession : undefined}
-                  isOffScreen={isRowOffScreen(session, workMode, onScreenTabId)}
                 />
               ))}
             </div>

@@ -6,7 +6,7 @@
  *
  * These tabs are how the debug-gated test-fixtures seam reaches the `idle`
  * (pre-aged stale tab) and tab-backed `error` / `completed` (dead-tab
- * exit-code) StatusStrip buckets that the `injected_live_status` short-circuit
+ * exit-code) StatusStrip buckets that the `injected_location` / `injected_activity` short-circuit
  * cannot.
  */
 
@@ -40,7 +40,7 @@ describe("deriveSyntheticTabs", () => {
   it("ignores sessions without an injected_tab (the production path)", () => {
     const result = deriveSyntheticTabs([
       session({ session_id: "real-1" }),
-      session({ session_id: "real-2", injected_live_status: "active-in-zone" }),
+      session({ session_id: "real-2", injected_location: "hidden-here", injected_activity: "working" }),
     ]);
     expect(result.tabs).toEqual([]);
     expect(result.seedLastOutput).toEqual({});
