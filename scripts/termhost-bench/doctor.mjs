@@ -89,6 +89,19 @@ export function mapDoctor(f) {
       m[id] = v(UNKNOWN, record ? `the probe's doctor did not report ${id}` : `not probed: ${m["probe.binary"].reason}`);
     }
   }
+  // D9: the doctor's own probes must never move the foreground. A probe doctor that
+  // saw the foreground change around its probe window records it in `violations`
+  // (crates/termhost-probe/src/doctor.rs); that is a broken safety rule on THIS
+  // desktop, so it blocks the run rather than becoming a note beside it.
+  if (record) {
+    const violations = Array.isArray(record.violations) ? record.violations.map(String) : [];
+    m["probe.foreground_safety"] =
+      violations.length > 0
+        ? v(INOPERATIVE, `refused: the probe's doctor moved the foreground (${violations.length} D9 violation(s): ${violations.join("; ").slice(0, 300)})`)
+        : v(OPERATIVE, "the probe's doctor recorded no D9 violation");
+  } else {
+    m["probe.foreground_safety"] = v(UNKNOWN, `not probed: ${m["probe.binary"].reason}`);
+  }
   for (const [id, verdict] of Object.entries(f.setupMechanisms ?? {})) {
     m[id] = DOCTOR_STATES.includes(verdict?.state) ? v(verdict.state, String(verdict.reason || "(no reason given)")) : v(UNKNOWN, `malformed verdict for ${id}`);
   }
@@ -102,7 +115,7 @@ export function mapDoctor(f) {
  * with its reason instead of stopping the run).
  */
 export function blockingMechanisms(mechanisms) {
-  return ["env.platform", "env.harness", "env.xvfb", "probe.binary", "node.version", "device.drain"]
+  return ["env.platform", "env.harness", "env.xvfb", "probe.binary", "probe.foreground_safety", "node.version", "device.drain"]
     .filter((id) => mechanisms[id] && mechanisms[id].state !== OPERATIVE)
     .map((id) => ({ id, ...mechanisms[id] }));
 }

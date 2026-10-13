@@ -179,3 +179,18 @@ test("the doctor maps the drain read, and a drained or unknown drain blocks the 
   }
   assert.equal(drainMechanism({ state: "drained", detail: "coord reports this device drained (rebuild)" }).state, INOPERATIVE);
 });
+
+test("a D9 violation the probe's doctor recorded blocks the run; none recorded is operative (Phase 2 doctor violations)", () => {
+  const facts = healthyFacts();
+  const clean = mapDoctor(facts);
+  assert.equal(clean["probe.foreground_safety"].state, OPERATIVE);
+  assert.ok(!blockingMechanisms(clean).some((b) => b.id === "probe.foreground_safety"));
+  const moved = mapDoctor({ ...facts, probeDoctor: { ...facts.probeDoctor, record: { ...facts.probeDoctor.record, violations: ["D9: the foreground changed around the probe window (0x10 before, 0x20 after)"] } } });
+  assert.equal(moved["probe.foreground_safety"].state, INOPERATIVE);
+  assert.match(moved["probe.foreground_safety"].reason, /1 D9 violation\(s\): D9: the foreground changed around the probe window \(0x10 before, 0x20 after\)/);
+  assert.ok(blockingMechanisms(moved).some((b) => b.id === "probe.foreground_safety"), "a broken safety rule stops the run before any unit");
+  const empty = mapDoctor({ ...facts, probeDoctor: { ...facts.probeDoctor, record: { ...facts.probeDoctor.record, violations: [] } } });
+  assert.equal(empty["probe.foreground_safety"].state, OPERATIVE);
+  const unanswered = mapDoctor({ ...facts, probeDoctor: { record: null, error: "no answer" } });
+  assert.equal(unanswered["probe.foreground_safety"].state, UNKNOWN, "no record is never 'no violation'");
+});
