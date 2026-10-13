@@ -24,23 +24,25 @@ export interface TranscriptSession {
    */
   resume_name?: string | null;
   /**
-   * Optional `liveStatus` override populated only by the runner's
-   * debug-gated `/ui-bridge/test/inject-session` path
-   * (`mcp::test_fixtures` in qontinui-runner). Real on-disk transcripts
-   * omit the field entirely. When present, `useSessionManager` uses
-   * this value verbatim instead of computing live-status from
-   * tab/digest correlation, so SessionCard's `canPromote` / `canCommit`
-   * predicates can fire without a real PTY tab being open.
+   * Optional status overrides — the two axes of `sessionStatusModel`
+   * (`SessionLocation` / `SessionActivity` literals) — populated only by the
+   * runner's debug-gated `/ui-bridge/test/inject-session` path
+   * (`mcp::test_fixtures` in qontinui-runner). Real on-disk transcripts omit
+   * both. When both are present and valid, `useSessionManager` uses them
+   * verbatim instead of classifying (`injectedStatusOf`), so a card can be
+   * placed in any location × activity cell without a real PTY tab.
    */
-  injected_live_status?: string | null;
+  injected_location?: string | null;
+  /** See {@link TranscriptSession.injected_location}. */
+  injected_activity?: string | null;
   /**
    * Optional synthetic-tab spec populated only by the runner's debug-gated
    * test-fixtures path for a *tab-backed* injected fake. When present,
    * `deriveSyntheticTabs` (`syntheticTabs.ts`) turns it into a minimal
    * `TerminalTab` that flows through the REAL `useSessionManager`
-   * tab-correlation path — the only way to place a fake in the `idle` or
-   * tab-backed `error` / `completed` StatusStrip buckets. Real transcripts
-   * omit the field entirely.
+   * classification — a dead tab's exit code (`Exited` / `Exited — error`) or
+   * a silent tab with no digest (`Unknown`). Real transcripts omit the field
+   * entirely.
    */
   injected_tab?: {
     is_alive: boolean;

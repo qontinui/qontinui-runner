@@ -97,9 +97,9 @@ const zoneLayout = {
 function mountScenario(
   tabs: RosterTab[],
   claudeSessionCount: number,
-  working: { workingCount: number; externalWorkingCount: number } = {
+  working: { workingCount: number; outsideWorkingCount: number } = {
     workingCount: 0,
-    externalWorkingCount: 0,
+    outsideWorkingCount: 0,
   },
 ) {
   Object.assign(sessionValue, {
@@ -115,6 +115,7 @@ function mountScenario(
       ...working,
       completedCount: 0,
       idleCount: 0,
+      unknownCount: 0,
     },
   });
   return renderToStaticMarkup(<StatusStrip />);
@@ -170,14 +171,16 @@ describe("StatusStrip auto-hide gate", () => {
   });
 
   it("keeps counting Claude sessions with no tab in this window", () => {
-    // The union reads below neither input: two external sessions, no tabs.
+    // The union reads below neither input: two outside-runner sessions, no tabs.
     expect(buildTerminalSessionRoster([], {}, {})).toHaveLength(0);
     const html = mountScenario([], 2);
     expect(html).toContain('data-page-element="status-strip"');
     expect(html).toContain("2 sessions");
-    // The tooltip must not claim external sessions are "on this page" — only
+    // The tooltip must not claim outside sessions are "on this page" — only
     // the live-terminal half of the union is scoped to this window.
-    expect(html).toContain("2 sessions — 2 Claude (incl. external), 0 live terminals on this page");
+    expect(html).toContain(
+      "2 sessions — 2 Claude (incl. outside runner), 0 live terminals on this page",
+    );
     expect(html).not.toContain("2 sessions on this page");
   });
 });
@@ -191,22 +194,22 @@ describe("StatusStrip working count (UI-4)", () => {
       .trim();
   }
 
-  it("headlines the page's workers and reports external sessions apart — THE DEFECT", () => {
-    // One worker in a zone on this page, four other `claude` processes on the
-    // box. `workingCount` buckets all five; the strip is the PAGE's status.
-    const html = mountScenario(TWO_LIVE_TABS, 5, { workingCount: 5, externalWorkingCount: 4 });
-    expect(text(html)).toContain("1 working +4 external");
+  it("headlines the page's workers and reports outside-runner sessions apart — THE DEFECT", () => {
+    // One worker in a zone on this page, four `claude` processes this runner
+    // does not own. `workingCount` buckets all five; the strip is the PAGE's.
+    const html = mountScenario(TWO_LIVE_TABS, 5, { workingCount: 5, outsideWorkingCount: 4 });
+    expect(text(html)).toContain("1 working +4 outside runner");
     expect(text(html)).not.toContain("5 working");
   });
 
-  it("omits the external suffix when every worker is on this page", () => {
-    const html = mountScenario(TWO_LIVE_TABS, 2, { workingCount: 2, externalWorkingCount: 0 });
+  it("omits the outside suffix when every worker is on this page", () => {
+    const html = mountScenario(TWO_LIVE_TABS, 2, { workingCount: 2, outsideWorkingCount: 0 });
     expect(text(html)).toContain("2 working");
-    expect(text(html)).not.toContain("external");
+    expect(text(html)).not.toContain("outside runner");
   });
 
-  it("still reports external workers when none run on this page", () => {
-    const html = mountScenario(TWO_LIVE_TABS, 3, { workingCount: 3, externalWorkingCount: 3 });
-    expect(text(html)).toContain("0 working +3 external");
+  it("still reports outside workers when none run on this page", () => {
+    const html = mountScenario(TWO_LIVE_TABS, 3, { workingCount: 3, outsideWorkingCount: 3 });
+    expect(text(html)).toContain("0 working +3 outside runner");
   });
 });
