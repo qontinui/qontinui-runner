@@ -442,6 +442,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/sessionGroupSuggestions.ts",
   "components/terminal/sessionGrouping.ts",
   "components/terminal/sessionOrgOptimistic.ts",
+  "components/terminal/sessionQuery.test.ts",
   "components/terminal/sessionReviewApi.test.ts",
   "components/terminal/sessionReviewApi.ts",
   "components/terminal/sessionReviewView.ts",
