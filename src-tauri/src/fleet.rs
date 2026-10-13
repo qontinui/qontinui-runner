@@ -1818,6 +1818,13 @@ pub(crate) const MAX_CI_REPO_CAPABILITIES: usize = 64;
 static CI_REPO_CAP_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The capability vector `heartbeat_to_coord` sends: CI tokens, host facts and
+/// the credential family ([`heartbeat_capabilities`]). Its own function so the
+/// heartbeat's exact expression is what the seam test exercises.
+fn heartbeat_device_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
+    build_device_capabilities(ci_node, repo_allowlist, &heartbeat_capabilities())
+}
+
 /// Pure assembly of the whole `capabilities` vector the heartbeat sends.
 ///
 /// `ci_node` leads (it is the coarse fleet-role flag the CI filters read),
@@ -3056,8 +3063,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     //     itself retractable, so a stale label set left behind by a device that
     //     turned CI-node mode off is unreachable by any CI filter.
     let ci = crate::settings::get_ci_node_settings();
-    let mut capabilities =
-        build_device_capabilities(ci.enabled, &ci.repo_allowlist, &heartbeat_capabilities());
+    let mut capabilities = heartbeat_device_capabilities(ci.enabled, &ci.repo_allowlist);
     // Skill capabilities (plan 2026-10-13-coord-expedited-land-lever-for-agents
     // Phase 3b): advertised only when the skill is served AND the bearer this
     // heartbeat presents is a live device JWT.
@@ -9125,8 +9131,7 @@ mod tests {",
             (false, Vec::<String>::new()),
             (true, vec!["qontinui-runner".to_string()]),
         ] {
-            let payload_caps =
-                build_device_capabilities(ci_enabled, &allowlist, &heartbeat_capabilities());
+            let payload_caps = heartbeat_device_capabilities(ci_enabled, &allowlist);
             for token in [
                 CRED_PROBES_MARKER,
                 CRED_GH_CAPABILITY,
@@ -10031,8 +10036,8 @@ Add-Content -LiteralPath $Out -Value $lines
     }
 
     /// A gh shim that appends `args=<argv>` to `log` per run, prints the fake
-    /// secret, and exits 1 when handed `--active` unless `accepts_active` (a
-    /// an older gh rejecting the unknown flag); otherwise exits 0.
+    /// secret, and exits 1 when handed `--active` unless `accepts_active` (an
+    /// older gh rejecting the unknown flag); otherwise exits 0.
     fn write_gh_active_shim(
         dir: &std::path::Path,
         name: &str,
@@ -10121,7 +10126,7 @@ Add-Content -LiteralPath $Out -Value $lines
         assert_eq!(
             calls.len(),
             3,
-            "the `--active` bit is cached per process: no second capability check, got {calls:?}"
+            "the `--active` bit is cached for one HOST_PROBE_TTL: no second capability check, got {calls:?}"
         );
         assert_eq!(calls[2], "args=auth status --hostname github.com");
     }
