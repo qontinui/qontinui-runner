@@ -6,7 +6,7 @@
 //! wrapper framework we only port the essentials:
 //!
 //! 1. A `pending` map keyed by `command_id`, each slot holding the routing
-//!    `conn_id` plus a `oneshot::Sender<CommandResponse>` that the response
+//!    `conn_id` plus a `oneshot::Sender<Resolution>` that the response
 //!    handler completes. The `conn_id` lets cleanup paths target a specific
 //!    socket — see `reject_by_conn`.
 //! 2. A `dispatch(app_id, action, payload)` call that
@@ -74,11 +74,12 @@ pub struct CommandResponse {
 ///
 /// ui-bridge-wrapper's `LiveSessionTransport` — the transport the extension's
 /// live relay builds — sends `{code, message, retryable}`
-/// (`packages/ui-bridge-wrapper/src/transports/live.ts`); other wrappers send
-/// a bare string. Both are read by [`WrapperFailure::from_wire`]. Until that
-/// reader existed the runner parsed `error` as a string only, rejected every
-/// structured failure frame whole, and the command it answered resolved 30 s
-/// later as a timeout (coord finding `fb3fb468`).
+/// (`packages/ui-bridge-wrapper/src/transports/live.ts`). A bare string is
+/// still read — the one shape the runner accepted before — though no
+/// first-party sender sends one. Both are read by [`WrapperFailure::from_wire`].
+/// Until that reader existed the runner parsed `error` as a string only,
+/// rejected every structured failure frame whole, and the command it answered
+/// resolved 30 s later as a timeout (coord finding `fb3fb468`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapperFailure {
     /// The wrapper's own machine-readable code (`NO_HANDLER`,
@@ -176,6 +177,14 @@ pub enum CommandRelayError {
     #[error("wrapper returned error: {0}")]
     WrapperError(WrapperFailure),
 
+    /// The app ANSWERED this command — its response frame named it — but the
+    /// frame could not be read (coord finding `fb3fb468`). This is NOT the
+    /// app's own failure: what the app reported is unknown, so callers keep
+    /// it out of the app-code slot and, like a [`Self::Timeout`], treat the
+    /// outcome as unknown (`failure_origin: "transport"`, `retryable: null`).
+    #[error("the app answered, but its response frame could not be read: {0}")]
+    UnreadableResponse(String),
+
     /// The wrapper did not respond within `DEFAULT_COMMAND_TIMEOUT`.
     #[error("command timed out after {}ms waiting for wrapper response", .0.as_millis())]
     Timeout(Duration),
@@ -243,7 +252,18 @@ pub struct ResolveOutcome {
 /// commands too.
 struct PendingEntry {
     conn_id: u64,
-    sender: oneshot::Sender<CommandResponse>,
+    sender: oneshot::Sender<Resolution>,
+}
+
+/// How a pending command was settled by the side it was routed to.
+#[derive(Debug)]
+enum Resolution {
+    /// A response frame that could be read (or a displacement written by
+    /// [`CommandRelay::reject_by_conn`]).
+    Answered(CommandResponse),
+    /// A response frame that named the command but could not be read — the
+    /// parse error is the payload. See [`CommandRelayError::UnreadableResponse`].
+    Unreadable(String),
 }
 
 /// CommandRelay — the pending-command state machine.
@@ -320,7 +340,10 @@ impl CommandRelay {
         // entry from the pending map so it cannot be double-resolved or leak.
         let outcome = tokio::time::timeout(self.timeout, rx).await;
         match outcome {
-            Ok(Ok(response)) => {
+            Ok(Ok(Resolution::Unreadable(detail))) => {
+                Err(CommandRelayError::UnreadableResponse(detail))
+            }
+            Ok(Ok(Resolution::Answered(response))) => {
                 if response.success {
                     Ok(response)
                 } else {
@@ -366,22 +389,61 @@ impl CommandRelay {
         mode: BindingMode,
         response: CommandResponse,
     ) -> ResolveOutcome {
+        let command_id = response.command_id.clone();
+        self.settle(
+            answering_conn,
+            mode,
+            &command_id,
+            Resolution::Answered(response),
+        )
+        .await
+    }
+
+    /// Settle `command_id` as answered but UNREADABLE: a response frame named
+    /// it, so the app did answer, but the frame could not be read. The
+    /// dispatch fails at once with [`CommandRelayError::UnreadableResponse`]
+    /// instead of sitting out the timeout. Same R3 binding as
+    /// [`Self::resolve`].
+    pub async fn resolve_unreadable(
+        &self,
+        answering_conn: u64,
+        mode: BindingMode,
+        command_id: &str,
+        detail: String,
+    ) -> ResolveOutcome {
+        self.settle(
+            answering_conn,
+            mode,
+            command_id,
+            Resolution::Unreadable(detail),
+        )
+        .await
+    }
+
+    /// Hand `resolution` to the command's awaiter, under R3's binding.
+    async fn settle(
+        &self,
+        answering_conn: u64,
+        mode: BindingMode,
+        command_id: &str,
+        resolution: Resolution,
+    ) -> ResolveOutcome {
         let (entry, not_yours) = {
             let mut pending = self.pending.lock().await;
-            let not_yours = match pending.get(&response.command_id) {
+            let not_yours = match pending.get(command_id) {
                 Some(e) if mode != BindingMode::Off => e.conn_id != answering_conn,
                 _ => false,
             };
             let entry = if not_yours && mode == BindingMode::Enforce {
                 None
             } else {
-                pending.remove(&response.command_id)
+                pending.remove(command_id)
             };
             (entry, not_yours)
         };
         ResolveOutcome {
             matched: match entry {
-                Some(entry) => entry.sender.send(response).is_ok(),
+                Some(entry) => entry.sender.send(resolution).is_ok(),
                 None => false,
             },
             not_yours,
@@ -423,7 +485,7 @@ impl CommandRelay {
             // via the new `displaced_reason` field encoded in `error`. We use
             // a stable sentinel prefix the dispatcher recognizes so callers
             // can distinguish displacement from generic wrapper errors.
-            let _ = entry.sender.send(CommandResponse {
+            let _ = entry.sender.send(Resolution::Answered(CommandResponse {
                 command_id,
                 success: false,
                 result: None,
@@ -431,7 +493,7 @@ impl CommandRelay {
                     "{}{}",
                     DISPLACED_ERROR_PREFIX, reason
                 ))),
-            });
+            }));
         }
         count
     }
