@@ -63,7 +63,7 @@ import { createHash } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import path, { basename, dirname, join } from "node:path";
 
 import { HttpError, PRIMARY_RUNNER_PORT, RunnerClient, RunnerNotListed, SupervisorClient, httpJson, sleep, unwrap } from "../../lib/runner-clients.mjs";
 import { ECHO_REGION, MARKER_KINDS, markerOverlay, markerSeq } from "../marker.mjs";
@@ -212,10 +212,17 @@ export function checkFixCommits(commit, { repoRoot, run = spawnSync } = {}) {
  * point the runner outside its instance root (the runner refuses such overrides
  * with exit 78) or tie it to the harness's sessions, plus the D12 launch contract.
  *
+ * On Linux the subject's XDG directories are its own, but they sit BESIDE the
+ * root (`<unit>/runner-xdg/…`), never inside it: `dirs::config_dir` and
+ * `dirs::data_local_dir` resolve from XDG_CONFIG_HOME / XDG_DATA_HOME, and the
+ * runner refuses (exit 78) a root that CONTAINS a machine-global directory
+ * (`instance_env.rs` `machine_global_dirs`, `root_problem`). Putting them inside
+ * the root is exactly what the first CI run hit.
+ *
  * @param {{base: object, root: string, port: number, instanceName: string,
- *   platform?: string, display?: string | null, extra?: object}} o
+ *   platform?: string, display?: string | null, extra?: object, xdgDir?: string}} o
  */
-export function subjectEnv({ base, root, port, instanceName, platform = process.platform, display = null, extra = {} }) {
+export function subjectEnv({ base, root, port, instanceName, platform = process.platform, display = null, extra = {}, xdgDir = null }) {
   const env = {};
   for (const [k, v] of Object.entries(base)) {
     if (/^QONTINUI_.*_DIR$/.test(k)) continue;
@@ -249,13 +256,94 @@ export function subjectEnv({ base, root, port, instanceName, platform = process.
   if (platform === "linux") {
     if (display) env.DISPLAY = display;
     // dirs::config_dir / data_local_dir / cache follow XDG on Linux: keep the
-    // subject's WebKit storage, dev logs and caches inside its root too.
-    env.XDG_CONFIG_HOME = join(root, "xdg", "config");
-    env.XDG_DATA_HOME = join(root, "xdg", "data");
-    env.XDG_CACHE_HOME = join(root, "xdg", "cache");
-    env.XDG_STATE_HOME = join(root, "xdg", "state");
+    // subject's WebKit storage, dev logs and caches out of the harness user's
+    // home — beside the root, because the root may not contain them.
+    const xdg = xdgDir ?? subjectXdgDir(root);
+    env.XDG_CONFIG_HOME = join(xdg, "config");
+    env.XDG_DATA_HOME = join(xdg, "data");
+    env.XDG_CACHE_HOME = join(xdg, "cache");
+    env.XDG_STATE_HOME = join(xdg, "state");
   }
   return Object.assign(env, extra);
+}
+
+/** Where a subject's own XDG directories live: beside its root, in the unit dir. */
+export function subjectXdgDir(root) {
+  return join(dirname(root), "runner-xdg");
+}
+
+/**
+ * The location overrides the runner confines to its instance root
+ * (`instance_env.rs` `ROOT_CONFINED_ENV_KEYS`; a test reads that list from the
+ * source so the two cannot drift).
+ */
+export const ROOT_CONFINED_ENV_KEYS = Object.freeze([
+  "QONTINUI_CAPABILITY_STATE_DIR",
+  "QONTINUI_CONFIG_DIR",
+  "QONTINUI_EMBEDDED_PG_DIR",
+  "QONTINUI_HOME",
+  "QONTINUI_PANIC_LOG_DIR",
+  "QONTINUI_PROMPTS_DIR",
+  "QONTINUI_RUNNER_LOG_DIR",
+  "QONTINUI_SECURE_STORAGE_DIR",
+  "QONTINUI_SESSION_NAMES_DIR",
+  "WEBVIEW2_USER_DATA_FOLDER",
+]);
+
+/**
+ * The runner's startup contract for a subject (`instance_env.rs`
+ * `validate_instance_root` + `root_problem`), judged on the environment the
+ * adapter is about to pass — so a launch the runner would refuse with exit 78 is
+ * refused here first, naming every problem. Lexical, like the Rust:
+ *
+ * - the root is absolute, has no `..`, is not a filesystem root, and contains
+ *   none of the machine-global directories (`machine_global_dirs`: the data-local
+ *   and config directories as `dirs` resolves them from THIS env, `~/.qontinui`
+ *   and the home directory);
+ * - QONTINUI_PORT is set, parses as a port, is not 0 and not the primary's;
+ * - every non-blank ROOT_CONFINED_ENV_KEYS value is absolute, has no `..`, and
+ *   lies inside the root.
+ *
+ * @param {object} env the subject's environment
+ * @param {{platform?: string}} [o]
+ * @returns {string[]} problems (empty = the runner accepts the launch)
+ */
+export function subjectContractProblems(env, { platform = process.platform } = {}) {
+  const p = platform === "win32" ? path.win32 : path.posix;
+  const fold = platform === "win32" || platform === "darwin";
+  const norm = (x) => {
+    const n = p.normalize(x);
+    return fold ? n.toLowerCase() : n;
+  };
+  const hasDotDot = (x) => x.split(/[\\/]+/).includes("..");
+  const inside = (child, parent) => {
+    const rel = p.relative(norm(parent), norm(child));
+    return rel === "" || (!rel.startsWith("..") && !p.isAbsolute(rel));
+  };
+  const root = env.QONTINUI_INSTANCE_ROOT;
+  if (typeof root !== "string" || root === "") return ["QONTINUI_INSTANCE_ROOT is unset"];
+  if (!p.isAbsolute(root)) return [`QONTINUI_INSTANCE_ROOT must be an absolute path, got ${JSON.stringify(root)}`];
+  if (hasDotDot(root)) return [`QONTINUI_INSTANCE_ROOT must not contain \`..\`, got ${JSON.stringify(root)}`];
+  if (norm(root) === norm(p.parse(root).root)) return [`QONTINUI_INSTANCE_ROOT ${JSON.stringify(root)} is a filesystem root`];
+  const home = platform === "win32" ? env.USERPROFILE : env.HOME;
+  if (typeof home === "string" && home !== "") {
+    const { configDir, dataLocalDir } = platformDirs({ platform, env, home });
+    for (const dir of [dataLocalDir, configDir, p.join(home, ".qontinui"), home]) {
+      if (inside(dir, root)) return [`QONTINUI_INSTANCE_ROOT ${JSON.stringify(root)} contains the machine-global directory ${JSON.stringify(dir)}`];
+    }
+  }
+  const problems = [];
+  const port = env.QONTINUI_PORT;
+  if (port === undefined || port === "") problems.push("QONTINUI_PORT is unset");
+  else if (!/^\d+$/.test(port) || Number(port) > 65535) problems.push(`QONTINUI_PORT=${JSON.stringify(port)} is not a valid port`);
+  else if (Number(port) === 0) problems.push("QONTINUI_PORT=0 is not a fixed port");
+  else if (Number(port) === PRIMARY_RUNNER_PORT) problems.push(`QONTINUI_PORT=${port} is the primary runner's port`);
+  for (const key of ROOT_CONFINED_ENV_KEYS) {
+    const v = env[key];
+    if (typeof v !== "string" || v.trim() === "") continue;
+    if (!p.isAbsolute(v) || hasDotDot(v) || !inside(v, root)) problems.push(`${key}=${JSON.stringify(v)} is outside the instance root`);
+  }
+  return problems;
 }
 
 /**
@@ -539,8 +627,9 @@ export class RunnerAdapter {
       mkdirSync(cfg, { recursive: true });
       writeFileSync(assertInside(ctx.runDir, join(cfg, "settings.json")), `${JSON.stringify({ terminal: { pty_holder: true } }, null, 2)}\n`);
     }
+    const xdgDir = assertInside(ctx.runDir, subjectXdgDir(this.root));
     if (this.platform === "linux") {
-      for (const sub of ["config", "data", "cache", "state"]) mkdirSync(join(this.root, "xdg", sub), { recursive: true });
+      for (const sub of ["config", "data", "cache", "state"]) mkdirSync(join(xdgDir, sub), { recursive: true });
     }
     this.port = await freePort(9877);
     const env = subjectEnv({
@@ -551,7 +640,15 @@ export class RunnerAdapter {
       platform: this.platform,
       display: ctx.env?.env?.DISPLAY ?? null,
       extra: this.extraEnv,
+      xdgDir,
     });
+    // The runner's own startup contract, checked before it is spawned: a launch it
+    // would refuse with exit 78 is refused here, with every reason named.
+    const contract = subjectContractProblems(env, { platform: this.platform });
+    if (contract.length > 0) {
+      throw new AdapterRefusal("harness_error", `the subject launch would break the runner's instance-root contract: ${contract.join("; ")}`);
+    }
+    this.stderrPath = assertInside(ctx.runDir, join(ctx.unitDir, "runner-stderr.log"));
     const out = openSync(assertInside(ctx.runDir, join(ctx.unitDir, "runner-stdout.log")), "a");
     const err = openSync(assertInside(ctx.runDir, join(ctx.unitDir, "runner-stderr.log")), "a");
     try {
@@ -568,14 +665,33 @@ export class RunnerAdapter {
     this.log(`runner: subject pid ${this.pid} on :${this.port} under ${this.root}`);
   }
 
+  /**
+   * Why a subject that never became ready did not: its startup-refusal.log (written
+   * only when the root itself was usable), its exit, and the tail of its stderr —
+   * where a refusal the runner could not log into its root (exit 78 on the root
+   * itself) is printed. Runner-only text, so it may carry detail (D7).
+   */
   refusalLogText() {
     if (!this.root) return "";
+    const parts = [];
     try {
       const text = readFileSync(join(this.root, "startup-refusal.log"), "utf8").trim();
-      return text ? ` — startup-refusal.log: ${text.slice(-600)}` : "";
+      if (text) parts.push(`startup-refusal.log: ${text.slice(-600)}`);
     } catch {
-      return this.childExit ? ` — the runner exited ${JSON.stringify(this.childExit)}` : "";
+      // no refusal log: the root itself may have been refused
     }
+    if (this.childExit) {
+      parts.push(`the runner exited ${JSON.stringify(this.childExit)}`);
+      if (this.stderrPath) {
+        try {
+          const tail = readFileSync(this.stderrPath, "utf8").trim();
+          if (tail) parts.push(`stderr: ${tail.slice(-800)}`);
+        } catch {
+          // no stderr file
+        }
+      }
+    }
+    return parts.map((x) => ` — ${x}`).join("");
   }
 
   async launchSupervisor(ctx) {

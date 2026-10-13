@@ -14,7 +14,8 @@ import { EventEmitter } from "node:events";
 import net from "node:net";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { HttpError, RunnerClient, SupervisorClient, WaitAborted } from "../../lib/runner-clients.mjs";
 import { waitForGenerators, waitForNewSlot } from "../sessions.mjs";
@@ -36,7 +37,9 @@ import {
   parseSpawnSpans,
   refusalLane,
   spawnTestBody,
+  subjectContractProblems,
   subjectEnv,
+  ROOT_CONFINED_ENV_KEYS,
 } from "../adapters/runner.mjs";
 import { TILED_MAX_PANES, TmuxAdapter, cleanEnv, sessionShellArgv, tmuxConf, xtermArgv } from "../adapters/tmux.mjs";
 import { generatorArgv } from "../rundir.mjs";
@@ -242,7 +245,8 @@ test("the subject environment is the D12 contract and nothing that points outsid
   assert.equal(env.QONTINUI_ALLOW_NO_DB, "1");
   assert.equal(env.QONTINUI_SETUP_WIZARD_BYPASS, "1");
   assert.equal(env.DISPLAY, ":99");
-  assert.match(env.XDG_DATA_HOME.replace(/\\/g, "/"), /runner-root\/xdg\/data$/);
+  // Beside the root, never inside it: the runner refuses a root that contains its XDG dirs.
+  assert.equal(env.XDG_DATA_HOME.replace(/\\/g, "/"), "/tmp/tb/run/units/u0/runner-xdg/data");
   assert.equal(env.WEBKIT_DISABLE_DMABUF_RENDERER, "1");
   for (const k of ["QONTINUI_CONFIG_DIR", "QONTINUI_EMBEDDED_PG_DIR", "QONTINUI_HOME", "WEBVIEW2_USER_DATA_FOLDER", "QONTINUI_TERMINAL_ID", "CLAUDECODE"]) {
     assert.equal(env[k], undefined, `${k} must not leak into the subject`);
@@ -871,4 +875,77 @@ test("the launch waits end at the run's abort signal, not at their timeouts (rev
   assert.match(gens.detail, /interrupted/);
   assert.equal(await waitForNewSlot(dir, new Set(), { timeoutMs: 600_000, signal: ac3.signal }), null);
   assert.ok(Date.now() - t0 < 10_000, `every wait ended at the abort (${Date.now() - t0} ms)`);
+});
+
+
+test("the subject env passes the runner's instance-root contract; XDG dirs inside the root are what CI's exit 78 was (ci run 38341619507)", () => {
+  const root = "/home/runner/work/_temp/tb/termhost-bench/ci-1/units/u000-runner-default-single-n1-r0/runner-root";
+  const base = { PATH: "/usr/bin", HOME: "/home/runner", QONTINUI_HOME: "/home/runner/.qontinui", QONTINUI_SESSION_NAMES_DIR: "/home/runner/.qontinui/session-names" };
+  const env = subjectEnv({ base, root, port: 9877, instanceName: "termhost-ci-1", platform: "linux", display: ":90" });
+  assert.deepEqual(subjectContractProblems(env, { platform: "linux" }), []);
+  // The reproduction: the env the first CI run passed (XDG dirs inside the root).
+  const ci = { ...env, XDG_CONFIG_HOME: `${root}/xdg/config`, XDG_DATA_HOME: `${root}/xdg/data` };
+  assert.deepEqual(subjectContractProblems(ci, { platform: "linux" }), [`QONTINUI_INSTANCE_ROOT ${JSON.stringify(root)} contains the machine-global directory ${JSON.stringify(`${root}/xdg/data`)}`]);
+  // Every other refusal path of validate_instance_root / root_problem.
+  const bad = (patch) => subjectContractProblems({ ...env, ...patch }, { platform: "linux" });
+  assert.match(bad({ QONTINUI_INSTANCE_ROOT: "relative/root" })[0], /must be an absolute path/);
+  assert.match(bad({ QONTINUI_INSTANCE_ROOT: "/a/../b" })[0], /must not contain `\.\.`/);
+  assert.match(bad({ QONTINUI_INSTANCE_ROOT: "/" })[0], /is a filesystem root/);
+  assert.match(bad({ QONTINUI_INSTANCE_ROOT: "/home" })[0], /contains the machine-global directory "\/home\/runner/);
+  assert.deepEqual(bad({ QONTINUI_PORT: "" }), ["QONTINUI_PORT is unset"]);
+  assert.deepEqual(bad({ QONTINUI_PORT: " 9877" }), ['QONTINUI_PORT=" 9877" is not a valid port']);
+  assert.deepEqual(bad({ QONTINUI_PORT: "0" }), ["QONTINUI_PORT=0 is not a fixed port"]);
+  assert.deepEqual(bad({ QONTINUI_PORT: "9876" }), ["QONTINUI_PORT=9876 is the primary runner's port"]);
+  assert.deepEqual(bad({ QONTINUI_HOME: "/home/runner/.qontinui" }), ['QONTINUI_HOME="/home/runner/.qontinui" is outside the instance root']);
+  assert.deepEqual(bad({ QONTINUI_CONFIG_DIR: `${root}/../x` }), [`QONTINUI_CONFIG_DIR=${JSON.stringify(`${root}/../x`)} is outside the instance root`]);
+  assert.deepEqual(bad({ QONTINUI_CONFIG_DIR: `${root}/config`, QONTINUI_HOME: "  " }), [], "inside the root, and a blank value is no override");
+  // Windows folds case, as PLATFORM_PATH_CASE does there.
+  const w = { QONTINUI_INSTANCE_ROOT: "C:\\tb\\u0\\runner-root", QONTINUI_PORT: "9877", USERPROFILE: "C:\\Users\\ci", QONTINUI_HOME: "c:\\TB\\u0\\RUNNER-ROOT\\home" };
+  assert.deepEqual(subjectContractProblems(w, { platform: "win32" }), []);
+});
+
+test("the contract mirror reads the runner's own lists: ROOT_CONFINED_ENV_KEYS and machine_global_dirs, from instance_env.rs", () => {
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "src-tauri", "src", "instance_env.rs"), "utf8");
+  const keys = /pub const ROOT_CONFINED_ENV_KEYS: &\[&str\] = &\[([\s\S]*?)\];/.exec(src);
+  assert.ok(keys, "ROOT_CONFINED_ENV_KEYS is defined");
+  assert.deepEqual([...keys[1].matchAll(/"([A-Z0-9_]+)"/g)].map((m) => m[1]), [...ROOT_CONFINED_ENV_KEYS]);
+  const dirsBody = /pub fn machine_global_dirs\(\) -> Vec<PathBuf> \{([\s\S]*?)\r?\n\}/.exec(src);
+  assert.ok(dirsBody, "machine_global_dirs is defined");
+  // One entry per line (an entry may itself contain a comma).
+  const entries = /\[([\s\S]*?)\]\s*\.into_iter\(\)/.exec(dirsBody[1])[1].split(/\r?\n/).map((x) => x.trim().replace(/,$/, "")).filter(Boolean);
+  assert.deepEqual(entries, ["dirs::data_local_dir()", "dirs::config_dir()", "crate::ambient::qontinui_dir_from(None, home.clone())", "home"], "the JS mirror checks exactly these four");
+});
+
+test("a subject launch the contract refuses is never spawned, and a subject that exits names its stderr tail (ci run 38341619507)", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-contract-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const unitDir = join(dir, "units", "u0");
+  mkdirSync(unitDir, { recursive: true });
+  const spawned = [];
+  const a = new RunnerAdapter({
+    mode: "subject",
+    build: { role: "single", commit: "f".repeat(40), exe: process.execPath },
+    repoRoot: ".",
+    platform: process.platform,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME ?? dir, USERPROFILE: process.env.USERPROFILE ?? dir },
+    extraEnv: { QONTINUI_HOME: join(tmpdir(), "somewhere-else", ".qontinui") },
+    fetch: async () => {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    },
+    portListening: async () => false,
+    spawnFn: (...x) => {
+      spawned.push(x);
+      throw new Error("must not spawn");
+    },
+    list: () => new Map(),
+  });
+  await assert.rejects(a.launchSubject({ runDir: dir, unitDir, genRunId: "r1", env: { env: {} } }), (e) => /instance-root contract: QONTINUI_HOME=.* is outside the instance root/.test(e.detail ?? e.message));
+  assert.deepEqual(spawned, []);
+  // A subject that did start and then refused: the exit AND its stderr tail.
+  a.childExit = { code: 78, signal: null };
+  a.stderrPath = join(unitDir, "runner-stderr.log");
+  writeFileSync(a.stderrPath, "qontinui-runner: refusing to start under QONTINUI_INSTANCE_ROOT=/r: it contains the machine-global directory /r/xdg/data\n");
+  const why = a.refusalLogText();
+  assert.match(why, / — the runner exited \{"code":78,"signal":null\}/);
+  assert.match(why, / — stderr: qontinui-runner: refusing to start under QONTINUI_INSTANCE_ROOT=\/r: it contains the machine-global directory \/r\/xdg\/data$/);
 });
