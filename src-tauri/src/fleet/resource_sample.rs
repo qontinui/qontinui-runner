@@ -201,6 +201,13 @@ pub(crate) struct ResourceSample {
     /// equivalent, and a fabricated 0.0 would read as "idle".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) load_1m: Option<f64>,
+    /// CPU package temperature in degrees Celsius, display only (plan
+    /// `2026-10-13-cpu-temperature-in-fleet-resource-telemetry`). `None` means
+    /// UNMEASURED: Windows, the `wsl` lane (no `/sys/class/thermal`), a Linux
+    /// host with no `x86_pkg_temp` zone or `coretemp` hwmon, or an implausible
+    /// reading. Never a fabricated 0, which would read as "cool".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_temp_c: Option<f64>,
     /// Whole-host CPU busy ratio in permille (0..=1000), measured between this
     /// sample and the previous one on every OS. `None` on the first sample
     /// after start (no delta exists yet) — never a fabricated 0.
@@ -588,6 +595,7 @@ impl ResourceSample {
             lane_instance,
             cpu_cores: None,
             load_1m: None,
+            cpu_temp_c: None,
             cpu_busy_permille: None,
             mem_total_bytes: None,
             mem_available_bytes: None,
@@ -902,6 +910,82 @@ fn sample_cpu_busy_permille() -> Option<i32> {
     advance_cpu_busy(&mut slot, cur)
 }
 
+/// Plausible CPU package temperature range, degrees Celsius. A stuck sensor
+/// reporting 0 or 255000 millidegrees must not become a datum.
+const CPU_TEMP_MIN_C: f64 = -20.0;
+const CPU_TEMP_MAX_C: f64 = 150.0;
+
+/// Parse one sysfs temperature file body (millidegrees Celsius) into Celsius.
+/// `None` on empty or non-numeric text, on a NEGATIVE raw value, or on a
+/// converted value outside [`CPU_TEMP_MIN_C`]..=[`CPU_TEMP_MAX_C`]. The
+/// `-20..150` range applies to the CONVERTED Celsius value; a negative raw
+/// sysfs value (e.g. `-1`) is a driver error sentinel, not a reading, and is
+/// rejected as an error before conversion. `/1000` is applied exactly once,
+/// here, so the wire is always Celsius.
+fn parse_millidegrees_c(text: &str) -> Option<f64> {
+    let milli: i64 = text.trim().parse().ok()?;
+    if milli < 0 {
+        return None;
+    }
+    let c = milli as f64 / 1000.0;
+    (CPU_TEMP_MIN_C..=CPU_TEMP_MAX_C).contains(&c).then_some(c)
+}
+
+/// Read the CPU package temperature from a sysfs tree rooted at `sys_root`
+/// (`/sys` in production; a fake tree in tests).
+///
+/// 1. `class/thermal/thermal_zone*/type` == `x86_pkg_temp` -> that zone's
+///    `temp`.
+/// 2. Fallback: the hottest valid `temp*_input` of the `class/hwmon/hwmon*`
+///    whose `name` is `coretemp`.
+///
+/// Any I/O or parse failure yields `None` (UNKNOWN, never zero).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_cpu_package_temp_c(sys_root: &std::path::Path) -> Option<f64> {
+    fn read(p: std::path::PathBuf) -> Option<String> {
+        std::fs::read_to_string(p).ok()
+    }
+    fn entries(dir: std::path::PathBuf, prefix: &str) -> Vec<std::path::PathBuf> {
+        let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    }
+
+    for zone in entries(sys_root.join("class/thermal"), "thermal_zone") {
+        if read(zone.join("type")).is_some_and(|t| t.trim() == "x86_pkg_temp") {
+            if let Some(c) = read(zone.join("temp")).and_then(|t| parse_millidegrees_c(&t)) {
+                return Some(c);
+            }
+        }
+    }
+
+    for hw in entries(sys_root.join("class/hwmon"), "hwmon") {
+        if !read(hw.join("name")).is_some_and(|n| n.trim() == "coretemp") {
+            continue;
+        }
+        let max = std::fs::read_dir(&hw)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("temp") && n.ends_with("_input")
+            })
+            .filter_map(|e| read(e.path()).and_then(|t| parse_millidegrees_c(&t)))
+            .fold(None::<f64>, |m, c| Some(m.map_or(c, |m| m.max(c))));
+        if max.is_some() {
+            return max;
+        }
+    }
+    None
+}
+
 /// Collect the `host` lane. Blocking (sysinfo refresh + a disk enumeration), so
 /// callers run it on a blocking pool.
 ///
@@ -958,6 +1042,13 @@ fn collect_host_lane() -> ResourceSample {
     #[cfg(not(windows))]
     {
         s.load_1m = Some(sysinfo::System::load_average().one);
+    }
+
+    // Linux only: Windows has no unprivileged package-temperature interface and
+    // `sysinfo`'s `component` feature is deliberately not enabled.
+    #[cfg(target_os = "linux")]
+    {
+        s.cpu_temp_c = read_cpu_package_temp_c(std::path::Path::new("/sys"));
     }
 
     s.cpu_busy_permille = sample_cpu_busy_permille();
@@ -1778,6 +1869,72 @@ fn warn_once(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_temp_parse_millidegrees() {
+        assert_eq!(parse_millidegrees_c("71000"), Some(71.0));
+        assert_eq!(parse_millidegrees_c("71000\n"), Some(71.0));
+        assert_eq!(parse_millidegrees_c(""), None);
+        assert_eq!(parse_millidegrees_c("abc"), None);
+        assert_eq!(parse_millidegrees_c("-1"), None);
+        assert_eq!(parse_millidegrees_c("255000"), None);
+    }
+
+    fn fake_sys(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("qontinui-cputemp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn put(root: &std::path::Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn cpu_temp_reader_prefers_pkg_zone_then_coretemp_then_none() {
+        let r = fake_sys("zone");
+        put(&r, "class/thermal/thermal_zone0/type", "acpitz\n");
+        put(&r, "class/thermal/thermal_zone0/temp", "20000\n");
+        put(&r, "class/thermal/thermal_zone1/type", "x86_pkg_temp\n");
+        put(&r, "class/thermal/thermal_zone1/temp", "71000\n");
+        put(&r, "class/hwmon/hwmon3/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon3/temp1_input", "90000\n");
+        assert_eq!(read_cpu_package_temp_c(&r), Some(71.0));
+        let _ = std::fs::remove_dir_all(&r);
+
+        let r = fake_sys("hwmon");
+        put(&r, "class/hwmon/hwmon1/name", "nvme\n");
+        put(&r, "class/hwmon/hwmon1/temp1_input", "99000\n");
+        put(&r, "class/hwmon/hwmon3/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon3/temp1_input", "55000\n");
+        put(&r, "class/hwmon/hwmon3/temp2_input", "63500\n");
+        put(&r, "class/hwmon/hwmon3/temp3_input", "255000\n");
+        assert_eq!(read_cpu_package_temp_c(&r), Some(63.5));
+        let _ = std::fs::remove_dir_all(&r);
+
+        let r = fake_sys("bad");
+        put(&r, "class/thermal/thermal_zone0/type", "x86_pkg_temp\n");
+        put(&r, "class/thermal/thermal_zone0/temp", "abc");
+        assert_eq!(read_cpu_package_temp_c(&r), None);
+        assert_eq!(read_cpu_package_temp_c(&r.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn cpu_temp_serializes_only_when_known_and_wsl_stays_none() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        let j = serde_json::to_value(&s).unwrap();
+        assert!(j.get("cpu_temp_c").is_none(), "None must omit the key");
+        s.cpu_temp_c = Some(71.5);
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["cpu_temp_c"], 71.5);
+        let w = ResourceSample::empty(Lane::Wsl, Some("Ubuntu".into()));
+        assert_eq!(w.cpu_temp_c, None);
+        assert!(serde_json::to_value(&w).unwrap().get("cpu_temp_c").is_none());
+    }
 
     #[test]
     fn cpu_busy_delta_arithmetic() {
