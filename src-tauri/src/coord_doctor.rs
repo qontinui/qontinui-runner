@@ -4621,7 +4621,7 @@ mod tests {
         let path = dir.join("live.enc");
         let _ = std::fs::remove_file(&path);
         let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
-        let auth = crate::auth::AuthManager::with_storage(storage);
+        let auth = crate::auth::AuthManager::with_storage_no_keychain(storage);
         let now = chrono::Utc::now().timestamp();
 
         let (ok, detail) = device_jwt_live_predicate(&auth);

@@ -165,7 +165,9 @@ const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 /// the blocking pool. What is still synchronous on the worker is small file
 /// I/O (`machine.json`'s device id, the pair-arm id reads) and the pair arm's
 /// legacy-token reads, each bounded by the store's own `STORE_LOCK_TIMEOUT`
-/// rather than by this constant. Plan
+/// rather than by this constant. (`publish_coord_credential_status`, which
+/// every arm calls, reads `machine.json` and may fall back to the legacy token;
+/// it does both on the blocking pool.) Plan
 /// `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
 /// Phase 2 step 2. Sized well above a legitimate worst-case pass (a few slots x
 /// 10 s refresh + re-derive, then the legacy arm's self-refresh, pair-cli and
@@ -242,8 +244,18 @@ pub(crate) fn parse_retry_after_at(value: Option<&str>, now: i64) -> Option<Dura
     if let Ok(secs) = v.parse::<u64>() {
         return Some(Duration::from_secs(secs));
     }
-    // IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") is an RFC 2822 date.
-    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?.timestamp();
+    // IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") is an RFC 2822 date; the
+    // two obsolete forms RFC 9110 §5.6.7 still requires recipients to accept are
+    // RFC 850 ("Sunday, 06-Nov-94 08:49:37 GMT") and asctime
+    // ("Sun Nov  6 08:49:37 1994"), both GMT.
+    let at = match chrono::DateTime::parse_from_rfc2822(v) {
+        Ok(d) => d.timestamp(),
+        Err(_) => ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]
+            .iter()
+            .find_map(|f| chrono::NaiveDateTime::parse_from_str(v, f).ok())?
+            .and_utc()
+            .timestamp(),
+    };
     Some(Duration::from_secs(u64::try_from(at - now).unwrap_or(0)))
 }
 
@@ -372,6 +384,33 @@ pub(crate) fn fold_retry_hint(hint: PassRetryHint, cause: KeptExistingCause) -> 
             PassRetryHint::Transient
         }
         (h, KeptExistingCause::Other) => h,
+    }
+}
+
+/// Fold the expiry of credentials this pass tried and FAILED to renew into a
+/// rate-limited hint's deadline. A 429 on slot A must not park the loop past
+/// slot B's expiry when B failed transiently in the same pass. A no-op for any
+/// other hint.
+pub(crate) fn with_unrenewed_deadline(hint: PassRetryHint, exp: Option<i64>) -> PassRetryHint {
+    match (hint, exp) {
+        (
+            PassRetryHint::RateLimited {
+                retry_after,
+                deadline,
+            },
+            Some(e),
+        ) => PassRetryHint::RateLimited {
+            retry_after,
+            deadline: Some(deadline.map_or(e, |d| d.min(e))),
+        },
+        (h, _) => h,
+    }
+}
+
+fn min_exp(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -1270,11 +1309,39 @@ async fn publish_coord_credential_status(
     health: &CoordCredentialHealth,
 ) {
     // device_id: env override first (multi-instance / test), else machine.json.
-    let device_id = std::env::var("QONTINUI_MACHINE_ID")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string())
-        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+    //
+    // tenant_id: machine.json::active_tenant_id (Phase 8b semantics: the
+    // DEVICE-LEVEL DEFAULT binding — this publish is a device-scoped surface,
+    // so the default is the correct attribution; session-scoped writes get
+    // their tenant from the owning session instead), then the outgoing
+    // device-JWT claim (still parseable when expired). NULL is acceptable on
+    // the wire (coord's StatusUpsert.tenant_id is Option), but we send it
+    // when known so the row is tenant-scoped — the explicit-tenant_id
+    // publisher posture D2 site 16b/Phase 8 item 7 asks for.
+    //
+    // Both read files and the store, so they run on the blocking pool: this is
+    // called from every refresher arm, on a one-worker runtime (PASS_BOUND).
+    let mgr = auth_manager.clone();
+    let Ok((device_id, tenant_id)) = spawn_blocking_tracked(move || {
+        let device_id = std::env::var("QONTINUI_MACHINE_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+        let tenant_id = crate::session::dual_write::resolve_active_tenant_id().or_else(|| {
+            mgr.get_access_token()
+                .ok()
+                .as_deref()
+                .and_then(qontinui_runner_lib::pair::tenant_id_from_oauth_claim)
+                .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        });
+        (device_id, tenant_id)
+    })
+    .await
+    else {
+        warn!("device_jwt_refresher: status-publish identity read task failed (best-effort)");
+        return;
+    };
     let Some(device_id) = device_id else {
         // No stable identity → coord can't key the row; skip silently-ish.
         warn!(
@@ -1289,23 +1356,6 @@ async fn publish_coord_credential_status(
         );
         return;
     };
-
-    // tenant_id: machine.json::active_tenant_id (Phase 8b semantics: the
-    // DEVICE-LEVEL DEFAULT binding — this publish is a device-scoped surface,
-    // so the default is the correct attribution; session-scoped writes get
-    // their tenant from the owning session instead), then the outgoing
-    // device-JWT claim (still parseable when expired). NULL is acceptable on
-    // the wire (coord's StatusUpsert.tenant_id is Option), but we send it
-    // when known so the row is tenant-scoped — the explicit-tenant_id
-    // publisher posture D2 site 16b/Phase 8 item 7 asks for.
-    let tenant_id = crate::session::dual_write::resolve_active_tenant_id().or_else(|| {
-        auth_manager
-            .get_access_token()
-            .ok()
-            .as_deref()
-            .and_then(qontinui_runner_lib::pair::tenant_id_from_oauth_claim)
-            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
-    });
 
     let (base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = format!("{base}/coord/status");
@@ -1711,7 +1761,10 @@ pub(crate) async fn try_device_self_refresh(
         // Absent/opaque exp, or already expired → Cognito fallback.
         _ => return SelfRefreshOutcome::NotAttempted,
     }
-    let kept = |cause| SelfRefreshOutcome::KeptExisting { cause };
+    let kept = |cause| SelfRefreshOutcome::KeptExisting {
+        cause,
+        credential_exp: current_exp,
+    };
 
     let url = format!(
         "{}/devices/{}/refresh-token",
@@ -1845,7 +1898,11 @@ pub(crate) enum SelfRefreshOutcome {
     /// No currently-valid device JWT to present — no request was made.
     NotAttempted,
     /// A request was made and the existing JWT was left in place.
-    KeptExisting { cause: KeptExistingCause },
+    /// `credential_exp` is that JWT's decoded `exp`.
+    KeptExisting {
+        cause: KeptExistingCause,
+        credential_exp: Option<i64>,
+    },
 }
 
 impl SelfRefreshOutcome {
@@ -1860,7 +1917,7 @@ impl SelfRefreshOutcome {
     /// The kept-existing cause, iff a request was made and failed.
     pub(crate) fn kept_existing_cause(&self) -> Option<KeptExistingCause> {
         match self {
-            SelfRefreshOutcome::KeptExisting { cause } => Some(*cause),
+            SelfRefreshOutcome::KeptExisting { cause, .. } => Some(*cause),
             _ => None,
         }
     }
@@ -4873,63 +4930,101 @@ async fn store_write_off_runtime<R: Send + 'static>(
 /// `tenant`, and seeding either slot with that credential would be the exact
 /// cross-tenant substitution `select_device_bearer` refuses by design. A
 /// `None` return (mismatch, or any other failure) leaves this slot cleared.
+///
+/// ## Compare-and-clear
+///
+/// `observed` is the exact slot value the pass judged dead. The clear goes
+/// through [`crate::auth::AuthManager::clear_tenant_device_jwts_if_unchanged`],
+/// so a slot another writer refreshed in the meantime — a UI sign-in,
+/// pair-cli, `qontinui_profile device pair`, a second runner sharing
+/// `auth_tokens.enc` — is NOT destroyed: the pass snapshots every slot up
+/// front and then works through them one by one, so the gap between judging B
+/// and clearing B can be a full slot refresh of A. A changed slot comes back as
+/// [`SlotClearAttempt::ChangedUnderUs`]: never counted, never logged as a
+/// clear, never re-derived.
 async fn clear_and_rederive_tenant_slot(
     auth_manager: &crate::auth::AuthManager,
     tenant: &uuid::Uuid,
+    observed: &str,
     web_base: &str,
     device_id: &str,
     cause: SlotClearCause,
     evidence: &str,
-) -> TenantSlotOutcome {
+) -> SlotClearAttempt {
     // ONE non-cancellable unit. The clear itself completes on the blocking pool
     // even if the pass is dropped at its await, so everything that must follow
     // a clear — the counters, the forensics row, the CLEARED warning, the
     // re-derive — must not be droppable either. A spawned task outlives the
     // `JoinHandle` dropped with an abandoned pass (PASS_BOUND); before this, a
     // slot could vanish with no forensic line at all.
-    let (mgr, t, web, did, ev) = (
+    let (mgr, t, obs, web, did, ev) = (
         auth_manager.clone(),
         *tenant,
+        observed.to_string(),
         web_base.to_string(),
         device_id.to_string(),
         evidence.to_string(),
     );
     match tokio::spawn(async move {
-        clear_and_rederive_tenant_slot_unit(&mgr, &t, &web, &did, cause, &ev).await
+        clear_and_rederive_tenant_slot_unit(&mgr, &t, obs, &web, &did, cause, &ev).await
     })
     .await
     {
         Ok(o) => o,
         Err(e) => {
             warn!("device_jwt_refresher: tenant {tenant} slot clear task failed: {e}");
-            TenantSlotOutcome::KeptExisting {
+            SlotClearAttempt::Done(TenantSlotOutcome::KeptExisting {
                 cause: KeptExistingCause::Other,
-            }
+            })
         }
     }
+}
+
+/// What [`clear_and_rederive_tenant_slot`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotClearAttempt {
+    /// The slot still held the judged value; this is the pass's outcome for it
+    /// (a clear, possibly re-derived, or a failed clear that left it as-is).
+    Done(TenantSlotOutcome),
+    /// Another writer replaced the slot after the pass judged it; it was left
+    /// untouched and nothing was counted or logged as a clear.
+    ChangedUnderUs,
 }
 
 /// The body of [`clear_and_rederive_tenant_slot`], run as its own task.
 async fn clear_and_rederive_tenant_slot_unit(
     auth_manager: &crate::auth::AuthManager,
     tenant: &uuid::Uuid,
+    observed: String,
     web_base: &str,
     device_id: &str,
     cause: SlotClearCause,
     evidence: &str,
-) -> TenantSlotOutcome {
+) -> SlotClearAttempt {
     use std::sync::atomic::Ordering;
     let t = *tenant;
-    if let Err(e) =
-        store_write_off_runtime(auth_manager, move |m| m.clear_tenant_device_jwt(&t)).await
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.clear_tenant_device_jwts_if_unchanged(&[(t, observed)])
+    })
+    .await
     {
-        warn!(
-            "device_jwt_refresher: tenant {tenant} slot clear FAILED ({e}) — slot left \
-             as-is ({evidence})"
-        );
-        return TenantSlotOutcome::KeptExisting {
-            cause: KeptExistingCause::Other,
-        };
+        Ok(removed) if removed.iter().any(|(_, r)| *r) => {}
+        Ok(_) => {
+            info!(
+                "device_jwt_refresher: tenant {tenant} slot changed after this pass judged \
+                 it ({evidence}) — another writer stored a new value; NOT cleared"
+            );
+            return SlotClearAttempt::ChangedUnderUs;
+        }
+        Err(e) => {
+            warn!(
+                "device_jwt_refresher: tenant {tenant} slot clear FAILED ({e}) — slot left \
+                 as-is ({evidence})"
+            );
+            return SlotClearAttempt::Done(TenantSlotOutcome::KeptExisting {
+                cause: KeptExistingCause::Other,
+            });
+        }
     }
     match cause {
         SlotClearCause::DecodedExpiry => CLEARED_ON_EXPIRY_TOTAL.fetch_add(1, Ordering::Relaxed),
@@ -4954,10 +5049,10 @@ async fn clear_and_rederive_tenant_slot_unit(
             "device_jwt_refresher: tenant {tenant} slot cleared but no web backend URL \
              is configured — cannot re-derive this pass"
         );
-        return TenantSlotOutcome::Cleared {
+        return SlotClearAttempt::Done(TenantSlotOutcome::Cleared {
             cause,
             rederived: false,
-        };
+        });
     }
     // expected_tenant = Some(*tenant): a mismatched mint is already refused
     // (both slots) inside try_device_machine_key_exchange, so a `Some` here
@@ -4965,10 +5060,10 @@ async fn clear_and_rederive_tenant_slot_unit(
     let Some(jwt) =
         try_device_machine_key_exchange(auth_manager, web_base, device_id, Some(*tenant)).await
     else {
-        return TenantSlotOutcome::Cleared {
+        return SlotClearAttempt::Done(TenantSlotOutcome::Cleared {
             cause,
             rederived: false,
-        };
+        });
     };
     let jwt_len = jwt.len();
     match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &jwt)).await
@@ -4982,17 +5077,42 @@ async fn clear_and_rederive_tenant_slot_unit(
             // LATCHED: re-derive succeeds, rung 1 says `live`, and the next
             // pass's rung 5 read the dead credential's streak back.
             reset_upstream_rejections_for(Some(*tenant));
-            TenantSlotOutcome::Cleared {
+            SlotClearAttempt::Done(TenantSlotOutcome::Cleared {
                 cause,
                 rederived: true,
-            }
+            })
         }
         Err(e) => {
             warn!("device_jwt_refresher: tenant {tenant} re-derived slot persist failed: {e}");
-            TenantSlotOutcome::Cleared {
+            SlotClearAttempt::Done(TenantSlotOutcome::Cleared {
                 cause,
                 rederived: false,
+            })
+        }
+    }
+}
+
+/// Map a [`SlotClearAttempt`] to the slot's pass outcome and health evidence.
+/// A slot changed under the pass is `KeptExisting { Other }` — not a clear —
+/// and its snapshot observation is demoted to UNKNOWN so the posture does not
+/// speak from a value the store no longer holds.
+fn settle_clear_attempt(
+    attempt: SlotClearAttempt,
+    evidence: String,
+    slot_seen: &mut [(uuid::Uuid, Option<i64>, bool, bool)],
+) -> (TenantSlotOutcome, String) {
+    match attempt {
+        SlotClearAttempt::Done(o) => (o, evidence),
+        SlotClearAttempt::ChangedUnderUs => {
+            if let Some(last) = slot_seen.last_mut() {
+                last.3 = true;
             }
+            (
+                TenantSlotOutcome::KeptExisting {
+                    cause: KeptExistingCause::Other,
+                },
+                format!("{evidence} — but another writer replaced the slot first; NOT cleared"),
+            )
         }
     }
 }
@@ -5118,8 +5238,9 @@ pub(crate) async fn refresh_tenant_slots(
         }
     }
     for (tenant, read) in reads {
-        let token = match read {
-            Ok(Some(t)) if !t.trim().is_empty() => t.trim().to_string(),
+        // `raw` is the exact stored value — what a compare-and-clear must match.
+        let raw = match read {
+            Ok(Some(t)) if !t.trim().is_empty() => t,
             Ok(_) => {
                 // Empty slot: nothing to refresh, and nothing to clear.
                 let o = TenantSlotOutcome::SkippedNoToken;
@@ -5145,6 +5266,7 @@ pub(crate) async fn refresh_tenant_slots(
                 continue;
             }
         };
+        let token = raw.trim().to_string();
         let exp = crate::auth::decode_jwt_exp(&token);
         slot_seen.push((tenant, exp, true, false));
         match plan_tenant_slot(exp, now) {
@@ -5168,15 +5290,17 @@ pub(crate) async fn refresh_tenant_slots(
                         "slot value is opaque — no decodable exp, cannot be presented".to_string()
                     }
                 };
-                let o = clear_and_rederive_tenant_slot(
+                let attempt = clear_and_rederive_tenant_slot(
                     auth_manager,
                     &tenant,
+                    &raw,
                     web_base,
                     device_id,
                     SlotClearCause::DecodedExpiry,
                     &evidence,
                 )
                 .await;
+                let (o, evidence) = settle_clear_attempt(attempt, evidence, &mut slot_seen);
                 health.push(health_row(&tenant, o, evidence));
                 outcomes.push((tenant, o));
                 continue;
@@ -5231,15 +5355,17 @@ pub(crate) async fn refresh_tenant_slots(
                 // already expired, so keeping it only re-enters the absorbing
                 // state on the next pass.
                 let evidence = format!("coord rejected the presented slot token: HTTP {status}");
-                let o = clear_and_rederive_tenant_slot(
+                let attempt = clear_and_rederive_tenant_slot(
                     auth_manager,
                     &tenant,
+                    &raw,
                     web_base,
                     device_id,
                     SlotClearCause::CoordRejection,
                     &evidence,
                 )
                 .await;
+                let (o, evidence) = settle_clear_attempt(attempt, evidence, &mut slot_seen);
                 health.push(health_row(&tenant, o, evidence));
                 outcomes.push((tenant, o));
                 continue;
@@ -5931,6 +6057,12 @@ async fn refresher_loop(
 /// Phase 2 step 3 (plan 2026-10-09-…-only-refresh-window): those causes used to
 /// be discarded right here, so a slot inside its window that failed on transport
 /// waited a flat 300 s.
+///
+/// The third value is the earliest `exp` among slots that failed to renew on a
+/// retry-worthy cause (transport, 5xx, 429) — read back from the store in one
+/// blocking hop, only when there is such a slot — and it is already folded into
+/// a rate-limited hint ([`with_unrenewed_deadline`]); the caller passes it on so
+/// a later 429 in the same pass (the legacy self-refresh) folds it too.
 pub(crate) async fn tenant_slot_stage(
     auth_manager: &crate::auth::AuthManager,
     coord_base: &str,
@@ -5938,10 +6070,44 @@ pub(crate) async fn tenant_slot_stage(
     device_id: &str,
     app: Option<&tauri::AppHandle>,
     pins: PosturePinInputs,
-) -> (Vec<(uuid::Uuid, TenantSlotOutcome)>, PassRetryHint) {
+) -> (
+    Vec<(uuid::Uuid, TenantSlotOutcome)>,
+    PassRetryHint,
+    Option<i64>,
+) {
     let outcomes =
         refresh_tenant_slots(auth_manager, coord_base, web_base, device_id, app, pins).await;
     let hint = pass_retry_hint(outcomes.iter().filter_map(|(_, o)| o.kept_existing_cause()));
+    let unrenewed: Vec<uuid::Uuid> = outcomes
+        .iter()
+        .filter(|(_, o)| {
+            matches!(
+                o.kept_existing_cause(),
+                Some(
+                    KeptExistingCause::Transport
+                        | KeptExistingCause::Upstream5xx
+                        | KeptExistingCause::RateLimited { .. }
+                )
+            )
+        })
+        .map(|(t, _)| *t)
+        .collect();
+    let unrenewed_exp = if unrenewed.is_empty() {
+        None
+    } else {
+        let mgr = auth_manager.clone();
+        spawn_blocking_tracked(move || {
+            unrenewed
+                .iter()
+                .filter_map(|t| mgr.get_tenant_device_jwt(t).ok().flatten())
+                .filter_map(|v| crate::auth::decode_jwt_exp(v.trim()))
+                .min()
+        })
+        .await
+        .ok()
+        .flatten()
+    };
+    let hint = with_unrenewed_deadline(hint, unrenewed_exp);
     if !outcomes.is_empty() {
         let refreshed = outcomes
             .iter()
@@ -5953,22 +6119,29 @@ pub(crate) async fn tenant_slot_stage(
             outcomes.len()
         );
     }
-    (outcomes, hint)
+    (outcomes, hint, unrenewed_exp)
 }
 
 /// The legacy arm's self-refresh, with its kept-existing cause folded into the
-/// hint the slot stage produced.
+/// hint the slot stage produced. `unrenewed_exp` is the slot stage's earliest
+/// unrenewed `exp`; it, and the legacy credential's own `exp` when its refresh
+/// failed, bound a rate-limited wait.
 pub(crate) async fn legacy_self_refresh_stage(
     auth_manager: &crate::auth::AuthManager,
     coord_base: &str,
     device_id: &str,
     hint: PassRetryHint,
+    unrenewed_exp: Option<i64>,
 ) -> (SelfRefreshOutcome, PassRetryHint) {
     let outcome = try_device_self_refresh(auth_manager, coord_base, device_id).await;
-    let hint = match outcome.kept_existing_cause() {
-        Some(cause) => fold_retry_hint(hint, cause),
-        None => hint,
+    let (hint, legacy_exp) = match &outcome {
+        SelfRefreshOutcome::KeptExisting {
+            cause,
+            credential_exp,
+        } => (fold_retry_hint(hint, *cause), *credential_exp),
+        _ => (hint, None),
     };
+    let hint = with_unrenewed_deadline(hint, min_exp(unrenewed_exp, legacy_exp));
     (outcome, hint)
 }
 
@@ -5988,6 +6161,9 @@ async fn refresher_pass(
     stage: &PassStageCell,
 ) -> PassOutput {
     let mut hint = PassRetryHint::None;
+    // Earliest `exp` among slots this pass failed to renew (see
+    // `tenant_slot_stage`); bounds a later 429's wait.
+    let mut unrenewed_exp: Option<i64> = None;
 
     // Heal a vanished `paired_user.json` from valid per-tenant slots
     // BEFORE anything below reads it, so the tier (`device_is_paired`),
@@ -6127,7 +6303,7 @@ async fn refresher_pass(
                 // Empty simply disables re-derivation for the pass.
                 let (slot_web_base, _slot_web_arm) = resolve_pair_base(&settings_snapshot);
                 stage.set(PassStage::TenantSlotPass);
-                hint = tenant_slot_stage(
+                let (_, slot_hint, slot_unrenewed) = tenant_slot_stage(
                     auth_manager,
                     &coord_base,
                     &slot_web_base,
@@ -6135,8 +6311,9 @@ async fn refresher_pass(
                     Some(&api_state.app_handle),
                     sweep_inputs.posture_pin_inputs(),
                 )
-                .await
-                .1;
+                .await;
+                hint = slot_hint;
+                unrenewed_exp = slot_unrenewed;
             }
             None => warn!(
                 "device_jwt_refresher: tenant device-JWT slots present but no device_id \
@@ -6237,7 +6414,8 @@ async fn refresher_pass(
                     crate::coord_mcp::coord_base_url_with_source();
                 stage.set(PassStage::SelfRefresh);
                 let (self_refresh, folded) =
-                    legacy_self_refresh_stage(auth_manager, &coord_base, &did, hint).await;
+                    legacy_self_refresh_stage(auth_manager, &coord_base, &did, hint, unrenewed_exp)
+                        .await;
                 hint = folded;
                 if let SelfRefreshOutcome::Refreshed(new_jwt) = self_refresh {
                     info!(
@@ -6603,16 +6781,22 @@ pub mod commands {
 /// A base URL whose listener ACCEPTS and immediately DROPS every connection, so
 /// a request to it fails at the transport layer with no HTTP status. Used
 /// instead of bind-0-then-drop, whose freed port another test can grab.
+///
+/// ONE listener (and one accept thread) for the whole test binary.
 #[cfg(test)]
 pub(crate) fn accept_and_drop_base() -> String {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = l.local_addr().expect("addr").port();
-    std::thread::spawn(move || {
-        for conn in l.incoming() {
-            drop(conn);
-        }
-    });
-    format!("http://127.0.0.1:{port}")
+    static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for conn in l.incoming() {
+                drop(conn);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    })
+    .clone()
 }
 #[cfg(test)]
 mod tests {
@@ -7824,10 +8008,8 @@ mod device_self_refresh_tests {
 
         let got = try_device_self_refresh(&mgr, &base, DID).await;
         assert_eq!(
-            got,
-            SelfRefreshOutcome::KeptExisting {
-                cause: KeptExistingCause::Upstream5xx
-            }
+            got.kept_existing_cause(),
+            Some(KeptExistingCause::Upstream5xx)
         );
         assert_eq!(*cap.hits.lock().unwrap(), 1);
         assert_eq!(mgr.get_access_token().unwrap(), existing);
@@ -7845,7 +8027,7 @@ mod device_self_refresh_tests {
         let (base, _cap, _shutdown) =
             spawn_mock(StatusCode::BAD_GATEWAY, r#"{"error":"down"}"#.to_string());
         let (outcome, hint) =
-            legacy_self_refresh_stage(&mgr, &base, DID, PassRetryHint::None).await;
+            legacy_self_refresh_stage(&mgr, &base, DID, PassRetryHint::None, None).await;
         assert_eq!(
             outcome.kept_existing_cause(),
             Some(KeptExistingCause::Upstream5xx)
@@ -7856,8 +8038,18 @@ mod device_self_refresh_tests {
             retry_after: Some(Duration::from_secs(90)),
             deadline: None,
         };
-        let (_, hint) = legacy_self_refresh_stage(&mgr, &base, DID, limited).await;
-        assert_eq!(hint, limited);
+        let (_, hint) = legacy_self_refresh_stage(&mgr, &base, DID, limited, None).await;
+        // Still rate-limited, now bounded by the legacy credential's own exp.
+        assert!(
+            matches!(
+                hint,
+                PassRetryHint::RateLimited {
+                    retry_after: Some(r),
+                    deadline: Some(_),
+                } if r == Duration::from_secs(90)
+            ),
+            "{hint:?}"
+        );
     }
 
     /// Coord unreachable: `Transport`, existing JWT untouched.
@@ -7873,10 +8065,8 @@ mod device_self_refresh_tests {
 
         let got = try_device_self_refresh(&mgr, &dead_base, DID).await;
         assert_eq!(
-            got,
-            SelfRefreshOutcome::KeptExisting {
-                cause: KeptExistingCause::Transport
-            }
+            got.kept_existing_cause(),
+            Some(KeptExistingCause::Transport)
         );
         assert_eq!(mgr.get_access_token().unwrap(), existing);
     }
@@ -8419,6 +8609,108 @@ mod tenant_slot_refresh_tests {
         assert_eq!(wait, Some(Duration::from_secs(42)));
     }
 
+    /// SHOULD-FIX (round 2): the pass judges a slot from its SNAPSHOT, then
+    /// clears it after other slots' network work — another writer can store a
+    /// fresh credential in between. The clear must compare-and-clear: the fresh
+    /// token survives, and nothing is counted or logged as a clear.
+    #[tokio::test]
+    async fn a_slot_replaced_after_the_snapshot_is_not_cleared() {
+        use std::sync::atomic::Ordering;
+        let _serialised = health_lock();
+        let mgr = test_auth_manager("clear_compare_and_clear");
+        let ta = tenant(0);
+        let now = chrono::Utc::now().timestamp();
+        let snapshot = synth_jwt(now - 60, "judged-dead");
+        mgr.store_tenant_device_jwt(&ta, &snapshot).expect("slot a");
+        // Another writer refreshes the slot after the pass took its snapshot.
+        let fresh = synth_jwt(now + 4 * 60 * 60, "fresh-from-sign-in");
+        mgr.store_tenant_device_jwt(&ta, &fresh).expect("fresh");
+        let before_exp = CLEARED_ON_EXPIRY_TOTAL.load(Ordering::Relaxed);
+        let before_rej = CLEARED_ON_REJECTION_TOTAL.load(Ordering::Relaxed);
+
+        for cause in [
+            SlotClearCause::DecodedExpiry,
+            SlotClearCause::CoordRejection,
+        ] {
+            let got = clear_and_rederive_tenant_slot(
+                &mgr,
+                &ta,
+                &snapshot,
+                "",
+                DID,
+                cause,
+                "test: judged from the snapshot",
+            )
+            .await;
+            assert_eq!(got, SlotClearAttempt::ChangedUnderUs, "{cause:?}");
+        }
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(fresh.as_str()),
+            "the fresh credential must survive"
+        );
+        assert_eq!(CLEARED_ON_EXPIRY_TOTAL.load(Ordering::Relaxed), before_exp);
+        assert_eq!(
+            CLEARED_ON_REJECTION_TOTAL.load(Ordering::Relaxed),
+            before_rej
+        );
+
+        // And the pass maps it to a kept-existing, never a clear.
+        let mut seen = vec![(ta, Some(now - 60), true, false)];
+        let (o, ev) = settle_clear_attempt(SlotClearAttempt::ChangedUnderUs, "e".into(), &mut seen);
+        assert_eq!(
+            o,
+            TenantSlotOutcome::KeptExisting {
+                cause: KeptExistingCause::Other
+            }
+        );
+        assert!(ev.contains("NOT cleared"), "{ev}");
+        assert!(
+            seen[0].3,
+            "the stale snapshot no longer speaks for the posture"
+        );
+    }
+
+    /// Nit (a): a 429 on one slot must not park the loop past a DIFFERENT
+    /// slot's expiry when that slot failed transiently in the same pass.
+    #[tokio::test]
+    async fn a_429_wait_is_bounded_by_a_transiently_failed_sibling_slot() {
+        let _serialised = health_lock();
+        let mgr = test_auth_manager("multi_slot_429_and_transient");
+        let (ta, tb) = (tenant(0), tenant(1));
+        let now = chrono::Utc::now().timestamp();
+        // A: rate-limited (Retry-After 42 s from the mock), 110 min left.
+        let jwt_a = synth_jwt(now + 110 * 60, "limited");
+        // B: coord answers 503, only 10 min left.
+        let jwt_b = synth_jwt(now + 10 * 60, "failing");
+        mgr.store_tenant_device_jwt(&ta, &jwt_a).expect("slot a");
+        mgr.store_tenant_device_jwt(&tb, &jwt_b).expect("slot b");
+        let (base, _cap, _shutdown) = spawn_mock(vec![(jwt_a.clone(), 429), (jwt_b.clone(), 503)]);
+        let (_, hint, unrenewed) =
+            tenant_slot_stage(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(unrenewed, Some(now + 10 * 60));
+        assert_eq!(
+            hint,
+            PassRetryHint::RateLimited {
+                retry_after: Some(Duration::from_secs(42)),
+                deadline: Some(now + 10 * 60),
+            }
+        );
+        // With a long Retry-After, B's expiry is what bounds the wait.
+        let long = PassRetryHint::RateLimited {
+            retry_after: Some(Duration::from_secs(3600)),
+            deadline: None,
+        };
+        let w = wait_after_pass(
+            None,
+            with_unrenewed_deadline(long, unrenewed),
+            &mut RefreshBackoff::default(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(w, Duration::from_secs(10 * 60) - RATE_LIMIT_EXPIRY_MARGIN);
+    }
+
     /// The pass's WIRED slot stage ([`tenant_slot_stage`], what `refresher_pass`
     /// calls): coord down while the slot is inside its window -> the stage hands
     /// back a `Transient` hint, and the next wake is on the transient backoff,
@@ -8433,8 +8725,13 @@ mod tenant_slot_refresh_tests {
         let jwt = synth_jwt(now + 100 * 60, "outage-in-window");
         mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
         let dead_base = accept_and_drop_base();
-        let (outcomes, hint) =
+        let (outcomes, hint, unrenewed) =
             tenant_slot_stage(&mgr, &dead_base, "", DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(
+            unrenewed,
+            Some(now + 100 * 60),
+            "the failed slot's exp is carried out"
+        );
         assert_eq!(
             outcomes,
             vec![(
@@ -8466,12 +8763,16 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&ta, &synth_jwt(now - 60, "dead"))
             .expect("slot a");
         let before = CLEARED_ON_EXPIRY_TOTAL.load(Ordering::Relaxed);
+        // (`synth_jwt` is deterministic, so `dead` below is byte-identical to
+        // the stored value — the compare-and-clear matches.)
 
         // Poll exactly once, then drop: the clear's write is now on the
         // blocking pool and the caller is gone.
+        let dead = synth_jwt(now - 60, "dead");
         let fut = clear_and_rederive_tenant_slot(
             &mgr,
             &ta,
+            &dead,
             "",
             DID,
             SlotClearCause::DecodedExpiry,
@@ -13861,6 +14162,18 @@ mod refresh_window_outage_tests {
             parse_retry_after_at(Some(date), at + 30),
             Some(Duration::ZERO)
         );
+        // The two obsolete forms RFC 9110 still requires recipients to accept.
+        let imf = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let t = chrono::DateTime::parse_from_rfc2822(imf)
+            .unwrap()
+            .timestamp();
+        for obsolete in ["Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"] {
+            assert_eq!(
+                parse_retry_after_at(Some(obsolete), t - 60),
+                Some(Duration::from_secs(60)),
+                "{obsolete}"
+            );
+        }
     }
 
     #[test]
@@ -13999,6 +14312,24 @@ mod refresh_window_outage_tests {
             credential_exp: Some(NOW + 30),
         }]);
         assert_eq!(wait(None, hint), Some(TRANSIENT_BACKOFF_MIN));
+        // `with_unrenewed_deadline` tightens, never loosens, and leaves a
+        // non-rate-limited hint alone.
+        let h = PassRetryHint::RateLimited {
+            retry_after: None,
+            deadline: Some(NOW + 600),
+        };
+        assert_eq!(
+            with_unrenewed_deadline(h, Some(NOW + 300)),
+            PassRetryHint::RateLimited {
+                retry_after: None,
+                deadline: Some(NOW + 300)
+            }
+        );
+        assert_eq!(with_unrenewed_deadline(h, Some(NOW + 900)), h);
+        assert_eq!(
+            with_unrenewed_deadline(PassRetryHint::Transient, Some(NOW)),
+            PassRetryHint::Transient
+        );
         // Several rate-limited credentials: the EARLIEST one bounds the wait.
         let hint = pass_retry_hint([
             KeptExistingCause::RateLimited {

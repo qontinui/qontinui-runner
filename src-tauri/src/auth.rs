@@ -5809,7 +5809,7 @@ mod device_jwt_tests {
     /// opaque or absent token is not.
     #[test]
     fn device_jwt_is_live_keys_on_expiry_not_the_refresh_threshold() {
-        let mgr = create_test_auth_manager("device_jwt_is_live_expiry");
+        let mgr = no_keychain_auth_manager("device_jwt_is_live_expiry");
         let now = chrono::Utc::now().timestamp();
         assert!(!mgr.device_jwt_is_live().unwrap(), "absent is not live");
         mgr.store_tokens(&synth_jwt(now + 100 * 60), "").unwrap();
@@ -5851,9 +5851,17 @@ mod device_jwt_tests {
     /// The TTL/2 boundary on the predicate itself, not only on the constant:
     /// a JWT 100 minutes from expiry was "fresh" under TTL/3 and is inside
     /// the window now; one 130 minutes out is still fresh.
+    /// As `create_test_auth_manager`, but never touching the OS keychain.
+    fn no_keychain_auth_manager(test_name: &str) -> AuthManager {
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_device_jwt");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        let _ = fs::remove_file(&storage_path);
+        AuthManager::with_storage_no_keychain(SecureStorage::with_path(storage_path).unwrap())
+    }
+
     #[test]
     fn needs_refresh_boundary_moves_to_ttl_over_two() {
-        let mgr = create_test_auth_manager("needs_refresh_boundary_ttl_over_two");
+        let mgr = no_keychain_auth_manager("needs_refresh_boundary_ttl_over_two");
         let now = chrono::Utc::now().timestamp();
         mgr.store_tokens(&synth_jwt(now + 100 * 60), "").unwrap();
         assert!(
