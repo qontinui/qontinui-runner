@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 
 use super::app_discovery::DiscoveredApp;
 use super::app_registry::{AppRegistry, AppTransport};
-use super::command_relay::{CommandRelay, CommandResponse, WrapperFailure};
+use super::command_relay::{CommandRelay, CommandResponse, ResolveOutcome, WrapperFailure};
 use super::origin_guard::{NormOrigin, RequesterPrincipal};
 use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState, RULE_R6};
 use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
@@ -876,36 +876,20 @@ async fn handle_inbound_text(
         Err(e) => {
             warn!("[ws-relay] invalid inbound frame from '{}': {}", app_id, e);
             // A response frame that names its command still ANSWERS it, even
-            // when another field is unreadable: resolve that command now with
-            // a typed failure instead of leaving it to the 30 s timeout,
-            // which would report a wrapper that answered in a millisecond as
-            // one that never answered (coord finding `fb3fb468`).
+            // when another field is unreadable: settle that command now
+            // instead of leaving it to the 30 s timeout, which would report an
+            // app that answered in a millisecond as one that never answered
+            // (coord finding `fb3fb468`). It settles as UNREADABLE — never as
+            // the app's own failure, since what the app reported is unknown.
             if let Some(command_id) = unreadable_response_command_id(text) {
-                let response = CommandResponse {
-                    command_id,
-                    success: false,
-                    result: None,
-                    error: Some(WrapperFailure {
-                        code: Some(MALFORMED_RESPONSE_FRAME.to_string()),
-                        message: format!(
-                            "the wrapper answered this command, but the runner could not \
-                             read its response frame: {e}"
-                        ),
-                        retryable: None,
-                    }),
-                };
-                resolve_inbound_response(
-                    app_id, conn_id, mode, principal, binding, relay, response,
-                )
-                .await;
+                let outcome = relay
+                    .resolve_unreadable(conn_id, mode, &command_id, e.to_string())
+                    .await;
+                meter_resolve_outcome(app_id, mode, principal, binding, &command_id, outcome);
             }
         }
     }
 }
-
-/// `code` of the failure a command resolves with when the wrapper's
-/// response frame named the command but could not be read.
-const MALFORMED_RESPONSE_FRAME: &str = "MALFORMED_RESPONSE_FRAME";
 
 /// The `commandId` of a frame that failed to parse as an [`InboundFrame`] but
 /// is still recognisably a `response`: a JSON object with `type: "response"`
@@ -919,8 +903,8 @@ fn unreadable_response_command_id(text: &str) -> Option<String> {
     (!command_id.is_empty()).then(|| command_id.to_string())
 }
 
-/// Hand an inbound response to the relay under R3's connection binding: the
-/// one path every `response` frame takes, readable or not.
+/// Hand a readable inbound response to the relay under R3's connection
+/// binding.
 async fn resolve_inbound_response(
     app_id: &str,
     conn_id: u64,
@@ -932,6 +916,19 @@ async fn resolve_inbound_response(
 ) {
     let command_id = response.command_id.clone();
     let outcome = relay.resolve(conn_id, mode, response).await;
+    meter_resolve_outcome(app_id, mode, principal, binding, &command_id, outcome);
+}
+
+/// Count or log what R3 made of a `response` frame — readable or not, every
+/// one is metered here.
+fn meter_resolve_outcome(
+    app_id: &str,
+    mode: BindingMode,
+    principal: &Principal,
+    binding: &Arc<RelayBinding>,
+    command_id: &str,
+    outcome: ResolveOutcome,
+) {
     if outcome.not_yours {
         // Counted on `/health` under R3 — `meter` returns the refusal
         // in `enforce`, and there is no frame to send it in.
@@ -1229,8 +1226,9 @@ mod tests {
     }
 
     /// A response frame that names its command but carries a field the
-    /// runner cannot read still ANSWERS that command: it resolves with a
-    /// typed `MALFORMED_RESPONSE_FRAME` failure, not a 30 s timeout.
+    /// runner cannot read still ANSWERS that command: it settles at once as
+    /// `UnreadableResponse` — not a 30 s timeout, and never a `WrapperError`,
+    /// because what the app reported is unknown.
     #[tokio::test]
     async fn an_unreadable_response_frame_resolves_its_command_with_a_typed_failure() {
         let got = dispatch_answered_by("click", |id| {
@@ -1238,18 +1236,10 @@ mod tests {
         })
         .await;
         match got {
-            Err(CommandRelayError::WrapperError(failure)) => {
-                assert_eq!(failure.code.as_deref(), Some(MALFORMED_RESPONSE_FRAME));
-                assert!(
-                    failure
-                        .message
-                        .contains("could not read its response frame"),
-                    "{}",
-                    failure.message
-                );
-                assert_eq!(failure.retryable, None, "retryability is UNKNOWN here");
+            Err(err @ CommandRelayError::UnreadableResponse(_)) => {
+                assert!(err.to_string().contains("could not be read"), "{err}");
             }
-            other => panic!("expected MALFORMED_RESPONSE_FRAME, got {other:?}"),
+            other => panic!("expected UnreadableResponse, got {other:?}"),
         }
     }
 
