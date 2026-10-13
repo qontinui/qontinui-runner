@@ -249,6 +249,18 @@ impl AppDispatcher {
                     .text()
                     .await
                     .unwrap_or_else(|_| "<unreadable body>".to_string());
+                let json: Option<serde_json::Value> = serde_json::from_str(&body).ok();
+                // An app that ANSWERED `{success:false, error, code?}` reported
+                // its own failure, whatever the status. This is the mapping
+                // the SDK-connection path makes (`http_dispatch_inner`), so
+                // the app's code reaches `/apps/{id}/dispatch` as the app's
+                // failure, instead of a 200 whose `data` buries it.
+                if let Some(answered) = json
+                    .as_ref()
+                    .and_then(|json| app_answered_failure(&url, status.as_u16(), json))
+                {
+                    return Err(answered);
+                }
                 if !status.is_success() {
                     return Err(DispatchError::HttpStatus {
                         url,
@@ -256,7 +268,7 @@ impl AppDispatcher {
                         body,
                     });
                 }
-                serde_json::from_str(&body).map_err(|_| DispatchError::InvalidJson(body))
+                json.ok_or_else(|| DispatchError::InvalidJson(body))
             }
         }
     }
