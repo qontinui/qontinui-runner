@@ -1864,6 +1864,9 @@ fn build_device_capabilities(
 /// registration names it verbatim.
 pub const EXPEDITE_REVIEW_CAPABILITY: &str = "skill:expedite-review";
 
+/// The skill the capability stands for, as named in the served corpus.
+pub const EXPEDITE_REVIEW_SKILL: &str = "expedite-review";
+
 /// The skill-capability tokens, from the two facts above. Pure.
 fn skill_capabilities(expedite_review_served: bool, device_jwt_live: bool) -> Vec<String> {
     if expedite_review_served && device_jwt_live {
@@ -1871,6 +1874,13 @@ fn skill_capabilities(expedite_review_served: bool, device_jwt_live: bool) -> Ve
     } else {
         Vec::new()
     }
+}
+
+/// The heartbeat's skill-capability tokens: asks `served` about EXACTLY the
+/// skill the token stands for. Split out so a test pins the name the heartbeat
+/// looks up, not just the AND.
+fn skill_capability_tokens(served: impl Fn(&str) -> bool, device_jwt_live: bool) -> Vec<String> {
+    skill_capabilities(served(EXPEDITE_REVIEW_SKILL), device_jwt_live)
 }
 
 /// True when a PowerShell interpreter resolves on PATH — `pwsh` (PowerShell 7,
@@ -2233,8 +2243,8 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     // heartbeat presents is a live device JWT.
     let device_jwt_live = crate::auth::device_bearer_scoped(bearer_scope)
         .is_some_and(|t| crate::auth::slot_jwt_is_usable(&t));
-    capabilities.extend(skill_capabilities(
-        crate::fleet_skills::skill_is_served("expedite-review"),
+    capabilities.extend(skill_capability_tokens(
+        crate::fleet_skills::skill_is_served,
         device_jwt_live,
     ));
     let ci_runner_labels = if ci.enabled {
@@ -7702,6 +7712,22 @@ mod tests {",
         assert!(skill_capabilities(false, true).is_empty(), "skill not served");
         assert!(skill_capabilities(false, false).is_empty());
         assert_eq!(EXPEDITE_REVIEW_CAPABILITY, "skill:expedite-review");
+    }
+
+    /// The heartbeat asks the served corpus about exactly `expedite-review`.
+    #[test]
+    fn skill_capability_tokens_look_up_the_expedite_review_skill() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let served = |name: &str| {
+            asked.borrow_mut().push(name.to_string());
+            name == "expedite-review"
+        };
+        assert_eq!(
+            skill_capability_tokens(served, true),
+            vec![EXPEDITE_REVIEW_CAPABILITY.to_string()]
+        );
+        assert_eq!(asked.borrow().as_slice(), ["expedite-review".to_string()]);
+        assert!(skill_capability_tokens(|_| false, true).is_empty());
     }
 
     /// The populated wire shape: every advertised token appears verbatim, in
