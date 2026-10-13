@@ -181,6 +181,7 @@ describe("registered actions — the cost/destruction declarations are not empty
         .sort(),
     ).toEqual([
       "terminal.analyze",
+      "terminal.elevated",
       "terminal.generate-workflow",
       "terminal.orchestrate",
       "terminal.plan-implement",
