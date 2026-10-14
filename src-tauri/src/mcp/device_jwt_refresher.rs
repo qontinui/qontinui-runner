@@ -521,11 +521,12 @@ pub(crate) enum PassStage {
     CognitoRefresh,
     PairCli,
     MachineKeyExchange,
+    ConcludeRecovery,
     KickRelay,
 }
 
 impl PassStage {
-    const ALL: [PassStage; 13] = [
+    const ALL: [PassStage; 14] = [
         PassStage::Start,
         PassStage::HealBindingStore,
         PassStage::ReadNeedsRefresh,
@@ -538,6 +539,7 @@ impl PassStage {
         PassStage::CognitoRefresh,
         PassStage::PairCli,
         PassStage::MachineKeyExchange,
+        PassStage::ConcludeRecovery,
         PassStage::KickRelay,
     ];
 
@@ -556,6 +558,7 @@ impl PassStage {
             PassStage::CognitoRefresh => "cognito-refresh",
             PassStage::PairCli => "pair-cli",
             PassStage::MachineKeyExchange => "machine-key-exchange",
+            PassStage::ConcludeRecovery => "conclude-recovery",
             PassStage::KickRelay => "kick-relay",
         }
     }
@@ -1867,6 +1870,10 @@ pub(crate) struct PairMintRequest<'a> {
     pub machine_tenant: Option<uuid::Uuid>,
     /// Device id for the device-machine-key fallback; `None` disables it.
     pub dmk_device_id: Option<&'a str>,
+    /// The pass's stage cell, so a pass abandoned inside the mint names the
+    /// sub-step ([`PassStage::MachineKeyExchange`],
+    /// [`PassStage::ConcludeRecovery`]). `None` outside a refresher pass.
+    pub stage: Option<&'a PassStageCell>,
 }
 
 /// What one `Pair`-arm mint attempt concluded.
@@ -1931,7 +1938,10 @@ pub(crate) async fn attempt_pair_mint(
         PairBearer::Present(t) | PairBearer::DeadSlot(t) => t.as_str(),
         PairBearer::Nothing => "",
     };
-    let outgoing_jwt = auth_manager.get_access_token().ok();
+    // Store reads go through the blocking pool: on the refresher's one-worker
+    // runtime a store-lock wait or a keychain fallback would block the very
+    // timer PASS_BOUND relies on.
+    let outgoing_jwt = access_token_off_worker(auth_manager).await;
     let resolved_tenant = resolve_pair_tenant_id(hint, outgoing_jwt.as_deref(), req.machine_tenant);
     let tenant_resolved = resolved_tenant.is_some();
 
@@ -1951,6 +1961,15 @@ pub(crate) async fn attempt_pair_mint(
             .await,
         ),
         PairBearer::DeadSlot(_) | PairBearer::Nothing => None,
+    };
+    // Read once, off the worker, only when an arm below needs it.
+    let slot_dead = match &outcome {
+        Some(RefreshOutcome::KeptExisting)
+        | Some(RefreshOutcome::PersistFailed(_))
+        | Some(RefreshOutcome::BearerRejected { .. }) => {
+            slot_jwt_is_expired_or_absent_off_worker(auth_manager).await
+        }
+        _ => false,
     };
     let progress = match &outcome {
         // D1: pair-cli skipped. A transient Cognito blip may still hand us a
@@ -1975,7 +1994,7 @@ pub(crate) async fn attempt_pair_mint(
             //     healthy (a transient coord 5xx we'll retry).
             if !tenant_resolved {
                 PairProgress::BailNoTenant
-            } else if slot_jwt_is_expired_or_absent(auth_manager) {
+            } else if slot_dead {
                 PairProgress::BailRefreshFailedExpired
             } else {
                 PairProgress::Healthy
@@ -1985,7 +2004,7 @@ pub(crate) async fn attempt_pair_mint(
         // while it is still valid the runner is healthy for now, and the
         // recorded verdict says what the next expiry will need.
         Some(RefreshOutcome::BearerRejected { status }) => {
-            if slot_jwt_is_expired_or_absent(auth_manager) {
+            if slot_dead {
                 PairProgress::BailNeedsSignIn {
                     rejected_status: Some(*status),
                 }
@@ -2027,6 +2046,9 @@ pub(crate) async fn attempt_pair_mint(
             | PairProgress::BailNeedsSignIn { .. }
     ) {
         if let Some(did) = req.dmk_device_id {
+            if let Some(stage) = req.stage {
+                stage.set(PassStage::MachineKeyExchange);
+            }
             dmk_jwt = try_device_machine_key_exchange(
                 auth_manager,
                 req.pair_base,
@@ -2067,14 +2089,21 @@ pub(crate) async fn run_pair_tick(
     req: PairMintRequest<'_>,
     posture: PassPosture<'_>,
 ) -> PairMintAttempt {
+    let stage = req.stage;
     let attempt = attempt_pair_mint(auth_manager, req).await;
+    if let Some(stage) = stage {
+        stage.set(PassStage::ConcludeRecovery);
+    }
+    // AWAITED before `note_pass_concluded` — D5's pinned order survives the
+    // move off the worker.
     conclude_default_slot_recovery(
         auth_manager,
         attempt.verdict(),
         posture.publish_legacy,
         posture.pins,
         posture.app,
-    );
+    )
+    .await;
     note_pass_concluded();
     attempt
 }
@@ -2082,17 +2111,65 @@ pub(crate) async fn run_pair_tick(
 /// Record how the `Pair` arm's recovery of the default slot concluded, and —
 /// on a runner whose coord credential IS that slot (`publish_legacy`, i.e. no
 /// per-tenant slot exists) — re-publish the posture from it.
-fn conclude_default_slot_recovery(
+///
+/// The store reads (the token the verdict is keyed by, and the legacy probe)
+/// run on the blocking pool: `get_access_token` can fall back to the keychain
+/// and any store read can wait on the cross-process lock, which on the
+/// refresher's one-worker runtime would block the worker — and with it the
+/// PASS_BOUND timer. The PUBLISH happens back on the async side, after the
+/// await, so a pass abandoned at this await publishes nothing.
+async fn conclude_default_slot_recovery(
     auth_manager: &crate::auth::AuthManager,
     verdict: DefaultSlotRecovery,
     publish_legacy: bool,
     pins: PosturePinInputs,
     app: Option<&tauri::AppHandle>,
 ) {
-    record_default_slot_recovery(verdict, auth_manager.get_access_token().ok().as_deref());
-    if publish_legacy {
-        derive_and_publish_legacy_posture(auth_manager, pins, app);
+    let mgr = auth_manager.clone();
+    let read = spawn_blocking_tracked(move || {
+        #[cfg(test)]
+        note_conclude_read_thread();
+        record_default_slot_recovery(verdict, mgr.get_access_token().ok().as_deref());
+        publish_legacy.then(|| legacy_slot_observation(mgr.probe_access_token()))
+    })
+    .await;
+    match read {
+        Ok(Some(obs)) => publish_legacy_observation(obs, pins, app),
+        Ok(None) => {}
+        Err(e) => warn!("device_jwt_refresher: recovery-conclusion task failed ({e})"),
     }
+}
+
+/// The legacy slot's token, read on the blocking pool (`None` when absent,
+/// unreadable, or the read task failed).
+async fn access_token_off_worker(auth_manager: &crate::auth::AuthManager) -> Option<String> {
+    let mgr = auth_manager.clone();
+    spawn_blocking_tracked(move || mgr.get_access_token().ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`slot_jwt_is_expired_or_absent`] on the blocking pool. A failed read task
+/// answers `true` — the same "cannot show it is live" direction the sync
+/// predicate takes for an unreadable store.
+async fn slot_jwt_is_expired_or_absent_off_worker(auth_manager: &crate::auth::AuthManager) -> bool {
+    let mgr = auth_manager.clone();
+    spawn_blocking_tracked(move || slot_jwt_is_expired_or_absent(&mgr))
+        .await
+        .unwrap_or(true)
+}
+
+/// Test probe: the thread the recovery conclusion's store reads ran on.
+#[cfg(test)]
+static CONCLUDE_READ_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_conclude_read_thread() {
+    *CONCLUDE_READ_THREAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
 }
 
 /// Coord's `POST /devices/:device_id/refresh-token` response. Only the
@@ -5458,12 +5535,27 @@ pub(crate) fn pinned_tenant_reason(
 /// `Err` both for a never-paired runner and for a present-but-undecryptable
 /// store, and collapsing the two would fire a "you have no coord credential"
 /// banner at a paired runner whose store merely failed to decrypt this tick.
+#[cfg(test)]
 fn derive_and_publish_legacy_posture(
     auth_manager: &crate::auth::AuthManager,
     pins: PosturePinInputs,
     app: Option<&tauri::AppHandle>,
 ) {
-    let obs = legacy_slot_observation(auth_manager.probe_access_token());
+    publish_legacy_observation(
+        legacy_slot_observation(auth_manager.probe_access_token()),
+        pins,
+        app,
+    );
+}
+
+/// Publish the legacy slot's posture from an observation already read — the
+/// publish half of `derive_and_publish_legacy_posture` (test-only now), for callers that
+/// read the store off the worker and publish on the async side.
+fn publish_legacy_observation(
+    obs: SlotObservation,
+    pins: PosturePinInputs,
+    app: Option<&tauri::AppHandle>,
+) {
     if let Some(transition) =
         derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
     {
@@ -7004,15 +7096,18 @@ async fn refresher_pass(
         // regressing to `expired` on every pass. Run on the blocking pool: it
         // probes the store (PASS_BOUND).
         stage.set(PassStage::LegacyPosture);
+        // Read on the blocking pool; PUBLISH here, after the await, so a pass
+        // abandoned at this await publishes nothing late.
         let mgr = std::sync::Arc::clone(auth_manager);
-        let pins = sweep_inputs.posture_pin_inputs();
-        let app = api_state.app_handle.clone();
-        if let Err(e) = spawn_blocking_tracked(move || {
-            derive_and_publish_legacy_posture(&mgr, pins, Some(&app))
-        })
-        .await
+        match spawn_blocking_tracked(move || legacy_slot_observation(mgr.probe_access_token()))
+            .await
         {
-            warn!("device_jwt_refresher: legacy posture task failed ({e})");
+            Ok(obs) => publish_legacy_observation(
+                obs,
+                sweep_inputs.posture_pin_inputs(),
+                Some(&api_state.app_handle),
+            ),
+            Err(e) => warn!("device_jwt_refresher: legacy posture task failed ({e})"),
         }
     }
 
@@ -7088,7 +7183,8 @@ async fn refresher_pass(
                         !has_tenant_slots,
                         sweep_inputs.posture_pin_inputs(),
                         Some(&api_state.app_handle),
-                    );
+                    )
+                    .await;
                     stage.set(PassStage::PublishStatus);
                     publish_coord_credential_status(
                         auth_manager,
@@ -7132,7 +7228,7 @@ async fn refresher_pass(
             let (cognito_bearer, refresh_class) = refresh_cognito_bearer(auth_manager).await;
             let bearer = pair_bearer_for(
                 cognito_bearer,
-                auth_manager.get_access_token().ok(),
+                access_token_off_worker(auth_manager).await,
                 chrono::Utc::now().timestamp(),
             );
             if bearer == PairBearer::Nothing {
@@ -7159,7 +7255,8 @@ async fn refresher_pass(
                     !has_tenant_slots,
                     sweep_inputs.posture_pin_inputs(),
                     Some(&api_state.app_handle),
-                );
+                )
+                .await;
                 // Phase 2: if the refresh token is dead
                 // (`invalid_grant`) and we also have no device-JWT
                 // bearer, fire the credential-dark notification +
@@ -7249,7 +7346,8 @@ async fn refresher_pass(
                         !has_tenant_slots,
                         sweep_inputs.posture_pin_inputs(),
                         Some(&api_state.app_handle),
-                    );
+                    )
+                    .await;
                     return PassOutput::new(PassEnd::Wait(REFRESH_CHECK_INTERVAL), hint);
                 }
             };
@@ -7294,6 +7392,7 @@ async fn refresher_pass(
                     user_id: &user_id,
                     machine_tenant,
                     dmk_device_id: dmk_device_id.as_deref(),
+                    stage: Some(stage),
                 },
                 PassPosture {
                     publish_legacy: !has_tenant_slots,
@@ -15422,6 +15521,89 @@ mod refresh_window_outage_tests {
         assert_eq!(got, Ok(out));
     }
 
+    /// Review fix: the recovery conclusion's store reads run OFF the
+    /// refresher's single worker — on another thread than the task awaiting it.
+    #[tokio::test]
+    async fn the_recovery_conclusion_reads_the_store_off_the_refresher_worker() {
+        let _serialised = posture_test_lock();
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_conclude_off_worker");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("conclude.enc");
+        let _ = std::fs::remove_file(&path);
+        let mgr = crate::auth::AuthManager::with_storage_no_keychain(
+            crate::secure_storage::SecureStorage::with_path(path).expect("storage"),
+        );
+        *CONCLUDE_READ_THREAD.lock().unwrap() = None;
+        let handle = on_refresher_runtime(move || {
+            tokio::spawn(async move {
+                let worker = std::thread::current().id();
+                conclude_default_slot_recovery(
+                    &mgr,
+                    DefaultSlotRecovery::KeptExisting,
+                    false,
+                    PosturePinInputs::UNPINNED,
+                    None,
+                )
+                .await;
+                (worker, std::thread::current().name().map(str::to_string))
+            })
+        });
+        let (worker, name) = handle.await.expect("ran");
+        assert_eq!(name.as_deref(), Some("jwt-refresher-rt"));
+        let read_on = CONCLUDE_READ_THREAD.lock().unwrap().expect("the read ran");
+        assert_ne!(
+            read_on, worker,
+            "the store reads must not run on the refresher's worker"
+        );
+        reset_coord_credential_posture_for_test();
+    }
+
+    /// Review fix: the dmk exchange now lives in `attempt_pair_mint`, so the
+    /// stage cell must be threaded in to name it; `run_pair_tick` then tags
+    /// the recovery conclusion.
+    #[tokio::test]
+    async fn the_pair_tick_tags_the_machine_key_exchange_and_the_conclusion() {
+        let _serialised = posture_test_lock();
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_pair_tick_stage");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("stage.enc");
+        let _ = std::fs::remove_file(&path);
+        let mgr = crate::auth::AuthManager::with_storage_no_keychain(
+            crate::secure_storage::SecureStorage::with_path(path).expect("storage"),
+        );
+        // No Cognito, an expired device JWT: pair-cli is skipped (D1), the
+        // dmk fallback runs (no key stored, so it returns at once).
+        let dead = PairBearer::DeadSlot("x.y.z".to_string());
+        let req = |stage| PairMintRequest {
+            pair_base: "http://127.0.0.1:9",
+            pair_base_arm: None,
+            bearer: &dead,
+            refresh_class: RefreshClass::NoSession,
+            device_id: "d",
+            user_id: "u",
+            machine_tenant: None,
+            dmk_device_id: Some("d"),
+            stage,
+        };
+        let stage = PassStageCell::default();
+        let _ = attempt_pair_mint(&mgr, req(Some(&stage))).await;
+        assert_eq!(stage.get(), PassStage::MachineKeyExchange);
+
+        let stage = PassStageCell::default();
+        let _ = run_pair_tick(
+            &mgr,
+            req(Some(&stage)),
+            PassPosture {
+                publish_legacy: false,
+                pins: PosturePinInputs::UNPINNED,
+                app: None,
+            },
+        )
+        .await;
+        assert_eq!(stage.get(), PassStage::ConcludeRecovery);
+        reset_coord_credential_posture_for_test();
+    }
+
     /// What `start_refresher` spawns through `on_refresher_runtime` runs on the
     /// refresher's OWN runtime, not the caller's.
     #[tokio::test]
@@ -15643,6 +15825,7 @@ mod default_slot_recovery_tests {
                 user_id: UID,
                 machine_tenant: None,
                 dmk_device_id: Some(DID),
+                stage: None,
             },
         )
         .await
@@ -16091,6 +16274,7 @@ mod default_slot_recovery_tests {
                 user_id: UID,
                 machine_tenant: None,
                 dmk_device_id: Some(DID),
+                stage: None,
             },
             PassPosture {
                 publish_legacy: true,
