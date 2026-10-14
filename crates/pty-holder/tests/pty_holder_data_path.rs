@@ -250,8 +250,9 @@ fn pty_holder_data_path_echo_resize_and_exit_code() {
     // Input rides its own connection and is not ordered against control
     // verbs on the attached one (protocol.rs), so the newline that makes the
     // child run `stty size` is sent only after the holder has answered `ok`
-    // to the resize — which it does after applying it. Sending both at once
-    // let the child read its size first under load ("24 80", 2 of 80 runs).
+    // to the resize — which it sends after ATTEMPTING the resize (server.rs
+    // does not report the ioctl's result). Sent back to back, the child can
+    // read its size before the resize is attempted and print the old one.
     let resize_ok = Event::Reply(Reply::Ok {
         verb: "resize".into(),
     });
@@ -260,12 +261,16 @@ fn pty_holder_data_path_echo_resize_and_exit_code() {
         c.events.contains(&resize_ok)
     });
     inp.input(b"\n", soon()).unwrap();
+    // Stop on the old size too: a child that prints it then blocks on its
+    // next `read`, so waiting only for the new size would time out instead
+    // of naming the failure.
     let c2 = collect_until(&mut s, resized.next, Duration::from_secs(10), |c| {
-        contains(&c.bytes, b"40 100")
+        contains(&c.bytes, b"40 100") || contains(&c.bytes, b"24 80")
     });
     assert!(
-        !contains(&resized.bytes, b"24 80") && !contains(&c2.bytes, b"24 80"),
-        "the child saw the old size after the resize was acknowledged"
+        !contains(&c2.bytes, b"24 80"),
+        "the child reported the old size after the resize was acknowledged: {:?}",
+        String::from_utf8_lossy(&c2.bytes)
     );
 
     inp.input(b"\n", soon()).unwrap();
@@ -786,8 +791,7 @@ fn pty_holder_data_path_input_on_the_attached_connection_is_refused() {
 /// The kill is sent only once the child has PRINTED that its `trap '' HUP` is
 /// in place. Sending it earlier races the shell's startup: a SIGHUP that lands
 /// before `trap` runs kills the child with SIGHUP (signal 1), which is the
-/// holder working correctly and says nothing about escalation — measured as
-/// 7 of 80 concurrent full-binary runs on a loaded box.
+/// holder working correctly and says nothing about escalation.
 #[test]
 fn pty_holder_data_path_kill_escalates_past_an_ignored_hangup() {
     let mut h = start(
