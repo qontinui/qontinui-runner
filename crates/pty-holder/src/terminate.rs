@@ -217,6 +217,8 @@ mod tests {
             versions: vec![2],
             started_at_unix_ms: 0,
             holder_build: "test".into(),
+            child_start: None,
+            scope_unit: None,
         }
     }
 

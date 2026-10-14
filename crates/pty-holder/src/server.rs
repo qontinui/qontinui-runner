@@ -241,6 +241,8 @@ impl Holder {
                 versions: PROTOCOL_VERSIONS.to_vec(),
                 started_at_unix_ms: info.started_at_unix_ms,
                 holder_build: holder_build(),
+                child_start: pane.child_start().map(str::to_string),
+                scope_unit: own_scope_unit(),
             })?;
             #[cfg(unix)]
             {
@@ -328,11 +330,36 @@ impl Holder {
             eprintln!("pty-holder: accept thread: {e}");
         }
         let exit = pane.wait_for_end();
+        // Plan D8: this holder is the reaper of its own child tree. Still
+        // under the lock, so a boot sweep cannot take this pane for dead while
+        // its remainder is being ended.
+        let reap = pane.reap_tree();
+        if !reap.killed.is_empty() || !reap.notes.is_empty() {
+            log_line(
+                &log,
+                &format!("pane ended; reaped its tree: {}", reap.summary()),
+            );
+        }
         // Closes the writer under its mutex BEFORE the lock is released, so no
         // later timer tick can touch a successor holder's files.
         crate::scrollback::persist_final(&pane, &scrollback, &log);
         drop(lock);
         exit
+    }
+}
+
+/// The transient scope unit this holder runs in, when the spawner put it in
+/// one (`crate::spawn`'s scope route). Recorded in the lock so a boot sweep can
+/// stop what a dead holder left in it.
+fn own_scope_unit() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let cgroup = crate::reap::own_holder_scope_cgroup()?;
+        cgroup.rsplit('/').next().map(str::to_string)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
