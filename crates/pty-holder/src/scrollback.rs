@@ -43,14 +43,20 @@
 //!   target, and the directory is `fsync`ed — it is atomic. A stale `.tmp`
 //!   (a holder killed mid-rewrite) is ignored by readers and removed by the
 //!   next rewrite.
-//! - **Crash-safe recovery rule** — an append is not atomic, so a holder or
-//!   host dying mid-append can leave one torn record at the END of the file.
-//!   A reader ignores a final record that runs past end-of-file or fails its
-//!   checksum, and returns everything before it: the tail as of the previous
-//!   tick. A bad record with more data after it is not a crash artefact and
-//!   the whole file is refused ([`ScrollbackError::Corrupt`]), as is a record
-//!   that does not start where the previous one ended. After a failed append
-//!   the writer never appends again to that file: its next write is a rewrite.
+//! - **Crash-safe recovery rule: the longest valid prefix.** An append is not
+//!   atomic, and an un-`fsync`ed one need not survive a power loss in any
+//!   particular shape — a filesystem can make the new SIZE durable before the
+//!   data, leaving zeros (or garbage) after the last synced record. So a
+//!   reader walks the records in order and stops at the first one that is
+//!   incomplete, declares more than the cap, or fails its checksum; it
+//!   returns every record before it — each of which passed its own checksum
+//!   and starts exactly where its predecessor ended — and reports what it
+//!   dropped in [`Scrollback::discarded_bytes`] (never silently). Two things
+//!   are refused outright ([`ScrollbackError::Corrupt`]), because no crash
+//!   produces them: a damaged header, and a record that passes its checksum
+//!   but does not start where the previous one ended. After a failed append
+//!   or a failed `fsync` the writer never appends to that file again: its next
+//!   write is a rewrite.
 //!
 //! ## When — and what it costs
 //!
@@ -82,6 +88,11 @@
 //!   append survives a holder crash (it is in the page cache); only a power
 //!   loss can drop it, and then the recovery rule above returns the tail as
 //!   of the last sync.
+//! - **Staleness.** A holder killed without warning loses at most the last
+//!   [`SCROLLBACK_INTERVAL`] (~5 s) of output from the durable copy (~35 s for
+//!   a flooding pane, see the flood bound). A POWER LOSS can lose up to ~35 s
+//!   of output: up to [`FSYNC_INTERVAL`] (30 s) of unsynced appends plus the
+//!   tick interval. In every case the offset anchor says exactly how much.
 //!
 //! ## Lifecycle
 //!
@@ -166,9 +177,18 @@ pub struct Scrollback {
     pub start_offset: u64,
     /// At most [`SCROLLBACK_CAP_BYTES`].
     pub bytes: Vec<u8>,
+    /// Bytes after the longest valid prefix that the reader dropped: a torn
+    /// or damaged record and everything after it (see the module docs). Zero
+    /// for a file that read back whole.
+    pub discarded_bytes: u64,
 }
 
 impl Scrollback {
+    /// Whether the reader dropped anything ([`Scrollback::discarded_bytes`]).
+    pub fn is_torn(&self) -> bool {
+        self.discarded_bytes > 0
+    }
+
     /// Absolute offset one past the last persisted byte.
     pub fn end_offset(&self) -> u64 {
         self.start_offset + self.bytes.len() as u64
@@ -237,34 +257,29 @@ fn decode(buf: &[u8]) -> Result<Scrollback, ScrollbackError> {
     }
     let child_pid = be_u32(&header[12..]);
 
+    // The longest valid prefix: stop at the first record that is incomplete,
+    // over the cap, or fails its checksum — whatever its position, since an
+    // unsynced append can leave a durable size with zeros behind it.
     let mut records: Vec<(u64, &[u8])> = Vec::new();
     let mut pos = HEADER_LEN;
     while pos < buf.len() {
         let rest = &buf[pos..];
-        // A record cut short by end-of-file is a torn final append: stop.
         if rest.len() < RECORD_OVERHEAD {
             break;
         }
         let start = be_u64(rest);
         let len = be_u32(&rest[8..]) as usize;
-        let Some(total) = len.checked_add(RECORD_OVERHEAD) else {
-            break;
-        };
-        if total > rest.len() {
+        if len > SCROLLBACK_CAP_BYTES || RECORD_OVERHEAD + len > rest.len() {
             break;
         }
-        if len > SCROLLBACK_CAP_BYTES {
-            return corrupt("a record exceeds the cap");
-        }
+        let total = RECORD_OVERHEAD + len;
         let bytes = &rest[12..12 + len];
         let sum = be_u64(&rest[12 + len..]);
         if sum != fnv1a64(&[&rest[..8], &rest[8..12], bytes]) {
-            if total == rest.len() {
-                // The final record, torn: the recovery rule drops it.
-                break;
-            }
-            return corrupt("a record's checksum fails with data after it");
+            break;
         }
+        // A record that passes its checksum is one the writer wrote whole;
+        // out of order, it is not a crash artefact.
         if let Some(&(prev_start, prev)) = records.last() {
             if prev_start + prev.len() as u64 != start {
                 return corrupt("records are not contiguous");
@@ -299,6 +314,7 @@ fn decode(buf: &[u8]) -> Result<Scrollback, ScrollbackError> {
         child_pid,
         start_offset,
         bytes,
+        discarded_bytes: (buf.len() - pos) as u64,
     })
 }
 
@@ -310,8 +326,10 @@ pub enum ScrollbackError {
     Io(io::Error),
     /// The file is larger than any file this crate writes; it was not read.
     TooLarge { len: u64 },
-    /// The file is not a valid tail (beyond the one torn final record the
-    /// recovery rule tolerates).
+    /// The file has no valid tail: a damaged header, no whole first record,
+    /// or two checksum-valid records out of order. (A torn or damaged record
+    /// is NOT this: the reader returns the valid prefix before it and reports
+    /// the rest in [`Scrollback::discarded_bytes`].)
     Corrupt(&'static str),
 }
 
@@ -528,6 +546,10 @@ impl ScrollbackWriter {
         // power loss.
         f.sync_data()?;
         drop(f);
+        // Let go of the old file's append handle BEFORE the rename: Windows
+        // refuses to replace a file that is open without delete sharing, and
+        // a failed rename must not leave appends going to the old file.
+        self.file = None;
         std::fs::rename(&self.tmp, &self.path)?;
         // Make the rename itself durable. Best effort: if the directory
         // cannot be synced, the file on disk is still one whole tail — the
@@ -559,7 +581,13 @@ impl ScrollbackWriter {
         let Some(f) = self.file.as_ref() else {
             return Ok(());
         };
-        f.sync_data()?;
+        if let Err(e) = f.sync_data() {
+            // The kernel may have dropped the unsynced pages: appending after
+            // them could leave a hole mid-file. Drop the handle, so the next
+            // write is a rewrite of the whole tail.
+            self.file = None;
+            return Err(e);
+        }
         self.unsynced = false;
         self.last_sync = Instant::now();
         Ok(())
@@ -936,22 +964,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn pty_holder_scrollback_torn_final_append_is_dropped_mid_file_damage_refused() {
-        let dir = tmpdir("torn");
+    /// A file of three records: "synced part", " appended", " more".
+    fn three_records(dir: &Path) -> Vec<u8> {
         let mut ring = OutputRing::new(4096);
         ring.push(b"synced part");
-        let mut w = writer(&dir);
+        let mut w = writer(dir);
         tick(&mut w, &ring);
         ring.push(b" appended");
-        tick(&mut w, &ring);
-        let whole = std::fs::read(scrollback_path(&dir, &pane())).unwrap();
+        assert_eq!(tick(&mut w, &ring), Some("append"));
+        ring.push(b" more");
+        assert_eq!(tick(&mut w, &ring), Some("append"));
+        std::fs::read(scrollback_path(dir, &pane())).unwrap()
+    }
+
+    #[test]
+    fn pty_holder_scrollback_reads_the_longest_valid_prefix_and_says_so() {
+        let dir = tmpdir("prefix");
+        let whole = three_records(&dir);
         let target = scrollback_path(&dir, &pane());
-        // A crash mid-append: the last record is cut short, or complete in
-        // length but with damaged bytes. Either way: the previous tail.
+        let read_back = |bytes: &[u8]| {
+            std::fs::write(&target, bytes).unwrap();
+            read(&dir)
+        };
+        let sb = read_back(&whole);
+        assert_eq!(sb.bytes, b"synced part appended more");
+        assert!(!sb.is_torn());
+
+        // Power loss after an unsynced append: the size became durable, the
+        // data did not — zeros after the last whole record.
+        let mut zeros = whole.clone();
+        zeros.extend(std::iter::repeat_n(0u8, 200));
+        let sb = read_back(&zeros);
+        assert_eq!(sb.bytes, b"synced part appended more");
+        assert_eq!(sb.discarded_bytes, 200);
+        assert_eq!(sb.end_offset(), 25);
+
+        // A crash mid-append: the last record cut short, or whole in length
+        // with damaged bytes. The tail as of the previous record.
+        let last = RECORD_OVERHEAD + 5;
         for torn in [
             whole[..whole.len() - 3].to_vec(),
-            whole[..whole.len() - (RECORD_OVERHEAD + 9) + 4].to_vec(),
+            whole[..whole.len() - last + 4].to_vec(),
             {
                 let mut b = whole.clone();
                 let n = b.len();
@@ -959,17 +1012,68 @@ mod tests {
                 b
             },
         ] {
-            std::fs::write(&target, &torn).unwrap();
-            assert_eq!(read(&dir).bytes, b"synced part");
+            let sb = read_back(&torn);
+            assert_eq!(sb.bytes, b"synced part appended");
+            assert_eq!(
+                sb.discarded_bytes,
+                (torn.len() - (whole.len() - last)) as u64
+            );
         }
-        // Damage in a record with data AFTER it is not a crash artefact.
-        let mut mid = whole.clone();
-        mid[HEADER_LEN + 12] ^= 0xFF;
-        std::fs::write(&target, &mid).unwrap();
+
+        // Damage in a MIDDLE record — its checksum, or its length field made
+        // large (over the cap, or merely past end-of-file) — stops the walk
+        // there too, under the same rule: the prefix before it, and every
+        // byte from it on counted as discarded, never silently.
+        let second = HEADER_LEN + RECORD_OVERHEAD + 11;
+        let after_first = (whole.len() - second) as u64;
+        let mut bad_sum = whole.clone();
+        bad_sum[second + 12] ^= 0xFF;
+        let mut over_cap = whole.clone();
+        over_cap[second + 8..second + 12]
+            .copy_from_slice(&((SCROLLBACK_CAP_BYTES as u32) + 1).to_be_bytes());
+        let mut past_eof = whole.clone();
+        past_eof[second + 8..second + 12].copy_from_slice(&1000u32.to_be_bytes());
+        for damaged in [bad_sum, over_cap, past_eof] {
+            let sb = read_back(&damaged);
+            assert_eq!(sb.bytes, b"synced part");
+            assert_eq!(sb.discarded_bytes, after_first);
+            assert!(sb.is_torn());
+        }
+
+        // The FIRST record is always a synced rewrite: without it there is no
+        // valid prefix at all.
+        let mut first = whole.clone();
+        first[HEADER_LEN + 12] ^= 0xFF;
+        std::fs::write(&target, &first).unwrap();
         assert!(matches!(
             read_scrollback(&dir, &pane()),
             Err(ScrollbackError::Corrupt(_))
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_scrollback_failed_fsync_forces_a_rewrite() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tmpdir("fsync");
+        let mut ring = OutputRing::new(4096);
+        ring.push(b"abc");
+        let mut w = writer(&dir);
+        tick(&mut w, &ring);
+        ring.push(b"def");
+        assert_eq!(tick(&mut w, &ring), Some("append"));
+        // An O_PATH descriptor refuses fsync (EBADF): a stand-in for a disk
+        // that fails it.
+        let mut opts = OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_PATH);
+        w.file = Some(opts.open(scrollback_path(&dir, &pane())).unwrap());
+        assert!(w.sync_if_due(true).is_err());
+        assert!(w.file.is_none(), "a failed fsync drops the append handle");
+        w.rewrite_min_interval = Duration::ZERO;
+        ring.push(b"ghi");
+        assert_eq!(tick(&mut w, &ring), Some("rewrite"));
+        assert_eq!(read(&dir).bytes, b"abcdefghi");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
