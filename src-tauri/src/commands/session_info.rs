@@ -1004,6 +1004,13 @@ pub struct SessionInfoEnvelope {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Wire `claudeSessionId`: set ONLY on a degraded row of a LISTING
+    /// ([`Self::unavailable_for`]), which has no `body` and so no
+    /// `identity.claudeSessionId` — without it the client cannot attach the
+    /// row's real `reason` to the session it belongs to. Absent everywhere
+    /// else (an available envelope carries the id in `identity`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
     #[serde(flatten)]
     pub body: Option<SessionInfoBody>,
 }
@@ -1014,7 +1021,17 @@ impl SessionInfoEnvelope {
         Self {
             available: false,
             reason: Some(reason.to_string()),
+            claude_session_id: None,
             body: None,
+        }
+    }
+
+    /// The degraded envelope for ONE row of a listing: the reason AND the
+    /// session it is about, so the client indexes it to its row.
+    pub fn unavailable_for(reason: &str, claude_session_id: &str) -> Self {
+        Self {
+            claude_session_id: Some(claude_session_id.to_string()),
+            ..Self::unavailable(reason)
         }
     }
 }
@@ -1177,6 +1194,7 @@ pub fn project_session_info(
     SessionInfoEnvelope {
         available: true,
         reason: None,
+        claude_session_id: None,
         body: Some(SessionInfoBody {
             identity: SessionIdentity {
                 claude_session_id: rec.claude_session_id.clone(),
@@ -1320,7 +1338,10 @@ pub async fn build_session_info_owned(
                 "session_info: blocking reads for {} failed: {e}",
                 rec.claude_session_id
             );
-            return SessionInfoEnvelope::unavailable("session_read_failed");
+            return SessionInfoEnvelope::unavailable_for(
+                "session_read_failed",
+                &rec.claude_session_id,
+            );
         }
     };
     let prs = load_prs(&rec.claude_session_id).await;
@@ -1396,6 +1417,22 @@ mod tests {
         let unresolvable = crate::coord_mcp::tenant_unresolvable_error();
         assert!(refusal_reason(&unresolvable)
             .starts_with("COORD_MCP_PROXY_TENANT_UNRESOLVABLE: this machine"));
+    }
+
+    /// A degraded LISTING row names its session on the wire
+    /// (`claudeSessionId`) beside its reason, so the client can attach the
+    /// real reason to the row; the single-session degraded envelope does not.
+    #[test]
+    fn a_degraded_listing_row_carries_its_session_id_on_the_wire() {
+        let row = super::SessionInfoEnvelope::unavailable_for("session_read_failed", "abc-123");
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["available"], false);
+        assert_eq!(json["reason"], "session_read_failed");
+        assert_eq!(json["claudeSessionId"], "abc-123");
+        assert!(json.get("identity").is_none());
+
+        let bare = serde_json::to_value(super::SessionInfoEnvelope::unavailable("x")).unwrap();
+        assert!(bare.get("claudeSessionId").is_none());
     }
 
     /// The defect this classification exists for: a bare shell must NOT be
