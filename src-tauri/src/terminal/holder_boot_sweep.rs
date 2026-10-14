@@ -109,7 +109,7 @@ use std::time::{Duration, Instant};
 use qontinui_pty_holder::pane::PaneId;
 use qontinui_pty_holder::sweep::{boot_sweep_with_pending, SweepEntry, SweepOutcome, SweepReport};
 use qontinui_pty_holder::terminate::terminate_verified_holder;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tracing::{error, info, warn};
 
 use super::manager::{AdoptError, TerminalManager};
@@ -574,6 +574,76 @@ pub enum AdoptOutcome {
     /// The holder is live but below the data path this runner drives: not
     /// adopted, not touched (plan D15; review round 4, H1).
     LeftAlone(String),
+    /// The background retry's holder died before it could be adopted. Its
+    /// session must be re-decided by the restore ([`released_session`]).
+    HolderGone,
+}
+
+/// Why the background retry stops early.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryStop {
+    /// The holder died: its session is the restore's to re-decide.
+    HolderGone,
+    /// Another path owns the pane or the session.
+    Other(String),
+}
+
+/// The event that hands a session back to the webview's restore when the
+/// holder a deferred adoption was retrying dies (review round 6, T1): the
+/// restore refused its resume while the holder's `claude` was alive, and
+/// nothing else would ever re-decide it.
+pub const HOLDER_SESSION_RELEASED_EVENT: &str = "pty-holder-session-released";
+
+/// [`HOLDER_SESSION_RELEASED_EVENT`]'s payload.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReleased {
+    pub session_id: String,
+    pub terminal_id: String,
+    /// The page to re-run the restore on; `None` → the default page.
+    pub page_id: Option<String>,
+}
+
+/// The session to hand back to the restore after a background retry ended
+/// with `outcome`: only when its holder died and the pane hosted a known
+/// session. Pure, so the wiring is tested on its own.
+pub fn released_session(outcome: &AdoptOutcome, adoption: &Adoption) -> Option<SessionReleased> {
+    (*outcome == AdoptOutcome::HolderGone && !adoption.pinned_session_id.is_empty()).then(|| {
+        SessionReleased {
+            session_id: adoption.pinned_session_id.clone(),
+            terminal_id: adoption.pane_id.clone(),
+            page_id: adoption.page_id.clone(),
+        }
+    })
+}
+
+/// Clears an id's [`adoption_pending`] mark when dropped — however the
+/// thread holding it ends, a panic included — unless [`Self::hand_over`]
+/// passed it on (to the background retry, which takes a guard of its own).
+struct PendingGuard {
+    terminal_id: String,
+    armed: bool,
+}
+
+impl PendingGuard {
+    fn new(terminal_id: &str) -> Self {
+        PendingGuard {
+            terminal_id: terminal_id.to_string(),
+            armed: true,
+        }
+    }
+
+    fn hand_over(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            set_adoption_pending(&self.terminal_id, false);
+        }
+    }
 }
 
 /// One attempt's verdict, by the failure's [`FailureDisposition`].
@@ -622,7 +692,7 @@ fn adopt_with_retries(
 fn retry_in_background(
     adopt: &dyn Fn() -> Result<(), AdoptError>,
     end: &dyn Fn(&str),
-    stop: &dyn Fn() -> Option<String>,
+    stop: &dyn Fn() -> Option<RetryStop>,
     every: Duration,
     for_: Duration,
 ) -> AdoptOutcome {
@@ -630,8 +700,10 @@ fn retry_in_background(
     let mut last = String::from("the retry window ran out");
     while Instant::now() + every <= until {
         std::thread::sleep(every);
-        if let Some(why) = stop() {
-            return AdoptOutcome::Skipped(why);
+        match stop() {
+            Some(RetryStop::HolderGone) => return AdoptOutcome::HolderGone,
+            Some(RetryStop::Other(why)) => return AdoptOutcome::Skipped(why),
+            None => {}
         }
         match judge(adopt(), end) {
             Ok(outcome) => return outcome,
@@ -743,6 +815,8 @@ fn spawn_background_retry(
     let name = format!("pty-holder-readopt-{}", adoption.pane_id);
     let pane_id_for_error = adoption.pane_id.clone();
     let spawned = std::thread::Builder::new().name(name).spawn(move || {
+        // Cleared however this thread ends, a panic included.
+        let pending = PendingGuard::new(&adoption.pane_id);
         let adopt = || {
             let mut fresh = adoption.clone();
             if let SessionNow::OpenOn { page_id, .. } = session_now(store.as_deref(), &adoption) {
@@ -753,15 +827,18 @@ fn spawn_background_retry(
         let end = |why: &str| end_unadoptable_holder(&pane_dir, &adoption, why);
         let stop = || {
             if manager.get(&adoption.pane_id).is_some() {
-                Some("the pane was opened by another path".to_string())
+                Some(RetryStop::Other(
+                    "the pane was opened by another path".to_string(),
+                ))
             } else if holder_gone(&pane_dir, &adoption) {
-                Some("the holder is gone".to_string())
+                Some(RetryStop::HolderGone)
             } else {
                 retry_stop_reason(
                     &adoption.pane_id,
                     &session_now(store.as_deref(), &adoption),
                     |terminal| manager.get(terminal).is_some(),
                 )
+                .map(RetryStop::Other)
             }
         };
         let late = retry_in_background(
@@ -774,7 +851,21 @@ fn spawn_background_retry(
         // However the retry ended — adopted, stopped, or out of time — the
         // adoption is no longer pending: the lifecycle poll may judge the
         // record on its own evidence again.
-        set_adoption_pending(&adoption.pane_id, false);
+        drop(pending);
+        // The holder died before it could be adopted: hand its session back
+        // to the webview's restore, which refused its resume while the
+        // holder's `claude` was alive (review round 6, T1).
+        if let Some(released) = released_session(&late, &adoption) {
+            warn!(
+                pane = %adoption.pane_id,
+                session = %released.session_id,
+                "pty holder boot sweep: a deferred holder died — its session is handed back to \
+                 the restore to be resumed"
+            );
+            if let Err(e) = app_handle.emit(HOLDER_SESSION_RELEASED_EVENT, &released) {
+                error!(error = %e, "pty holder boot sweep: could not emit {HOLDER_SESSION_RELEASED_EVENT}");
+            }
+        }
         if matches!(late, AdoptOutcome::Deferred(_)) {
             error!(
                 pane = %adoption.pane_id,
@@ -832,6 +923,9 @@ fn adopt_all(
         let thread = std::thread::Builder::new()
             .name(format!("pty-holder-adopt-{}", adoption.pane_id))
             .spawn(move || {
+                // Cleared however this thread ends, a panic included, unless
+                // handed over to the background retry.
+                let mut pending = PendingGuard::new(&adoption.pane_id);
                 let adopt = || {
                     // A session the user already resumed in another live
                     // terminal is not adopted a second time (review round 5).
@@ -857,7 +951,8 @@ fn adopt_all(
                         why = %why,
                         "pty holder boot sweep: pane not adopted — another path owns it"
                     ),
-                    AdoptOutcome::Ended(_) => {}
+                    // HolderGone comes only from the background retry.
+                    AdoptOutcome::Ended(_) | AdoptOutcome::HolderGone => {}
                     AdoptOutcome::LeftAlone(why) => warn!(
                         pane = %adoption.pane_id,
                         why = %why,
@@ -876,6 +971,7 @@ fn adopt_all(
                             BACKGROUND_RETRY_EVERY.as_secs(),
                             BACKGROUND_RETRY_FOR.as_secs()
                         );
+                        pending.hand_over();
                         spawn_background_retry(
                             manager.clone(),
                             app_handle.clone(),
@@ -885,10 +981,9 @@ fn adopt_all(
                         );
                     }
                 }
-                // Pending stays set only while the background retry has it.
-                if !matches!(outcome, AdoptOutcome::Deferred(_)) {
-                    set_adoption_pending(&adoption.pane_id, false);
-                }
+                // Pending stays set only while the background retry has it
+                // (the guard was handed over); otherwise it clears here.
+                drop(pending);
                 release_held(&adoption.pane_id);
                 outcome == AdoptOutcome::Adopted
             });
@@ -1289,11 +1384,11 @@ mod tests {
         let stopped = retry_in_background(
             &|| panic!("must not adopt after stop"),
             &|_| panic!("must not end after stop"),
-            &|| Some("the holder is gone".into()),
+            &|| Some(RetryStop::Other("hosted elsewhere".into())),
             Duration::from_millis(1),
             Duration::from_secs(5),
         );
-        assert_eq!(stopped, AdoptOutcome::Skipped("the holder is gone".into()));
+        assert_eq!(stopped, AdoptOutcome::Skipped("hosted elsewhere".into()));
     }
 
     /// R1: only a definitive failure ends the holder — once.
@@ -1380,5 +1475,71 @@ mod tests {
             hold_for_withheld_boot_restore(orphan, adoption_pending(id)),
             PollAction::CloseNoTerminal
         );
+    }
+
+    /// Review round 6, T1: when the background retry stops because its holder
+    /// DIED, the session is handed back to the restore — the event carries
+    /// its id and page — and only then.
+    #[test]
+    fn pty_holder_boot_sweep_a_dead_deferred_holder_hands_its_session_back() {
+        let outcome = retry_in_background(
+            &|| panic!("must not adopt a dead holder"),
+            &|_| panic!("must not end"),
+            &|| Some(RetryStop::HolderGone),
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        );
+        assert_eq!(outcome, AdoptOutcome::HolderGone);
+        let adoption = Adoption {
+            pane_id: "t-pane".into(),
+            page_id: Some("page-2".into()),
+            pinned_session_id: "sess-1".into(),
+            holder_pid: 10,
+        };
+        assert_eq!(
+            released_session(&outcome, &adoption),
+            Some(SessionReleased {
+                session_id: "sess-1".into(),
+                terminal_id: "t-pane".into(),
+                page_id: Some("page-2".into()),
+            })
+        );
+        let json = serde_json::to_value(released_session(&outcome, &adoption)).unwrap();
+        assert_eq!(json["sessionId"], "sess-1", "the webview reads camelCase");
+        for other in [
+            AdoptOutcome::Adopted,
+            AdoptOutcome::Skipped("x".into()),
+            AdoptOutcome::Deferred("x".into()),
+        ] {
+            assert_eq!(released_session(&other, &adoption), None, "{other:?}");
+        }
+        let untracked = Adoption {
+            pinned_session_id: String::new(),
+            ..adoption
+        };
+        assert_eq!(released_session(&outcome, &untracked), None);
+    }
+
+    /// Review round 6, nit (a): the pending mark clears however its thread
+    /// ends — unless handed over.
+    #[test]
+    fn pty_holder_boot_sweep_pending_guard_clears_unless_handed_over() {
+        let id = "t-guarded";
+        set_adoption_pending(id, true);
+        drop(PendingGuard::new(id));
+        assert!(!adoption_pending(id));
+        set_adoption_pending(id, true);
+        let caught = std::panic::catch_unwind(|| {
+            let _g = PendingGuard::new(id);
+            panic!("adoption thread panics");
+        });
+        assert!(caught.is_err());
+        assert!(!adoption_pending(id), "a panic does not strand the mark");
+        set_adoption_pending(id, true);
+        let mut g = PendingGuard::new(id);
+        g.hand_over();
+        drop(g);
+        assert!(adoption_pending(id), "handed over: the retry owns it");
+        set_adoption_pending(id, false);
     }
 }

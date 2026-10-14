@@ -22,6 +22,7 @@ import {
   HOLDER_SWEEP_RECHECK_ATTEMPTS,
   fetchHolderSweepStatus,
   splitRestoreByHold,
+  onHolderSessionReleased,
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
@@ -964,5 +965,35 @@ describe("the holder sweep's census — restore what is not held, now", () => {
     const live = vi.fn().mockResolvedValue(new Set<string>());
     await expect(recheckRefusedAfterSweep([], live, ["s-t2"])).resolves.toEqual(["s-t2"]);
     expect(live).not.toHaveBeenCalled();
+  });
+});
+
+describe("onHolderSessionReleased — a deferred holder died before adoption", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: true } });
+  });
+
+  const payload = { sessionId: "sess-1", terminalId: "t-pane", pageId: "page-2" };
+
+  it("re-runs the restore of its page for that session when no live process hosts it", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(onHolderSessionReleased(payload, schedule, live)).resolves.toBe(true);
+    expect(schedule).toHaveBeenCalledWith("page-2", ["sess-1"]);
+  });
+
+  it("leaves a session a live process still hosts alone", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set(["sess-1"]));
+    await expect(onHolderSessionReleased(payload, schedule, live)).resolves.toBe(false);
+    expect(schedule).not.toHaveBeenCalled();
+  });
+
+  it("re-runs the default page when the record named none", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await onHolderSessionReleased({ ...payload, pageId: null }, schedule, live);
+    expect(schedule).toHaveBeenCalledWith("default", ["sess-1"]);
   });
 });
