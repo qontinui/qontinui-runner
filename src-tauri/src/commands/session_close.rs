@@ -116,9 +116,7 @@ mod tests {
         }));
         for open in [
             GracefulExitOutcome::NoLiveClaude,
-            GracefulExitOutcome::ProbeUnavailable {
-                detail: "x".into(),
-            },
+            GracefulExitOutcome::ProbeUnavailable { detail: "x".into() },
             GracefulExitOutcome::Refused {
                 reason: "busy".into(),
                 claude_pids: vec![1],
@@ -164,7 +162,10 @@ mod tests {
             .map(|i| start + i)
             .expect("the command body ends");
         let body = &src[start..end];
-        assert!(body.contains(".graceful_exit("), "closes through graceful_exit");
+        assert!(
+            body.contains(".graceful_exit("),
+            "closes through graceful_exit"
+        );
         assert!(!body.contains(".close("), "never a plain close");
         assert!(!body.contains("terminal_close("), "never the kill door");
     }
