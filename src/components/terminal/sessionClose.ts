@@ -50,6 +50,11 @@ export interface CloseTarget {
   /** Has a tab here — otherwise it is listed but nothing is closed. */
   closable: boolean;
   /**
+   * Why a non-closable row closes nothing, reported in its result; absent =
+   * "it has no live tab in this window".
+   */
+  notClosableReason?: string;
+  /**
    * Why the row is offered for closing (`Finished · PRs green`, `Exited 0`);
    * set by the Ready-to-close review, absent for a close the operator asked for.
    */

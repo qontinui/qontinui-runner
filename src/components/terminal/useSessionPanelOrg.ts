@@ -10,6 +10,7 @@
 import { useCallback, useMemo, useState } from "react";
 
 import { sessionCardName, sessionCardStatusDisplay, type SessionCardOrgMenu } from "./SessionCard";
+import { closeTargetsFor } from "./sessionBulkActions";
 import type { CloseTarget } from "./sessionClose";
 import { SESSION_GROUP_COLOR_VAR } from "./sessionGroupColors";
 import { suggestGroups, type GroupSuggestion } from "./sessionGroupSuggestions";
@@ -191,22 +192,18 @@ export function useSessionPanelOrg({
   }, []);
   // Re-read LIVE while the dialog is open: a row that turned `Needs you`
   // since it was asked for grows its second-tick requirement.
+  // A requested row that left the list stays as a "no longer listed"
+  // placeholder (`closeTargetsFor`), so the results answer every row asked for.
   const closeTargets: CloseTarget[] = useMemo(() => {
     if (!closeRequest) return [];
-    return closeRequest.sessionIds.flatMap((id) => {
-      const row = allSessions.find((s) => s.sessionId === id);
-      if (!row) return [];
-      return [
-        {
-          sessionId: row.sessionId,
-          title: sessionCardName(row),
-          activity: row.status.activity,
-          activityWord: sessionCardStatusDisplay(row.status).activityLabel,
-          closable: closableTabId(row) !== null,
-          reason: closeRequest.reasons?.[row.sessionId],
-        },
-      ];
-    });
+    return closeTargetsFor(closeRequest.sessionIds, allSessions, (row) => ({
+      sessionId: row.sessionId,
+      title: sessionCardName(row),
+      activity: row.status.activity,
+      activityWord: sessionCardStatusDisplay(row.status).activityLabel,
+      closable: closableTabId(row) !== null,
+      reason: closeRequest.reasons?.[row.sessionId],
+    }));
   }, [closeRequest, allSessions, closableTabId]);
   const rowsOf = useCallback(
     (ids: readonly string[]) => allSessions.filter((s) => ids.includes(s.sessionId)),
