@@ -118,28 +118,47 @@ export interface SessionOrgClient {
 }
 
 /**
- * How long one apply may go unanswered before it is treated as failed. Applies
- * are chained, so a call whose answer is lost would otherwise hold every later
- * apply forever while the preview kept showing them as applied.
+ * How long a caller waits for one apply's answer. Past it the caller is told the
+ * outcome is UNKNOWN (the call may still land) and the org is re-read, so a
+ * lost answer never leaves the preview showing an edit as applied.
  */
 export const SESSION_ORG_APPLY_TIMEOUT_MS = 15_000;
 
-function withApplyTimeout<T>(call: Promise<T>, ms: number): Promise<T> {
+/**
+ * How long the apply queue waits for a timed-out call to actually settle
+ * before sending the next apply. Releasing the next apply while the slow one
+ * is still in flight would let the two race for the store's lock — exactly the
+ * reordering the queue exists to prevent — so ordering holds up to this bound,
+ * and liveness is restored after it.
+ */
+export const SESSION_ORG_APPLY_HOLD_MS = 60_000;
+
+/** The apply's answer did not arrive in time; whether it landed is UNKNOWN. */
+export class SessionOrgApplyTimeout extends Error {}
+
+function formatMs(ms: number): string {
+  return ms < 1000 ? `${ms} ms` : `${Math.round(ms / 1000)} s`;
+}
+
+/** `call`, or a rejection with `onTimeout()` after `ms`; the timer is always cleared. */
+function within<T>(call: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`no answer from session_org_apply within ${Math.round(ms / 1000)} s`)),
-      ms,
-    );
+    timer = setTimeout(() => reject(onTimeout()), ms);
   });
   return Promise.race([call, timeout]).finally(() => clearTimeout(timer));
 }
 
+/** At most this many failures are listed in one burst's error. */
+const MAX_LISTED_ERRORS = 3;
+
 /** Build a client over `transport`. Exported for tests; surfaces use the hook. */
 export function createSessionOrgClient(
   transport: SessionOrgTransport,
-  applyTimeoutMs: number = SESSION_ORG_APPLY_TIMEOUT_MS,
+  timing: { answerMs?: number; holdMs?: number } = {},
 ): SessionOrgClient {
+  const answerMs = timing.answerMs ?? SESSION_ORG_APPLY_TIMEOUT_MS;
+  const holdMs = timing.holdMs ?? SESSION_ORG_APPLY_HOLD_MS;
   let confirmed: SessionOrgSnapshot | null = null;
   let loadError: string | null = null;
   let pending: { id: number; ops: SessionOrgOp[] }[] = [];
@@ -150,9 +169,13 @@ export function createSessionOrgClient(
    * two calls fired back to back race for the store's lock, and a pin then
    * unpin could otherwise land reversed. The optimistic view is not delayed —
    * only the transport calls queue, and an apply with nothing ahead of it is
-   * sent at once. Null when no apply is in flight.
+   * sent at once. A call whose answer times out still holds the queue until it
+   * really settles, up to SESSION_ORG_APPLY_HOLD_MS — so ordering is
+   * guaranteed up to that bound. Never rejects. Null when no apply is in flight.
    */
   let applyTail: Promise<unknown> | null = null;
+  /** The failures of the current burst of edits, in order. */
+  let burstErrors: string[] = [];
   let lastError: string | null = null;
   let view: SessionOrgView = { phase: "loading" };
   let holders = 0;
@@ -225,7 +248,37 @@ export function createSessionOrgClient(
 
   /** Add one batch's failure to the burst's error, never replacing an earlier one. */
   function noteError(message: string): void {
-    lastError = lastError ? `${lastError}; ${message}` : message;
+    burstErrors = [...burstErrors, message];
+    const extra = burstErrors.length - MAX_LISTED_ERRORS;
+    lastError =
+      burstErrors.slice(0, MAX_LISTED_ERRORS).join("; ") + (extra > 0 ? ` (+${extra} more)` : "");
+  }
+
+  /**
+   * Send one apply. `answer` is what the caller awaits (bounded by answerMs);
+   * `release` is when the next queued apply may go (the real call settling,
+   * bounded by holdMs). `release` never rejects.
+   */
+  function send(filled: SessionOrgOp[]): {
+    answer: Promise<SessionOrgApplyResponse>;
+    release: Promise<void>;
+  } {
+    const real = transport.apply(filled);
+    const settledReal = real.then(
+      () => undefined,
+      () => undefined,
+    );
+    return {
+      answer: within(
+        real,
+        answerMs,
+        () =>
+          new SessionOrgApplyTimeout(
+            `no answer from session_org_apply within ${formatMs(answerMs)}`,
+          ),
+      ),
+      release: within(settledReal, holdMs, () => new Error("hold elapsed")).catch(() => undefined),
+    };
   }
 
   async function apply(ops: SessionOrgOp[]): Promise<SessionOrgApplyResponse> {
@@ -236,16 +289,27 @@ export function createSessionOrgClient(
     // A new burst of edits starts with a clean slate; an apply queued behind
     // one that failed must not erase that failure (ordered settling would
     // otherwise guarantee the erasure).
-    if (pending.length === 0) lastError = null;
+    if (pending.length === 0) {
+      burstErrors = [];
+      lastError = null;
+    }
     pending = [...pending, batch];
     recompute();
-    const send = () => withApplyTimeout(transport.apply(filled), applyTimeoutMs);
     try {
-      const turn = applyTail ? applyTail.then(send) : send();
-      const settled: Promise<unknown> = turn.catch(() => undefined);
-      applyTail = settled;
-      void settled.then(() => {
-        if (applyTail === settled) applyTail = null;
+      let turn: Promise<SessionOrgApplyResponse>;
+      let release: Promise<void>;
+      if (applyTail) {
+        const started = applyTail.then(() => send(filled));
+        turn = started.then((s) => s.answer);
+        release = started.then((s) => s.release).catch(() => undefined);
+      } else {
+        const s = send(filled);
+        turn = s.answer;
+        release = s.release;
+      }
+      applyTail = release;
+      void release.then(() => {
+        if (applyTail === release) applyTail = null;
       });
       const response = await turn;
       pending = pending.filter((b) => b.id !== batch.id);
@@ -256,7 +320,11 @@ export function createSessionOrgClient(
       return response;
     } catch (e) {
       pending = pending.filter((b) => b.id !== batch.id);
-      noteError(`not applied: ${describeThrown(e, "session_org_apply failed")}`);
+      noteError(
+        e instanceof SessionOrgApplyTimeout
+          ? `outcome unknown: ${e.message}; re-reading`
+          : `not applied: ${describeThrown(e, "session_org_apply failed")}`,
+      );
       recompute();
       await refresh();
       throw e;
