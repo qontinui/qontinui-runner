@@ -1985,7 +1985,10 @@ pub(crate) fn effective_session_floors(
 /// point). It does a blocking sysinfo refresh, and [`effective_thread_ceilings`]
 /// runs on every spawn, so it is cached in a `OnceLock` — neither quantity
 /// changes under a live process in any way this guard should chase.
-fn host_capacity() -> crate::ci_node::host_sizing::HostCapacity {
+///
+/// Also read by `fleet::host_capabilities` for the `mem_ge_<N>` memory-tier
+/// tokens, so the heartbeat and this guard judge the same `MemTotal`.
+pub(crate) fn host_capacity() -> crate::ci_node::host_sizing::HostCapacity {
     static HOST: std::sync::OnceLock<crate::ci_node::host_sizing::HostCapacity> =
         std::sync::OnceLock::new();
     *HOST.get_or_init(crate::ci_node::host_sizing::probe)

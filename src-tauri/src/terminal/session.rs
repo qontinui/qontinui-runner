@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use super::transport_stats::{self, Leg};
 use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter};
 
@@ -297,11 +297,17 @@ pub(crate) struct WireFlow {
     /// relay reconnect re-presents the grant.
     sent: Mutex<bool>,
     wire_paused: AtomicBool,
+    /// `io.unwatched_pauses_source()`, read once: when false, `hidden` never
+    /// contributes to the wire state (a PTY-holder pane's grid and state
+    /// tracking live HERE, so an unwatched tier must keep its bytes flowing).
+    hidden_pauses: bool,
 }
 
 impl WireFlow {
     pub(crate) fn new(io: Arc<dyn PaneIo>) -> Self {
+        let hidden_pauses = io.unwatched_pauses_source();
         Self {
+            hidden_pauses,
             io,
             gate_paused: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
@@ -330,8 +336,8 @@ impl WireFlow {
     fn sync(&self) {
         // Held across the decision AND the send — see the `sent` field's note.
         let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
-        let desired =
-            self.gate_paused.load(Ordering::Acquire) || self.hidden.load(Ordering::Acquire);
+        let desired = self.gate_paused.load(Ordering::Acquire)
+            || (self.hidden_pauses && self.hidden.load(Ordering::Acquire));
         if *sent == desired {
             return;
         }
@@ -561,15 +567,15 @@ impl SyncFrameCoalescer {
 /// keeps its own offset-free payload.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TerminalOutputWire<'a> {
-    terminal_id: &'a str,
-    data: &'a str,
+pub(super) struct TerminalOutputWire<'a> {
+    pub(super) terminal_id: &'a str,
+    pub(super) data: &'a str,
     /// Absolute byte offset of this chunk's first byte in the session's
     /// output stream (the value of `total_bytes_produced` before this chunk
     /// was teed). Lets the frontend dedup a scrollback-ring replay against
     /// live chunks — see `terminal_get_scrollback` and the frontend's
     /// `scrollbackReplay.ts`.
-    offset: u64,
+    pub(super) offset: u64,
 }
 
 /// Emit one `terminal-output` event to the webview.
@@ -585,7 +591,10 @@ fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offse
         data: encoded,
         offset,
     };
-    if let Err(e) = app.emit("terminal-output", &event) {
+    let started = Instant::now();
+    let emitted = app.emit("terminal-output", &event);
+    transport_stats::record_webview_emit(encoded, started.elapsed());
+    if let Err(e) = emitted {
         warn!(
             terminal_id = %terminal_id,
             error = %e,
@@ -614,6 +623,43 @@ const SUBMIT_ENTER: &[u8] = b"\r";
 /// gate at all, which left the entire `TERMINAL_EXITED` chain unreachable
 /// through every one of them.
 pub const TERMINAL_EXITED: &str = "TERMINAL_EXITED";
+
+/// Machine-readable code prefixing an error [`TerminalSession::submit_prompt`]
+/// or [`TerminalSession::insert_prompt`] returns once some of the prompt had
+/// already reached the PTY: the paste block broke part-way, or it was written
+/// whole and the submitting CR then failed. Either way text may be sitting in
+/// the TUI's input box, unsent — which a caller must tell its operator rather
+/// than report "nothing was written". An error WITHOUT this prefix wrote no
+/// byte.
+pub const PROMPT_PARTIALLY_WRITTEN: &str = "PROMPT_PARTIALLY_WRITTEN";
+
+/// `write_all`, counting: on failure, how many bytes reached `writer` first.
+fn write_all_counting(
+    writer: &mut dyn Write,
+    mut buf: &[u8],
+) -> Result<(), (usize, std::io::Error)> {
+    let mut written = 0usize;
+    while !buf.is_empty() {
+        match writer.write(buf) {
+            Ok(0) => {
+                return Err((
+                    written,
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ),
+                ))
+            }
+            Ok(n) => {
+                written += n;
+                buf = &buf[n..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err((written, e)),
+        }
+    }
+    Ok(())
+}
 
 /// Delay between the bracketed-paste block and the trailing submit keystroke.
 ///
@@ -947,6 +993,24 @@ fn submit_payload_of(report: &SanitizeReport) -> SubmitPayload {
     }
 }
 
+/// Describe an insert — the paste block alone, with no submitting CR.
+fn insert_payload_of(report: &SanitizeReport) -> SubmitPayload {
+    SubmitPayload {
+        bytes: BRACKETED_PASTE_BEGIN.len() + report.body.len() + BRACKETED_PASTE_END.len(),
+        sanitized: report.changed,
+    }
+}
+
+/// Which of the two prompt writes [`TerminalSession::paste_prompt`] serves —
+/// only the attribution log line differs between them.
+#[derive(Clone, Copy)]
+enum PromptOp {
+    /// [`TerminalSession::submit_prompt`]: paste, then a CR.
+    Submit,
+    /// [`TerminalSession::insert_prompt`]: paste only.
+    Insert,
+}
+
 /// WHO put bytes on a PTY — the caller tag every producer of
 /// [`TerminalSession::write`] and [`TerminalSession::submit_prompt`] passes.
 ///
@@ -982,6 +1046,10 @@ pub enum PtyWriteCaller {
     AutoResponse { rule_id: String },
     /// `claude_session::worker_session`'s sender.
     WorkerSession,
+    /// `POST /sessions/{id}/review/send` and `…/review/insert`
+    /// (`mcp/session_review.rs`) — the operator's composed review notes,
+    /// submitted as a turn or inserted as an unsent draft.
+    ReviewNotes,
     // ---- `write` producers ----------------------------------------------
     /// The Tauri `terminal_write` command — the pane's own keystrokes.
     TauriTerminalWrite,
@@ -1029,6 +1097,7 @@ impl PtyWriteCaller {
                 return Cow::Owned(format!("auto_response:{rule_id}"))
             }
             Self::WorkerSession => "worker_session",
+            Self::ReviewNotes => "review_notes",
             Self::TauriTerminalWrite => "tauri_terminal_write",
             Self::TauriInvokeProxy => "tauri_invoke_proxy",
             Self::RemoteTerminalInput => "remote_terminal_input",
@@ -1561,7 +1630,29 @@ impl TerminalSession {
             Some(&app_handle),
         )?;
 
-        let opened = LocalPty::open(&id, cols, rows)?;
+        // The pane's backend: in-process `LocalPty`, or — behind
+        // `terminal.pty_holder`, default OFF — an out-of-process PTY holder
+        // (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+        // Phase 2). Read once per spawn. A local PTY is opened HERE, before the
+        // environment is assembled, so an `openpty` failure leaves none of
+        // that side-effecting work behind; a holder pane has no PTY in this
+        // process to open.
+        //
+        // Cost on the OFF path (review round 2, N10): `get_terminal_settings`
+        // is `read_settings_from_disk`, the mtime-keyed in-process settings
+        // cache — one `stat` and a clone on a hit, no file read or parse. That
+        // is the same per-spawn price this function already pays for
+        // `get_performance_settings` (the scrollback capacity, `spawn_with_io`), not a
+        // new kind of read.
+        let backend = crate::terminal::daemon_pane_io::pane_backend_for(
+            &crate::settings::get_terminal_settings(),
+        );
+        let opened = match backend {
+            crate::terminal::daemon_pane_io::PaneBackend::LocalPty => {
+                Some(LocalPty::open(&id, cols, rows)?)
+            }
+            crate::terminal::daemon_pane_io::PaneBackend::Holder => None,
+        };
 
         // Build the PTY child command: an explicit program+args override
         // (Decision 3) when supplied, else the interactive shell. Whether it
@@ -1734,7 +1825,13 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
-        let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
+        let sealed = ScrubbedCommand::seal(cmd);
+        let io: Arc<dyn PaneIo> = match opened {
+            Some(opened) => Arc::new(opened.spawn(sealed)?),
+            None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
+                &id, sealed, cols, rows,
+            )?,
+        };
 
         Self::spawn_with_io(
             id,
@@ -1793,9 +1890,11 @@ impl TerminalSession {
             "Terminal session spawned"
         );
 
-        // Assign to Windows Job Object for crash safety
+        // Assign to Windows Job Object for crash safety — the pid the pane
+        // allows, which is `None` for a PTY-holder pane (its child must outlive
+        // this runner; see `PaneIo::job_enroll_pid`).
         #[cfg(target_os = "windows")]
-        if let Some(pid) = child_pid {
+        if let Some(pid) = io.job_enroll_pid() {
             Self::assign_to_job_object(pid);
         }
 
@@ -1931,6 +2030,7 @@ impl TerminalSession {
                 // and (through them) the coord output pipe receive every chunk,
                 // in order, byte-identical, in every tier.
                 let emit_impl = |payload: &[u8], offset: u64, gated: bool| {
+                    transport_stats::record_frame(payload.len());
                     let tier = reader_visibility.tier();
                     let sent = reader_bytes_sent.load(Ordering::Relaxed);
                     let acked = reader_bytes_acked.load(Ordering::Relaxed);
@@ -1968,19 +2068,29 @@ impl TerminalSession {
                     // does not need encoding here — one encode per flush
                     // window instead of one per chunk.
                     let encoded = if to_sse || to_ws || admission == WebviewAdmission::Now {
-                        Some(STANDARD.encode(payload))
+                        Some(transport_stats::encode(payload))
                     } else {
                         None
                     };
+                    transport_stats::classify_encode(
+                        &reader_app,
+                        &reader_id,
+                        encoded.is_some(),
+                        admission == WebviewAdmission::Now,
+                        to_sse,
+                        to_ws,
+                    );
 
                     // Broadcast to HTTP/SSE subscribers (skipped when none —
                     // the `send` would drop the value anyway, and the clone is
                     // a full copy of the base64 payload).
                     if let (true, Some(encoded)) = (to_sse, encoded.as_ref()) {
+                        transport_stats::record_leg(Leg::Sse, payload.len());
                         let _ = reader_output_tx.send(encoded.clone());
                     }
                     // Broadcast to backend relay for remote mobile access
                     if let (true, Some(encoded)) = (to_ws, encoded.as_ref()) {
+                        transport_stats::record_leg(Leg::Ws, payload.len());
                         crate::event_system::broadcast_ws_notification(
                             &reader_app,
                             "terminal-output",
@@ -2016,7 +2126,7 @@ impl TerminalSession {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
-                                    &STANDARD.encode(&window),
+                                    &transport_stats::encode(&window),
                                     window_offset,
                                 );
                             }
@@ -2027,7 +2137,7 @@ impl TerminalSession {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
-                                    &STANDARD.encode(&window),
+                                    &transport_stats::encode(&window),
                                     window_offset,
                                 );
                             }
@@ -2064,6 +2174,7 @@ impl TerminalSession {
                             break;
                         }
                         Ok(n) => {
+                            transport_stats::record_reader_chunk(n);
                             let data = interceptor.process(&reader_id, &buf[..n]);
 
                             // Tee processed output into the per-session
@@ -2186,7 +2297,7 @@ impl TerminalSession {
                         emit_terminal_output(
                             &reader_app,
                             &reader_id,
-                            &STANDARD.encode(&window),
+                            &transport_stats::encode(&window),
                             window_offset,
                         );
                     }
@@ -2260,6 +2371,14 @@ impl TerminalSession {
                 // away, which is a different fact and the one that makes the
                 // webview drop the tab. See `terminal::exit_notice`.
                 TauriExitSink { app: &waiter_app }.emit_exit(&waiter_id, code);
+
+                // Review notes sent into this pane and not yet seen arriving in
+                // its transcript can no longer arrive: settle them `unknown`
+                // (never `confirmed` on a guess). Fire-and-forget.
+                crate::mcp::session_review::settle_on_terminal_exit(
+                    waiter_app.clone(),
+                    waiter_id.clone(),
+                );
 
                 // Push notification for mobile (fire-and-forget)
                 crate::commands::workflow_events::emit_terminal_exited(
@@ -3601,6 +3720,67 @@ impl TerminalSession {
         message: &str,
         caller: PtyWriteCaller,
     ) -> Result<SubmitPayload, String> {
+        let report = self.paste_prompt(message, caller, PromptOp::Submit)?;
+
+        // Sleep so Claude Code's readline can fully process the paste
+        // sequence BEFORE the submit byte arrives. Without this, the
+        // bracketed-paste handler consumes the trailing CR as paste-tail
+        // and never submits — see [`POST_PASTE_DELAY`] doc for the §6 E2E
+        // reproduction. Sync sleep is acceptable here; callers
+        // (`claude_session/worker_message.rs::send_message_to_worker`) tolerate ~150ms
+        // blocking on the multi-threaded tokio runtime. Move to
+        // `tokio::task::spawn_blocking` if this ever goes hot-path.
+        std::thread::sleep(POST_PASTE_DELAY);
+
+        // Phase 2: bare CR (Enter) as a separate read cycle. Re-acquires
+        // the writer lock; if the worker pty has been closed in the
+        // meantime, this Err propagates cleanly.
+        // Every failure from here on follows a paste that is already on the
+        // wire, so each is tagged: the text is in the input box, unsent.
+        let mut writer = self.writer.lock().map_err(|e| {
+            format!("{PROMPT_PARTIALLY_WRITTEN}: the paste was written but the writer lock is poisoned before the submit enter: {e}")
+        })?;
+        writer.write_all(SUBMIT_ENTER).map_err(|e| {
+            format!("{PROMPT_PARTIALLY_WRITTEN}: the paste was written but the submit enter failed: {e}")
+        })?;
+        writer.flush().map_err(|e| {
+            format!("{PROMPT_PARTIALLY_WRITTEN}: the paste was written but flushing the submit enter failed: {e}")
+        })?;
+        // Both halves are on the wire, so this describes a write that really
+        // happened rather than one that was merely predicted.
+        Ok(submit_payload_of(&report))
+    }
+
+    /// Put `message` into a Claude-style prompt WITHOUT submitting it: the
+    /// same neutralized bracketed-paste block [`Self::submit_prompt`] writes,
+    /// and no trailing CR, so the text lands in the TUI's input box as a draft
+    /// the operator sends (or edits) themselves.
+    ///
+    /// Shares every gate of `submit_prompt` through [`Self::paste_prompt`] —
+    /// the liveness refusal, the body neutralizer, the rewrite warn and the
+    /// attribution `info!` (spelled `terminal insert_prompt`, so an inserted
+    /// draft is never mistaken for a submitted turn) — because an inserted
+    /// body is exactly as untrusted as a submitted one. The returned
+    /// [`SubmitPayload::bytes`] counts the paste block only.
+    pub fn insert_prompt(
+        &self,
+        message: &str,
+        caller: PtyWriteCaller,
+    ) -> Result<SubmitPayload, String> {
+        let report = self.paste_prompt(message, caller, PromptOp::Insert)?;
+        Ok(insert_payload_of(&report))
+    }
+
+    /// The half [`Self::submit_prompt`] and [`Self::insert_prompt`] share:
+    /// the liveness gate, the neutralizer, the two log lines, the paste-block
+    /// write and the input-slot record. Returns the sanitize report so the
+    /// caller can describe what it wrote.
+    fn paste_prompt(
+        &self,
+        message: &str,
+        caller: PtyWriteCaller,
+        op: PromptOp,
+    ) -> Result<SanitizeReport, String> {
         // Same LIVENESS GATE as `write`. `submit_prompt` takes the writer lock
         // directly rather than routing through `write`, so it does NOT inherit
         // that gate — without this, `POST /terminals/{id}/submit-prompt` and
@@ -3659,13 +3839,22 @@ impl TerminalSession {
         // body is untrusted and never logged; its length (matchable against a
         // transcript turn) and a short KEYED digest of the sanitized body (what
         // actually reaches the wire; see `short_body_hash`) are logged instead.
-        info!(
-            terminal_id = %self.id,
-            caller = %caller,
-            body_bytes = report.body.len(),
-            body_hmac_8 = %short_body_hash(&report.body),
-            "terminal submit_prompt"
-        );
+        match op {
+            PromptOp::Submit => info!(
+                terminal_id = %self.id,
+                caller = %caller,
+                body_bytes = report.body.len(),
+                body_hmac_8 = %short_body_hash(&report.body),
+                "terminal submit_prompt"
+            ),
+            PromptOp::Insert => info!(
+                terminal_id = %self.id,
+                caller = %caller,
+                body_bytes = report.body.len(),
+                body_hmac_8 = %short_body_hash(&report.body),
+                "terminal insert_prompt"
+            ),
+        }
 
         let block = paste_block_from_body(&report.body);
 
@@ -3677,18 +3866,27 @@ impl TerminalSession {
                 .writer
                 .lock()
                 .map_err(|e| format!("Writer lock poisoned: {}", e))?;
-            writer
-                .write_all(&block)
-                .map_err(|e| format!("Failed to write paste block: {}", e))?;
-            writer
-                .flush()
-                .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+            // A paste that broke before its first byte wrote nothing; one that
+            // broke after it may have left a fragment in the input box.
+            write_all_counting(&mut **writer, &block).map_err(|(written, e)| {
+                if written == 0 {
+                    format!("Failed to write paste block: {}", e)
+                } else {
+                    format!(
+                        "{PROMPT_PARTIALLY_WRITTEN}: the paste block broke after {written} of {} bytes: {e}",
+                        block.len()
+                    )
+                }
+            })?;
+            writer.flush().map_err(|e| {
+                format!("{PROMPT_PARTIALLY_WRITTEN}: the paste block was written but flushing it failed: {e}")
+            })?;
         } // writer lock released
 
         // The body is on the wire now, so this is an input event the PTY
-        // child can act on even if the trailing CR below fails — record it
-        // here rather than after the CR, or a half-written submit would read
-        // as "no input" to the phantom-turn detector.
+        // child can act on even if a submit's trailing CR then fails — record
+        // it here rather than after the CR, or a half-written submit would
+        // read as "no input" to the phantom-turn detector.
         self.record_input(
             PtyInputObservation {
                 caller,
@@ -3698,32 +3896,7 @@ impl TerminalSession {
             InputSlot::Submit,
         );
 
-        // Sleep so Claude Code's readline can fully process the paste
-        // sequence BEFORE the submit byte arrives. Without this, the
-        // bracketed-paste handler consumes the trailing CR as paste-tail
-        // and never submits — see [`POST_PASTE_DELAY`] doc for the §6 E2E
-        // reproduction. Sync sleep is acceptable here; callers
-        // (`claude_session/worker_message.rs::send_message_to_worker`) tolerate ~150ms
-        // blocking on the multi-threaded tokio runtime. Move to
-        // `tokio::task::spawn_blocking` if this ever goes hot-path.
-        std::thread::sleep(POST_PASTE_DELAY);
-
-        // Phase 2: bare CR (Enter) as a separate read cycle. Re-acquires
-        // the writer lock; if the worker pty has been closed in the
-        // meantime, this Err propagates cleanly.
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|e| format!("Writer lock poisoned: {}", e))?;
-        writer
-            .write_all(SUBMIT_ENTER)
-            .map_err(|e| format!("Failed to write submit enter: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("Failed to flush PTY: {}", e))?;
-        // Both halves are on the wire, so this describes a write that really
-        // happened rather than one that was merely predicted.
-        Ok(submit_payload_of(&report))
+        Ok(report)
     }
 
     /// Resize the pane's viewport.
@@ -3886,7 +4059,7 @@ impl TerminalSession {
         };
         // Emit under the lock: it is this session's webview ordering point.
         if let Some((window, offset)) = taken {
-            emit_terminal_output(app, &self.id, &STANDARD.encode(&window), offset);
+            emit_terminal_output(app, &self.id, &transport_stats::encode(&window), offset);
         }
     }
 
@@ -4182,6 +4355,16 @@ impl TerminalSession {
         if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
             *slot = Some(ctx);
         }
+    }
+
+    /// `(worktree_path, parent_sha)` of every coord-allocated worktree the
+    /// parked `IsolatedEditContext` holds; empty for a shared-checkout session.
+    pub fn allocation_bases(&self) -> Vec<(std::path::PathBuf, String)> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ctx| ctx.allocation_bases()))
+            .unwrap_or_default()
     }
 
     /// Take the parked `IsolatedEditContext` back OFF this session, leaving
@@ -4556,12 +4739,15 @@ impl TerminalSession {
         // Release the pane's handles — for a local PTY this closes the OS pipe
         // and unblocks the reader thread which may be stuck in a blocking
         // read() call. Bounded for the same reason as the writer above.
+        // `release` can fail for more than a spent budget — a holder pane
+        // released after a kill that did not land says so in its error — so
+        // the log carries the pane's own reason rather than assuming one.
         if let Err(e) = self.io.release(lock_budget) {
             warn!(
                 terminal_id = %self.id,
                 error = %e,
-                "Could not release the pane within the shutdown budget — the \
-                 handle will be released by process exit"
+                "pane release reported an error (see `error`); any handle it \
+                 could not release is released by process exit"
             );
         }
 
@@ -7412,6 +7598,79 @@ pub(crate) mod tests {
         }
     }
 
+    /// Writes its first `ok_writes` calls, then fails every write.
+    struct FailingAfter {
+        buf: Arc<Mutex<Vec<u8>>>,
+        ok_writes: usize,
+        partial_first: bool,
+    }
+
+    impl Write for FailingAfter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if self.ok_writes == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pty gone",
+                ));
+            }
+            self.ok_writes -= 1;
+            // Optionally accept only part of the first buffer, so the next
+            // call (which fails) leaves a fragment behind.
+            let n = if self.partial_first {
+                data.len().min(3)
+            } else {
+                data.len()
+            };
+            self.partial_first = false;
+            self.buf.lock().unwrap().extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session_failing_after(
+        ok_writes: usize,
+        partial_first: bool,
+    ) -> (LiveTestSession, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        *session.writer.lock().unwrap() = Box::new(FailingAfter {
+            buf: buf.clone(),
+            ok_writes,
+            partial_first,
+        });
+        (session, buf)
+    }
+
+    /// The review send's "the text may already be in the input box": a CR
+    /// that fails after the paste landed, or a paste that broke part-way, is
+    /// tagged [`PROMPT_PARTIALLY_WRITTEN`]; a paste that wrote nothing is not.
+    #[test]
+    fn submit_prompt_tags_a_failure_after_bytes_reached_the_pty() {
+        let (paste_only, buf) = session_failing_after(1, false);
+        let err = paste_only
+            .submit_prompt("hello", PtyWriteCaller::Test)
+            .expect_err("the CR fails");
+        assert!(err.starts_with(PROMPT_PARTIALLY_WRITTEN), "got {err:?}");
+        assert_eq!(buf.lock().unwrap().as_slice(), b"\x1b[200~hello\x1b[201~");
+
+        let (fragment, buf) = session_failing_after(1, true);
+        let err = fragment
+            .submit_prompt("hello", PtyWriteCaller::Test)
+            .expect_err("the paste breaks part-way");
+        assert!(err.starts_with(PROMPT_PARTIALLY_WRITTEN), "got {err:?}");
+        assert_eq!(buf.lock().unwrap().len(), 3);
+
+        let (nothing, buf) = session_failing_after(0, false);
+        let err = nothing
+            .submit_prompt("hello", PtyWriteCaller::Test)
+            .expect_err("the paste fails at once");
+        assert!(!err.starts_with(PROMPT_PARTIALLY_WRITTEN), "got {err:?}");
+        assert!(buf.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn submit_prompt_writes_bracketed_paste_then_bare_cr() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -7421,6 +7680,34 @@ pub(crate) mod tests {
             .expect("submit_prompt failed");
         let written = buf.lock().unwrap().clone();
         assert_eq!(written, b"\x1b[200~hello\x1b[201~\r");
+    }
+
+    /// The review send bar's "insert without sending": the same neutralized
+    /// paste block `submit_prompt` writes, and NO submitting CR — the text is a
+    /// draft in the TUI's input box, not a turn.
+    #[test]
+    fn insert_prompt_writes_the_neutralized_paste_block_and_no_cr() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        let payload = session
+            .insert_prompt("a\x1b[201~b", PtyWriteCaller::ReviewNotes)
+            .expect("insert_prompt failed");
+        let written = buf.lock().unwrap().clone();
+        assert_eq!(written, b"\x1b[200~a[201~b\x1b[201~");
+        assert_eq!(payload.bytes, written.len());
+        assert!(payload.sanitized, "the embedded paste END was neutralized");
+    }
+
+    /// The insert shares submit's liveness gate: nothing reaches a dead PTY.
+    #[test]
+    fn insert_prompt_to_an_exited_pty_is_refused_and_drops_the_bytes() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        let err = session
+            .insert_prompt("draft", PtyWriteCaller::ReviewNotes)
+            .expect_err("insert_prompt to an exited pty must be refused");
+        assert!(err.starts_with(TERMINAL_EXITED), "got {err:?}");
+        assert!(buf.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -7529,6 +7816,7 @@ pub(crate) mod tests {
                 rule_id: "rule-7".to_string(),
             },
             PtyWriteCaller::WorkerSession,
+            PtyWriteCaller::ReviewNotes,
             PtyWriteCaller::TauriTerminalWrite,
             PtyWriteCaller::TauriInvokeProxy,
             PtyWriteCaller::RemoteTerminalInput,
@@ -7560,6 +7848,7 @@ pub(crate) mod tests {
                 "session_message_poller",
                 "auto_response:rule-7",
                 "worker_session",
+                "review_notes",
                 "tauri_terminal_write",
                 "tauri_invoke_proxy",
                 "remote_terminal_input",

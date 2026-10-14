@@ -276,6 +276,14 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
                  resolver per registration)",
     },
     PinSurface {
+        surface: "transcript_autobind_mint",
+        timing: PinTiming::Live,
+        readers: &["session/transcript_autobind.rs::mint_gate"],
+        detail: "the tenant a transcript-bound row is MINTED under, read on every mint \
+                 attempt (an unpinned multi-tenant device mints nothing); no running session \
+                 moves",
+    },
+    PinSurface {
         surface: "coord_mcp_mint_and_provisioning",
         timing: PinTiming::Live,
         readers: &[
@@ -322,6 +330,16 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
                  and resolve_volume_poster, which rebuilds the poster when the tenant in its \
                  key changes; fs_backstop tick_once; maintenance report_reset_git_op; \
                  resource_sample publish_once)",
+    },
+    PinSurface {
+        surface: "register_heartbeat_slot_fallback_default",
+        timing: PinTiming::Live,
+        readers: &["fleet.rs::read_active_tenant"],
+        detail: "the register heartbeat's DEFAULT tenant when paired_user.json and a usable \
+                 legacy slot both miss (fleet.rs resolve_heartbeat_binding_set): re-read on \
+                 every heartbeat (30 s) that reaches the per-tenant-slot fallback, and honoured \
+                 only while it is among the usable slots coord's bound set lists \
+                 (heartbeat_slot_fallback); no other resolver reads it",
     },
     PinSurface {
         surface: "session_outbox_tenant_backfill",
