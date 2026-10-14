@@ -10,8 +10,9 @@
 //! 1. **Take a handle on the process first** — Linux `pidfd_open`, Windows
 //!    `OpenProcess`. From here on the handle refers to ONE process, whatever
 //!    later happens to the pid.
-//! 2. **Then verify** that this pane's lock is HELD right now and its record
-//!    names `holder_pid`. A holder that had died before step 1 left its lock
+//! 2. **Then verify** that this pane's lock is HELD right now, its record
+//!    names `holder_pid`, and — when the record carries the holder's start
+//!    token (Phase 3) — the process behind the handle is that holder. A holder that had died before step 1 left its lock
 //!    acquirable (the lock is an `flock` on a close-on-exec descriptor, so no
 //!    child inherits it), so a held lock naming the pid after step 1 means the
 //!    process behind the handle is that live holder.
@@ -63,6 +64,21 @@ fn verify_holder(pane_dir: &Path, pane_id: &PaneId, holder_pid: u32) -> Result<(
         Err(e) => return Err(format!("lock unreadable: {e}")),
     }
     match read_record(&lock_file) {
+        // A held lock can be a transient hold (a prober, a forked child —
+        // finding 9bbe1079) on a dead holder's file whose pid was since
+        // reused: when the record carries the holder's start token, the
+        // process behind the handle must BE that holder.
+        Some(r)
+            if r.holder_pid == holder_pid
+                && r.holder_start.as_deref().is_some_and(|t| {
+                    !crate::proc_identity::is_same_process(holder_pid, Some(t))
+                }) =>
+        {
+            Err(format!(
+                "pid {holder_pid} is not the holder the lock record names (its start token \
+                 differs): the pid was reused"
+            ))
+        }
         Some(r) if r.holder_pid == holder_pid => Ok(()),
         Some(r) => Err(format!(
             "the lock names holder pid {}, not {holder_pid}",
@@ -220,6 +236,7 @@ mod tests {
             child_start: None,
             scope_unit: None,
             holder_start: None,
+            ended: None,
         }
     }
 
@@ -263,7 +280,18 @@ mod tests {
         assert!(!t.signalled, "{t:?}");
         assert!(victim.try_wait().unwrap().is_none());
 
-        lock.write_record(&record(victim.id())).unwrap();
+        // Review round 2, N5: the record names the pid, but its start token
+        // says the holder was another process — a reused pid is refused.
+        let mut reused = record(victim.id());
+        reused.holder_start = Some("linux:another-boot:1".into());
+        lock.write_record(&reused).unwrap();
+        let t = terminate_verified_holder(&dir, &id, victim.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(victim.try_wait().unwrap().is_none());
+
+        let mut genuine = record(victim.id());
+        genuine.holder_start = crate::proc_identity::start_token(victim.id());
+        lock.write_record(&genuine).unwrap();
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(t.signalled, "{t:?}");
         assert!(t.detail.contains("pidfd"), "{t:?}");

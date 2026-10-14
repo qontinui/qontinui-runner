@@ -22,10 +22,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use qontinui_pty_holder::client::{connect, Event};
-use qontinui_pty_holder::lock::read_record;
+use qontinui_pty_holder::lock::{read_record, ENDED_BY_EXIT};
 use qontinui_pty_holder::pane::{lock_path, socket_path, PaneId};
 use qontinui_pty_holder::spawn::{
-    spawn_holder, RouteRequest, SpawnRequest, SpawnedHolder, DEFAULT_REPORT_TIMEOUT,
+    spawn_holder, HostFacts, RouteRequest, SpawnRequest, SpawnedHolder, DEFAULT_REPORT_TIMEOUT,
 };
 use qontinui_pty_holder::spec::ChildSpec;
 use qontinui_pty_holder::sweep::{boot_sweep, SweepOutcome};
@@ -63,12 +63,26 @@ fn alive(pid: u32) -> bool {
 /// session id is the child's pid): every member SIGKILLed on drop — the
 /// child, a `sleep` it runs in the foreground, a job it put in the background.
 /// While any member lives the id is pinned to this session (POSIX), so the
-/// sweep reaches only processes this test's holder spawned.
-struct PaneSession(u32);
+/// sweep reaches only processes this test's holder spawned — which is why a
+/// test DISARMS it once it has seen every member dead: from then on the id
+/// may be recycled, and a sweep could hit a stranger's session.
+struct PaneSession(u32, bool);
+
+impl PaneSession {
+    fn new(sid: u32) -> Self {
+        PaneSession(sid, true)
+    }
+
+    fn disarm(&mut self) {
+        self.1 = false;
+    }
+}
 
 impl Drop for PaneSession {
     fn drop(&mut self) {
-        let _ = qontinui_pty_holder::reap::reap_session_of_exited_child(self.0);
+        if self.1 {
+            let _ = qontinui_pty_holder::reap::reap_session_of_exited_child(self.0);
+        }
     }
 }
 
@@ -108,14 +122,18 @@ fn spec_with_background_job(then: &str) -> ChildSpec {
 }
 
 fn spawn(dir: &Path, pane: &PaneId, child: &ChildSpec) -> SpawnedHolder {
+    // Plain: no transient scope, so the reaping under test is the session
+    // sweep, not systemd's.
+    spawn_on(dir, pane, child, RouteRequest::Plain)
+}
+
+fn spawn_on(dir: &Path, pane: &PaneId, child: &ChildSpec, route: RouteRequest) -> SpawnedHolder {
     spawn_holder(&SpawnRequest {
         holder_exe: Path::new(BIN),
         pane_dir: dir,
         pane_id: pane,
         child,
-        // Plain: no transient scope, so the reaping under test is the
-        // session sweep, not systemd's.
-        route: RouteRequest::Plain,
+        route,
         report_timeout: DEFAULT_REPORT_TIMEOUT,
     })
     .expect("spawn")
@@ -151,15 +169,16 @@ fn background_pid(dir: &Path, pane: &PaneId, wait_for_exit: bool) -> u32 {
     bg.expect("the child reported its background job")
 }
 
-/// D8 as decided 2026-10-14: a child that EXITS ON ITS OWN leaves what it
-/// started running — the holder ends the pane without reaping it, exactly as
-/// an in-process PTY never did.
-#[test]
-fn pty_holder_reap_normal_exit_leaves_detached_jobs_running() {
-    let dir = pane_dir("end");
+/// D8 as decided 2026-10-14 (review round 2, N1): a child that EXITS ON ITS
+/// OWN leaves what it started running — the holder ends the pane without
+/// reaping it, its record says so, and the NEXT BOOT SWEEP touches nothing
+/// either (on the scope route it would otherwise stop the holder's scope, and
+/// the job in it).
+fn normal_exit_then_boot_sweep(route: RouteRequest, tag: &str) {
+    let dir = pane_dir(tag);
     let pane = PaneId::new("p1").unwrap();
-    let h = spawn(&dir, &pane, &spec_with_background_job("exit 0"));
-    let _session = PaneSession(h.child_pid);
+    let h = spawn_on(&dir, &pane, &spec_with_background_job("exit 0"), route);
+    let _session = PaneSession::new(h.child_pid);
     let _holder = HolderGuard {
         dir: &dir,
         pane: &pane,
@@ -175,6 +194,84 @@ fn pty_holder_reap_normal_exit_leaves_detached_jobs_running() {
         alive(bg),
         "a normal exit must not reap the child's detached job"
     );
+    let record = read_record(&lock_path(&dir, &pane)).expect("the record outlives the holder");
+    assert_eq!(record.ended.as_deref(), Some(ENDED_BY_EXIT), "{record:?}");
+
+    let report = boot_sweep(&dir, Duration::from_secs(10), &[], |_, _| {}).unwrap();
+    match &report.entries[0].outcome {
+        SweepOutcome::Reaped {
+            reap,
+            orphan_kept: false,
+            ..
+        } => {
+            assert!(reap.killed.is_empty(), "{reap:?}");
+            assert!(reap.unattributed.is_empty(), "{reap:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        alive(bg),
+        "the boot sweep must not reap a normally ended pane's job"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pty_holder_boot_sweep_after_a_normal_exit_leaves_detached_jobs_running() {
+    normal_exit_then_boot_sweep(RouteRequest::Plain, "end");
+}
+
+/// The same on the scope route, where the sweep's tool is stopping the
+/// holder's transient unit — run where a user systemd is reachable.
+#[test]
+fn pty_holder_boot_sweep_after_a_normal_exit_on_the_scope_route_leaves_the_scope() {
+    let facts = HostFacts::probe();
+    if !(facts.linux && facts.scope_tooling) {
+        eprintln!("pty_holder_boot_sweep: no user systemd here — scope-route case not applicable");
+        return;
+    }
+    normal_exit_then_boot_sweep(RouteRequest::Scope, "endscope");
+}
+
+/// Review round 2, N2: a KILL that arrives after the child already exited on
+/// its own reaches nothing — the pane still ended by exit, and its leftovers
+/// are left alone.
+#[test]
+fn pty_holder_reap_a_kill_after_a_normal_exit_reaps_nothing() {
+    let dir = pane_dir("late");
+    let pane = PaneId::new("p1").unwrap();
+    let h = spawn(&dir, &pane, &spec_with_background_job("exit 0"));
+    let _session = PaneSession::new(h.child_pid);
+    let _holder = HolderGuard {
+        dir: &dir,
+        pane: &pane,
+        pid: h.holder_pid,
+    };
+    let (holder, child) = (h.holder_pid, h.child_pid);
+    let bg = background_pid(&dir, &pane, false);
+    h.reap_in_background();
+    wait_dead(child, "the child that exits on its own");
+    // The exit is not collected yet, so the holder lingers: now the late kill.
+    let mut s = connect(&dir, &pane, soon())
+        .unwrap()
+        .attach(None, soon())
+        .unwrap();
+    s.writer.kill(soon()).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(ev)) = s.reader.next_event(Some(end)) {
+        if matches!(ev, Event::Exit(_)) {
+            break;
+        }
+    }
+    drop(s);
+    wait_dead(holder, "the holder after the late kill");
+    assert!(
+        alive(bg),
+        "a kill that reached no live child must reap nothing"
+    );
+    let record = read_record(&lock_path(&dir, &pane)).expect("record");
+    assert_eq!(record.ended.as_deref(), Some(ENDED_BY_EXIT), "{record:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -191,7 +288,7 @@ fn pty_holder_reap_kill_ends_the_child_tree() {
         pid: h.holder_pid,
     };
     let (holder, child) = (h.holder_pid, h.child_pid);
-    let _session = PaneSession(child);
+    let mut session = PaneSession::new(child);
     let bg = background_pid(&dir, &pane, false);
     h.reap_in_background();
     let mut s = connect(&dir, &pane, soon())
@@ -208,6 +305,7 @@ fn pty_holder_reap_kill_ends_the_child_tree() {
     drop(s);
     wait_dead(child, "the killed child");
     wait_dead(bg, "the killed pane's SIGHUP-immune background job");
+    session.disarm();
     wait_dead(holder, "the holder after its pane was killed");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -223,9 +321,9 @@ fn pty_holder_boot_sweep_leaves_a_live_holder_running_and_lists_it() {
         pane: &pane,
         pid: h.holder_pid,
     };
-    let _session = PaneSession(h.child_pid);
+    let _session = PaneSession::new(h.child_pid);
     let mut adopted = Vec::new();
-    let report = boot_sweep(&dir, Duration::from_secs(10), &[], |entries| {
+    let report = boot_sweep(&dir, Duration::from_secs(10), &[], |entries, _dead| {
         adopted = entries
             .iter()
             .map(|e| e.pane_id.clone())
@@ -259,7 +357,7 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
     let pane = PaneId::new("p1").unwrap();
     let h = spawn(&dir, &pane, &spec_with_background_job("sleep 300"));
     let (holder, child) = (h.holder_pid, h.child_pid);
-    let _session = PaneSession(child);
+    let mut session = PaneSession::new(child);
     let bg = background_pid(&dir, &pane, false);
     h.reap_in_background();
 
@@ -272,7 +370,7 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
     assert!(alive(child), "fixture: the child survives its holder");
     assert!(alive(bg), "fixture: the background job survives its holder");
 
-    let report = boot_sweep(&dir, Duration::from_secs(10), &[], |_| {}).unwrap();
+    let report = boot_sweep(&dir, Duration::from_secs(10), &[], |_, _| {}).unwrap();
     assert_eq!(report.entries.len(), 1, "{report:?}");
     match &report.entries[0].outcome {
         SweepOutcome::Reaped {
@@ -292,6 +390,7 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
     if cfg!(target_os = "linux") {
         wait_dead(child, "the orphaned child");
         wait_dead(bg, "the orphaned background job");
+        session.disarm();
     }
     // Off Linux there is no start token, so nothing was provable and nothing
     // signalled: the `PaneSession` guard cleans the fixture up.

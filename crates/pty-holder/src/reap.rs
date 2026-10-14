@@ -130,6 +130,12 @@ impl ReapReport {
 /// caller holds that pane's lock, so no holder for it can start meanwhile.
 pub fn reap_orphans_of_dead_holder(record: &LockRecord) -> ReapReport {
     let mut report = ReapReport::default();
+    // The holder recorded a NORMAL end: what the child left running is its
+    // user's, now and at every later sweep (plan D8 as decided 2026-10-14).
+    if record.ended.as_deref() == Some(crate::lock::ENDED_BY_EXIT) {
+        report.note("the pane ended by its child's own exit: its leftovers are not touched");
+        return report;
+    }
     #[cfg(target_os = "linux")]
     if let Some(unit) = &record.scope_unit {
         if unit.starts_with(crate::spawn::HOLDER_UNIT_PREFIX)
@@ -138,7 +144,8 @@ pub fn reap_orphans_of_dead_holder(record: &LockRecord) -> ReapReport {
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         {
             match crate::spawn::stop_scope_unit(unit, crate::spawn::SYSTEMCTL_DEADLINE) {
-                Ok(()) => report.note(format!("stopped scope unit {unit}")),
+                // `--no-block`: success means the stop job was QUEUED.
+                Ok(()) => report.note(format!("stop queued for scope unit {unit}")),
                 Err(e) => report.note(format!("scope unit {unit} NOT stopped: {e}")),
             }
         } else {
@@ -463,6 +470,17 @@ mod imp {
         out
     }
 
+    /// Every process the snapshot records as a child of `parent` pid, as
+    /// UNATTRIBUTED: the parent is gone or unverifiable, so the link proves
+    /// nothing — but the processes must not drop out of the orphan ledger.
+    fn unattributed_children_of(parent: u32, report: &mut ReapReport) {
+        report.unattributed = snapshot()
+            .into_iter()
+            .filter(|&(pid, ppid)| ppid == parent && pid != parent)
+            .map(|(pid, _)| pid)
+            .collect();
+    }
+
     /// The recorded child, if alive and verified, plus every descendant: a
     /// process joins the tree only if its parent is in the tree AND it was
     /// created no earlier than that parent (Windows keeps a dead parent's pid
@@ -472,14 +490,22 @@ mod imp {
     /// through that handle — descendants first.
     pub(super) fn reap_recorded_child(child: u32, token: Option<&str>, report: &mut ReapReport) {
         let Some(token) = token else {
+            unattributed_children_of(child, report);
             report.note(format!(
-                "record has no child start token: child {child} is not verifiable"
+                "record has no child start token: child {child} is not verifiable; {} \
+                 process(es) whose recorded parent is pid {child} are NOT provably its \
+                 (the pid may since name another process) — left alone",
+                report.unattributed.len()
             ));
             return;
         };
         let Some(root) = open(child) else {
+            unattributed_children_of(child, report);
             report.note(format!(
-                "recorded child {child} is gone (the holder's job ended its tree)"
+                "recorded child {child} is gone; {} process(es) whose recorded parent is pid \
+                 {child} are NOT provably its (the pid may since name another process) — \
+                 left alone",
+                report.unattributed.len()
             ));
             return;
         };
@@ -498,10 +524,12 @@ mod imp {
             "recorded child {child} is alive and verified (it was never contained by the \
              holder's job)"
         ));
-        let procs = snapshot();
-        // Taken AFTER the snapshot: a pid the snapshot listed that was since
-        // reused belongs to a process created after this instant.
+        // Taken BEFORE the snapshot: a pid the snapshot lists that was reused
+        // at any point after this instant names a process created after it,
+        // and is refused. (A real descendant created in the instant between
+        // the two is refused too: the error is toward signalling less.)
         let snapshot_at = qontinui_runner_win32::holder_spawn::filetime_now();
+        let procs = snapshot();
         let mut tree: Vec<(u32, u64, Proc)> = vec![(child, root_created, root)];
         let mut i = 0;
         while i < tree.len() {
@@ -567,12 +595,26 @@ mod tests {
     }
 
     /// Ends the fixture's whole session on drop, so a failed assert leaves no
-    /// `sleep 300` behind (the session id is pinned while a member lives).
-    struct SessionGuard(u32);
+    /// `sleep 300` behind. Only while ARMED: the session id is pinned to this
+    /// fixture only while a member lives, so a test disarms it once it has
+    /// seen every member dead — a later sweep could hit a recycled id.
+    struct SessionGuard(u32, bool);
+
+    impl SessionGuard {
+        fn new(sid: u32) -> Self {
+            SessionGuard(sid, true)
+        }
+
+        fn disarm(&mut self) {
+            self.1 = false;
+        }
+    }
 
     impl Drop for SessionGuard {
         fn drop(&mut self) {
-            let _ = reap_session_of_exited_child(self.0);
+            if self.1 {
+                let _ = reap_session_of_exited_child(self.0);
+            }
         }
     }
 
@@ -594,6 +636,7 @@ mod tests {
             child_start: token,
             scope_unit: None,
             holder_start: None,
+            ended: None,
         }
     }
 
@@ -601,13 +644,14 @@ mod tests {
     #[test]
     fn pty_holder_reap_session_of_exited_child_ends_the_session_and_nothing_else() {
         let (mut leader, bg) = session_with_a_background_job();
-        let _guard = SessionGuard(leader.id());
+        let mut guard = SessionGuard::new(leader.id());
         let mut bystander = Command::new("sleep").arg("300").spawn().unwrap();
         let report = reap_session_of_exited_child(leader.id());
         assert!(report.killed.contains(&bg), "{report:?}");
         assert!(report.killed.contains(&leader.id()), "{report:?}");
         let _ = leader.wait();
         wait_dead(bg);
+        guard.disarm();
         assert!(
             bystander.try_wait().unwrap().is_none(),
             "a process outside the session was signalled"
@@ -620,13 +664,14 @@ mod tests {
     #[test]
     fn pty_holder_reap_dead_holder_with_a_verified_child_ends_its_tree() {
         let (mut leader, bg) = session_with_a_background_job();
-        let _guard = SessionGuard(leader.id());
+        let mut guard = SessionGuard::new(leader.id());
         let token = crate::proc_identity::start_token(leader.id());
         assert!(token.is_some());
         let report = reap_orphans_of_dead_holder(&record(leader.id(), token));
         assert!(report.killed.contains(&leader.id()), "{report:?}");
         let _ = leader.wait();
         wait_dead(bg);
+        guard.disarm();
     }
 
     /// Moment 2, unverified: a token that does not match (the pid was reused,
@@ -634,7 +679,7 @@ mod tests {
     #[test]
     fn pty_holder_reap_dead_holder_never_signals_an_unverified_pid() {
         let (mut leader, bg) = session_with_a_background_job();
-        let _guard = SessionGuard(leader.id());
+        let mut guard = SessionGuard::new(leader.id());
         for token in [Some("linux:another-boot:1".to_string()), None] {
             let report = reap_orphans_of_dead_holder(&record(leader.id(), token));
             assert!(report.killed.is_empty(), "{report:?}");
@@ -646,6 +691,7 @@ mod tests {
         assert!(report.killed.contains(&bg));
         let _ = leader.wait();
         wait_dead(bg);
+        guard.disarm();
     }
 }
 

@@ -982,23 +982,43 @@ fn spawn_os(
 /// The holder WMI made could not be held by a process handle. Most often it
 /// failed fast (say `lock_held`) and exited before it could be opened — but it
 /// may be LIVE (its handle refused on a false identity mismatch), and a live
-/// holder must never be left running while the caller falls back to an
-/// in-process PTY (two copies of one command). So, judged by the pane itself:
+/// holder must never be left running its command while the caller falls back
+/// to an in-process PTY (two copies of one command). So, in this order:
 ///
-/// - its report says `holder_error=…` → [`SpawnError::HolderFailed`];
-/// - its report says `holder_ready`, and the pane's endpoint answers the
-///   handshake as that holder pid → accepted, held by pane identity
-///   ([`HolderProcess::Unheld`]) instead of by handle;
-/// - otherwise, if the pane's lock is held, its recorded holder is ended
-///   through `terminate::terminate_verified_holder`; a holder that can be
-///   neither held nor ended is [`SpawnError::LiveHolderUnreachable`] — never
-///   a plain failure a caller would fall back from.
+/// 1. **Unlink the spec.** If that succeeds, no holder consumed it and none
+///    ever can: no holder will run this pane's command, and falling back is
+///    safe. Any other failure than `NotFound` leaves a holder free to consume
+///    it later: [`SpawnError::LiveHolderUnreachable`].
+/// 2. `NotFound`: a holder consumed the spec, having taken the pane's lock
+///    first. Its report decides: `holder_ready` with an endpoint that answers
+///    the handshake as that pid → accepted, held by pane identity
+///    ([`HolderProcess::Unheld`]).
+/// 3. Otherwise the holder must be CONFIRMED dead before a fallback: the
+///    pane's lock free, or — while it is held — the recorded holder ended
+///    through `terminate::terminate_verified_holder` and the lock seen free
+///    within [`FAILURE_WAIT`]. Anything short of that is
+///    [`SpawnError::LiveHolderUnreachable`].
 #[cfg(windows)]
 fn settle_unheld_wmi_holder(
     req: &SpawnRequest<'_>,
     report: &Path,
     why: &str,
 ) -> Result<HolderProcess, AttemptError> {
+    let fail = |e: SpawnError| Err(AttemptError::Other(e));
+    match std::fs::remove_file(spec_path(req.pane_dir, req.pane_id)) {
+        Ok(()) => {
+            return fail(SpawnError::Spawn(format!(
+                "{why}; the spec was still unconsumed and is now removed — no holder can run \
+                 this pane's command"
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return fail(SpawnError::LiveHolderUnreachable(format!(
+                "{why}; the spec could not be removed ({e}), so a holder may still run it"
+            )))
+        }
+    }
     let deadline = Instant::now() + req.report_timeout;
     let line = loop {
         if let Some(line) = take_report_file(report).filter(|l| !l.is_empty()) {
@@ -1009,61 +1029,60 @@ fn settle_unheld_wmi_holder(
         }
         std::thread::sleep(REPORT_FILE_POLL);
     };
-    if let Some(line) = &line {
-        if line.starts_with("holder_error=") {
-            return Err(AttemptError::Other(SpawnError::HolderFailed {
-                line: line.clone(),
-                status: format!("exited before it could be opened ({why})"),
-            }));
-        }
-        if let Some(ready) = parse_ready_line(line) {
-            let answered =
-                crate::client::connect(req.pane_dir, req.pane_id, Instant::now() + FAILURE_WAIT)
-                    .is_ok_and(|c| {
-                        signalable_pid(c.hello_ack().holder_pid) == Some(ready.holder_pid)
-                    });
-            if answered {
-                return Ok(HolderProcess::Unheld {
-                    pid: ready.holder_pid as u32,
-                    pane_dir: req.pane_dir.to_path_buf(),
-                    pane_id: req.pane_id.clone(),
-                    ready_line: Some(line.clone()),
-                });
-            }
+    if let Some(ready) = line.as_deref().and_then(parse_ready_line) {
+        let answered =
+            crate::client::connect(req.pane_dir, req.pane_id, Instant::now() + FAILURE_WAIT)
+                .is_ok_and(|c| signalable_pid(c.hello_ack().holder_pid) == Some(ready.holder_pid));
+        if answered {
+            return Ok(HolderProcess::Unheld {
+                pid: ready.holder_pid as u32,
+                pane_dir: req.pane_dir.to_path_buf(),
+                pane_id: req.pane_id.clone(),
+                ready_line: line,
+            });
         }
     }
     let lock_file = crate::pane::lock_path(req.pane_dir, req.pane_id);
-    match crate::lock::PaneLock::try_acquire_existing(&lock_file) {
-        Ok(crate::lock::TryLock::Held) => {
-            let Some(record) = crate::lock::read_record(&lock_file) else {
-                return Err(AttemptError::Other(SpawnError::LiveHolderUnreachable(
-                    format!("{why}; the pane's lock is held by an unidentified holder"),
-                )));
-            };
-            let t = crate::terminate::terminate_verified_holder(
-                req.pane_dir,
-                req.pane_id,
-                record.holder_pid,
-            );
-            if t.signalled {
-                Err(AttemptError::Other(SpawnError::Spawn(format!(
-                    "{why}; the unheld holder (pid {}) was ended: {}",
-                    record.holder_pid, t.detail
-                ))))
-            } else {
-                Err(AttemptError::Other(SpawnError::LiveHolderUnreachable(
-                    format!(
-                        "{why}; holder pid {} holds the pane and could not be ended: {}",
-                        record.holder_pid, t.detail
-                    ),
-                )))
+    let lock_free = || {
+        !matches!(
+            crate::lock::PaneLock::try_acquire_existing(&lock_file),
+            Ok(crate::lock::TryLock::Held)
+        )
+    };
+    let reported = line.unwrap_or_else(|| "no report".into());
+    if lock_free() {
+        // The holder that consumed the spec is gone; on Windows its armed
+        // job ended the child with it.
+        return fail(if reported.starts_with("holder_error=") {
+            SpawnError::HolderFailed {
+                line: reported,
+                status: format!("exited before it could be opened ({why})"),
             }
-        }
-        // Lock free or gone: no holder is alive for this pane.
-        _ => Err(AttemptError::Other(SpawnError::Spawn(format!(
-            "{why}; {}",
-            line.unwrap_or_else(|| "no report".into())
-        )))),
+        } else {
+            SpawnError::Spawn(format!("{why}; the holder is gone: {reported}"))
+        });
+    }
+    let Some(record) = crate::lock::read_record(&lock_file) else {
+        return fail(SpawnError::LiveHolderUnreachable(format!(
+            "{why}; the pane's lock is held by an unidentified holder"
+        )));
+    };
+    let t =
+        crate::terminate::terminate_verified_holder(req.pane_dir, req.pane_id, record.holder_pid);
+    let gone_by = Instant::now() + FAILURE_WAIT;
+    while t.signalled && !lock_free() && Instant::now() < gone_by {
+        std::thread::sleep(REPORT_FILE_POLL);
+    }
+    if t.signalled && lock_free() {
+        fail(SpawnError::Spawn(format!(
+            "{why}; the unheld holder (pid {}) was ended and has exited: {}",
+            record.holder_pid, t.detail
+        )))
+    } else {
+        fail(SpawnError::LiveHolderUnreachable(format!(
+            "{why}; holder pid {} holds the pane and was not seen to exit: {}",
+            record.holder_pid, t.detail
+        )))
     }
 }
 
