@@ -68,6 +68,18 @@ export function f(setError: (m: string) => void) {
 declare function doThing(): void;
 `;
 
+/** The CAST spelling of the catch-site discard (production-only arm). */
+const CATCH_SITE_CAST = `
+export function f(setError: (m: string) => void) {
+  try {
+    doThing();
+  } catch (err) {
+    setError((err as Error).message);
+  }
+}
+declare function doThing(): void;
+`;
+
 const POPULATION_NAME = `export const sessionCount = 1;\n`;
 
 async function errorMessages(code: string, filePath: string, ruleIds: string[]): Promise<string[]> {
@@ -113,6 +125,13 @@ describe("output-text boundary (eslint.config.js)", () => {
     it(`keeps the catch-site discard guard live in ${filePath}`, async () => {
       const msgs = await errorMessages(CATCH_SITE_DISCARD, filePath, ["no-restricted-syntax"]);
       expect(msgs.some((m) => m.includes("describeThrown"))).toBe(true);
+    }, 60_000);
+
+    // Same REPLACE reason for the production-only cast arm: these two files are
+    // production code, so the boundary blocks must re-state it too.
+    it(`keeps the catch-site cast guard live in ${filePath}`, async () => {
+      const msgs = await errorMessages(CATCH_SITE_CAST, filePath, ["no-restricted-syntax"]);
+      expect(msgs.some((m) => m.includes("is a cast, not a check"))).toBe(true);
     }, 60_000);
   }
 

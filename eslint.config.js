@@ -364,8 +364,9 @@ export default [
   },
   {
     // Output-text boundary (dynamic `import()`) for useTerminalFindings.ts.
-    // Spreads both selector lists the earlier blocks apply under
-    // src/components/terminal/**, for the same REPLACE reason.
+    // Spreads every selector list the earlier blocks apply under
+    // src/components/terminal/** (population-name, catch-site discard and
+    // cast), for the same REPLACE reason.
     files: ["src/components/terminal/useTerminalFindings.ts"],
     rules: {
       "no-restricted-syntax": [
