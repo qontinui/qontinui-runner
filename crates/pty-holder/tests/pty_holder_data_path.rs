@@ -171,7 +171,20 @@ fn collect_until(
             c.events,
             String::from_utf8_lossy(&c.bytes[c.bytes.len().saturating_sub(200)..])
         );
-        match s.reader.next_event(Some(end)).expect("stream read") {
+        let event = match s.reader.next_event(Some(end)) {
+            Ok(e) => e,
+            // The read's deadline IS `bound`: report what arrived, as the
+            // assertion above does, instead of a bare TimedOut.
+            Err(ConnectError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => panic!(
+                "stream did not reach the expected state within {bound:?} (read timed out); have {} bytes, next offset {}, events {:?}, tail {:?}",
+                c.bytes.len(),
+                c.next,
+                c.events,
+                String::from_utf8_lossy(&c.bytes[c.bytes.len().saturating_sub(200)..])
+            ),
+            Err(e) => panic!("stream read: {e:?}"),
+        };
+        match event {
             None => break,
             // A reported loss is the holder being honest (its ring rolled past
             // bytes this connection had not been sent): the stream continues
@@ -234,17 +247,25 @@ fn pty_holder_data_path_echo_resize_and_exit_code() {
         contains(&c.bytes, b"got:hello")
     });
 
+    // Input rides its own connection and is not ordered against control
+    // verbs on the attached one (protocol.rs), so the newline that makes the
+    // child run `stty size` is sent only after the holder has answered `ok`
+    // to the resize — which it does after applying it. Sending both at once
+    // let the child read its size first under load ("24 80", 2 of 80 runs).
+    let resize_ok = Event::Reply(Reply::Ok {
+        verb: "resize".into(),
+    });
     s.writer.resize(100, 40, soon()).unwrap();
+    let resized = collect_until(&mut s, c.next, Duration::from_secs(10), |c| {
+        c.events.contains(&resize_ok)
+    });
     inp.input(b"\n", soon()).unwrap();
-    let c2 = collect_until(&mut s, c.next, Duration::from_secs(10), |c| {
+    let c2 = collect_until(&mut s, resized.next, Duration::from_secs(10), |c| {
         contains(&c.bytes, b"40 100")
     });
     assert!(
-        c2.events.contains(&Event::Reply(Reply::Ok {
-            verb: "resize".into()
-        })),
-        "{:?}",
-        c2.events
+        !contains(&resized.bytes, b"24 80") && !contains(&c2.bytes, b"24 80"),
+        "the child saw the old size after the resize was acknowledged"
     );
 
     inp.input(b"\n", soon()).unwrap();
