@@ -31,6 +31,22 @@ interface AiSettingsProps {
   onLog: LogFunction;
 }
 
+/** The READ-ONLY account-selection view fields of a `get_ai_settings`
+ * response (the mode that governs, why, and the raw fleet value). Display-only:
+ * `saveSettings` passes explicit arguments, so these are never sent back. */
+function selectionViewFrom(
+  data: AiSettingsType,
+): Pick<
+  AiSettingsType,
+  "effective_account_selection_mode" | "account_selection_source" | "fleet_account_selection_mode"
+> {
+  return {
+    effective_account_selection_mode: data.effective_account_selection_mode,
+    account_selection_source: data.account_selection_source,
+    fleet_account_selection_mode: data.fleet_account_selection_mode,
+  };
+}
+
 export function AiSettings({ onLog }: AiSettingsProps) {
   const [settings, setSettings] = useState<AiSettingsType>(DEFAULT_AI_SETTINGS);
   const [loading, setLoading] = useState(true);
@@ -91,6 +107,22 @@ export function AiSettings({ onLog }: AiSettingsProps) {
     }
   };
 
+  /** Re-read ONLY the read-only account-selection view fields, leaving the
+   * form's own state alone. A failed read keeps the last view: the page then
+   * still describes the current form state through
+   * `displayedAccountSelection`, which re-applies the runner's rule. */
+  const refreshSelectionView = async () => {
+    try {
+      const result = await invoke<TauriResult<AiSettingsType>>("get_ai_settings");
+      if (result?.success && result.data) {
+        const view = selectionViewFrom(result.data);
+        setSettings((prev) => ({ ...prev, ...view }));
+      }
+    } catch (err) {
+      console.error("Failed to refresh account-selection view:", err);
+    }
+  };
+
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -110,9 +142,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               result.data.claude_cli?.timeout_seconds ||
               DEFAULT_AI_SETTINGS.claude_cli.timeout_seconds,
             config_dir: result.data.claude_cli?.config_dir,
-            account_selection_mode:
-              result.data.claude_cli?.account_selection_mode ||
-              DEFAULT_AI_SETTINGS.claude_cli.account_selection_mode,
+            // Left undefined when the runner did not report it (like the
+            // pin), so a save sends "not provided" and the stored
+            // machine-global mode is kept — never a substituted default.
+            account_selection_mode: result.data.claude_cli?.account_selection_mode,
             // Left undefined when the runner did not report it, so a save
             // sends "not provided" and the stored pin is kept.
             account_selection_pinned: result.data.claude_cli?.account_selection_pinned,
@@ -155,8 +188,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           // READ-ONLY view fields (the mode that actually governs and why).
           // Display-only: `saveSettings` passes explicit arguments, so these
           // are never sent back as stored settings.
-          effective_account_selection_mode: result.data.effective_account_selection_mode,
-          account_selection_source: result.data.account_selection_source,
+          ...selectionViewFrom(result.data),
         });
         onLog("debug", "AI settings loaded");
       }
@@ -232,8 +264,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         customPath: settings.claude_cli.custom_path || null,
         timeoutSeconds: settings.claude_cli.timeout_seconds,
         configDir: settings.claude_cli.config_dir || null,
-        // `undefined` (never loaded) is omitted and read as `None`, which
-        // KEEPS the stored machine-global mode rather than resetting it.
+        // `undefined` (unknown — the load failed) is omitted by the invoke
+        // and read as `None` by the command, which KEEPS the stored
+        // machine-global mode rather than resetting it.
         accountSelectionMode: settings.claude_cli.account_selection_mode,
         // `undefined` (unknown — never loaded, never toggled) is omitted by the
         // invoke and read as `None` by the command, which KEEPS the stored pin.
@@ -264,6 +297,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       });
 
       if (geminiResult && geminiResult.success) {
+        // The save may have changed which mode governs (a new local mode, a
+        // pin toggled) — re-read the runner's view of it.
+        await refreshSelectionView();
         setSaveSuccess(true);
         onLog("success", "AI settings saved successfully");
         setTimeout(() => setSaveSuccess(false), 3000);

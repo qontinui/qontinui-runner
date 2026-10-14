@@ -337,8 +337,9 @@ impl AccountSelectionSource {
 /// `Option`), so a fleet term that only filled an absent local value would
 /// never take effect on any machine that has ever saved settings.
 ///
-/// Every decision site reads the mode through this function (directly or via
-/// [`resolve_selection_mode`]) — the picker
+/// This is the ONE rule: every decision and report site goes through it —
+/// [`resolve_selection_mode`] is only its tested mode-half, used where the
+/// source is not needed. Sites: the picker
 /// ([`crate::ai_provider::account_usage::pick_best_account`]), the spawn-time
 /// config-dir resolution (`ai_provider::config::get_effective_config_dir`),
 /// the per-device account report, the AI-settings reads and the env capture —
@@ -424,12 +425,24 @@ pub fn effective_selection_mode() -> AccountSelectionMode {
 /// decided it — the pair the AI-settings reads and the env capture report, so
 /// a fleet override is visible as one rather than as an unexplained mode.
 pub fn effective_selection() -> (AccountSelectionMode, AccountSelectionSource) {
+    let (mode, source, _fleet) = effective_selection_with_fleet();
+    (mode, source)
+}
+
+/// [`effective_selection`] plus the RAW fleet-policy value it was resolved
+/// against (`None` = the fleet has no opinion), all from ONE read of the
+/// fleet cache so the three can never disagree. The Settings page needs the
+/// raw value to re-apply [`resolve_selection`] to its unsaved form state (an
+/// un-ticked pin, a different local mode) without a round trip.
+pub fn effective_selection_with_fleet() -> (
+    AccountSelectionMode,
+    AccountSelectionSource,
+    Option<AccountSelectionMode>,
+) {
     let (local, pinned) = local_selection();
-    resolve_selection(
-        local,
-        pinned,
-        crate::mcp::fleet_policy_poller::fleet_account_selection_mode(),
-    )
+    let fleet = crate::mcp::fleet_policy_poller::fleet_account_selection_mode();
+    let (mode, source) = resolve_selection(local, pinned, fleet);
+    (mode, source, fleet)
 }
 
 /// Read-modify-write the machine-global roster file (last-writer-wins).

@@ -882,9 +882,22 @@ fn runner_plans_dir_setting() -> Option<String> {
 /// The env collector's account-selection door: the effective mode and the
 /// input that decided it, as wire strings. Re-resolved per call, so a fleet
 /// policy change or a pin edit reaches the next capture.
+///
+/// The source reads `unknown` (the mode is still what applies right now)
+/// until coord has answered the fleet-policy domain in this process: a
+/// capture taken before the poller's first answer would otherwise report
+/// `local` on a machine the fleet is about to override. A PINNED machine is
+/// `pinned` regardless — the fleet's answer cannot change that.
 fn runner_effective_account_selection() -> (&'static str, &'static str) {
     let (mode, source) = crate::claude_accounts::effective_selection();
-    (mode.as_str(), source.as_str())
+    let source = if source == crate::claude_accounts::AccountSelectionSource::Pinned
+        || crate::mcp::fleet_policy_poller::account_selection_answered()
+    {
+        source.as_str()
+    } else {
+        "unknown"
+    };
+    (mode.as_str(), source)
 }
 
 /// Parse a boolean env lever the way the rest of the boot path does.

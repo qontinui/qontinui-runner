@@ -3295,6 +3295,8 @@ static ACCOUNT_SELECTION_DOOR: std::sync::OnceLock<AccountSelectionFn> = std::sy
 /// Until it is published the section reports only `local_selection_mode`
 /// and `selection_source=unknown` — never the file value under the
 /// `selection_mode` key, which would claim a fleet-overridable value governs.
+/// The door itself may also answer `unknown` as the source (the binary does
+/// until coord's fleet-policy domain has answered in this process).
 pub fn publish_account_selection(door: AccountSelectionFn) {
     let _ = ACCOUNT_SELECTION_DOOR.set(door);
 }
