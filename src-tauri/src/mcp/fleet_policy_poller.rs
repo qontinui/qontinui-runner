@@ -971,9 +971,11 @@ async fn poll_command_safety_rewrite_once() -> PollOutcome {
 /// Test-only RAII pin over the command-safety rewrite cache. Serializes every
 /// test that pins it (the cache is process-global and read by
 /// `claude_hook::materialize`) and restores the default — `on`, unanswered — on
-/// drop, including a panicking drop.
+/// drop, including a panicking drop. Holds the hierarchy root (`env_lock`)
+/// beneath its own mutex, like [`PlanCaptureLevelPin`]: a pin taken without it
+/// can AB/BA-deadlock `cargo test`.
 #[cfg(test)]
-pub(crate) struct CommandSafetyRewritePin(std::sync::MutexGuard<'static, ()>);
+pub(crate) struct CommandSafetyRewritePin(crate::test_env::TestLockGuard);
 
 #[cfg(test)]
 impl CommandSafetyRewritePin {
@@ -1002,7 +1004,7 @@ impl Drop for CommandSafetyRewritePin {
 #[cfg(test)]
 pub(crate) fn pin_command_safety_rewrite_for_test() -> CommandSafetyRewritePin {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let pin = CommandSafetyRewritePin(LOCK.lock().unwrap_or_else(|p| p.into_inner()));
+    let pin = CommandSafetyRewritePin(crate::test_env::hierarchy_lock(&LOCK));
     pin.set_unanswered();
     pin
 }
