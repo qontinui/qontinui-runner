@@ -10,7 +10,10 @@
  *   outcome maps to a per-item result, and a refusal is reported as
  *   "not closed: <reason>" — it NEVER falls back to a kill.
  * - **Force close** is the page's plain close (`terminal_close`, which kills
- *   the pane tree). It is a separate action with its own confirmation.
+ *   the pane tree). It is a separate action with its own confirmation, and it
+ *   reports what the close actually did ({@link describeForceCloseOutcome}):
+ *   a kill is "closed" only once `terminal_close` answered; a Conductor
+ *   worker's tab is a view, so closing it kills nothing.
  * - Each confirmation names every session and its activity word, and a row
  *   reading `Needs you` / `Working` / `Unknown` needs a second explicit tick
  *   ({@link closeNeedsSecondTick}).
@@ -160,13 +163,67 @@ export function describeGracefulOutcome(raw: unknown): Pick<CloseItemResult, "st
   }
 }
 
+/**
+ * What the page's close path (`useTerminalManager().closeTerminalReporting`)
+ * observed doing to one tab.
+ *
+ * - `killed` — `terminal_close` answered success: the pane tree was killed.
+ * - `worker-view` — a Conductor worker's tab (`sessionBacked`): the tab was
+ *   hidden and nothing was killed; the Conductor owns the worker.
+ * - `no-process` — a tab with no PTY (a plan tab): removed, nothing to kill.
+ * - `unconfirmed` — the kill was requested and never confirmed (the command
+ *   rejected, answered failure, or the close path returned no outcome).
+ */
+export type TerminalCloseOutcome =
+  | { kind: "killed" }
+  | { kind: "worker-view" }
+  | { kind: "no-process" }
+  | { kind: "unconfirmed"; detail: string };
+
+/** A per-item result for one Force close outcome — "closed" only for an observed kill. */
+export function describeForceCloseOutcome(
+  raw: TerminalCloseOutcome | void | undefined,
+): Pick<CloseItemResult, "state" | "detail"> {
+  switch (raw?.kind) {
+    case "killed":
+      return { state: "closed", detail: "Force closed — the pane was killed" };
+    case "worker-view":
+      return {
+        state: "not-closed",
+        detail:
+          "not closed: a Conductor worker's tab is a view; nothing was killed (the tab was hidden)",
+      };
+    case "no-process":
+      return {
+        state: "not-closed",
+        detail: "not closed: the tab had no process; nothing was killed (the tab was removed)",
+      };
+    case "unconfirmed":
+      return { state: "unknown", detail: `kill requested; not confirmed (${raw.detail})` };
+    default:
+      return { state: "unknown", detail: "kill requested; not confirmed (no outcome reported)" };
+  }
+}
+
 export interface CloseEffects {
   /** `terminal_graceful_close`; rejects when the runner has no such terminal. */
   gracefulClose: (tabId: string) => Promise<unknown>;
-  /** The page's plain close — kills the pane tree (Force close only). */
-  forceClose: (tabId: string) => void;
-  /** Drop a tab the runner already closed from this window's tab list. */
-  dropTab: (tabId: string) => void;
+  /**
+   * The page's plain close — kills the pane tree (Force close only) — and
+   * what it observed. A `void` answer is read as unconfirmed.
+   */
+  forceClose: (tabId: string) => Promise<TerminalCloseOutcome> | void;
+  /**
+   * Drop a tab the runner already closed from this window's tab list.
+   *
+   * ORDERING: the graceful path calls this only AFTER `gracefulClose` for that
+   * tab has resolved to a `closed` result — never before, never for any other
+   * result (pinned by `sessionClose.test.ts`, "drops a tab only after its
+   * graceful close answered closed"). So when it goes through the page's close
+   * path, the runner has already ended the pane and that path's own
+   * `terminal_close` has nothing left to kill.
+   */
+  dropTab: (tabId: string) => unknown;
   /** One batch of `recordClosed` ops for the sessions that closed. */
   recordClosed: (ops: SessionOrgOp[]) => void;
   now?: () => number;
@@ -238,22 +295,28 @@ export async function closeSessionsGracefully(
   return results;
 }
 
-/** Force close `items` (the kill path) and record each one closed. */
-export function forceCloseSessions(
+/**
+ * Force close `items` (the kill path), all at once, and answer one result per
+ * item in input order. Only an observed kill counts as closed, and only the
+ * sessions that closed are recorded as recently closed (in ONE batch).
+ */
+export async function forceCloseSessions(
   items: readonly CloseItem[],
   effects: CloseEffects,
-): CloseItemResult[] {
-  const results = items.map((item): CloseItemResult => {
-    if (!item.tabId) return nothingHere(item);
-    if (!item.tabAlive) return removeExited(item, effects);
-    effects.forceClose(item.tabId);
-    return {
-      sessionId: item.sessionId,
-      title: item.title,
-      state: "closed",
-      detail: "Force closed — the pane was killed",
-    };
-  });
+): Promise<CloseItemResult[]> {
+  const results = await Promise.all(
+    items.map(async (item): Promise<CloseItemResult> => {
+      if (!item.tabId) return nothingHere(item);
+      if (!item.tabAlive) return removeExited(item, effects);
+      let outcome: TerminalCloseOutcome | void;
+      try {
+        outcome = await effects.forceClose(item.tabId);
+      } catch (e) {
+        outcome = { kind: "unconfirmed", detail: describeThrown(e, "terminal_close failed") };
+      }
+      return { sessionId: item.sessionId, title: item.title, ...describeForceCloseOutcome(outcome) };
+    }),
+  );
   const closed = items.filter((_, i) => results[i].state === "closed");
   if (closed.length > 0) effects.recordClosed(recordOps(closed, (effects.now ?? Date.now)()));
   return results;
