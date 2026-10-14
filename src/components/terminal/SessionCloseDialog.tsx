@@ -15,40 +15,27 @@
  * runs, the dialog lists each session's outcome — closed, not closed with the
  * reason, or unknown — and never one "done" for a partial batch (served
  * policy `ux-priorities` `an-action-must-acknowledge-itself`).
+ *
+ * A close over several rows (the bulk bar's Close, the Ready-to-close review)
+ * opens with every row included and lets each be left out. Whatever the button
+ * showed, the confirm itself re-reads the rows as they are at that instant
+ * (`idsToClose`), so a row that turned `Needs you` between the last render and
+ * the click still stops the close until it is ticked.
  */
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { AlertTriangle, Loader2 } from "lucide-react";
 
-import { closeNeedsSecondTick, summarizeCloseResults, type CloseItemResult } from "./sessionClose";
+import { idsToClose } from "./sessionBulkActions";
+import {
+  closeNeedsSecondTick,
+  closeTickKey,
+  summarizeCloseResults,
+  untickedRiskyTargets,
+  type CloseItemResult,
+  type CloseTarget,
+} from "./sessionClose";
 import { sessionOrgControlAttrs } from "./sessionOrgControls";
-import type { SessionActivity } from "./sessionStatusModel";
-
-/** One session the dialog would close, as of this render. */
-export interface CloseTarget {
-  sessionId: string;
-  title: string;
-  activity: SessionActivity;
-  /** The activity word the card shows (`Needs you`, `Exited — error (code 2)`, …). */
-  activityWord: string;
-  /** Has a live tab here — otherwise it is listed but nothing is closed. */
-  closable: boolean;
-}
-
-/** The tick key: a tick covers one session in ONE activity. */
-export function closeTickKey(target: Pick<CloseTarget, "sessionId" | "activity">): string {
-  return `${target.sessionId}:${target.activity}`;
-}
-
-/** Targets that would close and still need their second tick. */
-export function untickedRiskyTargets(
-  targets: readonly CloseTarget[],
-  ticks: ReadonlySet<string>,
-): CloseTarget[] {
-  return targets.filter(
-    (t) => t.closable && closeNeedsSecondTick(t.activity) && !ticks.has(closeTickKey(t)),
-  );
-}
 
 interface SessionCloseDialogProps {
   /** e.g. "Close 3 sessions" / "Close group Refactor". */
@@ -57,6 +44,8 @@ interface SessionCloseDialogProps {
   onClose: (sessionIds: string[]) => Promise<CloseItemResult[]>;
   onForceClose: (sessionIds: string[]) => CloseItemResult[];
   onDismiss: () => void;
+  /** Each row gets an include box, all ticked at open (a multi-row close). */
+  excludable?: boolean;
 }
 
 type Phase =
@@ -77,13 +66,29 @@ export function SessionCloseDialog({
   onClose,
   onForceClose,
   onDismiss,
+  excludable = false,
 }: SessionCloseDialogProps) {
   const [phase, setPhase] = useState<Phase>({ kind: "confirm" });
   const [ticks, setTicks] = useState<Set<string>>(() => new Set());
-  const closable = targets.filter((t) => t.closable);
-  const unticked = untickedRiskyTargets(targets, ticks);
-  const ids = closable.map((t) => t.sessionId);
+  const [excluded, setExcluded] = useState<Set<string>>(() => new Set());
+  const included = targets.filter((t) => !excluded.has(t.sessionId));
+  const closable = included.filter((t) => t.closable);
+  const unticked = untickedRiskyTargets(included, ticks);
   const canClose = closable.length > 0 && unticked.length === 0;
+  // The confirm re-checks against the rows as they are when it fires.
+  const latest = useRef({ targets, excluded, ticks });
+  latest.current = { targets, excluded, ticks };
+  const confirmIds = (): string[] | null => {
+    const now = idsToClose(latest.current.targets, latest.current.excluded, latest.current.ticks);
+    return now.ids.length > 0 ? now.ids : null;
+  };
+  const toggleExcluded = (id: string) =>
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
 
   const toggleTick = (key: string) =>
     setTicks((prev) => {
@@ -94,11 +99,15 @@ export function SessionCloseDialog({
     });
 
   const runClose = async () => {
+    const ids = confirmIds();
+    if (!ids) return;
     setPhase({ kind: "running" });
     const results = await onClose(ids);
     setPhase({ kind: "done", results, forced: false });
   };
   const runForce = () => {
+    const ids = confirmIds();
+    if (!ids) return;
     setPhase({ kind: "done", results: onForceClose(ids), forced: true });
   };
 
@@ -166,7 +175,7 @@ export function SessionCloseDialog({
                 context is lost and the transcript&apos;s last turn may not be written.
               </span>
             </div>
-            <TargetList targets={closable} ticks={ticks} onToggle={toggleTick} />
+            <TargetList targets={closable} ticks={ticks} onToggle={toggleTick} excluded={excluded} />
             <div className="flex justify-end gap-2 px-3 py-2 border-t border-[#2a2d3d]">
               <button
                 {...sessionOrgControlAttrs("closeCancel")}
@@ -200,6 +209,8 @@ export function SessionCloseDialog({
               targets={targets}
               ticks={ticks}
               onToggle={toggleTick}
+              excluded={excluded}
+              onToggleExcluded={excludable ? toggleExcluded : undefined}
               disabled={phase.kind === "running"}
             />
             <div className="flex items-center gap-2 px-3 py-2 border-t border-[#2a2d3d]">
@@ -246,31 +257,57 @@ function TargetList({
   targets,
   ticks,
   onToggle,
+  excluded,
+  onToggleExcluded,
   disabled = false,
 }: {
   targets: readonly CloseTarget[];
   ticks: ReadonlySet<string>;
   onToggle: (key: string) => void;
+  excluded: ReadonlySet<string>;
+  /** Present for a multi-row close: each row's include box. */
+  onToggleExcluded?: (sessionId: string) => void;
   disabled?: boolean;
 }) {
   return (
     <ul className="max-h-[50vh] overflow-y-auto px-3 py-2 space-y-1.5">
       {targets.map((t) => {
         const key = closeTickKey(t);
-        const risky = t.closable && closeNeedsSecondTick(t.activity);
+        const out = excluded.has(t.sessionId);
+        const risky = t.closable && !out && closeNeedsSecondTick(t.activity);
         return (
           <li
             key={t.sessionId}
             data-session-id={t.sessionId}
             data-activity={t.activity}
+            data-included={out ? "false" : "true"}
             className="text-[11px]"
           >
             <div className="flex items-baseline gap-2 min-w-0">
-              <span className="truncate text-[#c0caf5]" title={t.title}>
+              {onToggleExcluded && (
+                <input
+                  type="checkbox"
+                  {...sessionOrgControlAttrs("closeInclude", t.sessionId)}
+                  aria-label={`Include ${t.title}`}
+                  checked={!out}
+                  disabled={disabled}
+                  onChange={() => onToggleExcluded(t.sessionId)}
+                  className="w-3 h-3 shrink-0 self-center"
+                />
+              )}
+              <span
+                className={`truncate ${out ? "text-[#565f89] line-through" : "text-[#c0caf5]"}`}
+                title={t.title}
+              >
                 {t.title}
               </span>
               <span className="shrink-0 text-[10px] text-[#565f89]">{t.activityWord}</span>
             </div>
+            {t.reason && (
+              <span className="block text-[10px] text-[#9ece6a]" title={t.reason}>
+                {t.reason}
+              </span>
+            )}
             {!t.closable && (
               <span className="block text-[10px] text-[#565f89]">
                 no live tab in this window — nothing to close
