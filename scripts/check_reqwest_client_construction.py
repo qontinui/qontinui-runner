@@ -9,9 +9,26 @@ Constructing a `reqwest` client anywhere but `src-tauri/src/util/http.rs`:
     reqwest::Client::new()                    reqwest::Client::builder()
     reqwest::blocking::Client::new()          reqwest::blocking::Client::builder()
     reqwest::ClientBuilder::new()             reqwest::blocking::ClientBuilder::new()
-    Client::new() / Client::builder()         -- where `Client` is imported from reqwest
+    reqwest::Client::default()                reqwest::ClientBuilder::default()
+    reqwest::blocking::Client::default()      reqwest::blocking::ClientBuilder::default()
+    Client::new() / Client::builder() / Client::default()
+                                              -- where `Client` is imported from reqwest
                                                  (including `use reqwest::Client as Http;`
                                                  and `use reqwest::blocking;` + `blocking::Client::new()`)
+    rq::Client::new()                         -- where `use reqwest as rq;` renames the crate
+
+`default` is in that list because reqwest implements `Default` for all four
+client types, so `Client::default()` is a compiling, unconverted, GaiResolver-
+backed construction. It used to walk straight through this check.
+
+KNOWN OUT OF REACH
+------------------
+The TYPED spelling `let c: reqwest::Client = Default::default();` (and
+`let c: reqwest::Client = <_>::default();`) names no reqwest path at the call
+site: resolving it needs type inference, which a regex scanner does not have.
+It is documented here rather than papered over with a pattern that would only
+appear to cover it. The `// reqwest-client-ok:` escape and code review are the
+controls for that form.
 
 The sanctioned constructors are, in `src-tauri/src/util/http.rs`:
 
@@ -107,10 +124,16 @@ FACTORY_FILES = frozenset(
 
 ESCAPE_RE = re.compile(r"//\s*reqwest-client-ok:\s*\S")
 
-_QUAL_RE = re.compile(
-    r"(?<![\w:])reqwest\s*::\s*(?:blocking\s*::\s*)?"
-    r"(?:Client\s*::\s*(?:new|builder)|ClientBuilder\s*::\s*new)\s*\("
+# `default` is as much a construction as `new`: reqwest implements Default for
+# Client, ClientBuilder and both blocking twins.
+_CLIENT_CTORS = r"(?:new|builder|default)"
+_BUILDER_CTORS = r"(?:new|default)"
+_CTOR_TAIL = (
+    rf"(?:blocking\s*::\s*)?"
+    rf"(?:Client\s*::\s*{_CLIENT_CTORS}|ClientBuilder\s*::\s*{_BUILDER_CTORS})\s*\("
 )
+
+_QUAL_RE = re.compile(r"(?<![\w:])reqwest\s*::\s*" + _CTOR_TAIL)
 
 
 @dataclass(frozen=True)
@@ -199,24 +222,97 @@ def _match_brace(src: str, open_idx: int) -> int:
     return len(src) - 1
 
 
-_CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+_CFG_ATTR_RE = re.compile(r"#\s*\[\s*cfg\s*\(")
+
+
+def _match_paren(src: str, open_idx: int) -> int:
+    """Index of the `)` closing the `(` at `open_idx`, or the last index."""
+    depth = 0
+    for k in range(open_idx, len(src)):
+        if src[k] == "(":
+            depth += 1
+        elif src[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return k
+    return len(src) - 1
+
+
+def cfg_selects_test(pred: str) -> bool:
+    """Does this `cfg(...)` predicate select TEST builds?
+
+    `#[cfg(test)]` is the common spelling but not the only one: a helper
+    attributed `#[cfg(all(test, feature = "x"))]` or `#[cfg(any(test, doc))]` is
+    test code too, and treating it as shipping code produced false positives.
+    `not(test)` is the opposite claim and must NOT match, or real shipping code
+    would be skipped silently -- a false NEGATIVE, which is worse.
+    """
+    i = 0
+    n = len(pred)
+    stack: list[bool] = []  # one entry per open paren: did it open a not(…)?
+    negated = 0
+    while i < n:
+        m = re.match(r"(\w+)\s*\(", pred[i:])
+        if m:
+            is_not = m.group(1) == "not"
+            stack.append(is_not)
+            negated += is_not
+            i += len(m.group(0))
+            continue
+        if pred[i] == ")":
+            if stack:
+                negated -= stack.pop()
+            i += 1
+            continue
+        m = re.match(r"\w+", pred[i:])
+        if m:
+            if m.group(0) == "test" and negated == 0:
+                return True
+            i += len(m.group(0))
+            continue
+        i += 1
+    return False
+
+
+def _item_end(src: str, start: int) -> int:
+    """End index of the item beginning at `start`.
+
+    Its body's closing brace, or the `;` of a body-less item (`mod tests;`,
+    `use …;`) -- but only a brace or semicolon at depth 0 of `()` and `[]`.
+    Scanning for a bare `;` cut `const N: [u8; 4] = …;` off inside its own type
+    and left the rest of the item unblanked.
+    """
+    depth = 0
+    for k in range(start, len(src)):
+        c = src[k]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif depth <= 0:
+            if c == "{":
+                return _match_brace(src, k)
+            if c == ";":
+                return k
+    return -1
 
 
 def strip_test_items(src: str) -> str:
-    """Blank every item attributed `#[cfg(test)]` (on already-noise-stripped text)."""
+    """Blank every item attributed a test-selecting `cfg` (on noise-stripped text)."""
     out = list(src)
-    for m in _CFG_TEST_RE.finditer(src):
-        j = m.end()
-        # The item ends at its body's closing brace, or at `;` for a body-less
-        # item (`mod tests;`, `use …;`), whichever comes first.
-        brace = src.find("{", j)
-        semi = src.find(";", j)
-        if brace == -1 and semi == -1:
+    for m in _CFG_ATTR_RE.finditer(src):
+        open_paren = src.index("(", m.start())
+        close_paren = _match_paren(src, open_paren)
+        if not cfg_selects_test(src[open_paren + 1 : close_paren]):
             continue
-        if brace == -1 or (semi != -1 and semi < brace):
-            end = semi
-        else:
-            end = _match_brace(src, brace)
+        # Past the attribute's own `]`, so its brackets cannot be mistaken for
+        # the item's.
+        bracket = src.find("]", close_paren)
+        if bracket == -1:
+            continue
+        end = _item_end(src, bracket + 1)
+        if end == -1:
+            continue
         for k in range(m.start(), end + 1):
             if out[k] != "\n":
                 out[k] = " "
@@ -228,6 +324,11 @@ def strip_test_items(src: str) -> str:
 # ---------------------------------------------------------------------------
 
 _USE_RE = re.compile(r"\buse\s+(?:::)?reqwest\s*::\s*(.*?);", re.S)
+
+# `use reqwest as rq;` renames the CRATE, so `rq::Client::new()` is a fully
+# qualified construction that `_QUAL_RE` (which looks for the literal
+# `reqwest`) cannot see.
+_USE_CRATE_ALIAS_RE = re.compile(r"\buse\s+(?:::)?reqwest\s+as\s+(\w+)\s*;")
 
 
 def _flatten_use_tree(tree: str, prefix: list[str]) -> list[tuple[list[str], str]]:
@@ -275,25 +376,27 @@ def _flatten_use_tree(tree: str, prefix: list[str]) -> list[tuple[list[str], str
 def construction_patterns(src: str) -> list[re.Pattern]:
     """Patterns for bare spellings made reachable by this file's reqwest imports."""
     pats: list[re.Pattern] = []
+    for m in _USE_CRATE_ALIAS_RE.finditer(src):
+        alias = re.escape(m.group(1))
+        pats.append(re.compile(r"(?<![\w:])" + alias + r"\s*::\s*" + _CTOR_TAIL))
     for m in _USE_RE.finditer(src):
         for path, name in _flatten_use_tree(m.group(1), []):
             if name == "_":
                 continue
             n = re.escape(name)
             if path in (["Client"], ["blocking", "Client"]):
-                pats.append(re.compile(r"(?<![\w:])" + n + r"\s*::\s*(?:new|builder)\s*\("))
+                pats.append(re.compile(r"(?<![\w:])" + n + r"\s*::\s*" + _CLIENT_CTORS + r"\s*\("))
             elif path in (["ClientBuilder"], ["blocking", "ClientBuilder"]):
-                pats.append(re.compile(r"(?<![\w:])" + n + r"\s*::\s*new\s*\("))
+                pats.append(re.compile(r"(?<![\w:])" + n + r"\s*::\s*" + _BUILDER_CTORS + r"\s*\("))
             elif path == ["blocking"]:
-                pats.append(
-                    re.compile(
-                        r"(?<![\w:])" + n + r"\s*::\s*"
-                        r"(?:Client\s*::\s*(?:new|builder)|ClientBuilder\s*::\s*new)\s*\("
-                    )
-                )
+                pats.append(re.compile(r"(?<![\w:])" + n + r"\s*::\s*" + _CTOR_TAIL))
             elif path == ["*"] or path == ["blocking", "*"]:
-                pats.append(re.compile(r"(?<![\w:])Client\s*::\s*(?:new|builder)\s*\("))
-                pats.append(re.compile(r"(?<![\w:])ClientBuilder\s*::\s*new\s*\("))
+                pats.append(
+                    re.compile(r"(?<![\w:])Client\s*::\s*" + _CLIENT_CTORS + r"\s*\(")
+                )
+                pats.append(
+                    re.compile(r"(?<![\w:])ClientBuilder\s*::\s*" + _BUILDER_CTORS + r"\s*\(")
+                )
     return pats
 
 
@@ -443,6 +546,94 @@ SELF_TEST_CASES: list[tuple[str, str, str, int]] = [
     ("factory exempt", "src-tauri/src/util/http.rs", "fn f() { reqwest::Client::builder(); }", 0),
     ("lifetime then call", "src-tauri/src/a.rs", "fn f<'a>(x: &'a str) { reqwest::Client::new(); }", 1),
     ("raw string", "src-tauri/src/a.rs", 'fn f() { let s = r#"reqwest::Client::new()"#; }', 0),
+    # reqwest implements Default for all four client types: these compiled and
+    # walked straight through the check until 2026-09-18.
+    ("Client::default", "src-tauri/src/a.rs", "fn f() { let c = reqwest::Client::default(); }", 1),
+    ("ClientBuilder::default", "src-tauri/src/a.rs", "fn f() { reqwest::ClientBuilder::default(); }", 1),
+    (
+        "blocking Client::default",
+        "src-tauri/src/a.rs",
+        "fn f() { reqwest::blocking::Client::default(); }",
+        1,
+    ),
+    (
+        "blocking ClientBuilder::default",
+        "src-tauri/src/a.rs",
+        "fn f() { reqwest::blocking::ClientBuilder::default(); }",
+        1,
+    ),
+    (
+        "imported bare default",
+        "src-tauri/src/a.rs",
+        "use reqwest::Client;\nfn f() { Client::default(); }",
+        1,
+    ),
+    # A renamed crate: `_QUAL_RE` looks for the literal `reqwest` and sees none.
+    ("crate alias", "src-tauri/src/a.rs", "use reqwest as rq;\nfn f() { rq::Client::new(); }", 1),
+    (
+        "crate alias blocking builder",
+        "src-tauri/src/a.rs",
+        "use reqwest as rq;\nfn f() { rq::blocking::Client::builder(); }",
+        1,
+    ),
+    (
+        "unrelated crate alias",
+        "src-tauri/src/a.rs",
+        "use other_crate as rq;\nfn f() { rq::Client::new(); }",
+        0,
+    ),
+    # N11: a test helper gated on more than the bare `test` predicate is still
+    # test code; a `not(test)` item is emphatically not.
+    (
+        "cfg(all(test, feature))",
+        "src-tauri/src/a.rs",
+        '#[cfg(all(test, feature = "x"))]\nmod t { fn f() { reqwest::Client::new(); } }',
+        0,
+    ),
+    (
+        "cfg(any(test, doc))",
+        "src-tauri/src/a.rs",
+        "#[cfg(any(test, doc))]\nmod t { fn f() { reqwest::Client::new(); } }",
+        0,
+    ),
+    (
+        "cfg(not(test)) is shipping code",
+        "src-tauri/src/a.rs",
+        "#[cfg(not(test))]\nfn f() { reqwest::Client::new(); }",
+        1,
+    ),
+    (
+        "cfg(all(not(test), unix))",
+        "src-tauri/src/a.rs",
+        "#[cfg(all(not(test), unix))]\nfn f() { reqwest::Client::new(); }",
+        1,
+    ),
+    # N11: an array type carries a `;` BEFORE the item's opening brace, which
+    # used to end the item there and leave its body scanned as shipping code.
+    (
+        "cfg(test) fn with an array parameter",
+        "src-tauri/src/a.rs",
+        "#[cfg(test)]\nfn t(buf: [u8; 4]) { reqwest::Client::new(); }",
+        0,
+    ),
+    (
+        "cfg(test) fn returning an array",
+        "src-tauri/src/a.rs",
+        "#[cfg(test)]\nfn t() -> [u8; 4] { reqwest::Client::new(); [0; 4] }",
+        0,
+    ),
+    (
+        "cfg(test) const with an array type",
+        "src-tauri/src/a.rs",
+        "#[cfg(test)]\nconst K: [u8; 4] = [0; 4];\nfn ship() { reqwest::Client::new(); }",
+        1,
+    ),
+    (
+        "cfg(test) item with a further attribute",
+        "src-tauri/src/a.rs",
+        "#[cfg(test)]\n#[tokio::test]\nasync fn t() { reqwest::Client::new(); }",
+        0,
+    ),
 ]
 
 
@@ -564,12 +755,24 @@ def main() -> int:
 
     if args.list_roots:
         print("SCANNED:")
-        print(f"  {SCAN_ROOT.as_posix()}/**/*.rs  (minus #[cfg(test)] items, comments, literals)")
+        print(f"  {SCAN_ROOT.as_posix()}/**/*.rs  (minus test-cfg'd items, comments, literals)")
         print("EXEMPT — the sanctioned factory:")
         for f in sorted(FACTORY_FILES):
             print(f"  {f}")
         print("NOT SCANNED — crates/*: they cannot depend on the runner crate, so they")
         print("have no util::http to route through.")
+        print()
+        print("WHAT A GREEN RUN DOES AND DOES NOT CLAIM")
+        print("  Green means every FIRST-PARTY client resolves through the OS DNS lane.")
+        print("  It says NOTHING about clients built inside third-party crates on the")
+        print("  same reqwest 0.13, which get reqwest's default GaiResolver:")
+        print("    opentelemetry-otlp / opentelemetry-http — ROUTED: src-tauri/src/otel.rs")
+        print("      injects util::http's client via .with_http_client(...).")
+        print("    tauri, tauri-plugin-updater, postgresql_archive — NOT routed: no")
+        print("      injection point exists, and none is claimed.")
+        print("    sentry — rides a separate reqwest 0.12, which never had hickory-dns.")
+        print("  The typed spelling `let c: reqwest::Client = Default::default();` needs")
+        print("  type inference and is out of this scanner's reach; see the module docstring.")
         return 0
 
     if args.list:

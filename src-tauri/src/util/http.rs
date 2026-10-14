@@ -21,12 +21,34 @@
 //! modules — the bin re-exports the lib's copy so there is one DNS lane per
 //! process, not one per crate.
 //!
+//! # Reach — what "every client" does and does not cover
+//!
+//! It covers every FIRST-PARTY client: everything `src-tauri/src/**` builds,
+//! machine-checked by `scripts/check_reqwest_client_construction.py`. It does
+//! NOT reach a client a third-party crate builds for itself out of the same
+//! `reqwest 0.13`, and removing the `hickory-dns` feature removed it from the
+//! whole dependency graph, so those crates now get `GaiResolver` on tokio's
+//! blocking pool — partially re-exposing them to #918's starvation flood.
+//! Measured on this graph:
+//!
+//! * `opentelemetry-otlp` / `opentelemetry-http` — a process-lifetime periodic
+//!   exporter, exactly the class this plan is about. Its builder takes
+//!   `.with_http_client(...)`, so `src-tauri/src/otel.rs` injects a client from
+//!   [`client_builder`]; it is on the same reqwest 0.13, so the injection is
+//!   type-compatible.
+//! * `tauri`, `tauri-plugin-updater`, `postgresql_archive` — **no injection
+//!   point.** They are not routed here, and no claim to the contrary is made
+//!   anywhere in this tree.
+//! * `sentry` rides a SEPARATE `reqwest 0.12`, which never had `hickory-dns`,
+//!   so nothing about it changed either way.
+//!
 //! # Public API
 //!
 //! * [`client_builder`] / [`blocking_client_builder`] — start every client here.
 //! * [`ResettableClient`] — a long-lived client that rebuilds itself after
 //!   consecutive transport failures.
-//! * [`is_transport_failure`] — the classifier it uses.
+//! * [`classify_transport`] — which faults a rebuild can actually fix.
+//! * [`dns_lane_class`] — the lane class hiding inside a `reqwest::Error`.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -37,6 +59,36 @@ use std::time::{Duration, Instant};
 /// their own `connect_timeout` simply override it.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Overrides [`DEFAULT_CONNECT_TIMEOUT`], in milliseconds. `0` and unparseable
+/// are ignored.
+///
+/// The lever exists because this ceiling and the DNS lane's deadline together
+/// SHRANK the effective budget for coord: `coord_http`'s client carried no
+/// `connect_timeout` at all before this plan, and hickory allowed several
+/// attempts. A box whose cold `getaddrinfo` takes 5–6s would otherwise fail
+/// every first request with no dial to turn — and a running runner cannot be
+/// restarted to change a constant (served policy `production-and-cost`
+/// `runner-lifecycle`).
+pub const ENV_CONNECT_TIMEOUT_MS: &str = "QONTINUI_HTTP_CONNECT_TIMEOUT_MS";
+
+/// The connect-phase ceiling in force: [`ENV_CONNECT_TIMEOUT_MS`] if it parses
+/// to a positive integer, else [`DEFAULT_CONNECT_TIMEOUT`]. Reported in every
+/// [`crate::util::dns::DnsLaneSnapshot`] so an envelope names the value that
+/// was actually applied.
+pub fn connect_timeout() -> Duration {
+    connect_timeout_from(std::env::var(ENV_CONNECT_TIMEOUT_MS).ok().as_deref())
+}
+
+/// The parsing half, kept pure: a test that set the real variable would change
+/// the connect timeout of every client built by every other test running in
+/// parallel.
+fn connect_timeout_from(raw: Option<&str>) -> Duration {
+    match raw.map(|s| s.trim().parse::<u64>()) {
+        Some(Ok(ms)) if ms > 0 => Duration::from_millis(ms),
+        _ => DEFAULT_CONNECT_TIMEOUT,
+    }
+}
+
 /// Consecutive transport failures before a [`ResettableClient`] rebuilds.
 pub const DEFAULT_REBUILD_THRESHOLD: u32 = 3;
 
@@ -44,12 +96,12 @@ pub const DEFAULT_REBUILD_THRESHOLD: u32 = 3;
 pub const DEFAULT_MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(60);
 
 /// An async client builder resolving through the shared OS DNS lane, with
-/// [`DEFAULT_CONNECT_TIMEOUT`]. Add per-client settings, then `.build()`.
+/// [`connect_timeout`]. Add per-client settings, then `.build()`.
 pub fn client_builder() -> reqwest::ClientBuilder {
     // reqwest-client-ok: the sanctioned factory.
     reqwest::Client::builder()
         .dns_resolver(crate::util::dns::shared())
-        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout())
 }
 
 /// The `reqwest::blocking` twin of [`client_builder`].
@@ -61,7 +113,7 @@ pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
     // reqwest-client-ok: the sanctioned factory.
     reqwest::blocking::Client::builder()
         .dns_resolver(crate::util::dns::shared())
-        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout())
 }
 
 /// The factory's `reqwest::Client::new()`: [`client_builder`] with no further
@@ -91,11 +143,72 @@ pub fn new_blocking_client() -> reqwest::blocking::Client {
     )
 }
 
-/// A failure of the transport itself — connect (which includes DNS) or a
-/// timeout — as opposed to coord answering badly. Only these count toward a
-/// rebuild: a 5xx proves the transport works.
+/// What a failed request's transport fault was, for the one decision that
+/// depends on it: could rebuilding this client possibly fix it?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportFault {
+    /// Connect / TCP / TLS, or a DNS answer of "no such host". A rebuild drops
+    /// a pool that may hold connections bound to a vanished local address, so
+    /// it can help.
+    Rebuildable,
+    /// The shared DNS lane refused, was unavailable, or timed out (the carried
+    /// value is [`crate::util::dns::DnsLaneError::class`]).
+    ///
+    /// **A rebuild cannot fix this and must not be attempted.** The lane is
+    /// process-wide: a rebuilt client installs the SAME lane, so the rebuild is
+    /// a guaranteed no-op — and because a rebuild resets the streak, counting
+    /// it would make `client_health.consecutive_transport_failures` understate
+    /// the outage it was added to diagnose, while the rebuild WARN asserted a
+    /// heal that did not happen.
+    DnsLane(&'static str),
+    /// Not a transport fault: a decode, a redirect policy, a 5xx body — or a
+    /// legitimate whole-request timeout. `COORD_PROXY_CLIENT` allows 300s
+    /// precisely because coord tool calls run long, and such a timeout has
+    /// `is_timeout()` true with `is_connect()` false; blaming the transport for
+    /// three slow-but-successful calls would rebuild a healthy client.
+    None,
+}
+
+/// The [`crate::util::dns::DnsLaneError`] class hiding in a `reqwest::Error`'s
+/// source chain, if any. reqwest boxes a resolver error, so the typed class
+/// survives — it just has to be dug out rather than inferred from
+/// `is_connect()`, which is true for every one of them.
+pub fn dns_lane_class(e: &reqwest::Error) -> Option<&'static str> {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(s) = src {
+        if let Some(lane) = s.downcast_ref::<crate::util::dns::DnsLaneError>() {
+            return Some(lane.class());
+        }
+        src = s.source();
+    }
+    None
+}
+
+/// Classify one failed request. See [`TransportFault`].
+pub fn classify_transport(e: &reqwest::Error) -> TransportFault {
+    if let Some(class) = dns_lane_class(e) {
+        return match class {
+            // The lane itself failed to run the lookup.
+            "saturated" | "unavailable" | "timeout" => TransportFault::DnsLane(class),
+            // `lookup_failed`: the OS resolver ANSWERED (with an error). That
+            // is a real resolution outcome, not a lane fault.
+            _ => TransportFault::Rebuildable,
+        };
+    }
+    // `is_connect()` unconditionally — it covers a connect-phase timeout, for
+    // which reqwest reports both `is_connect()` and `is_timeout()`. A timeout
+    // WITHOUT `is_connect()` is the caller's own request deadline.
+    if e.is_connect() {
+        return TransportFault::Rebuildable;
+    }
+    TransportFault::None
+}
+
+/// Whether this error is a transport fault of any kind — a rebuildable one or
+/// a lane fault. Used to decide whether the DNS-vs-TCP discriminator has
+/// anything to say, NOT whether to rebuild (see [`classify_transport`]).
 pub fn is_transport_failure(e: &reqwest::Error) -> bool {
-    e.is_connect() || e.is_timeout()
+    classify_transport(e) != TransportFault::None
 }
 
 type Factory = Box<dyn Fn() -> Result<reqwest::Client, reqwest::Error> + Send + Sync>;
@@ -126,6 +239,15 @@ pub struct ResettableClient {
     consecutive_failures: AtomicU32,
     rebuilds: AtomicU64,
     last_rebuild: Mutex<Option<Instant>>,
+    /// Faults a rebuild cannot fix, counted here instead of being folded into
+    /// the rebuild streak — otherwise a DNS-lane outage would be invisible in
+    /// the envelope exactly when it mattered. See [`TransportFault::DnsLane`].
+    dns_lane_failures: AtomicU64,
+    last_dns_lane_class: Mutex<Option<&'static str>>,
+    /// Failures reading a response BODY after headers had already arrived. The
+    /// connect phase demonstrably worked, so this is not a connect fault and
+    /// never drives a rebuild; it is the stale-pooled-connection signal.
+    body_failures: AtomicU64,
 }
 
 impl std::fmt::Debug for ResettableClient {
@@ -174,6 +296,9 @@ impl ResettableClient {
             consecutive_failures: AtomicU32::new(0),
             rebuilds: AtomicU64::new(0),
             last_rebuild: Mutex::new(None),
+            dns_lane_failures: AtomicU64::new(0),
+            last_dns_lane_class: Mutex::new(None),
+            body_failures: AtomicU64::new(0),
         })
     }
 
@@ -208,16 +333,29 @@ impl ResettableClient {
     }
 
     /// Report a failed request. Non-transport errors (a body decode, a
-    /// redirect policy) neither count nor reset the streak. Returns `true` iff
-    /// this call rebuilt the client.
+    /// redirect policy, a whole-request timeout) neither count nor reset the
+    /// streak; a DNS-lane fault is counted separately because a rebuild cannot
+    /// fix it. Returns `true` iff this call rebuilt the client.
     pub fn record_failure(&self, e: &reqwest::Error) -> bool {
-        if !is_transport_failure(e) {
-            return false;
+        match classify_transport(e) {
+            TransportFault::Rebuildable => self.note_transport_failure(),
+            TransportFault::DnsLane(class) => {
+                self.note_dns_lane_failure(class);
+                false
+            }
+            TransportFault::None => false,
         }
-        self.note_transport_failure()
     }
 
-    /// Consecutive transport failures since the last success or rebuild.
+    /// Report a failure reading a response BODY (headers had already arrived).
+    /// Counted for diagnosis; never toward a rebuild.
+    pub fn record_body_failure(&self, _e: &reqwest::Error) {
+        self.body_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Consecutive REBUILDABLE transport failures since the last success or
+    /// rebuild. A DNS-lane outage does not move this — read
+    /// [`dns_lane_failures`](Self::dns_lane_failures) for that.
     pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
@@ -227,13 +365,51 @@ impl ResettableClient {
         self.rebuilds.load(Ordering::Relaxed)
     }
 
-    /// `{name, consecutive_transport_failures, rebuilds}` for egress envelopes.
+    /// Failures attributed to the shared DNS lane since construction.
+    pub fn dns_lane_failures(&self) -> u64 {
+        self.dns_lane_failures.load(Ordering::Relaxed)
+    }
+
+    /// Response-body read failures since construction.
+    pub fn body_failures(&self) -> u64 {
+        self.body_failures.load(Ordering::Relaxed)
+    }
+
+    /// The per-client health block carried by an egress envelope.
+    ///
+    /// `note` is not decoration: without it a reader who sees
+    /// `consecutive_transport_failures: 0` during a DNS outage would conclude
+    /// the transport was fine, which is the misreading this split created and
+    /// must therefore explain in the same object.
     pub fn health_json(&self) -> serde_json::Value {
         serde_json::json!({
             "name": self.name,
             "consecutive_transport_failures": self.consecutive_failures(),
             "rebuilds": self.rebuilds(),
+            "dns_lane_failures": self.dns_lane_failures(),
+            "last_dns_lane_class": *self
+                .last_dns_lane_class
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            "body_read_failures": self.body_failures(),
+            "note": "dns_lane_failures and body_read_failures are deliberately NOT in \
+                     consecutive_transport_failures: the dns lane is process-wide (a rebuilt \
+                     client installs the same lane) and a body read failure proves the connect \
+                     phase worked, so a rebuild fixes neither",
         })
+    }
+
+    fn note_dns_lane_failure(&self, class: &'static str) {
+        let n = self.dns_lane_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        *self
+            .last_dns_lane_class
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(class);
+        tracing::warn!(
+            "egress: {} saw a dns-lane {class} failure (#{n}); NOT rebuilding — the lane is \
+             process-wide, so a fresh client would install the same one",
+            self.name
+        );
     }
 
     fn note_transport_failure(&self) -> bool {
@@ -485,6 +661,196 @@ mod tests {
             lane.snapshot().resolved >= 2,
             "each new connection re-resolved"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // F2 / F3: only rebuild for faults a rebuild can fix
+    // -----------------------------------------------------------------
+
+    /// A lane whose worker threads can never be started, so every lookup
+    /// through it ends as `DnsLaneError::Unavailable`.
+    fn dead_lane(prefix: &'static str) -> Arc<OsDnsResolver> {
+        let spawn: crate::util::dns::SpawnFn =
+            Arc::new(|_n, _b| Err(std::io::Error::other("spawn refused (test)")));
+        Arc::new(OsDnsResolver::with_lookup_and_spawn(
+            DnsLaneConfig {
+                threads: 1,
+                queue_capacity: 4,
+                deadline: Duration::from_millis(200),
+                thread_name_prefix: prefix.to_string(),
+            },
+            Arc::new(|_h: &str| Ok(vec![SocketAddr::from(([10, 0, 0, 1], 0))])),
+            spawn,
+        ))
+    }
+
+    /// The whole of F2: a lane fault is real, is reported, and must NOT rebuild
+    /// the client — a rebuilt client installs the same process-wide lane, and
+    /// the rebuild would reset the streak the envelope reports.
+    #[tokio::test]
+    async fn a_dns_lane_fault_is_counted_and_never_rebuilds() {
+        let lane = dead_lane("dns-lane-t-http-dead");
+        let built = Arc::new(AtomicU32::new(0));
+        let built_f = Arc::clone(&built);
+        let lane_f = Arc::clone(&lane);
+        // Threshold 1: if lane faults counted at all, the FIRST one would
+        // rebuild, so this test cannot pass by accident.
+        let c = ResettableClient::with_policy("t-lane", 1, Duration::ZERO, move || {
+            built_f.fetch_add(1, Ordering::Relaxed);
+            // reqwest-client-ok: test client on an injected dead lane.
+            reqwest::Client::builder()
+                .dns_resolver(Arc::clone(&lane_f))
+                .connect_timeout(Duration::from_secs(2))
+                .no_proxy()
+                .build()
+        })
+        .unwrap();
+
+        for i in 0..3 {
+            let r = c.client().get("http://lane.test/").send().await;
+            let err = r.as_ref().expect_err("the lane cannot resolve anything");
+            assert_eq!(
+                dns_lane_class(err),
+                Some("unavailable"),
+                "the typed lane class must survive reqwest's wrapping: {err:?}"
+            );
+            assert_eq!(
+                classify_transport(err),
+                TransportFault::DnsLane("unavailable")
+            );
+            assert!(is_transport_failure(err), "it IS a transport fault");
+            assert!(!c.record_outcome(&r), "iteration {i} must not rebuild");
+        }
+        assert_eq!(c.rebuilds(), 0);
+        assert_eq!(
+            built.load(Ordering::Relaxed),
+            1,
+            "built once, never rebuilt"
+        );
+        assert_eq!(
+            c.consecutive_failures(),
+            0,
+            "the rebuild streak must stay clean so it keeps meaning what it says"
+        );
+        assert_eq!(c.dns_lane_failures(), 3, "the outage IS reported");
+        let h = c.health_json();
+        assert_eq!(h["dns_lane_failures"], 3, "{h}");
+        assert_eq!(h["last_dns_lane_class"], "unavailable", "{h}");
+        assert!(
+            h["note"].as_str().unwrap_or_default().contains("dns lane"),
+            "the envelope must explain the zero streak: {h}"
+        );
+    }
+
+    /// A server that accepts and then says nothing: the client's OWN
+    /// whole-request timeout fires, with the transport in perfect health.
+    fn serve_stalling() -> SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            while let Ok((s, _)) = l.accept() {
+                std::thread::sleep(Duration::from_millis(1500));
+                drop(s);
+            }
+        });
+        addr
+    }
+
+    /// F3: `COORD_PROXY_CLIENT` allows 300s because coord tool calls run long.
+    /// Three slow-but-successful-transport calls must not rebuild it.
+    #[tokio::test]
+    async fn a_whole_request_timeout_is_not_a_transport_failure() {
+        let stalling = serve_stalling();
+        let built = Arc::new(AtomicU32::new(0));
+        let built_f = Arc::clone(&built);
+        let c = ResettableClient::with_policy("t-slow", 1, Duration::ZERO, move || {
+            built_f.fetch_add(1, Ordering::Relaxed);
+            client_builder()
+                .timeout(Duration::from_millis(250))
+                .no_proxy()
+                .build()
+        })
+        .unwrap();
+        let url = format!("http://{stalling}/");
+        for _ in 0..3 {
+            let r = c.client().get(&url).send().await;
+            let err = r.as_ref().expect_err("the request times out");
+            assert!(err.is_timeout(), "{err:?}");
+            assert!(
+                !err.is_connect(),
+                "the connect phase SUCCEEDED — the server accepted: {err:?}"
+            );
+            assert_eq!(classify_transport(err), TransportFault::None, "{err:?}");
+            assert!(!c.record_outcome(&r), "a long request must not rebuild");
+        }
+        assert_eq!(c.rebuilds(), 0);
+        assert_eq!(c.consecutive_failures(), 0);
+        assert_eq!(built.load(Ordering::Relaxed), 1);
+    }
+
+    /// A connect-phase failure still counts: this is the fault a rebuild can
+    /// actually fix, and F3 must not have disarmed it.
+    #[tokio::test]
+    async fn a_connect_failure_is_still_rebuildable() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let c = ResettableClient::with_policy("t-connect", 2, Duration::ZERO, || {
+            client_builder()
+                .connect_timeout(Duration::from_millis(300))
+                .no_proxy()
+                .build()
+        })
+        .unwrap();
+        let url = format!("http://{dead}/");
+        let r1 = c.client().get(&url).send().await;
+        assert_eq!(
+            classify_transport(r1.as_ref().unwrap_err()),
+            TransportFault::Rebuildable
+        );
+        assert!(!c.record_outcome(&r1));
+        let r2 = c.client().get(&url).send().await;
+        assert!(c.record_outcome(&r2), "the second connect failure rebuilds");
+        assert_eq!(c.rebuilds(), 1);
+        assert_eq!(c.dns_lane_failures(), 0);
+    }
+
+    /// A body-read failure is counted apart from the rebuild streak: headers
+    /// had arrived, so the connect phase demonstrably worked.
+    #[tokio::test]
+    async fn a_body_failure_is_counted_apart_from_the_rebuild_streak() {
+        let stalling = serve_stalling();
+        let c = ResettableClient::with_policy("t-body", 1, Duration::ZERO, || {
+            client_builder()
+                .timeout(Duration::from_millis(250))
+                .no_proxy()
+                .build()
+        })
+        .unwrap();
+        let err = c
+            .client()
+            .get(format!("http://{stalling}/"))
+            .send()
+            .await
+            .expect_err("times out");
+        c.record_body_failure(&err);
+        assert_eq!(c.body_failures(), 1);
+        assert_eq!(c.rebuilds(), 0);
+        assert_eq!(c.consecutive_failures(), 0);
+        assert_eq!(c.health_json()["body_read_failures"], 1);
+    }
+
+    #[test]
+    fn the_connect_timeout_dial_parses_or_falls_back() {
+        assert_eq!(connect_timeout_from(None), DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(
+            connect_timeout_from(Some(" 2500 ")),
+            Duration::from_millis(2500)
+        );
+        assert_eq!(connect_timeout_from(Some("0")), DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(connect_timeout_from(Some("soon")), DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(connect_timeout_from(Some("")), DEFAULT_CONNECT_TIMEOUT);
     }
 
     #[test]

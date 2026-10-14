@@ -84,11 +84,29 @@ mdns-sd = "0.11"
 # Plan mention: cocool97/adb_client. Features: `usb` for direct USB device I/O,
 # `mdns` for adb mDNS services. The crate is sync; call via tokio::spawn_blocking.
 adb_client = { version = "3", features = ["usb", "mdns"] }
-# reqwest DNS: every client resolves through ONE process-wide resolver,
-# `util::dns::shared()` -- the OS resolver (getaddrinfo, which follows network
-# changes, VPN/NRPT and the hosts file) on a dedicated, bounded `dns-lane-*`
-# thread lane with a hard per-lookup deadline. Clients are built only through
-# `util::http::client_builder()` / `blocking_client_builder()`, which install it.
+# reqwest DNS: every FIRST-PARTY client resolves through ONE process-wide
+# resolver, `util::dns::shared()` -- the OS resolver (getaddrinfo, which follows
+# network changes, VPN/NRPT and the hosts file) on a dedicated, bounded
+# `dns-lane-*` thread lane with a hard per-lookup deadline. Clients are built
+# only through `util::http::client_builder()` / `blocking_client_builder()`,
+# which install it.
+#
+# "FIRST-PARTY" is the honest scope, and the word is load-bearing. Removing
+# `hickory-dns` removes it from the WHOLE dependency graph, so third-party
+# crates sharing this reqwest 0.13 now get `GaiResolver` on tokio's blocking
+# pool -- partially re-exposing them to #918. Measured on this graph:
+#   * opentelemetry-otlp / opentelemetry-http: ROUTED. `src/otel.rs` injects a
+#     factory-built client via `.with_http_client(...)`; same reqwest 0.13, so
+#     it is type-compatible. It is a process-lifetime periodic exporter, i.e.
+#     exactly the class the plan is about.
+#   * tauri, tauri-plugin-updater, postgresql_archive: NOT routed -- they
+#     expose no injection point, and no claim to the contrary is made.
+#   * sentry: rides a SEPARATE reqwest 0.12, which never had hickory-dns.
+#
+# The lane's shape and the connect ceiling are env-overridable
+# (QONTINUI_DNS_LANE_THREADS / _QUEUE / _DEADLINE_MS,
+# QONTINUI_HTTP_CONNECT_TIMEOUT_MS), because a running runner cannot be
+# restarted to change a constant.
 #
 # Why NOT `hickory-dns` (removed 2026-09-16; enabled by #918 on 2026-08-01): in
 # reqwest 0.13 each client owns a hickory resolver created on first lookup from

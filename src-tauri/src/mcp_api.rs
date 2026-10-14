@@ -5830,9 +5830,12 @@ async fn coord_mcp_proxy_handler(
         Err(e) => {
             let chain = crate::util::error_chain::error_chain(&e);
             let tail = crate::util::error_chain::error_chain_tail(&e);
-            // A body stalled past the client timeout counts toward a rebuild
-            // (a half-dead pooled connection presents exactly this way).
-            resettable.record_failure(&e);
+            // Counted, but NOT toward a rebuild: coord's headers had already
+            // arrived, so the connect phase demonstrably worked and this is not
+            // a connect fault. It is the stale-pooled-connection signal, and it
+            // is reported as `client_health.body_read_failures` rather than
+            // inflating the streak that decides a rebuild.
+            resettable.record_body_failure(&e);
             let egress = crate::util::egress_context::snapshot(
                 crate::util::egress_context::EgressClient::CoordMcpProxy,
             );

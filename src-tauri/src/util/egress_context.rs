@@ -405,12 +405,114 @@ fn dns_lane_json() -> Value {
 /// The probe runs INLINE on the failure path, before the error envelope is
 /// returned, because the envelope is where the caller (an agent session with no
 /// log access) reads the class — a detached probe could only ever reach the
-/// log. It cannot meaningfully delay a response: it runs only after a transport
-/// failure that already cost up to the client's `connect_timeout`, it is capped
-/// here at 2s (below the lane's own 4s deadline), and a saturated lane refuses
-/// instantly rather than queueing, so a burst of failures during an outage adds
-/// no queueing delay either.
+/// log. It runs only after a transport failure that has already cost up to the
+/// client's `connect_timeout`, and it is capped here at 2s, below the lane's
+/// own deadline.
+///
+/// ⚠️ **What this cap does NOT buy, corrected 2026-09-18.** An earlier version
+/// of this comment claimed "a saturated lane refuses instantly rather than
+/// queueing, so a burst of failures during an outage adds no queueing delay".
+/// That is false and was never measured: `lane_worker` SKIPS a job whose caller
+/// has already given up, so the queue self-drains, `try_send` keeps succeeding,
+/// and each failing probe pays the full 2s inline before its 502. N failing
+/// requests would also have become N extra lane jobs competing for the lane's
+/// threads — able to push the lane into `Saturated` and so to fail the real
+/// lookups it was diagnosing. Two guards, not the cap, are what bound it now:
+/// [`dns_probe`] short-circuits when the error chain ALREADY names the lane
+/// class, and otherwise goes through [`probe_host`], which single-flights and
+/// memoises per host for [`DNS_PROBE_TTL`].
 pub(crate) const DNS_PROBE_CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long one host's probe answer is reused. Short enough that a second
+/// outage minutes later is measured fresh, long enough that one burst of
+/// failures costs ONE lookup.
+pub(crate) const DNS_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hosts the memo keeps. The runner talks to a handful; the cap is there so a
+/// pathological caller cannot grow the map without bound.
+const DNS_PROBE_MEMO_CAP: usize = 32;
+
+/// One host's probe state: the gate that makes concurrent probes single-flight,
+/// and the last answer with the instant it was taken.
+struct HostProbe {
+    gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    answer: Option<(Instant, Value)>,
+}
+
+fn probe_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, HostProbe>> {
+    static MEMO: OnceLock<std::sync::Mutex<std::collections::HashMap<String, HostProbe>>> =
+        OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Probe `host` at most once per [`DNS_PROBE_TTL`], however many failures ask.
+///
+/// The per-host async gate is what makes this single-flight rather than merely
+/// cached: during an outage every failing request arrives at once and would
+/// otherwise all miss an empty memo. A waiter blocks for at most one probe —
+/// time it was going to spend anyway — and adds no lane job.
+async fn probe_host(host: &str) -> Value {
+    let gate = {
+        let mut memo = probe_memo().lock().unwrap_or_else(|p| p.into_inner());
+        // Evict expired entries nobody is waiting on, so the map stays small
+        // without a sweeper task.
+        if memo.len() >= DNS_PROBE_MEMO_CAP {
+            memo.retain(|_, v| {
+                std::sync::Arc::strong_count(&v.gate) > 1
+                    || v.answer
+                        .as_ref()
+                        .is_some_and(|(at, _)| at.elapsed() < DNS_PROBE_TTL)
+            });
+        }
+        let entry = memo.entry(host.to_string()).or_insert_with(|| HostProbe {
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            answer: None,
+        });
+        if let Some((at, v)) = entry
+            .answer
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < DNS_PROBE_TTL)
+        {
+            return memoised(v.clone(), at.elapsed());
+        }
+        std::sync::Arc::clone(&entry.gate)
+    };
+
+    let _held = gate.lock().await;
+    // The winner of the gate may have answered while this caller waited.
+    {
+        let memo = probe_memo().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, v)) = memo
+            .get(host)
+            .and_then(|e| e.answer.as_ref())
+            .filter(|(at, _)| at.elapsed() < DNS_PROBE_TTL)
+        {
+            return memoised(v.clone(), at.elapsed());
+        }
+    }
+
+    let probe = crate::util::dns::shared().probe(host, DNS_PROBE_CAP).await;
+    let value = serde_json::to_value(probe)
+        .unwrap_or_else(|e| json!({ "unavailable": format!("serialize: {e}") }));
+    let mut memo = probe_memo().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(entry) = memo.get_mut(host) {
+        entry.answer = Some((Instant::now(), value.clone()));
+    }
+    value
+}
+
+/// Mark a reused answer as reused: an unlabelled one would read as a fresh
+/// measurement taken at the moment of THIS failure, which it is not.
+fn memoised(mut v: Value, age: std::time::Duration) -> Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("memoised".to_string(), json!(true));
+        obj.insert(
+            "memo_age_ms".to_string(),
+            json!(age.as_millis().min(u128::from(u64::MAX)) as u64),
+        );
+    }
+    v
+}
 
 /// The host a failed request was dialling: reqwest's own record of the URL,
 /// else `fallback_url`.
@@ -431,9 +533,24 @@ fn failing_host(err: &reqwest::Error, fallback_url: &str) -> Option<String> {
 /// `skipped` with the reason, never silently absent.
 pub(crate) async fn dns_probe(err: &reqwest::Error, fallback_url: &str) -> Value {
     if !crate::util::http::is_transport_failure(err) {
-        return json!({ "skipped": "not a connect/timeout failure" });
+        return json!({ "skipped": "not a transport failure (see util::http::classify_transport)" });
     }
-    let Some(host) = failing_host(err, fallback_url) else {
+    let host = failing_host(err, fallback_url);
+    // The error already carries the typed lane class. Probing would add a lane
+    // job to the very outage being diagnosed, and could only re-derive what is
+    // already in hand — so read it off the chain and touch nothing.
+    if let Some(class) = crate::util::http::dns_lane_class(err) {
+        return json!({
+            "source": "error_chain",
+            "class": crate::util::dns::probe_class_for(class),
+            "error_class": class,
+            "host": host,
+            "lane": dns_lane_json(),
+            "skipped": "the reqwest error chain already names the lane class; probing again \
+                        would queue another lookup on the lane that just failed",
+        });
+    }
+    let Some(host) = host else {
         return json!({ "skipped": "no host in the failing url" });
     };
     // `host_str` keeps IPv6 brackets; an IP literal involves no DNS at all.
@@ -444,9 +561,7 @@ pub(crate) async fn dns_probe(err: &reqwest::Error, fallback_url: &str) -> Value
     {
         return json!({ "skipped": "ip literal: no dns involved", "host": host });
     }
-    let probe = crate::util::dns::shared().probe(&host, DNS_PROBE_CAP).await;
-    serde_json::to_value(probe)
-        .unwrap_or_else(|e| json!({ "unavailable": format!("serialize: {e}") }))
+    probe_host(&host).await
 }
 
 /// [`snapshot`] plus the discriminator for one transport failure: the
@@ -678,7 +793,16 @@ mod tests {
         let v = failure_snapshot(EgressClient::CoordMcpProxy, &err, &url, Some(&rc)).await;
         let probe = &v["dns_probe"];
         assert_eq!(probe["host"], "localhost", "{v}");
-        assert_eq!(probe["class"], "tcp", "localhost resolves fast: {v}");
+        // `tcp` is the expected reading (localhost resolves from the hosts
+        // file), but the class flips to `dns` whenever the lookup takes longer
+        // than DNS_SLOW_THRESHOLD — the first `getaddrinfo` on a loaded box
+        // does. Asserting `tcp` alone made this test a load-dependent flake;
+        // what the discriminator must actually guarantee is that it CLASSIFIED
+        // the failure and got addresses back.
+        assert!(
+            probe["class"] == "tcp" || probe["class"] == "dns",
+            "the probe must land on a real class: {v}"
+        );
         assert!(probe["os_resolve_ms"].is_number(), "{v}");
         assert!(probe["addrs_n"].as_u64().unwrap_or(0) >= 1, "{v}");
         assert_eq!(probe["lane"]["lane"], "dns", "{v}");
@@ -711,6 +835,84 @@ mod tests {
                 .starts_with("ip literal"),
             "{probe}"
         );
+    }
+
+    /// F4: when the error chain already names the lane class, the probe must
+    /// read it off the chain rather than sending ANOTHER lookup into the lane
+    /// that just failed.
+    #[tokio::test]
+    async fn a_lane_error_is_read_off_the_chain_not_re_probed() {
+        use crate::util::dns::{DnsLaneConfig, OsDnsResolver, SpawnFn};
+        use std::sync::Arc;
+        let spawn: SpawnFn = Arc::new(|_n, _b| Err(std::io::Error::other("spawn refused (test)")));
+        let lane = Arc::new(OsDnsResolver::with_lookup_and_spawn(
+            DnsLaneConfig {
+                threads: 1,
+                queue_capacity: 4,
+                deadline: std::time::Duration::from_millis(200),
+                thread_name_prefix: "dns-lane-t-egress-chain".to_string(),
+            },
+            Arc::new(|_h: &str| Ok(vec![std::net::SocketAddr::from(([10, 0, 0, 1], 0))])),
+            spawn,
+        ));
+        // reqwest-client-ok: test client on an injected dead lane.
+        let client = reqwest::Client::builder()
+            .dns_resolver(Arc::clone(&lane))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let url = "http://egress-chain.test/";
+        let before = lane.snapshot().total;
+        let err = client.get(url).send().await.expect_err("cannot resolve");
+
+        let started = Instant::now();
+        let probe = dns_probe(&err, url).await;
+        assert_eq!(probe["source"], "error_chain", "{probe}");
+        assert_eq!(probe["error_class"], "unavailable", "{probe}");
+        assert_eq!(
+            probe["class"], "unknown",
+            "a dead LANE says nothing about the OS resolver: {probe}"
+        );
+        assert_eq!(probe["host"], "egress-chain.test", "{probe}");
+        assert_eq!(
+            lane.snapshot().total,
+            before + 1,
+            "only the request's own lookup — the probe must add none: {probe}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the short-circuit must be instant, not another capped probe"
+        );
+    }
+
+    /// F4: a burst of failures for one host shares ONE lookup.
+    #[tokio::test]
+    async fn a_burst_of_probes_for_one_host_shares_one_lookup() {
+        // The lane's counters are process-wide and other tests resolve through
+        // them concurrently, so the honest assertion is over the memo's own
+        // markers — which is what single-flight means — not over a global
+        // delta that a peer test can move.
+        let host = "localhost";
+        let results = futures::future::join_all((0..8).map(|_| probe_host(host))).await;
+        let reused = results
+            .iter()
+            .filter(|v| v.get("memoised").is_some())
+            .count();
+        assert!(
+            reused >= 7,
+            "8 concurrent probes must share ONE lookup; only {reused} were reused: {results:?}"
+        );
+        for v in &results {
+            assert!(
+                v.get("memoised").is_some() || v.get("class").is_some(),
+                "every caller gets a real answer, reused or fresh: {v}"
+            );
+        }
+        // Inside the TTL a later failure reuses the same answer.
+        let again = probe_host(host).await;
+        assert_eq!(again["memoised"], json!(true), "{again}");
+        assert!(again["memo_age_ms"].is_number(), "{again}");
     }
 
     /// Uptime is `null`, not `0`, until something anchors the clock.

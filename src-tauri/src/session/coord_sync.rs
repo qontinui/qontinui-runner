@@ -102,6 +102,19 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 15;
 const DEFAULT_STALE_SECS: u64 = 45;
 
 /// Read a `u64` env var with a sane default.
+/// THE coord-sync client: the shared OS-DNS lane plus the per-request timeout
+/// the drain loop depends on — slow enough to ride out a hiccup, fast enough
+/// that the loop does not stall on a hung coord. 30s matches the
+/// `agent_claims` heartbeat client.
+///
+/// A free function rather than an inline closure so the first build and every
+/// rebuild are provably the same client.
+fn coord_sync_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::util::http::client_builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+}
+
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -192,21 +205,21 @@ impl CoordSync {
         ));
         let stale = Duration::from_secs(env_u64("QONTINUI_SESSION_STALE_SECS", DEFAULT_STALE_SECS));
 
-        let http = crate::util::http::ResettableClient::new("coord-sync", || {
-            crate::util::http::client_builder()
-                // Per-request timeout — slow enough to ride out a hiccup,
-                // fast enough that the drain loop doesn't stall on a hung
-                // coord. 30s matches the `agent_claims` heartbeat client.
-                .timeout(Duration::from_secs(30))
-                .build()
-        })
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "coord_sync: reqwest client build failed; using default");
-            crate::util::http::ResettableClient::new("coord-sync", || {
-                crate::util::http::client_builder().build()
-            })
-            .expect("coord_sync: default reqwest client")
-        });
+        // ONE factory, used for the first build and for every rebuild, so the
+        // fallback arm cannot silently drop the 30s timeout the comment inside
+        // it calls required — which the two-closure version did.
+        let http = crate::util::http::ResettableClient::new("coord-sync", coord_sync_client)
+            .unwrap_or_else(|e| {
+                // `ResettableClient::new` fails only when the first build
+                // fails, i.e. TLS-backend / system-config init — which the old
+                // `reqwest::Client::new()` fallback would have panicked on too.
+                // Retry once (it can be a transient config read) and then
+                // panic, rather than run the drain loop on a client with no
+                // request timeout.
+                tracing::warn!(error = %e, "coord_sync: reqwest client build failed; retrying once");
+                crate::util::http::ResettableClient::new("coord-sync", coord_sync_client)
+                    .expect("coord_sync: reqwest client (30s timeout) could not be built")
+            });
 
         Self {
             inner: Arc::new(CoordSyncInner {
@@ -270,8 +283,22 @@ impl CoordSync {
     /// The shared reqwest client (connection-pooled, 30s timeout). The
     /// Phase 7 handoff trigger + receiver reuse it rather than minting a
     /// fresh client per call.
+    ///
+    /// ⚠️ **Outcomes on this clone are NOT reported**, so requests made through
+    /// it neither advance nor reset the self-healing backstop's streak. That is
+    /// a deliberate exclusion, not an oversight: the callers are a handoff
+    /// trigger and receiver with their own error handling and no shared send
+    /// helper to route through, and the drain loop — this client's dominant
+    /// traffic — already drives the backstop. Report an outcome explicitly with
+    /// [`CoordSync::record_http_outcome`] if you want a call site to count.
     pub fn http_client(&self) -> reqwest::Client {
         self.inner.http.client()
+    }
+
+    /// Feed one `send()` result from a [`CoordSync::http_client`] clone into
+    /// the self-healing backstop. Returns `true` iff it rebuilt the client.
+    pub fn record_http_outcome<T>(&self, outcome: &Result<T, reqwest::Error>) -> bool {
+        self.inner.http.record_outcome(outcome)
     }
 
     /// The tenant scope that owns `session_id`, for per-session credential

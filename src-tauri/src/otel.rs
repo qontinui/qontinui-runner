@@ -142,13 +142,29 @@ fn try_init_otel(
 > {
     use opentelemetry::trace::TracerProvider;
     use opentelemetry::KeyValue;
-    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
     use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
 
-    // Build the OTLP span exporter (HTTP via reqwest)
+    // Build the OTLP span exporter (HTTP via reqwest).
+    //
+    // `.with_http_client` is the reason this is not left to the exporter's own
+    // default. Dropping reqwest's `hickory-dns` feature dropped it from the
+    // WHOLE dependency graph, so `opentelemetry-http`'s own client would get
+    // reqwest's `GaiResolver` — one tokio blocking-pool slot per lookup, the
+    // starvation flood runner #918 fixed — and this is a process-lifetime
+    // periodic exporter, exactly the class plan
+    // 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes
+    // is about. `opentelemetry-http` rides the SAME reqwest 0.13 as the runner
+    // (`impl HttpClient for reqwest::Client`), so the factory's client drops
+    // straight in and the exporter resolves through the shared OS-DNS lane.
+    //
+    // `tauri`, `tauri-plugin-updater` and `postgresql_archive` expose no such
+    // injection point and are NOT routed; `sentry` rides a separate reqwest
+    // 0.12 that never had hickory. See `util::http`'s "Reach" section.
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
+        .with_http_client(crate::util::http::client_builder().build()?)
         .with_endpoint(&config.endpoint)
         .build()?;
 
