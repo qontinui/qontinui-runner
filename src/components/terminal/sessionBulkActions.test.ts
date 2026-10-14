@@ -23,6 +23,7 @@ import {
   bulkPin,
   bulkResumeItems,
   bulkSnooze,
+  closeTargetsFor,
   idsToClose,
   moveResults,
   resumeBlockerOf,
@@ -220,6 +221,45 @@ describe("a bulk close with partial failure", () => {
 });
 
 // ── The re-check at confirm ──────────────────────────────────────────────────
+
+describe("closeTargetsFor — a requested row that left the list", () => {
+  it("stays as a non-closable placeholder, so the results answer N of N", async () => {
+    // Asked for a, b, c; b left `allSessions` while the dialog was open.
+    const rows = [{ sessionId: "a" }, { sessionId: "c" }];
+    const targets = closeTargetsFor(["a", "b", "c"], rows, (r) =>
+      target(r.sessionId, "idle-at-prompt"),
+    );
+    expect(targets.map((t) => [t.sessionId, t.closable])).toEqual([
+      ["a", true],
+      ["b", false],
+      ["c", true],
+    ]);
+    const at = idsToClose(targets, new Set(), new Set());
+    expect(at.ids).toEqual(["a", "c"]);
+    expect(at.skipped).toEqual([
+      {
+        sessionId: "b",
+        title: "b",
+        state: "not-closed",
+        detail: "not closed: it is no longer listed",
+      },
+    ]);
+    const fx: CloseEffects = {
+      gracefulClose: vi.fn(async () => ({ outcome: "exited", waited_ms: 1, claude_pids: [1] })),
+      forceClose: vi.fn(),
+      dropTab: vi.fn(),
+      recordClosed: vi.fn(),
+      now: () => 1,
+    };
+    const closed = await closeSessionsGracefully(
+      at.ids.map((id) => closeItem(id)),
+      fx,
+    );
+    expect(summarizeCloseResults([...closed, ...at.skipped])).toBe(
+      "2 of 3 closed · 1 not closed",
+    );
+  });
+});
 
 describe("idsToClose — the re-check at confirm", () => {
   it("excludes a session that changed to Needs you while the dialog was open, and closes the rest", () => {
