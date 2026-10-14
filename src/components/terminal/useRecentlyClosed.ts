@@ -10,17 +10,16 @@
 
 import { useCallback, useMemo } from "react";
 
-import { describeThrown } from "@/lib/utils";
-
-import { lastReopenable, planReopen, type ReopenRow } from "./sessionReopen";
+import {
+  lastReopenable,
+  reopenClosedSession,
+  type ReopenResult,
+  type ReopenRow,
+} from "./sessionReopen";
 import type { ClosedSession, SessionOrgApplyResponse, SessionOrgOp } from "./sessionOrgTypes";
 import type { SessionOrgView } from "./useSessionOrg";
 
-/** One reopen's outcome. */
-export interface ReopenResult {
-  state: "done" | "not-done" | "unknown";
-  detail: string;
-}
+export type { ReopenResult } from "./sessionReopen";
 
 /** The list as a surface renders it; `null` entries = the store is not known. */
 export interface RecentlyClosedView {
@@ -69,36 +68,8 @@ export function useRecentlyClosed<R extends ReopenRow>({
   );
 
   const run = useCallback(
-    async (entry: ClosedSession): Promise<ReopenResult> => {
-      const plan = planReopen(entry, rows, known);
-      if (plan.kind === "refused") return { state: "not-done", detail: `not reopened: ${plan.reason}` };
-      if (plan.kind === "focus") {
-        focus(plan.row);
-        return { state: "done", detail: "Already open — focused it" };
-      }
-      resume(plan.row);
-      if (plan.ops.length === 0) {
-        return { state: "done", detail: `Reopened${plan.note ? ` — ${plan.note}` : ""}` };
-      }
-      try {
-        const response = await applyOrg(plan.ops);
-        const ok = response.results.every((r) => r.ok);
-        return ok
-          ? { state: "done", detail: "Reopened in its group" }
-          : {
-              state: "not-done",
-              detail: `Reopened, but not put back in its group (refused: ${response.results
-                .map((r) => r.error ?? "")
-                .filter(Boolean)
-                .join(", ")})`,
-            };
-      } catch (e) {
-        return {
-          state: "unknown",
-          detail: `Reopened; whether it went back in its group is unknown: ${describeThrown(e, "session_org_apply failed")}`,
-        };
-      }
-    },
+    (entry: ClosedSession): Promise<ReopenResult> =>
+      reopenClosedSession(entry, rows, known, { resume, focus, applyOrg }),
     [rows, known, applyOrg, resume, focus],
   );
 

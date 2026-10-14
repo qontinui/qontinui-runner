@@ -14,7 +14,14 @@
  * Pure: no React, no Tauri.
  */
 
-import type { ClosedSession, SessionOrg, SessionOrgOp } from "./sessionOrgTypes";
+import { describeThrown } from "@/lib/utils";
+
+import type {
+  ClosedSession,
+  SessionOrg,
+  SessionOrgApplyResponse,
+  SessionOrgOp,
+} from "./sessionOrgTypes";
 import type { SessionLocation } from "./sessionStatusModel";
 
 /** The row fields a reopen reads. */
@@ -48,7 +55,13 @@ export function groupRestore(
   if (!org.groups.some((g) => g.id === entry.groupId)) {
     return { ops: [], note: "its group no longer exists; it reopened ungrouped" };
   }
-  if (org.members[entry.sessionKey]?.groupId === entry.groupId) return { ops: [], note: null };
+  const now = org.members[entry.sessionKey]?.groupId ?? null;
+  if (now === entry.groupId) return { ops: [], note: null };
+  if (now !== null) {
+    // Moved to another group since it closed: that later choice stands.
+    const title = org.groups.find((g) => g.id === now)?.title ?? now;
+    return { ops: [], note: `it was moved to ${title} after it closed; it stays there` };
+  }
   return {
     ops: [{ op: "addMembers", groupId: entry.groupId, sessionKeys: [entry.sessionKey] }],
     note: null,
@@ -75,12 +88,19 @@ export function planReopen<R extends ReopenRow>(
     };
   }
   if (location !== "not-running") {
-    return { kind: "refused", reason: "it is running outside this runner — a resume would fork it" };
+    return {
+      kind: "refused",
+      reason: "it is running outside this runner — a resume would fork it",
+    };
   }
   return { kind: "resume", row, ...groupRestore(entry, org) };
 }
 
-/** The newest entry a reopen chord would act on: the first that is not refused. */
+/**
+ * The newest entry the reopen chord acts on: the first that would RESUME.
+ * An entry already open here (a focus) or refused is passed over, so pressing
+ * the chord again walks back through the list as Chrome's Ctrl+Shift+T does.
+ */
 export function lastReopenable<R extends ReopenRow>(
   entries: readonly ClosedSession[],
   rows: readonly R[],
@@ -91,4 +111,71 @@ export function lastReopenable<R extends ReopenRow>(
     if (plan.kind === "resume") return { entry, plan };
   }
   return null;
+}
+
+/** One reopen's outcome. */
+export interface ReopenResult {
+  state: "done" | "not-done" | "unknown";
+  detail: string;
+}
+
+export interface ReopenEffects<R> {
+  resume: (row: R) => void;
+  focus: (row: R) => void;
+  applyOrg: (ops: SessionOrgOp[]) => Promise<SessionOrgApplyResponse>;
+}
+
+/**
+ * Reopen `entry`: resume (or focus) it, then put it back in the group it
+ * closed from. The restore is READ BACK from the snapshot the apply answered —
+ * an op that said ok while the store shows the session elsewhere is "not
+ * done", and a store that could not be read back is "unknown", never "done".
+ */
+export async function reopenClosedSession<R extends ReopenRow>(
+  entry: ClosedSession,
+  rows: readonly R[],
+  org: SessionOrg | null,
+  effects: ReopenEffects<R>,
+): Promise<ReopenResult> {
+  const plan = planReopen(entry, rows, org);
+  if (plan.kind === "refused") return { state: "not-done", detail: `not reopened: ${plan.reason}` };
+  try {
+    if (plan.kind === "focus") {
+      effects.focus(plan.row);
+      return { state: "done", detail: "Already open — focused it" };
+    }
+    effects.resume(plan.row);
+  } catch (e) {
+    return { state: "not-done", detail: `not reopened: ${describeThrown(e, "resume failed")}` };
+  }
+  if (plan.ops.length === 0) {
+    return { state: "done", detail: `Reopened${plan.note ? ` — ${plan.note}` : ""}` };
+  }
+  let response: SessionOrgApplyResponse;
+  try {
+    response = await effects.applyOrg(plan.ops);
+  } catch (e) {
+    return {
+      state: "unknown",
+      detail: `Reopened; whether it went back in its group is unknown: ${describeThrown(e, "session_org_apply failed")}`,
+    };
+  }
+  const after = response.snapshot.status === "known" ? response.snapshot.org : null;
+  if (!after) {
+    return {
+      state: "unknown",
+      detail: `Reopened; whether it went back in its group is unknown: ${response.snapshot.reason ?? "the store could not be read back"}`,
+    };
+  }
+  if (after.members[entry.sessionKey]?.groupId === entry.groupId) {
+    return { state: "done", detail: "Reopened in its group" };
+  }
+  const refusals = response.results
+    .map((r) => r.error)
+    .filter((e): e is string => Boolean(e))
+    .join(", ");
+  return {
+    state: "not-done",
+    detail: `Reopened, but not put back in its group${refusals ? ` (refused: ${refusals})` : ""}`,
+  };
 }
