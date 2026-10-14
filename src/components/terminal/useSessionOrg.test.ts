@@ -187,6 +187,28 @@ describe("useSessionOrg client", () => {
     expect(after.phase === "known" && after.org.revision).toBe(1);
   });
 
+  it("sends applies in the order they were made, even when the first is slow", async () => {
+    const { transport } = fakeTransport(known(emptyOrg()));
+    const client = createSessionOrgClient(transport);
+    client.retain();
+    await flush();
+    transport.applyGate = deferred<void>();
+    const gate = transport.applyGate;
+    const pin = client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: true }]);
+    transport.applyGate = null;
+    const unpin = client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: false }]);
+    await flush();
+    // The unpin must not reach the store while the pin is still in flight.
+    expect((transport.apply as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+    gate.resolve();
+    await Promise.all([pin, unpin]);
+    const calls = (transport.apply as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect((calls[1][0] as SessionOrgOp[])[0]).toMatchObject({ op: "setPinned", pinned: false });
+    const view = client.getView();
+    expect(view.phase === "known" && view.org.members.s1?.pinned).not.toBe(true);
+  });
+
   it("a refused op vanishes from the view and is reported", async () => {
     const { transport } = fakeTransport(known(emptyOrg()));
     transport.apply = vi.fn(async () => ({
