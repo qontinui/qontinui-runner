@@ -1397,8 +1397,9 @@ impl AgenticExecutor {
 
             // Emit realtime cost update for the main AI session
             {
-                // The CLI's reported cost is what the session was billed at;
-                // the cache-aware price table is the fallback when it is absent.
+                // The CLI's reported cost is its list-price figure (a
+                // list-price equivalent, not the user's bill); the cache-aware
+                // price table is the fallback when it is absent.
                 let cost_usd = match (
                     session_reported_cost_usd,
                     session_input_tokens,

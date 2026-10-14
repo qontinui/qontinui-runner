@@ -17,7 +17,7 @@ import { CircuitBreakerStatus } from "./CircuitBreakerStatus";
 import { AnomalyFeed } from "./AnomalyFeed";
 import { BudgetWarningBanner } from "./BudgetWarningBanner";
 import { CostRecommendations } from "./CostRecommendations";
-import { describeCostProvenance } from "./costProvenance";
+import { describeCostFigure } from "./costProvenance";
 
 /** Source id → label used in the error banner. */
 const SOURCE_LABELS: Record<string, string> = {
@@ -50,10 +50,10 @@ export default function CostControlPanel() {
     refresh,
   } = useCostControl();
 
-  // Say whether the total is what the provider billed or a price-table
-  // estimate, so an estimate never reads as a bill.
-  const costProvenance = describeCostProvenance(dashboard?.cost_provenance);
-  const totalCostSubtitle = costProvenance ? `Last 30 days · ${costProvenance}` : "Last 30 days";
+  // Label the total as a list-price equivalent (never the user's bill) and say
+  // how much of it the CLI reported versus the price table estimated — served
+  // policy production-and-cost `per-task-cost-is-a-labelled-equivalent`.
+  const totalCostSubtitle = `Last 30 days · ${describeCostFigure(dashboard?.cost_provenance)}`;
 
   // Render the page header unconditionally so navigation tests/snapshots
   // always see "Cost Control" even while data is loading or fetches fail.

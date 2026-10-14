@@ -1053,6 +1053,11 @@ impl PgDb {
         // does with the SAME constraint names, so whichever runs first the other is
         // a no-op. Gated on the table existing and on a column being absent, so
         // the ACCESS EXCLUSIVE `ALTER TABLE` does not run on every boot.
+        // The check-then-add is not atomic: two runners booting against one
+        // shared Postgres can both see the constraint absent, and the loser's
+        // ADD would raise. Each ALTER therefore swallows exactly the
+        // already-exists error (`duplicate_object` / `duplicate_column`), so a
+        // lost race is a no-op rather than a degraded boot.
         conn.batch_execute(
             "DO $$
              BEGIN
@@ -1070,9 +1075,12 @@ impl PgDb {
                      AND column_name = 'cost_microusd'
                  )
                ) THEN
-                 ALTER TABLE project.phase_token_usage
-                     ADD COLUMN IF NOT EXISTS cost_source TEXT NULL,
-                     ADD COLUMN IF NOT EXISTS cost_microusd BIGINT NULL;
+                 BEGIN
+                   ALTER TABLE project.phase_token_usage
+                       ADD COLUMN IF NOT EXISTS cost_source TEXT NULL,
+                       ADD COLUMN IF NOT EXISTS cost_microusd BIGINT NULL;
+                 EXCEPTION WHEN duplicate_column THEN NULL;
+                 END;
                END IF;
                IF EXISTS (
                  SELECT 1 FROM information_schema.columns
@@ -1083,9 +1091,12 @@ impl PgDb {
                  WHERE conname = 'ck_phase_token_usage_cost_source'
                    AND conrelid = to_regclass('project.phase_token_usage')
                ) THEN
-                 ALTER TABLE project.phase_token_usage
-                     ADD CONSTRAINT ck_phase_token_usage_cost_source
-                     CHECK (cost_source IN ('reported', 'estimated'));
+                 BEGIN
+                   ALTER TABLE project.phase_token_usage
+                       ADD CONSTRAINT ck_phase_token_usage_cost_source
+                       CHECK (cost_source IN ('reported', 'estimated'));
+                 EXCEPTION WHEN duplicate_object THEN NULL;
+                 END;
                END IF;
                IF EXISTS (
                  SELECT 1 FROM information_schema.columns
@@ -1096,9 +1107,12 @@ impl PgDb {
                  WHERE conname = 'ck_phase_token_usage_cost_microusd_nonneg'
                    AND conrelid = to_regclass('project.phase_token_usage')
                ) THEN
-                 ALTER TABLE project.phase_token_usage
-                     ADD CONSTRAINT ck_phase_token_usage_cost_microusd_nonneg
-                     CHECK (cost_microusd IS NULL OR cost_microusd >= 0);
+                 BEGIN
+                   ALTER TABLE project.phase_token_usage
+                       ADD CONSTRAINT ck_phase_token_usage_cost_microusd_nonneg
+                       CHECK (cost_microusd IS NULL OR cost_microusd >= 0);
+                 EXCEPTION WHEN duplicate_object THEN NULL;
+                 END;
                END IF;
              END $$;",
         )

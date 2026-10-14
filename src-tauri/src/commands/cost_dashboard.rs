@@ -80,7 +80,9 @@ pub fn microusd_to_usd(microusd: i64) -> f64 {
 /// Aggregate the per-phase query rows into the dashboard figures. Pure, so
 /// the arithmetic is testable without a database.
 fn summarize(rows: &[PhaseCacheCostRow], budget_utilization: Option<f64>) -> CostDashboard {
-    let mut per_phase: Vec<PhaseCostBreakdown> = Vec::new();
+    // Each phase keeps its exact micro-USD beside it, so the ordering below
+    // compares integers rather than the f64 dollars the dashboard displays.
+    let mut per_phase: Vec<(i64, PhaseCostBreakdown)> = Vec::new();
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
     let mut total_cache_creation: u64 = 0;
@@ -102,18 +104,22 @@ fn summarize(rows: &[PhaseCacheCostRow], budget_utilization: Option<f64>) -> Cos
         total_microusd = total_microusd.saturating_add(microusd);
         total_provenance.add(provenance);
 
-        per_phase.push(PhaseCostBreakdown {
-            phase: row.phase.clone(),
-            input_tokens: row.input_tokens.max(0) as u64,
-            output_tokens: row.output_tokens.max(0) as u64,
-            cache_creation_tokens: row.cache_creation_tokens.max(0) as u64,
-            cache_read_tokens: row.cache_read_tokens.max(0) as u64,
-            cost_usd: microusd_to_usd(microusd),
-            cost_provenance: provenance,
-        });
+        per_phase.push((
+            microusd,
+            PhaseCostBreakdown {
+                phase: row.phase.clone(),
+                input_tokens: row.input_tokens.max(0) as u64,
+                output_tokens: row.output_tokens.max(0) as u64,
+                cache_creation_tokens: row.cache_creation_tokens.max(0) as u64,
+                cache_read_tokens: row.cache_read_tokens.max(0) as u64,
+                cost_usd: microusd_to_usd(microusd),
+                cost_provenance: provenance,
+            },
+        ));
     }
     // Most expensive phase first, compared in exact micro-USD.
-    per_phase.sort_by(|a, b| b.cost_usd.total_cmp(&a.cost_usd));
+    per_phase.sort_by_key(|(microusd, _)| std::cmp::Reverse(*microusd));
+    let per_phase: Vec<PhaseCostBreakdown> = per_phase.into_iter().map(|(_, p)| p).collect();
 
     let total_tokens = total_input + total_output;
 
@@ -283,7 +289,7 @@ mod tests {
 
     /// The reason the precision column exists: a reported $0.0042 call is
     /// `cost_cents = 0`. Summed in whole cents it would show $0.00; summed in
-    /// micro-USD it shows what was billed, and is labelled reported.
+    /// micro-USD it shows the CLI's list-price figure, labelled reported.
     #[test]
     fn a_sub_cent_reported_row_is_not_rendered_as_free() {
         let written = PhaseCost::reported(0.0042);

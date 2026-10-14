@@ -74,8 +74,10 @@ pub(super) fn record_phase_token_usage(
 
 /// Decide the cost triple a `phase_token_usage` row records.
 ///
-/// - A provider-REPORTED cost (Claude CLI `total_cost_usd`) wins: it is what
-///   the call was billed at, at full precision.
+/// - A provider-REPORTED cost (Claude CLI `total_cost_usd`) wins: it is the
+///   CLI's list-price figure, at full precision. It is a list-price
+///   equivalent even on subscription auth, never the user's bill (served
+///   policy production-and-cost `per-task-cost-is-a-labelled-equivalent`).
 /// - Otherwise the cost is ESTIMATED from the token counts against the
 ///   cache-aware price table (cache writes at the 5-minute-TTL 1.25x rate —
 ///   a 1-hour-TTL write bills higher, so this under-estimates those — and
