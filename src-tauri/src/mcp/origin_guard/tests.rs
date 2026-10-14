@@ -1164,44 +1164,35 @@ async fn rg_04_by_route_withheld_from_browser_classes() {
     assert!(!body.contains("settings/ai/api-key"), "{body}");
 }
 
-/// Collects the `message` of every event emitted while installed.
-#[derive(Clone, Default)]
-struct MessageCapture(Arc<Mutex<Vec<String>>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MessageCapture {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        struct Msg(String);
-        impl tracing::field::Visit for Msg {
-            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                if f.name() == "message" {
-                    self.0 = format!("{v:?}");
-                }
-            }
-        }
-        let mut m = Msg(String::new());
-        event.record(&mut m);
-        self.0.lock().unwrap().push(m.0);
+/// The grace decision the middleware reaches for `origin` at the AI-key door.
+fn grace_decision(origin: &str) -> Decision {
+    Decision {
+        class: OriginClass::Trusted,
+        verdict: Verdict::GraceAdmitted,
+        method: "POST".to_string(),
+        origin: Some(origin.to_string()),
+        route: Some("/settings/ai/api-key".to_string()),
     }
 }
 
 /// RG-5: the grace WARN has its own sighting set. 512 distinct Foreign shadow
 /// sightings fill the shared shadow set's cap, and a grace admission after
-/// that still logs its WARN — so "zero grace lines" can mean zero use.
+/// that still counts as a first sighting — so "zero grace lines" can mean
+/// zero use.
+///
+/// Asserted on the sighting predicate, not on a captured log line: a scoped
+/// `tracing` capture is racy under parallel `cargo test` (a parallel test can
+/// be the first to hit the WARN callsite on a thread with no subscriber and
+/// cache its interest as `never`). The middleware gates the WARN on
+/// `first_grace_sighting`, so after one admission the key must already be
+/// spent; with the WARN back on the shared, capped set it would still be
+/// fresh.
+///
+/// Side effect: this fills the PROCESS-WIDE shadow `SEEN` set to its 512 cap
+/// for the rest of the test binary, so no later shadow WARN is logged in this
+/// process. No test asserts on a shadow WARN.
 #[tokio::test]
 async fn rg_05_grace_warn_survives_a_full_shadow_sighting_set() {
-    use tracing_subscriber::layer::SubscriberExt;
-    let cap = MessageCapture::default();
-    let _sub = tracing::subscriber::set_default(tracing_subscriber::registry().with(cap.clone()));
-    // Parallel tests have already hit the grace WARN's callsite with no
-    // subscriber, caching its interest as `never`; `Dispatch::new` rebuilds
-    // that cache from the thread's PREVIOUS default (tracing-core's
-    // single-dispatcher fast path), so without this rebuild the capture can
-    // never see the event and the assertion below fails for the wrong reason.
-    tracing::callsite::rebuild_interest_cache();
     let h = harness("");
     for i in 0..512 {
         let origin = format!("https://shadow-fill-{i}.example");
@@ -1221,34 +1212,75 @@ async fn rg_05_grace_warn_survives_a_full_shadow_sighting_set() {
         h.guard.health_json(None)["shadowWouldRefuse"]["foreign"],
         512
     );
+    // Anti-vacuity: the shared shadow set really is at its cap now.
+    let shadow = Decision {
+        class: OriginClass::Foreign,
+        verdict: Verdict::ShadowWouldRefuse,
+        method: "GET".to_string(),
+        origin: Some("https://shadow-fill-after-cap.example".to_string()),
+        route: Some("/sessions".to_string()),
+    };
+    assert!(
+        !first_shadow_sighting(&shadow),
+        "the shared shadow set should be capped after 512 sightings"
+    );
+    // One grace admission through the middleware spends its key in the
+    // guard's own set (that is the WARN's gate)...
     let (status, _, _) = send(&h, ai_key_req(&h, WEB)).await;
     assert_eq!(status, StatusCode::OK);
-    let grace_lines = cap
-        .0
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|m| m.contains("origin guard (grace): ADMITTED"))
-        .count();
-    assert_eq!(
-        grace_lines, 1,
-        "the grace admission logged no WARN after the shadow set filled"
+    assert!(
+        !h.guard.first_grace_sighting(&grace_decision(WEB)),
+        "the middleware did not gate the grace WARN on the guard's own sighting set"
     );
+    // ...and a fresh grace key is still a first sighting despite the full
+    // shadow set, exactly once.
+    let fresh = grace_decision("http://127.0.0.1:3001");
+    assert!(h.guard.first_grace_sighting(&fresh));
+    assert!(!h.guard.first_grace_sighting(&fresh));
 }
 
-/// RG-6: no source text still rests on the false premise that qontinui-web
-/// PR 1380 retires the grace.
-/// The needles are split so this file does not match its own grep.
+/// RG-6 (plan acceptance 6): no `.rs`/`.ts`/`.tsx` file under `src-tauri/src`
+/// or `src` still rests on the false premise that qontinui-web PR 1380 retires
+/// the grace. The needles are split, and this file is skipped, so the test
+/// does not match itself.
 #[test]
 fn rg_06_no_stale_1380_premise_text() {
-    let sources = [
-        ("origin_guard.rs", include_str!("../origin_guard.rs")),
-        ("settings.rs", include_str!("../../settings.rs")),
-        (
-            "AllowedOriginsSettings.tsx",
-            include_str!("../../../../src/components/settings/AllowedOriginsSettings.tsx"),
-        ),
-    ];
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == "node_modules") {
+                    continue;
+                }
+                walk(&p, out);
+            } else if p
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| matches!(x, "rs" | "ts" | "tsx"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&manifest.join("src"), &mut files);
+    walk(&manifest.join("../src"), &mut files);
+    // Anti-vacuity: the walk reached both trees, including the three files
+    // that carried the premise.
+    for must in [
+        "src/mcp/origin_guard.rs",
+        "src/settings.rs",
+        "src/components/settings/AllowedOriginsSettings.tsx",
+    ] {
+        assert!(
+            files.iter().any(|f| f.ends_with(must)),
+            "walk missed {must}"
+        );
+    }
     let needles = [
         concat!("1380", " deploys"),
         concat!(
@@ -1256,11 +1288,21 @@ fn rg_06_no_stale_1380_premise_text() {
             "that removes that need is deployed"
         ),
     ];
-    for (name, src) in sources {
+    let mut hits = Vec::new();
+    for f in &files {
+        if f.ends_with("src/mcp/origin_guard/tests.rs") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(f) else {
+            continue;
+        };
         for needle in needles {
-            assert!(!src.contains(needle), "{name} still says {needle:?}");
+            if src.contains(needle) {
+                hits.push(format!("{} says {needle:?}", f.display()));
+            }
         }
     }
+    assert!(hits.is_empty(), "stale premise text: {hits:#?}");
 }
 
 /// R2: every extension scheme is the Extension class; Extension never gets a
@@ -1548,6 +1590,12 @@ fn grace_and_extension_only_lists_are_well_formed() {
             "grace entry is not a door: {m} {p}"
         );
         assert!(reg(m, p), "grace entry not registered: {m} {p}");
+    }
+    for o in GRACE_ORIGINS {
+        assert!(
+            DEFAULT_TRUSTED_ORIGINS.contains(o),
+            "grace origin is not a default Trusted origin: {o}"
+        );
     }
     for (m, p) in EXTENSION_ONLY_ROUTES {
         assert!(reg(m, p), "extension-only entry not registered: {m} {p}");
