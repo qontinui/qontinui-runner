@@ -56,14 +56,11 @@ use qontinui_types::runner::RunnerInstanceRole;
 use serde_json::Value;
 use tauri::Manager;
 use tokio::sync::{broadcast, watch, Mutex};
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{
-        client::IntoClientRequest,
-        handshake::client::Request as HttpRequest,
-        http::{header, HeaderValue},
-        Message,
-    },
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    handshake::client::Request as HttpRequest,
+    http::{header, HeaderValue},
+    Message,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -957,23 +954,15 @@ async fn relay_loop(
         // like any other transport failure (record + backoff + retry) instead
         // of blocking the task forever on a stalled socket. `is_unauthorized`
         // returns false for an Io error, so a timeout correctly does NOT kick
-        // the refresher (a hung connect is not a 401).
+        // the refresher (a hung connect is not a 401). The connect goes
+        // through the HTTP proxy the environment / OS names for the backend,
+        // or direct (`outbound_net::connect_ws`, plan
+        // 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 4).
         let connect_result =
-            match tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)).await {
-                Ok(inner) => inner,
-                Err(_elapsed) => Err(tokio_tungstenite::tungstenite::Error::Io(
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "WS connect exceeded {}s with no handshake response",
-                            CONNECT_TIMEOUT.as_secs()
-                        ),
-                    ),
-                )),
-            };
+            qontinui_runner_lib::outbound_net::connect_ws(request, CONNECT_TIMEOUT).await;
 
         match connect_result {
-            Ok((ws_stream, _response)) => {
+            Ok(ws_stream) => {
                 info!("Connected to runner WS at {}", ws_url);
                 let connected_at = std::time::Instant::now();
                 // NOTE: the connection error is intentionally NOT cleared
@@ -1237,7 +1226,7 @@ async fn relay_loop(
                 // unified-devices migration plan.) Detection factored
                 // into [`is_unauthorized`] so the Phase 5.3 tests can
                 // exercise the branching without spinning up a WS server.
-                if is_unauthorized(&e) {
+                if e.as_tungstenite().is_some_and(is_unauthorized) {
                     info!(
                         "Backend relay got 401 on WS upgrade — kicking \
                          device-JWT refresher to re-exchange"

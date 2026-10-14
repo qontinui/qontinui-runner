@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use super::transport_stats::{self, Leg};
 use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter};
 
@@ -297,11 +297,17 @@ pub(crate) struct WireFlow {
     /// relay reconnect re-presents the grant.
     sent: Mutex<bool>,
     wire_paused: AtomicBool,
+    /// `io.unwatched_pauses_source()`, read once: when false, `hidden` never
+    /// contributes to the wire state (a PTY-holder pane's grid and state
+    /// tracking live HERE, so an unwatched tier must keep its bytes flowing).
+    hidden_pauses: bool,
 }
 
 impl WireFlow {
     pub(crate) fn new(io: Arc<dyn PaneIo>) -> Self {
+        let hidden_pauses = io.unwatched_pauses_source();
         Self {
+            hidden_pauses,
             io,
             gate_paused: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
@@ -330,8 +336,8 @@ impl WireFlow {
     fn sync(&self) {
         // Held across the decision AND the send — see the `sent` field's note.
         let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
-        let desired =
-            self.gate_paused.load(Ordering::Acquire) || self.hidden.load(Ordering::Acquire);
+        let desired = self.gate_paused.load(Ordering::Acquire)
+            || (self.hidden_pauses && self.hidden.load(Ordering::Acquire));
         if *sent == desired {
             return;
         }
@@ -561,15 +567,15 @@ impl SyncFrameCoalescer {
 /// keeps its own offset-free payload.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TerminalOutputWire<'a> {
-    terminal_id: &'a str,
-    data: &'a str,
+pub(super) struct TerminalOutputWire<'a> {
+    pub(super) terminal_id: &'a str,
+    pub(super) data: &'a str,
     /// Absolute byte offset of this chunk's first byte in the session's
     /// output stream (the value of `total_bytes_produced` before this chunk
     /// was teed). Lets the frontend dedup a scrollback-ring replay against
     /// live chunks — see `terminal_get_scrollback` and the frontend's
     /// `scrollbackReplay.ts`.
-    offset: u64,
+    pub(super) offset: u64,
 }
 
 /// Emit one `terminal-output` event to the webview.
@@ -585,7 +591,10 @@ fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offse
         data: encoded,
         offset,
     };
-    if let Err(e) = app.emit("terminal-output", &event) {
+    let started = Instant::now();
+    let emitted = app.emit("terminal-output", &event);
+    transport_stats::record_webview_emit(encoded, started.elapsed());
+    if let Err(e) = emitted {
         warn!(
             terminal_id = %terminal_id,
             error = %e,
@@ -1621,7 +1630,29 @@ impl TerminalSession {
             Some(&app_handle),
         )?;
 
-        let opened = LocalPty::open(&id, cols, rows)?;
+        // The pane's backend: in-process `LocalPty`, or — behind
+        // `terminal.pty_holder`, default OFF — an out-of-process PTY holder
+        // (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+        // Phase 2). Read once per spawn. A local PTY is opened HERE, before the
+        // environment is assembled, so an `openpty` failure leaves none of
+        // that side-effecting work behind; a holder pane has no PTY in this
+        // process to open.
+        //
+        // Cost on the OFF path (review round 2, N10): `get_terminal_settings`
+        // is `read_settings_from_disk`, the mtime-keyed in-process settings
+        // cache — one `stat` and a clone on a hit, no file read or parse. That
+        // is the same per-spawn price this function already pays for
+        // `get_performance_settings` (the scrollback capacity, `spawn_with_io`), not a
+        // new kind of read.
+        let backend = crate::terminal::daemon_pane_io::pane_backend_for(
+            &crate::settings::get_terminal_settings(),
+        );
+        let opened = match backend {
+            crate::terminal::daemon_pane_io::PaneBackend::LocalPty => {
+                Some(LocalPty::open(&id, cols, rows)?)
+            }
+            crate::terminal::daemon_pane_io::PaneBackend::Holder => None,
+        };
 
         // Build the PTY child command: an explicit program+args override
         // (Decision 3) when supplied, else the interactive shell. Whether it
@@ -1794,7 +1825,13 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
-        let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
+        let sealed = ScrubbedCommand::seal(cmd);
+        let io: Arc<dyn PaneIo> = match opened {
+            Some(opened) => Arc::new(opened.spawn(sealed)?),
+            None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
+                &id, sealed, cols, rows,
+            )?,
+        };
 
         Self::spawn_with_io(
             id,
@@ -1853,9 +1890,11 @@ impl TerminalSession {
             "Terminal session spawned"
         );
 
-        // Assign to Windows Job Object for crash safety
+        // Assign to Windows Job Object for crash safety — the pid the pane
+        // allows, which is `None` for a PTY-holder pane (its child must outlive
+        // this runner; see `PaneIo::job_enroll_pid`).
         #[cfg(target_os = "windows")]
-        if let Some(pid) = child_pid {
+        if let Some(pid) = io.job_enroll_pid() {
             Self::assign_to_job_object(pid);
         }
 
@@ -1991,6 +2030,7 @@ impl TerminalSession {
                 // and (through them) the coord output pipe receive every chunk,
                 // in order, byte-identical, in every tier.
                 let emit_impl = |payload: &[u8], offset: u64, gated: bool| {
+                    transport_stats::record_frame(payload.len());
                     let tier = reader_visibility.tier();
                     let sent = reader_bytes_sent.load(Ordering::Relaxed);
                     let acked = reader_bytes_acked.load(Ordering::Relaxed);
@@ -2028,19 +2068,29 @@ impl TerminalSession {
                     // does not need encoding here — one encode per flush
                     // window instead of one per chunk.
                     let encoded = if to_sse || to_ws || admission == WebviewAdmission::Now {
-                        Some(STANDARD.encode(payload))
+                        Some(transport_stats::encode(payload))
                     } else {
                         None
                     };
+                    transport_stats::classify_encode(
+                        &reader_app,
+                        &reader_id,
+                        encoded.is_some(),
+                        admission == WebviewAdmission::Now,
+                        to_sse,
+                        to_ws,
+                    );
 
                     // Broadcast to HTTP/SSE subscribers (skipped when none —
                     // the `send` would drop the value anyway, and the clone is
                     // a full copy of the base64 payload).
                     if let (true, Some(encoded)) = (to_sse, encoded.as_ref()) {
+                        transport_stats::record_leg(Leg::Sse, payload.len());
                         let _ = reader_output_tx.send(encoded.clone());
                     }
                     // Broadcast to backend relay for remote mobile access
                     if let (true, Some(encoded)) = (to_ws, encoded.as_ref()) {
+                        transport_stats::record_leg(Leg::Ws, payload.len());
                         crate::event_system::broadcast_ws_notification(
                             &reader_app,
                             "terminal-output",
@@ -2076,7 +2126,7 @@ impl TerminalSession {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
-                                    &STANDARD.encode(&window),
+                                    &transport_stats::encode(&window),
                                     window_offset,
                                 );
                             }
@@ -2087,7 +2137,7 @@ impl TerminalSession {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
-                                    &STANDARD.encode(&window),
+                                    &transport_stats::encode(&window),
                                     window_offset,
                                 );
                             }
@@ -2124,6 +2174,7 @@ impl TerminalSession {
                             break;
                         }
                         Ok(n) => {
+                            transport_stats::record_reader_chunk(n);
                             let data = interceptor.process(&reader_id, &buf[..n]);
 
                             // Tee processed output into the per-session
@@ -2246,7 +2297,7 @@ impl TerminalSession {
                         emit_terminal_output(
                             &reader_app,
                             &reader_id,
-                            &STANDARD.encode(&window),
+                            &transport_stats::encode(&window),
                             window_offset,
                         );
                     }
@@ -4008,7 +4059,7 @@ impl TerminalSession {
         };
         // Emit under the lock: it is this session's webview ordering point.
         if let Some((window, offset)) = taken {
-            emit_terminal_output(app, &self.id, &STANDARD.encode(&window), offset);
+            emit_terminal_output(app, &self.id, &transport_stats::encode(&window), offset);
         }
     }
 
@@ -4688,12 +4739,15 @@ impl TerminalSession {
         // Release the pane's handles — for a local PTY this closes the OS pipe
         // and unblocks the reader thread which may be stuck in a blocking
         // read() call. Bounded for the same reason as the writer above.
+        // `release` can fail for more than a spent budget — a holder pane
+        // released after a kill that did not land says so in its error — so
+        // the log carries the pane's own reason rather than assuming one.
         if let Err(e) = self.io.release(lock_budget) {
             warn!(
                 terminal_id = %self.id,
                 error = %e,
-                "Could not release the pane within the shutdown budget — the \
-                 handle will be released by process exit"
+                "pane release reported an error (see `error`); any handle it \
+                 could not release is released by process exit"
             );
         }
 
