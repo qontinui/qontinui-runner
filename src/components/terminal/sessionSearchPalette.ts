@@ -193,6 +193,26 @@ export function searchPalette(
   return matches.slice(0, limit);
 }
 
+/** A transcript answer, kept with the query it answered. */
+export interface KeyedTranscriptAnswer {
+  query: string;
+  answer: { state: "pending" | "failed" | "done" | "idle"; resp?: TranscriptSearchResponse };
+}
+
+/**
+ * The transcript response that answers `query`, or `null` when the kept answer
+ * is for another query (or is not done). A caller that sets a new query and
+ * filters in the same tick — the `search` bridge action — would otherwise
+ * attribute the PREVIOUS query's transcript hits to the new one.
+ */
+export function transcriptAnswerFor(
+  kept: KeyedTranscriptAnswer | null,
+  query: string,
+): TranscriptSearchResponse | null {
+  if (!kept || kept.query !== query.trim() || kept.answer.state !== "done") return null;
+  return kept.answer.resp ?? null;
+}
+
 /**
  * The palette's honest note on its transcript arm: how much was searched, and
  * whether the answer is complete. `null` when no transcript search ran.

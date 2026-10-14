@@ -24,7 +24,7 @@
  * the rows the operator confirmed still close.
  */
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { AlertTriangle, Loader2 } from "lucide-react";
 
 import { idsToClose, type CloseConfirmation } from "./sessionBulkActions";
@@ -148,8 +148,13 @@ export function SessionCloseDialog({
           {heading}
         </div>
 
+        {/* Each phase is KEYED so React mounts its buttons fresh instead of
+            reusing the previous phase's nodes: the UI Bridge registers a
+            control by its node, so a reused node kept its old id — the done
+            phase's Done button stayed registered as `force-close` and
+            `close-cancel` was unreachable after a close (Phase 8 live run). */}
         {phase.kind === "done" ? (
-          <>
+          <Fragment key="done">
             <p className="px-3 pt-2 text-[11px] text-[#a9b1d6]" data-testid="close-summary">
               {summarizeCloseResults(phase.results)}
             </p>
@@ -177,9 +182,9 @@ export function SessionCloseDialog({
                 Done
               </button>
             </div>
-          </>
+          </Fragment>
         ) : phase.kind === "force-confirm" ? (
-          <>
+          <Fragment key="force-confirm">
             <div className="px-3 py-2 text-[11px] text-[#e0af68] flex gap-2">
               <AlertTriangle className="w-4 h-4 shrink-0" />
               <span>
@@ -215,9 +220,9 @@ export function SessionCloseDialog({
                 Force close {closable.length}
               </button>
             </div>
-          </>
+          </Fragment>
         ) : (
-          <>
+          <Fragment key="confirm">
             <p className="px-3 pt-2 text-[11px] text-[#a9b1d6]">
               Closing ends each session&apos;s live conversation. Claude is asked to /exit at an
               empty prompt; nothing is killed. The transcript stays and can be resumed.
@@ -263,7 +268,7 @@ export function SessionCloseDialog({
                 {phase.kind === "running" ? "Closing…" : `Close ${closable.length}`}
               </button>
             </div>
-          </>
+          </Fragment>
         )}
       </div>
     </div>
