@@ -138,22 +138,23 @@ impl SweepReport {
 }
 
 /// Sweep `pane_dir`: classify every pane under ONE deadline `timeout` from now,
-/// hand the classification to `before_reaping` (the caller adopts the live
-/// panes there, so their adoption never waits on reaping), then reap the
-/// dead, re-check the orphan ledger, and remove stray files. A missing pane
-/// directory is an empty report (and `before_reaping` still runs, with
-/// nothing); one that is unreadable or (Unix) not private is an error — the
-/// sweep never acts on a directory another user could have planted files in.
+/// hand the classification — and how many DEAD panes are about to be reaped —
+/// to `before_reaping` (the caller adopts the live panes there, so their
+/// adoption never waits on reaping), then reap the dead, re-check the orphan
+/// ledger, and remove stray files. A missing pane directory is an empty
+/// report (and `before_reaping` still runs, with nothing); one that is
+/// unreadable or (Unix) not private is an error — the sweep never acts on a
+/// directory another user could have planted files in.
 pub fn boot_sweep(
     pane_dir: &Path,
     timeout: Duration,
     skip: &[PaneId],
-    before_reaping: impl FnOnce(&[SweepEntry]),
+    before_reaping: impl FnOnce(&[SweepEntry], usize),
 ) -> io::Result<SweepReport> {
     match check_private_dir(pane_dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            before_reaping(&[]);
+            before_reaping(&[], 0);
             return Ok(SweepReport::default());
         }
         Err(e) => return Err(e),
@@ -185,7 +186,7 @@ pub fn boot_sweep(
             outcome,
         });
     }
-    before_reaping(&report.entries);
+    before_reaping(&report.entries, dead.len());
     for pane_id in dead {
         let outcome = match PaneId::new(&pane_id) {
             Ok(pane) => reap_dead(pane_dir, &pane, &mut report.errors),
@@ -243,11 +244,21 @@ fn recheck_orphans(pane_dir: &Path, report: &mut SweepReport) {
             continue;
         }
         let record = read_record(&path);
-        let stale = record.as_ref().is_none_or(|r| {
-            r.child_start
-                .as_deref()
-                .is_some_and(|t| !crate::proc_identity::token_is_from_this_boot(t))
-        });
+        // An entry is stale once it is from an earlier boot: by its token's
+        // boot id; or, for a record with NO token, by the entry's own age —
+        // it expires once it predates this boot (the host has restarted
+        // since, so none of what it listed can still be running). Where the
+        // boot time is unreadable (macOS) a token-less entry is kept.
+        let written = entry.metadata().and_then(|m| m.modified()).ok();
+        let stale = record
+            .as_ref()
+            .is_none_or(|r| match r.child_start.as_deref() {
+                Some(t) => !crate::proc_identity::token_is_from_this_boot(t),
+                None => matches!(
+                    (written, crate::proc_identity::boot_time()),
+                    (Some(w), Some(boot)) if w < boot
+                ),
+            });
         let reap = match (&record, stale) {
             (Some(r), false) => reap_orphans_of_dead_holder(r),
             _ => ReapReport::default(),
@@ -433,7 +444,7 @@ mod tests {
     fn pty_holder_boot_sweep_missing_dir_is_an_empty_report() {
         let d = std::env::temp_dir().join(format!("ptysw-none-{}", std::process::id()));
         assert_eq!(
-            boot_sweep(&d, Duration::from_secs(1), &[], |_| {}).unwrap(),
+            boot_sweep(&d, Duration::from_secs(1), &[], |_, _| {}).unwrap(),
             SweepReport::default()
         );
     }
@@ -446,7 +457,7 @@ mod tests {
         let pane = PaneId::new("gone").unwrap();
         std::fs::write(lock_path(&d, &pane), b"").unwrap();
         std::fs::write(spec_path(&d, &pane), b"{}").unwrap();
-        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
+        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_, _| {}).unwrap();
         assert_eq!(report.entries.len(), 1, "{report:?}");
         match &report.entries[0].outcome {
             SweepOutcome::Reaped {
@@ -473,7 +484,7 @@ mod tests {
         };
         std::fs::write(spec_path(&d, &pane), b"{}").unwrap();
         age(&spec_path(&d, &pane), STRAY_MIN_AGE * 2);
-        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
+        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_, _| {}).unwrap();
         assert!(
             matches!(report.entries[0].outcome, SweepOutcome::Unknown { .. }),
             "{report:?}"
@@ -513,7 +524,7 @@ mod tests {
         age(&ancient_log, DEAD_LOG_RETENTION * 2);
         age(&foreign, DEAD_LOG_RETENTION * 2);
         let skip = [PaneId::new("c").unwrap()];
-        let report = boot_sweep(&d, Duration::from_secs(5), &skip, |_| {}).unwrap();
+        let report = boot_sweep(&d, Duration::from_secs(5), &skip, |_, _| {}).unwrap();
         let mut removed = report.strays_removed.clone();
         removed.sort();
         assert_eq!(removed, vec![old_spec, ancient_log], "{report:?}");
@@ -570,12 +581,13 @@ mod tests {
                 child_start: None,
                 scope_unit: None,
                 holder_start: None,
+                ended: None,
             })
             .unwrap();
         }
         // Let `sh` fork its job.
         std::thread::sleep(Duration::from_millis(200));
-        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
+        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_, _| {}).unwrap();
         match &report.entries[0].outcome {
             SweepOutcome::Reaped {
                 reap, orphan_kept, ..
@@ -587,11 +599,11 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(orphan_path(&d, &pane).exists());
-        let again = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
+        let again = boot_sweep(&d, Duration::from_secs(5), &[], |_, _| {}).unwrap();
         assert!(again.orphans.iter().any(|o| o.kept), "{again:?}");
         drop(leader);
         std::thread::sleep(Duration::from_millis(200));
-        let gone = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
+        let gone = boot_sweep(&d, Duration::from_secs(5), &[], |_, _| {}).unwrap();
         assert!(gone.orphans.iter().all(|o| !o.kept), "{gone:?}");
         assert!(!orphan_path(&d, &pane).exists());
         let _ = std::fs::remove_dir_all(&d);

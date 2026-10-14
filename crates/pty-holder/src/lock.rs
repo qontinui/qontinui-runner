@@ -31,7 +31,10 @@
 //! takes its lock with [`PaneLock::try_acquire_unless_live`]: on `Held` it
 //! retries with a short bounded backoff ([`TRANSIENT_HOLD_BACKOFF_MS`]) — but
 //! ONLY while the lock's record names no live holder
-//! ([`record_names_live_holder`]). Against a live holder it never retries.
+//! ([`record_names_live_holder`]). A holder whose record names it live is
+//! never retried against. One that holds the lock but has not yet WRITTEN its
+//! record (it is starting) is retried against for those ~300 ms — harmlessly:
+//! a held lock is never taken, so the retries can only end in `Held`.
 //!
 //! The lock file is never unlinked by a holder. Unlinking a lock file lets a
 //! second holder lock a fresh file under the same name while a third still
@@ -69,6 +72,13 @@ pub struct LockRecord {
     /// earlier holders, which then count as live whenever their pid exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder_start: Option<String>,
+    /// How the pane ended, written by its holder under the lock before it
+    /// releases it: [`ENDED_BY_EXIT`] when the child exited on its own. A
+    /// boot sweep then signals NOTHING for this pane — the child's leftovers
+    /// are its user's (plan D8 as decided 2026-10-14). `None` while the pane
+    /// runs, after a kill, and when the holder crashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
     /// The child's start token (`crate::proc_identity`), taken right after it
     /// was spawned: what lets a boot sweep tell the recorded child from a
     /// process that later got the same pid (Phase 3, D8). Absent from records
@@ -88,6 +98,9 @@ pub struct PaneLock {
     file: File,
     path: PathBuf,
 }
+
+/// [`LockRecord::ended`] for a pane whose child exited on its own.
+pub const ENDED_BY_EXIT: &str = "exited";
 
 /// The pauses (ms) [`PaneLock::try_acquire_unless_live`] waits out a lock held
 /// by no live holder: about 300 ms in all.
@@ -523,6 +536,7 @@ mod tests {
             child_start: Some("linux:boot:1".into()),
             scope_unit: None,
             holder_start: None,
+            ended: None,
         };
         first.write_record(&rec).unwrap();
         // Readable while held — on Windows too, because the locked byte is
@@ -619,6 +633,7 @@ mod tests {
             child_start: None,
             scope_unit: None,
             holder_start: crate::proc_identity::start_token(me),
+            ended: None,
         })
         .unwrap();
         assert!(record_names_live_holder(read_record(&path).as_ref()));

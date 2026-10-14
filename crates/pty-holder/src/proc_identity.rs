@@ -41,6 +41,31 @@ pub fn token_is_from_this_boot(token: &str) -> bool {
     true
 }
 
+/// When this host booted, or `None` where that is not readable (macOS).
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let secs: u64 = stat
+            .lines()
+            .find_map(|l| l.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: GetTickCount64 takes no arguments and cannot fail.
+        let up = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_millis(up))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
 /// Whether `pid` is alive right now AND is the process `token` was taken from.
 /// `false` for an absent token: unverifiable is never "verified".
 pub fn is_same_process(pid: u32, token: Option<&str>) -> bool {
