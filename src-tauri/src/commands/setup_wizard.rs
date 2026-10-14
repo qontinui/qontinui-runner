@@ -934,8 +934,10 @@ pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
 
     // 2. Scan <claude_root>/.claude-*/ (multi-account setups): `C:\claude` on
     // Windows, the home dir elsewhere (`~/.claude-<x>` beside `~/.claude`).
-    // Same root rule as the session archive's account-home discovery, so the
-    // wizard and the census never disagree about which homes exist.
+    // Same scan root as the session archive's account-home discovery
+    // (`claude_root_for`). The two still differ on purpose: the census also
+    // reads the configured roster and always keeps the default home, which
+    // the wizard skips when per-account homes exist (step 3).
     let home = dirs::home_dir();
     let mut found_per_account = false;
     if let Some(claude_root) = qontinui_runner_lib::session_archive::discovery::claude_root_for(
@@ -945,8 +947,11 @@ pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
     .filter(|root| root.is_dir())
     {
         if let Ok(entries) = std::fs::read_dir(&claude_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
+            // `read_dir` order is filesystem-defined; sort so the wizard lists
+            // homes in the same order every time (as the census does).
+            let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for path in paths {
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name.starts_with(".claude-") {
