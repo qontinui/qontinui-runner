@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { TerminalSquare, X, CheckSquare, History, Radio, Server } from "lucide-react";
+import { X, CheckSquare, History, Radio, Server } from "lucide-react";
 import { SessionManagerHeader } from "./SessionManagerHeader";
 import { StewardControl } from "./StewardControl";
 import { SessionCard } from "./SessionCard";
@@ -11,6 +11,11 @@ import { groupSessions, type SessionSection } from "./sessionGrouping";
 import { SessionGroupHeader } from "./SessionGroupHeader";
 import { GroupMenuItems, type MenuPage } from "./SessionOrgMenus";
 import { SessionCloseDialog } from "./SessionCloseDialog";
+import { ReadyToCloseBanner, SessionBulkBar, SessionBulkOutcome } from "./SessionBulkBar";
+import { RecentlyClosedSection } from "./RecentlyClosedSection";
+import { bulkAddToGroup, bulkMute, bulkNewGroup, bulkPin, bulkSnooze } from "./sessionBulkActions";
+import { useSessionSelection } from "./useSessionSelection";
+import { useSessionTriage } from "./useSessionTriage";
 import { SessionGroupSuggestionsDialog } from "./SessionGroupSuggestionsDialog";
 import { SessionRail } from "./SessionRail";
 import { sessionOrgControlAttrs } from "./sessionOrgControls";
@@ -104,20 +109,16 @@ export function SessionManagerPanel({
     closableTabId,
     closeSessions,
     forceCloseSessions,
-    selectedIds,
-    toggleSelect,
-    selectAllVisible,
-    clearSelection,
-    bulkResume,
     org,
     sessionKeyOf,
     allAccounts,
     activityCounts,
     unidentifiedCount,
+    allSessions,
+    recentlyClosed,
+    reopenClosed,
   } = manager;
-  const selectableVisible = sessions.filter((s) => s.source === "transcript").length;
 
-  const selectionMode = selectedIds.size > 0;
   const { windowLabel } = useWindowAssignments();
   const { layout, setWidth, toggleRail } = useSessionPanelLayout(windowLabel);
   const knownOrg = org.phase === "known" ? org.org : null;
@@ -127,6 +128,25 @@ export function SessionManagerPanel({
     [sessions, groupBy, org, sessionKeyOf],
   );
   const groupLens = groupBy === "groups";
+
+  // ── Selection (visible order: what the sections render) ─────────────────
+
+  const visibleIds = useMemo(() => visibleRows(sections).map((s) => s.sessionId), [sections]);
+  const openRow = useCallback(
+    (rowId: string) => {
+      const row = allSessions.find((s) => s.sessionId === rowId);
+      if (row) openSession(row);
+    },
+    [allSessions, openSession],
+  );
+  const selection = useSessionSelection({ visibleIds, onOpen: openRow });
+  const selectedIds = selection.selectedIds;
+  const selectionMode = selectedIds.size > 0;
+  const onRowClick = useCallback(
+    (session: UnifiedSession, mods: { toggle: boolean; range: boolean }) =>
+      selection.onRowClick(session.sessionId, mods),
+    [selection],
+  );
 
   /**
    * Cross-link target from `SessionCard`: the worktree path of the session
@@ -149,6 +169,7 @@ export function SessionManagerPanel({
     closeRequest,
     requestClose,
     requestCloseGroup,
+    requestCloseRows,
     dismissClose,
     closeTargets,
     rowsOf,
@@ -165,6 +186,26 @@ export function SessionManagerPanel({
     currentPageId,
     onNewSessionInGroup,
     groupLens,
+  });
+
+  const currentPage = useMemo(
+    () => ({
+      id: currentPageId,
+      name: pages.find((p) => p.id === currentPageId)?.name ?? currentPageId,
+    }),
+    [pages, currentPageId],
+  );
+  const pageName = useCallback(
+    (pageId: string) => pages.find((p) => p.id === pageId)?.name ?? pageId,
+    [pages],
+  );
+  const triage = useSessionTriage({
+    manager,
+    selectedIds,
+    clearSelection: selection.clear,
+    currentPage,
+    pageName,
+    requestCloseRows,
   });
 
   // ── Resize ───────────────────────────────────────────────────────────────
@@ -334,7 +375,10 @@ export function SessionManagerPanel({
       {view === "fleet" ? (
         <FleetSessionPicker />
       ) : view === "previous" ? (
-        <PastSessionsView onResumePastSession={onResumePastSession} />
+        <PastSessionsView
+          onResumePastSession={onResumePastSession}
+          recentlyClosed={<RecentlyClosedSection view={recentlyClosed} onReopen={reopenClosed} />}
+        />
       ) : (
         <>
           <StewardControl />
@@ -400,48 +444,67 @@ export function SessionManagerPanel({
             </div>
           )}
 
+          {/* Ready to close (Chrome's Declutter): `is:closable` rows with a tab here */}
+          {triage.readyBanner && (
+            <ReadyToCloseBanner
+              text={triage.readyBanner}
+              count={triage.readyCount}
+              onReview={triage.reviewReadyToClose}
+            />
+          )}
+
           {/* Bulk action bar */}
           {selectionMode && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-[#7aa2f7]/5 border-b border-[#2a2d3d]">
-              <span className="text-[10px] text-[#7aa2f7] font-medium">
-                {selectedIds.size} selected
-              </span>
-              <div className="flex-1" />
-              <button
-                onClick={bulkResume}
-                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-[#9ece6a]/15 text-[#9ece6a] hover:bg-[#9ece6a]/25 transition-colors"
-                title="Resume all selected sessions"
-              >
-                <TerminalSquare className="w-3 h-3" />
-                Resume {selectedIds.size}
-              </button>
-              <button
-                onClick={clearSelection}
-                className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
-                title="Clear selection"
-              >
-                <X className="w-3 h-3" />
-              </button>
-            </div>
+            <SessionBulkBar
+              count={selectedIds.size}
+              running={triage.running}
+              groups={knownOrg ? knownOrg.groups : null}
+              pages={otherPages}
+              onClose={triage.closeSelected}
+              onMarkFinished={() => void triage.markFinished()}
+              onAddToGroup={(g) => void triage.applyOrgAction("Adding", bulkAddToGroup(g.id, g.title))}
+              onNewGroup={(title) => void triage.applyOrgAction("Grouping", bulkNewGroup(title))}
+              onPin={(pinned) => void triage.applyOrgAction(pinned ? "Pinning" : "Unpinning", bulkPin(pinned))}
+              onMute={(muted) => void triage.applyOrgAction(muted ? "Muting" : "Unmuting", bulkMute(muted))}
+              onSnooze={(until) =>
+                void triage.applyOrgAction(until === null ? "Unsnoozing" : "Snoozing", bulkSnooze(until))
+              }
+              onMoveToPage={(pageId) => void triage.moveToPage(pageId)}
+              onResume={() => void triage.resume()}
+              onClear={selection.clear}
+            />
+          )}
+          {triage.outcome && (
+            <SessionBulkOutcome outcome={triage.outcome} onDismiss={triage.dismissOutcome} />
           )}
 
           {/* Select what the filter shows */}
-          {!selectionMode && selectableVisible > 1 && (
+          {!selectionMode && visibleIds.length > 1 && (
             <div className="flex items-center px-3 py-1 border-b border-[#2a2d3d]">
               <button
                 data-ui-bridge-id={SESSION_MANAGER_PANEL_IDS.selectVisible}
-                onClick={selectAllVisible}
+                onClick={selection.selectVisible}
                 className="flex items-center gap-1 text-[10px] text-[#7aa2f7]/70 hover:text-[#7aa2f7] transition-colors"
-                title="Select every session the current filter shows"
+                title="Select every session the current filter shows (Ctrl+A in the list)"
               >
                 <CheckSquare className="w-3 h-3" />
-                Select all {selectableVisible} shown
+                Select all {visibleIds.length} shown
               </button>
             </div>
           )}
 
           {/* Session list */}
-          <div className="flex-1 overflow-y-auto scrollbar-dark" data-group-by={groupBy}>
+          <div
+            {...sessionOrgControlAttrs("sessionList")}
+            role="listbox"
+            aria-multiselectable="true"
+            aria-label="Sessions — ↑/↓ move, Enter opens, Space selects, Ctrl+A selects all"
+            tabIndex={0}
+            onKeyDown={selection.onListKeyDown}
+            data-selected-count={selectedIds.size}
+            className="flex-1 overflow-y-auto scrollbar-dark focus:outline-none"
+            data-group-by={groupBy}
+          >
             {loading && sessions.length === 0 && !showSections ? (
               <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
                 <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />
@@ -533,7 +596,9 @@ export function SessionManagerPanel({
                         onOpen={openSession}
                         onViewTranscript={viewTranscript}
                         onCopyId={copySessionId}
-                        onToggleSelect={toggleSelect}
+                        onToggleSelect={selection.toggle}
+                        onRowClick={onRowClick}
+                        isCursor={selection.cursor === session.sessionId}
                         onAfterPromote={refresh}
                         onOpenWorktrees={setWorktreeFocus}
                         isOnScreen={isRowOnScreen(session, onScreenTabId)}
@@ -553,6 +618,7 @@ export function SessionManagerPanel({
               onClose={(ids) => closeSessions(rowsOf(ids))}
               onForceClose={(ids) => forceCloseSessions(rowsOf(ids))}
               onDismiss={dismissClose}
+              excludable={closeRequest.excludable}
             />
           )}
 
