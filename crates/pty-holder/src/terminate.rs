@@ -319,4 +319,57 @@ mod tests {
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Review round 6, nit (b): a dead holder's lock held TRANSIENTLY — by
+    /// another open description, as a forked-but-not-yet-exec'd child or a
+    /// prober holds it (finding 9bbe1079) — over a record whose `holder_start`
+    /// does not match the process now behind that pid: the kill is refused.
+    #[test]
+    fn pty_holder_terminate_refuses_a_transient_hold_over_a_mismatched_token() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("ptytt-{}-{nanos:x}", std::process::id()));
+        crate::pane::prepare_private_dir(&dir).unwrap();
+        let id = PaneId::new("t").unwrap();
+        let lock_file = lock_path(&dir, &id);
+        // The process the reused pid now names — this test's own.
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // The dead holder wrote its record, with ITS start token.
+        {
+            let TryLock::Acquired(mut lock) = PaneLock::try_acquire(&lock_file).unwrap() else {
+                panic!("fresh lock");
+            };
+            let mut dead = record(stranger.id());
+            dead.holder_start = Some("linux:the-dead-holders-boot:1".into());
+            lock.write_record(&dead).unwrap();
+        }
+        // A transient hold of the same file by another open description (a
+        // fork of another test may hold it an instant longer: wait it out).
+        let end = Instant::now() + Duration::from_secs(5);
+        let _transient = loop {
+            if let Ok(TryLock::Acquired(lock)) = PaneLock::try_acquire_existing(&lock_file) {
+                break lock;
+            }
+            assert!(
+                Instant::now() < end,
+                "the dead holder's lock never came free"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let t = terminate_verified_holder(&dir, &id, stranger.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(t.detail.contains("start token"), "{t:?}");
+        assert!(
+            stranger.try_wait().unwrap().is_none(),
+            "the stranger behind the reused pid was signalled"
+        );
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
