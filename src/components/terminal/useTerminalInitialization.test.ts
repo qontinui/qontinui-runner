@@ -23,6 +23,9 @@ import {
   fetchHolderSweepStatus,
   splitRestoreByHold,
   onHolderSessionReleased,
+  ownsReleasedPage,
+  RestoreRerunQueue,
+  ColdResumeGuard,
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
@@ -995,5 +998,115 @@ describe("onHolderSessionReleased — a deferred holder died before adoption", (
     const live = vi.fn().mockResolvedValue(new Set<string>());
     await onHolderSessionReleased({ ...payload, pageId: null }, schedule, live);
     expect(schedule).toHaveBeenCalledWith("default", ["sess-1"]);
+  });
+});
+
+describe("restore re-runs — one run per page, one cold resume per session (review round 7, U1)", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: true } });
+  });
+
+  /**
+   * The hook's wiring, minus React: `schedule` is `scheduleRecheckRerun`,
+   * `run` is the init effect — `begin` at its start, a guarded cold resume per
+   * record, `finish` (and a trigger) in its `finally`.
+   */
+  function harness() {
+    const queue = new RestoreRerunQueue();
+    const guard = new ColdResumeGuard();
+    const createTerminal = vi.fn();
+    const triggered: string[] = [];
+    const schedule = (pageId: string, ids: string[]) => {
+      if (queue.schedule(pageId, ids)) triggered.push(pageId);
+    };
+    const runBody = (pageId: string, records: readonly string[]) => {
+      const only = queue.begin(pageId);
+      const claims: string[] = [];
+      for (const id of only ? [...only] : records) {
+        if (!guard.tryClaim(id)) continue;
+        claims.push(id);
+        createTerminal(id);
+      }
+      return () => {
+        for (const id of claims) guard.release(id);
+        if (queue.finish(pageId, true)) triggered.push(pageId);
+      };
+    };
+    return { queue, guard, createTerminal, triggered, schedule, runBody };
+  }
+
+  it("two schedules for one session while a run is in flight produce exactly one cold resume", async () => {
+    const h = harness();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    // The page's first restore is in flight; it refused sess-1 as live.
+    const endFirst = h.runBody("page-2", []);
+    // A late sweep settle and a released holder both ask for sess-1.
+    const released = { sessionId: "sess-1", terminalId: "t-pane", pageId: "page-2" };
+    await onHolderSessionReleased(released, h.schedule, live);
+    await onHolderSessionReleased(released, h.schedule, live);
+    expect(h.triggered).toEqual([]);
+    endFirst();
+    // ONE re-run, for the merged ids.
+    expect(h.triggered).toEqual(["page-2"]);
+    h.runBody("page-2", ["sess-1", "sess-other"])();
+    expect(h.createTerminal).toHaveBeenCalledTimes(1);
+    expect(h.createTerminal).toHaveBeenCalledWith("sess-1");
+    expect(h.triggered).toEqual(["page-2"]);
+  });
+
+  it("a schedule with no run in flight triggers at once", () => {
+    const h = harness();
+    h.runBody("page-2", [])();
+    h.schedule("page-2", ["sess-1"]);
+    expect(h.triggered).toEqual(["page-2"]);
+    expect(h.queue.begin("page-2")).toEqual(new Set(["sess-1"]));
+  });
+
+  it("a page this window never began restoring is not re-run: its full restore covers it", () => {
+    const h = harness();
+    h.schedule("page-9", ["sess-1"]);
+    expect(h.triggered).toEqual([]);
+    expect(h.queue.begin("page-9")).toBeUndefined();
+  });
+
+  it("a run that restored nothing drops what was scheduled meanwhile: its full retry covers it", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(false);
+    expect(queue.finish("page-2", false)).toBe(false);
+    expect(queue.begin("page-2")).toBeUndefined();
+  });
+
+  it("the session guard keeps two concurrent runs from both creating a tab", () => {
+    const guard = new ColdResumeGuard();
+    expect(guard.tryClaim("sess-1")).toBe(true);
+    expect(guard.tryClaim("sess-1")).toBe(false);
+    guard.release("sess-1");
+    expect(guard.tryClaim("sess-1")).toBe(true);
+  });
+});
+
+describe("ownsReleasedPage — one window handles a released session (review round 7, N4)", () => {
+  const bindings = { "page-pop": "term-1" };
+
+  it("the main window owns every page not detached into a pop-out", () => {
+    expect(ownsReleasedPage("page-2", null, bindings)).toBe(true);
+    expect(ownsReleasedPage("default", null, bindings)).toBe(true);
+    expect(ownsReleasedPage("page-pop", null, bindings)).toBe(false);
+  });
+
+  it("a pinned pop-out owns its one page only", () => {
+    expect(ownsReleasedPage("page-pop", "page-pop", bindings)).toBe(true);
+    expect(ownsReleasedPage("page-2", "page-pop", bindings)).toBe(false);
+  });
+
+  it("exactly one window owns each page", () => {
+    for (const page of ["page-2", "page-pop", "default"]) {
+      const owners = [null, "page-pop"].filter((pinned) =>
+        ownsReleasedPage(page, pinned, bindings),
+      );
+      expect(owners).toHaveLength(1);
+    }
   });
 });
