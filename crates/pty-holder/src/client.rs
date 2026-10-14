@@ -43,8 +43,8 @@ use crate::frame::{
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{check_private_dir, lock_path, PaneId};
 use crate::protocol::{
-    parse_reply, to_payload, AttachedReply, CensusReply, ExitReply, HelloAck, Reply, Request,
-    DATA_PATH_VERSION, PROTOCOL_VERSIONS, RESTORE_VERSION,
+    parse_reply, to_payload, AttachedReply, CensusReply, ExitReply, HelloAck, RejectReason, Reply,
+    Request, DATA_PATH_VERSION, PROTOCOL_VERSIONS, RESTORE_VERSION,
 };
 use crate::transport::{self, remaining, Conn, DeadlineIo};
 
@@ -57,6 +57,13 @@ pub enum ConnectError {
     Protocol(String),
     /// Connect, write, read or deadline failure.
     Io(io::Error),
+    /// The holder refused the request (`rejected`, which also closes the
+    /// connection). Whether that is final is the reason's to say
+    /// ([`ConnectError::is_definitive`]).
+    Rejected {
+        reason: RejectReason,
+        detail: String,
+    },
     /// An earlier call on this [`Client`] failed, so the stream's position is
     /// unknown (a reply may be half-read, a request half-written). Nothing
     /// more is sent or read on it; the string is the failure that poisoned it.
@@ -73,6 +80,9 @@ impl std::fmt::Display for ConnectError {
                 )
             }
             ConnectError::Protocol(m) => write!(f, "protocol error: {m}"),
+            ConnectError::Rejected { reason, detail } => {
+                write!(f, "holder rejected the request ({reason:?}: {detail})")
+            }
             ConnectError::Io(e) => write!(f, "{e}"),
             ConnectError::Poisoned(why) => write!(
                 f,
@@ -83,6 +93,22 @@ impl std::fmt::Display for ConnectError {
 }
 
 impl std::error::Error for ConnectError {}
+
+impl ConnectError {
+    /// Whether this failure says the holder can NEVER be driven by this
+    /// runner — it speaks no version we do, or it refused a request for a
+    /// reason no retry changes — as opposed to a failure a retry may clear
+    /// (an IO error or a timeout on a loaded box, a holder at its connection
+    /// cap, a garbled reply). The boot sweep ends a holder only on a
+    /// definitive failure (review round 3, R1).
+    pub fn is_definitive(&self) -> bool {
+        match self {
+            ConnectError::Incompatible { .. } => true,
+            ConnectError::Rejected { reason, .. } => !matches!(reason, RejectReason::Busy),
+            ConnectError::Protocol(_) | ConnectError::Io(_) | ConnectError::Poisoned(_) => false,
+        }
+    }
+}
 
 impl From<io::Error> for ConnectError {
     fn from(e: io::Error) -> Self {
@@ -337,10 +363,11 @@ impl Client {
     ) -> Result<AttachedStream, ConnectError> {
         self.check()?;
         if self.ack.version < DATA_PATH_VERSION {
-            return Err(ConnectError::Protocol(format!(
-                "holder negotiated version {}; the data path needs {DATA_PATH_VERSION}",
-                self.ack.version
-            )));
+            // A version mismatch: the holder answered, and cannot serve the
+            // data path this runner drives.
+            return Err(ConnectError::Incompatible {
+                holder_versions: vec![self.ack.version],
+            });
         }
         let request = Request::Attach {
             from_offset,
@@ -348,6 +375,9 @@ impl Client {
         };
         let info = match self.request(&request, deadline)? {
             Reply::Attached(a) => a,
+            Reply::Rejected { reason, detail } => {
+                return Err(ConnectError::Rejected { reason, detail })
+            }
             other => {
                 return Err(ConnectError::Protocol(format!(
                     "expected attached, got {other:?}"
@@ -867,6 +897,29 @@ mod tests {
             },
             theirs,
         )
+    }
+
+    /// Review round 3, R1: only a version mismatch or a final refusal is
+    /// definitive; a busy holder, an IO error or a garbled reply may clear.
+    #[test]
+    fn pty_holder_boot_sweep_attach_failure_is_definitive_only_when_final() {
+        assert!(ConnectError::Incompatible {
+            holder_versions: vec![1]
+        }
+        .is_definitive());
+        assert!(ConnectError::Rejected {
+            reason: RejectReason::VerbNotInVersion,
+            detail: String::new(),
+        }
+        .is_definitive());
+        assert!(!ConnectError::Rejected {
+            reason: RejectReason::Busy,
+            detail: String::new(),
+        }
+        .is_definitive());
+        assert!(!ConnectError::Io(io::Error::from(io::ErrorKind::TimedOut)).is_definitive());
+        assert!(!ConnectError::Protocol("x".into()).is_definitive());
+        assert!(!ConnectError::Poisoned("x".into()).is_definitive());
     }
 
     /// Nit from review: a synthetic frame is accepted only on a connection
