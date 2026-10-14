@@ -162,7 +162,9 @@ mod tests {
             .and_then(|tail| tail.find("\n}\n"))
             .map(|i| start + i)
             .expect("the command body ends");
-        let body = src.get(start..end).expect("the body is a char-aligned span");
+        let body = src
+            .get(start..end)
+            .expect("the body is a char-aligned span");
         assert!(
             body.contains(".graceful_exit("),
             "closes through graceful_exit"
