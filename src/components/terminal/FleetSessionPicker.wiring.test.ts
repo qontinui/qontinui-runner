@@ -25,7 +25,12 @@ import { readFileSync } from "node:fs";
 
 import { describe, it, expect } from "vitest";
 
-import { assertAnchored, callsOf, subjectDir } from "../../lib/__test-helpers__/assertAnchored";
+import {
+  argsOf,
+  assertAnchored,
+  callsOf,
+  subjectDir,
+} from "../../lib/__test-helpers__/assertAnchored";
 
 // `subjectDir` is this directory, or the mutation probe's staged copy of it
 // (see FleetSessionPicker.wiring.test.mutants.json) — the file reads are the
@@ -71,10 +76,10 @@ function codeOf(text: string): string {
  *    single-site check is what makes "the first occurrence" a safe thing to
  *    measure — otherwise a helper declared above the real call would be
  *    silently measured in its place.
- *  - Unbalanced, or not four arguments: thrown. Paren counting here does not
- *    understand string, template or regex literals, so a `)` inside an
- *    argument would end the slice early; the arity check turns that from a
- *    confusing green-ish failure into a stated one.
+ *  - Unbalanced, or not four arguments: thrown. The slice and the split are
+ *    `callsOf` / `argsOf`, which skip string and template literals; regex
+ *    literals are not understood, so a `)` or `,` inside one would still cut
+ *    an argument — the arity check turns that into a stated failure.
  */
 function emptyReadArgs(): string[] {
   const code = codeOf(SOURCE);
@@ -87,35 +92,7 @@ function emptyReadArgs(): string[] {
         `the first, so it can no longer speak for the picker's own call`,
     );
   }
-  const open = code.indexOf(needle) + needle.length - 1;
-  let depth = 0;
-  let end = -1;
-  for (let i = open; i < code.length; i += 1) {
-    if (code[i] === "(") depth += 1;
-    else if (code[i] === ")") {
-      depth -= 1;
-      if (depth === 0) {
-        end = i;
-        break;
-      }
-    }
-  }
-  if (end < 0) throw new Error("unbalanced fleetEmptyReadMessage( call in FleetSessionPicker");
-
-  const inner = code.slice(open + 1, end);
-  const args: string[] = [];
-  let buf = "";
-  let d = 0;
-  for (const ch of inner) {
-    if (ch === "(" || ch === "[" || ch === "{") d += 1;
-    else if (ch === ")" || ch === "]" || ch === "}") d -= 1;
-    if (ch === "," && d === 0) {
-      args.push(buf);
-      buf = "";
-    } else buf += ch;
-  }
-  if (buf.trim()) args.push(buf);
-  const cleaned = args.map((a) => a.replace(/\s+/g, " ").trim()).filter((a) => a.length > 0);
+  const cleaned = argsOf(callsOf(code, needle)[0]);
   if (cleaned.length !== 4) {
     throw new Error(
       `expected 4 arguments to fleetEmptyReadMessage, parsed ${cleaned.length}: ` +

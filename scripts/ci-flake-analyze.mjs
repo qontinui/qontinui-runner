@@ -598,13 +598,49 @@ function ghJson(path) {
   return JSON.parse(out);
 }
 
+/**
+ * `gh api <path>` for a plain-text body such as a job log, through `call`
+ * (an argv -> stdout runner that throws on failure).
+ *
+ * Current `gh` refuses to print a response containing terminal escape
+ * sequences unless given `--allow-escape-sequences` — and a `cargo test` log
+ * always contains them (`CARGO_TERM_COLOR: always`), so every failed Windows
+ * test job read as unreadable (run 38263126224 went DARK on one). Older `gh`
+ * does not know the flag and would reject it as an unknown argument, so it is
+ * passed only on the retry that this exact refusal asks for. ANSI escapes in
+ * the text are harmless: the per-line normaliser strips them.
+ */
+export function ghApiText(path, call) {
+  const args = ["api", path];
+  try {
+    return call(args);
+  } catch (err) {
+    if (!/--allow-escape-sequences/.test(String(err?.stderr ?? "") + String(err?.message ?? ""))) {
+      throw err;
+    }
+    try {
+      return call([...args, "--allow-escape-sequences"]);
+    } catch (retryErr) {
+      const why = String(retryErr?.stderr || retryErr?.message || retryErr).trim();
+      const wrapped = new Error(
+        `gh refused escape sequences in the response, and the --allow-escape-sequences retry failed: ${why}`,
+        { cause: retryErr },
+      );
+      wrapped.stderr = wrapped.message;
+      throw wrapped;
+    }
+  }
+}
+
 /** Raw (non-JSON) `gh api` call — used for job logs, which are plain text. */
 function ghText(path) {
-  return execFileSync("gh", ["api", path], {
-    encoding: "utf8",
-    maxBuffer: 256 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  return ghApiText(path, (args) =>
+    execFileSync("gh", args, {
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
 }
 
 function listRuns({ repo, workflow, runs, since, log }) {

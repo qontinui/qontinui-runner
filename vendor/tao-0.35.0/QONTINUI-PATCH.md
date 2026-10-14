@@ -2,7 +2,7 @@
 
 This directory is the crates.io `tao` 0.35.0 source
 (`checksum 1cf65722394c2ac443e80120064987f8914ee1d4e4e36e63cdf10f2990f01159`),
-**byte-identical except for the change described below**, wired in via
+**byte-identical except for the three changes described below**, wired in via
 `[patch.crates-io]` in the workspace `Cargo.toml`.
 
 ## The change
@@ -23,14 +23,66 @@ This directory is the crates.io `tao` 0.35.0 source
 +    let runner_shared = Arc::new(EventLoopRunner::new(thread_msg_target, wait_thread_id));
 ```
 
+### Linux (added 2026-10-01)
+
+`EventLoopWindowTarget::windows` becomes an `Arc` instead of an `Rc`.
+
+```diff
+--- src/platform_impl/linux/event_loop.rs
+-  sync::atomic::{AtomicBool, Ordering},
++  sync::{
++    atomic::{AtomicBool, Ordering},
++    Arc,
++  },
+
+-  pub(crate) windows: Rc<RefCell<HashSet<WindowId>>>,
++  pub(crate) windows: Arc<RefCell<HashSet<WindowId>>>,
+
+-      windows: Rc::new(RefCell::new(HashSet::new())),
++      windows: Arc::new(RefCell::new(HashSet::new())),
+```
+
+Same bug, Linux field: the Linux `EventLoopWindowTarget` is `#[derive(Clone)]`
+and that `Rc` is its only non-atomic refcount (`gdk::Display` /
+`gtk::Application` clones are atomic `g_object_ref`s, `glib::Sender` and
+`crossbeam_channel::Sender` are `Arc`-backed). Every off-main-thread
+`AppHandle` / `Webview` clone or drop reaches it through the same
+`DispatcherMainThreadContext` `unsafe impl Send + Sync`. A lost update frees
+the `RcBox` while it is still referenced, and glibc later aborts the process
+on the corrupted free lists: `malloc(): unaligned tcache chunk detected`,
+`corrupted double-linked list`, `malloc(): unsorted double linked list
+corrupted`. That killed the Linux primary 12 times between 2026-09-13 and
+2026-10-01 (counted in qontinui-dev-notes `investigation-results/2026-10-01-runner-heap-corruption-aborts.md`) while only the Windows half
+was patched. As on Windows, only the REFCOUNT becomes atomic; the `RefCell` is
+still only borrowed on the main thread (`platform_impl/linux/window.rs`, in
+window construction).
+
+### Windows `EventLoopThreadExecutor::execute_in_thread` (qontinui-runner `d7e1ede77`, 2026-08-30)
+
+Not a refcount change, and not recorded here until 2026-10-06 — so a re-vendor
+that re-applied only the two `Rc` -> `Arc` deltas above would silently drop it.
+In `src/platform_impl/windows/event_loop.rs`, `execute_in_thread`:
+
+- reclaims the double-boxed closure (`drop(Box::from_raw(raw))`) on EVERY
+  `PostMessageW` failure instead of leaking it;
+- treats `ERROR_INVALID_WINDOW_HANDLE` (`E_INVALID_WINDOW_HANDLE`) as a benign
+  race with window teardown — the target is remembered in
+  `DEAD_TARGET_WINDOWS` and logged once per window — instead of the upstream
+  `assert!(res.is_ok(), "PostMessage failed ; is the messages queue full?")`
+  panic; any other failure still panics.
+
+Read `git show d7e1ede77 -- vendor/tao-0.35.0/src/platform_impl/windows/event_loop.rs`
+for the exact hunk before re-vendoring.
+
 That is the entire source delta. Verify the `src/` tree is identical to the
-crates.io release except for those two files:
+crates.io release except for those three files:
 
 ```sh
 diff -rq ~/.cargo/registry/src/index.crates.io-*/tao-0.35.0/src vendor/tao-0.35.0/src
 # expected: exactly
 #   .../event_loop/runner.rs  and  vendor/.../event_loop/runner.rs differ
 #   .../event_loop.rs         and  vendor/.../event_loop.rs        differ
+#   .../linux/event_loop.rs   and  vendor/.../linux/event_loop.rs  differ
 ```
 
 Only cargo-vendor bookkeeping files differ outside `src/`: this copy drops the

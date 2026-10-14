@@ -4,20 +4,6 @@
 //! the command handlers instead, because it resolves `AppState` out of
 //! Tauri's managed state and that type is owned there.
 
-use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
-
-/// Health status info for a single monitored process (for frontend display).
-#[derive(Debug, Clone, Serialize)]
-pub struct ProcessHealthInfo {
-    pub pid: u32,
-    pub process_type: String,
-    pub label: String,
-    pub status: String,
-    pub inactive_checks: u32,
-}
-
 /// Force stop a process by PID.
 #[tauri::command]
 pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
@@ -49,11 +35,4 @@ pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
             Err(format!("Failed to kill process {}", pid))
         }
     }
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_doctor_commands")
-        .invoke_handler(tauri::generate_handler![stop_process_by_pid])
-        .build()
 }

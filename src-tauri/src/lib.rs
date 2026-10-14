@@ -42,10 +42,10 @@ pub mod git_posture;
 pub mod process_helpers;
 pub mod profile_cli;
 // Out-of-process PTY holder (plan
-// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`). In the
-// LIB crate so `main()` can dispatch to it before any Tauri init, exactly like
-// `profile_cli`, and so Phase 1 can grow the spike into the real
-// `--pty-holder` without touching the runner bin's module tree.
+// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`): the
+// runner's door to spawning a pane's holder. In the LIB crate because it needs
+// nothing from the bin; the bin's `terminal::daemon_pane_io` composes it with
+// the bin-only instance scoping.
 pub mod pty_holder;
 // Out-of-process runner discovery: the bound-API-port breadcrumb. In the LIB
 // crate for the same reason as `intercept_core` — the WRITER is the runner bin
@@ -89,6 +89,11 @@ pub mod fs_perms;
 /// durable `device_id`. The runner bin imports it, and `auth` must consult it
 /// before falling back to its own cache.
 pub mod machine_identity;
+// Proxy resolution and the ONE proxy-aware WebSocket connect (plan
+// `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 4). In the lib
+// beside `coord_ws`, which it serves; the bin's relay and cloud tunnel reach it
+// as `qontinui_runner_lib::outbound_net`.
+pub mod outbound_net;
 pub mod secure_storage;
 /// The machine's tenant pin — moved out of the bin-only `session` tree so the
 /// LIB can read it too (plan
@@ -156,6 +161,13 @@ pub mod util {
 // through. In the LIB so the wrapper and `util::resource_exhaustion` share ONE
 // handle; only the runner bin registers the allocator.
 pub mod alloc_breadcrumb;
+
+// Per-local-user connection guard for every runner TCP listener (plan
+// `2026-10-04-runner-loopback-api-refuses-other-local-users`): refuses a
+// loopback connection whose peer process runs as a different OS user. In the
+// LIB because the `:9876` API (bin) and the pairing / Cognito callback
+// listeners (lib) all wrap their listeners with it.
+pub mod peer_user_guard;
 
 // Device-pairing flow (headless + browser-mediated). Lifted out of
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI

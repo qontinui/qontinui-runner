@@ -418,6 +418,11 @@ pub struct AuthManager {
     /// [`Self::with_storage_force_keychain`] for why this exists.
     #[cfg(test)]
     force_keychain_enabled: bool,
+    /// Test-only override that forces [`Self::keychain_enabled`] to `false`
+    /// regardless of `QONTINUI_DISABLE_KEYCHAIN` — see
+    /// [`Self::with_storage_no_keychain`].
+    #[cfg(test)]
+    force_keychain_disabled: bool,
 }
 
 impl AuthManager {
@@ -434,6 +439,8 @@ impl AuthManager {
             machine_file: crate::machine_identity::machine_file_path(),
             #[cfg(test)]
             force_keychain_enabled: false,
+            #[cfg(test)]
+            force_keychain_disabled: false,
         }
     }
 
@@ -446,6 +453,10 @@ impl AuthManager {
         #[cfg(test)]
         if self.force_keychain_enabled {
             return true;
+        }
+        #[cfg(test)]
+        if self.force_keychain_disabled {
+            return false;
         }
         keychain_enabled_env()
     }
@@ -475,6 +486,21 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: None,
             force_keychain_enabled: false,
+            force_keychain_disabled: false,
+        }
+    }
+
+    /// As [`Self::with_storage`], but [`Self::keychain_enabled`] always
+    /// returns `false` for this instance: no keychain read or write at all,
+    /// whatever `QONTINUI_DISABLE_KEYCHAIN` says, and without mutating that
+    /// process-global env var (which would race every parallel test reading
+    /// it). For hermetic tests that store and read tokens and must never
+    /// block on — or leave entries in — a real OS keychain.
+    #[cfg(test)]
+    pub fn with_storage_no_keychain(secure_storage: SecureStorage) -> Self {
+        Self {
+            force_keychain_disabled: true,
+            ..Self::with_storage(secure_storage)
         }
     }
 
@@ -500,6 +526,7 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: None,
             force_keychain_enabled: true,
+            force_keychain_disabled: false,
         }
     }
 
@@ -516,6 +543,7 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: Some(machine_file),
             force_keychain_enabled: false,
+            force_keychain_disabled: false,
         }
     }
 
@@ -3237,13 +3265,12 @@ mod jwt_exp_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs;
 
     /// Create an isolated AuthManager for testing.
     /// Each test gets its own unique storage file to avoid test interference.
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
@@ -3258,7 +3285,7 @@ mod tests {
         test_name: &str,
         machine_file: std::path::PathBuf,
     ) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
@@ -3397,8 +3424,7 @@ mod tests {
         // A store that EXISTS but cannot be decrypted/parsed — what a machine
         // rename or disk move leaves behind (the AES key derives from
         // hostname+username). Same path the helper handed the manager.
-        let store_path = env::temp_dir()
-            .join("qontinui_test_auth")
+        let store_path = crate::test_env::process_scratch_dir("qontinui_test_auth")
             .join(format!("{test_name}.enc"));
         fs::write(&store_path, b"not-ciphertext-at-all").unwrap();
         assert!(
@@ -3516,7 +3542,7 @@ mod tests {
         // every platform: with no keychain entry, get_access_token returns
         // Err — exactly the case where the OLD code would have re-migrated
         // and overwritten the file had a keychain token existed.
-        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth");
         let storage_path = temp_dir.join("malformed_store_present_is_not_overwritten.enc");
         let _ = fs::remove_file(&storage_path);
         fs::create_dir_all(&temp_dir).unwrap();
@@ -3549,11 +3575,10 @@ mod tests {
 mod signed_in_verdict_tests {
     use super::*;
     use base64::Engine;
-    use std::env;
     use std::fs;
 
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth_verdict");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_verdict");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
@@ -3700,11 +3725,10 @@ mod signed_in_verdict_tests {
 #[cfg(test)]
 mod tenant_device_jwt_tests {
     use super::*;
-    use std::env;
     use std::fs;
 
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth_tenant_jwt");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_tenant_jwt");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
@@ -3781,11 +3805,10 @@ mod tenant_device_jwt_tests {
 #[cfg(test)]
 mod bearer_selection_tests {
     use super::*;
-    use std::env;
     use std::fs;
 
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth_bearer_select");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_bearer_select");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
@@ -5671,13 +5694,12 @@ mod bearer_selection_tests {
 #[cfg(test)]
 mod device_jwt_tests {
     use super::*;
-    use std::env;
     use std::fs;
 
     /// Each test gets its own isolated storage file so they don't poison
     /// each other.
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth_device_jwt");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_device_jwt");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();

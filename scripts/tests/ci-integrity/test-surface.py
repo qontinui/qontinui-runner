@@ -32,6 +32,14 @@ def lift(fn_name):
     return textwrap.dedent("\n".join(lines[start:end]))
 
 
+def lift_line(name):
+    """A one-line module constant (`NAME = ...`) from the run block."""
+    for l in run.split("\n"):
+        if l.lstrip().startswith(name + " = "):
+            return l.strip()
+    print("could not lift %s from the workflow" % name); sys.exit(1)
+
+
 # `token` is lifted alongside the digest functions because the guard's own
 # docstring tells authors WHICH token to write into the PR body, and an untested
 # rule there misroutes every author of the file it governs. Deleting token()'s
@@ -40,9 +48,11 @@ def lift(fn_name):
 ns = {"yaml": yaml, "hashlib": hashlib, "json": json, "os": os}
 exec(compile(lift("canon") + "\n\n" + lift("digest") + "\n\n"
              + lift("uses_yaml_aliases") + "\n\n" + lift("surface") + "\n\n"
-             + lift("token"),
+             + lift("token") + "\n\n" + lift_line("WHOLE_FILE_GATES") + "\n\n"
+             + lift("file_findings") + "\n\n" + lift("path_findings"),
              "lifted", "exec"), ns)
 surface, digest, token = ns["surface"], ns["digest"], ns["token"]
+file_findings, path_findings = ns["file_findings"], ns["path_findings"]
 uses_yaml_aliases = ns["uses_yaml_aliases"]
 
 checks = failures = 0
@@ -394,6 +404,42 @@ eq("an anchored rewrite DOES digest identically (hence the refusal)", True,
    digest(jobs_of(ANCHORED)["g"]) == digest(jobs_of(PLAIN)["g"]))
 eq("a merge-key rewrite DOES digest identically too", True,
    digest(jobs_of(MERGED)["g"]) == digest(jobs_of(PLAIN)["g"]))
+
+print("\n6. path_findings() -- routing, and the non-YAML gating script.")
+# The defect this closes: surface() YAML-parses its input, the script is
+# Python, and a None from surface() is the hard `!PARSE` error -- so before the
+# whole-file branch existed NO PR could ever edit the script and pass.
+PY_PATH = "scripts/check_untimed_subprocess.py"
+PY_BASE = 'EXPECTED_SCAN_ROOTS: tuple[str, ...] = (\n    "crates/a/src",\n)\n'
+PY_HEAD = 'EXPECTED_SCAN_ROOTS: tuple[str, ...] = (\n    "crates/a/src",\n    "crates/b/src",\n)\n'
+CHG = [("CHANGED", PY_PATH, "check_untimed_subprocess#file")]
+eq("the script is unparseable as a surface (the original deadlock)", None,
+   surface(PY_BASE + "def f():\n    return 1\n"))
+eq("an edited script is CHANGED check_untimed_subprocess#file, not !PARSE", CHG,
+   path_findings(PY_PATH, PY_BASE, PY_HEAD))
+eq("a comment-only edit still counts (no structure to be cosmetic about)", CHG,
+   path_findings(PY_PATH, PY_BASE, PY_BASE + "# note\n"))
+eq("an unchanged script yields nothing", [],
+   path_findings(PY_PATH, PY_BASE, PY_BASE))
+eq("a deleted script is a REMOVAL",
+   [("REMOVED", PY_PATH, "check_untimed_subprocess#file")],
+   path_findings(PY_PATH, PY_BASE, None))
+eq("a script absent at base is a new gate: additive, nothing to name", [],
+   path_findings(PY_PATH, None, PY_HEAD))
+# Routing is by EXACT path: any other non-YAML file under the trigger still
+# fails CLOSED, and a near-miss spelling of the script is not the script.
+for other in (".github/actions/a/run.sh", ".github/workflows/README.md",
+              "scripts/Check_untimed_subprocess.py", "scripts/check_untimed_subprocess.py.bak"):
+    eq("non-gate non-YAML %s fails closed (!PARSE)" % other,
+       [("!PARSE", other, "-")],
+       path_findings(other, "echo base\n", "echo head\n"))
+# The YAML branch is unchanged: a job edit still names <stem>#<job>.
+eq("a YAML workflow still goes through surface()",
+   [("CHANGED", ".github/workflows/ci.yml", "ci#test")],
+   path_findings(".github/workflows/ci.yml", BASE,
+                 BASE.replace("cargo test", "cargo test || true")))
+eq("token() is unchanged for a .py.yml workflow (no new collision)",
+   "ci.py#test", token(".github/workflows/ci.py.yml", "test"))
 
 print()
 if failures:

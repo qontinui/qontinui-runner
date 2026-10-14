@@ -20,7 +20,7 @@
 //! expected", verdict always `match`).
 //!
 //! So `expected` is LATCHED ONCE AT BOOT ([`latch_expected`]), from
-//! `store.restorable_records(now, prior_marker_at, boot_was_clean)` — already
+//! `store.restorable_records(now, prior_marker_at, boot_was_clean, booted_at_ms)` — already
 //! the exact set the boot-restore path consumes — read BEFORE any restore,
 //! reconcile pass or liveness tick can mutate a record, and held in a
 //! process-wide `OnceLock` for the life of the process. That is the
@@ -256,9 +256,10 @@ pub fn latch_expected(
 ) {
     let prior_marker_at = boot.and_then(|c| c.prior_marker_at);
     let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
-    // Exactly the three arguments `terminal_session_list_open` passes, so the
+    let booted_at_ms = boot.map(|c| c.booted_at_ms);
+    // Exactly the four arguments `terminal_session_list_open` passes, so the
     // latched set IS the set the restore path will consume.
-    let records = store.restorable_records(now_ms, prior_marker_at, boot_was_clean);
+    let records = store.restorable_records(now_ms, prior_marker_at, boot_was_clean, booted_at_ms);
     let census = BootCensus {
         boot_at_ms: now_ms,
         expected: expected_rows(records, probe),
