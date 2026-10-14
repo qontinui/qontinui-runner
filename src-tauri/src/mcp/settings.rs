@@ -197,9 +197,14 @@ async fn save_app_mode(
 // ============================================================================
 
 /// GET /settings/ai
+///
+/// Returns the stored settings FLATTENED together with the effective
+/// account-selection mode and its source (`fleet` | `local` | `pinned`) —
+/// see [`settings::AiSettingsView`]. The two derived keys are read-only; a
+/// client echoing them back on PUT is harmless.
 async fn get_ai_settings(
-) -> Result<Json<ApiResponse<settings::AiSettings>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = spawn_blocking_tracked(settings::get_ai_settings)
+) -> Result<Json<ApiResponse<settings::AiSettingsView>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = spawn_blocking_tracked(settings::AiSettingsView::current)
         .await
         .map_err(|e| {
             error!("Failed to get AI settings: {}", e);
@@ -212,26 +217,107 @@ async fn get_ai_settings(
     Ok(Json(ApiResponse::success(result)))
 }
 
+/// Merge `patch` over `base` with ABSENT-MEANS-KEEP semantics. PURE.
+///
+/// - Both objects: every key the patch carries is applied — recursively when
+///   both sides hold an object at that key, else the patch value REPLACES the
+///   base value (an explicit `null` included, which is how a caller clears an
+///   `Option` field such as `claude_cli.config_dir`). A key the patch does not
+///   carry keeps the base value.
+/// - Anything else: the patch replaces the base outright (so a non-object
+///   body fails the subsequent `AiSettings` deserialize rather than being
+///   silently ignored).
+///
+/// This differs from RFC 7396 JSON Merge Patch in exactly one place: `null`
+/// SETS null instead of deleting the key — deleting would let a
+/// `#[serde(default)]` field silently fall back to its default, the very
+/// reset this function exists to stop.
+fn merge_json_patch_keep_absent(
+    base: serde_json::Value,
+    patch: serde_json::Value,
+) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(mut base), serde_json::Value::Object(patch)) => {
+            for (key, patch_value) in patch {
+                let merged = match base.remove(&key) {
+                    Some(base_value @ serde_json::Value::Object(_)) if patch_value.is_object() => {
+                        merge_json_patch_keep_absent(base_value, patch_value)
+                    }
+                    _ => patch_value,
+                };
+                base.insert(key, merged);
+            }
+            serde_json::Value::Object(base)
+        }
+        (_, patch) => patch,
+    }
+}
+
+/// Apply a `PUT /settings/ai` body to the STORED settings. PURE: the stored
+/// document is passed in, so tests never touch the machine's `settings.json`
+/// or `claude-accounts.json`.
+///
+/// `Err` is a deserialize failure of the merged document — a caller error
+/// (wrong shape / wrong type), reported as 422, never a 500.
+fn apply_ai_settings_patch(
+    stored: &settings::AiSettings,
+    patch: serde_json::Value,
+) -> Result<settings::AiSettings, String> {
+    let base = serde_json::to_value(stored)
+        .map_err(|e| format!("Failed to serialize stored AI settings: {}", e))?;
+    serde_json::from_value(merge_json_patch_keep_absent(base, patch))
+        .map_err(|e| format!("Invalid AI settings body: {}", e))
+}
+
+/// Outcome of a `PUT /settings/ai`, split so a bad body is a 422 and a
+/// failed write is a 500.
+enum PutAiSettingsError {
+    InvalidBody(String),
+    SaveFailed(String),
+}
+
 /// PUT /settings/ai
+///
+/// MERGE-PATCH over the stored settings (plan
+/// `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
+/// Phase 1): a key the body omits KEEPS its stored value, an explicit value —
+/// `null` included — sets it. Before this, the body was deserialized straight
+/// into `AiSettings`, so every `#[serde(default)]` field a caller omitted was
+/// reset to its default and SAVED — including the three machine-global roster
+/// fields mirrored into `claude-accounts.json` (`config_dir`,
+/// `account_selection_mode`, `account_selection_pinned`), which re-pointed
+/// every runner on the machine. The stored document comes from
+/// `settings::get_ai_settings()`, which already carries the
+/// `claude-accounts.json` overlay, so an omitted roster field is written back
+/// unchanged. Same absent-means-keep rule as `PUT /settings/paths`.
 async fn save_ai_settings(
-    Json(payload): Json<settings::AiSettings>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = spawn_blocking_tracked(move || settings::save_ai_settings(payload))
-        .await
-        .map_err(|e| {
-            error!("Failed to save AI settings: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Task failed: {}", e))),
-            )
-        })?;
+    let result = spawn_blocking_tracked(move || {
+        let merged = apply_ai_settings_patch(&settings::get_ai_settings(), payload)
+            .map_err(PutAiSettingsError::InvalidBody)?;
+        settings::save_ai_settings(merged).map_err(PutAiSettingsError::SaveFailed)
+    })
+    .await
+    .map_err(|e| {
+        error!("Failed to save AI settings: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task failed: {}", e))),
+        )
+    })?;
 
     match result {
         Ok(()) => {
             info!("AI settings saved via HTTP");
             Ok(Json(ApiResponse::success(())))
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(PutAiSettingsError::InvalidBody(e)) => {
+            Err((StatusCode::UNPROCESSABLE_ENTITY, Json(api_error(e))))
+        }
+        Err(PutAiSettingsError::SaveFailed(e)) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
     }
 }
 
@@ -1315,4 +1401,169 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/settings/backup/summary", get(get_backup_summary))
         .route("/settings/backup/export", post(export_all_data))
         .route("/settings/backup/import", post(import_all_data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{AccountSelectionMode, AiSettings, ClaudeCliSettings};
+    use serde_json::json;
+
+    /// A stored document whose every field under test differs from its serde
+    /// default, so "kept" and "reset to default" can never agree by accident.
+    /// Built in memory — no test here reads or writes the machine's
+    /// `settings.json` or `claude-accounts.json`.
+    fn stored() -> AiSettings {
+        let mut s: AiSettings = serde_json::from_value(json!({
+            "provider": "claude_cli",
+            "claude_cli": {
+                "execution_mode": "native",
+                "custom_path": null,
+                "timeout_seconds": 600
+            },
+            "claude_api": {"model": "m", "max_tokens": 1000}
+        }))
+        .expect("minimal AiSettings decodes");
+        s.claude_cli = ClaudeCliSettings {
+            config_dir: Some("/home/u/.claude-work".to_string()),
+            account_selection_mode: AccountSelectionMode::Manual,
+            account_selection_pinned: true,
+            auto_migrate_on_token_exhaustion: !s.claude_cli.auto_migrate_on_token_exhaustion,
+            ..s.claude_cli
+        };
+        s.git_op_federation_enabled = false;
+        s.compression.enabled = !s.compression.enabled;
+        s
+    }
+
+    #[test]
+    fn put_ai_settings_absent_roster_fields_keep_stored() {
+        let stored = stored();
+        // The shape qontinui-web sends: a claude_cli block with neither the
+        // mode nor the pin, and no config_dir either.
+        let body = json!({
+            "provider": "claude_cli",
+            "claude_cli": {"execution_mode": "auto", "timeout_seconds": 900},
+            "claude_api": {"model": "m2", "max_tokens": 2000}
+        });
+        let merged = apply_ai_settings_patch(&stored, body).unwrap();
+        assert_eq!(
+            merged.claude_cli.account_selection_mode,
+            AccountSelectionMode::Manual
+        );
+        assert!(merged.claude_cli.account_selection_pinned);
+        assert_eq!(
+            merged.claude_cli.config_dir.as_deref(),
+            Some("/home/u/.claude-work")
+        );
+        assert_eq!(
+            merged.claude_cli.auto_migrate_on_token_exhaustion,
+            stored.claude_cli.auto_migrate_on_token_exhaustion
+        );
+        // The fields the body DID carry took effect.
+        assert_eq!(merged.claude_cli.timeout_seconds, 900);
+        assert_eq!(merged.claude_api.model, "m2");
+    }
+
+    #[test]
+    fn put_ai_settings_explicit_roster_values_change_them() {
+        let stored = stored();
+        let body = json!({
+            "claude_cli": {
+                "account_selection_pinned": false,
+                "account_selection_mode": "least_usage",
+                "config_dir": null
+            }
+        });
+        let merged = apply_ai_settings_patch(&stored, body).unwrap();
+        assert!(!merged.claude_cli.account_selection_pinned);
+        assert_eq!(
+            merged.claude_cli.account_selection_mode,
+            AccountSelectionMode::LeastUsage
+        );
+        assert_eq!(merged.claude_cli.config_dir, None, "explicit null clears");
+        // Siblings in the same object the body did not name are kept.
+        assert_eq!(merged.claude_cli.timeout_seconds, 600);
+    }
+
+    #[test]
+    fn put_ai_settings_absent_top_level_fields_keep_stored() {
+        let stored = stored();
+        let merged = apply_ai_settings_patch(&stored, json!({"provider": "claude_api"})).unwrap();
+        assert!(
+            !merged.git_op_federation_enabled,
+            "an omitted git_op_federation_enabled must not re-enable federation"
+        );
+        assert_eq!(merged.compression.enabled, stored.compression.enabled);
+        assert!(matches!(
+            merged.provider,
+            crate::settings::AiProvider::ClaudeApi
+        ));
+
+        // An empty body is a no-op.
+        let same = apply_ai_settings_patch(&stored, json!({})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&same).unwrap(),
+            serde_json::to_value(&stored).unwrap()
+        );
+    }
+
+    #[test]
+    fn put_ai_settings_echoed_view_keys_are_harmless() {
+        let stored = stored();
+        let view = crate::settings::AiSettingsView::from_parts(
+            stored.clone(),
+            (
+                AccountSelectionMode::HighestExpectedUsage,
+                crate::claude_accounts::AccountSelectionSource::Fleet,
+            ),
+        );
+        let body = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            body["effective_account_selection_mode"],
+            "highest_expected_usage"
+        );
+        assert_eq!(body["account_selection_source"], "fleet");
+        let merged = apply_ai_settings_patch(&stored, body).unwrap();
+        // The EFFECTIVE mode in the view must not be written as the local one.
+        assert_eq!(
+            merged.claude_cli.account_selection_mode,
+            AccountSelectionMode::Manual
+        );
+        let merged_json = serde_json::to_value(&merged).unwrap();
+        assert!(merged_json
+            .get("effective_account_selection_mode")
+            .is_none());
+        assert!(merged_json.get("account_selection_source").is_none());
+    }
+
+    #[test]
+    fn put_ai_settings_bad_shape_is_a_body_error() {
+        let stored = stored();
+        assert!(
+            apply_ai_settings_patch(&stored, json!({"claude_cli": {"timeout_seconds": "x"}}))
+                .is_err()
+        );
+        assert!(apply_ai_settings_patch(&stored, json!([1, 2])).is_err());
+        assert!(apply_ai_settings_patch(
+            &stored,
+            json!({"claude_cli": {"account_selection_mode": "nope"}})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn merge_keep_absent_rules() {
+        let base = json!({"a": {"b": 1, "c": 2}, "d": 3, "e": {"f": 4}});
+        let patch = json!({"a": {"b": 10}, "e": null, "g": 5});
+        assert_eq!(
+            merge_json_patch_keep_absent(base, patch),
+            json!({"a": {"b": 10, "c": 2}, "d": 3, "e": null, "g": 5})
+        );
+        // A non-object patch value replaces an object base value wholesale.
+        assert_eq!(
+            merge_json_patch_keep_absent(json!({"a": {"b": 1}}), json!({"a": 7})),
+            json!({"a": 7})
+        );
+    }
 }

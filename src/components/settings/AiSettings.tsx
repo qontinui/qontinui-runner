@@ -152,6 +152,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           interactive_sessions_enabled:
             result.data.interactive_sessions_enabled ??
             DEFAULT_AI_SETTINGS.interactive_sessions_enabled,
+          // READ-ONLY view fields (the mode that actually governs and why).
+          // Display-only: `saveSettings` passes explicit arguments, so these
+          // are never sent back as stored settings.
+          effective_account_selection_mode: result.data.effective_account_selection_mode,
+          account_selection_source: result.data.account_selection_source,
         });
         onLog("debug", "AI settings loaded");
       }
@@ -227,8 +232,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         customPath: settings.claude_cli.custom_path || null,
         timeoutSeconds: settings.claude_cli.timeout_seconds,
         configDir: settings.claude_cli.config_dir || null,
-        accountSelectionMode:
-          settings.claude_cli.account_selection_mode || "highest_expected_usage",
+        // `undefined` (never loaded) is omitted and read as `None`, which
+        // KEEPS the stored machine-global mode rather than resetting it.
+        accountSelectionMode: settings.claude_cli.account_selection_mode,
         // `undefined` (unknown — never loaded, never toggled) is omitted by the
         // invoke and read as `None` by the command, which KEEPS the stored pin.
         accountSelectionPinned: settings.claude_cli.account_selection_pinned,

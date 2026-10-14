@@ -299,31 +299,73 @@ pub fn apply_roster_overlay(settings: &mut crate::settings::Settings, roster: Cl
     settings.ai.claude_cli.account_selection_pinned = roster.account_selection_pinned;
 }
 
-/// The one rule deciding which account-selection mode governs. PURE.
+/// Which input decided the effective account-selection mode — reported beside
+/// the mode wherever the mode is SHOWN (the AI-settings reads, the env
+/// capture) so a reader can tell a fleet override from a local choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSelectionSource {
+    /// Unpinned, and the fleet's `account_selection_mode` policy has a value.
+    Fleet,
+    /// Unpinned, and the fleet has no opinion — the local mode applies.
+    Local,
+    /// Pinned — the local mode applies whatever the fleet says.
+    Pinned,
+}
+
+impl AccountSelectionSource {
+    /// The snake_case wire spelling — byte-identical to what serde emits
+    /// (pinned by `selection_source_str_matches_serde`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountSelectionSource::Fleet => "fleet",
+            AccountSelectionSource::Local => "local",
+            AccountSelectionSource::Pinned => "pinned",
+        }
+    }
+}
+
+/// The one rule deciding which account-selection mode governs, and which
+/// input decided it. PURE.
 ///
-/// A PINNED machine uses its local mode, full stop. An unpinned machine uses
-/// the fleet's `account_selection_mode` fleet-policy value when the fleet has
-/// an opinion (`Some`), else its local mode. This is FORCE-APPLY, not a
-/// default-fill: the local mode is always a concrete value on disk (the field
-/// is not an `Option`), so a fleet term that only filled an absent local value
-/// would never take effect on any machine that has ever saved settings.
+/// A PINNED machine uses its local mode, full stop (source `Pinned`, whether
+/// or not the fleet has a value — the pin is the thing the user controls). An
+/// unpinned machine uses the fleet's `account_selection_mode` fleet-policy
+/// value when the fleet has an opinion (`Some`, source `Fleet`), else its
+/// local mode (source `Local`). This is FORCE-APPLY, not a default-fill: the
+/// local mode is always a concrete value on disk (the field is not an
+/// `Option`), so a fleet term that only filled an absent local value would
+/// never take effect on any machine that has ever saved settings.
 ///
-/// Every decision site reads the mode through this function — the picker
+/// Every decision site reads the mode through this function (directly or via
+/// [`resolve_selection_mode`]) — the picker
 /// ([`crate::ai_provider::account_usage::pick_best_account`]), the spawn-time
-/// config-dir resolution (`ai_provider::config::get_effective_config_dir`) and
-/// the per-device account report — so the fleet value cannot half-apply (the
-/// picker rotating under the fleet mode while the spawn path honours a local
-/// `manual`).
+/// config-dir resolution (`ai_provider::config::get_effective_config_dir`),
+/// the per-device account report, the AI-settings reads and the env capture —
+/// so the fleet value cannot half-apply and the source can never be computed
+/// by a second rule.
+pub fn resolve_selection(
+    local: AccountSelectionMode,
+    pinned: bool,
+    fleet: Option<AccountSelectionMode>,
+) -> (AccountSelectionMode, AccountSelectionSource) {
+    if pinned {
+        (local, AccountSelectionSource::Pinned)
+    } else {
+        match fleet {
+            Some(f) => (f, AccountSelectionSource::Fleet),
+            None => (local, AccountSelectionSource::Local),
+        }
+    }
+}
+
+/// The mode half of [`resolve_selection`].
 pub fn resolve_selection_mode(
     local: AccountSelectionMode,
     pinned: bool,
     fleet: Option<AccountSelectionMode>,
 ) -> AccountSelectionMode {
-    if pinned {
-        local
-    } else {
-        fleet.unwrap_or(local)
-    }
+    resolve_selection(local, pinned, fleet).0
 }
 
 /// [`resolve_selection_mode`] applied to one `ClaudeCliSettings` document
@@ -335,11 +377,12 @@ pub fn resolve_selection_mode(
 /// unit tests hermetic: a test's settings value, not the host machine's
 /// `claude-accounts.json`, decides the local half).
 pub fn resolve_for_cli_settings(cli: &crate::settings::ClaudeCliSettings) -> AccountSelectionMode {
-    resolve_selection_mode(
+    resolve_selection(
         cli.account_selection_mode,
         cli.account_selection_pinned,
         crate::mcp::fleet_policy_poller::fleet_account_selection_mode(),
     )
+    .0
 }
 
 /// The machine's LOCAL `(mode, pinned)` pair, before any fleet term.
@@ -374,8 +417,15 @@ fn local_selection() -> (AccountSelectionMode, bool) {
 /// the machine, not about one instance's settings document, and the picker
 /// must rotate under the same mode the report names.
 pub fn effective_selection_mode() -> AccountSelectionMode {
+    effective_selection().0
+}
+
+/// [`effective_selection_mode`] plus the [`AccountSelectionSource`] that
+/// decided it — the pair the AI-settings reads and the env capture report, so
+/// a fleet override is visible as one rather than as an unexplained mode.
+pub fn effective_selection() -> (AccountSelectionMode, AccountSelectionSource) {
     let (local, pinned) = local_selection();
-    resolve_selection_mode(
+    resolve_selection(
         local,
         pinned,
         crate::mcp::fleet_policy_poller::fleet_account_selection_mode(),
@@ -655,14 +705,19 @@ mod tests {
             for pinned in [true, false] {
                 for fleet in fleets {
                     let expected = match (pinned, fleet) {
-                        (true, _) => local,
-                        (false, Some(f)) => f,
-                        (false, None) => local,
+                        (true, _) => (local, AccountSelectionSource::Pinned),
+                        (false, Some(f)) => (f, AccountSelectionSource::Fleet),
+                        (false, None) => (local, AccountSelectionSource::Local),
                     };
                     assert_eq!(
-                        resolve_selection_mode(local, pinned, fleet),
+                        resolve_selection(local, pinned, fleet),
                         expected,
                         "local={local:?} pinned={pinned} fleet={fleet:?}"
+                    );
+                    assert_eq!(
+                        resolve_selection_mode(local, pinned, fleet),
+                        expected.0,
+                        "mode half disagrees: local={local:?} pinned={pinned} fleet={fleet:?}"
                     );
                     cells += 1;
                 }
@@ -689,6 +744,34 @@ mod tests {
             AccountSelectionMode::Manual,
             "a PINNED machine ignores the fleet"
         );
+        assert_eq!(
+            resolve_selection(
+                AccountSelectionMode::Manual,
+                true,
+                Some(AccountSelectionMode::HighestExpectedUsage)
+            ),
+            (AccountSelectionMode::Manual, AccountSelectionSource::Pinned),
+            "a pin reports Pinned even when the fleet has a value"
+        );
+        assert_eq!(
+            resolve_selection(AccountSelectionMode::Manual, false, None),
+            (AccountSelectionMode::Manual, AccountSelectionSource::Local),
+            "unpinned with no fleet opinion is Local"
+        );
+    }
+
+    #[test]
+    fn selection_source_str_matches_serde() {
+        for src in [
+            AccountSelectionSource::Fleet,
+            AccountSelectionSource::Local,
+            AccountSelectionSource::Pinned,
+        ] {
+            assert_eq!(
+                serde_json::to_value(src).unwrap(),
+                serde_json::Value::String(src.as_str().to_string())
+            );
+        }
     }
 
     /// `resolve_for_cli_settings` reads the mode AND the pin off the document

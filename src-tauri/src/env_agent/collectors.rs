@@ -3272,18 +3272,59 @@ fn read_shell_profiles() -> Option<String> {
     }
 }
 
+/// The bin crate's effective account-selection door: returns
+/// `(effective_mode, source)` as wire strings — the mode from
+/// `claude_accounts::effective_selection()` and its source
+/// (`fleet` | `local` | `pinned`). Published as a FUNCTION (like
+/// [`WorkspaceRootFn`] / [`PlansDirFn`]) because both halves move at runtime —
+/// the fleet-policy poller refreshes the fleet term, the operator edits the
+/// pin — so each capture must ask afresh.
+///
+/// The resolver lives in the BIN crate (see the CRATE-BOUNDARY NOTE above)
+/// and reads the fleet-policy cache this lib crate cannot reach; re-deriving
+/// it here would be a second rule for which mode governs.
+pub type AccountSelectionFn = fn() -> (&'static str, &'static str);
+
+static ACCOUNT_SELECTION_DOOR: std::sync::OnceLock<AccountSelectionFn> = std::sync::OnceLock::new();
+
+/// Publish the runner's effective account-selection reader so
+/// [`collect_claude_accounts`] can report the mode that actually governs and
+/// its source. Called by the binary at boot next to [`publish_plans_dir`].
+/// Idempotent — a second call is ignored.
+///
+/// Until it is published the section reports only `local_selection_mode`
+/// and `selection_source=unknown` — never the file value under the
+/// `selection_mode` key, which would claim a fleet-overridable value governs.
+pub fn publish_account_selection(door: AccountSelectionFn) {
+    let _ = ACCOUNT_SELECTION_DOOR.set(door);
+}
+
+/// `selection_source` value emitted before [`publish_account_selection`] has
+/// run (or in a process that never publishes it).
+const SELECTION_SOURCE_UNKNOWN: &str = "unknown";
+
 /// Collect the `claude_accounts` section. Resolves the roster from
-/// `dirs::config_dir()` and the user's shell profiles, then delegates to the
-/// injectable core. Returns `None` when neither the accounts file nor any
-/// config dir is found (so the isolation driver omits the section).
+/// `dirs::config_dir()` and the user's shell profiles, asks the published
+/// account-selection door (if any) for the effective mode and its source,
+/// then delegates to the injectable core. Returns `None` when neither the
+/// accounts file nor any config dir is found (so the isolation driver omits
+/// the section).
 pub fn collect_claude_accounts() -> Option<Section> {
     let config_root = dirs::config_dir()?;
     let profiles = read_shell_profiles();
-    collect_claude_accounts_from(&config_root, profiles.as_deref())
+    let effective = ACCOUNT_SELECTION_DOOR.get().map(|door| door());
+    collect_claude_accounts_from(&config_root, profiles.as_deref(), effective)
 }
 
 /// Injectable core so tests can drive a temp config root (and control the
 /// shell-profile text) without touching the real environment.
+///
+/// `effective` is the published door's answer — `(effective_mode, source)` —
+/// passed in rather than read from the static so tests control it. Keys:
+/// `local_selection_mode` is always the file value; with `Some` the section
+/// also carries `selection_mode` (the EFFECTIVE mode) and `selection_source`
+/// (`fleet` | `local` | `pinned`); with `None` it carries
+/// `selection_source=unknown` and NO `selection_mode`.
 ///
 /// SECRET-SAFETY INVARIANT (pinned by `secret_safety_claude_accounts_*`): this
 /// function NEVER opens `.credentials.json` (or `.claude.json`) — it emits only
@@ -3291,6 +3332,7 @@ pub fn collect_claude_accounts() -> Option<Section> {
 fn collect_claude_accounts_from(
     config_root: &Path,
     profiles_text: Option<&str>,
+    effective: Option<(&str, &str)>,
 ) -> Option<Section> {
     let runner_dir = config_root.join("com.qontinui.runner");
     let accounts_file = runner_dir.join("claude-accounts.json");
@@ -3299,7 +3341,7 @@ fn collect_claude_accounts_from(
     let mut config_dirs: Vec<String> = Vec::new();
     // Mirrors `AccountSelectionMode::default()` (settings.rs) — the mode a
     // roster/settings file with no explicit field resolves to.
-    let mut selection_mode = String::from("highest_expected_usage");
+    let mut local_selection_mode = String::from("highest_expected_usage");
     let mut launch_commands: HashMap<String, String> = HashMap::new();
     let mut accounts_file_found = false;
 
@@ -3309,7 +3351,7 @@ fn collect_claude_accounts_from(
         if let Ok(p) = serde_json::from_str::<AccountsFileProbe>(&contents) {
             config_dirs = p.claude_config_dirs;
             if let Some(m) = p.account_selection_mode.filter(|m| !m.is_empty()) {
-                selection_mode = m;
+                local_selection_mode = m;
             }
             launch_commands = p.claude_account_launch_commands;
         }
@@ -3322,7 +3364,7 @@ fn collect_claude_accounts_from(
                     .account_selection_mode
                     .filter(|m| !m.is_empty())
             {
-                selection_mode = m;
+                local_selection_mode = m;
             }
             launch_commands = p.claude_account_launch_commands;
         }
@@ -3341,7 +3383,14 @@ fn collect_claude_accounts_from(
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut section = Section::new();
-    put(&mut section, "selection_mode", selection_mode);
+    match effective {
+        Some((mode, source)) => {
+            put(&mut section, "selection_mode", mode);
+            put(&mut section, "selection_source", source);
+        }
+        None => put(&mut section, "selection_source", SELECTION_SOURCE_UNKNOWN),
+    }
+    put(&mut section, "local_selection_mode", local_selection_mode);
     let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
     put(&mut section, "accounts", names.join(","));
 
@@ -6707,7 +6756,7 @@ dependencies = [
             ),
         );
 
-        let section = collect_claude_accounts_from(root, None).expect("section present");
+        let section = collect_claude_accounts_from(root, None, None).expect("section present");
         let json = serde_json::to_string(&section).unwrap();
 
         assert_eq!(
@@ -6748,7 +6797,9 @@ dependencies = [
             ),
         );
 
-        let section = collect_claude_accounts_from(root, None).unwrap();
+        // The door says the fleet overrides the file's `manual`.
+        let section =
+            collect_claude_accounts_from(root, None, Some(("least_usage", "fleet"))).unwrap();
         assert_eq!(
             section.get("accounts").and_then(|v| v.as_str()),
             Some("gmail,work"),
@@ -6756,6 +6807,31 @@ dependencies = [
         );
         assert_eq!(
             section.get("selection_mode").and_then(|v| v.as_str()),
+            Some("least_usage"),
+            "selection_mode is the EFFECTIVE mode, not the file value"
+        );
+        assert_eq!(
+            section.get("selection_source").and_then(|v| v.as_str()),
+            Some("fleet")
+        );
+        assert_eq!(
+            section.get("local_selection_mode").and_then(|v| v.as_str()),
+            Some("manual"),
+            "the file value is reported under its own key"
+        );
+
+        // Before the door is published: only the local mode and an UNKNOWN
+        // source — never the file value dressed up as the effective mode.
+        let unpublished = collect_claude_accounts_from(root, None, None).unwrap();
+        assert!(unpublished.get("selection_mode").is_none());
+        assert_eq!(
+            unpublished.get("selection_source").and_then(|v| v.as_str()),
+            Some("unknown")
+        );
+        assert_eq!(
+            unpublished
+                .get("local_selection_mode")
+                .and_then(|v| v.as_str()),
             Some("manual")
         );
         assert_eq!(
@@ -6769,7 +6845,7 @@ dependencies = [
 
         // None when neither the accounts file nor any config dir is found.
         let empty = tempfile::tempdir().unwrap();
-        assert!(collect_claude_accounts_from(empty.path(), None).is_none());
+        assert!(collect_claude_accounts_from(empty.path(), None, None).is_none());
     }
 
     /// Vet caveat: with no `claude-accounts.json`, the mode must be read from
@@ -6796,11 +6872,15 @@ dependencies = [
         )
         .unwrap();
 
-        let section = collect_claude_accounts_from(root, None).unwrap();
+        let section = collect_claude_accounts_from(root, None, Some(("manual", "pinned"))).unwrap();
         assert_eq!(
-            section.get("selection_mode").and_then(|v| v.as_str()),
+            section.get("local_selection_mode").and_then(|v| v.as_str()),
             Some("manual"),
             "mode must come from nested ai.claude_cli, not a flat lookup"
+        );
+        assert_eq!(
+            section.get("selection_source").and_then(|v| v.as_str()),
+            Some("pinned")
         );
         assert_eq!(
             section.get("accounts").and_then(|v| v.as_str()),
@@ -6838,7 +6918,7 @@ dependencies = [
             gmail.to_string_lossy()
         );
 
-        let section = collect_claude_accounts_from(root, Some(&profile)).unwrap();
+        let section = collect_claude_accounts_from(root, Some(&profile), None).unwrap();
         assert_eq!(
             section.get("shortcut_gmail").and_then(|v| v.as_str()),
             Some("present"),
@@ -6851,7 +6931,7 @@ dependencies = [
         );
 
         // No profile text → shortcut keys omitted.
-        let no_profile = collect_claude_accounts_from(root, None).unwrap();
+        let no_profile = collect_claude_accounts_from(root, None, None).unwrap();
         assert!(no_profile.get("shortcut_gmail").is_none());
         assert!(no_profile.get("shortcut_work").is_none());
     }
