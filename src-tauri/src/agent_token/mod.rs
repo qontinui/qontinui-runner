@@ -402,6 +402,21 @@ pub async fn maybe_refresh(
     agent_id: Uuid,
     who: &str,
 ) -> Result<RefreshOutcome> {
+    maybe_refresh_with_proof(token, coord_http_base, agent_id, who, device_proof()).await
+}
+
+/// [`maybe_refresh`] with the device proof supplied by the caller. The future
+/// is awaited only when a request is actually about to go out, so the
+/// production wrapper reads the credential store exactly when it did before.
+/// Tests pass a fixed value here so they never touch the operator's real
+/// store or send a real device JWT to a stub.
+async fn maybe_refresh_with_proof(
+    token: &SharedToken,
+    coord_http_base: &str,
+    agent_id: Uuid,
+    who: &str,
+    proof: impl std::future::Future<Output = Option<reqwest::header::HeaderValue>>,
+) -> Result<RefreshOutcome> {
     let now = chrono::Utc::now().timestamp();
     let (needs, ttl, rejected, next_attempt) = {
         let g = token.read().await;
@@ -446,7 +461,7 @@ pub async fn maybe_refresh(
     // Attached on EVERY refresh, deliberately: the runner keeps no lineage
     // bookkeeping, and the device JWT already rides every data-plane call
     // (`auth::attach_device_auth`), so this adds no new exposure class.
-    let resp = match attach_device_proof(req, device_proof().await).send().await {
+    let resp = match attach_device_proof(req, proof.await).send().await {
         Ok(r) => r,
         Err(e) => {
             let streak = token.write().await.record_transient_failure(now);
@@ -466,7 +481,16 @@ pub async fn maybe_refresh(
                     g.health.last_refusal = Some(format!(
                         "lineage bound reached; device proof was {device_proof}"
                     ));
-                    g.record_transient_failure(now)
+                    let streak = g.record_transient_failure(now);
+                    // The bearer dies at its `exp`, at most a refresh margin
+                    // away. Never back off past that: the attempt after expiry
+                    // is the one that latches, and until it does every daemon
+                    // sharing the slot keeps presenting the token.
+                    let latest = g.exp.saturating_add(1);
+                    if g.health.next_attempt_epoch_secs > latest {
+                        g.health.next_attempt_epoch_secs = latest.max(now);
+                    }
+                    streak
                 };
                 log_transient(
                     who,
@@ -508,7 +532,12 @@ pub async fn maybe_refresh(
             .map(|l| format!(" (redirect to {l} not followed)"))
             .unwrap_or_default();
         let streak = token.write().await.record_transient_failure(now);
-        log_transient(who, agent_id, streak, &format!("returned {status}{location}"));
+        log_transient(
+            who,
+            agent_id,
+            streak,
+            &format!("returned {status}{location}"),
+        );
         return Ok(RefreshOutcome::Deferred);
     }
     let body: RefreshResponseBody = match resp.json().await {
@@ -521,9 +550,11 @@ pub async fn maybe_refresh(
     };
     if let Some(verdict) = body.device_proof.as_deref() {
         // Present only from a lineage-aware coord. `absent` (no usable device
-        // JWT held) and `ignored: …` (it did not pass coord's gates) mean this
-        // lineage will end at coord's bound. `not_needed` (coord evaluates the
-        // proof only once a lineage reaches its bound) and `accepted` are fine.
+        // JWT held) means this lineage will end at coord's bound. `not_needed`
+        // (coord evaluates the proof only once a lineage reaches its bound) and
+        // `accepted` are fine. `ignored: …` cannot arrive on a 200 from today's
+        // coord (an ignored proof leaves the lineage refused); the arm is
+        // defensive.
         if verdict == "absent" || verdict.starts_with("ignored") {
             warn!(
                 "{who}: agent_id={agent_id} device proof not accepted ({verdict}); \
@@ -605,7 +636,7 @@ mod tests {
             }),
         ))
         .await;
-        let out = maybe_refresh(&slot, &base, agent, "test").await.unwrap();
+        let out = maybe_refresh_with_proof(&slot, &base, agent, "test", std::future::ready(None)).await.unwrap();
         assert_eq!(out, RefreshOutcome::Deferred);
         {
             let g = slot.read().await;
@@ -620,7 +651,7 @@ mod tests {
         // the earlier cause is still on the slot for the log line.
         let base = stub_coord(answering(401, serde_json::json!({"error": "expired"}))).await;
         slot.write().await.health.next_attempt_epoch_secs = 0;
-        let out = maybe_refresh(&slot, &base, agent, "test").await.unwrap();
+        let out = maybe_refresh_with_proof(&slot, &base, agent, "test", std::future::ready(None)).await.unwrap();
         assert_eq!(out, RefreshOutcome::Rejected);
         let g = slot.read().await;
         assert!(g.is_rejected());
@@ -631,7 +662,9 @@ mod tests {
     async fn refresh_bearer_refusal_still_latches() {
         let slot = slot_in_margin();
         let base = stub_coord(answering(403, serde_json::json!({"error": "revoked"}))).await;
-        let out = maybe_refresh(&slot, &base, Uuid::now_v7(), "test").await.unwrap();
+        let out = maybe_refresh_with_proof(&slot, &base, Uuid::now_v7(), "test", std::future::ready(None))
+            .await
+            .unwrap();
         assert_eq!(out, RefreshOutcome::Rejected);
         assert!(slot.read().await.is_rejected());
     }
@@ -651,7 +684,9 @@ mod tests {
             }),
         ))
         .await;
-        let out = maybe_refresh(&slot, &base, Uuid::now_v7(), "test").await.unwrap();
+        let out = maybe_refresh_with_proof(&slot, &base, Uuid::now_v7(), "test", std::future::ready(None))
+            .await
+            .unwrap();
         assert_eq!(out, RefreshOutcome::Refreshed);
         let g = slot.read().await;
         assert_eq!(g.token, "agent.jwt.new");
@@ -682,13 +717,78 @@ mod tests {
         }))
         .await;
         let slot = slot_in_margin();
-        let out = maybe_refresh(&slot, &base, Uuid::now_v7(), "test").await.unwrap();
+        let out = maybe_refresh_with_proof(&slot, &base, Uuid::now_v7(), "test", std::future::ready(None))
+            .await
+            .unwrap();
         assert_eq!(out, RefreshOutcome::Deferred);
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the redirect target must never see the request (or its device proof)"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_puts_the_proof_on_the_wire_and_an_accept_clears_the_refusal() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+        let record = seen.clone();
+        let jti = Uuid::now_v7();
+        let exp = chrono::Utc::now().timestamp() + TOKEN_REFRESH_MARGIN_SECS * 8;
+        let base = stub_coord(axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let record = record.clone();
+            async move {
+                record.lock().unwrap().push(
+                    headers
+                        .get(DEVICE_PROOF_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string),
+                );
+                axum::Json(serde_json::json!({
+                    "token": "agent.jwt.reanchored",
+                    "agent_id": Uuid::now_v7(),
+                    "jti": jti,
+                    "exp": exp,
+                    "lineage_iat": exp - TOKEN_REFRESH_MARGIN_SECS * 8,
+                    "device_proof": "accepted",
+                }))
+            }
+        }))
+        .await;
+        let slot = slot_in_margin();
+        slot.write().await.health.last_refusal = Some("lineage bound reached".into());
+        let out = maybe_refresh_with_proof(
+            &slot,
+            &base,
+            Uuid::now_v7(),
+            "test",
+            std::future::ready(proof_header_value(Some("device.jwt.fixture".into()))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, RefreshOutcome::Refreshed);
+        assert_eq!(*seen.lock().unwrap(), vec![Some("device.jwt.fixture".to_string())]);
+        let g = slot.read().await;
+        assert_eq!(g.token, "agent.jwt.reanchored");
+        assert_eq!(g.health.last_refusal, None, "a fresh token clears the refusal");
+    }
+
+    #[tokio::test]
+    async fn refresh_lineage_expiry_never_backs_off_past_the_bearer() {
+        let slot = slot_in_margin();
+        let exp = slot.read().await.exp;
+        // Deep in the ladder already: the next delay would be 30 min.
+        slot.write().await.health.consecutive_failures = 10;
+        let base = stub_coord(answering(
+            403,
+            serde_json::json!({"code": "agent_token_lineage_expired", "device_proof": "absent"}),
+        ))
+        .await;
+        let out = maybe_refresh_with_proof(&slot, &base, Uuid::now_v7(), "test", std::future::ready(None))
+            .await
+            .unwrap();
+        assert_eq!(out, RefreshOutcome::Deferred);
+        let next = slot.read().await.health.next_attempt_epoch_secs;
+        assert!(next <= exp + 1, "retry at {next} must not pass the bearer's exp {exp}");
     }
 
     #[test]
@@ -717,10 +817,7 @@ mod tests {
         assert_eq!(proof_header_value(None), None);
         assert_eq!(proof_header_value(Some("   ".into())), None);
         // Trimmed, so a trailing newline from a file read is not fatal...
-        assert_eq!(
-            proof_header_value(Some("a.b.c\n".into())).unwrap(),
-            "a.b.c"
-        );
+        assert_eq!(proof_header_value(Some("a.b.c\n".into())).unwrap(), "a.b.c");
         // ...but an interior control character drops the proof rather than
         // failing the whole refresh request.
         assert_eq!(proof_header_value(Some("a.b\nc".into())), None);
@@ -742,7 +839,10 @@ mod tests {
             classify_refusal(&serde_json::json!({"error": "revoked"})),
             Refusal::BearerRefused
         );
-        assert_eq!(classify_refusal(&serde_json::Value::Null), Refusal::BearerRefused);
+        assert_eq!(
+            classify_refusal(&serde_json::Value::Null),
+            Refusal::BearerRefused
+        );
     }
 
     const NOW: i64 = 1_700_000_000;
