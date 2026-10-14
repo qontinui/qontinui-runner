@@ -536,6 +536,53 @@ pub struct AiSettings {
     pub git_op_federation_enabled: bool,
 }
 
+/// The READ shape of the AI settings: the stored [`AiSettings`] plus the
+/// account-selection mode that actually governs this machine and the input
+/// that decided it ([`crate::claude_accounts::effective_selection`]).
+///
+/// Read-only by construction — it is `Serialize` only, and the two derived
+/// keys are never fields of [`AiSettings`]: a derived value persisted into
+/// `settings.json` would be written back by every save. A client that echoes
+/// the view back on `PUT /settings/ai` is harmless, because `AiSettings` has
+/// no `deny_unknown_fields` and the two keys are dropped on deserialize
+/// (pinned by `mcp::settings` tests).
+///
+/// Plan `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
+/// Phase 2.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSettingsView {
+    #[serde(flatten)]
+    pub settings: AiSettings,
+    pub effective_account_selection_mode: AccountSelectionMode,
+    pub account_selection_source: crate::claude_accounts::AccountSelectionSource,
+}
+
+impl AiSettingsView {
+    /// PURE constructor from a settings document and an already-resolved
+    /// `(mode, source)` pair.
+    pub fn from_parts(
+        settings: AiSettings,
+        (mode, source): (
+            AccountSelectionMode,
+            crate::claude_accounts::AccountSelectionSource,
+        ),
+    ) -> Self {
+        Self {
+            settings,
+            effective_account_selection_mode: mode,
+            account_selection_source: source,
+        }
+    }
+
+    /// The current stored settings plus this machine's effective selection.
+    pub fn current() -> Self {
+        Self::from_parts(
+            get_ai_settings(),
+            crate::claude_accounts::effective_selection(),
+        )
+    }
+}
+
 fn default_interactive_sessions_enabled() -> bool {
     true
 }

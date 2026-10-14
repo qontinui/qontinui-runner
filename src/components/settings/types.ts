@@ -96,6 +96,11 @@ export type AiProvider = "claude_cli" | "claude_api" | "gemini_cli" | "gemini_ap
 export type CliExecutionMode = "auto" | "windows_native" | "wsl" | "native";
 export type GeminiAuthMethod = "oauth" | "api_key";
 export type AccountSelectionMode = "manual" | "least_usage" | "highest_expected_usage";
+/** Which input decided the effective account-selection mode (runner
+ * `claude_accounts::AccountSelectionSource`): `pinned` — the local mode, pinned
+ * against the fleet; `fleet` — unpinned and the fleet policy has a value;
+ * `local` — unpinned and the fleet has no opinion. */
+export type AccountSelectionSource = "fleet" | "local" | "pinned";
 
 export interface ClaudeCliSettings {
   execution_mode: CliExecutionMode;
@@ -424,6 +429,51 @@ export interface AiSettings {
    * When true, sessions use multi-turn interactive mode with message queuing.
    * When false, sessions use one-shot inline mode. */
   interactive_sessions_enabled: boolean;
+  /** READ-ONLY (runner `AiSettingsView`): the account-selection mode that
+   * actually governs this machine — the fleet policy's value when unpinned
+   * and the fleet has one, else `claude_cli.account_selection_mode`. Never
+   * saved; absent from an older runner. */
+  effective_account_selection_mode?: AccountSelectionMode;
+  /** READ-ONLY: which input decided `effective_account_selection_mode`. */
+  account_selection_source?: AccountSelectionSource;
+}
+
+/** The account-selection mode the Settings page DESCRIBES, and whether the
+ * fleet policy is what set it.
+ *
+ * Only a `fleet` source makes the effective mode differ from the local one
+ * (the runner's rule: pinned or no fleet opinion ⇒ local), so for every other
+ * source the LOCAL value is returned — which also keeps the description in
+ * step with an unsaved local edit. Ticking the pin (even unsaved) likewise
+ * hands the description back to the local mode. Falls back to local when the
+ * runner predates the view fields. */
+export function displayedAccountSelection(settings: AiSettings): {
+  mode: AccountSelectionMode | undefined;
+  fleetManaged: boolean;
+} {
+  const local = settings.claude_cli.account_selection_mode;
+  const fleetManaged =
+    settings.account_selection_source === "fleet" &&
+    !(settings.claude_cli.account_selection_pinned ?? false) &&
+    settings.effective_account_selection_mode !== undefined;
+  return {
+    mode: fleetManaged ? settings.effective_account_selection_mode : local,
+    fleetManaged,
+  };
+}
+
+/** Human label for an account-selection mode (the selector's button text). */
+export function accountSelectionModeLabel(mode: AccountSelectionMode | undefined): string {
+  switch (mode) {
+    case "manual":
+      return "Manual";
+    case "least_usage":
+      return "Least Usage";
+    case "highest_expected_usage":
+      return "Highest Expected Usage";
+    default:
+      return "Unknown";
+  }
 }
 
 export interface AiConnectionTestResult {

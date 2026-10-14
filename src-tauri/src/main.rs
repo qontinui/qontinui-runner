@@ -872,6 +872,14 @@ fn runner_plans_dir_setting() -> Option<String> {
     )
 }
 
+/// The env collector's account-selection door: the effective mode and the
+/// input that decided it, as wire strings. Re-resolved per call, so a fleet
+/// policy change or a pin edit reaches the next capture.
+fn runner_effective_account_selection() -> (&'static str, &'static str) {
+    let (mode, source) = crate::claude_accounts::effective_selection();
+    (mode.as_str(), source.as_str())
+}
+
 /// Parse a boolean env lever the way the rest of the boot path does.
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -2150,6 +2158,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // capture and the scan agree on what "unset" means.
                 qontinui_runner_lib::env_agent::collectors::publish_plans_dir(
                     runner_plans_dir_setting,
+                );
+                // And for the effective account-selection mode + its source
+                // (`fleet` | `local` | `pinned`): the resolver and the
+                // fleet-policy cache it reads live in this crate, so the
+                // `claude_accounts` section reports what actually governs
+                // through this door rather than a re-derived second rule.
+                qontinui_runner_lib::env_agent::collectors::publish_account_selection(
+                    runner_effective_account_selection,
                 );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's

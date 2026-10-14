@@ -61,7 +61,10 @@ pub struct AiConnectionTestResult {
 
 /// Get the current AI settings.
 ///
-/// Returns the AI settings stored in the persistent settings file.
+/// Returns the AI settings stored in the persistent settings file, flattened
+/// together with the READ-ONLY `effective_account_selection_mode` and
+/// `account_selection_source` (`fleet` | `local` | `pinned`) — see
+/// [`settings::AiSettingsView`].
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with AI settings data
@@ -74,18 +77,45 @@ pub fn get_ai_settings() -> Result<CommandResponse, String> {
 fn get_ai_settings_impl() -> Result<CommandResponse, AppError> {
     info!("Getting AI settings");
 
-    let ai_settings = settings::get_ai_settings();
+    let view = settings::AiSettingsView::current();
 
     Ok(CommandResponse {
         success: true,
         message: Some("AI settings retrieved".to_string()),
-        data: Some(serde_json::to_value(&ai_settings)?),
+        data: Some(serde_json::to_value(&view)?),
     })
+}
+
+/// The account-selection mode a Tauri `save_ai_settings` call stores. PURE.
+///
+/// An ABSENT mode (`None` — a caller that does not send it) KEEPS the stored
+/// mode: the mode is machine-global (mirrored into `claude-accounts.json`), so
+/// defaulting it would silently re-point every runner on the machine. A sent
+/// value is parsed: `manual` and `least_usage` select those modes, anything
+/// else (including `highest_expected_usage`) is `HighestExpectedUsage`, the
+/// settings.rs default. Plan
+/// `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
+/// Phase 1.
+fn resolve_saved_selection_mode(
+    sent: Option<&str>,
+    stored: AccountSelectionMode,
+) -> AccountSelectionMode {
+    match sent {
+        None => stored,
+        Some("manual") => AccountSelectionMode::Manual,
+        Some("least_usage") => AccountSelectionMode::LeastUsage,
+        Some(_) => AccountSelectionMode::HighestExpectedUsage,
+    }
 }
 
 /// Save AI settings.
 ///
 /// Updates the AI settings in the persistent settings file.
+///
+/// Absent-means-keep for `account_selection_mode`, `account_selection_pinned`
+/// and the migration toggles; `config_dir` stays EXPLICIT — over Tauri IPC an
+/// absent and a `null` value both arrive as `None`, and the Settings page
+/// always sends it, so `None` clears it.
 ///
 /// # Arguments
 /// * `provider` - AI provider ("claude_cli" or "claude_api")
@@ -144,16 +174,10 @@ pub fn save_ai_settings(
     // Get existing settings to preserve Gemini configuration when saving Claude settings
     let existing_settings = settings::get_ai_settings();
 
-    // Default to highest-expected-usage; only an explicit "manual" pins to a
-    // single account, and only an explicit "least_usage" opts into the older
-    // headroom-only ranking. (None / unknown resolve to HighestExpectedUsage
-    // so a multi-account runner auto-balances by default — matching the
-    // AccountSelectionMode::HighestExpectedUsage default in settings.rs.)
-    let selection_mode = match account_selection_mode.as_deref() {
-        Some("manual") => AccountSelectionMode::Manual,
-        Some("least_usage") => AccountSelectionMode::LeastUsage,
-        _ => AccountSelectionMode::HighestExpectedUsage,
-    };
+    let selection_mode = resolve_saved_selection_mode(
+        account_selection_mode.as_deref(),
+        existing_settings.claude_cli.account_selection_mode,
+    );
 
     let ai_settings = AiSettings {
         provider: ai_provider,
@@ -2424,6 +2448,44 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             reset_provider_circuit,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod save_selection_mode_tests {
+    use super::*;
+
+    #[test]
+    fn absent_mode_keeps_the_stored_mode() {
+        for stored in [
+            AccountSelectionMode::Manual,
+            AccountSelectionMode::LeastUsage,
+            AccountSelectionMode::HighestExpectedUsage,
+        ] {
+            assert_eq!(resolve_saved_selection_mode(None, stored), stored);
+        }
+    }
+
+    #[test]
+    fn sent_mode_replaces_the_stored_mode() {
+        let stored = AccountSelectionMode::Manual;
+        assert_eq!(
+            resolve_saved_selection_mode(Some("least_usage"), stored),
+            AccountSelectionMode::LeastUsage
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("highest_expected_usage"), stored),
+            AccountSelectionMode::HighestExpectedUsage
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("manual"), AccountSelectionMode::LeastUsage),
+            AccountSelectionMode::Manual
+        );
+        // An unknown spelling keeps the historical fallback to the default.
+        assert_eq!(
+            resolve_saved_selection_mode(Some("bogus"), stored),
+            AccountSelectionMode::HighestExpectedUsage
+        );
+    }
 }
 
 #[cfg(test)]
