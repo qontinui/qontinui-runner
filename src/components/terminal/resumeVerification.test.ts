@@ -29,6 +29,7 @@ import {
   waitForClaudeHandshake,
   typeResumeAndVerify,
   probeClaudeInPane,
+  clearLineSequence,
 } from "./resumeVerification";
 import { claudeDescriptor } from "./providerAdapter";
 import { buildResumeCmd } from "./useTerminalInitialization";
@@ -392,8 +393,8 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
       readTail,
     });
     expect(out).toBe("verified");
-    // attempt 1: CMD; attempt 2: ESC (clear any half-typed line) + CMD.
-    expect(writes).toEqual([CMD, "\x1b", CMD]);
+    // attempt 1: CMD; attempt 2: Ctrl-E Ctrl-U (clear any half-typed line; ESC on Windows) + CMD.
+    expect(writes).toEqual([CMD, "\x05\x15", CMD]);
   });
 
   it("answers the resume-size picker at most ONCE when pickerAnswer is set", async () => {
@@ -676,7 +677,7 @@ describe("typeResumeAndVerify (does not type into a live claude)", () => {
       probeClaude: async () => ({ state: "remote", sessionIds: [] }),
     });
     expect(out).toBe("failed");
-    expect(writes).toEqual([CMD, "\x1b", CMD]);
+    expect(writes).toEqual([CMD, "\x05\x15", CMD]);
   });
 
   it("skipFirstProbe (fresh boot-restore pane) probes only before the retype", async () => {
@@ -719,5 +720,20 @@ describe("probeClaudeInPane", () => {
         throw new Error("Terminal not found");
       }),
     ).toEqual(unknown);
+  });
+});
+
+// 2026-10-08 — the retry's line-clear was a bare ESC, which GNU readline/zsh
+// read as the META prefix: it combined with the retyped command's first key
+// (`C` → M-C, capitalize-word) and the retype ran as `LAUDE_CODE_…`. Only
+// PSReadLine treats a bare ESC as "clear line".
+describe("clearLineSequence (retry line-clear per host OS)", () => {
+  it("never sends a bare ESC to a readline/zsh shell", () => {
+    const seq = clearLineSequence(false);
+    expect(seq).not.toContain("\x1b");
+    expect(seq).toBe("\x05\x15");
+  });
+  it("keeps ESC (RevertLine) for PSReadLine on Windows", () => {
+    expect(clearLineSequence(true)).toBe("\x1b");
   });
 });

@@ -28,6 +28,8 @@ import {
   decideColdResume,
   decideDrainSkipDisposition,
   applyDrainSkip,
+  resolveRestoreConfigDir,
+  restorePanePin,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -647,6 +649,43 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
     const unbound = buildResumeCmd("sess-1", undefined, "summary");
     expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
     expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  });
+});
+
+// 2026-10-08 — a `configDir: null` record (a default-account launch) whose
+// transcript lives only under `~/.claude` was resumed with NO
+// CLAUDE_CONFIG_DIR prefix, so `claude --resume` inherited the restore PTY's
+// picker-chosen account (`~/.claude-iris`) and answered "No conversation
+// found" in 22 of 22 panes. The backend now resolves `resumeConfigDir`; the
+// restore must use it for the typed resume (and the pane pin), and the raw
+// `configDir` must never outrank it.
+describe("restore account resolution (null configDir)", () => {
+  it("a null-configDir record resumes under the transcript's resolved default dir", () => {
+    const r = rec({ configDir: undefined, resumeConfigDir: "/home/u/.claude" });
+    const dir = resolveRestoreConfigDir(r);
+    expect(dir).toBe("/home/u/.claude");
+    const cmd = buildResumeCmd("sess-1", dir, "full");
+    expect(cmd.startsWith('CLAUDE_CONFIG_DIR="/home/u/.claude" ')).toBe(true);
+    expect(cmd).toContain("--resume sess-1\r");
+  });
+
+  it("the resolved transcript account outranks a stale recorded one (the picker's must not win)", () => {
+    const r = rec({ configDir: "/home/u/.claude-iris", resumeConfigDir: "/home/u/.claude" });
+    expect(resolveRestoreConfigDir(r)).toBe("/home/u/.claude");
+  });
+
+  it("pins only an auto-resume pane; a terminal-only pane is left to the picker", () => {
+    expect(restorePanePin("auto-resume", "/home/u/.claude")).toBe("/home/u/.claude");
+    expect(restorePanePin("terminal-only", "/home/u/.claude")).toBeUndefined();
+    expect(restorePanePin("skip-invalid", "/home/u/.claude")).toBeUndefined();
+  });
+
+  it("falls back to the recorded configDir only when no resolved dir is usable", () => {
+    expect(resolveRestoreConfigDir(rec({ configDir: "/acct/x" }))).toBe("/acct/x");
+    expect(
+      resolveRestoreConfigDir(rec({ configDir: "/acct/x", resumeConfigDir: "/bad;rm -rf" })),
+    ).toBe("/acct/x");
+    expect(resolveRestoreConfigDir(rec({}))).toBeUndefined();
   });
 });
 

@@ -108,4 +108,15 @@ export interface TerminalSessionRecord {
    * this field for exactly that reason.
    */
   transcriptExists?: boolean;
+  /**
+   * DERIVED by `terminal_session_list_open` (never persisted): the Claude
+   * config dir this session's resume MUST run under — the account its
+   * transcript was found under, else the record's own `configDir`, else the
+   * ambient default (`~/.claude`). Explicit even when `configDir` is absent:
+   * an absent account made the restore type a bare `claude --resume` that
+   * inherited the restore PTY's picker-chosen account and found no
+   * conversation (2026-10-08, 22 of 22 panes). Prefer this over `configDir`
+   * for every restore-time use.
+   */
+  resumeConfigDir?: string;
 }

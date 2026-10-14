@@ -234,6 +234,37 @@ pub fn find_claude_config_dirs() -> Vec<PathBuf> {
     .collect()
 }
 
+/// The Claude config dir a child process uses when NOTHING pins one — the
+/// account a PTY launched without a `CLAUDE_CONFIG_DIR` of its own actually
+/// reads: the runner's inherited `CLAUDE_CONFIG_DIR` when it has one, else the
+/// platform default `~/.claude`.
+///
+/// This is the value "no account recorded" must be translated INTO, never left
+/// as an absence. An absent dir handed to a resume reads as "inherit whatever
+/// the PTY got", and a PTY spawned by the account picker carries the picker's
+/// account, not the default — so `claude --resume <id>` for a default-account
+/// session answers "No conversation found" (measured 2026-10-08: 22 of 22
+/// boot-restored panes on one page).
+///
+/// `None` only when there is no env override AND no home directory resolves.
+pub fn ambient_claude_config_dir() -> Option<PathBuf> {
+    ambient_claude_config_dir_from(std::env::var("CLAUDE_CONFIG_DIR").ok(), dirs::home_dir())
+}
+
+/// [`ambient_claude_config_dir`] over explicit inputs, so the precedence is a
+/// unit test rather than a process-env dance. A blank env value is treated as
+/// no value (the runner never pins a blank one either — see
+/// `TerminalSession::caller_pinned_config_dir`).
+pub fn ambient_claude_config_dir_from(
+    env_config_dir: Option<String>,
+    home_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match env_config_dir.filter(|s| !s.trim().is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir.trim())),
+        None => home_dir.map(|h| h.join(".claude")),
+    }
+}
+
 /// Encode a project path to the directory name format used by Claude Code.
 ///
 /// Example: `C:/Users/jspin/Documents/qontinui_parent` → `C--Users-jspin-Documents-qontinui-parent`
@@ -1982,6 +2013,26 @@ pub fn scan_external_claude_processes(exclude_pids: &[u32]) -> ExternalClaudeSca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ambient account: the inherited `CLAUDE_CONFIG_DIR` when set and
+    /// non-blank, else `~/.claude`.
+    #[test]
+    fn ambient_config_dir_prefers_env_then_home_default() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            ambient_claude_config_dir_from(Some("/acct/x".into()), home.clone()),
+            Some(PathBuf::from("/acct/x"))
+        );
+        assert_eq!(
+            ambient_claude_config_dir_from(Some("   ".into()), home.clone()),
+            Some(PathBuf::from("/home/u/.claude"))
+        );
+        assert_eq!(
+            ambient_claude_config_dir_from(None, home),
+            Some(PathBuf::from("/home/u/.claude"))
+        );
+        assert_eq!(ambient_claude_config_dir_from(None, None), None);
+    }
 
     /// Transcript-sourced titles can carry raw SGR/OSC escapes (a `/rename`
     /// pasted from colored output, or a summary derived from one). Nothing

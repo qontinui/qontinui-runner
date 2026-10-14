@@ -344,10 +344,30 @@ export async function probeClaudeInPane(
 export type ResumeOutcome = "verified" | "failed";
 
 /**
- * ESC clears any partially-typed line in PSReadLine / readline before a
- * retry retype, so a half-landed first attempt can't corrupt the second.
+ * The keystrokes that clear a partially-typed line before a retry retype, so a
+ * half-landed first attempt (or terminal-query replies such as a DA1
+ * `ESC[?1;2c` that a just-exited CLI left in the shell's input) can't corrupt
+ * the second.
+ *
+ * PSReadLine (Windows) binds a bare ESC to RevertLine. GNU readline and zsh
+ * do NOT: there ESC is the META PREFIX, so it combines with the NEXT key
+ * typed — the `C` of `CLAUDE_…` became `M-C` (capitalize-word) and the retype
+ * ran as `LAUDE_CODE_RESUME_TOKEN_THRESHOLD=…` (measured 2026-10-08 on a Linux
+ * runner's restored panes). On those shells Ctrl-E (end of line) then Ctrl-U
+ * (bash: discard to line start; zsh: kill the whole line) empties the buffer
+ * with no prefix state left behind. Pure + exported for unit tests.
+ *
+ * Keyed on the HOST OS, not the pane's shell: a Git Bash / WSL bash pane on a
+ * Windows runner still gets the bare ESC. That case is unchanged by this fix
+ * (it had the same bug before) and is narrower than the Linux/macOS default.
  */
-const CLEAR_LINE = "\x1b";
+export function clearLineSequence(isWindows: boolean): string {
+  return isWindows ? "\x1b" : "\x05\x15";
+}
+
+function platformIsWindows(): boolean {
+  return typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
+}
 
 export interface TypeAndVerifyOptions extends HandshakeWaitOptions {
   /** Total attempts (initial type + retries). Spec: retry ONCE → 2. */
@@ -496,7 +516,7 @@ export async function typeResumeAndVerify(
     }
     if (attempt > 1) {
       // Clear any half-typed line from the failed attempt, then retype.
-      void write(terminalRefs, tabId, CLEAR_LINE);
+      void write(terminalRefs, tabId, clearLineSequence(platformIsWindows()));
       await new Promise((r) => setTimeout(r, settleMs));
     }
     const refusal = await typeAndCheck(resumeCmd);
