@@ -882,7 +882,9 @@ struct Stats {
     recent: Mutex<VecDeque<Value>>,
     /// `graceAdmitted.byRoute`. Only a [`Verdict::GraceAdmitted`] inserts, and
     /// its key is the canonical origin, so the map is bounded by
-    /// `GRACE_ORIGINS.len() × TRUSTED_DOOR_GRACE.len()`.
+    /// `GRACE_ORIGINS.len() × TRUSTED_DOOR_GRACE.len()`. An `OPTIONS`
+    /// preflight is judged by its `Access-Control-Request-Method` and counts
+    /// as an admission, so `count` is admissions, not door executions.
     grace_by_route: Mutex<BTreeMap<GraceKey, GraceTally>>,
     /// The grace WARN's OWN sighting set — never the shadow WARNs' shared,
     /// 512-capped one, which Foreign shadow sightings can fill and so silence
