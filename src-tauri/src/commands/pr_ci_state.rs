@@ -43,7 +43,7 @@ use qontinui_runner_lib::tenant_pin::TenantPin;
 
 /// coord tool calls in flight at once.
 pub const PR_CI_CONCURRENCY: usize = 4;
-/// Per-call bound.
+/// Per-call bound, enforced off the tokio runtime (`off_runtime::deadline`).
 pub const PR_CI_CALL_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long an answered card is reused.
 pub const PR_CI_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -234,25 +234,51 @@ fn scope_for(pin: TenantPin) -> TenantScope {
 }
 
 async fn fetch_card(client: &reqwest::Client, url: &str, pin: TenantPin, pr: &PrRef) -> PrCiRead {
+    fetch_card_within(client, url, pin, pr, PR_CI_CALL_TIMEOUT).await
+}
+
+/// [`fetch_card`] under an explicit bound — the tested core.
+async fn fetch_card_within(
+    client: &reqwest::Client,
+    url: &str,
+    pin: TenantPin,
+    pr: &PrRef,
+    bound: Duration,
+) -> PrCiRead {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": { "name": TOOL, "arguments": { "repo": pr.repo, "number": pr.number } },
     });
-    let rb = crate::auth::attach_device_auth_for(client.post(url).json(&body), scope_for(pin))
-        .timeout(PR_CI_CALL_TIMEOUT);
-    let resp = match rb.send().await {
-        Ok(r) => r,
-        Err(e) => return PrCiRead::unknown(pr, format!("coord unreachable: {e}")),
+    let rb = crate::auth::attach_device_auth_for(client.post(url).json(&body), scope_for(pin));
+    // Bounded by `off_runtime::deadline`, like the sibling commands — never a
+    // tokio-timer-driven bound (reqwest `.timeout()` included), which goes
+    // inert when every worker is parked. Covers the send AND the body read.
+    let call = async {
+        let resp = rb
+            .send()
+            .await
+            .map_err(|e| format!("coord unreachable: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("coord /mcp HTTP {status}"));
+        }
+        resp.json::<Value>()
+            .await
+            .map_err(|e| format!("coord body unreadable: {e}"))
     };
-    let status = resp.status();
-    if !status.is_success() {
-        return PrCiRead::unknown(pr, format!("coord /mcp HTTP {status}"));
-    }
-    let rpc: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => return PrCiRead::unknown(pr, format!("coord body unreadable: {e}")),
+    let rpc: Value = tokio::select! {
+        r = call => match r {
+            Ok(v) => v,
+            Err(reason) => return PrCiRead::unknown(pr, reason),
+        },
+        _ = crate::off_runtime::deadline(bound) => {
+            return PrCiRead::unknown(
+                pr,
+                format!("coord call timed out after {} ms", bound.as_millis()),
+            );
+        }
     };
     match unwrap_tool_result(&rpc) {
         Ok(card) => classify_card(pr, &card, chrono::Utc::now().timestamp_millis()),
@@ -481,5 +507,37 @@ mod tests {
         assert_eq!(keep.len(), PR_CI_MAX_PER_CALL);
         assert_eq!(keep[0], pr());
         assert_eq!(over.len(), 3);
+    }
+
+    /// A coord that accepts the connection and never answers is bounded by
+    /// the off-runtime deadline and reads `unknown` with the reason — never
+    /// a hang and never a guessed state.
+    #[tokio::test]
+    async fn pr_ci_state_a_silent_coord_is_unknown_after_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // accept, never respond
+            }
+        });
+        let client = reqwest::Client::new();
+        let started = Instant::now();
+        let read = fetch_card_within(
+            &client,
+            &format!("http://{addr}/mcp"),
+            TenantPin::Unpinned,
+            &pr(),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(read.state, "unknown");
+        assert!(
+            read.reason.as_deref().unwrap_or("").contains("timed out"),
+            "{read:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        hold.abort();
     }
 }
