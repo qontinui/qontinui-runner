@@ -2138,10 +2138,19 @@ async fn conclude_default_slot_recovery(
     let read = spawn_blocking_tracked(move || {
         #[cfg(test)]
         note_conclude_read_thread();
-        (
-            mgr.get_access_token().ok(),
-            publish_legacy.then(|| mgr.probe_access_token()),
-        )
+        // With a legacy publish, the token comes FROM the probe, so the
+        // verdict and the posture key on the same read (and one keychain
+        // round-trip less); otherwise a plain token read.
+        if publish_legacy {
+            let probe = mgr.probe_access_token();
+            let token = match &probe {
+                crate::secure_storage::StoredTokenRead::Present(t) => Some(t.clone()),
+                _ => None,
+            };
+            (token, Some(probe))
+        } else {
+            (mgr.get_access_token().ok(), None)
+        }
     })
     .await;
     match read {
@@ -2232,8 +2241,9 @@ pub(crate) async fn try_device_self_refresh(
     // Precondition: a currently-valid (future-exp) device-JWT must be held —
     // coord authenticates this request with THAT bearer. An absent/opaque/
     // already-expired JWT cannot self-refresh, so hand off to Cognito.
-    // Read on the blocking pool: the store read may wait on the store lock,
-    // and on the refresher's one-worker runtime that would stall its timer.
+    // Read on the blocking pool: `get_access_token` can fall back to the OS
+    // keychain (store reads themselves are lock-free), and on the refresher's
+    // one-worker runtime a slow keychain call would stall its timer.
     let mgr = auth_manager.clone();
     let read = spawn_blocking_tracked(move || {
         let token = mgr.get_access_token().ok().filter(|t| !t.trim().is_empty());
@@ -5877,9 +5887,11 @@ pub(crate) async fn refresh_tenant_slots(
     app: Option<&tauri::AppHandle>,
     pins: PosturePinInputs,
 ) -> Vec<(uuid::Uuid, TenantSlotOutcome)> {
-    // Every slot read for this pass in ONE blocking-pool hop: a store read may
-    // wait on the store lock, and on the refresher's one-worker runtime that
-    // would stall the very timer PASS_BOUND relies on.
+    // Every slot read for this pass in ONE blocking-pool hop. Per-tenant slot
+    // reads have no keychain fallback and take no lock — each is a file read
+    // plus a decrypt — so this is about keeping synchronous disk I/O and
+    // crypto off the refresher's single worker (PASS_BOUND), not a known
+    // unbounded wait.
     let mgr = auth_manager.clone();
     let reads: Vec<(uuid::Uuid, Result<Option<String>, String>)> =
         match spawn_blocking_tracked(move || {
@@ -6945,8 +6957,9 @@ async fn refresher_pass(
 
     // Snapshot settings + needs-refresh decision once per iteration.
     stage.set(PassStage::ReadNeedsRefresh);
-    // Off the worker: both read files, and the token read may wait on the store
-    // lock (see PASS_BOUND for why that matters on this runtime).
+    // Off the worker: both read files, and `device_jwt_needs_refresh` goes
+    // through `get_access_token`, which can fall back to the OS keychain (see
+    // PASS_BOUND for why that matters on this runtime).
     let mgr = std::sync::Arc::clone(auth_manager);
     let Ok((settings_snapshot, needs_refresh_result)) =
         spawn_blocking_tracked(move || (settings::load_settings(), mgr.device_jwt_needs_refresh()))
@@ -8399,6 +8412,60 @@ mod try_refresh_once_tests {
              refresher replaces it with a real device-JWT. Without this, \
              pre-Phase-3 paired installs are permanently wedged on the \
              opaque bearer and the relay 401-spins every reconnect."
+        );
+    }
+
+    /// Round-3 follow-up: `try_refresh_once` resolves the tenant from its
+    /// `outgoing_jwt` PARAMETER (read off the worker by its caller), never by
+    /// re-reading the store. The store holds a JWT with NO tenant claim; only
+    /// the parameter carries one — so a store read would bail KeptExisting.
+    #[tokio::test]
+    async fn try_refresh_once_takes_the_tenant_from_its_outgoing_jwt_parameter() {
+        let _serialised = super::posture_test_lock();
+        let mgr = test_auth_manager("outgoing_jwt_parameter_not_store");
+        mgr.store_tokens(&synth_jwt(chrono::Utc::now().timestamp() + 30 * 60), "")
+            .expect("store");
+        let param_tenant = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        let outgoing =
+            synth_jwt_with_tenant(chrono::Utc::now().timestamp() + 30 * 60, param_tenant);
+
+        let new_jwt = synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        let body = serde_json::json!({
+            "token": new_jwt,
+            "device_id": "11111111-1111-4111-8111-111111111111",
+            "user_id":   "22222222-2222-4222-8222-222222222222",
+            "jti":       "33333333-3333-4333-8333-333333333333",
+            "exp":       chrono::Utc::now().timestamp() + 4 * 60 * 60,
+        })
+        .to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &tok_no_tenant(),
+            DID,
+            UID,
+            None,
+            Some(outgoing.as_str()),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, RefreshOutcome::Replaced { .. }),
+            "the parameter's tenant must let the refresh proceed: {outcome:?}"
+        );
+        let sent = cap
+            .last_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("pair-cli received a request body");
+        let sent_json: serde_json::Value = serde_json::from_str(&sent).expect("JSON body");
+        assert_eq!(
+            sent_json.get("tenant_id").and_then(|v| v.as_str()),
+            Some(param_tenant),
+            "pair-cli must receive the tenant from the outgoing_jwt PARAMETER"
         );
     }
 
