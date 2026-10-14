@@ -265,6 +265,18 @@ mod tests {
             };
             lock.write_record(&record(victim.id())).unwrap();
         }
+        // The lock is free now — once no child that another test in this
+        // process forks shares its open file description any more (the
+        // fork-before-exec hold of finding 9bbe1079). Wait for that, so the
+        // case below is the free-lock case it means to be.
+        let end = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            PaneLock::try_acquire_existing(&lock_file),
+            Ok(TryLock::Acquired(_))
+        ) {
+            assert!(Instant::now() < end, "the dropped lock never became free");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(!t.signalled, "{t:?}");
         assert!(
