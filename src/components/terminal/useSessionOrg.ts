@@ -117,8 +117,29 @@ export interface SessionOrgClient {
   importLegacyKeys(): Promise<SessionOrgImportOutcome>;
 }
 
+/**
+ * How long one apply may go unanswered before it is treated as failed. Applies
+ * are chained, so a call whose answer is lost would otherwise hold every later
+ * apply forever while the preview kept showing them as applied.
+ */
+export const SESSION_ORG_APPLY_TIMEOUT_MS = 15_000;
+
+function withApplyTimeout<T>(call: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`no answer from session_org_apply within ${Math.round(ms / 1000)} s`)),
+      ms,
+    );
+  });
+  return Promise.race([call, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** Build a client over `transport`. Exported for tests; surfaces use the hook. */
-export function createSessionOrgClient(transport: SessionOrgTransport): SessionOrgClient {
+export function createSessionOrgClient(
+  transport: SessionOrgTransport,
+  applyTimeoutMs: number = SESSION_ORG_APPLY_TIMEOUT_MS,
+): SessionOrgClient {
   let confirmed: SessionOrgSnapshot | null = null;
   let loadError: string | null = null;
   let pending: { id: number; ops: SessionOrgOp[] }[] = [];
@@ -202,18 +223,25 @@ export function createSessionOrgClient(transport: SessionOrgTransport): SessionO
     }
   }
 
+  /** Add one batch's failure to the burst's error, never replacing an earlier one. */
+  function noteError(message: string): void {
+    lastError = lastError ? `${lastError}; ${message}` : message;
+  }
+
   async function apply(ops: SessionOrgOp[]): Promise<SessionOrgApplyResponse> {
     const filled = ops.map((op) =>
       op.op === "createGroup" && !op.groupId ? { ...op, groupId: newGroupId() } : op,
     );
     const batch = { id: nextBatchId++, ops: filled };
+    // A new burst of edits starts with a clean slate; an apply queued behind
+    // one that failed must not erase that failure (ordered settling would
+    // otherwise guarantee the erasure).
+    if (pending.length === 0) lastError = null;
     pending = [...pending, batch];
-    lastError = null;
     recompute();
+    const send = () => withApplyTimeout(transport.apply(filled), applyTimeoutMs);
     try {
-      const turn = applyTail
-        ? applyTail.then(() => transport.apply(filled))
-        : transport.apply(filled);
+      const turn = applyTail ? applyTail.then(send) : send();
       const settled: Promise<unknown> = turn.catch(() => undefined);
       applyTail = settled;
       void settled.then(() => {
@@ -222,13 +250,13 @@ export function createSessionOrgClient(transport: SessionOrgTransport): SessionO
       const response = await turn;
       pending = pending.filter((b) => b.id !== batch.id);
       const refused = response.results.filter((r) => !r.ok).map((r) => r.error ?? "refused");
-      lastError = refused.length ? `refused: ${refused.join(", ")}` : null;
+      if (refused.length) noteError(`refused: ${refused.join(", ")}`);
       accept(response.snapshot);
       recompute();
       return response;
     } catch (e) {
       pending = pending.filter((b) => b.id !== batch.id);
-      lastError = `not applied: ${describeThrown(e, "session_org_apply failed")}`;
+      noteError(`not applied: ${describeThrown(e, "session_org_apply failed")}`);
       recompute();
       await refresh();
       throw e;
