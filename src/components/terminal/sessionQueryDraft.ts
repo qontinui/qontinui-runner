@@ -12,8 +12,8 @@
  * the DOM. A keystroke survived that (its later render caught up), but the UI
  * Bridge `type` / `clear` actions call `onChange` a second time after their
  * input event, read the restored old text, and wrote it back: the query never
- * changed (measured on a temp runner: `onChange "is:idle"` then
- * `onChange ""`, then renders `"is:idle"`, `""`).
+ * changed (the shape: `onChange "is:idle"`, then `onChange ""`, then renders
+ * `"is:idle"`, `""`).
  *
  * So the box renders a local draft — a cheap update in the box's own component,
  * the shape the palette and group-rename inputs already use — and forwards each
@@ -55,6 +55,14 @@ export function queryDraftReducer(state: QueryDraftState, event: QueryDraftEvent
   }
   const q = event.query;
   if (q === state.seen) return state;
+  if (q === state.draft) {
+    // The manager now shows exactly what the box shows: it has caught up with
+    // the box's latest edit, so nothing the box sent is still in flight. Any
+    // pending value left behind (typing a → ab → a leaves "ab") would
+    // otherwise later mistake an external change to that exact text for an
+    // echo.
+    return { ...state, pending: [], seen: q };
+  }
   const echo = state.pending.indexOf(q);
   if (echo >= 0) {
     // The box's own edit coming back: keep the draft, drop it and anything
