@@ -31,25 +31,41 @@
 //! reads `terminal_list`, so a surviving session is reconnected rather than
 //! cold-resumed a second time — is kept by a "settled" signal instead: the
 //! sweep settles once the census is in, every live pane's adoption has
-//! finished (a failed one ends its holder, see below), AND the dead panes
-//! are reaped — so the restore never sees a dead holder's still-running
-//! `claude` as live, refuses its resume, and then watches the sweep reap it
-//! (review round 2, N4). With no dead panes it settles right after the
-//! adoptions. The webview's restore first awaits [`wait_settled`] (the
-//! `terminal_holder_sweep_settled` command) for at most [`RESTORE_WAIT`]. A restore that stops waiting still cannot double-resume:
-//! an adoption that lands later is an ordinary `terminal-created` tab, and the
-//! frontend's live-process check (`fetchLiveClaudeSessionIds`, PID verified)
-//! refuses a resume of a session whose `claude` is alive.
+//! finished (one that failed definitively ended its holder; one that failed
+//! transiently is left alive for a background retry — see below), AND the
+//! dead panes are reaped (concurrently, under
+//! `qontinui_pty_holder::sweep::REAP_BUDGET`) — so the restore never sees a
+//! dead holder's still-running `claude` as live, refuses its resume, and then
+//! watches the sweep reap it (review round 2, N4). With no dead panes it
+//! settles right after the adoptions. The webview's restore first awaits
+//! [`wait_settled`] (the `terminal_holder_sweep_settled` command) for at most
+//! [`RESTORE_WAIT`], which is DERIVED from those steps' bounds (review round
+//! 3, R2). If it still stops waiting, it re-decides the sessions it refused as
+//! live once the sweep reports settled (`recheckRefusedAfterSweep` in the
+//! webview), and an adoption that lands later is an ordinary
+//! `terminal-created` tab.
 //!
-//! # A failed adoption
+//! # A failed adoption (review round 3, R1)
 //!
-//! A live holder that cannot be adopted would keep its `claude` running with
-//! no tab, and the restore would refuse to resume a session whose process is
-//! alive — invisible until the next start. So a failed adoption ENDS the
-//! holder through its verified lock (`terminate_verified_holder`, which checks
-//! the holder's start token), waits for its child to go, and logs it as an
-//! error; the restore then cold-resumes the session the normal way.
-//! Incompatible and unanswering (Unknown) holders are not adopted and not
+//! Preserving a live session is the point of the holder, so the sweep NEVER
+//! ends a live holder over a transient failure ([`adopt_with_retries`]):
+//!
+//! - the terminal id is already open or being built → skipped: another path
+//!   owns the pane;
+//! - a timeout, an IO error, a busy holder, a session that could not be built
+//!   → retried [`ATTACH_ATTEMPTS`] times with backoff; if it still fails, the
+//!   holder is LEFT ALIVE and handed to a background retry
+//!   ([`retry_in_background`]: every [`BACKGROUND_RETRY_EVERY`] for at most
+//!   [`BACKGROUND_RETRY_FOR`]) that adopts it — the same `terminal-created`
+//!   a normal adoption emits, so the tab appears — and stops when the holder
+//!   dies or the pane is opened by another path. Logged loudly;
+//! - ONLY a definitive failure — the holder speaks no protocol version this
+//!   runner drives, or finally refuses (`ConnectError::is_definitive`) — ends
+//!   the holder, through its verified lock (`terminate_verified_holder`,
+//!   which checks the holder's start token), waits for its child to go, and
+//!   logs it as an error; the restore then cold-resumes the session.
+//!
+//! Incompatible and unanswering (Unknown) panes are not adopted and not
 //! touched (D15; nothing proves an Unknown pane is ours to end).
 //!
 //! # Gate
@@ -70,16 +86,49 @@ use qontinui_pty_holder::terminate::terminate_verified_holder;
 use tauri::AppHandle;
 use tracing::{error, info, warn};
 
-use super::manager::TerminalManager;
+use super::manager::{AdoptError, TerminalManager};
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
 
 /// One deadline for classifying every pane (the census's handshakes run
 /// concurrently under it).
 pub const CENSUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The longest the webview's restore waits for the sweep to settle: the
-/// census plus one attach (`daemon_pane_io::ATTACH_DEADLINE`), with margin.
-pub const RESTORE_WAIT: Duration = Duration::from_secs(20);
+/// Attach attempts one adoption gets inside the sweep before it is handed to
+/// the background retry.
+pub const ATTACH_ATTEMPTS: usize = 3;
+
+/// The pauses between those attempts.
+pub const ATTACH_BACKOFF: [Duration; ATTACH_ATTEMPTS - 1] =
+    [Duration::from_secs(1), Duration::from_secs(2)];
+
+/// How often the background retry tries an adoption the sweep deferred.
+pub const BACKGROUND_RETRY_EVERY: Duration = Duration::from_secs(15);
+
+/// How long the background retry keeps trying.
+pub const BACKGROUND_RETRY_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// How long a definitively failed adoption waits for the holder it ended, and
+/// its child, to be gone.
+pub const FAILED_ADOPTION_END_WAIT: Duration = Duration::from_secs(5);
+
+/// Slack for scheduling and the lock and record reads around the steps.
+const SETTLE_MARGIN: Duration = Duration::from_secs(4);
+
+/// The longest the sweep takes to settle — and so the longest the webview's
+/// restore waits for it: the census, then one adoption's worst case (every
+/// attempt timing out, the backoffs between, and a definitive failure's end
+/// wait — adoptions run concurrently, so one is the bound), then the reaping
+/// step's own budget, plus margin. Derived, not chosen: a step that grows
+/// moves it (`pty_holder_boot_sweep_restore_wait_covers_every_step`).
+pub const RESTORE_WAIT: Duration = Duration::from_secs(
+    CENSUS_TIMEOUT.as_secs()
+        + super::daemon_pane_io::ATTACH_DEADLINE.as_secs() * ATTACH_ATTEMPTS as u64
+        + ATTACH_BACKOFF[0].as_secs()
+        + ATTACH_BACKOFF[1].as_secs()
+        + FAILED_ADOPTION_END_WAIT.as_secs()
+        + qontinui_pty_holder::sweep::REAP_BUDGET.as_secs()
+        + SETTLE_MARGIN.as_secs(),
+);
 
 /// Where the boot sweep is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,12 +313,8 @@ impl Drop for SettleOnDrop {
     }
 }
 
-/// How long a failed adoption waits for the holder it ended, and its child,
-/// to be gone.
-const FAILED_ADOPTION_END_WAIT: Duration = Duration::from_secs(5);
-
-/// End the holder of a pane whose adoption failed (see the module docs) and
-/// wait for it and its child to be gone.
+/// End the holder of a pane whose adoption failed DEFINITIVELY (see the
+/// module docs) and wait for it and its child to be gone.
 fn end_unadoptable_holder(pane_dir: &Path, adoption: &Adoption, why: &str) {
     let Ok(pane) = PaneId::new(&adoption.pane_id) else {
         return;
@@ -283,8 +328,8 @@ fn end_unadoptable_holder(pane_dir: &Path, adoption: &Adoption, why: &str) {
         why,
         signalled = t.signalled,
         detail = %t.detail,
-        "pty holder boot sweep: adoption FAILED — ending the holder so the session is \
-         cold-resumed instead of left running with no tab"
+        "pty holder boot sweep: adoption failed DEFINITIVELY — ending the holder so the \
+         session is cold-resumed instead of left running with no tab"
     );
     if !t.signalled {
         return;
@@ -294,10 +339,7 @@ fn end_unadoptable_holder(pane_dir: &Path, adoption: &Adoption, why: &str) {
         .as_ref()
         .and_then(|r| r.child_pid.zip(r.child_start.clone()));
     loop {
-        let holder_gone = !matches!(
-            qontinui_pty_holder::lock::PaneLock::try_acquire_existing(&lock_file),
-            Ok(qontinui_pty_holder::lock::TryLock::Held)
-        );
+        let holder_gone = holder_gone(pane_dir, adoption);
         let child_gone = child.as_ref().is_none_or(|(pid, token)| {
             !qontinui_pty_holder::proc_identity::is_same_process(*pid, Some(token))
         });
@@ -317,9 +359,171 @@ fn end_unadoptable_holder(pane_dir: &Path, adoption: &Adoption, why: &str) {
     }
 }
 
-/// Adopt `adoptions` concurrently; returns how many were adopted. Each is
-/// bounded by its attach (`daemon_pane_io::ATTACH_DEADLINE`); a failed one
-/// ends its holder ([`end_unadoptable_holder`]).
+/// Whether the holder an adoption is for is gone: its pane's lock is FREE (or
+/// the lock file is gone), or the lock's record no longer names a live holder
+/// with that pid.
+fn holder_gone(pane_dir: &Path, adoption: &Adoption) -> bool {
+    use qontinui_pty_holder::lock::{read_record, record_names_live_holder, PaneLock, TryLock};
+    let Ok(pane) = PaneId::new(&adoption.pane_id) else {
+        return true;
+    };
+    let lock_file = qontinui_pty_holder::pane::lock_path(pane_dir, &pane);
+    match PaneLock::try_acquire_existing(&lock_file) {
+        Ok(TryLock::Acquired(_)) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        // Held, or unreadable: gone only if the record says so.
+        _ => {
+            let record = read_record(&lock_file);
+            !(record
+                .as_ref()
+                .is_some_and(|r| r.holder_pid == adoption.holder_pid)
+                && record_names_live_holder(record.as_ref()))
+        }
+    }
+}
+
+/// How one adoption ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptOutcome {
+    Adopted,
+    /// Another path owns the pane (already open, or being built).
+    Skipped(String),
+    /// A definitive failure: the holder was ended.
+    Ended(String),
+    /// Transient failures only: the holder is alive, and the background
+    /// retry takes the pane.
+    Deferred(String),
+}
+
+/// One adoption, with the retry policy of the module docs: up to
+/// [`ATTACH_ATTEMPTS`] attempts, `pause(i)` between them; `end` only on a
+/// definitive failure. Generic over the door, so the policy is tested
+/// without a Tauri runtime.
+fn adopt_with_retries(
+    adopt: &dyn Fn() -> Result<(), AdoptError>,
+    end: &dyn Fn(&str),
+    pause: &dyn Fn(usize),
+) -> AdoptOutcome {
+    let mut last = String::new();
+    for attempt in 0..ATTACH_ATTEMPTS {
+        if attempt > 0 {
+            pause(attempt - 1);
+        }
+        match adopt() {
+            Ok(()) => return AdoptOutcome::Adopted,
+            Err(AdoptError::Claimed(why)) => return AdoptOutcome::Skipped(why),
+            Err(AdoptError::Attach(e)) if e.definitive => {
+                end(&e.reason);
+                return AdoptOutcome::Ended(e.reason);
+            }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    AdoptOutcome::Deferred(last)
+}
+
+/// The background retry of a deferred adoption: every `every`, for at most
+/// `for_`, try `adopt` — unless `stop()` says the pane is no longer this
+/// retry's to adopt (the holder died, or another path opened the pane). Ends
+/// the holder only on a definitive failure, as [`adopt_with_retries`].
+fn retry_in_background(
+    adopt: &dyn Fn() -> Result<(), AdoptError>,
+    end: &dyn Fn(&str),
+    stop: &dyn Fn() -> Option<String>,
+    every: Duration,
+    for_: Duration,
+) -> AdoptOutcome {
+    let until = Instant::now() + for_;
+    let mut last = String::from("the retry window ran out");
+    while Instant::now() + every <= until {
+        std::thread::sleep(every);
+        if let Some(why) = stop() {
+            return AdoptOutcome::Skipped(why);
+        }
+        match adopt() {
+            Ok(()) => return AdoptOutcome::Adopted,
+            Err(AdoptError::Claimed(why)) => return AdoptOutcome::Skipped(why),
+            Err(AdoptError::Attach(e)) if e.definitive => {
+                end(&e.reason);
+                return AdoptOutcome::Ended(e.reason);
+            }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    AdoptOutcome::Deferred(last)
+}
+
+/// The adoption door for `adoption`, as [`adopt_with_retries`] and
+/// [`retry_in_background`] call it.
+fn adopt_once(
+    manager: &TerminalManager,
+    app_handle: &AppHandle,
+    adoption: &Adoption,
+) -> Result<(), AdoptError> {
+    manager
+        .adopt_holder_pane(
+            &adoption.pane_id,
+            None,
+            adoption.page_id.clone(),
+            None,
+            app_handle.clone(),
+            adoption.pinned_session_id.clone(),
+        )
+        .map(|_| ())
+}
+
+/// Hand a deferred adoption to [`retry_in_background`] on a thread of its
+/// own: the sweep does not wait for it.
+fn spawn_background_retry(
+    manager: Arc<TerminalManager>,
+    app_handle: AppHandle,
+    pane_dir: std::path::PathBuf,
+    adoption: Adoption,
+) {
+    let name = format!("pty-holder-readopt-{}", adoption.pane_id);
+    let spawned = std::thread::Builder::new().name(name).spawn(move || {
+        let adopt = || adopt_once(&manager, &app_handle, &adoption);
+        let end = |why: &str| end_unadoptable_holder(&pane_dir, &adoption, why);
+        let stop = || {
+            if manager.get(&adoption.pane_id).is_some() {
+                Some("the pane was opened by another path".to_string())
+            } else if holder_gone(&pane_dir, &adoption) {
+                Some("the holder is gone".to_string())
+            } else {
+                None
+            }
+        };
+        let late = retry_in_background(
+            &adopt,
+            &end,
+            &stop,
+            BACKGROUND_RETRY_EVERY,
+            BACKGROUND_RETRY_FOR,
+        );
+        let level_error = matches!(late, AdoptOutcome::Deferred(_));
+        if level_error {
+            error!(
+                pane = %adoption.pane_id,
+                outcome = ?late,
+                "pty holder boot sweep: background adoption retry GAVE UP — the holder is left \
+                 running with no tab until the next start's sweep"
+            );
+        } else {
+            info!(
+                pane = %adoption.pane_id,
+                outcome = ?late,
+                "pty holder boot sweep: background adoption retry finished"
+            );
+        }
+    });
+    if let Err(e) = spawned {
+        error!(error = %e, "pty holder boot sweep: background adoption retry did not start");
+    }
+}
+
+/// Adopt `adoptions` concurrently; returns how many were adopted inside the
+/// sweep. Each follows [`adopt_with_retries`]; a deferred one is handed to
+/// [`spawn_background_retry`], which the sweep does not wait for.
 fn adopt_all(
     manager: &Arc<TerminalManager>,
     app_handle: &AppHandle,
@@ -340,23 +544,42 @@ fn adopt_all(
         let thread = std::thread::Builder::new()
             .name(format!("pty-holder-adopt-{}", adoption.pane_id))
             .spawn(move || {
-                match manager.adopt_holder_pane(
-                    &adoption.pane_id,
-                    None,
-                    adoption.page_id.clone(),
-                    None,
-                    app_handle,
-                    adoption.pinned_session_id.clone(),
-                ) {
-                    Ok(info) => {
-                        info!(pane = %info.id, "pty holder boot sweep: pane adopted into a terminal tab");
-                        true
+                let adopt = || adopt_once(&manager, &app_handle, &adoption);
+                let end = |why: &str| end_unadoptable_holder(&pane_dir, &adoption, why);
+                let outcome = adopt_with_retries(&adopt, &end, &|i| {
+                    std::thread::sleep(ATTACH_BACKOFF[i])
+                });
+                match &outcome {
+                    AdoptOutcome::Adopted => {
+                        info!(pane = %adoption.pane_id, "pty holder boot sweep: pane adopted into a terminal tab")
                     }
-                    Err(e) => {
-                        end_unadoptable_holder(&pane_dir, &adoption, &e);
-                        false
+                    AdoptOutcome::Skipped(why) => info!(
+                        pane = %adoption.pane_id,
+                        why = %why,
+                        "pty holder boot sweep: pane not adopted — another path owns it"
+                    ),
+                    AdoptOutcome::Ended(_) => {}
+                    AdoptOutcome::Deferred(why) => {
+                        error!(
+                            pane = %adoption.pane_id,
+                            holder_pid = adoption.holder_pid,
+                            why = %why,
+                            "pty holder boot sweep: could not adopt a LIVE holder after {} \
+                             attempts — it is left running, and retried in the background \
+                             every {}s for up to {}s",
+                            ATTACH_ATTEMPTS,
+                            BACKGROUND_RETRY_EVERY.as_secs(),
+                            BACKGROUND_RETRY_FOR.as_secs()
+                        );
+                        spawn_background_retry(
+                            manager.clone(),
+                            app_handle.clone(),
+                            pane_dir.clone(),
+                            adoption.clone(),
+                        );
                     }
                 }
+                outcome == AdoptOutcome::Adopted
             });
         match thread {
             Ok(t) => threads.push(t),
@@ -572,5 +795,138 @@ mod tests {
         sweep_then_settle(&dir, &[], |_| 0, || *settled_early.lock().unwrap() = true).unwrap();
         assert!(*settled_early.lock().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn transient() -> AdoptError {
+        AdoptError::Attach(super::super::daemon_pane_io::AttachError {
+            reason: "attach timed out".into(),
+            definitive: false,
+        })
+    }
+
+    fn definitive() -> AdoptError {
+        AdoptError::Attach(super::super::daemon_pane_io::AttachError {
+            reason: "no common protocol version".into(),
+            definitive: true,
+        })
+    }
+
+    /// Review round 3, R1: a claim refusal skips — another path owns the
+    /// pane — and never ends the holder.
+    #[test]
+    fn pty_holder_boot_sweep_claim_refusal_leaves_the_holder_alive() {
+        use std::cell::Cell;
+        let (tries, ends) = (Cell::new(0), Cell::new(0));
+        let outcome = adopt_with_retries(
+            &|| {
+                tries.set(tries.get() + 1);
+                Err(AdoptError::Claimed("already open".into()))
+            },
+            &|_| ends.set(ends.get() + 1),
+            &|_| {},
+        );
+        assert_eq!(outcome, AdoptOutcome::Skipped("already open".into()));
+        assert_eq!((tries.get(), ends.get()), (1, 0));
+    }
+
+    /// R1: transient failures are retried, then DEFERRED with the holder
+    /// alive; the background retry then adopts it.
+    #[test]
+    fn pty_holder_boot_sweep_transient_failure_leaves_the_holder_alive_and_retry_adopts() {
+        use std::cell::Cell;
+        let (tries, ends, pauses) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let outcome = adopt_with_retries(
+            &|| {
+                tries.set(tries.get() + 1);
+                Err(transient())
+            },
+            &|_| ends.set(ends.get() + 1),
+            &|_| pauses.set(pauses.get() + 1),
+        );
+        assert!(matches!(outcome, AdoptOutcome::Deferred(_)), "{outcome:?}");
+        assert_eq!(tries.get(), ATTACH_ATTEMPTS);
+        assert_eq!(pauses.get(), ATTACH_ATTEMPTS - 1);
+        assert_eq!(
+            ends.get(),
+            0,
+            "a transient failure never ends a live holder"
+        );
+
+        // The background retry: one more transient failure, then success.
+        let late_tries = Cell::new(0);
+        let late = retry_in_background(
+            &|| {
+                late_tries.set(late_tries.get() + 1);
+                if late_tries.get() < 2 {
+                    Err(transient())
+                } else {
+                    Ok(())
+                }
+            },
+            &|_| ends.set(ends.get() + 1),
+            &|| None,
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        );
+        assert_eq!(late, AdoptOutcome::Adopted);
+        assert_eq!(ends.get(), 0);
+
+        // It stops — touching nothing — once the pane is no longer its to adopt.
+        let stopped = retry_in_background(
+            &|| panic!("must not adopt after stop"),
+            &|_| panic!("must not end after stop"),
+            &|| Some("the holder is gone".into()),
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        );
+        assert_eq!(stopped, AdoptOutcome::Skipped("the holder is gone".into()));
+    }
+
+    /// R1: only a definitive failure ends the holder — once.
+    #[test]
+    fn pty_holder_boot_sweep_definitive_failure_ends_the_holder() {
+        use std::cell::Cell;
+        let ends = Cell::new(0);
+        let outcome = adopt_with_retries(
+            &|| Err(definitive()),
+            &|_| ends.set(ends.get() + 1),
+            &|_| {},
+        );
+        assert!(matches!(outcome, AdoptOutcome::Ended(_)), "{outcome:?}");
+        assert_eq!(ends.get(), 1);
+        // After a transient one, too.
+        let tries = Cell::new(0);
+        let outcome = adopt_with_retries(
+            &|| {
+                tries.set(tries.get() + 1);
+                if tries.get() == 1 {
+                    Err(transient())
+                } else {
+                    Err(definitive())
+                }
+            },
+            &|_| ends.set(ends.get() + 1),
+            &|_| {},
+        );
+        assert!(matches!(outcome, AdoptOutcome::Ended(_)));
+        assert_eq!(ends.get(), 2);
+    }
+
+    /// Review round 3, R2: the restore's wait covers every step the sweep
+    /// takes before it settles — pinned to the constants, not chosen.
+    #[test]
+    fn pty_holder_boot_sweep_restore_wait_covers_every_step() {
+        let adoption_worst = super::super::daemon_pane_io::ATTACH_DEADLINE * ATTACH_ATTEMPTS as u32
+            + ATTACH_BACKOFF.iter().sum::<Duration>()
+            + FAILED_ADOPTION_END_WAIT;
+        let steps = CENSUS_TIMEOUT
+            + adoption_worst
+            + qontinui_pty_holder::sweep::REAP_BUDGET
+            + SETTLE_MARGIN;
+        assert_eq!(RESTORE_WAIT, steps);
+        assert!(
+            RESTORE_WAIT
+                > CENSUS_TIMEOUT + adoption_worst + qontinui_pty_holder::sweep::REAP_BUDGET
+        );
     }
 }

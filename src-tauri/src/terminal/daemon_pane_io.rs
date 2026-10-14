@@ -102,8 +102,7 @@ use qontinui_pty_holder::frame::SyntheticPart;
 use qontinui_pty_holder::protocol::{ExitReply, Reply, Request, RestoreMeta};
 use qontinui_pty_holder::terminate::{terminate_verified_holder, Termination};
 use qontinui_runner_lib::pty_holder::spawn::{
-    pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, SpawnError, Unprotected,
-    NEW_TAB_SPAWN_BUDGET,
+    pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, Unprotected, NEW_TAB_SPAWN_BUDGET,
 };
 use tracing::{debug, info, warn};
 
@@ -116,9 +115,9 @@ use crate::settings::TerminalSettings;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolderPaneError {
     pub reason: String,
-    /// A holder for this pane is (or may be) still LIVE: it could be neither
-    /// held nor ended (`SpawnError::LiveHolderUnreachable`). The caller must
-    /// not fall back to an in-process PTY.
+    /// A holder for this pane is (or may be) still LIVE, or already RAN the
+    /// pane's command (`SpawnError::forbids_fallback`). The caller must not
+    /// fall back to an in-process PTY: the command would run twice.
     pub live_holder_left: bool,
 }
 
@@ -134,6 +133,39 @@ impl From<String> for HolderPaneError {
 impl std::fmt::Display for HolderPaneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.reason)
+    }
+}
+
+/// Why an attach to a holder produced no pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachError {
+    pub reason: String,
+    /// The holder can NEVER be driven by this runner (no common protocol
+    /// version, or a final refusal: `ConnectError::is_definitive`). Anything
+    /// else — a timeout, an IO error, a busy holder — may clear on a retry,
+    /// and must never be the reason a live session is ended (review round 3,
+    /// R1).
+    pub definitive: bool,
+}
+
+impl AttachError {
+    fn transient(reason: String) -> Self {
+        AttachError {
+            reason,
+            definitive: false,
+        }
+    }
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl From<AttachError> for HolderPaneError {
+    fn from(e: AttachError) -> Self {
+        HolderPaneError::from(e.reason)
     }
 }
 
@@ -1042,7 +1074,7 @@ impl DaemonPaneIo {
         let spec = cmd.to_holder_spec(cols, rows);
         let spawned = spawn_pane_holder(holder_exe, pane_dir, pane_id, &spec).map_err(|e| {
             HolderPaneError {
-                live_holder_left: matches!(e, SpawnError::LiveHolderUnreachable(_)),
+                live_holder_left: e.forbids_fallback(),
                 reason: format!("PTY holder spawn failed: {e}"),
             }
         })?;
@@ -1086,7 +1118,7 @@ impl DaemonPaneIo {
         pane_dir: &Path,
         pane_id: &PaneId,
         unprotected: Option<Unprotected>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, AttachError> {
         Self::attach(
             pane_dir,
             pane_id,
@@ -1116,7 +1148,7 @@ impl DaemonPaneIo {
         pane_id: &PaneId,
         from_offset: Option<u64>,
         size: Option<(u16, u16)>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, AttachError> {
         let restore = match size {
             Some((cols, rows)) => RestoreAt::Fitted(cols, rows),
             None => RestoreAt::PtySize,
@@ -1133,14 +1165,17 @@ impl DaemonPaneIo {
         from_offset: Option<u64>,
         unprotected: Option<Unprotected>,
         restore_at: Option<RestoreAt>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, AttachError> {
         let deadline = Instant::now() + ATTACH_DEADLINE;
         let stream = connect(pane_dir, pane_id, deadline)
             .and_then(|c| match restore_at {
                 Some(_) => c.attach_restoring(from_offset, deadline),
                 None => c.attach(from_offset, deadline),
             })
-            .map_err(|e| format!("PTY holder {pane_id}: attach failed: {e}"))?;
+            .map_err(|e| AttachError {
+                definitive: e.is_definitive(),
+                reason: format!("PTY holder {pane_id}: attach failed: {e}"),
+            })?;
         let info = stream.info.clone();
         if restore_at.is_some() && info.restore.is_none() {
             // An older holder (protocol < 3): the tail is replayed bare, so a
@@ -1198,7 +1233,11 @@ impl DaemonPaneIo {
             std::thread::Builder::new()
                 .name(format!("pty-holder-ctl-{key}"))
                 .spawn(move || control.run(link.as_ref(), &out, &key))
-                .map_err(|e| format!("Failed to spawn pty holder control thread: {e}"))?;
+                .map_err(|e| {
+                    AttachError::transient(format!(
+                        "Failed to spawn pty holder control thread: {e}"
+                    ))
+                })?;
         }
         let ctx = PumpCtx {
             pane_dir: pane_dir.to_path_buf(),
@@ -1220,7 +1259,9 @@ impl DaemonPaneIo {
             .spawn(move || ctx.pump(stream.reader))
         {
             control.close();
-            return Err(format!("Failed to spawn pty holder pump thread: {e}"));
+            return Err(AttachError::transient(format!(
+                "Failed to spawn pty holder pump thread: {e}"
+            )));
         }
         if restore_at.is_some() {
             control.nudge(cols.load(Ordering::Relaxed), rows.load(Ordering::Relaxed));
@@ -1342,9 +1383,9 @@ pub fn reattach_holder_pane(
     terminal_id: &str,
     from_offset: Option<u64>,
     size: Option<(u16, u16)>,
-) -> Result<DaemonPaneIo, String> {
-    let pane_dir = runner_pane_dir()?;
-    let pane_id = PaneId::new(terminal_id).map_err(|e| e.to_string())?;
+) -> Result<DaemonPaneIo, AttachError> {
+    let pane_dir = runner_pane_dir().map_err(AttachError::transient)?;
+    let pane_id = PaneId::new(terminal_id).map_err(|e| AttachError::transient(e.to_string()))?;
     off_the_async_workers(|| DaemonPaneIo::attach_existing(&pane_dir, &pane_id, from_offset, size))
 }
 
