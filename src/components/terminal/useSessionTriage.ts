@@ -22,10 +22,8 @@ import {
   type BulkOutcome,
   type OrgBulkAction,
 } from "./sessionBulkActions";
-import type { SessionPageFact } from "./sessionFacts";
 import { readyToClose, readyToCloseBanner } from "./sessionReadyToClose";
 import { isInjectedSession } from "./syntheticTabs";
-import { useSessionFacts, type SessionFactsRowInput } from "./useSessionFacts";
 import type { CloseRequest } from "./useSessionPanelOrg";
 import type { UnifiedSession, UseSessionManagerReturn } from "./useSessionManager";
 
@@ -34,8 +32,6 @@ export interface SessionTriageDeps {
   /** The selected row ids. */
   selectedIds: ReadonlySet<string>;
   clearSelection: () => void;
-  /** This page, for the facts' `page:` (a row with a tab here is on it). */
-  currentPage: SessionPageFact;
   pageName: (pageId: string) => string;
   requestCloseRows: (request: CloseRequest) => void;
 }
@@ -50,19 +46,18 @@ export function useSessionTriage({
   manager,
   selectedIds,
   clearSelection,
-  currentPage,
   pageName,
   requestCloseRows,
 }: SessionTriageDeps) {
   const {
     allSessions,
-    org,
     sessionKeyOf,
     closableTabId,
     applyOrgChecked,
     moveSessionsToPage,
     resumeSession,
     refresh,
+    factsById: facts,
   } = manager;
 
   const selectedRows = useMemo(
@@ -126,7 +121,7 @@ export function useSessionTriage({
             reason: "marked finished from the Session Manager",
           }),
         );
-        // The rows' Finished word comes from the marker store; re-read it.
+        // The rows' Finished word comes from the session-info listing; re-read it.
         refresh();
         return results;
       }),
@@ -175,21 +170,7 @@ export function useSessionTriage({
 
   // ── Ready to close (`is:closable`) ───────────────────────────────────────
 
-  const factsRows = useMemo(
-    (): SessionFactsRowInput[] =>
-      allSessions.map((row) => {
-        const sessionKey = sessionKeyOf(row);
-        return {
-          row,
-          sessionKey,
-          claudeSessionId: claudeIdOf(row, sessionKey),
-          page: closableTabId(row) !== null ? currentPage : null,
-        };
-      }),
-    [allSessions, sessionKeyOf, closableTabId, currentPage],
-  );
-  const { facts } = useSessionFacts({ rows: factsRows, org });
-
+  // The manager's facts — the same listing the Live list is filtered by.
   const ready = useMemo(
     () =>
       readyToClose(

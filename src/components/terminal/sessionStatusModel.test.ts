@@ -18,7 +18,6 @@ import {
   classifySession,
   countUnidentified,
   nextWithActivity,
-  parseActivityFilter,
   type DigestInput,
   type SessionActivity,
   type SessionLocation,
@@ -283,13 +282,6 @@ describe("labels", () => {
   it("Needs you sorts first", () => {
     const min = Math.min(...SESSION_ACTIVITIES.map((a) => ACTIVITY_PRIORITY[a]));
     expect(ACTIVITY_PRIORITY["needs-you"]).toBe(min);
-  });
-
-  it("a filter persisted under the retired enum reads as all", () => {
-    expect(parseActivityFilter("frozen")).toBe("all");
-    expect(parseActivityFilter("active-in-zone")).toBe("all");
-    expect(parseActivityFilter(null)).toBe("all");
-    expect(parseActivityFilter("needs-you")).toBe("needs-you");
   });
 });
 

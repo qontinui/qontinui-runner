@@ -5,6 +5,7 @@ import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
+import { SessionSearchPaletteHost } from "./SessionSearchPaletteHost";
 import type { PastSession } from "./usePastSessions";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
@@ -1595,6 +1596,15 @@ function TerminalPageInner({
         {remoteCloseNotice && (
           <RemoteCloseNotice notice={remoteCloseNotice} onDismiss={dismissRemoteCloseNotice} />
         )}
+
+        {/* The session search palette (Ctrl+Shift+Space, /sessions.find) —
+            mounted with the page, so it works while the panel is hidden. */}
+        <SessionSearchPaletteHost
+          manager={sessionManager}
+          zoneLayout={zoneLayout}
+          onResumePastSession={handleResumePastSession}
+          notify={(message, type) => workflowGen.setNotification({ message, type })}
+        />
 
         <div className="flex-1 flex flex-row overflow-hidden">
           {workflowGen.showSidebar && (
