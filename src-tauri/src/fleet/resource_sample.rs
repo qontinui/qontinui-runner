@@ -910,80 +910,75 @@ fn sample_cpu_busy_permille() -> Option<i32> {
     advance_cpu_busy(&mut slot, cur)
 }
 
-/// Plausible CPU package temperature range, degrees Celsius. A stuck sensor
-/// reporting 0 or 255000 millidegrees must not become a datum.
-const CPU_TEMP_MIN_C: f64 = -20.0;
-const CPU_TEMP_MAX_C: f64 = 150.0;
+/// Accepted RAW sysfs range, millidegrees Celsius: `1..=150000`, i.e. a
+/// converted `0.001..=150` C. Raw `0` is rejected on purpose (a stuck or
+/// unavailable sensor reads 0, and "0 C" must never become a datum), and so is
+/// any negative raw value (a driver error sentinel such as `-1`). This is the
+/// unified collector rule mirrored by the supervisor follow-up.
+const CPU_TEMP_RAW_MIN_MILLI: i64 = 1;
+const CPU_TEMP_RAW_MAX_MILLI: i64 = 150_000;
 
 /// Parse one sysfs temperature file body (millidegrees Celsius) into Celsius.
-/// `None` on empty or non-numeric text, on a NEGATIVE raw value, or on a
-/// converted value outside [`CPU_TEMP_MIN_C`]..=[`CPU_TEMP_MAX_C`]. The
-/// `-20..150` range applies to the CONVERTED Celsius value; a negative raw
-/// sysfs value (e.g. `-1`) is a driver error sentinel, not a reading, and is
-/// rejected as an error before conversion. `/1000` is applied exactly once,
-/// here, so the wire is always Celsius.
+/// `None` on empty or non-numeric text or a raw value outside
+/// [`CPU_TEMP_RAW_MIN_MILLI`]..=[`CPU_TEMP_RAW_MAX_MILLI`]. `/1000` is applied
+/// exactly once, here, so the wire is always Celsius.
 fn parse_millidegrees_c(text: &str) -> Option<f64> {
     let milli: i64 = text.trim().parse().ok()?;
-    if milli < 0 {
-        return None;
-    }
-    let c = milli as f64 / 1000.0;
-    (CPU_TEMP_MIN_C..=CPU_TEMP_MAX_C).contains(&c).then_some(c)
+    (CPU_TEMP_RAW_MIN_MILLI..=CPU_TEMP_RAW_MAX_MILLI)
+        .contains(&milli)
+        .then(|| milli as f64 / 1000.0)
 }
 
 /// Read the CPU package temperature from a sysfs tree rooted at `sys_root`
 /// (`/sys` in production; a fake tree in tests).
 ///
-/// 1. `class/thermal/thermal_zone*/type` == `x86_pkg_temp` -> that zone's
-///    `temp`.
-/// 2. Fallback: the hottest valid `temp*_input` of the `class/hwmon/hwmon*`
-///    whose `name` is `coretemp`.
+/// 1. The MAX valid `temp` over ALL `class/thermal/thermal_zone*` whose `type`
+///    is exactly `x86_pkg_temp` (independent of directory order).
+/// 2. If no such zone yields a valid value: the MAX valid `temp*_input` over
+///    ALL `class/hwmon/hwmon*` whose `name` is exactly `coretemp`.
 ///
-/// Any I/O or parse failure yields `None` (UNKNOWN, never zero).
+/// A directory or file that cannot be read or parsed is skipped, never
+/// escalated: it contributes nothing, and the remaining readings still count.
+/// `None` only when nothing valid was found (UNKNOWN, never zero).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn read_cpu_package_temp_c(sys_root: &std::path::Path) -> Option<f64> {
     fn read(p: std::path::PathBuf) -> Option<String> {
         std::fs::read_to_string(p).ok()
     }
+    fn max_of(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, None) => x,
+            (None, y) => y,
+        }
+    }
+    // An unreadable directory yields no entries rather than an error.
     fn entries(dir: std::path::PathBuf, prefix: &str) -> Vec<std::path::PathBuf> {
-        let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
             .map(|e| e.path())
-            .collect();
-        v.sort();
-        v
+            .collect()
     }
 
-    for zone in entries(sys_root.join("class/thermal"), "thermal_zone") {
-        if read(zone.join("type")).is_some_and(|t| t.trim() == "x86_pkg_temp") {
-            if let Some(c) = read(zone.join("temp")).and_then(|t| parse_millidegrees_c(&t)) {
-                return Some(c);
-            }
-        }
+    let zones = entries(sys_root.join("class/thermal"), "thermal_zone")
+        .into_iter()
+        .filter(|z| read(z.join("type")).is_some_and(|t| t.trim() == "x86_pkg_temp"))
+        .filter_map(|z| read(z.join("temp")).and_then(|t| parse_millidegrees_c(&t)))
+        .fold(None, |m, c| max_of(m, Some(c)));
+    if zones.is_some() {
+        return zones;
     }
 
-    for hw in entries(sys_root.join("class/hwmon"), "hwmon") {
-        if read(hw.join("name")).is_none_or(|n| n.trim() != "coretemp") {
-            continue;
-        }
-        let max = std::fs::read_dir(&hw)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| {
-                let n = e.file_name().to_string_lossy().into_owned();
-                n.starts_with("temp") && n.ends_with("_input")
-            })
-            .filter_map(|e| read(e.path()).and_then(|t| parse_millidegrees_c(&t)))
-            .fold(None::<f64>, |m, c| Some(m.map_or(c, |m| m.max(c))));
-        if max.is_some() {
-            return max;
-        }
-    }
-    None
+    entries(sys_root.join("class/hwmon"), "hwmon")
+        .into_iter()
+        .filter(|h| read(h.join("name")).is_some_and(|n| n.trim() == "coretemp"))
+        .flat_map(|h| entries(h, "temp"))
+        .filter(|p| p.to_string_lossy().ends_with("_input"))
+        .filter_map(|p| read(p).and_then(|t| parse_millidegrees_c(&t)))
+        .fold(None, |m, c| max_of(m, Some(c)))
 }
 
 /// Collect the `host` lane. Blocking (sysinfo refresh + a disk enumeration), so
@@ -1877,6 +1872,10 @@ mod tests {
         assert_eq!(parse_millidegrees_c(""), None);
         assert_eq!(parse_millidegrees_c("abc"), None);
         assert_eq!(parse_millidegrees_c("-1"), None);
+        assert_eq!(parse_millidegrees_c("0"), None);
+        assert_eq!(parse_millidegrees_c("1"), Some(0.001));
+        assert_eq!(parse_millidegrees_c("150000"), Some(150.0));
+        assert_eq!(parse_millidegrees_c("150001"), None);
         assert_eq!(parse_millidegrees_c("255000"), None);
     }
 
@@ -1921,6 +1920,61 @@ mod tests {
         put(&r, "class/thermal/thermal_zone0/temp", "abc");
         assert_eq!(read_cpu_package_temp_c(&r), None);
         assert_eq!(read_cpu_package_temp_c(&r.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn cpu_temp_takes_max_over_all_pkg_zones_regardless_of_order() {
+        for (first, second) in [("60000", "75000"), ("75000", "60000")] {
+            let r = fake_sys("twozones");
+            put(&r, "class/thermal/thermal_zone0/type", "x86_pkg_temp\n");
+            put(&r, "class/thermal/thermal_zone0/temp", first);
+            put(&r, "class/thermal/thermal_zone1/type", "x86_pkg_temp\n");
+            put(&r, "class/thermal/thermal_zone1/temp", second);
+            put(&r, "class/thermal/thermal_zone2/type", "x86_pkg_temp\n");
+            put(&r, "class/thermal/thermal_zone2/temp", "0\n");
+            assert_eq!(read_cpu_package_temp_c(&r), Some(75.0));
+            let _ = std::fs::remove_dir_all(&r);
+        }
+    }
+
+    #[test]
+    fn cpu_temp_falls_back_to_max_across_all_coretemp_hwmons() {
+        let r = fake_sys("twohw");
+        put(&r, "class/thermal/thermal_zone0/type", "x86_pkg_temp\n");
+        put(&r, "class/thermal/thermal_zone0/temp", "0\n");
+        put(&r, "class/hwmon/hwmon1/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon1/temp1_input", "58000\n");
+        put(&r, "class/hwmon/hwmon2/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon2/temp1_input", "66500\n");
+        put(&r, "class/hwmon/hwmon2/temp2_input", "-1\n");
+        put(&r, "class/hwmon/hwmon3/name", "coretemp_other\n");
+        put(&r, "class/hwmon/hwmon3/temp1_input", "99000\n");
+        assert_eq!(read_cpu_package_temp_c(&r), Some(66.5));
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn cpu_temp_unreadable_entry_does_not_discard_a_valid_reading() {
+        let r = fake_sys("unreadable");
+        // A zone whose `temp` is a DIRECTORY (read fails) and one whose
+        // `type` file is missing, beside a valid zone.
+        std::fs::create_dir_all(r.join("class/thermal/thermal_zone0/temp")).unwrap();
+        put(&r, "class/thermal/thermal_zone0/type", "x86_pkg_temp\n");
+        std::fs::create_dir_all(r.join("class/thermal/thermal_zone1")).unwrap();
+        put(&r, "class/thermal/thermal_zone2/type", "x86_pkg_temp\n");
+        put(&r, "class/thermal/thermal_zone2/temp", "64000\n");
+        // hwmon: an unreadable hwmon dir name entry beside a valid one.
+        std::fs::create_dir_all(r.join("class/hwmon/hwmon0/name")).unwrap();
+        assert_eq!(read_cpu_package_temp_c(&r), Some(64.0));
+        let _ = std::fs::remove_dir_all(&r);
+
+        let r = fake_sys("unreadable-hw");
+        std::fs::create_dir_all(r.join("class/hwmon/hwmon0/name")).unwrap();
+        put(&r, "class/hwmon/hwmon1/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon1/temp1_input", "51000\n");
+        std::fs::create_dir_all(r.join("class/hwmon/hwmon1/temp2_input")).unwrap();
+        assert_eq!(read_cpu_package_temp_c(&r), Some(51.0));
         let _ = std::fs::remove_dir_all(&r);
     }
 
