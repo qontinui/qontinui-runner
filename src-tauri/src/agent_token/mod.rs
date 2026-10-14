@@ -269,6 +269,30 @@ impl RefreshOutcome {
     }
 }
 
+/// Header coord's `POST /agents/:id/refresh-token` reads the device-proof
+/// re-anchor from (qontinui-coord `tokens::DEVICE_PROOF_HEADER`).
+pub const DEVICE_PROOF_HEADER: &str = "x-coord-device-proof";
+
+/// The paired device JWT to present as a re-anchor proof, when one is held.
+/// The DEFAULT binding's credential: the proof is about the device, which is
+/// the same whichever tenant the bearer was minted for.
+fn device_proof() -> Option<String> {
+    crate::auth::device_bearer().filter(|t| !t.trim().is_empty())
+}
+
+/// Attach [`DEVICE_PROOF_HEADER`] when a proof is held; leave the request
+/// untouched otherwise. Split out so the header is testable without a
+/// keychain.
+fn attach_device_proof(
+    req: reqwest::RequestBuilder,
+    proof: Option<String>,
+) -> reqwest::RequestBuilder {
+    match proof {
+        Some(p) => req.header(DEVICE_PROOF_HEADER, p),
+        None => req,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RefreshResponseBody {
     token: String,
@@ -341,12 +365,15 @@ pub async fn maybe_refresh(
     // coord-auth-exempt(agent-jwt): presents the PER-AGENT coord JWT being
     // refreshed, not the device JWT. Coord's refresh route authenticates the
     // token against itself; the device credential would be rejected.
-    let resp = match agent_http::client()
-        .post(&url)
-        .bearer_auth(&current)
-        .send()
-        .await
-    {
+    let req = agent_http::client().post(&url).bearer_auth(&current);
+    // Coord bounds an agent-token lineage (plan
+    // `2026-10-14-agent-token-refresh-renews-without-bound`): past
+    // `AGENT_TOKEN_MAX_LINEAGE_SECS` a refresh is refused unless it also
+    // proves this runner still holds the agent's DEVICE. The paired device JWT
+    // is that proof, so a session that outlives the bound keeps refreshing.
+    // Coord ignores a proof that does not verify (and a coord predating the
+    // bound ignores the header), so attaching it is never what fails a refresh.
+    let resp = match attach_device_proof(req, device_proof()).send().await {
         Ok(r) => r,
         Err(e) => {
             let streak = token.write().await.record_transient_failure(now);
@@ -416,6 +443,28 @@ fn log_transient(who: &str, agent_id: Uuid, streak: u32, what: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_attaches_device_proof_header_only_when_held() {
+        let client = reqwest::Client::new();
+        let with = attach_device_proof(
+            client.post("http://127.0.0.1:1/agents/x/refresh-token"),
+            Some("device.jwt.value".to_string()),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            with.headers().get(DEVICE_PROOF_HEADER).unwrap(),
+            "device.jwt.value"
+        );
+        let without = attach_device_proof(
+            client.post("http://127.0.0.1:1/agents/x/refresh-token"),
+            None,
+        )
+        .build()
+        .unwrap();
+        assert!(without.headers().get(DEVICE_PROOF_HEADER).is_none());
+    }
 
     const NOW: i64 = 1_700_000_000;
 
