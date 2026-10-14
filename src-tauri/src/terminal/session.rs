@@ -1640,14 +1640,14 @@ impl TerminalSession {
         )?;
 
         // The pane's backend: in-process `LocalPty`, or — behind
-        // `terminal.pty_holder`, default OFF — an out-of-process PTY holder
+        // `terminal.pty_holder`, default ON since Phase 5 — an out-of-process PTY holder
         // (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
         // Phase 2). Read once per spawn. A local PTY is opened HERE, before the
         // environment is assembled, so an `openpty` failure leaves none of
         // that side-effecting work behind; a holder pane has no PTY in this
         // process to open.
         //
-        // Cost on the OFF path (review round 2, N10): `get_terminal_settings`
+        // Cost of the read (review round 2, N10): `get_terminal_settings`
         // is `read_settings_from_disk`, the mtime-keyed in-process settings
         // cache — one `stat` and a clone on a hit, no file read or parse. That
         // is the same per-spawn price this function already pays for
