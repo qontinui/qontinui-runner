@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { autonomousResumeDetector, subscribeCoordDrainState } from "@/hooks/useCoordDrainState";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
 import type { TerminalRefsMap } from "./writeWhenReady";
@@ -165,6 +166,35 @@ export async function recheckRefusedAfterSweep(
   if (!settled) return [...heldBack];
   const live = refused.length > 0 ? await liveIds() : null;
   return [...heldBack, ...refused.filter((id) => decideColdResume(live, id) === "respawn")];
+}
+
+/** The runner's event for a session handed back to the restore (Rust: `HOLDER_SESSION_RELEASED_EVENT`). */
+export const HOLDER_SESSION_RELEASED_EVENT = "pty-holder-session-released";
+
+/** Its payload. */
+export interface HolderSessionReleased {
+  sessionId: string;
+  terminalId: string;
+  pageId: string | null;
+}
+
+/**
+ * A holder whose adoption the runner was still retrying DIED (review round 6,
+ * T1). The restore had refused its session's resume while that holder's
+ * `claude` was alive, and nothing else would re-decide it: re-decide it now
+ * — the same recheck a late sweep settle runs — and `schedule` a re-run of
+ * the restore for its page when it is resumable. Returns whether one was
+ * scheduled. Exported for tests.
+ */
+export async function onHolderSessionReleased(
+  payload: HolderSessionReleased,
+  schedule: (pageId: string, sessionIds: string[]) => void,
+  liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+): Promise<boolean> {
+  const resumable = await recheckRefusedAfterSweep([payload.sessionId], liveIds);
+  if (resumable.length === 0) return false;
+  schedule(payload.pageId ?? "default", resumable);
+  return true;
 }
 
 /** The restore set for a page, or the coord device drain's deferral of it. */
@@ -1064,6 +1094,35 @@ export function useTerminalInitialization({
   // `recheckRefusedAfterSweep`), per page. A re-run triggered for them (the
   // same epoch bump as a drain re-run) restores exactly these records.
   const holderSweepRecheck = useRef<Map<string, Set<string>>>(new Map());
+  // Re-run the restore of `forPage` (merging, like a drain re-run) for
+  // exactly `sessionIds` — after a late sweep settle, or a session a dead
+  // holder handed back. The active page re-runs now; another page when it is
+  // next activated.
+  const scheduleRecheckRerun = useCallback((forPage: string, sessionIds: string[]) => {
+    const merged = holderSweepRecheck.current.get(forPage) ?? new Set<string>();
+    for (const id of sessionIds) merged.add(id);
+    holderSweepRecheck.current.set(forPage, merged);
+    drainDeferredPages.current.add(forPage);
+    didInitPages.current.delete(forPage);
+    setDrainResumeEpoch((n) => n + 1);
+  }, []);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<HolderSessionReleased>(HOLDER_SESSION_RELEASED_EVENT, (event) => {
+      console.warn(
+        `[TerminalPage] a PTY holder died before adoption; re-deciding session ${event.payload.sessionId}`,
+      );
+      void onHolderSessionReleased(event.payload, scheduleRecheckRerun);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [scheduleRecheckRerun]);
   useEffect(
     () =>
       subscribeCoordDrainState(
@@ -1671,10 +1730,7 @@ export function useTerminalInitialization({
               `[TerminalPage] the holder sweep settled late; resuming ${resumable.length} ` +
                 `session(s) it had kept from a cold resume`,
             );
-            holderSweepRecheck.current.set(initPageId, new Set(resumable));
-            drainDeferredPages.current.add(initPageId);
-            didInitPages.current.delete(initPageId);
-            setDrainResumeEpoch((n) => n + 1);
+            scheduleRecheckRerun(initPageId, resumable);
           });
         }
       }
@@ -1682,6 +1738,7 @@ export function useTerminalInitialization({
   }, [
     pageId,
     drainResumeEpoch,
+    scheduleRecheckRerun,
     reconnectToExistingSessions,
     createTerminal,
     adoptWorkerTab,
