@@ -23,7 +23,9 @@ use tracing::{debug, error, info};
 ///
 /// The rest of this module stays bin-side: it reaches into `crate::mcp::types`
 /// and `crate::session`, neither of which is in the lib.
-pub use qontinui_runner_lib::instance_env::{instance_name, is_secondary};
+pub use qontinui_runner_lib::instance_env::{
+    instance_name, instance_root, is_secondary, shares_primary_settings,
+};
 
 /// True iff this runner is the canonical instance — the one allowed to own
 /// SHARED, machine-wide state that is not path-isolated per instance.
@@ -36,8 +38,9 @@ pub use qontinui_runner_lib::instance_env::{instance_name, is_secondary};
 /// the primary next boots — which, for a protected primary, can be days.
 ///
 /// **Deliberately `resolve_data_subdir`-based, not [`is_secondary`].**
-/// `is_secondary()` keys on `QONTINUI_INSTANCE_NAME` alone, so a secondary the
-/// supervisor spawned without that env var reads as PRIMARY and would be handed
+/// `is_secondary()` keys on `QONTINUI_INSTANCE_NAME` and `QONTINUI_INSTANCE_ROOT`
+/// only, so a secondary the supervisor spawned with neither reads as PRIMARY and
+/// would be handed
 /// the shared root config — the exact fail-open this guard exists to prevent.
 /// `resolve_data_subdir` additionally detects a secondary by `primary_port` or
 /// a non-default API port, so a nameless secondary fails CLOSED (quarantined,
@@ -50,6 +53,7 @@ pub use qontinui_runner_lib::instance_env::{instance_name, is_secondary};
 pub fn owns_shared_root_state() -> bool {
     resolve_data_subdir(
         instance_name().as_deref(),
+        instance_root().as_deref(),
         primary_port(),
         crate::mcp::types::get_mcp_api_port(),
     )
@@ -64,11 +68,26 @@ pub fn owns_shared_root_state() -> bool {
 /// supervisor uses `RunnerKind::from_id` (with the runner id, not env) to
 /// produce the precise variant. Callers in the runner that need the
 /// secondary/primary split should still prefer `is_secondary()` for clarity.
+///
+/// A nameless runner under an instance root is `Named` with its stable
+/// `rooted_instance_id` — never `Primary`, which would hand it the primary's
+/// WebView2 profile fallback in [`webview2_data_dir`].
 pub fn runner_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
+    runner_kind_from(instance_name(), instance_root().as_deref())
+}
+
+/// Env-free core of [`runner_kind`].
+fn runner_kind_from(
+    name: Option<String>,
+    instance_root: Option<&Path>,
+) -> qontinui_types::wire::runner_kind::RunnerKind {
     use qontinui_types::wire::runner_kind::RunnerKind;
-    match instance_name() {
-        Some(name) => RunnerKind::Named { name },
-        None => RunnerKind::Primary,
+    match (name, instance_root) {
+        (Some(name), _) => RunnerKind::Named { name },
+        (None, Some(root)) => RunnerKind::Named {
+            name: qontinui_runner_lib::instance_env::rooted_instance_id(root),
+        },
+        (None, None) => RunnerKind::Primary,
     }
 }
 
@@ -77,6 +96,10 @@ pub fn runner_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
 /// harness; `scheduler_service`'s tests mutate `QONTINUI_PORT` concurrently).
 ///
 /// - `name`: `QONTINUI_INSTANCE_NAME`, the supervisor's explicit instance id.
+/// - `instance_root`: `QONTINUI_INSTANCE_ROOT` — a SUBJECT runner's root (plan
+///   `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+///   D3). A root implies secondary; a named subject keeps its name's subdir,
+///   a nameless one gets the stable [`rooted_subdir`] of its root.
 /// - `primary_port`: `QONTINUI_PRIMARY_PORT` — set only on a runner that has a
 ///   primary to proxy to, i.e. never on the primary itself.
 /// - `api_port`: this runner's API port. Only the primary owns
@@ -86,11 +109,15 @@ pub fn runner_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
 /// presents no secondary signal at all.
 fn resolve_data_subdir(
     name: Option<&str>,
+    instance_root: Option<&Path>,
     primary_port: Option<u16>,
     api_port: u16,
 ) -> Option<String> {
     if let Some(n) = name {
         return Some(format!("instance-{}", sanitize(n)));
+    }
+    if let Some(root) = instance_root {
+        return Some(rooted_subdir(root));
     }
     if primary_port.is_some() || api_port != crate::mcp::types::MCP_API_PORT {
         // Secondary by another signal, but nameless — quarantine, never the
@@ -98,6 +125,18 @@ fn resolve_data_subdir(
         return Some(format!("instance-unnamed-{api_port}"));
     }
     None
+}
+
+/// The data subdir of a NAMELESS subject: `instance-<rooted_instance_id>`, i.e.
+/// `instance-root-<16 hex>`. Stable across processes, releases and spellings
+/// of the same root, so a subject restarted under it finds its own scoped
+/// state again, and two subjects under different roots never share a subdir of
+/// a still machine-global base.
+fn rooted_subdir(root: &Path) -> String {
+    format!(
+        "instance-{}",
+        qontinui_runner_lib::instance_env::rooted_instance_id(root)
+    )
 }
 
 /// Returns the per-instance path segment, or `None` for the primary runner.
@@ -110,11 +149,14 @@ fn resolve_data_subdir(
 /// `instance-unnamed-<port>` rather than being handed the primary's `None`.
 pub fn data_subdir() -> Option<String> {
     let name = instance_name();
+    let root = instance_root();
     let primary = primary_port();
     let api_port = crate::mcp::types::get_mcp_api_port();
-    let sub = resolve_data_subdir(name.as_deref(), primary, api_port);
+    let sub = resolve_data_subdir(name.as_deref(), root.as_deref(), primary, api_port);
 
-    if name.is_none() && sub.is_some() {
+    // A nameless SUBJECT (instance root set) is not a supervisor slip — the
+    // root is its identity — so only a rootless nameless secondary is loud.
+    if name.is_none() && root.is_none() && sub.is_some() {
         // Loud, not silent: this is a supervisor bug (it is contracted to set
         // QONTINUI_INSTANCE_NAME on every non-primary spawn) and the operator
         // needs to see it — but the runner still gets a usable, ISOLATED path.
@@ -160,6 +202,67 @@ pub fn primary_port() -> Option<u16> {
         .and_then(|p| p.parse().ok())
 }
 
+// ============================================================================
+// Subject-runner instance root (plan
+// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`)
+// ============================================================================
+//
+// The contract itself — validation, root-derived defaults, the refusal — lives
+// in the LIB (`qontinui_runner_lib::instance_env`) so every binary of this
+// crate runs the same one first thing in its `main`. Only the runner bin binds
+// `QONTINUI_PORT`, so only it requires one.
+
+/// The runner bin's startup contract: [`qontinui_runner_lib::instance_env::enforce_instance_root_or_exit`]
+/// with the port required (D3). A no-op without an instance root.
+pub fn enforce_instance_root_at_startup() {
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(true);
+}
+
+/// The ports the MCP API bind loop tries, in order. Normally `port` and two
+/// fallbacks (a crashed predecessor's zombie sockets on Windows). Under an
+/// instance root ONLY `port`: the launcher chose it and is about to address
+/// the subject on it, and a silent `+1` could land on another runner's port.
+pub fn api_ports_to_try(port: u16) -> Vec<u16> {
+    api_ports_to_try_for(port, instance_root().is_some())
+}
+
+/// Test support: turn an [`crate::test_env::IsolatedAmbient`] into a NAMELESS
+/// subject launch — a root at `<fixture>/subject`, the fixture's own
+/// out-of-root dir keys and any instance name cleared, then the real lib
+/// startup contract (`apply_instance_root_env`, CLI form) applied, exactly as a
+/// binary's `main` would. Returns the root and a restore guard for the one
+/// default the fixture does not capture (`WEBVIEW2_USER_DATA_FOLDER`).
+#[cfg(test)]
+pub(crate) fn enter_rooted_subject_for_test(
+    amb: &crate::test_env::IsolatedAmbient,
+) -> (PathBuf, crate::test_env::EnvVarRestore) {
+    let restore = crate::test_env::EnvVarRestore::capture(&["WEBVIEW2_USER_DATA_FOLDER"]);
+    std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
+    for key in [
+        "QONTINUI_HOME",
+        "QONTINUI_CONFIG_DIR",
+        "QONTINUI_SECURE_STORAGE_DIR",
+        "QONTINUI_INSTANCE_NAME",
+    ] {
+        std::env::remove_var(key);
+    }
+    let root = amb.dir().join("subject");
+    std::env::set_var("QONTINUI_INSTANCE_ROOT", &root);
+    let applied = qontinui_runner_lib::instance_env::apply_instance_root_env(false)
+        .expect("the fixture's subject launch must satisfy the contract");
+    assert_eq!(applied.as_deref(), Some(root.as_path()));
+    (root, restore)
+}
+
+/// Env-free core of [`api_ports_to_try`].
+fn api_ports_to_try_for(port: u16, under_instance_root: bool) -> Vec<u16> {
+    if under_instance_root {
+        vec![port]
+    } else {
+        vec![port, port + 1, port + 2]
+    }
+}
+
 /// Resolve the WebView2 user-data folder for this runner.
 ///
 /// Resolution order:
@@ -192,7 +295,12 @@ pub fn webview2_data_dir() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(p));
     }
     let kind = runner_kind();
-    let id = instance_name().unwrap_or_else(|| "primary".into());
+    // The kind's own name: the instance name, or a root-only subject's
+    // `rooted_instance_id` — never "primary" for anything but the primary.
+    let id = match &kind {
+        qontinui_types::wire::runner_kind::RunnerKind::Named { name } => name.clone(),
+        _ => instance_name().unwrap_or_else(|| "primary".into()),
+    };
     qontinui_types::wire::webview2_data_dir(&kind, &id)
 }
 
@@ -308,7 +416,7 @@ mod tests {
     /// other harness threads — an env-based assertion here would flake.
     #[test]
     fn primary_keeps_the_unscoped_path() {
-        assert_eq!(resolve_data_subdir(None, None, PRIMARY), None);
+        assert_eq!(resolve_data_subdir(None, None, None, PRIMARY), None);
     }
 
     /// Item 1 residual (fail-open on the isolation boundary): the isolation
@@ -320,20 +428,20 @@ mod tests {
     fn nameless_secondary_refuses_primary_scoped_state() {
         // Non-default API port ⇒ not the primary.
         assert_eq!(
-            resolve_data_subdir(None, None, 9877),
+            resolve_data_subdir(None, None, None, 9877),
             Some("instance-unnamed-9877".to_string()),
         );
         // Has a primary to proxy to ⇒ not the primary, even on the default
         // port (the belt-and-braces signal).
         assert_eq!(
-            resolve_data_subdir(None, Some(PRIMARY), PRIMARY),
+            resolve_data_subdir(None, None, Some(PRIMARY), PRIMARY),
             Some("instance-unnamed-9876".to_string()),
         );
         // The property that actually matters: never the primary's own path.
         let base = Path::new(".qontinui").join("runner");
         for sub in [
-            resolve_data_subdir(None, None, 9877),
-            resolve_data_subdir(None, Some(PRIMARY), PRIMARY),
+            resolve_data_subdir(None, None, None, 9877),
+            resolve_data_subdir(None, None, Some(PRIMARY), PRIMARY),
         ] {
             let scoped = base.join(sub.expect("a nameless secondary must be quarantined"));
             assert_ne!(scoped, base, "must not resolve to the primary's path");
@@ -353,7 +461,7 @@ mod tests {
     fn window_assignments_path_cannot_be_inherited_across_instances() {
         let base = Path::new(".qontinui").join("runner");
         let path_for = |name: &str, port: u16| {
-            base.join(resolve_data_subdir(Some(name), None, port).unwrap())
+            base.join(resolve_data_subdir(Some(name), None, None, port).unwrap())
                 .join("window-assignments.json")
         };
 
@@ -370,7 +478,7 @@ mod tests {
         assert_ne!(first, primary);
         assert_ne!(recycled, primary);
         assert_eq!(
-            resolve_data_subdir(None, None, PRIMARY),
+            resolve_data_subdir(None, None, None, PRIMARY),
             None,
             "the primary keeps the legacy unscoped window-assignments path"
         );
@@ -393,11 +501,11 @@ mod tests {
     fn lifecycle_store_and_snapshot_paths_cannot_be_inherited_across_instances() {
         let base = Path::new(".qontinui").join("runner");
         let store_for = |name: &str, port: u16| {
-            base.join(resolve_data_subdir(Some(name), None, port).unwrap())
+            base.join(resolve_data_subdir(Some(name), None, None, port).unwrap())
                 .join("terminal-sessions.json")
         };
         let snapshot_for = |name: &str, port: u16| {
-            base.join(resolve_data_subdir(Some(name), None, port).unwrap())
+            base.join(resolve_data_subdir(Some(name), None, None, port).unwrap())
                 .join("session-restore")
                 .join("session-snapshots.jsonl")
         };
@@ -428,7 +536,7 @@ mod tests {
         // (c) The primary keeps the legacy UNSCOPED lifecycle/snapshot path
         // (`data_subdir() == None` ⇒ `scope_path` returns the base unchanged),
         // so its crash-recovery reattach is byte-for-byte preserved.
-        assert_eq!(resolve_data_subdir(None, None, PRIMARY), None);
+        assert_eq!(resolve_data_subdir(None, None, None, PRIMARY), None);
     }
 
     /// Sibling to `lifecycle_store_and_snapshot_paths_cannot_be_inherited_across_instances`
@@ -472,7 +580,7 @@ mod tests {
         // resolve to distinct markers, and the primary keeps the unscoped one.
         let base = Path::new(".qontinui").join("runner");
         let marker_for = |name: &str, port: u16| {
-            base.join(resolve_data_subdir(Some(name), None, port).unwrap())
+            base.join(resolve_data_subdir(Some(name), None, None, port).unwrap())
                 .join("last-shutdown.json")
         };
         assert_ne!(
@@ -484,7 +592,7 @@ mod tests {
         assert_ne!(marker_for("test-19f6faa3bf8-0", 9877), primary_marker);
         assert_ne!(marker_for("test-19f6fd50c26-2", 9877), primary_marker);
         assert_eq!(
-            resolve_data_subdir(None, None, PRIMARY),
+            resolve_data_subdir(None, None, None, PRIMARY),
             None,
             "the primary keeps the legacy UNSCOPED last-shutdown.json"
         );
@@ -520,12 +628,127 @@ mod tests {
     #[test]
     fn instance_name_wins_over_the_fallback() {
         assert_eq!(
-            resolve_data_subdir(Some("test-runner 7!"), Some(PRIMARY), 9877),
+            resolve_data_subdir(Some("test-runner 7!"), None, Some(PRIMARY), 9877),
             Some("instance-test-runner_7_".to_string()),
         );
         assert_eq!(
-            resolve_data_subdir(Some("test-9877"), None, PRIMARY),
+            resolve_data_subdir(Some("test-9877"), None, None, PRIMARY),
             Some("instance-test-9877".to_string()),
         );
+    }
+    // ------------------------------------------------------------------
+    // Subject-runner instance root (plan
+    // `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`).
+    // The contract's own tests live with it in `instance_env`.
+    // ------------------------------------------------------------------
+
+    fn abs(rel: &str) -> PathBuf {
+        std::env::temp_dir().join(rel)
+    }
+
+    /// D3: a root alone makes the runner a secondary with its own subdir, so
+    /// `owns_shared_root_state()` (which is `resolve_data_subdir(..).is_none()`)
+    /// is false and `scope_path` never hands it the primary's path — even on
+    /// the primary's port with no primary to proxy to.
+    #[test]
+    fn an_instance_root_alone_is_a_scoped_secondary() {
+        let root = abs("subject-a");
+        let sub = resolve_data_subdir(None, Some(&root), None, PRIMARY)
+            .expect("a rooted runner must never resolve to the primary's unscoped path");
+        assert!(sub.starts_with("instance-root-"), "{sub}");
+        assert_eq!(
+            sub,
+            format!(
+                "instance-{}",
+                qontinui_runner_lib::instance_env::rooted_instance_id(&root)
+            )
+        );
+        // Stable for one root, distinct across roots.
+        assert_eq!(
+            resolve_data_subdir(None, Some(&root), None, 9877),
+            Some(sub.clone())
+        );
+        assert_ne!(
+            resolve_data_subdir(None, Some(&abs("subject-b")), None, PRIMARY),
+            Some(sub)
+        );
+        // An explicit name still wins under a root.
+        assert_eq!(
+            resolve_data_subdir(Some("subject 1"), Some(&root), None, 9877),
+            Some("instance-subject_1".to_string())
+        );
+        // And with no root at all nothing changed.
+        assert_eq!(resolve_data_subdir(None, None, None, PRIMARY), None);
+    }
+
+    #[test]
+    fn a_root_only_subject_is_not_the_primary_kind() {
+        use qontinui_types::wire::runner_kind::RunnerKind;
+        let root = abs("subject-kind");
+        let id = qontinui_runner_lib::instance_env::rooted_instance_id(&root);
+        assert_eq!(
+            runner_kind_from(None, Some(&root)),
+            RunnerKind::Named { name: id }
+        );
+        assert_eq!(
+            runner_kind_from(Some("n".to_string()), Some(&root)),
+            RunnerKind::Named { name: "n".into() }
+        );
+        assert_eq!(runner_kind_from(None, None), RunnerKind::Primary);
+    }
+
+    /// The MCP API bind loop must take its port list from [`api_ports_to_try`];
+    /// a bind loop that rebuilt `[port, port + 1, port + 2]` inline would
+    /// silently re-open the fallback for a subject. Source-level, because the
+    /// loop itself binds real sockets.
+    #[test]
+    fn the_mcp_api_bind_loop_takes_its_ports_from_api_ports_to_try() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_api.rs"))
+            .expect("mcp_api.rs is readable");
+        assert!(
+            src.contains("let ports_to_try = crate::instance::api_ports_to_try(port);"),
+            "the bind loop no longer asks instance::api_ports_to_try for its ports"
+        );
+        assert!(
+            !src.contains("[port, port + 1, port + 2]"),
+            "an inline fallback port list is back in mcp_api.rs"
+        );
+    }
+
+    #[test]
+    fn under_a_root_the_api_binds_only_the_requested_port() {
+        assert_eq!(api_ports_to_try_for(9881, true), vec![9881]);
+        assert_eq!(api_ports_to_try_for(9876, false), vec![9876, 9877, 9878]);
+    }
+
+    /// Through the real entry points: with `QONTINUI_INSTANCE_ROOT` in the
+    /// process env, `is_secondary()`, `data_subdir()` and
+    /// `owns_shared_root_state()` all read the runner as an isolated subject.
+    #[test]
+    fn a_root_in_the_env_makes_the_live_predicates_read_secondary() {
+        let amb = crate::test_env::isolated_ambient();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        std::env::remove_var("QONTINUI_PRIMARY_PORT");
+        std::env::remove_var("QONTINUI_PORT");
+        assert!(owns_shared_root_state(), "fixture baseline: the primary");
+        assert!(!is_secondary());
+
+        let root = amb.dir().join("subject");
+        std::env::set_var("QONTINUI_INSTANCE_ROOT", &root);
+        assert!(is_secondary());
+        assert!(!owns_shared_root_state());
+        assert_eq!(
+            data_subdir(),
+            Some(format!(
+                "instance-{}",
+                qontinui_runner_lib::instance_env::rooted_instance_id(&root)
+            ))
+        );
+        assert!(!matches!(
+            runner_kind(),
+            qontinui_types::wire::runner_kind::RunnerKind::Primary
+        ));
+        assert_eq!(api_ports_to_try(9881), vec![9881]);
     }
 }

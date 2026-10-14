@@ -14,9 +14,14 @@ import {
   credentialDarkPresentation,
   effectiveCredentialDark,
   makeRePairClickHandler,
+  makeRetryRefreshHandler,
   makeSwitchTenantHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
+  RETRY_DID_NOT_RECOVER,
+  RETRY_STILL_RUNNING,
+  retryErrorSurvives,
+  retryRefreshResult,
   shouldShowAuthBanner,
   shouldShowRePairCta,
   statusSignature,
@@ -835,5 +840,141 @@ describe("makeSwitchTenantHandler", () => {
     await expect(failing("t2")).rejects.toThrow("no device_id");
     expect(invoker).not.toHaveBeenCalled();
     expect(onPinned).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Retry refresh now" reports what happened (plan
+// 2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover D5)
+// ---------------------------------------------------------------------------
+
+describe("retry refresh CTA reports the concluded posture", () => {
+  /** The `/health` `coordCredential` object, as the command returns it. */
+  const posture = (over: Record<string, unknown>) => ({
+    posture: "expired",
+    cause: null,
+    canAnswer: false,
+    reason: "the coord credential this runner holds has EXPIRED.",
+    cta: "retry_refresh",
+    since: 1_791_337_078,
+    tenantId: null,
+    pinnedTenant: false,
+    lastRefreshOutcome: null,
+    ...over,
+  });
+
+  /** The banner state before the click: the incident's `expired` posture. */
+  const expiredBefore = () =>
+    applyCredentialDarkSignal({}, credentialDarkFromPostureSnapshot(posture({}))!);
+
+  it("asks the runner to wait for the kicked pass", async () => {
+    const invoker = vi.fn().mockResolvedValue(null);
+    await makeRetryRefreshHandler(invoker)();
+    expect(invoker).toHaveBeenCalledWith("kick_device_jwt_refresher_cmd", {
+      awaitConclusion: true,
+    });
+  });
+
+  it("an `unrefreshable` result swaps the CTA to the sign-in and says the retry failed", async () => {
+    const invoker = vi.fn().mockResolvedValue({
+      concluded: true,
+      posture: posture({
+        posture: "unrefreshable",
+        reason: "the coord credential expired and automatic refresh FAILED (unrefreshable).",
+        cta: "re_pair",
+        lastRefreshOutcome: "needs-sign-in",
+      }),
+    });
+    const result = await makeRetryRefreshHandler(invoker)();
+    expect(result.error).toBe(`${RETRY_DID_NOT_RECOVER} Sign in to re-pair.`);
+    expect(result.signal?.dark).toBe(true);
+
+    const shown = effectiveCredentialDark(
+      applyCredentialDarkSignal(expiredBefore(), result.signal!),
+    );
+    const presentation = credentialDarkPresentation(shown!, () => "03:57");
+    expect(presentation.ctaLabel).toBe("Sign in to re-pair");
+    expect(presentation.ctaAction).toBe("cognito_sign_in");
+    expect(presentation.title).toBe("Coord credential expired — automatic refresh failed");
+  });
+
+  it("a `live` result clears the banner with no error", () => {
+    const result = retryRefreshResult({
+      concluded: true,
+      posture: posture({ posture: "live", canAnswer: true, cta: null }),
+    });
+    expect(result.error).toBeNull();
+    expect(result.signal?.dark).toBe(false);
+    expect(
+      effectiveCredentialDark(applyCredentialDarkSignal(expiredBefore(), result.signal!)),
+    ).toBe(null);
+  });
+
+  it("a still-dark `expired` result keeps the retry and says it did not recover", () => {
+    const result = retryRefreshResult({ concluded: true, posture: posture({}) });
+    expect(result.error).toBe(RETRY_DID_NOT_RECOVER);
+    expect(result.signal?.cta).toBe("retry_refresh");
+  });
+
+  it("a timeout renders as still running, never as success", () => {
+    // Even if the snapshot it carries reads `live`, an unconcluded pass is
+    // UNKNOWN: it must not clear the banner.
+    const live = retryRefreshResult({
+      concluded: false,
+      posture: posture({ posture: "live", canAnswer: true, cta: null }),
+    });
+    expect(live.error).toBe(RETRY_STILL_RUNNING);
+    expect(live.signal).toBeNull();
+    expect(effectiveCredentialDark(expiredBefore())?.dark).toBe(true);
+
+    const stillDark = retryRefreshResult({ concluded: false, posture: posture({}) });
+    expect(stillDark.error).toBe(RETRY_STILL_RUNNING);
+    expect(stillDark.signal?.dark).toBe(true);
+  });
+
+  it("a timed-out retry's 'still running' clears when that pass's posture event lands", () => {
+    // The click: the runner's bounded wait ran out with the slot still `expired`.
+    const timedOut = retryRefreshResult({ concluded: false, posture: posture({}) });
+    expect(timedOut.error).toBe(RETRY_STILL_RUNNING);
+    // A re-announcement of the SAME posture leaves the message standing.
+    const same = credentialDarkFromPostureSnapshot(posture({}))!;
+    expect(retryErrorSurvives(timedOut.signal, same)).toBe(true);
+    // The pass then concludes `unrefreshable` and its event arrives: the CTA
+    // swaps to the sign-in, and the stale "still running" must go with it.
+    const concluded = normalizeCredentialDarkSignal({
+      source: "posture",
+      dark: true,
+      cause: "unrefreshable",
+      message: "the coord credential expired and automatic refresh FAILED (unrefreshable).",
+      cta: "re_pair",
+      since: 1_791_337_100,
+    })!;
+    expect(retryErrorSurvives(timedOut.signal, concluded)).toBe(false);
+    // The formatter is injected: the default `formatSince` goes through
+    // `toLocaleTimeString`, whose first call initialises ICU/timezone data and
+    // took >5 s on a cold Windows CI runner. Nothing here is about the clock.
+    expect(credentialDarkPresentation(concluded, () => "03:57").ctaLabel).toBe(
+      "Sign in to re-pair",
+    );
+  });
+
+  it("a 'did not recover' does not outlive a recovery (no resurfacing on a later dark episode)", () => {
+    const failed = retryRefreshResult({
+      concluded: true,
+      posture: posture({ posture: "unrefreshable", cta: "re_pair" }),
+    });
+    expect(failed.error).not.toBeNull();
+    const recovered = credentialDarkFromPostureSnapshot(
+      posture({ posture: "live", canAnswer: true, cta: null }),
+    )!;
+    expect(retryErrorSurvives(failed.signal, recovered)).toBe(false);
+    // A retry that produced no signal (an older runner, a thrown invoke)
+    // survives nothing.
+    expect(retryErrorSurvives(null, recovered)).toBe(false);
+  });
+
+  it("an older runner that answers nothing changes nothing", () => {
+    expect(retryRefreshResult(null)).toEqual({ signal: null, error: null });
+    expect(retryRefreshResult(undefined)).toEqual({ signal: null, error: null });
   });
 });

@@ -10,8 +10,9 @@
  *
  * This module is the testable core of that tap:
  *
- *   - `base64ToBytes` mirrors `TerminalInstance`'s base64 → `Uint8Array`
- *     decode of the event payload exactly.
+ *   - `base64ToBytes` is THE base64 → `Uint8Array` decode of an event
+ *     payload: `TerminalInstance`'s pane handler calls it too, so the tap and
+ *     the pane decode the same bytes by construction.
  *   - `TerminalOutputCoalescer` decodes each raw chunk with ONE streaming
  *     `TextDecoder` per terminalId — matching each `TerminalInstance`'s own
  *     per-instance `outputDecoderRef` byte-for-byte (partial multibyte
@@ -29,9 +30,11 @@
  */
 
 /**
- * Decode a base64 payload to raw bytes, identical to `TerminalInstance`'s
- * inline `atob` + charCode loop. Kept in lock-step so the tap sees the exact
- * same bytes the instance's xterm-write path sees.
+ * Decode a base64 payload to raw bytes (`atob` + charCode loop). Shared by the
+ * page tap and `TerminalInstance`'s pane handler, so both see the exact same
+ * bytes — and, today, each pays the decode separately (plan
+ * `2026-09-20-terminal-output-transport-is-unmeasured-encoded-broadcast`
+ * Phase 2 decodes once).
  */
 export function base64ToBytes(b64: string): Uint8Array {
   const raw = atob(b64);
