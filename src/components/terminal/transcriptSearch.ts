@@ -59,6 +59,22 @@ export function searchTranscripts(
   });
 }
 
+/**
+ * Whether a response failed to cover its scope in a way `notScanned` does not
+ * name. Each arm is a reason a non-hit cannot be read as "no match":
+ *
+ * - `not_run`: the scan never ran, whatever else the response says.
+ * - `scanned < total` with an empty `notScanned`: files were skipped and the
+ *   response does not say which, so no session can be read as covered.
+ * - an unscoped scan that stopped early for anything but its hit limit (a
+ *   scoped scan lists exactly what it missed in `notScanned`).
+ */
+export function responseIsIncomplete(resp: TranscriptSearchResponse, scoped: boolean): boolean {
+  if (resp.truncation.includes("not_run")) return true;
+  if (resp.scanned < resp.total && resp.notScanned.length === 0) return true;
+  return !scoped && resp.truncated && !resp.truncation.every((t) => t === "limit");
+}
+
 /** The evaluator's view of one response. `scoped` = sessionKeys were sent. */
 export function textSearchResultFrom(
   resp: TranscriptSearchResponse,
@@ -68,10 +84,9 @@ export function textSearchResultFrom(
     status: "done",
     matched: new Set(resp.hits.map((h) => h.sessionId)),
     notScanned: new Set(resp.notScanned),
+    missing: new Set(resp.missing),
     limitHit: resp.truncation.includes("limit"),
-    // A scoped scan lists exactly what it missed in `notScanned`; an unscoped
-    // one that stopped early cannot say which sessions it missed.
-    incomplete: !scoped && resp.truncated && !resp.truncation.every((t) => t === "limit"),
+    incomplete: responseIsIncomplete(resp, scoped),
   };
 }
 
