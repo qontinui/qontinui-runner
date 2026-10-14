@@ -995,3 +995,74 @@ fn pty_holder_attach_restore_needs_version_3() {
         c.events
     );
 }
+
+/// Round-2 B(ii): a restoring attach on a pane that touched NO modes still
+/// gets both synthetic frames — empty — so a client can tell the envelope was
+/// delivered rather than lost with the connection.
+#[test]
+fn pty_holder_attach_untouched_pane_gets_two_empty_synthetic_frames() {
+    let h = start("plain", sh("stty -echo; printf plain-output; exec cat"));
+    let mut s = attach(&h, None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while !contains(&seen, b"plain-output") {
+        if let Some(Event::Output { bytes, .. }) = s.reader.next_event(Some(deadline)).unwrap() {
+            seen.extend_from_slice(&bytes);
+        }
+    }
+    drop(s);
+    let mut s = connect(&h.dir, &pid("p1"), soon())
+        .expect("handshake")
+        .attach_restoring(None, soon())
+        .expect("restoring attach");
+    let end = s.info.end_offset;
+    let mut synthetic = Vec::new();
+    while synthetic.len() < 2 {
+        match s.reader.next_event(Some(deadline)).unwrap().expect("event") {
+            Event::Synthetic {
+                part,
+                anchor,
+                bytes,
+            } => synthetic.push((part, anchor, bytes)),
+            Event::Output { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        synthetic,
+        vec![
+            (SyntheticPart::Preamble, s.info.start_offset, Vec::new()),
+            (SyntheticPart::Postamble, end, Vec::new()),
+        ]
+    );
+}
+
+/// Round-2 C, holder side: a restoring attach whose requested offset has
+/// already left the ring gets the loss report FIRST, then the preamble for
+/// where the stream resumes — so a client reading them in order knows that
+/// preamble follows a break in continuity and must be applied.
+#[test]
+fn pty_holder_attach_known_loss_precedes_the_preamble() {
+    let (h, _end) = moded_past_its_ring("lossfirst");
+    let mut s = connect(&h.dir, &pid("p1"), soon())
+        .expect("handshake")
+        .attach_restoring(Some(0), soon())
+        .expect("restoring attach");
+    let ring_start = s.info.ring_start_offset;
+    assert!(ring_start > 0, "the small ring has rolled");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    match s.reader.next_event(Some(deadline)).unwrap() {
+        Some(Event::Lost {
+            from_offset,
+            to_offset,
+        }) => assert_eq!((from_offset, to_offset), (0, ring_start)),
+        other => panic!("expected the loss first, got {other:?}"),
+    }
+    match s.reader.next_event(Some(deadline)).unwrap() {
+        Some(Event::Synthetic { part, anchor, .. }) => {
+            assert_eq!(part, SyntheticPart::Preamble);
+            assert_eq!(anchor, ring_start);
+        }
+        other => panic!("expected the preamble second, got {other:?}"),
+    }
+}

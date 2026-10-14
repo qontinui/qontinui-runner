@@ -434,6 +434,10 @@ impl ModeTracker {
                     PendingChange::Title(t) => self.titles.push(self.fed, Some(t)),
                 }
             }
+            // `vte` consumes at least one byte of a non-empty slice; `fed` is
+            // the ring's end offset only while that holds. Release builds stop
+            // rather than spin if it ever does not.
+            debug_assert!(n > 0, "vte consumed nothing of a non-empty slice");
             if n == 0 {
                 break;
             }

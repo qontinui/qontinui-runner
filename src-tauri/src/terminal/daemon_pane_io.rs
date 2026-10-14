@@ -954,6 +954,19 @@ impl RestoreProgress {
     fn saw_postamble(&mut self) {
         self.postamble_owed = false;
     }
+
+    /// A loss marker already breaks this consumer's continuity, so the NEXT
+    /// preamble (a reattach's, describing where the stream now resumes) is
+    /// the one it needs — not one to drop as a duplicate.
+    fn saw_loss(&mut self) {
+        self.awaiting_preamble = true;
+    }
+}
+
+/// Whether the pump's reattach asks for a restore: only while a restoring
+/// attach's postamble is still owed.
+fn reattach_restoring(restore: Option<RestoreProgress>) -> bool {
+    restore.is_some_and(|r| r.postamble_owed)
 }
 
 /// How the pump's connection ended.
@@ -1405,7 +1418,12 @@ impl PumpCtx {
             Event::Lost {
                 from_offset,
                 to_offset,
-            } => self.out.note_lost(from_offset, to_offset),
+            } => {
+                if let Some(r) = restore.as_mut() {
+                    r.saw_loss();
+                }
+                self.out.note_lost(from_offset, to_offset);
+            }
             // The restore envelope: displayed, never counted — the stream
             // offset stays the holder's (plan D14).
             Event::Synthetic { part, bytes, .. } => {
@@ -1471,7 +1489,7 @@ impl PumpCtx {
                 Probe::Healthy { .. } => {
                     let deadline = Instant::now() + ATTACH_DEADLINE;
                     let from = self.out.offset();
-                    let restoring = restore.is_some_and(|r| r.postamble_owed);
+                    let restoring = reattach_restoring(*restore);
                     if restoring {
                         info!(pane = %self.key, holder_pid = self.holder_pid, from, "pty holder: the connection dropped before the restore postamble arrived — reattaching WITH a restore");
                     }
@@ -2043,6 +2061,51 @@ mod tests {
         let mut got = Vec::new();
         out.take_reader().unwrap().read_to_end(&mut got).unwrap();
         assert_eq!(got, b"\x1b[?1049htail\x1b[?2004h".to_vec());
+    }
+
+    /// The reattach asks for a restore exactly while a postamble is owed.
+    #[test]
+    fn pty_holder_attach_reattach_restores_only_while_a_postamble_is_owed() {
+        let owed = RestoreProgress::new();
+        assert!(reattach_restoring(Some(owed)), "owed: restoring");
+        let mut delivered = RestoreProgress::new();
+        delivered.saw_postamble();
+        assert!(!reattach_restoring(Some(delivered)), "delivered: plain");
+        assert!(!reattach_restoring(None), "no restore asked: plain");
+    }
+
+    /// Round-2 edge C: after a reported loss the reattach's preamble — which
+    /// describes where the stream now resumes — is SHOWN, even though the
+    /// first connection's preamble was shown too: the loss marker already
+    /// broke continuity, and dropping it would leave the consumer on stale
+    /// state.
+    #[test]
+    fn pty_holder_attach_preamble_after_a_loss_is_shown() {
+        let out = Arc::new(PaneOutput::new(
+            "t-pump",
+            Vec::new(),
+            0,
+            holder_lost_output_marker,
+        ));
+        let pump = bare_pump(out.clone(), Some(RestoreProgress::new()));
+        let mut restore = pump.restore;
+        pump.on_event(synthetic(SyntheticPart::Preamble, b"P1"), &mut restore);
+        // The connection dropped; the reattach finds the ring rolled past.
+        pump.on_event(
+            Event::Lost {
+                from_offset: 0,
+                to_offset: 10,
+            },
+            &mut restore,
+        );
+        pump.on_event(synthetic(SyntheticPart::Preamble, b"P2"), &mut restore);
+        out.settle(Ok(0));
+        let mut got = Vec::new();
+        out.take_reader().unwrap().read_to_end(&mut got).unwrap();
+        let mut want = b"P1".to_vec();
+        want.extend_from_slice(&holder_lost_output_marker(10));
+        want.extend_from_slice(b"P2");
+        assert_eq!(got, want);
     }
 
     /// A reattach that arrives before ANYTHING of the first connection was
