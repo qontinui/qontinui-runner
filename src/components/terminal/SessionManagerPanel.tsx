@@ -13,6 +13,8 @@ import { GroupMenuItems, type MenuPage } from "./SessionOrgMenus";
 import { SessionCloseDialog } from "./SessionCloseDialog";
 import { ReadyToCloseBanner, SessionBulkBar, SessionBulkOutcome } from "./SessionBulkBar";
 import { RecentlyClosedSection } from "./RecentlyClosedSection";
+import { SessionQueryUnknownTail } from "./SessionQueryUnknownTail";
+import type { SessionQueryBarProps } from "./SessionQueryBar";
 import { bulkAddToGroup, bulkMute, bulkNewGroup, bulkPin, bulkSnooze } from "./sessionBulkActions";
 import { useSessionSelection } from "./useSessionSelection";
 import { useSessionTriage } from "./useSessionTriage";
@@ -91,12 +93,10 @@ export function SessionManagerPanel({
     sessions,
     loading,
     accountUsage,
-    searchQuery,
-    setSearchQuery,
-    statusFilter,
-    setStatusFilter,
-    accountFilter,
-    setAccountFilter,
+    query,
+    queryUnknown,
+    liveFacts,
+    applyOrg,
     groupBy,
     setGroupBy,
     sortBy,
@@ -188,13 +188,6 @@ export function SessionManagerPanel({
     groupLens,
   });
 
-  const currentPage = useMemo(
-    () => ({
-      id: currentPageId,
-      name: pages.find((p) => p.id === currentPageId)?.name ?? currentPageId,
-    }),
-    [pages, currentPageId],
-  );
   const pageName = useCallback(
     (pageId: string) => pages.find((p) => p.id === pageId)?.name ?? pageId,
     [pages],
@@ -203,10 +196,34 @@ export function SessionManagerPanel({
     manager,
     selectedIds,
     clearSelection: selection.clear,
-    currentPage,
     pageName,
     requestCloseRows,
   });
+
+  // ── The query bar (D5): the whole filter ─────────────────────────────────
+
+  const queryBar = useMemo((): SessionQueryBarProps => {
+    const result = query.result;
+    return {
+      query: query.query,
+      onQueryChange: query.setQuery,
+      parsed: query.parsed,
+      chipCounts: query.chipCounts,
+      accounts: allAccounts,
+      groups: knownOrg ? knownOrg.groups : null,
+      savedViews: knownOrg ? knownOrg.savedViews : null,
+      orgUnavailableReason: org.phase === "unknown" ? org.reason : null,
+      onSaveView: (name, q) => void applyOrg([{ op: "saveView", name, query: q }]),
+      onDeleteView: (name) => void applyOrg([{ op: "deleteView", name }]),
+      summary: result.ok
+        ? { matched: result.matched.length, unknown: result.unknown.length, total: liveFacts.length }
+        : null,
+    };
+  }, [query, allAccounts, knownOrg, org, applyOrg, liveFacts.length]);
+  const rowById = useMemo(
+    () => new Map(allSessions.map((s) => [s.sessionId, s])),
+    [allSessions],
+  );
 
   // ── Resize ───────────────────────────────────────────────────────────────
 
@@ -238,6 +255,39 @@ export function SessionManagerPanel({
       />
     );
   }
+
+  /** One Live row's card — the sections and the Unknown tail render the same card. */
+  const renderCard = (session: UnifiedSession, compact: boolean) => (
+    <SessionCard
+      key={session.sessionId}
+      session={session}
+      isSelected={session.sessionId === selectedSessionId}
+      isChecked={selectedIds.has(session.sessionId)}
+      selectionMode={selectionMode}
+      orgMember={memberOf(org, sessionKeyOf(session))}
+      groupColor={groupColorOf(session)}
+      compact={compact}
+      sessionKey={sessionKeyOf(session)}
+      orgMenu={orgMenu}
+      drag={drag.card}
+      dropBefore={
+        drag.hover?.kind === "row" && drag.hover.sessionId === session.sessionId
+      }
+      fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
+      lockState={sessionLockStates?.get(session.sessionId)}
+      onResume={resumeSession}
+      onOpen={openSession}
+      onViewTranscript={viewTranscript}
+      onCopyId={copySessionId}
+      onToggleSelect={selection.toggle}
+      onRowClick={onRowClick}
+      isCursor={selection.cursor === session.sessionId}
+      onAfterPromote={refresh}
+      onOpenWorktrees={setWorktreeFocus}
+      isOnScreen={isRowOnScreen(session, onScreenTabId)}
+      onClose={closableTabId(session) !== null ? requestClose : undefined}
+    />
+  );
 
   /** Every section header but a group's (that one is a `SessionGroupHeader`). */
   const renderSectionHeader = (section: SessionSection<UnifiedSession>) => {
@@ -384,18 +434,12 @@ export function SessionManagerPanel({
           <StewardControl />
           <SessionManagerHeader
             loading={loading}
-            searchQuery={searchQuery}
-            onSearchChange={setSearchQuery}
-            statusFilter={statusFilter}
-            onStatusFilterChange={setStatusFilter}
-            accountFilter={accountFilter}
-            onAccountFilterChange={setAccountFilter}
+            queryBar={queryBar}
             groupBy={groupBy}
             onGroupByChange={setGroupBy}
             sortBy={sortBy}
             onSortByChange={setSortBy}
             accountUsage={accountUsage}
-            accounts={allAccounts}
             onRefresh={refresh}
             activityCounts={activityCounts}
             totalCount={sessions.length}
@@ -512,9 +556,7 @@ export function SessionManagerPanel({
               </div>
             ) : !showSections ? (
               <div className="px-3 py-8 text-center text-[#565f89] text-xs">
-                {searchQuery || statusFilter !== "all" || accountFilter !== "all"
-                  ? "No sessions match filters"
-                  : "No sessions found"}
+                {query.query.trim() !== "" ? "No sessions match the filter" : "No sessions found"}
               </div>
             ) : (
               sections.map((section) => {
@@ -574,41 +616,21 @@ export function SessionManagerPanel({
                     ) : (
                       renderSectionHeader(section)
                     )}
-                    {section.sessions.map((session) => (
-                      <SessionCard
-                        key={session.sessionId}
-                        session={session}
-                        isSelected={session.sessionId === selectedSessionId}
-                        isChecked={selectedIds.has(session.sessionId)}
-                        selectionMode={selectionMode}
-                        orgMember={memberOf(org, sessionKeyOf(session))}
-                        groupColor={groupColorOf(session)}
-                        compact={section.kind === "pinned"}
-                        sessionKey={sessionKeyOf(session)}
-                        orgMenu={orgMenu}
-                        drag={drag.card}
-                        dropBefore={
-                          drag.hover?.kind === "row" && drag.hover.sessionId === session.sessionId
-                        }
-                        fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
-                        lockState={sessionLockStates?.get(session.sessionId)}
-                        onResume={resumeSession}
-                        onOpen={openSession}
-                        onViewTranscript={viewTranscript}
-                        onCopyId={copySessionId}
-                        onToggleSelect={selection.toggle}
-                        onRowClick={onRowClick}
-                        isCursor={selection.cursor === session.sessionId}
-                        onAfterPromote={refresh}
-                        onOpenWorktrees={setWorktreeFocus}
-                        isOnScreen={isRowOnScreen(session, onScreenTabId)}
-                        onClose={closableTabId(session) !== null ? requestClose : undefined}
-                      />
-                    ))}
+                    {section.sessions.map((session) =>
+                      renderCard(session, section.kind === "pinned"),
+                    )}
                   </div>
                 );
               })
             )}
+            {/* Rows the query could not evaluate: neither shown nor hidden. */}
+            <SessionQueryUnknownTail
+              unknown={queryUnknown}
+              renderRow={(f) => {
+                const row = rowById.get(f.rowId);
+                return row ? renderCard(row, false) : null;
+              }}
+            />
           </div>
 
           {closeRequest && (
