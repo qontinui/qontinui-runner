@@ -73,9 +73,10 @@ export function defaultFleetTenantChoice(
  * A picked tenant that is no longer bound is NOT a pick any more: kept, it
  * would go on reading a tenant whose read is refused — and when its loss left
  * one binding, `showSwitcher` hides the selector, so nothing on screen could
- * change it. It falls back to the default instead. An EMPTY candidate list is
- * not evidence of that (it is also what a list still loading looks like), so a
- * pick survives it.
+ * change it. It falls back to the default instead, and the picker CONSUMES the
+ * pick (with its device filter) so a binding that later returns does not
+ * silently re-select it. An EMPTY candidate list is not evidence of that (it is
+ * also what a list still loading looks like), so a pick survives it.
  */
 export function resolveFleetTenantChoice(
   pick: FleetTenantChoice | undefined,

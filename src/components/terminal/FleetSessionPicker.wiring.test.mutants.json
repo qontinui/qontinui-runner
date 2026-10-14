@@ -1032,6 +1032,22 @@
           "replace": "  const fleetTenant: FleetTenantChoice =\n    fleetTenantPick !== undefined\n      ? fleetTenantPick\n      : defaultFleetTenantChoice(tenantPin, tenantCandidates);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'opens on the policy default until the operator picks'"
+        },
+        {
+          "label": "fsp-wiring-default-derived-not-effect-stale-pick-kept",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    setFleetTenantPick(undefined);\n    setServer((s) => ({ ...s, deviceId: null }));\n",
+          "replace": "    setServer((s) => ({ ...s, deviceId: null }));\n",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'opens on the policy default until the operator picks'"
+        },
+        {
+          "label": "fsp-wiring-default-derived-not-effect-stale-pick-keeps-device-filter",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    setFleetTenantPick(undefined);\n    setServer((s) => ({ ...s, deviceId: null }));\n",
+          "replace": "    setFleetTenantPick(undefined);\n",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'opens on the policy default until the operator picks'"
         }
       ]
     },
@@ -1116,6 +1132,14 @@
           "file": "src/components/terminal/FleetSessionPicker.tsx",
           "anchor": "singleTenant: merged ? null : mintTenantOf(walks[0]?.requestedTenant ?? null),",
           "replace": "singleTenant: servedTenants[0] ?? null,",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
+        },
+        {
+          "label": "fsp-wiring-mint-under-served-tenant-third-group-create-site",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+          "replace": "onCreate={() => {\n                        void createRemote(\n                          groupKey, g.deviceId, g.label, fleetTenant);\n                        void createRemote(groupKey, g.deviceId, g.label, g.mintTenantId);\n                      }}",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
         }
