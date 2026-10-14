@@ -60,7 +60,11 @@ export function queryDraftReducer(state: QueryDraftState, event: QueryDraftEvent
     // the box's latest edit, so nothing the box sent is still in flight. Any
     // pending value left behind (typing a → ab → a leaves "ab") would
     // otherwise later mistake an external change to that exact text for an
-    // echo.
+    // echo. The trade-off this picks: echoes carry no sequence number, so if
+    // the manager renders an intermediate edit ("ab") AFTER one equal to the
+    // draft, that late echo is adopted as an outside change and briefly rolls
+    // the box back. That window is one render; mistaking a real outside change
+    // for an echo (the other choice) would hide it until the next edit.
     return { ...state, pending: [], seen: q };
   }
   const echo = state.pending.indexOf(q);
