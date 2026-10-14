@@ -274,10 +274,37 @@ impl RefreshOutcome {
 pub const DEVICE_PROOF_HEADER: &str = "x-coord-device-proof";
 
 /// The paired device JWT to present as a re-anchor proof, when one is held.
-/// The DEFAULT binding's credential: the proof is about the device, which is
-/// the same whichever tenant the bearer was minted for.
-fn device_proof() -> Option<String> {
-    crate::auth::device_bearer().filter(|t| !t.trim().is_empty())
+///
+/// The DEFAULT binding's credential. Coord's check
+/// (`tokens::device_proof_admits` in qontinui-coord) compares the proof's
+/// `device_id` with the agent token's and nothing else, and every binding's
+/// device JWT names this same device.
+///
+/// The read goes through `spawn_blocking`: `device_bearer` reads an encrypted
+/// file and may reach the OS keychain, which must not run on a tokio worker.
+async fn device_proof() -> Option<reqwest::header::HeaderValue> {
+    let raw = tokio::task::spawn_blocking(crate::auth::device_bearer)
+        .await
+        .ok()
+        .flatten();
+    proof_header_value(raw)
+}
+
+/// Turn a stored bearer into a header value, or `None` when it cannot be one.
+///
+/// Dropping a malformed value here is what keeps the proof OPTIONAL in
+/// practice: a value reqwest cannot put on the wire (a stray newline, say)
+/// would otherwise fail the whole request, and the refresh would back off and
+/// retry the same bad header until the agent token expired. Marked sensitive
+/// so it is redacted from debug output the way `bearer_auth` is.
+fn proof_header_value(raw: Option<String>) -> Option<reqwest::header::HeaderValue> {
+    let trimmed = raw?.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut v = reqwest::header::HeaderValue::from_str(&trimmed).ok()?;
+    v.set_sensitive(true);
+    Some(v)
 }
 
 /// Attach [`DEVICE_PROOF_HEADER`] when a proof is held; leave the request
@@ -285,7 +312,7 @@ fn device_proof() -> Option<String> {
 /// keychain.
 fn attach_device_proof(
     req: reqwest::RequestBuilder,
-    proof: Option<String>,
+    proof: Option<reqwest::header::HeaderValue>,
 ) -> reqwest::RequestBuilder {
     match proof {
         Some(p) => req.header(DEVICE_PROOF_HEADER, p),
@@ -293,9 +320,40 @@ fn attach_device_proof(
     }
 }
 
+/// How to treat a 401/403 from the refresh route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refusal {
+    /// Coord refused the bearer itself. Terminal: retrying presents it again.
+    BearerRefused,
+    /// Coord refused because the token's LINEAGE reached its bound
+    /// (`agent_token_lineage_expired`). The bearer is still valid, and a later
+    /// attempt can succeed if the device proof becomes acceptable (the device
+    /// JWT refresher renews it), so this is retried, not latched. Carries
+    /// coord's `device_proof` verdict for the log.
+    LineageExpired { device_proof: String },
+}
+
+fn classify_refusal(body: &serde_json::Value) -> Refusal {
+    if body.get("code").and_then(|c| c.as_str()) == Some("agent_token_lineage_expired") {
+        Refusal::LineageExpired {
+            device_proof: body
+                .get("device_proof")
+                .and_then(|d| d.as_str())
+                .unwrap_or("unreported")
+                .to_string(),
+        }
+    } else {
+        Refusal::BearerRefused
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RefreshResponseBody {
     token: String,
+    /// coord's verdict on [`DEVICE_PROOF_HEADER`]: `absent`, `accepted`, or
+    /// `ignored: <why>`. Absent from a coord that predates the lineage bound.
+    #[serde(default)]
+    device_proof: Option<String>,
     #[allow(dead_code)]
     agent_id: Uuid,
     jti: Uuid,
@@ -373,7 +431,7 @@ pub async fn maybe_refresh(
     // is that proof, so a session that outlives the bound keeps refreshing.
     // Coord ignores a proof that does not verify (and a coord predating the
     // bound ignores the header), so attaching it is never what fails a refresh.
-    let resp = match attach_device_proof(req, device_proof()).send().await {
+    let resp = match attach_device_proof(req, device_proof().await).send().await {
         Ok(r) => r,
         Err(e) => {
             let streak = token.write().await.record_transient_failure(now);
@@ -386,6 +444,20 @@ pub async fn maybe_refresh(
         // 401/403 = the bearer itself was refused. Unrecoverable by
         // retry, because the retry would present the same bearer.
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            let refusal_body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if let Refusal::LineageExpired { device_proof } = classify_refusal(&refusal_body) {
+                let streak = token.write().await.record_transient_failure(now);
+                log_transient(
+                    who,
+                    agent_id,
+                    streak,
+                    &format!(
+                        "refused: the token lineage reached coord's bound and the device proof \
+                         did not re-anchor it (device_proof: {device_proof})"
+                    ),
+                );
+                return Ok(RefreshOutcome::Deferred);
+            }
             // Bind first: a write guard created inside an `if` condition
             // lives until the end of the whole `if` statement, which
             // would hold the slot locked across the log call.
@@ -412,6 +484,14 @@ pub async fn maybe_refresh(
             return Ok(RefreshOutcome::Deferred);
         }
     };
+    if let Some(verdict) = body.device_proof.as_deref() {
+        if verdict.starts_with("ignored") {
+            warn!(
+                "{who}: agent_id={agent_id} coord ignored the device proof ({verdict}); \
+                 this agent's token lineage cannot outlive coord's bound"
+            );
+        }
+    }
     let mut g = token.write().await;
     g.adopt_fresh(body.token, body.jti, body.exp);
     info!(
@@ -449,14 +529,13 @@ mod tests {
         let client = reqwest::Client::new();
         let with = attach_device_proof(
             client.post("http://127.0.0.1:1/agents/x/refresh-token"),
-            Some("device.jwt.value".to_string()),
+            proof_header_value(Some("device.jwt.value".to_string())),
         )
         .build()
         .unwrap();
-        assert_eq!(
-            with.headers().get(DEVICE_PROOF_HEADER).unwrap(),
-            "device.jwt.value"
-        );
+        let v = with.headers().get(DEVICE_PROOF_HEADER).unwrap();
+        assert_eq!(v, "device.jwt.value");
+        assert!(v.is_sensitive(), "the proof must be redacted like a bearer");
         let without = attach_device_proof(
             client.post("http://127.0.0.1:1/agents/x/refresh-token"),
             None,
@@ -464,6 +543,39 @@ mod tests {
         .build()
         .unwrap();
         assert!(without.headers().get(DEVICE_PROOF_HEADER).is_none());
+    }
+
+    #[test]
+    fn refresh_device_proof_drops_values_that_cannot_be_a_header() {
+        assert_eq!(proof_header_value(None), None);
+        assert_eq!(proof_header_value(Some("   ".into())), None);
+        // Trimmed, so a trailing newline from a file read is not fatal...
+        assert_eq!(
+            proof_header_value(Some("a.b.c\n".into())).unwrap(),
+            "a.b.c"
+        );
+        // ...but an interior control character drops the proof rather than
+        // failing the whole refresh request.
+        assert_eq!(proof_header_value(Some("a.b\nc".into())), None);
+    }
+
+    #[test]
+    fn refresh_lineage_expiry_is_retried_not_latched() {
+        let body = serde_json::json!({
+            "code": "agent_token_lineage_expired",
+            "device_proof": "ignored: does not verify",
+        });
+        assert_eq!(
+            classify_refusal(&body),
+            Refusal::LineageExpired {
+                device_proof: "ignored: does not verify".into()
+            }
+        );
+        assert_eq!(
+            classify_refusal(&serde_json::json!({"error": "revoked"})),
+            Refusal::BearerRefused
+        );
+        assert_eq!(classify_refusal(&serde_json::Value::Null), Refusal::BearerRefused);
     }
 
     const NOW: i64 = 1_700_000_000;
