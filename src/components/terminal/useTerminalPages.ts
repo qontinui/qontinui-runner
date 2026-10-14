@@ -445,6 +445,33 @@ export async function readOccupiedPageIds(bestEffort = false): Promise<Set<strin
   return complete || bestEffort ? ids : null;
 }
 
+/**
+ * The close loop behind "Close empty tabs", with its two effects injected so the
+ * ordering is testable without React or Tauri.
+ *
+ * Occupancy is read once to pick candidates, then RE-READ immediately before
+ * each close: a terminal may have landed on a candidate while earlier pages were
+ * being removed (`removePage` kills the page's terminals, so a stale decision is
+ * destructive). FAIL-CLOSED: an unreadable occupancy closes nothing. Returns how
+ * many pages were closed.
+ */
+export async function closeEmptyPagesWith(
+  visiblePages: TerminalPageConfig[],
+  read: () => Promise<Set<string> | null>,
+  remove: (id: string) => Promise<void>,
+): Promise<number> {
+  const ids = await read();
+  if (!ids) return 0;
+  let closed = 0;
+  for (const id of emptyPageIds(visiblePages, ids)) {
+    const fresh = await read();
+    if (!fresh || fresh.has(id)) continue;
+    await remove(id);
+    closed++;
+  }
+  return closed;
+}
+
 export function useTerminalPages() {
   // A page-pinned pop-out window is fixed to one page for its whole lifetime.
   const [pinnedPageId] = useState<string | null>(readPinnedPageId);
@@ -594,21 +621,10 @@ export function useTerminalPages() {
    * UNKNOWN and nothing is closed — an unread source must not read as "empty".
    * Returns the number of pages closed.
    */
-  const closeEmptyPages = useCallback(async (): Promise<number> => {
-    const ids = await readOccupiedPageIds();
-    if (!ids) return 0;
-    const toClose = emptyPageIds(visiblePagesRef.current, ids);
-    let closed = 0;
-    for (const id of toClose) {
-      // Re-read just before each close: a terminal may have landed on this page
-      // while earlier pages were being removed (removePage kills its terminals).
-      const fresh = await readOccupiedPageIds();
-      if (!fresh || fresh.has(id)) continue;
-      await removePage(id);
-      closed++;
-    }
-    return closed;
-  }, [removePage]);
+  const closeEmptyPages = useCallback(
+    () => closeEmptyPagesWith(visiblePagesRef.current, readOccupiedPageIds, removePage),
+    [removePage],
+  );
 
   const renamePage = useCallback((id: string, name: string) => {
     setPages((prev) => {
