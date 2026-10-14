@@ -32,6 +32,7 @@ import {
   paletteTerms,
   searchPalette,
   stepSelection,
+  transcriptAnswerFor,
   transcriptCoverageNote,
   type PaletteEntry,
   type PaletteMatch,
@@ -191,7 +192,9 @@ function PaletteBody({ live, previous, closed, onActivate }: SessionSearchPalett
         handler: guardedHandler("search", QUERY_SCHEMA, (args) => {
           const q = textArg(args, "query");
           setQuery(q);
-          return searchPalette(entries, q, resp).map((m) => ({
+          // Only an answer kept FOR this query — `resp` is the query on
+          // screen before this call, whose transcript hits are not this one's.
+          return searchPalette(entries, q, transcriptAnswerFor(answer, q)).map((m) => ({
             key: m.entry.key,
             source: m.entry.source,
             title: m.entry.title,
