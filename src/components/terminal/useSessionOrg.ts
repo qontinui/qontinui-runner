@@ -119,8 +119,10 @@ export interface SessionOrgClient {
 
 /**
  * How long a caller waits for one apply's answer. Past it the caller is told the
- * outcome is UNKNOWN (the call may still land) and the org is re-read, so a
- * lost answer never leaves the preview showing an edit as applied.
+ * outcome is UNKNOWN (the call may still land), its preview is withdrawn and the
+ * org is re-read — and re-read again if the call does land later. Applies queued
+ * behind a hung call keep their previews until it settles or the hold below
+ * runs out (so up to about holdMs + answerMs).
  */
 export const SESSION_ORG_APPLY_TIMEOUT_MS = 15_000;
 
@@ -134,7 +136,9 @@ export const SESSION_ORG_APPLY_TIMEOUT_MS = 15_000;
 export const SESSION_ORG_APPLY_HOLD_MS = 60_000;
 
 /** The apply's answer did not arrive in time; whether it landed is UNKNOWN. */
-export class SessionOrgApplyTimeout extends Error {}
+export class SessionOrgApplyTimeout extends Error {
+  override name = "SessionOrgApplyTimeout";
+}
 
 function formatMs(ms: number): string {
   return ms < 1000 ? `${ms} ms` : `${Math.round(ms / 1000)} s`;
@@ -268,15 +272,20 @@ export function createSessionOrgClient(
       () => undefined,
       () => undefined,
     );
+    let timedOut = false;
+    // A call that lands after its answer timed out changed the store behind
+    // the caller's back: re-read, so a window with no change-event channel
+    // still converges.
+    void settledReal.then(() => {
+      if (timedOut) void refresh();
+    });
     return {
-      answer: within(
-        real,
-        answerMs,
-        () =>
-          new SessionOrgApplyTimeout(
-            `no answer from session_org_apply within ${formatMs(answerMs)}`,
-          ),
-      ),
+      answer: within(real, answerMs, () => {
+        timedOut = true;
+        return new SessionOrgApplyTimeout(
+          `no answer from session_org_apply within ${formatMs(answerMs)}`,
+        );
+      }),
       release: within(settledReal, holdMs, () => new Error("hold elapsed")).catch(() => undefined),
     };
   }
