@@ -822,6 +822,8 @@ const PageSessionScope = memo(function PageSessionScope({
     tabLockStates,
     pageId,
     windowLabel: myWindowLabel,
+    // Focusing a session clears its unseen-activity dot.
+    focusedTabId: activeId ?? null,
   });
 
   const workflowGen = useWorkflowGeneration({

@@ -35,6 +35,9 @@ export const SESSION_ORG_CONTROLS = {
   pinnedSection: control("pinned-section", "read"),
   ungroupedSection: control("ungrouped-section", "read"),
   railItem: control("rail-item", "read"),
+  // Quick identification (Phase 7)
+  hoverCard: control("hover-card", "read"),
+  unseenDot: control("unseen-dot", "read"),
   // Group header
   groupHeader: control("group-header", "read"),
   groupCollapse: control("group-collapse", "write"),

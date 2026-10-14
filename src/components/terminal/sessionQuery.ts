@@ -654,12 +654,9 @@ function evaluateIs(f: SessionFacts, value: IsValue, ctx: QueryContext): Verdict
       return onFact(f.muted, (b) => b);
     case "snoozed":
       return onFact(f.snoozedUntil, (u) => u !== null && u > ctx.now);
-    case "unseen": {
-      if (!f.lastActivityAt.known) return U(f.lastActivityAt.reason);
-      if (!f.lastSeenAt.known) return U(f.lastSeenAt.reason);
-      const seen = f.lastSeenAt.value;
-      return bool(seen === null || f.lastActivityAt.value > seen);
-    }
+    case "unseen":
+      // The card's unseen dot, verbatim — one verdict for the dot and the filter.
+      return onFact(f.unseen, (b) => b);
   }
 }
 
