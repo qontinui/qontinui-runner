@@ -216,25 +216,48 @@ export function ownsReleasedPage(
   return !bindings[pageId];
 }
 
+/** How many times an ABORTED restore re-runs on its own for ids it still owes (review V1). */
+export const ABORT_RETRY_LIMIT = 3;
+/** The first such re-run's delay; each later one doubles it (2 s, 4 s, 8 s). */
+export const ABORT_RETRY_BASE_MS = 2_000;
+
+/** How a restore run of a page ended. */
+export type RestoreRunOutcome = "restored" | "aborted" | "deferred";
+
 /**
  * Serializes the targeted re-runs of each page's restore (review round 7,
  * U1). A late sweep settle and a released holder can both ask for a re-run of
  * the same page, for the same session, while a run is still in flight; two
  * runs racing would each cold-resume it. Ids scheduled while a run of the
  * page is in flight are only merged, and the run's end triggers ONE re-run
- * for all of them (none when that run restored nothing — its full retry
- * covers every id). A page this window has not begun restoring is not re-run
+ * for all of them. A page this window has not begun restoring is not re-run
  * at all: its first full restore, whenever it runs, covers every id — and a
- * window that does not own the page never restores it. Exported for tests.
+ * window that does not own the page never restores it.
+ *
+ * An ABORTED run (indeterminate reconnect) restored nothing, but its page
+ * stays known and every id it owed is KEPT (review V1, coord finding
+ * c7d478a8): dropping them left a released session unresumed until the
+ * operator re-activated the page, and the lifecycle poll retires such a
+ * record within minutes. The queue re-runs the page itself, at most
+ * {@link ABORT_RETRY_LIMIT} times in a row with a doubling backoff; past
+ * that, the ids wait for the next schedule or activation — never a loop. A
+ * page with no completed restore re-runs IN FULL, which covers the ids. A
+ * drain-deferred run drops them: the drain lift re-runs the page in full.
+ * Exported for tests.
  */
 export class RestoreRerunQueue {
   private readonly inFlight = new Set<string>();
   private readonly restored = new Set<string>();
+  /** Consecutive aborted runs per page; a page in here is known. */
+  private readonly aborted = new Map<string, number>();
   private readonly pending = new Map<string, Set<string>>();
+  /** The ids each in-flight run took, given back if it aborts. */
+  private readonly taken = new Map<string, Set<string>>();
 
   /** Merge `sessionIds` for `pageId`; true when the caller must trigger a re-run now. */
   schedule(pageId: string, sessionIds: readonly string[]): boolean {
-    const known = this.restored.has(pageId) || this.inFlight.has(pageId);
+    const known =
+      this.restored.has(pageId) || this.inFlight.has(pageId) || this.aborted.has(pageId);
     if (!known || sessionIds.length === 0) return false;
     const merged = this.pending.get(pageId) ?? new Set<string>();
     for (const id of sessionIds) merged.add(id);
@@ -242,27 +265,49 @@ export class RestoreRerunQueue {
     return !this.inFlight.has(pageId);
   }
 
-  /**
-   * A run of `pageId` starts. Returns the ids it alone must restore, or
-   * `undefined` for a full restore.
-   */
-  begin(pageId: string): ReadonlySet<string> | undefined {
-    this.inFlight.add(pageId);
-    const only = this.pending.get(pageId);
-    this.pending.delete(pageId);
-    return only;
+  /** Whether a restore of `pageId` has completed — a re-run of it merges. */
+  restoredOnce(pageId: string): boolean {
+    return this.restored.has(pageId);
   }
 
   /**
-   * The run of `pageId` ended; `restored` is false when it restored nothing
-   * (aborted or deferred — the full retry covers every id). True when ids
-   * were scheduled meanwhile: the caller triggers one re-run.
+   * A run of `pageId` starts. Returns the ids it alone must restore, or
+   * `undefined` for a full restore — always, until a restore of the page has
+   * completed.
    */
-  finish(pageId: string, restored: boolean): boolean {
+  begin(pageId: string): ReadonlySet<string> | undefined {
+    this.inFlight.add(pageId);
+    const ids = this.pending.get(pageId);
+    this.pending.delete(pageId);
+    if (ids) this.taken.set(pageId, ids);
+    else this.taken.delete(pageId);
+    return this.restored.has(pageId) ? ids : undefined;
+  }
+
+  /**
+   * The run of `pageId` ended with `outcome`. Returns `null` for no re-run,
+   * or the delay in ms after which the caller triggers ONE re-run (`0`: now).
+   */
+  finish(pageId: string, outcome: RestoreRunOutcome): number | null {
     this.inFlight.delete(pageId);
-    if (restored) this.restored.add(pageId);
-    else this.pending.delete(pageId);
-    return (this.pending.get(pageId)?.size ?? 0) > 0;
+    const taken = this.taken.get(pageId);
+    this.taken.delete(pageId);
+    if (outcome === "deferred") {
+      this.pending.delete(pageId);
+      return null;
+    }
+    if (outcome === "restored") {
+      this.restored.add(pageId);
+      this.aborted.delete(pageId);
+      return (this.pending.get(pageId)?.size ?? 0) > 0 ? 0 : null;
+    }
+    const kept = this.pending.get(pageId) ?? new Set<string>();
+    for (const id of taken ?? []) kept.add(id);
+    if (kept.size > 0) this.pending.set(pageId, kept);
+    const streak = (this.aborted.get(pageId) ?? 0) + 1;
+    this.aborted.set(pageId, streak);
+    if (kept.size === 0 || streak > ABORT_RETRY_LIMIT) return null;
+    return ABORT_RETRY_BASE_MS * 2 ** (streak - 1);
   }
 }
 
@@ -1187,10 +1232,21 @@ export function useTerminalInitialization({
   const rerunQueue = useRef(new RestoreRerunQueue());
   // Sessions a run is creating a tab for right now.
   const coldResumeGuard = useRef(new ColdResumeGuard());
-  const triggerRerun = useCallback((forPage: string) => {
-    drainDeferredPages.current.add(forPage);
+  // Re-run `forPage`'s restore: merging into its live tabs (`merge`, like a
+  // drain re-run), or — retrying an aborted first restore — as that restore.
+  const triggerRerun = useCallback((forPage: string, merge = true) => {
+    if (merge) drainDeferredPages.current.add(forPage);
     didInitPages.current.delete(forPage);
     setDrainResumeEpoch((n) => n + 1);
+  }, []);
+  // An aborted restore's backoff retries (review V1), cleared on unmount.
+  const rerunTimers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  useEffect(() => {
+    const timers = rerunTimers.current;
+    return () => {
+      for (const t of timers) clearTimeout(t);
+      timers.clear();
+    };
   }, []);
   // Re-run the restore of `forPage` (merging, like a drain re-run) for
   // exactly `sessionIds` — after a late sweep settle, or a session a dead
@@ -1198,7 +1254,10 @@ export function useTerminalInitialization({
   // flight ends); another page when it is next activated.
   const scheduleRecheckRerun = useCallback(
     (forPage: string, sessionIds: string[]) => {
-      if (rerunQueue.current.schedule(forPage, sessionIds)) triggerRerun(forPage);
+      if (rerunQueue.current.schedule(forPage, sessionIds)) {
+        // A page whose restore only ever aborted re-runs as its first restore.
+        triggerRerun(forPage, rerunQueue.current.restoredOnce(forPage));
+      }
     },
     [triggerRerun],
   );
@@ -1841,9 +1900,22 @@ export function useTerminalInitialization({
           });
         }
         for (const id of coldClaims) coldResumeGuard.current.release(id);
-        // Re-runs scheduled while this run was in flight: one, now.
-        if (rerunQueue.current.finish(initPageId, !restoreAborted && !restoreDeferred)) {
+        // Re-runs scheduled while this run was in flight: one, now — or,
+        // after an abort, a bounded retry for the ids it still owes.
+        const rerunAfter = rerunQueue.current.finish(
+          initPageId,
+          restoreAborted ? "aborted" : restoreDeferred ? "deferred" : "restored",
+        );
+        if (rerunAfter === 0) {
           triggerRerun(initPageId);
+        } else if (rerunAfter !== null) {
+          // The aborted run is retried as what it was: a merging re-run, or
+          // the page's first restore.
+          const timer = setTimeout(() => {
+            rerunTimers.current.delete(timer);
+            triggerRerun(initPageId, isDrainRerun);
+          }, rerunAfter);
+          rerunTimers.current.add(timer);
         }
       }
     })();
