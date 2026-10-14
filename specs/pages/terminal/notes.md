@@ -66,3 +66,55 @@ transitions `enter-tmux-work-mode`, `tmux-swap-session` and
   runner, the snapshot exceeded its 10 s budget (5,596 registered elements)
   while `POST /ui-bridge/control/find` answered in ~2.4 s and
   `GET /ui-bridge/control/element/<id>` in < 100 ms. Use those two.
+
+## Session organization (plan `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`)
+
+States `session-org-*` cover the Session Manager's group lens, group
+headers (expanded / collapsed), Suggest groups, the query box and chips,
+the Unknown tail, the search palette, the bulk bar, the Ready-to-close
+banner, the close and force-close confirmations, Recently closed, the hover
+card, the unseen dot and rail mode. Every transition carries its declared
+`effect` in the IR (`state-machine.derived.json`); the bundled projection
+drops `effect` by design (`projectIRToBundledPage`), so read the class from
+the IR, from this table, or off the element's own `data-effect`.
+
+- **Ids and effects have one source**: `SESSION_ORG_CONTROLS`
+  (`src/components/terminal/sessionOrgControls.ts`) and
+  `SESSION_QUERY_CONTROLS` (`sessionQueryChips.ts`). Every control renders
+  `data-ui-bridge-id` and `data-effect`. Per-row / per-group controls append
+  the id: `terminal.session-org.group-header-<groupId>`,
+  `…group-collapse-<groupId>`, `…group-menu.close-group-<groupId>`,
+  `…rail-item-<sessionId>`, `…unseen-dot-<sessionId>`,
+  `…recently-closed.resume-<sessionKey>`, `…query-chip-<chipKey>`.
+- **Destructive** (an autonomous walk must not fire them): `close`
+  (row menu `session-menu.close`, component `session-org` `close`),
+  `close-group` (`group-menu.close-group`, `session-org` `close-group`),
+  `close-confirm`, `force-close-confirm`, `bulk.close`,
+  `ready-to-close.review`. Close always goes through the confirmation and
+  `graceful_exit`, never a kill (D7).
+- **Write** (reversible org state, or starts a process): every group-menu
+  item but Close group, every session-menu item but Close, the bulk bar's
+  Finish / Add to group / New group / Pin / Unpin / Mute / Snooze / Move to
+  page / Resume, `recently-closed.resume`, group collapse, `query-save-view`,
+  `query-delete-view`, and the component actions `session-org`
+  create/rename/recolor/move/ungroup/delete-group, set-group-collapsed,
+  add-to/remove-from-group, set-pinned, set-muted, snooze, move-to-page;
+  `session-group-suggestions` accept-suggestion / dismiss-suggestion /
+  accept-all; `session-search-palette` activate.
+- **Read**: chips, query input / clear, pickers, saved-view apply, the
+  palette's search / close, Suggest groups (preview only), the rail toggle,
+  the resize handle, the hover card, the unseen dot, bulk Clear, close
+  Cancel, Force close (arms the second confirmation only), the Include and
+  per-session ticks.
+- **Drive org changes through `session-org`, not a drag.** Drag-and-drop
+  is the operator's path; `POST
+  /ui-bridge/control/component/session-org/action/<action>` (or the runner's
+  `GET`/`POST /terminal/session-org`) is the deterministic one, and
+  `list-groups` reads the store back.
+- **Status words are two attributes, not one**: every row carries
+  `data-session-location` and `data-session-activity`; `data-session-unseen`
+  is `true` / `false` / `unknown` / `untracked`. A query row whose facts are
+  unread is listed under the Unknown tail (`data-unknown-reason`), never
+  counted as a non-match.
+- **Hover card and unseen dot have no runnable jsdom test** on a box without
+  `jsdom`; the Phase 8 temp-runner UI Bridge run is their live check.
