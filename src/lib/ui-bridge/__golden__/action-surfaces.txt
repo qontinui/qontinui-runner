@@ -67,9 +67,9 @@ src/components/terminal/SessionQueryBar.tsx:157	literal	component	clear-query	sc
 src/components/terminal/SessionQueryBar.tsx:164	guarded	component	toggle-chip	schema=yes	arity=-	effect=read
 src/components/terminal/SessionQueryBar.tsx:175	guarded	component	save-view	schema=yes	arity=-	effect=write
 src/components/terminal/SessionQueryBar.tsx:189	guarded	component	delete-view	schema=yes	arity=-	effect=write
-src/components/terminal/SessionSearchPalette.tsx:185	guarded	component	search	schema=yes	arity=-	effect=read
-src/components/terminal/SessionSearchPalette.tsx:202	guarded	component	activate	schema=yes	arity=-	effect=write
-src/components/terminal/SessionSearchPalette.tsx:217	literal	component	close	schema=no	arity=0	effect=read
+src/components/terminal/SessionSearchPalette.tsx:186	guarded	component	search	schema=yes	arity=-	effect=read
+src/components/terminal/SessionSearchPalette.tsx:205	guarded	component	activate	schema=yes	arity=-	effect=write
+src/components/terminal/SessionSearchPalette.tsx:220	literal	component	close	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:227	literal	element	focus	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:249	literal	element	blur	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:269	guarded	element	sendKeys	schema=no	arity=-	effect=destructive
