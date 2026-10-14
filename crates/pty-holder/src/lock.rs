@@ -22,16 +22,16 @@
 //!   reading who holds it; a range past EOF is legal and blocks nothing a
 //!   reader touches.
 //!
-//! **The fork-to-exec window.** The lock fd is `O_CLOEXEC`, but between a
-//! `fork` and the child's `exec` the child holds a copy of the open file
-//! description — and with it the `flock`. So when a process that briefly
-//! holds a pane lock (a runner probe's acquire-and-drop) spawns any child
-//! concurrently, the lock can read `Held` for that window after the drop,
-//! with NO live holder. Under load the window is observable
-//! (`pty_holder_lock_is_exclusive_and_released_on_drop` waits it out). The
-//! spawn path should therefore retry `LockHeld` when the lock record names
-//! no live holder, rather than report the pane taken — owed by Phase 3, which
-//! owns the spawn and lock paths.
+//! **A held lock is not always a live holder** (coord finding `9bbe1079`, owned
+//! by Phase 3). An `flock` belongs to an open file DESCRIPTION, and a process
+//! forked between a lock file's open and its `exec` shares that description —
+//! and so the lock — until the exec closes it; a prober (`client::probe`)
+//! also holds a dead pane's lock for an instant. A holder starting at such a
+//! moment used to exit `lock_held` against nobody. A starting holder therefore
+//! takes its lock with [`PaneLock::try_acquire_unless_live`]: on `Held` it
+//! retries with a short bounded backoff ([`TRANSIENT_HOLD_BACKOFF_MS`]) — but
+//! ONLY while the lock's record names no live holder
+//! ([`record_names_live_holder`]). Against a live holder it never retries.
 //!
 //! The lock file is never unlinked by a holder. Unlinking a lock file lets a
 //! second holder lock a fresh file under the same name while a third still
@@ -64,6 +64,11 @@ pub struct LockRecord {
     pub versions: Vec<u32>,
     pub started_at_unix_ms: u64,
     pub holder_build: String,
+    /// The HOLDER's own start token (`crate::proc_identity`), so "is the
+    /// recorded holder alive?" survives pid reuse. Absent from records of
+    /// earlier holders, which then count as live whenever their pid exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_start: Option<String>,
     /// The child's start token (`crate::proc_identity`), taken right after it
     /// was spawned: what lets a boot sweep tell the recorded child from a
     /// process that later got the same pid (Phase 3, D8). Absent from records
@@ -82,6 +87,40 @@ pub struct LockRecord {
 pub struct PaneLock {
     file: File,
     path: PathBuf,
+}
+
+/// The pauses (ms) [`PaneLock::try_acquire_unless_live`] waits out a lock held
+/// by no live holder: about 300 ms in all.
+pub const TRANSIENT_HOLD_BACKOFF_MS: [u64; 4] = [20, 40, 80, 160];
+
+/// Whether `record` names a holder that is alive right now: its pid is the
+/// process its start token was taken from, or — for a record with no token —
+/// its pid exists at all (the conservative answer). No record names nobody.
+pub fn record_names_live_holder(record: Option<&LockRecord>) -> bool {
+    let Some(r) = record else {
+        return false;
+    };
+    match &r.holder_start {
+        Some(token) => crate::proc_identity::is_same_process(r.holder_pid, Some(token)),
+        None => pid_exists(r.holder_pid),
+    }
+}
+
+/// Whether any process has pid `pid`.
+fn pid_exists(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(pid) = crate::spawn::signalable_pid(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 delivers nothing; it only checks for existence.
+        let delivered = unsafe { libc::kill(pid, 0) } == 0;
+        delivered || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        crate::proc_identity::start_token(pid).is_some()
+    }
 }
 
 /// How many times [`PaneLock::try_acquire`] re-opens a lock file that was
@@ -143,6 +182,25 @@ impl PaneLock {
             "{} was unlinked under every lock attempt",
             path.display()
         )))
+    }
+
+    /// [`PaneLock::try_acquire`] for a STARTING holder: a lock held while its
+    /// record names no live holder is a transient hold (module docs), waited
+    /// out over [`TRANSIENT_HOLD_BACKOFF_MS`]. A lock whose record names a
+    /// live holder is `Held` at once, with no retry.
+    pub fn try_acquire_unless_live(path: &Path) -> io::Result<TryLock> {
+        let mut pauses = TRANSIENT_HOLD_BACKOFF_MS.iter();
+        loop {
+            match Self::try_acquire(path)? {
+                TryLock::Held if !record_names_live_holder(read_record(path).as_ref()) => {
+                    match pauses.next() {
+                        Some(ms) => std::thread::sleep(std::time::Duration::from_millis(*ms)),
+                        None => return Ok(TryLock::Held),
+                    }
+                }
+                other => return Ok(other),
+            }
+        }
     }
 
     /// Like [`PaneLock::try_acquire`], but never creates the file: a missing
@@ -464,6 +522,7 @@ mod tests {
             holder_build: "b".into(),
             child_start: Some("linux:boot:1".into()),
             scope_unit: None,
+            holder_start: None,
         };
         first.write_record(&rec).unwrap();
         // Readable while held — on Windows too, because the locked byte is
@@ -521,6 +580,60 @@ mod tests {
         let old = br#"{"holder_pid":7,"child_pid":8,"versions":[2],"started_at_unix_ms":1,"holder_build":"b"}"#;
         let rec: LockRecord = serde_json::from_slice(old).unwrap();
         assert_eq!((rec.child_start, rec.scope_unit), (None, None));
+    }
+
+    /// Finding 9bbe1079: a lock held by no live holder (here: by another open
+    /// description of this process, released shortly — what a fork-before-exec
+    /// or a prober does) is waited out; a lock whose record names a live holder
+    /// is `Held` at once.
+    #[test]
+    fn pty_holder_lock_retries_a_transient_hold_but_never_a_live_holder() {
+        let dir = tmpdir("transient");
+        let path = dir.join("t.lock");
+        let TryLock::Acquired(transient) = PaneLock::try_acquire(&path).unwrap() else {
+            panic!("fresh lock");
+        };
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(transient);
+        });
+        assert!(
+            matches!(
+                PaneLock::try_acquire_unless_live(&path).unwrap(),
+                TryLock::Acquired(_)
+            ),
+            "a transient hold with no live holder on record is waited out"
+        );
+        release.join().unwrap();
+
+        let TryLock::Acquired(mut live) = PaneLock::try_acquire(&path).unwrap() else {
+            panic!("lock");
+        };
+        let me = std::process::id();
+        live.write_record(&LockRecord {
+            holder_pid: me,
+            child_pid: None,
+            versions: vec![3],
+            started_at_unix_ms: 0,
+            holder_build: "b".into(),
+            child_start: None,
+            scope_unit: None,
+            holder_start: crate::proc_identity::start_token(me),
+        })
+        .unwrap();
+        assert!(record_names_live_holder(read_record(&path).as_ref()));
+        let asked = std::time::Instant::now();
+        assert!(matches!(
+            PaneLock::try_acquire_unless_live(&path).unwrap(),
+            TryLock::Held
+        ));
+        assert!(
+            asked.elapsed() < std::time::Duration::from_millis(TRANSIENT_HOLD_BACKOFF_MS[0]),
+            "no retry against a live holder"
+        );
+        drop(live);
+        assert!(!record_names_live_holder(None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

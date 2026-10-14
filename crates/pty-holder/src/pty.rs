@@ -39,6 +39,7 @@
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -121,10 +122,17 @@ pub struct Pane {
     /// [`Pane::spawn`] BEFORE the waiter can reap it — so it is the child's,
     /// never a recycled pid's.
     child_start: Option<String>,
-    /// Unix: what the waiter's session reap did (moment 1 of `crate::reap`),
-    /// kept for [`Pane::reap_tree`] to report.
+    /// Unix: what the waiter's session reap did (`crate::reap`, the kill
+    /// path), kept for [`Pane::reap_tree`] to report.
     #[cfg(unix)]
     session_reap: Mutex<Option<crate::reap::ReapReport>>,
+    /// The pane is being KILLED ([`Pane::kill_now`]), as opposed to its child
+    /// exiting on its own. Only a kill reaps the tree the child leaves behind
+    /// (plan D8 as decided 2026-10-14): a normal exit leaves `nohup` /
+    /// `disown` jobs and deliberately detached programs alone, as an
+    /// in-process PTY always did. Set BEFORE the first signal, so the waiter —
+    /// which acts only after the child has died — always sees it.
+    kill_requested: AtomicBool,
 }
 
 impl std::fmt::Debug for Pane {
@@ -227,6 +235,7 @@ impl Pane {
             child_start,
             #[cfg(unix)]
             session_reap: Mutex::new(None),
+            kill_requested: AtomicBool::new(false),
         });
 
         let p = Arc::clone(&pane);
@@ -328,7 +337,7 @@ impl Pane {
         let pid = self.child_pid as libc::pid_t;
         // Phase 1: wait for the exit WITHOUT reaping, so the pid stays ours
         // (a zombie) while `kill` may still be looking at it.
-        loop {
+        let exited = loop {
             // SAFETY: siginfo_t is plain data; zeroed is a valid initial value.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             // SAFETY: waitid on our own child pid with a valid out-pointer.
@@ -341,17 +350,21 @@ impl Pane {
                 )
             };
             if rc == 0 {
-                break;
+                break true;
             }
             if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                break;
+                break false;
             }
+        };
+        // Plan D8, kill path only: the child was killed and is a zombie now —
+        // `exited` says waitid saw it so — so its pid (= its session id) is
+        // pinned: end what it left in its session BEFORE the reap below
+        // releases that id. A child that exited on its own leaves its session
+        // as an in-process PTY did.
+        if exited && self.kill_requested.load(Ordering::SeqCst) {
+            let session_reap = crate::reap::reap_session_of_exited_child(self.child_pid);
+            *self.session_reap.lock().unwrap_or_else(|p| p.into_inner()) = Some(session_reap);
         }
-        // Plan D8: the child is a zombie now, so its pid (= its session id)
-        // is pinned — end what it left in its session BEFORE the reap below
-        // releases that id.
-        let session_reap = crate::reap::reap_session_of_exited_child(self.child_pid);
-        *self.session_reap.lock().unwrap_or_else(|p| p.into_inner()) = Some(session_reap);
         // Phase 2: under the lock, mark it gone and reap it — `kill` checks
         // `child_gone` under the same lock, so it can never signal the pid
         // after this point.
@@ -554,6 +567,7 @@ impl Pane {
 
     /// [`Pane::kill`], on the calling thread.
     pub fn kill_now(&self) {
+        self.kill_requested.store(true, Ordering::SeqCst);
         #[cfg(unix)]
         {
             if !self.signal_child(libc::SIGHUP) {
@@ -587,37 +601,46 @@ impl Pane {
         }
     }
 
-    /// End what the child left of its process tree, once the pane is over
-    /// (plan D8: each holder reaps exactly its own child tree), and report it.
-    /// Unix: the child's session remainder was already ended by the waiter,
-    /// while the child was an unreaped zombie (`crate::reap`, moment 1); this
-    /// adds, on the scope route, everything else in the holder's scope. Windows: the holder-owned job is
-    /// terminated — the same outcome its `KILL_ON_JOB_CLOSE` would reach when
-    /// the holder exits, made explicit so it happens under the pane lock.
+    /// What the holder reaped of its child's tree, reported once the pane is
+    /// over (plan D8; the decision of 2026-10-14 on WHEN it reaps):
+    ///
+    /// - **The pane was killed** ([`Pane::kill_now`] — a tab closed, or the
+    ///   runner gave up on the pane). Unix: the child's session was swept by
+    ///   the waiter while the child was an unreaped zombie (`crate::reap`), and
+    ///   here, on the scope route, everything else in the holder's own scope.
+    ///   Windows: `kill_now` already terminated the holder-owned job.
+    /// - **The child exited on its own.** Nothing is reaped here: what it left
+    ///   running (`nohup` / `disown` jobs, a tmux server, an agent) keeps
+    ///   running, as with an in-process PTY. Windows: those processes are
+    ///   still in the holder's `KILL_ON_JOB_CLOSE` job, which ends them when
+    ///   the holder — the job's owner — exits. That is the old semantics with
+    ///   the holder in the runner's place: the runner's own job ended a tab's
+    ///   leftovers when the runner, ITS owner, exited.
     pub fn reap_tree(&self) -> crate::reap::ReapReport {
+        let mut report = crate::reap::ReapReport::default();
+        if !self.kill_requested.load(Ordering::SeqCst) {
+            report.note("the child exited on its own: its leftovers are not reaped");
+            return report;
+        }
         #[cfg(unix)]
         {
-            let mut report = self
+            if let Some(session) = self
                 .session_reap
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take()
-                .unwrap_or_default();
+            {
+                report.absorb(session);
+            }
             report.absorb(crate::reap::reap_own_scope());
-            report
         }
         #[cfg(windows)]
-        {
-            let mut report = crate::reap::ReapReport::default();
-            match &self.job {
-                Some(job) => match job.terminate() {
-                    Ok(()) => report.note("job terminated"),
-                    Err(e) => report.note(format!("job terminate failed: {e}")),
-                },
-                None => report.note("the child was never in a job: its tree is not reaped"),
-            }
-            report
-        }
+        report.note(if self.job.is_some() {
+            "killed: the job holding the child's tree was terminated"
+        } else {
+            "killed: the child was never in a job, so only the child was terminated"
+        });
+        report
     }
 
     /// Record that an `exit` frame reached a client.

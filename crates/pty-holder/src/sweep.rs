@@ -16,6 +16,12 @@
 //! | lock held, handshake unanswered | [`SweepOutcome::Unknown`] | nothing: counted, never touched |
 //! | lock free (holder dead) | [`SweepOutcome::Reaped`] | under that lock: reap what the record PROVES is the pane's tree (`crate::reap`), remove the endpoint/spec/report, then the lock file |
 //!
+//! A dead holder's leftovers that nothing proves are the pane's are not
+//! signalled — and not forgotten either: its record moves to the ORPHAN
+//! LEDGER (`<pane-id>.orphan`), which every later sweep re-checks with the
+//! same rule, dropping an entry once nothing unattributed is left or once its
+//! record is from an earlier boot.
+//!
 //! Then the files no lock accounts for: an endpoint, spec or report whose pane
 //! has no lock file and that is older than [`STRAY_MIN_AGE`] (a spawn in
 //! flight writes its spec before its holder creates the lock, so a young one
@@ -39,7 +45,8 @@ use std::time::{Duration, SystemTime};
 use crate::client::{census, Probe};
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{
-    check_private_dir, lock_path, report_path, report_tmp_path, socket_path, spec_path, PaneId,
+    check_private_dir, lock_path, orphan_path, report_path, report_tmp_path, socket_path,
+    spec_path, PaneId,
 };
 use crate::protocol::HelloAck;
 use crate::reap::{reap_orphans_of_dead_holder, ReapReport};
@@ -82,7 +89,20 @@ pub enum SweepOutcome {
         /// `false` only on Windows, when another process had the lock file
         /// open at the instant of removal (it is left for the next sweep).
         lock_removed: bool,
+        /// The reap left processes it could not attribute, so the record
+        /// was kept in the orphan ledger (`<pane-id>.orphan`).
+        orphan_kept: bool,
     },
+}
+
+/// One orphan-ledger entry the sweep re-checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanEntry {
+    pub pane_id: String,
+    pub record: Option<LockRecord>,
+    pub reap: ReapReport,
+    /// Still unattributed processes: the entry stays for the next sweep.
+    pub kept: bool,
 }
 
 /// One swept lock file.
@@ -99,6 +119,8 @@ pub struct SweepEntry {
 pub struct SweepReport {
     /// One per lock file, sorted by pane id.
     pub entries: Vec<SweepEntry>,
+    /// Orphan-ledger entries re-checked this sweep.
+    pub orphans: Vec<OrphanEntry>,
     /// Files removed because no lock accounted for them.
     pub strays_removed: Vec<PathBuf>,
     /// Removals that failed, one line each. They do not stop the sweep.
@@ -116,16 +138,28 @@ impl SweepReport {
 }
 
 /// Sweep `pane_dir`: classify every pane under ONE deadline `timeout` from now,
-/// reap the dead, remove stray files. A missing pane directory is an empty
-/// report; one that is unreadable or (Unix) not private is an error — the
+/// hand the classification to `before_reaping` (the caller adopts the live
+/// panes there, so their adoption never waits on reaping), then reap the
+/// dead, re-check the orphan ledger, and remove stray files. A missing pane
+/// directory is an empty report (and `before_reaping` still runs, with
+/// nothing); one that is unreadable or (Unix) not private is an error — the
 /// sweep never acts on a directory another user could have planted files in.
-pub fn boot_sweep(pane_dir: &Path, timeout: Duration, skip: &[PaneId]) -> io::Result<SweepReport> {
+pub fn boot_sweep(
+    pane_dir: &Path,
+    timeout: Duration,
+    skip: &[PaneId],
+    before_reaping: impl FnOnce(&[SweepEntry]),
+) -> io::Result<SweepReport> {
     match check_private_dir(pane_dir) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SweepReport::default()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            before_reaping(&[]);
+            return Ok(SweepReport::default());
+        }
         Err(e) => return Err(e),
     }
     let mut report = SweepReport::default();
+    let mut dead: Vec<String> = Vec::new();
     for row in census(pane_dir, timeout, skip)? {
         let outcome = match row.probe {
             Probe::Healthy { hello_ack } => SweepOutcome::Live {
@@ -141,21 +175,98 @@ pub fn boot_sweep(pane_dir: &Path, timeout: Duration, skip: &[PaneId]) -> io::Re
             // A census walks lock files, so it never answers Absent; a lock
             // file that vanished mid-walk was removed by someone else.
             Probe::Absent => continue,
-            Probe::Dead { .. } => match PaneId::new(&row.pane_id) {
-                Ok(pane) => reap_dead(pane_dir, &pane, &mut report.errors),
-                Err(e) => SweepOutcome::Unknown {
-                    reason: e.to_string(),
-                    record: None,
-                },
-            },
+            Probe::Dead { .. } => {
+                dead.push(row.pane_id);
+                continue;
+            }
         };
         report.entries.push(SweepEntry {
             pane_id: row.pane_id,
             outcome,
         });
     }
+    before_reaping(&report.entries);
+    for pane_id in dead {
+        let outcome = match PaneId::new(&pane_id) {
+            Ok(pane) => reap_dead(pane_dir, &pane, &mut report.errors),
+            Err(e) => SweepOutcome::Unknown {
+                reason: e.to_string(),
+                record: None,
+            },
+        };
+        report.entries.push(SweepEntry { pane_id, outcome });
+    }
+    report.entries.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+    recheck_orphans(pane_dir, &mut report);
     remove_strays(pane_dir, SystemTime::now(), skip, &mut report);
     Ok(report)
+}
+
+/// Write `record` to the pane's orphan-ledger entry (`<pane-id>.orphan`,
+/// 0600, never through a symlink).
+fn write_orphan(pane_dir: &Path, pane: &PaneId, record: &LockRecord) -> io::Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(orphan_path(pane_dir, pane))?;
+    f.write_all(&bytes)?;
+    f.sync_data()
+}
+
+/// Re-check every orphan-ledger entry whose pane has no lock file: reap what
+/// is now PROVABLY the pane's (the same rule as for a dead holder), and drop
+/// the entry once nothing unattributed is left — or once its record is from
+/// an earlier boot, after which none of the pane's processes can exist.
+fn recheck_orphans(pane_dir: &Path, report: &mut SweepReport) {
+    let Ok(entries) = std::fs::read_dir(pane_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("orphan") {
+            continue;
+        }
+        let Some(pane) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| PaneId::new(s).ok())
+        else {
+            continue;
+        };
+        if lock_path(pane_dir, &pane).exists() {
+            continue;
+        }
+        let record = read_record(&path);
+        let stale = record.as_ref().is_none_or(|r| {
+            r.child_start
+                .as_deref()
+                .is_some_and(|t| !crate::proc_identity::token_is_from_this_boot(t))
+        });
+        let reap = match (&record, stale) {
+            (Some(r), false) => reap_orphans_of_dead_holder(r),
+            _ => ReapReport::default(),
+        };
+        let kept = !stale && !reap.unattributed.is_empty();
+        if !kept {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => report.errors.push(format!("{}: {e}", path.display())),
+            }
+        }
+        report.orphans.push(OrphanEntry {
+            pane_id: pane.to_string(),
+            record,
+            reap,
+            kept,
+        });
+    }
 }
 
 /// Take a lock the census just found free. A child the caller forks between
@@ -218,6 +329,19 @@ fn reap_dead(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> SweepO
             Err(e) => errors.push(format!("{}: {e}", f.display())),
         }
     }
+    // Processes nothing proves are the pane's are left alone — but not
+    // forgotten: the record moves to the orphan ledger, where every later
+    // sweep re-checks it, instead of vanishing with the lock.
+    let orphan_kept = match &record {
+        Some(r) if !reap.unattributed.is_empty() => match write_orphan(pane_dir, pane, r) {
+            Ok(()) => true,
+            Err(e) => {
+                errors.push(format!("{}: {e}", orphan_path(pane_dir, pane).display()));
+                false
+            }
+        },
+        _ => false,
+    };
     let lock_removed = match lock.remove() {
         Ok(removed) => removed,
         Err(e) => {
@@ -229,6 +353,7 @@ fn reap_dead(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> SweepO
         record,
         reap,
         lock_removed,
+        orphan_kept,
     }
 }
 
@@ -308,7 +433,7 @@ mod tests {
     fn pty_holder_boot_sweep_missing_dir_is_an_empty_report() {
         let d = std::env::temp_dir().join(format!("ptysw-none-{}", std::process::id()));
         assert_eq!(
-            boot_sweep(&d, Duration::from_secs(1), &[]).unwrap(),
+            boot_sweep(&d, Duration::from_secs(1), &[], |_| {}).unwrap(),
             SweepReport::default()
         );
     }
@@ -321,13 +446,14 @@ mod tests {
         let pane = PaneId::new("gone").unwrap();
         std::fs::write(lock_path(&d, &pane), b"").unwrap();
         std::fs::write(spec_path(&d, &pane), b"{}").unwrap();
-        let report = boot_sweep(&d, Duration::from_secs(5), &[]).unwrap();
+        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
         assert_eq!(report.entries.len(), 1, "{report:?}");
         match &report.entries[0].outcome {
             SweepOutcome::Reaped {
                 record: None,
                 reap,
                 lock_removed: true,
+                orphan_kept: false,
             } => assert!(reap.killed.is_empty(), "{reap:?}"),
             other => panic!("{other:?}"),
         }
@@ -347,7 +473,7 @@ mod tests {
         };
         std::fs::write(spec_path(&d, &pane), b"{}").unwrap();
         age(&spec_path(&d, &pane), STRAY_MIN_AGE * 2);
-        let report = boot_sweep(&d, Duration::from_secs(5), &[]).unwrap();
+        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
         assert!(
             matches!(report.entries[0].outcome, SweepOutcome::Unknown { .. }),
             "{report:?}"
@@ -387,13 +513,87 @@ mod tests {
         age(&ancient_log, DEAD_LOG_RETENTION * 2);
         age(&foreign, DEAD_LOG_RETENTION * 2);
         let skip = [PaneId::new("c").unwrap()];
-        let report = boot_sweep(&d, Duration::from_secs(5), &skip).unwrap();
+        let report = boot_sweep(&d, Duration::from_secs(5), &skip, |_| {}).unwrap();
         let mut removed = report.strays_removed.clone();
         removed.sort();
         assert_eq!(removed, vec![old_spec, ancient_log], "{report:?}");
         for kept in [young_spec, skipped_spec, recent_log, foreign] {
             assert!(kept.exists(), "{} was removed", kept.display());
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Finding #7: a dead holder's leftovers that nothing proves are the
+    /// pane's are left alone AND kept in the orphan ledger, re-checked by every
+    /// sweep, and dropped once they are gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_boot_sweep_keeps_unattributed_leftovers_in_the_orphan_ledger() {
+        use std::os::unix::process::CommandExt;
+        /// Kills (and reaps) what this test spawned, even on a failed assert.
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // SAFETY: the process group of a child this test spawned and
+                // made a session (and group) leader.
+                unsafe {
+                    libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+                }
+                let _ = self.0.wait();
+            }
+        }
+        let d = dir("orphan");
+        let pane = PaneId::new("o").unwrap();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 300 & wait"]);
+        // SAFETY: setsid in the forked child before exec; async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let leader = Fixture(cmd.spawn().unwrap());
+        // A dead holder's record that names the leader WITHOUT a start token:
+        // nothing about it is provable.
+        {
+            let TryLock::Acquired(mut lock) = PaneLock::try_acquire(&lock_path(&d, &pane)).unwrap()
+            else {
+                panic!("fresh lock");
+            };
+            lock.write_record(&LockRecord {
+                holder_pid: 999_999,
+                child_pid: Some(leader.0.id()),
+                versions: vec![3],
+                started_at_unix_ms: 0,
+                holder_build: "t".into(),
+                child_start: None,
+                scope_unit: None,
+                holder_start: None,
+            })
+            .unwrap();
+        }
+        // Let `sh` fork its job.
+        std::thread::sleep(Duration::from_millis(200));
+        let report = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
+        match &report.entries[0].outcome {
+            SweepOutcome::Reaped {
+                reap, orphan_kept, ..
+            } => {
+                assert!(reap.killed.is_empty(), "{reap:?}");
+                assert!(!reap.unattributed.is_empty(), "{reap:?}");
+                assert!(orphan_kept);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(orphan_path(&d, &pane).exists());
+        let again = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
+        assert!(again.orphans.iter().any(|o| o.kept), "{again:?}");
+        drop(leader);
+        std::thread::sleep(Duration::from_millis(200));
+        let gone = boot_sweep(&d, Duration::from_secs(5), &[], |_| {}).unwrap();
+        assert!(gone.orphans.iter().all(|o| !o.kept), "{gone:?}");
+        assert!(!orphan_path(&d, &pane).exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 }
