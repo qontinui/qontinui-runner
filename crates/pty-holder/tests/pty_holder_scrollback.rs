@@ -139,7 +139,10 @@ fn pty_holder_scrollback_production_spawn_entry_persists_output() {
     let sb = tail_with(&p, b"armed-marker", SCROLLBACK_INTERVAL * 3);
     assert_eq!(sb.child_pid, p.child_pid);
     assert_eq!(sb.start_offset, 0);
-    assert!(!p.exited(), "the pane is still live: the timer wrote this");
+    assert!(
+        !p.exited(),
+        "the pane is still live: the persister wrote this before the holder ended"
+    );
 }
 
 #[test]
@@ -171,14 +174,38 @@ fn pty_holder_scrollback_timer_persists_and_survives_holder_sigkill() {
 
 #[test]
 fn pty_holder_scrollback_final_write_when_holder_ends() {
-    // The child prints only AFTER the holder's immediate first tick, and the
-    // holder ends ~0.2 s after the child (nobody attaches; short linger) —
-    // long before the next 5 s tick. So the bytes can reach disk only
-    // through the final write, made before the lock is released.
-    let mut spec = sh("sleep 0.5; printf 'last-words-of-the-child'");
+    // The child prints only once the test creates a go-file, which it does
+    // AFTER spawn_holder returned and the holder's first tick is on disk
+    // (without the marker). The holder then ends ~0.2 s after the child
+    // (nobody attaches; short linger) — before the next 5 s tick. So the
+    // bytes can reach disk only through the final write, made before the
+    // lock is released.
+    let go = pane_dir("go");
+    let script = format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done; printf 'last-words-of-the-child'",
+        go.display()
+    );
+    let mut spec = sh(&script);
     spec.exit_linger_ms = Some(200);
-    let mut p = Pane::start("end", spec);
+    // The first tick happens after the holder's ready line, so no earlier
+    // than this instant; the next one no earlier than 5 s after it.
     let started = Instant::now();
+    let mut p = Pane::start("end", spec);
+    let first = loop {
+        if let Some(sb) = p.tail() {
+            break sb;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no first tick within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        !contains(&first.bytes, b"last-words-of-the-child"),
+        "the child printed before the go-file existed"
+    );
+    std::fs::write(&go, b"").unwrap();
     while !p.exited() {
         assert!(
             started.elapsed() < Duration::from_secs(15),
@@ -186,6 +213,7 @@ fn pty_holder_scrollback_final_write_when_holder_ends() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let _ = std::fs::remove_file(&go);
     assert!(
         started.elapsed() < SCROLLBACK_INTERVAL,
         "the holder outlived a timer interval ({:?}); this test would no longer isolate the final write",

@@ -26,6 +26,17 @@
 //! locked lets a second holder lock a fresh inode under the same name while a
 //! third still holds the old one — two "exclusive" holders. Reaping dead lock
 //! files is a later phase's boot sweep, done under the lock.
+//!
+//! **The fork-to-exec window.** The lock fd is `O_CLOEXEC`, but between a
+//! `fork` and the child's `exec` the child holds a copy of the open file
+//! description — and with it the `flock`. So when a process that briefly
+//! holds a pane lock (a runner probe's acquire-and-drop) spawns any child
+//! concurrently, the lock can read `Held` for that window after the drop,
+//! with NO live holder. Under load the window is observable
+//! (`pty_holder_lock_is_exclusive_and_released_on_drop` waits it out). The
+//! spawn path should therefore retry `LockHeld` when the lock record names
+//! no live holder, rather than report the pane taken — owed by Phase 3, which
+//! owns the spawn and lock paths.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
