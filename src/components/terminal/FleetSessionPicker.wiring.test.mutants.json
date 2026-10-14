@@ -6,34 +6,50 @@
       "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
       "mutants": [
         {
-          "label": "fsp-wiring-classifies-completeness-positive-spelling",
-          "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "const truncation = fleetTruncation(response, sessions.length, hasMore);",
-          "replace": "const truncation = fleetTruncation(response, server.limit, hasMore);",
+          "label": "fsp-wiring-classifies-completeness-hook-union-gone",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "truncation: fleetUnionTruncation(",
+          "replace": "truncation: fleetTruncationOfUnion(",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'classifies completeness from the response'"
         },
         {
-          "label": "fsp-wiring-classifies-completeness-forbidden-server-limit",
-          "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "const truncation = fleetTruncation(response, sessions.length, hasMore);",
-          "replace": "const truncation = fleetTruncation(response, sessions.length, hasMore);\n  void fleetTruncation(response, server.limit, hasMore);",
+          "label": "fsp-wiring-classifies-completeness-hook-loaded-not-accumulated",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "loaded: w.walk.sessions.length,",
+          "replace": "loaded: w.walk.pages,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'classifies completeness from the response'"
         },
         {
-          "label": "fsp-wiring-classifies-completeness-forbidden-applied-query",
+          "label": "fsp-wiring-classifies-completeness-tsx-drops-hook-truncation",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "const truncation = fleetTruncation(response, sessions.length, hasMore);",
-          "replace": "const truncation = fleetTruncation(response, sessions.length, hasMore);\n  void fleetTruncation(response, appliedQuery, hasMore);",
+          "anchor": "    truncation,\n    readTenants,\n    servedTenants,\n    deviceCatalog,",
+          "replace": "    readTenants,\n    servedTenants,\n    deviceCatalog,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'classifies completeness from the response'"
         },
         {
-          "label": "fsp-wiring-classifies-completeness-forbidden-envelope-cursor",
+          "label": "fsp-wiring-classifies-completeness-tsx-reclassifies",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "const truncation = fleetTruncation(response, sessions.length, hasMore);",
-          "replace": "const truncation = fleetTruncation(response, sessions.length, hasMore);\n  void response.nextCursor;",
+          "anchor": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);",
+          "replace": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);\n  void fleetTruncation(response, sessions.length, hasMore);",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'classifies completeness from the response'"
+        },
+        {
+          "label": "fsp-wiring-classifies-completeness-tsx-forbidden-server-limit",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);",
+          "replace": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);\n  void fleetTruncation(response, server.limit, hasMore);",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'classifies completeness from the response'"
+        },
+        {
+          "label": "fsp-wiring-classifies-completeness-tsx-forbidden-envelope-cursor",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);",
+          "replace": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);\n  void response.nextCursor;",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'classifies completeness from the response'"
         }
@@ -77,8 +93,24 @@
         {
           "label": "fsp-wiring-empty-read-arg2-tenant-invented-tenant",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "    response?.tenantId ?? null,\n    truncation.kind",
-          "replace": "    null,\n    truncation.kind",
+          "anchor": "    readTenants,\n    truncation.kind",
+          "replace": "    { answered: [], failed: [] },\n    truncation.kind",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'does not hand the empty message a tenant'"
+        },
+        {
+          "label": "fsp-wiring-empty-read-arg2-tenant-hook-answered-requested-not-served",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": ".map((w) => servedTenantOf(w.response, w.requestedTenant)),",
+          "replace": ".map((w) => w.requestedTenant),",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'does not hand the empty message a tenant'"
+        },
+        {
+          "label": "fsp-wiring-empty-read-arg2-tenant-hook-failed-dropped",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "failed: walks.filter(walkFailed).map((w) => w.requestedTenant),",
+          "replace": "failed: [],",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'does not hand the empty message a tenant'"
         }
@@ -107,8 +139,16 @@
         {
           "label": "fsp-wiring-tenant-attribute-placement-drop-tenant-attr",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "data-fleet-tenant={response?.tenantId ?? \"\"}",
-          "replace": "data-fleet-tenant-moved={response?.tenantId ?? \"\"}",
+          "anchor": "data-fleet-tenant={servedTenants.join(\",\")}",
+          "replace": "data-fleet-tenant-moved={servedTenants.join(\",\")}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'projects the tenant as an attribute'"
+        },
+        {
+          "label": "fsp-wiring-tenant-attribute-placement-drop-failed-attr",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "data-fleet-tenant-failed=",
+          "replace": "data-fleet-tenantfailed=",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'projects the tenant as an attribute'"
         },
@@ -245,34 +285,34 @@
       "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
       "mutants": [
         {
-          "label": "fsp-wiring-applied-query-same-tick-move-after-catch",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "        setAppliedQuery({",
-          "replace": "        void 0;\n      } catch (e) {\n        throw e;\n      }\n      {\n        setAppliedQuery({",
+          "label": "fsp-wiring-applied-query-same-tick-delete-applied-in-update",
+          "file": "src/components/terminal/fleetWalker.ts",
+          "anchor": "        appliedQuery: {",
+          "replace": "        appliedQueryX: {",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'publishes the applied query in the SAME tick'"
+        },
+        {
+          "label": "fsp-wiring-applied-query-same-tick-delete-start-marker",
+          "file": "src/components/terminal/fleetWalker.ts",
+          "anchor": "        response: result,",
+          "replace": "        response: result ,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'publishes the applied query in the SAME tick'"
         },
         {
           "label": "fsp-wiring-applied-query-same-tick-delete-end-marker",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "} catch",
-          "replace": "}catch",
+          "file": "src/components/terminal/fleetWalker.ts",
+          "anchor": "    } catch (err) {\n      if (!this.isCurrent(generation)) return;\n      const code",
+          "replace": "    }catch (err) {\n      if (!this.isCurrent(generation)) return;\n      const code",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'publishes the applied query in the SAME tick'"
         },
         {
-          "label": "fsp-wiring-applied-query-same-tick-delete-set-applied",
+          "label": "fsp-wiring-applied-query-same-tick-effect-over-snapshots",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "setAppliedQuery({",
-          "replace": "setAppliedQueryX({",
-          "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'publishes the applied query in the SAME tick'"
-        },
-        {
-          "label": "fsp-wiring-applied-query-same-tick-effect-over-response",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "const limitRef = useRef(limit);",
-          "replace": "const limitRef = useRef(limit);\n  useEffect(() => {\n    setAppliedQuery(null);\n  }, [response]);",
+          "anchor": "  const limitRef = useRef(limit);",
+          "replace": "  const limitRef = useRef(limit);\n  useEffect(() => {\n    void snapshots.list.map((s) => s.appliedQuery);\n  }, [snapshots]);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'publishes the applied query in the SAME tick'"
         }
@@ -300,26 +340,34 @@
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'no fleet module reads, declares or fakes'"
         },
         {
+          "label": "fsp-wiring-retired-flag-gone-hook-doc-comment-gone",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "`truncated` is GONE",
+          "replace": "`truncated` was removed",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'no fleet module reads, declares or fakes'"
+        },
+        {
           "label": "fsp-wiring-retired-flag-gone-discovery-dot-truncated",
           "file": "src/components/terminal/fleetDiscovery.ts",
-          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
-          "replace": "  void (scope as { truncated?: boolean }).truncated;\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
+          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+          "replace": "  void (scope as { truncated?: boolean }).truncated;\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'no fleet module reads, declares or fakes'"
         },
         {
           "label": "fsp-wiring-retired-flag-gone-discovery-field-decl",
           "file": "src/components/terminal/fleetDiscovery.ts",
-          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
-          "replace": "  type Retired = {\n    truncated?: boolean;\n  };\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
+          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+          "replace": "  type Retired = {\n    truncated?: boolean;\n  };\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'no fleet module reads, declares or fakes'"
         },
         {
-          "label": "fsp-wiring-retired-flag-gone-hook-doc-comment-gone",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "`truncated` is GONE",
-          "replace": "`truncated` was removed",
+          "label": "fsp-wiring-retired-flag-gone-walker-dot-truncated",
+          "file": "src/components/terminal/fleetWalker.ts",
+          "anchor": "const limit = this.opts.pageSize();",
+          "replace": "const limit = this.opts.pageSize();\n    void (this as { truncated?: boolean }).truncated;",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'no fleet module reads, declares or fakes'"
         }
@@ -349,8 +397,16 @@
         {
           "label": "fsp-wiring-page-ladder-deleted-discovery-at-ceiling",
           "file": "src/components/terminal/fleetDiscovery.ts",
-          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
-          "replace": "  void \"at-ceiling\";\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
+          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+          "replace": "  void \"at-ceiling\";\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'the page ladder is deleted'"
+        },
+        {
+          "label": "fsp-wiring-page-ladder-deleted-walker-nextLimit",
+          "file": "src/components/terminal/fleetWalker.ts",
+          "anchor": "const limit = this.opts.pageSize();",
+          "replace": "const limit = this.opts.pageSize();\n    const nextLimit = limit * 2;",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'the page ladder is deleted'"
         }
@@ -387,8 +443,16 @@
         {
           "label": "fsp-wiring-cursor-on-the-wire-args-without-cursor",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "args: { deviceId, state, includeClosed, limit, cursor }",
-          "replace": "args: { deviceId, state, includeClosed, limit }",
+          "anchor": "      cursor: req.cursor,\n",
+          "replace": "",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'puts the cursor on the wire'"
+        },
+        {
+          "label": "fsp-wiring-cursor-on-the-wire-tenant-key-misspelled",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "      tenant: req.tenant,\n",
+          "replace": "      tenantId: req.tenant,\n",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'puts the cursor on the wire'"
         },
@@ -399,129 +463,52 @@
           "replace": "\"fleet_sessions_list_v2\"",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'puts the cursor on the wire'"
+        },
+        {
+          "label": "fsp-wiring-cursor-on-the-wire-walker-not-on-production-fetch",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "fetchPage: invokeFleetPage,",
+          "replace": "fetchPage: (req) => invokeFleetPage({ ...req, cursor: null }),",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'puts the cursor on the wire'"
         }
       ]
     },
     {
-      "id": "FleetSessionPicker.wiring:cursor-only-when-advancing",
+      "id": "FleetSessionPicker.wiring:walker-per-scope",
       "kind": "vitest-it",
       "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
       "mutants": [
         {
-          "label": "fsp-wiring-cursor-only-when-advancing-always-cursor",
+          "label": "fsp-wiring-walker-per-scope-no-dispose",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "const cursor = mode === \"more\" ? cursorRef.current : null;",
-          "replace": "const cursor = cursorRef.current;",
+          "anchor": "      for (const w of walkers) w.dispose();\n",
+          "replace": "",
           "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'sends a cursor ONLY when advancing'"
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'builds a NEW walker per scope'"
         },
         {
-          "label": "fsp-wiring-cursor-only-when-advancing-restart-keeps-cursor",
+          "label": "fsp-wiring-walker-per-scope-shared-walker",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "if (mode === \"restart\") cursorRef.current = null;",
-          "replace": "void 0;",
+          "anchor": "        new FleetTenantWalker({",
+          "replace": "        sharedWalker.reuse({",
           "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'sends a cursor ONLY when advancing'"
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'builds a NEW walker per scope'"
         }
       ]
     },
     {
-      "id": "FleetSessionPicker.wiring:no-advance-without-cursor",
+      "id": "FleetSessionPicker.wiring:advance-only-with-cursor",
       "kind": "vitest-it",
       "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
       "mutants": [
         {
-          "label": "fsp-wiring-no-advance-without-cursor-drop-refusal",
+          "label": "fsp-wiring-advance-only-with-cursor-advance-every-walk",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "if (mode === \"more\" && cursor === null) return;",
-          "replace": "void 0;",
+          "anchor": "walkersRef.current.filter((w) => w.canAdvance).map((w) => w.loadMore())",
+          "replace": "walkersRef.current.map((w) => w.loadMore())",
           "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'with no cursor instead of re-reading page one'"
-        }
-      ]
-    },
-    {
-      "id": "FleetSessionPicker.wiring:restart-on-scope-mismatch",
-      "kind": "vitest-it",
-      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
-      "mutants": [
-        {
-          "label": "fsp-wiring-restart-on-scope-mismatch-no-restart-token",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "setRestartToken((t) => t + 1);",
-          "replace": "void 0;",
-          "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'restarts on a scope mismatch'"
-        },
-        {
-          "label": "fsp-wiring-restart-on-scope-mismatch-branch-end-marker-gone",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "if (fleetErrorInvalidatesCursor(code)) {",
-          "replace": "if (fleetErrorDropsCursor(code)) {",
-          "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'restarts on a scope mismatch'"
-        },
-        {
-          "label": "fsp-wiring-restart-on-scope-mismatch-branch-start-marker-gone",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "if (fleetErrorIsRestart(code)) {",
-          "replace": "if (fleetErrorWantsRestart(code)) {",
-          "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'restarts on a scope mismatch'"
-        },
-        {
-          "label": "fsp-wiring-restart-on-scope-mismatch-branch-publishes-error",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "          setRestartToken((t) => t + 1);",
-          "replace": "          setError(null);\n          setRestartToken((t) => t + 1);",
-          "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'restarts on a scope mismatch'"
-        },
-        {
-          "label": "fsp-wiring-restart-on-scope-mismatch-branch-keeps-cursor",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "          cursorRef.current = null;\n          setRestartToken",
-          "replace": "          setRestartToken",
-          "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'restarts on a scope mismatch'"
-        }
-      ]
-    },
-    {
-      "id": "FleetSessionPicker.wiring:discard-superseded-response",
-      "kind": "vitest-it",
-      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
-      "mutants": [
-        {
-          "label": "fsp-wiring-discard-superseded-response-drop-generation-check",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "if (generationRef.current !== generation) return;",
-          "replace": "void 0;",
-          "expect_count": 2,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'discards a response whose scope'"
-        }
-      ]
-    },
-    {
-      "id": "FleetSessionPicker.wiring:loadmore-via-cursor-ref",
-      "kind": "vitest-it",
-      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
-      "mutants": [
-        {
-          "label": "fsp-wiring-loadmore-via-cursor-ref-cursor-ref-gone",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "const cursorRef = useRef<string | null>(null);",
-          "replace": "let cursorRefX: string | null = null;",
-          "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'off a stale closure by reading the cursor'"
-        },
-        {
-          "label": "fsp-wiring-loadmore-via-cursor-ref-loadmore-renamed",
-          "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "const loadMore = useCallback(() => fetchPage(\"more\"), [fetchPage]);",
-          "replace": "const loadMore = useCallback(() => fetchPage(\"restart\"), [fetchPage]);",
-          "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'off a stale closure by reading the cursor'"
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'advances only walks that hold a cursor'"
         }
       ]
     },
@@ -631,28 +618,28 @@
       "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
       "mutants": [
         {
-          "label": "fsp-wiring-walk-answer-not-envelope-hook-envelope-cursor",
+          "label": "fsp-wiring-walk-answer-not-envelope-hook-hasmore-envelope-cursor",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "hasMore: walk.nextCursor !== null,",
-          "replace": "hasMore: response?.nextCursor != null,",
+          "anchor": "hasMore: walks.some((w) => w.walk.nextCursor !== null),",
+          "replace": "hasMore: walks.some((w) => w.response?.nextCursor != null),",
           "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'which the hook exports for this'"
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'reads each WALK'"
         },
         {
-          "label": "fsp-wiring-walk-answer-not-envelope-tsx-drop-hasmore",
-          "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "    hasMore,\n",
-          "replace": "    hasMoreX,\n",
+          "label": "fsp-wiring-walk-answer-not-envelope-hook-canadvance-envelope-cursor",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "canAdvance: w.walk.nextCursor !== null,",
+          "replace": "canAdvance: w.response?.nextCursor != null,",
           "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'which the hook exports for this'"
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'reads each WALK'"
         },
         {
-          "label": "fsp-wiring-walk-answer-not-envelope-tsx-classifier-drop",
-          "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "const truncation = fleetTruncation(response, sessions.length, hasMore);",
-          "replace": "const truncation = fleetTruncation(response, sessions.length, true);",
+          "label": "fsp-wiring-walk-answer-not-envelope-hook-forbidden-envelope-read",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "  const limitRef = useRef(limit);",
+          "replace": "  const limitRef = useRef(limit);\n  const response = snapshots.list[0]?.response;\n  void (response && response.nextCursor);",
           "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'which the hook exports for this'"
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'reads each WALK'"
         }
       ]
     },
@@ -772,16 +759,16 @@
         {
           "label": "fsp-wiring-restart-trigger-names-scope-scopekey-decl",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });",
-          "replace": "const scopeKey = fleetScopeKey({ deviceId, state, includeClosed, limit });",
+          "anchor": "tenants.map((tenantId) => fleetScopeKey({ deviceId, state, includeClosed, tenantId })),",
+          "replace": "tenants.map((tenantId) => fleetScopeKey({ deviceId, state, includeClosed, tenantId, limit })),",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'names the scope explicitly in the restart trigger'"
         },
         {
           "label": "fsp-wiring-restart-trigger-names-scope-dep-list",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "}, [fetchPage, scopeKey, restartToken]);",
-          "replace": "}, [fetchPage, restartToken]);",
+          "anchor": "}, [scopeKey, tenantsKey, deviceId, state, includeClosed, publish, acceptRows]);",
+          "replace": "}, [tenantsKey, deviceId, state, includeClosed, publish, acceptRows]);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'names the scope explicitly in the restart trigger'"
         },
@@ -804,7 +791,7 @@
           "label": "fsp-wiring-limit-ref-synced-before-restart-swap-order",
           "file": "src/components/terminal/useFleetSessions.ts",
           "anchor": "    limitRef.current = limit;",
-          "replace": "    void fetchPage(\"restart\");\n    limitRef.current = limit;",
+          "replace": "    for (const w of walkers) void w.restart();\n    limitRef.current = limit;",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'syncs the page-size ref BEFORE'"
         },
@@ -819,8 +806,8 @@
         {
           "label": "fsp-wiring-limit-ref-synced-before-restart-restart-call-gone",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "void fetchPage(\"restart\");",
-          "replace": "void fetchPage(\"again\");",
+          "anchor": "for (const w of walkers) void w.restart();",
+          "replace": "for (const w of walkers) void w.reset();",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'syncs the page-size ref BEFORE'"
         }
@@ -834,16 +821,16 @@
         {
           "label": "fsp-wiring-limit-out-of-dep-list-limit-added",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "[deviceId, state, includeClosed],",
-          "replace": "[deviceId, state, includeClosed, limit],",
+          "anchor": "}, [scopeKey, tenantsKey, deviceId, state, includeClosed, publish, acceptRows]);",
+          "replace": "}, [scopeKey, tenantsKey, deviceId, state, includeClosed, publish, acceptRows, limit]);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'out of the dependency list that restarts the walk'"
         },
         {
-          "label": "fsp-wiring-limit-out-of-dep-list-list-reordered",
+          "label": "fsp-wiring-limit-out-of-dep-list-limit-added-mid-list",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "[deviceId, state, includeClosed],",
-          "replace": "[state, deviceId, includeClosed],",
+          "anchor": "}, [scopeKey, tenantsKey, deviceId, state, includeClosed, publish, acceptRows]);",
+          "replace": "}, [scopeKey, limit, tenantsKey, deviceId, state, includeClosed, publish, acceptRows]);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'out of the dependency list that restarts the walk'"
         }
@@ -863,9 +850,17 @@
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'reads the page size through a ref'"
         },
         {
-          "label": "fsp-wiring-page-size-via-ref-read-current",
+          "label": "fsp-wiring-page-size-via-ref-hook-closes-over-limit",
           "file": "src/components/terminal/useFleetSessions.ts",
-          "anchor": "const limit = limitRef.current;",
+          "anchor": "pageSize: () => limitRef.current,",
+          "replace": "pageSize: () => limit,",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'reads the page size through a ref'"
+        },
+        {
+          "label": "fsp-wiring-page-size-via-ref-walker-fixed-size",
+          "file": "src/components/terminal/fleetWalker.ts",
+          "anchor": "const limit = this.opts.pageSize();",
           "replace": "const limit = 50;",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'reads the page size through a ref'"
@@ -880,8 +875,8 @@
         {
           "label": "fsp-wiring-scope-fingerprint-omits-limit-limit-in-key",
           "file": "src/components/terminal/fleetDiscovery.ts",
-          "anchor": "return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
-          "replace": "return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.limit]);",
+          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+          "replace": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId, scope.limit]);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'out of the scope fingerprint itself'"
         }
@@ -968,6 +963,164 @@
           "replace": "void id",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'keeps the relative label moving'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:tenant-in-walk-scope",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-tenant-in-walk-scope-tenant-dropped-from-scope",
+          "file": "src/components/terminal/useFleetSessions.ts",
+          "anchor": "tenants.map((tenantId) => fleetScopeKey({ deviceId, state, includeClosed, tenantId })),",
+          "replace": "tenants.map(() => fleetScopeKey({ deviceId, state, includeClosed, tenantId: null })),",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'restarts the walk on a tenant change'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:selection-to-hook-only",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-selection-to-hook-only-tsx-writes-active-tenant",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);",
+          "replace": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);\n  void invoke(\"set_active_tenant\", { tenantId: fleetTenant });",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'hands the selection to the hook and never to set_active_tenant'"
+        },
+        {
+          "label": "fsp-wiring-selection-to-hook-only-tsx-walks-default-not-selection",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "fleetWalkTenants(fleetTenant, tenantCandidates)",
+          "replace": "fleetWalkTenants(tenantPin, tenantCandidates)",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'hands the selection to the hook and never to set_active_tenant'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:default-derived-not-effect",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-default-derived-not-effect-effect-writes-pick",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);",
+          "replace": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);\n  useEffect(() => {\n    setFleetTenantPick(null);\n  }, [tenantPin]);",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'opens on the policy default until the operator picks'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:requested-beside-served",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-requested-beside-served-row-tenant-attr-gone",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "data-fleet-row-tenant={s.servedTenantId ?? \"\"}",
+          "replace": "data-fleet-row-tenant-x={s.servedTenantId ?? \"\"}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'projects the requested tenant beside the one'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:mint-under-served-tenant",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-mint-under-served-tenant-attach-under-selection",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "tenant: s.servedTenantId ?? null,",
+          "replace": "tenant: fleetTenant ?? null,",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'mints attach and create grants under the tenant the ROW or GROUP was served for'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:merged-error-strip",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-merged-error-strip-strip-in-single-view",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "{merged && failures.length > 0 && (",
+          "replace": "{failures.length > 0 && (",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'renders the per-tenant error strip in the merged view only'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:merged-groups-by-tenant",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-merged-groups-by-tenant-group-by-device-only",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "groupByDevice(visible, { byTenant: merged })",
+          "replace": "groupByDevice(visible, { byTenant: false })",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'groups a merged read by device AND tenant'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:row-own-envelope",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-row-own-envelope-first-envelope",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "envelopes.get(s.servedTenantId ?? null)?.deviceIdentityColumnsPresent",
+          "replace": "response?.deviceIdentityColumnsPresent",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'degraded flags off its OWN tenant'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:empty-create-per-tenant",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-empty-create-per-tenant-create-under-pinned-default",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "onCreate={() => createRemote(key, pinned, label, t.tenant)}",
+          "replace": "onCreate={() => createRemote(key, pinned, label, null)}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'create PER answered tenant'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:merged-device-count",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-merged-device-count-tenant-count-dropped",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "tenants: merged ? servedTenants.length : undefined,",
+          "replace": "tenants: undefined,",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'counts devices, not groups, and names the tenant count'"
         }
       ]
     }
