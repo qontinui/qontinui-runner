@@ -27,8 +27,16 @@
 //!   lock whose holder does not answer, and a holder with no common protocol
 //!   version (D15), are reported as such; the verdict blocks on each.
 //! - **A pane this runner is spawning right now is not probed** (a probe can
-//!   steal a starting holder's lock — `client::census`'s own warning). It is
-//!   reported Unknown ("being spawned by the caller"), and blocks like one.
+//!   steal a starting holder's lock — `client::census`'s own warning). The
+//!   in-flight set is read inside the walk, after the directory is
+//!   enumerated; such a pane is reported Unknown ("being spawned by the
+//!   caller") and blocks like one. A pane that starts spawning after the walk
+//!   is added by [`add_in_flight`], which the caller runs after its process
+//!   snapshot (review F2).
+//! - **Identity, not boot time, for an adopted pane** (review F1):
+//!   [`verified_holder_children`] proves a live terminal pid is its holder's
+//!   recorded child by start token, so the PID-reuse guard does not call a
+//!   pane adopted after a restart "recycled".
 //! - **An unreadable pane directory is an error, not an empty census**: the
 //!   readiness verdict fails closed on it. A pane directory that does not exist
 //!   is an empty census — no holder was ever started there.
@@ -37,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use qontinui_pty_holder::client::{census_with_versions, CensusEntry, Probe};
+use qontinui_pty_holder::client::{census_with_skip, CensusEntry, Probe};
 use qontinui_pty_holder::lock::{read_record, LockRecord, ENDED_BY_EXIT};
 use qontinui_pty_holder::pane::{lock_path, PaneId};
 use qontinui_pty_holder::proc_identity::is_same_process;
@@ -56,32 +64,150 @@ pub const CENSUS_TIMEOUT: Duration = Duration::from_secs(2);
 /// Take this runner instance's holder census, fresh. Never fails: every
 /// failure is carried in the returned [`HolderCensus`] (an unreadable pane
 /// directory as `error`, an unanswered pane as Unknown).
+///
+/// The caller must still run [`add_in_flight`] AFTER its process snapshot:
+/// a pane that starts spawning after the walk is not in it.
 pub async fn take(manager: &Arc<TerminalManager>) -> HolderCensus {
-    // Panes being built right now: probing one can steal its starting
-    // holder's lock. Read BEFORE the walk, so a pane that starts building
-    // after this read is one whose spec is not yet written — and whose lock
-    // does not exist yet either, so the walk cannot see it.
-    let skip: Vec<PaneId> = manager
-        .in_flight_ids()
-        .iter()
-        .filter_map(|id| PaneId::new(id).ok())
-        .collect();
-    let pane_dir = super::daemon_pane_io::runner_pane_dir();
-    match tokio::task::spawn_blocking(move || {
-        census_in(pane_dir, &skip, CENSUS_TIMEOUT, PROTOCOL_VERSIONS)
-    })
+    take_in(
+        super::daemon_pane_io::runner_pane_dir(),
+        manager.clone(),
+        CENSUS_TIMEOUT,
+    )
     .await
-    {
+}
+
+/// [`take`] over an explicit pane directory and deadline — the seam the tests
+/// drive with a real [`TerminalManager`].
+pub async fn take_in(
+    pane_dir: Result<PathBuf, String>,
+    manager: Arc<TerminalManager>,
+    timeout: Duration,
+) -> HolderCensus {
+    // The live terminals' pids, for the identity proof (review F1). Cloned
+    // out; no manager lock is held across the census.
+    let terminals: Vec<(String, u32)> = manager
+        .list()
+        .into_iter()
+        .filter_map(|t| t.pid.filter(|&p| p > 0).map(|p| (t.id, p)))
+        .collect();
+    let joined = tokio::task::spawn_blocking(move || {
+        // Review F2: the skip set (panes being built) is read INSIDE the
+        // walk, after the pane directory is enumerated and before any pane is
+        // probed (`census_with_skip`), so a pane whose lock the walk saw and
+        // that is being spawned right now is never probed. A pane that began
+        // building after that read had no lock file when the directory was
+        // enumerated; [`add_in_flight`] accounts for it after the snapshot.
+        let skip_manager = manager.clone();
+        let mut census = census_in(
+            pane_dir.clone(),
+            move || in_flight_panes(&skip_manager),
+            timeout,
+            PROTOCOL_VERSIONS,
+        );
+        if let Ok(dir) = &pane_dir {
+            census.verified_terminal_pids =
+                verified_holder_children_in(dir, &terminals, is_same_process);
+        }
+        census
+    })
+    .await;
+    match joined {
         Ok(census) => census,
         Err(e) => HolderCensus {
-            panes: Vec::new(),
             error: Some(format!("the holder census task did not complete: {e}")),
+            ..HolderCensus::default()
         },
     }
 }
 
-/// [`take`]'s body over an explicit pane directory, skip list, deadline and
-/// version offer — the seam the tests drive.
+fn in_flight_panes(manager: &TerminalManager) -> Vec<PaneId> {
+    manager
+        .in_flight_ids()
+        .iter()
+        .filter_map(|id| PaneId::new(id).ok())
+        .collect()
+}
+
+/// Add a counted, unprobed `Unknown` row for every terminal this runner is
+/// building right now (`in_flight`, read AFTER the caller's process
+/// snapshot) that the census has no row for. Review F2: a pane that began
+/// spawning after the census walked the pane directory — on Windows possibly
+/// under a WMI-spawned holder outside the runner's subtree, so the snapshot
+/// cannot see its `claude` either — is otherwise in neither source.
+///
+/// Every in-flight id is added, holder-backed or not: which backend a pane
+/// being built will get is not knowable from here, and the window is the
+/// seconds a spawn takes. Over-counting a tab that is opening is the
+/// fail-closed direction.
+pub fn add_in_flight(census: &mut HolderCensus, in_flight: &[String]) {
+    for id in in_flight {
+        if census.panes.iter().any(|p| &p.pane_id == id) {
+            continue;
+        }
+        census.panes.push(HolderPane {
+            pane_id: id.clone(),
+            state: HolderPaneState::Unknown,
+            holder_pid: None,
+            child_pid: None,
+            holder_build: None,
+            negotiated_version: None,
+            holder_versions: Vec::new(),
+            detail: Some(
+                "being spawned by this runner (in flight) — not probed, counted".to_string(),
+            ),
+            claude_pids: Vec::new(),
+        });
+    }
+    census.panes.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+}
+
+/// Review F1: the live terminal pids PROVEN to be their holder's recorded
+/// child — the pane's lock record names that pid as `child_pid`, and the
+/// record's `child_start` token matches the live process
+/// (`proc_identity::is_same_process`, passed as `same`). A restarted runner's
+/// adopted pane has a child that predates this boot; this proof is what lets
+/// the PID-reuse guard tell it from a recycled pid
+/// (`tracking_health::pid_reuse_reference`).
+///
+/// A record without a token (an older holder), a pid the record does not
+/// name, or a token that does not match proves nothing, and the pid keeps the
+/// boot-time guard. A pane dir that is not private is never trusted.
+pub fn verified_holder_children_in(
+    pane_dir: &Path,
+    terminals: &[(String, u32)],
+    same: impl Fn(u32, Option<&str>) -> bool,
+) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    if qontinui_pty_holder::pane::check_private_dir(pane_dir).is_err() {
+        return out;
+    }
+    for (id, pid) in terminals {
+        let Ok(pane) = PaneId::new(id) else { continue };
+        let Some(record) = read_record(&lock_path(pane_dir, &pane)) else {
+            continue;
+        };
+        if record.child_pid == Some(*pid)
+            && record.child_start.is_some()
+            && same(*pid, record.child_start.as_deref())
+        {
+            out.insert(*pid);
+        }
+    }
+    out
+}
+
+/// [`verified_holder_children_in`] over this runner instance's pane
+/// directory. Empty when none resolves (no holder can exist then).
+pub fn verified_holder_children(terminals: &[(String, u32)]) -> std::collections::HashSet<u32> {
+    match super::daemon_pane_io::runner_pane_dir() {
+        Ok(dir) => verified_holder_children_in(&dir, terminals, is_same_process),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// [`take`]'s walk over an explicit pane directory, skip source, deadline and
+/// version offer — the seam the tests drive. `skip` is read after the
+/// directory is enumerated (`census_with_skip`).
 ///
 /// `pane_dir: Err` means this process has no runner data directory at all.
 /// Then no holder can have been spawned by it either (`DaemonPaneIo`'s spawn
@@ -89,7 +215,7 @@ pub async fn take(manager: &Arc<TerminalManager>) -> HolderCensus {
 /// one), so the census is empty — not unknown.
 pub fn census_in(
     pane_dir: Result<PathBuf, String>,
-    skip: &[PaneId],
+    skip: impl FnOnce() -> Vec<PaneId>,
     timeout: Duration,
     versions: &[u32],
 ) -> HolderCensus {
@@ -103,7 +229,7 @@ pub fn census_in(
             return HolderCensus::default();
         }
     };
-    match census_with_versions(&pane_dir, timeout, skip, versions) {
+    match census_with_skip(&pane_dir, timeout, skip, versions) {
         Ok(rows) => HolderCensus {
             panes: rows
                 .into_iter()
@@ -113,14 +239,14 @@ pub fn census_in(
                     pane_from_row(row, record, is_same_process)
                 })
                 .collect(),
-            error: None,
+            ..HolderCensus::default()
         },
         Err(e) => HolderCensus {
-            panes: Vec::new(),
             error: Some(format!(
                 "the PTY holder pane directory {} could not be enumerated: {e}",
                 pane_dir.display()
             )),
+            ..HolderCensus::default()
         },
     }
 }
@@ -398,7 +524,7 @@ mod tests {
     fn pty_holder_census_no_pane_dir_is_empty_but_an_unreadable_one_is_an_error() {
         let none = census_in(
             Err("no home".into()),
-            &[],
+            Vec::new,
             CENSUS_TIMEOUT,
             PROTOCOL_VERSIONS,
         );
@@ -412,7 +538,7 @@ mod tests {
                 .unwrap()
                 .subsec_nanos()
         ));
-        let empty = census_in(Ok(missing), &[], CENSUS_TIMEOUT, PROTOCOL_VERSIONS);
+        let empty = census_in(Ok(missing), Vec::new, CENSUS_TIMEOUT, PROTOCOL_VERSIONS);
         assert!(empty.panes.is_empty() && empty.error.is_none());
 
         #[cfg(unix)]
@@ -421,7 +547,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("ptyc-open-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-            let refused = census_in(Ok(dir.clone()), &[], CENSUS_TIMEOUT, PROTOCOL_VERSIONS);
+            let refused = census_in(Ok(dir.clone()), Vec::new, CENSUS_TIMEOUT, PROTOCOL_VERSIONS);
             let _ = std::fs::remove_dir_all(&dir);
             assert!(refused.panes.is_empty());
             assert!(
@@ -429,6 +555,134 @@ mod tests {
                 "a pane dir others can write to is UNKNOWN, never an empty census"
             );
         }
+    }
+
+    /// Review F1: a terminal pid is proven to be its holder's child only when
+    /// the lock record names that pid AND its `child_start` token matches the
+    /// live process. A mismatched token, a different pid, or no token proves
+    /// nothing.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_census_identity_proof_needs_the_recorded_pid_and_a_matching_token() {
+        use qontinui_pty_holder::lock::{PaneLock, TryLock};
+        let dir = std::env::temp_dir().join(format!(
+            "ptyv-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        qontinui_pty_holder::pane::prepare_private_dir(&dir).unwrap();
+        let write = |id: &str, r: LockRecord| {
+            let pane = PaneId::new(id).unwrap();
+            match PaneLock::try_acquire(&lock_path(&dir, &pane)).unwrap() {
+                TryLock::Acquired(mut l) => l.write_record(&r).unwrap(),
+                TryLock::Held => panic!("held"),
+            }
+        };
+        write("a", rec(20, Some(21)));
+        let mut tokenless = rec(30, Some(31));
+        tokenless.child_start = None;
+        write("b", tokenless);
+        write("c", rec(40, Some(41)));
+        let terminals = vec![
+            ("a".to_string(), 21),
+            ("b".to_string(), 31),
+            ("c".to_string(), 99), // the record names 41, not 99
+            ("absent".to_string(), 51),
+        ];
+        let proven = verified_holder_children_in(&dir, &terminals, same_as_recorded);
+        assert_eq!(proven, [21].into_iter().collect());
+        // The same records, but every token mismatches: nothing is proven.
+        let none = verified_holder_children_in(&dir, &terminals, |_, _| false);
+        assert!(none.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review F2: every terminal still being built after the snapshot is a
+    /// counted Unknown row — added once, never duplicating a census row.
+    #[test]
+    fn pty_holder_census_in_flight_panes_are_counted_never_dropped() {
+        let mut census = HolderCensus {
+            panes: vec![pane_from_row(
+                row(
+                    "seen",
+                    Probe::Unknown {
+                        reason: "x".into(),
+                        record: None,
+                    },
+                ),
+                || None,
+                same_as_recorded,
+            )],
+            ..HolderCensus::default()
+        };
+        add_in_flight(&mut census, &["seen".to_string(), "new-tab".to_string()]);
+        assert_eq!(census.panes.len(), 2);
+        let added = census
+            .panes
+            .iter()
+            .find(|p| p.pane_id == "new-tab")
+            .unwrap();
+        assert_eq!(added.state, HolderPaneState::Unknown);
+        assert!(added.is_unresolved());
+        assert!(added.detail.as_deref().unwrap().contains("in flight"));
+    }
+
+    /// Review F5: [`take_in`] against a real [`TerminalManager`] with an
+    /// in-flight id. The pane's lock exists (its holder is starting), so the
+    /// walk sees it — and the skip set read inside the walk keeps it from
+    /// being probed: it is reported "not probed: being spawned", counted.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_holder_census_take_skips_and_counts_an_in_flight_pane() {
+        use qontinui_pty_holder::lock::{PaneLock, TryLock};
+        let dir = std::env::temp_dir().join(format!(
+            "ptyt-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        qontinui_pty_holder::pane::prepare_private_dir(&dir).unwrap();
+        let starting = PaneId::new("starting").unwrap();
+        let _held = match PaneLock::try_acquire(&lock_path(&dir, &starting)).unwrap() {
+            TryLock::Acquired(l) => l,
+            TryLock::Held => panic!("held"),
+        };
+        let manager = Arc::new(TerminalManager::new());
+        manager.mark_in_flight_for_test("starting");
+        manager.mark_in_flight_for_test("no-lock-yet");
+
+        let mut census = take_in(Ok(dir.clone()), manager.clone(), Duration::from_secs(2)).await;
+        assert_eq!(census.error, None);
+        let starting_row = census
+            .panes
+            .iter()
+            .find(|p| p.pane_id == "starting")
+            .unwrap();
+        assert_eq!(starting_row.state, HolderPaneState::Unknown);
+        assert!(
+            starting_row
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("not probed"),
+            "{:?}",
+            starting_row.detail
+        );
+        // The pane with no lock yet is invisible to the walk...
+        assert!(census.panes.iter().all(|p| p.pane_id != "no-lock-yet"));
+        // ...and is counted once the caller adds the in-flight set.
+        add_in_flight(&mut census, &manager.in_flight_ids());
+        assert!(census
+            .panes
+            .iter()
+            .any(|p| p.pane_id == "no-lock-yet" && p.is_unresolved()));
+        assert_eq!(census.panes.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End to end against the real `qontinui-pty-holder` (Linux; the Windows
@@ -487,7 +741,7 @@ mod tests {
 
             let census = census_in(
                 Ok(dir.clone()),
-                &[],
+                Vec::new,
                 Duration::from_secs(5),
                 PROTOCOL_VERSIONS,
             );
@@ -510,7 +764,7 @@ mod tests {
             assert!(live.holder_pid.is_some());
 
             // The same live holder, offered only a version it does not speak.
-            let foreign = census_in(Ok(dir.clone()), &[], Duration::from_secs(5), &[999]);
+            let foreign = census_in(Ok(dir.clone()), Vec::new, Duration::from_secs(5), &[999]);
             let foreign_live = foreign
                 .panes
                 .iter()
@@ -526,7 +780,7 @@ mod tests {
             // A pane the caller is spawning is not probed — and still counted.
             let skipped = census_in(
                 Ok(dir.clone()),
-                std::slice::from_ref(&live_id),
+                || vec![live_id.clone()],
                 Duration::from_secs(5),
                 PROTOCOL_VERSIONS,
             );

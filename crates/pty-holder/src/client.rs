@@ -836,6 +836,24 @@ pub fn census_with_versions(
     skip: &[PaneId],
     versions: &[u32],
 ) -> io::Result<Vec<CensusEntry>> {
+    census_with_skip(pane_dir, timeout, || skip.to_vec(), versions)
+}
+
+/// [`census_with_versions`] with the skip list read LATE: `skip` is called
+/// once, AFTER the pane directory has been enumerated and before any pane is
+/// probed. A caller whose set of panes-being-spawned changes concurrently
+/// (the runner's in-flight terminal ids) reads it here, so a pane that began
+/// spawning before the walk saw its lock file is in the list the walk is
+/// filtered by — never probed, so never robbed of its lock. A pane that
+/// begins spawning after this read had no lock file when the directory was
+/// enumerated, so the walk cannot see it; the caller must account for it
+/// separately (the runner adds a row for every in-flight id afterwards).
+pub fn census_with_skip(
+    pane_dir: &Path,
+    timeout: Duration,
+    skip: impl FnOnce() -> Vec<PaneId>,
+    versions: &[u32],
+) -> io::Result<Vec<CensusEntry>> {
     let deadline = Instant::now() + timeout;
     match check_private_dir(pane_dir) {
         Ok(()) => {}
@@ -860,6 +878,7 @@ pub fn census_with_versions(
         };
         stems.push(stem);
     }
+    let skip = skip();
 
     let (tx, rx) = mpsc::channel::<CensusEntry>();
     let mut rows: Vec<CensusEntry> = Vec::new();
