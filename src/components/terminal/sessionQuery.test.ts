@@ -240,11 +240,14 @@ describe("is:", () => {
     expect(match("is:snoozed", facts())).toBe(false);
   });
 
-  it("unseen = activity since the last focus (never focused counts)", () => {
-    expect(match("is:unseen", facts({ lastSeenAt: known(NOW - HOUR) }))).toBe(true);
-    expect(match("is:unseen", facts({ lastSeenAt: known(NOW) }))).toBe(false);
-    expect(match("is:unseen", facts({ lastSeenAt: known(null) }))).toBe(true);
-    expect(match("is:unseen", facts({ lastSeenAt: unknownFact("org") }))).toBe("unknown");
+  it("unseen reads the card dot's verdict, Unknown included", () => {
+    expect(match("is:unseen", facts({ unseen: known(true) }))).toBe(true);
+    expect(match("is:unseen", facts({ unseen: known(false) }))).toBe(false);
+    expect(match("is:unseen", facts({ unseen: unknownFact("org") }))).toBe("unknown");
+    // Not re-derived from lastSeenAt: the dot's verdict alone decides.
+    expect(match("is:unseen", facts({ lastSeenAt: known(null), unseen: known(false) }))).toBe(
+      false,
+    );
   });
 });
 
