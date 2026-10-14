@@ -127,6 +127,9 @@ impl ConnectError {
     /// See [`FailureDisposition`].
     pub fn disposition(&self) -> FailureDisposition {
         match self {
+            // Corner, kept on purpose: the census filters `no_common_version`
+            // holders out (left alone, D15), so this only meets one whose
+            // answer CHANGED between the census and the attach.
             ConnectError::Incompatible { .. } => FailureDisposition::End,
             ConnectError::NoDataPath { .. } => FailureDisposition::LeaveAlone,
             ConnectError::Rejected { reason, .. } => match reason {
