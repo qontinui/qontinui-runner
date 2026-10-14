@@ -299,6 +299,37 @@ export async function bulkResumeItems(
   return out;
 }
 
+// ── Close: the targets a request names ───────────────────────────────────────
+
+/** The detail a requested row that left the session list is answered with. */
+export const NO_LONGER_LISTED = "it is no longer listed";
+
+/**
+ * The close dialog's targets, one per REQUESTED id, in request order — re-read
+ * from the live rows on every render. A requested row that left the list
+ * while the dialog was open stays as a placeholder (`closable: false`, "no
+ * longer listed"), so the results answer N of N rather than silently fewer.
+ */
+export function closeTargetsFor<R extends { sessionId: string }>(
+  sessionIds: readonly string[],
+  rows: readonly R[],
+  toTarget: (row: R) => CloseTarget,
+): CloseTarget[] {
+  const byId = new Map(rows.map((r) => [r.sessionId, r]));
+  return sessionIds.map((id) => {
+    const row = byId.get(id);
+    if (row) return toTarget(row);
+    return {
+      sessionId: id,
+      title: id,
+      activity: "unknown",
+      activityWord: "No longer listed",
+      closable: false,
+      notClosableReason: NO_LONGER_LISTED,
+    };
+  });
+}
+
 // ── Close: the re-check at confirm ───────────────────────────────────────────
 
 /** What a confirm fired NOW closes, and the included rows it leaves alone. */
@@ -344,7 +375,7 @@ export function idsToClose(
         sessionId: t.sessionId,
         title: t.title,
         state: "not-closed",
-        detail: "not closed: it has no live tab in this window",
+        detail: `not closed: ${t.notClosableReason ?? "it has no live tab in this window"}`,
       });
       continue;
     }
