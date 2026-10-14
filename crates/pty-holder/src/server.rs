@@ -347,23 +347,38 @@ impl Holder {
         // as decided 2026-10-14). So, still under the lock: the record says
         // the pane ENDED BY EXIT (a sweep then cleans its files and signals
         // nothing), and on Windows the job stops killing on close.
+        let mut end_errors: Vec<String> = Vec::new();
         if pane.ended_by_kill() != Some(true) {
             record.ended = Some(crate::lock::ENDED_BY_EXIT.to_string());
             if let Err(e) = lock.write_record(&record) {
-                log_line(
-                    &log,
-                    &format!("could not mark the record ended-by-exit: {e}"),
-                );
+                // Review round 3, R4: a record that still reads `ended: None`
+                // would let the next sweep reap the leftovers. An EMPTY one
+                // makes it signal nothing (no record, nothing provable).
+                let cleared = lock.clear_record();
+                end_errors.push(format!(
+                    "ERROR: could not mark the record ended-by-exit ({e}); cleared it instead: \
+                     {cleared:?}"
+                ));
             }
             if let Err(e) = pane.release_leftovers_on_normal_exit() {
-                log_line(&log, &format!("could not release the leftovers' job: {e}"));
+                end_errors.push(format!(
+                    "ERROR: could not disarm the job's kill-on-close ({e}): the child's \
+                     leftovers will end when this holder exits"
+                ));
+            }
+            for e in &end_errors {
+                log_line(&log, e);
             }
         }
         pane.wait_for_delivery();
         // Plan D8: on a KILL this holder is the reaper of its own child tree.
         // Still under the lock, so a boot sweep cannot take this pane for dead
         // while its remainder is being ended.
-        let reap = pane.reap_tree();
+        let mut reap = pane.reap_tree();
+        // The pane-end report carries what failed above, too.
+        for e in end_errors {
+            reap.note(e);
+        }
         if !reap.killed.is_empty() || !reap.notes.is_empty() {
             log_line(&log, &format!("pane ended; its tree: {}", reap.summary()));
         }

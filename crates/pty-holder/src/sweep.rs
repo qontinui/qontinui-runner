@@ -40,7 +40,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::client::{census, Probe};
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
@@ -61,6 +61,14 @@ pub const STRAY_MIN_AGE: Duration = Duration::from_secs(10 * 60);
 const RETAKE_TRIES: usize = 5;
 /// The pause between those tries.
 const RETAKE_PAUSE: Duration = Duration::from_millis(20);
+
+/// The wall-clock bound on the whole reaping step of a sweep — every dead
+/// pane's reap and every orphan-ledger re-check, run concurrently. One reap is
+/// bounded by a scope stop ([`crate::spawn::SYSTEMCTL_DEADLINE`]), the lock
+/// retakes and [`crate::reap::REAP_PASSES`] short passes; this is that with
+/// margin. A reap that overruns it is reported as Unknown and finishes in the
+/// background.
+pub const REAP_BUDGET: Duration = Duration::from_secs(8);
 
 /// A pane's diagnostic log is kept this long after its lock is gone.
 pub const DEAD_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -187,20 +195,95 @@ pub fn boot_sweep(
         });
     }
     before_reaping(&report.entries, dead.len());
-    for pane_id in dead {
-        let outcome = match PaneId::new(&pane_id) {
-            Ok(pane) => reap_dead(pane_dir, &pane, &mut report.errors),
-            Err(e) => SweepOutcome::Unknown {
-                reason: e.to_string(),
-                record: None,
-            },
-        };
+    // The reaping step — every dead pane, then every orphan-ledger entry —
+    // runs CONCURRENTLY under one wall-clock budget (review round 3, R2): a
+    // pane's reap can take a `systemctl` stop and several passes, and a
+    // caller's own deadline (the webview's restore) is derived from this one.
+    let deadline = Instant::now() + REAP_BUDGET;
+    let jobs = dead
+        .into_iter()
+        .map(|pane_id| {
+            let dir = pane_dir.to_path_buf();
+            let id = pane_id.clone();
+            let job: ReapJob<(SweepOutcome, Vec<String>)> =
+                Box::new(move || match PaneId::new(&id) {
+                    Ok(pane) => reap_dead(&dir, &pane),
+                    Err(e) => (
+                        SweepOutcome::Unknown {
+                            reason: e.to_string(),
+                            record: None,
+                        },
+                        Vec::new(),
+                    ),
+                });
+            (pane_id, job)
+        })
+        .collect();
+    let (done, pending) = run_until(jobs, deadline);
+    for (pane_id, (outcome, errors)) in done {
+        report.errors.extend(errors);
         report.entries.push(SweepEntry { pane_id, outcome });
     }
+    for pane_id in pending {
+        report.entries.push(SweepEntry {
+            outcome: SweepOutcome::Unknown {
+                reason: format!(
+                    "dead holder: its reap was still running at the {}s reap budget",
+                    REAP_BUDGET.as_secs()
+                ),
+                record: None,
+            },
+            pane_id,
+        });
+    }
     report.entries.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
-    recheck_orphans(pane_dir, &mut report);
+    recheck_orphans(pane_dir, deadline, &mut report);
     remove_strays(pane_dir, SystemTime::now(), skip, &mut report);
     Ok(report)
+}
+
+/// One job of the reaping step, run on a thread of its own.
+type ReapJob<T> = Box<dyn FnOnce() -> T + Send>;
+
+/// An orphan-ledger re-check: the entry, and a removal error if any.
+type OrphanJob = ReapJob<(OrphanEntry, Option<String>)>;
+
+/// Run `jobs` each on a thread of its own and collect what finishes by
+/// `deadline`; the keys of the rest are returned as pending (their threads
+/// finish on their own). A job whose thread cannot start runs inline.
+fn run_until<T: Send + 'static>(
+    jobs: Vec<(String, ReapJob<T>)>,
+    deadline: Instant,
+) -> (Vec<(String, T)>, Vec<String>) {
+    let (tx, rx) = std::sync::mpsc::channel::<(String, T)>();
+    let mut pending: Vec<String> = Vec::new();
+    let mut done = Vec::new();
+    for (key, job) in jobs {
+        let tx = tx.clone();
+        let k = key.clone();
+        // The closure is moved into the thread; if the thread cannot start
+        // it is dropped unrun, so the job counts as pending.
+        let spawned = std::thread::Builder::new()
+            .name("pty-holder-reap".into())
+            .spawn(move || {
+                let _ = tx.send((k, job()));
+            });
+        if spawned.is_ok() {
+            pending.push(key);
+        }
+    }
+    drop(tx);
+    while !pending.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((key, value)) => {
+                pending.retain(|p| p != &key);
+                done.push((key, value));
+            }
+            Err(_) => break,
+        }
+    }
+    (done, pending)
 }
 
 /// Write `record` to the pane's orphan-ledger entry (`<pane-id>.orphan`,
@@ -224,10 +307,11 @@ fn write_orphan(pane_dir: &Path, pane: &PaneId, record: &LockRecord) -> io::Resu
 /// is now PROVABLY the pane's (the same rule as for a dead holder), and drop
 /// the entry once nothing unattributed is left — or once its record is from
 /// an earlier boot, after which none of the pane's processes can exist.
-fn recheck_orphans(pane_dir: &Path, report: &mut SweepReport) {
+fn recheck_orphans(pane_dir: &Path, deadline: Instant, report: &mut SweepReport) {
     let Ok(entries) = std::fs::read_dir(pane_dir) else {
         return;
     };
+    let mut jobs: Vec<(String, OrphanJob)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("orphan") {
@@ -259,24 +343,44 @@ fn recheck_orphans(pane_dir: &Path, report: &mut SweepReport) {
                     (Some(w), Some(boot)) if w < boot
                 ),
             });
-        let reap = match (&record, stale) {
-            (Some(r), false) => reap_orphans_of_dead_holder(r),
-            _ => ReapReport::default(),
-        };
-        let kept = !stale && !reap.unattributed.is_empty();
-        if !kept {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => report.errors.push(format!("{}: {e}", path.display())),
-            }
-        }
-        report.orphans.push(OrphanEntry {
-            pane_id: pane.to_string(),
-            record,
-            reap,
-            kept,
-        });
+        let key = pane.to_string();
+        jobs.push((
+            key.clone(),
+            Box::new(move || {
+                let reap = match (&record, stale) {
+                    (Some(r), false) => reap_orphans_of_dead_holder(r),
+                    _ => ReapReport::default(),
+                };
+                let kept = !stale && !reap.unattributed.is_empty();
+                let mut error = None;
+                if !kept {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => error = Some(format!("{}: {e}", path.display())),
+                    }
+                }
+                (
+                    OrphanEntry {
+                        pane_id: key,
+                        record,
+                        reap,
+                        kept,
+                    },
+                    error,
+                )
+            }),
+        ));
+    }
+    let (done, pending) = run_until(jobs, deadline);
+    for (_, (orphan, error)) in done {
+        report.errors.extend(error);
+        report.orphans.push(orphan);
+    }
+    for pane_id in pending {
+        report.errors.push(format!(
+            "orphan-ledger entry {pane_id}: its re-check was still running at the reap budget"
+        ));
     }
 }
 
@@ -299,7 +403,13 @@ fn retake_lock(lock_file: &Path) -> io::Result<TryLock> {
 
 /// A dead holder's pane: re-take its lock (anything else means it is no
 /// longer dead), and under it reap, remove its files, remove the lock.
-fn reap_dead(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> SweepOutcome {
+fn reap_dead(pane_dir: &Path, pane: &PaneId) -> (SweepOutcome, Vec<String>) {
+    let mut errors = Vec::new();
+    let outcome = reap_dead_into(pane_dir, pane, &mut errors);
+    (outcome, errors)
+}
+
+fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> SweepOutcome {
     let lock_file = lock_path(pane_dir, pane);
     let lock = match retake_lock(&lock_file) {
         Ok(TryLock::Acquired(lock)) => lock,
@@ -438,6 +548,16 @@ mod tests {
     fn age(path: &Path, by: Duration) {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(SystemTime::now() - by).unwrap();
+    }
+
+    /// The reap budget covers one pane's worst case: a scope stop, the lock
+    /// retakes, and the reap passes' pauses.
+    #[test]
+    fn pty_holder_boot_sweep_reap_budget_covers_one_reap() {
+        let one = crate::spawn::SYSTEMCTL_DEADLINE
+            + RETAKE_PAUSE * RETAKE_TRIES as u32
+            + Duration::from_millis(20) * crate::reap::REAP_PASSES as u32;
+        assert!(REAP_BUDGET > one, "{REAP_BUDGET:?} <= {one:?}");
     }
 
     #[test]

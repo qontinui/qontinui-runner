@@ -522,9 +522,23 @@ pub enum SpawnError {
     /// be neither held nor ended. A caller must NOT fall back to an
     /// in-process PTY: the pane's command would run twice.
     LiveHolderUnreachable(String),
+    /// Windows WMI route: a holder could not be held, but it RAN the pane's
+    /// command (it reported ready, or recorded a child) before it went away.
+    /// A caller must NOT fall back: that would run the command a second time.
+    RanUnheld(String),
 }
 
 impl SpawnError {
+    /// Whether a caller must NOT fall back to an in-process PTY after this
+    /// error: a holder may still be running the pane's command, or already
+    /// ran it.
+    pub fn forbids_fallback(&self) -> bool {
+        matches!(
+            self,
+            SpawnError::LiveHolderUnreachable(_) | SpawnError::RanUnheld(_)
+        )
+    }
+
     /// The `<kind>` of a `holder_error=<kind>` report (`lock_held`, `spec`,
     /// `child`, `detach`, `start`, `usage`).
     pub fn holder_error_kind(&self) -> Option<&str> {
@@ -553,6 +567,12 @@ impl std::fmt::Display for SpawnError {
             }
             SpawnError::HolderFailed { line, status } => {
                 write!(f, "holder failed [{status}]: {line}")
+            }
+            SpawnError::RanUnheld(m) => {
+                write!(
+                    f,
+                    "the holder ran this pane's command and could not be held: {m}"
+                )
             }
             SpawnError::LiveHolderUnreachable(m) => {
                 write!(
@@ -993,11 +1013,14 @@ fn spawn_os(
 ///    first. Its report decides: `holder_ready` with an endpoint that answers
 ///    the handshake as that pid → accepted, held by pane identity
 ///    ([`HolderProcess::Unheld`]).
-/// 3. Otherwise the holder must be CONFIRMED dead before a fallback: the
-///    pane's lock free, or — while it is held — the recorded holder ended
+/// 3. Otherwise the holder must be CONFIRMED dead before anything else: the
+///    pane's lock FREE (only `Ok(Acquired)` counts — an unreadable lock
+///    proves nothing), or — while it is held — the recorded holder ended
 ///    through `terminate::terminate_verified_holder` and the lock seen free
 ///    within [`FAILURE_WAIT`]. Anything short of that is
-///    [`SpawnError::LiveHolderUnreachable`].
+///    [`SpawnError::LiveHolderUnreachable`]. And even a confirmed-dead holder
+///    forbids a fallback if it RAN the command (it reported ready, or
+///    recorded a child): [`SpawnError::RanUnheld`]. See [`unheld_verdict`].
 #[cfg(windows)]
 fn settle_unheld_wmi_holder(
     req: &SpawnRequest<'_>,
@@ -1043,46 +1066,102 @@ fn settle_unheld_wmi_holder(
         }
     }
     let lock_file = crate::pane::lock_path(req.pane_dir, req.pane_id);
-    let lock_free = || {
-        !matches!(
-            crate::lock::PaneLock::try_acquire_existing(&lock_file),
-            Ok(crate::lock::TryLock::Held)
-        )
-    };
-    let reported = line.unwrap_or_else(|| "no report".into());
-    if lock_free() {
-        // The holder that consumed the spec is gone; on Windows its armed
-        // job ended the child with it.
-        return fail(if reported.starts_with("holder_error=") {
-            SpawnError::HolderFailed {
-                line: reported,
-                status: format!("exited before it could be opened ({why})"),
+    let seen = || LockSeen::of(crate::lock::PaneLock::try_acquire_existing(&lock_file));
+    let record = crate::lock::read_record(&lock_file);
+    let mut lock = seen();
+    let mut ended = String::new();
+    if lock == LockSeen::Held {
+        // A holder consumed the spec and is alive: end it, through its
+        // verified lock, and see it go before anything else is decided.
+        if let Some(r) = &record {
+            let t = crate::terminate::terminate_verified_holder(
+                req.pane_dir,
+                req.pane_id,
+                r.holder_pid,
+            );
+            ended = format!("; holder pid {} ended: {}", r.holder_pid, t.detail);
+            let gone_by = Instant::now() + FAILURE_WAIT;
+            while t.signalled && lock == LockSeen::Held && Instant::now() < gone_by {
+                std::thread::sleep(REPORT_FILE_POLL);
+                lock = seen();
             }
-        } else {
-            SpawnError::Spawn(format!("{why}; the holder is gone: {reported}"))
-        });
+        }
     }
-    let Some(record) = crate::lock::read_record(&lock_file) else {
-        return fail(SpawnError::LiveHolderUnreachable(format!(
-            "{why}; the pane's lock is held by an unidentified holder"
-        )));
-    };
-    let t =
-        crate::terminate::terminate_verified_holder(req.pane_dir, req.pane_id, record.holder_pid);
-    let gone_by = Instant::now() + FAILURE_WAIT;
-    while t.signalled && !lock_free() && Instant::now() < gone_by {
-        std::thread::sleep(REPORT_FILE_POLL);
+    let reported = line.clone().unwrap_or_else(|| "no report".into());
+    let verdict = unheld_verdict(
+        line.as_deref().and_then(parse_ready_line).is_some(),
+        record.as_ref().is_some_and(|r| r.child_pid.is_some()),
+        reported.starts_with("holder_error="),
+        lock,
+    );
+    let context = format!("{why}{ended}; report: {reported}");
+    fail(match verdict {
+        UnheldVerdict::HolderFailed => SpawnError::HolderFailed {
+            line: reported,
+            status: format!("exited before it could be opened ({why})"),
+        },
+        UnheldVerdict::Fallback => SpawnError::Spawn(format!(
+            "{context}; the holder is gone and never ran the command"
+        )),
+        UnheldVerdict::Ran => SpawnError::RanUnheld(context),
+        UnheldVerdict::Unreachable => SpawnError::LiveHolderUnreachable(context),
+    })
+}
+
+/// What a pane's lock says, read once: only `Ok(Acquired)` is FREE (review
+/// round 3, R3) — an error (a sharing violation, access denied, the file gone
+/// mid-read) proves nothing about the holder.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockSeen {
+    Free,
+    Held,
+    Unreadable,
+}
+
+#[cfg(any(windows, test))]
+impl LockSeen {
+    fn of(r: std::io::Result<crate::lock::TryLock>) -> Self {
+        match r {
+            Ok(crate::lock::TryLock::Acquired(_)) => LockSeen::Free,
+            Ok(crate::lock::TryLock::Held) => LockSeen::Held,
+            Err(_) => LockSeen::Unreadable,
+        }
     }
-    if t.signalled && lock_free() {
-        fail(SpawnError::Spawn(format!(
-            "{why}; the unheld holder (pid {}) was ended and has exited: {}",
-            record.holder_pid, t.detail
-        )))
-    } else {
-        fail(SpawnError::LiveHolderUnreachable(format!(
-            "{why}; holder pid {} holds the pane and was not seen to exit: {}",
-            record.holder_pid, t.detail
-        )))
+}
+
+/// How an unheld WMI holder that CONSUMED its pane's spec settles.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnheldVerdict {
+    /// It reported `holder_error=…` and is gone: it never ran the command.
+    HolderFailed,
+    /// It is gone and never got as far as the command: fall back.
+    Fallback,
+    /// It ran the command (it reported ready, or recorded a child) and is
+    /// gone now: falling back would run it a SECOND time (review round 3, R7).
+    Ran,
+    /// It may still be live, or nothing about it can be read: no fallback.
+    Unreachable,
+}
+
+/// The settle decision, over what was observed after the holder was (if it
+/// was live) ended: `ready` — its report was a ready line; `recorded_child` —
+/// its lock record names a child; `failed` — its report was
+/// `holder_error=…`; `lock` — the pane's lock, last read. Pure, so it is
+/// tested on every OS.
+#[cfg(any(windows, test))]
+fn unheld_verdict(
+    ready: bool,
+    recorded_child: bool,
+    failed: bool,
+    lock: LockSeen,
+) -> UnheldVerdict {
+    match lock {
+        LockSeen::Held | LockSeen::Unreadable => UnheldVerdict::Unreachable,
+        LockSeen::Free if ready || recorded_child => UnheldVerdict::Ran,
+        LockSeen::Free if failed => UnheldVerdict::HolderFailed,
+        LockSeen::Free => UnheldVerdict::Fallback,
     }
 }
 
@@ -1370,6 +1449,49 @@ mod tests {
     fn pty_holder_spawn_verify_pty_child_refuses_an_unrelated_process() {
         let me = std::process::id() as i32;
         assert_eq!(verify_pty_child(2, me), None);
+    }
+
+    /// Review round 3, R3 + R7: only a FREE lock lets anything fall back, and
+    /// even then not after the holder ran the command.
+    #[test]
+    fn pty_holder_spawn_unheld_wmi_verdict_never_runs_a_command_twice() {
+        use UnheldVerdict::*;
+        for ready in [false, true] {
+            for child in [false, true] {
+                for failed in [false, true] {
+                    for lock in [LockSeen::Held, LockSeen::Unreadable] {
+                        assert_eq!(
+                            unheld_verdict(ready, child, failed, lock),
+                            Unreachable,
+                            "a held or unreadable lock never falls back"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            unheld_verdict(true, false, false, LockSeen::Free),
+            Ran,
+            "R7"
+        );
+        assert_eq!(unheld_verdict(false, true, false, LockSeen::Free), Ran);
+        assert_eq!(
+            unheld_verdict(false, false, true, LockSeen::Free),
+            HolderFailed
+        );
+        assert_eq!(
+            unheld_verdict(false, false, false, LockSeen::Free),
+            Fallback
+        );
+        assert_eq!(
+            LockSeen::of(Err(std::io::Error::other("sharing violation"))),
+            LockSeen::Unreadable,
+            "R3: an error is not a free lock"
+        );
+        assert_eq!(LockSeen::of(Ok(crate::lock::TryLock::Held)), LockSeen::Held);
+        assert!(SpawnError::RanUnheld("x".into()).forbids_fallback());
+        assert!(SpawnError::LiveHolderUnreachable("x".into()).forbids_fallback());
+        assert!(!SpawnError::Spawn("x".into()).forbids_fallback());
     }
 
     #[test]

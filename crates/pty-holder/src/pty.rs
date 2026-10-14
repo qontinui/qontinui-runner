@@ -131,10 +131,17 @@ pub struct Pane {
     /// path), kept for [`Pane::reap_tree`] to report.
     #[cfg(unix)]
     session_reap: Mutex<Option<crate::reap::ReapReport>>,
-    /// A kill REACHED the live child: set under the state lock, only while
-    /// `child_gone` is false, right before the signal (Unix) or the job
-    /// termination (Windows). A `kill` that arrives after the child has
-    /// already exited sets nothing. Only a reached kill makes the pane's end a
+    /// A kill was sent while the child HAD NOT EXITED AT THE MOMENT OF THE
+    /// CHECK: set under the state lock, only while `child_gone` is false and
+    /// a non-reaping `waitid(WNOHANG|WNOWAIT)` (Unix) / a zero-timeout wait
+    /// (Windows) sees no exit, right before the signal / the job termination.
+    /// A `kill` that arrives after the child has exited sets nothing.
+    ///
+    /// **Inherent gap** (review round 3, R6): a child that exits on its own in
+    /// the instant between that check and the signal (or `TerminateJobObject`)
+    /// is recorded as killed, and its leftovers are reaped. No OS offers an
+    /// atomic "signal only if not yet exited"; the window is the few
+    /// instructions between two syscalls. Only a reached kill makes the pane's end a
     /// KILL, the one end that reaps the child's leftovers (plan D8 as decided
     /// 2026-10-14): a normal exit leaves `nohup` / `disown` jobs and
     /// deliberately detached programs alone, as an in-process PTY always did.
