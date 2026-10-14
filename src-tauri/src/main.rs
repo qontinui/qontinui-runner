@@ -4878,6 +4878,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     },
                                 },
                             };
+                            // A PTY holder is alive for this record's terminal
+                            // and its adoption is still pending or retrying
+                            // (plan 2026-09-12 Phase 3): held like a withheld
+                            // restore — never closed `no-terminal` meanwhile.
+                            let adoption_pending =
+                                terminal::holder_boot_sweep::adoption_pending(&rec.terminal_id);
                             let action = hold_for_withheld_boot_restore(
                                 classify(
                                     live_is_alive,
@@ -4889,8 +4895,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     confirmed,
                                     worker_plane,
                                 ),
-                                held,
+                                held || adoption_pending,
                             );
+                            if adoption_pending && action == PollAction::Skip {
+                                consecutive_no_match.remove(&rec.claude_session_id);
+                            }
                             if held && action == PollAction::Skip {
                                 held_for_restore += 1;
                                 // A held record is waiting, not missing: any
