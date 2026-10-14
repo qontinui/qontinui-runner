@@ -711,7 +711,8 @@ jobs:
               --harness "$harness" --sessions 10 --soak-ms 45000
               --work-dir "$out/work" --run-id "settle-$which-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
               --out "$out/$which.json"
-              --runner-env WEBKIT_DISABLE_DMABUF_RENDERER=1)
+              --runner-env WEBKIT_DISABLE_DMABUF_RENDERER=1
+              --runner-env QONTINUI_TIMEOUT_UI_BRIDGE_IPC=60)
             "${launcher[@]}" node scripts/termhost-bench/cli.mjs settle-perf-harness "${args[@]}" \
               || echo "::warning::the $which settle exited $?"
           done

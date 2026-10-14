@@ -25,9 +25,12 @@ import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_TERMINAL_PAGE,
+  PERF_PROBE_ACTIONS,
+  PERF_PROBE_COMPONENT,
   TERMINAL_PAGE_COMPONENT,
   VIEW_STATE_ACTION,
   closeCreated,
+  probeAction,
   resolveTerminalPage,
   runHarness,
 } from "../../perf-harness.mjs";
@@ -76,9 +79,10 @@ function attachedConfig(over = {}) {
  * A fake temp runner behind `fetch`: the routes an attached perf-harness run
  * calls, a terminal table with one pre-existing terminal, and a record of every
  * request. `activePage` is the `pageId` the Terminal page's view-state action
- * reports (`null` = a build whose action predates the field).
+ * reports (`null` = a build whose action predates the field). `perfProbe: false`
+ * is a build whose webview has no `perf-probe` component (the door's own 404).
  */
-function fakeRunner({ activePage = "page-7", failDelete = new Set() } = {}) {
+function fakeRunner({ activePage = "page-7", failDelete = new Set(), perfProbe = true, sampleError = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "perf-harness-test-"));
   const logFile = join(dir, "qontinui-runner.log");
   writeFileSync(logFile, "");
@@ -93,6 +97,16 @@ function fakeRunner({ activePage = "page-7", failDelete = new Set() } = {}) {
     if (method === "POST" && path === `/ui-bridge/control/component/${TERMINAL_PAGE_COMPONENT}/action/${VIEW_STATE_ACTION}`) {
       const result = { maximizedZone: null, zoneCount: 1, layoutId: "single" };
       if (activePage !== null) result.pageId = activePage;
+      return ok({ success: true, result, durationMs: 1 });
+    }
+    const probe = /^\/ui-bridge\/control\/component\/perf-probe\/action\/([^/]+)$/.exec(path);
+    if (method === "POST" && probe) {
+      if (!perfProbe) {
+        return { status: 404, json: { success: false, error: "Component not found: perf-probe", code: "ELEMENT_NOT_FOUND" } };
+      }
+      if (sampleError && decodeURIComponent(probe[1]) === "sample") return { status: 500, json: { success: false, error: sampleError } };
+      const result = PROBE_ANSWERS[decodeURIComponent(probe[1])];
+      if (!result) return { status: 400, json: { success: false, error: `Action ${probe[1]} not found on component perf-probe` } };
       return ok({ success: true, result, durationMs: 1 });
     }
     if (method === "POST" && path === "/ui-bridge/control/page/evaluate") {
@@ -117,18 +131,59 @@ function fakeRunner({ activePage = "page-7", failDelete = new Set() } = {}) {
     if (/\/grid$/.test(path)) return ok({ alt_screen: false });
     return { status: 404, json: { error: `no route ${method} ${path}` } };
   };
+  // A supervisor on :9875 whose spawn-test hands back the fake runner on :9881.
+  const supervisorRoute = (method, path) => {
+    if (method === "GET" && path === "/health") return { status: 200, json: { status: "ok", build: { available_slots: 1 } } };
+    if (method === "POST" && path === "/runners/spawn-test") return { status: 200, json: { id: "test-9881", port: 9881, api_url: RUNNER_URL } };
+    if (method === "POST" && path === "/runners/test-9881/stop") return { status: 200, json: { stopped: true } };
+    return { status: 404, json: { error: `no supervisor route ${method} ${path}` } };
+  };
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
     assert.notEqual(u.port, "9876", "the primary runner is never addressed");
     const method = init.method ?? "GET";
     const body = init.body === undefined ? undefined : JSON.parse(init.body);
-    calls.push({ method, path: u.pathname, body });
-    const a = route(method, u.pathname, body);
+    calls.push({ method, path: u.pathname, body, port: u.port });
+    const a = u.port === "9875" ? supervisorRoute(method, u.pathname, body) : route(method, u.pathname, body);
     const text = JSON.stringify(a.json);
     return { ok: a.status >= 200 && a.status < 300, status: a.status, text: async () => text };
   };
   return { fetch, calls, terminals };
 }
+
+/** The `perf-probe` answers, in the shapes `src/lib/perfProbe.ts` returns. */
+const PROBE_ANSWERS = {
+  install: { installed: true, longTaskObserver: true, errors: [] },
+  reset: { reset: true },
+  sample: {
+    elapsedMs: 1000,
+    frameGapsMs: [16, 17, 18, 40],
+    longTasks: [{ start: 1, duration: 60 }],
+    webviewOutputEvents: 12,
+    webviewHooked: true,
+    errors: [],
+    ipc: { fallbackWarned: false, postMessageHooked: true, postMessageCalls: 0 },
+  },
+  stop: { stopped: true },
+  "transport-reset": { available: true },
+  "transport-sample": {
+    available: true,
+    stats: {
+      enabled: true,
+      sinceResetMs: 1000,
+      decodeNs: { pane: 1, tap: 2 },
+      decodeCalls: { pane: 1, tap: 1 },
+      decodeBytes: { pane: 10, tap: 10 },
+      writeToRenderNs: 5,
+      writeToRenderCount: 1,
+      writeToRenderBytes: 10,
+      eventsDelivered: 12,
+      eventsForeign: 0,
+      ringReplay: { fetches: 0, bytesFetched: 0, bytesWritten: 0 },
+      rawIpc: null,
+    },
+  },
+};
 
 // ---------------------------------------------------------------------------
 // The shared clients
@@ -291,4 +346,125 @@ test("closes are issued together, so one hung DELETE does not hold the others (o
   const out = await closeCreated(runner, [{ id: "a" }, { id: "b" }, { id: "c" }]);
   assert.equal(peak, 3);
   assert.deepEqual(out.closed, ["a", "b", "c"], "the order of the created list is kept");
+});
+
+// ---------------------------------------------------------------------------
+// The frontend probe is the bundled perf-probe component, never page/evaluate
+// (plan 2026-10-14-perf-harness-frontend-probe-evaluates-strings-the-csp-refuses)
+// ---------------------------------------------------------------------------
+
+const probePath = (action) => `/ui-bridge/control/component/${PERF_PROBE_COMPONENT}/action/${action}`;
+
+test("an attached run never posts to page/evaluate: the CSP refuses every evaluated string", ATTACHED, async () => {
+  const r = fakeRunner();
+  await runHarness(attachedConfig(), quiet, { fetch: r.fetch });
+  assert.deepEqual(r.calls.filter((c) => c.path === "/ui-bridge/control/page/evaluate"), []);
+  // And no evaluated string survives in the harness to be sent later.
+  const src = readFileSync(PERF_HARNESS, "utf8");
+  assert.ok(!/runner\.evaluate\(/.test(src), "perf-harness still calls runner.evaluate");
+  for (const gone of ["PROBE_INSTALL", "PROBE_SAMPLE", "TRANSPORT_SAMPLE", "__qontinuiPerfProbe"]) {
+    assert.ok(!src.includes(gone), `perf-harness still carries ${gone}`);
+  }
+});
+
+test("an attached run drives every perf-probe action and measures the frontend from them", ATTACHED, async () => {
+  const r = fakeRunner();
+  const run = await runHarness(attachedConfig(), quiet, { fetch: r.fetch });
+  const driven = r.calls.filter((c) => c.method === "POST" && c.path.startsWith(probePath("")));
+  const actions = new Set(driven.map((c) => c.path.slice(probePath("").length)));
+  assert.deepEqual([...actions].sort(), Object.values(PERF_PROBE_ACTIONS).sort());
+  // install first, stop last, and the soak's reset/sample once per level.
+  assert.equal(driven[0].path, probePath("install"));
+  assert.equal(driven.at(-1).path, probePath("stop"));
+  for (const a of ["reset", "sample", "transport-reset", "transport-sample"]) {
+    assert.equal(driven.filter((c) => c.path === probePath(a)).length, 2, `${a} once per level`);
+  }
+  for (const level of run.levels) {
+    assert.equal(level.frontendError, null);
+    assert.equal(level.frontend.frameCount, 4);
+    assert.equal(level.frontend.longTasks.count, 1);
+    assert.equal(level.frontend.webviewOutputEvents, 12);
+    assert.equal(level.transport.frontendError, null);
+  }
+});
+
+test("an absent perf-probe component reads unknown with the reason, never zero", ATTACHED, async () => {
+  const r = fakeRunner({ perfProbe: false });
+  const run = await runHarness(attachedConfig(), quiet, { fetch: r.fetch });
+  for (const level of run.levels) {
+    assert.equal(level.frontend, null, "no zero-filled frontend sample");
+    assert.match(level.frontendError, /perf-probe UI Bridge component is not registered/);
+    assert.match(level.frontendError, /Component not found: perf-probe/);
+    assert.match(level.transport.frontendError, /perf-probe UI Bridge component is not registered/);
+    assert.equal(level.chunks.webviewEventsPerSec, null);
+    assert.equal(level.webviewWedged, false);
+  }
+  assert.ok(run.notes.some((n) => /probe install FAILED/.test(n) && /UNKNOWN, not zero/.test(n)));
+  // A probe that never installed is not asked for a window it does not have.
+  assert.deepEqual(r.calls.filter((c) => c.path === probePath("reset") || c.path === probePath("sample")), []);
+});
+
+test("the harness's perf-probe actions are the ones the bundle registers, from the app shell", () => {
+  const lib = readFileSync(join(REPO, "src", "lib", "perfProbe.ts"), "utf8");
+  const factory = lib.slice(lib.indexOf("export function buildPerfProbeActions"));
+  const registered = [...factory.matchAll(/^\s{6}id: "([a-z-]+)",$/gm)].map((m) => m[1]);
+  assert.deepEqual(registered.sort(), Object.values(PERF_PROBE_ACTIONS).sort());
+  const hook = readFileSync(join(REPO, "src", "components", "app", "usePerfProbeComponent.ts"), "utf8");
+  assert.ok(hook.includes(`id: "${PERF_PROBE_COMPONENT}"`), "the component id the harness addresses");
+  assert.match(hook, /actions: buildPerfProbeActions\(perfProbe\)/);
+  const app = readFileSync(join(REPO, "src", "App.tsx"), "utf8");
+  const content = app.slice(app.indexOf("function AppContent()"));
+  const call = content.indexOf("usePerfProbeComponent();");
+  assert.ok(call > 0, "AppContent registers the probe");
+  assert.ok(call < content.indexOf('presentation.mode === "early-return"'), "before any early return");
+});
+
+test("probeAction unwraps the {success, result} envelope and refuses an inner failure", async () => {
+  const runner = { componentAction: async (id, action) => ({ success: true, result: { id, action } }) };
+  assert.deepEqual(await probeAction(runner, "sample"), { id: PERF_PROBE_COMPONENT, action: "sample" });
+  const refused = { componentAction: async () => ({ success: false, error: "boom" }) };
+  await assert.rejects(probeAction(refused, "sample"), /perf-probe\.sample failed: boom/);
+});
+
+test("--dry-run measures the frontend through the fake's perf-probe component", async () => {
+  const run = await runHarness({ ...attachedConfig({ runnerUrl: null }), dryRun: true, sessions: [2] }, quiet);
+  const [level] = run.levels;
+  assert.equal(level.frontendError, null);
+  assert.ok(level.frontend.frameCount > 0);
+  assert.ok(level.transport.frontend, "the webview transport half is measured too");
+});
+
+// ---------------------------------------------------------------------------
+// The perf-probe route waits the runner's UI Bridge IPC budget
+// ---------------------------------------------------------------------------
+
+test("a runner the harness spawns gets the probe's IPC budget, beside RUST_LOG", ATTACHED, async () => {
+  const r = fakeRunner();
+  const run = await runHarness(attachedConfig({ runnerUrl: null, sessions: [2] }), quiet, { fetch: r.fetch });
+  const spawn = r.calls.find((c) => c.port === "9875" && c.path === "/runners/spawn-test");
+  assert.ok(spawn, "the harness spawned through the supervisor");
+  assert.equal(spawn.body.extra_env.QONTINUI_TIMEOUT_UI_BRIDGE_IPC, "60");
+  assert.equal(spawn.body.extra_env.RUST_LOG, "info");
+  assert.ok(r.calls.some((c) => c.port === "9875" && c.path === "/runners/test-9881/stop"), "and stopped it");
+  assert.equal(run.levels[0].created, 1, "topped up to 2 over the one pre-existing terminal");
+});
+
+test("an attached run says its IPC budget is the runner's own", ATTACHED, async () => {
+  const r = fakeRunner();
+  const run = await runHarness(attachedConfig({ sessions: [2] }), quiet, { fetch: r.fetch });
+  assert.ok(run.notes.some((n) => n.includes("QONTINUI_TIMEOUT_UI_BRIDGE_IPC")));
+});
+
+test("a timed-out sample and an open UI Bridge circuit breaker both read as a wedged webview", ATTACHED, async () => {
+  for (const error of [
+    "UI Bridge request timed out after 10000ms",
+    "UI Bridge temporarily unavailable (circuit breaker open)",
+  ]) {
+    const r = fakeRunner({ sampleError: error });
+    const run = await runHarness(attachedConfig({ sessions: [2] }), quiet, { fetch: r.fetch });
+    assert.equal(run.levels[0].frontend, null, error);
+    assert.equal(run.levels[0].webviewWedged, true, error);
+  }
+  const ok = await runHarness(attachedConfig({ sessions: [2] }), quiet, { fetch: fakeRunner({ sampleError: "something else" }).fetch });
+  assert.equal(ok.levels[0].webviewWedged, false, "any other failure is not a wedge");
 });

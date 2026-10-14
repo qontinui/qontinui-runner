@@ -4,16 +4,16 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 175
+# total: 181
 #   guarded: 22
-#   literal: 54
+#   literal: 60
 #   registry: 42
 #   delegated: 9
 #   builtin: 15
 #   fixture: 33
 
-src/App.tsx:218	literal	component	complete	schema=no	arity=0	effect=write
-src/App.tsx:234	guarded	component	go-to-step	schema=yes	arity=-	effect=read
+src/App.tsx:219	literal	component	complete	schema=no	arity=0	effect=write
+src/App.tsx:235	guarded	component	go-to-step	schema=yes	arity=-	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:89	literal	component	start-run	schema=no	arity=0	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:109	literal	component	stop-run	schema=no	arity=0	effect=destructive
 src/components/active-dashboard/ActiveDashboardPage.tsx:120	literal	component	refresh	schema=no	arity=0	effect=read
@@ -174,6 +174,12 @@ src/components/terminal/terminalLaunchMenuActions.ts:206	guarded	free	create-wit
 src/hooks/changeTrackingHandler.test.ts:52	builtin	element	click	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/usePageEvents.ts:1360	delegated	component	map	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/utils.ts:192	delegated	component	map	schema=no	arity=-	effect=-
+src/lib/perfProbe.ts:371	literal	free	install	schema=no	arity=0	effect=write
+src/lib/perfProbe.ts:382	literal	free	reset	schema=no	arity=0	effect=write
+src/lib/perfProbe.ts:392	literal	free	sample	schema=no	arity=0	effect=read
+src/lib/perfProbe.ts:402	literal	free	stop	schema=no	arity=0	effect=write
+src/lib/perfProbe.ts:411	literal	free	transport-reset	schema=no	arity=0	effect=write
+src/lib/perfProbe.ts:421	literal	free	transport-sample	schema=no	arity=0	effect=read
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx:17	literal	component	open-advanced-controls	schema=no	arity=0	effect=read
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx:30	literal	component	scroll-to-top	schema=no	arity=0	effect=read
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx:39	literal	component	get-pipeline-phase	schema=no	arity=0	effect=read
