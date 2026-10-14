@@ -571,7 +571,9 @@ pub(crate) enum PairProgress {
     /// `403 device_credential_revoked` ([`device_revocation_latched`]). Not a
     /// bail of this tick's attempt: no mint door is asked (bar the hourly
     /// re-probe) until an operator authenticates the runner.
-    Revoked,
+    /// `reprobe_impossible` = the hourly re-probe is due but no request can
+    /// be sent (no unexpired device JWT, no machine key).
+    Revoked { reprobe_impossible: bool },
     /// The `Pair` arm completed with a usable JWT — either a fresh `Replaced`
     /// or a `KeptExisting`/`PersistFailed` whose existing JWT is still valid.
     Healthy,
@@ -650,10 +652,18 @@ pub(crate) fn coord_credential_health(
                      refused: {refusal} — sign in to re-pair"
                 ))
             }
-            Some(PairProgress::Revoked) => CoordCredentialHealth::bad(format!(
-                "coord revoked this device ({DEVICE_CREDENTIAL_REVOKED_CODE}) — the runner has \
-                 stopped retrying; an operator must Authenticate it on /runners"
-            )),
+            Some(PairProgress::Revoked { reprobe_impossible }) => {
+                CoordCredentialHealth::bad(format!(
+                    "coord revoked this device ({DEVICE_CREDENTIAL_REVOKED_CODE}) — the runner \
+                     has stopped retrying; an operator must Authenticate it on /runners{}",
+                    if reprobe_impossible {
+                        " (re-probe impossible: no valid bearer — no unexpired device JWT and \
+                         no device machine key)"
+                    } else {
+                        ""
+                    }
+                ))
+            }
             Some(PairProgress::BailNoTenant) => CoordCredentialHealth::bad(
                 "no resolvable tenant_id (OAuth claim, outgoing device-JWT, or \
                  machine.json::active_tenant_id all absent)",
@@ -852,14 +862,30 @@ async fn publish_coord_credential_status_tracked(
     if rate_limited && !status_publish_due(last, health, now) {
         return;
     }
-    publish_coord_credential_status(auth_manager, health).await;
-    *last = Some((now, health.clone()));
+    let delivered = publish_coord_credential_status(auth_manager, health).await;
+    record_status_publish(last, health, now, delivered);
 }
 
+/// Pure: record a publish attempt. Only a DELIVERED publish (coord answered
+/// 2xx) is recorded — a failed one leaves `last` as it was, so the next pass
+/// retries it instead of the rate limit suppressing it for a whole interval.
+pub(crate) fn record_status_publish(
+    last: &mut LastStatusPublish,
+    health: &CoordCredentialHealth,
+    now: std::time::Instant,
+    delivered: bool,
+) {
+    if delivered {
+        *last = Some((now, health.clone()));
+    }
+}
+
+/// POST this device's `coord_credential` status. `true` iff coord answered
+/// 2xx; every other outcome only `warn!`s and returns `false`.
 async fn publish_coord_credential_status(
     auth_manager: &crate::auth::AuthManager,
     health: &CoordCredentialHealth,
-) {
+) -> bool {
     // device_id: env override first (multi-instance / test), else machine.json.
     let device_id = std::env::var("QONTINUI_MACHINE_ID")
         .ok()
@@ -872,13 +898,13 @@ async fn publish_coord_credential_status(
             "device_jwt_refresher: cannot publish coord_credential status — \
              no device_id (QONTINUI_MACHINE_ID unset, machine.json unreadable)"
         );
-        return;
+        return false;
     };
     let Ok(device_uuid) = uuid::Uuid::parse_str(device_id.trim()) else {
         warn!(
             "device_jwt_refresher: device_id {device_id} is not a UUID — skipping status publish"
         );
-        return;
+        return false;
     };
 
     // tenant_id: machine.json::active_tenant_id (Phase 8b semantics: the
@@ -919,7 +945,7 @@ async fn publish_coord_credential_status(
         Ok(c) => c,
         Err(e) => {
             warn!("device_jwt_refresher: status-publish client build failed: {e}");
-            return;
+            return false;
         }
     };
     // Tenant-scoped: when `tenant_id` made it onto the body the status row is
@@ -938,18 +964,20 @@ async fn publish_coord_credential_status(
     .send()
     .await
     {
-        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) if resp.status().is_success() => true,
         Ok(resp) => {
             warn!(
                 "device_jwt_refresher: coord_credential status publish got HTTP {} \
                  (best-effort; loop continues)",
                 resp.status()
             );
+            false
         }
         Err(e) => {
             warn!(
                 "device_jwt_refresher: coord_credential status publish failed: {e} (best-effort)"
             );
+            false
         }
     }
 }
@@ -2940,8 +2968,120 @@ pub(crate) fn credential_generation() -> u64 {
 pub(crate) const REVOCATION_REPROBE_INTERVAL_SECS: i64 = 3600;
 
 /// Pure: may a latched runner probe again at `now`?
+///
+/// A NEGATIVE elapsed time means the wall clock stepped backwards since the
+/// last probe; that is treated as "allowed" rather than holding the probe off
+/// for the length of the step.
 pub(crate) fn revocation_reprobe_spacing_allows(latch: &RevocationLatch, now: i64) -> bool {
-    now - latch.last_probe_at >= REVOCATION_REPROBE_INTERVAL_SECS
+    let elapsed = now - latch.last_probe_at;
+    !(0..REVOCATION_REPROBE_INTERVAL_SECS).contains(&elapsed)
+}
+
+/// Is the hourly re-probe due at `now`? A PEEK: unlike
+/// [`take_revocation_reprobe`] it records nothing, so a pass that finds it has
+/// no request it can send does not spend the hour.
+pub(crate) fn revocation_reprobe_due(now: i64) -> bool {
+    DEVICE_REVOKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|l| revocation_reprobe_spacing_allows(&l, now))
+}
+
+/// Which request the hour's single re-probe sends, given what is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReprobeRequest {
+    /// The device self-refresh, presenting the unexpired legacy device JWT.
+    SelfRefresh,
+    /// The device-machine-key exchange — the only request a runner holding no
+    /// unexpired device JWT can still send.
+    MachineKey,
+    /// Nothing can be sent: no unexpired bearer and no machine key (or no
+    /// device id / web base to send it with). The hour is NOT spent.
+    Impossible,
+}
+
+/// Pure: pick the re-probe request. `legacy_presentable` = an unexpired legacy
+/// device JWT and a device id are held; `machine_key_sendable` = a stored
+/// `dmk_`, a device id and a web base.
+pub(crate) fn plan_revocation_reprobe(
+    legacy_presentable: bool,
+    machine_key_sendable: bool,
+) -> ReprobeRequest {
+    if legacy_presentable {
+        ReprobeRequest::SelfRefresh
+    } else if machine_key_sendable {
+        ReprobeRequest::MachineKey
+    } else {
+        ReprobeRequest::Impossible
+    }
+}
+
+/// What [`run_revocation_reprobe`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReprobeOutcome {
+    /// Not latched, or the hour has not passed: nothing sent.
+    NotDue,
+    /// One request was sent. `recovered` = it persisted a credential (which
+    /// spent the latch); otherwise the latch stands (a `revoked` answer
+    /// re-latched, any other failure left it in place).
+    Sent {
+        via: ReprobeRequest,
+        recovered: bool,
+    },
+    /// Due, but no request could be sent ([`ReprobeRequest::Impossible`]).
+    /// The hour is not spent; the posture says why.
+    Impossible,
+}
+
+/// The legacy arm's hourly re-probe while a revocation is latched. Sends at
+/// most ONE request, and only spends the hour ([`take_revocation_reprobe`])
+/// when it actually has one to send.
+pub(crate) async fn run_revocation_reprobe(
+    auth_manager: &crate::auth::AuthManager,
+    coord_base: &str,
+    web_base: &str,
+    device_id: Option<&str>,
+    expected_tenant: Option<uuid::Uuid>,
+    now: i64,
+) -> ReprobeOutcome {
+    if !device_revocation_latched() || !revocation_reprobe_due(now) {
+        return ReprobeOutcome::NotDue;
+    }
+    let legacy_presentable = device_id.is_some()
+        && auth_manager
+            .get_access_token()
+            .ok()
+            .is_some_and(|t| !t.trim().is_empty())
+        && auth_manager.access_token_exp().is_some_and(|exp| now < exp);
+    let machine_key_sendable = device_id.is_some()
+        && !web_base.trim().is_empty()
+        && matches!(auth_manager.get_device_machine_key(), Ok(Some(k)) if !k.trim().is_empty());
+    let via = plan_revocation_reprobe(legacy_presentable, machine_key_sendable);
+    let Some(did) = device_id else {
+        return ReprobeOutcome::Impossible;
+    };
+    match via {
+        ReprobeRequest::Impossible => ReprobeOutcome::Impossible,
+        ReprobeRequest::SelfRefresh => {
+            if !take_revocation_reprobe(now) {
+                return ReprobeOutcome::NotDue;
+            }
+            let recovered = try_device_self_refresh(auth_manager, coord_base, did)
+                .await
+                .is_some();
+            ReprobeOutcome::Sent { via, recovered }
+        }
+        ReprobeRequest::MachineKey => {
+            if !take_revocation_reprobe(now) {
+                return ReprobeOutcome::NotDue;
+            }
+            let recovered =
+                try_device_machine_key_exchange(auth_manager, web_base, did, expected_tenant)
+                    .await
+                    .is_some();
+            ReprobeOutcome::Sent { via, recovered }
+        }
+    }
 }
 
 /// Record coord's revocation verdict. From here on the refresher presents
@@ -5437,6 +5577,17 @@ async fn clear_and_rederive_tenant_slot(
         crate::secure_storage::process_attribution()
     );
 
+    // A standing revocation (this clear came from the hourly re-probe's own
+    // refresh being refused): the machine-key exchange is a mint door coord
+    // refuses a revoked device too, and asking it here would make the hour's
+    // ONE probe two. The legacy arm's re-probe is the exchange's turn.
+    if device_revocation_latched() {
+        info!(
+            "device_jwt_refresher: tenant {tenant} slot cleared during a revocation re-probe \
+             — not re-deriving (the hour's one probe request was already sent)"
+        );
+        return TenantSlotOutcome::Revoked;
+    }
     if web_base.trim().is_empty() {
         warn!(
             "device_jwt_refresher: tenant {tenant} slot cleared but no web backend URL \
@@ -5628,8 +5779,16 @@ pub(crate) async fn refresh_tenant_slots(
         // without it a coord-side un-revoke is never noticed by a build that
         // lacks the operator-authorized redeem. The probe is this slot's own
         // refresh, forced; a success persists a credential (clearing the
-        // latch), a `revoked` re-latches.
-        let reprobe = device_revocation_latched() && take_revocation_reprobe(now);
+        // latch), a `revoked` re-latches. Taken ONLY when this slot holds an
+        // UNEXPIRED token it can present: an expired slot can send nothing,
+        // so it must neither spend the hour nor be cleared — the legacy arm's
+        // probe ([`run_revocation_reprobe`]) then sends the hour's request
+        // through the device-machine-key exchange instead.
+        let presentable = exp.is_some_and(|e| now < e);
+        let reprobe = device_revocation_latched()
+            && presentable
+            && revocation_reprobe_due(now)
+            && take_revocation_reprobe(now);
         if device_revocation_latched() && !reprobe {
             let o = TenantSlotOutcome::Revoked;
             health.push(health_row(
@@ -6701,23 +6860,67 @@ async fn refresher_loop(
                 }
                 continue;
             }
-            // The hourly re-probe ([`take_revocation_reprobe`]) is the one
-            // way past this arm while latched: it falls through to the `Pair`
-            // arm below, which then asks ONLY the device self-refresh.
-            Decision::Pair
-                if device_revocation_latched()
-                    && !take_revocation_reprobe(chrono::Utc::now().timestamp()) =>
-            {
+            Decision::Pair if device_revocation_latched() => {
                 // G1 step 4: coord revoked this device. Self-refresh, the
                 // Cognito pair and the machine-key exchange are all mint doors
-                // coord refuses for it, so none is asked. The posture published
-                // above already says `revoked`; tell coord's fleet view too —
-                // once on entering, then at the steady cadence, never per kick
-                // ([`status_publish_due`]). Then wait for an operator's
-                // Authenticate (its pairing write spends the latch) or a kick.
+                // coord refuses for it, so none is asked — bar the hourly
+                // re-probe ([`run_revocation_reprobe`]): ONE request, through
+                // the unexpired legacy JWT if one is held, else the
+                // device-machine-key exchange. The slot pass above may already
+                // have spent this hour on a slot's own refresh; then this is
+                // `NotDue`. A probe that persists a credential spends the
+                // latch, and the next iteration runs the ordinary arms.
+                let (coord_base, _coord_base_source) =
+                    crate::coord_mcp::coord_base_url_with_source();
+                let (reprobe_web_base, _reprobe_web_arm) = resolve_pair_base(&settings_snapshot);
+                let reprobe_device_id = std::env::var("QONTINUI_MACHINE_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+                    .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+                let reprobe = run_revocation_reprobe(
+                    &auth_manager,
+                    &coord_base,
+                    &reprobe_web_base,
+                    reprobe_device_id.as_deref(),
+                    crate::auth::default_binding_tenant(),
+                    chrono::Utc::now().timestamp(),
+                )
+                .await;
+                if matches!(
+                    reprobe,
+                    ReprobeOutcome::Sent {
+                        recovered: true,
+                        ..
+                    }
+                ) {
+                    info!(
+                        "device_jwt_refresher: the hourly re-probe was answered with a credential \
+                         ({reprobe:?}) — coord no longer refuses this device"
+                    );
+                    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                    continue;
+                }
+                if reprobe == ReprobeOutcome::Impossible {
+                    warn!(
+                        "device_jwt_refresher: device revoked and the hourly re-probe is due, but \
+                         no request can be sent (no unexpired device JWT, no device machine key) \
+                         — only an operator's Authenticate can recover this runner"
+                    );
+                }
+                // The posture published above already says `revoked`; tell
+                // coord's fleet view too — once on entering, then at the
+                // steady cadence, never per kick ([`status_publish_due`]).
+                // Then wait for an operator's Authenticate (its pairing write
+                // spends the latch), the next hour, or a kick.
                 publish_coord_credential_status_tracked(
                     &auth_manager,
-                    &coord_credential_health(decision, Some(PairProgress::Revoked)),
+                    &coord_credential_health(
+                        decision,
+                        Some(PairProgress::Revoked {
+                            reprobe_impossible: reprobe == ReprobeOutcome::Impossible,
+                        }),
+                    ),
                     &mut last_status_publish,
                     true,
                 )
@@ -6791,15 +6994,6 @@ async fn refresher_loop(
                         // without knocking on another mint door.
                         continue;
                     }
-                }
-                if device_revocation_latched() {
-                    // Reached only through the hourly re-probe, and the probe
-                    // is the device self-refresh ALONE: it did not persist a
-                    // credential (which would have cleared the latch), so the
-                    // Cognito pair and the machine-key exchange — mint doors
-                    // coord refuses a revoked device too — are not asked.
-                    // Back to the parked arm.
-                    continue;
                 }
 
                 // The web backend's pair-cli endpoint gates on the user
@@ -7180,6 +7374,26 @@ pub mod commands {
                 "posture": self.posture.as_ref().map(CoordCredentialStatus::to_json),
             })
         }
+    }
+
+    /// Test-only: install a refresher holder with NO task behind it and hand
+    /// back its kick receiver, so a test can observe that a kick reached the
+    /// channel a live refresher waits on. `None` restores the empty holder.
+    #[cfg(test)]
+    pub(crate) async fn install_kick_probe_for_test(install: bool) -> Option<watch::Receiver<u64>> {
+        let mut guard = get_holder().lock().await;
+        if !install {
+            *guard = None;
+            return None;
+        }
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let (kick_tx, kick_rx) = watch::channel(0u64);
+        *guard = Some(Arc::new(RefresherState {
+            shutdown_tx,
+            kick_tx,
+            task_handle: Mutex::new(None),
+        }));
+        Some(kick_rx)
     }
 }
 
@@ -15577,6 +15791,12 @@ mod dark_gap_tests {
         let ta = Some(t);
         let before = dark_crossings_for_test(&key);
         let arrived_before = dark_crossing_kicks_arrived_for_test(&key);
+        // A refresher's kick channel, so the test observes the wake a live
+        // refresher's `wait_with_signals` would return on — not merely that
+        // the spawned task ran.
+        let mut kick_rx = commands::install_kick_probe_for_test(true)
+            .await
+            .expect("kick probe installed");
         reject(ta, UPSTREAM_DARK_THRESHOLD - 1);
         assert_eq!(
             dark_crossings_for_test(&key),
@@ -15595,6 +15815,10 @@ mod dark_gap_tests {
             kicks_arrived(&key, arrived_before + 1).await,
             arrived_before + 1,
             "the crossing's kick must reach the refresher"
+        );
+        assert!(
+            kick_rx.has_changed().unwrap_or(false) && *kick_rx.borrow_and_update() >= 1,
+            "the kick must advance the refresher's kick channel (what wakes its wait)"
         );
         reject(ta, 5);
         assert_eq!(
@@ -15622,6 +15846,11 @@ mod dark_gap_tests {
             kicks_arrived(&key, arrived_before + 2).await,
             arrived_before + 2
         );
+        assert!(
+            kick_rx.has_changed().unwrap_or(false),
+            "the second crossing wakes the refresher's channel again"
+        );
+        commands::install_kick_probe_for_test(false).await;
     }
 
     // ---- review MAJOR 1: on a ONE-slot box the refused LEGACY token is replaced ----
@@ -15822,7 +16051,12 @@ mod dark_gap_tests {
     fn a_kicked_pass_does_not_repost_an_identical_status() {
         let t0 = std::time::Instant::now();
         let ok = coord_credential_health(Decision::Idle, None);
-        let revoked = coord_credential_health(Decision::Pair, Some(PairProgress::Revoked));
+        let revoked = coord_credential_health(
+            Decision::Pair,
+            Some(PairProgress::Revoked {
+                reprobe_impossible: false,
+            }),
+        );
         assert!(!revoked.ok);
         assert!(revoked
             .reason
@@ -15859,6 +16093,247 @@ mod dark_gap_tests {
             legacy_arm_decision(RunnerTier::Local, false, true),
             Decision::Pair,
             "the wrong tier is never asked to mint"
+        );
+    }
+
+    // ---- round 2 MAJOR-A: the re-probe sends a request, or spends nothing ----
+
+    #[test]
+    fn the_reprobe_request_falls_back_to_the_machine_key_when_no_bearer_is_unexpired() {
+        assert_eq!(
+            plan_revocation_reprobe(true, true),
+            ReprobeRequest::SelfRefresh
+        );
+        assert_eq!(
+            plan_revocation_reprobe(false, true),
+            ReprobeRequest::MachineKey
+        );
+        assert_eq!(
+            plan_revocation_reprobe(false, false),
+            ReprobeRequest::Impossible
+        );
+    }
+
+    fn latch_due_now(now: i64) {
+        set_device_revocation_latch_for_test(Some(RevocationLatch {
+            latched_at: now - 6 * REVOCATION_REPROBE_INTERVAL_SECS,
+            last_probe_at: now - REVOCATION_REPROBE_INTERVAL_SECS - 1,
+        }));
+    }
+
+    /// Four-plus hours after a revocation the legacy JWT has expired and no
+    /// slot exists: the hour's probe is the machine-key exchange — exactly
+    /// one request per hour however often the arm runs.
+    #[tokio::test]
+    async fn an_expired_legacy_token_reprobes_through_the_machine_key_once_per_hour() {
+        let _clean = Clean::take();
+        let mgr = manager(
+            "reprobe_expired_legacy",
+            Some("dmk_unit_fixture_placeholder"),
+        );
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_tokens(&jwt(now - 60, "expired-legacy", None), "")
+            .expect("legacy");
+        latch_due_now(now);
+        let (base, mock, _stop) = spawn(vec![], Some((403, REVOKED_BODY.to_string())));
+        let first = run_revocation_reprobe(&mgr, &base, &base, Some(DID), None, now).await;
+        assert_eq!(
+            first,
+            ReprobeOutcome::Sent {
+                via: ReprobeRequest::MachineKey,
+                recovered: false
+            }
+        );
+        assert!(device_revocation_latched(), "a revoked answer re-latches");
+        for k in 1..4 {
+            assert_eq!(
+                run_revocation_reprobe(&mgr, &base, &base, Some(DID), None, now + k * 60).await,
+                ReprobeOutcome::NotDue
+            );
+        }
+        assert_eq!(
+            *mock.exchanges.lock().unwrap(),
+            1,
+            "one request in the hour"
+        );
+        assert!(
+            mock.bearers.lock().unwrap().is_empty(),
+            "no expired bearer presented"
+        );
+        // The next hour sends the next one.
+        let later = chrono::Utc::now().timestamp() + REVOCATION_REPROBE_INTERVAL_SECS;
+        assert!(matches!(
+            run_revocation_reprobe(&mgr, &base, &base, Some(DID), None, later).await,
+            ReprobeOutcome::Sent { .. }
+        ));
+        assert_eq!(*mock.exchanges.lock().unwrap(), 2);
+    }
+
+    /// A coord-side un-revoke during that state is noticed: the exchange mints,
+    /// the credential is persisted, and the latch is spent.
+    #[tokio::test]
+    async fn a_coord_unrevoke_recovers_a_runner_whose_legacy_token_expired() {
+        let _clean = Clean::take();
+        let mgr = manager(
+            "reprobe_expired_recovers",
+            Some("dmk_unit_fixture_placeholder"),
+        );
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_tokens(&jwt(now - 60, "expired-legacy", None), "")
+            .expect("legacy");
+        latch_due_now(now);
+        let fresh = jwt(now + 4 * 60 * 60, "unrevoked", None);
+        let (base, mock, _stop) = spawn(
+            vec![],
+            Some((200, serde_json::json!({ "token": fresh }).to_string())),
+        );
+        assert_eq!(
+            run_revocation_reprobe(&mgr, &base, &base, Some(DID), None, now).await,
+            ReprobeOutcome::Sent {
+                via: ReprobeRequest::MachineKey,
+                recovered: true
+            }
+        );
+        assert_eq!(*mock.exchanges.lock().unwrap(), 1);
+        assert!(
+            !device_revocation_latched(),
+            "the persisted credential spends the latch"
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), fresh);
+    }
+
+    /// With no unexpired bearer and no machine key nothing can be sent: the
+    /// hour is NOT spent, and the health names why.
+    #[tokio::test]
+    async fn a_reprobe_with_nothing_to_send_spends_nothing_and_says_so() {
+        let _clean = Clean::take();
+        let mgr = manager("reprobe_impossible", None);
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_tokens(&jwt(now - 60, "expired-legacy", None), "")
+            .expect("legacy");
+        latch_due_now(now);
+        let (base, mock, _stop) = spawn(vec![], Some((200, "{}".to_string())));
+        assert_eq!(
+            run_revocation_reprobe(&mgr, &base, &base, Some(DID), None, now).await,
+            ReprobeOutcome::Impossible
+        );
+        assert!(revocation_reprobe_due(now), "the hour is still unspent");
+        assert_eq!(*mock.exchanges.lock().unwrap(), 0);
+        assert!(mock.bearers.lock().unwrap().is_empty());
+        let h = coord_credential_health(
+            Decision::Pair,
+            Some(PairProgress::Revoked {
+                reprobe_impossible: true,
+            }),
+        );
+        assert!(h
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("re-probe impossible: no valid bearer")));
+    }
+
+    /// The slot pass neither spends the hour on, nor clears, a slot whose
+    /// token has expired — it cannot present it.
+    #[tokio::test]
+    async fn the_slot_pass_does_not_spend_the_reprobe_on_an_expired_slot() {
+        let _clean = Clean::take();
+        let mgr = manager("reprobe_expired_slot", Some("dmk_unit_fixture_placeholder"));
+        let ta = tenant(17);
+        let now = chrono::Utc::now().timestamp();
+        let expired = jwt(now - 60, "expired-slot", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &expired).expect("a");
+        latch_due_now(now);
+        let (base, mock, _stop) = spawn(vec![], Some((200, "{}".to_string())));
+        let out =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(out, vec![(ta, TenantSlotOutcome::Revoked)]);
+        assert!(mock.bearers.lock().unwrap().is_empty());
+        assert_eq!(*mock.exchanges.lock().unwrap(), 0);
+        assert!(
+            revocation_reprobe_due(now),
+            "the hour is left for the legacy arm's probe"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(expired.as_str()),
+            "the slot is kept, not cleared"
+        );
+    }
+
+    // ---- round 2 MINOR-B: a refused slot re-probe is ONE request, not two ----
+
+    #[tokio::test]
+    async fn a_slot_reprobe_refused_with_401_does_not_also_ask_the_machine_key() {
+        let _clean = Clean::take();
+        let mgr = manager(
+            "reprobe_401_no_rederive",
+            Some("dmk_unit_fixture_placeholder"),
+        );
+        let ta = tenant(18);
+        let now = chrono::Utc::now().timestamp();
+        let tok = jwt(now + 3 * 60 * 60, "rejected", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &tok).expect("a");
+        latch_due_now(now);
+        let (base, mock, _stop) = spawn(
+            vec![(tok.clone(), 401, r#"{"code":"token_revoked"}"#.to_string())],
+            Some((200, serde_json::json!({ "token": "x" }).to_string())),
+        );
+        let out =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(out, vec![(ta, TenantSlotOutcome::Revoked)]);
+        assert_eq!(
+            mock.bearers.lock().unwrap().len(),
+            1,
+            "the one probe request"
+        );
+        assert_eq!(
+            *mock.exchanges.lock().unwrap(),
+            0,
+            "no machine-key exchange on top of it"
+        );
+        assert!(device_revocation_latched());
+    }
+
+    // ---- round 2 MINOR-C / MINOR-D ----
+
+    #[test]
+    fn a_failed_status_publish_is_not_recorded() {
+        let t0 = std::time::Instant::now();
+        let revoked = coord_credential_health(
+            Decision::Pair,
+            Some(PairProgress::Revoked {
+                reprobe_impossible: false,
+            }),
+        );
+        let mut last: LastStatusPublish = None;
+        record_status_publish(&mut last, &revoked, t0, false);
+        assert!(
+            last.is_none(),
+            "a failed POST must be retried, not suppressed"
+        );
+        assert!(status_publish_due(
+            &last,
+            &revoked,
+            t0 + Duration::from_secs(1)
+        ));
+        record_status_publish(&mut last, &revoked, t0, true);
+        assert!(!status_publish_due(
+            &last,
+            &revoked,
+            t0 + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn a_backward_clock_step_does_not_hold_the_reprobe_off() {
+        let latch = RevocationLatch {
+            latched_at: 2_000_000_000,
+            last_probe_at: 2_000_000_000,
+        };
+        assert!(!revocation_reprobe_spacing_allows(&latch, 2_000_000_010));
+        assert!(
+            revocation_reprobe_spacing_allows(&latch, 2_000_000_000 - 86_400),
+            "a clock stepped back a day must not delay the probe by a day"
         );
     }
 
