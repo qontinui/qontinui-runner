@@ -6,15 +6,20 @@
  *
  * One item per session in the Live list's order: the status dot over a stripe
  * of the session's group color. The dot is the only status signal here, so
- * every item's tooltip and accessible name carry the session name and BOTH
- * status words — never color alone. Phase 7 replaces the tooltip with the
- * hover card.
+ * every item's accessible name carries the session name and BOTH status
+ * words — never color alone. Hovering an item opens the session hover card
+ * beside the rail (Phase 7): the card is the rail item's body, so the item
+ * carries no native tooltip that would compete with it. Without a hover-card
+ * binding the item falls back to the tooltip. An unseen session's item
+ * carries the unseen mark too.
  */
 
 import { PanelLeftOpen } from "lucide-react";
 
 import { sessionCardName, sessionCardStatusDisplay } from "./SessionCard";
 import { sessionOrgControlAttrs } from "./sessionOrgControls";
+import type { SessionHoverCardController } from "./SessionHoverCard";
+import { unseenAttr, type UnseenVerdict } from "./sessionUnseen";
 import type { UnifiedSession } from "./useSessionManager";
 
 /** The rail item's tooltip: name, then activity · location. */
@@ -32,6 +37,10 @@ export interface SessionRailProps {
   onOpen: (session: UnifiedSession) => void;
   onExpand: () => void;
   width: number;
+  /** The panel's hover-card binding; absent = the native tooltip instead. */
+  hoverCard?: SessionHoverCardController["bind"];
+  /** A row's unseen-activity verdict; absent = not tracked. */
+  unseenOf?: (session: UnifiedSession) => UnseenVerdict;
 }
 
 export function SessionRail({
@@ -41,6 +50,8 @@ export function SessionRail({
   onOpen,
   onExpand,
   width,
+  hoverCard,
+  unseenOf,
 }: SessionRailProps) {
   return (
     <div
@@ -63,6 +74,10 @@ export function SessionRail({
           const status = sessionCardStatusDisplay(session.status);
           const title = railItemTitle(session);
           const color = groupColorOf(session);
+          const hover = hoverCard?.(session.sessionId);
+          const unseen = unseenOf?.(session);
+          const isUnseen = unseen?.state === "unseen";
+          const label = `${title.replace("\n", ": ")}${isUnseen ? " (new activity)" : ""}`;
           return (
             <button
               key={session.sessionId}
@@ -70,12 +85,15 @@ export function SessionRail({
               data-session-id={session.sessionId}
               data-session-activity={status.activity}
               data-session-location={status.location}
+              data-session-unseen={unseen ? unseenAttr(unseen) : "untracked"}
               onClick={() => onOpen(session)}
-              title={title}
-              aria-label={title.replace("\n", ": ")}
+              onMouseEnter={hover?.onMouseEnter}
+              onMouseLeave={hover?.onMouseLeave}
+              title={hover ? undefined : title}
+              aria-label={label}
               aria-current={session.sessionId === selectedSessionId ? "true" : undefined}
               style={{ borderLeftColor: color ?? "transparent" }}
-              className={`flex items-center justify-center h-6 border-l-[3px] hover:bg-[#1a1b26] ${
+              className={`relative flex items-center justify-center h-6 border-l-[3px] hover:bg-[#1a1b26] ${
                 session.sessionId === selectedSessionId ? "bg-[#7aa2f7]/10" : ""
               }`}
             >
@@ -83,6 +101,13 @@ export function SessionRail({
                 className={`w-2 h-2 rounded-full ${status.pulse ? "animate-pulse" : ""}`}
                 style={{ backgroundColor: status.color }}
               />
+              {isUnseen && (
+                <span
+                  {...sessionOrgControlAttrs("unseenDot", session.sessionId)}
+                  aria-hidden="true"
+                  className="absolute top-0.5 right-1.5 w-1 h-1 rounded-full bg-brand-primary"
+                />
+              )}
             </button>
           );
         })}

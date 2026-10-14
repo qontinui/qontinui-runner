@@ -28,6 +28,7 @@
 
 import type { SessionActivity, SessionLocation, SessionStatus } from "./sessionStatusModel";
 import type { SessionGroupColorRole, SessionOrg } from "./sessionOrgTypes";
+import { unseenVerdict, type UnseenVerdict } from "./sessionUnseen";
 import type { SessionInfoState } from "./useSessionInfo";
 
 // ── Facts ────────────────────────────────────────────────────────────────────
@@ -98,6 +99,12 @@ export interface SessionFacts {
   snoozedUntil: Fact<number | null>;
   /** Epoch ms of the last focus; `null` = never focused. */
   lastSeenAt: Fact<number | null>;
+  /**
+   * The unseen-activity dot (Phase 7): activity changed or output arrived
+   * after the last focus. The SAME verdict the card's dot renders
+   * (`useSessionUnseen`), so `is:unseen` filters exactly the dotted rows.
+   */
+  unseen: Fact<boolean>;
   /** `null` = ungrouped. */
   group: Fact<SessionGroupFact | null>;
   tags: Fact<readonly string[]>;
@@ -207,6 +214,37 @@ export interface SessionFactsSources {
   thisDeviceLabel?: string | null;
   /** Epoch ms of the tab's last PTY output, when a tab exists. */
   lastOutputAt?: number | null;
+  /**
+   * The unseen verdict the panel's dot renders (`useSessionUnseen().verdictOf`).
+   * Absent = derived here from the store's `lastSeenAt` and the row's last
+   * activity alone, with no in-process observation (a never-focused session
+   * is then UNKNOWN, not unseen).
+   */
+  unseen?: UnseenVerdict;
+}
+
+/**
+ * Epoch ms of a row's last activity: its last transcript record, its file's
+ * modification, the tab's last output — the newest; `null` = none known.
+ * The facts' `lastActivityAt` and the unseen dot both read it.
+ */
+export function rowLastActivityAt(
+  row: Pick<SessionFactsRow, "lastMessageTimestamp" | "lastModified">,
+  lastOutputAt?: number | null,
+): number | null {
+  const ms = Math.max(
+    parseMs(row.lastMessageTimestamp) ?? -Infinity,
+    parseMs(row.lastModified) ?? -Infinity,
+    lastOutputAt ?? -Infinity,
+  );
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** An unseen verdict as a fact: `unknown` stays UNKNOWN with its reason. */
+export function unseenFact(verdict: UnseenVerdict): Fact<boolean> {
+  return verdict.state === "unknown"
+    ? unknownFact(verdict.reason)
+    : known(verdict.state === "unseen");
 }
 
 /** The key PR CI reads are indexed by. */
@@ -413,10 +451,16 @@ export function buildSessionFacts(src: SessionFactsSources): SessionFacts {
   else device = unknownFact("this device's label not known");
 
   const started = parseMs(row.startedAt) ?? (body ? body.lifecycle.openedAt : null);
-  const lastActivity = Math.max(
-    parseMs(row.lastMessageTimestamp) ?? -Infinity,
-    parseMs(row.lastModified) ?? -Infinity,
-    src.lastOutputAt ?? -Infinity,
+  const lastActivity = rowLastActivityAt(row, src.lastOutputAt);
+  const org = orgFacts(src.org, src.sessionKey);
+  const unseen = unseenFact(
+    src.unseen ??
+      unseenVerdict({
+        lastSeenAt: org.lastSeenAt,
+        lastActivityAt: lastActivity,
+        observation: undefined,
+        focused: false,
+      }),
   );
 
   return {
@@ -438,7 +482,8 @@ export function buildSessionFacts(src: SessionFactsSources): SessionFacts {
     activity,
     exitCode: status.exitCode,
     finished,
-    ...orgFacts(src.org, src.sessionKey),
+    ...org,
+    unseen,
     account,
     repo,
     branch,
@@ -447,9 +492,8 @@ export function buildSessionFacts(src: SessionFactsSources): SessionFacts {
     device,
     page: known(src.page),
     startedAt: started !== null ? known(started) : unknownFact("start time not recorded"),
-    lastActivityAt: Number.isFinite(lastActivity)
-      ? known(lastActivity)
-      : unknownFact("no activity timestamp"),
+    lastActivityAt:
+      lastActivity !== null ? known(lastActivity) : unknownFact("no activity timestamp"),
     messageCount:
       row.source === "transcript" ? known(row.messageCount) : unknownFact("no transcript yet"),
   };

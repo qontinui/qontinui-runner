@@ -43,7 +43,9 @@ import {
 } from "./sessionManagerLiveRows";
 import { refreshLiveClaudeSessions, useLiveClaudeSessions } from "./useLiveClaudeSessions";
 import { refreshExternalClaudeScan, useExternalClaudeScan } from "./useExternalClaudeScan";
-import { finishedMarker, type SessionFacts } from "./sessionFacts";
+import { finishedMarker, rowLastActivityAt, type SessionFacts } from "./sessionFacts";
+import { useSessionUnseen, type UnseenRow } from "./useSessionUnseen";
+import { focusedSessionKey, type UnseenVerdict } from "./sessionUnseen";
 import { useSessionFacts, useSessionInfoList, type SessionFactsRowInput } from "./useSessionFacts";
 import { useSessionQuery, type SessionQueryState } from "./useSessionQuery";
 import type { UnknownRow } from "./sessionQuery";
@@ -371,6 +373,11 @@ export interface UseSessionManagerParams {
    */
   pageId?: string;
   windowLabel?: string;
+  /**
+   * The tab the operator is looking at (the page's active / focused tab);
+   * `null` = none. Focusing a session clears its unseen dot (Phase 7).
+   */
+  focusedTabId?: string | null;
 }
 
 /** One session's Move-to-page outcome. */
@@ -409,6 +416,11 @@ export interface UseSessionManagerReturn {
   liveFacts: readonly SessionFacts[];
   /** Facts by row id (`UnifiedSession.sessionId`). */
   factsById: ReadonlyMap<string, SessionFacts>;
+  /**
+   * The unseen-activity dot of a row (Phase 7) — the same verdict
+   * `is:unseen` filters on (`SessionFacts.unseen`).
+   */
+  unseenOf: (session: UnifiedSession) => UnseenVerdict;
   groupBy: SessionGroupBy;
   setGroupBy: (g: SessionGroupBy) => void;
   sortBy: SessionSortBy;
@@ -601,6 +613,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     tabLockStates,
     pageId = "default",
     windowLabel = "main",
+    focusedTabId = null,
   } = params;
 
   // Account usage state
@@ -977,18 +990,52 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     [allSessions],
   );
 
+  // ── Unseen activity (Phase 7) ────────────────────────────────────────────
+  // Activity changed or output arrived after the session's `lastSeenAt` in
+  // the org store; cleared by focusing it. The verdict feeds both the card's
+  // dot and the `is:unseen` fact, so the filter shows exactly the dotted rows.
+
+  const unseenRows = useMemo(
+    (): UnseenRow[] =>
+      allSessions.map((row) => ({
+        key: sessionKeyOf(row),
+        activity: row.status.activity,
+        lastActivityAt: rowLastActivityAt(row),
+      })),
+    [allSessions, sessionKeyOf],
+  );
+  const focusedKey = useMemo(
+    () => focusedSessionKey(allSessions, focusedTabId, sessionKeyOf),
+    [allSessions, focusedTabId, sessionKeyOf],
+  );
+  const { verdictOf: unseenVerdictOf, markSeen } = useSessionUnseen({
+    rows: unseenRows,
+    org,
+    apply: applyOrg,
+    focusedKey,
+  });
+  const unseenOf = useCallback(
+    (session: UnifiedSession) => unseenVerdictOf(sessionKeyOf(session)),
+    [unseenVerdictOf, sessionKeyOf],
+  );
+
   // ── Query facts and the query (D5) ───────────────────────────────────────
 
   const factsRows = useMemo(
     (): SessionFactsRowInput[] =>
-      allSessions.map((row) => ({
-        row,
-        sessionKey: sessionKeyOf(row),
-        claudeSessionId: claudeIdOf(row),
-        // A row with a tab in this window is on this page.
-        page: row.zoneTabId !== null || row.source === "tab" ? { id: pageId, name: pageId } : null,
-      })),
-    [allSessions, sessionKeyOf, claudeIdOf, pageId],
+      allSessions.map((row) => {
+        const sessionKey = sessionKeyOf(row);
+        return {
+          row,
+          sessionKey,
+          claudeSessionId: claudeIdOf(row),
+          // A row with a tab in this window is on this page.
+          page:
+            row.zoneTabId !== null || row.source === "tab" ? { id: pageId, name: pageId } : null,
+          unseen: unseenVerdictOf(sessionKey),
+        };
+      }),
+    [allSessions, sessionKeyOf, claudeIdOf, pageId, unseenVerdictOf],
   );
   const { facts: factsById } = useSessionFacts({ rows: factsRows, org, info: sessionInfo });
   const liveFacts = useMemo(
@@ -1169,9 +1216,12 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         onFocusSessionTab(session.sessionId, route.tabId, session.source);
       } else if (route.kind === "transcript") {
         onSelectSession(session.sessionId);
+        // Reading its transcript is seeing it; a focused tab is marked by
+        // `useSessionUnseen` when focus arrives.
+        markSeen(sessionKeyOf(session));
       }
     },
-    [tabs, onSelectSession, onFocusSessionTab],
+    [tabs, onSelectSession, onFocusSessionTab, markSeen, sessionKeyOf],
   );
 
   const copySessionId = useCallback((session: UnifiedSession) => {
@@ -1274,6 +1324,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     queryUnknown,
     liveFacts,
     factsById,
+    unseenOf,
     groupBy,
     setGroupBy,
     sortBy,
