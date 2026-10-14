@@ -64,7 +64,8 @@
 //!   `attached` with `restore {cwd, title}` metadata, and brackets the replayed
 //!   tail with two `KIND_SYNTHETIC` frames (`crate::frame`), ALWAYS both,
 //!   possibly empty: a PREAMBLE (screen buffer, title — the state at the first
-//!   byte the connection can be sent) before the first output frame, and a
+//!   byte the connection can be sent) before the first output frame and after
+//!   any loss report already due at attach time, and a
 //!   POSTAMBLE (input modes, keypad, kitty flags, cursor visibility — the
 //!   state at the stream's end when the attach was served) exactly when the
 //!   stream reaches that offset, or before a loss report that would pass it. Synthetic bytes
