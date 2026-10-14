@@ -64,6 +64,26 @@ export const SESSION_ORG_CONTROLS = {
   closeCancel: control("close-cancel", "read"),
   forceClose: control("force-close", "read"),
   forceCloseConfirm: control("force-close-confirm", "destructive"),
+  closeInclude: control("close-include", "read"),
+  // Triage (Phase 5): the list, the bulk bar, Ready to close, Recently closed
+  sessionList: control("session-list", "read"),
+  bulkBar: control("bulk-bar", "read"),
+  bulkClose: control("bulk.close", "destructive"),
+  bulkFinish: control("bulk.finish", "write"),
+  bulkAddToGroup: control("bulk.add-to-group", "write"),
+  bulkNewGroup: control("bulk.new-group", "write"),
+  bulkPin: control("bulk.pin", "write"),
+  bulkUnpin: control("bulk.unpin", "write"),
+  bulkMute: control("bulk.mute", "write"),
+  bulkSnooze: control("bulk.snooze", "write"),
+  bulkMoveToPage: control("bulk.move-to-page", "write"),
+  bulkResume: control("bulk.resume", "write"),
+  bulkClear: control("bulk.clear", "read"),
+  bulkResults: control("bulk-results", "read"),
+  readyToClose: control("ready-to-close", "read"),
+  readyToCloseReview: control("ready-to-close.review", "destructive"),
+  recentlyClosed: control("recently-closed", "read"),
+  recentlyClosedResume: control("recently-closed.resume", "write"),
 } as const satisfies Record<string, SessionOrgControl>;
 
 export type SessionOrgControlName = keyof typeof SESSION_ORG_CONTROLS;

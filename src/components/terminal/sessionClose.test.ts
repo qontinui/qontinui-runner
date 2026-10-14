@@ -17,11 +17,12 @@ import {
 } from "./sessionClose";
 import { SESSION_ACTIVITIES } from "./sessionStatusModel";
 
-function item(id: string, tabId: string | null = `tab-${id}`): CloseItem {
+function item(id: string, tabId: string | null = `tab-${id}`, tabAlive = true): CloseItem {
   return {
     sessionId: id,
     title: `Session ${id}`,
     tabId,
+    tabAlive,
     sessionKey: `key-${id}`,
     resumeCmd: `claude --resume ${id}`,
   };
@@ -143,6 +144,27 @@ describe("closeSessionsGracefully", () => {
     await closeSessionsGracefully([item("a")], fx);
     expect(fx.recordClosed).not.toHaveBeenCalled();
     expect(fx.dropTab).not.toHaveBeenCalled();
+  });
+});
+
+describe("closing an exited session", () => {
+  it("removes its tab without /exit or a kill, and records it closed", async () => {
+    const fx = effects({});
+    const results = await closeSessionsGracefully([item("x", "tab-x", false)], fx);
+    expect(fx.gracefulClose).not.toHaveBeenCalled();
+    expect(fx.forceClose).not.toHaveBeenCalled();
+    expect(fx.dropTab.mock.calls).toEqual([["tab-x"]]);
+    expect(results[0].state).toBe("closed");
+    expect(results[0].detail).toContain("already exited");
+    expect(fx.recordClosed.mock.calls[0][0]).toHaveLength(1);
+  });
+
+  it("Force close takes the same removal, never the kill", () => {
+    const fx = effects({});
+    const results = forceCloseSessions([item("x", "tab-x", false)], fx);
+    expect(fx.forceClose).not.toHaveBeenCalled();
+    expect(fx.dropTab.mock.calls).toEqual([["tab-x"]]);
+    expect(results[0].state).toBe("closed");
   });
 });
 
