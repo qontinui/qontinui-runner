@@ -76,6 +76,29 @@ describe("readPageHealth", () => {
     expect(JSON.stringify(obs)).not.toContain("CRITICAL");
   });
 
+  it("a registry whose elements are all invisible is unknown, never a CRITICAL measurement", () => {
+    // Elements registered, none visible: the producer considered nothing, so
+    // a coverage verdict would be a statement about zero elements. Through
+    // @qontinui/ui-bridge 0.31.0 this was a `measured` CRITICAL report; 0.31.1
+    // (ui-bridge#248) answers `unknown{input_missing}`.
+    const hidden = (id: string) => ({
+      id,
+      type: "text",
+      category: "content",
+      state: { visible: false, textContent: id },
+    });
+    const obs = overTheWire(() => ({
+      elements: [hidden("a"), hidden("b"), hidden("c")],
+      components: [],
+      timestamp: 1,
+    }));
+    expect(obs.status).toBe("unknown");
+    expect((obs.unknown as { code: string }).code).toBe("input_missing");
+    expect(obs).not.toHaveProperty("value");
+    expect(JSON.stringify(obs)).not.toContain("CRITICAL");
+    expectCanonicalProvenance(obs);
+  });
+
   it("a laid-out snapshot is measured by the SDK's producer, on the canonical wire", () => {
     const obs = overTheWire(() => ({
       elements: [
