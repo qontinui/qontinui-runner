@@ -70,6 +70,7 @@ import {
   type FleetTenantChoice,
 } from "./FleetTenantSelect";
 import { shortTenantId } from "./SpawnTenantPicker";
+import { mintTenantOf } from "./fleetWalker";
 import { formatRelativeTime } from "../../lib/formatting";
 
 /**
@@ -606,7 +607,9 @@ export function FleetSessionPicker() {
    */
   const emptyCreate = emptyCreateTargets({
     merged,
-    servedTenant: servedTenants[0] ?? null,
+    // A single read's create mints under the tenant its walk presented, the
+    // same rule as a row's attach (`mintTenantOf`).
+    singleTenant: mintTenantOf(walkTenants[0] ?? null),
     answeredTenants: readTenants.answered,
     shortTenant: shortTenantId,
   });
@@ -639,11 +642,13 @@ export function FleetSessionPicker() {
           // Same routing as `createTerminal`: the tab lands on THIS page via
           // the `terminal-created` listener that claims its `pageId`.
           pageId: pageId !== "default" ? pageId : null,
-          // The tenant the ROW was served under — stamped on it by its own
+          // The tenant the ROW's own walk presented — stamped on it by that
           // walk, never the selection (which in a merged view is every tenant)
           // nor the default slot. coord resolves an attach target within the
           // presented principal's tenant only, so any other tenant is a 404.
-          tenant: s.servedTenantId ?? null,
+          // `null` when that walk named no tenant: it read under the default
+          // credential, and mints under it exactly as before the selector.
+          tenant: s.mintTenantId ?? null,
         });
         set({ pending: false, openedId: info.id });
         setActiveId(info.id);
@@ -1332,13 +1337,13 @@ export function FleetSessionPicker() {
                       deviceLabel={g.label}
                       isCallerDevice={g.isCallerDevice}
                       state={createState[groupKey]}
-                      onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.tenantId)}
+                      onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}
                     />
                   </div>
                   <RemoteCreateOutcome
                     bridgeKey={groupKey}
                     state={createState[groupKey]}
-                    onRetry={() => void createRemote(groupKey, g.deviceId, g.label, g.tenantId)}
+                    onRetry={() => void createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}
                   />
 
                   {g.sessions.map((s) => {

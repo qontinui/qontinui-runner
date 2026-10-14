@@ -16,6 +16,7 @@ import { describe, it, expect } from "vitest";
 import {
   FleetTenantWalker,
   initialFleetWalkSnapshot,
+  mintTenantOf,
   servedTenantOf,
   stampServedTenant,
   type FleetPageRequest,
@@ -323,6 +324,24 @@ describe("FleetTenantWalker — what a page says about itself", () => {
     await settle();
     expect(w.snapshot.walk.sessions.map((s) => s.servedTenantId)).toEqual([B, B]);
   });
+
+  it("mints a row under the tenant its walk ASKED for — none when it asked for none", async () => {
+    // A read that named no tenant presented the default credential; pinning
+    // the envelope's tenant on its attach would route the mint through the
+    // owned-tenant checks and could refuse one that worked before the selector.
+    const coord = fakeCoord();
+    const unnamed = walker({ tenant: null, fetchPage: coord.fetchPage });
+    void unnamed.restart();
+    coord.calls[0].resolve(envelope({ tenantId: B, sessions: [session("s1")] }));
+    await settle();
+    expect(unnamed.snapshot.walk.sessions.map((s) => s.mintTenantId)).toEqual([null]);
+
+    const named = walker({ tenant: B, fetchPage: coord.fetchPage });
+    void named.restart();
+    coord.calls[1].resolve(envelope({ tenantId: B, sessions: [session("s2")] }));
+    await settle();
+    expect(named.snapshot.walk.sessions.map((s) => s.mintTenantId)).toEqual([B]);
+  });
 });
 
 describe("servedTenantOf / stampServedTenant", () => {
@@ -331,6 +350,15 @@ describe("servedTenantOf / stampServedTenant", () => {
     expect(servedTenantOf(envelope({ tenantId: "  " }), A)).toBe(A);
     expect(servedTenantOf(envelope({ tenantId: "" }), null)).toBeNull();
     expect(servedTenantOf(null, null)).toBeNull();
+  });
+
+  it("mints under the tenant ASKED for, never the envelope's", () => {
+    expect(mintTenantOf(A)).toBe(A);
+    expect(mintTenantOf("  ")).toBeNull();
+    expect(mintTenantOf(null)).toBeNull();
+    const out = stampServedTenant(envelope({ tenantId: B, sessions: [session("s1")] }), null);
+    expect(out.sessions[0].servedTenantId).toBe(B);
+    expect(out.sessions[0].mintTenantId).toBeNull();
   });
 
   it("does not mutate coord's rows", () => {

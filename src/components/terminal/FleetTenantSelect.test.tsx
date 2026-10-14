@@ -122,6 +122,18 @@ describe("the merged choice (Phase 4)", () => {
     expect(fleetWalkTenants(FLEET_TENANT_ALL_VALUE, [])).toEqual([null]);
   });
 
+  it("keeps a picked tenant that is no longer bound on screen, disabled, rather than showing 'all tenants'", () => {
+    const D = "dddddddd-0000-4000-8000-00000000000d";
+    const html = render(true, D);
+    expect(html).toMatch(
+      /<option value="dddddddd-[^"]*"[^>]*disabled=""[^>]*selected=""[^>]*>dddddddd — no longer bound<\/option>/,
+    );
+    // A bound pick gets no extra option.
+    expect(render(true, A)).not.toContain("no longer bound");
+    expect(render(true, null)).not.toContain("no longer bound");
+    expect(render(true, FLEET_TENANT_ALL_VALUE)).not.toContain("no longer bound");
+  });
+
   it("marks the merged option selected when chosen", () => {
     expect(render(true, FLEET_TENANT_ALL_VALUE)).toMatch(/<option value="\*"[^>]*selected=""/);
     expect(isAllTenants(FLEET_TENANT_ALL_VALUE)).toBe(true);

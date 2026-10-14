@@ -356,8 +356,8 @@ export function createButtonState(group: { deviceId: string; isCallerDevice: boo
  */
 export interface EmptyCreateTarget {
   /** The tenant the create mints its grant under — and so the tenant the new
-   * session is created in. `null` only in a single-tenant read whose envelope
-   * named none, where the runner's own authority order is the read's own. */
+   * session is created in. `null` only in a single-tenant read that named no
+   * tenant, where the runner's own authority order is the read's own. */
   tenant: string | null;
   /** Shown beside the button in a merged read, so the operator sees which
    * tenant each one creates in. `null` in a single-tenant read. */
@@ -373,8 +373,9 @@ export const EMPTY_CREATE_NO_TENANT_REASON =
  * read covered (plan
  * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`).
  *
- * - A SINGLE-tenant read offers one create under the tenant its rows were
- *   served under (`servedTenant`, possibly null) — the pre-merge behaviour.
+ * - A SINGLE-tenant read offers one create under the tenant that read
+ *   presented (`singleTenant`; null when it named none) — the pre-merge
+ *   behaviour.
  * - A MERGED read has no one tenant the empty page belongs to, and sending none
  *   would let the runner's authority order pick a tenant the operator never
  *   chose. So it offers one create PER tenant that answered, each naming its
@@ -383,12 +384,12 @@ export const EMPTY_CREATE_NO_TENANT_REASON =
  */
 export function emptyCreateTargets(args: {
   merged: boolean;
-  servedTenant: string | null;
+  singleTenant: string | null;
   answeredTenants: readonly (string | null)[];
   shortTenant: (tenant: string) => string;
 }): { targets: EmptyCreateTarget[]; disabledReason: string | null } {
   if (!args.merged) {
-    return { targets: [{ tenant: args.servedTenant, tenantLabel: null }], disabledReason: null };
+    return { targets: [{ tenant: args.singleTenant, tenantLabel: null }], disabledReason: null };
   }
   const seen = new Set<string>();
   const targets: EmptyCreateTarget[] = [];
