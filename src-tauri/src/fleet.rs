@@ -1818,9 +1818,11 @@ pub(crate) const MAX_CI_REPO_CAPABILITIES: usize = 64;
 static CI_REPO_CAP_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// The capability vector `heartbeat_to_coord` sends: CI tokens, host facts and
-/// the credential family ([`heartbeat_capabilities`]). Its own function so the
-/// heartbeat's exact expression is what the seam test exercises.
+/// The base of the capability vector `heartbeat_to_coord` sends: CI tokens,
+/// host facts and the credential family ([`heartbeat_capabilities`]). The
+/// heartbeat then appends the skill tokens ([`skill_capability_tokens`]),
+/// which depend on its bearer. Its own function so the heartbeat's exact
+/// expression is what the seam test exercises.
 fn heartbeat_device_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
     build_device_capabilities(ci_node, repo_allowlist, &heartbeat_capabilities())
 }
