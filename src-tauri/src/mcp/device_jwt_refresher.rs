@@ -1676,6 +1676,11 @@ pub(crate) fn resolve_pair_tenant_id(
 /// collapses to [`RefreshOutcome::KeptExisting`]. The caller MUST NOT clear the
 /// JWT in response to either variant — see the doc-comment on
 /// [`RefreshOutcome`].
+///
+/// `outgoing_jwt` is the legacy slot's current token, READ BY THE CALLER (off
+/// the refresher's worker — see [`access_token_off_worker`]); it feeds the
+/// tenant fallback chain below.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_refresh_once(
     auth_manager: &crate::auth::AuthManager,
     pair_base: &str,
@@ -1683,6 +1688,7 @@ pub(crate) async fn try_refresh_once(
     device_id: &str,
     user_id: &str,
     machine_tenant: Option<uuid::Uuid>,
+    outgoing_jwt: Option<&str>,
     pair_base_arm: Option<crate::api_config::ApiBaseUrlArm>,
 ) -> RefreshOutcome {
     let base = pair_base.to_string();
@@ -1709,9 +1715,8 @@ pub(crate) async fn try_refresh_once(
     //      `session::dual_write::resolve_active_tenant_id()`; tests inject
     //      `Some`/`None` directly so they stay hermetic on any host).
     // Only if ALL THREE are absent/malformed do we keep the existing JWT.
-    let outgoing_jwt = auth_manager.get_access_token().ok();
     let (tenant_id, tenant_source) =
-        match resolve_pair_tenant_id(&token, outgoing_jwt.as_deref(), machine_tenant) {
+        match resolve_pair_tenant_id(&token, outgoing_jwt, machine_tenant) {
             Some(resolved) => resolved,
             None => {
                 warn!(
@@ -1939,8 +1944,8 @@ pub(crate) async fn attempt_pair_mint(
         PairBearer::Nothing => "",
     };
     // Store reads go through the blocking pool: on the refresher's one-worker
-    // runtime a store-lock wait or a keychain fallback would block the very
-    // timer PASS_BOUND relies on.
+    // runtime a keychain fallback in `get_access_token` would block the very
+    // timer PASS_BOUND relies on. Read ONCE and handed to `try_refresh_once`.
     let outgoing_jwt = access_token_off_worker(auth_manager).await;
     let resolved_tenant = resolve_pair_tenant_id(hint, outgoing_jwt.as_deref(), req.machine_tenant);
     let tenant_resolved = resolved_tenant.is_some();
@@ -1956,6 +1961,7 @@ pub(crate) async fn attempt_pair_mint(
                 req.device_id,
                 req.user_id,
                 req.machine_tenant,
+                outgoing_jwt.as_deref(),
                 req.pair_base_arm,
             )
             .await,
@@ -2113,11 +2119,14 @@ pub(crate) async fn run_pair_tick(
 /// per-tenant slot exists) — re-publish the posture from it.
 ///
 /// The store reads (the token the verdict is keyed by, and the legacy probe)
-/// run on the blocking pool: `get_access_token` can fall back to the keychain
-/// and any store read can wait on the cross-process lock, which on the
-/// refresher's one-worker runtime would block the worker — and with it the
-/// PASS_BOUND timer. The PUBLISH happens back on the async side, after the
-/// await, so a pass abandoned at this await publishes nothing.
+/// run on the blocking pool: `AuthManager::get_access_token` can fall back to
+/// the OS keychain (and, rarely, migrate a keychain token into an absent store
+/// file), which on the refresher's one-worker runtime would block the worker —
+/// and with it the PASS_BOUND timer. (Store READS themselves are lock-free.)
+/// The closure returns raw reads only; RECORDING the verdict and PUBLISHING the
+/// posture both happen back on the async side, after the await, so a pass
+/// abandoned at this await writes nothing late — no old verdict paired with a
+/// newer token's fingerprint, and no stale posture.
 async fn conclude_default_slot_recovery(
     auth_manager: &crate::auth::AuthManager,
     verdict: DefaultSlotRecovery,
@@ -2129,13 +2138,20 @@ async fn conclude_default_slot_recovery(
     let read = spawn_blocking_tracked(move || {
         #[cfg(test)]
         note_conclude_read_thread();
-        record_default_slot_recovery(verdict, mgr.get_access_token().ok().as_deref());
-        publish_legacy.then(|| legacy_slot_observation(mgr.probe_access_token()))
+        (
+            mgr.get_access_token().ok(),
+            publish_legacy.then(|| mgr.probe_access_token()),
+        )
     })
     .await;
     match read {
-        Ok(Some(obs)) => publish_legacy_observation(obs, pins, app),
-        Ok(None) => {}
+        Ok((token, probe)) => {
+            // Record FIRST, so the legacy posture reads this verdict.
+            record_default_slot_recovery(verdict, token.as_deref());
+            if let Some(probe) = probe {
+                publish_legacy_observation(legacy_slot_observation(probe), pins, app);
+            }
+        }
         Err(e) => warn!("device_jwt_refresher: recovery-conclusion task failed ({e})"),
     }
 }
@@ -8179,7 +8195,17 @@ mod try_refresh_once_tests {
             r#"{"error":"token expired"}"#.to_string(),
         );
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &tok(),
+            DID,
+            UID,
+            None,
+            mgr.get_access_token().ok().as_deref(),
+            None,
+        )
+        .await;
         assert_eq!(
             outcome,
             RefreshOutcome::BearerRejected { status: 401 },
@@ -8215,7 +8241,17 @@ mod try_refresh_once_tests {
             r#"{"error":"coord overloaded"}"#.to_string(),
         );
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &tok(),
+            DID,
+            UID,
+            None,
+            mgr.get_access_token().ok().as_deref(),
+            None,
+        )
+        .await;
         assert_eq!(outcome, RefreshOutcome::KeptExisting);
 
         let still = mgr.get_access_token().expect("token still present");
@@ -8250,7 +8286,17 @@ mod try_refresh_once_tests {
 
         let (base, _cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &tok(),
+            DID,
+            UID,
+            None,
+            mgr.get_access_token().ok().as_deref(),
+            None,
+        )
+        .await;
         match outcome {
             RefreshOutcome::Replaced { new_jwt: got } => {
                 assert_eq!(got, new_jwt, "Replaced must carry the new JWT");
@@ -8297,7 +8343,17 @@ mod try_refresh_once_tests {
         let body = serde_json::json!({ "token": wrong_tenant_jwt, "user_id": UID }).to_string();
         let (base, _cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &tok(),
+            DID,
+            UID,
+            None,
+            mgr.get_access_token().ok().as_deref(),
+            None,
+        )
+        .await;
         match outcome {
             RefreshOutcome::TenantMismatch { expected, returned } => {
                 assert_eq!(
@@ -8379,7 +8435,17 @@ mod try_refresh_once_tests {
         .to_string();
         let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, None, None).await;
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &tok_no_tenant(),
+            DID,
+            UID,
+            None,
+            mgr.get_access_token().ok().as_deref(),
+            None,
+        )
+        .await;
         match outcome {
             RefreshOutcome::Replaced { new_jwt: got } => {
                 assert_eq!(got, new_jwt, "Replaced must carry the new JWT");
@@ -8429,7 +8495,17 @@ mod try_refresh_once_tests {
         let body = serde_json::json!({ "token": new_jwt }).to_string();
         let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, None, None).await;
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &tok_no_tenant(),
+            DID,
+            UID,
+            None,
+            mgr.get_access_token().ok().as_deref(),
+            None,
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -8475,8 +8551,17 @@ mod try_refresh_once_tests {
         let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
         let machine = uuid::Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
-        let outcome =
-            try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, Some(machine), None).await;
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &tok_no_tenant(),
+            DID,
+            UID,
+            Some(machine),
+            mgr.get_access_token().ok().as_deref(),
+            None,
+        )
+        .await;
 
         match outcome {
             RefreshOutcome::Replaced { new_jwt: got } => {
@@ -15526,6 +15611,7 @@ mod refresh_window_outage_tests {
     #[tokio::test]
     async fn the_recovery_conclusion_reads_the_store_off_the_refresher_worker() {
         let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
         let dir = crate::test_env::process_scratch_dir("qontinui_test_conclude_off_worker");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("conclude.enc");
@@ -15545,6 +15631,23 @@ mod refresh_window_outage_tests {
                     None,
                 )
                 .await;
+                let first = *CONCLUDE_READ_THREAD.lock().unwrap();
+                *CONCLUDE_READ_THREAD.lock().unwrap() = None;
+                // And with the legacy publish: the probe is off the worker too,
+                // and the publish (on the async side) still lands.
+                conclude_default_slot_recovery(
+                    &mgr,
+                    DefaultSlotRecovery::NeedsSignIn,
+                    true,
+                    PosturePinInputs::UNPINNED,
+                    None,
+                )
+                .await;
+                assert!(first.is_some_and(|t| t != worker), "{first:?}");
+                assert!(
+                    coord_credential_posture().is_some(),
+                    "publish_legacy=true publishes the posture after the await"
+                );
                 (worker, std::thread::current().name().map(str::to_string))
             })
         });
@@ -16000,7 +16103,17 @@ mod default_slot_recovery_tests {
             (StatusCode::FORBIDDEN, "{}".into()),
             (StatusCode::OK, "{}".into()),
         );
-        let outcome = try_refresh_once(&mgr, &base, &user_bearer(), DID, UID, None, None).await;
+        let outcome = try_refresh_once(
+            &mgr,
+            &base,
+            &user_bearer(),
+            DID,
+            UID,
+            None,
+            mgr.get_access_token().ok().as_deref(),
+            None,
+        )
+        .await;
         assert_eq!(outcome, RefreshOutcome::BearerRejected { status: 403 });
     }
 
