@@ -20,6 +20,8 @@ import {
   waitForHolderSweep,
   recheckRefusedAfterSweep,
   HOLDER_SWEEP_RECHECK_ATTEMPTS,
+  fetchHolderSweepStatus,
+  splitRestoreByHold,
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
@@ -902,5 +904,65 @@ describe("recheckRefusedAfterSweep — sessions refused as live before the sweep
   it("does nothing for nothing refused", async () => {
     await expect(recheckRefusedAfterSweep([])).resolves.toEqual([]);
     expect(mockInvoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("the holder sweep's census — restore what is not held, now", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  const rec = (terminalId: string) => ({ terminalId, claudeSessionId: `s-${terminalId}` });
+
+  it("restores a non-held record without waiting while a held one is still adopting", async () => {
+    // The census is in: t2's pane is still being adopted, the sweep is unsettled.
+    mockInvoke.mockImplementation(
+      (cmd: unknown) =>
+        cmd === "terminal_holder_sweep_status"
+          ? Promise.resolve({
+              success: true,
+              message: null,
+              data: { settled: false, held: ["t2"] },
+            })
+          : new Promise(() => {}), // a settle-wait would never resolve
+    );
+    const status = await fetchHolderSweepStatus();
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_holder_sweep_status");
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_holder_sweep_settled");
+    const { now, heldBack } = splitRestoreByHold([rec("t1"), rec("t2")], status);
+    expect(now.map((r) => r.terminalId)).toEqual(["t1"]);
+    expect(heldBack.map((r) => r.terminalId)).toEqual(["t2"]);
+  });
+
+  it("holds nothing back once the sweep settled, or with no census", () => {
+    const records = [rec("t1"), rec("t2")];
+    expect(splitRestoreByHold(records, { settled: true, held: new Set(["t2"]) }).heldBack).toEqual(
+      [],
+    );
+    expect(splitRestoreByHold(records, { settled: false, held: null }).now).toHaveLength(2);
+  });
+
+  it("reads a runner without the command as settled with nothing held", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("unknown command"));
+    const status = await fetchHolderSweepStatus();
+    expect(status.settled).toBe(true);
+    expect(status.held?.size).toBe(0);
+  });
+
+  it("reads a census that did not come in as held: null", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { settled: false, held: null },
+    });
+    await expect(fetchHolderSweepStatus()).resolves.toEqual({ settled: false, held: null });
+  });
+
+  it("re-runs the held-back sessions after the sweep, settled or not", async () => {
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: false } });
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(recheckRefusedAfterSweep([], live, ["s-t2"])).resolves.toEqual(["s-t2"]);
+    expect(live).not.toHaveBeenCalled();
   });
 });
