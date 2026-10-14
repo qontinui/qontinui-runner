@@ -329,6 +329,21 @@ function prFacts(
   return known(list);
 }
 
+/**
+ * The work-axis finished marker of one live session, from its lifecycle
+ * record in the `session_info_list` listing: `true` / `false` when the record
+ * carries `finishedAt`, `null` (UNKNOWN) otherwise — no Claude session id, the
+ * listing loading or unavailable, no lifecycle record, an unavailable
+ * envelope, or a runner build whose record omits the field. A missing source
+ * is never "not finished". Pure.
+ */
+export function finishedMarker(info: SessionInfoListView, id: string | null): boolean | null {
+  if (id === null || info.phase !== "ok") return null;
+  const finishedAt = info.byId.get(id)?.body?.lifecycle.finishedAt;
+  if (typeof finishedAt === "number") return true;
+  return finishedAt === null ? false : null;
+}
+
 /** Build one session's facts. Pure. */
 export function buildSessionFacts(src: SessionFactsSources): SessionFacts {
   const { row, info, fleet } = src;
@@ -349,11 +364,13 @@ export function buildSessionFacts(src: SessionFactsSources): SessionFacts {
   const activity: Fact<SessionActivity> =
     status.activity === "unknown" ? unknownFact(status.reason) : known(status.activity);
 
+  const marker = finishedMarker(info, src.claudeSessionId);
   let finished: Fact<boolean>;
-  if (body) finished = known(body.lifecycle.finishedAt !== null);
+  if (marker !== null) finished = known(marker);
   else if (fleet?.sessionStatus) finished = known(fleet.sessionStatus === "finished");
   else if (status.activity === "finished") finished = known(true);
-  else finished = unknownFact(infoReason);
+  else
+    finished = unknownFact(body ? "the lifecycle record carries no finished marker" : infoReason);
 
   const workingDir = body?.placement.workingDir ?? null;
   const repoName =

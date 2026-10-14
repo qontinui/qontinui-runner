@@ -1,18 +1,20 @@
 /**
- * `useSessionFacts` — hydrates the Session Manager query engine's
- * `SessionFacts` for every row (plan
+ * Hydration of the Session Manager's `SessionFacts` (plan
  * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
- * Phase 4).
+ * Phases 1 and 4), in two hooks because the listing feeds the status model
+ * BEFORE the facts are built:
  *
- * One refresh is ONE `session_info_list` call for every row's Claude session
- * id (never one `session_info_get` per row), then ONE `coord_pr_ci_states`
- * call for the PRs the runner's own ledger has not already settled. Both
- * re-run when the set of ids changes and every `pollMs`.
+ *  - {@link useSessionInfoList}: ONE `session_info_list` call per refresh for
+ *    every row's Claude session id (never one `session_info_get` per row).
+ *    `useSessionManager` reads each live row's finished marker from it
+ *    (`finishedMarker`) and hands the same listing to the facts.
+ *  - {@link useSessionFacts}: ONE `coord_pr_ci_states` call for the PRs the
+ *    runner's own ledger has not already settled, then every row's facts.
  *
  * Every failure is a stated state, never an empty one: a failed listing is
- * `{ phase: "unavailable", reason }`, under which every info-derived fact is
- * UNKNOWN; a failed CI read leaves `prCi` as it was (or `null`), under which
- * PR CI is UNKNOWN.
+ * `{ phase: "unavailable", reason }`, under which every info-derived fact —
+ * the finished marker included — is UNKNOWN; a failed CI read leaves `prCi`
+ * as it was (or `null`), under which PR CI is UNKNOWN.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -38,16 +40,20 @@ export type SessionFactsRowInput = Omit<SessionFactsSources, "info" | "prCi" | "
 export interface UseSessionFactsParams {
   rows: readonly SessionFactsRowInput[];
   org: SessionFactsSources["org"];
-  /** Re-read interval; default 30 s. */
-  pollMs?: number;
+  /** `useSessionInfoList().info` — the listing the rows were classified with. */
+  info: SessionInfoListView;
 }
 
 export interface SessionFactsState {
   /** Keyed by `row.sessionId`. */
   facts: ReadonlyMap<string, SessionFacts>;
-  info: SessionInfoListView;
   /** `null` until the first CI read answers. */
   prCi: ReadonlyMap<string, PrCiRead> | null;
+}
+
+export interface SessionInfoListState {
+  info: SessionInfoListView;
+  /** Re-read the listing now. */
   refresh: () => void;
 }
 
@@ -111,47 +117,33 @@ export async function fetchSessionInfoList(ids: readonly string[]): Promise<Sess
   return normalizeInfoList(await invoke<unknown>("session_info_list", { ids }));
 }
 
-export function useSessionFacts({
-  rows,
-  org,
-  pollMs = 30_000,
-}: UseSessionFactsParams): SessionFactsState {
+/**
+ * The batched session-info listing for `ids`, re-read when the set of ids
+ * changes and every `pollMs` (default 30 s). A thrown IPC is `unavailable`
+ * with its reason — never an empty listing.
+ */
+export function useSessionInfoList(
+  ids: readonly string[],
+  pollMs: number = 30_000,
+): SessionInfoListState {
   const [info, setInfo] = useState<SessionInfoListView>({ phase: "loading" });
-  const [prCi, setPrCi] = useState<ReadonlyMap<string, PrCiRead> | null>(null);
   const seq = useRef(0);
-
-  const idsKey = useMemo(() => {
-    const ids = new Set<string>();
-    for (const r of rows) if (r.claudeSessionId) ids.add(r.claudeSessionId);
-    return [...ids].sort().join("\n");
-  }, [rows]);
+  const idsKey = useMemo(() => [...new Set(ids)].sort().join("\n"), [ids]);
 
   const refresh = useCallback(() => {
     const mine = ++seq.current;
-    const ids = idsKey === "" ? [] : idsKey.split("\n");
+    const wanted = idsKey === "" ? [] : idsKey.split("\n");
     void (async () => {
       let next: SessionInfoListView;
       try {
-        next = await fetchSessionInfoList(ids);
+        next = await fetchSessionInfoList(wanted);
       } catch (e) {
         next = {
           phase: "unavailable",
           reason: `ipc_error: ${describeThrown(e, "session_info_list failed")}`,
         };
       }
-      if (mine !== seq.current) return;
-      setInfo(next);
-      const wanted = prsNeedingCi(next);
-      if (wanted.length === 0) {
-        setPrCi(new Map());
-        return;
-      }
-      try {
-        const ci = await fetchPrCiStates(wanted);
-        if (mine === seq.current) setPrCi(ci);
-      } catch (e) {
-        console.error("coord_pr_ci_states failed:", describeThrown(e, "unknown error"));
-      }
+      if (mine === seq.current) setInfo(next);
     })();
   }, [idsKey]);
 
@@ -161,11 +153,39 @@ export function useSessionFacts({
     return () => clearInterval(t);
   }, [refresh, pollMs]);
 
+  return { info, refresh };
+}
+
+/** The CI read of a listing that names no open PR: nothing to ask. */
+const NO_PR_CI: ReadonlyMap<string, PrCiRead> = new Map();
+
+/** Every row's facts over `info`, with coord's CI read for the open PRs it names. */
+export function useSessionFacts({ rows, org, info }: UseSessionFactsParams): SessionFactsState {
+  const [prCi, setPrCi] = useState<ReadonlyMap<string, PrCiRead> | null>(null);
+  const seq = useRef(0);
+
+  // Re-asked on every listing (each poll), so a PR's CI moves from pending to
+  // green without a reload. A listing naming no open PR needs no CI read.
+  const wanted = useMemo(() => (info.phase === "ok" ? prsNeedingCi(info) : null), [info]);
+  useEffect(() => {
+    const mine = ++seq.current;
+    if (wanted === null || wanted.length === 0) return;
+    fetchPrCiStates(wanted)
+      .then((ci) => {
+        if (mine === seq.current) setPrCi(ci);
+      })
+      .catch((e: unknown) => {
+        console.error("coord_pr_ci_states failed:", describeThrown(e, "unknown error"));
+      });
+  }, [wanted]);
+  const effectivePrCi = wanted !== null && wanted.length === 0 ? NO_PR_CI : prCi;
+
   const facts = useMemo(() => {
     const out = new Map<string, SessionFacts>();
-    for (const r of rows) out.set(r.row.sessionId, buildSessionFacts({ ...r, org, info, prCi }));
+    for (const r of rows)
+      out.set(r.row.sessionId, buildSessionFacts({ ...r, org, info, prCi: effectivePrCi }));
     return out;
-  }, [rows, org, info, prCi]);
+  }, [rows, org, info, effectivePrCi]);
 
-  return { facts, info, prCi, refresh };
+  return { facts, prCi: effectivePrCi };
 }

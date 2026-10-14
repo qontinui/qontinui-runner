@@ -187,13 +187,6 @@ export function locationText(status: Pick<SessionStatus, "location">): string {
   return SESSION_STATUS_LABELS.location[status.location];
 }
 
-/** Parse a persisted activity filter; anything unrecognized is `"all"`. */
-export function parseActivityFilter(raw: string | null): SessionActivity | "all" {
-  return raw !== null && (SESSION_ACTIVITIES as readonly string[]).includes(raw)
-    ? (raw as SessionActivity)
-    : "all";
-}
-
 /** Is this a {@link SessionLocation} literal? (Injected fixtures arrive as strings.) */
 export function isSessionLocation(v: unknown): v is SessionLocation {
   return typeof v === "string" && (SESSION_LOCATIONS as readonly string[]).includes(v);
