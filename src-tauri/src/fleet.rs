@@ -1917,12 +1917,12 @@ pub const EXPEDITE_REVIEWER_AGENT: &str = "expedite-reviewer";
 /// Whether this device can actually RUN the expedite-review skill, beyond it
 /// being served: its reviewer agent is bundled, and the tools its scripts call
 /// (`bash`, `python3`, `gh`, `curl`) resolve on PATH. A Windows device with only
-/// `python` (no `python3`) is under-advertised, deliberately. Known residual: on
-/// Windows `bash` may resolve to the WSL launcher, whose distro can lack `gh`
-/// credentials — that over-advertises; the review then posts nothing and coord
-/// counts the item `unreviewed`. A device lacking any of them would
+/// `python` (no `python3`) is under-advertised, deliberately. Known residuals,
+/// both over-advertising on Windows: `python3` may be the Microsoft Store alias
+/// stub, and `bash` may be the WSL launcher whose distro lacks `gh` credentials.
+/// The review then posts nothing and coord counts the item `unreviewed`. A device lacking any of them would
 /// claim review gates and post nothing; not advertising under-states, which
-/// coord counts `unreviewed`, never over-states.
+/// coord counts `unreviewed`.
 fn expedite_review_runnable() -> bool {
     crate::fleet_agents::agent_is_served(EXPEDITE_REVIEWER_AGENT)
         && binary_on_path("bash")

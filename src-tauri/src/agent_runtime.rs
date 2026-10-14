@@ -9455,10 +9455,11 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
         // No checkout to overlay — but the EMBEDDED floor needs none: write it,
         // so a published install still gets the bundled subagents.
         let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
-        provision_embedded_agent_floor(worktree_cwd, &agent_keep_decisions(&dst_dir, None));
+        let floor =
+            provision_embedded_agent_floor(worktree_cwd, &agent_keep_decisions(&dst_dir, None));
         warn!(
             "agent_runtime: no qontinui-root resolved; skipping the .claude/agents \
-             checkout overlay for {worktree_cwd} (the embedded floor was written)"
+             checkout overlay for {worktree_cwd} ({floor} embedded def(s) written)"
         );
         return Ok(ProvisionReport::unresolved(
             "agent_definitions",
@@ -9493,8 +9494,9 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
 /// degradation the ledger exists to end.
 ///
 /// Returns the `agent_definitions` report it recorded -- ONE entry. The embedded
-/// `fleet_agents` floor is recorded by `provision_embedded_agent_floor` (on both
-/// the root and the no-root arm), which does not hand it back to here, so it
+/// `fleet_agents` floor is recorded by `provision_embedded_agent_floor` (on the
+/// no-root arm and the root arm's write path; a cwd served in place writes and
+/// records no floor), which does not hand it back to here, so it
 /// is observable on the next manifest read rather than in this value. The spawn
 /// path ignores the return entirely.
 pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
@@ -18574,6 +18576,10 @@ mod continuation_agent_provisioning_tests {
             assert!(
                 body.contains("provision_fleet_skills_for_session(workdir)"),
                 "{fn_name} must provision .claude/skills"
+            );
+            assert!(
+                body.contains("provision_fleet_commands_for_session(workdir)"),
+                "{fn_name} must provision .claude/commands"
             );
         }
     }
