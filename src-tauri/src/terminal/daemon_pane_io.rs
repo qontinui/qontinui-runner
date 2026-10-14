@@ -5,8 +5,9 @@
 //! Phase 2. D2: the holder is the THIRD `PaneIo` impl, not a new subsystem —
 //! the reader thread, grid, scrollback ring, emission gate and waiter thread
 //! above it are the code a `LocalPty` drives. D13: one holder per pane. Shipped
-//! behind `terminal.pty_holder` (default ON since Phase 5, which made
-//! `/restart-readiness` count holder panes — `settings::TerminalSettings`);
+//! behind `terminal.pty_holder` (default ON on Linux since Phase 5, which made
+//! `/restart-readiness` count holder panes; OFF on Windows and macOS —
+//! `settings::TerminalSettings`);
 //! [`pane_backend_for`] is the one place that switch is read.
 //!
 //! # What is reused, and what is new
@@ -2296,12 +2297,20 @@ mod tests {
         );
     }
 
-    /// The setting ON (the default since plan Phase 5) yields the holder; OFF
-    /// yields `LocalPty`.
+    /// ON yields the holder, OFF yields `LocalPty`; the DEFAULT is ON on
+    /// Linux only (plan Phase 5 as amended 2026-10-15).
     #[test]
-    fn pty_holder_backend_on_by_default_yields_the_holder() {
+    fn pty_holder_backend_default_is_the_holder_on_linux_only() {
         assert_eq!(
             pane_backend_for(&TerminalSettings::default()),
+            if cfg!(target_os = "linux") {
+                PaneBackend::Holder
+            } else {
+                PaneBackend::LocalPty
+            }
+        );
+        assert_eq!(
+            pane_backend_for(&TerminalSettings { pty_holder: true }),
             PaneBackend::Holder
         );
         assert_eq!(
