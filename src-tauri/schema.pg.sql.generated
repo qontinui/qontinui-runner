@@ -1967,6 +1967,8 @@ CREATE TABLE coord.ci_dispatches (
     base_sha text,
     priority_tier smallint,
     priority_reason text,
+    model_access jsonb,
+    model_ledger jsonb,
     CONSTRAINT ck_ci_dispatches_base_sha_hex40 CHECK (((base_sha IS NULL) OR (base_sha ~ '^[0-9a-f]{40}$'::text))),
     CONSTRAINT ck_ci_dispatches_pr_head_sha_hex40 CHECK (((pr_head_sha IS NULL) OR (pr_head_sha ~ '^[0-9a-f]{40}$'::text))),
     CONSTRAINT ck_ci_dispatches_state CHECK ((state = ANY (ARRAY['queued'::text, 'dispatched'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'lost'::text, 'cancelled'::text])))
@@ -1999,6 +2001,20 @@ COMMENT ON COLUMN coord.ci_dispatches.priority_tier IS 'Merge-scheduler tier coo
 --
 
 COMMENT ON COLUMN coord.ci_dispatches.priority_reason IS 'Why the dispatch got priority_tier (label | red_main_fix | aged | none | ...; vocabulary owned by coord). NULL = not recorded.';
+
+
+--
+-- Name: COLUMN ci_dispatches.model_access; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_dispatches.model_access IS 'Coord grant for brokered model calls: {granted, reason, basis, dial}. Sent in the build_requested payload. NULL = not recorded.';
+
+
+--
+-- Name: COLUMN ci_dispatches.model_ledger; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_dispatches.model_ledger IS 'Per-dispatch model-call ledger reported with the result (<= 1 MiB, rejected not truncated; no attribution keys). NULL = none reported.';
 
 
 --
@@ -3782,6 +3798,7 @@ CREATE TABLE coord.device_resource_samples (
     wind_down_exit_stuck integer,
     wind_down_sessions jsonb,
     blocking_lanes jsonb,
+    cpu_temp_c real,
     CONSTRAINT ck_device_resource_samples_lane CHECK ((lane = ANY (ARRAY['host'::text, 'wsl'::text, 'container'::text]))),
     CONSTRAINT ck_device_resource_samples_lane_instance_nonempty CHECK (((lane_instance IS NULL) OR (lane_instance <> ''::text)))
 );
@@ -3988,6 +4005,13 @@ COMMENT ON COLUMN coord.device_resource_samples.wind_down_sessions IS 'Bounded J
 --
 
 COMMENT ON COLUMN coord.device_resource_samples.blocking_lanes IS 'Per-spawning-runtime in-flight tracked-blocking-body counts on the publishing runner at sample time, from wedge_diagnostics::tracked_blocking_by_thread() (plan 2026-09-16-runner-blocking-lane-telemetry-to-coord). Meaningful only on the host lane, the same row that carries thread_count / active_terminal_sessions (lasac_01) — a non-host lane row has no value for it, for the same reason it has none for those. NULL = NOT REPORTED (a runner build that predates this field, or a probe that failed this cycle) and must NEVER be read as "no blocking lanes are active" — that inverts the signal exactly as a fabricated thread_count = 0 would. {} (empty object) = reported, and every tracked lane''s in-flight count was zero everywhere; NULL and {} are different facts and must stay distinct, the same discipline wind_down_sessions (drr_01) established. A non-empty object is {lane_name: in_flight_count}, e.g. {"tokio-rt-worker": 3, "fleet-pub-rt": 1} — bounded to at most MAX_BLOCKING_LANES (15) plus one overflow lane by the runner''s own LaneTable, so no CHECK is needed here. Growth over time is bounded by coord prune_samples (default 7-day rolling window on sampled_at).';
+
+
+--
+-- Name: COLUMN device_resource_samples.cpu_temp_c; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.cpu_temp_c IS 'CPU package temperature in degrees Celsius at sample time (plan 2026-10-13-cpu-temperature-in-fleet-resource-telemetry). Package sensor (x86_pkg_temp, or the hottest coretemp input); divided to Celsius once at the collector, so the wire is always Celsius. NULL = NOT MEASURED (Windows or WSL host in v1, a host with no sensor, a failed read, or a publisher build that predates this field) and must NEVER be read as 0 or as "cool"; 0 is a legal real measurement and stays distinct from NULL. REPORTING ONLY: must not feed lane_pressure, lane_saturation or headroom.';
 
 
 --

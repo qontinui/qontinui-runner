@@ -18,6 +18,9 @@ import type { CostProvenance } from "./types";
 /** The label every per-task cost figure carries. */
 export const LIST_PRICE_EQUIVALENT = "list-price equivalent, not your bill";
 
+/** The series / legend name for a cost axis: the unit plus the label. */
+export const COST_SERIES_LABEL = `Cost (USD, ${LIST_PRICE_EQUIVALENT})`;
+
 /**
  * Whole-percent shares that sum to exactly 100 (largest-remainder rounding;
  * ties go to the earlier part).

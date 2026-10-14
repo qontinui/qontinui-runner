@@ -64,7 +64,9 @@ impl CostProvenance {
 /// 10_000 micro-USD. Negative inputs cannot be written (the writer clamps)
 /// and are read as zero rather than as a refund.
 pub fn phase_cost_microusd(precise_microusd: i64, legacy_cents: i64) -> i64 {
-    precise_microusd.max(0) + legacy_cents.max(0).saturating_mul(10_000)
+    precise_microusd
+        .max(0)
+        .saturating_add(legacy_cents.max(0).saturating_mul(10_000))
 }
 
 /// Convert micro-USD to USD. Sum in micro-USD first (exact integer

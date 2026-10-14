@@ -9,7 +9,7 @@ import { useMemo } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { Layers } from "lucide-react";
 import type { PhaseCostBreakdown } from "./types";
-import { describeCostFigure } from "./costProvenance";
+import { COST_SERIES_LABEL, describeCostFigure } from "./costProvenance";
 
 interface PhaseBreakdownChartProps {
   data: PhaseCostBreakdown[];
@@ -116,11 +116,11 @@ export function PhaseBreakdownChart({ data }: PhaseBreakdownChartProps) {
             <Tooltip content={<CustomTooltip />} />
             <Legend
               wrapperStyle={{ fontSize: 11 }}
-              formatter={(value: string) => (value === "cost" ? "Cost (USD)" : value)}
+              formatter={(value: string) => (value === "cost" ? COST_SERIES_LABEL : value)}
             />
             <Bar
               dataKey="cost"
-              name="Cost (USD)"
+              name={COST_SERIES_LABEL}
               fill="hsl(var(--chart-1))"
               radius={[0, 4, 4, 0]}
               maxBarSize={20}

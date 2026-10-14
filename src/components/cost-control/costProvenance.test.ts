@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 
 import {
+  COST_SERIES_LABEL,
   LIST_PRICE_EQUIVALENT,
   describeCostFigure,
   describeCostProvenance,
@@ -12,9 +13,13 @@ const p = (reported_rows: number, estimated_rows: number, unknown_rows: number) 
   unknown_rows,
 });
 
-/** The whole-percent numbers in a label, "<1%" and ">99%" excluded. */
+/**
+ * The whole-percent numbers in a label. A number preceded by "<" or ">" (the
+ * "<1%" / ">99%" bounds) is skipped whole: the lookbehind also refuses a digit,
+ * so the "9%" tail of ">99%" cannot match on its own.
+ */
 const percents = (label: string | null) =>
-  [...(label ?? "").matchAll(/(?<![<>])(\d+)%/g)].map((m) => Number(m[1]));
+  [...(label ?? "").matchAll(/(?<![<>\d])(\d+)%/g)].map((m) => Number(m[1]));
 
 describe("describeCostProvenance", () => {
   it("labels nothing when there are no rows", () => {
@@ -62,5 +67,17 @@ describe("describeCostFigure", () => {
     expect(describeCostFigure(p(5, 3, 0))).toBe(
       `${LIST_PRICE_EQUIVALENT} · of rows: 63% reported, 37% estimated`,
     );
+  });
+});
+
+describe("percents helper", () => {
+  it("skips the bounded shares entirely", () => {
+    expect(percents("of rows: >99% reported, <1% estimated")).toEqual([]);
+  });
+});
+
+describe("COST_SERIES_LABEL", () => {
+  it("names the unit and the list-price-equivalent label", () => {
+    expect(COST_SERIES_LABEL).toBe("Cost (USD, list-price equivalent, not your bill)");
   });
 });
