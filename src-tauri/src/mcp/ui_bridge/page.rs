@@ -104,6 +104,7 @@ impl RequestHints for NavigateAndWaitRequest {
         Some(serde_json::json!({
             "allowedActions": [
                 "click", "doubleClick", "double_click", "double", "right", "middle",
+                "rightClick", "middleClick",
                 "type", "sendKeys", "clear", "select", "focus", "blur", "hover",
                 "scroll", "scrollIntoView", "scroll_into_view", "check", "uncheck",
                 "toggle", "drag", "setValue", "submit", "reset", "autocomplete"
