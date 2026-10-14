@@ -540,9 +540,10 @@ impl TerminalManager {
     /// remote path passes `""` for a cwd it cannot know, a local holder can.
     ///
     /// `from_offset` is the first byte this runner already holds for the pane
-    /// (`None`: none — the ring's tail); `cols` × `rows` is the consumer's
-    /// fitted size. `pinned_session_id` is the harness session id the caller
-    /// resolved for the pane (the holder does not carry one).
+    /// (`None`: none — the ring's tail); `size` is the consumer's fitted size,
+    /// or `None` to keep the PTY's own (the boot sweep adopts before any
+    /// webview has fit a tab). `pinned_session_id` is the harness session id
+    /// the caller resolved for the pane (the holder does not carry one).
     ///
     /// [`DaemonPaneIo::attach_existing`]: super::daemon_pane_io::DaemonPaneIo::attach_existing
     /// [`DaemonPaneIo::session_identity`]: super::daemon_pane_io::DaemonPaneIo::session_identity
@@ -552,14 +553,20 @@ impl TerminalManager {
         terminal_id: &str,
         from_offset: Option<u64>,
         page_id: Option<String>,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         app_handle: AppHandle,
         pinned_session_id: String,
     ) -> Result<TerminalInfo, String> {
-        let pane =
-            super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, cols, rows)?;
+        // Never over an open terminal: inserting under a live id would orphan
+        // that session — still running, no longer listed.
+        if self.get(terminal_id).is_some() {
+            return Err(format!(
+                "terminal {terminal_id} is already open; not adopting its holder over it"
+            ));
+        }
+        let pane = super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, size)?;
         let (title, cwd) = pane.session_identity();
+        let (cols, rows) = pane.dims();
         self.insert_with_io(
             terminal_id.to_string(),
             title,

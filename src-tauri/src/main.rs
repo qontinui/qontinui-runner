@@ -4449,6 +4449,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Detached for the process lifetime (like the liveness poll
                 // below); best-effort at startup then every 30s.
                 session_pr_reconciler::start(lifecycle_store.clone());
+                let holder_sweep_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
@@ -4469,6 +4470,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         terminal::vt_sanitize::VtSanitizeHook::new(),
                     ));
                 }
+
+                // PTY-holder boot sweep (plan 2026-09-12-out-of-process-pty-
+                // owner-for-terminal-hosted-sessions, Phase 3): adopt every
+                // pane a holder kept alive across the last runner exit, and
+                // reap the dead — AFTER the sanitizer hook (an adopted pane's
+                // replay is untrusted output too) and BEFORE the webview's
+                // restore reads `terminal_list`. Bounded by
+                // `holder_boot_sweep::SETUP_WAIT`; one `stat` when no pane
+                // directory exists.
+                terminal::holder_boot_sweep::run(
+                    &term_for_session,
+                    app.handle(),
+                    Some(holder_sweep_store),
+                );
 
                 // (The usage-limit watcher and the fleet auto-response matcher
                 // are both grid-scan pollers spawned once at startup alongside
