@@ -1408,7 +1408,22 @@ async fn post_run(
     // Phase 4: the production registry-credential store (OS keyring). Tests call
     // `run_with_base` directly with a fake lookup so no real keyring is touched.
     let store = RegistryCredentialStore;
-    run_with_base(req, &base, &loopback_base, &store)
+    // ---- DYNAMIC interception mode (P4) -------------------------------------
+    // Read the device's EFFECTIVE install-interception level (`off` | `observe`
+    // | `gate`) from the process-global fleet-policy cache (refreshed every
+    // ~45s by `mcp::fleet_policy_poller`). The accessor is a synchronous lock
+    // read — no I/O on the request path — and defaults to `"off"` until the
+    // poller's first success (fail-safe — never gate).
+    //
+    // Read ONCE, HERE, and handed to `run_with_base` as an explicit input rather
+    // than read inside it: `run_with_base` is then a function of its arguments,
+    // so a test passes the mode it means instead of pinning a cache that every
+    // other test in the binary shares (plan
+    // `2026-10-10-install-effects-intercept-tests-race-on-the-process-global-fleet-policy-mode-cache`).
+    // The read still happens before `run_with_base`'s first await, so a request
+    // sees the same single mode snapshot it did when the read lived inside it.
+    let effective_mode = crate::mcp::fleet_policy_poller::effective_install_intercept_mode();
+    run_with_base(req, effective_mode, &base, &loopback_base, &store)
         .await
         .map(Json)
         .map_err(|e| e.into_response())
@@ -1571,11 +1586,15 @@ impl From<CoordError> for RunError {
     }
 }
 
-/// The orchestration body with the coord base URL + the runner's own typecheck
-/// loopback base injected. The route resolves both from config/AppState; tests
-/// pass a mock-server base for each.
+/// The orchestration body with the device's EFFECTIVE install-interception mode
+/// (`off` | `observe` | `gate`), the coord base URL and the runner's own
+/// typecheck loopback base injected. The route reads the mode from the
+/// fleet-policy cache ([`post_run`]) and resolves both bases from
+/// config/AppState; tests pass the mode they mean and a mock-server base for
+/// each, so the mode is an input here, never an ambient read.
 async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     req: RunRequest,
+    effective_mode: String,
     coord_base: &str,
     loopback_base: &str,
     cred_store: &L,
@@ -1591,12 +1610,10 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     let repo = repo_basename(&req.repo_path);
 
     // ---- DYNAMIC interception mode (P4) -------------------------------------
-    // Read the device's EFFECTIVE install-interception level from the
-    // process-global fleet-policy cache (refreshed every ~45s by
-    // `mcp::fleet_policy_poller`). `run_with_base` has no app state, so the
-    // accessor is a synchronous lock read of the cache directly. Defaults to
-    // `"off"` until the poller's first success (fail-safe — never gate).
-    let effective_mode = crate::mcp::fleet_policy_poller::effective_install_intercept_mode();
+    // `effective_mode` is the device's EFFECTIVE install-interception level,
+    // supplied by the caller: `post_run` reads it once from the process-global
+    // fleet-policy cache (where it defaults to `"off"` until the poller's first
+    // success — fail-safe, never gate), and a test passes the mode it means.
 
     // OFF short-circuit (D6): when the effective mode is `off`, an interception
     // pre-call must SKIP declare/predict entirely, return NO `correlation_id`
@@ -1839,8 +1856,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     // every coord write the synchronous path makes. Resolved only NOW: after
     // the OFF short-circuit (which makes no coord write at all) and after the
     // observe fast path (which resolves it inside its own deferred task), so
-    // neither of those pays a `git` probe or a cold coord read, and
-    // `effective_mode` above is read before this function's first await.
+    // neither of those pays a `git` probe or a cold coord read.
     let scope = crate::repo_detection::tenant_scope_for_path(repo_path).await;
 
     // ---- Phase 2: read-only dry-run + native-audit probes --------------------
@@ -3650,6 +3666,15 @@ mod tests {
         })
     }
 
+    /// The effective interception mode the `Full`-route tests hand to
+    /// `run_with_base`: the fleet-policy cache's fail-safe default. For a `Full`
+    /// request `run_with_base` never branches on the mode — both of its mode
+    /// branches are guarded by `req.mode == RunMode::Intercept` — it only echoes
+    /// it into the `RunResponse`, so the value is immaterial to what those
+    /// tests assert. The interception tests, where the mode decides the path
+    /// taken, state theirs through [`run_in_mode`].
+    const FULL_ROUTE_MODE: &str = "off";
+
     /// A repo dir an autodetect would call `cargo` for — but the bogus package
     /// makes `cargo add` fail fast, so the test never mutates anything real.
     /// We instead drive the manager explicitly to avoid running cargo.
@@ -3664,14 +3689,24 @@ mod tests {
         base: &str,
         loopback: &str,
     ) -> Result<ApiResponse<RunResponse>, RunError> {
-        run_lb_creds(req, base, loopback, &FakeCredStore::empty())
+        run_lb_creds(
+            req,
+            FULL_ROUTE_MODE,
+            base,
+            loopback,
+            &FakeCredStore::empty(),
+        )
     }
 
-    /// As [`run_lb`] but with an explicit fake registry-credential store so a
-    /// test can prove the secret threads into subprocesses without leaking into
-    /// any coord body.
+    /// As [`run_lb`] but with an explicit effective interception mode and an
+    /// explicit fake registry-credential store, so a test can prove the secret
+    /// threads into subprocesses without leaking into any coord body. The mode
+    /// is handed straight to `run_with_base` as an argument, so this helper
+    /// neither reads nor writes the process-global fleet-policy cache that the
+    /// rest of the binary shares.
     fn run_lb_creds<L: RegistryTokenLookup + ?Sized>(
         req: RunRequest,
+        mode: &str,
         base: &str,
         loopback: &str,
         store: &L,
@@ -3681,7 +3716,20 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(run_with_base(req, base, loopback, store))
+        rt.block_on(run_with_base(req, mode.to_string(), base, loopback, store))
+    }
+
+    /// As [`run`] but at an EXPLICIT effective interception mode — the helper
+    /// the interception tests use, because for an `Intercept` request the mode
+    /// decides the path taken: `off` short-circuits before declare, `observe`
+    /// returns before coord's verdict, and `gate` runs the synchronous
+    /// declare→predict→gate path.
+    fn run_in_mode(
+        req: RunRequest,
+        mode: &str,
+        base: &str,
+    ) -> Result<ApiResponse<RunResponse>, RunError> {
+        run_lb_creds(req, mode, base, DEAD_LOOPBACK, &FakeCredStore::empty())
     }
 
     /// In-memory fake registry-credential store for tests — NEVER touches a real
@@ -4122,6 +4170,7 @@ mod tests {
         let store = FakeCredStore::with("NPM_TOKEN", FAKE_SECRET);
         let resp = run_lb_creds(
             cargo_req(&d.path().display().to_string()),
+            FULL_ROUTE_MODE,
             &base,
             DEAD_LOOPBACK,
             &store,
@@ -4250,26 +4299,25 @@ mod tests {
     // Interception — `mode:"intercept"` pre-call + `/observe-verify` post
     // ===================================================================
 
-    /// Build an intercept-mode pre-call request for a real `repo_path`, pinned
-    /// to GATE mode.
+    /// Build an intercept-mode pre-call request for a real `repo_path`.
     ///
-    /// Pins the process-global fleet-policy cache to `gate` as a side effect so
-    /// (a) the P4 `off` short-circuit does NOT trigger and (b) the SYNCHRONOUS
-    /// declare→predict→gate→stash path runs on the request thread. GATE mode is
-    /// the deterministic path for asserting declare/predict hit counts, the gate
-    /// verdict, the override/escalation flag, and the stashed declare body — all
-    /// of which are computed BEFORE the response returns.
+    /// A PURE builder: it pins nothing. The effective interception mode is an
+    /// explicit argument to `run_with_base` — through [`run_in_mode`], or
+    /// directly as the observe test does — so each test states the mode it
+    /// means (the GATE tests pass `"gate"`, the observe test `"observe"`) and
+    /// none touches the process-global fleet-policy cache that every other test
+    /// in the binary shares.
+    ///
+    /// GATE is the deterministic path for asserting declare/predict hit counts,
+    /// the gate verdict, the override/escalation flag, and the stashed declare
+    /// body: the SYNCHRONOUS declare→predict→gate→stash path runs on the request
+    /// thread, so all of those are computed BEFORE the response returns, and the
+    /// P4 `off` short-circuit does not trigger.
     ///
     /// (The §6 async-observe fast-path defers declare/predict to a `tokio::spawn`,
     /// so those assertions can't be made synchronously in observe mode — observe
     /// has its own dedicated test below.)
     fn intercept_req(repo_path: &str, packages: Vec<&str>) -> RunRequest {
-        intercept_req_mode(repo_path, packages, "gate")
-    }
-
-    /// As [`intercept_req`] but pins the effective interception mode explicitly.
-    fn intercept_req_mode(repo_path: &str, packages: Vec<&str>, mode: &str) -> RunRequest {
-        crate::mcp::fleet_policy_poller::set_mode_for_test(mode);
         RunRequest {
             repo_path: repo_path.to_string(),
             package_manager: Some("npm".to_string()),
@@ -4318,8 +4366,9 @@ mod tests {
         )
         .unwrap();
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
-        let resp = run(
+        let resp = run_in_mode(
             intercept_req(&d.path().display().to_string(), vec!["left-pad"]),
+            "gate",
             &base,
         )
         .unwrap();
@@ -4364,8 +4413,9 @@ mod tests {
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
 
         // Pre-call.
-        let resp = run(
+        let resp = run_in_mode(
             intercept_req(&d.path().display().to_string(), vec!["left-pad"]),
+            "gate",
             &base,
         )
         .unwrap();
@@ -4446,8 +4496,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
-        let resp = run(
+        let resp = run_in_mode(
             intercept_req(&d.path().display().to_string(), vec!["bad-pkg"]),
+            "gate",
             &base,
         )
         .unwrap();
@@ -4489,7 +4540,7 @@ mod tests {
         // PRE-call: intercept mode, override on, escalate verdict.
         let mut pre = intercept_req(&d.path().display().to_string(), vec!["left-pad"]);
         pre.override_escalation = true;
-        let resp = run(pre, &base).unwrap();
+        let resp = run_in_mode(pre, "gate", &base).unwrap();
         let data = resp.data.unwrap();
         assert_eq!(data.gate, GateOutcome::Escalate, "verdict is escalate");
         assert!(
@@ -4532,8 +4583,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
-        let resp = run(
+        let resp = run_in_mode(
             intercept_req(&d.path().display().to_string(), vec![]),
+            "gate",
             &base,
         )
         .unwrap();
@@ -4579,10 +4631,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let req = intercept_req_mode(&d.path().display().to_string(), vec!["left-pad"], "observe");
+        let req = intercept_req(&d.path().display().to_string(), vec!["left-pad"]);
         let resp = rt
             .block_on(run_with_base(
                 req,
+                "observe".to_string(),
                 &base,
                 DEAD_LOOPBACK,
                 &FakeCredStore::empty(),

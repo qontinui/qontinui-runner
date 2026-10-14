@@ -177,6 +177,7 @@ mod install_effects_producer;
 mod instance;
 mod instance_health;
 mod instance_manager;
+mod ipc_registry; // Per-module Tauri IPC groups + name router (plan 2026-10-02-split-run-app-invoke-handler)
 mod iteration_bundle;
 mod journey;
 mod knowledge_acquisition;
@@ -1647,6 +1648,22 @@ fn main() {
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
 
+    // Export the machine profile's outbound-network settings (HTTPS_PROXY /
+    // HTTP_PROXY from `network.proxy_url` when the operator set neither, and
+    // NO_PROXY always including loopback) into this process's environment, so
+    // every reqwest client, the three WebSocket transports (through
+    // `outbound_net::connect_ws`), `git` and the spawned `claude` CLI agree
+    // (plan `2026-10-10-spec-front-end-phase-9-generic-boundary`, C2). HERE,
+    // beside the other `set_var`, because writing the environment is sound only
+    // while no other thread exists — before the runtime below. The one thing
+    // the step runs besides env writes is the Windows-only `git config` probe
+    // (when the profile says `network.trust: "os"`); it runs FIRST and waits
+    // (bounded) for its pipe-reader threads to finish, and every env write
+    // happens after it. Nothing is logged here — logging does not exist yet;
+    // the outcome, including a failed probe, is logged by
+    // `outbound_net::log_startup_posture` in `run_app`.
+    qontinui_runner_lib::outbound_net::apply_profile_environment_at_startup();
+
     // Install the startup-panic hook FIRST, before any other setup. Panics
     // during early init (database connection, Tauri builder, axum router
     // construction) would otherwise vanish — the process exits with code 1
@@ -1732,6 +1749,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ..LoggingConfig::default()
     })?;
     setup_panic_handler();
+
+    // The proxy rung `main` resolved before logging existed (and an explicit
+    // UNKNOWN when a PAC script is configured, which is not evaluated).
+    qontinui_runner_lib::outbound_net::log_startup_posture();
 
     // Best-effort live crash writer for the CATCHABLE subset (Windows
     // deliverable structured exceptions). The panic hooks above already write
@@ -2642,8 +2663,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             None,
         ))
         .plugin(ui_bridge_plugin::init())
-        // All other in-app Tauri commands are registered via the central
-        // `generate_handler!` below rather than per-module plugins.
+        // All other in-app Tauri commands are app-level, never per-module
+        // plugins: modules moved onto `crate::ipc_group!` are routed by
+        // `ipc_registry`, the rest by the central `generate_handler!` below
+        // (plan 2026-10-02-split-run-app-invoke-handler moves them all).
         //
         // Rationale: the 90-module plugin split (Workstream B of
         // REFACTOR_WAVE_3_PLAN) compiled clean but broke runtime IPC. Tauri 2
@@ -2662,8 +2685,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // `ui_bridge_plugin` remains the one exception — its handler fns are
         // non-`pub` and the frontend talks to them only via HTTP, not IPC.
         //
-        // The per-module `plugin()` fns are left in place for future reuse
-        // even though nothing invokes them now.
+        // The remaining per-module `plugin()` fns are dead code; each is
+        // deleted as its module moves onto `ipc_group!`.
         //
         // 2026-05-21 audit-trail shim — every IPC dispatch is observed once
         // before being forwarded to the macro-generated handler. We record
@@ -3208,52 +3231,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::mcp::list_mcp_server_tools,
             commands::mcp::list_mcp_servers,
             commands::mcp::update_mcp_server,
-            commands::meta_optimizer::activate_prompt_variant,
-            commands::meta_optimizer::apply_meta_optimizer_recommendation,
-            commands::meta_optimizer::build_golden_dataset,
-            commands::meta_optimizer::capture_meta_optimizer_baseline,
-            commands::meta_optimizer::convert_comparison_to_recommendation,
-            commands::meta_optimizer::start_recommendation_validation_comparison,
-            commands::meta_optimizer::create_eval_spec,
-            commands::meta_optimizer::create_prompt_canary,
-            commands::meta_optimizer::delete_eval_spec,
-            commands::meta_optimizer::evaluate_with_io,
-            commands::meta_optimizer::generate_default_eval_spec,
-            commands::meta_optimizer::get_agent_cascade_effect,
-            commands::meta_optimizer::get_agent_cost_effectiveness,
-            commands::meta_optimizer::get_agent_effectiveness,
-            commands::meta_optimizer::get_agent_interaction_matrix,
-            commands::meta_optimizer::get_canary_rollouts,
-            commands::meta_optimizer::get_eval_results,
-            commands::meta_optimizer::get_eval_specs,
-            commands::meta_optimizer::get_golden_datasets,
-            commands::meta_optimizer::get_meta_optimizer_failure_analysis,
-            commands::meta_optimizer::get_meta_optimizer_progress,
-            commands::meta_optimizer::get_meta_optimizer_recommendations,
-            commands::meta_optimizer::get_meta_optimizer_runs,
-            commands::meta_optimizer::get_meta_optimizer_snapshots,
-            commands::meta_optimizer::get_model_profiles,
-            commands::meta_optimizer::get_model_recommendations,
-            commands::meta_optimizer::get_prompt_canary_status,
-            commands::meta_optimizer::get_prompt_evolution_diff,
-            commands::meta_optimizer::get_prompt_evolution_history,
-            commands::meta_optimizer::get_prompt_group_metrics,
-            commands::meta_optimizer::get_prompt_optimization_evidence,
-            commands::meta_optimizer::get_prompt_optimization_status,
-            commands::meta_optimizer::get_prompt_variant_content,
-            commands::meta_optimizer::get_prompt_variants,
-            commands::meta_optimizer::get_recommendation_outcomes,
-            commands::meta_optimizer::get_robustness_reports,
-            commands::meta_optimizer::promote_canary_rollout,
-            commands::meta_optimizer::reevaluate_recommendation_outcome,
-            commands::meta_optimizer::refresh_model_profiles,
-            commands::meta_optimizer::reject_meta_optimizer_recommendation,
-            commands::meta_optimizer::rollback_canary_rollout,
-            commands::meta_optimizer::rollback_meta_optimizer_recommendation,
-            commands::meta_optimizer::run_recommendation_eval,
-            commands::meta_optimizer::run_robustness_test,
-            commands::meta_optimizer::start_canary_rollout,
-            commands::meta_optimizer::trigger_meta_optimizer,
             commands::mobile::capture_mobile_feedback,
             commands::mobile::capture_mobile_logcat,
             commands::mobile::capture_mobile_screenshot,
@@ -3568,6 +3545,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal_windows::focus_runner_window,
             commands::terminal_windows::get_window_assignments,
             commands::terminal_windows::list_runner_windows,
+            commands::terminal_windows::open_elevated_terminal,
             commands::terminal_windows::open_terminal_window,
             commands::test_orchestrator::delete_orchestration_plan,
             commands::test_orchestrator::execute_test_orchestration,
@@ -3678,7 +3656,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             ]);
             move |invoke: tauri::ipc::Invoke<tauri::Wry>| -> bool {
                 tauri_command_audit::record(invoke.message.command());
-                inner(invoke)
+                // Route by name BEFORE calling: a generated handler consumes
+                // the `Invoke` even when it does not own the command, so
+                // handlers cannot be chained. Commands moved onto a module's
+                // `ipc_group!` dispatch through that group's small frame;
+                // the rest still go through the central list above until
+                // Phase 2c of plan 2026-10-02-split-run-app-invoke-handler
+                // deletes it.
+                match ipc_registry::lookup(invoke.message.command()) {
+                    Some(group) => group(invoke),
+                    None => inner(invoke),
+                }
             }
         })
         .manage(shared_app_state)
@@ -3699,16 +3687,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(std::sync::Arc::new(
             commands::spec_sync_state::SpecSyncStateBus::new(),
         )) // P2 SSE remediation: useSpecSync progress mirror, consumed by /ui-bridge/sdk/spec-sync/{status,stream}
-        // Tauri command handlers are registered via the central
-        // `tauri::generate_handler![...]` block above. Each command module
-        // (`commands/*.rs` and a few subsystem `commands.rs` files) ALSO
-        // exposes a `pub fn plugin<R: Runtime>() -> TauriPlugin<R>` for
-        // future plugin-based registration, but those are not currently
-        // wired — Tauri 2's plugin path requires `plugin:<name>|<cmd>`
-        // invoke prefixes and the frontend invokes commands bare, so the
-        // plugin form was rolled back to the central handler at commit
-        // `1f1d807f6`. The `plugin()` fns are kept as ready-to-go scaffolding
-        // for any future migration that updates the frontend invoke sites.
+        // Tauri command handlers are registered through `.invoke_handler`
+        // above: modules moved onto `crate::ipc_group!` are routed by
+        // `ipc_registry`, the rest by the central `generate_handler!` list
+        // until plan 2026-10-02-split-run-app-invoke-handler moves them too.
+        // The remaining per-module `plugin()` fns are dead — Tauri 2 plugin
+        // commands are reachable only as `plugin:<name>|<cmd>` and the
+        // frontend invokes bare names (rolled back at `1f1d807f6`) — and are
+        // deleted as each module moves.
         .setup(|app| {
             info!("Tauri application setup starting");
 

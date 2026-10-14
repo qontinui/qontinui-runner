@@ -20,10 +20,11 @@
 //! loop that refreshes all of them every [`POLL_INTERVAL`]:
 //!
 //! 1. The `effective_level`, read SYNCHRONOUSLY (no app state, no async) by
-//!    `install_effects_producer::run_with_base` via
-//!    [`effective_install_intercept_mode`] so the interception pre-call can make
-//!    the per-install mode DYNAMIC (P4) rather than trusting the shim's
-//!    spawn-time `QONTINUI_INSTALL_INTERCEPT_MODE` env.
+//!    `install_effects_producer::post_run` via
+//!    [`effective_install_intercept_mode`] — once per `POST /install-effects/run`
+//!    request, then handed to `run_with_base` as an explicit argument — so the
+//!    interception pre-call can make the per-install mode DYNAMIC (P4) rather
+//!    than trusting the shim's spawn-time `QONTINUI_INSTALL_INTERCEPT_MODE` env.
 //! 2. The tenant-wide **session-protection floors** ([`SessionFloors`], one set
 //!    per lane), read just as synchronously by
 //!    [`crate::resource_guard::effective_session_floors`] — which is on the
@@ -269,9 +270,10 @@ fn cache() -> &'static RwLock<String> {
 /// Read the current effective install-interception mode. Returns `"off"`
 /// until the first successful poll (and after any auth/absent reset).
 ///
-/// SYNCHRONOUS + lock-only — safe to call from `run_with_base` (which has no
-/// app state and is not the place to do async I/O). A poisoned lock degrades
-/// fail-safe to `"off"`.
+/// SYNCHRONOUS + lock-only — safe to call on the request path:
+/// `install_effects_producer::post_run` reads it once per
+/// `POST /install-effects/run` request, ahead of its first await, and hands the
+/// value to `run_with_base`. A poisoned lock degrades fail-safe to `"off"`.
 pub fn effective_install_intercept_mode() -> String {
     cache()
         .read()
@@ -284,15 +286,6 @@ fn set_mode(mode: &str) {
     if let Ok(mut g) = cache().write() {
         *g = mode.to_string();
     }
-}
-
-/// Test-only cache setter so other modules' tests (e.g.
-/// `install_effects_producer`'s intercept-mode tests, which need a non-`off`
-/// effective mode for the pre-call to proceed past the P4 short-circuit) can
-/// pin the process-global cache. NEVER compiled into a release binary.
-#[cfg(test)]
-pub(crate) fn set_mode_for_test(mode: &str) {
-    set_mode(mode);
 }
 
 // ===========================================================================
@@ -2719,9 +2712,11 @@ mod tests {
     fn default_mode_constant_is_off() {
         // The fail-safe contract pin: the cache's resting/initial value is `off`
         // (NEVER gate before a successful poll). We assert the CONSTANT only —
-        // NOT a live read of the shared process-global cache, which other
-        // modules' tests legitimately mutate via `set_mode_for_test` and which
-        // would race under cargo's parallel test threads.
+        // NOT a live read of the shared process-global cache: that is
+        // process-wide state the poll loop rewrites at runtime, so a live read
+        // would assert on whatever it last held rather than on the contract.
+        // (No test writes it: `install_effects_producer::run_with_base` takes
+        // the effective mode as an explicit argument.)
         assert_eq!(DEFAULT_MODE, "off");
     }
 
@@ -2814,7 +2809,7 @@ mod tests {
         // states the name is the cheapest place for that to be noticed.
         assert_eq!(CONTROLS_DOMAIN, "fleet_resources");
         // …and the interception domain is untouched by this generalization:
-        // `install_effects_producer::run_with_base` reads its cache
+        // `install_effects_producer::post_run` reads its cache
         // synchronously and must keep working byte-for-byte.
         assert_eq!(DOMAIN, "install_interception");
     }

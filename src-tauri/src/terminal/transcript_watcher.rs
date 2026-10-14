@@ -1412,6 +1412,17 @@ async fn tail_session(
     let mut action_tracker = super::commit_report::SensitiveActionTracker::new();
     let action_lane = super::commit_report::agent_notification_lane(&session_id);
 
+    // ── Bind this transcript to a coord session (unfinished-resume Phase 1) ──
+    //
+    // Every transcript the watcher tails is bound by its file-named id, not
+    // only the ones the `claude --resume` sniffer happened to see. Done at
+    // tail start so an idle, closed session is bound too; throttled and
+    // best-effort, it never fails the tail. Retried below when an append finds
+    // the session still unbound.
+    if let Some(t) = tailer.as_ref() {
+        crate::session::transcript_autobind::spawn_ensure_bound(t, &path);
+    }
+
     debug!(
         "transcript_watcher: tail started for {} at offset {} ({})",
         session_id,
@@ -1591,6 +1602,12 @@ async fn tail_session(
         if let Some(t) = tailer.as_ref() {
             use crate::session::session_transcript_tailer::Admit;
             let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
+            // An append found the session unbound (coord was unreachable at
+            // tail start, or the throttle window had not elapsed): retry the
+            // bind, which is a cheap no-op inside its throttle window.
+            if !t.is_bound(&session_id) {
+                crate::session::transcript_autobind::spawn_ensure_bound(t, &path);
+            }
             let verdict = t.admit(
                 &session_id,
                 bytes.len(),

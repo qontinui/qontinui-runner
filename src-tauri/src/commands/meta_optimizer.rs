@@ -4,7 +4,6 @@
 //! and manual optimizer triggering.
 
 use std::sync::Arc;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::State;
 
 // Migrated to StorageCompartment (Workstream C) — 43 handlers. The 44th
@@ -805,55 +804,54 @@ pub async fn get_prompt_evolution_diff(
     }))
 }
 
-pub fn plugin() -> TauriPlugin<tauri::Wry> {
-    PluginBuilder::<tauri::Wry>::new("qontinui_meta_optimizer")
-        .invoke_handler(tauri::generate_handler![
-            get_meta_optimizer_recommendations,
-            apply_meta_optimizer_recommendation,
-            reject_meta_optimizer_recommendation,
-            rollback_meta_optimizer_recommendation,
-            get_prompt_variants,
-            activate_prompt_variant,
-            get_meta_optimizer_runs,
-            get_meta_optimizer_progress,
-            capture_meta_optimizer_baseline,
-            get_meta_optimizer_snapshots,
-            get_agent_effectiveness,
-            get_meta_optimizer_failure_analysis,
-            get_recommendation_outcomes,
-            reevaluate_recommendation_outcome,
-            get_agent_cost_effectiveness,
-            get_agent_interaction_matrix,
-            get_agent_cascade_effect,
-            start_canary_rollout,
-            get_canary_rollouts,
-            promote_canary_rollout,
-            rollback_canary_rollout,
-            create_prompt_canary,
-            get_prompt_canary_status,
-            trigger_meta_optimizer,
-            get_eval_specs,
-            create_eval_spec,
-            delete_eval_spec,
-            get_eval_results,
-            run_recommendation_eval,
-            generate_default_eval_spec,
-            evaluate_with_io,
-            run_robustness_test,
-            get_robustness_reports,
-            get_golden_datasets,
-            build_golden_dataset,
-            get_model_profiles,
-            refresh_model_profiles,
-            get_model_recommendations,
-            convert_comparison_to_recommendation,
-            start_recommendation_validation_comparison,
-            get_prompt_optimization_status,
-            get_prompt_group_metrics,
-            get_prompt_optimization_evidence,
-            get_prompt_evolution_history,
-            get_prompt_variant_content,
-            get_prompt_evolution_diff,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    activate_prompt_variant,
+    apply_meta_optimizer_recommendation,
+    build_golden_dataset,
+    capture_meta_optimizer_baseline,
+    convert_comparison_to_recommendation,
+    start_recommendation_validation_comparison,
+    create_eval_spec,
+    create_prompt_canary,
+    delete_eval_spec,
+    evaluate_with_io,
+    generate_default_eval_spec,
+    get_agent_cascade_effect,
+    get_agent_cost_effectiveness,
+    get_agent_effectiveness,
+    get_agent_interaction_matrix,
+    get_canary_rollouts,
+    get_eval_results,
+    get_eval_specs,
+    get_golden_datasets,
+    get_meta_optimizer_failure_analysis,
+    get_meta_optimizer_progress,
+    get_meta_optimizer_recommendations,
+    get_meta_optimizer_runs,
+    get_meta_optimizer_snapshots,
+    get_model_profiles,
+    get_model_recommendations,
+    get_prompt_canary_status,
+    get_prompt_evolution_diff,
+    get_prompt_evolution_history,
+    get_prompt_group_metrics,
+    get_prompt_optimization_evidence,
+    get_prompt_optimization_status,
+    get_prompt_variant_content,
+    get_prompt_variants,
+    get_recommendation_outcomes,
+    get_robustness_reports,
+    promote_canary_rollout,
+    reevaluate_recommendation_outcome,
+    refresh_model_profiles,
+    reject_meta_optimizer_recommendation,
+    rollback_canary_rollout,
+    rollback_meta_optimizer_recommendation,
+    run_recommendation_eval,
+    run_robustness_test,
+    start_canary_rollout,
+    trigger_meta_optimizer,
+);
