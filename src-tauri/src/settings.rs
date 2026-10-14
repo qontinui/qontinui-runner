@@ -2600,27 +2600,29 @@ mod session_guard_tests {
 mod pty_holder_setting_tests {
     use super::*;
 
-    /// Plan 2026-09-12 Phase 2: `terminal.pty_holder` defaults OFF for a
+    /// Plan 2026-09-12 Phase 5: `terminal.pty_holder` defaults ON for a
     /// fresh install, an empty settings.json, and a `terminal` object that
-    /// names no field — every settings file that exists today.
+    /// names no field — every settings file written before Phase 5. (Phase 2
+    /// shipped it OFF; Phase 5 flips it together with the holder census.)
     #[test]
-    fn pty_holder_setting_defaults_off() {
+    fn pty_holder_setting_defaults_on() {
         for s in [
             Settings::default(),
             serde_json::from_str::<Settings>("{}").expect("empty object"),
             serde_json::from_str::<Settings>(r#"{"terminal": {}}"#).expect("empty terminal"),
         ] {
-            assert!(!s.terminal.pty_holder);
+            assert!(s.terminal.pty_holder);
             assert_eq!(s.terminal, TerminalSettings::default());
         }
     }
 
-    /// The hand-edit the doc names turns it on and round-trips.
+    /// The hand-edit the doc names turns it OFF and round-trips — the
+    /// operator's opt-out survives a load/save.
     #[test]
-    fn pty_holder_setting_round_trips_when_on() {
+    fn pty_holder_setting_round_trips_when_off() {
         let parsed: Settings =
-            serde_json::from_str(r#"{"terminal": {"pty_holder": true}}"#).expect("parse");
-        assert!(parsed.terminal.pty_holder);
+            serde_json::from_str(r#"{"terminal": {"pty_holder": false}}"#).expect("parse");
+        assert!(!parsed.terminal.pty_holder);
         let back: Settings =
             serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(back.terminal, parsed.terminal);
@@ -3719,7 +3721,7 @@ pub struct Settings {
     #[serde(default)]
     pub api: ApiSettings,
     /// Terminal pane backend knobs. See [`TerminalSettings`]; the one field,
-    /// `terminal.pty_holder`, defaults OFF.
+    /// `terminal.pty_holder`, defaults ON (since plan 2026-09-12 Phase 5).
     #[serde(default)]
     pub terminal: TerminalSettings,
 }
@@ -3727,28 +3729,40 @@ pub struct Settings {
 /// `terminal.*` — how a LOCAL terminal pane is backed.
 ///
 /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
-/// Phase 2 (vetted 2026-09-27, "Missing — no default-on switch"). Struct-level
-/// `#[serde(default)]`, so a `settings.json` written before this key — every
-/// one today — loads with the switch OFF, and a hand-edit naming one field
-/// keeps the default for the rest.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Phase 2 (vetted 2026-09-27, "Missing — no default-on switch"), flipped ON
+/// by Phase 5. Struct-level `#[serde(default)]` over the hand-written
+/// [`Default`] below, so a `settings.json` written before this key — or an
+/// empty `terminal` object — loads with the switch ON, and a hand-edit naming
+/// one field keeps the default for the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
     /// Run each new local pane's PTY in its own out-of-process holder
     /// (`qontinui-pty-holder`, driven by `terminal::daemon_pane_io`) instead
-    /// of in this process (`LocalPty`). Default **false**, and it must stay
-    /// false until Phase 5 of that plan: a holder pane's processes leave the
-    /// runner's process subtree, and `/restart-readiness` does not count them
-    /// until the holder census lands — flipping this early makes a restart
-    /// read "safe" by making the sessions invisible (the plan's Risk 2). Phase
-    /// 5 flips the default in the same change that makes the census count
-    /// holder panes.
+    /// of in this process (`LocalPty`). Default **true** since Phase 5 of that
+    /// plan, which flipped it in the same change that makes
+    /// `/restart-readiness` count holder panes (`terminal::holder_census`,
+    /// the fifth class of `session::tracking_health`'s partition) — the
+    /// ordering the plan's Risk 2 requires: a holder pane's processes can
+    /// leave the runner's process subtree, and before that census a restart
+    /// would have read "safe" by making those sessions invisible.
+    ///
+    /// A holder that cannot be started falls back, visibly, to an in-process
+    /// PTY (`daemon_pane_io::spawn_holder_pane_or_fallback`), so ON never
+    /// costs a working terminal. `{"terminal": {"pty_holder": false}}` turns
+    /// it off for new panes.
     ///
     /// Read once per spawn, from the non-mutating cached settings read
     /// ([`get_terminal_settings`]), so a change applies to the next terminal;
     /// an open pane keeps the backend it was born with. No settings UI: a
-    /// hand-edit of `settings.json` (`{"terminal": {"pty_holder": true}}`).
+    /// hand-edit of `settings.json` (`{"terminal": {"pty_holder": false}}`).
     pub pty_holder: bool,
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self { pty_holder: true }
+    }
 }
 
 /// The `terminal.*` settings for a spawn happening now.
@@ -3757,8 +3771,8 @@ pub struct TerminalSettings {
 /// rather than [`load_settings`], whose loader can write the operator's
 /// settings file, mint ids and touch the keyring: nothing a terminal spawn
 /// should do. An unreadable settings file yields the defaults, i.e. the switch
-/// OFF, which is the safe reading of UNKNOWN here (the census-invisibility
-/// failure stays unreachable).
+/// ON — safe since Phase 5, because the holder census counts holder panes (the
+/// census-invisibility failure stays unreachable either way).
 pub fn get_terminal_settings() -> TerminalSettings {
     read_settings_from_disk().settings.terminal
 }
