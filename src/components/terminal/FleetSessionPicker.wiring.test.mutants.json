@@ -1001,6 +1001,14 @@
           "replace": "fleetWalkTenants(tenantPin, tenantCandidates)",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'hands the selection to the hook and never to set_active_tenant'"
+        },
+        {
+          "label": "fsp-wiring-selection-to-hook-only-select-writes-active-tenant",
+          "file": "src/components/terminal/FleetTenantSelect.tsx",
+          "anchor": "        onChange(e.target.value === FLEET_TENANT_DEFAULT_VALUE ? null : e.target.value)\n",
+          "replace": "        void invoke(\"set_active_tenant\", { tenantId: e.target.value }) &&\n        onChange(e.target.value === FLEET_TENANT_DEFAULT_VALUE ? null : e.target.value)\n",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'hands the selection to the hook and never to set_active_tenant'"
         }
       ]
     },
@@ -1042,10 +1050,34 @@
         {
           "label": "fsp-wiring-mint-under-served-tenant-attach-under-selection",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "tenant: s.servedTenantId ?? null,",
+          "anchor": "tenant: s.mintTenantId ?? null,",
           "replace": "tenant: fleetTenant ?? null,",
           "expect_count": 1,
-          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'mints attach and create grants under the tenant the ROW or GROUP was served for'"
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
+        },
+        {
+          "label": "fsp-wiring-mint-under-served-tenant-attach-under-envelope",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "tenant: s.mintTenantId ?? null,",
+          "replace": "tenant: s.servedTenantId ?? null,",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
+        },
+        {
+          "label": "fsp-wiring-mint-under-served-tenant-group-create-under-envelope",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+          "replace": "onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.tenantId)}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
+        },
+        {
+          "label": "fsp-wiring-mint-under-served-tenant-empty-create-under-served",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "singleTenant: mintTenantOf(walkTenants[0] ?? null),",
+          "replace": "singleTenant: servedTenants[0] ?? null,",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
         }
       ]
     },

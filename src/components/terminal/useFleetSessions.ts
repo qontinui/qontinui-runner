@@ -111,6 +111,13 @@ export interface FleetSession {
    * the request named one (the runner's authority order then decides again).
    */
   servedTenantId?: string | null;
+  /**
+   * The tenant attach / create mint under for this row — the tenant its walk
+   * ASKED for, else `null` (`mintTenantOf` in `fleetWalker.ts`). Equal to
+   * `servedTenantId` whenever the walk named a tenant; `null` for a read that
+   * named none, which then mints exactly as before the selector.
+   */
+  mintTenantId?: string | null;
 }
 
 /**
@@ -408,6 +415,9 @@ export interface FleetDeviceGroup {
    * row's, which in a single-tenant read is every row's.
    */
   tenantId: string | null;
+  /** The tenant this group's "New terminal" mints under (its rows'
+   * `mintTenantId`) — `null` when the read named no tenant. */
+  mintTenantId: string | null;
   /** Best available human label, falling back to the id. */
   label: string;
   isCallerDevice: boolean;
@@ -481,6 +491,7 @@ export function groupByDevice(
       key,
       deviceId: first.deviceId,
       tenantId: first.servedTenantId ?? null,
+      mintTenantId: first.mintTenantId ?? null,
       label: deviceLabel(first),
       isCallerDevice: first.isCallerDevice,
       sessions: [...rows].sort(byActivityDesc),
