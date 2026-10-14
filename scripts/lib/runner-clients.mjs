@@ -1,32 +1,21 @@
 /**
  * Shared HTTP clients for the dev supervisor (`:9875`) and for a runner under
- * test — the two classes `scripts/perf-harness.mjs` defines privately at
- * `SupervisorClient` / `RunnerClient`, lifted here so a second harness
+ * test, used by `scripts/perf-harness.mjs` and by a second harness
  * (`scripts/termhost-bench/`, plan `2026-10-11-terminal-page-performance-kpis-across-setups`
- * Phase 3) imports them instead of copying them.
+ * Phase 3), which import them rather than copying them.
  *
- * ## Alignment with perf-harness and runner#1856
+ * ## perf-harness imports this module
  *
- * The plan moves perf-harness's two classes here, but that move edits
- * `perf-harness.mjs`, which runner#1856 (open, held) rewrites, so it is
- * sequenced behind #1856. Until then perf-harness keeps its private copies and
- * this module is their SUPERSET:
- *
- *   - every method perf-harness calls exists here with the same name, the same
- *     arguments, the same HTTP request and the same return value — including
- *     the three #1856 adds to `RunnerClient` (`resetTransportStats`,
- *     `transportStats`, `gridAltScreen`, taken from #1856's head `db0fea935`);
- *   - `httpJson` / `unwrap` / `sleep` behave identically, error messages
- *     included. The one widening: a failed request throws an {@link HttpError}
- *     (a subclass of `Error`, same message) that also carries `status` and the
- *     parsed `body`, so a caller can branch on a refusal without parsing prose;
- *   - both constructors keep their `(baseUrl, log)` positional form; an optional
- *     third `opts` argument only adds `fetch` injection for tests.
- *
- * So the later switch is a deletion in perf-harness (its two classes plus
- * `httpJson` / `unwrap` and the `PRIMARY_RUNNER_PORT` constant) and one import
- * line — no reconciliation. Everything below the "termhost-bench additions"
- * markers is additive and perf-harness does not need it.
+ * `perf-harness.mjs` used to define these classes (and `httpJson` / `unwrap`)
+ * privately. The switch was sequenced behind runner#1856, which rewrote
+ * perf-harness; since that landed, perf-harness imports from here and keeps no
+ * copy, so one implementation serves both harnesses. Error messages are the
+ * ones the private copies threw; a failed request throws an {@link HttpError}
+ * (a subclass of `Error`, same message) that also carries `status` and the
+ * parsed `body`. Both constructors keep their `(baseUrl, log)` positional form;
+ * the optional third `opts` argument adds `fetch` injection for tests. The
+ * methods below the "termhost-bench additions" markers are not used by
+ * perf-harness.
  *
  * ## The primary is never driven
  *
@@ -79,7 +68,7 @@ export class RunnerNotListed extends Error {
 
 /**
  * A non-2xx answer or a non-JSON body. The message is exactly what
- * perf-harness's private `httpJson` threw; `status` and `body` are added so a
+ * perf-harness's former private `httpJson` threw; `status` and `body` are added so a
  * caller can tell a 404 from a 409 from a refusal envelope without parsing it.
  */
 export class HttpError extends Error {

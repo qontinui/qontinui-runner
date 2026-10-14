@@ -10,8 +10,11 @@
  *   node scripts/termhost-bench/cli.mjs report  <results.json> [--format md|json]
  *            [--redact-to <file>] [--require-measured k1,k2 --at-n 15] [--require-rows-n 1,5,15]
  *   node scripts/termhost-bench/cli.mjs compare <results.json> [<baseline-results.json>]
+ *   node scripts/termhost-bench/cli.mjs settle-perf-harness --env linux-xvfb --runner-exe <exe>
+ *            --head-commit <sha> --harness <perf-harness.mjs> --out <file.json> [--sessions 10] ...
  *
- * Exit: 0 success; 1 a failure (an invalid file, a failed assertion, a run that
+ * Exit: 0 success (for `settle-perf-harness`: a result file was written, whatever
+ * its verdict — the caller asserts on it); 1 a failure (an invalid file, a failed assertion, a run that
  * left no row, a run that stopped on an incident); 2 usage; 3 the doctor says a run
  * cannot start here (`run` refuses before any unit; `doctor` reports a blocking
  * mechanism).
@@ -32,6 +35,7 @@ import { resolveProbeBinary } from "./probe.mjs";
 import { checkAssertions, prepareReport, renderReport } from "./report.mjs";
 import { InvalidResults } from "./results.mjs";
 import { RUN_DEFAULTS, RunAbort, RunFailed, planUnits, runBench } from "./run.mjs";
+import { SETTLE_DEFAULTS, runSettle, summaryLine } from "./settle-perf-harness.mjs";
 import { createAdapter } from "./adapters/index.mjs";
 import { supervisorAnswers } from "./adapters/runner.mjs";
 
@@ -49,6 +53,13 @@ export const HELP = `termhost-bench — terminal-host performance under N AI ses
            [--setups ...] [--arms ...] [--roles head,single]
            [--ab-baseline <sha>]   (an A/B run: every runner row at --at-n must have a proven build)
   compare  <results.json> [<baseline.json>] [--setup runner] [--variant default] [--format md|json]
+  settle-perf-harness --env linux-xvfb --runner-exe <exe> --head-commit <sha>
+           --harness <path to a perf-harness.mjs> --out <result.json>
+           [--sessions ${SETTLE_DEFAULTS.sessions}] [--soak-ms ${SETTLE_DEFAULTS.soakMs}] [--looks ${SETTLE_DEFAULTS.looks}] [--probe <path>]
+           [--work-dir <dir>] [--run-id <id>] [--runner-env K=V ...]
+           Run that perf-harness against a subject runner with the AI-session
+           generator in its terminals, and record whether the probe SAW their
+           markers: rendered | not_rendered | unknown (Phase 3).
 
 run options:
   --profile <id|path>        load profile (default claude-tui)       --seed <n>       (default 1)
@@ -119,6 +130,9 @@ const FLAGS_WITH_VALUES = new Set([
   "roles",
   "setup",
   "variant",
+  "harness",
+  "sessions",
+  "looks",
 ]);
 const BOOLEAN_FLAGS = new Set(["json", "help"]);
 
@@ -397,6 +411,48 @@ function cmdCompare(positional, flags, io) {
 }
 
 /**
+ * Normalise `settle-perf-harness` options.
+ *
+ * @param {Record<string, any>} flags
+ */
+export function normaliseSettleOptions(flags, { resolve: resolveFn = resolveCommit } = {}) {
+  if (!flags.env) throw new UsageError("--env is required");
+  const spec = environmentSpec(flags.env);
+  if (!flags["runner-exe"]) throw new UsageError("--runner-exe is required (the subject runner's exe)");
+  if (!flags["head-commit"]) throw new UsageError("--head-commit is required (the build the exe was built from, D12)");
+  if (!flags.harness) throw new UsageError("--harness is required (the perf-harness.mjs to settle)");
+  if (!flags.out) throw new UsageError("--out is required");
+  const runnerEnv = {};
+  for (const kv of flags["runner-env"] ?? []) {
+    const i = kv.indexOf("=");
+    if (i <= 0) throw new UsageError(`--runner-env takes KEY=VALUE, got ${kv}`);
+    runnerEnv[kv.slice(0, i)] = kv.slice(i + 1);
+  }
+  return {
+    env: spec.id,
+    runnerExe: resolve(flags["runner-exe"]),
+    headCommit: resolveFn(flags["head-commit"]),
+    harness: resolve(flags.harness),
+    sessions: int(flags, "sessions", SETTLE_DEFAULTS.sessions, { min: 1 }),
+    soakMs: int(flags, "soak-ms", SETTLE_DEFAULTS.soakMs, { min: 1 }),
+    looks: int(flags, "looks", SETTLE_DEFAULTS.looks, { min: 1 }),
+    probe: flags.probe ? resolve(flags.probe) : undefined,
+    workDir: flags["work-dir"] ? resolve(flags["work-dir"]) : undefined,
+    runId: flags["run-id"],
+    out: resolve(flags.out),
+    runnerEnv,
+    repoRoot: REPO_ROOT,
+  };
+}
+
+async function cmdSettle(flags, io, deps = {}) {
+  const o = normaliseSettleOptions(flags, deps.resolve ? { resolve: deps.resolve } : {});
+  const res = await (deps.runSettle ?? runSettle)(o, { log: (s) => io.err(`termhost-bench: ${s}\n`) });
+  io.out(`${summaryLine(res)}\n${o.out}\n`);
+  return 0;
+}
+
+/**
  * @param {string[]} argv
  * @param {{out?: (s: string) => void, err?: (s: string) => void}} [io]
  * @returns {Promise<number>} exit code
@@ -426,6 +482,8 @@ export async function main(argv, io = {}, deps = {}) {
         return cmdReport(positional, flags, { out, err });
       case "compare":
         return cmdCompare(positional, flags, { out, err });
+      case "settle-perf-harness":
+        return await cmdSettle(flags, { out, err }, deps);
       default:
         throw new UsageError(`unknown command ${command}`);
     }

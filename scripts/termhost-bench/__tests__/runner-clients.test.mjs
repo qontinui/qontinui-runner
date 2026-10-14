@@ -2,18 +2,15 @@
  * The shared supervisor and runner clients (`scripts/lib/runner-clients.mjs`):
  * the primary is never driven, every request is the one the method names, errors
  * keep perf-harness's messages while carrying status and body, the async
- * spawn-test path resolves or explains, the UI Bridge readiness wait pokes — and
- * the module stays a superset of perf-harness's private copies until the switch
- * sequenced behind runner#1856.
+ * spawn-test path resolves or explains, and the UI Bridge readiness wait pokes.
+ * perf-harness imports this module (its private copies are gone — see
+ * `perf-harness.test.mjs`), so there is no second copy left to keep in parity.
  *
  *   node --test scripts/termhost-bench/__tests__/runner-clients.test.mjs
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   HttpError,
@@ -23,12 +20,6 @@ import {
   httpJson,
   unwrap,
 } from "../../lib/runner-clients.mjs";
-import { classSource, functionSource, normalize, parityReport } from "./helpers/client-parity.mjs";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const SCRIPTS = join(HERE, "..", "..");
-const PERF_HARNESS = join(SCRIPTS, "perf-harness.mjs");
-const CLIENTS = join(SCRIPTS, "lib", "runner-clients.mjs");
 
 /** A recording fetch that answers from a script of responses (or a function). */
 function fakeFetch(answers) {
@@ -236,57 +227,6 @@ test("waitUiBridgeReady fails fast when the process exits, and times out with th
     r.waitUiBridgeReady(3000, { sleepFn: async (ms) => { t += ms; }, now: () => t }),
     /did not report uiBridgeIpcObserved:true within 3s \(uiBridgeIpcObserved=false, responsive=false\)/,
   );
-});
-
-// ---------------------------------------------------------------------------
-// Parity with perf-harness's private copies (until the switch behind #1856)
-// ---------------------------------------------------------------------------
-
-test("runner-clients.mjs is a superset of perf-harness's private clients (or perf-harness imports it)", () => {
-  const report = parityReport(readFileSync(PERF_HARNESS, "utf8"), readFileSync(CLIENTS, "utf8"));
-  assert.deepEqual(
-    report.problems,
-    [],
-    "perf-harness.mjs's private client drifted from scripts/lib/runner-clients.mjs. Mirror the change in " +
-      "runner-clients.mjs (same name, arguments, request and return), or finish the switch: delete perf-harness's " +
-      "private SupervisorClient/RunnerClient/httpJson/unwrap and import them from ./lib/runner-clients.mjs.",
-  );
-  if (report.mode === "private") {
-    for (const m of ["SupervisorClient.spawnTest", "RunnerClient.evaluate", "RunnerClient.createTerminal", "httpJson", "unwrap"]) {
-      assert.ok(report.checked.includes(m), `${m} was compared`);
-    }
-  }
-});
-
-test("the parity check can fail: a drifted method body and a missing method are both caught", () => {
-  const harness = readFileSync(PERF_HARNESS, "utf8");
-  const clients = readFileSync(CLIENTS, "utf8");
-  if (classSource(harness, "RunnerClient") === null) return; // after the switch there is nothing to drift
-  const drifted = clients.replace("/log-sources/runner-log-sink`", "/log-sources/runner-log-sink-v2`");
-  assert.match(parityReport(harness, drifted).problems.join("\n"), /RunnerClient\.logSink differs/);
-  const missing = clients.replace(/\n {2}async activateTab\(tabId\) \{[\s\S]*?\n {2}\}\n/, "\n");
-  assert.match(parityReport(harness, missing).problems.join("\n"), /RunnerClient\.activateTab is in perf-harness but missing/);
-  // Formatting alone is not drift.
-  assert.equal(normalize("return httpJson(`${a}/x`, {\n  timeoutMs: 1,\n},\n);"), normalize("return this.http(`${a}/x`, { timeoutMs: 1 });"));
-});
-
-test("httpJson and unwrap throw perf-harness's exact messages (run side by side)", async () => {
-  const harness = readFileSync(PERF_HARNESS, "utf8");
-  const theirsSrc = functionSource(harness, "httpJson");
-  const theirUnwrapSrc = functionSource(harness, "unwrap");
-  if (theirsSrc === null || theirUnwrapSrc === null) return; // switched: perf-harness uses these very functions
-  const answers = [{ status: 404, json: { error: "no such terminal" } }, { status: 500, text: "oops <b>" }, { json: { a: 1 } }];
-  for (const a of answers) {
-    const { fetch } = fakeFetch([a]);
-    // perf-harness's function with a local `fetch` shadowing the global.
-    const theirs = new Function("fetch", `${theirsSrc}\nreturn httpJson;`)(fetch);
-    const t = await theirs("http://127.0.0.1:9881/x", { method: "POST", body: { q: 1 } }).then((v) => ({ v }), (e) => ({ e: e.message }));
-    const o = await httpJson("http://127.0.0.1:9881/x", { method: "POST", body: { q: 1 }, fetch }).then((v) => ({ v }), (e) => ({ e: e.message }));
-    assert.deepEqual(o, t);
-  }
-  const theirUnwrap = new Function(`${theirUnwrapSrc}\nreturn unwrap;`)();
-  const env = { success: false, data: null, error: "x" };
-  assert.throws(() => unwrap(env), { message: (() => { try { theirUnwrap(env); } catch (e) { return e.message; } })() });
 });
 
 test("stopRunnerChecked stops only a listed, unprotected runner of the right requester (review N8)", async () => {

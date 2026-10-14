@@ -185,7 +185,12 @@ test("only the runner's rows leave the job: the artifact and the summary come fr
   assert.ok(paths.length >= uploads.length, `upload paths found: ${paths.length}`);
   // Every upload path names the redacted file or a runner unit directory.
   for (const p of paths) {
-    assert.ok(/termhost-bench-linux-xvfb-runner\.json$/.test(p) || /\/units\/\*-runner-\*\//.test(p), `upload path ${p} could carry a third-party row`);
+    // The settle (settle-perf-harness.mjs) launches the runner alone, so its work
+    // dir and results hold no third-party row.
+    assert.ok(
+      /termhost-bench-linux-xvfb-runner\.json$/.test(p) || /\/units\/\*-runner-\*\//.test(p) || /\/tb-settle\/(work\/\*\*|\*\.json)$/.test(p),
+      `upload path ${p} could carry a third-party row`,
+    );
   }
   assert.ok(!paths.some((p) => /results\.json$/.test(p)), "the full results file is never uploaded");
   // The summary renders the redacted copy only.

@@ -50,7 +50,8 @@ name: termhost-bench probe
 # sibling checkout action. Nothing else compiles the probe (ci.yml builds
 # src-tauri). The `push` to main runs the same paths so the cache saved
 # there (`save-if` below) exists for pull requests to restore. The shared
-# runner clients are a path of the benchmark's alone; the benchmark narrows
+# runner clients and perf-harness with its lib (whose inactive-page inference the run job
+# settles, below) are paths of the benchmark's alone; the benchmark narrows
 # these triggers further for itself (`bench-scope`, below).
 on:
   pull_request:
@@ -58,6 +59,8 @@ on:
       - "crates/termhost-probe/**"
       - "scripts/termhost-bench/**"
       - "scripts/lib/runner-clients.mjs"
+      - "scripts/perf-harness.mjs"
+      - "scripts/perf-harness-lib.mjs"
       - ".github/workflows/termhost-bench.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -318,7 +321,9 @@ jobs:
   # exists to save the probe jobs' cache. Neither is a reason to spend an hour
   # building and booting the runner: the plan's smoke runs on a pull request
   # that touches the benchmark (scripts/termhost-bench/**,
-  # crates/termhost-probe/**, plus the shared runner clients and this file).
+  # crates/termhost-probe/**, plus the shared runner clients, this file, and
+  # scripts/perf-harness.mjs and its lib, whose inactive-page inference the job
+  # settles).
   # Schedule and dispatch always run it; push never does.
   bench-scope:
     name: termhost-bench run scope
@@ -345,7 +350,7 @@ jobs:
               # The checkout is GitHub's merge commit; its first parent is the
               # base tip, so this diff is exactly what the PR changes.
               changed="$(git diff --name-only HEAD^1 HEAD)"
-              if grep -qE '^(scripts/termhost-bench/|crates/termhost-probe/|scripts/lib/runner-clients\.mjs$|\.github/workflows/termhost-bench\.yml$)' <<<"$changed"; then
+              if grep -qE '^(scripts/termhost-bench/|crates/termhost-probe/|scripts/lib/runner-clients\.mjs$|scripts/perf-harness\.mjs$|scripts/perf-harness-lib\.mjs$|\.github/workflows/termhost-bench\.yml$)' <<<"$changed"; then
                 run=true
               else
                 run=false
@@ -661,6 +666,88 @@ jobs:
           fi
           node scripts/termhost-bench/cli.mjs report "$redacted" >> "$GITHUB_STEP_SUMMARY"
 
+      # Plan Phase 3, "Settle perf-harness's inactive-page inference": origin/main's
+      # perf-harness created its terminals with `POST /terminals {page_id:
+      # "perf-harness"}`, a page of their own that the frontend does not activate
+      # while the active page is occupied, so its frontend numbers would describe
+      # an idle page. (On a FRESH runner the premise fails: an empty `default` page
+      # is hidden and the frontend switches to the harness's page, which renders.
+      # So the settle first seats one marker-free terminal on the active page
+      # through the launch menu, as an operator's box has.) The settle runs a
+      # perf-harness at S = 10 against a subject head runner (launched as a `run`
+      # unit launches it, under the same session bus and renderer setting) with the
+      # AI-session generator in every terminal, and records whether the probe SAW
+      # their markers during the soak (`settle-perf-harness.mjs`): rendered |
+      # not_rendered (the inference confirmed) | unknown (a precondition failed).
+      # Twice: BEFORE = origin/main's perf-harness (it imports ./perf-harness-lib.mjs
+      # and ./lib/... relatively, so its copy sits in scripts/), and the HEAD one.
+      # Only the head run is asserted — `rendered`, and none of its terminals left
+      # behind; the before run is evidence, reported and never gated on.
+      # UNMEASURED until its first CI run: two subject launches, a 45 s soak and
+      # teardown each, estimated at about 4 minutes apiece; 30 minutes is a
+      # generous first bound.
+      - name: Settle perf-harness's inactive-page inference
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/tb-settle"
+          mkdir -p "$out"
+          git show origin/main:scripts/perf-harness.mjs > scripts/perf-harness.settle-before.mjs
+          launcher=()
+          if command -v dbus-run-session >/dev/null; then
+            launcher=(dbus-run-session --)
+          else
+            echo "::warning::dbus-run-session not found: running without a session bus"
+          fi
+          for which in before head; do
+            if [ "$which" = before ]; then harness=scripts/perf-harness.settle-before.mjs; else harness=scripts/perf-harness.mjs; fi
+            args=(--env linux-xvfb
+              --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner"
+              --head-commit "$(git rev-parse HEAD)"
+              --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe"
+              --harness "$harness" --sessions 10 --soak-ms 45000
+              --work-dir "$out/work" --run-id "settle-$which-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+              --out "$out/$which.json"
+              --runner-env WEBKIT_DISABLE_DMABUF_RENDERER=1)
+            "${launcher[@]}" node scripts/termhost-bench/cli.mjs settle-perf-harness "${args[@]}" \
+              || echo "::warning::the $which settle exited $?"
+          done
+          {
+            echo "### Settle perf-harness's inactive-page inference (S = 10)"
+            echo
+            echo "| perf-harness | verdict | sessions seen | generators | perf-harness exit | terminals left |"
+            echo "|---|---|---|---|---|---|"
+            for which in before head; do
+              if [ -f "$out/$which.json" ]; then
+                jq -r --arg w "$which" '"| \($w) | \(.verdict) | \(.sessionsSeen | map(tostring) | join(",")) | \(.generatorsStarted)/\(.sessions) | \(.perfHarnessExit.code // "?") | \(.terminalsLeftAfterHarness // "UNKNOWN") |"' "$out/$which.json"
+              else
+                echo "| $which | (no result file) | | | | |"
+              fi
+            done
+            echo
+            echo "before = origin/main's scripts/perf-harness.mjs; head = this commit's."
+            for which in before head; do
+              if [ -f "$out/$which.json" ]; then jq -r --arg w "$which" '"- \($w): \(.verdictReason)"' "$out/$which.json"; fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          head="$out/head.json"
+          [ -f "$head" ] || { echo "::error::the head settle wrote no result file"; exit 1; }
+          head_verdict="$(jq -r .verdict "$head")"
+          head_left="$(jq -r '.terminalsLeftAfterHarness // "null"' "$head")"
+          rc=0
+          if [ "$head_verdict" != rendered ]; then
+            echo "::error::the head perf-harness's terminals did not render: $head_verdict ($(jq -r .verdictReason "$head"))"
+            rc=1
+          fi
+          if [ "$head_left" != 0 ]; then
+            echo "::error::the head perf-harness left $head_left of its terminals behind (expected 0)"
+            rc=1
+          fi
+          exit "$rc"
+
       # Runner unit directories only (`u<k>-runner-...`): their stdout and
       # stderr, the runner's own log files, and those units' probe and generator
       # records. tmux's unit directories never leave the VM (D7).
@@ -674,5 +761,7 @@ jobs:
             ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-stderr.log
             ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-root/**/*.log*
             ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/gen/*.jsonl
+            ${{ runner.temp }}/tb-settle/work/**
+            ${{ runner.temp }}/tb-settle/*.json
           if-no-files-found: ignore
           retention-days: 14
