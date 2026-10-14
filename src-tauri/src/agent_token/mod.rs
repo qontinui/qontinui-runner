@@ -176,6 +176,7 @@ impl TokenSlot {
             rejected: self.health.rejected,
             consecutive_failures: self.health.consecutive_failures,
             retry_in_secs: (self.health.next_attempt_epoch_secs - now_unix).max(0),
+            last_refusal: self.health.last_refusal.clone(),
             state: if self.health.rejected {
                 TokenState::Rejected
             } else if self.health.consecutive_failures > 0 {
@@ -221,6 +222,10 @@ pub struct AgentTokenHealth {
     pub consecutive_failures: u32,
     /// Seconds until the next refresh attempt is allowed; 0 = eligible now.
     pub retry_in_secs: i64,
+    /// coord's last non-bearer refusal (today: the lineage bound, with its
+    /// device-proof verdict), so a `degraded` slot names its cause. Never a
+    /// credential.
+    pub last_refusal: Option<String>,
     pub state: TokenState,
 }
 
@@ -474,7 +479,22 @@ async fn maybe_refresh_with_proof(
         // 401/403 = the bearer itself was refused. Unrecoverable by
         // retry, because the retry would present the same bearer.
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            let refusal_body: serde_json::Value = resp.json().await.unwrap_or_default();
+            // A body that fails to ARRIVE (timeout, reset) is transient: it
+            // must not be read as "no lineage code" and latch the slot. A body
+            // that arrives but is not JSON is a plain bearer refusal.
+            let refusal_body: serde_json::Value = match resp.bytes().await {
+                Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+                Err(e) => {
+                    let streak = token.write().await.record_transient_failure(now);
+                    log_transient(
+                        who,
+                        agent_id,
+                        streak,
+                        &format!("returned {status} but its body could not be read: {e}"),
+                    );
+                    return Ok(RefreshOutcome::Deferred);
+                }
+            };
             if let Refusal::LineageExpired { device_proof } = classify_refusal(&refusal_body) {
                 let streak = {
                     let mut g = token.write().await;
@@ -486,9 +506,16 @@ async fn maybe_refresh_with_proof(
                     // away. Never back off past that: the attempt after expiry
                     // is the one that latches, and until it does every daemon
                     // sharing the slot keeps presenting the token.
-                    let latest = g.exp.saturating_add(1);
+                    // ...but keep a floor of one base step, so a slot past its
+                    // bookkeeping `exp` (coord's verifier allows some leeway,
+                    // and `exp` is bookkeeping only) does not retry on every
+                    // tick of every daemon sharing it.
+                    let latest = g
+                        .exp
+                        .saturating_add(1)
+                        .max(now.saturating_add(REFRESH_BACKOFF_BASE_SECS));
                     if g.health.next_attempt_epoch_secs > latest {
-                        g.health.next_attempt_epoch_secs = latest.max(now);
+                        g.health.next_attempt_epoch_secs = latest;
                     }
                     streak
                 };
@@ -636,7 +663,9 @@ mod tests {
             }),
         ))
         .await;
-        let out = maybe_refresh_with_proof(&slot, &base, agent, "test", std::future::ready(None)).await.unwrap();
+        let out = maybe_refresh_with_proof(&slot, &base, agent, "test", std::future::ready(None))
+            .await
+            .unwrap();
         assert_eq!(out, RefreshOutcome::Deferred);
         {
             let g = slot.read().await;
@@ -651,7 +680,9 @@ mod tests {
         // the earlier cause is still on the slot for the log line.
         let base = stub_coord(answering(401, serde_json::json!({"error": "expired"}))).await;
         slot.write().await.health.next_attempt_epoch_secs = 0;
-        let out = maybe_refresh_with_proof(&slot, &base, agent, "test", std::future::ready(None)).await.unwrap();
+        let out = maybe_refresh_with_proof(&slot, &base, agent, "test", std::future::ready(None))
+            .await
+            .unwrap();
         assert_eq!(out, RefreshOutcome::Rejected);
         let g = slot.read().await;
         assert!(g.is_rejected());
@@ -662,9 +693,15 @@ mod tests {
     async fn refresh_bearer_refusal_still_latches() {
         let slot = slot_in_margin();
         let base = stub_coord(answering(403, serde_json::json!({"error": "revoked"}))).await;
-        let out = maybe_refresh_with_proof(&slot, &base, Uuid::now_v7(), "test", std::future::ready(None))
-            .await
-            .unwrap();
+        let out = maybe_refresh_with_proof(
+            &slot,
+            &base,
+            Uuid::now_v7(),
+            "test",
+            std::future::ready(None),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, RefreshOutcome::Rejected);
         assert!(slot.read().await.is_rejected());
     }
@@ -684,9 +721,15 @@ mod tests {
             }),
         ))
         .await;
-        let out = maybe_refresh_with_proof(&slot, &base, Uuid::now_v7(), "test", std::future::ready(None))
-            .await
-            .unwrap();
+        let out = maybe_refresh_with_proof(
+            &slot,
+            &base,
+            Uuid::now_v7(),
+            "test",
+            std::future::ready(None),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, RefreshOutcome::Refreshed);
         let g = slot.read().await;
         assert_eq!(g.token, "agent.jwt.new");
@@ -717,9 +760,15 @@ mod tests {
         }))
         .await;
         let slot = slot_in_margin();
-        let out = maybe_refresh_with_proof(&slot, &base, Uuid::now_v7(), "test", std::future::ready(None))
-            .await
-            .unwrap();
+        let out = maybe_refresh_with_proof(
+            &slot,
+            &base,
+            Uuid::now_v7(),
+            "test",
+            std::future::ready(None),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, RefreshOutcome::Deferred);
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -734,25 +783,27 @@ mod tests {
         let record = seen.clone();
         let jti = Uuid::now_v7();
         let exp = chrono::Utc::now().timestamp() + TOKEN_REFRESH_MARGIN_SECS * 8;
-        let base = stub_coord(axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
-            let record = record.clone();
-            async move {
-                record.lock().unwrap().push(
-                    headers
-                        .get(DEVICE_PROOF_HEADER)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string),
-                );
-                axum::Json(serde_json::json!({
-                    "token": "agent.jwt.reanchored",
-                    "agent_id": Uuid::now_v7(),
-                    "jti": jti,
-                    "exp": exp,
-                    "lineage_iat": exp - TOKEN_REFRESH_MARGIN_SECS * 8,
-                    "device_proof": "accepted",
-                }))
-            }
-        }))
+        let base = stub_coord(axum::Router::new().fallback(
+            move |headers: axum::http::HeaderMap| {
+                let record = record.clone();
+                async move {
+                    record.lock().unwrap().push(
+                        headers
+                            .get(DEVICE_PROOF_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    axum::Json(serde_json::json!({
+                        "token": "agent.jwt.reanchored",
+                        "agent_id": Uuid::now_v7(),
+                        "jti": jti,
+                        "exp": exp,
+                        "lineage_iat": exp - TOKEN_REFRESH_MARGIN_SECS * 8,
+                        "device_proof": "accepted",
+                    }))
+                }
+            },
+        ))
         .await;
         let slot = slot_in_margin();
         slot.write().await.health.last_refusal = Some("lineage bound reached".into());
@@ -766,10 +817,48 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out, RefreshOutcome::Refreshed);
-        assert_eq!(*seen.lock().unwrap(), vec![Some("device.jwt.fixture".to_string())]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("device.jwt.fixture".to_string())]
+        );
         let g = slot.read().await;
         assert_eq!(g.token, "agent.jwt.reanchored");
-        assert_eq!(g.health.last_refusal, None, "a fresh token clears the refusal");
+        assert_eq!(
+            g.health.last_refusal, None,
+            "a fresh token clears the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_lineage_expiry_keeps_a_floor_after_the_bearer_exp() {
+        let slot = slot_in_margin();
+        let now = chrono::Utc::now().timestamp();
+        slot.write().await.exp = now - 10;
+        let base = stub_coord(answering(
+            403,
+            serde_json::json!({"code": "agent_token_lineage_expired", "device_proof": "absent"}),
+        ))
+        .await;
+        let out = maybe_refresh_with_proof(
+            &slot,
+            &base,
+            Uuid::now_v7(),
+            "test",
+            std::future::ready(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, RefreshOutcome::Deferred);
+        let g = slot.read().await;
+        assert!(
+            g.health.next_attempt_epoch_secs >= now + REFRESH_BACKOFF_BASE_SECS,
+            "a slot past its exp must still back off at least one base step"
+        );
+        assert_eq!(
+            g.health_report(Uuid::now_v7(), now).last_refusal.as_deref(),
+            Some("lineage bound reached; device proof was absent"),
+            "the health surface names the cause"
+        );
     }
 
     #[tokio::test]
@@ -783,12 +872,21 @@ mod tests {
             serde_json::json!({"code": "agent_token_lineage_expired", "device_proof": "absent"}),
         ))
         .await;
-        let out = maybe_refresh_with_proof(&slot, &base, Uuid::now_v7(), "test", std::future::ready(None))
-            .await
-            .unwrap();
+        let out = maybe_refresh_with_proof(
+            &slot,
+            &base,
+            Uuid::now_v7(),
+            "test",
+            std::future::ready(None),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, RefreshOutcome::Deferred);
         let next = slot.read().await.health.next_attempt_epoch_secs;
-        assert!(next <= exp + 1, "retry at {next} must not pass the bearer's exp {exp}");
+        assert!(
+            next <= exp + 1,
+            "retry at {next} must not pass the bearer's exp {exp}"
+        );
     }
 
     #[test]
