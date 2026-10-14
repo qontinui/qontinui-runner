@@ -6007,11 +6007,13 @@ pub(crate) async fn refresh_tenant_slots(
                 continue;
             }
         }
+        // Read BEFORE sending: a `revoked` answer may only latch if no new
+        // credential was persisted while this request was in flight.
+        let sent_at_generation = credential_generation();
         // Present THIS slot's token — coord re-mints for the claim's tenant.
         // coord-auth-exempt(self-refresh): presents THIS tenant slot's own JWT so
         // coord re-mints for that slot's tenant. The default binding's token would
         // refresh the wrong slot.
-        let sent_at_generation = credential_generation();
         let resp = match client.post(&url).bearer_auth(&token).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -6310,10 +6312,12 @@ pub(crate) async fn try_device_machine_key_exchange_gated(
     if !before_send() {
         return None;
     }
+    // Read BEFORE sending: a `revoked` answer may only latch if no new
+    // credential was persisted while this request was in flight.
+    let sent_at_generation = credential_generation();
     // coord-auth-exempt(not-coord): `qontinui-web`
     // `/api/v1/devices/{id}/machine-credential/exchange`, authenticated by the
     // device machine key. This is one of the paths that MINTS the device JWT.
-    let sent_at_generation = credential_generation();
     let resp = match client
         .post(&url)
         .header("X-Device-Machine-Key", dmk.trim())
