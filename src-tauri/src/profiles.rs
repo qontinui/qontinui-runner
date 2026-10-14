@@ -454,12 +454,20 @@ fn network_at(
 ) -> Option<(NetworkProfile, String)> {
     let bytes = std::fs::read(path).ok()?;
     let file: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
-    let active = env_active
-        .map(str::to_string)
-        .or(file.active)
-        .unwrap_or_else(|| "dev".to_string());
+    let active = network_profile_name(&file, env_active);
     let network = file.profiles.get(&active)?.network.clone()?;
     Some((network, active))
+}
+
+/// The name of the profile whose `network` block the runner's startup step
+/// reads: `QONTINUI_ENV` (passed as `env_active`), else the file's `active`,
+/// else `dev`. `qontinui_profile network` edits the block through this same
+/// rule, so the CLI can never write a profile the runner does not read.
+pub fn network_profile_name(file: &ProfilesFile, env_active: Option<&str>) -> String {
+    env_active
+        .map(str::to_string)
+        .or_else(|| file.active.clone())
+        .unwrap_or_else(|| "dev".to_string())
 }
 
 // ============================================================================
