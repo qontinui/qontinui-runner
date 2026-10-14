@@ -3,6 +3,7 @@ import { RotateCcw, X } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { SessionState } from "./useZoneLayout";
 import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
+import { groupColorAt } from "./sessionGroupColors";
 import {
   DEFAULT_MINIMAP_OFFSET,
   clampMinimapOffset,
@@ -221,7 +222,7 @@ export function ZoneMinimap() {
             from: z1,
             to: z2,
             tag: shared[0],
-            color: labelColorMap[shared[0]] ?? "#bb9af7",
+            color: labelColorMap[shared[0]] ?? groupColorAt(0),
           });
         }
       }
@@ -364,7 +365,8 @@ export function ZoneMinimap() {
                 key={`conn-${i}`}
                 d={`M${fromCenter.x},${fromCenter.y} Q${midX},${midY} ${toCenter.x},${toCenter.y}`}
                 fill="none"
-                stroke={conn.color}
+                // A CSS custom property: only the style property resolves var().
+                style={{ stroke: conn.color }}
                 strokeWidth={0.8}
                 opacity={0.3}
               />
