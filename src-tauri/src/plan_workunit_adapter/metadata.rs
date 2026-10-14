@@ -818,8 +818,8 @@ mod tests {
 
     /// The archive stamp carries a declared area, and an explicit `null` when
     /// none is declared.
-    #[tokio::test]
-    async fn archive_stamp_keeps_a_declared_area() {
+    #[test]
+    fn archive_stamp_keeps_a_declared_area() {
         let with = ParsedWorkUnit {
             area: Some("ci-runners".to_string()),
             ..unit("2026-01-01-archived", "shipped")
@@ -855,10 +855,10 @@ mod tests {
         }
     }
 
-    /// No phases detected: the patch has no `phases` key on any arm, so
+    /// No phases detected: the active patch has no `phases` key, so
     /// coord keeps its stored list; a stale `archive_path` is cleared.
-    #[tokio::test]
-    async fn no_detected_phases_sends_a_patch_that_omits_phases_on_every_upsert() {
+    #[test]
+    fn active_patch_omits_phases_when_none_detected() {
         let none = phases_unit("s", &[]);
         let p = active_dir_patch(&none);
         let obj = p.as_object().unwrap();

@@ -11287,9 +11287,7 @@ Body.
         };
         // A rejected `Area:` is OMITTED from the patch (the stored area is
         // kept); an undeclared one would be an explicit `null` (RFC 7396 delete).
-        assert!(meta_for("2026-01-01-bad-area")
-            .get("area")
-            .is_none_or(|a| a.is_null()));
+        assert!(meta_for("2026-01-01-bad-area").get("area").is_none());
         assert_eq!(meta_for("2026-01-01-good-area")["area"], "ci-runners");
     }
 
