@@ -123,6 +123,15 @@ export function createSessionOrgClient(transport: SessionOrgTransport): SessionO
   let loadError: string | null = null;
   let pending: { id: number; ops: SessionOrgOp[] }[] = [];
   let nextBatchId = 0;
+  /**
+   * The tail of the in-flight apply chain. Applies reach the store in the
+   * order the operator made them: `session_org_apply` is an async command, so
+   * two calls fired back to back race for the store's lock, and a pin then
+   * unpin could otherwise land reversed. The optimistic view is not delayed —
+   * only the transport calls queue, and an apply with nothing ahead of it is
+   * sent at once. Null when no apply is in flight.
+   */
+  let applyTail: Promise<unknown> | null = null;
   let lastError: string | null = null;
   let view: SessionOrgView = { phase: "loading" };
   let holders = 0;
@@ -202,7 +211,15 @@ export function createSessionOrgClient(transport: SessionOrgTransport): SessionO
     lastError = null;
     recompute();
     try {
-      const response = await transport.apply(filled);
+      const turn = applyTail
+        ? applyTail.then(() => transport.apply(filled))
+        : transport.apply(filled);
+      const settled: Promise<unknown> = turn.catch(() => undefined);
+      applyTail = settled;
+      void settled.then(() => {
+        if (applyTail === settled) applyTail = null;
+      });
+      const response = await turn;
       pending = pending.filter((b) => b.id !== batch.id);
       const refused = response.results.filter((r) => !r.ok).map((r) => r.error ?? "refused");
       lastError = refused.length ? `refused: ${refused.join(", ")}` : null;
