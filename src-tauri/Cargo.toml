@@ -492,6 +492,11 @@ mut_range_bound = { level = "allow", priority = 2 }
 
 [dev-dependencies]
 tempfile = "3"
+# Plan-adapter metadata contract tests (`plan_workunit_adapter::metadata`): the
+# coord model resolves each patch with the same RFC 7396 crate and major version
+# coord uses. Already in Cargo.lock via tauri-build/codegen/utils, so this edge
+# adds no crate to the graph.
+json-patch = "3.0"
 # TLS trust census (`outbound_net::tls_trust` tests): mint a throwaway root and
 # leaf, and serve them over native-tls. All three are already in Cargo.lock
 # transitively (rcgen via adb_client, the TLS pair via tokio-tungstenite), so
