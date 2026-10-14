@@ -298,10 +298,24 @@ mod tests {
         assert_eq!(read_record(&path), Some(rec));
 
         drop(first);
-        assert!(matches!(
-            PaneLock::try_acquire_existing(&path).unwrap(),
-            TryLock::Acquired(_)
-        ));
+        // Released on drop — but a sibling test that spawns a process while
+        // `first` was open (terminate.rs spawns `sleep`) gives the child a
+        // reference to this open file description until its exec closes the
+        // CLOEXEC fd, and under load that window is long enough to observe.
+        // So: acquirable within a bound, not necessarily on the first try.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match PaneLock::try_acquire_existing(&path).unwrap() {
+                TryLock::Acquired(_) => break,
+                TryLock::Held => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "lock still held 5 s after drop"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
