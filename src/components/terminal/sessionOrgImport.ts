@@ -14,6 +14,13 @@
  * keys concurrently converge on the same org. A key whose value cannot be
  * parsed is left in place and reported — never imported as empty, never
  * deleted unread.
+ *
+ * A single label the store can never accept (longer than
+ * {@link MAX_LEGACY_LABEL_CHARS}, or refused `invalid_tag`) is SKIPPED and
+ * reported in the outcome's `skipped`, and the rest still import. Without
+ * that, one over-long label failed the whole import on every run and the
+ * keys were never removed. A skipped label is not retried: the store's rule
+ * would refuse it again.
  */
 
 import { instanceStorage } from "@/lib/instance-storage";
@@ -29,9 +36,29 @@ export interface LegacyStorage {
   removeItem(key: string): void;
 }
 
+/**
+ * Longest tag the runner store accepts, in Unicode scalar values (Rust
+ * `MAX_LABEL_CHARS` in `session_org_store.rs`, counted with `chars()`).
+ */
+export const MAX_LEGACY_LABEL_CHARS = 120;
+
+/** A legacy label that was not imported, and why. */
+export interface SkippedLegacyLabel {
+  sessionKey: string;
+  label: string;
+  reason: string;
+}
+
 export type SessionOrgImportOutcome =
   | { status: "nothing-to-import"; unreadable: string[] }
-  | { status: "imported"; pinned: number; tagged: number; unreadable: string[] }
+  | {
+      status: "imported";
+      pinned: number;
+      tagged: number;
+      unreadable: string[];
+      /** Labels the store cannot accept — left out, reported, not retried. */
+      skipped: SkippedLegacyLabel[];
+    }
   | { status: "failed"; reason: string; unreadable: string[] };
 
 interface ImportDeps {
@@ -83,10 +110,22 @@ export async function runSessionOrgImport({
   if (importable.length === 0) return { status: "nothing-to-import", unreadable };
 
   const ops: SessionOrgOp[] = [];
+  // The label each `addTags` op carries, by op index — so a refusal names it.
+  const labelOf = new Map<number, [string, string]>();
+  const skipped: SkippedLegacyLabel[] = [];
   if (pinned && pinned.length > 0) {
     ops.push({ op: "setPinned", sessionKeys: pinned, pinned: true });
   }
   for (const [sessionKey, label] of labels ?? []) {
+    if ([...label].length > MAX_LEGACY_LABEL_CHARS) {
+      skipped.push({
+        sessionKey,
+        label,
+        reason: `longer than ${MAX_LEGACY_LABEL_CHARS} characters`,
+      });
+      continue;
+    }
+    labelOf.set(ops.length, [sessionKey, label]);
     ops.push({ op: "addTags", sessionKeys: [sessionKey], tags: [label] });
   }
 
@@ -101,7 +140,17 @@ export async function runSessionOrgImport({
         unreadable,
       };
     }
-    const refused = response.results.filter((r) => !r.ok).map((r) => r.error ?? "refused");
+    const refused: string[] = [];
+    response.results.forEach((r, i) => {
+      if (r.ok) return;
+      const tagged = labelOf.get(i);
+      // A label the store refuses as a tag will be refused on every retry.
+      if (tagged && r.error === "invalid_tag") {
+        skipped.push({ sessionKey: tagged[0], label: tagged[1], reason: "refused: invalid_tag" });
+        return;
+      }
+      refused.push(r.error ?? "refused");
+    });
     if (response.snapshot.status !== "known" || refused.length > 0) {
       return {
         status: "failed",
@@ -118,7 +167,8 @@ export async function runSessionOrgImport({
   return {
     status: "imported",
     pinned: pinned?.length ?? 0,
-    tagged: labels?.length ?? 0,
+    tagged: (labels?.length ?? 0) - skipped.length,
     unreadable,
+    skipped,
   };
 }
