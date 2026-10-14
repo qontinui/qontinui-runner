@@ -663,6 +663,18 @@ impl TerminalManager {
         })
     }
 
+    /// Ids being built right now — a holder being spawned for one of them may
+    /// not hold its lock yet, so a probe could steal it (the holder census
+    /// skips these and counts them as unknown).
+    pub fn in_flight_ids(&self) -> Vec<String> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// Ids open now AND ids being built: what the boot sweep must not probe.
     pub fn open_or_in_flight_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.list().into_iter().map(|t| t.id).collect();
