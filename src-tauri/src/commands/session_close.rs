@@ -157,11 +157,12 @@ mod tests {
         let start = src
             .find("pub async fn terminal_graceful_close")
             .expect("the command is defined");
-        let end = src[start..]
-            .find("\n}\n")
+        let end = src
+            .get(start..)
+            .and_then(|tail| tail.find("\n}\n"))
             .map(|i| start + i)
             .expect("the command body ends");
-        let body = &src[start..end];
+        let body = src.get(start..end).expect("the body is a char-aligned span");
         assert!(
             body.contains(".graceful_exit("),
             "closes through graceful_exit"
