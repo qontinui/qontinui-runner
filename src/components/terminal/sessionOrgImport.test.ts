@@ -168,6 +168,17 @@ describe("runSessionOrgImport", () => {
     expect((await runSessionOrgImport({ apply, storage })).status).toBe("nothing-to-import");
   });
 
+  it("measures a label after trimming, as the store does", async () => {
+    const padded = `  ${"y".repeat(MAX_LEGACY_LABEL_CHARS)}  `;
+    const storage = memoryStorage({ [LEGACY_LABELS_KEY]: JSON.stringify({ s1: padded }) });
+    const apply = okApply();
+    const outcome = await runSessionOrgImport({ apply, storage });
+    expect(outcome).toMatchObject({ status: "imported", tagged: 1, skipped: [] });
+    expect(apply.mock.calls[0][0]).toEqual([
+      { op: "addTags", sessionKeys: ["s1"], tags: [padded.trim()] },
+    ]);
+  });
+
   it("a label the runner refuses as invalid_tag is skipped, not a failed import", async () => {
     const storage = memoryStorage({
       [LEGACY_LABELS_KEY]: JSON.stringify({ s1: "bad", s2: "good" }),
