@@ -17,6 +17,7 @@ absent)::
     python scripts/lib/envelope.py require --door <d> --key data.value        < file
     python scripts/lib/envelope.py require --door <d> --first-of a,b,c --accept non-empty-str --raw
     python scripts/lib/envelope.py require --door <d> --collection findings
+    python scripts/lib/envelope.py require --door <d> --mcp-text --key hits   < call-result
 
 # The defect this exists for
 
@@ -68,8 +69,9 @@ do not re-derive it from a summary elsewhere.
 | coord `GET /coord/sessions/worktrees` | `{tenantId, sessions, reapStatusCounts, count}` | `require_collection(p, "sessions")` (camelCase door) |
 | coord `GET /coord/alerts` | `{alerts, total_count, count}` | `require_collection(p, "alerts")`; `total_count` is the unpaged total |
 | coord MCP `tools/call` (JSON-RPC) | `{jsonrpc, id, result}` or `{jsonrpc, id, error}` | `require_key(p, "error")` first — its presence IS the answer; then `require_key(p, "result")` |
-| coord `coord_memory_search` | `{hits, count, vector_arm, …}` | `require_collection(p, "hits")`; read `vector_arm` (`skipped_no_embedding` is the normal case) before calling a zero a miss |
-| coord `coord_memory_overview` | `{live_row_count, …}` | `require_key(p, "live_row_count")` — a zero-hit search against a populated store is a miss; against an empty or unreadable one it is UNKNOWN |
+| `coord-revive.sh call <tool> '<json>'` stdout (the MCP `result`) | `{content: [{type, text: "<the tool's body as a JSON STRING>"}], isError?}` | `unwrap_mcp_text(p, door)` (CLI `--mcp-text`, bash `envelope_mcp_body`) FIRST — the tool's own `{hits, count, …}` sits one JSON decode deeper; `isError: true` and a non-JSON `text` are UNKNOWN. Then read the tool's row below |
+| coord `coord_memory_search` | `{hits, vector_arm, live_row_count, query_echo, anchored_hits, anchored_hit_count, …}` — **no `count`** (measured live 2026-09-26; web `MemoryQueryResponse` declares none) | `require_key(p, "hits")` — NOT `require_collection`, which would answer UNKNOWN on the absent `count` every time. Beside a zero read `live_row_count` (this response's own tenant-wide denominator) and `vector_arm` (`skipped_no_embedding` is the normal case); a zero against `live_row_count > 0` is still a hypothesis until a control query returns rows |
+| coord `coord_memory_overview` | `{row_count, corpus_complete, facets: {live_row_count, by_kind, by_scope} or null, …}` | `require_key(p, "facets.live_row_count")` — NESTED under `facets` (a top-level `live_row_count` read is the wrong-key defect); `facets: null` beside `corpus_complete: false` is UNKNOWN |
 | web `GET /api/v1/memory/records` | `{records, next_cursor, count}` | `require_collection(p, "records")` |
 | web `GET /api/v1/plan-library` | `{items, total, offset, limit, count}` | `require_collection(p, "items")`; `total` is the UNPAGED total |
 | web `/plan-library/candidates`, `/open-followups` | `{items, total, count}` | `require_collection(p, "items")` |
@@ -119,6 +121,7 @@ __all__ = [
     "require_collection",
     "require_first_present",
     "non_empty_str",
+    "unwrap_mcp_text",
     "UNKNOWN_EXIT",
 ]
 
@@ -164,8 +167,10 @@ class EnvelopeUnknown(Exception):
         present_keys: Sequence[str],
         provenance: Provenance,
         detail: str = "",
+        state: str = "absent",
     ) -> None:
         self.door = door
+        self.state = state
         self.path = path
         self.present_keys = list(present_keys)
         self.provenance = provenance
@@ -175,7 +180,7 @@ class EnvelopeUnknown(Exception):
     def __str__(self) -> str:
         present = ", ".join(self.present_keys)
         out = (
-            f"UNKNOWN: {self.door}: key `{self.path}` absent; "
+            f"UNKNOWN: {self.door}: key `{self.path}` {self.state}; "
             f"present: [{present}]; {self.provenance.render()}"
         )
         if self.detail:
@@ -184,8 +189,10 @@ class EnvelopeUnknown(Exception):
 
 
 def non_empty_str(value: Any) -> bool:
-    """The `accept` predicate for the mint read: a non-empty string."""
-    return isinstance(value, str) and value != ""
+    """The `accept` predicate for the mint read: a string with at least one
+    non-whitespace character. `" "` is not a token: accepted, it would become
+    `Authorization: Bearer  ` and read downstream as a refused credential."""
+    return isinstance(value, str) and value.strip() != ""
 
 
 def _present_keys(container: Any) -> list:
@@ -321,6 +328,70 @@ def require_first_present(
     )
 
 
+def unwrap_mcp_text(
+    payload: Any,
+    door: str,
+    provenance: Optional[Provenance] = None,
+) -> Any:
+    """The tool's own body out of an MCP `tools/call` result.
+
+    `coord-revive.sh call` prints the MCP `result` object, whose body is a
+    JSON STRING at `content[0].text` - so `hits` is one decode deeper than any
+    `require_*` reaches, and reading it straight off the result answers
+    "absent" every time. The unwrap:
+
+      * a full JSON-RPC envelope (`jsonrpc` present) descends into `result`;
+        an `error` there is UNKNOWN naming it;
+      * an `isError` that is present and not falsy (`true`, `"true"`, `1`, any
+        non-empty value other than `false`/`"false"`/`0`/`null`) is UNKNOWN
+        naming the tool's own error text - an error result is never a body
+        with zero rows;
+      * `content` present: it must hold EXACTLY ONE item, whose `text` is a
+        string holding JSON, else UNKNOWN naming which half failed. A second
+        item is refused rather than ignored: coord answers one text item, and
+        a body spread over two is not one this reader can vouch for;
+      * no `content` at all: the object itself falls through unchanged (a
+        body that was never wrapped), so a later `require_*` still names the
+        key it could not find.
+    """
+    prov = _prov(door, provenance)
+    cur = payload
+    if isinstance(cur, dict) and "jsonrpc" in cur:
+        if "error" in cur:
+            raise EnvelopeUnknown(door, "error", _present_keys(cur), prov,
+                                  f"the JSON-RPC call failed: {json.dumps(cur['error'])[:300]}",
+                                  state="present")
+        cur, _ = require_key(cur, "result", door, prov)
+    if not isinstance(cur, dict):
+        return cur
+    if "isError" in cur and cur["isError"] not in (False, None, 0, "", "false", "False"):
+        text = ""
+        content = cur.get("content")
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            text = str(content[0].get("text", ""))
+        raise EnvelopeUnknown(door, "isError", _present_keys(cur), prov,
+                              f"the tool answered an error, not a body: {text[:300]!r}",
+                              state="is true")
+    if "content" not in cur:
+        return cur
+    content = cur["content"]
+    if isinstance(content, list) and len(content) > 1:
+        raise EnvelopeUnknown(door, "content", _present_keys(cur), prov,
+                              f"an MCP result carrying {len(content)} content items; exactly one is read",
+                              state="holds more than one item")
+    found, text, prefix, container = _walk(cur, "content.0.text")
+    if not found or not isinstance(text, str):
+        raise EnvelopeUnknown(door, "content.0.text", _present_keys(container), prov,
+                              "an MCP result whose `content[0].text` is absent or not a string",
+                              state="absent or not a string")
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise EnvelopeUnknown(door, "content.0.text", _present_keys(cur), prov,
+                              f"`content[0].text` is not JSON ({exc.__class__.__name__}); "
+                              f"first 120 chars: {text[:120]!r}", state="not JSON") from None
+
+
 @dataclass(frozen=True)
 class Envelope:
     """A parsed body plus its provenance; the method forms forward to the
@@ -332,6 +403,11 @@ class Envelope:
     @property
     def door(self) -> str:
         return self.provenance.door
+
+    def mcp_body(self) -> "Envelope":
+        """This envelope with the MCP `result` wrapper removed (`unwrap_mcp_text`)."""
+        return Envelope(payload=unwrap_mcp_text(self.payload, self.door, self.provenance),
+                        provenance=self.provenance)
 
     def require_key(self, path: str) -> Tuple[Any, Provenance]:
         return require_key(self.payload, path, self.door, self.provenance)
@@ -399,12 +475,15 @@ def _cli(argv: Sequence[str]) -> int:
     req.add_argument("--door", required=True, help="the door the body came from (named in the UNKNOWN line)")
     req.add_argument("--source", default="stdin", help="provenance source label (default: stdin)")
     how = req.add_mutually_exclusive_group(required=True)
-    how.add_argument("--key", help="dotted path, e.g. data.value")
+    how.add_argument("--key", help="dotted path, e.g. data.value (`.` is the whole body)")
     how.add_argument("--first-of", help="comma-separated dotted paths tried in order")
     how.add_argument("--collection", help="collection key whose sibling `count` must equal len(rows)")
     req.add_argument("--accept", choices=sorted(_ACCEPTS), default="any",
                      help="predicate a --first-of value must satisfy (non-empty-str for the mint read)")
     req.add_argument("--count-key", default="count", help="sibling count key for --collection (default: count)")
+    req.add_argument("--mcp-text", action="store_true",
+                     help="the body is an MCP tools/call result (coord-revive.sh call stdout): decode "
+                          "content[0].text first; isError or a non-JSON text is UNKNOWN")
     req.add_argument("--raw", action="store_true",
                      help="print a string value bare (jq -r); non-strings are still JSON")
     args = parser.parse_args(list(argv))
@@ -412,6 +491,8 @@ def _cli(argv: Sequence[str]) -> int:
     raw = sys.stdin.buffer.read()
     try:
         env = load(raw, door=args.door, source=args.source)
+        if args.mcp_text:
+            env = env.mcp_body()
         if args.key is not None:
             value, _ = env.require_key(args.key)
         elif args.first_of is not None:

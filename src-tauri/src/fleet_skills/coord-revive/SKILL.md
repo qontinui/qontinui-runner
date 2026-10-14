@@ -58,7 +58,7 @@ Cascade — stops at the first LIVE door:
 | L1 | Own cwd's `.mcp.json`, re-read fresh | A re-provision from the same workdir+terminal rewrites this file in place; the FILE holds the current key while the session still holds its startup snapshot (the client reads `.mcp.json` ONCE) |
 | L2 | Sibling sweep: `<workspace-root>/.mcp.json` + every `<workspace-root>/*/.mcp.json` | A sibling repo's config often holds the live key/port when yours was evicted (same loop as `/gate` Step 2) |
 | L3 | `coord-acting-bearer.sh` → direct coord MCP over HTTPS | Independent of the whole `.mcp.json` family; needs `$COORD_AGENT_JWT` |
-| L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** — `POST /ui-bridge/invoke/get_coord_device_token` (no tier gate; `Dispatch::InProcess`, so it answers headless), sent `{"tenantId": "<the session's tenant>"}` when that is known (see "The session's tenant" below), then `POST /ui-bridge/invoke/get_access_token_for_websocket` for a build carrying only the older entry — and the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when the build answers the allowlist 400 for *both*. The eval door is refused outright on a CSP-enforcing build (see `RUNNER_EVAL_CSP_BLOCKED`), so it is a legacy rung, not a safety net. All against the same public coord MCP door; the door name says which answered (`source=runner-invoke:<command>` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
+| L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** — `POST /ui-bridge/invoke/get_coord_device_token` (no tier gate; `Dispatch::InProcess`, so it answers headless), sent `{"args": {"tenantId": "<the session's tenant>"}}` when that is known — the tenant goes INSIDE `args`, because the runner's `InvokeRequestBody` reads only `args` and drops a top-level key (see "The session's tenant" below), then `POST /ui-bridge/invoke/get_access_token_for_websocket` for a build carrying only the older entry — and the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when the build answers the allowlist 400 for *both*. The eval door is refused outright on a CSP-enforcing build (see `RUNNER_EVAL_CSP_BLOCKED`), so it is a legacy rung, not a safety net. All against the same public coord MCP door; the door name says which answered (`source=runner-invoke:<command>` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
 | L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file (plus the session's `tenant_id` when known), then a **control read** to prove the token before it is called LIVE. ✅ **Measured LIVE 2026-09-04** — `200` with a device-subject agent JWT | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. On 2026-09-04 it was the **only** live rung on merytshost: static device JWT `401`, invoke mint `400`, eval mint `400` |
 | L6 | **The WEB host** — `GET $QONTINUI_WEB_HTTP_URL/api/v1/plan-library?kind=plan&limit=1` (default `https://api.qontinui.io`), first anonymously (is a program answering?), then with a **`user_id`-bearing device JWT** from `$COORD_DEVICE_JWT` / `~/.qontinui/coord-device-jwt` — the same two static sources as L4 sources 1-2, shape-tested and sent; the host's `401` is the freshness gate, exactly as at L4 (no local `exp` decode). Emits **typed faults on the credential axis** (`WEB_HOST_NO_USER_JWT`, `WEB_HOST_JWT_UNAUTHORIZED`) and a host-level one only for a transport failure (`WEB_HOST_UNREACHABLE`) | It is a **different program on a different host**: plan-library and memory live there, behind `get_audit_actor_user`, which wants a `user_id` claim the agent-minted tokens (L5, `/agents/allocate`) never carry. Measured 2026-09-06: the same device JWT `coord.qontinui.io` answered `200` to also answered `200`/`422` here — one credential, two hosts, two capabilities — and this file named `api.qontinui.io` nowhere. A `LIVE` here is `PARTIAL`: it proves the host axis, not a coord door |
 
@@ -398,8 +398,19 @@ whose:
   UNKNOWN.
 - **The runner door.** On a runner build carrying the P2/P3 change,
   `get_coord_device_token` takes an optional tenant —
-  `{"tenantId": "<uuid>"}` over `/ui-bridge/invoke` (`tenant_id` is accepted as an
-  alias), `tenantId` over Tauri IPC. **With a tenant** it answers THAT tenant's
+  `{"args": {"tenantId": "<uuid>"}}` over `/ui-bridge/invoke` (`tenant_id` is
+  accepted as an alias inside `args`), `tenantId` over Tauri IPC. **The envelope
+  is load-bearing:** the invoke route's request body (`InvokeRequestBody`) has ONE
+  field, `args`, defaulted to `{}`, and silently drops every top-level key — so
+  `{"tenantId": "<uuid>"}` at the top level is a TENANT-LESS call (a second `409
+  tenant_required` on a multi-slot runner, the default slot on a one-slot one;
+  a runner carrying that plan's Phase 7 refuses it instead, with `400
+  get_coord_device_token:tenant_misplaced` naming the envelope).
+  This script sent exactly that until plan
+  `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`
+  Phase 3, and its test stub read the top-level key, so the suite was green
+  against the defect; `tenant-arg-test.sh` now models the real contract and a
+  mutant restoring the top-level body reddens it. **With a tenant** it answers THAT tenant's
   device JWT — its own slot, or the default slot only when that tenant is the
   default binding — and `null` for a tenant this runner is not paired for; it
   never substitutes another tenant's token. **Without one**, a runner holding
@@ -462,12 +473,28 @@ the coord row stamp, which for a tenant-less spawn is the default the registry
 chose, not a tenant the session named. Sending it would turn that build's working
 default-slot answer into a `WRONG_TENANT` refusal and buy nothing.
 
-**Every LIVE from a runner mint or the bootstrap credential names the tenant it
-established** (the L1/L2 proxy doors and L3 are unchanged). The nonce mint prints a
-`TENANT:` line with the acting tenant `coord_query_identity` reported (or
-UNKNOWN and why), the invoke mint adds a `PARTIAL: tenant established:` line
-with the token's claim, and L5 prints a `TENANT:` line with the minted token's
-claim.
+**Every LIVE from a bearer door names the tenant it acts for, by slug AND id**
+(the L1/L2 proxy doors are unchanged). L3's acting bearer and L6's web-host
+token are named from the token's own `tenant_id` claim alone — neither is spent
+on a coord identity read — so their slug reads `slug UNKNOWN` unless an earlier
+read in the run named it; they print the same `TENANT:` and `TENANT DIFFERS`
+lines. The nonce
+mint prints a `TENANT:` line with the acting tenant `coord_query_identity`
+reported (or UNKNOWN and why). The bearer doors — the static `$COORD_DEVICE_JWT`
+and `~/.qontinui/coord-device-jwt`, the invoke mint, and L5 — ask
+`coord_query_identity` over the bearer itself (read-only) and print
+`TENANT: acting tenant <slug> (<uuid>) (<basis>); expected <slug> (<uuid>) from <source>; <what was sent>`,
+the slugs coming from that answer's `tenant_slug` and `device_tenant_bindings`;
+when the identity read fails the token's own claim is used and the slug reads
+`slug UNKNOWN`, never a guess. The invoke mint also keeps its
+`PARTIAL: tenant established:` line, now with the slug. When the acting tenant is
+not the session's expected one (resolved as below), the next line is
+
+    TENANT DIFFERS from expected <slug> (<uuid>): this door acts as <slug> (<uuid>), …
+
+which is how a STATIC token for another tenant — which no mint check reaches —
+becomes visible: every tenant-scoped read or write over that door answers about
+the tenant it names, not the session's.
 
 Omitting it is exactly today's call, so a single-tenant device, an older runner
 and an older coord all keep working. **A runner that ignores the argument is
