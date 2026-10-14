@@ -1640,7 +1640,7 @@ impl TerminalSession {
         )?;
 
         // The pane's backend: in-process `LocalPty`, or — behind
-        // `terminal.pty_holder`, default ON since Phase 5 — an out-of-process PTY holder
+        // `terminal.pty_holder`, default ON on Linux since Phase 5 — an out-of-process PTY holder
         // (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
         // Phase 2). Read once per spawn. A local PTY is opened HERE, before the
         // environment is assembled, so an `openpty` failure leaves none of
