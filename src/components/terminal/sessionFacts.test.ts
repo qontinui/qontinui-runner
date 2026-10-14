@@ -438,6 +438,23 @@ describe("normalizeInfoList / indexPrCi", () => {
     expect(v.branches.get(DIR)?.branch).toBe("main");
   });
 
+  it("a row the runner could not read is indexed by the id it carries, with its reason", () => {
+    const v = normalizeInfoList({
+      status: "ok",
+      reason: null,
+      sessions: [{ available: false, reason: "session_read_failed", claudeSessionId: SID }],
+      notFound: [],
+      branches: [],
+    });
+    expect(v.phase).toBe("ok");
+    if (v.phase !== "ok") return;
+    expect(v.byId.get(SID)).toEqual({
+      status: "unavailable",
+      reason: "session_read_failed",
+      body: null,
+    });
+  });
+
   it("a degraded or malformed listing is unavailable with a reason, never empty-ok", () => {
     expect(
       normalizeInfoList({
