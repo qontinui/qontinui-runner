@@ -8,6 +8,7 @@ import {
   paletteTerms,
   searchPalette,
   stepSelection,
+  transcriptAnswerFor,
   transcriptCoverageNote,
 } from "./sessionSearchPalette";
 import { requestSessionSearchOpen, sessionSearchPaletteStore } from "./sessionSearchPaletteStore";
@@ -191,5 +192,29 @@ describe("sessionSearchPaletteStore", () => {
     expect(sessionSearchPaletteStore.isOpen()).toBe(false);
     expect(calls).toBe(4);
     unsub();
+  });
+});
+
+describe("transcriptAnswerFor", () => {
+  const resp = transcript({ terms: ["merge", "train"] });
+  const kept = { query: "merge train", answer: { state: "done" as const, resp } };
+
+  it("answers the query it was kept for", () => {
+    expect(transcriptAnswerFor(kept, "merge train")).toBe(resp);
+    expect(transcriptAnswerFor(kept, "  merge train ")).toBe(resp);
+  });
+
+  // Phase 8 live run: the `search` bridge action set a new query and filtered
+  // in the same tick with the PREVIOUS query's response, so "closeme" listed
+  // sessions whose transcripts only matched "merge train".
+  it("is null for another query, so a stale answer never attributes hits", () => {
+    expect(transcriptAnswerFor(kept, "closeme")).toBeNull();
+  });
+
+  it("is null when nothing is kept or the kept answer is not done", () => {
+    expect(transcriptAnswerFor(null, "merge train")).toBeNull();
+    expect(
+      transcriptAnswerFor({ query: "merge train", answer: { state: "pending" } }, "merge train"),
+    ).toBeNull();
   });
 });
