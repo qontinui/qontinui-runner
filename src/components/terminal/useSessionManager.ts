@@ -55,7 +55,7 @@ import {
   type StatusTabInput,
 } from "./sessionStatusModel";
 import { useSessionOrg, memberOf, sessionKeyFor, type SessionOrgView } from "./useSessionOrg";
-import type { SessionOrgOp } from "./sessionOrgTypes";
+import type { SessionOrgApplyResponse, SessionOrgOp } from "./sessionOrgTypes";
 import { parseGroupBy, type SessionGroupBy } from "./sessionGrouping";
 import {
   closeSessionsGracefully,
@@ -63,6 +63,7 @@ import {
   type CloseItem,
   type CloseItemResult,
 } from "./sessionClose";
+import { useRecentlyClosed, type UseRecentlyClosedResult } from "./useRecentlyClosed";
 
 export type { SessionGroupBy } from "./sessionGrouping";
 
@@ -413,8 +414,9 @@ export interface UseSessionManagerReturn {
   openSession: (session: UnifiedSession) => void;
   copySessionId: (session: UnifiedSession) => void;
   /**
-   * The live tab a row's close action would close, or `null` when the row has
-   * none in this window (a transcript-only row) — its card offers no close.
+   * The tab a row's close action would close — live or exited — or `null`
+   * when the row has none in this window (a transcript-only row): its card
+   * then offers no close.
    */
   closableTabId: (session: UnifiedSession) => string | null;
   /**
@@ -433,14 +435,6 @@ export interface UseSessionManagerReturn {
     pageId: string,
   ) => Promise<MoveToPageResult[]>;
 
-  // Multi-select & bulk actions
-  selectedIds: Set<string>;
-  toggleSelect: (sessionId: string) => void;
-  /** Select every visible (filtered) row that can be bulk-selected. */
-  selectAllVisible: () => void;
-  clearSelection: () => void;
-  bulkResume: () => void;
-
   // Organization (the runner's session-org store)
   /** The store as this window sees it: loading, unknown, or known. */
   org: SessionOrgView;
@@ -449,6 +443,18 @@ export interface UseSessionManagerReturn {
    * `org.lastError`; the returned promise never rejects.
    */
   applyOrg: (ops: SessionOrgOp[]) => Promise<void>;
+  /**
+   * Apply org ops and answer the runner's per-op results and snapshot —
+   * what a bulk action reads each session back from. Rejects when the runner
+   * could not be asked.
+   */
+  applyOrgChecked: (ops: SessionOrgOp[]) => Promise<SessionOrgApplyResponse>;
+  /** The store's Recently closed list (newest first). */
+  recentlyClosed: UseRecentlyClosedResult["recentlyClosed"];
+  /** Reopen one closed session: resume it and put it back in its group. */
+  reopenClosed: UseRecentlyClosedResult["reopenClosed"];
+  /** Reopen the newest closed session that can be reopened. */
+  reopenLastClosed: UseRecentlyClosedResult["reopenLastClosed"];
   /** A row's organization-store key (`sessionKeyFor`). */
   sessionKeyOf: (session: UnifiedSession) => string;
 
@@ -525,6 +531,20 @@ export function liveTabIdForSession(
   const tabId = session.zoneTabId;
   if (!tabId || isInjectedSession(session)) return null;
   return tabs.some((t) => t.id === tabId && t.isAlive) ? tabId : null;
+}
+
+/**
+ * The tab a row's close would act on: its tab in this window whether it is
+ * live or exited (closing an exited one only removes the tab), or null when
+ * the row has none here. Injected fixtures have no real tab.
+ */
+export function tabIdForSession(
+  session: Pick<UnifiedSession, "zoneTabId" | "_transcript">,
+  tabs: readonly Pick<TerminalTab, "id">[],
+): string | null {
+  const tabId = session.zoneTabId;
+  if (!tabId || isInjectedSession(session)) return null;
+  return tabs.some((t) => t.id === tabId) ? tabId : null;
 }
 
 /**
@@ -1122,7 +1142,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, []);
 
   const closableTabId = useCallback(
-    (session: UnifiedSession) => (onCloseSessionTab ? liveTabIdForSession(session, tabs) : null),
+    (session: UnifiedSession) => (onCloseSessionTab ? tabIdForSession(session, tabs) : null),
     [tabs, onCloseSessionTab],
   );
 
@@ -1131,13 +1151,14 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       sessionId: session.sessionId,
       title: session.registryName || session.resumeName || session.displayName,
       tabId: closableTabId(session),
+      tabAlive: liveTabIdForSession(session, tabs) !== null,
       sessionKey: sessionKeyOf(session),
       resumeCmd:
         session.source === "transcript" && !isInjectedSession(session)
           ? `claude --resume ${session.sessionId}`
           : null,
     }),
-    [closableTabId, sessionKeyOf],
+    [closableTabId, sessionKeyOf, tabs],
   );
 
   const closeEffects = useMemo(
@@ -1192,57 +1213,15 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     [tabs],
   );
 
-  // ── Multi-select & bulk actions ──────────────────────────────────────────
+  // ── Recently closed ────────────────────────────────────────────────────────
 
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-
-  const toggleSelect = useCallback((sessionId: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(sessionId)) {
-        next.delete(sessionId);
-      } else {
-        next.add(sessionId);
-      }
-      return next;
-    });
-  }, []);
-
-  // Selects what the filter shows: every visible transcript row (a tab-sourced
-  // row has nothing to bulk-resume).
-  const selectAllVisible = useCallback(() => {
-    setSelectedIds(
-      new Set(sessions.filter((s) => s.source === "transcript").map((s) => s.sessionId)),
-    );
-  }, [sessions]);
-
-  const clearSelection = useCallback(() => {
-    setSelectedIds(new Set());
-  }, []);
-
-  const bulkResume = useCallback(async () => {
-    // F1 inertness: drop synthetic-backed fakes from the bulk set — they have
-    // no real transcript to resume (see `resumeSession`).
-    // Only transcript rows are resumable; a tab-sourced row is already live.
-    const toResume = transcriptRows.filter(
-      (s) => selectedIds.has(s.sessionId) && !isInjectedSession(s),
-    );
-    const skipped = transcriptRows.filter(
-      (s) => selectedIds.has(s.sessionId) && isInjectedSession(s),
-    );
-    for (const s of skipped) {
-      console.warn(
-        `[test-fixtures] ignoring resume on synthetic tab ${s.zoneTabId ?? s.sessionId}`,
-      );
-    }
-    setSelectedIds(new Set());
-    // Resume sequentially with a small delay to let each tab initialize
-    for (const session of toResume) {
-      onResumeSession(session._transcript);
-      // Small delay between resumes to avoid race conditions in terminal creation
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-  }, [transcriptRows, selectedIds, onResumeSession]);
+  const { recentlyClosed, reopenClosed, reopenLastClosed } = useRecentlyClosed({
+    org,
+    rows: allSessions,
+    applyOrg: applyOrgRaw,
+    resume: resumeSession,
+    focus: openSession,
+  });
 
   return {
     sessions,
@@ -1271,13 +1250,12 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     closeSessions,
     forceCloseSessions,
     moveSessionsToPage,
-    selectedIds,
-    toggleSelect,
-    selectAllVisible,
-    clearSelection,
-    bulkResume,
     org,
     applyOrg,
+    applyOrgChecked: applyOrgRaw,
+    recentlyClosed,
+    reopenClosed,
+    reopenLastClosed,
     sessionKeyOf,
     allAccounts,
     savedConfigDirs,

@@ -102,6 +102,13 @@ interface SessionCardProps {
   onViewTranscript: (session: UnifiedSession) => void;
   onCopyId: (session: UnifiedSession) => void;
   onToggleSelect: (sessionId: string) => void;
+  /**
+   * The row click with its modifiers (Phase 5 multi-select): Ctrl/⌘ toggles,
+   * Shift selects a range, a plain click opens. Absent = a plain click opens.
+   */
+  onRowClick?: (session: UnifiedSession, mods: { toggle: boolean; range: boolean }) => void;
+  /** The session list's keyboard cursor is on this row. */
+  isCursor?: boolean;
   /** Optional: notify parent that the session list should refresh after a promotion. */
   onAfterPromote?: () => void;
   /**
@@ -326,14 +333,12 @@ export interface SessionCardActions {
   copySessionId: boolean;
   promote: boolean;
   commit: boolean;
-  /** Selecting for bulk resume (checkbox + "Select for Bulk"). */
-  bulkSelect: boolean;
 }
 
 /**
  * The card's action set. A tab-sourced row (a plain shell, a session before its
  * first message, a remote session tab) has no transcript, so view transcript,
- * copy session id, resume and bulk select do not apply, and nothing backs
+ * copy session id and resume do not apply, and nothing backs
  * promote or commit (both key on a Claude session id the row does not carry).
  * Promote and commit additionally need a session that is live in this runner
  * (`On screen` / `Hidden here`, not exited).
@@ -349,7 +354,6 @@ export function sessionCardActions(
     copySessionId: transcript,
     promote: transcript && liveHere,
     commit: transcript && liveHere,
-    bulkSelect: transcript,
   };
 }
 
@@ -403,6 +407,8 @@ function SessionCardInner({
   onViewTranscript,
   onCopyId,
   onToggleSelect,
+  onRowClick,
+  isCursor = false,
   onAfterPromote,
   onOpenWorktrees,
   isOnScreen = false,
@@ -625,7 +631,7 @@ function SessionCardInner({
       className={`
         group relative border-l-[3px] transition-colors
         ${dropBefore ? "border-t-2 border-t-brand-primary" : ""}
-        ${isOnScreen ? "bg-brand-primary/10" : isSelected ? "bg-[#7aa2f7]/5" : "hover:bg-[#1a1b26]"}
+        ${isChecked ? "bg-[#7aa2f7]/15" : isOnScreen ? "bg-brand-primary/10" : isSelected ? "bg-[#7aa2f7]/5" : "hover:bg-[#1a1b26]"}
       `}
     >
       <button
@@ -641,18 +647,29 @@ function SessionCardInner({
         data-session-account={session.accountLabel}
         data-session-source={session.source}
         data-session-on-screen={isOnScreen ? "true" : "false"}
+        data-session-checked={isChecked ? "true" : "false"}
+        data-session-cursor={isCursor ? "true" : "false"}
+        aria-selected={isChecked}
         aria-current={isOnScreen ? "true" : undefined}
         // `accessibleName` and `ai/find` resolve on this. `title` carries the
         // rich multi-line tooltip, which makes a poor name, so the headline is
         // stated separately here; the tooltip is unchanged visually.
         aria-label={cardName}
-        onClick={() => onOpen(session)}
-        className={`w-full text-left px-3 pr-20 ${compact ? "py-1" : "py-2"}`}
+        onClick={(e) =>
+          onRowClick
+            ? onRowClick(session, { toggle: e.ctrlKey || e.metaKey, range: e.shiftKey })
+            : onOpen(session)
+        }
+        // The list owns keyboard focus (↑/↓/Enter/Space); rows are reached by it.
+        tabIndex={onRowClick ? -1 : undefined}
+        className={`w-full text-left px-3 pr-20 ${compact ? "py-1" : "py-2"} ${
+          isCursor ? "outline outline-1 -outline-offset-1 outline-brand-primary/60" : ""
+        }`}
         title={sessionCardTooltip(session)}
       >
         {/* Row 1: Status dot + Name + Account badge */}
         <div className="flex items-center gap-1.5 mb-0.5">
-          {selectionMode && actions.bulkSelect && (
+          {selectionMode && (
             <input
               type="checkbox"
               checked={isChecked}
@@ -1083,7 +1100,7 @@ function SessionCardInner({
                 />
               </>
             )}
-            {!selectionMode && actions.bulkSelect && (
+            {!selectionMode && (
               <button
                 onClick={() => {
                   onToggleSelect(session.sessionId);
@@ -1091,7 +1108,7 @@ function SessionCardInner({
                 }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
-                <Copy className="w-3 h-3" /> Select for Bulk
+                <Copy className="w-3 h-3" /> Select (Ctrl-click)
               </button>
             )}
             {onClose && (
