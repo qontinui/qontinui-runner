@@ -14,6 +14,10 @@ Usage:
     python find_rag.py --project-id <id> --capture-screen --monitor 0
 """
 
+import os_trust  # noqa: F401  # side effect: outbound TLS trusts the OS store (os_trust.py)
+
+# isort: split
+
 import argparse
 import asyncio
 import base64

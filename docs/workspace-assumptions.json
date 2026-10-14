@@ -1506,6 +1506,42 @@
     },
     {
       "class": "repo_layout",
+      "file": "src/canonical_corpus.rs",
+      "symbol": "const DEFAULT_URL",
+      "excerpt": "const DEFAULT_URL: &str = \"https://github.com/qontinui/qontinui-claude-config.git\";",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Last rung of the canonical mirror's clone-URL resolution, after QONTINUI_CANONICAL_CORPUS_URL and the workspace checkout's remote.origin.url: a remote URL in the same https://github.com/qontinui/<repo>.git form ci_node uses, never a local path. Absent network, the mirror fails closed and the spawn falls to the next corpus rung."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/canonical_corpus.rs",
+      "symbol": "const MIRROR_DIR",
+      "excerpt": "const MIRROR_DIR: &str = \"canonical/qontinui-claude-config.git\";",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The bare mirror's path UNDER the per-instance runner config dir — a directory the runner owns and creates, not an assumption about the workspace layout; the repo name is only the directory's label."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/canonical_corpus.rs",
+      "symbol": "refresh_into",
+      "excerpt": "\"canonical_corpus: serving qontinui-claude-config@{} ({} of {} bundled \\",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "A log message naming which repo@sha the mirror is serving — diagnostic text, never a path resolved on disk."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/canonical_corpus.rs",
+      "symbol": "resolve_url",
+      "excerpt": ".map(|root| root.join(\"qontinui-claude-config\"))",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Middle rung of the canonical mirror's clone-URL resolution: read the workspace qontinui-claude-config checkout's remote.origin.url when that checkout exists; absent, the https://github.com/qontinui/qontinui-claude-config.git default answers. Off the spawn path; no checkout is read or written beyond that one bounded git config."
+    },
+    {
+      "class": "repo_layout",
       "file": "src/capability_manifest.rs",
       "symbol": "Rung::describe",
       "excerpt": "\"found under `<workspace-root>/qontinui-runner/src-tauri/…` — this \\",
@@ -1521,6 +1557,15 @@
       "count": 1,
       "disposition": "unreviewed",
       "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/capability_manifest.rs",
+      "symbol": "Rung::from_command_source",
+      "excerpt": "qontinui-claude-config origin/main), not an account-layer arm\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk."
     },
     {
       "class": "repo_layout",
@@ -1809,15 +1854,6 @@
     },
     {
       "class": "repo_layout",
-      "file": "src/fleet_commands.rs",
-      "symbol": "with_provenance",
-      "excerpt": "\"{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \\",
-      "count": 1,
-      "disposition": "unreviewed",
-      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
-    },
-    {
-      "class": "repo_layout",
       "file": "src/main.rs",
       "symbol": "run_app",
       "excerpt": "injected. Set $QONTINUI_ROOT (or `paths.workspace_root`) to \\",
@@ -1905,6 +1941,15 @@
       "excerpt": "is already installed for this interpreter. Set $QONTINUI_ROOT to the \\",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/provenance.rs",
+      "symbol": "const CANONICAL_REPO",
+      "excerpt": "const CANONICAL_REPO: &str = \"qontinui-claude-config\";",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk."
     },
     {
       "class": "repo_layout",

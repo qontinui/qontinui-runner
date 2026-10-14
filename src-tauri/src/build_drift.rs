@@ -110,12 +110,27 @@ fn latest_cell() -> &'static Mutex<Option<BuildDriftStatus>> {
 // the end of one tick. Nothing here runs on the request path.
 // ---------------------------------------------------------------------------
 
-/// The repo-relative path of the file that declares the four consts, tried in
-/// order: the runner repo root (`candidate_repo_dir`'s first candidate), then
-/// the `src-tauri` crate root (its second).
-const TOOL_POLICY_SOURCE_PATHS: &[&str] = &["src-tauri/src/mcp_api.rs", "src/mcp_api.rs"];
+/// The repo-relative paths that may declare the four consts, tried in order.
+///
+/// The split of `mcp_api.rs` (plan
+/// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+/// D4) moves the consts to `mcp_api/coord_mcp_proxy/tool_policy.rs`, so that
+/// path is tried FIRST and the pre-split `mcp_api.rs` second: this binary must
+/// read a trunk on either side of the move. Each is spelled from the runner
+/// repo root (`candidate_repo_dir`'s first candidate) and from the `src-tauri`
+/// crate root (its second).
+///
+/// A trunk may hold BOTH files — the post-split `mcp_api.rs` still exists, just
+/// without the consts — which is why [`first_parsable_tool_policy`] selects on
+/// a successful PARSE, never on the first readable path.
+const TOOL_POLICY_SOURCE_PATHS: &[&str] = &[
+    "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+    "src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+    "src-tauri/src/mcp_api.rs",
+    "src/mcp_api.rs",
+];
 
-/// The four `&[&str]` consts parsed out of `mcp_api.rs` — the SAME four the
+/// The four `&[&str]` consts parsed out of trunk's source — the SAME four the
 /// binary compiled, read from a different commit. Pure data; see
 /// [`parse_tool_policy_consts`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +159,7 @@ impl ParsedToolPolicy {
 /// trunk commit its `cause` is measured against.
 #[derive(Debug, Clone)]
 pub struct TrunkToolPolicy {
-    /// The commit whose `mcp_api.rs` was parsed — the resolved trunk tip when
+    /// The commit whose tool-policy source was parsed — the resolved trunk tip when
     /// `git show` could reach it.
     pub trunk_sha: String,
     /// Unix millis when the read completed. Rendered as `trunkReadAt` in the
@@ -204,11 +219,13 @@ fn parse_str_slice_const(source: &str, name: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Parse the four coord-mcp tool-policy consts out of `mcp_api.rs` source
-/// text. Pure over its input, so the self-test in `mcp_api.rs` can pin it
-/// against `include_str!` of the very file it reads: a reformat that breaks
-/// this parser breaks that test, not production (production degrades to
-/// `None`, i.e. `cause: "unknown"`).
+/// Parse the four coord-mcp tool-policy consts out of source text (whichever
+/// of `TOOL_POLICY_SOURCE_PATHS` declares them). Pure over its input, so the
+/// self-test in the `mcp_api` module can pin it — through
+/// [`first_parsable_tool_policy`], the same one-file-at-a-time selection
+/// production makes — against the working tree's own source: a reformat that
+/// breaks this parser breaks that test, not production (production degrades
+/// to `None`, i.e. `cause: "unknown"`).
 pub fn parse_tool_policy_consts(source: &str) -> Option<ParsedToolPolicy> {
     Some(ParsedToolPolicy {
         allowed: parse_str_slice_const(source, "COORD_MCP_ALLOWED_TOOLS")?,
@@ -236,13 +253,18 @@ const TRUNK_PRIVATE_REF: &str = "refs/build-drift/trunk";
 /// This is split from [`read_trunk_tool_policy`] so a tool-policy PARSE
 /// failure cannot also destroy the drift COUNT: the two were independent
 /// before the caches were unified and must stay independent. A trunk that
-/// reformats `mcp_api.rs` past the hand-rolled parser is a case
+/// reformats the tool-policy source past the hand-rolled parser is a case
 /// [`parse_tool_policy_consts`] plans for; it must degrade `cause` to
 /// `unknown`, not blank `commitsBehind` on every box in the fleet.
 ///
 /// Every git call is bounded ([`git_output`] / [`run_probe_quiet`]) and
-/// inherits the fleet's single-source credential posture from
-/// [`crate::process_helpers::no_window`] — never a second copy here.
+/// starts from the fleet's single-source credential posture
+/// ([`crate::process_helpers::no_window`] — never a second copy here), which
+/// also scrubs the repository-local environment with ONE shared function,
+/// [`qontinui_runner_lib::git_posture::scrub_repo_local_git_env`]: this
+/// module's own calls are built by [`drift_git`], and the trunk-name read
+/// ([`crate::git_trunk::resolve_trunk_branch`]) applies the same scrub inside
+/// its resolver.
 /// `--no-write-fetch-head` keeps the fetch from rewriting the source
 /// checkout's per-worktree `FETCH_HEAD` (git writes it even for a refspec
 /// with a destination ref, and a peer mid-`git pull` there would otherwise
@@ -262,7 +284,7 @@ fn resolve_trunk_tip(repo: &Path) -> Option<(String, &'static str)> {
     // status + stderr there, and still WARNs on a timeout) — `trunkSource`
     // says the fetch failed, never why.
     let fetched = {
-        let mut cmd = crate::process_helpers::no_window("git");
+        let mut cmd = drift_git();
         cmd.args([
             "-c",
             "gc.auto=0",
@@ -298,25 +320,70 @@ fn resolve_trunk_tip(repo: &Path) -> Option<(String, &'static str)> {
     None
 }
 
-/// Read trunk's `mcp_api.rs` at an already-resolved tip and parse its tool
-/// policy. `None` when the file is unreadable at that sha or the consts do
-/// not parse — the caller keeps the sha regardless (see
-/// [`resolve_trunk_tip`]).
+/// The tool policy from the first of [`TOOL_POLICY_SOURCE_PATHS`] that is
+/// readable through `read` AND parses. `None` when no path does.
+///
+/// Selecting on readability alone was the pre-split reader, and it goes blind
+/// the moment the consts leave `mcp_api.rs`: that file stays readable, the
+/// parse fails, and the refusal's `cause` degrades to `unknown` although the
+/// policy sits one path further on. `read` is the `git show` seam, injected
+/// so the selection is testable against a fixture tree.
+pub(crate) fn first_parsable_tool_policy(
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<ParsedToolPolicy> {
+    TOOL_POLICY_SOURCE_PATHS
+        .iter()
+        .find_map(|p| read(p).and_then(|text| parse_tool_policy_consts(&text)))
+}
+
+/// Read trunk's tool policy at an already-resolved tip, from whichever of
+/// [`TOOL_POLICY_SOURCE_PATHS`] declares it. `None` when no path is readable
+/// at that sha with the consts parsing — the caller keeps the sha regardless
+/// (see [`resolve_trunk_tip`]).
+///
+/// Only paths [`present_tool_policy_paths`] lists are `git show`n. Most of the
+/// list is ABSENT on any given trunk (the split's new path before the move,
+/// the pre-split one after it, and the crate-root spellings always), and
+/// `git_output` WARNs on every non-zero exit — so showing each path blind
+/// would log a routine miss at WARN on every tick on every box. A `show` of a
+/// path the listing says exists can still fail, and that one is unexpected
+/// and keeps its WARN.
+///
+/// Not hermetically testable end to end, which is why the git-backed test
+/// below drives this function and not its caller: [`check_once_blocking`]
+/// takes its repo from [`candidate_repo_dir`], fixed at COMPILE time to this
+/// source checkout, and calls this only after [`resolve_trunk_tip`] reports a
+/// real `fetched` origin result — neither of which a test can point at a
+/// fixture tree.
 fn read_trunk_tool_policy(
     repo: &Path,
     trunk_sha: &str,
     source: &'static str,
 ) -> Option<TrunkToolPolicy> {
-    let source_text = TOOL_POLICY_SOURCE_PATHS
-        .iter()
-        .find_map(|p| git_output(repo, &["show", &format!("{trunk_sha}:{p}")]))?;
-    let policy = parse_tool_policy_consts(&source_text)?;
+    let present = present_tool_policy_paths(repo, trunk_sha)?;
+    let policy = first_parsable_tool_policy(|p| {
+        if present.iter().any(|q| q == p) {
+            git_output(repo, &["show", &format!("{trunk_sha}:{p}")])
+        } else {
+            None
+        }
+    })?;
     Some(TrunkToolPolicy {
         trunk_sha: trunk_sha.to_string(),
         read_at: chrono::Utc::now().timestamp_millis(),
         source,
         policy,
     })
+}
+
+/// Which of [`TOOL_POLICY_SOURCE_PATHS`] exist at `trunk_sha`, in ONE git call
+/// whose exit is 0 whether or not any of them does. Paths are spelled from the
+/// repo root (`--full-tree`), as `git show <sha>:<path>` reads them. `None`
+/// when the listing itself fails or names none of them.
+fn present_tool_policy_paths(repo: &Path, trunk_sha: &str) -> Option<Vec<String>> {
+    let mut args = vec!["ls-tree", "--full-tree", "--name-only", trunk_sha, "--"];
+    args.extend_from_slice(TOOL_POLICY_SOURCE_PATHS);
+    git_output(repo, &args).map(|listing| listing.lines().map(str::to_string).collect())
 }
 
 /// Clone of the most recent drift status, if any check has completed.
@@ -372,10 +439,22 @@ fn candidate_repo_dir() -> Option<PathBuf> {
         .find(|dir| dir.join(".git").exists())
 }
 
+/// The one `git` command every drift probe starts from:
+/// [`crate::process_helpers::no_window`]'s posture, which scrubs the
+/// repository-local environment
+/// ([`qontinui_runner_lib::git_posture::scrub_repo_local_git_env`], the same
+/// scrub the trunk resolver applies). `git -C` / `current_dir` do not
+/// override an inherited `GIT_DIR`, so without it a runner started from a git
+/// hook would measure drift — and read the tool policy — from the caller's
+/// repo instead of [`candidate_repo_dir`].
+fn drift_git() -> std::process::Command {
+    crate::process_helpers::no_window("git")
+}
+
 /// Run `git <args>` in `repo`, returning trimmed stdout on success. Any
 /// failure (spawn error, non-zero exit, empty output) → `None`.
 fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = crate::process_helpers::no_window("git");
+    let mut cmd = drift_git();
     // A credential prompt would sit until `DRIFT_GIT_TIMEOUT` reaps it, every
     // tick; refuse the prompt so an unauthenticated remote fails fast instead.
     cmd.args(args).current_dir(repo);
@@ -515,7 +594,7 @@ fn check_once_blocking() -> BuildDriftStatus {
     // then `trunkSource: local-ref` says the two may trail each other.
     //
     // The tool-policy PARSE is deliberately downstream of the sha: a trunk
-    // that reformats `mcp_api.rs` past the hand-rolled parser degrades `cause`
+    // that reformats the tool-policy source past the hand-rolled parser degrades `cause`
     // to `unknown` and must NOT also blank `commitsBehind`. The two readings
     // were independent before the caches were unified; unifying the STORE
     // must not couple the failures.
@@ -886,6 +965,355 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         assert!(parse_tool_policy_consts("nothing here").is_none());
         let truncated = SAMPLE.replace("];\nconst COORD_MCP_ALLOWED_TOOL_PREFIXES", "\nconst X");
         assert!(parse_tool_policy_consts(&truncated).is_none());
+    }
+
+    /// A fixture trunk tree: repo-relative path -> contents. Reading a path it
+    /// lacks is `None`, as `git show <sha>:<path>` is for a missing blob.
+    fn tree(files: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let files: std::collections::BTreeMap<String, String> = files
+            .iter()
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .collect();
+        move |p| files.get(p).cloned()
+    }
+
+    /// The post-split trunk (plan
+    /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+    /// D4): the consts live ONLY in `mcp_api/coord_mcp_proxy/tool_policy.rs`,
+    /// and `mcp_api.rs` is still there without them. The pre-split reader
+    /// tried `mcp_api.rs` alone, found it readable, failed the parse and
+    /// returned `None` — `cause: unknown` on every refusal.
+    #[test]
+    fn reads_the_policy_from_the_split_tool_policy_file() {
+        for root in ["src-tauri/", ""] {
+            let read = tree(&[
+                (
+                    format!("{root}src/mcp_api.rs").as_str(),
+                    "mod coord_mcp_proxy;\n",
+                ),
+                (
+                    format!("{root}src/mcp_api/coord_mcp_proxy/tool_policy.rs").as_str(),
+                    SAMPLE,
+                ),
+            ]);
+            let p = first_parsable_tool_policy(&read).expect("the split file declares the policy");
+            assert_eq!(p.allowed, vec!["coord_alpha", "coord_beta", "coord_gamma"]);
+            assert_eq!(p.deliberate, vec!["coord_create_pr"]);
+        }
+    }
+
+    /// Selection is by PARSE SUCCESS, not readability: a readable path whose
+    /// consts do not parse must not hide a later one that does. Here the
+    /// new-layout file exists but declares nothing (a partial move), and the
+    /// policy is still in `mcp_api.rs`.
+    #[test]
+    fn a_readable_file_without_the_consts_does_not_hide_one_with_them() {
+        let read = tree(&[
+            (
+                "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+                "const COORD_MCP_ALLOWED_METHODS: &[&str] = &[\"initialize\"];\n",
+            ),
+            ("src-tauri/src/mcp_api.rs", SAMPLE),
+        ]);
+        let p = first_parsable_tool_policy(&read).expect("mcp_api.rs still declares the policy");
+        assert_eq!(p.allowed_prefixes, vec!["coord_query_"]);
+    }
+
+    /// No path parses: UNKNOWN, never a guess.
+    #[test]
+    fn no_parsable_path_is_none() {
+        assert!(first_parsable_tool_policy(tree(&[])).is_none());
+        let read = tree(&[("src/mcp_api.rs", "nothing here")]);
+        assert!(first_parsable_tool_policy(&read).is_none());
+    }
+
+    /// Run fixture `git <args>` in `repo` (fixed identity, no signing, no
+    /// hooks), returning trimmed stdout; panics on failure.
+    fn fixture_git(repo: &Path, args: &[&str]) -> String {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .current_dir(repo);
+        // Run under a git hook (or any caller that exported them), these
+        // would point the fixture's git at the CALLER's repo and index
+        // instead of the tempdir — the same scrub production applies.
+        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
+        let out = cmd.output().expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A one-commit git repo holding `files`, and that commit's sha.
+    fn git_fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        for (rel, text) in files {
+            let path = repo.join(rel);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write fixture");
+        }
+        fixture_git(repo, &["init", "--quiet"]);
+        fixture_git(repo, &["add", "-A"]);
+        fixture_git(repo, &["commit", "--quiet", "-m", "fixture"]);
+        let sha = fixture_git(repo, &["rev-parse", "HEAD"]);
+        (dir, sha)
+    }
+
+    /// The same post-split shape end to end through `git show`, so the path
+    /// list is proven against a real tree and not only the injected seam.
+    #[test]
+    fn read_trunk_tool_policy_finds_the_split_file_through_git_show() {
+        let (dir, sha) = git_fixture(&[
+            ("src-tauri/src/mcp_api.rs", "mod coord_mcp_proxy;\n"),
+            (
+                "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+                SAMPLE,
+            ),
+        ]);
+        let repo = dir.path();
+        // Only the two paths that exist are listed, so only they are ever
+        // `git show`n.
+        assert_eq!(
+            present_tool_policy_paths(repo, &sha).expect("the listing succeeds"),
+            vec![
+                "src-tauri/src/mcp_api.rs",
+                "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+            ]
+        );
+
+        let read = read_trunk_tool_policy(repo, &sha, "local-ref")
+            .expect("the split tool_policy.rs is read through git show");
+        assert_eq!(read.trunk_sha, sha);
+        assert_eq!(
+            read.policy.allowed,
+            vec!["coord_alpha", "coord_beta", "coord_gamma"]
+        );
+    }
+
+    /// The PRE-split trunk every box reads today: the consts are in
+    /// `mcp_api.rs`, and the split's `tool_policy.rs` — FIRST on the path list
+    /// — does not exist yet. Reading it must be silent at WARN. A blind
+    /// `git show` of each listed path runs `git_output` on the two absent
+    /// `tool_policy.rs` spellings first, and each non-zero exit WARNs — two
+    /// lines every tick on every box for an expected miss.
+    #[test]
+    fn a_pre_split_trunk_is_read_without_warning_about_the_absent_split_path() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// Run `f` under a fresh WARN-level capture; its result and the text
+        /// logged. Scoped, not global: other tests run in parallel, and
+        /// `run_probe` WARNs on this (the calling) thread.
+        fn warns_of<R>(f: impl FnOnce() -> R) -> (R, String) {
+            let sink = Captured::default();
+            let buf = sink.0.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let out = tracing::subscriber::with_default(subscriber, f);
+            let logged = String::from_utf8_lossy(&buf.lock().expect("capture lock")).to_string();
+            (out, logged)
+        }
+
+        let (dir, sha) = git_fixture(&[("src-tauri/src/mcp_api.rs", SAMPLE)]);
+
+        // Positive control, through the SAME capture: a `git show` of a path
+        // that is not in the tree does WARN, and the capture records it.
+        // Without this, the absence assertion below would also pass if the
+        // capture recorded nothing at all.
+        let (shown, control) =
+            warns_of(|| git_output(dir.path(), &["show", &format!("{sha}:no/such/path")]));
+        assert!(shown.is_none(), "the path is absent from the fixture");
+        assert!(
+            control.contains("build_drift: git"),
+            "the capture must record git_output's WARN, or the absence \
+             assertion below proves nothing:\n{control}"
+        );
+
+        let (read, logged) = warns_of(|| read_trunk_tool_policy(dir.path(), &sha, "fetched"));
+        let read = read.expect("the pre-split mcp_api.rs is read");
+        assert_eq!(read.policy.deliberate, vec!["coord_create_pr"]);
+        assert!(
+            !logged.contains("build_drift: git"),
+            "an absent path on the list must not WARN:\n{logged}"
+        );
+    }
+
+    /// Every drift probe's `git` carries the shared scrub: each
+    /// repository-local variable is REMOVED on the command (`get_envs`
+    /// reports a removal as `None`), so an inherited value never reaches the
+    /// child. That the list is git's own is pinned beside it
+    /// (`git_posture`'s `repo_local_git_env_covers_gits_own_list`).
+    #[test]
+    fn drift_git_removes_every_repo_local_variable() {
+        let cmd = drift_git();
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            assert!(
+                removed.iter().any(|r| r == var),
+                "drift_git must remove {var}; removed: {removed:?}"
+            );
+        }
+    }
+
+    /// And the list is the one that matters: with `GIT_DIR` naming a decoy
+    /// repo, git reads the DECOY although `current_dir` names the target —
+    /// until the scrub runs. The decoy is set on the `Command`, never on this
+    /// process's environment, which parallel tests share.
+    #[test]
+    fn a_decoy_git_dir_is_not_read_once_scrubbed() {
+        let (target, target_sha) = git_fixture(&[("a.txt", "target\n")]);
+        let (decoy, decoy_sha) = git_fixture(&[("a.txt", "decoy\n")]);
+        assert_ne!(target_sha, decoy_sha);
+        let head = |scrub: bool| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(["rev-parse", "HEAD"])
+                .current_dir(target.path())
+                .env("GIT_DIR", decoy.path().join(".git"));
+            if scrub {
+                qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
+            }
+            let out = cmd.output().expect("git runs");
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            head(false),
+            decoy_sha,
+            "control: an unscrubbed GIT_DIR wins"
+        );
+        assert_eq!(head(true), target_sha, "scrubbed, current_dir decides");
+    }
+
+    const CHILD_TARGET_ENV: &str = "QONTINUI_TEST_DRIFT_TARGET";
+    const CHILD_TARGET_SHA_ENV: &str = "QONTINUI_TEST_DRIFT_TARGET_SHA";
+    const CHILD_DECOY_SHA_ENV: &str = "QONTINUI_TEST_DRIFT_DECOY_SHA";
+    const CHILD_REMOTE_SHA_ENV: &str = "QONTINUI_TEST_DRIFT_REMOTE_SHA";
+
+    /// Child of [`production_drift_probes_ignore_an_inherited_git_dir`]:
+    /// skipped in a normal run, run only re-executed by it.
+    #[test]
+    #[ignore = "re-executed by production_drift_probes_ignore_an_inherited_git_dir"]
+    fn inherited_git_dir_child_drift_probes_read_the_named_repo() {
+        use crate::git_trunk::inherited_git_dir_reexec as reexec;
+        let Some(target) = reexec::child_input(CHILD_TARGET_ENV) else {
+            eprintln!("not under the re-exec parent; nothing to assert");
+            return;
+        };
+        let input = |name| reexec::child_input(name).expect("set with the child flag");
+        let (target_sha, decoy_sha, remote_sha) = (
+            input(CHILD_TARGET_SHA_ENV),
+            input(CHILD_DECOY_SHA_ENV),
+            input(CHILD_REMOTE_SHA_ENV),
+        );
+        reexec::assert_inherited_git_dir(&input("GIT_DIR"));
+        let target = Path::new(&target);
+
+        // Control: a raw, UNscrubbed git (the production posture now scrubs
+        // at construction), in the same `current_dir`, answers for the
+        // inherited decoy.
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(target)
+            .output()
+            .expect("git runs");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            decoy_sha,
+            "control: the inherited decoy must answer unscrubbed git"
+        );
+
+        assert_eq!(
+            git_output(target, &["rev-parse", "HEAD"]),
+            Some(target_sha),
+            "git_output must read the repo it names, not the inherited GIT_DIR"
+        );
+        // The fetch must land in the target (where `git_output` then reads
+        // it), so the verdict is `fetched` with the remote's tip.
+        assert_eq!(
+            resolve_trunk_tip(target),
+            Some((remote_sha, "fetched")),
+            "resolve_trunk_tip must fetch into the repo it names"
+        );
+        println!("{}", reexec::ASSERTED_MARKER);
+    }
+
+    /// The REAL drift probes — [`git_output`] and [`resolve_trunk_tip`]'s
+    /// fetch, both built by [`drift_git`] — under a `GIT_DIR` the process
+    /// INHERITED (set on a re-executed child only). The target, its decoy
+    /// and their shared `origin` (a local path, no network) each hold a
+    /// different commit. [`a_decoy_git_dir_is_not_read_once_scrubbed`] proves
+    /// the scrub on a hand-built command; this proves the probes use it.
+    #[test]
+    fn production_drift_probes_ignore_an_inherited_git_dir() {
+        let (remote, remote_sha) = git_fixture(&[("a.txt", "remote\n")]);
+        fixture_git(remote.path(), &["branch", "-M", "main"]);
+        let (target, target_sha) = git_fixture(&[("a.txt", "target\n")]);
+        let (decoy, decoy_sha) = git_fixture(&[("a.txt", "decoy\n")]);
+        let origin = remote.path().to_str().expect("utf-8 tempdir");
+        for repo in [target.path(), decoy.path()] {
+            fixture_git(repo, &["remote", "add", "origin", origin]);
+        }
+        assert!(
+            target_sha != decoy_sha && target_sha != remote_sha && decoy_sha != remote_sha,
+            "three distinct commits, or the shas prove nothing"
+        );
+        let private_ref = |repo: &Path| {
+            git_output(
+                repo,
+                &["rev-parse", "--verify", "--quiet", TRUNK_PRIVATE_REF],
+            )
+        };
+        assert_eq!(private_ref(target.path()), None, "no fetch has run yet");
+
+        crate::git_trunk::inherited_git_dir_reexec::run_child(
+            module_path!(),
+            "inherited_git_dir_child_drift_probes_read_the_named_repo",
+            &decoy.path().join(".git"),
+            &[
+                (CHILD_TARGET_ENV, target.path().as_os_str()),
+                (CHILD_TARGET_SHA_ENV, std::ffi::OsStr::new(&target_sha)),
+                (CHILD_DECOY_SHA_ENV, std::ffi::OsStr::new(&decoy_sha)),
+                (CHILD_REMOTE_SHA_ENV, std::ffi::OsStr::new(&remote_sha)),
+            ],
+        );
+
+        // Where the child's fetch landed, read from out here.
+        assert_eq!(private_ref(target.path()), Some(remote_sha));
+        assert_eq!(
+            private_ref(decoy.path()),
+            None,
+            "the inherited decoy must not receive the fetch"
+        );
     }
 
     #[test]

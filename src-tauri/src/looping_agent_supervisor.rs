@@ -1108,7 +1108,11 @@ async fn spawn_looping_agent_terminal(
     // `--append-system-prompt-file` when that cache exists, inline otherwise
     // (plan `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`).
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-        crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+        crate::terminal::runner_context(
+            crate::terminal::spawn_seam_api_port(),
+            coord_mcp,
+            &crate::served_corpus::probe_async(workdir.as_str()).await,
+        ),
     ));
     // Carried to the child env by the capture hint below; from the SAME
     // carrier the argv uses.

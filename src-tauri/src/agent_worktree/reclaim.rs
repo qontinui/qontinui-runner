@@ -814,6 +814,155 @@ fn worktree_is_building(worktree: &Path, window: Duration) -> bool {
         || path_recently_touched(worktree, window)
 }
 
+// ---------------------------------------------------------------------------
+// Allocation-sibling guard — a remove waits for the whole allocation.
+//
+// One coord allocation materialises several checkouts side by side under
+// `<worktree-root>/<agent-uuid>/` (the requested repo plus every declared
+// sibling build dependency). coord's remove instruction is per-path, and the
+// G1/G6 guards above only look at the TARGET — so a remove could proceed while
+// the allocation's other checkout held uncommitted work or a live build that
+// still compiles against it. Plan
+// `2026-10-07-runner-executes-a-coord-remove-without-checking-the-allocations-other-checkouts`
+// Phase 1.
+// ---------------------------------------------------------------------------
+
+/// Why an allocation sibling holds a removal back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SiblingBusy {
+    /// `git status --porcelain` answered and reported real work.
+    Dirty,
+    /// The sibling (or the agent dir itself) could not be read: the dirty
+    /// probe did not answer, its `.git` presence is undeterminable, or the
+    /// directory listing / an entry's file type errored. Fails closed.
+    Unreadable,
+    /// G6 — a held `.cargo-lock` or recent activity inside the window.
+    Building,
+}
+
+impl SiblingBusy {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            SiblingBusy::Dirty => "dirty",
+            SiblingBusy::Unreadable => "unreadable",
+            SiblingBusy::Building => "building",
+        }
+    }
+}
+
+/// The first checkout beside `worktree` in its allocation that is dirty,
+/// unreadable or building — `None` when every sibling is clean and idle, and
+/// a removal of `worktree` may proceed as far as the allocation is concerned.
+///
+/// Scope: the agent dir is `worktree.parent()`, and the guard applies ONLY
+/// when that is a session-uuid dir ([`is_session_uuid_dir`]). Any other parent
+/// — a sibling-scan worktree at the workspace root — is a no-op, so the guard
+/// can never turn into a walk of every canonical checkout.
+///
+/// Per sibling directory (the target itself, `.cargo/`, stray files and
+/// symlinks are skipped): a sibling MEASURED to have no `.git` is not a
+/// checkout, so git has nothing to report on it — it is skipped once the
+/// activity check finds it idle (a non-git build output can still be
+/// building). Skipping it is deliberate rather than leaning on
+/// [`super::dirty::verdict_from_outcome`]'s carve-out: the carve-out only fires
+/// when `git status` DEGRADES, and a no-`.git` dir nested in an enclosing repo
+/// gets that repo's porcelain instead. Otherwise the tri-state dirty probe
+/// (only [`super::dirty::DirtyVerdict::permits_removal`] passes) and then
+/// [`probe_building`]'s G6 signal.
+///
+/// Fail-closed: an unreadable agent dir reports the agent dir itself as
+/// [`SiblingBusy::Unreadable`]; an entry whose type cannot be read reports
+/// that entry.
+pub(super) fn busy_allocation_sibling(worktree: &Path) -> Option<(PathBuf, SiblingBusy)> {
+    busy_allocation_sibling_with(
+        worktree,
+        Duration::from_secs(activity_window_secs()),
+        super::dirty::RECLAIM_DIRTY_PROBE_TIMEOUT,
+    )
+}
+
+/// [`busy_allocation_sibling`] with the G6 window and the dirty-probe budget
+/// injected, so tests drive it without touching the process environment.
+fn busy_allocation_sibling_with(
+    worktree: &Path,
+    window: Duration,
+    dirty_timeout: Duration,
+) -> Option<(PathBuf, SiblingBusy)> {
+    use super::dirty::{DirtyVerdict, GitPresence};
+
+    let agent_dir = worktree.parent()?;
+    if !is_session_uuid_dir(agent_dir) {
+        return None;
+    }
+    let entries = match std::fs::read_dir(agent_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(
+                "worktree_reclaim: cannot list allocation dir {} ({e}) — treating it as \
+                 unreadable",
+                agent_dir.display()
+            );
+            return Some((agent_dir.to_path_buf(), SiblingBusy::Unreadable));
+        }
+    };
+    let target_name = worktree.file_name();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Some((agent_dir.to_path_buf(), SiblingBusy::Unreadable));
+        };
+        let name = entry.file_name();
+        if Some(name.as_os_str()) == target_name || name == ".cargo" {
+            continue;
+        }
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => {}
+            Ok(_) => continue, // a stray file or a link — not a checkout
+            Err(_) => return Some((path, SiblingBusy::Unreadable)),
+        }
+        match super::dirty::probe_git_presence(&path) {
+            // Not a checkout, so there is nothing for git to report — but a
+            // non-git build output (or a half-materialised sibling) can still
+            // be mid-build, so the activity check runs before it is skipped.
+            GitPresence::Absent => {
+                if worktree_is_building(&path, window) {
+                    return Some((path, SiblingBusy::Building));
+                }
+                continue;
+            }
+            GitPresence::Undetermined => return Some((path, SiblingBusy::Unreadable)),
+            GitPresence::Present => {}
+        }
+        match super::dirty::probe_reclaim_dirty(
+            &path,
+            dirty_timeout,
+            "worktree_reclaim: allocation sibling git status --porcelain",
+        ) {
+            DirtyVerdict::Clean => {}
+            DirtyVerdict::Dirty => return Some((path, SiblingBusy::Dirty)),
+            DirtyVerdict::Unknown => return Some((path, SiblingBusy::Unreadable)),
+        }
+        if worktree_is_building(&path, window) {
+            return Some((path, SiblingBusy::Building));
+        }
+    }
+    None
+}
+
+/// The one log line every removal path emits when [`busy_allocation_sibling`]
+/// holds a remove back.
+///
+/// `unreadable` logs at WARN: a sibling that can never be read holds its whole
+/// allocation back indefinitely, and that should be visible, not routine.
+pub(super) fn log_busy_sibling_skip(worktree: &Path, sibling: &Path, busy: SiblingBusy) {
+    let (w, s, b) = (worktree.display(), sibling.display(), busy.as_str());
+    if busy == SiblingBusy::Unreadable {
+        warn!("worktree_reclaim: {w} — skipping remove: allocation sibling {s} is {b}");
+    } else {
+        info!("worktree_reclaim: {w} — skipping remove: allocation sibling {s} is {b}");
+    }
+}
+
 /// Execute all instructions in one pull.
 fn execute_pull(pull: &ReclaimPull) {
     if pull.instructions.is_empty() {
@@ -891,6 +1040,15 @@ fn execute_pull(pull: &ReclaimPull) {
                     instr.worktree_path
                 );
                 continue;
+            }
+
+            // The allocation's OTHER checkouts — a remove waits until every
+            // sibling under the same agent dir is clean, readable and idle.
+            if instr.action == ReclaimAction::Remove && root_exists {
+                if let Some((sibling, busy)) = busy_allocation_sibling(&wt) {
+                    log_busy_sibling_skip(&wt, &sibling, busy);
+                    continue;
+                }
             }
         }
 
@@ -1367,6 +1525,11 @@ fn backstop_consider_one(repo_dir: &Path, ceiling: u64, coord_ever_live: bool) {
         );
         return;
     }
+    // Never remove one checkout of an allocation while another is busy.
+    if let Some((sibling, busy)) = busy_allocation_sibling(repo_dir) {
+        log_busy_sibling_skip(repo_dir, &sibling, busy);
+        return;
+    }
     // INV-W4: unlink every top-level junction (plus the Tauri-layout
     // `src-tauri/target`) BEFORE the recursive removal, via the same step
     // machinery as coord-issued removals ([`execute_steps`] aborts the plan
@@ -1624,7 +1787,7 @@ pub fn spawn_reclaim() {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(in crate::agent_worktree) mod tests {
     use super::*;
 
     /// The health signal must separate "idle" from "dead". This is the single
@@ -1901,6 +2064,161 @@ mod tests {
         assert!(
             dir.path().join(session).exists(),
             "session dir with a surviving sibling must not be pruned"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Allocation-sibling guard (`busy_allocation_sibling`). Real `git init`
+    // repos rather than `session_worktree`'s fake gitfile, which makes
+    // `git status` fail and would read every sibling as Unreadable.
+    // -----------------------------------------------------------------
+
+    const ALLOC_SESSION: &str = "019fbb23-0b1c-7a2d-8e3f-4a5b6c7d8e9f";
+    const NO_WINDOW: Duration = Duration::from_secs(0);
+    const PROBE_BUDGET: Duration = Duration::from_secs(30);
+
+    /// A `git` command that cannot reach an outer repository: an inherited
+    /// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / object-directory
+    /// override (a test run from a git hook exports them) overrides `-C`, and would point `init`/`add` at the
+    /// enclosing repo instead of the temp dir.
+    pub(in crate::agent_worktree) fn hermetic_git() -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            cmd.env_remove(key);
+        }
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd
+    }
+
+    /// `git init` a repo at `dir` — hermetic: no commit is made, so no
+    /// identity or ambient config is consulted beyond `git status`'s own.
+    fn git_init(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = hermetic_git()
+            .args(["-c", "init.defaultBranch=main", "init", "-q"])
+            .arg(dir)
+            .output()
+            .expect("git on PATH");
+        assert!(out.status.success(), "git init: {out:?}");
+    }
+
+    /// Make `repo` dirty with a STAGED file — visible to `git status` even
+    /// under an ambient `status.showUntrackedFiles=no`.
+    fn make_dirty(repo: &Path) {
+        std::fs::write(repo.join("wip.txt"), "uncommitted").unwrap();
+        let out = hermetic_git()
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "wip.txt"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git add: {out:?}");
+    }
+
+    /// `<tmp>/<uuid>/{a,b}`, both real, clean repos. Returns (a, b).
+    fn allocation_pair(root: &Path) -> (PathBuf, PathBuf) {
+        let a = root.join(ALLOC_SESSION).join("a");
+        let b = root.join(ALLOC_SESSION).join("b");
+        git_init(&a);
+        git_init(&b);
+        (a, b)
+    }
+
+    #[test]
+    fn a_dirty_allocation_sibling_holds_the_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = allocation_pair(dir.path());
+        make_dirty(&b);
+        assert_eq!(
+            busy_allocation_sibling_with(&a, NO_WINDOW, PROBE_BUDGET),
+            Some((b, SiblingBusy::Dirty))
+        );
+    }
+
+    #[test]
+    fn clean_idle_allocation_siblings_permit_the_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _b) = allocation_pair(dir.path());
+        // Stray files and `.cargo/` beside the checkouts are not siblings.
+        std::fs::write(dir.path().join(ALLOC_SESSION).join("stray.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join(ALLOC_SESSION).join(".cargo")).unwrap();
+        assert_eq!(
+            busy_allocation_sibling_with(&a, NO_WINDOW, PROBE_BUDGET),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sibling_whose_git_cannot_be_read_holds_the_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join(ALLOC_SESSION).join("a");
+        git_init(&a);
+        let b = dir.path().join(ALLOC_SESSION).join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join(".git"), "gitdir: /nonexistent/.git/worktrees/b").unwrap();
+        assert_eq!(
+            busy_allocation_sibling_with(&a, NO_WINDOW, PROBE_BUDGET),
+            Some((b, SiblingBusy::Unreadable))
+        );
+    }
+
+    #[test]
+    fn a_building_allocation_sibling_holds_the_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = allocation_pair(dir.path());
+        // Freshly created ⇒ root mtime is inside a 600 s window ⇒ G6.
+        assert_eq!(
+            busy_allocation_sibling_with(&a, Duration::from_secs(600), PROBE_BUDGET),
+            Some((b, SiblingBusy::Building))
+        );
+    }
+
+    #[test]
+    fn a_sibling_with_no_git_is_not_a_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join(ALLOC_SESSION).join("a");
+        git_init(&a);
+        std::fs::create_dir_all(dir.path().join(ALLOC_SESSION).join("scratch")).unwrap();
+        assert_eq!(
+            busy_allocation_sibling_with(&a, NO_WINDOW, PROBE_BUDGET),
+            None
+        );
+    }
+
+    #[test]
+    fn a_building_sibling_with_no_git_still_holds_the_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join(ALLOC_SESSION).join("a");
+        git_init(&a);
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&a, old).unwrap();
+        let scratch = dir.path().join(ALLOC_SESSION).join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert_eq!(
+            busy_allocation_sibling_with(&a, Duration::from_secs(600), PROBE_BUDGET),
+            Some((scratch, SiblingBusy::Building))
+        );
+    }
+
+    #[test]
+    fn a_non_uuid_parent_never_walks_its_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("qontinui-root").join("a");
+        let b = dir.path().join("qontinui-root").join("b");
+        git_init(&a);
+        git_init(&b);
+        make_dirty(&b);
+        assert_eq!(
+            busy_allocation_sibling_with(&a, Duration::from_secs(600), PROBE_BUDGET),
+            None,
+            "a sibling-scan worktree at the workspace root must not trigger a walk"
         );
     }
 
