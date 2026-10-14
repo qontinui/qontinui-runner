@@ -479,7 +479,9 @@ export function displayedAccountSelection(settings: AiSettings): {
     settings.effective_account_selection_mode !== undefined;
   return {
     mode: fleetManaged ? settings.effective_account_selection_mode : local,
-    source: settings.account_selection_source,
+    // A ticked (even unsaved) pin is what governs, whatever the runner said
+    // at load time.
+    source: pinned ? "pinned" : settings.account_selection_source,
     fleetManaged,
   };
 }

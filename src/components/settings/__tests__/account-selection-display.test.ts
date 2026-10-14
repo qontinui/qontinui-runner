@@ -115,7 +115,7 @@ describe("displayedAccountSelection — older runner without the raw fleet value
       displayedAccountSelection(
         settingsWith({ local: "manual", pinned: true, effective: "least_usage", source: "fleet" }),
       ),
-    ).toEqual({ mode: "manual", source: "fleet", fleetManaged: false });
+    ).toEqual({ mode: "manual", source: "pinned", fleetManaged: false });
   });
 
   it("falls back to local when the runner reports no view fields at all", () => {

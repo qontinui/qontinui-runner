@@ -540,12 +540,13 @@ pub struct AiSettings {
 /// account-selection mode that actually governs this machine and the input
 /// that decided it ([`crate::claude_accounts::effective_selection`]).
 ///
-/// Read-only by construction — it is `Serialize` only, and the two derived
-/// keys are never fields of [`AiSettings`]: a derived value persisted into
-/// `settings.json` would be written back by every save. A client that echoes
-/// the view back on `PUT /settings/ai` is harmless, because `AiSettings` has
-/// no `deny_unknown_fields` and the two keys are dropped on deserialize
-/// (pinned by `mcp::settings` tests).
+/// Read-only by construction — it is `Serialize` only, and the three derived
+/// keys (`effective_account_selection_mode`, `account_selection_source`,
+/// `fleet_account_selection_mode`) are never fields of [`AiSettings`]: a
+/// derived value persisted into `settings.json` would be written back by every
+/// save. A client that echoes the view back on `PUT /settings/ai` is harmless,
+/// because `AiSettings` has no `deny_unknown_fields` and the three keys are
+/// dropped on deserialize (pinned by `mcp::settings` tests).
 ///
 /// Plan `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
 /// Phase 2.
@@ -5829,7 +5830,10 @@ pub fn save_ci_node_settings(ci_node: CiNodeSettings) -> Result<(), String> {
     update_settings(|settings| settings.ci_node = ci_node)
 }
 
-/// Save AI settings.
+/// Persist AI settings WITHOUT the write lock — private on purpose: every
+/// writer goes through [`update_ai_settings`], which holds
+/// `AI_SETTINGS_WRITE_LOCK` across the read and this write. A second public
+/// door here is how a lock-free read-modify-write loses a concurrent change.
 ///
 /// The whole-`AiSettings` per-instance save stays as-is (its embedded
 /// `claude_cli.config_dir` / `account_selection_mode` / `account_selection_pinned`
@@ -5837,7 +5841,7 @@ pub fn save_ci_node_settings(ci_node: CiNodeSettings) -> Result<(), String> {
 /// in `load_settings` wins unconditionally). ADDITIONALLY mirrors those three
 /// roster fields into the machine-global `claude-accounts.json` so mode/pin
 /// changes made on any instance reach every instance.
-pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
+fn save_ai_settings_unlocked(ai_settings: AiSettings) -> Result<(), String> {
     let config_dir = ai_settings.claude_cli.config_dir.clone();
     let selection_mode = ai_settings.claude_cli.account_selection_mode;
     let selection_pinned = ai_settings.claude_cli.account_selection_pinned;
@@ -5859,7 +5863,9 @@ pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
 /// `claude-accounts.json` — merging over it would write a stale
 /// `config_dir` / mode / pin back machine-wide. The base here is
 /// [`get_ai_settings`] (roster overlaid), and the write is
-/// [`save_ai_settings`] (per-instance save + roster mirror), unchanged.
+/// [`save_ai_settings_unlocked`] (per-instance save + roster mirror).
+/// That writer is private to this module, so this function is the ONLY door
+/// through which `settings.ai` is written.
 static AI_SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Why [`update_ai_settings`] did not save.
@@ -5882,7 +5888,7 @@ pub fn update_ai_settings<E>(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let next = f(get_ai_settings()).map_err(AiSettingsUpdateError::Rejected)?;
-    save_ai_settings(next.clone()).map_err(AiSettingsUpdateError::SaveFailed)?;
+    save_ai_settings_unlocked(next.clone()).map_err(AiSettingsUpdateError::SaveFailed)?;
     Ok(next)
 }
 
@@ -6054,11 +6060,6 @@ fn store_performance_cache(entry: CachedPerformance) {
 /// Get the interactive sessions enabled setting
 pub fn get_interactive_sessions_enabled() -> bool {
     crate::config_facade::get_interactive_sessions_enabled()
-}
-
-/// Save the interactive sessions enabled setting
-pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
-    crate::config_facade::save_interactive_sessions_enabled(enabled)
 }
 
 /// Get the auto-continue AI workflow setting
