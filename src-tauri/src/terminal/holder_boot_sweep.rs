@@ -36,9 +36,11 @@
 //! dead panes are reaped (concurrently, under
 //! `qontinui_pty_holder::sweep::REAP_BUDGET`) — so the restore never sees a
 //! dead holder's still-running `claude` as live, refuses its resume, and then
-//! watches the sweep reap it (review round 2, N4). With no dead panes it
-//! settles right after the adoptions. A reap that overruns its budget keeps
-//! the sweep unsettled until it finishes (review round 4, L1).
+//! watches the sweep reap it (review round 2, N4) — and the orphan-ledger
+//! re-checks are done too. It settles ONCE, after all of that; a reap that
+//! overruns its budget keeps it unsettled until it finishes (review round 4,
+//! L1). (The restore does not wait for it to start on unheld records: see
+//! the census below.)
 //!
 //! The webview does not wait for all of that before restoring anything
 //! (review round 4, M1): [`sweep_status`] (the `terminal_holder_sweep_status`
@@ -66,9 +68,9 @@
 //!   fails, the holder is LEFT ALIVE and handed to a background retry
 //!   ([`retry_in_background`]: every [`BACKGROUND_RETRY_EVERY`] for at most
 //!   [`BACKGROUND_RETRY_FOR`]). Each background attempt re-reads the
-//!   session's registry record, and the retry stops when that record is
-//!   retired, the session is hosted by another live terminal, the holder
-//!   dies, or another path opens the pane ([`retry_stop_reason`]);
+//!   session's registry record (its current page), and the retry stops when
+//!   the session is hosted by another live terminal, the holder dies, or
+//!   another path opens the pane ([`retry_stop_reason`]);
 //! - LEAVE ALONE — a live holder below this runner's data path: not adopted,
 //!   NOT touched, exactly like a census Incompatible (plan D15);
 //! - END — only a FINAL answer: `no_common_version`, `peer_not_authorized`,
@@ -79,6 +81,17 @@
 //!
 //! Incompatible and unanswering (Unknown) panes are not adopted and not
 //! touched (D15; nothing proves an Unknown pane is ours to end).
+//!
+//! While a live holder's adoption is pending — in the sweep, or in the
+//! background retry — its terminal id is in [`adoption_pending`], and the
+//! session lifecycle poll HOLDS the record on that terminal instead of
+//! closing it `no-terminal` (review round 5, S1): without a tab the record
+//! matches no live terminal, and ~3 min of that would retire a session whose
+//! `claude` is alive. A retired record does not stop an adoption either. The
+//! id leaves the set when the adoption succeeds, when it stops for another
+//! reason (another path owns the pane, the holder is gone, the session is
+//! hosted elsewhere), or when the background retry's window ends — then
+//! nothing is ended, and it is logged loudly.
 //!
 //! # Gate
 //!
@@ -173,12 +186,43 @@ struct SweepState {
     /// The terminal ids of the live panes still being adopted — `None` until
     /// the census is in. Every other record may be restored at once.
     held: Option<BTreeSet<String>>,
+    /// Held panes that stay held until the settle even once their adoption
+    /// finished: a definitive end whose holder or child could not be seen
+    /// gone (review round 5, L4) — the restore must not refuse that session
+    /// as "live" before the sweep has done everything it will do.
+    held_until_settle: BTreeSet<String>,
 }
 
 static STATE: Mutex<SweepState> = Mutex::new(SweepState {
     phase: Phase::NotStarted,
     held: None,
+    held_until_settle: BTreeSet::new(),
 });
+
+/// Terminal ids whose holder is ALIVE and whose adoption is pending — in the
+/// sweep, or in the background retry. The session lifecycle poll holds a
+/// record on such a terminal (never closes it `no-terminal`) for as long as
+/// the id is here (review round 5, S1): otherwise a deferred adoption's live
+/// `claude` would lose its record ~3 min in, and with it its tab.
+static ADOPTION_PENDING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Whether `terminal_id`'s holder is alive with its adoption pending — what
+/// the lifecycle poll asks before it may close a record on that terminal.
+pub fn adoption_pending(terminal_id: &str) -> bool {
+    ADOPTION_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(terminal_id)
+}
+
+fn set_adoption_pending(terminal_id: &str, pending: bool) {
+    let mut set = ADOPTION_PENDING.lock().unwrap_or_else(|p| p.into_inner());
+    if pending {
+        set.insert(terminal_id.to_string());
+    } else {
+        set.remove(terminal_id);
+    }
+}
 static STATE_CHANGED: Condvar = Condvar::new();
 
 fn with_state(f: impl FnOnce(&mut SweepState)) {
@@ -191,6 +235,7 @@ fn set_phase(phase: Phase) {
         s.phase = phase;
         if phase == Phase::Running {
             s.held = None;
+            s.held_until_settle.clear();
         }
     });
 }
@@ -204,9 +249,19 @@ fn publish_held(ids: impl IntoIterator<Item = String>) {
 /// or deferred to the background retry. Its record is the restore's again.
 fn release_held(id: &str) {
     with_state(|s| {
+        if s.held_until_settle.contains(id) {
+            return;
+        }
         if let Some(held) = &mut s.held {
             held.remove(id);
         }
+    });
+}
+
+/// Keep `id` held until the sweep settles (see [`SweepState`]).
+fn hold_until_settle(id: &str) {
+    with_state(|s| {
+        s.held_until_settle.insert(id.to_string());
     });
 }
 
@@ -462,11 +517,19 @@ fn end_unadoptable_holder(pane_dir: &Path, adoption: &Adoption, why: &str) {
             }
         }
         if Instant::now() >= end {
-            warn!(
+            // Review round 5, L4: not provably gone — a child the dead-holder
+            // reap could not prove (no start token, or not Linux), or a holder
+            // that outlived the wait. The session stays HELD until the sweep
+            // settles, so the restore re-decides it then instead of refusing
+            // it as "live" now.
+            hold_until_settle(&adoption.pane_id);
+            error!(
                 pane = %adoption.pane_id,
                 holder_gone,
                 child_gone,
-                "pty holder boot sweep: the ended holder's pane is not gone yet"
+                "pty holder boot sweep: the ended holder's pane is not provably gone — its \
+                 session is held until the sweep settles; if its child is still alive then, \
+                 it is left running with no tab"
             );
             return;
         }
@@ -625,9 +688,10 @@ pub enum SessionNow {
     },
 }
 
-/// Whether the background retry must stop, and why: the session's record was
-/// retired, or the session is now hosted by a DIFFERENT live terminal (the
-/// user cold-resumed it by hand). Pure, so it is tested on its own.
+/// Whether an adoption must stop, and why: the session is now hosted by a
+/// DIFFERENT live terminal (the user cold-resumed it by hand). A RETIRED
+/// record does not stop it (review round 5, S1). Pure, so it is tested on its
+/// own.
 pub fn retry_stop_reason(
     pane_id: &str,
     now: &SessionNow,
@@ -635,7 +699,10 @@ pub fn retry_stop_reason(
 ) -> Option<String> {
     match now {
         SessionNow::Untracked => None,
-        SessionNow::Retired => Some("the session's registry record was retired".into()),
+        // Retired: keep adopting — a live holder's session must not be lost
+        // to a record some other path closed (review round 5, S1); the tab
+        // comes back, and the session can be resumed from it.
+        SessionNow::Retired => None,
         SessionNow::OpenOn { terminal_id, .. }
             if terminal_id != pane_id && terminal_live(terminal_id) =>
         {
@@ -674,6 +741,7 @@ fn spawn_background_retry(
     adoption: Adoption,
 ) {
     let name = format!("pty-holder-readopt-{}", adoption.pane_id);
+    let pane_id_for_error = adoption.pane_id.clone();
     let spawned = std::thread::Builder::new().name(name).spawn(move || {
         let adopt = || {
             let mut fresh = adoption.clone();
@@ -703,12 +771,17 @@ fn spawn_background_retry(
             BACKGROUND_RETRY_EVERY,
             BACKGROUND_RETRY_FOR,
         );
+        // However the retry ended — adopted, stopped, or out of time — the
+        // adoption is no longer pending: the lifecycle poll may judge the
+        // record on its own evidence again.
+        set_adoption_pending(&adoption.pane_id, false);
         if matches!(late, AdoptOutcome::Deferred(_)) {
             error!(
                 pane = %adoption.pane_id,
                 outcome = ?late,
-                "pty holder boot sweep: background adoption retry GAVE UP — the holder is left \
-                 running with no tab until the next start's sweep"
+                "pty holder boot sweep: background adoption retry GAVE UP after its window — \
+                 the holder is left RUNNING with no tab (nothing is ended), and its record is \
+                 no longer held from the lifecycle poll"
             );
         } else {
             info!(
@@ -719,6 +792,7 @@ fn spawn_background_retry(
         }
     });
     if let Err(e) = spawned {
+        set_adoption_pending(&pane_id_for_error, false);
         error!(error = %e, "pty holder boot sweep: background adoption retry did not start");
     }
 }
@@ -736,6 +810,9 @@ fn adopt_all(
     // The census is in: publish which panes are held, so the restore can
     // start on every other record now (review round 4, M1).
     publish_held(adoptions.iter().map(|a| a.pane_id.clone()));
+    for a in &adoptions {
+        set_adoption_pending(&a.pane_id, true);
+    }
     let mut threads = Vec::new();
     for adoption in adoptions {
         if adoption.pinned_session_id.is_empty() {
@@ -755,7 +832,18 @@ fn adopt_all(
         let thread = std::thread::Builder::new()
             .name(format!("pty-holder-adopt-{}", adoption.pane_id))
             .spawn(move || {
-                let adopt = || adopt_once(&manager, &app_handle, &adoption);
+                let adopt = || {
+                    // A session the user already resumed in another live
+                    // terminal is not adopted a second time (review round 5).
+                    if let Some(why) = retry_stop_reason(
+                        &adoption.pane_id,
+                        &session_now(store.as_deref(), &adoption),
+                        |terminal| manager.get(terminal).is_some(),
+                    ) {
+                        return Err(AdoptError::Claimed(why));
+                    }
+                    adopt_once(&manager, &app_handle, &adoption)
+                };
                 let end = |why: &str| end_unadoptable_holder(&pane_dir, &adoption, why);
                 let outcome = adopt_with_retries(&adopt, &end, &|i| {
                     std::thread::sleep(ATTACH_BACKOFF[i])
@@ -797,12 +885,17 @@ fn adopt_all(
                         );
                     }
                 }
+                // Pending stays set only while the background retry has it.
+                if !matches!(outcome, AdoptOutcome::Deferred(_)) {
+                    set_adoption_pending(&adoption.pane_id, false);
+                }
                 release_held(&adoption.pane_id);
                 outcome == AdoptOutcome::Adopted
             });
         match thread {
             Ok(t) => threads.push(t),
             Err(e) => {
+                set_adoption_pending(&pane_id, false);
                 release_held(&pane_id);
                 warn!(error = %e, "pty holder boot sweep: adoption thread did not start");
             }
@@ -815,9 +908,10 @@ fn adopt_all(
         .count()
 }
 
-/// Classify, `adopt` the live panes, reap the dead — and `settle` only once
-/// the dead are reaped (every reap, including one that overran its budget),
-/// or right after the adoptions when there are none (review round 2, N4). Returns the report and how many were adopted.
+/// Classify, `adopt` the live panes, reap the dead, re-check the orphan
+/// ledger — and `settle` once, after ALL of that, including a reap that
+/// overran its budget (review rounds 2 and 5, N4). Returns the report and how
+/// many were adopted.
 /// Separate from the Tauri wiring so the ordering is tested on its own.
 fn sweep_then_settle(
     pane_dir: &Path,
@@ -826,11 +920,8 @@ fn sweep_then_settle(
     settle: impl Fn(),
 ) -> std::io::Result<(SweepReport, usize)> {
     let mut adopted = 0;
-    let swept = boot_sweep_with_pending(pane_dir, CENSUS_TIMEOUT, skip, |entries, dead| {
+    let swept = boot_sweep_with_pending(pane_dir, CENSUS_TIMEOUT, skip, |entries, _dead| {
         adopted = adopt(entries);
-        if dead == 0 {
-            settle();
-        }
     });
     let report = match swept {
         Ok((report, pending)) => {
@@ -991,8 +1082,8 @@ mod tests {
     }
 
     /// Review round 2, N4: with a dead pane to reap, the sweep settles only
-    /// AFTER the reap — at every settle, the dead pane's lock is already gone.
-    /// With none, it settles right after the adoptions.
+    /// AFTER the reap — at every settle, the dead pane's lock is already gone —
+    /// and exactly once.
     #[test]
     fn pty_holder_boot_sweep_settles_only_after_the_dead_are_reaped() {
         let nanos = std::time::SystemTime::now()
@@ -1029,16 +1120,11 @@ mod tests {
             .filter(|(what, _)| *what == "settle")
             .map(|(_, lock_present)| *lock_present)
             .collect();
-        assert!(!settles.is_empty());
-        assert!(
-            settles.iter().all(|present| !present),
-            "settled while the dead pane was still unreaped: {seen:?}"
+        assert_eq!(
+            settles,
+            vec![false],
+            "settled once, after the reap: {seen:?}"
         );
-
-        // No dead pane: settled already from the adoption step.
-        let settled_early = Mutex::new(false);
-        sweep_then_settle(&dir, &[], |_| 0, || *settled_early.lock().unwrap() = true).unwrap();
-        assert!(*settled_early.lock().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1076,8 +1162,8 @@ mod tests {
         assert_eq!((tries.get(), ends.get()), (1, 0));
     }
 
-    /// Review round 4, M2: the background retry stops once the session's
-    /// record is retired, or the session is hosted by another live terminal.
+    /// Review rounds 4 and 5, M2/S1: an adoption stops once the session is
+    /// hosted by another live terminal — but not because its record retired.
     #[test]
     fn pty_holder_boot_sweep_background_retry_stops_on_a_moved_or_retired_session() {
         let live = |t: &str| t == "t-other-live";
@@ -1085,7 +1171,11 @@ mod tests {
             retry_stop_reason("t-pane", &SessionNow::Untracked, live),
             None
         );
-        assert!(retry_stop_reason("t-pane", &SessionNow::Retired, live).is_some());
+        assert_eq!(
+            retry_stop_reason("t-pane", &SessionNow::Retired, live),
+            None,
+            "review round 5, S1: a retired record does not stop a live holder's adoption"
+        );
         let on = |terminal: &str| SessionNow::OpenOn {
             terminal_id: terminal.into(),
             page_id: "p".into(),
@@ -1252,6 +1342,43 @@ mod tests {
         assert!(
             RESTORE_WAIT
                 > CENSUS_TIMEOUT + adoption_worst + qontinui_pty_holder::sweep::REAP_BUDGET
+        );
+    }
+
+    /// Review round 5, S1: while a holder's adoption is pending, the lifecycle
+    /// poll never closes a record on its terminal — the no-match arms become a
+    /// hold — and it judges the record on its own evidence again once the
+    /// adoption is no longer pending.
+    #[test]
+    fn pty_holder_boot_sweep_poll_holds_a_record_whose_adoption_is_pending() {
+        use crate::session::session_lifecycle_store::{
+            classify, hold_for_withheld_boot_restore, PollAction, WorkerPlane,
+        };
+        let id = "t-pending-adoption";
+        // A record matching no live terminal, past the orphan debounce.
+        let orphan = classify(
+            None,
+            false,
+            0,
+            99,
+            true,
+            false,
+            true,
+            WorkerPlane::NotWorker,
+        );
+        assert_eq!(orphan, PollAction::CloseNoTerminal);
+        set_adoption_pending(id, true);
+        assert!(adoption_pending(id));
+        assert_eq!(
+            hold_for_withheld_boot_restore(orphan, adoption_pending(id)),
+            PollAction::Skip,
+            "pending adoption: never a close"
+        );
+        set_adoption_pending(id, false);
+        assert!(!adoption_pending(id));
+        assert_eq!(
+            hold_for_withheld_boot_restore(orphan, adoption_pending(id)),
+            PollAction::CloseNoTerminal
         );
     }
 }
