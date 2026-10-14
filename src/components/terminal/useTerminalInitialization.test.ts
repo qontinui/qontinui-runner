@@ -18,6 +18,8 @@ import {
   fetchOpenRecords,
   fetchRestoreSet,
   waitForHolderSweep,
+  recheckRefusedAfterSweep,
+  HOLDER_SWEEP_RECHECK_ATTEMPTS,
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
@@ -850,17 +852,55 @@ describe("waitForHolderSweep — PTY-holder boot sweep before the restore", () =
 
   it("asks the runner to wait for the sweep to settle", async () => {
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { settled: true } });
-    await waitForHolderSweep();
+    await expect(waitForHolderSweep()).resolves.toBe(true);
     expect(mockInvoke).toHaveBeenCalledWith("terminal_holder_sweep_settled");
   });
 
-  it("proceeds when the sweep did not settle in time", async () => {
+  it("reports a sweep that did not settle in time", async () => {
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { settled: false } });
-    await expect(waitForHolderSweep()).resolves.toBeUndefined();
+    await expect(waitForHolderSweep()).resolves.toBe(false);
   });
 
-  it("proceeds when the runner has no such command", async () => {
+  it("counts a runner with no such command as settled (no sweep there)", async () => {
     mockInvoke.mockRejectedValueOnce(new Error("command terminal_holder_sweep_settled not found"));
-    await expect(waitForHolderSweep()).resolves.toBeUndefined();
+    await expect(waitForHolderSweep()).resolves.toBe(true);
+  });
+});
+
+describe("recheckRefusedAfterSweep — sessions refused as live before the sweep settled", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  const unsettled = { success: true, message: null, data: { settled: false } };
+  const settled = { success: true, message: null, data: { settled: true } };
+
+  it("once the sweep settles, returns exactly the refused ids no longer hosted live", async () => {
+    mockInvoke.mockResolvedValueOnce(unsettled).mockResolvedValueOnce(settled);
+    const live = vi.fn().mockResolvedValue(new Set(["still-alive", "never-refused"]));
+    await expect(
+      recheckRefusedAfterSweep(["reaped-by-sweep", "still-alive"], live),
+    ).resolves.toEqual(["reaped-by-sweep"]);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+    expect(live).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes nothing when the sweep never settles", async () => {
+    mockInvoke.mockResolvedValue(unsettled);
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(recheckRefusedAfterSweep(["a"], live)).resolves.toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledTimes(HOLDER_SWEEP_RECHECK_ATTEMPTS);
+    expect(live).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the live registry cannot be read", async () => {
+    mockInvoke.mockResolvedValue(settled);
+    const live = vi.fn().mockResolvedValue(null);
+    await expect(recheckRefusedAfterSweep(["a"], live)).resolves.toEqual([]);
+  });
+
+  it("does nothing for nothing refused", async () => {
+    await expect(recheckRefusedAfterSweep([])).resolves.toEqual([]);
+    expect(mockInvoke).not.toHaveBeenCalled();
   });
 });

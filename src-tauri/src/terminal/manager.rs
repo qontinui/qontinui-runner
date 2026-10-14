@@ -46,6 +46,29 @@ pub struct TerminalManager {
     in_flight: Mutex<HashSet<String>>,
 }
 
+/// Why [`TerminalManager::adopt_holder_pane`] adopted nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptError {
+    /// The terminal id is already open or being built: another path owns it.
+    Claimed(String),
+    /// The attach to the holder failed — definitively or not
+    /// ([`super::daemon_pane_io::AttachError::definitive`]).
+    Attach(super::daemon_pane_io::AttachError),
+    /// The session could not be built around the attached pane, which was
+    /// detached again (the holder keeps its child).
+    Session(String),
+}
+
+impl std::fmt::Display for AdoptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdoptError::Claimed(m) => write!(f, "{m}"),
+            AdoptError::Attach(e) => write!(f, "{e}"),
+            AdoptError::Session(m) => write!(f, "session: {m}"),
+        }
+    }
+}
+
 /// A [`TerminalManager::claim_in_flight`] claim, released on drop.
 struct InFlightClaim<'a> {
     manager: &'a TerminalManager,
@@ -583,28 +606,41 @@ impl TerminalManager {
         size: Option<(u16, u16)>,
         app_handle: AppHandle,
         pinned_session_id: String,
-    ) -> Result<TerminalInfo, String> {
+    ) -> Result<TerminalInfo, AdoptError> {
         // Insert-if-absent: never over an open terminal, and never over one
         // being built (inserting under a live id would orphan that session —
         // still running, no longer listed).
-        let _building = self.claim_in_flight(terminal_id)?;
-        super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, size).and_then(
-            |pane| {
-                let (title, cwd) = pane.session_identity();
-                let (cols, rows) = pane.dims();
-                self.insert_with_io(
-                    terminal_id.to_string(),
-                    title,
-                    cwd,
-                    page_id,
-                    cols,
-                    rows,
-                    app_handle,
-                    Arc::new(pane),
-                    pinned_session_id,
-                )
-            },
+        let _building = self
+            .claim_in_flight(terminal_id)
+            .map_err(AdoptError::Claimed)?;
+        let pane = Arc::new(
+            super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, size)
+                .map_err(AdoptError::Attach)?,
+        );
+        let (title, cwd) = pane.session_identity();
+        let (cols, rows) = pane.dims();
+        let io: Arc<dyn super::pane_io::PaneIo> = pane.clone();
+        self.insert_with_io(
+            terminal_id.to_string(),
+            title,
+            cwd,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            io,
+            pinned_session_id,
         )
+        .map_err(|e| {
+            // The session could not be built around the attached pane. DETACH
+            // it, so that dropping it does not kill the live session: the
+            // holder keeps the child for a retry.
+            let _ = super::pane_io::PaneIo::release(
+                pane.as_ref(),
+                super::daemon_pane_io::DETACH_FRAME_BUDGET,
+            );
+            AdoptError::Session(e)
+        })
     }
 
     /// Claim `id` as being built: refused when it is already open or already
