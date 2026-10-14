@@ -67,6 +67,31 @@ export function defaultFleetTenantChoice(
 }
 
 /**
+ * The choice the view reads under: the operator's pick, else
+ * {@link defaultFleetTenantChoice}.
+ *
+ * A picked tenant that is no longer bound is NOT a pick any more: kept, it
+ * would go on reading a tenant whose read is refused — and when its loss left
+ * one binding, `showSwitcher` hides the selector, so nothing on screen could
+ * change it. It falls back to the default instead. An EMPTY candidate list is
+ * not evidence of that (it is also what a list still loading looks like), so a
+ * pick survives it.
+ */
+export function resolveFleetTenantChoice(
+  pick: FleetTenantChoice | undefined,
+  pin: string | null,
+  candidates: readonly string[],
+): FleetTenantChoice {
+  const stale =
+    pick !== undefined &&
+    pick !== null &&
+    !isAllTenants(pick) &&
+    candidates.length > 0 &&
+    !candidates.includes(pick);
+  return pick !== undefined && !stale ? pick : defaultFleetTenantChoice(pin, candidates);
+}
+
+/**
  * The tenants to walk for a choice — one independent cursor walk each, because
  * coord fingerprints the tenant into its cursor. `null` in the result means
  * "send no tenant". "All tenants" with no known candidates (a list still
@@ -148,14 +173,6 @@ export function FleetTenantSelect({
 }: FleetTenantSelectProps) {
   if (!showSwitcher) return null;
   const options = fleetTenantOptions(candidates, credentials);
-  // A picked tenant that is no longer bound (the binding went away after the
-  // pick) has no option of its own, and a controlled <select> would then SHOW
-  // its first option — "all tenants" — while the view still reads that one
-  // tenant. Keep it on screen, disabled, saying so.
-  const stalePick =
-    selected !== null && !isAllTenants(selected) && !candidates.includes(selected)
-      ? selected
-      : null;
   return (
     <select
       data-ui-bridge-id={FLEET_PICKER_TENANT_SELECT_ID}
@@ -176,11 +193,6 @@ export function FleetTenantSelect({
           {o.label}
         </option>
       ))}
-      {stalePick !== null && (
-        <option value={stalePick} title={stalePick} disabled>
-          {shortTenantId(stalePick)} — no longer bound
-        </option>
-      )}
     </select>
   );
 }
