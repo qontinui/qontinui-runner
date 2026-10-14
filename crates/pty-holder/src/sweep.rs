@@ -40,6 +40,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::client::{census, Probe};
@@ -69,6 +70,11 @@ const RETAKE_PAUSE: Duration = Duration::from_millis(20);
 /// margin. A reap that overruns it is reported as Unknown and finishes in the
 /// background.
 pub const REAP_BUDGET: Duration = Duration::from_secs(8);
+
+/// The same bound for the orphan-ledger re-checks, which run after the dead
+/// panes' reaps under a budget of their own: one re-check can stop a scope
+/// unit and run the reap passes, as one reap can.
+pub const ORPHAN_RECHECK_BUDGET: Duration = REAP_BUDGET;
 
 /// A pane's diagnostic log is kept this long after its lock is gone.
 pub const DEAD_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -159,11 +165,24 @@ pub fn boot_sweep(
     skip: &[PaneId],
     before_reaping: impl FnOnce(&[SweepEntry], usize),
 ) -> io::Result<SweepReport> {
+    // Reaps still running at their budgets finish on their own threads.
+    boot_sweep_with_pending(pane_dir, timeout, skip, before_reaping).map(|(report, _)| report)
+}
+
+/// [`boot_sweep`], also returning the reaps still running at their budgets
+/// ([`PendingReaps`]): what a caller waits on before it may say the dead are
+/// reaped.
+pub fn boot_sweep_with_pending(
+    pane_dir: &Path,
+    timeout: Duration,
+    skip: &[PaneId],
+    before_reaping: impl FnOnce(&[SweepEntry], usize),
+) -> io::Result<(SweepReport, PendingReaps)> {
     match check_private_dir(pane_dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             before_reaping(&[], 0);
-            return Ok(SweepReport::default());
+            return Ok((SweepReport::default(), PendingReaps::default()));
         }
         Err(e) => return Err(e),
     }
@@ -219,7 +238,7 @@ pub fn boot_sweep(
             (pane_id, job)
         })
         .collect();
-    let (done, pending) = run_until(jobs, deadline);
+    let (done, pending, mut late) = run_until(jobs, deadline);
     for (pane_id, (outcome, errors)) in done {
         report.errors.extend(errors);
         report.entries.push(SweepEntry { pane_id, outcome });
@@ -237,9 +256,15 @@ pub fn boot_sweep(
         });
     }
     report.entries.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
-    recheck_orphans(pane_dir, deadline, &mut report);
+    // The orphan re-checks get a budget of their own, not what the dead
+    // panes' reaps left over (review round 4, L1).
+    late.absorb(recheck_orphans(
+        pane_dir,
+        Instant::now() + ORPHAN_RECHECK_BUDGET,
+        &mut report,
+    ));
     remove_strays(pane_dir, SystemTime::now(), skip, &mut report);
-    Ok(report)
+    Ok((report, late))
 }
 
 /// One job of the reaping step, run on a thread of its own.
@@ -248,28 +273,79 @@ type ReapJob<T> = Box<dyn FnOnce() -> T + Send>;
 /// An orphan-ledger re-check: the entry, and a removal error if any.
 type OrphanJob = ReapJob<(OrphanEntry, Option<String>)>;
 
+/// Reaps (and orphan re-checks) still running when their budget ran out.
+/// They finish on their own threads; [`PendingReaps::wait`] blocks until they
+/// have. A caller that must not act before every reap is done — the runner's
+/// "settled" signal (review round 4, L1) — waits on it.
+#[derive(Default)]
+pub struct PendingReaps {
+    waiters: Vec<Box<dyn FnOnce() + Send>>,
+    count: usize,
+}
+
+impl PendingReaps {
+    /// How many reaps are still running.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Block until every pending reap has finished. Each is bounded by its
+    /// own steps (a `systemctl` stop's deadline, the reap passes).
+    pub fn wait(self) {
+        for w in self.waiters {
+            w();
+        }
+    }
+
+    fn absorb(&mut self, other: PendingReaps) {
+        self.count += other.count;
+        self.waiters.extend(other.waiters);
+    }
+}
+
+impl std::fmt::Debug for PendingReaps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingReaps")
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
 /// Run `jobs` each on a thread of its own and collect what finishes by
-/// `deadline`; the keys of the rest are returned as pending (their threads
-/// finish on their own). A job whose thread cannot start runs inline.
+/// `deadline`; the keys of the rest are returned as pending, with a
+/// [`PendingReaps`] to wait for them. A job whose thread cannot start runs
+/// INLINE, on the caller's thread (review round 4, L2): no pane is ever
+/// dropped from the report.
 fn run_until<T: Send + 'static>(
     jobs: Vec<(String, ReapJob<T>)>,
     deadline: Instant,
-) -> (Vec<(String, T)>, Vec<String>) {
+) -> (Vec<(String, T)>, Vec<String>, PendingReaps) {
     let (tx, rx) = std::sync::mpsc::channel::<(String, T)>();
     let mut pending: Vec<String> = Vec::new();
     let mut done = Vec::new();
     for (key, job) in jobs {
         let tx = tx.clone();
         let k = key.clone();
-        // The closure is moved into the thread; if the thread cannot start
-        // it is dropped unrun, so the job counts as pending.
+        // The job sits in a slot the thread takes it from, so a thread that
+        // cannot start leaves it here, to run inline.
+        let slot = Arc::new(Mutex::new(Some(job)));
+        let thread_slot = Arc::clone(&slot);
         let spawned = std::thread::Builder::new()
             .name("pty-holder-reap".into())
             .spawn(move || {
-                let _ = tx.send((k, job()));
+                let job = thread_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(job) = job {
+                    let _ = tx.send((k, job()));
+                }
             });
         if spawned.is_ok() {
             pending.push(key);
+        } else if let Some(job) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            done.push((key, job()));
         }
     }
     drop(tx);
@@ -283,7 +359,19 @@ fn run_until<T: Send + 'static>(
             Err(_) => break,
         }
     }
-    (done, pending)
+    let count = pending.len();
+    let waiter: Box<dyn FnOnce() + Send> = Box::new(move || {
+        for _ in 0..count {
+            if rx.recv().is_err() {
+                break;
+            }
+        }
+    });
+    let late = PendingReaps {
+        waiters: if count == 0 { Vec::new() } else { vec![waiter] },
+        count,
+    };
+    (done, pending, late)
 }
 
 /// Write `record` to the pane's orphan-ledger entry (`<pane-id>.orphan`,
@@ -307,9 +395,9 @@ fn write_orphan(pane_dir: &Path, pane: &PaneId, record: &LockRecord) -> io::Resu
 /// is now PROVABLY the pane's (the same rule as for a dead holder), and drop
 /// the entry once nothing unattributed is left — or once its record is from
 /// an earlier boot, after which none of the pane's processes can exist.
-fn recheck_orphans(pane_dir: &Path, deadline: Instant, report: &mut SweepReport) {
+fn recheck_orphans(pane_dir: &Path, deadline: Instant, report: &mut SweepReport) -> PendingReaps {
     let Ok(entries) = std::fs::read_dir(pane_dir) else {
-        return;
+        return PendingReaps::default();
     };
     let mut jobs: Vec<(String, OrphanJob)> = Vec::new();
     for entry in entries.flatten() {
@@ -372,16 +460,17 @@ fn recheck_orphans(pane_dir: &Path, deadline: Instant, report: &mut SweepReport)
             }),
         ));
     }
-    let (done, pending) = run_until(jobs, deadline);
+    let (done, pending, late) = run_until(jobs, deadline);
     for (_, (orphan, error)) in done {
         report.errors.extend(error);
         report.orphans.push(orphan);
     }
     for pane_id in pending {
         report.errors.push(format!(
-            "orphan-ledger entry {pane_id}: its re-check was still running at the reap budget"
+            "orphan-ledger entry {pane_id}: its re-check was still running at its budget"
         ));
     }
+    late
 }
 
 /// Take a lock the census just found free. A child the caller forks between
@@ -548,6 +637,32 @@ mod tests {
     fn age(path: &Path, by: Duration) {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(SystemTime::now() - by).unwrap();
+    }
+
+    /// Review round 4, L1/L2: a job past the deadline is reported pending,
+    /// and its PendingReaps waits for it; a finished one is reported done.
+    #[test]
+    fn pty_holder_boot_sweep_reaps_past_the_budget_are_pending_until_done() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = Arc::clone(&finished);
+        let jobs: Vec<(String, ReapJob<u8>)> = vec![
+            ("quick".into(), Box::new(|| 1)),
+            (
+                "slow".into(),
+                Box::new(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    f.store(true, std::sync::atomic::Ordering::SeqCst);
+                    2
+                }),
+            ),
+        ];
+        let (done, pending, late) = run_until(jobs, Instant::now() + Duration::from_millis(100));
+        assert_eq!(done, vec![("quick".to_string(), 1)]);
+        assert_eq!(pending, vec!["slow".to_string()]);
+        assert_eq!(late.len(), 1);
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+        late.wait();
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// The reap budget covers one pane's worst case: a scope stop, the lock
