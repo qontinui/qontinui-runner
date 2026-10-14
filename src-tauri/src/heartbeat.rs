@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use serde::Serialize;
@@ -302,7 +302,13 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
         // Backend heartbeat: every 30s. Primary heartbeat: every 15s.
         // We tick every 15s and send the backend heartbeat every other tick.
         let mut ticker = interval(Duration::from_secs(15));
+        // After a suspension the default `Burst` replays every missed tick
+        // back-to-back. Measured 2026-09-18: 20 ticks in about 1s, each
+        // re-running the recovery backstop and the backend POST. None of them
+        // carries information the first did not.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut tick_count: u64 = 0;
+        let mut resume_grace = ResumeGrace::default();
         // One `warn!` per suppression EPISODE, not per tick. The gate below
         // re-evaluates every 15s, and an undeliverable ping can persist for
         // hours — logging each tick would rebuild, in the recovery path, the
@@ -312,6 +318,15 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
         loop {
             ticker.tick().await;
             tick_count += 1;
+            if let Some(gap_ms) = resume_grace.observe_tick(wall_clock_ms()) {
+                info!(
+                    gap_ms,
+                    grace_ms = RESUME_GRACE_MS,
+                    "heartbeat resumed after a suspension-sized gap (sleep / Modern \
+                     Standby); UI recovery is held for the grace window so a live UI \
+                     can pong before a stale pong is treated as a dead webview"
+                );
+            }
 
             let port = app_state.api_port.load(Ordering::Relaxed);
             if port == 0 {
@@ -448,9 +463,17 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // a `ping_delivery` on the heartbeat that the `recover` decision
             // beside it was not computed from.
             let mut ping_report = crate::ui_error::ping_delivery_report_now();
-            let recover =
-                ui_dead && ping_report.delivery != crate::ui_error::PingDelivery::Undeliverable;
-            if ui_dead && !recover {
+            let undeliverable =
+                ping_report.delivery == crate::ui_error::PingDelivery::Undeliverable;
+            // RESUME GRACE (see `ResumeGrace`). This is a second piece of
+            // positive evidence that the stale pong does not mean a dead UI:
+            // the process itself was not running.
+            let in_resume_grace = resume_grace.in_grace(wall_clock_ms());
+            let recover = ui_dead && !undeliverable && !in_resume_grace;
+            if ui_dead && in_resume_grace && !undeliverable {
+                debug!("UI recovery held: inside the post-resume grace window");
+            }
+            if ui_dead && undeliverable {
                 crate::ui_error::record_false_death_suppressed();
                 // Re-read only the counter we just moved, so this tick's
                 // heartbeat carries THIS tick's suppression rather than the
@@ -691,6 +714,72 @@ fn get_local_ip() -> Option<String> {
     Some(addr.ip().to_string())
 }
 
+/// A gap between two heartbeat ticks at least this long means the process was
+/// not running in between: Modern Standby / sleep suspends it, and when it
+/// wakes the loop resumes with a wall-clock jump. The loop ticks every 15s, so
+/// this is four missed ticks. An unusually slow loop body can also cross it.
+/// That false positive only delays recovery by [`RESUME_GRACE_MS`].
+const SUSPEND_GAP_MS: u64 = 60_000;
+
+/// How long after a detected resume the staleness backstop may not recover.
+///
+/// The pong is stale on wake for the same reason the tick is late: nothing ran
+/// in between. That is not evidence that the UI died. Measured 2026-09-17 on
+/// the operator box: after a 70-minute suspension the backstop fired on the
+/// first tick after wake. The recreate it started ran into the machine going
+/// back into standby, blocked for 3 hours, and then failed with
+/// `RPC_E_DISCONNECTED`. That permanently destroyed a webview that had
+/// probably been fine.
+///
+/// The ping keeps firing every 3s, so a live UI pongs well inside this window.
+/// A UI that is really dead is still recovered once the window closes. Reusing
+/// [`crate::ui_error::UI_DEAD_AFTER_MS`] gives a woken UI the same allowance a
+/// running one gets.
+const RESUME_GRACE_MS: u64 = crate::ui_error::UI_DEAD_AFTER_MS;
+
+/// Detects process suspension from the heartbeat's own tick cadence, and
+/// holds the destructive UI-recovery response for [`RESUME_GRACE_MS`] after
+/// it. Pure state machine over caller-supplied wall-clock millis.
+///
+/// This gates the RESPONSE only, not the signal. This matches the
+/// ping-delivery gate beside it, and `derived_status` still publishes
+/// `errored` off a stale pong. The `ProcessFailed` push path is not touched
+/// either, so a WebView2 process that really crashed is still recovered at
+/// once.
+#[derive(Debug, Default)]
+struct ResumeGrace {
+    last_tick_ms: u64,
+    grace_until_ms: u64,
+}
+
+impl ResumeGrace {
+    /// Record a tick. Returns the suspension gap when this tick is the first
+    /// one after a resume, so the caller can log it once.
+    fn observe_tick(&mut self, now_ms: u64) -> Option<u64> {
+        // `saturating_sub`: a backwards clock step reads as no gap.
+        let gap = now_ms.saturating_sub(self.last_tick_ms);
+        let resumed = self.last_tick_ms > 0 && gap >= SUSPEND_GAP_MS;
+        self.last_tick_ms = now_ms;
+        if resumed {
+            self.grace_until_ms = now_ms.saturating_add(RESUME_GRACE_MS);
+            Some(gap)
+        } else {
+            None
+        }
+    }
+
+    fn in_grace(&self, now_ms: u64) -> bool {
+        now_ms < self.grace_until_ms
+    }
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Fallback when PG query fails — returns empty.
 fn get_running_tasks_fallback() -> (u32, Vec<String>) {
     (0, vec![])
@@ -711,6 +800,52 @@ mod tests {
         }
     }
     use super::*;
+
+    const T0: u64 = 1_700_000_000_000;
+    const TICK: u64 = 15_000;
+
+    #[test]
+    fn resume_grace_is_silent_on_a_normal_cadence() {
+        let mut g = ResumeGrace::default();
+        for n in 0..100 {
+            let now = T0 + n * TICK;
+            assert_eq!(g.observe_tick(now), None);
+            assert!(!g.in_grace(now));
+        }
+    }
+
+    #[test]
+    fn resume_grace_holds_recovery_after_a_suspension_then_releases() {
+        // The 2026-09-17 shape: a 70-minute gap, then the first tick after wake.
+        let mut g = ResumeGrace::default();
+        g.observe_tick(T0);
+        let wake = T0 + 70 * 60 * 1_000;
+        assert_eq!(g.observe_tick(wake), Some(70 * 60 * 1_000));
+        assert!(g.in_grace(wake));
+        assert!(g.in_grace(wake + RESUME_GRACE_MS - 1));
+        // After the window a still-dead UI is recovered as before.
+        g.observe_tick(wake + TICK);
+        assert!(!g.in_grace(wake + RESUME_GRACE_MS));
+    }
+
+    #[test]
+    fn resume_grace_ignores_the_first_tick_and_backwards_clock_steps() {
+        let mut g = ResumeGrace::default();
+        // First tick ever: there is no previous tick to measure a gap from.
+        assert_eq!(g.observe_tick(T0), None);
+        // An NTP step backwards is not a suspension.
+        assert_eq!(g.observe_tick(T0 - 10 * 60 * 1_000), None);
+        assert!(!g.in_grace(T0));
+    }
+
+    #[test]
+    fn resume_grace_threshold_sits_between_cadence_and_dead_verdict() {
+        // It must never fire on a healthy cadence, and it must stay shorter
+        // than the dead verdict so a suspension is noticed before a
+        // recovery decision is made.
+        assert!(SUSPEND_GAP_MS > 2 * TICK);
+        assert!(SUSPEND_GAP_MS < crate::ui_error::UI_DEAD_AFTER_MS);
+    }
 
     /// Loopback bind ⇒ heartbeat advertises `lan_reachable: false`, with the
     /// flag DERIVED from a listener's real bound address through the same

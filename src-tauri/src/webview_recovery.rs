@@ -71,10 +71,18 @@ pub const RECOVERY_BACKOFF_BASE_MS: u64 = 5_000;
 /// Ceiling on the exponential backoff.
 pub const RECOVERY_BACKOFF_MAX_MS: u64 = 60_000;
 
-/// A webview that ran this long since the last recovery attempt is a **fresh
-/// incident**, not a spin — the attempt counter (and the terminal `exhausted`
-/// state) reset. Without this a runner that recovers successfully at 09:00 and
+/// A guard that nobody has **asked** for this long is a **fresh incident**,
+/// not a spin — the attempt counter (and the terminal `exhausted` state)
+/// reset. Without this a runner that recovers successfully at 09:00 and
 /// crashes again unrelated at 23:00 would inherit the morning's spent budget.
+///
+/// Measured from the last *ask* ([`LoopGuard::decide`]), NOT the last attempt.
+/// An exhausted incident still gets asked on every stale heartbeat tick, and
+/// those asks spend no attempt; measuring from the last attempt made a UI that
+/// never came back "reset" every ten minutes. Each reset spent three more
+/// doomed recreates and re-armed the exhaustion dialog. Observed 2026-09-18:
+/// the dialog came back every ~10.5 min for 15 hours against a webview that
+/// was permanently gone.
 pub const RECOVERY_ATTEMPT_RESET_MS: u64 = 10 * 60 * 1_000;
 
 /// How long to wait for Tauri's event loop to actually retire a destroyed
@@ -733,6 +741,9 @@ pub enum GuardDecision {
 pub struct LoopGuard {
     attempts: u32,
     last_attempt_ms: u64,
+    /// Every [`Self::decide`] call, including the ones that answer
+    /// `Exhausted` and spend nothing. The incident reset reads this.
+    last_ask_ms: u64,
     exhausted: bool,
 }
 
@@ -741,6 +752,7 @@ impl LoopGuard {
         Self {
             attempts: 0,
             last_attempt_ms: 0,
+            last_ask_ms: 0,
             exhausted: false,
         }
     }
@@ -759,11 +771,14 @@ impl LoopGuard {
     /// that is not recorded is a decision that can be taken twice in parallel.
     pub fn decide(&mut self, now_ms: u64) -> GuardDecision {
         // A long-quiet gap means the last incident is over; start fresh.
-        if self.last_attempt_ms > 0
-            && now_ms.saturating_sub(self.last_attempt_ms) >= RECOVERY_ATTEMPT_RESET_MS
+        // "Quiet" = nobody asked, so an incident that is still being reported
+        // stays one incident however long it lasts.
+        if self.last_ask_ms > 0
+            && now_ms.saturating_sub(self.last_ask_ms) >= RECOVERY_ATTEMPT_RESET_MS
         {
             *self = Self::new();
         }
+        self.last_ask_ms = now_ms;
 
         if self.exhausted || self.attempts >= MAX_RECOVERY_ATTEMPTS {
             self.exhausted = true;
@@ -2562,6 +2577,33 @@ mod tests {
             GuardDecision::Proceed { attempt: 0 }
         );
         assert!(!g.is_exhausted());
+    }
+
+    #[test]
+    fn loop_guard_stays_exhausted_while_the_incident_keeps_being_reported() {
+        // 2026-09-18 regression: a webview gone for good, re-reported by the
+        // 15s heartbeat backstop. Measuring the reset from the last ATTEMPT
+        // re-armed the ladder (and the user-facing dialog) every ten minutes.
+        const TICK_MS: u64 = 15_000;
+        let mut g = LoopGuard::new();
+        for _ in 0..MAX_RECOVERY_ATTEMPTS {
+            g.decide(T0);
+        }
+        let mut now = T0;
+        while now < T0 + 3 * RECOVERY_ATTEMPT_RESET_MS {
+            now += TICK_MS;
+            assert_eq!(
+                g.decide(now),
+                GuardDecision::Exhausted,
+                "reset mid-incident at +{}ms",
+                now - T0
+            );
+        }
+        // Once the reports stop for a full window, the next one is new.
+        assert_eq!(
+            g.decide(now + RECOVERY_ATTEMPT_RESET_MS),
+            GuardDecision::Proceed { attempt: 0 }
+        );
     }
 
     #[test]
