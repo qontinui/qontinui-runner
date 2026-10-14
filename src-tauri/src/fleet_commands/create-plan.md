@@ -232,6 +232,36 @@ rather than reporting "no existing plan" as though both agreed. On this fleet th
 document layer has measured empty against hundreds of plans on disk, so treating
 its silence as absence is how the same plan gets authored twice.
 
+### 2b. Read the fleet policy — before research and design
+
+This step is mandatory and comes before Step 3. Plans written without the fleet
+policy in view have repeatedly made decisions the engineering and other policies
+already settle (effort or backward-compatibility weighed as priorities, deprecate
+instead of delete, work split off rather than finished, verification skipped).
+Policy is the authority on those; a plan is not the place to re-decide them.
+
+1. **Fetch the documents fresh — never from memory.** They version frequently.
+   Call `coord_list_prompt_documents`, then `coord_get_prompt_document` (kind
+   `policy`) for each body you need. Read at least `engineering-priorities`,
+   `planning-and-scope`, `plan-discipline`, `implementation-priorities`,
+   `testing`, `verification-and-evidence`, `operating-rules`,
+   `security-and-autonomy`, `production-and-cost` and `git-operations`, and
+   `ux-priorities` as well when the plan touches a user-facing surface. Read any
+   other document the index lists whose description matches the prompt's subject.
+   Where the coord tools are not visible, use the `/policy` skill (`/policy list`,
+   `/policy get policy <name>`) — it reads the same documents over the other doors.
+2. **Apply, don't just read.** Step 4's design choices, phase sizing, gates and
+   sequencing are decided by these clauses wherever a clause speaks. Note each one
+   you apply as `[policy: <doc>/<clause>]`.
+3. **Record it in the plan** under `## Policy applied` (template in Step 5): the
+   documents read with their versions, and one line per decision a clause governed.
+   A clause the plan must deviate from is stated explicitly with the reason; a plan
+   never contradicts a clause silently.
+4. **If a document cannot be read**, write `Policy review: UNKNOWN (<what failed>)`
+   in that section and continue; do not substitute memory and do not report it as
+   reviewed. A clause with no coverage for a decision you had to make is a
+   `POLICY_GAP` — record it there rather than inventing a rule.
+
 ### 3. Research the codebase
 
 Identify the repo(s) the prompt touches (file paths, symbol names, or repo
@@ -327,7 +357,7 @@ the existing corpus in `plans/*.md`).
 **Structure** (matches the existing `plans/*.md` corpus and the lifecycle
 `/vet-plan` / `/implement-plan` / `/verify-plan-status` all read):
 
-```markdown
+````markdown
 # Plan: <Title>
 
 > **Status: DRAFT <YYYY-MM-DD>.** <one-line summary of what this plan does>.
@@ -350,6 +380,11 @@ existing plans do (see `plans/2026-05-24-symbol-claim-tenant-scoping.md`
 §"Design decision" for the shape) and end with **Resolved.** + the
 deciding priority>
 
+## Policy applied
+<documents read + versions, e.g. `engineering-priorities` v4; one line per design
+decision a clause governed, ending `[policy: <doc>/<clause>]`; any deliberate
+deviation with its reason; any `POLICY_GAP`; or `Policy review: UNKNOWN (<what failed>)`. Required.>
+
 ## Discovered prior art (verified <YYYY-MM-DD> against <repo> `origin/main` <short-sha>)
 | Piece | Location | Notes |
 |---|---|---|
@@ -366,6 +401,28 @@ deciding priority>
 **Phase 2 — <name>**
 - ...
 
+## Done when
+- `domain_spec/<name>#<claim_id>` reads **confirmed** in the served `claims[]`
+  (one bullet per claim; at least one, OR the escape line below; the id must
+  exist in that array today and must not already read `confirmed`)
+<!-- No probe-able claim exists yet? Name the spec the plan will add it to and
+     append the block(s) in `text` fences — a `probe` fence IS a live claim.
+     The `text` fence is display-only: when moving a block into the spec,
+     change the `text` fence to a ```probe fence and drop the leading `probe`
+     line. `addressed_by` is optional. -->
+- `domain_spec/<name>` gains, in the phase that makes it observable:
+
+  ```text
+  probe
+  claim: <stable kebab-case id, unique in that document>
+  anchor: <one JSON object — a typed anchor coord's anchor_observer resolves>
+  verified_at: <RFC 3339 UTC>
+  verified_against: <repo@sha, or the live door the reading came from>
+  addressed_by: <this-plan-stem>#<phase>
+  ```
+<!-- Escape, counted and never silent — ONE line replacing the bullets above:
+Done when: no claim — <reason no served claim can observe this plan's outcome> -->
+
 ## Risks
 - ...
 
@@ -375,7 +432,7 @@ deciding priority>
 
 ## Related
 - `[[other-plan-stem]]` / memory names this plan builds on or supersedes.
-```
+````
 
 **Where the `**Difficulty:**` line goes, when Step 4 says to write one.** On
 its own line, below `> **Repo(s):**`, and **above the first `##`–`######`
@@ -402,6 +459,58 @@ enters through the changed function is the dossier
 `shipped-fix-inert-on-its-population`. `/vet-plan` treats a phase without a
 parseable `Arming:` line as a **Missing** defect and writes one; a corpus
 measurement (check #75, report-only) counts how many new plans carry it.
+
+**Every plan carries a `## Done when` section — acceptance is a served claim,
+not an attestation.** *(Plan
+`2026-10-05-declared-intent-drives-autonomous-work-selection` Phase 2; the
+principle is §5 of `2026-09-20-nothing-measures-the-product-against-its-declared-intent`.)*
+`Gate:` and `Arming:` say a phase is correct and observed to run; `## Done when`
+says what the plan was FOR, in a form coord re-verdicts on its own every tick.
+Exactly one of three shapes, chosen in this order:
+
+1. **Named claims** — one bullet per `domain_spec/<name>#<claim_id>` that must
+   read `confirmed` in the `claims[]` coord serves beside that document
+   (`coord_get_prompt_document`). **Only `domain_spec` is citable:** coord's
+   claim sweep probes that kind alone (`PROBED_KINDS`, qontinui-coord
+   `crates/coord/src/prompt_document_claims.rs`), so a claim on any other kind
+   is never verdicted and can never read `confirmed`; widen this only when coord
+   probes another kind. Read the document before you cite it: the claim id must
+   **exist in the served array today AND must not already read `confirmed`** — a
+   claim that is confirmed before any phase lands cannot be what this plan
+   moves, so it is not this plan's acceptance (`/vet-plan` §3 check 2 marks it
+   **Stale**). A stale row (`detail.stale: true`) whose `detail.stored_state` is
+   `confirmed` counts as confirmed; a document whose `claims_state_source` is not
+   `table` cannot be cited until it is. `unknown` and `contradicted` are the citable states.
+   Prefer a claim in a document that `serves:` an initiative item, and prefer a
+   behaviour-shaped anchor — a `content`/`blob` confirmation proves source, not
+   behaviour, and `/vet-plan` flags it `source_only` on a goal-facing claim.
+2. **Appended probe blocks** — when no served claim observes the outcome yet,
+   name the spec the plan will add the claim to and write each block **in a
+   `text` fence, never a `probe` fence** (a `probe` fence anywhere is parsed as
+   a live claim of whatever document holds it). Use the grammar coord's
+   `parse_probe_blocks` reads — `claim`, `anchor`, `verified_at`,
+   `verified_against` — plus, optionally, `addressed_by: <this-plan-stem>#<phase>`,
+   the link the verification-failure detector joins on (that plan's Phase 6;
+   until coord's Phase 5 grammar lands the key is ignored, never refused, so a
+   block without it is still a valid claim). **The `text` fence is
+   display-only:** coord recognises a block only when its opening fence line is
+   exactly ```` ```probe ```` (`PROBE_FENCE` in `prompt_document_claims.rs`), and
+   the leading `probe` line inside the template stands in for that tag. When the
+   phase moves a block into the spec, change the `text` fence to a ```` ```probe ````
+   fence and drop the leading `probe` line — pasted as-is, the block is never
+   parsed and the claim never exists. Copy one of the spec's own
+   blocks as the shape; never invent an anchor `type` its anchor registry does
+   not serve — where none observes the behaviour, the honest anchor is
+   `{"type": "none", "reason": "…"}` naming the phase that will make it
+   observable.
+3. **The escape** — the single line `Done when: no claim — <reason>`. Permitted,
+   and **counted**: `/vet-plan` reports every plan that takes it, and a reason
+   that only says "hard to probe" is a defect, not a reason. Docs-only and
+   plan-edit plans are the honest users of it.
+
+`/implement-plan` and `/verify-plan-status` read this section at closeout: a
+landed plan whose named claims do not read `confirmed` is stamped
+`SHIPPED — UNCONFIRMED (<claim ids>)`, never bare `SHIPPED`.
 
 **Do not add a `## Gates` section.** That block (`<!-- GATE-SWEEP:BEGIN -->`)
 is machine-managed by `/gate-sweep`, and the `unit_ready` coord gate itself
@@ -524,6 +633,7 @@ Under 100 words:
 - **DRAFT only.** Never stamp `VETTED` — that status, and the coord
   work-unit + gate registration that comes with it, belongs solely to
   `/vet-plan`.
+- **Policy first.** Step 2b is mandatory before research and design, and the plan carries a `## Policy applied` section.
 - **Don't duplicate an existing plan.** Step 2 is mandatory before writing.
 - **Parallelize research.** Grep/Glob/Read concurrently; spawn `Explore` for
   anything broader than a single targeted lookup.

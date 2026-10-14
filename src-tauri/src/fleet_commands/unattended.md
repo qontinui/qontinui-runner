@@ -120,16 +120,26 @@ Enumerate what this session actually did. Sources, in order of trustworthiness:
      wrote). Untracked files are outside every `refs/wip/` snapshot;
      `.gitignore`d files are not listed, by design. Classify the tracked
      changes with
-     `bash <workspace-root>/qontinui-claude-config/scripts/dirty-provenance.sh <tree>`
-     and branch on its EXIT code: 0 clean (every modified file is provisioner
-     residue), 1 found, 3 UNKNOWN, anything else UNKNOWN. In a shared tree the
-     exit code judges every file, peers' included, so run it with `--json`
-     and read `files[]` only for the paths this session wrote. A non-empty
-     top-level `error` makes the whole tree UNKNOWN. Per file, `class:
-     UNKNOWN` is UNKNOWN (it wins over `restorable: false`), then
-     `class: UNIQUE` or `restorable: false` is found, and `restorable: true`
-     is clean. A path of this session's that is absent from `files[]` is clean
-     only when `error` is empty.
+     `bash <workspace-root>/qontinui-claude-config/scripts/dirty-provenance.sh --json <tree>`
+     and read the JSON, not only the exit code: exit 1 also covers
+     `EOL_REWRITE_ONLY`, a tree whose only UNIQUE files are line-ending
+     rewrites of the upstream tip's own blob. A non-empty top-level `error`, a
+     body that does not parse, or an exit other than 0/1/3 is UNKNOWN. A body
+     with no `content_unique_count` field comes from a copy that predates it:
+     there exit 1 is found, never read as a count of 0, and the rest of this
+     rule does not apply. Otherwise: `content_unique_count > 0` or
+     `outside_footprint_count > 0` is found; otherwise `unknown_count > 0` is
+     UNKNOWN; otherwise clean. A UNIQUE file with
+     `content_upstream: true` is clean, because nothing in it exists only on
+     disk. For a clean tree anyway, name its remedy,
+     `git restore --source=<upstream> --worktree -- <path>` (`<upstream>` is
+     the JSON's `upstream`). In a shared tree the counts judge every file,
+     peers' included, so read `files[]` only for the paths this session
+     wrote. Per file, `class: UNKNOWN` is UNKNOWN (it wins over
+     `restorable: false`), then `class: UNIQUE` with `content_upstream: true`
+     is clean, then `class: UNIQUE` or `restorable: false` is found, and
+     `restorable: true` is clean. A path of this session's that is absent
+     from `files[]` is clean only when `error` is empty.
    - **Unpushed commits:** `git -C <tree> fetch --prune` (without `--prune`, a
      remote branch deleted before it landed still hides the commits it held),
      then `git -C <tree> rev-list HEAD --not --remotes` (also for a branch this
@@ -2191,8 +2201,10 @@ and emits content on stdout only in state 0. A `2` here is UNKNOWN -- never
 
 **Door 3 — the deployed backend, with a coord DEVICE JWT.**
 `~/.qontinui/coord-device-jwt` carries the `user_id` claim the route requires;
-an `/agents/allocate` agent token does not. When the file token is expired,
-mint one from the runner (it holds no secret at rest):
+an `/agents/allocate` agent token does not. Use it only when its `tenant_id`
+claim is this session's tenant (the same check the snippet below applies to a
+minted token); when it is expired or claims another tenant, mint one from the
+runner (it holds no secret at rest):
 
 ```bash
 # DOOR 3a, always first: the runner's IN-PROCESS invoke mint - no WebView hop,
@@ -2206,13 +2218,34 @@ mint one from the runner (it holds no secret at rest):
 # $R holds a LIVE bearer in $AUTHFILE: `rm -rf "$R"` at the end is not optional.
 W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
 R=$(mktemp -d); AUTHFILE="$R/auth"
-S1=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
+# THE TENANT this session reads for: $QONTINUI_TENANT_ID, else the runner
+# session census row for $QONTINUI_TERMINAL_ID (coord-revive.sh
+# resolve_session_tenant's rule). Sent ONLY as {"args":{"tenantId":...}} - the
+# runner reads `args` and drops a top-level key, which on a multi-slot runner
+# is a 409 tenant_required. Named, the older name and 3b (the DEFAULT slot,
+# which cannot be asked for a tenant) are skipped, and the token's claim is
+# checked below. A malformed value is an error, never ignored.
+TEN="${QONTINUI_TENANT_ID:-}"
+if [ -z "$TEN" ] && [ -n "${QONTINUI_TERMINAL_ID:-}" ]; then
+  curl -sS -m 10 http://127.0.0.1:9876/control/sessions/info > "$R/census" 2>/dev/null
+  TEN=$(QT="$QONTINUI_TERMINAL_ID" python3 -c 'import json,os,sys
+try: rows=json.load(open(sys.argv[1]))["data"]["sessions"]  # envelope-ok: a predicate search over the census rows; any miss prints nothing, never a default
+except Exception: sys.exit(0)
+for r in rows:
+    if isinstance(r,dict) and (r.get("identity") or {}).get("terminalId")==os.environ["QT"]:
+        t=r.get("tenancy") or {}; c=t.get("credential") or {}
+        print((t.get("row") or {}).get("tenantId") or (c.get("tenantId") if c.get("status")=="resolved" else "") or ""); break' "$R/census" 2>/dev/null)
+fi
+[ -z "$TEN" ] || [[ "$TEN" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || { echo "tenant '$TEN' is not a uuid - refusing to mint" >&2; TEN=INVALID; }
+echo "tenant: ${TEN:-UNKNOWN (none named; tenant-less mint)}" >&2
+MB='{}'; [ -n "$TEN" ] && MB="{\"args\":{\"tenantId\":\"${TEN,,}\"}}"
+S1=; [ "$TEN" = INVALID ] || S1=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
   http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token \
-  -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint1" | tail -n 1)   # (source: runner-invoke)
+  -H 'Content-Type: application/json' -d "$MB" 2>&1 >"$R/mint1" | tail -n 1)   # (source: runner-invoke)
 # The token never reaches the terminal or argv: it is read (exit 3 on
 # `data: null` = unpaired, or any other shape) straight into the header file.
 S2=""
-if [ "$S1" = 400 ] || [ "$S1" = 404 ]; then   # the older name, ONLY on 400/404
+if [ -z "$TEN" ] && { [ "$S1" = 400 ] || [ "$S1" = 404 ]; }; then   # the older name, ONLY on 400/404, ONLY with no tenant named
   S2=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
     http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket \
     -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint2" | tail -n 1)
@@ -2221,6 +2254,14 @@ if [ "$S1" = 400 ] || [ "$S1" = 404 ]; then   # the older name, ONLY on 400/404
 else
   echo "HTTP $S1" >&2
   T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint1")
+fi
+# CLAIM CHECK: a token claiming ANOTHER tenant is discarded, never staged - its
+# claim is printed, the token never is (it rides the environment, not argv).
+if [ -n "$T" ] && [ -n "$TEN" ]; then
+  CLAIM=$(T="$T" python3 -c 'import os,json,base64
+p=os.environ["T"].split(".")[1]; p+="="*(-len(p)%4)
+print(json.loads(base64.urlsafe_b64decode(p)).get("tenant_id") or "")' 2>/dev/null)
+  [ "${CLAIM,,}" = "${TEN,,}" ] || { echo "minted token claims tenant '${CLAIM:-none}', not $TEN - DISCARDED" >&2; T=; }
 fi
 [ -n "$T" ] && printf 'Authorization: Bearer %s\n' "$T" > "$AUTHFILE"; unset T
 
@@ -2657,6 +2698,22 @@ A finished session is dropped from the runner's resume set, so after the next
 runner rebuild it does not reappear among the sessions asking to be resumed.
 That is the whole point — an operator rebuilding a runner should be handed the
 work that is still open, not everything that ever ran.
+
+### A session finishes before its plan does
+
+A **session** is finished when its own work is handed off, not when the plan it
+worked on is complete. A plan is complete only when every one of its PRs has
+landed; a session is complete when each PR it opened is **initially green** (CI
+passing, no known defect, no conflict) and is in coord's hands. Coord merges the
+PRs and, where one later goes red or conflicts, spawns a `/babysit-prs` session
+for it. So a PR that is green but not yet merged is **WATCHED**, never a reason
+to hold the session open, and a plan whose PRs are all green-but-unmerged is NOT
+stamped SHIPPED by this session: the plan stays IN PROGRESS and coord's merge
+plus the work-unit citations derive `shipped`. What does hold a session open is
+a PR that is **not green** and that this session could still fix: fix it first
+(`/babysit-prs`), and only when it is green is the session done. A red PR that
+is red for an environmental, shared reason is IMPEDED (finding id), not
+WATCHED.
 
 ### The gate
 
