@@ -16,9 +16,14 @@
 //! `subscription_scope_required`; a token that is present but bad is refused
 //! as a credential failure, never downgraded to anonymous. `?pattern=` is no
 //! longer how the scope is chosen: alongside a token it only narrows the
-//! principal's entitlement, and WITHOUT one it is admitted only inside a
-//! legacy allowlist (`anonymous_entitlement`) and refused 403
-//! `pattern_out_of_scope` outside it. This module never sends `?pattern=`.
+//! principal's entitlement, and WITHOUT one it is refused outright — 403
+//! `pattern_removed` on its own, `subscription_scope_required` beside a
+//! `?subscribe=`. Coord no longer keeps an anonymous allowlist
+//! (qontinui-coord#3219, plan
+//! `2026-09-20-fleet-tab-attach-loses-the-grant-push-race` item 1). This module
+//! never sends `?pattern=`: it names its scope only through `?subscribe=`,
+//! presenting the device JWT (as `?token=` and `Authorization: Bearer`)
+//! whenever one resolves.
 //!
 //! This module is the single place that knows both halves:
 //!
@@ -507,8 +512,9 @@ mod tests {
         );
     }
 
-    /// The URL never carries a `?pattern=` — the new coord refuses it 400 and
-    /// the old one would PSUBSCRIBE a caller-chosen glob, which is the leak.
+    /// The URL never carries a `?pattern=` — coord refuses an anonymous one
+    /// 403 `pattern_removed`, and a coord older than the server-derived
+    /// subscription would PSUBSCRIBE a caller-chosen glob, which is the leak.
     #[test]
     fn build_ws_url_never_emits_a_pattern_query() {
         for sub in [
