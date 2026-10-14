@@ -43,7 +43,8 @@
 //! them from one look at `crate::modes::ModeTracker` under the pane lock:
 //!
 //! - the PREAMBLE (state at the first byte the connection can still be sent)
-//!   is the pump's first frame, before any output;
+//!   is the pump's first frame — after a loss report only when the requested
+//!   offset has already left the ring — and precedes all output;
 //! - the POSTAMBLE (state at the stream's end at that moment) is held and sent
 //!   the moment the stream reaches that end — output frames are cut at the
 //!   anchor, and a loss report that would jump past it is preceded by it — so
@@ -794,8 +795,9 @@ enum PumpStep {
 
 /// Stream the pane's output to one connection from absolute offset `next`.
 ///
-/// With `restore` (a version-3 `attach {restore: true}`), the pump first sends
-/// the PREAMBLE and holds the POSTAMBLE, both from one look at the mode
+/// With `restore` (a version-3 `attach {restore: true}`), the pump first
+/// reports any loss already known (the requested offset left the ring), then
+/// sends the PREAMBLE and holds the POSTAMBLE, both from one look at the mode
 /// tracker under the pane lock — the preamble for the first byte this
 /// connection can still be sent (`max(next, ring start)`), the postamble
 /// anchored at the stream's end at that moment. Both frames are ALWAYS sent
@@ -809,17 +811,36 @@ enum PumpStep {
 fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64, restore: bool) {
     let mut postamble: Option<(u64, Vec<u8>)> = None;
     if restore {
-        let env = {
+        let (lost, env) = {
             let st = pane.lock_state();
-            st.modes.envelope(next.max(st.ring.start_offset()))
+            let ring_start = st.ring.start_offset();
+            let lost = (next < ring_start).then_some((next, ring_start));
+            (lost, st.modes.envelope(next.max(ring_start)))
         };
-        let sent = send_synthetic(
-            writer,
-            SyntheticPart::Preamble,
-            env.preamble_at,
-            &env.preamble,
-            PUMP_WRITE_TIMEOUT,
-        );
+        // A loss already known now is reported BEFORE the preamble, so a
+        // client reads "continuity broken, then the state where the stream
+        // resumes" — and knows that preamble is one it needs.
+        let lost_sent = match lost {
+            Some((from, to)) => {
+                next = to;
+                to_payload(&Reply::OutputLost {
+                    from_offset: from,
+                    to_offset: to,
+                })
+                .map_err(io::Error::other)
+                .and_then(|p| send_frame(writer, KIND_CONTROL, &p, PUMP_WRITE_TIMEOUT))
+            }
+            None => Ok(()),
+        };
+        let sent = lost_sent.and_then(|()| {
+            send_synthetic(
+                writer,
+                SyntheticPart::Preamble,
+                env.preamble_at,
+                &env.preamble,
+                PUMP_WRITE_TIMEOUT,
+            )
+        });
         if sent.is_err() {
             flow.closed.store(true, Ordering::SeqCst);
             writer.lock().unwrap_or_else(|p| p.into_inner()).shutdown();
