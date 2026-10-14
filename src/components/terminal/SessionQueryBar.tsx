@@ -15,7 +15,7 @@
  * organization store by the caller.
  */
 
-import { useRef, useState } from "react";
+import { startTransition, useEffect, useReducer, useRef, useState } from "react";
 import { Bookmark, Search, X } from "lucide-react";
 import {
   UIBridgeComponentScope,
@@ -29,6 +29,7 @@ import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { textArg } from "./commands";
 import type { SavedView, SessionGroup } from "./sessionOrgTypes";
 import { highlightQuery, type HighlightKind, type ParsedQuery } from "./sessionQuery";
+import { initialQueryDraft, queryDraftReducer } from "./sessionQueryDraft";
 import {
   QUERY_CHIPS,
   SESSION_QUERY_CONTROLS,
@@ -273,8 +274,19 @@ function QueryInput({
     type: "button",
     label: "Clear the session filter",
   });
+  // The box renders its own draft (see `sessionQueryDraft.ts` for why it
+  // cannot bind to `query` directly) and follows `query` only when it changes
+  // from elsewhere.
+  const [{ draft }, dispatch] = useReducer(queryDraftReducer, query, initialQueryDraft);
+  useEffect(() => dispatch({ kind: "prop", query }), [query]);
+  const edit = (value: string) => {
+    dispatch({ kind: "typed", value });
+    // Outside the input event's synchronous batch, so the box's own update
+    // commits before React restores the controlled value.
+    startTransition(() => onQueryChange(value));
+  };
   const overlayRef = useRef<HTMLDivElement>(null);
-  const segments = highlightQuery(query);
+  const segments = highlightQuery(draft);
   return (
     <div className="relative rounded border border-[#2a2d3d] bg-[#1a1b26] focus-within:border-[#7aa2f7]/50">
       <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#565f89]" />
@@ -297,8 +309,8 @@ function QueryInput({
         type="text"
         spellCheck={false}
         autoComplete="off"
-        value={query}
-        onChange={(e) => onQueryChange(e.target.value)}
+        value={draft}
+        onChange={(e) => edit(e.target.value)}
         onScroll={(e) => {
           if (overlayRef.current) overlayRef.current.scrollLeft = e.currentTarget.scrollLeft;
         }}
@@ -306,11 +318,11 @@ function QueryInput({
         title="Words match title, topic and preview. Fields: is: where: group: color: tag: account: repo: branch: pr: plan: unit: device: page: title: text: started: — and idle>30m, age<2h, msgs>100, -negation, OR"
         className="relative w-full pl-7 pr-6 py-1 text-xs bg-transparent text-transparent caret-[#c0caf5] placeholder-[#414868] focus:outline-none"
       />
-      {query !== "" && (
+      {draft !== "" && (
         <button
           ref={clearRef}
           {...sessionQueryControlAttrs("clear")}
-          onClick={() => onQueryChange("")}
+          onClick={() => edit("")}
           className="absolute right-1 top-1/2 -translate-y-1/2 p-0.5 rounded text-[#565f89] hover:text-[#c0caf5]"
           title="Clear the filter"
           aria-label="Clear the session filter"
