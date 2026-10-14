@@ -206,7 +206,7 @@ pub use imp::{current_process_in_job, spawn_holder};
 mod wmi;
 
 #[cfg(windows)]
-pub use wmi::{spawn_holder_wmi, WmiProcess};
+pub use wmi::{filetime_now, spawn_holder_wmi, WmiProcess};
 
 /// Quote one argument for a Windows command line so `CommandLineToArgvW` (the
 /// MSVC CRT's rules, which Rust's own `main` uses) reads it back unchanged.
@@ -354,6 +354,32 @@ mod tests {
         })
     }
 
+    /// Whether `line` spells 0x200 in decimal (`512`, as a whole number) or as
+    /// a shift (`1 << 9`, any spacing).
+    fn names_512(line: &str) -> bool {
+        let wordish = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        // `needle` in `text` as a whole token: no word character either side.
+        let whole = |text: &str, needle: &str| {
+            text.match_indices(needle).any(|(i, _)| {
+                let before = text.get(..i).and_then(|b| b.chars().last());
+                let after = text.get(i + needle.len()..).and_then(|a| a.chars().next());
+                !wordish(before) && !wordish(after)
+            })
+        };
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        whole(line, "512") || whole(&compact, "1<<9")
+    }
+
+    #[test]
+    fn pty_holder_breakaway_names_512_matches_decimal_and_shift_forms() {
+        assert!(names_512("flags | 512)"));
+        assert!(names_512("flags | (1 << 9)"));
+        assert!(names_512("1<<9"));
+        assert!(!names_512("5120"));
+        assert!(!names_512("1 << 90"));
+        assert!(!names_512("x512"));
+    }
+
     #[test]
     fn pty_holder_breakaway_names_0x200_matches_only_that_number() {
         assert!(names_0x200("flags | 0x200)"));
@@ -364,15 +390,25 @@ mod tests {
 
     #[test]
     fn pty_holder_breakaway_source_never_ors_in_create_new_process_group() {
-        let src = include_str!("holder_spawn.rs");
-        let code = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
-        let wmi = include_str!("holder_spawn/wmi.rs");
-        for (file, text) in [("holder_spawn.rs", code), ("holder_spawn/wmi.rs", wmi)] {
-            for (n, line) in text.lines().enumerate() {
+        // `lines()` drops a trailing `\r` too, so a CRLF checkout scans the
+        // same way. Only this file's code before its test module is scanned.
+        let src: Vec<&str> = include_str!("holder_spawn.rs").lines().collect();
+        let tests_at = src
+            .windows(2)
+            .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim() == "mod tests {")
+            .expect("the tests module");
+        let wmi: Vec<&str> = include_str!("holder_spawn/wmi.rs").lines().collect();
+        for (file, text) in [
+            ("holder_spawn.rs", &src[..tests_at]),
+            ("holder_spawn/wmi.rs", &wmi[..]),
+        ] {
+            for (n, line) in text.iter().enumerate() {
                 let line = line.split("//").next().unwrap_or("");
                 let declaration = line.contains("pub const CREATE_NEW_PROCESS_GROUP: u32");
+                let lower = line.to_ascii_lowercase();
                 let mentions = line.contains("CREATE_NEW_PROCESS_GROUP")
-                    || names_0x200(&line.to_ascii_lowercase());
+                    || names_0x200(&lower)
+                    || names_512(&lower);
                 assert!(
                     declaration || !mentions,
                     "{file}:{}: CREATE_NEW_PROCESS_GROUP reaches a holder spawn: {line}",

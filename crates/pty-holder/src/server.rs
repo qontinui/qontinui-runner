@@ -3,8 +3,10 @@
 //! Start-up order is plan D3, per pane (D13), with Phase 2's child in it:
 //!
 //! 1. Make sure the pane directory exists and (Unix) is ours and 0700.
-//! 2. Take `<pane-id>.lock`, non-blocking. Held → another holder is alive for
-//!    this pane → exit, touching nothing (not even the spec).
+//! 2. Take `<pane-id>.lock`, non-blocking. Held by a live holder → exit,
+//!    touching nothing (not even the spec). Held while its record names no
+//!    live holder → a transient hold, waited out briefly first
+//!    (`crate::lock::PaneLock::try_acquire_unless_live`, finding 9bbe1079).
 //! 3. Consume `<pane-id>.spec` (`crate::spec`): read it, unlink it.
 //! 4. Open the PTY and spawn the child on it (`crate::pty`).
 //! 5. Write the [`LockRecord`] (holder pid, CHILD pid, versions, start time).
@@ -121,7 +123,8 @@ pub const MAX_LOG_BYTES: u64 = 256 * 1024;
 pub enum StartError {
     /// Another live process holds this pane's lock.
     LockHeld {
-        record: Option<LockRecord>,
+        /// Boxed: a record is large next to every other variant.
+        record: Option<Box<LockRecord>>,
     },
     /// The pane directory is unusable (not absolute, not ours, cannot be made
     /// private).
@@ -218,11 +221,13 @@ impl Holder {
             _ => StartError::Io(e),
         })?;
         let lock_file = lock_path(pane_dir, pane_id);
-        let mut lock = match PaneLock::try_acquire(&lock_file)? {
+        // A hold by no live holder (a fork-before-exec, a prober) is waited
+        // out briefly; a live holder is never retried against (`crate::lock`).
+        let mut lock = match PaneLock::try_acquire_unless_live(&lock_file)? {
             TryLock::Acquired(l) => l,
             TryLock::Held => {
                 return Err(StartError::LockHeld {
-                    record: crate::lock::read_record(&lock_file),
+                    record: crate::lock::read_record(&lock_file).map(Box::new),
                 })
             }
         };
@@ -242,6 +247,7 @@ impl Holder {
                 started_at_unix_ms: info.started_at_unix_ms,
                 holder_build: holder_build(),
                 child_start: pane.child_start().map(str::to_string),
+                holder_start: crate::proc_identity::start_token(info.holder_pid),
                 scope_unit: own_scope_unit(),
             })?;
             #[cfg(unix)]
@@ -335,10 +341,7 @@ impl Holder {
         // its remainder is being ended.
         let reap = pane.reap_tree();
         if !reap.killed.is_empty() || !reap.notes.is_empty() {
-            log_line(
-                &log,
-                &format!("pane ended; reaped its tree: {}", reap.summary()),
-            );
+            log_line(&log, &format!("pane ended; its tree: {}", reap.summary()));
         }
         // Closes the writer under its mutex BEFORE the lock is released, so no
         // later timer tick can touch a successor holder's files.

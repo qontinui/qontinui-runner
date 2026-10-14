@@ -219,6 +219,7 @@ mod tests {
             holder_build: "test".into(),
             child_start: None,
             scope_unit: None,
+            holder_start: None,
         }
     }
 

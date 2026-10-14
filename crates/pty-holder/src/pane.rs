@@ -115,6 +115,12 @@ pub fn report_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.report-tmp", pane.as_str()))
 }
 
+/// `<pane-dir>/<pane-id>.orphan` — the orphan ledger's entry for a dead
+/// holder whose leftovers could not be attributed (`crate::sweep`).
+pub fn orphan_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.orphan", pane.as_str()))
+}
+
 /// `<pane-dir>/<pane-id>.log` — the holder's diagnostic log.
 pub fn log_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.log", pane.as_str()))

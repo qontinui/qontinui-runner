@@ -26,6 +26,21 @@ pub fn start_token(pid: u32) -> Option<String> {
     imp::start_token(pid)
 }
 
+/// Whether `token` was taken during THIS boot. A Linux token carries its boot
+/// id; any other token (a Windows creation time is absolute) answers `true`,
+/// since nothing in it says otherwise.
+pub fn token_is_from_this_boot(token: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(rest) = token.strip_prefix("linux:") {
+        return match (imp::boot_id(), rest.split_once(':')) {
+            (Some(now), Some((then, _))) => now == then,
+            _ => true,
+        };
+    }
+    let _ = token;
+    true
+}
+
 /// Whether `pid` is alive right now AND is the process `token` was taken from.
 /// `false` for an absent token: unverifiable is never "verified".
 pub fn is_same_process(pid: u32, token: Option<&str>) -> bool {
@@ -69,7 +84,7 @@ mod imp {
     use super::{parse_stat, ProcStat};
 
     /// This boot's id, read once.
-    fn boot_id() -> Option<&'static str> {
+    pub fn boot_id() -> Option<&'static str> {
         static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         BOOT.get_or_init(|| {
             std::fs::read_to_string("/proc/sys/kernel/random/boot_id")

@@ -175,8 +175,9 @@ const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 const CLOCK_SLACK_BEFORE: u64 = 10_000_000; // 1 s
 const CLOCK_SLACK_AFTER: u64 = 1_000_000; // 100 ms
 
-/// Now, as a FILETIME value.
-fn filetime_now() -> u64 {
+/// Now, as a FILETIME value (100 ns since 1601-01-01) — the unit process
+/// creation times are in.
+pub fn filetime_now() -> u64 {
     let since_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() / 100)
