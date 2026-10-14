@@ -33,12 +33,8 @@ vi.mock("@qontinui/ui-bridge", () => ({
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve(null)) }));
 
 import { SessionGroupHeader, groupCountLabel, needsYouBadge } from "./SessionGroupHeader";
-import {
-  SessionCloseDialog,
-  untickedRiskyTargets,
-  closeTickKey,
-  type CloseTarget,
-} from "./SessionCloseDialog";
+import { SessionCloseDialog } from "./SessionCloseDialog";
+import { untickedRiskyTargets, closeTickKey, type CloseTarget } from "./sessionClose";
 import { SessionCard, snoozeLabel } from "./SessionCard";
 import { SessionRail, railItemTitle } from "./SessionRail";
 import { SESSION_ORG_CONTROLS, sessionOrgControlId } from "./sessionOrgControls";

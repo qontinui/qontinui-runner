@@ -195,7 +195,6 @@ describe("SessionCard actions by row source", () => {
       copySessionId: false,
       promote: false,
       commit: false,
-      bulkSelect: false,
     });
   });
 
@@ -208,7 +207,6 @@ describe("SessionCard actions by row source", () => {
       copySessionId: true,
       promote: true,
       commit: true,
-      bulkSelect: true,
     });
   });
 
@@ -221,7 +219,6 @@ describe("SessionCard actions by row source", () => {
       copySessionId: true,
       promote: false,
       commit: false,
-      bulkSelect: true,
     });
   });
 
