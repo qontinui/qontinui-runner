@@ -7,7 +7,7 @@
  * `useTabSessionIdCapture.test.ts`).
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -25,6 +25,13 @@ import {
   onHolderSessionReleased,
   ownsReleasedPage,
   RestoreRerunQueue,
+  ABORT_RETRY_BASE_MS,
+  ABORT_RETRY_LIMIT,
+  RerunTimers,
+  beginRestoreRun,
+  scheduleRestoreRerun,
+  settleRestoreRun,
+  type RestoreRerunWiring,
   ColdResumeGuard,
   mayClaimRecordedZone,
   claimInitForPage,
@@ -1030,7 +1037,7 @@ describe("restore re-runs — one run per page, one cold resume per session (rev
       }
       return () => {
         for (const id of claims) guard.release(id);
-        if (queue.finish(pageId, true)) triggered.push(pageId);
+        if (queue.finish(pageId, "restored") === 0) triggered.push(pageId);
       };
     };
     return { queue, guard, createTerminal, triggered, schedule, runBody };
@@ -1070,12 +1077,13 @@ describe("restore re-runs — one run per page, one cold resume per session (rev
     expect(h.queue.begin("page-9")).toBeUndefined();
   });
 
-  it("a run that restored nothing drops what was scheduled meanwhile: its full retry covers it", () => {
+  it("a drain-deferred run drops what was scheduled meanwhile: the drain lift re-runs in full", () => {
     const queue = new RestoreRerunQueue();
     queue.begin("page-2");
     expect(queue.schedule("page-2", ["sess-1"])).toBe(false);
-    expect(queue.finish("page-2", false)).toBe(false);
+    expect(queue.finish("page-2", "deferred")).toBeNull();
     expect(queue.begin("page-2")).toBeUndefined();
+    expect(queue.finish("page-2", "restored")).toBeNull();
   });
 
   it("the session guard keeps two concurrent runs from both creating a tab", () => {
@@ -1084,6 +1092,219 @@ describe("restore re-runs — one run per page, one cold resume per session (rev
     expect(guard.tryClaim("sess-1")).toBe(false);
     guard.release("sess-1");
     expect(guard.tryClaim("sess-1")).toBe(true);
+  });
+});
+
+describe("RestoreRerunQueue — an aborted restore keeps what it owes (review V1)", () => {
+  it("(a) an abort with pending ids still re-runs them, after a backoff", () => {
+    const queue = new RestoreRerunQueue();
+    // The page's first restore is in flight; a released session arrives.
+    queue.begin("page-2");
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(false);
+    // The run aborts (indeterminate reconnect): the id is kept, and the
+    // queue asks for a re-run after the first backoff.
+    expect(queue.finish("page-2", "aborted")).toBe(ABORT_RETRY_BASE_MS);
+    // That re-run is the page's FULL restore (none ever completed), which
+    // covers sess-1.
+    expect(queue.begin("page-2")).toBeUndefined();
+    expect(queue.finish("page-2", "restored")).toBeNull();
+  });
+
+  it("(a) an aborted targeted re-run gives its ids back, and the retry restores exactly them", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    queue.finish("page-2", "restored");
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(true);
+    expect(queue.begin("page-2")).toEqual(new Set(["sess-1"]));
+    expect(queue.finish("page-2", "aborted")).toBe(ABORT_RETRY_BASE_MS);
+    expect(queue.begin("page-2")).toEqual(new Set(["sess-1"]));
+    expect(queue.finish("page-2", "restored")).toBeNull();
+    expect(queue.begin("page-2")).toBeUndefined();
+  });
+
+  it("(b) a schedule after an abort is kept, and triggers a re-run", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    // Aborted with nothing owed: no re-run of its own.
+    expect(queue.finish("page-2", "aborted")).toBeNull();
+    // The page stays known: a later released session is kept, not ignored.
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(true);
+    expect(queue.restoredOnce("page-2")).toBe(false);
+    expect(queue.begin("page-2")).toBeUndefined();
+    expect(queue.finish("page-2", "restored")).toBeNull();
+    expect(queue.restoredOnce("page-2")).toBe(true);
+  });
+
+  it("(c) consecutive aborts retry at most ABORT_RETRY_LIMIT times, with a doubling backoff", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    queue.schedule("page-2", ["sess-1"]);
+    const delays: Array<number | null> = [queue.finish("page-2", "aborted")];
+    // Drive every retry the queue asks for; each one aborts too.
+    while (delays[delays.length - 1] !== null && delays.length < 50) {
+      queue.begin("page-2");
+      delays.push(queue.finish("page-2", "aborted"));
+    }
+    expect(delays).toEqual([
+      ...Array.from({ length: ABORT_RETRY_LIMIT }, (_, i) => ABORT_RETRY_BASE_MS * 2 ** i),
+      null,
+    ]);
+    // The id is still owed: the next schedule (or activation) re-runs the
+    // page, and a completed restore resets the streak.
+    expect(queue.schedule("page-2", ["sess-2"])).toBe(true);
+    queue.begin("page-2");
+    expect(queue.finish("page-2", "restored")).toBeNull();
+    queue.schedule("page-2", ["sess-3"]);
+    queue.begin("page-2");
+    expect(queue.finish("page-2", "aborted")).toBe(ABORT_RETRY_BASE_MS);
+  });
+});
+
+describe("restore re-run wiring — the hook's timer, trigger and unmount (review V1, r1)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * The hook's wiring with its effect replaced by a recorder: `trigger` is
+   * `triggerRerun`, and a "run" is `beginRestoreRun` … `settleRestoreRun`,
+   * exactly as the init effect calls them. `drainDeferred` is the hook's
+   * `drainDeferredPages`, and a page in it re-runs merging.
+   */
+  function wiring() {
+    const drainDeferred = new Set<string>();
+    const runs: Array<{ pageId: string; merge: boolean }> = [];
+    const w: RestoreRerunWiring = {
+      queue: new RestoreRerunQueue(),
+      timers: new RerunTimers(),
+      markMerging: (pageId) => drainDeferred.add(pageId),
+      trigger: (pageId, merge) => {
+        if (merge) drainDeferred.add(pageId);
+        runs.push({ pageId, merge: merge || drainDeferred.has(pageId) });
+      },
+    };
+    // The init effect's own start: it consumes the page's merge mark.
+    const begin = (pageId: string) => {
+      const merging = drainDeferred.delete(pageId);
+      return { only: beginRestoreRun(w, pageId), merging };
+    };
+    return { w, runs, drainDeferred, begin };
+  }
+
+  it("a backoff retry that a schedule beat to it starts no second restore (finding 1)", () => {
+    const { w, runs, begin } = wiring();
+    // The page's first restore is in flight and owes sess-1; it aborts.
+    begin("page-2");
+    scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+    settleRestoreRun(w, "page-2", "aborted", false);
+    expect(runs).toEqual([]);
+    expect(vi.getTimerCount()).toBe(1);
+    // Before the backoff fires, another released session wins the race: it
+    // re-runs the page at once, and that run restores.
+    scheduleRestoreRerun(w, "page-2", ["sess-2"]);
+    expect(runs).toEqual([{ pageId: "page-2", merge: false }]);
+    const { only } = begin("page-2");
+    expect(only).toBeUndefined();
+    // The run beginning cancelled the page's backoff retry.
+    expect(vi.getTimerCount()).toBe(0);
+    settleRestoreRun(w, "page-2", "restored", false);
+    // The pending retry is moot: no further run, however long we wait.
+    vi.advanceTimersByTime(60_000);
+    expect(runs).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a retry that fires owing nothing does nothing, and decides merging when it fires (finding 1)", () => {
+    const { w, runs, begin } = wiring();
+    begin("page-2");
+    settleRestoreRun(w, "page-2", "restored", false);
+    // A targeted re-run aborts while owing sess-1: retried after the backoff,
+    // merging — the page has a completed restore.
+    scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+    runs.length = 0;
+    begin("page-2");
+    settleRestoreRun(w, "page-2", "aborted", false);
+    vi.advanceTimersByTime(ABORT_RETRY_BASE_MS);
+    expect(runs).toEqual([{ pageId: "page-2", merge: true }]);
+    // Defence in depth: a retry still armed when its ids were taken by a run
+    // that did not cancel it (the queue driven directly) fires into nothing.
+    runs.length = 0;
+    scheduleRestoreRerun(w, "page-2", ["sess-3"]);
+    runs.length = 0;
+    begin("page-2");
+    settleRestoreRun(w, "page-2", "aborted", false);
+    expect(vi.getTimerCount()).toBe(1);
+    w.queue.begin("page-2");
+    w.queue.finish("page-2", "restored");
+    vi.advanceTimersByTime(60_000);
+    expect(runs).toEqual([]);
+  });
+
+  it("a run that ends after unmount schedules nothing (finding 2)", () => {
+    const { w, runs, begin } = wiring();
+    begin("page-2");
+    scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+    w.timers.setActive(false);
+    settleRestoreRun(w, "page-2", "aborted", false);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(runs).toEqual([]);
+  });
+
+  it("unmount clears a pending retry; a re-mount re-arms scheduling", () => {
+    const { w, runs, begin } = wiring();
+    begin("page-2");
+    scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+    settleRestoreRun(w, "page-2", "aborted", false);
+    w.timers.setActive(false);
+    expect(vi.getTimerCount()).toBe(0);
+    w.timers.setActive(true);
+    begin("page-2");
+    settleRestoreRun(w, "page-2", "aborted", false);
+    vi.advanceTimersByTime(ABORT_RETRY_BASE_MS * 2);
+    expect(runs).toEqual([{ pageId: "page-2", merge: false }]);
+  });
+
+  it("an aborted merging re-run re-runs merging on every path (finding 3)", () => {
+    // Via the backoff timer.
+    {
+      const { w, runs, drainDeferred, begin } = wiring();
+      drainDeferred.add("page-2"); // the drain lifted: a merging re-run
+      const { merging } = begin("page-2");
+      expect(merging).toBe(true);
+      scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+      settleRestoreRun(w, "page-2", "aborted", merging);
+      expect(drainDeferred.has("page-2")).toBe(true);
+      vi.advanceTimersByTime(ABORT_RETRY_BASE_MS);
+      expect(runs).toEqual([{ pageId: "page-2", merge: true }]);
+    }
+    // Via a later schedule (the page never completed a restore).
+    {
+      const { w, runs, drainDeferred, begin } = wiring();
+      drainDeferred.add("page-2");
+      const { merging } = begin("page-2");
+      settleRestoreRun(w, "page-2", "aborted", merging);
+      scheduleRestoreRerun(w, "page-2", ["sess-1"]);
+      expect(runs).toEqual([{ pageId: "page-2", merge: true }]);
+    }
+    // Via re-activation: the effect's own start finds the merge mark.
+    {
+      const { w, drainDeferred, begin } = wiring();
+      drainDeferred.add("page-2");
+      const { merging } = begin("page-2");
+      settleRestoreRun(w, "page-2", "aborted", merging);
+      expect(begin("page-2").merging).toBe(true);
+    }
+    // An aborted FIRST restore stays a first restore.
+    {
+      const { w, drainDeferred, begin } = wiring();
+      const { merging } = begin("page-2");
+      settleRestoreRun(w, "page-2", "aborted", merging);
+      expect(drainDeferred.has("page-2")).toBe(false);
+    }
   });
 });
 
