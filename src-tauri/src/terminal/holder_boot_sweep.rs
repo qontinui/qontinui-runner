@@ -606,13 +606,24 @@ pub struct SessionReleased {
 
 /// The session to hand back to the restore after a background retry ended
 /// with `outcome`: only when its holder died and the pane hosted a known
-/// session. Pure, so the wiring is tested on its own.
-pub fn released_session(outcome: &AdoptOutcome, adoption: &Adoption) -> Option<SessionReleased> {
+/// session. Its page is the one `now` — the registry read at release time —
+/// records, so a session moved to another page while the retry ran re-runs
+/// THAT page's restore (review round 7, N2); the sweep-time page only when the
+/// record is no longer open. Pure, so the wiring is tested on its own.
+pub fn released_session(
+    outcome: &AdoptOutcome,
+    adoption: &Adoption,
+    now: &SessionNow,
+) -> Option<SessionReleased> {
     (*outcome == AdoptOutcome::HolderGone && !adoption.pinned_session_id.is_empty()).then(|| {
+        let page_id = match now {
+            SessionNow::OpenOn { page_id, .. } => Some(page_id.clone()),
+            SessionNow::Untracked | SessionNow::Retired => adoption.page_id.clone(),
+        };
         SessionReleased {
             session_id: adoption.pinned_session_id.clone(),
             terminal_id: adoption.pane_id.clone(),
-            page_id: adoption.page_id.clone(),
+            page_id,
         }
     })
 }
@@ -855,7 +866,9 @@ fn spawn_background_retry(
         // The holder died before it could be adopted: hand its session back
         // to the webview's restore, which refused its resume while the
         // holder's `claude` was alive (review round 6, T1).
-        if let Some(released) = released_session(&late, &adoption) {
+        if let Some(released) =
+            released_session(&late, &adoption, &session_now(store.as_deref(), &adoption))
+        {
             warn!(
                 pane = %adoption.pane_id,
                 session = %released.session_id,
@@ -1496,28 +1509,44 @@ mod tests {
             pinned_session_id: "sess-1".into(),
             holder_pid: 10,
         };
+        // Review round 7, N2: the page comes from the registry read at
+        // release time — the session was moved to "page-9" while the retry
+        // ran — and falls back to the sweep-time page only when the record
+        // is no longer open.
+        let moved = SessionNow::OpenOn {
+            terminal_id: "t-pane".into(),
+            page_id: "page-9".into(),
+        };
         assert_eq!(
-            released_session(&outcome, &adoption),
+            released_session(&outcome, &adoption, &moved),
             Some(SessionReleased {
                 session_id: "sess-1".into(),
                 terminal_id: "t-pane".into(),
-                page_id: Some("page-2".into()),
+                page_id: Some("page-9".into()),
             })
         );
-        let json = serde_json::to_value(released_session(&outcome, &adoption)).unwrap();
+        for gone in [SessionNow::Retired, SessionNow::Untracked] {
+            assert_eq!(
+                released_session(&outcome, &adoption, &gone).map(|r| r.page_id),
+                Some(Some("page-2".into())),
+                "{gone:?}"
+            );
+        }
+        let json = serde_json::to_value(released_session(&outcome, &adoption, &moved)).unwrap();
         assert_eq!(json["sessionId"], "sess-1", "the webview reads camelCase");
+        assert_eq!(json["pageId"], "page-9");
         for other in [
             AdoptOutcome::Adopted,
             AdoptOutcome::Skipped("x".into()),
             AdoptOutcome::Deferred("x".into()),
         ] {
-            assert_eq!(released_session(&other, &adoption), None, "{other:?}");
+            assert_eq!(released_session(&other, &adoption, &moved), None, "{other:?}");
         }
         let untracked = Adoption {
             pinned_session_id: String::new(),
             ..adoption
         };
-        assert_eq!(released_session(&outcome, &untracked), None);
+        assert_eq!(released_session(&outcome, &untracked, &SessionNow::Untracked), None);
     }
 
     /// Review round 6, nit (a): the pending mark clears however its thread

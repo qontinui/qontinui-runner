@@ -45,7 +45,7 @@ const ACTIVE_PAGE_KEY = "qontinui-terminal-active-page";
  * fixes it as active, and never mutates the shared page list / active-page key —
  * it is a read-only detached view of one page. Returns null in the main window.
  */
-function readPinnedPageId(): string | null {
+export function readPinnedPageId(): string | null {
   try {
     const v = new URLSearchParams(window.location.search).get("page");
     return v && v.trim() ? v : null;
