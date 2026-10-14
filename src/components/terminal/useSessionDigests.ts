@@ -12,7 +12,7 @@
  * Phase 1). A row that still has no digest renders activity `Unknown`.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import type { CommandResponse } from "./types";
@@ -41,6 +41,64 @@ export const DIGEST_CHUNK_SIZE = 100;
 export const RECENT_ROWS_DIGESTED = 50;
 
 const DIGEST_POLL_MS = 30_000;
+
+/**
+ * How many poll periods a digest may go without a successful refresh before
+ * it is dropped. 3 (90 s): one or two failed rounds keep the last answer
+ * (a blip should not blank every row), but past that the digest is too old
+ * to classify activity from, and the row falls to `Unknown` rather than
+ * reading a status from an unbounded-age tail.
+ */
+export const DIGEST_MAX_AGE_POLLS = 3;
+export const DIGEST_MAX_AGE_MS = DIGEST_MAX_AGE_POLLS * DIGEST_POLL_MS;
+
+/** One digest and when the round that produced it answered. */
+export interface DigestEntry {
+  digest: SessionDigest;
+  fetchedAt: number;
+}
+
+/** One chunk of a round: the ids it asked for, and the answer (`null` = failed). */
+export interface DigestChunkResult {
+  ids: readonly string[];
+  data: readonly SessionDigest[] | null;
+}
+
+/**
+ * Fold one polling round into the previous entries.
+ *
+ * - A successful chunk is authoritative for its ids: each returned digest is
+ *   stored fresh, and an id it answered without a digest is dropped.
+ * - A failed chunk keeps its ids' previous entries, with their OLD timestamp.
+ * - Ids no longer requested are dropped.
+ * - Any entry older than {@link DIGEST_MAX_AGE_MS} is dropped, so a run of
+ *   failures ages a digest out instead of keeping it forever.
+ */
+export function mergeDigestRound(
+  prev: Readonly<Record<string, DigestEntry>>,
+  requested: readonly string[],
+  chunks: readonly DigestChunkResult[],
+  now: number,
+  maxAgeMs = DIGEST_MAX_AGE_MS,
+): Record<string, DigestEntry> {
+  const next: Record<string, DigestEntry> = {};
+  const answered = new Set<string>();
+  for (const chunk of chunks) {
+    if (!chunk.data) continue;
+    for (const id of chunk.ids) answered.add(id);
+    for (const d of chunk.data) next[d.session_id] = { digest: d, fetchedAt: now };
+  }
+  for (const id of requested) {
+    if (answered.has(id) || next[id]) continue;
+    const old = prev[id];
+    if (old) next[id] = old;
+  }
+  const wanted = new Set(requested);
+  for (const id of Object.keys(next)) {
+    if (!wanted.has(id) || now - next[id].fetchedAt > maxAgeMs) delete next[id];
+  }
+  return next;
+}
 
 /** Split `ids` into request-sized chunks. */
 export function chunkIds(ids: readonly string[], size = DIGEST_CHUNK_SIZE): string[][] {
@@ -76,10 +134,12 @@ export interface UseSessionDigestsResult {
 /**
  * Digests for `ids`, re-fetched when the id set changes and every 30 s (the
  * activity a digest decides — idle vs. mid-tool — moves while a session runs).
- * A failed round keeps the previous digests rather than blanking every row.
+ * Each chunk's answer is applied on its own; a failed chunk keeps its ids'
+ * previous digests for at most {@link DIGEST_MAX_AGE_POLLS} poll periods
+ * ({@link mergeDigestRound}), after which those rows read `Unknown`.
  */
 export function useSessionDigests(ids: readonly string[]): UseSessionDigestsResult {
-  const [digests, setDigests] = useState<Record<string, SessionDigest>>({});
+  const [entries, setEntries] = useState<Record<string, DigestEntry>>({});
   const [loading, setLoading] = useState(false);
   const key = ids.join("|");
   const idsRef = useRef<readonly string[]>(ids);
@@ -93,27 +153,39 @@ export function useSessionDigests(ids: readonly string[]): UseSessionDigestsResu
     const requested = idsRef.current;
     const gen = ++generation.current;
     if (requested.length === 0) {
-      setDigests({});
+      setEntries({});
       return;
     }
     setLoading(true);
     try {
-      const map: Record<string, SessionDigest> = {};
+      const chunks: DigestChunkResult[] = [];
       for (const chunk of chunkIds(requested)) {
-        const result = await invoke<CommandResponse>("transcript_session_digests", {
-          sessionIds: chunk,
-        });
-        if (!result?.success || !Array.isArray(result.data)) return;
-        for (const d of result.data as SessionDigest[]) map[d.session_id] = d;
+        try {
+          const result = await invoke<CommandResponse>("transcript_session_digests", {
+            sessionIds: chunk,
+          });
+          const ok = result?.success && Array.isArray(result.data);
+          chunks.push({ ids: chunk, data: ok ? (result.data as SessionDigest[]) : null });
+        } catch {
+          // A transport failure says nothing new about this chunk's ids.
+          chunks.push({ ids: chunk, data: null });
+        }
       }
       // A newer request superseded this one while it ran.
-      if (gen === generation.current) setDigests(map);
-    } catch {
-      // Keep the previous round: a transport failure says nothing new.
+      if (gen === generation.current) {
+        const now = Date.now();
+        setEntries((prev) => mergeDigestRound(prev, requested, chunks, now));
+      }
     } finally {
       if (gen === generation.current) setLoading(false);
     }
   }, []);
+
+  const digests = useMemo(() => {
+    const out: Record<string, SessionDigest> = {};
+    for (const [id, e] of Object.entries(entries)) out[id] = e.digest;
+    return out;
+  }, [entries]);
 
   useEffect(() => {
     let cancelled = false;
