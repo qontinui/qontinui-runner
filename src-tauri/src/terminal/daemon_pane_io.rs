@@ -102,7 +102,8 @@ use qontinui_pty_holder::frame::SyntheticPart;
 use qontinui_pty_holder::protocol::{ExitReply, Reply, Request, RestoreMeta};
 use qontinui_pty_holder::terminate::{terminate_verified_holder, Termination};
 use qontinui_runner_lib::pty_holder::spawn::{
-    pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, Unprotected, NEW_TAB_SPAWN_BUDGET,
+    pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, SpawnError, Unprotected,
+    NEW_TAB_SPAWN_BUDGET,
 };
 use tracing::{debug, info, warn};
 
@@ -110,6 +111,31 @@ use super::pane_io::{CredentialScrub, PaneIo, ScrubbedCommand};
 use super::pane_output::PaneOutput;
 use super::remote_pane_io::{DetachOutcome, DETACH_EXIT_CODE};
 use crate::settings::TerminalSettings;
+
+/// Why [`DaemonPaneIo::spawn`] produced no pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderPaneError {
+    pub reason: String,
+    /// A holder for this pane is (or may be) still LIVE: it could be neither
+    /// held nor ended (`SpawnError::LiveHolderUnreachable`). The caller must
+    /// not fall back to an in-process PTY.
+    pub live_holder_left: bool,
+}
+
+impl From<String> for HolderPaneError {
+    fn from(reason: String) -> Self {
+        HolderPaneError {
+            reason,
+            live_holder_left: false,
+        }
+    }
+}
+
+impl std::fmt::Display for HolderPaneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
 
 /// Bound on connecting to a freshly spawned (or existing) holder and reading
 /// its `attached` reply.
@@ -336,14 +362,29 @@ fn spawn_holder_pane_or_fallback_blocking(
     cols: u16,
     rows: u16,
 ) -> Result<Arc<dyn PaneIo>, String> {
-    let attempt = exe.and_then(|exe| {
-        let pane_dir = pane_dir?;
-        let pane_id = PaneId::new(terminal_id).map_err(|e| e.to_string())?;
+    let attempt = (|| {
+        let exe = exe.map_err(HolderPaneError::from)?;
+        let pane_dir = pane_dir.map_err(HolderPaneError::from)?;
+        let pane_id = PaneId::new(terminal_id).map_err(|e| HolderPaneError::from(e.to_string()))?;
         DaemonPaneIo::spawn(exe, &pane_dir, &pane_id, &cmd, cols, rows)
-    });
+    })();
     let reason = match attempt {
         Ok(pane) => return Ok(Arc::new(pane)),
-        Err(e) => e,
+        // A holder for this pane may still be running its command: an
+        // in-process fallback would run it a second time.
+        Err(e) if e.live_holder_left => {
+            warn!(
+                terminal_id,
+                reason = %e.reason,
+                "pty holder: a live holder could be neither held nor ended — NOT falling back"
+            );
+            return Err(format!(
+                "PTY holder unusable and still running ({}); no in-process fallback, which \
+                 would run the pane's command twice",
+                e.reason
+            ));
+        }
+        Err(e) => e.reason,
     };
     warn!(
         terminal_id,
@@ -997,10 +1038,14 @@ impl DaemonPaneIo {
         cmd: &ScrubbedCommand,
         cols: u16,
         rows: u16,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, HolderPaneError> {
         let spec = cmd.to_holder_spec(cols, rows);
-        let spawned = spawn_pane_holder(holder_exe, pane_dir, pane_id, &spec)
-            .map_err(|e| format!("PTY holder spawn failed: {e}"))?;
+        let spawned = spawn_pane_holder(holder_exe, pane_dir, pane_id, &spec).map_err(|e| {
+            HolderPaneError {
+                live_holder_left: matches!(e, SpawnError::LiveHolderUnreachable(_)),
+                reason: format!("PTY holder spawn failed: {e}"),
+            }
+        })?;
         // Plan Phase 3: the holder's spawn is on every new tab's path, and the
         // WMI route is slow — measured per spawn, held against the budget.
         if spawned.over_new_tab_budget() {
@@ -1028,7 +1073,7 @@ impl DaemonPaneIo {
             }
             Err(e) => {
                 spawned.teardown();
-                Err(e)
+                Err(e.into())
             }
         }
     }

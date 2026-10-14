@@ -3,12 +3,13 @@
 //!
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
 //! Phase 3 (D8 under D13). The walk itself — classify each pane by handshake
-//! and lock, reap a dead holder's PROVEN tree remainder, clean its files — is
+//! and lock, reap a dead holder's PROVEN tree remainder, keep what cannot be
+//! attributed in the orphan ledger, clean files — is
 //! `qontinui_pty_holder::sweep::boot_sweep`, over this instance's pane
 //! directory ([`super::daemon_pane_io::runner_pane_dir`]). What only the
-//! runner can do is here: turn each LIVE pane back into a terminal tab, through
-//! [`TerminalManager::adopt_holder_pane`] (Phase 2b) — the first production
-//! caller of that door.
+//! runner can do is here: turn each LIVE pane back into a terminal tab,
+//! through [`TerminalManager::adopt_holder_pane`] (Phase 2b) — the first
+//! production caller of that door.
 //!
 //! # Identity
 //!
@@ -22,16 +23,20 @@
 //! adopted — the process is alive and must be visible — under an empty pinned
 //! id and the default page, and the log says so.
 //!
-//! # Ordering against the webview's restore
+//! # Ordering against the webview's restore — without blocking setup
 //!
-//! The sweep starts in setup, before the webview loads, and setup waits for
-//! it up to [`SETUP_WAIT`]. An adopted pane is then an ordinary live terminal in
-//! `terminal_list`, which the frontend's restore reconnects to FIRST and binds
-//! to its registry record — so it never also cold-resumes that session (two
-//! `claude` processes on one session id). A pane whose attach runs past the
-//! wait is still adopted when it lands (a `terminal-created` event); for it
-//! the frontend's live-process check (`fetchLiveClaudeSessionIds`, PID
-//! verified) is what refuses a duplicate resume.
+//! [`run`] starts the sweep on a thread of its own and returns at once: setup
+//! never waits on a census (an unanswering holder costs [`CENSUS_TIMEOUT`]) or
+//! on reaping. The ordering the restore needs — adoption BEFORE the webview
+//! reads `terminal_list`, so a surviving session is reconnected rather than
+//! cold-resumed a second time — is kept by a "settled" signal instead: the
+//! sweep settles once the census is in and every live pane's adoption has
+//! finished, BEFORE it reaps the dead; the webview's restore first awaits
+//! [`wait_settled`] (the `terminal_holder_sweep_settled` command) for at most
+//! [`RESTORE_WAIT`]. A restore that stops waiting still cannot double-resume:
+//! an adoption that lands later is an ordinary `terminal-created` tab, and the
+//! frontend's live-process check (`fetchLiveClaudeSessionIds`, PID verified)
+//! refuses a resume of a session whose `claude` is alive.
 //!
 //! # Gate
 //!
@@ -42,11 +47,11 @@
 //! setting off and no pane directory — the default — it costs one `stat`.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use qontinui_pty_holder::pane::PaneId;
-use qontinui_pty_holder::sweep::{boot_sweep, SweepOutcome, SweepReport};
+use qontinui_pty_holder::sweep::{boot_sweep, SweepEntry, SweepOutcome, SweepReport};
 use tauri::AppHandle;
 use tracing::{info, warn};
 
@@ -57,11 +62,49 @@ use crate::session::session_lifecycle_store::SessionLifecycleStore;
 /// concurrently under it).
 pub const CENSUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long setup waits for the whole sweep (census, reaping the dead, and
-/// every adoption's attach, concurrently) before it carries on. An attach is
-/// bounded by `daemon_pane_io::ATTACH_DEADLINE`; this covers the census plus
-/// one of them.
-pub const SETUP_WAIT: Duration = Duration::from_secs(16);
+/// The longest the webview's restore waits for the sweep to settle: the
+/// census plus one attach (`daemon_pane_io::ATTACH_DEADLINE`), with margin.
+pub const RESTORE_WAIT: Duration = Duration::from_secs(20);
+
+/// Where the boot sweep is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// [`run`] was never called (a process with no boot sweep): nothing to
+    /// wait for.
+    NotStarted,
+    Running,
+    /// The census is in and every live pane's adoption has finished.
+    Settled,
+}
+
+static PHASE: Mutex<Phase> = Mutex::new(Phase::NotStarted);
+static PHASE_CHANGED: Condvar = Condvar::new();
+
+fn set_phase(phase: Phase) {
+    *PHASE.lock().unwrap_or_else(|p| p.into_inner()) = phase;
+    PHASE_CHANGED.notify_all();
+}
+
+/// Block until the boot sweep has settled (see the module docs), at most
+/// `timeout`. `true` when it settled or never started; `false` when the wait
+/// ran out.
+pub fn wait_settled(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut phase = PHASE.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        if *phase != Phase::Running {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        phase = match PHASE_CHANGED.wait_timeout(phase, left) {
+            Ok((g, _)) => g,
+            Err(p) => p.into_inner().0,
+        };
+    }
+}
 
 /// One pane to adopt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,24 +117,25 @@ pub struct Adoption {
     pub pinned_session_id: String,
 }
 
-/// The live panes of `report` that `already_open` does not name, each with
+/// The live panes of `entries` that `already_open` does not name, each with
 /// the identity `open_record` (terminal id → `(session id, page id)`) gives
 /// it. Pure, so the identity rule is tested without a sweep.
 pub fn plan_adoptions(
-    report: &SweepReport,
+    entries: &[SweepEntry],
     already_open: &[String],
     open_record: impl Fn(&str) -> Option<(String, String)>,
 ) -> Vec<Adoption> {
-    report
-        .live()
-        .filter(|(pane_id, _)| !already_open.iter().any(|t| t == pane_id))
-        .map(|(pane_id, _)| {
-            let (pinned_session_id, page_id) = match open_record(pane_id) {
+    entries
+        .iter()
+        .filter(|e| matches!(e.outcome, SweepOutcome::Live { .. }))
+        .filter(|e| !already_open.contains(&e.pane_id))
+        .map(|e| {
+            let (pinned_session_id, page_id) = match open_record(&e.pane_id) {
                 Some((session, page)) => (session, Some(page)),
                 None => (String::new(), None),
             };
             Adoption {
-                pane_id: pane_id.to_string(),
+                pane_id: e.pane_id.clone(),
                 page_id,
                 pinned_session_id,
             }
@@ -99,8 +143,8 @@ pub fn plan_adoptions(
         .collect()
 }
 
-/// One log line per non-live pane, so a reaped orphan or an unanswering
-/// holder is never silent.
+/// One log line per pane, so a reaped orphan or an unanswering holder is
+/// never silent.
 fn log_report(pane_dir: &Path, report: &SweepReport) {
     for entry in &report.entries {
         match &entry.outcome {
@@ -108,7 +152,7 @@ fn log_report(pane_dir: &Path, report: &SweepReport) {
                 pane = %entry.pane_id,
                 holder_pid = hello_ack.holder_pid,
                 child_pid = ?hello_ack.child_pid,
-                "pty holder boot sweep: live holder found — adopting"
+                "pty holder boot sweep: live holder found"
             ),
             SweepOutcome::Incompatible { holder_versions } => warn!(
                 pane = %entry.pane_id,
@@ -126,13 +170,27 @@ fn log_report(pane_dir: &Path, report: &SweepReport) {
                 record,
                 reap,
                 lock_removed,
+                orphan_kept,
             } => info!(
                 pane = %entry.pane_id,
                 holder_pid = ?record.as_ref().map(|r| r.holder_pid),
                 lock_removed,
+                orphan_kept,
                 reap = %reap.summary(),
                 "pty holder boot sweep: dead holder reaped"
             ),
+        }
+    }
+    for orphan in &report.orphans {
+        if orphan.kept {
+            warn!(
+                pane = %orphan.pane_id,
+                unattributed = ?orphan.reap.unattributed,
+                "pty holder boot sweep: orphan-ledger entry KEPT — processes a dead holder may \
+                 have left are still running and nothing proves they are the pane's"
+            );
+        } else {
+            info!(pane = %orphan.pane_id, "pty holder boot sweep: orphan-ledger entry cleared");
         }
     }
     for path in &report.strays_removed {
@@ -143,10 +201,9 @@ fn log_report(pane_dir: &Path, report: &SweepReport) {
     }
 }
 
-/// Sweep this instance's pane directory and adopt every live pane into
-/// `manager`, on a thread of its own. Blocks the caller for at most
-/// [`SETUP_WAIT`] — the census, the reaping of dead panes and the adoptions
-/// all count against it; whatever is still running then finishes on its own.
+/// Start the boot sweep of this instance's pane directory on a thread of its
+/// own and return at once. See the module docs for how the webview's restore
+/// is ordered after it.
 pub fn run(
     manager: &Arc<TerminalManager>,
     app_handle: &AppHandle,
@@ -162,61 +219,28 @@ pub fn run(
     if !pane_dir.exists() {
         return;
     }
-    let started = Instant::now();
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    set_phase(Phase::Running);
     let (manager, app_handle) = (manager.clone(), app_handle.clone());
     let spawned = std::thread::Builder::new()
         .name("pty-holder-boot-sweep".into())
         .spawn(move || {
             sweep_and_adopt(&manager, &app_handle, store.as_deref(), &pane_dir);
-            let _ = done_tx.send(());
+            // Settled already, unless the sweep failed before its census.
+            set_phase(Phase::Settled);
         });
     if let Err(e) = spawned {
+        set_phase(Phase::Settled);
         warn!(error = %e, "pty holder boot sweep: thread did not start — nothing adopted");
-        return;
-    }
-    if done_rx.recv_timeout(SETUP_WAIT).is_err() {
-        warn!(
-            waited_ms = started.elapsed().as_millis() as u64,
-            "pty holder boot sweep: setup stopped waiting; the sweep finishes in the \
-             background and its adoptions land when their attach completes"
-        );
     }
 }
 
-/// The sweep proper: classify, reap, adopt (concurrently), log.
-fn sweep_and_adopt(
+/// Adopt `adoptions` concurrently; returns how many were adopted. Each is
+/// bounded by its attach (`daemon_pane_io::ATTACH_DEADLINE`).
+fn adopt_all(
     manager: &Arc<TerminalManager>,
     app_handle: &AppHandle,
-    store: Option<&SessionLifecycleStore>,
-    pane_dir: &Path,
-) {
-    let started = Instant::now();
-    let already_open: Vec<String> = manager.list().into_iter().map(|t| t.id).collect();
-    // Never probe a pane this runner already serves (or is spawning into the
-    // manager): a probe can steal a starting holder's lock.
-    let skip: Vec<PaneId> = already_open
-        .iter()
-        .filter_map(|id| PaneId::new(id).ok())
-        .collect();
-    let report = match boot_sweep(pane_dir, CENSUS_TIMEOUT, &skip) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                pane_dir = %pane_dir.display(),
-                error = %e,
-                "pty holder boot sweep: the pane directory could not be swept — live holders \
-                 in it are NOT adopted this run"
-            );
-            return;
-        }
-    };
-    log_report(pane_dir, &report);
-    let adoptions = plan_adoptions(&report, &already_open, |terminal_id| {
-        store?
-            .find_open_by_terminal(terminal_id)
-            .map(|r| (r.claude_session_id, r.page_id))
-    });
+    adoptions: Vec<Adoption>,
+) -> usize {
     let mut threads = Vec::new();
     for adoption in adoptions {
         if adoption.pinned_session_id.is_empty() {
@@ -227,7 +251,6 @@ fn sweep_and_adopt(
             );
         }
         let (manager, app_handle) = (manager.clone(), app_handle.clone());
-        // Each adoption is bounded by its attach (`daemon_pane_io::ATTACH_DEADLINE`).
         let thread = std::thread::Builder::new()
             .name(format!("pty-holder-adopt-{}", adoption.pane_id))
             .spawn(move || {
@@ -259,24 +282,63 @@ fn sweep_and_adopt(
             Err(e) => warn!(error = %e, "pty holder boot sweep: adoption thread did not start"),
         }
     }
-    let adopted = threads
+    threads
         .into_iter()
         .map(|t| t.join().unwrap_or(false))
         .filter(|ok| *ok)
-        .count();
-    info!(
-        swept = report.entries.len(),
-        adopted,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "pty holder boot sweep: done"
-    );
+        .count()
+}
+
+/// The sweep proper: classify; adopt the live panes and SETTLE; then reap the
+/// dead and log.
+fn sweep_and_adopt(
+    manager: &Arc<TerminalManager>,
+    app_handle: &AppHandle,
+    store: Option<&SessionLifecycleStore>,
+    pane_dir: &Path,
+) {
+    let started = Instant::now();
+    let already_open: Vec<String> = manager.list().into_iter().map(|t| t.id).collect();
+    // Never probe a pane this runner already serves (or is spawning into the
+    // manager): a probe can steal a starting holder's lock.
+    let skip: Vec<PaneId> = already_open
+        .iter()
+        .filter_map(|id| PaneId::new(id).ok())
+        .collect();
+    let mut adopted = 0;
+    let swept = boot_sweep(pane_dir, CENSUS_TIMEOUT, &skip, |entries| {
+        let adoptions = plan_adoptions(entries, &already_open, |terminal_id| {
+            store?
+                .find_open_by_terminal(terminal_id)
+                .map(|r| (r.claude_session_id, r.page_id))
+        });
+        adopted = adopt_all(manager, app_handle, adoptions);
+        // The restore may run now; reaping the dead does not concern it.
+        set_phase(Phase::Settled);
+    });
+    match swept {
+        Ok(report) => {
+            log_report(pane_dir, &report);
+            info!(
+                swept = report.entries.len(),
+                adopted,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "pty holder boot sweep: done"
+            );
+        }
+        Err(e) => warn!(
+            pane_dir = %pane_dir.display(),
+            error = %e,
+            "pty holder boot sweep: the pane directory could not be swept — live holders in \
+             it are NOT adopted this run"
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use qontinui_pty_holder::protocol::HelloAck;
-    use qontinui_pty_holder::sweep::SweepEntry;
 
     fn live(id: &str) -> SweepEntry {
         SweepEntry {
@@ -295,30 +357,25 @@ mod tests {
 
     #[test]
     fn pty_holder_boot_sweep_adopts_live_panes_under_their_registry_identity() {
-        let report = SweepReport {
-            entries: vec![
-                live("t-known"),
-                live("t-unrecorded"),
-                live("t-open-already"),
-                SweepEntry {
-                    pane_id: "t-dead".into(),
-                    outcome: SweepOutcome::Reaped {
-                        record: None,
-                        reap: Default::default(),
-                        lock_removed: true,
-                    },
+        let entries = vec![
+            live("t-known"),
+            live("t-unrecorded"),
+            live("t-open-already"),
+            SweepEntry {
+                pane_id: "t-wedged".into(),
+                outcome: SweepOutcome::Unknown {
+                    reason: "x".into(),
+                    record: None,
                 },
-                SweepEntry {
-                    pane_id: "t-wedged".into(),
-                    outcome: SweepOutcome::Unknown {
-                        reason: "x".into(),
-                        record: None,
-                    },
+            },
+            SweepEntry {
+                pane_id: "t-old".into(),
+                outcome: SweepOutcome::Incompatible {
+                    holder_versions: vec![1],
                 },
-            ],
-            ..Default::default()
-        };
-        let plans = plan_adoptions(&report, &["t-open-already".to_string()], |id| {
+            },
+        ];
+        let plans = plan_adoptions(&entries, &["t-open-already".to_string()], |id| {
             (id == "t-known").then(|| ("sess-1".to_string(), "page-2".to_string()))
         });
         assert_eq!(
@@ -335,7 +392,27 @@ mod tests {
                     pinned_session_id: String::new(),
                 },
             ],
-            "only live panes not already open are adopted; dead, unknown and open ones are not"
+            "only live panes not already open are adopted; unknown, incompatible and open ones \
+             are not"
         );
+    }
+
+    /// The restore's wait: a sweep that never started is no reason to wait; a
+    /// running one is waited for until it settles, and no longer than asked.
+    #[test]
+    fn pty_holder_boot_sweep_restore_waits_for_settle_and_no_longer() {
+        set_phase(Phase::NotStarted);
+        assert!(wait_settled(Duration::from_secs(5)), "never started");
+        set_phase(Phase::Running);
+        let t = Instant::now();
+        assert!(!wait_settled(Duration::from_millis(50)), "still running");
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let settle = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            set_phase(Phase::Settled);
+        });
+        assert!(wait_settled(Duration::from_secs(5)));
+        settle.join().unwrap();
+        set_phase(Phase::NotStarted);
     }
 }
