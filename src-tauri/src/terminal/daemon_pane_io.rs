@@ -95,14 +95,15 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use qontinui_pty_holder::client::{
-    connect, probe, ConnectError, Event, InputStream, Probe, ShutdownHandle, StreamReader,
-    StreamWriter,
+    connect, probe, ConnectError, Event, FailureDisposition, InputStream, Probe, ShutdownHandle,
+    StreamReader, StreamWriter,
 };
 use qontinui_pty_holder::frame::SyntheticPart;
 use qontinui_pty_holder::protocol::{ExitReply, Reply, Request, RestoreMeta};
 use qontinui_pty_holder::terminate::{terminate_verified_holder, Termination};
 use qontinui_runner_lib::pty_holder::spawn::{
-    pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, Unprotected, NEW_TAB_SPAWN_BUDGET,
+    pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, SpawnError, Unprotected,
+    NEW_TAB_SPAWN_BUDGET,
 };
 use tracing::{debug, info, warn};
 
@@ -111,21 +112,31 @@ use super::pane_output::PaneOutput;
 use super::remote_pane_io::{DetachOutcome, DETACH_EXIT_CODE};
 use crate::settings::TerminalSettings;
 
+/// Why a fallback to an in-process PTY is refused: the pane's command would
+/// run twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoFallback {
+    /// A holder for this pane is (or may be) still running the command
+    /// (`SpawnError::LiveHolderUnreachable`).
+    HolderStillRunning,
+    /// A holder already RAN the command and is gone
+    /// (`SpawnError::RanUnheld`).
+    CommandAlreadyRan,
+}
+
 /// Why [`DaemonPaneIo::spawn`] produced no pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolderPaneError {
     pub reason: String,
-    /// A holder for this pane is (or may be) still LIVE, or already RAN the
-    /// pane's command (`SpawnError::forbids_fallback`). The caller must not
-    /// fall back to an in-process PTY: the command would run twice.
-    pub live_holder_left: bool,
+    /// `Some` when the caller must NOT fall back to an in-process PTY.
+    pub no_fallback: Option<NoFallback>,
 }
 
 impl From<String> for HolderPaneError {
     fn from(reason: String) -> Self {
         HolderPaneError {
             reason,
-            live_holder_left: false,
+            no_fallback: None,
         }
     }
 }
@@ -140,19 +151,24 @@ impl std::fmt::Display for HolderPaneError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachError {
     pub reason: String,
-    /// The holder can NEVER be driven by this runner (no common protocol
-    /// version, or a final refusal: `ConnectError::is_definitive`). Anything
-    /// else — a timeout, an IO error, a busy holder — may clear on a retry,
-    /// and must never be the reason a live session is ended (review round 3,
-    /// R1).
-    pub definitive: bool,
+    /// What an adopter should do about it (`ConnectError::disposition`):
+    /// END the holder only on a final answer (no common version, peer not
+    /// authorized, a verb its negotiated version lacks), LEAVE ALONE a holder
+    /// below the data path (plan D15), RETRY anything else — a timeout, an IO
+    /// error, a busy holder, an unknown reason, a runner bug (review rounds 3
+    /// and 4, R1/H1).
+    pub disposition: FailureDisposition,
+    /// The holder rejected a request this runner malformed: a runner bug, to
+    /// be logged loudly.
+    pub runner_bug: bool,
 }
 
 impl AttachError {
     fn transient(reason: String) -> Self {
         AttachError {
             reason,
-            definitive: false,
+            disposition: FailureDisposition::Retry,
+            runner_bug: false,
         }
     }
 }
@@ -404,16 +420,26 @@ fn spawn_holder_pane_or_fallback_blocking(
         Ok(pane) => return Ok(Arc::new(pane)),
         // A holder for this pane may still be running its command: an
         // in-process fallback would run it a second time.
-        Err(e) if e.live_holder_left => {
-            warn!(
-                terminal_id,
-                reason = %e.reason,
-                "pty holder: a live holder could be neither held nor ended — NOT falling back"
-            );
+        Err(HolderPaneError {
+            reason,
+            no_fallback: Some(why),
+        }) => {
+            let (log, user) = match why {
+                NoFallback::HolderStillRunning => (
+                    "pty holder: a live holder could be neither held nor ended — NOT falling back",
+                    "a PTY holder for this tab is still running its command and could not be \
+                     reached",
+                ),
+                NoFallback::CommandAlreadyRan => (
+                    "pty holder: a holder ran the command and is gone — NOT falling back",
+                    "a PTY holder already ran this tab's command and exited before it could be \
+                     attached",
+                ),
+            };
+            warn!(terminal_id, reason = %reason, "{log}");
             return Err(format!(
-                "PTY holder unusable and still running ({}); no in-process fallback, which \
-                 would run the pane's command twice",
-                e.reason
+                "{user} ({reason}); no in-process fallback, which would run the command a \
+                 second time"
             ));
         }
         Err(e) => e.reason,
@@ -1074,7 +1100,11 @@ impl DaemonPaneIo {
         let spec = cmd.to_holder_spec(cols, rows);
         let spawned = spawn_pane_holder(holder_exe, pane_dir, pane_id, &spec).map_err(|e| {
             HolderPaneError {
-                live_holder_left: e.forbids_fallback(),
+                no_fallback: match e {
+                    SpawnError::LiveHolderUnreachable(_) => Some(NoFallback::HolderStillRunning),
+                    SpawnError::RanUnheld(_) => Some(NoFallback::CommandAlreadyRan),
+                    _ => None,
+                },
                 reason: format!("PTY holder spawn failed: {e}"),
             }
         })?;
@@ -1173,7 +1203,8 @@ impl DaemonPaneIo {
                 None => c.attach(from_offset, deadline),
             })
             .map_err(|e| AttachError {
-                definitive: e.is_definitive(),
+                disposition: e.disposition(),
+                runner_bug: e.is_runner_bug(),
                 reason: format!("PTY holder {pane_id}: attach failed: {e}"),
             })?;
         let info = stream.info.clone();
