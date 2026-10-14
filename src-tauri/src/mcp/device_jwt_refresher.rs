@@ -8618,6 +8618,10 @@ mod device_self_refresh_tests {
     /// sessions get the same new credential.
     #[tokio::test]
     async fn a_one_slot_box_refused_on_unpinned_traffic_replaces_the_legacy_bearer() {
+        // A persisted mint spends the PROCESS-GLOBAL revocation latch
+        // (`reset_upstream_rejections_for`); serialise with the suites that
+        // assert on it.
+        let _posture = posture_test_lock();
         let t = uuid::Uuid::parse_str("d4a00000-0000-4000-8000-0000000000f1").unwrap();
         let mgr = test_auth_manager("one_slot_unpinned_replaces_legacy");
         let now = chrono::Utc::now().timestamp();
@@ -8673,6 +8677,10 @@ mod device_self_refresh_tests {
 
     #[tokio::test]
     async fn self_refresh_preferred_when_valid_device_jwt_held() {
+        // A persisted mint spends the PROCESS-GLOBAL revocation latch
+        // (`reset_upstream_rejections_for`); serialise with the suites that
+        // assert on it.
+        let _posture = posture_test_lock();
         // A currently-valid (future-exp) device-JWT is held → self-refresh
         // re-mints from it (presenting it as the bearer), stores the new token,
         // and returns Some. The caller uses this to SKIP the Cognito path
@@ -14601,6 +14609,10 @@ mod device_machine_key_exchange_tests {
 
     #[tokio::test]
     async fn exchange_recovers_device_jwt_from_stored_dmk() {
+        // A persisted mint spends the PROCESS-GLOBAL revocation latch
+        // (`reset_upstream_rejections_for`); serialise with the suites that
+        // assert on it.
+        let _posture = posture_test_lock();
         // The >30-day cold-start: the slot holds an EXPIRED device JWT (4a +
         // Cognito already failed), but a dmk_ is stored → the exchange mints a
         // fresh device JWT, stores it, and returns it. The dmk_ must ride the
