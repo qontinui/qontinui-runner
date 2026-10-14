@@ -13,22 +13,44 @@
 
 use std::sync::Arc;
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
 use crate::session::session_org_store::{
-    SessionOrgApplyResponse, SessionOrgOp, SessionOrgSnapshot, SessionOrgStore,
+    SessionOrgApplyResponse, SessionOrgOp, SessionOrgSnapshot, SessionOrgStatus, SessionOrgStore,
 };
 
 /// The whole organization, or `status: "unknown"` with the reason and where
 /// an unreadable file was preserved.
+///
+/// `async` + blocking pool: the store lock is held across an apply's file
+/// write, so even this read must not wait for it on the main thread. Never
+/// rejects — a failed task answers `unknown` with its reason, the same shape
+/// the frontend already renders.
 #[tauri::command]
-pub fn session_org_get(store: tauri::State<'_, Arc<SessionOrgStore>>) -> SessionOrgSnapshot {
-    store.snapshot()
+pub async fn session_org_get(
+    store: tauri::State<'_, Arc<SessionOrgStore>>,
+) -> Result<SessionOrgSnapshot, String> {
+    let store = Arc::clone(store.inner());
+    Ok(spawn_blocking_tracked(move || store.snapshot())
+        .await
+        .unwrap_or_else(|e| SessionOrgSnapshot {
+            status: SessionOrgStatus::Unknown,
+            org: None,
+            reason: Some(format!("session_org_get task failed: {e}")),
+            preserved_at: None,
+        }))
 }
 
 /// Apply `ops` in order; returns one result per op and the resulting state.
+/// The apply persists the org to disk, so it runs on the blocking pool, never
+/// on the main thread.
 #[tauri::command]
-pub fn session_org_apply(
+pub async fn session_org_apply(
     store: tauri::State<'_, Arc<SessionOrgStore>>,
     ops: Vec<SessionOrgOp>,
 ) -> Result<SessionOrgApplyResponse, String> {
-    store.apply(&ops)
+    let store = Arc::clone(store.inner());
+    spawn_blocking_tracked(move || store.apply(&ops))
+        .await
+        .map_err(|e| format!("session_org_apply task failed: {e}"))?
 }

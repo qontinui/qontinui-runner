@@ -468,7 +468,14 @@ impl SessionOrgStore {
             .map_err(|e| format!("session_org: store lock poisoned: {e}"))?;
 
         let mut working: Option<SessionOrg> = match &*state {
-            Loaded::Known(org) => Some(org.clone()),
+            Loaded::Known(org) => {
+                let mut org = org.clone();
+                // A file written by hand (or by an older build) may hold
+                // default members; prune them up front so `before` below
+                // compares like with like.
+                prune_default_members(&mut org);
+                Some(org)
+            }
             Loaded::Unknown { .. } => None,
         };
         let mut results = Vec::with_capacity(ops.len());
@@ -478,6 +485,13 @@ impl SessionOrgStore {
                 Some(org) => {
                     let before = org.clone();
                     let result = apply_op(org, op, now);
+                    // Ops reach members through `entry().or_default()`, so a
+                    // no-op (`setPinned false` on a non-member) leaves a
+                    // default member behind. It carries no information and is
+                    // dropped on persist anyway — prune it BEFORE comparing,
+                    // or a no-op bumps the revision, rewrites the file and
+                    // broadcasts a change for nothing.
+                    prune_default_members(org);
                     if *org != before {
                         changed = true;
                     }
@@ -494,6 +508,13 @@ impl SessionOrgStore {
                             results.push(SessionOrgOpResult::refused("preserve_failed"));
                             continue;
                         }
+                        // The bytes now live at `aside`. Record that at once:
+                        // if the persist below fails the org stays Unknown,
+                        // and its `preservedAt` must name where the bytes
+                        // ARE, not the path they just left.
+                        if let Loaded::Unknown { preserved_at, .. } = &mut *state {
+                            *preserved_at = Some(aside);
+                        }
                     }
                     working = Some(SessionOrg::default());
                     changed = true;
@@ -505,7 +526,7 @@ impl SessionOrgStore {
 
         if changed {
             if let Some(org) = working.as_mut() {
-                org.members.retain(|_, m| !m.is_default());
+                prune_default_members(org);
                 org.revision += 1;
                 write_atomic(&self.path, org)
                     .map_err(|e| format!("session_org: persist failed: {e}"))?;
@@ -593,10 +614,21 @@ fn corrupt_aside_path(path: &Path, now: i64) -> PathBuf {
     path.with_file_name(format!("session-org.corrupt-{now}.json"))
 }
 
+/// Drop members whose every field is at its default — they carry nothing.
+fn prune_default_members(org: &mut SessionOrg) {
+    org.members.retain(|_, m| !m.is_default());
+}
+
+/// Temp file + `sync_all` + rename: the bytes are durable BEFORE the rename
+/// makes them the file, so a crash cannot leave a renamed-but-empty org.
 fn write_atomic(path: &Path, org: &SessionOrg) -> std::io::Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(org).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, &bytes)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(tmp, path)
 }
 
@@ -1182,6 +1214,93 @@ mod tests {
         assert_eq!(std::fs::read(aside.join("marker")).unwrap(), b"keep");
         assert!(path.is_file(), "fresh org written");
         assert_eq!(known(&store_in(dir.path())).revision, 1);
+    }
+
+    /// A no-op apply is a no-op: `setPinned false` (and `unmute`, `snooze`
+    /// clear, `removeTags`) on a session that is not a member leaves the
+    /// revision alone, writes no file and emits no change event.
+    #[test]
+    fn session_org_a_no_op_on_a_non_member_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(STORE_FILE_NAME);
+        let store = store_in(dir.path());
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        store.set_notifier(Box::new(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let no_ops = [
+            SessionOrgOp::SetPinned {
+                session_keys: keys(&["ghost"]),
+                pinned: false,
+            },
+            SessionOrgOp::SetMuted {
+                session_keys: keys(&["ghost"]),
+                muted: false,
+            },
+            SessionOrgOp::Snooze {
+                session_keys: keys(&["ghost"]),
+                until: None,
+            },
+            SessionOrgOp::RemoveTags {
+                session_keys: keys(&["ghost"]),
+                tags: keys(&["x"]),
+            },
+        ];
+        let resp = store.apply_at(&no_ops, T0).unwrap();
+        assert!(resp.results.iter().all(|r| r.ok), "{:?}", resp.results);
+        assert_eq!(resp.snapshot.org.as_ref().unwrap().revision, 0);
+        assert!(!path.exists(), "a no-op must not write the file");
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "no change event");
+
+        // Same on an org that already has state on disk.
+        store
+            .apply_at(
+                &[SessionOrgOp::SetPinned {
+                    session_keys: keys(&["real"]),
+                    pinned: true,
+                }],
+                T0,
+            )
+            .unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        let resp = store.apply_at(&no_ops, T0 + 1).unwrap();
+        assert_eq!(resp.snapshot.org.as_ref().unwrap().revision, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    /// The reset moves an in-place unreadable file aside, then its persist
+    /// fails: the org stays Unknown and `preservedAt` names the aside path —
+    /// where the bytes now are — not the path they left.
+    #[test]
+    fn session_org_failed_persist_after_reset_reports_where_the_bytes_are() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(STORE_FILE_NAME);
+        std::fs::write(&path, b"not json").unwrap();
+        let store = SessionOrgStore::open(&path).unwrap();
+        // The bytes reappear in place (e.g. restored by hand) so the reset
+        // has a file to move.
+        std::fs::write(&path, b"second copy").unwrap();
+        // A directory at the temp path makes the persist fail.
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+
+        let reset_at = T0 + 7;
+        let err = store
+            .apply_at(&[SessionOrgOp::ResetAfterUnknown], reset_at)
+            .unwrap_err();
+        assert!(err.contains("persist failed"), "{err}");
+        let aside = corrupt_aside_path(&path, reset_at);
+        assert_eq!(std::fs::read(&aside).unwrap(), b"second copy");
+        assert!(!path.exists());
+        let snap = store.snapshot();
+        assert_eq!(snap.status, SessionOrgStatus::Unknown);
+        assert_eq!(
+            snap.preserved_at.as_deref(),
+            Some(aside.display().to_string().as_str()),
+            "preservedAt must name where the bytes actually are"
+        );
     }
 
     /// Enumerate: deleting a group with members ungroups them — every member

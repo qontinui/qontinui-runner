@@ -25,12 +25,11 @@
 //!
 //! Extracted text is cached per transcript keyed by `(path, mtime, size)`, so a
 //! repeat search re-parses only the files that changed; the cache is bounded
-//! by bytes and evicts the oldest entries first. Measured 2026-10-13 on the
-//! operator box (Linux, `cargo test` dev profile) with the synthetic fixture in
-//! `two_hundred_transcripts_search_within_the_budget` — 200 transcripts of
-//! ~140 KB JSONL each, ~28 MB in all: **39 ms cold, 4 ms warm**, against the
-//! plan's 2 s budget. So the on-disk inverted index the plan's Risks section
-//! reserved for a > 2 s measurement is not built.
+//! by bytes and evicts the oldest entries first. A search over 200 synthetic
+//! transcripts (~140 KB of JSONL each, ~28 MB in all) completes within the
+//! plan's 2 s budget, see `two_hundred_transcripts_search_within_the_budget`,
+//! so the on-disk inverted index the plan's Risks section reserved for a > 2 s
+//! measurement is not built.
 //!
 //! A scan is bounded in time. Every response states `{scanned, total,
 //! truncated, elapsedMs}`, and a scan that stopped early (time budget), dropped
@@ -64,8 +63,10 @@ pub const SCAN_TIME_BUDGET: Duration = Duration::from_secs(8);
 /// (`off_runtime::deadline`) so an exhausted blocking pool cannot hold the
 /// command open forever.
 const BLOCKING_WAIT: Duration = Duration::from_secs(15);
-/// Bytes of extracted text (original + lowercased copy) the cache may hold.
-pub const TEXT_CACHE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+/// Bytes of extracted text the cache may hold, counting BOTH the original and
+/// the lowercased copy of every entry — so this is the resident bound, not
+/// half of it.
+pub const TEXT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Snippet context before / after the hit, in bytes (rounded to char
 /// boundaries).
 const SNIPPET_BEFORE: usize = 80;
@@ -309,8 +310,9 @@ pub struct TranscriptSearchResponse {
     /// Why: [`TRUNCATED_TIME_BUDGET`] | [`TRUNCATED_LIMIT`] |
     /// [`TRUNCATED_UNREADABLE`] | [`TRUNCATED_NOT_RUN`].
     pub truncation: Vec<String>,
-    /// Named sessions with a transcript that was NOT searched (time budget or
-    /// unreadable) — UNKNOWN for this query, never "no match".
+    /// Named sessions with a transcript that was NOT searched (time budget,
+    /// unreadable, or the scan never ran) — UNKNOWN for this query, never "no
+    /// match".
     pub not_scanned: Vec<String>,
     /// Named sessions with no transcript on disk at all.
     pub missing: Vec<String>,
@@ -512,6 +514,7 @@ pub async fn transcript_search(
     };
     let started = Instant::now();
     let terms = parsed.terms.clone();
+    let requested = session_keys.clone();
     let task = spawn_blocking_tracked(move || {
         let index = DiskTranscriptIndex::discover();
         run_search(
@@ -530,20 +533,46 @@ pub async fn transcript_search(
                  answering not-run rather than holding the command open",
                 BLOCKING_WAIT.as_secs()
             );
-            Ok(TranscriptSearchResponse {
+            Ok(not_run_response(
                 terms,
-                hits: Vec::new(),
-                matched: 0,
-                scanned: 0,
-                total: 0,
-                failed: 0,
-                truncated: true,
-                truncation: vec![TRUNCATED_NOT_RUN.to_string()],
-                not_scanned: Vec::new(),
-                missing: Vec::new(),
-                elapsed_ms: started.elapsed().as_millis() as u64,
-            })
+                requested.as_deref(),
+                started.elapsed(),
+            ))
         }
+    }
+}
+
+/// The answer when the blocking pool never ran the scan: truncated
+/// `not_run`, and every requested session key listed in `not_scanned` — a
+/// scoped search that did not run must never read as "no match" for the
+/// sessions it named.
+pub fn not_run_response(
+    terms: Vec<String>,
+    session_keys: Option<&[String]>,
+    elapsed: Duration,
+) -> TranscriptSearchResponse {
+    let mut not_scanned: Vec<String> = session_keys
+        .unwrap_or_default()
+        .iter()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    not_scanned.sort();
+    TranscriptSearchResponse {
+        terms,
+        hits: Vec::new(),
+        matched: 0,
+        scanned: 0,
+        total: 0,
+        failed: 0,
+        truncated: true,
+        truncation: vec![TRUNCATED_NOT_RUN.to_string()],
+        not_scanned,
+        missing: Vec::new(),
+        elapsed_ms: elapsed.as_millis() as u64,
     }
 }
 
@@ -790,6 +819,31 @@ mod tests {
         assert_eq!(r.not_scanned, vec!["bad"]);
     }
 
+    /// A scan the blocking pool never ran names every requested session as
+    /// not scanned, so none of them reads as "no match".
+    #[test]
+    fn a_scan_that_never_ran_lists_every_requested_session_as_not_scanned() {
+        let keys = vec![
+            "b".to_string(),
+            "a".to_string(),
+            " ".to_string(),
+            "a".to_string(),
+        ];
+        let r = not_run_response(
+            vec!["needle".to_string()],
+            Some(&keys),
+            Duration::from_secs(15),
+        );
+        assert!(r.truncated);
+        assert_eq!(r.truncation, vec![TRUNCATED_NOT_RUN]);
+        assert_eq!(r.not_scanned, vec!["a", "b"]);
+        assert_eq!(r.scanned, 0);
+        assert!(r.hits.is_empty());
+        // Unscoped: nothing to name, but still truncated not_run.
+        let unscoped = not_run_response(vec!["x".to_string()], None, Duration::ZERO);
+        assert!(unscoped.truncated && unscoped.not_scanned.is_empty());
+    }
+
     #[test]
     fn the_cache_is_keyed_by_mtime_and_size_and_rereads_a_changed_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -841,8 +895,7 @@ mod tests {
 
     /// The plan's measured budget: 200 synthetic transcripts searched in < 2 s
     /// cold. Each is ~140 KB of JSONL (60 user/assistant turn pairs of ~1 KB
-    /// text) — ~28 MB in all. The measurement is in the module docs; the
-    /// assertion is the budget itself.
+    /// text) — ~28 MB in all. The assertion is the budget itself.
     #[test]
     fn two_hundred_transcripts_search_within_the_budget() {
         let tmp = tempfile::tempdir().unwrap();

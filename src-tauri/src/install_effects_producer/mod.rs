@@ -909,6 +909,7 @@ async fn get_sessions_restore_health(
 /// | Branch | `reason` |
 /// |---|---|
 /// | lifecycle store absent from Tauri state | `lifecycle_store_unavailable` |
+/// | the shared discovery task (config dirs, registry, transcripts) failed | `discovery_failed` |
 ///
 /// A degraded PR ledger does NOT degrade the listing — identity is answerable
 /// without it — it degrades each session's `prs.status` with its own reason.
@@ -916,8 +917,11 @@ async fn get_sessions_restore_health(
 /// Also carries `branches` — one bounded, cached `git rev-parse` per distinct
 /// working dir (see `commands::session_info_list`).
 ///
-/// Read-only: it stats the disk, reads git, and touches no registry state, so
-/// probing it is always safe.
+/// Writes no state, but it is NOT free: a call walks the Claude config dirs and
+/// the transcript index, runs a blocking-pool read and a PR-ledger query per
+/// session (8 at a time), and FORKS `git rev-parse` — up to 4 at once, 3 s
+/// each, for up to 64 distinct working dirs whose branch is not cached (20 s
+/// TTL). Probe it at a polling cadence, not in a tight loop.
 async fn get_sessions_info(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<crate::commands::session_info_list::SessionsInfoListResponse>> {
