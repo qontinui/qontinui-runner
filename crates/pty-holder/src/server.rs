@@ -328,7 +328,9 @@ impl Holder {
             eprintln!("pty-holder: accept thread: {e}");
         }
         let exit = pane.wait_for_end();
-        crate::scrollback::persist_tick(&pane, &scrollback, &log);
+        // Closes the writer under its mutex BEFORE the lock is released, so no
+        // later timer tick can touch a successor holder's files.
+        crate::scrollback::persist_final(&pane, &scrollback, &log);
         drop(lock);
         exit
     }
