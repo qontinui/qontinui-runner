@@ -277,11 +277,11 @@ describe("emptyCreateTargets — a merged empty state never creates under an unc
   const B = "bbbbbbbb-0000-4000-8000-00000000000b";
   const short = (t: string) => t.slice(0, 8);
 
-  it("offers ONE create under the served tenant in a single-tenant read, as before", () => {
+  it("offers ONE create under the tenant a single-tenant read presented, as before", () => {
     expect(
       emptyCreateTargets({
         merged: false,
-        servedTenant: A,
+        singleTenant: A,
         answeredTenants: [A],
         shortTenant: short,
       }),
@@ -289,7 +289,7 @@ describe("emptyCreateTargets — a merged empty state never creates under an unc
     expect(
       emptyCreateTargets({
         merged: false,
-        servedTenant: null,
+        singleTenant: null,
         answeredTenants: [],
         shortTenant: short,
       }).targets,
@@ -299,7 +299,7 @@ describe("emptyCreateTargets — a merged empty state never creates under an unc
   it("offers one create PER answered tenant in a merged read, each naming its tenant", () => {
     const out = emptyCreateTargets({
       merged: true,
-      servedTenant: A,
+      singleTenant: A,
       answeredTenants: [A, B, A],
       shortTenant: short,
     });
@@ -313,7 +313,7 @@ describe("emptyCreateTargets — a merged empty state never creates under an unc
   it("never sends null in a merged read — an unnamed or absent tenant is skipped, then disabled with a reason", () => {
     const out = emptyCreateTargets({
       merged: true,
-      servedTenant: null,
+      singleTenant: null,
       answeredTenants: [null, "  "],
       shortTenant: short,
     });

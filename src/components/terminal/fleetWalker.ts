@@ -130,17 +130,41 @@ export function servedTenantOf(
 }
 
 /**
- * Stamp every row with the tenant its page was served under. Attach and create
- * mint their grant under THIS tenant — coord resolves a target within the
- * presented principal's tenant only, so in a merged view a row minted under
- * any other tenant (the selection, the default slot) is a 404.
+ * The tenant attach and create MINT under for a row of a walk: the tenant that
+ * walk ASKED for — the credential it presented, and so the principal coord
+ * scoped the rows to — else null.
+ *
+ * Not the envelope's tenant. A walk that named no tenant (a single-tenant
+ * device, or the device default) presented the runner's default credential, so
+ * its rows mint with no tenant exactly as they did before the selector: pinning
+ * the envelope's tenant there would route the mint through the owned-tenant
+ * checks and could refuse one that always worked. Same rule as the probe's
+ * `WalkPlan::pin_to_served` (`remote_interactivity_probe.rs`). In a merged view
+ * every walk names its tenant, so each row mints under its own.
+ */
+export function mintTenantOf(requested: string | null): string | null {
+  const asked = (requested ?? "").trim();
+  return asked.length > 0 ? asked : null;
+}
+
+/**
+ * Stamp every row with the tenant its page was served under (`servedTenantId`,
+ * what the view SAYS about the row) and the tenant attach and create mint
+ * under (`mintTenantId`, see {@link mintTenantOf}). coord resolves a target
+ * within the presented principal's tenant only, so in a merged view a row
+ * minted under any other tenant (the selection, the default slot) is a 404.
  */
 export function stampServedTenant(
   response: FleetSessionsResponse,
   requested: string | null,
 ): FleetSessionsResponse {
   const servedTenantId = servedTenantOf(response, requested);
-  const sessions: FleetSession[] = (response.sessions ?? []).map((s) => ({ ...s, servedTenantId }));
+  const mintTenantId = mintTenantOf(requested);
+  const sessions: FleetSession[] = (response.sessions ?? []).map((s) => ({
+    ...s,
+    servedTenantId,
+    mintTenantId,
+  }));
   return { ...response, sessions };
 }
 

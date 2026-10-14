@@ -43,6 +43,8 @@ const DISCOVERY = readFileSync(`${DIR}fleetDiscovery.ts`, "utf8");
  * asserted behaviourally in `fleetWalker.test.ts`; the pins here are only the
  * wiring between it and the hook. */
 const WALKER = readFileSync(`${DIR}fleetWalker.ts`, "utf8");
+/** The selector itself — the component that owns the `<select>`'s `onChange`. */
+const TENANT_SELECT = readFileSync(`${DIR}FleetTenantSelect.tsx`, "utf8");
 
 /**
  * The same source with its comments removed.
@@ -607,9 +609,15 @@ describe("the tenant selector reads, and attaches, the tenant it names", () => {
   it("hands the selection to the hook and never to set_active_tenant", () => {
     expect(SOURCE).toContain("tenants: walkTenants,");
     expect(SOURCE).toContain("fleetWalkTenants(fleetTenant, tenantCandidates)");
-    // Moving the device default for new sessions is not this view's to do.
-    expect(codeOf(SOURCE)).not.toContain("set_active_tenant");
-    expect(codeOf(SOURCE)).not.toContain("setDefaultTenantForNewSessions");
+    // Moving the device default for new sessions is not this view's to do —
+    // neither in the picker nor in the selector whose `onChange` it hands down.
+    for (const [name, text] of [
+      ["FleetSessionPicker.tsx", SOURCE],
+      ["FleetTenantSelect.tsx", TENANT_SELECT],
+    ] as const) {
+      expect(codeOf(text), name).not.toContain("set_active_tenant");
+      expect(codeOf(text), name).not.toContain("setDefaultTenantForNewSessions");
+    }
   });
 
   it("opens on the policy default until the operator picks — derived, not written by an effect", () => {
@@ -625,11 +633,17 @@ describe("the tenant selector reads, and attaches, the tenant it names", () => {
     expect(SOURCE).toContain('data-fleet-row-tenant={s.servedTenantId ?? ""}');
   });
 
-  it("mints attach and create grants under the tenant the ROW or GROUP was served for", () => {
+  it("mints attach and create grants under the tenant the ROW's or GROUP's own walk presented", () => {
     // Never the selection — in a merged view that is every tenant, and between
     // a switch and its answer the rows still belong to the previous one.
-    expect(SOURCE).toContain("tenant: s.servedTenantId ?? null,");
-    expect(SOURCE).toContain("createRemote(groupKey, g.deviceId, g.label, g.tenantId)");
+    // The mint tenant is the one the row's own walk PRESENTED (`mintTenantOf`):
+    // null for a read that named none, so a single-tenant device mints exactly
+    // as before the selector.
+    expect(SOURCE).toContain("tenant: s.mintTenantId ?? null,");
+    expect(SOURCE).toContain("createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)");
+    expect(SOURCE).toContain("singleTenant: mintTenantOf(walkTenants[0] ?? null),");
+    expect(codeOf(SOURCE)).not.toContain("tenant: s.servedTenantId");
+    expect(codeOf(SOURCE)).not.toContain("g.label, g.tenantId)");
     expect(codeOf(SOURCE)).not.toMatch(/tenant: fleetTenant/);
     expect(codeOf(SOURCE)).not.toContain("rowsTenant");
   });

@@ -148,6 +148,14 @@ export function FleetTenantSelect({
 }: FleetTenantSelectProps) {
   if (!showSwitcher) return null;
   const options = fleetTenantOptions(candidates, credentials);
+  // A picked tenant that is no longer bound (the binding went away after the
+  // pick) has no option of its own, and a controlled <select> would then SHOW
+  // its first option — "all tenants" — while the view still reads that one
+  // tenant. Keep it on screen, disabled, saying so.
+  const stalePick =
+    selected !== null && !isAllTenants(selected) && !candidates.includes(selected)
+      ? selected
+      : null;
   return (
     <select
       data-ui-bridge-id={FLEET_PICKER_TENANT_SELECT_ID}
@@ -168,6 +176,11 @@ export function FleetTenantSelect({
           {o.label}
         </option>
       ))}
+      {stalePick !== null && (
+        <option value={stalePick} title={stalePick} disabled>
+          {shortTenantId(stalePick)} — no longer bound
+        </option>
+      )}
     </select>
   );
 }
