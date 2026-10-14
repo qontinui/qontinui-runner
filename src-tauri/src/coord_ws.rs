@@ -24,7 +24,8 @@
 //!
 //! - [`build_ws_url`] — scheme swap, idempotent `/ws`, `?subscribe=<name>`;
 //! - [`connect`] — resolve the device JWT PER CONNECT and present it as
-//!   `?token=` AND `Authorization: Bearer`, BOUND the attempt by
+//!   `?token=` AND `Authorization: Bearer`, connect through
+//!   `outbound_net::connect_ws` (the proxy-aware connect), BOUND the attempt by
 //!   [`CONNECT_TIMEOUT`], then name any refusal (status + coord's `error`
 //!   code) so a 401/403 reconnect flap is diagnosable from the log, and hand
 //!   a 401 to the device-JWT refresher through [`set_unauthorized_hook`].
@@ -186,29 +187,22 @@ pub type CoordWs =
 /// `lane` is the log prefix of the calling subscriber.
 pub async fn connect(ws_url: &str, lane: &str) -> anyhow::Result<CoordWs> {
     let request = build_upgrade_request(ws_url, lane)?;
-    let attempt = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(request),
-    )
-    .await
-    {
-        Ok(inner) => inner,
-        // Render the expired budget as the transport error it is, so the
-        // caller's existing `Err` arm backs off and retries exactly as it
-        // would for a refused connection. See [`CONNECT_TIMEOUT`].
-        Err(_elapsed) => Err(tungstenite::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!(
-                "coord /ws connect exceeded {}s with no handshake response",
-                CONNECT_TIMEOUT.as_secs()
-            ),
-        ))),
-    };
-    match attempt {
-        Ok((ws, _resp)) => Ok(ws),
+    // Through the HTTP proxy the environment (or the OS system proxy) names
+    // for coord, or direct — `outbound_net::connect_ws` decides, with the same
+    // matcher reqwest uses. Bounded by [`CONNECT_TIMEOUT`]: an expired budget
+    // surfaces as `Io(TimedOut)`, so the caller's existing `Err` arm backs off
+    // and retries exactly as it would for a refused connection.
+    match crate::outbound_net::connect_ws(request, CONNECT_TIMEOUT).await {
+        Ok(ws) => Ok(ws),
         Err(e) => {
-            log_upgrade_failure(lane, &e);
-            if upgrade_refusal_is_unauthorized(&e) {
+            match e.as_tungstenite() {
+                Some(inner) => log_upgrade_failure(lane, inner),
+                None => warn!(
+                    "{lane}: coord /ws connect failed at the HTTP proxy: {e} — the proxy, not \
+                     coord, refused; check network.proxy_url / HTTPS_PROXY"
+                ),
+            }
+            if e.is_unauthorized() {
                 kick_unauthorized_hook(lane);
             }
             Err(anyhow::anyhow!("WS upgrade: {e}"))
