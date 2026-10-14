@@ -120,3 +120,29 @@ export function unseenVerdict(inputs: UnseenInputs): UnseenVerdict {
 export function unseenAttr(verdict: UnseenVerdict): "true" | "false" | "unknown" {
   return verdict.state === "unseen" ? "true" : verdict.state === "seen" ? "false" : "unknown";
 }
+
+/** The row fields {@link focusedSessionKey} reads — `UnifiedSession` satisfies it. */
+export interface FocusableRow {
+  sessionId: string;
+  source: "transcript" | "tab";
+  /** The live tab backing a transcript row in this window, if any. */
+  zoneTabId: string | null;
+}
+
+/**
+ * The store key of the session the operator is looking at: the row whose
+ * live tab is the focused tab (a transcript row through its `zoneTabId`, a
+ * tab-sourced row through its own id). `null` = no tab focused, or the
+ * focused tab backs no listed row (a plain shell the list does not carry).
+ */
+export function focusedSessionKey<R extends FocusableRow>(
+  rows: readonly R[],
+  focusedTabId: string | null,
+  keyOf: (row: R) => string,
+): string | null {
+  if (focusedTabId === null) return null;
+  const row = rows.find(
+    (r) => r.zoneTabId === focusedTabId || (r.source === "tab" && r.sessionId === focusedTabId),
+  );
+  return row ? keyOf(row) : null;
+}

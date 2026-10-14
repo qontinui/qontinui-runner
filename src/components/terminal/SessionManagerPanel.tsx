@@ -20,6 +20,7 @@ import { useSessionSelection } from "./useSessionSelection";
 import { useSessionTriage } from "./useSessionTriage";
 import { SessionGroupSuggestionsDialog } from "./SessionGroupSuggestionsDialog";
 import { SessionRail } from "./SessionRail";
+import { SessionHoverCardHost, useSessionHoverCard } from "./SessionHoverCard";
 import { sessionOrgControlAttrs } from "./sessionOrgControls";
 import { RAIL_WIDTH, useSessionPanelLayout } from "./sessionPanelLayout";
 import { useSessionPanelOrg, type NewSessionInGroupRequest } from "./useSessionPanelOrg";
@@ -96,6 +97,8 @@ export function SessionManagerPanel({
     query,
     queryUnknown,
     liveFacts,
+    factsById,
+    unseenOf,
     applyOrg,
     groupBy,
     setGroupBy,
@@ -216,13 +219,28 @@ export function SessionManagerPanel({
       onSaveView: (name, q) => void applyOrg([{ op: "saveView", name, query: q }]),
       onDeleteView: (name) => void applyOrg([{ op: "deleteView", name }]),
       summary: result.ok
-        ? { matched: result.matched.length, unknown: result.unknown.length, total: liveFacts.length }
+        ? {
+            matched: result.matched.length,
+            unknown: result.unknown.length,
+            total: liveFacts.length,
+          }
         : null,
     };
   }, [query, allAccounts, knownOrg, org, applyOrg, liveFacts.length]);
-  const rowById = useMemo(
-    () => new Map(allSessions.map((s) => [s.sessionId, s])),
-    [allSessions],
+  const rowById = useMemo(() => new Map(allSessions.map((s) => [s.sessionId, s])), [allSessions]);
+
+  // ── Hover card (Phase 7): one per panel, for the hovered row only ─────────
+
+  const hover = useSessionHoverCard();
+  const hoverSessionOf = useCallback((id: string) => rowById.get(id), [rowById]);
+  const hoverFactsOf = useCallback((id: string) => factsById.get(id) ?? null, [factsById]);
+  // One verdict object per row per listing, so the memoized cards hold.
+  const unseenById = useMemo(
+    () => new Map(allSessions.map((s) => [s.sessionId, unseenOf(s)])),
+    [allSessions, unseenOf],
+  );
+  const hoverCardHost = (
+    <SessionHoverCardHost controller={hover} sessionOf={hoverSessionOf} factsOf={hoverFactsOf} />
   );
 
   // ── Resize ───────────────────────────────────────────────────────────────
@@ -244,15 +262,24 @@ export function SessionManagerPanel({
   );
 
   if (layout.rail && view === "live") {
+    // The rail item's body is the hover card (Phase 3 rail mode, Phase 7).
     return (
-      <SessionRail
-        sessions={visibleRows(sections)}
-        groupColorOf={groupColorOf}
-        selectedSessionId={selectedSessionId}
-        onOpen={openSession}
-        onExpand={toggleRail}
-        width={RAIL_WIDTH}
-      />
+      <>
+        <SessionRail
+          sessions={visibleRows(sections)}
+          groupColorOf={groupColorOf}
+          selectedSessionId={selectedSessionId}
+          onOpen={openSession}
+          onExpand={() => {
+            hover.close();
+            toggleRail();
+          }}
+          width={RAIL_WIDTH}
+          hoverCard={hover.bind}
+          unseenOf={unseenOf}
+        />
+        {hoverCardHost}
+      </>
     );
   }
 
@@ -270,9 +297,7 @@ export function SessionManagerPanel({
       sessionKey={sessionKeyOf(session)}
       orgMenu={orgMenu}
       drag={drag.card}
-      dropBefore={
-        drag.hover?.kind === "row" && drag.hover.sessionId === session.sessionId
-      }
+      dropBefore={drag.hover?.kind === "row" && drag.hover.sessionId === session.sessionId}
       fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
       lockState={sessionLockStates?.get(session.sessionId)}
       onResume={resumeSession}
@@ -286,6 +311,8 @@ export function SessionManagerPanel({
       onOpenWorktrees={setWorktreeFocus}
       isOnScreen={isRowOnScreen(session, onScreenTabId)}
       onClose={closableTabId(session) !== null ? requestClose : undefined}
+      unseen={unseenById.get(session.sessionId)}
+      hoverCard={hover.bind}
     />
   );
 
@@ -506,12 +533,21 @@ export function SessionManagerPanel({
               pages={otherPages}
               onClose={triage.closeSelected}
               onMarkFinished={() => void triage.markFinished()}
-              onAddToGroup={(g) => void triage.applyOrgAction("Adding", bulkAddToGroup(g.id, g.title))}
+              onAddToGroup={(g) =>
+                void triage.applyOrgAction("Adding", bulkAddToGroup(g.id, g.title))
+              }
               onNewGroup={(title) => void triage.applyOrgAction("Grouping", bulkNewGroup(title))}
-              onPin={(pinned) => void triage.applyOrgAction(pinned ? "Pinning" : "Unpinning", bulkPin(pinned))}
-              onMute={(muted) => void triage.applyOrgAction(muted ? "Muting" : "Unmuting", bulkMute(muted))}
+              onPin={(pinned) =>
+                void triage.applyOrgAction(pinned ? "Pinning" : "Unpinning", bulkPin(pinned))
+              }
+              onMute={(muted) =>
+                void triage.applyOrgAction(muted ? "Muting" : "Unmuting", bulkMute(muted))
+              }
               onSnooze={(until) =>
-                void triage.applyOrgAction(until === null ? "Unsnoozing" : "Snoozing", bulkSnooze(until))
+                void triage.applyOrgAction(
+                  until === null ? "Unsnoozing" : "Snoozing",
+                  bulkSnooze(until),
+                )
               }
               onMoveToPage={(pageId) => void triage.moveToPage(pageId)}
               onResume={() => void triage.resume()}
@@ -548,6 +584,9 @@ export function SessionManagerPanel({
             data-selected-count={selectedIds.size}
             className="flex-1 overflow-y-auto scrollbar-dark focus:outline-none"
             data-group-by={groupBy}
+            // The card is placed against the row's rectangle at open time; a
+            // scroll moves the row, so close it rather than let it drift over.
+            onScroll={hover.close}
           >
             {loading && sessions.length === 0 && !showSections ? (
               <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
@@ -667,6 +706,7 @@ export function SessionManagerPanel({
         worktree affordance opens it focused on that session's worktree.
       */}
           <WorktreesPanel defaultOpen={worktreeFocus !== null} highlightPath={worktreeFocus} />
+          {hoverCardHost}
         </>
       )}
 
