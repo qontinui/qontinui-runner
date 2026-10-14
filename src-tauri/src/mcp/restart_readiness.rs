@@ -114,9 +114,9 @@
 //!
 //! ## PTY-holder panes are counted, never invisible (2026-10-14)
 //!
-//! With `terminal.pty_holder` on — the default since plan
+//! With `terminal.pty_holder` on — the Linux default since plan
 //! `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions` Phase 5
-//! — each new local pane's PTY lives in its own `qontinui-pty-holder` process.
+//! (opt-in on Windows and macOS) — each new local pane's PTY lives in its own `qontinui-pty-holder` process.
 //! That process can leave this runner's subtree (a WMI-spawned holder; every
 //! holder adopted after a restart), and the census above walks the subtree, so
 //! without more a restart could read "safe" because the sessions became
@@ -204,7 +204,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 ///
@@ -339,7 +339,10 @@ pub struct HeadlessPlane {
 /// but does not answer (`unknown`), or that speaks no common protocol version
 /// (`incompatible`, D15) — feeds `live_claude.holder_unresolved_panes` and
 /// blocks as a PANE, because nothing this runner can drive proves what it is
-/// running. A holder pane is not treated as surviving a restart: that is the
+/// running. A LIVE holder pane whose tree holds no `claude` (a plain shell)
+/// does not block, exactly as an in-process shell pane does not: this endpoint
+/// counts agent sessions, and a shell carries none. A holder pane is not
+/// treated as surviving a restart: that is the
 /// feature's goal, but the plan's acceptance run (kill the runner, reattach,
 /// same `claude` pid) is unrun, so the verdict stays fail-closed.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -379,7 +382,10 @@ pub struct HolderPlane {
 /// `safe_to_restart` reads.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LiveClaudeTotals {
-    /// Every live `claude` process in the runner's inclusive subtree.
+    /// Every live `claude` process in the runner's inclusive subtree, PLUS
+    /// every one in a PTY holder pane's tree (plan 2026-09-12 Phase 5) — the
+    /// sum of the five process classes. Unresolved holder PANES are not in
+    /// it: see `holder_unresolved_panes`.
     pub total: usize,
     pub terminal_hosted: usize,
     /// Held by a PTY holder pane and claimed by no live tracked terminal.
@@ -3902,6 +3908,7 @@ mod tests {
                 holder_census_pane("foreign", HolderPaneState::Incompatible, None),
             ],
             error: None,
+            verified_terminal_pids: Default::default(),
         };
         let report = evaluate(
             &snap,
