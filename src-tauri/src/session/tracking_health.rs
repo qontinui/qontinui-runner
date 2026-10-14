@@ -217,6 +217,31 @@ pub struct HolderCensus {
     /// refused as not private). The census is then UNKNOWN — never empty — and
     /// `/restart-readiness` fails closed on it.
     pub error: Option<String>,
+    /// Live terminal pids PROVEN to be a holder's recorded child — the lock
+    /// record's `child_start` token matches the live process
+    /// (`crate::terminal::holder_census::verified_holder_children`). The
+    /// PID-reuse guard's boot-time comparison is replaced by that proof for
+    /// these pids ([`pid_reuse_reference`]): a pane adopted after a restart
+    /// legitimately predates this boot.
+    pub verified_terminal_pids: HashSet<u32>,
+}
+
+/// The reference instant for the PID-reuse guard
+/// (`claude_present_in_inclusive_subtree`) for terminal pid `pid`.
+///
+/// Normally this runner's own boot: a terminal root created BEFORE it cannot
+/// be a pane this runner spawned, so it is a recycled pid. A pane ADOPTED
+/// from its PTY holder after a restart breaks that premise — its child
+/// predates the boot by construction (plan 2026-09-12 Phase 5, review F1).
+/// For a pid in `verified` (identity proven by its holder's lock record start
+/// token) the boot comparison is skipped: `i64::MIN` makes no creation time
+/// "earlier". Every other pid keeps the boot guard unchanged.
+pub fn pid_reuse_reference(pid: u32, verified: &HashSet<u32>, boot_unix_millis: i64) -> i64 {
+    if verified.contains(&pid) {
+        i64::MIN
+    } else {
+        boot_unix_millis
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -821,8 +846,15 @@ pub fn evaluate(
     for rec in open_records {
         let alive = match terminal_pids.get(&rec.terminal_id) {
             Some(&pid) => {
-                let present =
-                    claude_present_in_inclusive_subtree(pid, snapshot, primary_boot_unix_millis);
+                let present = claude_present_in_inclusive_subtree(
+                    pid,
+                    snapshot,
+                    pid_reuse_reference(
+                        pid,
+                        &holders.verified_terminal_pids,
+                        primary_boot_unix_millis,
+                    ),
+                );
                 // ⚠ The CLAIM is registered whether or not the record is
                 // `present`, while `terminal_claimed` (the classification set)
                 // stays gated on `present` exactly as before.
@@ -1030,11 +1062,16 @@ pub async fn compute(
     // one answered handshake per holder, all under one deadline. Taken BEFORE
     // the process snapshot so every pid it names is judged against a snapshot
     // at least as new as the answer.
-    let holders = crate::terminal::holder_census::take(terminal_manager).await;
+    let mut holders = crate::terminal::holder_census::take(terminal_manager).await;
     let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
     if snap.parent_map.is_empty() {
         return None;
     }
+    // Review F2: a pane that began spawning after the census walked the pane
+    // directory is in neither the census nor (on the WMI route) this
+    // snapshot's runner subtree. Every terminal still being built NOW — read
+    // after the snapshot — is a counted Unknown row.
+    crate::terminal::holder_census::add_in_flight(&mut holders, &terminal_manager.in_flight_ids());
 
     let open = store.open_records();
     let terminal_pids: HashMap<String, u32> = terminal_manager
@@ -1065,8 +1102,24 @@ pub async fn compute(
     // (`claude_pids_in_inclusive_subtree`) over the SAME `snap` that
     // `evaluate` is handed one line later, so the two walks cannot disagree —
     // they are the same computation, evaluated twice over one snapshot.
-    let live_pids =
+    let mut live_pids =
         crate::process_capture::process_tree::claude_pids_in_inclusive_subtree(runner_pid, &snap);
+    // The holder panes' `claude` too (the same roots `evaluate` walks), so a
+    // holder-hosted process outside the runner's subtree reports its cwd.
+    for pane in &holders.panes {
+        for root in [pane.holder_pid, pane.child_pid].into_iter().flatten() {
+            if root <= 1 || root == runner_pid {
+                continue;
+            }
+            for pid in
+                crate::process_capture::process_tree::claude_pids_in_inclusive_subtree(root, &snap)
+            {
+                if !live_pids.contains(&pid) {
+                    live_pids.push(pid);
+                }
+            }
+        }
+    }
     let cwd_by_pid =
         crate::process_capture::process_tree::working_directories_for_pids(&live_pids).await;
 
@@ -2290,6 +2343,7 @@ mod tests {
                 holder_pane("dead", HolderPaneState::Dead, None, Some(400)),
             ],
             error: None,
+            verified_terminal_pids: Default::default(),
         };
         (snap, census)
     }
@@ -2396,6 +2450,7 @@ mod tests {
                 Some(101),
             )],
             error: None,
+            verified_terminal_pids: Default::default(),
         };
         let unclaimed = eval_holders(&snap, &[], &HashMap::new(), &census, now_ms);
         assert_eq!(unclaimed.live_claude_total, 1);
@@ -2434,6 +2489,7 @@ mod tests {
                 Some(0),
             )],
             error: None,
+            verified_terminal_pids: Default::default(),
         };
         let report = eval_holders(&snap, &[], &HashMap::new(), &census, now_s * 1000);
         assert!(report.holder_hosted.is_empty());
@@ -2457,5 +2513,94 @@ mod tests {
         let dropped = report.holder_hosted.pop().unwrap();
         report.live_claude_total -= 1;
         assert!(!report.partition_covers_total(), "dropped {}", dropped.pid);
+    }
+
+    /// Review F1: a pane ADOPTED from its holder after a restart. Its shell
+    /// (101, the terminal pid) and `claude` (102) were created an hour before
+    /// this runner booted, so the PID-reuse guard alone calls the shell
+    /// recycled: the record reads tracked-dead and the `claude` lands in
+    /// `holder_hosted`. With the shell's identity PROVEN by its holder's lock
+    /// record (`verified_terminal_pids`), the pane is a live terminal-hosted
+    /// pane — it keeps the coord-finished discount and wind-down eligibility.
+    /// An unproven pid (the mismatched-token case resolves to "not in the set")
+    /// keeps the boot guard.
+    #[test]
+    fn pty_holder_adopted_pane_with_a_proven_identity_is_live_and_terminal_hosted() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let boot_ms = now_ms - 60_000;
+        let born = now_s - 3600;
+        let snap = snap_with(
+            &[(1, &[]), (100, &[101]), (101, &[102])],
+            &[(100, born), (101, born), (102, born)],
+            &[(100, "qontinui-pty-holder"), (101, "bash"), (102, "claude")],
+        );
+        let records = [record("sess-1", "t-1", now_ms - 7_200_000)];
+        let terminal_pids: HashMap<String, u32> = [("t-1".to_string(), 101)].into_iter().collect();
+        let census = |verified: &[u32]| HolderCensus {
+            panes: vec![holder_pane(
+                "t-1",
+                HolderPaneState::Live,
+                Some(100),
+                Some(101),
+            )],
+            error: None,
+            verified_terminal_pids: verified.iter().copied().collect(),
+        };
+        let run = |c: &HolderCensus| {
+            evaluate(
+                &snap,
+                1,
+                &records,
+                &terminal_pids,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                boot_ms,
+                now_ms,
+                c,
+            )
+        };
+
+        // Unproven (no token match): the boot guard calls it recycled.
+        let unproven = run(&census(&[]));
+        assert_eq!(unproven.tracked_dead.len(), 1);
+        assert!(unproven.terminal_hosted.is_empty());
+        assert_eq!(
+            unproven.holder_hosted.len(),
+            1,
+            "still counted, fail-closed"
+        );
+        assert!(unproven.partition_covers_total());
+
+        // Proven: a live terminal-hosted pane, attributed to its session.
+        let proven = run(&census(&[101]));
+        assert!(proven.tracked_dead.is_empty());
+        assert_eq!(proven.terminal_hosted.len(), 1);
+        assert_eq!(
+            proven.terminal_hosted[0].session_id.as_deref(),
+            Some("sess-1")
+        );
+        assert!(proven.holder_hosted.is_empty());
+        assert!(proven.partition_covers_total());
+
+        // The liveness poll's input (main.rs): `claude_present` for the record,
+        // computed with the same reference — dead without the proof, alive with
+        // it. That bool is the only thing the poll's `classify` reads from the
+        // process table, so with the proof the record is never closed
+        // `poll-dead`.
+        let present = |verified: &HashSet<u32>| {
+            claude_present_in_inclusive_subtree(
+                101,
+                &snap,
+                pid_reuse_reference(101, verified, boot_ms),
+            )
+        };
+        assert!(!present(&HashSet::new()));
+        assert!(present(&[101].into_iter().collect()));
+        // A different proven pid does not lift the guard for this one.
+        assert!(!present(&[999].into_iter().collect()));
+        assert_eq!(pid_reuse_reference(5, &HashSet::new(), boot_ms), boot_ms);
     }
 }

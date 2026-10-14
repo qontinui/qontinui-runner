@@ -743,6 +743,16 @@ impl TerminalManager {
     }
 
     /// Test seam: hold `session` under `id` without spawning a PTY.
+    /// Test seam: mark `id` as being built, as `create` does for the length
+    /// of a spawn.
+    #[cfg(test)]
+    pub(crate) fn mark_in_flight_for_test(&self, id: &str) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string());
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_for_test(&self, id: &str, session: Arc<TerminalSession>) {
         if let Ok(mut sessions) = self.sessions.lock() {
