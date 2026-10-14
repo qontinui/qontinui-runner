@@ -88,6 +88,13 @@ pub struct RefreshHealth {
     /// it can never start working. Only a fresh allocation clears this —
     /// see [`TokenSlot::adopt_fresh`].
     pub rejected: bool,
+    /// The last refusal coord gave that was NOT a bearer refusal — today only
+    /// the lineage bound (`agent_token_lineage_expired`), with coord's verdict
+    /// on the device proof. Carried into the terminal latch's log line: once
+    /// the lineage bound is reached the bearer expires within the refresh
+    /// margin and coord then answers a plain 401, which would otherwise be
+    /// logged as "coord refused the bearer" with the real cause lost.
+    pub last_refusal: Option<String>,
 }
 
 /// Mutable token + bookkeeping. Behind an `RwLock` (in
@@ -326,10 +333,14 @@ enum Refusal {
     /// Coord refused the bearer itself. Terminal: retrying presents it again.
     BearerRefused,
     /// Coord refused because the token's LINEAGE reached its bound
-    /// (`agent_token_lineage_expired`). The bearer is still valid, and a later
-    /// attempt can succeed if the device proof becomes acceptable (the device
-    /// JWT refresher renews it), so this is retried, not latched. Carries
-    /// coord's `device_proof` verdict for the log.
+    /// (`agent_token_lineage_expired`). The bearer itself is still valid, but
+    /// only for the rest of the refresh margin: coord refuses as soon as the
+    /// presented token already expires at the bound, i.e. about
+    /// [`TOKEN_REFRESH_MARGIN_SECS`] before it dies. Retrying inside that
+    /// window succeeds if the device proof becomes acceptable meanwhile (the
+    /// device-JWT refresher renews it); otherwise the bearer expires, coord
+    /// answers 401, and the slot latches with this refusal named as the cause.
+    /// Carries coord's `device_proof` verdict for the log.
     LineageExpired { device_proof: String },
 }
 
@@ -350,8 +361,9 @@ fn classify_refusal(body: &serde_json::Value) -> Refusal {
 #[derive(Debug, Deserialize)]
 struct RefreshResponseBody {
     token: String,
-    /// coord's verdict on [`DEVICE_PROOF_HEADER`]: `absent`, `accepted`, or
-    /// `ignored: <why>`. Absent from a coord that predates the lineage bound.
+    /// coord's verdict on [`DEVICE_PROOF_HEADER`]: `absent`, `not_needed`,
+    /// `accepted`, or `ignored: <why>`. Absent from a coord that predates the
+    /// lineage bound.
     #[serde(default)]
     device_proof: Option<String>,
     #[allow(dead_code)]
@@ -431,6 +443,9 @@ pub async fn maybe_refresh(
     // is that proof, so a session that outlives the bound keeps refreshing.
     // Coord ignores a proof that does not verify (and a coord predating the
     // bound ignores the header), so attaching it is never what fails a refresh.
+    // Attached on EVERY refresh, deliberately: the runner keeps no lineage
+    // bookkeeping, and the device JWT already rides every data-plane call
+    // (`auth::attach_device_auth`), so this adds no new exposure class.
     let resp = match attach_device_proof(req, device_proof().await).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -446,7 +461,13 @@ pub async fn maybe_refresh(
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             let refusal_body: serde_json::Value = resp.json().await.unwrap_or_default();
             if let Refusal::LineageExpired { device_proof } = classify_refusal(&refusal_body) {
-                let streak = token.write().await.record_transient_failure(now);
+                let streak = {
+                    let mut g = token.write().await;
+                    g.health.last_refusal = Some(format!(
+                        "lineage bound reached; device proof was {device_proof}"
+                    ));
+                    g.record_transient_failure(now)
+                };
                 log_transient(
                     who,
                     agent_id,
@@ -461,19 +482,33 @@ pub async fn maybe_refresh(
             // Bind first: a write guard created inside an `if` condition
             // lives until the end of the whole `if` statement, which
             // would hold the slot locked across the log call.
-            let newly_rejected = token.write().await.record_rejected();
+            let (newly_rejected, cause) = {
+                let mut g = token.write().await;
+                (g.record_rejected(), g.health.last_refusal.clone())
+            };
             if newly_rejected {
+                let cause = cause
+                    .map(|c| format!(" Earlier refusal: {c}."))
+                    .unwrap_or_default();
                 error!(
                     "{who}: agent_id={agent_id} token refresh REJECTED ({status}) — \
                      coord refused the bearer, so retrying it cannot succeed. \
                      Refresh loop latched off for this agent; it needs a fresh \
-                     allocation to recover. (ttl_secs={ttl})"
+                     allocation to recover.{cause} (ttl_secs={ttl})"
                 );
             }
             return Ok(RefreshOutcome::Rejected);
         }
+        // A redirect is never followed (agent_http's client), so name its
+        // target: a coord base that needs one is a misconfiguration.
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|l| l.to_str().ok())
+            .map(|l| format!(" (redirect to {l} not followed)"))
+            .unwrap_or_default();
         let streak = token.write().await.record_transient_failure(now);
-        log_transient(who, agent_id, streak, &format!("returned {status}"));
+        log_transient(who, agent_id, streak, &format!("returned {status}{location}"));
         return Ok(RefreshOutcome::Deferred);
     }
     let body: RefreshResponseBody = match resp.json().await {
@@ -485,9 +520,13 @@ pub async fn maybe_refresh(
         }
     };
     if let Some(verdict) = body.device_proof.as_deref() {
-        if verdict.starts_with("ignored") {
+        // Present only from a lineage-aware coord. `absent` (no usable device
+        // JWT held) and `ignored: …` (it did not pass coord's gates) mean this
+        // lineage will end at coord's bound. `not_needed` (coord evaluates the
+        // proof only once a lineage reaches its bound) and `accepted` are fine.
+        if verdict == "absent" || verdict.starts_with("ignored") {
             warn!(
-                "{who}: agent_id={agent_id} coord ignored the device proof ({verdict}); \
+                "{who}: agent_id={agent_id} device proof not accepted ({verdict}); \
                  this agent's token lineage cannot outlive coord's bound"
             );
         }
@@ -523,6 +562,134 @@ fn log_transient(who: &str, agent_id: Uuid, streak: u32, what: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- `maybe_refresh` against a local stub coord ---------------------
+
+    /// Serve `router` on an ephemeral loopback port; returns its base URL.
+    async fn stub_coord(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A slot inside its refresh margin, so `maybe_refresh` calls coord.
+    fn slot_in_margin() -> SharedToken {
+        let exp = chrono::Utc::now().timestamp() + 60;
+        from_token_parts("agent.jwt.old", Uuid::now_v7(), exp).unwrap()
+    }
+
+    fn answering(status: u16, body: serde_json::Value) -> axum::Router {
+        axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move {
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(body),
+                )
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn refresh_lineage_expiry_defers_then_names_itself_in_the_latch() {
+        let agent = Uuid::now_v7();
+        let slot = slot_in_margin();
+        let base = stub_coord(answering(
+            403,
+            serde_json::json!({
+                "code": "agent_token_lineage_expired",
+                "device_proof": "absent",
+            }),
+        ))
+        .await;
+        let out = maybe_refresh(&slot, &base, agent, "test").await.unwrap();
+        assert_eq!(out, RefreshOutcome::Deferred);
+        {
+            let g = slot.read().await;
+            assert!(!g.is_rejected(), "a lineage expiry must not latch");
+            assert_eq!(g.health.consecutive_failures, 1);
+            assert_eq!(
+                g.health.last_refusal.as_deref(),
+                Some("lineage bound reached; device proof was absent")
+            );
+        }
+        // The bearer then expires and coord answers a plain 401: latched, and
+        // the earlier cause is still on the slot for the log line.
+        let base = stub_coord(answering(401, serde_json::json!({"error": "expired"}))).await;
+        slot.write().await.health.next_attempt_epoch_secs = 0;
+        let out = maybe_refresh(&slot, &base, agent, "test").await.unwrap();
+        assert_eq!(out, RefreshOutcome::Rejected);
+        let g = slot.read().await;
+        assert!(g.is_rejected());
+        assert!(g.health.last_refusal.is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_bearer_refusal_still_latches() {
+        let slot = slot_in_margin();
+        let base = stub_coord(answering(403, serde_json::json!({"error": "revoked"}))).await;
+        let out = maybe_refresh(&slot, &base, Uuid::now_v7(), "test").await.unwrap();
+        assert_eq!(out, RefreshOutcome::Rejected);
+        assert!(slot.read().await.is_rejected());
+    }
+
+    #[tokio::test]
+    async fn refresh_decodes_a_coord_that_predates_the_lineage_bound() {
+        let slot = slot_in_margin();
+        let jti = Uuid::now_v7();
+        let exp = chrono::Utc::now().timestamp() + TOKEN_REFRESH_MARGIN_SECS * 8;
+        let base = stub_coord(answering(
+            200,
+            serde_json::json!({
+                "token": "agent.jwt.new",
+                "agent_id": Uuid::now_v7(),
+                "jti": jti,
+                "exp": exp,
+            }),
+        ))
+        .await;
+        let out = maybe_refresh(&slot, &base, Uuid::now_v7(), "test").await.unwrap();
+        assert_eq!(out, RefreshOutcome::Refreshed);
+        let g = slot.read().await;
+        assert_eq!(g.token, "agent.jwt.new");
+        assert_eq!(g.jti, jti);
+    }
+
+    #[tokio::test]
+    async fn refresh_never_follows_a_redirect() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        let target = stub_coord(axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::http::StatusCode::OK
+            }
+        }))
+        .await;
+        let location = format!("{target}/elsewhere");
+        let base = stub_coord(axum::Router::new().fallback(move || {
+            let location = location.clone();
+            async move {
+                (
+                    axum::http::StatusCode::TEMPORARY_REDIRECT,
+                    [(axum::http::header::LOCATION, location)],
+                )
+            }
+        }))
+        .await;
+        let slot = slot_in_margin();
+        let out = maybe_refresh(&slot, &base, Uuid::now_v7(), "test").await.unwrap();
+        assert_eq!(out, RefreshOutcome::Deferred);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target must never see the request (or its device proof)"
+        );
+    }
 
     #[test]
     fn refresh_attaches_device_proof_header_only_when_held() {
