@@ -39,6 +39,10 @@ const GUARDED: &[(&str, &str)] = &[
     ("terminate.rs", include_str!("terminate.rs")),
     // Phase 2b: the mode tracker parses every output byte.
     ("modes.rs", include_str!("modes.rs")),
+    // Phase 3: process identity, tree reaping, the boot sweep.
+    ("proc_identity.rs", include_str!("proc_identity.rs")),
+    ("reap.rs", include_str!("reap.rs")),
+    ("sweep.rs", include_str!("sweep.rs")),
 ];
 
 /// Files deliberately outside the guard: this file (it must spell the banned

@@ -117,6 +117,14 @@ pub struct Pane {
     #[cfg(windows)]
     job: Option<win_job::Job>,
     exit_linger: Duration,
+    /// The child's start token (`crate::proc_identity`), taken in
+    /// [`Pane::spawn`] BEFORE the waiter can reap it — so it is the child's,
+    /// never a recycled pid's.
+    child_start: Option<String>,
+    /// Unix: what the waiter's session reap did (moment 1 of `crate::reap`),
+    /// kept for [`Pane::reap_tree`] to report.
+    #[cfg(unix)]
+    session_reap: Mutex<Option<crate::reap::ReapReport>>,
 }
 
 impl std::fmt::Debug for Pane {
@@ -192,6 +200,8 @@ impl Pane {
             }
         };
         let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE_FRAMES);
+        // Before the waiter thread exists: the child cannot have been reaped.
+        let child_start = crate::proc_identity::start_token(child_pid);
 
         let pane = Arc::new(Pane {
             child_pid,
@@ -214,6 +224,9 @@ impl Pane {
             #[cfg(windows)]
             job,
             exit_linger: spec.exit_linger(),
+            child_start,
+            #[cfg(unix)]
+            session_reap: Mutex::new(None),
         });
 
         let p = Arc::clone(&pane);
@@ -233,6 +246,11 @@ impl Pane {
 
     pub fn child_pid(&self) -> u32 {
         self.child_pid
+    }
+
+    /// The child's start token, taken before it could be reaped.
+    pub fn child_start(&self) -> Option<&str> {
+        self.child_start.as_deref()
     }
 
     /// The directory the child was started in.
@@ -329,6 +347,11 @@ impl Pane {
                 break;
             }
         }
+        // Plan D8: the child is a zombie now, so its pid (= its session id)
+        // is pinned — end what it left in its session BEFORE the reap below
+        // releases that id.
+        let session_reap = crate::reap::reap_session_of_exited_child(self.child_pid);
+        *self.session_reap.lock().unwrap_or_else(|p| p.into_inner()) = Some(session_reap);
         // Phase 2: under the lock, mark it gone and reap it — `kill` checks
         // `child_gone` under the same lock, so it can never signal the pid
         // after this point.
@@ -561,6 +584,39 @@ impl Pane {
                 }
             }
             let _ = self.killer.lock().unwrap_or_else(|p| p.into_inner()).kill();
+        }
+    }
+
+    /// End what the child left of its process tree, once the pane is over
+    /// (plan D8: each holder reaps exactly its own child tree), and report it.
+    /// Unix: the child's session remainder was already ended by the waiter,
+    /// while the child was an unreaped zombie (`crate::reap`, moment 1); this
+    /// adds, on the scope route, everything else in the holder's scope. Windows: the holder-owned job is
+    /// terminated — the same outcome its `KILL_ON_JOB_CLOSE` would reach when
+    /// the holder exits, made explicit so it happens under the pane lock.
+    pub fn reap_tree(&self) -> crate::reap::ReapReport {
+        #[cfg(unix)]
+        {
+            let mut report = self
+                .session_reap
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .unwrap_or_default();
+            report.absorb(crate::reap::reap_own_scope());
+            report
+        }
+        #[cfg(windows)]
+        {
+            let mut report = crate::reap::ReapReport::default();
+            match &self.job {
+                Some(job) => match job.terminate() {
+                    Ok(()) => report.note("job terminated"),
+                    Err(e) => report.note(format!("job terminate failed: {e}")),
+                },
+                None => report.note("the child was never in a job: its tree is not reaped"),
+            }
+            report
         }
     }
 
