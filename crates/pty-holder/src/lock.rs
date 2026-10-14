@@ -22,11 +22,6 @@
 //!   reading who holds it; a range past EOF is legal and blocks nothing a
 //!   reader touches.
 //!
-//! The lock file is never unlinked by a holder. Unlinking a lock file while
-//! locked lets a second holder lock a fresh inode under the same name while a
-//! third still holds the old one — two "exclusive" holders. Reaping dead lock
-//! files is a later phase's boot sweep, done under the lock.
-//!
 //! **The fork-to-exec window.** The lock fd is `O_CLOEXEC`, but between a
 //! `fork` and the child's `exec` the child holds a copy of the open file
 //! description — and with it the `flock`. So when a process that briefly
@@ -37,6 +32,20 @@
 //! spawn path should therefore retry `LockHeld` when the lock record names
 //! no live holder, rather than report the pane taken — owed by Phase 3, which
 //! owns the spawn and lock paths.
+//!
+//! The lock file is never unlinked by a holder. Unlinking a lock file lets a
+//! second holder lock a fresh file under the same name while a third still
+//! holds the old one — two "exclusive" holders. Dead lock files are removed by
+//! the boot sweep (`crate::sweep`, Phase 3) through [`PaneLock::remove`], and
+//! that is made safe on both sides:
+//! - Unix: every acquisition re-checks, after locking, that the path still
+//!   names the file it locked (device and inode); a lock taken on a file that
+//!   was unlinked meanwhile is dropped and retried (or, for a prober,
+//!   reported `NotFound`). The sweep unlinks while it HOLDS the lock.
+//! - Windows: lock files are opened without `FILE_SHARE_DELETE`, so a delete
+//!   fails with a sharing violation while any process has one open. The sweep
+//!   closes its own handle, then deletes: it succeeds only when nobody else had
+//!   the file open, i.e. nobody can be holding (or about to take) that lock.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -55,6 +64,17 @@ pub struct LockRecord {
     pub versions: Vec<u32>,
     pub started_at_unix_ms: u64,
     pub holder_build: String,
+    /// The child's start token (`crate::proc_identity`), taken right after it
+    /// was spawned: what lets a boot sweep tell the recorded child from a
+    /// process that later got the same pid (Phase 3, D8). Absent from records
+    /// written by Phase 2 holders, which still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_start: Option<String>,
+    /// Linux scope route: the holder's own transient unit
+    /// (`qontinui-pty-holder-….scope`), so a sweep can stop what a dead
+    /// holder left in it. `None` on every other route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_unit: Option<String>,
 }
 
 /// An acquired pane lock. Dropping it releases the lock (by closing the file).
@@ -62,6 +82,21 @@ pub struct LockRecord {
 pub struct PaneLock {
     file: File,
     path: PathBuf,
+}
+
+/// How many times [`PaneLock::try_acquire`] re-opens a lock file that was
+/// unlinked under it.
+const UNLINK_RACE_RETRIES: usize = 4;
+
+/// The pause before re-opening a lock file a sweep is removing (Windows).
+const UNLINK_RACE_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// [`PaneLock::try_lock_file`]'s answer.
+enum Locked {
+    Current(PaneLock),
+    Held,
+    /// Locked, but the path no longer names the locked file.
+    Unlinked,
 }
 
 /// The outcome of a non-blocking lock attempt.
@@ -76,34 +111,99 @@ impl PaneLock {
     /// Try to take the lock at `path` without blocking, creating the file
     /// (mode 0600 on Unix) if absent.
     pub fn try_acquire(path: &Path) -> io::Result<TryLock> {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        // A lock won on a file the sweep unlinked meanwhile is worthless (see
+        // the module docs): retry on the file now at the path. Bounded — each
+        // retry needs a concurrent unlink, which only a sweep of a dead pane
+        // performs.
+        for _ in 0..UNLINK_RACE_RETRIES {
+            let mut opts = OpenOptions::new();
+            opts.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let file = match open_lock_file(&mut opts, path) {
+                Ok(f) => f,
+                // Windows: a sweep is deleting the dead pane's file right now;
+                // the next open creates a fresh one.
+                Err(e) if sys::removal_in_progress(&e) => {
+                    std::thread::sleep(UNLINK_RACE_PAUSE);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match Self::try_lock_file(file, path)? {
+                Locked::Current(lock) => return Ok(TryLock::Acquired(lock)),
+                Locked::Held => return Ok(TryLock::Held),
+                Locked::Unlinked => continue,
+            }
         }
-        let file = open_checked(&mut opts, path)?;
-        Self::try_lock_file(file, path)
+        Err(io::Error::other(format!(
+            "{} was unlinked under every lock attempt",
+            path.display()
+        )))
     }
 
     /// Like [`PaneLock::try_acquire`], but never creates the file: a missing
-    /// lock file is `NotFound`. What a prober uses, so probing cannot litter.
+    /// lock file is `NotFound` — including one unlinked between this open and
+    /// its lock. What a prober uses, so probing cannot litter.
     pub fn try_acquire_existing(path: &Path) -> io::Result<TryLock> {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
-        let file = open_checked(&mut opts, path)?;
-        Self::try_lock_file(file, path)
+        let file = open_lock_file(&mut opts, path)?;
+        match Self::try_lock_file(file, path)? {
+            Locked::Current(lock) => Ok(TryLock::Acquired(lock)),
+            Locked::Held => Ok(TryLock::Held),
+            Locked::Unlinked => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} was removed while it was being locked", path.display()),
+            )),
+        }
     }
 
-    fn try_lock_file(file: File, path: &Path) -> io::Result<TryLock> {
-        if sys::try_lock_exclusive(&file)? {
-            Ok(TryLock::Acquired(PaneLock {
-                file,
-                path: path.to_path_buf(),
-            }))
-        } else {
-            Ok(TryLock::Held)
+    fn try_lock_file(file: File, path: &Path) -> io::Result<Locked> {
+        if !sys::try_lock_exclusive(&file)? {
+            return Ok(Locked::Held);
+        }
+        if !sys::still_names(&file, path)? {
+            return Ok(Locked::Unlinked);
+        }
+        Ok(Locked::Current(PaneLock {
+            file,
+            path: path.to_path_buf(),
+        }))
+    }
+
+    /// Remove this (dead pane's) lock file and release the lock — the boot
+    /// sweep's last act on a pane. Safe against a holder starting for the same
+    /// pane at the same instant; see the module docs. `Ok(false)` on Windows
+    /// when another process had the file open, so it was left in place.
+    pub fn remove(self) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            // Unlinked while held: a racer that opened the old file fails
+            // `still_names` once it gets the lock, and retries on a new file.
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            drop(self.file);
+            Ok(true)
+        }
+        #[cfg(windows)]
+        {
+            // Our own handle denies delete sharing too, so close it first. The
+            // delete then fails while any other process has the file open.
+            let PaneLock { file, path } = self;
+            drop(file);
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(e) if e.raw_os_error() == Some(sys::ERROR_SHARING_VIOLATION) => Ok(false),
+                Err(e) => Err(e),
+            }
         }
     }
 
@@ -138,7 +238,7 @@ impl PaneLock {
 pub fn read_record(path: &Path) -> Option<LockRecord> {
     let mut opts = OpenOptions::new();
     opts.read(true);
-    let file = open_checked(&mut opts, path).ok()?;
+    let file = open_lock_file(&mut opts, path).ok()?;
     let mut buf = Vec::new();
     file.take(MAX_RECORD_LEN + 1).read_to_end(&mut buf).ok()?;
     if buf.len() as u64 > MAX_RECORD_LEN {
@@ -150,15 +250,30 @@ pub fn read_record(path: &Path) -> Option<LockRecord> {
 /// Largest lock record [`read_record`] will read.
 pub const MAX_RECORD_LEN: u64 = 64 * 1024;
 
-/// Open a lock file refusing anything but a regular file this user owns. Also
-/// the open `crate::scrollback` reads a persisted tail through.
+/// Open a LOCK file through [`open_checked`], denying delete sharing on
+/// Windows: a lock file cannot be deleted while anyone has it open (see the
+/// module docs, and `PaneLock::remove`). Every lock-file open goes through
+/// here; other pane files (the scrollback tail) do not, because Windows also
+/// refuses to rename over a file held open without delete sharing.
+fn open_lock_file(opts: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(sys::FILE_SHARE_READ_WRITE);
+    }
+    open_checked(opts, path)
+}
+
+/// Open a pane file refusing anything but a regular file this user owns: the
+/// lock file (through [`open_lock_file`]) and the open `crate::scrollback`
+/// reads and appends a persisted tail through.
 ///
-/// Unix: `O_NOFOLLOW` (a symlink at the lock path fails the open with
-/// `ELOOP` instead of locking or truncating whatever it points at) and
-/// `O_NONBLOCK` (a FIFO planted at the path cannot hang the open); then
-/// `fstat` of the OPENED fd — not a racy `stat` of the path — must say
-/// regular file and our euid. Windows: regular-file check only; the directory
-/// is the per-user app-data tree.
+/// Unix: `O_NOFOLLOW` (a symlink at the path fails the open with `ELOOP`
+/// instead of locking or truncating whatever it points at) and `O_NONBLOCK`
+/// (a FIFO planted at the path cannot hang the open); then `fstat` of the
+/// OPENED fd — not a racy `stat` of the path — must say regular file and our
+/// euid. Windows: regular-file check only; the directory is the per-user
+/// app-data tree.
 pub(crate) fn open_checked(opts: &mut OpenOptions, path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -192,7 +307,25 @@ pub(crate) fn open_checked(opts: &mut OpenOptions, path: &Path) -> io::Result<Fi
 mod sys {
     use std::fs::File;
     use std::io;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
+    use std::path::Path;
+
+    /// Unix unlinks never block an open: nothing to wait out.
+    pub fn removal_in_progress(_e: &io::Error) -> bool {
+        false
+    }
+
+    /// Whether `path` still names the file `file` has open (same device and
+    /// inode). A missing path is `false`.
+    pub fn still_names(file: &File, path: &Path) -> io::Result<bool> {
+        let held = file.metadata()?;
+        match std::fs::symlink_metadata(path) {
+            Ok(now) => Ok(now.dev() == held.dev() && now.ino() == held.ino()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 
     /// `Ok(true)` acquired, `Ok(false)` held elsewhere.
     pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
@@ -219,11 +352,38 @@ mod sys {
     use std::fs::File;
     use std::io;
     use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
     use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        LockFileEx, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
+        LOCKFILE_FAIL_IMMEDIATELY,
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    /// Every lock-file open's share mode: read and write, never delete.
+    pub const FILE_SHARE_READ_WRITE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+    /// `ERROR_SHARING_VIOLATION`, as `io::Error::raw_os_error` reports it.
+    pub const ERROR_SHARING_VIOLATION: i32 =
+        windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32;
+
+    /// `ERROR_DELETE_PENDING`: the file is being deleted and cannot be opened.
+    const ERROR_DELETE_PENDING: i32 = 303;
+
+    /// An open refused because a sweep is deleting the file this instant: a
+    /// sharing violation against the deleter's handle, or delete-pending.
+    pub fn removal_in_progress(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION) | Some(ERROR_DELETE_PENDING)
+        )
+    }
+
+    /// Always true: no handle to a lock file allows delete sharing, so the
+    /// file a handle has open cannot have been deleted out from under it.
+    pub fn still_names(_file: &File, _path: &Path) -> io::Result<bool> {
+        Ok(true)
+    }
 
     /// The locked byte sits at offset 2^62: far past any record, so the
     /// mandatory range lock never covers a byte a reader reads.
@@ -302,6 +462,8 @@ mod tests {
             versions: vec![1],
             started_at_unix_ms: 5,
             holder_build: "b".into(),
+            child_start: Some("linux:boot:1".into()),
+            scope_unit: None,
         };
         first.write_record(&rec).unwrap();
         // Readable while held — on Windows too, because the locked byte is
@@ -309,25 +471,56 @@ mod tests {
         assert_eq!(read_record(&path), Some(rec));
 
         drop(first);
-        // Released on drop — but a sibling test that spawns a process while
-        // `first` was open (terminate.rs spawns `sleep`) gives the child a
-        // reference to this open file description until its exec closes the
-        // CLOEXEC fd, and under load that window is long enough to observe.
-        // So: acquirable within a bound, not necessarily on the first try.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match PaneLock::try_acquire_existing(&path).unwrap() {
-                TryLock::Acquired(_) => break,
-                TryLock::Held => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "lock still held 5 s after drop"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
+        // Polled, not asserted once: a child another test forks in this
+        // process between our open and its exec shares the open file
+        // description, and with it the lock, until that exec closes it.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(
+            PaneLock::try_acquire_existing(&path).unwrap(),
+            TryLock::Acquired(_)
+        ) {
+            assert!(std::time::Instant::now() < end, "lock not released on drop");
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boot sweep's removal (Phase 3): a racer that opened the lock file
+    /// before the sweep unlinked it must not count the old file's lock as the
+    /// pane's.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_boot_sweep_lock_removal_defeats_an_open_racer() {
+        let dir = tmpdir("remove");
+        let path = dir.join("r.lock");
+        let TryLock::Acquired(sweeper) = PaneLock::try_acquire(&path).unwrap() else {
+            panic!("fresh lock");
+        };
+        // Opened the old file before the unlink, will lock it after.
+        let racer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(sweeper.remove().unwrap());
+        assert!(!path.exists());
+        assert!(matches!(
+            PaneLock::try_lock_file(racer, &path).unwrap(),
+            Locked::Unlinked
+        ));
+        // A fresh acquisition creates (and holds) a NEW file.
+        assert!(matches!(
+            PaneLock::try_acquire(&path).unwrap(),
+            TryLock::Acquired(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pty_holder_boot_sweep_lock_record_from_a_phase_2_holder_still_parses() {
+        let old = br#"{"holder_pid":7,"child_pid":8,"versions":[2],"started_at_unix_ms":1,"holder_build":"b"}"#;
+        let rec: LockRecord = serde_json::from_slice(old).unwrap();
+        assert_eq!((rec.child_start, rec.scope_unit), (None, None));
     }
 
     #[test]
