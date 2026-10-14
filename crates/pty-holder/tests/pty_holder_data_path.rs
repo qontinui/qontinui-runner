@@ -758,13 +758,29 @@ fn pty_holder_data_path_input_on_the_attached_connection_is_refused() {
 }
 
 /// A child that ignores SIGHUP still dies: SIGKILL follows the grace.
+///
+/// The kill is sent only once the child has PRINTED that its `trap '' HUP` is
+/// in place. Sending it earlier races the shell's startup: a SIGHUP that lands
+/// before `trap` runs kills the child with SIGHUP (signal 1), which is the
+/// holder working correctly and says nothing about escalation — measured as
+/// 7 of 80 concurrent full-binary runs on a loaded box.
 #[test]
 fn pty_holder_data_path_kill_escalates_past_an_ignored_hangup() {
-    let mut h = start("killhard", sh("trap '' HUP; while :; do sleep 1; done"));
-    let mut s = attach(&h, None);
+    let mut h = start(
+        "killhard",
+        sh("trap '' HUP; echo trap-armed; while :; do sleep 1; done"),
+    );
+    let mut s = attach(&h, Some(0));
+    let armed = collect_until(&mut s, 0, Duration::from_secs(15), |c| {
+        contains(&c.bytes, b"trap-armed") || exit_of(&c.events).is_some()
+    });
+    assert!(
+        exit_of(&armed.events).is_none(),
+        "the child exited before arming its trap: {:?}",
+        armed.events
+    );
     s.writer.kill(soon()).unwrap();
-    let first_offset = s.info.start_offset;
-    let c = collect_until(&mut s, first_offset, Duration::from_secs(15), |c| {
+    let c = collect_until(&mut s, armed.next, Duration::from_secs(15), |c| {
         exit_of(&c.events).is_some()
     });
     assert_eq!(exit_of(&c.events).unwrap().signal, Some(libc::SIGKILL));
