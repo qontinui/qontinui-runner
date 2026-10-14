@@ -144,6 +144,14 @@ pub(crate) fn embedded_agent_names() -> Vec<String> {
         .collect()
 }
 
+/// Whether the subagent definition `<name>.md` is in this binary's embedded
+/// bundle — the floor every spawned session that provisions agents receives.
+/// The `skill:expedite-review` capability is advertised only when the reviewer
+/// agent that skill requires is here (`crate::fleet`).
+pub(crate) fn agent_is_served(name: &str) -> bool {
+    FLEET_AGENTS.get_file(format!("{name}.md")).is_some()
+}
+
 /// Number of embedded subagent definitions, for log lines that want to say how
 /// many defaults were available independent of how many the checkout overlaid.
 pub(crate) fn embedded_agent_count() -> usize {
@@ -288,5 +296,27 @@ mod tests {
              this subagent specifically, so dropping it from the bundle silently makes \
              that policy unsatisfiable on a checkout-less device"
         );
+    }
+
+    /// The `/expedite-review` skill spawns its reviewer as this read-only type
+    /// and posts nothing when the harness has no such type (plan
+    /// 2026-10-13-coord-expedited-land-lever-for-agents Phase 6), so a runner
+    /// that serves the skill must serve the agent too.
+    #[test]
+    fn the_expedite_reviewer_is_bundled_and_read_only() {
+        assert!(agent_is_served(crate::fleet::EXPEDITE_REVIEWER_AGENT));
+        assert!(!agent_is_served("no-such-agent-for-this-test"));
+        let def = FLEET_AGENTS
+            .get_file("expedite-reviewer.md")
+            .and_then(|f| f.contents_utf8())
+            .expect("expedite-reviewer.md is not bundled");
+        // The FRONTMATTER's tool line, exactly one, and only Read.
+        let front = def.split("---").nth(1).expect("frontmatter");
+        let tools: Vec<&str> = front
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("tools:"))
+            .collect();
+        assert_eq!(tools, ["tools: Read"], "the expedite reviewer must be Read-only");
     }
 }

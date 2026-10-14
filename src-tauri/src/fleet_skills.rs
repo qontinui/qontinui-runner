@@ -684,6 +684,33 @@ mod tests {
         assert!(!skill_is_served("no-such-skill-for-this-test"));
     }
 
+    /// The bundle carries `expedite-review` (plan
+    /// 2026-10-13-coord-expedited-land-lever-for-agents Phase 6), so a runner
+    /// holding a live device JWT advertises `skill:expedite-review` and coord's
+    /// review gates can reach it. Its post script and the credential library it
+    /// sources ride along, or the provisioned skill could not post a verdict;
+    /// so does the parser it checks its input with.
+    #[test]
+    fn the_bundle_serves_the_expedite_review_skill() {
+        assert!(skill_is_served(crate::fleet::EXPEDITE_REVIEW_SKILL));
+        for file in [
+            "SKILL.md",
+            "parse-answer.py",
+            "parse-input.py",
+            "wrap-diff.py",
+            "post-verdict.sh",
+            "post-verdict-selftest.sh",
+            "lib/coord-tenant-credential.sh",
+        ] {
+            assert!(
+                FLEET_SKILLS
+                    .get_file(Path::new("expedite-review").join(file))
+                    .is_some(),
+                "expedite-review/{file} is not bundled"
+            );
+        }
+    }
+
     #[test]
     fn provisions_every_embedded_skill_into_dir() {
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -1216,11 +1243,11 @@ mod tests {
         resolved: usize,
         /// Citations naming a skill this bundle does not carry.
         foreign: usize,
-        /// Citations naming a DIRECTORY inside a bundled skill. No skill is
-        /// laid out that way today — [`SKILL_MANIFEST`] plus flat helper
-        /// scripts is the shape — so this is a latent case rather than a live
-        /// one, exempted so that adding a nested layout does not fail a guard
-        /// whose two-component parser was never about nesting.
+        /// Citations naming a DIRECTORY inside a bundled skill (several skills
+        /// carry a nested `lib/`). The parser resolves only two components, so
+        /// a citation INTO such a directory is counted here, not checked —
+        /// exempted so a nested layout does not fail a guard whose
+        /// two-component parser was never about nesting.
         directories: usize,
     }
 
