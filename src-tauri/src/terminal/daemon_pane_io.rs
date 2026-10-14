@@ -2894,13 +2894,27 @@ mod tests {
             let dir = pane_dir("re");
             let id = PaneId::new("re").unwrap();
             let first = Arc::new(
-                DaemonPaneIo::spawn(&holder(), &dir, &id, &sh("stty -echo; exec cat"), 80, 24)
-                    .expect("spawn + attach"),
+                DaemonPaneIo::spawn(
+                    &holder(),
+                    &dir,
+                    &id,
+                    &sh("stty -echo && printf READY; exec cat"),
+                    80,
+                    24,
+                )
+                .expect("spawn + attach"),
             );
             let child_pid = first.child_pid();
             let (c1, t1) = drain(&first);
+            // Write only once echo is off. Input that lands before `stty -echo`
+            // is echoed by the tty AND printed again by `cat`; the first pane
+            // then detaches at the echo and the reattach correctly receives
+            // cat's copy, which reads as a duplicate replay.
+            until(&c1, Duration::from_secs(10), |c| contains(c, b"READY"));
             first.writer().unwrap().write_all(b"one\r").unwrap();
-            until(&c1, Duration::from_secs(10), |c| contains(c, b"one"));
+            // cat's own line (ICRNL in, ONLCR out), not a bare "one" an
+            // unprotected notice's free text could contain.
+            until(&c1, Duration::from_secs(10), |c| contains(c, b"one\r\n"));
             first.release(Duration::from_secs(2)).unwrap();
             assert_eq!(first.detach_outcome(), DetachOutcome::Queued);
             assert_eq!(
