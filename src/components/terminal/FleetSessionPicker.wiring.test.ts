@@ -623,10 +623,20 @@ describe("the tenant selector reads, and attaches, the tenant it names", () => {
   it("opens on the policy default until the operator picks — derived, not written by an effect", () => {
     // `resolveFleetTenantChoice` falls back to `defaultFleetTenantChoice` both
     // before a pick and after a picked tenant stops being bound.
-    expect(SOURCE).toContain(
+    const code = codeOf(SOURCE);
+    expect(code).toContain(
       "resolveFleetTenantChoice(\n    fleetTenantPick,\n    tenantPin,\n    tenantCandidates,",
     );
-    expect(codeOf(SOURCE)).not.toMatch(/useEffect\([^]*?setFleetTenantPick/);
+    // A pick that resolved stale is consumed with its device filter, in render.
+    expect(code).toContain(
+      "if (fleetTenantPick !== undefined && fleetTenant !== fleetTenantPick) {\n    setFleetTenantPick(undefined);\n    setServer((s) => ({ ...s, deviceId: null }));",
+    );
+    // No effect writes the pick: an effect would publish one render under the
+    // stale choice first. Scanned per call, so a pick written in render (above)
+    // or in a handler does not trip it.
+    for (const effect of callsOf(code, "useEffect(")) {
+      expect(effect).not.toContain("setFleetTenantPick");
+    }
   });
 
   it("projects the requested tenant beside the one(s) that answered", () => {
@@ -654,8 +664,8 @@ describe("the tenant selector reads, and attaches, the tenant it names", () => {
     expect(code).toContain(
       "onRetry={() => void createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
     );
-    expect(code.split("createRemote(groupKey,").length - 1).toBe(2);
-    expect(SOURCE).toContain(
+    expect(code.match(/createRemote\(\s*groupKey\s*,/g)?.length).toBe(2);
+    expect(code).toContain(
       "singleTenant: merged ? null : mintTenantOf(walks[0]?.requestedTenant ?? null),",
     );
     expect(codeOf(SOURCE)).not.toContain("tenant: s.servedTenantId");
