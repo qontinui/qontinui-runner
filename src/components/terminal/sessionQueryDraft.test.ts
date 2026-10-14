@@ -36,6 +36,15 @@ describe("queryDraftReducer", () => {
     expect(s).toEqual({ draft: "", pending: [], seen: "" });
   });
 
+  it("an echo matching the draft clears every pending edit (a → ab → a)", () => {
+    // Typing a, ab, a sends three edits; the manager renders "a" back.
+    const s = run("", [typed("a"), typed("ab"), typed("a"), prop("a")]);
+    expect(s).toEqual({ draft: "a", pending: [], seen: "a" });
+    // A later change from elsewhere to exactly "ab" is adopted, not taken
+    // for a stale echo of the box's own "ab".
+    expect(queryDraftReducer(s, prop("ab"))).toEqual({ draft: "ab", pending: [], seen: "ab" });
+  });
+
   it("returns the same state when nothing changes", () => {
     const s = initialQueryDraft("is:idle");
     expect(queryDraftReducer(s, prop("is:idle"))).toBe(s);
