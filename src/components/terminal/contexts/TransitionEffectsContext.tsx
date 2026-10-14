@@ -14,6 +14,9 @@ import { useWindowTitle } from "../useWindowTitle";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { windowTitleCounts } from "../sessionCounts";
 import { restartInZone, type RestartOutcome } from "../restartInZone";
+import { mutedTabIds as mutedTabIdsOf } from "../sessionMute";
+import { useSessionOrg } from "../useSessionOrg";
+import { useWindowAssignments } from "./WindowAssignmentsContext";
 
 type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
 
@@ -48,6 +51,15 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
   );
 
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
+
+  // Muted sessions (the organization store) → their tabs, whose needs-input
+  // sound and notification `useStateTransitionEffects` suppresses.
+  const { view: orgView } = useSessionOrg();
+  const { windowLabel } = useWindowAssignments();
+  const mutedTabIds = useMemo(
+    () => mutedTabIdsOf(tabs, orgView, { pageId, windowLabel }),
+    [tabs, orgView, pageId, windowLabel],
+  );
 
   /**
    * Replace the finished/errored pane in `zoneIdx` with a fresh terminal,
@@ -98,6 +110,7 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
     setFocusedZone: zoneLayout.setFocusedZone,
     handleRestartInZone,
     addHistoryEvent,
+    mutedTabIds,
   });
 
   // Window title: show needs-input/error counts over the LIVE tabs only —
