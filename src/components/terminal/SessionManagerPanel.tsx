@@ -16,6 +16,7 @@ import { RecentlyClosedSection } from "./RecentlyClosedSection";
 import { SessionQueryUnknownTail } from "./SessionQueryUnknownTail";
 import type { SessionQueryBarProps } from "./SessionQueryBar";
 import { bulkAddToGroup, bulkMute, bulkNewGroup, bulkPin, bulkSnooze } from "./sessionBulkActions";
+import { renderedRowIds } from "./sessionSelection";
 import { useSessionSelection } from "./useSessionSelection";
 import { useSessionTriage } from "./useSessionTriage";
 import { SessionGroupSuggestionsDialog } from "./SessionGroupSuggestionsDialog";
@@ -73,11 +74,6 @@ export const SESSION_MANAGER_PANEL_IDS = {
   unidentified: "terminal.session-manager-unidentified",
 } as const;
 
-/** The rows a section renders, in order — what the rail mirrors. */
-function visibleRows(sections: readonly SessionSection<UnifiedSession>[]): UnifiedSession[] {
-  return sections.flatMap((s) => s.sessions);
-}
-
 export function SessionManagerPanel({
   manager,
   selectedSessionId,
@@ -134,7 +130,7 @@ export function SessionManagerPanel({
 
   // ── Selection (visible order: what the sections render) ─────────────────
 
-  const visibleIds = useMemo(() => visibleRows(sections).map((s) => s.sessionId), [sections]);
+  const visibleIds = useMemo(() => renderedRowIds(sections), [sections]);
   const openRow = useCallback(
     (rowId: string) => {
       const row = allSessions.find((s) => s.sessionId === rowId);
@@ -266,7 +262,7 @@ export function SessionManagerPanel({
     return (
       <>
         <SessionRail
-          sessions={visibleRows(sections)}
+          sessions={sections.flatMap((s) => s.sessions)}
           groupColorOf={groupColorOf}
           selectedSessionId={selectedSessionId}
           onOpen={openSession}
