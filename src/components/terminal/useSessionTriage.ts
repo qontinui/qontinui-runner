@@ -91,7 +91,11 @@ export function useSessionTriage({
   const dismissOutcome = useCallback(() => setOutcome(null), []);
 
   const runBatch = useCallback(
-    async (progress: string, label: string, act: (items: BulkItem[]) => Promise<BulkOutcome["results"]>) => {
+    async (
+      progress: string,
+      label: string,
+      act: (items: BulkItem[]) => Promise<BulkOutcome["results"]>,
+    ) => {
       const items = selectedRows.map(itemOf);
       if (items.length === 0) return;
       setRunning(`${progress} ${items.length}…`);

@@ -34,6 +34,9 @@ export interface SessionBulkBarProps {
   onClear: () => void;
 }
 
+/** The snooze presets by label; the deadline is computed when one is picked. */
+const SNOOZE_LABELS = snoozePresets(0).map((p) => p.label);
+
 const BUTTON =
   "px-1.5 py-0.5 rounded text-[10px] font-medium text-[#a9b1d6] hover:bg-[#2a2d3d] disabled:opacity-40 transition-colors";
 const SELECT =
@@ -125,14 +128,21 @@ export function SessionBulkBar(props: SessionBulkBarProps) {
           onChange={(e) => {
             const v = e.target.value;
             if (v === "") return;
-            props.onSnooze(v === "off" ? null : Number(v));
+            if (v === "off") {
+              props.onSnooze(null);
+              return;
+            }
+            // The deadline is taken when the operator picks, not when the bar
+            // rendered — a bar left open for hours must not snooze into the past.
+            const preset = snoozePresets(Date.now()).find((p) => p.label === v);
+            if (preset) props.onSnooze(preset.until);
           }}
           className={SELECT}
         >
           <option value="">Snooze…</option>
-          {snoozePresets(Date.now()).map((p) => (
-            <option key={p.label} value={String(p.until)}>
-              {p.label}
+          {SNOOZE_LABELS.map((label) => (
+            <option key={label} value={label}>
+              {label}
             </option>
           ))}
           <option value="off">Unsnooze</option>

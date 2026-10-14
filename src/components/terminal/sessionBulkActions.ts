@@ -27,7 +27,12 @@
 
 import { describeThrown } from "@/lib/utils";
 
-import { closeNeedsSecondTick, closeTickKey, type CloseTarget } from "./sessionClose";
+import {
+  closeNeedsSecondTick,
+  closeTickKey,
+  type CloseItemResult,
+  type CloseTarget,
+} from "./sessionClose";
 import type {
   MemberOrg,
   SessionGroupColorRole,
@@ -188,10 +193,7 @@ export const bulkAddToGroup = (groupId: string, groupTitle: string): OrgBulkActi
   missed: `not in ${groupTitle}`,
 });
 
-export const bulkNewGroup = (
-  title: string,
-  colorRole?: SessionGroupColorRole,
-): OrgBulkAction => ({
+export const bulkNewGroup = (title: string, colorRole?: SessionGroupColorRole): OrgBulkAction => ({
   label: `Grouped as ${title}`,
   op: (sessionKeys) => ({ op: "createGroup", title, colorRole, sessionKeys }),
   holds: (m, _org, groupId) => groupId !== null && m?.groupId === groupId,
@@ -220,7 +222,8 @@ export async function bulkApplyOrg(
   }
   const groupId = opResult?.groupId ?? null;
   return items.map((i) => {
-    if (action.holds(org.members[i.sessionKey], org, groupId)) return result(i, "done", action.label);
+    if (action.holds(org.members[i.sessionKey], org, groupId))
+      return result(i, "done", action.label);
     const refusal = opResult && !opResult.ok ? ` (refused: ${opResult.error ?? "no reason"})` : "";
     return result(i, "not-done", `${action.missed}${refusal}`);
   });
@@ -237,9 +240,7 @@ export function moveResults(
   return items.map((item) => {
     const o = outcomes.find((x) => x.sessionId === item.sessionId);
     if (!o) return result(item, "unknown", "the move answered nothing for it");
-    return o.ok
-      ? result(item, "done", `Moved to ${pageName}`)
-      : result(item, "not-done", o.detail);
+    return o.ok ? result(item, "done", `Moved to ${pageName}`) : result(item, "not-done", o.detail);
   });
 }
 
@@ -300,22 +301,64 @@ export async function bulkResumeItems(
 
 // ── Close: the re-check at confirm ───────────────────────────────────────────
 
+/** What a confirm fired NOW closes, and the included rows it leaves alone. */
+export interface CloseConfirmation {
+  /** The rows to close: included, with a tab here, and ticked where D7 asks. */
+  ids: string[];
+  /**
+   * Included rows the confirm will NOT close, each with why — reported
+   * beside the close's own results so no included row goes unanswered.
+   */
+  skipped: CloseItemResult[];
+  /**
+   * The subset of `skipped` that reads `Needs you` / `Working` / `Unknown`
+   * with no tick for THAT activity — a row that changed while the dialog was
+   * open. Non-empty means the dialog must show the new tick requirement.
+   */
+  needsTick: CloseTarget[];
+}
+
 /**
- * What a close confirmed NOW would close, from the targets as they read at
- * this instant: every closable, included target — or nothing, with the
- * targets that block it, when any of them reads `Needs you` / `Working` /
- * `Unknown` without a tick for THAT activity. A session that turned
- * `Needs you` while the dialog was open therefore blocks the confirm until it
- * is ticked again.
+ * The confirm's re-check, from the targets as they read at this instant.
+ *
+ * Every included target with a tab here closes — EXCEPT one that now reads
+ * `Needs you` / `Working` / `Unknown` without a tick for that activity (the
+ * tick is keyed by session AND activity, so a tick given while it read `Idle`
+ * does not cover it). Such a row turned risky while the dialog was open: it
+ * is excluded from this close and answered "not closed" with the reason,
+ * while the rows the operator did confirm still close. A row whose tab went
+ * away is answered too, never dropped silently.
  */
 export function idsToClose(
   targets: readonly CloseTarget[],
   excluded: ReadonlySet<string>,
   ticks: ReadonlySet<string>,
-): { ids: string[]; blocked: CloseTarget[] } {
-  const included = targets.filter((t) => t.closable && !excluded.has(t.sessionId));
-  const blocked = included.filter(
-    (t) => closeNeedsSecondTick(t.activity) && !ticks.has(closeTickKey(t)),
-  );
-  return { ids: blocked.length > 0 ? [] : included.map((t) => t.sessionId), blocked };
+): CloseConfirmation {
+  const ids: string[] = [];
+  const skipped: CloseItemResult[] = [];
+  const needsTick: CloseTarget[] = [];
+  for (const t of targets) {
+    if (excluded.has(t.sessionId)) continue;
+    if (!t.closable) {
+      skipped.push({
+        sessionId: t.sessionId,
+        title: t.title,
+        state: "not-closed",
+        detail: "not closed: it has no live tab in this window",
+      });
+      continue;
+    }
+    if (closeNeedsSecondTick(t.activity) && !ticks.has(closeTickKey(t))) {
+      needsTick.push(t);
+      skipped.push({
+        sessionId: t.sessionId,
+        title: t.title,
+        state: "not-closed",
+        detail: `not closed: it changed to ${t.activityWord} before the close ran — tick it to close it anyway`,
+      });
+      continue;
+    }
+    ids.push(t.sessionId);
+  }
+  return { ids, skipped, needsTick };
 }

@@ -40,6 +40,18 @@ export interface SelectionStep {
   open: string | null;
 }
 
+/**
+ * The ids the panel renders, top to bottom, from its sections — the
+ * `visible` every function here takes. A collapsed group's section carries
+ * no rows (`groupSessions` empties it), so its members are absent here and a
+ * Shift range or Ctrl+A over this list can never sweep them in.
+ */
+export function renderedRowIds(
+  sections: readonly { sessions: readonly { sessionId: string }[] }[],
+): string[] {
+  return sections.flatMap((s) => s.sessions.map((r) => r.sessionId));
+}
+
 /** The ids from `a` to `b` inclusive, in visible order; `[b]` when `a` is not visible. */
 export function visibleRange(visible: readonly string[], a: string | null, b: string): string[] {
   const to = visible.indexOf(b);
@@ -87,7 +99,10 @@ export function clearSelection(state: SelectionState): SelectionState {
 }
 
 /** Drop selected ids that no longer name a row — a closed session leaves the selection. */
-export function pruneSelection(state: SelectionState, existing: ReadonlySet<string>): SelectionState {
+export function pruneSelection(
+  state: SelectionState,
+  existing: ReadonlySet<string>,
+): SelectionState {
   const ids = [...state.ids].filter((id) => existing.has(id));
   if (ids.length === state.ids.size) return state;
   return { ...state, ids: new Set(ids) };
@@ -152,7 +167,10 @@ export function applyListKey(
       return { state: { ...state, cursor: visible[next] }, open: null };
     }
     case "open":
-      return { state: at < 0 ? state : { ...state, anchor: visible[at] }, open: at < 0 ? null : visible[at] };
+      return {
+        state: at < 0 ? state : { ...state, anchor: visible[at] },
+        open: at < 0 ? null : visible[at],
+      };
     case "toggle":
       return { state: at < 0 ? state : toggleRow(state, visible[at]), open: null };
     case "select-all":
