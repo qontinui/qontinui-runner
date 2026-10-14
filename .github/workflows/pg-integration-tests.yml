@@ -195,8 +195,10 @@ jobs:
             log="$RUNNER_TEMP/pg-tests-${filter//:/_}.log"
             cargo test --locked --features spec-authoring,pg_integration_tests \
               --bin qontinui-runner -- "$filter" --test-threads=1 2>&1 | tee "$log"
+            # `|| true`: under -e/pipefail a grep that matches nothing would
+            # end the step here, before the ::error:: below could say why.
             ran="$(grep -oE '^test result: ok\. [0-9]+ passed' "$log" \
-                   | grep -oE '[0-9]+' | head -1)"
+                   | grep -oE '[0-9]+' | head -1 || true)"
             echo "::endgroup::"
             if [ "${ran:-0}" -lt 1 ]; then
               echo "::error::filter '$filter' ran no tests"

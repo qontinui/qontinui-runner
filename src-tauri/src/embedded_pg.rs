@@ -964,7 +964,7 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
 /// once at compile time. [`apply_canonical_schema`] applies all of it to a
 /// fresh cluster; `database::pg::atlas_managed_provision` reads only its
 /// `atlas_managed` objects to create a table an older cluster lacks.
-pub const CANONICAL_SCHEMA_SQL: &str = include_str!("../schema.pg.sql.generated");
+pub static CANONICAL_SCHEMA_SQL: &str = include_str!("../schema.pg.sql.generated");
 
 /// Apply the bundled canonical schema to a freshly-created embedded database.
 ///

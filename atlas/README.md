@@ -135,7 +135,12 @@ schemas, and all three must stay consistent with `schema.hcl`:
   legacy `project` copy still in place is not created, so a leftover the move
   could not carry is never hidden behind an empty twin (and a child created
   beside such a leftover parent is created without that one FK). It runs in
-  one transaction under the move's own advisory lock.
+  one transaction under the move's own advisory lock. The same step then adds
+  any dump FK whose child and parent are now both in `atlas_managed` but whose
+  constraint is missing — the FK left out above, once a later boot's move has
+  carried the parent across. Embedded clusters never run Atlas, so nothing else
+  would add it. Each FK runs in its own transaction; one that cannot be added
+  (orphan rows in the child) is logged at WARN and left missing.
 
 All of that DDL runs under one session-level provisioning advisory lock, so
 runners booting against one database at once (a primary and a temp runner on

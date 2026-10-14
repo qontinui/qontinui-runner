@@ -27,6 +27,15 @@
 //! lock (`MOVE_LOCK_KEY`), so it can never interleave with a move running on
 //! another connection, and it is never fatal. On a converged database it is
 //! one catalog query and takes no lock.
+//!
+//! A child created while its parent is still only in `project` is created
+//! without that FK. Once a later boot's move carries the parent across, both
+//! tables are in `atlas_managed` and nothing above runs again, so
+//! [`add_missing_foreign_keys_in`] closes that gap on its own: it adds every
+//! dump FK whose child and parent are both in the target but whose constraint
+//! is not. Embedded clusters never run Atlas, so without it the key would stay
+//! missing for the life of the cluster. On a converged database it costs two
+//! catalog reads and a line scan of the bundled dump, and takes no lock.
 
 use std::collections::HashSet;
 
@@ -63,13 +72,14 @@ impl ObjectKind {
 
 /// One `atlas_managed` object from the dump: the table it belongs to, its
 /// kind, its statement exactly as pg_dump wrote it, and — for an FK — the
-/// `atlas_managed` table it references.
+/// `atlas_managed` table it references and the constraint's own name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DumpObject {
     pub table: String,
     pub kind: ObjectKind,
     pub sql: String,
     pub parent: Option<String>,
+    pub constraint: Option<String>,
 }
 
 /// Every `atlas_managed` object in `dump`, in dump order.
@@ -137,6 +147,18 @@ pub(crate) fn atlas_managed_objects(dump: &str) -> Result<Vec<DumpObject>, Strin
                 "could not tell which table atlas_managed object {name:?} belongs to"
             ));
         }
+        // pg_dump names a constraint `<table> <constraint>`.
+        let constraint = match kind {
+            ObjectKind::ForeignKey => match name.split_once(' ') {
+                Some((_, c)) if !c.is_empty() => Some(c.to_string()),
+                _ => {
+                    return Err(format!(
+                        "could not tell the constraint name of atlas_managed FK {name:?}"
+                    ))
+                }
+            },
+            _ => None,
+        };
         let parent = match kind {
             ObjectKind::ForeignKey => {
                 let parent = sql
@@ -158,6 +180,7 @@ pub(crate) fn atlas_managed_objects(dump: &str) -> Result<Vec<DumpObject>, Strin
             kind,
             sql,
             parent,
+            constraint,
         });
     }
     Ok(objects)
@@ -235,6 +258,56 @@ async fn presence<C: GenericClient + Sync>(
     Ok((in_target, in_legacy))
 }
 
+/// The `(table, constraint)` pairs of every FK already on a table in `target`.
+async fn existing_foreign_keys<C: GenericClient + Sync>(
+    client: &C,
+    target: &str,
+) -> Result<HashSet<(String, String)>, String> {
+    let rows = client
+        .query(
+            "SELECT c.relname::text, k.conname::text FROM pg_catalog.pg_constraint k \
+             JOIN pg_catalog.pg_class c ON c.oid = k.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND k.contype = 'f'",
+            &[&target],
+        )
+        .await
+        .map_err(|e| format!("FK catalog probe failed: {e}"))?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get(0).map_err(|e| e.to_string())?,
+                row.try_get(1).map_err(|e| e.to_string())?,
+            ))
+        })
+        .collect()
+}
+
+/// The dump FKs whose child and parent are both in `in_target` but whose
+/// constraint is not in `existing`, in dump order.
+///
+/// An FK is identified by `(table, constraint name)` on purpose: the dump's
+/// names are Postgres's defaults (`<table>_<column>_fkey`), which is also what
+/// any legacy copy carries, and a moved table keeps its FKs under their names.
+/// Comparing definitions instead would need a second parser for `pg_get_constraintdef`.
+fn pending_foreign_keys<'a>(
+    objects: &'a [DumpObject],
+    in_target: &HashSet<String>,
+    existing: &HashSet<(String, String)>,
+) -> Vec<&'a DumpObject> {
+    objects
+        .iter()
+        .filter(|o| o.kind == ObjectKind::ForeignKey)
+        .filter(|o| in_target.contains(&o.table))
+        .filter(|o| o.parent.as_ref().is_some_and(|p| in_target.contains(p)))
+        .filter(|o| {
+            o.constraint
+                .as_ref()
+                .is_some_and(|c| !existing.contains(&(o.table.clone(), c.clone())))
+        })
+        .collect()
+}
+
 /// The six tables, in [`ATLAS_MANAGED_TABLES`] (FK) order, that exist in
 /// neither schema.
 fn absent_from_both(in_target: &HashSet<String>, in_legacy: &HashSet<String>) -> Vec<&'static str> {
@@ -246,9 +319,32 @@ fn absent_from_both(in_target: &HashSet<String>, in_legacy: &HashSet<String>) ->
 }
 
 /// Create any Atlas-owned table missing from `atlas_managed` (and absent from
-/// `project`) from the bundled dump. Never fails: an error is logged and boot
-/// continues, exactly as a table left behind by the move does.
+/// `project`) from the bundled dump, then add any dump FK left out of an
+/// earlier creation whose parent has since arrived. Never fails: an error is
+/// logged and boot continues, exactly as a table left behind by the move does.
 pub async fn create_missing_atlas_managed_tables(client: &mut Client) -> Vec<&'static str> {
+    let created = create_tables(client).await;
+    match add_missing_foreign_keys_in(
+        client,
+        crate::embedded_pg::CANONICAL_SCHEMA_SQL,
+        ATLAS_MANAGED_SCHEMA,
+    )
+    .await
+    {
+        Ok(added) => {
+            if !added.is_empty() {
+                info!(
+                    fks = ?added,
+                    "atlas_managed: added FKs left out when their child was created before its parent was moved"
+                );
+            }
+        }
+        Err(e) => error!("atlas_managed: adding missing Atlas-owned FKs failed: {e}"),
+    }
+    created
+}
+
+async fn create_tables(client: &mut Client) -> Vec<&'static str> {
     match create_missing_in(
         client,
         crate::embedded_pg::CANONICAL_SCHEMA_SQL,
@@ -350,6 +446,86 @@ pub(crate) async fn create_missing_in(
         .await
         .map_err(|e| format!("COMMIT failed: {e}"))?;
     Ok(missing)
+}
+
+/// Add every dump FK whose child and parent are both in `target` but whose
+/// constraint is missing, as `table.constraint`. Each FK runs in its own
+/// transaction under the move's advisory lock and is re-checked under it, so
+/// one that cannot be added — rows in the child with no parent, a lock it
+/// cannot get in time — is logged at WARN and leaves the others alone. `Err`
+/// only when the catalog cannot be read at all.
+pub(crate) async fn add_missing_foreign_keys_in(
+    client: &mut Client,
+    dump: &str,
+    target: &str,
+) -> Result<Vec<String>, String> {
+    // Steady state: two catalog reads, no lock. `presence` is asked about
+    // `target` alone; the legacy half of its answer is not used here.
+    let (in_target, _) = presence(client, target, target).await?;
+    let existing = existing_foreign_keys(client, target).await?;
+    let objects = atlas_managed_objects(dump)?;
+    let pending = pending_foreign_keys(&objects, &in_target, &existing);
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let from = format!("{ATLAS_MANAGED_SCHEMA}.");
+    let to = format!("{target}.");
+    let mut added = Vec::new();
+    for fk in pending {
+        let label = format!(
+            "{}.{}",
+            fk.table,
+            fk.constraint.as_deref().unwrap_or_default()
+        );
+        let result: Result<bool, String> = async {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| format!("BEGIN failed: {e}"))?;
+            tx.batch_execute(&format!(
+                "SET LOCAL lock_timeout = '{}ms'; SET LOCAL statement_timeout = '{}ms';",
+                DEFAULT_LOCK_TIMEOUT.as_millis(),
+                STATEMENT_TIMEOUT.as_millis()
+            ))
+            .await
+            .map_err(|e| format!("session settings failed: {e}"))?;
+            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MOVE_LOCK_KEY])
+                .await
+                .map_err(|e| format!("advisory lock failed: {e}"))?;
+            // Re-read under the lock: a peer may have added it, or a table
+            // may have gone.
+            let (in_target, _) = presence(&tx, target, target).await?;
+            let existing = existing_foreign_keys(&tx, target).await?;
+            let still = pending_foreign_keys(std::slice::from_ref(fk), &in_target, &existing);
+            if still.is_empty() {
+                tx.commit()
+                    .await
+                    .map_err(|e| format!("COMMIT failed: {e}"))?;
+                return Ok(false);
+            }
+            let sql = fk.sql.replace(&from, &to);
+            tx.batch_execute(&sql)
+                .await
+                .map_err(|e| format!("{e}: while running {}", sql.trim()))?;
+            tx.commit()
+                .await
+                .map_err(|e| format!("COMMIT failed: {e}"))?;
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(true) => added.push(label),
+            Ok(false) => {}
+            Err(e) => warn!(
+                fk = %label,
+                "atlas_managed: could not add FK, left missing; retried on every boot \
+                 (rows in the child with no parent will fail it each time — delete them \
+                 to clear it): {e}"
+            ),
+        }
+    }
+    Ok(added)
 }
 
 #[cfg(test)]
@@ -470,6 +646,39 @@ mod tests {
         assert!(skipped_foreign_keys(&objects, &tables, &with_parent).is_empty());
     }
 
+    /// An FK is pending only when both of its tables are in the target and its
+    /// constraint is not already there.
+    #[test]
+    fn a_foreign_key_is_pending_only_when_both_tables_exist_and_it_does_not() {
+        let objects = atlas_managed_objects(DUMP).unwrap();
+        let names = |v: Vec<&DumpObject>| -> Vec<String> {
+            v.iter()
+                .map(|o| format!("{}.{}", o.table, o.constraint.as_deref().unwrap()))
+                .collect()
+        };
+        let none = HashSet::new();
+
+        let child_only: HashSet<String> = ["regression_diagnoses".to_string()].into();
+        assert!(pending_foreign_keys(&objects, &child_only, &none).is_empty());
+
+        let both: HashSet<String> = [
+            "regression_runs".to_string(),
+            "regression_diagnoses".to_string(),
+        ]
+        .into();
+        assert_eq!(
+            names(pending_foreign_keys(&objects, &both, &none)),
+            vec!["regression_diagnoses.regression_diagnoses_run_id_fkey".to_string()]
+        );
+
+        let present: HashSet<(String, String)> = [(
+            "regression_diagnoses".to_string(),
+            "regression_diagnoses_run_id_fkey".to_string(),
+        )]
+        .into();
+        assert!(pending_foreign_keys(&objects, &both, &present).is_empty());
+    }
+
     #[test]
     fn absent_from_both_keeps_fk_order_and_excludes_legacy_copies() {
         let in_target: HashSet<String> = ["regression_suites".to_string()].into();
@@ -503,6 +712,7 @@ mod tests {
         assert_eq!(objects[0].table, "t");
         assert_eq!(objects[0].kind, ObjectKind::ForeignKey);
         assert_eq!(objects[0].parent.as_deref(), Some("p"));
+        assert_eq!(objects[0].constraint.as_deref(), Some("t_fkey"));
         assert!(objects[0].sql.contains("REFERENCES atlas_managed.p(id);"));
     }
 
@@ -623,6 +833,42 @@ mod tests {
                 .await
                 .unwrap();
             assert!(again.is_empty());
+
+            // A later boot's move carries `regression_runs` across (without
+            // its own FKs). Every FK whose two tables are now both in the
+            // target is added; a second pass adds nothing.
+            client
+                .batch_execute(&format!(
+                    "DROP TABLE {legacy}.regression_runs; {}",
+                    creation_statements(&objects, &["regression_runs"], &[], &target).concat()
+                ))
+                .await
+                .unwrap();
+            let mut added = add_missing_foreign_keys_in(&mut client, dump, &target)
+                .await
+                .unwrap();
+            added.sort();
+            assert_eq!(
+                added,
+                vec![
+                    "regression_assertion_executions.regression_assertion_executions_run_id_fkey",
+                    "regression_diagnoses.regression_diagnoses_run_id_fkey",
+                    "regression_runs.regression_runs_suite_id_fkey",
+                ]
+            );
+            let fks = count(
+                &client,
+                "SELECT count(*) FROM pg_catalog.pg_constraint k \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = k.connamespace \
+                 WHERE n.nspname = $1 AND k.contype = 'f'",
+                &[&target],
+            )
+            .await;
+            assert_eq!(fks, 3);
+            assert!(add_missing_foreign_keys_in(&mut client, dump, &target)
+                .await
+                .unwrap()
+                .is_empty());
 
             client
                 .batch_execute(&format!(
