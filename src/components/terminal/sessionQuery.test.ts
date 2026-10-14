@@ -20,6 +20,7 @@ import {
   type QueryContext,
   type TextSearchResult,
 } from "./sessionQuery";
+import { textSearchResultFrom, type TranscriptSearchResponse } from "./transcriptSearch";
 
 const ctx: QueryContext = { now: NOW };
 
@@ -424,6 +425,7 @@ describe("text:", () => {
     status: "done",
     matched: new Set(["sid"]),
     notScanned: new Set(),
+    missing: new Set(),
     limitHit: false,
     incomplete: false,
     ...over,
@@ -459,6 +461,50 @@ describe("text:", () => {
     }
     // No result at all for the query: unknown too.
     expect(match("text:coord", facts())).toBe("unknown");
+  });
+
+  describe("through textSearchResultFrom (the backend response the hook receives)", () => {
+    const resp = (over: Partial<TranscriptSearchResponse> = {}): TranscriptSearchResponse => ({
+      terms: ["coord"],
+      hits: [],
+      matched: 0,
+      scanned: 1,
+      total: 1,
+      failed: 0,
+      truncated: false,
+      truncation: [],
+      notScanned: [],
+      missing: [],
+      elapsedMs: 1,
+      ...over,
+    });
+    const viaHook = (r: TranscriptSearchResponse) =>
+      match("text:coord", facts(), withText("coord", textSearchResultFrom(r, true)));
+
+    it("a complete scoped scan with no hit is false", () => {
+      expect(viaHook(resp())).toBe(false);
+    });
+
+    it("a scoped scan that never ran (not_run) is unknown even with an empty notScanned", () => {
+      expect(
+        viaHook(resp({ scanned: 0, total: 0, truncated: true, truncation: ["not_run"] })),
+      ).toBe("unknown");
+    });
+
+    it("a scoped scan that read fewer files than it had, naming none, is unknown", () => {
+      expect(viaHook(resp({ scanned: 1, total: 2 }))).toBe("unknown");
+    });
+
+    it("a named session with no transcript found (missing) is unknown, not no-match", () => {
+      const f = filterSessions(
+        "text:coord",
+        [facts()],
+        withText("coord", textSearchResultFrom(resp({ scanned: 0, total: 0, missing: ["sid"] }), true)),
+      );
+      expect(f.ok && f.unknown.map((u) => u.reason)).toEqual([
+        "no transcript found on this runner",
+      ]);
+    });
   });
 
   it("a row with no Claude session id is unknown for text:", () => {
