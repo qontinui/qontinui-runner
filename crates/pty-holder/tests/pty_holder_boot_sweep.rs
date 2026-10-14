@@ -21,7 +21,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use qontinui_pty_holder::client::{connect, Event};
+use qontinui_pty_holder::client::{
+    connect, connect_with_versions, ConnectError, Event, FailureDisposition,
+};
 use qontinui_pty_holder::lock::{read_record, ENDED_BY_EXIT};
 use qontinui_pty_holder::pane::{lock_path, socket_path, PaneId};
 use qontinui_pty_holder::spawn::{
@@ -399,5 +401,35 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
         "the dead pane's lock is gone"
     );
     assert!(!socket_path(&dir, &pane).exists(), "and its endpoint");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review round 4, H1: a holder that only speaks a version below the data path
+/// (here: the runner offers only v1, as a v1-only holder would answer) is a
+/// LIVE holder this runner cannot attach to — left alone, never ended.
+#[test]
+fn pty_holder_boot_sweep_a_v1_only_holder_is_left_alone() {
+    let dir = pane_dir("v1");
+    let pane = PaneId::new("p1").unwrap();
+    let h = spawn(&dir, &pane, &spec_with_background_job("sleep 300"));
+    let _session = PaneSession::new(h.child_pid);
+    let _holder = HolderGuard {
+        dir: &dir,
+        pane: &pane,
+        pid: h.holder_pid,
+    };
+    let client = connect_with_versions(&dir, &pane, soon(), &[1]).expect("v1 handshake");
+    assert_eq!(client.hello_ack().version, 1);
+    let err = client.attach(None, soon()).expect_err("no data path at v1");
+    assert!(
+        matches!(err, ConnectError::NoDataPath { version: 1 }),
+        "{err}"
+    );
+    assert_eq!(err.disposition(), FailureDisposition::LeaveAlone);
+    assert!(
+        alive(h.holder_pid) && alive(h.child_pid),
+        "nothing was touched"
+    );
+    h.teardown();
     let _ = std::fs::remove_dir_all(&dir);
 }
