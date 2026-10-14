@@ -7999,6 +7999,8 @@ async fn coord_mcp_proxy_handler(
             crate::coord_mcp::RunnerCredentialHeal::RemintReplacing { presented } => {
                 crate::coord_mcp::await_device_jwt_replacing_for(device_tenant, presented).await
             }
+            // `dark(no_default_binding)`: nothing a refresh does can cure it.
+            crate::coord_mcp::RunnerCredentialHeal::None => None,
         };
         match healed {
             // The store CONTRADICTS the cell — an operator re-paired, or the

@@ -1544,6 +1544,14 @@ pub(crate) enum RunnerCredentialHeal {
         /// which case any usable token is a replacement.
         presented: Option<CredentialFingerprint>,
     },
+    /// `dark(no_default_binding)` — a usable credential is held, but
+    /// `paired_user.json` names no default binding pointing at it. No refresh
+    /// cures that (the slot is fine; the binding file is not), so kicking the
+    /// refresher and waiting [`DEVICE_JWT_REMINT_WAIT`] would only delay the
+    /// same refusal by five seconds on every call. Refuse at once. It is
+    /// still bounded: the self-heal or an operator re-pair rebuilds the
+    /// binding, and the next pass publishes an answering posture.
+    None,
 }
 
 /// A SHA-256 of a bearer, so a heal can say "not THIS token" without carrying
@@ -1683,12 +1691,18 @@ pub(crate) fn runner_credential_heal(
         // is noise — but an operator's Authenticate lands a usable credential
         // that a local read contradicts the stale posture with.
         P::Unrefreshable | P::Revoked => RunnerCredentialHeal::LocalReadOnly,
-        P::Dark(_) => RunnerCredentialHeal::RemintReplacing {
-            presented: presented
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(CredentialFingerprint::of),
-        },
+        // Only the cause a refresh can cure gets the replacement-aware wait.
+        P::Dark(crate::mcp::device_jwt_refresher::DarkCause::NoDefaultBinding) => {
+            RunnerCredentialHeal::None
+        }
+        P::Dark(crate::mcp::device_jwt_refresher::DarkCause::UpstreamRejected) => {
+            RunnerCredentialHeal::RemintReplacing {
+                presented: presented
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(CredentialFingerprint::of),
+            }
+        }
     }
 }
 
@@ -25773,9 +25787,13 @@ mod runner_credential_tests {
                 presented: Some(CredentialFingerprint::of("refused.jwt"))
             }
         );
+        // ...but only for the cause a refresh can cure. `no_default_binding`
+        // holds a usable slot and lacks a binding file — no refresh changes
+        // that, so the wait would only delay the same refusal by five seconds
+        // per call. Refuse at once.
         assert_eq!(
-            runner_credential_heal(P::Dark(DarkCause::NoDefaultBinding), None),
-            RunnerCredentialHeal::RemintReplacing { presented: None }
+            runner_credential_heal(P::Dark(DarkCause::NoDefaultBinding), Some("held.jwt")),
+            RunnerCredentialHeal::None
         );
         // The fingerprint never prints the token (`?heal` is logged).
         let shown = format!(
@@ -25884,6 +25902,12 @@ mod runner_credential_tests {
                 && body.contains("RunnerCredentialHeal::LocalReadOnly")
                 && body.contains("RunnerCredentialHeal::RemintReplacing { presented }"),
             "every recovery must be attempted by the handler"
+        );
+        // `dark(no_default_binding)` refuses at once: no refresh cures it, so
+        // a wait would only delay the same refusal.
+        assert!(
+            body.contains("RunnerCredentialHeal::None => None"),
+            "the no-cure arm must refuse without waiting"
         );
         assert!(
             body.contains("await_device_jwt_replacing_for(device_tenant, presented)"),
