@@ -47,6 +47,31 @@ export async function fetchOpenRecords(
   return (await fetchRestoreSet(pageId, opts)).records;
 }
 
+/**
+ * Wait for the runner's PTY-holder boot sweep to settle — every pane a holder
+ * kept alive across the last runner exit adopted back as a live terminal —
+ * before the restore reads `terminal_list` (plan
+ * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 3).
+ * Otherwise a surviving session would look dead and be cold-resumed beside
+ * its still-running `claude`. The backend bounds the wait itself. An error
+ * (an older runner without the command) or a timeout proceeds: a late
+ * adoption arrives as an ordinary `terminal-created` tab, and the cold-resume
+ * path's live-process check still refuses a duplicate. Exported for tests.
+ */
+export async function waitForHolderSweep(): Promise<void> {
+  try {
+    const resp = await invoke<CommandResponse>("terminal_holder_sweep_settled");
+    const settled = (resp?.data as { settled?: boolean } | undefined)?.settled;
+    if (settled === false) {
+      console.warn(
+        "[TerminalPage] the PTY-holder boot sweep did not settle in time; restoring anyway",
+      );
+    }
+  } catch (err) {
+    console.warn(`[TerminalPage] terminal_holder_sweep_settled unavailable: ${err}`);
+  }
+}
+
 /** The restore set for a page, or the coord device drain's deferral of it. */
 export interface RestoreSet {
   records: TerminalSessionRecord[];
@@ -1004,6 +1029,10 @@ export function useTerminalInitialization({
         //    generation per pass. Abort instead: leave the page as-is and let
         //    the next activation retry. (Same null-awareness as the plan-tab
         //    cold-start check in step 4 below.)
+        // Holder panes that survived the last runner exit are adopted by the
+        // runner's boot sweep; wait for it, so they are reconnected below
+        // rather than mistaken for dead sessions.
+        await waitForHolderSweep();
         const reconnectDecision = decideReconnectOutcome(await reconnectToExistingSessions());
         if (reconnectDecision.kind === "abort-restore") {
           restoreAborted = true;
