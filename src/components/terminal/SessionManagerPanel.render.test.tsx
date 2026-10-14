@@ -128,7 +128,7 @@ function managerOver(
     copySessionId: noop,
     closableTabId: close.closableTabId ?? (() => null),
     closeSessions: close.closeSessions ?? (() => Promise.resolve([])),
-    forceCloseSessions: () => [],
+    forceCloseSessions: () => Promise.resolve([]),
     moveSessionsToPage: () => Promise.resolve([]),
     selectedIds: new Set<string>(),
     toggleSelect: noop,

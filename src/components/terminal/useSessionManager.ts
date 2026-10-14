@@ -70,6 +70,7 @@ import {
   forceCloseSessions as forceCloseItems,
   type CloseItem,
   type CloseItemResult,
+  type TerminalCloseOutcome,
 } from "./sessionClose";
 import { useRecentlyClosed, type UseRecentlyClosedResult } from "./useRecentlyClosed";
 
@@ -352,11 +353,13 @@ export interface UseSessionManagerParams {
   onFocusSessionTab: (sessionId: string, tabId: string, source: UnifiedSession["source"]) => void;
   /**
    * Close a session's terminal tab — the page's own close path
-   * (`useTerminalManager().closeTerminal`, which records the durable close).
+   * (`useTerminalManager().closeTerminalReporting`, which records the durable
+   * close) — answering what it observed doing. A `void` answer reads as an
+   * unconfirmed kill in Force close's results.
    * In tmux mode the panel is the only navigator, so without a close on the
    * row a hidden session could be closed only by showing it first.
    */
-  onCloseSessionTab?: (tabId: string) => void;
+  onCloseSessionTab?: (tabId: string) => Promise<TerminalCloseOutcome> | void;
   /**
    * The tabs whose pane is showing right now — the `On screen` vs `Hidden
    * here` split. In tmux mode that is the shown tab; in grid mode, the zoned
@@ -452,7 +455,7 @@ export interface UseSessionManagerReturn {
    * Force close: the page's plain close, which kills the pane tree. Its own,
    * separately confirmed action; records each closed session the same way.
    */
-  forceCloseSessions: (sessions: readonly UnifiedSession[]) => CloseItemResult[];
+  forceCloseSessions: (sessions: readonly UnifiedSession[]) => Promise<CloseItemResult[]>;
   /** Move the rows' live tabs to another Terminal page. */
   moveSessionsToPage: (
     sessions: readonly UnifiedSession[],
@@ -1256,8 +1259,10 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         invoke<unknown>("terminal_graceful_close", { terminalId: tabId }),
       forceClose: (tabId: string) => onCloseSessionTab?.(tabId),
       // The runner already closed this tab; the page's close path drops it
-      // from the window and records the durable close (its own
-      // `terminal_close` then finds nothing left to kill).
+      // from the window and records the durable close. `closeSessionsGracefully`
+      // calls this only after the tab's graceful close answered `closed` (see
+      // `CloseEffects.dropTab`), so that path's own `terminal_close` finds
+      // nothing left to kill.
       dropTab: (tabId: string) => onCloseSessionTab?.(tabId),
       recordClosed: (ops: SessionOrgOp[]) => void applyOrg(ops),
     }),

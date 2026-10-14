@@ -43,7 +43,7 @@ interface SessionCloseDialogProps {
   heading: string;
   targets: readonly CloseTarget[];
   onClose: (sessionIds: string[]) => Promise<CloseItemResult[]>;
-  onForceClose: (sessionIds: string[]) => CloseItemResult[];
+  onForceClose: (sessionIds: string[]) => Promise<CloseItemResult[]>;
   onDismiss: () => void;
   /** Each row gets an include box, all ticked at open (a multi-row close). */
   excludable?: boolean;
@@ -116,10 +116,17 @@ export function SessionCloseDialog({
     const results = await onClose(now.ids);
     setPhase({ kind: "done", results: [...results, ...now.skipped], forced: false });
   };
-  const runForce = () => {
+  const runForce = async () => {
     const now = confirmNow();
     if (!now) return;
-    const results = now.ids.length > 0 ? onForceClose(now.ids) : [];
+    if (now.ids.length === 0) {
+      setPhase({ kind: "done", results: now.skipped, forced: true });
+      return;
+    }
+    // A kill is reported only once the close path answered, so Force close
+    // waits like Close does rather than claiming "closed" up front.
+    setPhase({ kind: "running" });
+    const results = await onForceClose(now.ids);
     setPhase({ kind: "done", results: [...results, ...now.skipped], forced: true });
   };
 
@@ -208,7 +215,7 @@ export function SessionCloseDialog({
               </button>
               <button
                 {...sessionOrgControlAttrs("forceCloseConfirm")}
-                onClick={runForce}
+                onClick={() => void runForce()}
                 disabled={!canClose}
                 title={
                   unticked.length > 0
