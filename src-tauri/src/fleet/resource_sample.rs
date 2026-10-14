@@ -966,7 +966,7 @@ fn read_cpu_package_temp_c(sys_root: &std::path::Path) -> Option<f64> {
     }
 
     for hw in entries(sys_root.join("class/hwmon"), "hwmon") {
-        if !read(hw.join("name")).is_some_and(|n| n.trim() == "coretemp") {
+        if read(hw.join("name")).is_none_or(|n| n.trim() != "coretemp") {
             continue;
         }
         let max = std::fs::read_dir(&hw)
