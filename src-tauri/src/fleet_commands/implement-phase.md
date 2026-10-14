@@ -159,7 +159,10 @@ writes feature code itself — its job is to spawn, review, decide, and unblock.
    return, `failed` or `completed`, classify the result with
    `scripts/agent-report-verdict.sh classify --expect-label <chunk label> --checkpoint`
    before reviewing it: `PROGRESS_NOTE` / `MISLABELLED` is an UNFINISHED chunk
-   to resume from its checkpoint, never a result to review.
+   to resume — `SendMessage` the same agent id first, and respawn from its
+   checkpoint only on `No transcript found` (the recovery ladder in
+   `knowledge-base/qontinui-specific/agent-checkpoints.md`) — never a result to
+   review.
 2. **Review.** When each agent returns, read its summary critically. Spot-check
    the actual diff with `git diff` / `Read` — don't trust the summary alone
    (see [[feedback_verify_function_exists_before_trusting_stamp]]). Confirm
@@ -407,8 +410,12 @@ trigger is NOT a gate; skip those and just report the blocker.
   `vetted`; never on the status a REFUSED transition left, which on a fresh unit
   is `""` and clears at once; on a refused transition register no `unit_ready` gate (canonical: `_gate-registration`).
   (**NOT** `operator_approval` — `operator_approval`
-  is for genuine human decisions, not a work queue); schema/alembic-at-head →
-  `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
+  is for genuine human decisions, not a work queue); the whole alembic chain
+  applied → `migration_at_head` `{schema: "coord"}` (database-wide; born cleared
+  if registered before coord observes the new head — see `_gate-registration`,
+  What "born cleared" means);
+  one table/column existing on the serving DB → `schema_object_exists`
+  `{schema, object, column?}`; infra drift cleared → `infra_drift_clear`; a repo
   file/workflow existing → `file_exists` `{repo, path, on_ref?}` — **usable again;
   the 2026-08-05 fleet-wide 403 was FIXED by coord `e6f486b8` (2026-08-15) and that
   fix is deployed** (ancestor of the serving build, re-probed live 2026-08-31:
