@@ -53,6 +53,9 @@ use crate::transport::{self, remaining, Conn, DeadlineIo};
 pub enum ConnectError {
     /// The holder answered, and speaks none of our versions. It is alive.
     Incompatible { holder_versions: Vec<u32> },
+    /// The handshake succeeded, but at a version below the data path
+    /// ([`DATA_PATH_VERSION`]): the holder is live and cannot be attached to.
+    NoDataPath { version: u32 },
     /// The holder answered something that is not a handshake reply.
     Protocol(String),
     /// Connect, write, read or deadline failure.
@@ -79,6 +82,10 @@ impl std::fmt::Display for ConnectError {
                     "no common protocol version; holder speaks {holder_versions:?}"
                 )
             }
+            ConnectError::NoDataPath { version } => write!(
+                f,
+                "holder negotiated version {version}; the data path needs {DATA_PATH_VERSION}"
+            ),
             ConnectError::Protocol(m) => write!(f, "protocol error: {m}"),
             ConnectError::Rejected { reason, detail } => {
                 write!(f, "holder rejected the request ({reason:?}: {detail})")
@@ -94,19 +101,63 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
+/// What a caller that wants to ADOPT a live holder should do after an attach
+/// failed ([`ConnectError::disposition`]; review round 4, H1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    /// The holder can never be driven by this runner, and that is FINAL: it
+    /// answered `no_common_version`, refused our peer identity
+    /// (`peer_not_authorized`), or refused a verb its own negotiated version
+    /// lacks (`verb_not_in_version`, which can only follow a successful
+    /// handshake). The only failures that may end a live session.
+    End,
+    /// A live holder this runner cannot drive the data path of — it
+    /// negotiated a version below [`DATA_PATH_VERSION`]. Exactly like a
+    /// census `Incompatible` (plan D15): not adopted, NOT touched.
+    LeaveAlone,
+    /// Anything a retry may clear, or that says nothing final about the
+    /// holder: IO errors and timeouts, a busy holder, a garbled reply, a
+    /// reason this build does not know (a newer holder's), and a rejection of
+    /// a MALFORMED request — the last a bug in this runner, never a reason to
+    /// end the user's session ([`ConnectError::is_runner_bug`]).
+    Retry,
+}
+
 impl ConnectError {
-    /// Whether this failure says the holder can NEVER be driven by this
-    /// runner — it speaks no version we do, or it refused a request for a
-    /// reason no retry changes — as opposed to a failure a retry may clear
-    /// (an IO error or a timeout on a loaded box, a holder at its connection
-    /// cap, a garbled reply). The boot sweep ends a holder only on a
-    /// definitive failure (review round 3, R1).
-    pub fn is_definitive(&self) -> bool {
+    /// See [`FailureDisposition`].
+    pub fn disposition(&self) -> FailureDisposition {
         match self {
-            ConnectError::Incompatible { .. } => true,
-            ConnectError::Rejected { reason, .. } => !matches!(reason, RejectReason::Busy),
-            ConnectError::Protocol(_) | ConnectError::Io(_) | ConnectError::Poisoned(_) => false,
+            ConnectError::Incompatible { .. } => FailureDisposition::End,
+            ConnectError::NoDataPath { .. } => FailureDisposition::LeaveAlone,
+            ConnectError::Rejected { reason, .. } => match reason {
+                RejectReason::PeerNotAuthorized | RejectReason::VerbNotInVersion => {
+                    FailureDisposition::End
+                }
+                _ => FailureDisposition::Retry,
+            },
+            ConnectError::Protocol(_) | ConnectError::Io(_) | ConnectError::Poisoned(_) => {
+                FailureDisposition::Retry
+            }
         }
+    }
+
+    /// The holder rejected a request THIS runner malformed or sent out of
+    /// order: a runner bug, to be logged loudly — and still only retried.
+    pub fn is_runner_bug(&self) -> bool {
+        matches!(
+            self,
+            ConnectError::Rejected {
+                reason: RejectReason::Malformed
+                    | RejectReason::HandshakeRequired
+                    | RejectReason::DuplicateHello
+                    | RejectReason::UnexpectedDataFrame
+                    | RejectReason::NotAttached
+                    | RejectReason::AlreadyAttached
+                    | RejectReason::UnknownVerb
+                    | RejectReason::UnknownFrameKind,
+                ..
+            }
+        )
     }
 }
 
@@ -363,10 +414,10 @@ impl Client {
     ) -> Result<AttachedStream, ConnectError> {
         self.check()?;
         if self.ack.version < DATA_PATH_VERSION {
-            // A version mismatch: the holder answered, and cannot serve the
-            // data path this runner drives.
-            return Err(ConnectError::Incompatible {
-                holder_versions: vec![self.ack.version],
+            // The holder answered, and cannot serve the data path this runner
+            // drives: leave it alone, as a census Incompatible.
+            return Err(ConnectError::NoDataPath {
+                version: self.ack.version,
             });
         }
         let request = Request::Attach {
@@ -899,27 +950,50 @@ mod tests {
         )
     }
 
-    /// Review round 3, R1: only a version mismatch or a final refusal is
-    /// definitive; a busy holder, an IO error or a garbled reply may clear.
+    /// Review round 4, H1: only a final answer ends a session. A v1-only
+    /// holder is left alone; an unknown (newer) reason and a malformed-request
+    /// rejection (a runner bug) are retried.
     #[test]
-    fn pty_holder_boot_sweep_attach_failure_is_definitive_only_when_final() {
-        assert!(ConnectError::Incompatible {
-            holder_versions: vec![1]
-        }
-        .is_definitive());
-        assert!(ConnectError::Rejected {
-            reason: RejectReason::VerbNotInVersion,
+    fn pty_holder_boot_sweep_attach_failure_disposition() {
+        use FailureDisposition::*;
+        let rejected = |reason| ConnectError::Rejected {
+            reason,
             detail: String::new(),
+        };
+        assert_eq!(
+            ConnectError::Incompatible {
+                holder_versions: vec![9]
+            }
+            .disposition(),
+            End
+        );
+        assert_eq!(rejected(RejectReason::PeerNotAuthorized).disposition(), End);
+        assert_eq!(rejected(RejectReason::VerbNotInVersion).disposition(), End);
+        assert_eq!(
+            ConnectError::NoDataPath { version: 1 }.disposition(),
+            LeaveAlone
+        );
+        assert_eq!(rejected(RejectReason::Unknown).disposition(), Retry);
+        assert_eq!(rejected(RejectReason::Busy).disposition(), Retry);
+        for bug in [
+            RejectReason::Malformed,
+            RejectReason::HandshakeRequired,
+            RejectReason::DuplicateHello,
+            RejectReason::UnexpectedDataFrame,
+            RejectReason::NotAttached,
+            RejectReason::AlreadyAttached,
+        ] {
+            let e = rejected(bug);
+            assert_eq!(e.disposition(), Retry, "{bug:?}");
+            assert!(e.is_runner_bug(), "{bug:?}");
         }
-        .is_definitive());
-        assert!(!ConnectError::Rejected {
-            reason: RejectReason::Busy,
-            detail: String::new(),
-        }
-        .is_definitive());
-        assert!(!ConnectError::Io(io::Error::from(io::ErrorKind::TimedOut)).is_definitive());
-        assert!(!ConnectError::Protocol("x".into()).is_definitive());
-        assert!(!ConnectError::Poisoned("x".into()).is_definitive());
+        assert!(!rejected(RejectReason::Busy).is_runner_bug());
+        assert_eq!(
+            ConnectError::Io(io::Error::from(io::ErrorKind::TimedOut)).disposition(),
+            Retry
+        );
+        assert_eq!(ConnectError::Protocol("x".into()).disposition(), Retry);
+        assert_eq!(ConnectError::Poisoned("x".into()).disposition(), Retry);
     }
 
     /// Nit from review: a synthetic frame is accepted only on a connection
