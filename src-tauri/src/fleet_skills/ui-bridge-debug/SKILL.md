@@ -165,14 +165,21 @@ report the frame as a `frame` observation. Rules for reading any of them:
   `needs_multi_frame_input` → use `vision/diff` over two captures;
   `stale_input` → the producer only had an old sample (the web relay's cached
   snapshot) — re-run once the page answers; `capability_unavailable_in_build`
-  → the answering build does not serve the route — call the runner's `:9876`
-  route. Those nine are the whole closed `UnknownCode` set
+  → the build that had to answer does not serve it: on `control/page-health`
+  (producer `runner/page-health-forward`) the connected app's webview build
+  predates the `pageHealth` request, so upgrade that app/webview build —
+  re-calling the route will not help; on an SDK-only bridge's vision route,
+  call the runner's `:9876` route instead. Those nine are the whole closed `UnknownCode` set
   (`qontinui-schemas/rust-vision-core/src/observation.rs`); anything else is a
   contract break — report it verbatim as UNKNOWN.
-- **Name the producer from `provenance.producer.id`** (`runner/page-health`,
-  `sdk/page-health`, `sdk-server/page-health`, `sdk-native/page-health`,
-  `runner/vision-extract`, …), never from the URL you called:
-  which producer answers a route is a property of the build behind it.
+- **Name the producer from `provenance.producer.id`** (`sdk/page-health`,
+  `runner/page-health-forward`, `sdk-server/page-health`,
+  `sdk-native/page-health`, `runner/vision-extract`, …), never from the URL you
+  called: which producer answers a route is a property of the build behind it.
+  The runner's `control/page-health` forwards to the app and returns its
+  `sdk/page-health` answer unchanged; `runner/page-health-forward` is the
+  runner's own `unknown` when the forward fails; `runner/page-health` comes
+  only from older runner builds.
 - **When `provenance.cache.hit` is `true`, quote `provenance.observedAt` and
   `provenance.cache.storedAt`**: the answer describes the page as it was then.
   The cache key (`provenance.cache.keyInputs`) cannot see a page that changed

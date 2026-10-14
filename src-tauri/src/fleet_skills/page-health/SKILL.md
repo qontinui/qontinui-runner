@@ -55,8 +55,8 @@ raw coverage numbers; the LLM must apply the layout-aware gate before escalating
 
 ## Read `status` FIRST — could-not-see is not a broken page
 
-Every page-health producer — the runner's route and the `@qontinui/ui-bridge`
-SDK's (≥ 0.30.0) — answers `POST /ui-bridge/control/page-health` with an
+Every page-health producer — the `@qontinui/ui-bridge` SDK's (≥ 0.30.0), which
+the runner's route forwards to — answers `POST /ui-bridge/control/page-health` with an
 **Observation envelope**, always HTTP 200. `status` is the whole answer, and the
 report exists only under one of its states:
 
@@ -72,19 +72,31 @@ anyway, over zero elements, and read as a CRITICAL empty page. Before this chang
 now two, and only `measured` is a statement about the page.
 
 **Name the producer from the reply, never from the URL.** `provenance.producer.id`
-says who analyzed the page — `runner/page-health` (the runner's own analyzer),
-`sdk/page-health` (the `@qontinui/ui-bridge` SDK's, in-page or through the web
-relay), `sdk-server/page-health` (`@qontinui/ui-bridge-server`) or
-`sdk-native/page-health` (`@qontinui/ui-bridge-native`, a device). Which one
-answers a given URL is a property of the build serving it and is expected to
-move (the runner is slated to forward the SDK's answer), so quote the field.
+says who answered:
+
+- `sdk/page-health` — the `@qontinui/ui-bridge` SDK's analyzer, run in the app.
+  This is what the runner's `:9876` route returns when its forward succeeds: the
+  route keeps no analyzer of its own, sends the app's webview a `pageHealth`
+  request and returns the app's observation unchanged. The same producer
+  answers in-page and through the web relay.
+- `runner/page-health-forward` — the runner answering for itself because the
+  forward did not yield the app's observation. Always `unknown`, never a
+  report (see the code table).
+- `sdk-server/page-health` (`@qontinui/ui-bridge-server`) or
+  `sdk-native/page-health` (`@qontinui/ui-bridge-native`, a device).
+- `runner/page-health` — only an OLDER runner build, whose Rust analyzer ran
+  over a `discover` reply. Current builds never emit it.
+
+Which producer answers a given URL is a property of the build serving it, so
+quote the field.
 
 **`sdk-server/page-health` is a different analyzer with a different `value`.**
 Its report is `{status: "healthy"|"degraded"|"unhealthy", findings: [{key,
 severity: "critical"|"warning"|"info", message, details?}], heatmap, stats}` —
 no `summary`, no `check`. That inner `value.status` is the report's roll-up, not
 the envelope `status`. The check table, severities and single-column rule below
-describe the other three producers (`runner/`, `sdk/`, `sdk-native/`).
+describe the other producers (`sdk/`, `sdk-native/`, and an older runner's
+`runner/page-health`).
 
 ### `unknown.code` → the one next action
 
@@ -95,12 +107,13 @@ The codes are a closed set (`UnknownCode` in
 
 | `unknown.code` | Cause | Next action |
 |---|---|---|
-| `producer_failed` | The producer ran and errored: the runner's `discover` IPC failed (bridge down, timed out), or the SDK's registry snapshot / analysis threw | Check the answering app is up (`curl -s http://127.0.0.1:9876/health` for the runner); retry once it answers |
-| `input_missing` | The snapshot / `discover` reply carried no `elements` array (`observedAt: null` — no sample), OR visible elements exist and none carries a `normalizedRect` (nothing for the grid to place), OR the web relay refused a malformed snapshot | Capture `discover` directly and report what it returned; for the geometry case, the page's elements carry no layout rects — do not assess the layout |
-| `producer_not_run` | Zero elements / zero registered components — nothing is registered yet | The page is not hydrated or not instrumented: wait for load / navigate, then re-run. This is NOT an empty page |
-| `app_unreachable` | The web relay could not fetch a snapshot from the browser tab and holds none cached | Open or register a tab on that page (`ui-bridge-inject`), then re-run |
+| `producer_failed` | The producer ran and errored. From `sdk/page-health`: the registry snapshot or the analysis threw. From `runner/page-health-forward`: the forward timed out (`unknown.detail` starts with `timeout`), the app refused the `pageHealth` request, the app's reply was not a canonical `Observation<PageHealthValue>` (the runner parses it strictly and does not pass an untrusted reply through), or any other transport error (detail `the pageHealth request failed: …`) | Read `unknown.detail` for which; check the app is up (`curl -s http://127.0.0.1:9876/health` for the runner) and retry once it answers |
+| `input_missing` | The registry snapshot carried no `elements` array (`observedAt: null` — no sample), OR visible elements exist and none carries a `normalizedRect` (nothing for the grid to place), OR the web relay refused a malformed snapshot | Capture `discover` directly and report what it returned; for the geometry case, the page's elements carry no layout rects — do not assess the layout |
+| `producer_not_run` | Zero registered elements and zero registered components — nothing is registered yet | The page is not hydrated or not instrumented: wait for load / navigate, then re-run. This is NOT an empty page |
+| `app_unreachable` | No app answered. From `runner/page-health-forward`: the UI Bridge circuit breaker is open, the frontend never became ready, the request could not be emitted to the webview, or the app's UI Bridge is not mounted. From the web relay (`sdk/page-health`): it could not fetch a snapshot from the browser tab and holds none cached | Runner: bring the runner's frontend up / wait for it to be ready, then re-run. Web: open or register a tab on that page (`ui-bridge-inject`), then re-run |
 | `stale_input` | The web relay's refresh failed and only an older cached snapshot exists (`provenance.observedAt` is that snapshot's time) | Do not report the cached page as current; re-run once the tab answers |
-| `capability_unavailable_in_build`, `below_confidence_floor`, `model_reply_unparseable`, `needs_multi_frame_input` | Not emitted by any page-health producer today | Report the code verbatim as UNKNOWN and record a finding — a page-health reply carrying one is a contract break |
+| `capability_unavailable_in_build` | From `runner/page-health-forward`: the connected app's webview build predates the `pageHealth` request (its dispatcher answered `Unknown request type`) | The app/webview build is too old to answer page-health — upgrade it to a build whose webview handles the `pageHealth` request. Re-calling the same route will not help |
+| `below_confidence_floor`, `model_reply_unparseable`, `needs_multi_frame_input` | Not emitted by any page-health producer today | Report the code verbatim as UNKNOWN and record a finding — a page-health reply carrying one is a contract break |
 
 ### Coverage — elements the grid could not place
 
@@ -134,13 +147,14 @@ curl -s -X POST http://<device-ip>:8087/ui-bridge/control/page-health -H "Conten
 
 > **Which shape you get depends on the build that answers.** The runner's
 > `:9876` route and an SDK build ≥ `@qontinui/ui-bridge` 0.30.0 answer the
-> envelope. A web or device endpoint serving an older SDK pin still answers the
+> envelope (the runner's route returns the app's own `sdk/page-health` answer).
+> A runner build predating qontinui-runner#1890 answers the bare report too. A web or device endpoint serving an older SDK pin still answers the
 > bare report (`{summary, findings, ...}` with no `status`) — the filter above
 > labels it UNRECOGNISED. Over that older shape, an empty `findings` over zero
 > elements is UNKNOWN, not a clean or broken page.
 
-> **Targeting a device:** page-health is element-data-only (it calls
-> `discover` internally; no screenshot, no frame pipeline). Unlike the
+> **Targeting a device:** page-health is element-data-only (it reads the UI
+> Bridge registry snapshot; no screenshot, no frame pipeline). Unlike the
 > pixel skills (`/visual-check`, `/visual-audit`), it takes **no `target`
 > field** — to assess a device's page, POST directly to that device's own
 > `control/page-health` endpoint (each UI Bridge server, including the
@@ -175,14 +189,13 @@ A measured answer:
       ]
     },
     "provenance": {
-      "producer": { "id": "runner/page-health", "version": "<runner version>" },
+      "producer": { "id": "sdk/page-health", "version": "<@qontinui/ui-bridge version>" },
       "observedAt": "2026-09-30T12:00:00Z",
       "evaluatedAt": "2026-09-30T12:00:00.004Z",
       "coverage": { "considered": 38, "measured": 38, "unmeasured": [] },
       "confidence": null,
       "cache": null,
-      "source": { "transport": "runner-ipc",
-                  "discover": { "options": { "includeHidden": true, "interactiveOnly": false } } }
+      "source": { "snapshotId": "<registry snapshot id>" }
     }
   }
 }
@@ -196,19 +209,22 @@ An unknown answer (the page registered nothing yet):
   "data": {
     "status": "unknown",
     "unknown": { "code": "producer_not_run",
-                 "detail": "the page has registered no elements yet (not hydrated, or not instrumented), so there was nothing to assess" },
+                 "detail": "the bridge reports zero registered elements and zero registered components — nothing has registered yet (not hydrated, not mounted, or an empty registry), so there was nothing to look at" },
     "provenance": {
-      "producer": { "id": "runner/page-health", "version": "<runner version>" },
+      "producer": { "id": "sdk/page-health", "version": "<@qontinui/ui-bridge version>" },
       "observedAt": "2026-09-30T12:00:00Z", "evaluatedAt": "2026-09-30T12:00:00.001Z",
       "coverage": { "considered": 0, "measured": 0, "unmeasured": [] },
       "confidence": null, "cache": null,
-      "source": { "transport": "runner-ipc", "discover": { "...": "..." } }
+      "source": { "snapshotId": "<registry snapshot id>" }
     }
   }
 }
 ```
 
-`provenance.observedAt` is when the `discover` reply arrived (the sample time);
+`provenance.observedAt` is the registry snapshot's own timestamp (the sample
+time; `null` when no sample was taken). A `runner/page-health-forward` unknown
+carries `source: {transport: "runner-ipc", request: "pageHealth"}` and no
+sample;
 `confidence: null` states the report is a deduction over element data, not an
 estimate. `summary` is the worst finding severity **inside a measured report**
 — never read it off an unknown, which carries none.
@@ -240,8 +256,10 @@ The 20x20 viewport heatmap shows element distribution:
 
 ## How It Works
 
-The endpoint calls discover internally, judges whether it could see the page
-at all (the `unknown` codes above), then analyzes the element data server-side:
+The SDK producer takes a UI Bridge registry snapshot in the app (the runner's
+route forwards the request to the app's webview to do so), judges whether it
+could see the page at all (the `unknown` codes above), then analyzes the
+element data:
 
 1. Builds a 20x20 viewport coverage grid from element `normalizedRect` positions
 2. Classifies elements into layout regions (sidebar/header/content) by center position
