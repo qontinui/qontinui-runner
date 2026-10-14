@@ -7572,6 +7572,19 @@ pub fn create_router(
         });
     }
 
+    // Fetch this user's server-side Claude account roster (qontinui-web
+    // GET /api/v1/claude-accounts) and merge it into the machine-global
+    // claude-accounts.json that account rotation/spawn already reads
+    // unconditionally — see claude_accounts_remote.rs. Once per process,
+    // background, fail-soft; hung here beside the workflow sync and the
+    // defaults publisher for the same reason: off the spawn path entirely.
+    {
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            crate::claude_accounts_remote::sync_roster_from_web_once().await;
+        });
+    }
+
     // Start zombie task run sweep (detects and cleans up stale "running" tasks)
     {
         let sweep_handle = app_handle.clone();

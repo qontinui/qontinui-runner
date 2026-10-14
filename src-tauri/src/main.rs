@@ -54,6 +54,7 @@ mod check_executor;
 mod check_generation;
 mod ci_node;
 mod claude_accounts;
+mod claude_accounts_remote;
 mod claude_protocol;
 mod claude_session;
 mod click_overlay;
