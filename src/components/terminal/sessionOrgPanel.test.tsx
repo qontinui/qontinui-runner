@@ -189,7 +189,7 @@ describe("SessionCloseDialog", () => {
         heading: "Close?",
         targets,
         onClose: () => Promise.resolve([]),
-        onForceClose: () => [],
+        onForceClose: () => Promise.resolve([]),
         onDismiss: noop,
       }),
     );
