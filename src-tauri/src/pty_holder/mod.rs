@@ -22,7 +22,11 @@
 //! `qontinui_pty_holder::spawn`, whose own tests drive the real holder binary
 //! (`crates/pty-holder/tests/pty_holder_spawn.rs`, including survival of a
 //! SIGKILLed spawner). The Windows outer-job survival matrix it carried is
-//! Phase 3's; `qontinui_runner_win32::holder_spawn::OuterKillOnCloseJob` is
-//! kept for it.
+//! Phase 3's, in that same test file, over
+//! `qontinui_runner_win32::holder_spawn::OuterKillOnCloseJob`.
+//!
+//! Phase 3 adds the runner's half of the boot sweep: the bin's
+//! `terminal::holder_boot_sweep` walks this instance's pane directory
+//! (`qontinui_pty_holder::sweep`) at start-up and adopts every live holder.
 
 pub mod spawn;
