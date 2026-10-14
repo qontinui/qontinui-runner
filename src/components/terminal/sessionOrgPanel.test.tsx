@@ -337,7 +337,16 @@ describe("the control table", () => {
         .filter(([, c]) => c.effect === "destructive")
         .map(([n]) => n)
         .sort(),
-    ).toEqual(["closeConfirm", "forceCloseConfirm", "groupMenuCloseGroup", "sessionMenuClose"]);
+    ).toEqual([
+      // Each opens, or confirms, the D7 close: the bulk bar's Close and the
+      // Ready-to-close Review open the same confirmation the menu's Close does.
+      "bulkClose",
+      "closeConfirm",
+      "forceCloseConfirm",
+      "groupMenuCloseGroup",
+      "readyToCloseReview",
+      "sessionMenuClose",
+    ]);
   });
 });
 
