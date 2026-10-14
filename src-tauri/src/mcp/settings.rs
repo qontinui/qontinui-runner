@@ -253,27 +253,30 @@ fn merge_json_patch_keep_absent(
     }
 }
 
+/// Why a `PUT /settings/ai` body could not be applied, split by whose fault
+/// it is: a bad body is the caller's (422), an unserializable STORED document
+/// is the server's (500).
+#[derive(Debug)]
+enum PutAiSettingsError {
+    InvalidBody(String),
+    StoredUnserializable(String),
+}
+
 /// Apply a `PUT /settings/ai` body to the STORED settings. PURE: the stored
 /// document is passed in, so tests never touch the machine's `settings.json`
 /// or `claude-accounts.json`.
-///
-/// `Err` is a deserialize failure of the merged document — a caller error
-/// (wrong shape / wrong type), reported as 422, never a 500.
 fn apply_ai_settings_patch(
     stored: &settings::AiSettings,
     patch: serde_json::Value,
-) -> Result<settings::AiSettings, String> {
-    let base = serde_json::to_value(stored)
-        .map_err(|e| format!("Failed to serialize stored AI settings: {}", e))?;
+) -> Result<settings::AiSettings, PutAiSettingsError> {
+    let base = serde_json::to_value(stored).map_err(|e| {
+        PutAiSettingsError::StoredUnserializable(format!(
+            "Failed to serialize stored AI settings: {}",
+            e
+        ))
+    })?;
     serde_json::from_value(merge_json_patch_keep_absent(base, patch))
-        .map_err(|e| format!("Invalid AI settings body: {}", e))
-}
-
-/// Outcome of a `PUT /settings/ai`, split so a bad body is a 422 and a
-/// failed write is a 500.
-enum PutAiSettingsError {
-    InvalidBody(String),
-    SaveFailed(String),
+        .map_err(|e| PutAiSettingsError::InvalidBody(format!("Invalid AI settings body: {}", e)))
 }
 
 /// PUT /settings/ai
@@ -289,14 +292,14 @@ enum PutAiSettingsError {
 /// every runner on the machine. The stored document comes from
 /// `settings::get_ai_settings()`, which already carries the
 /// `claude-accounts.json` overlay, so an omitted roster field is written back
-/// unchanged. Same absent-means-keep rule as `PUT /settings/paths`.
+/// unchanged. Same absent-means-keep rule as `PUT /settings/paths`. The
+/// read-merge-write runs under [`settings::update_ai_settings`]'s process
+/// lock, so two concurrent partial PUTs cannot lose each other's fields.
 async fn save_ai_settings(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let result = spawn_blocking_tracked(move || {
-        let merged = apply_ai_settings_patch(&settings::get_ai_settings(), payload)
-            .map_err(PutAiSettingsError::InvalidBody)?;
-        settings::save_ai_settings(merged).map_err(PutAiSettingsError::SaveFailed)
+        settings::update_ai_settings(|stored| apply_ai_settings_patch(&stored, payload)).map(|_| ())
     })
     .await
     .map_err(|e| {
@@ -312,10 +315,14 @@ async fn save_ai_settings(
             info!("AI settings saved via HTTP");
             Ok(Json(ApiResponse::success(())))
         }
-        Err(PutAiSettingsError::InvalidBody(e)) => {
+        Err(settings::AiSettingsUpdateError::Rejected(PutAiSettingsError::InvalidBody(e))) => {
             Err((StatusCode::UNPROCESSABLE_ENTITY, Json(api_error(e))))
         }
-        Err(PutAiSettingsError::SaveFailed(e)) => {
+        Err(settings::AiSettingsUpdateError::Rejected(
+            PutAiSettingsError::StoredUnserializable(e),
+        ))
+        | Err(settings::AiSettingsUpdateError::SaveFailed(e)) => {
+            error!("Failed to save AI settings: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
@@ -355,9 +362,15 @@ async fn save_ai_path_prediction_enabled(
     Json(payload): Json<PathPredictionTogglePayload>,
 ) -> Result<Json<ApiResponse<PathPredictionToggleResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let result = spawn_blocking_tracked(move || {
-        let mut current = settings::get_ai_settings();
-        current.ai_path_prediction_enabled = payload.enabled;
-        settings::save_ai_settings(current).map(|()| payload.enabled)
+        settings::update_ai_settings(|mut current| {
+            current.ai_path_prediction_enabled = payload.enabled;
+            Ok::<_, std::convert::Infallible>(current)
+        })
+        .map(|saved| saved.ai_path_prediction_enabled)
+        .map_err(|e| match e {
+            settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+            settings::AiSettingsUpdateError::Rejected(never) => match never {},
+        })
     })
     .await
     .map_err(|e| {
@@ -1516,9 +1529,14 @@ mod tests {
             (
                 AccountSelectionMode::HighestExpectedUsage,
                 crate::claude_accounts::AccountSelectionSource::Fleet,
+                Some(AccountSelectionMode::HighestExpectedUsage),
             ),
         );
         let body = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            body["fleet_account_selection_mode"],
+            "highest_expected_usage"
+        );
         assert_eq!(
             body["effective_account_selection_mode"],
             "highest_expected_usage"
@@ -1535,21 +1553,25 @@ mod tests {
             .get("effective_account_selection_mode")
             .is_none());
         assert!(merged_json.get("account_selection_source").is_none());
+        assert!(merged_json.get("fleet_account_selection_mode").is_none());
     }
 
     #[test]
     fn put_ai_settings_bad_shape_is_a_body_error() {
         let stored = stored();
-        assert!(
-            apply_ai_settings_patch(&stored, json!({"claude_cli": {"timeout_seconds": "x"}}))
-                .is_err()
-        );
-        assert!(apply_ai_settings_patch(&stored, json!([1, 2])).is_err());
-        assert!(apply_ai_settings_patch(
-            &stored,
-            json!({"claude_cli": {"account_selection_mode": "nope"}})
-        )
-        .is_err());
+        for body in [
+            json!({"claude_cli": {"timeout_seconds": "x"}}),
+            json!([1, 2]),
+            json!({"claude_cli": {"account_selection_mode": "nope"}}),
+        ] {
+            assert!(
+                matches!(
+                    apply_ai_settings_patch(&stored, body.clone()),
+                    Err(PutAiSettingsError::InvalidBody(_))
+                ),
+                "a bad body is the caller's fault (422), not the server's: {body}"
+            );
+        }
     }
 
     #[test]

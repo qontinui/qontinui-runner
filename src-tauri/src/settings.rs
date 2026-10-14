@@ -555,22 +555,28 @@ pub struct AiSettingsView {
     pub settings: AiSettings,
     pub effective_account_selection_mode: AccountSelectionMode,
     pub account_selection_source: crate::claude_accounts::AccountSelectionSource,
+    /// The RAW fleet-policy `account_selection_mode` (`null` = the fleet has
+    /// no opinion), so a client can re-apply
+    /// [`crate::claude_accounts::resolve_selection`] to UNSAVED form state.
+    pub fleet_account_selection_mode: Option<AccountSelectionMode>,
 }
 
 impl AiSettingsView {
     /// PURE constructor from a settings document and an already-resolved
-    /// `(mode, source)` pair.
+    /// `(mode, source, fleet)` triple.
     pub fn from_parts(
         settings: AiSettings,
-        (mode, source): (
+        (mode, source, fleet): (
             AccountSelectionMode,
             crate::claude_accounts::AccountSelectionSource,
+            Option<AccountSelectionMode>,
         ),
     ) -> Self {
         Self {
             settings,
             effective_account_selection_mode: mode,
             account_selection_source: source,
+            fleet_account_selection_mode: fleet,
         }
     }
 
@@ -578,7 +584,7 @@ impl AiSettingsView {
     pub fn current() -> Self {
         Self::from_parts(
             get_ai_settings(),
-            crate::claude_accounts::effective_selection(),
+            crate::claude_accounts::effective_selection_with_fleet(),
         )
     }
 }
@@ -5841,6 +5847,43 @@ pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
         roster.account_selection_mode = selection_mode;
         roster.account_selection_pinned = selection_pinned;
     })
+}
+
+/// Serializes every read-modify-write of the AI settings in this process
+/// (`PUT /settings/ai`, the path-prediction toggle, the Tauri save), so two
+/// concurrent partial writes cannot each read the same base and have the later
+/// save drop the earlier one's change.
+///
+/// A process mutex rather than [`update_settings`]: that primitive hands its
+/// closure the RAW on-disk document, whose roster fields are stale shadows of
+/// `claude-accounts.json` — merging over it would write a stale
+/// `config_dir` / mode / pin back machine-wide. The base here is
+/// [`get_ai_settings`] (roster overlaid), and the write is
+/// [`save_ai_settings`] (per-instance save + roster mirror), unchanged.
+static AI_SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Why [`update_ai_settings`] did not save.
+#[derive(Debug)]
+pub enum AiSettingsUpdateError<E> {
+    /// The caller's transform refused the stored document (e.g. a bad body).
+    Rejected(E),
+    /// The transform succeeded but persisting failed.
+    SaveFailed(String),
+}
+
+/// Read the current AI settings, transform them with `f`, and save the result
+/// — atomically with respect to every other caller of this function.
+pub fn update_ai_settings<E>(
+    f: impl FnOnce(AiSettings) -> Result<AiSettings, E>,
+) -> Result<AiSettings, AiSettingsUpdateError<E>> {
+    // Poison-tolerant: a panic in another writer leaves no partial state
+    // behind this lock (the save itself is atomic on disk).
+    let _guard = AI_SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let next = f(get_ai_settings()).map_err(AiSettingsUpdateError::Rejected)?;
+    save_ai_settings(next.clone()).map_err(AiSettingsUpdateError::SaveFailed)?;
+    Ok(next)
 }
 
 /// Get the World State Verifier settings.

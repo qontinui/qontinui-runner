@@ -436,28 +436,50 @@ export interface AiSettings {
   effective_account_selection_mode?: AccountSelectionMode;
   /** READ-ONLY: which input decided `effective_account_selection_mode`. */
   account_selection_source?: AccountSelectionSource;
+  /** READ-ONLY: the raw fleet-policy mode (`null` = the fleet has no
+   * opinion; absent = an older runner). Lets the page re-apply the runner's
+   * rule to unsaved form state — see {@link displayedAccountSelection}. */
+  fleet_account_selection_mode?: AccountSelectionMode | null;
 }
 
-/** The account-selection mode the Settings page DESCRIBES, and whether the
- * fleet policy is what set it.
+/** The account-selection mode the Settings page DESCRIBES, which input
+ * decided it, and whether that input is the fleet policy.
  *
- * Only a `fleet` source makes the effective mode differ from the local one
- * (the runner's rule: pinned or no fleet opinion ⇒ local), so for every other
- * source the LOCAL value is returned — which also keeps the description in
- * step with an unsaved local edit. Ticking the pin (even unsaved) likewise
- * hands the description back to the local mode. Falls back to local when the
- * runner predates the view fields. */
+ * Re-applies the runner's ONE rule (`claude_accounts::resolve_selection`) to
+ * the CURRENT form state — the local mode and the pin checkbox, saved or not —
+ * against the raw fleet value the runner reported:
+ *   pinned → local mode, source `pinned`;
+ *   unpinned and the fleet has a value → the fleet's mode, source `fleet`;
+ *   otherwise → local mode, source `local`.
+ * So un-ticking the pin while the fleet has a value immediately shows the
+ * fleet's mode, and a different local mode shows at once when it governs.
+ *
+ * Against a runner that predates `fleet_account_selection_mode`, falls back to
+ * the runner-computed `effective_account_selection_mode` /
+ * `account_selection_source` (and to the local mode when those are absent). */
 export function displayedAccountSelection(settings: AiSettings): {
   mode: AccountSelectionMode | undefined;
+  source: AccountSelectionSource | undefined;
   fleetManaged: boolean;
 } {
   const local = settings.claude_cli.account_selection_mode;
+  const pinned = settings.claude_cli.account_selection_pinned ?? false;
+  const fleet = settings.fleet_account_selection_mode;
+
+  if (fleet !== undefined) {
+    if (pinned) return { mode: local, source: "pinned", fleetManaged: false };
+    if (fleet !== null) return { mode: fleet, source: "fleet", fleetManaged: true };
+    return { mode: local, source: "local", fleetManaged: false };
+  }
+
+  // Older runner: no raw fleet value, only its own resolution at load time.
   const fleetManaged =
     settings.account_selection_source === "fleet" &&
-    !(settings.claude_cli.account_selection_pinned ?? false) &&
+    !pinned &&
     settings.effective_account_selection_mode !== undefined;
   return {
     mode: fleetManaged ? settings.effective_account_selection_mode : local,
+    source: settings.account_selection_source,
     fleetManaged,
   };
 }
