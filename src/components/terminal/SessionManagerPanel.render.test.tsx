@@ -25,6 +25,7 @@ vi.mock("./PastSessionsView", () => ({ PastSessionsView: () => null }));
 
 import { SessionManagerPanel } from "./SessionManagerPanel";
 import { SESSION_ORG_CONTROLS } from "./sessionOrgControls";
+import { parseQuery } from "./sessionQuery";
 import {
   SESSION_ACTIVITIES,
   injectedStatus,
@@ -105,12 +106,17 @@ function managerOver(
     launchCommands: {},
     defaultLaunchCommand: null,
     fileLocks: [],
-    searchQuery: "",
-    setSearchQuery: noop,
-    statusFilter: "all",
-    setStatusFilter: noop,
-    accountFilter: "all",
-    setAccountFilter: noop,
+    query: {
+      query: "",
+      setQuery: noop,
+      parsed: parseQuery(""),
+      result: { ok: true, matched: [], unknown: [], excluded: 0 },
+      ctx: { now: 0 },
+      chipCounts: {},
+    },
+    queryUnknown: [],
+    liveFacts: [],
+    factsById: new Map(),
     groupBy: "status",
     setGroupBy: noop,
     sortBy: "recent",

@@ -8,10 +8,14 @@
  *    status, and whether this runner owns the process)
  * 4. The external `claude`-process scan (can a tab-less session be running?)
  * 5. Transcript tail digests, requested by session id
- * 6. The work-axis finished marker
+ * 6. The batched session-info listing (`session_info_list`): each live row's
+ *    work-axis finished marker, and the query facts (repo, branch, PRs, …)
  *
  * Each row's two-axis status (location × activity) is classified by the pure
- * `sessionStatusModel`. Provides search, filter, sort, grouping, and actions.
+ * `sessionStatusModel`. The Live list is filtered by the one query string of
+ * the D5 grammar (`useSessionQuery` over each row's `SessionFacts`); a row the
+ * query cannot evaluate is never hidden — it lands in `queryUnknown`, the
+ * "Unknown for this filter" tail. Provides sort, grouping, and actions.
  *
  * Organization (groups, pins, tags, mute, snooze, recently closed) is the
  * runner's session-org store, read through `useSessionOrg` — never this
@@ -39,7 +43,10 @@ import {
 } from "./sessionManagerLiveRows";
 import { refreshLiveClaudeSessions, useLiveClaudeSessions } from "./useLiveClaudeSessions";
 import { refreshExternalClaudeScan, useExternalClaudeScan } from "./useExternalClaudeScan";
-import { finishedFor, refreshFinishedMarkers, useFinishedMarkers } from "./useFinishedMarkers";
+import { finishedMarker, type SessionFacts } from "./sessionFacts";
+import { useSessionFacts, useSessionInfoList, type SessionFactsRowInput } from "./useSessionFacts";
+import { useSessionQuery, type SessionQueryState } from "./useSessionQuery";
+import type { UnknownRow } from "./sessionQuery";
 import { digestRequestIds, useSessionDigests } from "./useSessionDigests";
 import { computeStatusCounts } from "./sessionCounts";
 import {
@@ -48,7 +55,6 @@ import {
   classifyLocation,
   classifySession,
   countUnidentified,
-  parseActivityFilter,
   type RegistryRead,
   type SessionActivity,
   type SessionStatus,
@@ -389,14 +395,20 @@ export interface UseSessionManagerReturn {
   defaultLaunchCommand: string | null;
   fileLocks: FileLockInfo[];
 
-  // Filters
-  searchQuery: string;
-  setSearchQuery: (q: string) => void;
-  /** Filter on the activity axis. */
-  statusFilter: SessionActivity | "all";
-  setStatusFilter: (f: SessionActivity | "all") => void;
-  accountFilter: string | "all";
-  setAccountFilter: (f: string | "all") => void;
+  // Filter: the one query string (D5), persisted per window.
+  /** The query, its parse, the filter result and every chip's count. */
+  query: SessionQueryState<SessionFacts>;
+  /**
+   * Rows the query could not evaluate — a fact it needs is UNKNOWN — each
+   * with the reason, in display order. Never hidden: the panel lists them
+   * under "Unknown for this filter (N)". Empty on a parse error (nothing is
+   * filtered then) and for the empty query.
+   */
+  queryUnknown: readonly UnknownRow<SessionFacts>[];
+  /** Every Live row's query facts (`allSessions` order). */
+  liveFacts: readonly SessionFacts[];
+  /** Facts by row id (`UnifiedSession.sessionId`). */
+  factsById: ReadonlyMap<string, SessionFacts>;
   groupBy: SessionGroupBy;
   setGroupBy: (g: SessionGroupBy) => void;
   sortBy: SessionSortBy;
@@ -469,7 +481,7 @@ export interface UseSessionManagerReturn {
   savedConfigDirs: string[];
 
   // Stats
-  /** Rows per activity, over every row (the header's filter chips). */
+  /** Rows per activity, over every row (the header's dataset counts). */
   activityCounts: Readonly<Record<SessionActivity, number>>;
   /** Rows reading `No output (mid-tool)` — the Ctrl+Shift+J cycle. */
   noOutputCount: number;
@@ -605,15 +617,6 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   // Filter/sort state (persisted across restarts)
   const STORAGE_PREFIX = "session-manager-";
-  const [searchQuery, setSearchQuery] = useState("");
-  // A value persisted under the retired single-axis enum (`frozen`,
-  // `active-in-zone`, …) is not an activity and reads as "all".
-  const [statusFilter, setStatusFilter] = useState<SessionActivity | "all">(() =>
-    parseActivityFilter(instanceStorage.getItem(`${STORAGE_PREFIX}status-filter`)),
-  );
-  const [accountFilter, setAccountFilter] = useState<string | "all">(
-    () => instanceStorage.getItem(`${STORAGE_PREFIX}account-filter`) || "all",
-  );
   // The lens is persisted per WINDOW; "My groups" when nothing is stored.
   const groupByKey = `${STORAGE_PREFIX}group-by:${windowLabel}`;
   const [groupBy, setGroupBy] = useState<SessionGroupBy>(() =>
@@ -624,12 +627,6 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   );
 
   // Persist filter/sort changes
-  useEffect(() => {
-    instanceStorage.setItem(`${STORAGE_PREFIX}status-filter`, statusFilter);
-  }, [statusFilter]);
-  useEffect(() => {
-    instanceStorage.setItem(`${STORAGE_PREFIX}account-filter`, accountFilter);
-  }, [accountFilter]);
   useEffect(() => {
     instanceStorage.setItem(groupByKey, groupBy);
   }, [groupByKey, groupBy]);
@@ -777,13 +774,12 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     return map;
   }, [tabs]);
 
-  // ── Claude Code's live-session registry, the external scan, the finished
-  // marker (all webview-wide stores, polled once for every page scope) ──────
+  // ── Claude Code's live-session registry and the external scan (webview-wide
+  // stores, polled once for every page scope) ───────────────────────────────
 
   const liveRegistry = useLiveClaudeSessions();
   const registryNames = liveRegistry.names;
   const externalScan = useExternalClaudeScan();
-  const finishedMarkers = useFinishedMarkers();
 
   // ── Merge into rows (status classified below) ────────────────────────────
 
@@ -884,6 +880,29 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     [liveRegistry, tabsById],
   );
 
+  /** The Claude session id a row carries: its own, or its tab's. */
+  const claudeIdOf = useCallback(
+    (row: Pick<UnclassifiedSession, "source" | "sessionId">): string | null =>
+      row.source === "transcript"
+        ? row.sessionId
+        : (tabsById.get(row.sessionId)?.claudeSessionId ?? null),
+    [tabsById],
+  );
+
+  // ── The batched session-info listing: ONE call for every row's Claude
+  // session id. Each live row's finished marker comes from its lifecycle
+  // record here; the same listing feeds the query facts below. A missing
+  // source is UNKNOWN, never "not finished" (`finishedMarker`). ────────────
+  const infoIds = useMemo(
+    () =>
+      mergedRows
+        .filter((r) => !(r.source === "transcript" && isInjectedStatus(r._transcript)))
+        .map(claudeIdOf)
+        .filter((id): id is string => id !== null),
+    [mergedRows, claudeIdOf],
+  );
+  const { info: sessionInfo, refresh: refreshSessionInfo } = useSessionInfoList(infoIds);
+
   // The location axis first: it decides which sessions get a digest (every
   // one that may be running, however many — no 50-row cap).
   const digestIds = useMemo(
@@ -935,11 +954,10 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
                     lastMessageTimestamp: digest.last_message_timestamp,
                   }
                 : null,
-              finished: finishedFor(finishedMarkers, row.sessionId),
+              finished: finishedMarker(sessionInfo, row.sessionId),
             }),
           };
         }
-        const claudeId = tabsById.get(row.sessionId)?.claudeSessionId ?? null;
         return {
           ...row,
           status: classifySession({
@@ -947,11 +965,11 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
             registry: registryFor(row),
             externalScan: externalScan.state,
             digest: "not-applicable",
-            finished: claudeId ? finishedFor(finishedMarkers, claudeId) : null,
+            finished: finishedMarker(sessionInfo, claudeIdOf(row)),
           }),
         };
       }),
-    [mergedRows, digests, tabInputFor, registryFor, externalScan.state, finishedMarkers, tabsById],
+    [mergedRows, digests, tabInputFor, registryFor, externalScan.state, sessionInfo, claudeIdOf],
   );
 
   const transcriptRows = useMemo(
@@ -959,80 +977,101 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     [allSessions],
   );
 
+  // ── Query facts and the query (D5) ───────────────────────────────────────
+
+  const factsRows = useMemo(
+    (): SessionFactsRowInput[] =>
+      allSessions.map((row) => ({
+        row,
+        sessionKey: sessionKeyOf(row),
+        claudeSessionId: claudeIdOf(row),
+        // A row with a tab in this window is on this page.
+        page: row.zoneTabId !== null || row.source === "tab" ? { id: pageId, name: pageId } : null,
+      })),
+    [allSessions, sessionKeyOf, claudeIdOf, pageId],
+  );
+  const { facts: factsById } = useSessionFacts({ rows: factsRows, org, info: sessionInfo });
+  const liveFacts = useMemo(
+    () => allSessions.map((s) => factsById.get(s.sessionId)).filter((f): f is SessionFacts => !!f),
+    [allSessions, factsById],
+  );
+  const query = useSessionQuery({ rows: liveFacts, windowLabel });
+
   // ── Filter and sort ────────────────────────────────────────────────────────
 
-  const sessions = useMemo(() => {
-    let filtered = allSessions;
+  const sortRows = useCallback(
+    (rows: readonly UnifiedSession[]): UnifiedSession[] => {
+      const sorted = [...rows];
+      switch (sortBy) {
+        case "recent":
+          sorted.sort((a, b) => b.lastModified.localeCompare(a.lastModified));
+          break;
+        case "oldest":
+          sorted.sort((a, b) => a.lastModified.localeCompare(b.lastModified));
+          break;
+        case "messages":
+          sorted.sort((a, b) => b.messageCount - a.messageCount);
+          break;
+        case "staleness":
+          // Sort by activity priority (Needs you first), then by recency
+          sorted.sort((a, b) => {
+            const pa = ACTIVITY_PRIORITY[a.status.activity];
+            const pb = ACTIVITY_PRIORITY[b.status.activity];
+            if (pa !== pb) return pa - pb;
+            return b.lastModified.localeCompare(a.lastModified);
+          });
+          break;
+      }
 
-    // Status filter
-    if (statusFilter !== "all") {
-      filtered = filtered.filter((s) => s.status.activity === statusFilter);
-    }
-
-    // Account filter
-    if (accountFilter !== "all") {
-      filtered = filtered.filter((s) => s.accountLabel === accountFilter);
-    }
-
-    // Search
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      filtered = filtered.filter(
-        (s) =>
-          s.displayName.toLowerCase().includes(q) ||
-          // Searchable because it is the headline the card renders — typing the
-          // name you can see must find the card showing it.
-          (s.registryName?.toLowerCase().includes(q) ?? false) ||
-          (s.resumeName?.toLowerCase().includes(q) ?? false) ||
-          s.projectLabel.toLowerCase().includes(q) ||
-          s.sessionId.toLowerCase().includes(q) ||
-          (s.firstMessagePreview?.toLowerCase().includes(q) ?? false) ||
-          s.workSummaryHint.toLowerCase().includes(q),
-      );
-    }
-
-    // Sort
-    const sorted = [...filtered];
-    switch (sortBy) {
-      case "recent":
-        sorted.sort((a, b) => b.lastModified.localeCompare(a.lastModified));
-        break;
-      case "oldest":
-        sorted.sort((a, b) => a.lastModified.localeCompare(b.lastModified));
-        break;
-      case "messages":
-        sorted.sort((a, b) => b.messageCount - a.messageCount);
-        break;
-      case "staleness":
-        // Sort by activity priority (Needs you first), then by recency
+      // When grouping by status, always apply status priority as primary sort
+      if (groupBy === "status") {
         sorted.sort((a, b) => {
           const pa = ACTIVITY_PRIORITY[a.status.activity];
           const pb = ACTIVITY_PRIORITY[b.status.activity];
           if (pa !== pb) return pa - pb;
           return b.lastModified.localeCompare(a.lastModified);
         });
-        break;
-    }
+      }
 
-    // When grouping by status, always apply status priority as primary sort
-    if (groupBy === "status") {
-      sorted.sort((a, b) => {
-        const pa = ACTIVITY_PRIORITY[a.status.activity];
-        const pb = ACTIVITY_PRIORITY[b.status.activity];
-        if (pa !== pb) return pa - pb;
-        return b.lastModified.localeCompare(a.lastModified);
-      });
-    }
+      // Pinned sessions always float to the top (the "My groups" lens gives
+      // them their own section instead).
+      if (org.phase === "known") {
+        const pinned = (s: UnifiedSession) => (memberOf(org, sessionKeyOf(s))?.pinned ? 0 : 1);
+        sorted.sort((a, b) => pinned(a) - pinned(b));
+      }
+      return sorted;
+    },
+    [sortBy, groupBy, org, sessionKeyOf],
+  );
 
-    // Pinned sessions always float to the top (the "My groups" lens gives
-    // them their own section instead).
-    if (org.phase === "known") {
-      const pinned = (s: UnifiedSession) => (memberOf(org, sessionKeyOf(s))?.pinned ? 0 : 1);
-      sorted.sort((a, b) => pinned(a) - pinned(b));
-    }
+  const rowById = useMemo(() => new Map(allSessions.map((s) => [s.sessionId, s])), [allSessions]);
 
-    return sorted;
-  }, [allSessions, statusFilter, accountFilter, searchQuery, sortBy, groupBy, org, sessionKeyOf]);
+  // A parse error filters nothing (the bar shows the error); otherwise only
+  // the rows the query decided TRUE. Rows it could not decide go to the
+  // Unknown tail, never silently into or out of the list.
+  const sessions = useMemo(() => {
+    const result = query.result;
+    if (!result.ok) return sortRows(allSessions);
+    return sortRows(
+      result.matched
+        .map((f) => rowById.get(f.rowId))
+        .filter((s): s is UnifiedSession => s !== undefined),
+    );
+  }, [query.result, allSessions, rowById, sortRows]);
+
+  const queryUnknown = useMemo((): UnknownRow<SessionFacts>[] => {
+    const result = query.result;
+    if (!result.ok || result.unknown.length === 0) return [];
+    const reasonOf = new Map(result.unknown.map((u) => [u.facts.rowId, u]));
+    return sortRows(
+      result.unknown
+        .map((u) => rowById.get(u.facts.rowId))
+        .filter((s): s is UnifiedSession => s !== undefined),
+    ).flatMap((s) => {
+      const u = reasonOf.get(s.sessionId);
+      return u ? [u] : [];
+    });
+  }, [query.result, rowById, sortRows]);
 
   // ── Derived ─────────────────────────────────────────────────────────────────
 
@@ -1094,8 +1133,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     refreshDigests();
     void refreshLiveClaudeSessions();
     void refreshExternalClaudeScan();
-    void refreshFinishedMarkers();
-  }, [onRefreshSessions, refreshDigests]);
+    refreshSessionInfo();
+  }, [onRefreshSessions, refreshDigests, refreshSessionInfo]);
 
   const resumeSession = useCallback(
     (session: UnifiedSession) => {
@@ -1231,12 +1270,10 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     launchCommands,
     defaultLaunchCommand,
     fileLocks,
-    searchQuery,
-    setSearchQuery,
-    statusFilter,
-    setStatusFilter,
-    accountFilter,
-    setAccountFilter,
+    query,
+    queryUnknown,
+    liveFacts,
+    factsById,
     groupBy,
     setGroupBy,
     sortBy,

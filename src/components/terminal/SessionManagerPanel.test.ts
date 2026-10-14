@@ -92,7 +92,10 @@ describe("SessionManagerPanel view arms", () => {
   it.each([
     "<StewardControl",
     "<SessionManagerHeader",
-    "<SessionCard",
+    // Cards are rendered through `renderCard` (the sections and the query's
+    // Unknown tail share it); its CALLS are what must sit in the Live arm.
+    "renderCard(session",
+    "<SessionQueryUnknownTail",
     "<SessionGroupHeader",
     "<SessionCloseDialog",
     "<SessionGroupSuggestionsDialog",
@@ -106,6 +109,20 @@ describe("SessionManagerPanel view arms", () => {
       liveArmStart,
     );
     expect(at, `${marker} must not fall outside the Live fragment`).toBeLessThan(liveArmEnd);
+  });
+
+  it("renders <SessionCard exactly once — inside the Live arm's card renderer", () => {
+    const occurrences = [...SOURCE.matchAll(/<SessionCard\b/g)];
+    expect(occurrences).toHaveLength(1);
+    const renderer = SOURCE.indexOf("const renderCard = (session: UnifiedSession");
+    expect(renderer).toBeGreaterThan(-1);
+    expect(occurrences[0].index).toBeGreaterThan(renderer);
+    // `renderCard` is called only from the Live arm.
+    const { liveArmStart, liveArmEnd } = armBounds();
+    for (const call of SOURCE.matchAll(/renderCard\(/g)) {
+      expect(call.index).toBeGreaterThan(liveArmStart);
+      expect(call.index).toBeLessThan(liveArmEnd);
+    }
   });
 
   it("keeps the Live|Previous|Fleet toggle ABOVE the conditional so every view shows it", () => {
@@ -158,6 +175,13 @@ describe("SessionManagerPanel — Chrome-style organization (Phase 3)", () => {
     expect(MANAGER).toContain("importLegacyKeys()");
     for (const retired of ["onSetLabel", "onTogglePin", "showLabelInput"]) {
       expect(CARD, retired).not.toContain(retired);
+    }
+  });
+
+  it("the Live list is filtered by the parsed query, not a substring search (Phase 4)", () => {
+    expect(MANAGER).toContain("useSessionQuery({ rows: liveFacts, windowLabel })");
+    for (const retired of ["searchQuery", "statusFilter", "accountFilter", "useFinishedMarkers"]) {
+      expect(MANAGER, retired).not.toContain(retired);
     }
   });
 

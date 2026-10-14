@@ -1,6 +1,7 @@
 /**
  * The pure readers behind the Session Manager's status sources: the external
- * scan, the finished marker, and the by-id digest request (plan
+ * scan, the finished marker (from the batched session-info listing), and the
+ * by-id digest request (plan
  * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
  * Phase 1). Each one's UNKNOWN arm is asserted as UNKNOWN, never as zero or
  * "not finished".
@@ -11,7 +12,8 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { readExternalScan } from "./useExternalClaudeScan";
-import { finishedFor, readFinishedMarkers } from "./useFinishedMarkers";
+import { finishedMarker, type SessionInfoListView } from "./sessionFacts";
+import type { SessionInfoState } from "./useSessionInfo";
 import {
   DIGEST_CHUNK_SIZE,
   RECENT_ROWS_DIGESTED,
@@ -39,30 +41,40 @@ describe("readExternalScan", () => {
   });
 });
 
-describe("readFinishedMarkers / finishedFor", () => {
-  const ok = readFinishedMarkers({
-    success: true,
-    data: {
-      sessions: [
-        { claudeSessionId: "a", finished: true },
-        { claudeSessionId: "b", finished: false },
-        { claudeSessionId: "c" },
-        { claudeSessionId: "a", finished: false },
-      ],
-    },
+describe("finishedMarker — the live row's marker from the session-info listing", () => {
+  /** A listed session whose lifecycle record carries `finishedAt` as given. */
+  const listed = (finishedAt: unknown): SessionInfoState =>
+    ({
+      status: "ok",
+      reason: null,
+      body: { lifecycle: { finishedAt } },
+    }) as unknown as SessionInfoState;
+  const ok: SessionInfoListView = {
+    phase: "ok",
+    byId: new Map([
+      ["done", listed(1_700_000_000_000)],
+      ["open", listed(null)],
+      // A runner build whose record omits the field.
+      ["old-build", listed(undefined)],
+      ["no-body", { status: "unavailable", reason: "x", body: null }],
+    ]),
+    notFound: new Set(["gone"]),
+    branches: new Map(),
+  };
+
+  it("reads finished / not finished from the lifecycle record", () => {
+    expect(finishedMarker(ok, "done")).toBe(true);
+    expect(finishedMarker(ok, "open")).toBe(false);
   });
 
-  it("reads the marker where a record carries it; a finish on any record of a session wins", () => {
-    expect(finishedFor(ok, "a")).toBe(true);
-    expect(finishedFor(ok, "b")).toBe(false);
-  });
-
-  it("is UNKNOWN for a record without the field, an unknown session, and a failed read", () => {
-    expect(finishedFor(ok, "c")).toBeNull();
-    expect(finishedFor(ok, "zzz")).toBeNull();
-    const failed = readFinishedMarkers({ success: false });
-    expect(failed.read).toBe("failed");
-    expect(finishedFor(failed, "a")).toBeNull();
+  it("is UNKNOWN — never 'not finished' — wherever the record does not say", () => {
+    expect(finishedMarker(ok, "old-build")).toBeNull();
+    expect(finishedMarker(ok, "no-body")).toBeNull();
+    expect(finishedMarker(ok, "gone")).toBeNull();
+    expect(finishedMarker(ok, "never-listed")).toBeNull();
+    expect(finishedMarker(ok, null)).toBeNull();
+    expect(finishedMarker({ phase: "loading" }, "done")).toBeNull();
+    expect(finishedMarker({ phase: "unavailable", reason: "ipc_error: x" }, "done")).toBeNull();
   });
 });
 
