@@ -15,7 +15,7 @@
  * (`sessionOrgControlId`), the convention `sessionCardElementId` set.
  */
 
-import type { IREffect } from "@qontinui/ui-bridge";
+import type { IREffect, StandardAction } from "@qontinui/ui-bridge";
 
 export interface SessionOrgControl {
   id: string;
@@ -90,6 +90,25 @@ export const SESSION_ORG_CONTROLS = {
 } as const satisfies Record<string, SessionOrgControl>;
 
 export type SessionOrgControlName = keyof typeof SESSION_ORG_CONTROLS;
+
+/**
+ * The actions a group header advertises. The header is a `div`, so the SDK's
+ * inferred set has no `rightClick` / `doubleClick` — and the control route
+ * refuses an action the element does not advertise, which left the group
+ * menu (right-click) and inline rename (double-click) unreachable over the
+ * UI Bridge (Phase 8 live run). Declared explicitly instead.
+ */
+export const GROUP_HEADER_ACTIONS: StandardAction[] = [
+  "focus",
+  "blur",
+  "hover",
+  "scroll",
+  "scrollIntoView",
+  "click",
+  "hoverClick",
+  "doubleClick",
+  "rightClick",
+];
 
 /** A per-item control id: the base id plus the row's or group's id. */
 export function sessionOrgControlId(name: SessionOrgControlName, itemId: string): string {
