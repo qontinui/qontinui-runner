@@ -34,7 +34,7 @@
 //! - `KIND_OUTPUT` frames, at most [`MAX_OUTPUT_CHUNK`] bytes each;
 //! - once the child's exit is settled and everything before it is sent, one
 //!   `exit` frame — then it marks the exit delivered, which lets the holder
-//!   exit (`crate::pty::Pane::wait_for_end`).
+//!   exit (`crate::pty::Pane::wait_for_delivery`).
 //!
 //! ## The restore envelope (protocol version 3, plan D14)
 //!
@@ -180,6 +180,8 @@ pub struct Holder {
     log: PathBuf,
     // Held for the holder's lifetime; dropping it releases the pane.
     lock: PaneLock,
+    /// What `lock` holds, kept to rewrite it when the pane ends normally.
+    record: LockRecord,
 }
 
 fn now_unix_ms() -> u64 {
@@ -236,17 +238,19 @@ impl Holder {
             child_pid: Some(pane.child_pid()),
             started_at_unix_ms: now_unix_ms(),
         };
+        let record = LockRecord {
+            holder_pid: info.holder_pid,
+            child_pid: info.child_pid,
+            versions: PROTOCOL_VERSIONS.to_vec(),
+            started_at_unix_ms: info.started_at_unix_ms,
+            holder_build: holder_build(),
+            child_start: pane.child_start().map(str::to_string),
+            holder_start: crate::proc_identity::start_token(info.holder_pid),
+            scope_unit: own_scope_unit(),
+            ended: None,
+        };
         let bound = (|| -> io::Result<Listener> {
-            lock.write_record(&LockRecord {
-                holder_pid: info.holder_pid,
-                child_pid: info.child_pid,
-                versions: PROTOCOL_VERSIONS.to_vec(),
-                started_at_unix_ms: info.started_at_unix_ms,
-                holder_build: holder_build(),
-                child_start: pane.child_start().map(str::to_string),
-                holder_start: crate::proc_identity::start_token(info.holder_pid),
-                scope_unit: own_scope_unit(),
-            })?;
+            lock.write_record(&record)?;
             #[cfg(unix)]
             {
                 let sock = crate::pane::socket_path(pane_dir, pane_id);
@@ -272,6 +276,7 @@ impl Holder {
             listener,
             log: log_path(pane_dir, pane_id),
             lock,
+            record,
         })
     }
 
@@ -296,7 +301,7 @@ impl Holder {
         }
     }
 
-    /// Serve until the holder may exit (`crate::pty::Pane::wait_for_end`) and
+    /// Serve until the holder may exit (`crate::pty::Pane::wait_for_delivery`) and
     /// return the child's exit. The accept loop runs on its own thread and
     /// never ends the holder; the lock is held until this returns.
     pub fn run(self) -> ExitReply {
@@ -305,7 +310,8 @@ impl Holder {
             pane,
             listener,
             log,
-            lock,
+            mut lock,
+            mut record,
         } = self;
         let accept_pane = Arc::clone(&pane);
         let accept_log = log.clone();
@@ -317,10 +323,28 @@ impl Holder {
             // counted (its lock is held), until the child exits.
             eprintln!("pty-holder: accept thread: {e}");
         }
-        let exit = pane.wait_for_end();
-        // Plan D8: this holder is the reaper of its own child tree. Still
-        // under the lock, so a boot sweep cannot take this pane for dead while
-        // its remainder is being ended.
+        let exit = pane.wait_for_exit();
+        // A NORMAL end (the child exited on its own) must never cost the
+        // child's leftovers — not now, and not at a later boot sweep (plan D8
+        // as decided 2026-10-14). So, still under the lock: the record says
+        // the pane ENDED BY EXIT (a sweep then cleans its files and signals
+        // nothing), and on Windows the job stops killing on close.
+        if pane.ended_by_kill() != Some(true) {
+            record.ended = Some(crate::lock::ENDED_BY_EXIT.to_string());
+            if let Err(e) = lock.write_record(&record) {
+                log_line(
+                    &log,
+                    &format!("could not mark the record ended-by-exit: {e}"),
+                );
+            }
+            if let Err(e) = pane.release_leftovers_on_normal_exit() {
+                log_line(&log, &format!("could not release the leftovers' job: {e}"));
+            }
+        }
+        pane.wait_for_delivery();
+        // Plan D8: on a KILL this holder is the reaper of its own child tree.
+        // Still under the lock, so a boot sweep cannot take this pane for dead
+        // while its remainder is being ended.
         let reap = pane.reap_tree();
         if !reap.killed.is_empty() || !reap.notes.is_empty() {
             log_line(&log, &format!("pane ended; its tree: {}", reap.summary()));

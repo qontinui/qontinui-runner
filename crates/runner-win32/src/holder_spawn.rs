@@ -339,53 +339,93 @@ mod tests {
     /// where it is declared (and in these tests), so it cannot be ORed into a
     /// spawn beside the route table — `cmd.creation_flags(flags | 0x200)`
     /// would pass the route test and fail this one. Comments are ignored.
-    /// Whether `line` holds the literal 0x200 (any `_` grouping, any leading
-    /// zeros) — and not merely a longer number that starts with those digits.
+    /// The value of every integer literal in `line`, in any Rust spelling:
+    /// decimal, `0x` / `0o` / `0b`, `_` grouping, a type suffix (`512u32`,
+    /// `0x200_usize`). A token that is not a valid literal is skipped.
+    fn int_literals(line: &str) -> Vec<u128> {
+        const SUFFIXES: [&str; 12] = [
+            "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+        ];
+        let chars: Vec<char> = line.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let starts = chars[i].is_ascii_digit()
+                && (i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_'));
+            if !starts {
+                i += 1;
+                continue;
+            }
+            let end = (i..chars.len())
+                .find(|&j| !(chars[j].is_ascii_alphanumeric() || chars[j] == '_'))
+                .unwrap_or(chars.len());
+            let token: String = chars[i..end]
+                .iter()
+                .filter(|c| **c != '_')
+                .collect::<String>()
+                .to_ascii_lowercase();
+            i = end;
+            let rest = token.get(2..).unwrap_or("");
+            let (radix, body) = match token.get(..2) {
+                Some("0x") => (16, rest),
+                Some("0o") => (8, rest),
+                Some("0b") => (2, rest),
+                _ => (10, token.as_str()),
+            };
+            let digits_end = body
+                .find(|c: char| !c.is_digit(radix))
+                .unwrap_or(body.len());
+            let (digits, suffix) = body.split_at(digits_end);
+            if digits.is_empty() || !(suffix.is_empty() || SUFFIXES.contains(&suffix)) {
+                continue;
+            }
+            if let Ok(v) = u128::from_str_radix(digits, radix) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    /// Whether `line` spells the `CREATE_NEW_PROCESS_GROUP` bit by value: any
+    /// integer literal equal to 0x200, or the shift `1 << 9`.
     fn names_0x200(line: &str) -> bool {
-        line.match_indices("0x").any(|(i, _)| {
-            let digits: String = line
-                .get(i + 2..)
-                .unwrap_or("")
-                .chars()
-                .take_while(|c| c.is_ascii_hexdigit() || *c == '_')
-                .filter(|c| *c != '_')
-                .collect();
-            digits.trim_start_matches('0') == "200"
-        })
-    }
-
-    /// Whether `line` spells 0x200 in decimal (`512`, as a whole number) or as
-    /// a shift (`1 << 9`, any spacing).
-    fn names_512(line: &str) -> bool {
-        let wordish = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-        // `needle` in `text` as a whole token: no word character either side.
-        let whole = |text: &str, needle: &str| {
-            text.match_indices(needle).any(|(i, _)| {
-                let before = text.get(..i).and_then(|b| b.chars().last());
-                let after = text.get(i + needle.len()..).and_then(|a| a.chars().next());
-                !wordish(before) && !wordish(after)
-            })
-        };
         let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        whole(line, "512") || whole(&compact, "1<<9")
+        let shift = compact.match_indices("1<<9").any(|(i, _)| {
+            let wordish =
+                |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            !wordish(compact.get(..i).and_then(|b| b.chars().last()))
+                && !wordish(compact.get(i + 4..).and_then(|a| a.chars().next()))
+        });
+        shift || int_literals(line).contains(&0x200)
     }
 
     #[test]
-    fn pty_holder_breakaway_names_512_matches_decimal_and_shift_forms() {
-        assert!(names_512("flags | 512)"));
-        assert!(names_512("flags | (1 << 9)"));
-        assert!(names_512("1<<9"));
-        assert!(!names_512("5120"));
-        assert!(!names_512("1 << 90"));
-        assert!(!names_512("x512"));
-    }
-
-    #[test]
-    fn pty_holder_breakaway_names_0x200_matches_only_that_number() {
-        assert!(names_0x200("flags | 0x200)"));
-        assert!(names_0x200("0x0000_0200"));
-        assert!(!names_0x200("0x2000"));
-        assert!(!names_0x200("0x0100_0000"));
+    fn pty_holder_breakaway_names_0x200_in_every_spelling() {
+        for hit in [
+            "flags | 0x200)",
+            "0x0000_0200",
+            "flags | 512",
+            "512u32",
+            "512_u32",
+            "0x200_usize",
+            "0b10_0000_0000",
+            "0o1000",
+            "flags | (1 << 9)",
+            "1<<9",
+        ] {
+            assert!(names_0x200(hit), "{hit}");
+        }
+        for miss in [
+            "0x2000",
+            "5120",
+            "x512",
+            "1 << 90",
+            "0x0100_0000",
+            "512x",
+            "v512",
+        ] {
+            assert!(!names_0x200(miss), "{miss}");
+        }
     }
 
     #[test]
@@ -406,9 +446,7 @@ mod tests {
                 let line = line.split("//").next().unwrap_or("");
                 let declaration = line.contains("pub const CREATE_NEW_PROCESS_GROUP: u32");
                 let lower = line.to_ascii_lowercase();
-                let mentions = line.contains("CREATE_NEW_PROCESS_GROUP")
-                    || names_0x200(&lower)
-                    || names_512(&lower);
+                let mentions = line.contains("CREATE_NEW_PROCESS_GROUP") || names_0x200(&lower);
                 assert!(
                     declaration || !mentions,
                     "{file}:{}: CREATE_NEW_PROCESS_GROUP reaches a holder spawn: {line}",
