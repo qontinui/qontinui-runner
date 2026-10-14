@@ -13,6 +13,7 @@ vi.mock("@/lib/instance-storage", () => ({
 import {
   LEGACY_LABELS_KEY,
   LEGACY_PINNED_KEY,
+  MAX_LEGACY_LABEL_CHARS,
   runSessionOrgImport,
   type LegacyStorage,
 } from "./sessionOrgImport";
@@ -62,7 +63,13 @@ describe("runSessionOrgImport", () => {
     });
     const apply = okApply();
     const first = await runSessionOrgImport({ apply, storage });
-    expect(first).toEqual({ status: "imported", pinned: 2, tagged: 2, unreadable: [] });
+    expect(first).toEqual({
+      status: "imported",
+      pinned: 2,
+      tagged: 2,
+      unreadable: [],
+      skipped: [],
+    });
     expect(apply).toHaveBeenCalledTimes(1);
     expect(apply.mock.calls[0][0]).toEqual([
       { op: "setPinned", sessionKeys: ["s1", "s2"], pinned: true },
@@ -112,6 +119,7 @@ describe("runSessionOrgImport", () => {
       pinned: 0,
       tagged: 1,
       unreadable: [LEGACY_PINNED_KEY],
+      skipped: [],
     });
     expect(storage.data).toEqual({ [LEGACY_PINNED_KEY]: "{not json" });
   });
@@ -125,6 +133,63 @@ describe("runSessionOrgImport", () => {
     const outcome = await runSessionOrgImport({ apply, storage });
     expect(outcome.status).toBe("imported");
     expect(apply).not.toHaveBeenCalled();
+    expect(storage.data).toEqual({});
+  });
+
+  it("skips an over-long label, imports the rest, reports it, and completes", async () => {
+    const long = "x".repeat(MAX_LEGACY_LABEL_CHARS + 1);
+    const atLimit = "é".repeat(MAX_LEGACY_LABEL_CHARS); // counted in characters, not bytes
+    const storage = memoryStorage({
+      [LEGACY_PINNED_KEY]: JSON.stringify(["s1"]),
+      [LEGACY_LABELS_KEY]: JSON.stringify({ s1: long, s2: "ok", s3: atLimit }),
+    });
+    const apply = okApply();
+    const outcome = await runSessionOrgImport({ apply, storage });
+    expect(outcome).toEqual({
+      status: "imported",
+      pinned: 1,
+      tagged: 2,
+      unreadable: [],
+      skipped: [
+        {
+          sessionKey: "s1",
+          label: long,
+          reason: `longer than ${MAX_LEGACY_LABEL_CHARS} characters`,
+        },
+      ],
+    });
+    expect(apply.mock.calls[0][0]).toEqual([
+      { op: "setPinned", sessionKeys: ["s1"], pinned: true },
+      { op: "addTags", sessionKeys: ["s2"], tags: ["ok"] },
+      { op: "addTags", sessionKeys: ["s3"], tags: [atLimit] },
+    ]);
+    // Everything importable is in, so both keys are gone — the next run is a no-op.
+    expect(storage.data).toEqual({});
+    expect((await runSessionOrgImport({ apply, storage })).status).toBe("nothing-to-import");
+  });
+
+  it("a label the runner refuses as invalid_tag is skipped, not a failed import", async () => {
+    const storage = memoryStorage({
+      [LEGACY_LABELS_KEY]: JSON.stringify({ s1: "bad", s2: "good" }),
+    });
+    const apply = okApply();
+    apply.mockImplementationOnce(async (ops: SessionOrgOp[]) => {
+      const ok = await okApply()(ops);
+      return {
+        ...ok,
+        results: ops.map((op) =>
+          op.op === "addTags" && op.tags[0] === "bad"
+            ? { ok: false, error: "invalid_tag", groupId: null }
+            : { ok: true, error: null, groupId: null },
+        ),
+      };
+    });
+    const outcome = await runSessionOrgImport({ apply, storage });
+    expect(outcome).toMatchObject({
+      status: "imported",
+      tagged: 1,
+      skipped: [{ sessionKey: "s1", label: "bad", reason: "refused: invalid_tag" }],
+    });
     expect(storage.data).toEqual({});
   });
 
