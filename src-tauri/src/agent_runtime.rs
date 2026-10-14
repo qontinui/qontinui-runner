@@ -6856,6 +6856,11 @@ async fn run_continuation_terminal(
         // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
         // no qontinui-claude-config checkout has no skills dir at all.
         crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+        // And the named subagent defs (.claude/agents/): a dispatched skill may
+        // spawn one — `/expedite-review` posts nothing without its read-only
+        // `expedite-reviewer` (plan 2026-10-13-coord-expedited-land-lever-for-agents
+        // Phase 6).
+        let _ = provision_agent_definitions_recorded(workdir);
 
         // The PTY seam derives workspace trust for the pinned account through the
         // trust gate's SYNC door, which can only read the dial cache. Warm it here,
@@ -8256,6 +8261,12 @@ async fn run_continuation_headless(
     // the honest value is available (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+    // Parity with the terminal continuation: the fleet commands, skills and
+    // subagent defs the dispatched prompt may name (a headless `run_skill`
+    // continuation is otherwise handed a slash command its cwd cannot resolve).
+    crate::fleet_commands::provision_fleet_commands_for_session(workdir);
+    crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+    let _ = provision_agent_definitions_recorded(workdir);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
     let session_args = pinned_session_args(pinned_session_id);
@@ -9442,9 +9453,13 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// still proceeds.
 fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
     let Some(root) = qontinui_root_dir() else {
+        // No checkout to overlay — but the EMBEDDED floor needs none: write it,
+        // so a published install still gets the bundled subagents.
+        let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
+        provision_embedded_agent_floor(worktree_cwd, &agent_keep_decisions(&dst_dir, None));
         warn!(
-            "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
-             provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
+            "agent_runtime: no qontinui-root resolved; skipping the .claude/agents \
+             checkout overlay for {worktree_cwd} (the embedded floor was written)"
         );
         return Ok(ProvisionReport::unresolved(
             "agent_definitions",
@@ -9479,8 +9494,8 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
 /// degradation the ledger exists to end.
 ///
 /// Returns the `agent_definitions` report it recorded -- ONE entry. The embedded
-/// `fleet_agents` floor is recorded from inside
-/// [`provision_agent_definitions_from_root`], which does not hand it back, so it
+/// `fleet_agents` floor is recorded by `provision_embedded_agent_floor` (on both
+/// the root and the no-root arm), which does not hand it back to here, so it
 /// is observable on the next manifest read rather than in this value. The spawn
 /// path ignores the return entirely.
 pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
@@ -9506,35 +9521,23 @@ pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<Provisi
     vec![echo]
 }
 
-/// Core of [`provision_agent_definitions`] with the qontinui-root passed in
-/// explicitly (so tests can drive it deterministically without mutating the
-/// process-global `QONTINUI_ROOT` env). See that wrapper for full rationale.
-///
-/// Reports BOTH layers: the returned [`ProvisionReport`] is the checkout overlay
-/// (`agent_definitions`), and the embedded floor's own report (`fleet_agents`)
-/// is recorded into the session ledger from here, because this is the only
-/// caller that can see it.
-fn provision_agent_definitions_from_root(
-    root: &Path,
-    worktree_cwd: &str,
-) -> anyhow::Result<ProvisionReport> {
-    let src_dir = root
-        .join("qontinui-claude-config")
-        .join(".claude")
-        .join("agents");
-    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
-
-    // TRACKED DESTINATIONS ARE KEPT, in both layers below. Decided ONCE, before
-    // either writes, so the UNKNOWN arm keys on what was on disk before this
-    // pass (see `provision_guard::KeepDecisions`). In a qontinui-claude-config
-    // worktree `.claude/agents/*.md` is tracked content: the floor wrote this
-    // binary's render over it and the overlay wrote the PRIMARY checkout's copy
-    // (a different commit) over it, which left every such worktree dirty and fed
-    // the wip-custody snapshots a stream of junk refs. Same guard, same probe, as
-    // `fleet_commands` and `fleet_skills`.
-    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
+/// TRACKED DESTINATIONS ARE KEPT, in both layers (the embedded floor and the
+/// checkout overlay). Decided ONCE, before either writes, so the UNKNOWN arm
+/// keys on what was on disk before this pass (see
+/// `provision_guard::KeepDecisions`). In a qontinui-claude-config worktree
+/// `.claude/agents/*.md` is tracked content: the floor wrote this binary's
+/// render over it and the overlay wrote the PRIMARY checkout's copy (a
+/// different commit) over it, which left every such worktree dirty and fed the
+/// wip-custody snapshots a stream of junk refs. Same guard, same probe, as
+/// `fleet_commands` and `fleet_skills`. `src_dir` is the checkout overlay's
+/// source, or `None` when no qontinui-root resolved (floor only).
+fn agent_keep_decisions(
+    dst_dir: &Path,
+    src_dir: Option<&Path>,
+) -> crate::provision_guard::KeepDecisions {
+    let tracked = crate::provision_guard::TrackedPaths::probe(dst_dir);
     let mut candidates = crate::fleet_agents::embedded_agent_names();
-    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+    if let Some(Ok(entries)) = src_dir.map(std::fs::read_dir) {
         candidates.extend(
             entries
                 .filter_map(Result::ok)
@@ -9543,25 +9546,26 @@ fn provision_agent_definitions_from_root(
                 .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
         );
     }
-    let keep = crate::provision_guard::KeepDecisions::decide(
+    crate::provision_guard::KeepDecisions::decide(
         &tracked,
-        &dst_dir,
+        dst_dir,
         candidates.iter().map(String::as_str),
-    );
+    )
+}
 
-    // FLOOR FIRST: write the defs bundled into this binary, so a device with no
-    // qontinui-claude-config checkout gets a working subagent set instead of
-    // none. This is the fleet-portability follow-up this function's docstring
-    // has named since it was written; see `crate::fleet_agents`.
-    //
-    // Deliberately NOT fatal: if the embedded write fails we warn and continue
-    // to the checkout overlay, because a checkout present on this device is a
-    // complete answer on its own.
-    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, &keep) {
+/// Write this binary's embedded subagent defs into `<worktree_cwd>/.claude/agents`
+/// (keeping what `keep` says to keep) and record the `fleet_agents` ledger row.
+/// Returns how many landed. Fail-soft: an errored write is recorded, never fatal.
+fn provision_embedded_agent_floor(
+    worktree_cwd: &str,
+    keep: &crate::provision_guard::KeepDecisions,
+) -> usize {
+    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
+    let report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, keep) {
         Ok(report) => report,
         Err(e) => {
             warn!(
-                "agent_runtime: embedded agent-def write into {} failed; using checkout only: {e}",
+                "agent_runtime: embedded agent-def write into {} failed: {e}",
                 dst_dir.display()
             );
             let mut report = ProvisionReport::new(
@@ -9577,8 +9581,55 @@ fn provision_agent_definitions_from_root(
             report
         }
     };
-    let embedded = embedded_report.written;
-    capability_manifest::record_provision(worktree_cwd, embedded_report);
+    let written = report.written;
+    capability_manifest::record_provision(worktree_cwd, report);
+    written
+}
+
+/// Core of [`provision_agent_definitions`] with the qontinui-root passed in
+/// explicitly (so tests can drive it deterministically without mutating the
+/// process-global `QONTINUI_ROOT` env). See that wrapper for full rationale.
+///
+/// Reports BOTH layers: the returned [`ProvisionReport`] is the checkout overlay
+/// (`agent_definitions`), and the embedded floor's own report (`fleet_agents`)
+/// is recorded into the session ledger by `provision_embedded_agent_floor`.
+fn provision_agent_definitions_from_root(
+    root: &Path,
+    worktree_cwd: &str,
+) -> anyhow::Result<ProvisionReport> {
+    let src_dir = root
+        .join("qontinui-claude-config")
+        .join(".claude")
+        .join("agents");
+    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
+
+    // The destination IS the source (a cwd at the workspace root, whose
+    // `.claude` links into the config checkout): the session already reads the
+    // live definitions, and writing — or copying a file onto itself, which
+    // TRUNCATES it — would damage the operator's checkout. Write nothing.
+    if let (Ok(s), Ok(d)) = (src_dir.canonicalize(), dst_dir.canonicalize()) {
+        if s == d {
+            return Ok(ProvisionReport::unresolved(
+                "agent_definitions",
+                0,
+                dst_dir.display().to_string(),
+                "the destination resolves to the qontinui-claude-config agents dir itself \
+                 (the session already reads the live definitions); nothing written",
+            ));
+        }
+    }
+
+    let keep = agent_keep_decisions(&dst_dir, Some(&src_dir));
+
+    // FLOOR FIRST: write the defs bundled into this binary, so a device with no
+    // qontinui-claude-config checkout gets a working subagent set instead of
+    // none. This is the fleet-portability follow-up this function's docstring
+    // has named since it was written; see `crate::fleet_agents`.
+    //
+    // Deliberately NOT fatal: if the embedded write fails we warn and continue
+    // to the checkout overlay, because a checkout present on this device is a
+    // complete answer on its own.
+    let embedded = provision_embedded_agent_floor(worktree_cwd, &keep);
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
     // editing qontinui-claude-config/.claude/agents behaves exactly as before.
@@ -14432,7 +14483,10 @@ mod tests {
         // stdin and closes it — `cmd` with no args reads stdin then exits. On
         // Unix, `sh` reads stdin commands then exits. Either way the child
         // spawns and the pump observes a clean exit.
-        let workdir = std::env::temp_dir().to_string_lossy().to_string();
+        // A private temp dir, not the system temp root: the continuation now
+        // provisions `.claude/{commands,skills,agents}` into its cwd.
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let workdir = scratch.path().to_string_lossy().to_string();
         // The temp dir is neither already-trusted nor a coord-allocated
         // worktree, so the Phase-2 trust gate would REFUSE this spawn at any
         // posture above `report` — which is the gate working, not a defect. Pin
@@ -18446,6 +18500,75 @@ mod gateway_spawn_refusal_tests {
         match outcome {
             Ok(_) => panic!("an unresolved gateway must refuse the spawn"),
             Err(err) => assert!(format!("{err:#}").contains("model gateway"), "{err:#}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod continuation_agent_provisioning_tests {
+    use super::*;
+
+    /// The embedded floor lands without any checkout: a published install's
+    /// continuation gets the bundled subagents, the expedite reviewer included
+    /// (plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 6).
+    #[test]
+    fn the_embedded_agent_floor_needs_no_checkout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path().to_string_lossy().into_owned();
+        let written = provision_embedded_agent_floor(
+            &workdir,
+            &crate::provision_guard::KeepDecisions::default(),
+        );
+        assert_eq!(written, crate::fleet_agents::embedded_agent_count());
+        assert!(tmp
+            .path()
+            .join(".claude")
+            .join("agents")
+            .join(format!("{}.md", crate::fleet::EXPEDITE_REVIEWER_AGENT))
+            .is_file());
+    }
+
+    /// SAFETY: a cwd whose `.claude/agents` IS the config checkout's agents dir
+    /// (the workspace-root fallback, `.claude` symlinked into the checkout) is
+    /// never written: no floor over tracked files, no copy onto itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_cwd_linked_into_the_checkout_is_not_written() {
+        let root = tempfile::tempdir().expect("root");
+        let cfg = root.path().join("qontinui-claude-config").join(".claude");
+        std::fs::create_dir_all(cfg.join("agents")).expect("agents dir");
+        let def = cfg.join("agents").join("merge-specialist.md");
+        std::fs::write(&def, "operator's live definition\n").expect("def");
+        std::os::unix::fs::symlink(&cfg, root.path().join(".claude")).expect("symlink");
+        let cwd = root.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &cwd).expect("report");
+        assert_eq!(report.written, 0);
+        assert_eq!(std::fs::read_to_string(&def).expect("read"), "operator's live definition\n");
+        assert!(!cfg.join("agents").join("expedite-reviewer.md").exists(), "no floor written into the checkout");
+    }
+
+    /// Both gate-continuation spawn paths provision the subagent defs, so a
+    /// dispatched skill that spawns one (`/expedite-review`) can resolve it.
+    #[test]
+    fn both_continuation_paths_provision_agent_definitions() {
+        let src = include_str!("agent_runtime.rs");
+        for fn_name in ["async fn run_continuation_terminal(", "async fn run_continuation_headless("] {
+            let start = src.find(fn_name).unwrap_or_else(|| panic!("{fn_name} moved"));
+            let body_end = src
+                .get(start + fn_name.len()..)
+                // The fn's own closing brace: the first `}` at column 0.
+                .and_then(|rest| rest.find("\n}\n"))
+                .map(|i| start + fn_name.len() + i)
+                .expect("end of fn");
+            let body = src.get(start..body_end).expect("body");
+            assert!(
+                body.contains("provision_agent_definitions_recorded(workdir)"),
+                "{fn_name} must provision .claude/agents"
+            );
+            assert!(
+                body.contains("provision_fleet_skills_for_session(workdir)"),
+                "{fn_name} must provision .claude/skills"
+            );
         }
     }
 }

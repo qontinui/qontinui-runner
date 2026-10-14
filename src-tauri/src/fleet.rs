@@ -1897,7 +1897,9 @@ fn build_device_capabilities(
 /// Advertised ONLY when BOTH hold — the token therefore implies the review can
 /// actually be delivered:
 /// * the `expedite-review` skill is in the corpus this runner serves
-///   ([`crate::fleet_skills::skill_is_served`]); and
+///   ([`crate::fleet_skills::skill_is_served`]) and can run here
+///   (`expedite_review_runnable`: its reviewer agent is bundled, and `python3`,
+///   `gh` and `curl` resolve); and
 /// * the runner holds a LIVE device JWT for the heartbeat's own bearer scope,
 ///   because the skill posts its verdict to a device-JWT coord route.
 ///
@@ -1907,6 +1909,24 @@ pub const EXPEDITE_REVIEW_CAPABILITY: &str = "skill:expedite-review";
 
 /// The skill the capability stands for, as named in the served corpus.
 pub const EXPEDITE_REVIEW_SKILL: &str = "expedite-review";
+
+/// The read-only reviewer subagent the skill spawns; without it the skill posts
+/// nothing, so the capability is not advertised without it either.
+pub const EXPEDITE_REVIEWER_AGENT: &str = "expedite-reviewer";
+
+/// Whether this device can actually RUN the expedite-review skill, beyond it
+/// being served: its reviewer agent is bundled, and the tools its scripts call
+/// (`bash`, `python3`, `gh`, `curl`) resolve on PATH. A Windows device with only
+/// `python` (no `python3`) is under-advertised, deliberately. A device lacking any of them would
+/// claim review gates and post nothing; not advertising under-states, which
+/// coord counts `unreviewed`, never over-states.
+fn expedite_review_runnable() -> bool {
+    crate::fleet_agents::agent_is_served(EXPEDITE_REVIEWER_AGENT)
+        && binary_on_path("bash")
+        && binary_on_path("python3")
+        && binary_on_path("gh")
+        && binary_on_path("curl")
+}
 
 /// The skill-capability tokens, from the two facts above. Pure.
 fn skill_capabilities(expedite_review_served: bool, device_jwt_live: bool) -> Vec<String> {
@@ -3105,7 +3125,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     let device_jwt_live = crate::auth::device_bearer_scoped(bearer_scope)
         .is_some_and(|t| crate::auth::slot_jwt_is_usable(&t));
     capabilities.extend(skill_capability_tokens(
-        crate::fleet_skills::skill_is_served,
+        |name| crate::fleet_skills::skill_is_served(name) && expedite_review_runnable(),
         device_jwt_live,
     ));
     let ci_runner_labels = if ci.enabled {
