@@ -27,8 +27,9 @@ pub fn start_token(pid: u32) -> Option<String> {
 }
 
 /// Whether `token` was taken during THIS boot. A Linux token carries its boot
-/// id; any other token (a Windows creation time is absolute) answers `true`,
-/// since nothing in it says otherwise.
+/// id. A Windows token is an absolute creation time, compared against this
+/// boot's start ([`boot_time`]; review round 3, R5). Anything unreadable
+/// answers `true`, since nothing then says otherwise.
 pub fn token_is_from_this_boot(token: &str) -> bool {
     #[cfg(target_os = "linux")]
     if let Some(rest) = token.strip_prefix("linux:") {
@@ -37,8 +38,20 @@ pub fn token_is_from_this_boot(token: &str) -> bool {
             _ => true,
         };
     }
-    let _ = token;
+    if let (Some(created), Some(boot)) = (windows_token_time(token), boot_time()) {
+        return created >= boot;
+    }
     true
+}
+
+/// The creation instant a `windows:<FILETIME>` token names. Pure, so it is
+/// tested on every OS.
+fn windows_token_time(token: &str) -> Option<std::time::SystemTime> {
+    /// FILETIME units (100 ns) between 1601-01-01 and the Unix epoch.
+    const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+    let filetime: u64 = token.strip_prefix("windows:")?.parse().ok()?;
+    let since_unix = filetime.checked_sub(FILETIME_UNIX_EPOCH)?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(since_unix.checked_mul(100)?))
 }
 
 /// When this host booted, or `None` where that is not readable (macOS).
@@ -199,6 +212,21 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review round 3, R5: a Windows token's creation time is an absolute
+    /// instant, readable on any OS.
+    #[test]
+    fn pty_holder_reap_windows_token_time_reads_the_filetime() {
+        // 2021-01-01T00:00:00Z as FILETIME.
+        let t = windows_token_time("windows:132539328000000000").unwrap();
+        assert_eq!(
+            t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            1_609_459_200
+        );
+        assert_eq!(windows_token_time("linux:boot:5"), None);
+        assert_eq!(windows_token_time("windows:1"), None, "before 1970");
+        assert_eq!(windows_token_time("windows:x"), None);
+    }
 
     #[test]
     fn pty_holder_reap_parse_stat_counts_fields_after_the_last_paren() {

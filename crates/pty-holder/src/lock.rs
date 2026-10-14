@@ -294,6 +294,14 @@ impl PaneLock {
         self.file.sync_data()
     }
 
+    /// Empty the record, while holding the lock: a reader then sees "holder
+    /// unidentified", and a sweep signals nothing for the pane. The fallback
+    /// when a record could not be REWRITTEN.
+    pub fn clear_record(&mut self) -> io::Result<()> {
+        self.file.set_len(0)?;
+        self.file.sync_data()
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
