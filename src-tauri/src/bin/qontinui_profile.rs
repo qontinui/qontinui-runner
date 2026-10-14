@@ -223,6 +223,9 @@ enum DeviceCmd {
 // ============================================================================
 
 fn main() -> ExitCode {
+    // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
+    // defaults exported before anything here reads a path; no-op otherwise.
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
     let cli = Cli::parse();
 
     match cli.cmd.unwrap_or(Cmd::Show) {
@@ -465,6 +468,7 @@ fn cmd_init(host: &str) -> ExitCode {
             client_id: Some("qontinui-runner".to_string()),
             token: None,
         }),
+        network: None,
     };
     profiles.insert("canonical".to_string(), canonical);
     let file = ProfilesFile {
@@ -1428,7 +1432,7 @@ fn cmd_tier(set: Option<&str>, clear_choice: bool) -> ExitCode {
         eprintln!("cannot resolve settings.json path (source: {source})");
         return ExitCode::from(2);
     };
-    let is_secondary = qontinui_runner_lib::instance_env::is_secondary();
+    let is_secondary = qontinui_runner_lib::instance_env::shares_primary_settings();
 
     let outcome = match (set, clear_choice) {
         (Some(tier), _) => set_tier_choice_at(&path, is_secondary, tier),
