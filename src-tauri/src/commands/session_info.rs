@@ -1272,6 +1272,42 @@ pub async fn build_session_info(
     project_session_info(rec, live.as_ref(), transcript_exists, prs, tenancy)
 }
 
+/// [`build_session_info`] for the batched listing: the live-registry row is
+/// already resolved by the caller (ONE registry walk for the whole listing),
+/// and the remaining blocking reads — the transcript probe and the tenancy
+/// read (`.mcp.json`) — run on the blocking pool via
+/// [`spawn_blocking_tracked`](qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked)
+/// instead of an async worker. A blocking task that panicked degrades THIS
+/// row to `session_read_failed`, never the listing.
+pub async fn build_session_info_owned(
+    rec: TerminalSessionRecord,
+    live: Option<LiveClaudeSession>,
+    probe: Arc<dyn crate::session::snapshot_history::TranscriptProbe>,
+) -> SessionInfoEnvelope {
+    let rec = Arc::new(rec);
+    let blocking_rec = Arc::clone(&rec);
+    let reads = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        let exists = probe.transcript_exists(
+            &blocking_rec.claude_session_id,
+            blocking_rec.working_dir.as_deref(),
+        );
+        (exists, read_session_tenancy(&blocking_rec))
+    })
+    .await;
+    let (transcript_exists, tenancy) = match reads {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "session_info: blocking reads for {} failed: {e}",
+                rec.claude_session_id
+            );
+            return SessionInfoEnvelope::unavailable("session_read_failed");
+        }
+    };
+    let prs = load_prs(&rec.claude_session_id).await;
+    project_session_info(&rec, live.as_ref(), transcript_exists, prs, tenancy)
+}
+
 /// `session_info_get` — the ONE read the session-info dropdown makes.
 ///
 /// Returns the whole D1 projection for `claude_session_id`: durable record ⨝

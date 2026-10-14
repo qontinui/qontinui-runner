@@ -6,9 +6,11 @@
 //! The Session Manager hydrates its query facts (repo, branch, PRs, account,
 //! the finished marker) for every row on each refresh. One `session_info_get`
 //! per row would be N IPC round-trips and N config-dir discoveries; this is
-//! ONE call that discovers the config dirs and the transcript index once and
-//! projects every requested session through the same
-//! [`build_session_info`] the dropdown uses, so the two cannot disagree.
+//! ONE call that discovers the config dirs, the transcript index and the live
+//! registry once (off the async workers) and projects every requested session
+//! through the same `project_session_info` core the dropdown uses, so the two
+//! cannot disagree — [`SESSION_BUILD_CONCURRENCY`] rows at a time, each row's
+//! blocking reads on the blocking pool.
 //!
 //! ## Branch
 //!
@@ -27,10 +29,19 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use super::session_info::{build_session_info, SessionInfoEnvelope, STATUS_OK, STATUS_UNAVAILABLE};
+use futures::StreamExt;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
+use super::session_info::{
+    build_session_info_owned, SessionInfoEnvelope, STATUS_OK, STATUS_UNAVAILABLE,
+};
 use crate::session::reconcile::DiskTranscriptIndex;
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+use crate::session::snapshot_history::TranscriptProbe;
 
+/// Sessions projected at once (each is one blocking-pool task plus one PR
+/// ledger query), so a 200-row poll neither runs serially nor floods the pool.
+pub const SESSION_BUILD_CONCURRENCY: usize = 8;
 /// `git rev-parse` processes allowed to run at once.
 pub const BRANCH_PROBE_CONCURRENCY: usize = 4;
 /// How long one `git rev-parse` may take before it is killed and the
@@ -154,13 +165,6 @@ pub async fn list_sessions_info(
         return SessionsInfoListResponse::unavailable("lifecycle_store_unavailable");
     };
     let (records, not_found) = select_records(&store, ids);
-    // Discovered ONCE for the whole listing, not per session.
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
-    let probe = DiskTranscriptIndex::discover();
-    let mut sessions = Vec::with_capacity(records.len());
-    for rec in &records {
-        sessions.push(build_session_info(rec, &config_dirs, &probe).await);
-    }
     let dirs: Vec<String> = records
         .iter()
         .filter_map(|r| r.working_dir.as_deref())
@@ -170,6 +174,30 @@ pub async fn list_sessions_info(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    // Discovered ONCE for the whole listing, not per session, and off the
+    // async workers: the config dirs, the transcript index and the live
+    // registry are all directory walks.
+    let shared = spawn_blocking_tracked(|| {
+        let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+        let live = crate::session::claude_session_registry::index_live_sessions_by_id(&config_dirs);
+        (live, DiskTranscriptIndex::discover())
+    })
+    .await;
+    let Ok((live, probe)) = shared else {
+        tracing::warn!("session info list: shared discovery task failed — reporting unavailable");
+        return SessionsInfoListResponse::unavailable("discovery_failed");
+    };
+    let probe: Arc<dyn TranscriptProbe> = Arc::new(probe);
+    // Per-row work (blocking reads + the PR ledger) with bounded concurrency;
+    // `buffered` keeps the store's sort order.
+    let sessions: Vec<SessionInfoEnvelope> =
+        futures::stream::iter(records.into_iter().map(|rec| {
+            let row_live = live.get(&rec.claude_session_id).cloned();
+            build_session_info_owned(rec, row_live, Arc::clone(&probe))
+        }))
+        .buffered(SESSION_BUILD_CONCURRENCY)
+        .collect()
+        .await;
     let branches = probe_branches(&dirs, &GitRevParse).await;
     SessionsInfoListResponse {
         status: STATUS_OK.to_string(),
@@ -555,5 +583,28 @@ mod tests {
         // One branch entry for the one distinct working dir.
         assert_eq!(r.branches.len(), 1);
         assert_eq!(r.branches[0].working_dir, tmp.path().to_string_lossy());
+    }
+
+    /// More rows than the concurrency bound: every one is projected, in the
+    /// store's sort order (`buffered`, not `buffer_unordered`).
+    #[tokio::test]
+    async fn a_listing_wider_than_the_concurrency_bound_keeps_every_row_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionLifecycleStore::open(tmp.path().join("s.json")).unwrap());
+        let n = SESSION_BUILD_CONCURRENCY * 3 + 1;
+        let ids: Vec<String> = (0..n)
+            .map(|i| format!("00000000-0000-0000-0000-{i:012}"))
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            store.record_open(record(id, &format!("t{i:03}"), "open"));
+        }
+        let r = list_sessions_info(Some(store), Some(&ids)).await;
+        assert_eq!(r.status, STATUS_OK);
+        let got: Vec<String> = r
+            .sessions
+            .iter()
+            .map(|s| s.body.as_ref().unwrap().identity.claude_session_id.clone())
+            .collect();
+        assert_eq!(got, ids);
     }
 }
