@@ -24,7 +24,9 @@ export type NeedsYouJump<R> =
   | { kind: "row"; row: R };
 
 /** Where Ctrl+Shift+N goes. `tabStates` are this window's live tabs' states. */
-export function nextNeedsYouJump<R extends { sessionId: string; status: { activity: SessionActivity } }>(
+export function nextNeedsYouJump<
+  R extends { sessionId: string; status: { activity: SessionActivity } },
+>(
   tabStates: readonly (string | undefined)[],
   rows: readonly R[],
   afterRowId: string | null,

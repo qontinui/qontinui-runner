@@ -19,14 +19,15 @@
  * A close over several rows (the bulk bar's Close, the Ready-to-close review)
  * opens with every row included and lets each be left out. Whatever the button
  * showed, the confirm itself re-reads the rows as they are at that instant
- * (`idsToClose`), so a row that turned `Needs you` between the last render and
- * the click still stops the close until it is ticked.
+ * (`idsToClose`): a row that turned `Needs you` between the last render and
+ * the click is left OUT of the close and answered "not closed" with why, while
+ * the rows the operator confirmed still close.
  */
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { AlertTriangle, Loader2 } from "lucide-react";
 
-import { idsToClose } from "./sessionBulkActions";
+import { idsToClose, type CloseConfirmation } from "./sessionBulkActions";
 import {
   closeNeedsSecondTick,
   closeTickKey,
@@ -75,12 +76,17 @@ export function SessionCloseDialog({
   const closable = included.filter((t) => t.closable);
   const unticked = untickedRiskyTargets(included, ticks);
   const canClose = closable.length > 0 && unticked.length === 0;
-  // The confirm re-checks against the rows as they are when it fires.
-  const latest = useRef({ targets, excluded, ticks });
-  latest.current = { targets, excluded, ticks };
-  const confirmIds = (): string[] | null => {
-    const now = idsToClose(latest.current.targets, latest.current.excluded, latest.current.ticks);
-    return now.ids.length > 0 ? now.ids : null;
+  /**
+   * The re-check at confirm (`idsToClose`). `null` = close nothing and stay
+   * on the confirmation: every row left reads a risky activity it was not
+   * ticked for, and the list now shows that tick.
+   */
+  const confirmNow = (): CloseConfirmation | null => {
+    // The handler is the current render's, so these are the rows as the
+    // panel passed them in LIVE — not as they were when the dialog opened.
+    const now = idsToClose(targets, excluded, ticks);
+    if (now.ids.length === 0 && (now.needsTick.length > 0 || now.skipped.length === 0)) return null;
+    return now;
   };
   const toggleExcluded = (id: string) =>
     setExcluded((prev) => {
@@ -98,17 +104,23 @@ export function SessionCloseDialog({
       return next;
     });
 
+  // Rows the re-check left out are answered beside the close's own results.
   const runClose = async () => {
-    const ids = confirmIds();
-    if (!ids) return;
+    const now = confirmNow();
+    if (!now) return;
+    if (now.ids.length === 0) {
+      setPhase({ kind: "done", results: now.skipped, forced: false });
+      return;
+    }
     setPhase({ kind: "running" });
-    const results = await onClose(ids);
-    setPhase({ kind: "done", results, forced: false });
+    const results = await onClose(now.ids);
+    setPhase({ kind: "done", results: [...results, ...now.skipped], forced: false });
   };
   const runForce = () => {
-    const ids = confirmIds();
-    if (!ids) return;
-    setPhase({ kind: "done", results: onForceClose(ids), forced: true });
+    const now = confirmNow();
+    if (!now) return;
+    const results = now.ids.length > 0 ? onForceClose(now.ids) : [];
+    setPhase({ kind: "done", results: [...results, ...now.skipped], forced: true });
   };
 
   return (
@@ -175,7 +187,12 @@ export function SessionCloseDialog({
                 context is lost and the transcript&apos;s last turn may not be written.
               </span>
             </div>
-            <TargetList targets={closable} ticks={ticks} onToggle={toggleTick} excluded={excluded} />
+            <TargetList
+              targets={closable}
+              ticks={ticks}
+              onToggle={toggleTick}
+              excluded={excluded}
+            />
             <div className="flex justify-end gap-2 px-3 py-2 border-t border-[#2a2d3d]">
               <button
                 {...sessionOrgControlAttrs("closeCancel")}

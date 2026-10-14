@@ -242,6 +242,10 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
   "components/terminal/FilePathLinkProvider.ts":
     "xterm link provider: Ctrl/Cmd must be held for a path to be clickable. Not a " +
     "chord — a hover/click modifier, with no key field read at all.",
+  "components/terminal/SessionCard.tsx":
+    "Ctrl/Cmd+CLICK toggles the row into the Session Manager selection and Shift+CLICK " +
+    "selects a range (plan 2026-10-13-session-manager-…, Phase 5). Pointer modifiers on " +
+    "the row's click, not key chords.",
   "components/terminal/SessionSearchPalette.tsx":
     "palette input: Enter opens the picked session, Shift+Enter opens it in a new zone. " +
     "ELEMENT-scoped `onKeyDown` on the focused input; the palette's GLOBAL chord " +
@@ -266,6 +270,10 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
   "components/terminal/scrollKeys.ts":
     "VS Code-parity scrollback navigation, consumed by TerminalInstance's xterm " +
     "handler. Eight ELEMENT-scoped claims, inventoried in KNOWN_KEY_CLAIMS.",
+  "components/terminal/sessionSelection.ts":
+    "the Session Manager list's keys — bare ↑/↓/Enter/Space/Escape plus Ctrl/Cmd+A " +
+    "select-all — read by `listKeyAction` for the FOCUSED list's `onKeyDown` " +
+    "(`useSessionSelection`). ELEMENT-scoped; Ctrl+A is inventoried in KNOWN_KEY_CLAIMS.",
   "components/ui-bridge/NaturalLanguagePanel.tsx": "textarea: Enter submits, Shift+Enter newlines",
   "components/widgets/ai-conversation/MessageInput.tsx":
     "textarea: Enter sends, Shift+Enter newlines",
@@ -407,7 +415,10 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/SessionCloseDialog.tsx",
   "components/terminal/SessionGroupHeader.tsx",
   "components/terminal/SessionGroupSuggestionsDialog.tsx",
+  "components/terminal/SessionHoverCard.test.tsx",
+  "components/terminal/SessionHoverCard.tsx",
   "components/terminal/SessionInfoDropdown.tsx",
+  "components/terminal/SessionManagerHeader.test.tsx",
   "components/terminal/SessionManagerPanel.tsx",
   "components/terminal/SessionOrgMenus.tsx",
   "components/terminal/SessionQueryBar.tsx",
@@ -453,6 +464,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/sessionReviewApi.test.ts",
   "components/terminal/sessionReviewApi.ts",
   "components/terminal/sessionReviewView.ts",
+  "components/terminal/sessionUnseen.ts",
   "components/terminal/suggestions/useSuggestions.tsx",
   "components/terminal/terminalKeySequence.test.ts",
   "components/terminal/terminalKeySequence.ts",
@@ -465,6 +477,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/useMidSessionProbe.ts",
   "components/terminal/useSessionInfo.test.ts",
   "components/terminal/useSessionPanelOrg.ts",
+  "components/terminal/useSessionUnseen.ts",
   "components/terminal/writePtyById.test.ts",
   "components/terminal/writeWhenReady.test.ts",
   "components/terminal/zone-grid/CompactZoneCard.tsx",
@@ -579,6 +592,10 @@ const NON_DOM_CHORD_ROSTER: Record<string, string> = {
   "components/terminal/KeyboardShortcutsOverlay.tsx":
     "the shortcut cheat-sheet — 37 chord spellings rendered as help text. Documentation " +
     "of the table, not a second claimant of it.",
+  "components/terminal/useKeyboardShortcuts.chords.test.ts":
+    "pins that the help overlay has a row for every inline `isCtrlShiftChord` claim, and " +
+    "spells the Phase 5 triage chords (`Ctrl+Shift+Backspace`) as the overlay labels it " +
+    "expects. Assertions about documentation, not a binding.",
   "lib/globalChords.enforcement.test.ts":
     "THIS FILE. Its allowlists spell chords (`ctrl+shift+g`, `shift+pageup`) as the " +
     "inventory it pins. Scanned rather than exempted, for the same reason it is on the " +
@@ -664,7 +681,7 @@ const KNOWN_SHARED_CHORDS: Record<string, string> = {
 /**
  * Every `switch` on a key value in the tree.
  *
- * All four dispatch on BARE keys today, so none is a chord claim and none
+ * All five dispatch on BARE keys today, so none is a chord claim and none
  * can collide with `GLOBAL_CHORDS`.
  *
  * This roster used to carry the claim that "a `case` arm that started
@@ -679,6 +696,9 @@ const KNOWN_SWITCH_KEY_REGISTRIES: string[] = [
   "components/PromptSnippetSelector.tsx",
   "components/active-dashboard/ActiveRunsBar.tsx",
   "components/navigation/Sidebar.tsx",
+  // The Session Manager list's bare keys (↑/↓/Enter/Space/Escape); its one
+  // modified key, Ctrl/Cmd+A, returns before the switch and is in KNOWN_KEY_CLAIMS.
+  "components/terminal/sessionSelection.ts",
   "hooks/useTutorialKeyboard.ts",
 ];
 
@@ -711,6 +731,9 @@ const KNOWN_KEY_CLAIMS: Record<string, string[]> = {
   // Alt+←/→ reorders the focused page tab (WCAG 2.5.7 non-drag alternative).
   // Element-scoped: fires only while that tab button has focus.
   "components/terminal/TerminalPageTabBar.tsx": ["alt+arrowleft", "alt+arrowright"],
+  // Ctrl/Cmd+A selects every shown session. Element-scoped: read by the
+  // Session Manager list's own `onKeyDown`, only while the list has focus.
+  "components/terminal/sessionSelection.ts": ["ctrl+a"],
   // VS Code-parity scrollback navigation, consumed by `TerminalInstance`'s
   // xterm handler. THE EIGHT CLAIMS THE OLD SCANNER COULD NOT SEE: the file
   // holds no listener of its own, so no selection rule reached it, and its

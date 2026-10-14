@@ -5,7 +5,7 @@
  * selection with it, so the bulk bar never counts a session it cannot act on.
  */
 
-import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
+import { useCallback, useState, type KeyboardEvent } from "react";
 
 import {
   EMPTY_SELECTION,
@@ -41,13 +41,20 @@ export interface SessionSelection {
   onListKeyDown: (e: KeyboardEvent<HTMLElement>) => void;
 }
 
-export function useSessionSelection({ visibleIds, onOpen }: UseSessionSelectionDeps): SessionSelection {
+export function useSessionSelection({
+  visibleIds,
+  onOpen,
+}: UseSessionSelectionDeps): SessionSelection {
   const [state, setState] = useState<SelectionState>(EMPTY_SELECTION);
 
-  // Selected rows that are no longer rendered drop out.
-  useEffect(() => {
+  // Selected rows that are no longer rendered drop out — adjusted while
+  // rendering, when the rendered list changes, so no render ever shows (or
+  // the bulk bar counts) a selection over rows that are gone.
+  const [prunedFor, setPrunedFor] = useState(visibleIds);
+  if (prunedFor !== visibleIds) {
+    setPrunedFor(visibleIds);
     setState((prev) => pruneSelection(prev, new Set(visibleIds)));
-  }, [visibleIds]);
+  }
 
   const onRowClick = useCallback(
     (rowId: string, mods: { toggle: boolean; range: boolean }) => {

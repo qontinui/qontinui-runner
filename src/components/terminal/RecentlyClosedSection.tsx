@@ -12,6 +12,7 @@ import { RotateCcw } from "lucide-react";
 
 import { sessionOrgControlAttrs } from "./sessionOrgControls";
 import type { ClosedSession } from "./sessionOrgTypes";
+import { useNow1Hz } from "./useNow1Hz";
 import type { RecentlyClosedView, ReopenResult } from "./useRecentlyClosed";
 
 export interface RecentlyClosedSectionProps {
@@ -34,9 +35,9 @@ function ago(at: number, now: number): string {
 
 export function RecentlyClosedSection({ view, onReopen }: RecentlyClosedSectionProps) {
   const [results, setResults] = useState<Record<string, ReopenResult | "pending">>({});
+  const now = useNow1Hz();
   const { entries, total } = view;
   if (entries !== null && entries.length === 0) return null;
-  const now = Date.now();
 
   return (
     <div
