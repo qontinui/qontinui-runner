@@ -17,7 +17,7 @@ import { CircuitBreakerStatus } from "./CircuitBreakerStatus";
 import { AnomalyFeed } from "./AnomalyFeed";
 import { BudgetWarningBanner } from "./BudgetWarningBanner";
 import { CostRecommendations } from "./CostRecommendations";
-import { describeCostFigure } from "./costProvenance";
+import { LIST_PRICE_EQUIVALENT, describeCostFigure } from "./costProvenance";
 
 /** Source id → label used in the error banner. */
 const SOURCE_LABELS: Record<string, string> = {
@@ -179,7 +179,7 @@ export default function CostControlPanel() {
         <MetricCard
           title="Cache Savings"
           value={dashboard ? formatCost(dashboard.cache_savings_usd) : "$0.00"}
-          subtitle="Estimated savings"
+          subtitle={`Estimated savings · ${LIST_PRICE_EQUIVALENT}`}
           variant="success"
         />
       </div>

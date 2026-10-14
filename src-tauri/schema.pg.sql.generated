@@ -736,6 +736,21 @@ ALTER SEQUENCE agent.memory_query_cache_id_seq OWNED BY agent.memory_query_cache
 
 
 --
+-- Name: plan_difficulty_model_routes; Type: TABLE; Schema: agent; Owner: -
+--
+
+CREATE TABLE agent.plan_difficulty_model_routes (
+    organization_id uuid NOT NULL,
+    level text NOT NULL,
+    model_family text NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by_user_id uuid,
+    CONSTRAINT ck_plan_difficulty_model_routes_family CHECK ((model_family = ANY (ARRAY['fable'::text, 'opus'::text, 'sonnet'::text, 'haiku'::text]))),
+    CONSTRAINT ck_plan_difficulty_model_routes_level CHECK ((level = ANY (ARRAY['high'::text, 'medium'::text, 'low'::text])))
+);
+
+
+--
 -- Name: plan_scan_root_observations; Type: TABLE; Schema: agent; Owner: -
 --
 
@@ -19577,6 +19592,14 @@ ALTER TABLE ONLY agent.cached_app_specs
 
 ALTER TABLE ONLY agent.memory_query_cache
     ADD CONSTRAINT memory_query_cache_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: plan_difficulty_model_routes plan_difficulty_model_routes_pkey; Type: CONSTRAINT; Schema: agent; Owner: -
+--
+
+ALTER TABLE ONLY agent.plan_difficulty_model_routes
+    ADD CONSTRAINT plan_difficulty_model_routes_pkey PRIMARY KEY (organization_id, level);
 
 
 --
