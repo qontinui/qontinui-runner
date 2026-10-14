@@ -11,9 +11,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { AnomalyFeed } from "./AnomalyFeed";
 import { BudgetGauge } from "./BudgetGauge";
+import { BudgetWarningBanner } from "./BudgetWarningBanner";
 import { CircuitBreakerStatus } from "./CircuitBreakerStatus";
 import { LIST_PRICE_EQUIVALENT } from "./costProvenance";
-import type { ActiveBudgetStatus, CostAnomalyEvent } from "./types";
+import type { ActiveBudgetStatus, BudgetWarningEvent, CostAnomalyEvent } from "./types";
 
 const budget: ActiveBudgetStatus = {
   execution_id: "exec-1",
@@ -54,5 +55,18 @@ describe("cost panel labels", () => {
   it("CircuitBreakerStatus labels the mean cost", () => {
     const html = renderToStaticMarkup(<CircuitBreakerStatus budget={budget} />);
     expect(html).toContain(`$0.0123 (${LIST_PRICE_EQUIVALENT})`);
+  });
+
+  it("BudgetWarningBanner labels total / limit as a list-price equivalent", () => {
+    const warning: BudgetWarningEvent = {
+      task_run_id: "run-1",
+      remaining_fraction: 0.2,
+      total_cost_usd: 4,
+      budget_limit_usd: 5,
+      message: "80% of budget used",
+      timestamp: 1,
+    };
+    const html = renderToStaticMarkup(<BudgetWarningBanner warnings={[warning]} />);
+    expect(html).toContain(`$4.00 / $5.00 (${LIST_PRICE_EQUIVALENT})`);
   });
 });
