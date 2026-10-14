@@ -2,7 +2,7 @@
 //!
 //! Follows the same HashMap-based manager pattern as `claude_session::SessionManager`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
@@ -37,6 +37,11 @@ pub struct TerminalManager {
     /// the terminal had a coord row is not stranded local-only. Unattached →
     /// binding just sets the id.
     coord_bind_observer: OnceLock<CoordBindObserver>,
+    /// Terminal ids an [`Self::adopt_holder_pane`] is attaching right now.
+    /// Claimed under the sessions lock together with the "not already open"
+    /// check, so two adoptions of one pane cannot both pass it and the second
+    /// overwrite the first's session (orphaning it, unlisted but running).
+    adopting: Mutex<HashSet<String>>,
 }
 
 /// See [`TerminalManager::coord_bind_observer`].
@@ -195,6 +200,7 @@ impl TerminalManager {
             remote_identities: Mutex::new(HashMap::new()),
             remote_panes: Mutex::new(HashMap::new()),
             coord_bind_observer: OnceLock::new(),
+            adopting: Mutex::new(HashSet::new()),
         }
     }
 
@@ -557,27 +563,45 @@ impl TerminalManager {
         app_handle: AppHandle,
         pinned_session_id: String,
     ) -> Result<TerminalInfo, String> {
-        // Never over an open terminal: inserting under a live id would orphan
-        // that session — still running, no longer listed.
-        if self.get(terminal_id).is_some() {
-            return Err(format!(
-                "terminal {terminal_id} is already open; not adopting its holder over it"
-            ));
+        // Insert-if-absent: never over an open terminal (inserting under a
+        // live id would orphan that session — still running, no longer
+        // listed), and never twice at once. The check and the claim are one
+        // step under the sessions lock; terminal ids other paths insert are
+        // fresh uuids, so only another adoption can race this one.
+        {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
+            let mut adopting = self.adopting.lock().unwrap_or_else(|p| p.into_inner());
+            if sessions.contains_key(terminal_id) || !adopting.insert(terminal_id.to_string()) {
+                return Err(format!(
+                    "terminal {terminal_id} is already open (or being adopted); not adopting \
+                     its holder over it"
+                ));
+            }
         }
-        let pane = super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, size)?;
-        let (title, cwd) = pane.session_identity();
-        let (cols, rows) = pane.dims();
-        self.insert_with_io(
-            terminal_id.to_string(),
-            title,
-            cwd,
-            page_id,
-            cols,
-            rows,
-            app_handle,
-            Arc::new(pane),
-            pinned_session_id,
-        )
+        let adopted = super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, size)
+            .and_then(|pane| {
+                let (title, cwd) = pane.session_identity();
+                let (cols, rows) = pane.dims();
+                self.insert_with_io(
+                    terminal_id.to_string(),
+                    title,
+                    cwd,
+                    page_id,
+                    cols,
+                    rows,
+                    app_handle,
+                    Arc::new(pane),
+                    pinned_session_id,
+                )
+            });
+        self.adopting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(terminal_id);
+        adopted
     }
 
     /// The registry half of [`Self::create_with_io`] and

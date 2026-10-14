@@ -17,6 +17,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   fetchOpenRecords,
   fetchRestoreSet,
+  waitForHolderSweep,
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
@@ -839,5 +840,27 @@ describe("reportTreeReset — drain deferral", () => {
       "terminal_report_tree_reset",
       expect.objectContaining({ mountNumber: 2, openRecordCount: undefined }),
     );
+  });
+});
+
+describe("waitForHolderSweep — PTY-holder boot sweep before the restore", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("asks the runner to wait for the sweep to settle", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { settled: true } });
+    await waitForHolderSweep();
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_holder_sweep_settled");
+  });
+
+  it("proceeds when the sweep did not settle in time", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { settled: false } });
+    await expect(waitForHolderSweep()).resolves.toBeUndefined();
+  });
+
+  it("proceeds when the runner has no such command", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("command terminal_holder_sweep_settled not found"));
+    await expect(waitForHolderSweep()).resolves.toBeUndefined();
   });
 });

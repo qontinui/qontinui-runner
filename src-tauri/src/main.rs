@@ -3523,6 +3523,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_claude_session_list_live,
             commands::terminal::terminal_session_list_history,
             commands::terminal::terminal_session_list_open,
+            commands::terminal::terminal_holder_sweep_settled,
             commands::terminal::terminal_session_mark_restore_pending,
             commands::terminal::terminal_session_record_close,
             commands::terminal::terminal_session_set_finished,
@@ -4475,10 +4476,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // owner-for-terminal-hosted-sessions, Phase 3): adopt every
                 // pane a holder kept alive across the last runner exit, and
                 // reap the dead — AFTER the sanitizer hook (an adopted pane's
-                // replay is untrusted output too) and BEFORE the webview's
-                // restore reads `terminal_list`. Bounded by
-                // `holder_boot_sweep::SETUP_WAIT`; one `stat` when no pane
-                // directory exists.
+                // replay is untrusted output too). It runs on its own thread
+                // and never blocks setup; the webview's restore awaits its
+                // "settled" signal (`terminal_holder_sweep_settled`) before
+                // reading `terminal_list`. One `stat` when no pane directory
+                // exists.
                 terminal::holder_boot_sweep::run(
                     &term_for_session,
                     app.handle(),
