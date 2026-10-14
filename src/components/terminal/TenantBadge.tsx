@@ -67,7 +67,7 @@ export function repoExpectedText(repo: TenancyRepoExpected | null | undefined): 
       where = "no repo (the working directory is not a git checkout)";
       break;
     case "repo_unregistered":
-      where = `none (repo ${repo.repo ?? "?"} has no owning tenant in coord)`;
+      where = `none (repo ${repo.repo ?? "?"} is owned by no tenant this device is paired to)`;
       break;
     case "several":
       where = `ambiguous (repo ${repo.repo ?? "?"} is registered to ${repo.tenantIds.length} tenants: ${repo.tenantIds.join(", ")})`;
