@@ -1463,7 +1463,12 @@ fn requests_from_counts(counts: &ScenarioCounts) -> Vec<InjectSessionRequest> {
     };
 
     push("working", counts.working, TestActivity::Working, false);
-    push("needs-input", counts.needs_input, TestActivity::NeedsYou, false);
+    push(
+        "needs-input",
+        counts.needs_input,
+        TestActivity::NeedsYou,
+        false,
+    );
     push("idle", counts.idle, TestActivity::IdleAtPrompt, false);
     // error / completed → tab-backed dead tabs, so the strip's exit-code
     // buckets are fed by the production classifier.
@@ -3825,7 +3830,11 @@ mod tests {
     /// Build a `TestSession` directly (bypassing the HTTP handler) so the
     /// projection can be exercised per (activity, tab_backed) combination
     /// without touching the global registry.
-    fn make_session(activity: TestActivity, tab_backed: bool, quiet_ms: Option<u64>) -> TestSession {
+    fn make_session(
+        activity: TestActivity,
+        tab_backed: bool,
+        quiet_ms: Option<u64>,
+    ) -> TestSession {
         TestSession {
             task_run_id: "proj-test".to_string(),
             session_id: "proj-test".to_string(),
@@ -3923,8 +3932,7 @@ mod tests {
             Some(SILENT_TAB_DEFAULT_QUIET_MS),
             "quiet below the 61s floor must be clamped up",
         );
-        let large =
-            project_test_session(&make_session(TestActivity::Unknown, true, Some(120_000)));
+        let large = project_test_session(&make_session(TestActivity::Unknown, true, Some(120_000)));
         assert_eq!(
             large.injected_tab.unwrap().quiet_ms,
             Some(120_000),
@@ -3938,8 +3946,13 @@ mod tests {
     fn project_tab_backed_exited_emit_dead_tab_with_exit_code() {
         let err = project_test_session(&make_session(TestActivity::ExitedError, true, None));
         assert!(err.injected_activity.is_none());
-        let err_spec = err.injected_tab.expect("exited-error must emit a synthetic tab");
-        assert!(!err_spec.is_alive, "exited-error synthetic tab must be dead");
+        let err_spec = err
+            .injected_tab
+            .expect("exited-error must emit a synthetic tab");
+        assert!(
+            !err_spec.is_alive,
+            "exited-error synthetic tab must be dead"
+        );
         assert_eq!(err_spec.exit_code, Some(1), "exit code must be non-zero");
         assert_eq!(err_spec.quiet_ms, None);
 
@@ -4001,12 +4014,10 @@ mod tests {
             TestLocation::NotRunning,
             TestLocation::Unknown,
         ] {
-            let err = inject_session_handler(Json(tab_backed_request(
-                location,
-                TestActivity::Exited,
-            )))
-            .await
-            .expect_err(&format!("tab_backed at {location:?} should be rejected"));
+            let err =
+                inject_session_handler(Json(tab_backed_request(location, TestActivity::Exited)))
+                    .await
+                    .expect_err(&format!("tab_backed at {location:?} should be rejected"));
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
             assert!(err.1.error.contains("hidden-here"));
         }
