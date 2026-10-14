@@ -16,7 +16,11 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 
 import { SESSION_GROUP_COLOR_VAR } from "./sessionGroupColors";
-import { sessionOrgControlAttrs, sessionOrgControlId } from "./sessionOrgControls";
+import {
+  GROUP_HEADER_ACTIONS,
+  sessionOrgControlAttrs,
+  sessionOrgControlId,
+} from "./sessionOrgControls";
 import type { SessionGroup } from "./sessionOrgTypes";
 import { ACTIVITY_DOT } from "./sessionStatusModel";
 
@@ -78,6 +82,7 @@ export function SessionGroupHeader({
     id: headerId,
     type: "generic",
     label: `Session group ${group.title}`,
+    actions: GROUP_HEADER_ACTIONS,
   });
   const { ref: collapseRef } = useUIElement({
     id: collapseId,
