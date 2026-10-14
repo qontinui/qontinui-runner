@@ -360,6 +360,21 @@ pub fn resolve_selection(
     }
 }
 
+/// The `selection_source` a REPORT (the env capture) should carry. PURE.
+///
+/// `answered` is whether coord has answered the fleet account-selection
+/// domain in this process. Before it has, an unpinned source is `unknown`
+/// rather than `local` — the cache's "no fleet opinion" then means "not yet
+/// asked". A pinned machine is `pinned` either way: no fleet answer can change
+/// that.
+pub fn reported_selection_source(source: AccountSelectionSource, answered: bool) -> &'static str {
+    if source == AccountSelectionSource::Pinned || answered {
+        source.as_str()
+    } else {
+        "unknown"
+    }
+}
+
 /// The mode half of [`resolve_selection`].
 pub fn resolve_selection_mode(
     local: AccountSelectionMode,
@@ -771,6 +786,17 @@ mod tests {
             (AccountSelectionMode::Manual, AccountSelectionSource::Local),
             "unpinned with no fleet opinion is Local"
         );
+    }
+
+    #[test]
+    fn reported_source_is_unknown_until_the_fleet_answered() {
+        use AccountSelectionSource::*;
+        assert_eq!(reported_selection_source(Local, false), "unknown");
+        assert_eq!(reported_selection_source(Fleet, false), "unknown");
+        assert_eq!(reported_selection_source(Pinned, false), "pinned");
+        assert_eq!(reported_selection_source(Local, true), "local");
+        assert_eq!(reported_selection_source(Fleet, true), "fleet");
+        assert_eq!(reported_selection_source(Pinned, true), "pinned");
     }
 
     #[test]

@@ -198,10 +198,11 @@ async fn save_app_mode(
 
 /// GET /settings/ai
 ///
-/// Returns the stored settings FLATTENED together with the effective
-/// account-selection mode and its source (`fleet` | `local` | `pinned`) —
-/// see [`settings::AiSettingsView`]. The two derived keys are read-only; a
-/// client echoing them back on PUT is harmless.
+/// Returns the stored settings FLATTENED together with three read-only derived
+/// keys — see [`settings::AiSettingsView`]: `effective_account_selection_mode`,
+/// `account_selection_source` (`fleet` | `local` | `pinned`) and
+/// `fleet_account_selection_mode` (the raw fleet value, `null` = no opinion).
+/// A client echoing them back on PUT is harmless.
 async fn get_ai_settings(
 ) -> Result<Json<ApiResponse<settings::AiSettingsView>>, (StatusCode, Json<ApiResponse<()>>)> {
     let result = spawn_blocking_tracked(settings::AiSettingsView::current)
@@ -499,11 +500,17 @@ async fn save_agentic_settings(
     Json(payload): Json<AgenticSettingsPayload>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let result = spawn_blocking_tracked(move || {
-        let mut ai = settings::get_ai_settings();
-        ai.compression = payload.compression;
-        ai.retry = payload.retry;
-        ai.routing = payload.routing;
-        settings::save_ai_settings(ai)
+        settings::update_ai_settings(|mut ai| {
+            ai.compression = payload.compression;
+            ai.retry = payload.retry;
+            ai.routing = payload.routing;
+            Ok::<_, std::convert::Infallible>(ai)
+        })
+        .map(|_| ())
+        .map_err(|e| match e {
+            settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+            settings::AiSettingsUpdateError::Rejected(never) => match never {},
+        })
     })
     .await
     .map_err(|e| {

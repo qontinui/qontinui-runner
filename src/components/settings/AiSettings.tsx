@@ -51,6 +51,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   const [settings, setSettings] = useState<AiSettingsType>(DEFAULT_AI_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  // True only after a SUCCESSFUL load. Until then the form holds
+  // DEFAULT_AI_SETTINGS, and saving it would write those defaults — including
+  // an explicit `config_dir: null`, which clears the MACHINE-GLOBAL config dir
+  // — so Save stays disabled.
+  const [loaded, setLoaded] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -190,7 +195,12 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           // are never sent back as stored settings.
           ...selectionViewFrom(result.data),
         });
+        setLoaded(true);
         onLog("debug", "AI settings loaded");
+      } else {
+        const errorMsg = result?.message || "the runner returned no settings";
+        setError(`Failed to load settings: ${errorMsg}`);
+        onLog("error", `Failed to load AI settings: ${errorMsg}`);
       }
     } catch (err) {
       console.error("Failed to load AI settings:", err);
@@ -286,6 +296,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         return;
       }
 
+      // The Claude save may have changed which mode governs (a new local
+      // mode, a pin toggled) — re-read the runner's view of it now, so it is
+      // fresh even if the Gemini save below fails.
+      await refreshSelectionView();
+
       const geminiResult = await invoke<TauriResult<null>>("save_gemini_settings", {
         executionMode: settings.gemini_cli?.execution_mode || "auto",
         customPath: settings.gemini_cli?.custom_path || null,
@@ -297,9 +312,6 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       });
 
       if (geminiResult && geminiResult.success) {
-        // The save may have changed which mode governs (a new local mode, a
-        // pin toggled) — re-read the runner's view of it.
-        await refreshSelectionView();
         setSaveSuccess(true);
         onLog("success", "AI settings saved successfully");
         setTimeout(() => setSaveSuccess(false), 3000);
@@ -725,7 +737,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       <div className="flex justify-end">
         <button
           onClick={saveSettings}
-          disabled={saving}
+          disabled={saving || !loaded}
+          title={loaded ? undefined : "Settings did not load — saving now would overwrite them"}
           className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
         >
           {saving ? (

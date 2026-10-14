@@ -62,9 +62,10 @@ pub struct AiConnectionTestResult {
 /// Get the current AI settings.
 ///
 /// Returns the AI settings stored in the persistent settings file, flattened
-/// together with the READ-ONLY `effective_account_selection_mode` and
-/// `account_selection_source` (`fleet` | `local` | `pinned`) — see
-/// [`settings::AiSettingsView`].
+/// together with three READ-ONLY derived keys — `effective_account_selection_mode`,
+/// `account_selection_source` (`fleet` | `local` | `pinned`) and
+/// `fleet_account_selection_mode` (the raw fleet value, `null` = no opinion) —
+/// see [`settings::AiSettingsView`].
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with AI settings data

@@ -889,15 +889,16 @@ fn runner_plans_dir_setting() -> Option<String> {
 /// `local` on a machine the fleet is about to override. A PINNED machine is
 /// `pinned` regardless — the fleet's answer cannot change that.
 fn runner_effective_account_selection() -> (&'static str, &'static str) {
+    // Flag FIRST (Acquire), value second: the poller stores the fleet value
+    // and THEN raises the flag (Release), so reading in this order can never
+    // pair a raised flag with the pre-answer `None` (which would report
+    // `local` on a fleet-managed machine).
+    let answered = crate::mcp::fleet_policy_poller::account_selection_answered();
     let (mode, source) = crate::claude_accounts::effective_selection();
-    let source = if source == crate::claude_accounts::AccountSelectionSource::Pinned
-        || crate::mcp::fleet_policy_poller::account_selection_answered()
-    {
-        source.as_str()
-    } else {
-        "unknown"
-    };
-    (mode.as_str(), source)
+    (
+        mode.as_str(),
+        crate::claude_accounts::reported_selection_source(source, answered),
+    )
 }
 
 /// Parse a boolean env lever the way the rest of the boot path does.
