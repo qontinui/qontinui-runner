@@ -17,8 +17,11 @@ import type { SessionInfoState } from "./useSessionInfo";
 import {
   DIGEST_CHUNK_SIZE,
   RECENT_ROWS_DIGESTED,
+  DIGEST_MAX_AGE_MS,
   chunkIds,
   digestRequestIds,
+  mergeDigestRound,
+  type SessionDigest,
 } from "./useSessionDigests";
 
 describe("readExternalScan", () => {
@@ -107,5 +110,58 @@ describe("digest request by id", () => {
         { sessionId: "u", location: "unknown", lastModified: "2000-01-01T00:00:00Z" },
       ]),
     ).toEqual(["u"]);
+  });
+});
+
+describe("mergeDigestRound — a digest cannot outlive its refreshes", () => {
+  const dg = (id: string, preview = "p"): SessionDigest => ({
+    session_id: id,
+    config_dir: "c",
+    project_path: "/p",
+    last_message_type: "assistant",
+    last_message_timestamp: "2026-10-14T00:00:00Z",
+    last_message_preview: preview,
+    last_assistant_had_tool_use: false,
+    likely_frozen: false,
+    work_summary_hint: "",
+  });
+
+  it("applies a successful chunk even when another chunk of the round failed", () => {
+    const prev = { b: { digest: dg("b", "old"), fetchedAt: 0 } };
+    const next = mergeDigestRound(
+      prev,
+      ["a", "b"],
+      [
+        { ids: ["a"], data: [dg("a", "new")] },
+        { ids: ["b"], data: null },
+      ],
+      1_000,
+    );
+    expect(next.a).toEqual({ digest: dg("a", "new"), fetchedAt: 1_000 });
+    // The failed chunk keeps b's previous digest with its OLD timestamp.
+    expect(next.b).toEqual({ digest: dg("b", "old"), fetchedAt: 0 });
+  });
+
+  it("drops a digest whose chunk keeps failing past the max age, so the row reads Unknown", () => {
+    let entries = mergeDigestRound({}, ["a"], [{ ids: ["a"], data: [dg("a")] }], 0);
+    const failed = [{ ids: ["a"], data: null }];
+    entries = mergeDigestRound(entries, ["a"], failed, DIGEST_MAX_AGE_MS);
+    expect(entries.a).toBeDefined(); // exactly at the bound: still kept
+    entries = mergeDigestRound(entries, ["a"], failed, DIGEST_MAX_AGE_MS + 1);
+    expect(entries.a).toBeUndefined();
+  });
+
+  it("a successful chunk is authoritative: an answered id with no digest is dropped", () => {
+    const prev = { a: { digest: dg("a"), fetchedAt: 0 } };
+    expect(mergeDigestRound(prev, ["a"], [{ ids: ["a"], data: [] }], 10)).toEqual({});
+  });
+
+  it("drops ids no longer requested", () => {
+    const prev = { a: { digest: dg("a"), fetchedAt: 0 } };
+    expect(mergeDigestRound(prev, ["b"], [{ ids: ["b"], data: null }], 10)).toEqual({});
+  });
+
+  it("is three poll periods", () => {
+    expect(DIGEST_MAX_AGE_MS).toBe(90_000);
   });
 });
