@@ -5,8 +5,8 @@
  * Provides data fetching with caching, refetching, and error handling.
  */
 
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef } from "react";
 import { aiDataService } from "../services/ai-data-service";
 import { useRunnerEvents, useTaskRunProgress as useTaskRunProgressGql } from "./graphql";
 import type {
@@ -23,10 +23,14 @@ import type {
   ConsolidatedAiOutputResult,
   // SQLite migrated log types
   TaskRunEventsResult,
+  BoundedReadMeta,
   TaskRunPlaywrightResultsDbResult,
+  TaskRunPlaywrightResultDb,
   TaskRunMigratedLogsSummary,
   TaskRunApiRequestsDbResult,
+  TaskRunApiRequestDb,
   TaskRunAwasStepsDbResult,
+  TaskRunAwasStepDb,
   TaskRunVerificationResultsDbResult,
   // Process session types
   ProcessSession,
@@ -413,27 +417,79 @@ export function useTaskRunEvents(taskRunId: string | null, eventType?: string, l
 }
 
 /**
- * Hook to get Playwright test results from SQLite database.
- * @param taskRunId - Task run ID to get results for
+ * A keyset walk over a bounded read, merged across every page loaded so far.
+ *
+ * Counts (`first.total`, `first.passed`, …) come from the FIRST page, whose
+ * separate counts statement covers the whole match set (later pages run none,
+ * so their `bound_kind` is `at_least` and their per-status counts are absent);
+ * the rows are every page's rows in walk order; `remaining` is what the last
+ * page's exact total says lies beyond the loaded rows (`null` when that page
+ * ran no exact count, i.e. on every page after the first).
  */
-export function useTaskRunPlaywrightResults(
-  taskRunId: string | null,
-  limit?: number,
-  offset?: number,
-) {
-  return useQuery({
-    queryKey: [...aiDataKeys.taskRunPlaywrightResults(taskRunId ?? ""), limit, offset],
-    queryFn: async (): Promise<TaskRunPlaywrightResultsDbResult | null> => {
-      if (!taskRunId) return null;
-      const response = await aiDataService.getTaskRunPlaywrightResults(taskRunId, limit, offset);
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load Playwright results");
-      }
-      return response.data;
-    },
+export interface BoundedWalk<P extends BoundedReadMeta, R> {
+  first: P;
+  rows: R[];
+  remaining: number | null;
+  hasMore: boolean;
+}
+
+function mergeWalk<P extends BoundedReadMeta, R>(
+  pages: P[] | undefined,
+  rowsOf: (page: P) => R[],
+): BoundedWalk<P, R> | null {
+  if (!pages || pages.length === 0) return null;
+  const last = pages[pages.length - 1];
+  return {
+    first: pages[0],
+    rows: pages.flatMap(rowsOf),
+    remaining: last.total === null ? null : last.total - last.shown,
+    hasMore: last.next_cursor !== null,
+  };
+}
+
+/**
+ * Unwrap one page of a cursor-paged command. A refused cursor surfaces its
+ * `error_code` (`cursor_malformed`) in the message.
+ */
+function pageOrThrow<P>(
+  response: { success: boolean; data?: P; error?: string; error_code?: string },
+  what: string,
+): P {
+  if (!response.success || !response.data) {
+    const code = response.error_code ? ` [${response.error_code}]` : "";
+    throw new Error((response.error || `Failed to load ${what}`) + code);
+  }
+  return response.data;
+}
+
+/**
+ * Hook to walk a run's Playwright results by keyset cursor. `fetchNextPage`
+ * loads the following page; the merged walk is in `data`.
+ * @param taskRunId - Task run ID to get results for
+ * @param limit - Page size (default 200, max 1000)
+ */
+export function useTaskRunPlaywrightResults(taskRunId: string | null, limit?: number) {
+  const query = useInfiniteQuery({
+    queryKey: [...aiDataKeys.taskRunPlaywrightResults(taskRunId ?? ""), limit],
+    queryFn: async ({ pageParam }): Promise<TaskRunPlaywrightResultsDbResult> =>
+      pageOrThrow(
+        await aiDataService.getTaskRunPlaywrightResults(taskRunId ?? "", limit, pageParam),
+        "Playwright results",
+      ),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: !!taskRunId,
     staleTime: 10000,
   });
+  const data = useMemo(
+    () =>
+      mergeWalk<TaskRunPlaywrightResultsDbResult, TaskRunPlaywrightResultDb>(
+        query.data?.pages,
+        (p) => p.results,
+      ),
+    [query.data],
+  );
+  return { ...query, data };
 }
 
 /**
@@ -457,60 +513,63 @@ export function useTaskRunMigratedLogsSummary(taskRunId: string | null) {
 }
 
 /**
- * Hook to get API requests from SQLite database.
+ * Hook to walk a run's API requests by keyset cursor.
  * @param taskRunId - Task run ID to get API requests for
  * @param successFilter - Optional filter by success status
+ * @param limit - Page size (default 200, max 1000)
  */
 export function useTaskRunApiRequests(
   taskRunId: string | null,
   successFilter?: boolean,
   limit?: number,
-  offset?: number,
 ) {
-  return useQuery({
-    queryKey: [...aiDataKeys.taskRunApiRequests(taskRunId ?? "", successFilter), limit, offset],
-    queryFn: async (): Promise<TaskRunApiRequestsDbResult | null> => {
-      if (!taskRunId) return null;
-      const response = await aiDataService.getTaskRunApiRequests(
-        taskRunId,
-        successFilter,
-        limit,
-        offset,
-      );
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load API requests");
-      }
-      return response.data;
-    },
+  const query = useInfiniteQuery({
+    queryKey: [...aiDataKeys.taskRunApiRequests(taskRunId ?? "", successFilter), limit],
+    queryFn: async ({ pageParam }): Promise<TaskRunApiRequestsDbResult> =>
+      pageOrThrow(
+        await aiDataService.getTaskRunApiRequests(taskRunId ?? "", successFilter, limit, pageParam),
+        "API requests",
+      ),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: !!taskRunId,
     staleTime: 10000,
   });
+  const data = useMemo(
+    () =>
+      mergeWalk<TaskRunApiRequestsDbResult, TaskRunApiRequestDb>(
+        query.data?.pages,
+        (p) => p.requests,
+      ),
+    [query.data],
+  );
+  return { ...query, data };
 }
 
 /**
- * Hook to get AWAS steps from SQLite database.
+ * Hook to walk a run's AWAS steps by keyset cursor.
  * @param taskRunId - Task run ID to get AWAS steps for
  * @param stepType - Optional filter by step type ('awas_discover', 'awas_execute', etc.)
+ * @param limit - Page size (default 200, max 1000)
  */
-export function useTaskRunAwasSteps(
-  taskRunId: string | null,
-  stepType?: string,
-  limit?: number,
-  offset?: number,
-) {
-  return useQuery({
-    queryKey: [...aiDataKeys.taskRunAwasSteps(taskRunId ?? "", stepType), limit, offset],
-    queryFn: async (): Promise<TaskRunAwasStepsDbResult | null> => {
-      if (!taskRunId) return null;
-      const response = await aiDataService.getTaskRunAwasSteps(taskRunId, stepType, limit, offset);
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load AWAS steps");
-      }
-      return response.data;
-    },
+export function useTaskRunAwasSteps(taskRunId: string | null, stepType?: string, limit?: number) {
+  const query = useInfiniteQuery({
+    queryKey: [...aiDataKeys.taskRunAwasSteps(taskRunId ?? "", stepType), limit],
+    queryFn: async ({ pageParam }): Promise<TaskRunAwasStepsDbResult> =>
+      pageOrThrow(
+        await aiDataService.getTaskRunAwasSteps(taskRunId ?? "", stepType, limit, pageParam),
+        "AWAS steps",
+      ),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: !!taskRunId,
     staleTime: 10000,
   });
+  const data = useMemo(
+    () => mergeWalk<TaskRunAwasStepsDbResult, TaskRunAwasStepDb>(query.data?.pages, (p) => p.steps),
+    [query.data],
+  );
+  return { ...query, data };
 }
 
 /**

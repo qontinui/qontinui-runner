@@ -21,6 +21,10 @@ requests = "^2.31"
 pynput = "^1.7"
 httpx = "^0.28"
 aiohttp = "^3.9"
+# Outbound TLS verifies against the OS trust store instead of certifi's bundle
+# (os_trust.py, imported first by every spawned entry point), so a corporate
+# root IT installed into the store is trusted behind a TLS-inspecting proxy.
+truststore = "^0.10"
 # Web stack for embedding_server.py (standalone FastAPI service on port 8001,
 # launched by the runner's Process Manager — see dev_services.rs). These are
 # imported directly by embedding_server.py and are NOT pulled transitively by

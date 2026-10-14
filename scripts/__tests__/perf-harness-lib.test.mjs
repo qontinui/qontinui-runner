@@ -31,6 +31,14 @@ import {
   renderComparison,
   foldFrontendSample,
   foldChunkRates,
+  GENERATOR_PRESETS,
+  buildGeneratorCommand,
+  unwrapTransportStats,
+  framesAbove,
+  normalizeFrontendTransport,
+  foldIpcFallback,
+  foldTransport,
+  renderTransportSection,
 } from "../perf-harness-lib.mjs";
 
 // ---------------------------------------------------------------------------
@@ -533,4 +541,240 @@ test("foldChunkRates nulls the derived rates instead of dividing by zero", () =>
   assert.equal(chunks.bytesPerSec, null);
   assert.equal(chunks.webviewEventsPerSec, null);
   assert.equal(chunks.paintsPerWebviewEvent, null);
+});
+
+// ---------------------------------------------------------------------------
+// Transport counters (plan 2026-09-20-terminal-output-transport-is-unmeasured-
+// encoded-broadcast, Phase 1)
+// ---------------------------------------------------------------------------
+
+/** A `GET /terminals/transport-stats` body in the route's exact shape. */
+function transportDoc(overrides = {}) {
+  return {
+    since_reset_ms: 10000,
+    reader: { chunks: 1000, bytes: 20_000_000 },
+    encode: {
+      count: 1000,
+      frame_count: 500,
+      ns: 40_000_000,
+      bytes_in: 20_000_000,
+      bytes_out: 26_700_000,
+      waste: 250,
+    },
+    legs: {
+      sse: { chunks: 0, bytes: 0 },
+      ws: { chunks: 1000, bytes: 26_800_000 },
+      webview: { emits: 800, emit_ns: 40_000_000, bytes: 21_000_000 },
+    },
+    pipe: { chunks: 1000, decode_ns: 10_000_000, redact_ns: 5_000_000, reencode_ns: 15_000_000 },
+    ring_replay: { calls: 4, bytes: 4_194_304 },
+    frame_size_hist: {
+      bounds: [1024, 4096, 16384, 49152, 65536, 262144],
+      counts: [100, 100, 300, 300, 100, 80, 20],
+    },
+    ...overrides,
+  };
+}
+
+/** A `window.__qontinuiTransportStats` snapshot as the probe returns it. */
+function frontendSnapshot() {
+  return {
+    enabled: true,
+    sinceResetMs: 10000,
+    decodeNs: { pane: 30_000_000, tap: 50_000_000 },
+    decodeCalls: { pane: 300, tap: 800 },
+    decodeBytes: { pane: 6_000_000, tap: 16_000_000 },
+    writeToRenderNs: 3_000_000_000,
+    writeToRenderCount: 300,
+    writeToRenderBytes: 6_000_000,
+    eventsDelivered: 800,
+    eventsForeign: 200,
+    ringReplay: { fetches: 3, bytesFetched: 3_145_728, bytesWritten: 12_288 },
+    rawIpc: null,
+  };
+}
+
+test("buildGeneratorCommand runs the node generator at the terminal's geometry", () => {
+  assert.deepEqual(GENERATOR_PRESETS, ["tui-repaint", "spinner"]);
+  assert.equal(
+    buildGeneratorCommand({ preset: "tui-repaint", scriptPath: "/r/scripts/g.mjs", cols: 120, rows: 30 }),
+    'node "/r/scripts/g.mjs" --fps 30 --cols 120 --rows 30',
+  );
+  assert.equal(
+    buildGeneratorCommand({
+      preset: "spinner",
+      scriptPath: "C:\\Users\\a b\\g.mjs",
+      cols: 80,
+      rows: 24,
+      fps: 10,
+    }),
+    'node "C:\\Users\\a b\\g.mjs" --fps 10 --cols 80 --rows 24 --spinner',
+  );
+});
+
+test("buildGeneratorCommand refuses an unknown preset and an unquotable path", () => {
+  assert.throws(
+    () => buildGeneratorCommand({ preset: "date", scriptPath: "/g.mjs", cols: 1, rows: 1 }),
+    /unknown --generator-preset/,
+  );
+  // Each is live inside double quotes in some shell: `"` everywhere, `$` in
+  // PowerShell/POSIX, backtick in PowerShell/POSIX, `!` in bash, `%` in cmd.
+  for (const bad of ['/a"b.mjs', "/a$HOME.mjs", "/a`b.mjs", "/a!b.mjs", "C:\\a%TEMP%.mjs"]) {
+    assert.throws(
+      () => buildGeneratorCommand({ preset: "spinner", scriptPath: bad, cols: 1, rows: 1 }),
+      /quoted/,
+      bad,
+    );
+  }
+  // Spaces, parentheses and a single quote are literal inside double quotes.
+  assert.equal(
+    buildGeneratorCommand({
+      preset: "tui-repaint",
+      scriptPath: "/home/o'neil/x (1)/g.mjs",
+      cols: 1,
+      rows: 1,
+    }),
+    `node "/home/o'neil/x (1)/g.mjs" --fps 30 --cols 1 --rows 1`,
+  );
+});
+
+test("unwrapTransportStats accepts a document without encode.frame_count, and folds its waste % to UNKNOWN", () => {
+  const doc = transportDoc();
+  delete doc.encode.frame_count;
+  assert.equal(unwrapTransportStats(doc), doc);
+  const d = foldTransport({ backend: doc }).derived;
+  assert.equal(d.encodeFrameCount, null);
+  assert.equal(d.encodeWastePct, null, "never silently falls back to encode.count");
+  const bad = transportDoc();
+  bad.encode.frame_count = "500";
+  assert.equal(unwrapTransportStats(bad), null);
+});
+
+test("unwrapTransportStats accepts the bare document and the ApiResponse envelope", () => {
+  const doc = transportDoc();
+  assert.equal(unwrapTransportStats(doc), doc);
+  assert.equal(unwrapTransportStats({ success: true, data: doc }), doc);
+});
+
+test("unwrapTransportStats treats a failed or partial answer as UNKNOWN (null)", () => {
+  assert.equal(unwrapTransportStats({ success: false, data: transportDoc() }), null);
+  assert.equal(unwrapTransportStats(null), null);
+  assert.equal(unwrapTransportStats({ since_reset_ms: 1 }), null);
+  const badHist = transportDoc({ frame_size_hist: { bounds: [], counts: [1, 2] } });
+  assert.equal(unwrapTransportStats(badHist), null);
+});
+
+test("framesAbove sums the buckets strictly over a bound", () => {
+  const hist = transportDoc().frame_size_hist;
+  assert.equal(framesAbove(hist, 49152), 200);
+  assert.equal(framesAbove(hist, 262144), 20);
+  assert.equal(framesAbove(hist, 50000), null, "a non-bound threshold would straddle a bucket");
+  assert.equal(framesAbove({ counts: [1] }, 49152), null);
+});
+
+test("normalizeFrontendTransport is null for a webview without the object", () => {
+  assert.equal(normalizeFrontendTransport(null), null);
+  assert.equal(normalizeFrontendTransport({}), null);
+  const n = normalizeFrontendTransport(frontendSnapshot());
+  assert.equal(n.decodeNs.tap, 50_000_000);
+  assert.equal(n.rawIpc, null);
+  assert.equal(n.timingEnabled, true);
+});
+
+test("foldIpcFallback distinguishes a flip, a clean window and UNKNOWN", () => {
+  assert.equal(foldIpcFallback({ fallbackWarned: true }).postMessageFallback, true);
+  assert.equal(
+    foldIpcFallback({ postMessageHooked: true, postMessageCalls: 3 }).postMessageFallback,
+    true,
+  );
+  assert.equal(
+    foldIpcFallback({ postMessageHooked: true, postMessageCalls: 0 }).postMessageFallback,
+    false,
+  );
+  assert.equal(foldIpcFallback({ postMessageHooked: false }).postMessageFallback, null);
+  assert.equal(foldIpcFallback(null).postMessageFallback, null);
+});
+
+test("foldTransport derives the kill-criteria ratios", () => {
+  const t = foldTransport({
+    backend: transportDoc(),
+    frontend: normalizeFrontendTransport(frontendSnapshot()),
+    ipc: { postMessageHooked: true, postMessageCalls: 0 },
+    altScreen: { sampled: 4, onAltScreen: 1 },
+  });
+  const d = t.derived;
+  assert.equal(d.readerBytesPerSec, 2_000_000);
+  assert.equal(d.encodeNsPerChunk, 40_000);
+  // waste / frame_count (500), NOT waste / count (1000): flush encodes are never waste.
+  assert.equal(d.encodeFrameCount, 500);
+  assert.equal(d.encodeWastePct, 50);
+  assert.equal(d.webviewEmitNsPerEmit, 50_000);
+  assert.equal(d.pipeNsPerChunk, 30_000);
+  assert.equal(d.framesOverRelayHazard, 200);
+  assert.equal(d.framesOverRelayHazardPct, 20);
+  assert.equal(d.paneDecodeNsPerCall, 100_000);
+  assert.equal(d.writeToRenderMsMean, 10);
+  assert.equal(d.eventsForeignPct, 25);
+  assert.equal(d.ringReplayFetchToWriteRatio, 256);
+  // (40 + 40 + 30 + 50) ms of transport against 3000 ms of write->render.
+  assert.ok(Math.abs(d.k1TransportSharePct - (160 / 3160) * 100) < 1e-9);
+  assert.equal(t.ipc.postMessageFallback, false);
+  assert.deepEqual(t.altScreen, { sampled: 4, onAltScreen: 1 });
+});
+
+test("foldTransport keeps a missing half UNKNOWN with its reason", () => {
+  const t = foldTransport({
+    backend: null,
+    backendError: "GET /terminals/transport-stats: 404",
+    frontend: normalizeFrontendTransport(frontendSnapshot()),
+  });
+  assert.equal(t.backend, null);
+  assert.equal(t.backendError, "GET /terminals/transport-stats: 404");
+  assert.equal(t.derived.encodeNsPerChunk, undefined);
+  assert.equal(t.derived.k1TransportSharePct, undefined);
+  assert.equal(t.derived.eventsForeignPct, 25);
+  assert.equal(t.ipc.postMessageFallback, null);
+});
+
+test("flattenRun and compareRuns carry the transport metrics", () => {
+  const withTransport = (label, encodeNs) => {
+    const run = makeRun(label, { createP50: 100, createP95: 200, frameP95: 20, longTasks: 5, fps: 60 });
+    run.levels[0].transport = foldTransport({
+      backend: transportDoc({
+        encode: { count: 1000, frame_count: 800, ns: encodeNs, bytes_in: 1, bytes_out: 1, waste: 0 },
+      }),
+      frontend: normalizeFrontendTransport(frontendSnapshot()),
+    });
+    return run;
+  };
+  const before = withTransport("before", 40_000_000);
+  const after = withTransport("after", 10_000_000);
+  assert.equal(flattenRun(before)["S10/transport.encode_ns_per_chunk"], 40_000);
+  assert.equal(flattenRun(before)["S10/transport.encode_frame_count"], 800);
+  assert.equal(flattenRun(before)["S10/transport.encode_waste_pct"], 0);
+  const row = compareRuns(before, after).find(
+    (r) => r.key === "S10/transport.encode_ns_per_chunk",
+  );
+  assert.equal(row.unit, "ns");
+  assert.equal(row.verdict, "better");
+  assert.equal(metricMeta("S10/transport.reader_bytes_per_sec").lowerIsBetter, false);
+});
+
+test("renderTransportSection tabulates levels and names an UNAVAILABLE half", () => {
+  const run = makeRun("x", { createP50: 100, createP95: 200, frameP95: 20, longTasks: 5, fps: 60 });
+  assert.equal(renderTransportSection(run), "", "no transport block, no section");
+  run.levels[0].transport = foldTransport({
+    backend: null,
+    backendError: "GET /terminals/transport-stats: 404",
+    frontend: normalizeFrontendTransport(frontendSnapshot()),
+    ipc: { fallbackWarned: true },
+    altScreen: { sampled: 3, onAltScreen: 0 },
+  });
+  const md = renderTransportSection(run);
+  assert.ok(md.includes("K1 share %"));
+  assert.ok(md.includes("waste % (of frame)"));
+  assert.ok(md.includes("runner counters UNAVAILABLE — GET /terminals/transport-stats: 404"));
+  assert.ok(md.includes("| YES"));
+  assert.ok(md.includes("0/3"));
+  assert.ok(renderSingleRun(run).includes("#### Transport"));
 });
