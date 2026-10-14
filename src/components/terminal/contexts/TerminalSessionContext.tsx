@@ -802,7 +802,7 @@ const PageSessionScope = memo(function PageSessionScope({
       // keep painting the previous session's messages under it, so close it.
       rightPanelModeSetterRef.current((mode) => rightPanelModeAfterRowSelect(source, mode));
     },
-    onCloseSessionTab: terminalManager.closeTerminal,
+    onCloseSessionTab: terminalManager.closeTerminalReporting,
     visibleTabIds,
     tabLockStates,
     pageId,
