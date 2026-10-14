@@ -3524,6 +3524,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_session_list_history,
             commands::terminal::terminal_session_list_open,
             commands::terminal::terminal_holder_sweep_settled,
+            commands::terminal::terminal_holder_sweep_status,
             commands::terminal::terminal_session_mark_restore_pending,
             commands::terminal::terminal_session_record_close,
             commands::terminal::terminal_session_set_finished,

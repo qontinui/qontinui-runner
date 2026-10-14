@@ -80,6 +80,60 @@ export async function waitForHolderSweep(): Promise<boolean> {
   }
 }
 
+/** The boot sweep as the restore sees it before it starts. */
+export interface HolderSweepStatus {
+  settled: boolean;
+  /**
+   * Terminal ids of live holder panes still being adopted. `null` when the
+   * census did not come in within the runner's wait — the restore then waits
+   * for the whole sweep instead.
+   */
+  held: ReadonlySet<string> | null;
+}
+
+/**
+ * The PTY-holder boot sweep's status as soon as its CENSUS is in — a few
+ * seconds at most, not the whole sweep (review round 4, M1): which panes are
+ * HELD (live, still being adopted). The restore restores every other record
+ * at once, and waits only for the held ones. An error (an older runner
+ * without the command, so no sweep) is "settled, nothing held". Exported for
+ * tests.
+ */
+export async function fetchHolderSweepStatus(): Promise<HolderSweepStatus> {
+  try {
+    const resp = await invoke<CommandResponse>("terminal_holder_sweep_status");
+    const data = resp?.data as { settled?: boolean; held?: string[] | null } | undefined;
+    return {
+      settled: data?.settled !== false,
+      held: Array.isArray(data?.held) ? new Set(data.held) : null,
+    };
+  } catch (err) {
+    console.warn(`[TerminalPage] terminal_holder_sweep_status unavailable: ${err}`);
+    return { settled: true, held: new Set() };
+  }
+}
+
+/**
+ * Split the restore's records by the sweep's census: those whose terminal a
+ * holder pane is still being adopted into are HELD BACK (they come back as an
+ * adopted tab, or through the re-run after the sweep settles); every other
+ * record is restored NOW. A settled sweep holds nothing back. Pure; exported
+ * for tests.
+ */
+export function splitRestoreByHold<T extends { terminalId: string }>(
+  records: readonly T[],
+  status: HolderSweepStatus,
+): { now: T[]; heldBack: T[] } {
+  if (status.settled || status.held === null || status.held.size === 0) {
+    return { now: [...records], heldBack: [] };
+  }
+  const held = status.held;
+  return {
+    now: records.filter((r) => !held.has(r.terminalId)),
+    heldBack: records.filter((r) => held.has(r.terminalId)),
+  };
+}
+
 /** How many more times {@link recheckRefusedAfterSweep} waits for the sweep. */
 export const HOLDER_SWEEP_RECHECK_ATTEMPTS = 3;
 
@@ -98,15 +152,19 @@ export const HOLDER_SWEEP_RECHECK_ATTEMPTS = 3;
 export async function recheckRefusedAfterSweep(
   refused: readonly string[],
   liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+  heldBack: readonly string[] = [],
 ): Promise<string[]> {
-  if (refused.length === 0) return [];
+  if (refused.length === 0 && heldBack.length === 0) return [];
   let settled = false;
   for (let i = 0; i < HOLDER_SWEEP_RECHECK_ATTEMPTS && !settled; i++) {
     settled = await waitForHolderSweep();
   }
-  if (!settled) return [];
-  const live = await liveIds();
-  return refused.filter((id) => decideColdResume(live, id) === "respawn");
+  // Held-back records are always restored after the wait — the re-run
+  // reconnects the ones that were adopted, and applies the same live-process
+  // check to the rest. Refused ones only once the sweep SETTLED.
+  if (!settled) return [...heldBack];
+  const live = refused.length > 0 ? await liveIds() : null;
+  return [...heldBack, ...refused.filter((id) => decideColdResume(live, id) === "respawn")];
 }
 
 /** The restore set for a page, or the coord device drain's deferral of it. */
@@ -1034,8 +1092,10 @@ export function useTerminalInitialization({
     // A re-run for the holder sweep's late settle restores only these.
     const recheckOnly = holderSweepRecheck.current.get(initPageId);
     holderSweepRecheck.current.delete(initPageId);
-    // Sessions THIS run refuses as live while the sweep is unsettled.
+    // Sessions THIS run refuses as live while the sweep is unsettled, and
+    // sessions it holds back because their pane is still being adopted.
     const refusedWhileSweeping: string[] = [];
+    const heldBackWhileSweeping: string[] = [];
 
     // Per-page restore queue (Phase 3): local to this page's init run so a
     // second page initializing before this one's drain timer fires can't see
@@ -1077,9 +1137,15 @@ export function useTerminalInitialization({
         //    the next activation retry. (Same null-awareness as the plan-tab
         //    cold-start check in step 4 below.)
         // Holder panes that survived the last runner exit are adopted by the
-        // runner's boot sweep; wait for it, so they are reconnected below
-        // rather than mistaken for dead sessions.
-        const holderSweepSettled = await waitForHolderSweep();
+        // runner's boot sweep. Learn its census first (seconds, not the whole
+        // sweep): every record whose pane is NOT held is restored now; the
+        // held ones wait for the sweep (review round 4, M1). Without a census
+        // — or on a re-run for its late settle — fall back to the full wait.
+        const sweepStatus = recheckOnly
+          ? { settled: await waitForHolderSweep(), held: new Set<string>() }
+          : await fetchHolderSweepStatus();
+        const holderSweepSettled =
+          sweepStatus.held === null ? await waitForHolderSweep() : sweepStatus.settled;
         const reconnectDecision = decideReconnectOutcome(await reconnectToExistingSessions());
         if (reconnectDecision.kind === "abort-restore") {
           restoreAborted = true;
@@ -1197,10 +1263,19 @@ export function useTerminalInitialization({
         //    are claimed from records FIRST so the creation-order auto-fill in
         //    `useZoneLayout` can never steal a zone a record owns (it only fills
         //    zones still empty after this loop runs).
+        const { heldBack } = splitRestoreByHold(openRecords, {
+          settled: holderSweepSettled,
+          held: sweepStatus.held,
+        });
+        const heldBackIds = new Set(heldBack.map((r) => r.terminalId));
+        for (const r of heldBack) heldBackWhileSweeping.push(r.claudeSessionId);
         for (const [recIndex, rec] of openRecords.entries()) {
           // A re-run for the holder sweep's late settle restores ONLY the
           // sessions that settle showed resumable.
           if (recheckOnly && !recheckOnly.has(rec.claudeSessionId)) continue;
+          // Its holder pane is still being adopted: it comes back as that
+          // tab, or through the re-run once the sweep settles.
+          if (heldBackIds.has(rec.terminalId)) continue;
           // A Conductor worker (Phase 2b): no PTY exists or should exist for
           // it. Adopt the record as a `sessionBacked` tab and let
           // `reconcileAssignments` place it — every worker record is written
@@ -1582,11 +1657,15 @@ export function useTerminalInitialization({
         // cause) instead of a permanently blank window.
         setInitialized(true);
         // The PTY-holder boot sweep had not settled, and this run refused
-        // some sessions as live: once it settles, re-decide exactly those, and
-        // re-run the restore (merging, like a drain re-run) for the ones that
-        // are no longer hosted by a live process.
-        if (refusedWhileSweeping.length > 0) {
-          void recheckRefusedAfterSweep(refusedWhileSweeping).then((resumable) => {
+        // some sessions as live or held some back for an adoption in flight:
+        // once it settles, re-run the restore (merging, like a drain re-run)
+        // for the held-back ones and the refused ones no longer hosted live.
+        if (refusedWhileSweeping.length > 0 || heldBackWhileSweeping.length > 0) {
+          void recheckRefusedAfterSweep(
+            refusedWhileSweeping,
+            fetchLiveClaudeSessionIds,
+            heldBackWhileSweeping,
+          ).then((resumable) => {
             if (resumable.length === 0) return;
             console.warn(
               `[TerminalPage] the holder sweep settled late; resuming ${resumable.length} ` +
