@@ -77,7 +77,11 @@ export function normalizeInfoList(raw: unknown): SessionInfoListView {
   const byId = new Map<string, SessionInfoState>();
   for (const env of v.sessions) {
     const state = normalizeSessionInfo(env);
-    const id = state.body?.identity.claudeSessionId;
+    // A row the runner could not read carries no body, only the id it was
+    // asked for — index it by that so the row shows the real reason.
+    const wireId = (env as { claudeSessionId?: unknown } | null)?.claudeSessionId;
+    const id =
+      state.body?.identity.claudeSessionId ?? (typeof wireId === "string" ? wireId : undefined);
     if (id) byId.set(id, state);
   }
   const notFound = new Set(
