@@ -317,6 +317,10 @@ describe("useSessionOrg client", () => {
     expect(transport.apply).toHaveBeenCalledTimes(1);
     late.resolve();
     await unpin;
+    await flush();
+    // Reads: the initial one, the timeout's re-read, and one more when the
+    // timed-out call landed late.
+    expect((transport.get as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(3);
     // The store applied them in the order they were made.
     const stored = await transport.get();
     expect(stored.org?.members.s1?.pinned ?? false).toBe(false);
@@ -334,14 +338,13 @@ describe("useSessionOrg client", () => {
     transport.apply = vi.fn(async () => {
       throw new Error("down");
     });
-    transport.getFails = true;
     const client = createSessionOrgClient(transport);
     client.retain();
     await flush();
-    transport.getFails = false;
-    await flush();
     const runs = [1, 2, 3, 4, 5].map((n) =>
-      client.apply([{ op: "setPinned", sessionKeys: [`s${n}`], pinned: true }]).catch(() => undefined),
+      client
+        .apply([{ op: "setPinned", sessionKeys: [`s${n}`], pinned: true }])
+        .catch(() => undefined),
     );
     await Promise.all(runs);
     const view = client.getView();
@@ -349,7 +352,6 @@ describe("useSessionOrg client", () => {
       "not applied: down; not applied: down; not applied: down (+2 more)",
     );
   });
-
 
   it("a refused op vanishes from the view and is reported", async () => {
     const { transport } = fakeTransport(known(emptyOrg()));
