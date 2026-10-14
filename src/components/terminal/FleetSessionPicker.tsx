@@ -460,6 +460,14 @@ export function FleetSessionPicker() {
     tenantPin,
     tenantCandidates,
   );
+  // A pick that resolved STALE (its binding went away) is consumed here, during
+  // render — React's adjust-state-on-change pattern, not an effect — so a
+  // binding that later returns does not silently re-select it, and its device
+  // filter goes with it exactly as on an explicit switch (`chooseFleetTenant`).
+  if (fleetTenantPick !== undefined && fleetTenant !== fleetTenantPick) {
+    setFleetTenantPick(undefined);
+    setServer((s) => ({ ...s, deviceId: null }));
+  }
   const allTenants = isAllTenants(fleetTenant);
   /** One independent cursor walk per entry — coord fingerprints the tenant into
    * its cursor, so a union is N walks, never one wider one. */
