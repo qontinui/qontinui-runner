@@ -11,7 +11,11 @@ const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
-import { readOccupiedPageIds, type TerminalPageConfig } from "./useTerminalPages";
+import {
+  readOccupiedPageIds,
+  closeEmptyPagesWith,
+  type TerminalPageConfig,
+} from "./useTerminalPages";
 import { TerminalPageTabBar } from "./TerminalPageTabBar";
 
 function answer(terminals: unknown, sessions: unknown) {
@@ -110,5 +114,71 @@ describe("TerminalPageTabBar close-empty button", () => {
     const html = render([page("a"), page("b")], true, 2);
     expect(html).toContain("Close 2 empty tabs");
     expect(html).not.toContain('disabled=""');
+  });
+});
+
+describe("closeEmptyPagesWith (the close loop)", () => {
+  const pg = (id: string): TerminalPageConfig => ({ id, name: id, createdAt: 0 });
+  const pages = [pg("a"), pg("b"), pg("c")];
+
+  it("closes only the pages that are empty on both reads", async () => {
+    const removed: string[] = [];
+    const n = await closeEmptyPagesWith(
+      pages,
+      async () => new Set(["a"]),
+      async (id) => {
+        removed.push(id);
+      },
+    );
+    expect(removed).toEqual(["b", "c"]);
+    expect(n).toBe(2);
+  });
+
+  it("closes nothing when occupancy is unreadable", async () => {
+    const remove = vi.fn(async () => {});
+    expect(await closeEmptyPagesWith(pages, async () => null, remove)).toBe(0);
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("skips a page that became occupied between the first read and its turn", async () => {
+    const removed: string[] = [];
+    // read #1 picks candidates b and c; by the time b's per-page re-check runs,
+    // a terminal has landed on b.
+    const reads = [new Set(["a"]), new Set(["a", "b"]), new Set(["a", "b"])];
+    const n = await closeEmptyPagesWith(
+      pages,
+      async () => reads.shift() ?? null,
+      async (id) => {
+        removed.push(id);
+      },
+    );
+    expect(removed).toEqual(["c"]);
+    expect(n).toBe(1);
+  });
+
+  it("skips a page whose re-check cannot be read", async () => {
+    const removed: string[] = [];
+    const reads: Array<Set<string> | null> = [new Set(["a"]), null, new Set(["a"])];
+    const n = await closeEmptyPagesWith(
+      pages,
+      async () => reads.shift() ?? null,
+      async (id) => {
+        removed.push(id);
+      },
+    );
+    expect(removed).toEqual(["c"]);
+    expect(n).toBe(1);
+  });
+
+  it("keeps one page when every visible page is empty", async () => {
+    const removed: string[] = [];
+    await closeEmptyPagesWith(
+      pages,
+      async () => new Set(),
+      async (id) => {
+        removed.push(id);
+      },
+    );
+    expect(removed).toEqual(["b", "c"]);
   });
 });
