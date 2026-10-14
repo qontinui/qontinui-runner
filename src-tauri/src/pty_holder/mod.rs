@@ -15,7 +15,8 @@
 //!   teardown, reaping).
 //! - The pane side is the bin's `terminal::daemon_pane_io::DaemonPaneIo`, the
 //!   third `PaneIo` impl, chosen per spawn by the `terminal.pty_holder`
-//!   setting (`settings::TerminalSettings`; default ON since Phase 5).
+//!   setting (`settings::TerminalSettings`; default ON on Linux since Phase
+//!   5, OFF on Windows and macOS).
 //!
 //! Phase 5 makes `/restart-readiness` count holder panes: the bin's
 //! `terminal::holder_census` takes the same census the boot sweep classifies
