@@ -206,7 +206,75 @@ describe("useSessionOrg client", () => {
     expect(calls).toHaveLength(2);
     expect((calls[1][0] as SessionOrgOp[])[0]).toMatchObject({ op: "setPinned", pinned: false });
     const view = client.getView();
-    expect(view.phase === "known" && view.org.members.s1?.pinned).not.toBe(true);
+    expect(view.phase).toBe("known");
+    if (view.phase !== "known") return;
+    expect(view.org.members.s1?.pinned ?? false).toBe(false);
+  });
+
+  it("a queued apply still goes out after the one ahead of it fails, and keeps that failure", async () => {
+    const { transport } = fakeTransport(known(emptyOrg()));
+    const real = transport.apply;
+    let first = true;
+    transport.apply = vi.fn(async (ops: SessionOrgOp[]) => {
+      if (first) {
+        first = false;
+        throw new Error("invoke failed");
+      }
+      return real(ops);
+    });
+    const client = createSessionOrgClient(transport);
+    client.retain();
+    await flush();
+    const pin = client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: true }]);
+    const tag = client.apply([{ op: "addTags", sessionKeys: ["s1"], tags: ["x"] }]);
+    await expect(pin).rejects.toThrow("invoke failed");
+    await tag;
+    expect(transport.apply).toHaveBeenCalledTimes(2);
+    const view = client.getView();
+    expect(view.phase).toBe("known");
+    if (view.phase !== "known") return;
+    expect(view.org.members.s1?.tags).toEqual(["x"]);
+    // The later success does not erase the earlier failure.
+    expect(view.lastError).toBe("not applied: invoke failed");
+  });
+
+  it("once idle, the next apply is sent at once and starts with a clean error", async () => {
+    const { transport } = fakeTransport(known(emptyOrg()));
+    const client = createSessionOrgClient(transport);
+    client.retain();
+    await flush();
+    await client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: true }]);
+    await flush();
+    void client.apply([{ op: "setPinned", sessionKeys: ["s2"], pinned: true }]);
+    // Sent synchronously: nothing is in flight to wait behind.
+    expect(transport.apply).toHaveBeenCalledTimes(2);
+  });
+
+  it("an apply that is never answered times out, withdraws its preview and frees the queue", async () => {
+    const { transport } = fakeTransport(known(emptyOrg()));
+    const real = transport.apply;
+    let first = true;
+    transport.apply = vi.fn((ops: SessionOrgOp[]) => {
+      if (first) {
+        first = false;
+        return new Promise<SessionOrgApplyResponse>(() => {});
+      }
+      return real(ops);
+    });
+    const client = createSessionOrgClient(transport, 20);
+    client.retain();
+    await flush();
+    const lost = client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: true }]);
+    const next = client.apply([{ op: "setPinned", sessionKeys: ["s2"], pinned: true }]);
+    await expect(lost).rejects.toThrow(/no answer from session_org_apply/);
+    await next;
+    expect(transport.apply).toHaveBeenCalledTimes(2);
+    const view = client.getView();
+    expect(view.phase).toBe("known");
+    if (view.phase !== "known") return;
+    expect(view.pending).toBe(0);
+    expect(view.org.members.s2?.pinned).toBe(true);
+    expect(view.org.members.s1?.pinned ?? false).toBe(false);
   });
 
   it("a refused op vanishes from the view and is reported", async () => {
