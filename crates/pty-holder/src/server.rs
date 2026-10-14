@@ -175,6 +175,9 @@ pub struct Holder {
     pane: Arc<Pane>,
     listener: Listener,
     log: PathBuf,
+    /// The pane's durable tail (plan D7): written by its own timer thread and
+    /// once more when the holder ends.
+    scrollback: Arc<Mutex<crate::scrollback::ScrollbackWriter>>,
     // Held for the holder's lifetime; dropping it releases the pane.
     lock: PaneLock,
 }
@@ -258,11 +261,14 @@ impl Holder {
                 return Err(StartError::Io(e));
             }
         };
+        let scrollback =
+            crate::scrollback::ScrollbackWriter::new(pane_dir, pane_id, pane.child_pid());
         Ok(Holder {
             info: Arc::new(info),
             pane,
             listener,
             log: log_path(pane_dir, pane_id),
+            scrollback: Arc::new(Mutex::new(scrollback)),
             lock,
         })
     }
@@ -290,25 +296,39 @@ impl Holder {
 
     /// Serve until the holder may exit (`crate::pty::Pane::wait_for_end`) and
     /// return the child's exit. The accept loop runs on its own thread and
-    /// never ends the holder; the lock is held until this returns.
+    /// never ends the holder; the lock is held until this returns. The durable
+    /// tail is persisted on its timer throughout, and once more — the child's
+    /// last output — before the lock is released.
     pub fn run(self) -> ExitReply {
         let Holder {
             info,
             pane,
             listener,
             log,
+            scrollback,
             lock,
         } = self;
+        if let Err(e) = crate::scrollback::spawn_persister(
+            Arc::clone(&pane),
+            Arc::clone(&scrollback),
+            log.clone(),
+        ) {
+            // No timer: the pane runs on; its tail is still persisted at the
+            // end below.
+            log_line(&log, &format!("scrollback thread: {e}"));
+        }
         let accept_pane = Arc::clone(&pane);
+        let accept_log = log.clone();
         let spawned = std::thread::Builder::new()
             .name("pty-holder-accept".into())
-            .spawn(move || accept_loop(&listener, &info, &accept_pane, &log));
+            .spawn(move || accept_loop(&listener, &info, &accept_pane, &accept_log));
         if let Err(e) = spawned {
             // No accept loop: the pane runs on, unreachable but alive and
             // counted (its lock is held), until the child exits.
             eprintln!("pty-holder: accept thread: {e}");
         }
         let exit = pane.wait_for_end();
+        crate::scrollback::persist_tick(&pane, &scrollback, &log);
         drop(lock);
         exit
     }

@@ -32,6 +32,8 @@ const GUARDED: &[(&str, &str)] = &[
     // Phase 2 data path: the PTY owner, its ring, the spec, the spawner.
     ("pty.rs", include_str!("pty.rs")),
     ("ring.rs", include_str!("ring.rs")),
+    // Phase 4: the ring's durable tail.
+    ("scrollback.rs", include_str!("scrollback.rs")),
     ("spec.rs", include_str!("spec.rs")),
     ("startup.rs", include_str!("startup.rs")),
     ("spawn.rs", include_str!("spawn.rs")),

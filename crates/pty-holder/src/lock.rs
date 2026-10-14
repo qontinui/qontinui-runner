@@ -139,7 +139,8 @@ pub fn read_record(path: &Path) -> Option<LockRecord> {
 /// Largest lock record [`read_record`] will read.
 pub const MAX_RECORD_LEN: u64 = 64 * 1024;
 
-/// Open a lock file refusing anything but a regular file this user owns.
+/// Open a lock file refusing anything but a regular file this user owns. Also
+/// the open `crate::scrollback` reads a persisted tail through.
 ///
 /// Unix: `O_NOFOLLOW` (a symlink at the lock path fails the open with
 /// `ELOOP` instead of locking or truncating whatever it points at) and
@@ -147,7 +148,7 @@ pub const MAX_RECORD_LEN: u64 = 64 * 1024;
 /// `fstat` of the OPENED fd — not a racy `stat` of the path — must say
 /// regular file and our euid. Windows: regular-file check only; the directory
 /// is the per-user app-data tree.
-fn open_checked(opts: &mut OpenOptions, path: &Path) -> io::Result<File> {
+pub(crate) fn open_checked(opts: &mut OpenOptions, path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
