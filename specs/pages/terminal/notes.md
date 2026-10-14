@@ -118,3 +118,23 @@ the IR, from this table, or off the element's own `data-effect`.
   counted as a non-match.
 - **Hover card and unseen dot have no runnable jsdom test** on a box without
   `jsdom`; the Phase 8 temp-runner UI Bridge run is their live check.
+- **What the UI Bridge can and cannot drive here** (measured on the Phase 8
+  temp-runner run, 2026-10-14):
+  - Context menus: `rightClick` on a row, and on a group header (which
+    declares `GROUP_HEADER_ACTIONS`), opens the row / group menu. Builds
+    before qontinui-runner `0c8290a10` refused every right-click on the control
+    route. A menu closes when an item is chosen; a bridge `click` elsewhere
+    does not dismiss it (it listens for `mousedown`).
+  - Drag-and-drop is not advertised on rows or headers, so the `drag` action
+    is refused — move sessions with `session-org` `add-to-group` /
+    `move-group`.
+  - Typing into `terminal.session-org.query-input` with the `type` action
+    reports success but leaves the query unchanged (the palette input, with
+    the same action list, types fine) — set the query with `session-query`
+    `set-query` until that is resolved.
+  - The close dialog's buttons are re-registered per phase; after a close the
+    result list's **Done** is `terminal.session-org.close-cancel`.
+  - Recently closed lives in the **Previous** view, not the Live one.
+  - Status of a fixture: an idle `claude` stand-in must draw the `❯` prompt on
+    its cursor row, or `graceful_exit` refuses it ("not at an empty prompt")
+    and nothing is closed — by design, never a kill.
