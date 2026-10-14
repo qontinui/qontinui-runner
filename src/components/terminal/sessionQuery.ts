@@ -541,9 +541,18 @@ export type TextSearchResult =
       matched: ReadonlySet<string>;
       /** Ids in scope that were NOT searched (time budget, unreadable). */
       notScanned: ReadonlySet<string>;
+      /**
+       * Named ids the runner found no transcript for. "Not found" may mean
+       * "could not read", so a missing id is unknown — never "no match".
+       */
+      missing: ReadonlySet<string>;
       /** More matched than the limit returned — a non-hit is then unknown. */
       limitHit: boolean;
-      /** The scan was unscoped and stopped early — a non-hit is unknown. */
+      /**
+       * The scan did not cover its whole scope in a way `notScanned` names:
+       * it never ran, counted fewer files than it had without saying which,
+       * or was unscoped and stopped early — a non-hit is unknown.
+       */
       incomplete: boolean;
     };
 
@@ -667,6 +676,7 @@ function evaluateTranscript(f: SessionFacts, query: string, ctx: QueryContext): 
   if (r.status === "failed") return U(`transcript search failed: ${r.reason}`);
   if (r.matched.has(f.claudeSessionId)) return T;
   if (r.notScanned.has(f.claudeSessionId)) return U("transcript not searched (scan cut short)");
+  if (r.missing.has(f.claudeSessionId)) return U("no transcript found on this runner");
   if (r.limitHit) return U("transcript search hit its result limit");
   if (r.incomplete) return U("transcript search did not cover every transcript");
   return F;
