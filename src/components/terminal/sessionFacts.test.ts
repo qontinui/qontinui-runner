@@ -5,6 +5,8 @@ import {
   prCiKey,
   prsNeedingCi,
   repoOfPath,
+  rowLastActivityAt,
+  unseenFact,
   type PrCiRead,
   type SessionFactsRow,
   type SessionFactsSources,
@@ -500,5 +502,65 @@ describe("textSearchResultFrom", () => {
       incomplete: false,
       limitHit: true,
     });
+  });
+});
+
+describe("unseen fact (Phase 7)", () => {
+  it("carries the panel's dot verdict verbatim when one is supplied", () => {
+    // The org stamp (500) predates the activity, but the dot says seen.
+    expect(buildSessionFacts(sources({ unseen: { state: "seen" } })).unseen).toEqual({
+      known: true,
+      value: false,
+    });
+    expect(buildSessionFacts(sources({ unseen: { state: "unseen", since: 1 } })).unseen).toEqual({
+      known: true,
+      value: true,
+    });
+    expect(
+      buildSessionFacts(sources({ unseen: { state: "unknown", reason: "store down" } })).unseen,
+    ).toEqual({ known: false, reason: "store down" });
+  });
+
+  it("without a verdict, derives one from lastSeenAt and the last activity", () => {
+    // lastSeenAt 500 < last activity 2026-10-13T11:05Z.
+    expect(buildSessionFacts(sources()).unseen).toEqual({ known: true, value: true });
+    const seenLater = buildSessionFacts(
+      sources({
+        org: {
+          phase: "known",
+          org: {
+            ...ORG,
+            members: {
+              ...ORG.members,
+              [SID]: { ...ORG.members[SID], lastSeenAt: Date.parse("2026-10-13T12:00:00Z") },
+            },
+          },
+        },
+      }),
+    );
+    expect(seenLater.unseen).toEqual({ known: true, value: false });
+  });
+
+  it("without a verdict, an unreadable store is Unknown and a never-focused row too", () => {
+    const f = buildSessionFacts(sources({ org: { phase: "unknown", reason: "corrupt" } }));
+    expect(f.unseen.known).toBe(false);
+    // No member row: never focused, and no in-process first observation here.
+    const never = buildSessionFacts(sources({ sessionKey: "other" }));
+    expect(never.unseen).toEqual({ known: false, reason: "not observed yet" });
+  });
+
+  it("unseenFact maps the three verdicts", () => {
+    expect(unseenFact({ state: "unseen", since: 5 })).toEqual({ known: true, value: true });
+    expect(unseenFact({ state: "seen" })).toEqual({ known: true, value: false });
+    expect(unseenFact({ state: "unknown", reason: "r" })).toEqual({ known: false, reason: "r" });
+  });
+
+  it("rowLastActivityAt is the newest of record, file and tab output; null when none", () => {
+    const r = row();
+    expect(rowLastActivityAt(r)).toBe(Date.parse("2026-10-13T11:05:00Z"));
+    expect(rowLastActivityAt(r, Date.parse("2026-10-13T12:00:00Z"))).toBe(
+      Date.parse("2026-10-13T12:00:00Z"),
+    );
+    expect(rowLastActivityAt({ lastMessageTimestamp: "", lastModified: "garbage" })).toBeNull();
   });
 });
