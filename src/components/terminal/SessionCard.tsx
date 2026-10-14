@@ -30,6 +30,9 @@ import { describeThrown } from "@/lib/utils";
 import type { MemberOrg, SessionGroup, SessionOrgOp } from "./sessionOrgTypes";
 import { sessionOrgControlAttrs } from "./sessionOrgControls";
 import { SessionOrgMenuItems, type MenuPage } from "./SessionOrgMenus";
+import { sessionTopic, sessionTopicTitle } from "./sessionTopic";
+import { unseenAttr, type UnseenVerdict } from "./sessionUnseen";
+import type { SessionHoverCardController } from "./SessionHoverCard";
 import {
   ACTIVITY_DOT,
   activityText,
@@ -132,6 +135,16 @@ interface SessionCardProps {
    * offers no close.
    */
   onClose?: (session: UnifiedSession) => void;
+  /**
+   * The unseen-activity verdict (Phase 7): activity or output since the
+   * operator last focused this session. Absent = not tracked (no dot).
+   */
+  unseen?: UnseenVerdict;
+  /**
+   * The panel's hover-card binding (`useSessionHoverCard().bind`), shared by
+   * every card; hovering the row opens the card beside it. Absent = no card.
+   */
+  hoverCard?: SessionHoverCardController["bind"];
 }
 
 /** The panel's drag handlers; each names the row it fires on. */
@@ -326,6 +339,42 @@ export function sessionCardTooltip(
   return base;
 }
 
+/** The card's second line: the topic, and its full value for the `title`. */
+export interface SessionCardTopicLine {
+  text: string;
+  /** The full topic and the field it came from — the line truncates. */
+  title: string;
+}
+
+/**
+ * The card's second line (Phase 7): the session's topic — the work summary,
+ * else the resume name, else the first prompt — skipping a candidate that
+ * repeats the headline. `null` when no field carries one (no line rendered).
+ */
+export function sessionCardTopicLine(
+  session: Pick<
+    UnifiedSession,
+    "registryName" | "resumeName" | "displayName" | "workSummaryHint" | "firstMessagePreview"
+  >,
+): SessionCardTopicLine | null {
+  const topic = sessionTopic(session, sessionCardName(session));
+  return topic ? { text: topic.text, title: sessionTopicTitle(topic) } : null;
+}
+
+/**
+ * The unseen dot's tooltip, or `null` when no dot is drawn. Only `unseen`
+ * draws one: an UNKNOWN verdict draws nothing (the card's
+ * `data-session-unseen="unknown"` states it), never a dot or a "seen".
+ */
+export function unseenDotTitle(verdict: UnseenVerdict | undefined): string | null {
+  if (verdict?.state !== "unseen") return null;
+  const at = new Date(verdict.since).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `New activity since you last looked (at ${at}) — focus the session to clear`;
+}
+
 /** Which of a card's actions apply to its row. */
 export interface SessionCardActions {
   resume: boolean;
@@ -413,6 +462,8 @@ function SessionCardInner({
   onOpenWorktrees,
   isOnScreen = false,
   onClose,
+  unseen,
+  hoverCard,
 }: SessionCardProps) {
   const actions = sessionCardActions(session);
   const statusInfo = sessionCardStatusDisplay(session.status);
@@ -593,6 +644,9 @@ function SessionCardInner({
   }, [contextMenu]);
 
   const cardName = sessionCardName(session);
+  const topicLine = sessionCardTopicLine(session);
+  const unseenTitle = unseenDotTitle(unseen);
+  const hoverHandlers = hoverCard?.(session.sessionId);
   // Registered on the card's main BUTTON, not the wrapper `<div>`: the button
   // is what actually acts on a click — it focuses the session's open terminal
   // tab when it has one, else opens the transcript (a click dispatched at the wrapper
@@ -619,6 +673,8 @@ function SessionCardInner({
   return (
     <div
       onContextMenu={handleContextMenu}
+      onMouseEnter={hoverHandlers?.onMouseEnter}
+      onMouseLeave={hoverHandlers?.onMouseLeave}
       draggable={drag !== undefined}
       onDragStart={drag ? (e) => drag.start(session, e) : undefined}
       onDragEnd={drag?.end}
@@ -649,6 +705,7 @@ function SessionCardInner({
         data-session-on-screen={isOnScreen ? "true" : "false"}
         data-session-checked={isChecked ? "true" : "false"}
         data-session-cursor={isCursor ? "true" : "false"}
+        data-session-unseen={unseen ? unseenAttr(unseen) : "untracked"}
         aria-selected={isChecked}
         aria-current={isOnScreen ? "true" : undefined}
         // `accessibleName` and `ai/find` resolve on this. `title` carries the
@@ -687,6 +744,16 @@ function SessionCardInner({
             title={`${statusInfo.activityLabel} · ${statusInfo.locationLabel}`}
           />
           <span className="text-xs text-[#a9b1d6] truncate flex-1">{sessionCardName(session)}</span>
+          {unseenTitle && (
+            <span
+              {...sessionOrgControlAttrs("unseenDot", session.sessionId)}
+              data-testid="session-card-unseen"
+              className="w-1.5 h-1.5 rounded-full shrink-0 bg-brand-primary"
+              title={unseenTitle}
+              aria-label={unseenTitle}
+              role="img"
+            />
+          )}
           {isOnScreen && (
             <span
               data-testid="session-card-on-screen"
@@ -776,7 +843,19 @@ function SessionCardInner({
           )}
         </div>
 
-        {/* Row 2: Status words — activity, then location. Each carries the
+        {/* Row 2: the topic (not on a compact pinned row). Truncated, so the
+            full value and its source ride in the title. */}
+        {!compact && topicLine && (
+          <div
+            data-testid="session-card-topic"
+            className="ml-3.5 mb-0.5 text-[10px] text-[#565f89] truncate leading-tight"
+            title={topicLine.title}
+          >
+            {topicLine.text}
+          </div>
+        )}
+
+        {/* Row 3: Status words — activity, then location. Each carries the
             source that decided it in its tooltip. */}
         <div
           data-testid="session-card-status"
@@ -790,7 +869,7 @@ function SessionCardInner({
           <span className="truncate text-[#565f89]">{statusInfo.locationLabel}</span>
         </div>
 
-        {/* Row 3: Meta info (not on a compact pinned row) */}
+        {/* Row 4: Meta info (not on a compact pinned row) */}
         {!compact && (
           <div className="flex items-center gap-1 text-[10px] text-[#414868] ml-3.5">
             <span>{formatTimeAgo(session.lastModified)}</span>
@@ -805,13 +884,6 @@ function SessionCardInner({
             )}
             <span>&middot;</span>
             <span className="truncate">{session.projectLabel}</span>
-          </div>
-        )}
-
-        {/* Row 4: Work summary hint (only while the session may be running) */}
-        {!compact && session.workSummaryHint && mayBeRunning && (
-          <div className="mt-1 ml-3.5 text-[10px] text-[#565f89] truncate leading-tight">
-            {session.lastMessagePreview || session.workSummaryHint}
           </div>
         )}
 

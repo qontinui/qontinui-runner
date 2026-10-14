@@ -20,11 +20,11 @@
  * One card is mounted per panel, for the hovered row only — never one per row.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { sessionCardName } from "./SessionCard";
 import type { Fact, PrFact, SessionFacts } from "./sessionFacts";
-import type { SessionOrgControl } from "./sessionOrgControls";
+import { SESSION_ORG_CONTROLS, type SessionOrgControl } from "./sessionOrgControls";
 import {
   activityText,
   formatSilence,
@@ -33,6 +33,7 @@ import {
 } from "./sessionStatusModel";
 import { SESSION_TOPIC_SOURCE_LABELS, sessionTopic } from "./sessionTopic";
 import type { UnifiedSession } from "./useSessionManager";
+import { useNow1Hz } from "./useNow1Hz";
 
 // ── Placement (pure) ─────────────────────────────────────────────────────────
 
@@ -339,10 +340,7 @@ export function buildHoverCardModel(
 // ── Component ────────────────────────────────────────────────────────────────
 
 /** The card's UI Bridge id and effect; one card per panel, so no per-row suffix. */
-export const SESSION_HOVER_CARD: SessionOrgControl = {
-  id: "terminal.session-org.hover-card",
-  effect: "read",
-};
+export const SESSION_HOVER_CARD: SessionOrgControl = SESSION_ORG_CONTROLS.hoverCard;
 export const SESSION_HOVER_CARD_ID = SESSION_HOVER_CARD.id;
 
 function viewportSize(): Size {
@@ -487,4 +485,61 @@ export function useSessionHoverCard(): SessionHoverCardController {
   };
 
   return { target, bind, cardHandlers, close };
+}
+
+// ── Host ─────────────────────────────────────────────────────────────────────
+
+export interface SessionHoverCardHostProps {
+  controller: SessionHoverCardController;
+  /** The hovered row by id; `undefined` = gone from the list (no card). */
+  sessionOf: (sessionId: string) => HoverCardSession | undefined;
+  /** The row's facts; `null` = not built yet (facts-derived fields read Unknown). */
+  factsOf: (sessionId: string) => SessionFacts | null;
+}
+
+/**
+ * The panel's one hover card: mounted for the hovered row only, and only
+ * while one is hovered, so the 1 Hz clock it reads for "since" / "ago"
+ * re-renders this card alone — never the list.
+ */
+export function SessionHoverCardHost({
+  controller,
+  sessionOf,
+  factsOf,
+}: SessionHoverCardHostProps) {
+  const target = controller.target;
+  if (target === null) return null;
+  const session = sessionOf(target.sessionId);
+  if (!session) return null;
+  return (
+    <OpenSessionHoverCard
+      session={session}
+      facts={factsOf(target.sessionId)}
+      anchor={target.anchor}
+      handlers={controller.cardHandlers}
+    />
+  );
+}
+
+function OpenSessionHoverCard({
+  session,
+  facts,
+  anchor,
+  handlers,
+}: {
+  session: HoverCardSession;
+  facts: SessionFacts | null;
+  anchor: Rect;
+  handlers: SessionHoverCardController["cardHandlers"];
+}) {
+  const now = useNow1Hz();
+  const model = useMemo(() => buildHoverCardModel(session, facts, now), [session, facts, now]);
+  return (
+    <SessionHoverCard
+      model={model}
+      anchor={anchor}
+      onPointerEnter={handlers.onPointerEnter}
+      onPointerLeave={handlers.onPointerLeave}
+    />
+  );
 }
