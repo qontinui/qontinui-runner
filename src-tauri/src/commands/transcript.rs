@@ -895,8 +895,7 @@ pub async fn transcript_session_digests(
     // means the `spawn_blocking` future never resolves, and the bound has to be
     // one the sick runtime cannot disable — `off_runtime::deadline`, never
     // `tokio::time::timeout`.
-    let digest_task =
-        spawn_blocking_tracked(move || transcript::session_digests_batch(&requested));
+    let digest_task = spawn_blocking_tracked(move || transcript::session_digests_batch(&requested));
     let digest_bound = crate::off_runtime::deadline(DIGEST_WAIT_TIMEOUT);
     let digests = tokio::select! {
         joined = digest_task => match joined {
@@ -1599,9 +1598,18 @@ mod tests {
         let ids: Vec<String> = (0..200).map(|i| format!("s-{i}")).collect();
         let picked = sessions_by_id(all, &ids);
         assert_eq!(picked.len(), 200);
-        assert!(picked.iter().any(|s| s.session_id == "s-50"), "the 51st session");
-        assert!(picked.iter().any(|s| s.session_id == "s-199"), "the 200th session");
-        assert!(!picked.iter().any(|s| s.session_id == "s-200"), "an unrequested one");
+        assert!(
+            picked.iter().any(|s| s.session_id == "s-50"),
+            "the 51st session"
+        );
+        assert!(
+            picked.iter().any(|s| s.session_id == "s-199"),
+            "the 200th session"
+        );
+        assert!(
+            !picked.iter().any(|s| s.session_id == "s-200"),
+            "an unrequested one"
+        );
     }
 
     /// An id with no transcript is absent (the frontend renders it `Unknown`),

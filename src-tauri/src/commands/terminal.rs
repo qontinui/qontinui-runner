@@ -3709,10 +3709,22 @@ mod tests {
         snapshot.parent_map.insert(900, vec![901]);
         let managed = super::runner_managed_pids(&snapshot, 100, &[555]);
         assert!(managed.contains(&200));
-        assert!(managed.contains(&300), "a claude in a PTY tab is runner-managed");
-        assert!(managed.contains(&555), "an ai_pid_tracker pid is runner-managed");
-        assert!(!managed.contains(&901), "a claude outside the runner is not managed");
-        assert!(!managed.contains(&100), "the runner itself is not a session");
+        assert!(
+            managed.contains(&300),
+            "a claude in a PTY tab is runner-managed"
+        );
+        assert!(
+            managed.contains(&555),
+            "an ai_pid_tracker pid is runner-managed"
+        );
+        assert!(
+            !managed.contains(&901),
+            "a claude outside the runner is not managed"
+        );
+        assert!(
+            !managed.contains(&100),
+            "the runner itself is not a session"
+        );
     }
 
     /// The row is the registry entry FLATTENED plus `runnerManaged`, so every
