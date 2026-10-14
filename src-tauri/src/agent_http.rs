@@ -60,6 +60,12 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .connect_timeout(CONNECT_TIMEOUT)
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // Never follow a redirect. Every caller talks to coord's own routes,
+        // which do not redirect, and the agent-token refresh carries the
+        // paired device JWT in `x-coord-device-proof`: reqwest strips
+        // `Authorization` on a cross-host redirect but NOT a custom header,
+        // so following one could hand the device credential to another host.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|e| {
             // Realistically only TLS-backend init can fail here, and the
