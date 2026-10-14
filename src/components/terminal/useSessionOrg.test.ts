@@ -240,17 +240,30 @@ describe("useSessionOrg client", () => {
 
   it("once idle, the next apply is sent at once and starts with a clean error", async () => {
     const { transport } = fakeTransport(known(emptyOrg()));
+    const real = transport.apply;
+    transport.apply = vi.fn(async () => ({
+      results: [{ ok: false, error: "group_not_found", groupId: null }],
+      snapshot: known(emptyOrg()),
+    }));
     const client = createSessionOrgClient(transport);
     client.retain();
     await flush();
-    await client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: true }]);
+    await client.apply([{ op: "renameGroup", groupId: "nope", title: "x" }]);
     await flush();
-    void client.apply([{ op: "setPinned", sessionKeys: ["s2"], pinned: true }]);
-    // Sent synchronously: nothing is in flight to wait behind.
-    expect(transport.apply).toHaveBeenCalledTimes(2);
+    let view = client.getView();
+    expect(view.phase === "known" && view.lastError).toBe("refused: group_not_found");
+    transport.apply = vi.fn(real);
+    const next = client.apply([{ op: "setPinned", sessionKeys: ["s2"], pinned: true }]);
+    // Sent synchronously (nothing in flight), and the old burst's error is gone.
+    expect(transport.apply).toHaveBeenCalledTimes(1);
+    view = client.getView();
+    expect(view.phase === "known" && view.lastError).toBeNull();
+    await next;
+    view = client.getView();
+    expect(view.phase === "known" && view.lastError).toBeNull();
   });
 
-  it("an apply that is never answered times out, withdraws its preview and frees the queue", async () => {
+  it("an unanswered apply reports an unknown outcome, withdraws its preview, and frees the queue after the hold", async () => {
     const { transport } = fakeTransport(known(emptyOrg()));
     const real = transport.apply;
     let first = true;
@@ -261,21 +274,82 @@ describe("useSessionOrg client", () => {
       }
       return real(ops);
     });
-    const client = createSessionOrgClient(transport, 20);
+    const client = createSessionOrgClient(transport, { answerMs: 20, holdMs: 60 });
     client.retain();
     await flush();
     const lost = client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: true }]);
     const next = client.apply([{ op: "setPinned", sessionKeys: ["s2"], pinned: true }]);
-    await expect(lost).rejects.toThrow(/no answer from session_org_apply/);
+    await expect(lost).rejects.toThrow(/no answer from session_org_apply within 20 ms/);
+    // The answer timed out, but the call may still land: the next apply waits.
+    expect(transport.apply).toHaveBeenCalledTimes(1);
+    let view = client.getView();
+    expect(view.phase === "known" && view.lastError).toMatch(/^outcome unknown: /);
     await next;
     expect(transport.apply).toHaveBeenCalledTimes(2);
-    const view = client.getView();
+    view = client.getView();
     expect(view.phase).toBe("known");
     if (view.phase !== "known") return;
     expect(view.pending).toBe(0);
     expect(view.org.members.s2?.pinned).toBe(true);
     expect(view.org.members.s1?.pinned ?? false).toBe(false);
   });
+
+  it("a timed-out apply that lands late still goes before the next one", async () => {
+    const { transport } = fakeTransport(known(emptyOrg()));
+    const real = transport.apply;
+    const late = deferred<void>();
+    let first = true;
+    transport.apply = vi.fn(async (ops: SessionOrgOp[]) => {
+      if (first) {
+        first = false;
+        await late.promise;
+      }
+      return real(ops);
+    });
+    const client = createSessionOrgClient(transport, { answerMs: 20, holdMs: 10_000 });
+    client.retain();
+    await flush();
+    const pin = client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: true }]);
+    const unpin = client.apply([{ op: "setPinned", sessionKeys: ["s1"], pinned: false }]);
+    await expect(pin).rejects.toThrow(/no answer/);
+    // Well past the answer timeout, the unpin is still held behind the pin.
+    await new Promise((r) => setTimeout(r, 80));
+    expect(transport.apply).toHaveBeenCalledTimes(1);
+    late.resolve();
+    await unpin;
+    // The store applied them in the order they were made.
+    const stored = await transport.get();
+    expect(stored.org?.members.s1?.pinned ?? false).toBe(false);
+    const calls = (transport.apply as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect((calls[1][0] as SessionOrgOp[])[0]).toMatchObject({ pinned: false });
+    const view = client.getView();
+    expect(view.phase).toBe("known");
+    if (view.phase !== "known") return;
+    expect(view.org.members.s1?.pinned ?? false).toBe(false);
+  });
+
+  it("lists at most three failures in one burst and counts the rest", async () => {
+    const { transport } = fakeTransport(known(emptyOrg()));
+    transport.apply = vi.fn(async () => {
+      throw new Error("down");
+    });
+    transport.getFails = true;
+    const client = createSessionOrgClient(transport);
+    client.retain();
+    await flush();
+    transport.getFails = false;
+    await flush();
+    const runs = [1, 2, 3, 4, 5].map((n) =>
+      client.apply([{ op: "setPinned", sessionKeys: [`s${n}`], pinned: true }]).catch(() => undefined),
+    );
+    await Promise.all(runs);
+    const view = client.getView();
+    expect(view.phase === "known" && view.lastError).toBe(
+      "not applied: down; not applied: down; not applied: down (+2 more)",
+    );
+  });
+
 
   it("a refused op vanishes from the view and is reported", async () => {
     const { transport } = fakeTransport(known(emptyOrg()));

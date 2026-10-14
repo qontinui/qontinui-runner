@@ -81,13 +81,14 @@ export function normalizeInfoList(raw: unknown): SessionInfoListView {
     // asked for — index it by that so the row shows the real reason.
     // An available row that failed to normalize (malformed) still names its
     // session in `identity`; keep its reason on its row too.
-    const raw = env as {
+    const wire = env as {
       claudeSessionId?: unknown;
       identity?: { claudeSessionId?: unknown } | null;
     } | null;
-    const wireId = raw?.claudeSessionId ?? raw?.identity?.claudeSessionId;
-    const id =
-      state.body?.identity.claudeSessionId ?? (typeof wireId === "string" ? wireId : undefined);
+    const wireId = [wire?.claudeSessionId, wire?.identity?.claudeSessionId].find(
+      (x): x is string => typeof x === "string" && x !== "",
+    );
+    const id = state.body?.identity.claudeSessionId ?? wireId;
     if (id) byId.set(id, state);
   }
   const notFound = new Set(
