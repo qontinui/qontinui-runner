@@ -10,7 +10,7 @@
 import { useCallback, useMemo, useState } from "react";
 
 import { sessionCardName, sessionCardStatusDisplay, type SessionCardOrgMenu } from "./SessionCard";
-import type { CloseTarget } from "./SessionCloseDialog";
+import type { CloseTarget } from "./sessionClose";
 import { SESSION_GROUP_COLOR_VAR } from "./sessionGroupColors";
 import { suggestGroups, type GroupSuggestion } from "./sessionGroupSuggestions";
 import type { MenuPage } from "./SessionOrgMenus";
@@ -35,6 +35,10 @@ export interface NewSessionInGroupRequest {
 export interface CloseRequest {
   heading: string;
   sessionIds: string[];
+  /** A multi-row close: each row can be left out (all included at open). */
+  excludable?: boolean;
+  /** Why each row is offered (Ready to close), by row id. */
+  reasons?: Readonly<Record<string, string>>;
 }
 
 /** Drop from an open suggestion list the ones a batch just accepted or dismissed. */
@@ -177,6 +181,8 @@ export function useSessionPanelOrg({
       }),
     [groupRows],
   );
+  /** A close over several rows: the bulk bar's Close, the Ready-to-close review. */
+  const requestCloseRows = useCallback((request: CloseRequest) => setCloseRequest(request), []);
   const requestClose = useCallback((session: UnifiedSession) => {
     setCloseRequest({
       heading: `Close ${sessionCardName(session)}?`,
@@ -197,6 +203,7 @@ export function useSessionPanelOrg({
           activity: row.status.activity,
           activityWord: sessionCardStatusDisplay(row.status).activityLabel,
           closable: closableTabId(row) !== null,
+          reason: closeRequest.reasons?.[row.sessionId],
         },
       ];
     });
@@ -279,6 +286,7 @@ export function useSessionPanelOrg({
     closeRequest,
     requestClose,
     requestCloseGroup,
+    requestCloseRows,
     dismissClose,
     closeTargets,
     rowsOf,

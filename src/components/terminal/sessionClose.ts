@@ -37,6 +37,37 @@ export function closeNeedsSecondTick(activity: SessionActivity): boolean {
   return SECOND_TICK_ACTIVITIES.has(activity);
 }
 
+/** One session a close confirmation would close, as of this render. */
+export interface CloseTarget {
+  sessionId: string;
+  title: string;
+  activity: SessionActivity;
+  /** The activity word the card shows (`Needs you`, `Exited — error (code 2)`, …). */
+  activityWord: string;
+  /** Has a tab here — otherwise it is listed but nothing is closed. */
+  closable: boolean;
+  /**
+   * Why the row is offered for closing (`Finished · PRs green`, `Exited 0`);
+   * set by the Ready-to-close review, absent for a close the operator asked for.
+   */
+  reason?: string;
+}
+
+/** The tick key: a tick covers one session in ONE activity. */
+export function closeTickKey(target: Pick<CloseTarget, "sessionId" | "activity">): string {
+  return `${target.sessionId}:${target.activity}`;
+}
+
+/** Targets that would close and still need their second tick. */
+export function untickedRiskyTargets(
+  targets: readonly CloseTarget[],
+  ticks: ReadonlySet<string>,
+): CloseTarget[] {
+  return targets.filter(
+    (t) => t.closable && closeNeedsSecondTick(t.activity) && !ticks.has(closeTickKey(t)),
+  );
+}
+
 /** `GracefulExitOutcome` as the Tauri command serialises it (`outcome` tag). */
 export type GracefulCloseOutcome =
   | { outcome: "exited"; waited_ms: number; claude_pids: number[] }
@@ -69,8 +100,13 @@ export interface CloseItemResult {
 export interface CloseItem {
   sessionId: string;
   title: string;
-  /** The live tab in this window; `null` = nothing here to close. */
+  /** The session's tab in this window; `null` = nothing here to close. */
   tabId: string | null;
+  /**
+   * Whether that tab's process is still running. An exited tab has no
+   * conversation left to end, so closing it only removes the tab.
+   */
+  tabAlive: boolean;
   /** The organization-store key the close is recorded under. */
   sessionKey: string;
   /** The resume command recorded with the close; `null` = not resumable. */
@@ -146,6 +182,17 @@ function recordOps(items: readonly CloseItem[], now: number): SessionOrgOp[] {
   }));
 }
 
+/** An exited tab: nothing to /exit and nothing to kill — the tab is removed. */
+function removeExited(item: CloseItem, effects: CloseEffects): CloseItemResult {
+  if (item.tabId) effects.dropTab(item.tabId);
+  return {
+    sessionId: item.sessionId,
+    title: item.title,
+    state: "closed",
+    detail: "Closed — the session had already exited; its tab was removed",
+  };
+}
+
 function nothingHere(item: CloseItem): CloseItemResult {
   return {
     sessionId: item.sessionId,
@@ -167,6 +214,7 @@ export async function closeSessionsGracefully(
   const results = await Promise.all(
     items.map(async (item): Promise<CloseItemResult> => {
       if (!item.tabId) return nothingHere(item);
+      if (!item.tabAlive) return removeExited(item, effects);
       try {
         const outcome = await effects.gracefulClose(item.tabId);
         return {
@@ -185,7 +233,7 @@ export async function closeSessionsGracefully(
     }),
   );
   const closed = items.filter((_, i) => results[i].state === "closed");
-  for (const item of closed) if (item.tabId) effects.dropTab(item.tabId);
+  for (const item of closed) if (item.tabId && item.tabAlive) effects.dropTab(item.tabId);
   if (closed.length > 0) effects.recordClosed(recordOps(closed, (effects.now ?? Date.now)()));
   return results;
 }
@@ -197,6 +245,7 @@ export function forceCloseSessions(
 ): CloseItemResult[] {
   const results = items.map((item): CloseItemResult => {
     if (!item.tabId) return nothingHere(item);
+    if (!item.tabAlive) return removeExited(item, effects);
     effects.forceClose(item.tabId);
     return {
       sessionId: item.sessionId,

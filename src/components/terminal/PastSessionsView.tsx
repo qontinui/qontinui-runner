@@ -1,4 +1,4 @@
-import { useMemo, useState, useCallback } from "react";
+import { useMemo, useState, useCallback, type ReactNode } from "react";
 import { TerminalSquare, Copy, Check, RefreshCw, Layers, AlertTriangle } from "lucide-react";
 import { usePastSessions, type PastSession } from "./usePastSessions";
 import {
@@ -150,6 +150,11 @@ interface PastSessionsViewProps {
    * command.
    */
   onResumePastSession?: (session: PastSession) => void;
+  /**
+   * The Recently closed section (the Session Manager's own closes, from the
+   * organization store), rendered above the history. Absent = not shown.
+   */
+  recentlyClosed?: ReactNode;
 }
 
 /** A cohort: sessions sharing a `cohortId`, plus its derived header fields. */
@@ -433,7 +438,7 @@ function PastSessionCard({
  * resume + copy-command action. Additive to the live SessionManager — fed by
  * its own `usePastSessions` hook.
  */
-export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps) {
+export function PastSessionsView({ onResumePastSession, recentlyClosed }: PastSessionsViewProps) {
   const { sessions, loading, error, refresh: refreshSessions } = usePastSessions();
   // Live window names, for the subset of these rows whose process is still
   // running. Closed rows are always a miss and keep their `resumeName`.
@@ -528,6 +533,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto scrollbar-dark">
+        {recentlyClosed}
         {loading && sessions.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
             <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />

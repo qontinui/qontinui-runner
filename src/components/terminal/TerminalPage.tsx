@@ -101,6 +101,7 @@ import { ProjectFolderChip } from "./ProjectFolderChip";
 import { useApplyZoneProfile } from "./useApplyZoneProfile";
 import { useZoneProfileRestore } from "./useZoneProfileRestore";
 import { useHotField } from "./useTerminalHotStore";
+import { memberOf } from "./useSessionOrg";
 
 const logger = createLogger("TerminalPage");
 
@@ -1171,6 +1172,12 @@ function TerminalPageInner({
       needsInputCount: sessionManager.needsInputCount,
       sessions: sessionManager.sessions,
       openSession: sessionManager.openSession,
+      allSessions: sessionManager.allSessions,
+      groupPlaceOf: (s) => {
+        const member = memberOf(sessionManager.org, sessionManager.sessionKeyOf(s));
+        return member?.groupId ? { groupId: member.groupId, order: member.order } : null;
+      },
+      reopenLastClosed: sessionManager.reopenLastClosed,
     },
     // App.tsx keeps this page mounted behind a `hidden` div on every other
     // tab, so the hook's `window` listener outlives the page's visibility.
