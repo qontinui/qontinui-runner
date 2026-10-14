@@ -63,7 +63,7 @@ import { useTenant } from "@/contexts/TenantContext";
 import {
   FleetTenantSelect,
   FLEET_TENANT_ALL_VALUE,
-  defaultFleetTenantChoice,
+  resolveFleetTenantChoice,
   fleetTenantCredentialNote,
   fleetWalkTenants,
   isAllTenants,
@@ -455,10 +455,11 @@ export function FleetSessionPicker() {
     credentials: tenantCredentials,
   } = useTenant();
   const [fleetTenantPick, setFleetTenantPick] = useState<FleetTenantChoice | undefined>(undefined);
-  const fleetTenant: FleetTenantChoice =
-    fleetTenantPick !== undefined
-      ? fleetTenantPick
-      : defaultFleetTenantChoice(tenantPin, tenantCandidates);
+  const fleetTenant: FleetTenantChoice = resolveFleetTenantChoice(
+    fleetTenantPick,
+    tenantPin,
+    tenantCandidates,
+  );
   const allTenants = isAllTenants(fleetTenant);
   /** One independent cursor walk per entry — coord fingerprints the tenant into
    * its cursor, so a union is N walks, never one wider one. */
@@ -497,6 +498,7 @@ export function FleetSessionPicker() {
 
   const {
     merged,
+    walks,
     sessions,
     envelopes,
     loading,
@@ -607,9 +609,11 @@ export function FleetSessionPicker() {
    */
   const emptyCreate = emptyCreateTargets({
     merged,
-    // A single read's create mints under the tenant its walk presented, the
-    // same rule as a row's attach (`mintTenantOf`).
-    singleTenant: mintTenantOf(walkTenants[0] ?? null),
+    // A single read's create mints under the tenant the walk ON SCREEN
+    // presented — the same rule as a row's attach (`mintTenantOf`). The walk,
+    // not the selection: between a switch and its answer the empty page still
+    // belongs to the previous tenant.
+    singleTenant: merged ? null : mintTenantOf(walks[0]?.requestedTenant ?? null),
     answeredTenants: readTenants.answered,
     shortTenant: shortTenantId,
   });

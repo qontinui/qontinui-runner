@@ -1005,8 +1005,8 @@
         {
           "label": "fsp-wiring-selection-to-hook-only-select-writes-active-tenant",
           "file": "src/components/terminal/FleetTenantSelect.tsx",
-          "anchor": "        onChange(e.target.value === FLEET_TENANT_DEFAULT_VALUE ? null : e.target.value)\n",
-          "replace": "        void invoke(\"set_active_tenant\", { tenantId: e.target.value }) &&\n        onChange(e.target.value === FLEET_TENANT_DEFAULT_VALUE ? null : e.target.value)\n",
+          "anchor": "      onChange={(e) =>\n        onChange(e.target.value === FLEET_TENANT_DEFAULT_VALUE ? null : e.target.value)\n      }\n",
+          "replace": "      onChange={(e) => {\n        void invoke(\"set_active_tenant\", { tenantId: e.target.value });\n        onChange(e.target.value === FLEET_TENANT_DEFAULT_VALUE ? null : e.target.value);\n      }}\n",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'hands the selection to the hook and never to set_active_tenant'"
         }
@@ -1022,6 +1022,14 @@
           "file": "src/components/terminal/FleetSessionPicker.tsx",
           "anchor": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);",
           "replace": "const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);\n  useEffect(() => {\n    setFleetTenantPick(null);\n  }, [tenantPin]);",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'opens on the policy default until the operator picks'"
+        },
+        {
+          "label": "fsp-wiring-default-derived-not-effect-pick-used-raw",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "  const fleetTenant: FleetTenantChoice = resolveFleetTenantChoice(\n    fleetTenantPick,\n    tenantPin,\n    tenantCandidates,\n  );",
+          "replace": "  const fleetTenant: FleetTenantChoice =\n    fleetTenantPick !== undefined\n      ? fleetTenantPick\n      : defaultFleetTenantChoice(tenantPin, tenantCandidates);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'opens on the policy default until the operator picks'"
         }
@@ -1072,9 +1080,41 @@
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
         },
         {
+          "label": "fsp-wiring-mint-under-served-tenant-group-create-under-selection",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+          "replace": "onCreate={() => createRemote(groupKey, g.deviceId, g.label, fleetTenant)}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
+        },
+        {
+          "label": "fsp-wiring-mint-under-served-tenant-group-retry-under-selection",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "onRetry={() => void createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+          "replace": "onRetry={() => void createRemote(groupKey, g.deviceId, g.label, fleetTenant)}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
+        },
+        {
+          "label": "fsp-wiring-mint-under-served-tenant-group-retry-unpinned",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "onRetry={() => void createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+          "replace": "onRetry={() => void createRemote(groupKey, g.deviceId, g.label, null)}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
+        },
+        {
+          "label": "fsp-wiring-mint-under-served-tenant-empty-create-under-selection",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "singleTenant: merged ? null : mintTenantOf(walks[0]?.requestedTenant ?? null),",
+          "replace": "singleTenant: merged ? null : mintTenantOf(walkTenants[0] ?? null),",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
+        },
+        {
           "label": "fsp-wiring-mint-under-served-tenant-empty-create-under-served",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "singleTenant: mintTenantOf(walkTenants[0] ?? null),",
+          "anchor": "singleTenant: merged ? null : mintTenantOf(walks[0]?.requestedTenant ?? null),",
           "replace": "singleTenant: servedTenants[0] ?? null,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"

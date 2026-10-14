@@ -26,6 +26,7 @@ import {
   fleetTenantOptions,
   fleetWalkTenants,
   isAllTenants,
+  resolveFleetTenantChoice,
 } from "./FleetTenantSelect";
 
 const A = "aaaaaaaa-0000-4000-8000-00000000000a";
@@ -122,16 +123,22 @@ describe("the merged choice (Phase 4)", () => {
     expect(fleetWalkTenants(FLEET_TENANT_ALL_VALUE, [])).toEqual([null]);
   });
 
-  it("keeps a picked tenant that is no longer bound on screen, disabled, rather than showing 'all tenants'", () => {
+  it("drops a picked tenant that is no longer bound back to the default, but not on an empty list", () => {
     const D = "dddddddd-0000-4000-8000-00000000000d";
-    const html = render(true, D);
-    expect(html).toMatch(
-      /<option value="dddddddd-[^"]*"[^>]*disabled=""[^>]*selected=""[^>]*>dddddddd — no longer bound<\/option>/,
+    // Not picked: the default.
+    expect(resolveFleetTenantChoice(undefined, "unpinned", [A, B])).toBe(FLEET_TENANT_ALL_VALUE);
+    // A bound pick, the device default and "all" all stand.
+    expect(resolveFleetTenantChoice(A, "unpinned", [A, B])).toBe(A);
+    expect(resolveFleetTenantChoice(null, "unpinned", [A, B])).toBeNull();
+    expect(resolveFleetTenantChoice(FLEET_TENANT_ALL_VALUE, "pinned", [A])).toBe(
+      FLEET_TENANT_ALL_VALUE,
     );
-    // A bound pick gets no extra option.
-    expect(render(true, A)).not.toContain("no longer bound");
-    expect(render(true, null)).not.toContain("no longer bound");
-    expect(render(true, FLEET_TENANT_ALL_VALUE)).not.toContain("no longer bound");
+    // A pick whose binding went away falls back — here to N=1's default, where
+    // the selector is hidden and nothing else could change it.
+    expect(resolveFleetTenantChoice(D, "unpinned", [A])).toBeNull();
+    expect(resolveFleetTenantChoice(D, "unpinned", [A, B])).toBe(FLEET_TENANT_ALL_VALUE);
+    // An empty list is a list still loading as often as a lost binding.
+    expect(resolveFleetTenantChoice(D, "unpinned", [])).toBe(D);
   });
 
   it("marks the merged option selected when chosen", () => {

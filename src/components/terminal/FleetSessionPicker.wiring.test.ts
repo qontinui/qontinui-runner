@@ -621,7 +621,11 @@ describe("the tenant selector reads, and attaches, the tenant it names", () => {
   });
 
   it("opens on the policy default until the operator picks — derived, not written by an effect", () => {
-    expect(SOURCE).toContain("defaultFleetTenantChoice(tenantPin, tenantCandidates)");
+    // `resolveFleetTenantChoice` falls back to `defaultFleetTenantChoice` both
+    // before a pick and after a picked tenant stops being bound.
+    expect(SOURCE).toContain(
+      "resolveFleetTenantChoice(\n    fleetTenantPick,\n    tenantPin,\n    tenantCandidates,",
+    );
     expect(codeOf(SOURCE)).not.toMatch(/useEffect\([^]*?setFleetTenantPick/);
   });
 
@@ -640,8 +644,20 @@ describe("the tenant selector reads, and attaches, the tenant it names", () => {
     // null for a read that named none, so a single-tenant device mints exactly
     // as before the selector.
     expect(SOURCE).toContain("tenant: s.mintTenantId ?? null,");
-    expect(SOURCE).toContain("createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)");
-    expect(SOURCE).toContain("singleTenant: mintTenantOf(walkTenants[0] ?? null),");
+    // Every group create call — the button AND its retry — names the group's
+    // mint tenant; a third spelling (the selection, a literal null) is a
+    // second call site this count refuses.
+    const code = codeOf(SOURCE);
+    expect(code).toContain(
+      "onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+    );
+    expect(code).toContain(
+      "onRetry={() => void createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+    );
+    expect(code.split("createRemote(groupKey,").length - 1).toBe(2);
+    expect(SOURCE).toContain(
+      "singleTenant: merged ? null : mintTenantOf(walks[0]?.requestedTenant ?? null),",
+    );
     expect(codeOf(SOURCE)).not.toContain("tenant: s.servedTenantId");
     expect(codeOf(SOURCE)).not.toContain("g.label, g.tenantId)");
     expect(codeOf(SOURCE)).not.toMatch(/tenant: fleetTenant/);
