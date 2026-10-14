@@ -79,7 +79,13 @@ export function normalizeInfoList(raw: unknown): SessionInfoListView {
     const state = normalizeSessionInfo(env);
     // A row the runner could not read carries no body, only the id it was
     // asked for — index it by that so the row shows the real reason.
-    const wireId = (env as { claudeSessionId?: unknown } | null)?.claudeSessionId;
+    // An available row that failed to normalize (malformed) still names its
+    // session in `identity`; keep its reason on its row too.
+    const raw = env as {
+      claudeSessionId?: unknown;
+      identity?: { claudeSessionId?: unknown } | null;
+    } | null;
+    const wireId = raw?.claudeSessionId ?? raw?.identity?.claudeSessionId;
     const id =
       state.body?.identity.claudeSessionId ?? (typeof wireId === "string" ? wireId : undefined);
     if (id) byId.set(id, state);

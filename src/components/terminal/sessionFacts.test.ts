@@ -455,6 +455,20 @@ describe("normalizeInfoList / indexPrCi", () => {
     });
   });
 
+  it("a malformed available row keeps its reason on its own row", () => {
+    const v = normalizeInfoList({
+      status: "ok",
+      reason: null,
+      sessions: [{ available: true, identity: { claudeSessionId: SID } }],
+      notFound: [],
+      branches: [],
+    });
+    expect(v.phase).toBe("ok");
+    if (v.phase !== "ok") return;
+    expect(v.byId.get(SID)?.status).toBe("unavailable");
+    expect(v.byId.get(SID)?.body).toBeNull();
+  });
+
   it("a degraded or malformed listing is unavailable with a reason, never empty-ok", () => {
     expect(
       normalizeInfoList({
