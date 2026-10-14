@@ -28,6 +28,8 @@ export function facts(over: Partial<SessionFacts> = {}): SessionFacts {
     muted: known(false),
     snoozedUntil: known(null),
     lastSeenAt: known(NOW - HOUR),
+    // Activity 10 min ago, after the focus an hour ago.
+    unseen: known(true),
     group: known({ id: "g1", title: "Coord work", colorRole: "info" }),
     tags: known(["Urgent", "infra"]),
     account: known("paktis"),
