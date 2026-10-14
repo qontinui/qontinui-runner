@@ -1609,7 +1609,8 @@ pub(crate) fn close_outcome_response(outcome: &CloseOutcome) -> CommandResponse 
 }
 
 /// Wait (at most `holder_boot_sweep::RESTORE_WAIT`) for the PTY-holder boot
-/// sweep to settle — every surviving holder pane adopted into a terminal — and
+/// sweep to settle — every surviving holder pane adopted into a terminal (or,
+/// failing that, ended), and every dead holder's leftovers reaped — and
 /// say whether it did (`data.settled`). The webview's restore calls this
 /// BEFORE it reads `terminal_list`, so a session a holder kept alive is
 /// reconnected, never cold-resumed a second time (plan

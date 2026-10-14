@@ -49,8 +49,10 @@ export async function fetchOpenRecords(
 
 /**
  * Wait for the runner's PTY-holder boot sweep to settle — every pane a holder
- * kept alive across the last runner exit adopted back as a live terminal —
- * before the restore reads `terminal_list` (plan
+ * kept alive across the last runner exit adopted back as a live terminal (or,
+ * if it could not be adopted, ended so its session is resumed normally) and
+ * every dead holder's leftovers reaped — before the restore reads
+ * `terminal_list` (plan
  * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 3).
  * Otherwise a surviving session would look dead and be cold-resumed beside
  * its still-running `claude`. The backend bounds the wait itself. An error
