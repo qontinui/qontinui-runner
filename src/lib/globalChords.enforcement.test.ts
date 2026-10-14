@@ -510,6 +510,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "contexts/SessionContext.tsx",
   "contexts/WorkflowExecutionContext.tsx",
   "hooks/dashboard/useDashboardLayout.ts",
+  "hooks/ui-bridge-events/pageHealth.test.ts",
   "hooks/ui-bridge-events/recoveryScope.test.ts",
   "hooks/ui-bridge-events/recoveryScope.ts",
   "hooks/ui-bridge-events/useAISearchEvents.ts",
