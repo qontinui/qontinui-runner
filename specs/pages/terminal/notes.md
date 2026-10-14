@@ -128,10 +128,11 @@ the IR, from this table, or off the element's own `data-effect`.
   - Drag-and-drop is not advertised on rows or headers, so the `drag` action
     is refused — move sessions with `session-org` `add-to-group` /
     `move-group`.
-  - Typing into `terminal.session-org.query-input` with the `type` action
-    reports success but leaves the query unchanged (the palette input, with
-    the same action list, types fine) — set the query with `session-query`
-    `set-query` until that is resolved.
+  - Typing into `terminal.session-org.query-input` with `type` / `clear`
+    edits the query (the box keeps its own draft, `sessionQueryDraft.ts`;
+    before that, React restored the old text and the driver's second
+    `onChange` wrote it back). `session-query` `set-query` remains the
+    deterministic door.
   - The close dialog's buttons are re-registered per phase; after a close the
     result list's **Done** is `terminal.session-org.close-cancel`.
   - Recently closed lives in the **Previous** view, not the Live one.
