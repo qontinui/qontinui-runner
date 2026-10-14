@@ -8232,6 +8232,10 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_handles_coord_200_replaces_jwt() {
+        // A `Replaced` persist spends the PROCESS-GLOBAL revocation latch
+        // (`retire_rejection_streaks_after_legacy_mint`); serialise with the
+        // suites that assert on it.
+        let _posture = posture_test_lock();
         // Setup: AuthManager holds the OLD JWT.
         // Run: mock web backend returns canonical 200 with a NEW JWT.
         // Assert: outcome is Replaced with the NEW JWT, and the
@@ -8347,6 +8351,10 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_uses_outgoing_jwt_tenant_when_oauth_claim_absent() {
+        // A `Replaced` persist spends the PROCESS-GLOBAL revocation latch
+        // (`retire_rejection_streaks_after_legacy_mint`); serialise with the
+        // suites that assert on it.
+        let _posture = posture_test_lock();
         // PROD BUG REGRESSION: the OAuth/runner bearer carries NO tenant_id
         // (the operator's Cognito token) but the OUTGOING device-JWT — the one
         // we're about to replace — still carries its own tenant_id claim. The
@@ -8443,6 +8451,10 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_uses_machine_tenant_when_no_jwt_claims() {
+        // A `Replaced` persist spends the PROCESS-GLOBAL revocation latch
+        // (`retire_rejection_streaks_after_legacy_mint`); serialise with the
+        // suites that assert on it.
+        let _posture = posture_test_lock();
         // Fallback 3: OAuth bearer + persisted device-JWT both lack a tenant
         // claim, but the caller-injected `machine_tenant`
         // (machine.json::active_tenant_id in prod) supplies one → the refresh
