@@ -24,9 +24,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  ACTIVE_PAGE_KEY,
   DEFAULT_TERMINAL_PAGE,
-  activePageExpression,
+  TERMINAL_PAGE_COMPONENT,
+  VIEW_STATE_ACTION,
   closeCreated,
   resolveTerminalPage,
   runHarness,
@@ -75,8 +75,8 @@ function attachedConfig(over = {}) {
 /**
  * A fake temp runner behind `fetch`: the routes an attached perf-harness run
  * calls, a terminal table with one pre-existing terminal, and a record of every
- * request. `activePage` is what the frontend's persisted active-page key holds
- * (`null` = nothing persisted).
+ * request. `activePage` is the `pageId` the Terminal page's view-state action
+ * reports (`null` = a build whose action predates the field).
  */
 function fakeRunner({ activePage = "page-7", failDelete = new Set() } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "perf-harness-test-"));
@@ -90,13 +90,14 @@ function fakeRunner({ activePage = "page-7", failDelete = new Set() } = {}) {
     if (method === "GET" && path === "/health") return ok({ gitSha: "abc", buildId: "unit" });
     if (method === "GET" && path === "/log-sources/runner-log-sink") return ok({ current_file: logFile, exists: true });
     if (method === "POST" && path === "/ui-bridge/control/tab/activate") return ok(null);
+    if (method === "POST" && path === `/ui-bridge/control/component/${TERMINAL_PAGE_COMPONENT}/action/${VIEW_STATE_ACTION}`) {
+      const result = { maximizedZone: null, zoneCount: 1, layoutId: "single" };
+      if (activePage !== null) result.pageId = activePage;
+      return ok({ success: true, result, durationMs: 1 });
+    }
     if (method === "POST" && path === "/ui-bridge/control/page/evaluate") {
-      if (body.expression.includes(ACTIVE_PAGE_KEY)) {
-        const expected = `${ACTIVE_PAGE_KEY}:9881`;
-        assert.ok(body.expression.includes(JSON.stringify(expected)), "the key is namespaced by the runner's port");
-        return ok({ type: "object", value: { pageId: activePage } });
-      }
-      return ok({ type: "object", value: {} });
+      // The webview CSP refuses every evaluated string (no 'unsafe-eval'), as on a real build.
+      return { status: 400, json: { code: "INVALID_JSON", error: "JS evaluation error: Refused to evaluate a string as JavaScript" } };
     }
     if (method === "GET" && path === "/terminals") return ok([...terminals.values()]);
     if (method === "POST" && path === "/terminals") {
@@ -163,43 +164,47 @@ test("terminals are created on the page the Terminal tab is showing, never on a 
   const creates = r.calls.filter((c) => c.method === "POST" && c.path === "/terminals");
   assert.equal(creates.length, 2, "S=2 then S=3 on top of one pre-existing terminal");
   for (const c of creates) assert.equal(c.body.page_id, "page-7");
-  assert.deepEqual(run.terminalPage, { pageId: "page-7", source: "frontend active page" });
+  assert.equal(run.terminalPage.pageId, "page-7");
+  assert.match(run.terminalPage.source, /^frontend active page/);
   // The read happens after the tab is activated: that is when the page is the one shown.
   const activate = r.calls.findIndex((c) => c.path === "/ui-bridge/control/tab/activate");
-  const read = r.calls.findIndex((c) => c.path === "/ui-bridge/control/page/evaluate" && c.body.expression.includes(ACTIVE_PAGE_KEY));
+  const read = r.calls.findIndex((c) => c.path.endsWith(`/action/${VIEW_STATE_ACTION}`));
   assert.ok(activate >= 0 && read > activate);
 });
 
-test("with nothing persisted the page is the frontend's own default; --skip-frontend never evaluates", ATTACHED, async () => {
+test("a view state without pageId falls back to default and says so; --skip-frontend never asks", ATTACHED, async () => {
   const r = fakeRunner({ activePage: null });
   const run = await runHarness(attachedConfig({ sessions: [2] }), quiet, { fetch: r.fetch });
   assert.equal(run.terminalPage.pageId, DEFAULT_TERMINAL_PAGE);
   assert.equal(r.calls.find((c) => c.method === "POST" && c.path === "/terminals").body.page_id, "default");
+  assert.match(run.terminalPage.source, /reported no pageId/);
 
   const s = fakeRunner();
   const skipped = await runHarness(attachedConfig({ sessions: [2], skipFrontend: true }), quiet, { fetch: s.fetch });
   assert.equal(skipped.terminalPage.pageId, DEFAULT_TERMINAL_PAGE);
   assert.match(skipped.terminalPage.source, /--skip-frontend/);
-  assert.equal(s.calls.filter((c) => c.path === "/ui-bridge/control/page/evaluate").length, 0);
+  assert.equal(s.calls.filter((c) => c.path.startsWith("/ui-bridge/control/")).length, 0, "no frontend door is asked");
 });
 
-test("a failed active-page read falls back to default and says so", async () => {
-  const runner = { baseUrl: RUNNER_URL, evaluate: async () => { throw new Error("page_evaluate timed out"); } };
-  assert.deepEqual(await resolveTerminalPage(runner), {
+test("a failed view-state read falls back to default and says so", async () => {
+  const thrown = { componentAction: async () => { throw new Error("UI Bridge request timed out"); } };
+  assert.deepEqual(await resolveTerminalPage(thrown), {
     pageId: "default",
-    source: "fallback: active-page read failed (page_evaluate timed out)",
+    source: `fallback: ${VIEW_STATE_ACTION} failed (UI Bridge request timed out)`,
   });
-  const inPage = { baseUrl: RUNNER_URL, evaluate: async () => ({ error: "SecurityError" }) };
-  assert.match((await resolveTerminalPage(inPage)).source, /read failed in the page \(SecurityError\)/);
+  const refused = { componentAction: async () => ({ success: false, error: "component not registered" }) };
+  assert.match((await resolveTerminalPage(refused)).source, /failed \(component not registered\)/);
 });
 
-test("the active-page key is the one the frontend persists, namespaced the way instance-storage does", () => {
-  const pages = readFileSync(join(REPO, "src", "components", "terminal", "useTerminalPages.ts"), "utf8");
-  assert.match(pages, new RegExp(`const ACTIVE_PAGE_KEY = "${ACTIVE_PAGE_KEY}";`));
-  assert.match(pages, /instanceStorage\.getItem\(ACTIVE_PAGE_KEY\) \|\| "default"/, "the frontend's fallback is \"default\"");
-  const storage = readFileSync(join(REPO, "src", "lib", "instance-storage.ts"), "utf8");
-  assert.match(storage, /return port === 9876 \? key : `\$\{key\}:\$\{port\}`;/);
-  assert.ok(activePageExpression(9881).includes(JSON.stringify(`${ACTIVE_PAGE_KEY}:9881`)));
+test("the page is read through the Terminal page's own view-state action, never page/evaluate", () => {
+  const page = readFileSync(join(REPO, "src", "components", "terminal", "TerminalPage.tsx"), "utf8");
+  const action = page.slice(page.indexOf(`id: "${VIEW_STATE_ACTION}"`));
+  assert.ok(page.includes(`id: "${TERMINAL_PAGE_COMPONENT}"`), "the component id the harness addresses");
+  assert.match(action.slice(0, action.indexOf("}),")), /pageId: zoneMaximizeRef\.current\.pageId/, "the action reports the page it shows");
+  // page/evaluate is refused by the CSP on every build: no evaluated string can read anything.
+  const conf = JSON.parse(readFileSync(join(REPO, "src-tauri", "tauri.conf.json"), "utf8"));
+  assert.doesNotMatch(JSON.stringify(conf), /'unsafe-eval'/);
+  assert.ok(!readFileSync(PERF_HARNESS, "utf8").includes("qontinui-terminal-active-page"), "no evaluated localStorage read");
   const manager = readFileSync(join(REPO, "src-tauri", "src", "terminal", "manager.rs"), "utf8");
   assert.match(manager, /page_id\.unwrap_or_else\(\|\| "default"\.to_string\(\)\)/, "a page-less create lands on default");
 });

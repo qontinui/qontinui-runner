@@ -308,6 +308,7 @@ export async function runSettle(opts, deps = {}) {
     terminalsLeftAfterHarness: null,
     terminalsBeforeHarness: null,
     seatedTerminal: null,
+    harnessSessionsArg: null,
     runnerUrl: null,
     runId: null,
     looks: [],
@@ -379,11 +380,19 @@ export async function runSettle(opts, deps = {}) {
     if (seat.id !== null) adapter.terminals = [...new Set([...(adapter.terminals ?? []), seat.id])];
     log(`seat: ${seat.detail}`);
     if (!seat.ok) throw new Error(`seating a terminal on the active page failed: ${seat.detail}`);
+    // perf-harness tops the runner UP to `--sessions` terminals, counting every
+    // terminal already there — the seat included — so it is asked for S on top of
+    // them, or it would create (and run the generator in) fewer than S.
+    if (result.terminalsBeforeHarness === null) {
+      throw new Error("the subject's terminals could not be listed before the seat, so the harness's top-up cannot be sized");
+    }
+    const present = new Set([...result.terminalsBeforeHarness, seat.id]).size;
+    result.harnessSessionsArg = o.sessions + present;
     const harnessOut = join(unitDir, "perf-harness-run.json");
     const hArgv = harnessArgv({
       harness,
       runnerUrl,
-      sessions: o.sessions,
+      sessions: result.harnessSessionsArg,
       generator,
       soakMs: o.soakMs,
       settleMs: o.settleMs,

@@ -169,7 +169,10 @@ async function fakeSettle(t, { slots = 10, seen = [[], [], []], lookOk = true, l
     spawnHarness: (argv, o) => {
       calls.push(["spawnHarness", argv]);
       const gen = argv[argv.indexOf("--generator") + 1];
-      const genDir = /--run-dir (\S+)/.exec(gen)[1];
+      // The command line is shell-quoted: a Windows temp path (backslashes) arrives
+      // as `'C:\...\gen'`, a plain POSIX one bare.
+      const m = /--run-dir (?:'([^']*)'|(\S+))/.exec(gen);
+      const genDir = m[1] ?? m[2];
       for (let k = 0; k < slots; k += 1) writeFileSync(join(genDir, `slot-${k}`), `${JSON.stringify({ slot: k, pid: 1000 + k })}\n`);
       harnessIds = Array.from({ length: leftover }, (_, i) => `h${i}`);
       let done = false;
@@ -213,9 +216,13 @@ test("runSettle: the harness child is an argv array against the subject's port, 
   const url = argv[argv.indexOf("--runner-url") + 1];
   assert.equal(url, "http://127.0.0.1:9911");
   assert.notEqual(new URL(url).port, "9876");
-  assert.equal(argv[argv.indexOf("--sessions") + 1], "10");
+  // perf-harness tops UP to --sessions counting what is there: S = 10 on top of
+  // the seated terminal (CI run 38619704449 asked for 10 and got 9 generators).
+  assert.equal(argv[argv.indexOf("--sessions") + 1], String(10 + 1 + res.terminalsBeforeHarness.length));
+  assert.equal(res.harnessSessionsArg, 10 + 1 + res.terminalsBeforeHarness.length);
+  assert.ok(res.terminalsBeforeHarness.length >= 1, "the fake has a terminal of its own, so the count is not just S + 1");
   const gen = argv[argv.indexOf("--generator") + 1];
-  assert.match(gen, /generator\/ai-session\.mjs/);
+  assert.match(gen, /generator[\\/]ai-session\.mjs/);
   assert.match(gen, /--termhost-bench-generator settle-test-u0(\s|$)/);
   assert.match(gen, / --echo /);
   assert.ok(Number(argv[argv.indexOf("--soak-ms") + 1]) >= 30000, "the soak is long enough to hold the looks");

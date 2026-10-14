@@ -123,8 +123,8 @@ LOAD SHAPE
                          so create latency is measured against a growing
                          population — the O(N) hypothesis this plan tests.
                          Terminals are created on the page the Terminal tab is
-                         showing (read through the UI Bridge; "default" when
-                         none is persisted), so they mount and render: a
+                         showing (terminal-page.get-zone-view-state over the UI
+                         Bridge; "default" without it), so they mount and render: a
                          terminal on any other page is unwatched and gets no
                          webview output.
   --generator CMD        Noisy generator run in every terminal. Default is a
@@ -524,16 +524,13 @@ const PROBE_STOP = `(() => {
  */
 export const DEFAULT_TERMINAL_PAGE = "default";
 
-/**
- * The frontend's persisted active-page key (`useTerminalPages.ts`
- * `ACTIVE_PAGE_KEY`). `instance-storage.ts` namespaces it with `:<port>` on
- * every runner but the primary — and the harness never drives the primary.
- */
-export const ACTIVE_PAGE_KEY = "qontinui-terminal-active-page";
+/** The Terminal page's UI Bridge component, and its eval-free view-state read. */
+export const TERMINAL_PAGE_COMPONENT = "terminal-page";
+export const VIEW_STATE_ACTION = "get-zone-view-state";
 
 /**
- * Page evaluation reading the page the Terminal tab is showing — the same read
- * `useTerminalPages` initialises `activePageId` from.
+ * Resolve the page to create terminals on: the one the Terminal tab is showing,
+ * as its own `get-zone-view-state` action reports it (`pageId`).
  *
  * Terminals on any OTHER page are `unwatched` and get no webview output by
  * default. The original `page_id: "perf-harness"` only rendered when the
@@ -541,24 +538,11 @@ export const ACTIVE_PAGE_KEY = "qontinui-terminal-active-page";
  * where `default` is empty and hidden, but not once the active page holds a
  * terminal (an operator's box): there it measured an idle page.
  *
- * @param {number} port the runner's API port
- */
-export function activePageExpression(port) {
-  const key = JSON.stringify(`${ACTIVE_PAGE_KEY}:${port}`);
-  return `(() => {
-  try {
-    return { pageId: window.localStorage.getItem(${key}) };
-  } catch (e) {
-    return { error: String(e && e.message || e) };
-  }
-})()`;
-}
-
-/**
- * Resolve the page to create terminals on: the frontend's active page, or
- * `default` when nothing is persisted (exactly the frontend's own fallback).
- * Without the UI Bridge (`--skip-frontend`, or a failed read) it is `default`
- * too, and the source says why — the frontend metrics are absent then anyway.
+ * Not a page-evaluate read of the persisted key: the webview's CSP
+ * (`script-src 'self'`, no `'unsafe-eval'`) refuses every evaluated string.
+ * Without the UI Bridge (`--skip-frontend`), or from a build whose action
+ * predates `pageId`, it is `default` — where a page-less create lands — and the
+ * source says why.
  *
  * @returns {Promise<{pageId: string, source: string}>}
  */
@@ -566,18 +550,19 @@ export async function resolveTerminalPage(runner, { skipFrontend = false } = {})
   if (skipFrontend) {
     return { pageId: DEFAULT_TERMINAL_PAGE, source: "fallback: --skip-frontend (the UI Bridge is not used)" };
   }
-  const port = Number.parseInt(new URL(runner.baseUrl).port || "0", 10);
   try {
-    const r = await runner.evaluate(activePageExpression(port), 20000);
-    if (r && typeof r.pageId === "string" && r.pageId.trim()) {
-      return { pageId: r.pageId, source: "frontend active page" };
+    const raw = await runner.componentAction(TERMINAL_PAGE_COMPONENT, VIEW_STATE_ACTION, {}, 20000);
+    // The control door answers `{success, result}` around the handler's return.
+    const v = raw && typeof raw === "object" && "result" in raw ? raw.result : raw;
+    if (raw && raw.success === false) {
+      return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} failed (${raw.error ?? "no error"})` };
     }
-    if (r && r.error) {
-      return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: active-page read failed in the page (${r.error})` };
+    if (v && typeof v.pageId === "string" && v.pageId.trim()) {
+      return { pageId: v.pageId, source: `frontend active page (${TERMINAL_PAGE_COMPONENT}.${VIEW_STATE_ACTION})` };
     }
-    return { pageId: DEFAULT_TERMINAL_PAGE, source: "frontend active page (none persisted: the frontend's own default)" };
+    return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} reported no pageId (a build that predates it)` };
   } catch (e) {
-    return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: active-page read failed (${e.message})` };
+    return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} failed (${e.message})` };
   }
 }
 
@@ -693,6 +678,13 @@ class FakeRunner {
 
   async activateTab() {
     return { success: true };
+  }
+
+  async componentAction(componentId, actionId) {
+    if (componentId === TERMINAL_PAGE_COMPONENT && actionId === VIEW_STATE_ACTION) {
+      return { success: true, result: { maximizedZone: null, zoneCount: 1, layoutId: "single", pageId: DEFAULT_TERMINAL_PAGE } };
+    }
+    throw new Error(`dry-run: no component action ${componentId}.${actionId}`);
   }
 
   async resetTransportStats() {
