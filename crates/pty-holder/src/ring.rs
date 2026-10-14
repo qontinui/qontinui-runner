@@ -69,12 +69,26 @@ impl OutputRing {
     /// (`max(from, start)`, or `end` when `from` is past it) and the bytes.
     /// A caller that asked for `from < start` must report `[from, start)` as
     /// lost — this function never pretends those bytes exist.
+    ///
+    /// Copies with two `memcpy`s over the deque's halves, not byte by byte:
+    /// callers hold the pane lock while it runs, and a tail can be a MiB.
     pub fn slice_from(&self, from: u64, max: usize) -> (u64, Vec<u8>) {
         let end = self.end_offset();
         let lo = from.clamp(self.start, end);
         let skip = (lo - self.start) as usize;
         let take = ((end - lo) as usize).min(max);
-        (lo, self.buf.iter().skip(skip).take(take).copied().collect())
+        let (front, back) = self.buf.as_slices();
+        let mut out = Vec::with_capacity(take);
+        if skip < front.len() {
+            let n = (front.len() - skip).min(take);
+            out.extend_from_slice(&front[skip..skip + n]);
+            let rest = take - n;
+            out.extend_from_slice(&back[..rest]);
+        } else {
+            let b = skip - front.len();
+            out.extend_from_slice(&back[b..b + take]);
+        }
+        (lo, out)
     }
 }
 
@@ -101,6 +115,27 @@ mod tests {
         r.push(b"0123456789AB");
         assert_eq!((r.start_offset(), r.end_offset()), (14, 22));
         assert_eq!(r.slice_from(0, 100), (14, b"456789AB".to_vec()));
+    }
+
+    #[test]
+    fn pty_holder_ring_slice_spans_a_wrapped_deque() {
+        // Push and evict until the deque's storage wraps, then check every
+        // (from, max) against the plain byte sequence.
+        let mut r = OutputRing::new(64);
+        let all: Vec<u8> = (0u8..200).collect();
+        for chunk in all.chunks(13) {
+            r.push(chunk);
+        }
+        let (start, end) = (r.start_offset(), r.end_offset());
+        assert_eq!((start, end), (136, 200));
+        for from in start..=end {
+            for max in [0, 1, 7, 30, 64, 100] {
+                let (lo, got) = r.slice_from(from, max);
+                assert_eq!(lo, from);
+                let want_end = (from as usize + max).min(end as usize);
+                assert_eq!(got, all[from as usize..want_end], "from {from} max {max}");
+            }
+        }
     }
 
     #[test]
