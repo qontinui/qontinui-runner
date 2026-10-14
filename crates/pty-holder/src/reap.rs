@@ -7,14 +7,14 @@
 //! reaping is the HOLDER's job, and under D13 each holder reaps exactly its own
 //! child tree. Two moments, two entry points:
 //!
-//! 1. **The child exits, then the pane ends.** Whatever the child left running
-//!    is ended by its holder, in two steps:
+//! 1. **The pane is KILLED** (a tab closed, or the runner gave up on it —
+//!    `crate::pty::Pane::kill_now`). Its holder ends what the child leaves:
 //!    - [`reap_session_of_exited_child`] — called by the holder's waiter the
-//!      moment the child has exited and BEFORE it reaps it. The child is then a
-//!      zombie, so its pid — which is its session and process-group id (it
-//!      `setsid()`s onto its PTY) — cannot be reused by anyone: "session ==
-//!      child pid" provably names the pane's session. Linux: every member of
-//!      that session; other Unix: `killpg` of the child's group. Done later
+//!      moment the killed child has exited and BEFORE it reaps it. The child is
+//!      then a zombie, so its pid — which is its session and process-group id
+//!      (it `setsid()`s onto its PTY) — cannot be reused by anyone: "session
+//!      == child pid" provably names the pane's session. Linux: every member
+//!      of that session; other Unix: `killpg` of the child's group. Done later
 //!      (after the reap), an emptied session's id could already belong to a
 //!      stranger that called `setsid()`.
 //!    - [`reap_own_scope`] — Linux scope route, when the pane ends, still under
@@ -23,6 +23,13 @@
 //!      the session. The cgroup is the holder's own, so it names nothing else.
 //!    - Windows: the holder-owned job (`crate::pty`) is terminated, which ends
 //!      every process in it; this module is not involved.
+//!
+//!    A child that EXITS ON ITS OWN is not followed by any reap (decision of
+//!    2026-10-14): what it left running — `nohup` / `disown` jobs, a tmux
+//!    server, an agent — keeps running, exactly as with an in-process PTY.
+//!    D8's reaping is crash safety, the job the runner's `KILL_ON_JOB_CLOSE`
+//!    did when its OWNER went away; on Windows that stays true as-is (the
+//!    holder's job ends its contents when the holder exits).
 //!
 //! 2. **A holder died without doing that** ([`reap_orphans_of_dead_holder`],
 //!    called by the runner's boot sweep, `crate::sweep`, holding the dead
@@ -130,8 +137,10 @@ pub fn reap_orphans_of_dead_holder(record: &LockRecord) -> ReapReport {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         {
-            crate::spawn::stop_scope_unit(unit, crate::spawn::SYSTEMCTL_DEADLINE);
-            report.note(format!("stopped scope unit {unit}"));
+            match crate::spawn::stop_scope_unit(unit, crate::spawn::SYSTEMCTL_DEADLINE) {
+                Ok(()) => report.note(format!("stopped scope unit {unit}")),
+                Err(e) => report.note(format!("scope unit {unit} NOT stopped: {e}")),
+            }
         } else {
             report.note(format!("refused a scope unit name not ours: {unit:?}"));
         }
@@ -145,6 +154,17 @@ pub fn reap_orphans_of_dead_holder(record: &LockRecord) -> ReapReport {
 
 #[cfg(target_os = "linux")]
 pub use linux::own_holder_scope_cgroup;
+
+/// Windows tree walk: whether a process the snapshot listed under `parent` is
+/// still that parent's child. Its creation time (FILETIME) must be no earlier
+/// than the parent's — Windows keeps a dead parent's pid in the child's
+/// record, and that pid may name a newer process — and no later than the
+/// snapshot — the listed pid itself may have exited and been reused by a
+/// process created after the snapshot was taken.
+#[cfg(any(windows, test))]
+fn admits_descendant(created: u64, parent_created: u64, snapshot_at: u64) -> bool {
+    created >= parent_created && created <= snapshot_at
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -329,11 +349,15 @@ mod imp {
             return;
         };
         let Some(token) = token else {
-            report.note("record has no child start token: nothing is verifiable");
             report.unattributed = linux::session_members(sid)
                 .into_iter()
                 .map(|p| p as u32)
                 .collect();
+            report.note(format!(
+                "record has no child start token: {} process(es) in session {sid} are NOT \
+                 provably the pane's (the id may since name another session) — left alone",
+                report.unattributed.len()
+            ));
             return;
         };
         // Leader verified alive → its session is the pane's. The leader's own
@@ -347,7 +371,9 @@ mod imp {
                 .map(|p| p as u32)
                 .collect();
             report.note(format!(
-                "recorded child {child} is gone; its session's remainder is not provably the pane's"
+                "recorded child {child} is gone: {} process(es) in session {sid} are NOT \
+                 provably the pane's (the id may since name another session) — left alone",
+                report.unattributed.len()
             ));
         }
     }
@@ -473,6 +499,9 @@ mod imp {
              holder's job)"
         ));
         let procs = snapshot();
+        // Taken AFTER the snapshot: a pid the snapshot listed that was since
+        // reused belongs to a process created after this instant.
+        let snapshot_at = qontinui_runner_win32::holder_spawn::filetime_now();
         let mut tree: Vec<(u32, u64, Proc)> = vec![(child, root_created, root)];
         let mut i = 0;
         while i < tree.len() {
@@ -484,7 +513,11 @@ mod imp {
                 let Some(p) = open(pid) else { continue };
                 // SAFETY: `p` was opened with PROCESS_QUERY_LIMITED_INFORMATION.
                 match unsafe { creation_time(p.0) } {
-                    Some(created) if created >= parent_created => tree.push((pid, created, p)),
+                    Some(created)
+                        if super::admits_descendant(created, parent_created, snapshot_at) =>
+                    {
+                        tree.push((pid, created, p))
+                    }
                     _ => {}
                 }
             }
@@ -533,6 +566,16 @@ mod tests {
         (leader, line.trim().parse().unwrap())
     }
 
+    /// Ends the fixture's whole session on drop, so a failed assert leaves no
+    /// `sleep 300` behind (the session id is pinned while a member lives).
+    struct SessionGuard(u32);
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            let _ = reap_session_of_exited_child(self.0);
+        }
+    }
+
     fn wait_dead(pid: u32) {
         let end = Instant::now() + Duration::from_secs(5);
         while alive(pid) {
@@ -550,6 +593,7 @@ mod tests {
             holder_build: "test".into(),
             child_start: token,
             scope_unit: None,
+            holder_start: None,
         }
     }
 
@@ -557,6 +601,7 @@ mod tests {
     #[test]
     fn pty_holder_reap_session_of_exited_child_ends_the_session_and_nothing_else() {
         let (mut leader, bg) = session_with_a_background_job();
+        let _guard = SessionGuard(leader.id());
         let mut bystander = Command::new("sleep").arg("300").spawn().unwrap();
         let report = reap_session_of_exited_child(leader.id());
         assert!(report.killed.contains(&bg), "{report:?}");
@@ -575,6 +620,7 @@ mod tests {
     #[test]
     fn pty_holder_reap_dead_holder_with_a_verified_child_ends_its_tree() {
         let (mut leader, bg) = session_with_a_background_job();
+        let _guard = SessionGuard(leader.id());
         let token = crate::proc_identity::start_token(leader.id());
         assert!(token.is_some());
         let report = reap_orphans_of_dead_holder(&record(leader.id(), token));
@@ -588,6 +634,7 @@ mod tests {
     #[test]
     fn pty_holder_reap_dead_holder_never_signals_an_unverified_pid() {
         let (mut leader, bg) = session_with_a_background_job();
+        let _guard = SessionGuard(leader.id());
         for token in [Some("linux:another-boot:1".to_string()), None] {
             let report = reap_orphans_of_dead_holder(&record(leader.id(), token));
             assert!(report.killed.is_empty(), "{report:?}");
@@ -599,5 +646,32 @@ mod tests {
         assert!(report.killed.contains(&bg));
         let _ = leader.wait();
         wait_dead(bg);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::admits_descendant;
+
+    /// Finding #1 of the 2026-10-14 review: a pid the Toolhelp snapshot listed
+    /// may have been reused after it, so a process created after the snapshot
+    /// is never admitted — nor one older than the parent it supposedly has.
+    #[test]
+    fn pty_holder_reap_windows_tree_admission_bounds_creation_time() {
+        let (parent, snapshot) = (1_000, 5_000);
+        assert!(admits_descendant(1_000, parent, snapshot), "same instant");
+        assert!(admits_descendant(3_000, parent, snapshot));
+        assert!(
+            admits_descendant(5_000, parent, snapshot),
+            "at the snapshot"
+        );
+        assert!(
+            !admits_descendant(999, parent, snapshot),
+            "older than its parent"
+        );
+        assert!(
+            !admits_descendant(5_001, parent, snapshot),
+            "created after the snapshot"
+        );
     }
 }

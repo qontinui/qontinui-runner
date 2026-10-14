@@ -2,14 +2,18 @@
 //! and the boot sweep (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
 //! Phase 3, D8 under D13).
 //!
-//! - A holder reaps its OWN child tree when its pane ends: a `SIGHUP`-immune
-//!   background job the child left behind does not outlive the pane.
+//! - A holder reaps its OWN child tree when its pane is KILLED: a
+//!   `SIGHUP`-immune background job does not outlive the kill. When the child
+//!   EXITS ON ITS OWN, what it left running is left alone (an in-process
+//!   PTY's semantics; decision of 2026-10-14).
 //! - A boot sweep leaves a live holder running and hands it back as `Live`.
 //! - A boot sweep of a holder that was SIGKILLed — its `SIGHUP`-immune child
 //!   orphaned — ends that child, PROVEN by the start token in the lock record,
 //!   and removes the pane's files.
 //!
-//! Every process signalled here was spawned by this test. Unix only (the
+//! Every process signalled here was spawned by this test, and every one is
+//! guarded ([`PaneSession`], [`HolderGuard`]) so a failed assert leaves no
+//! `sleep 300` behind. Unix only (the
 //! fixtures are `sh`; the identity proof reads `/proc` on Linux); the Windows
 //! sweep is type-checked for `x86_64-pc-windows-msvc` and UNRUN here.
 #![cfg(unix)]
@@ -52,6 +56,33 @@ fn alive(pid: u32) -> bool {
         // No /proc (macOS): fall back to signal 0.
         // SAFETY: signal 0 only checks for existence.
         Err(_) => unsafe { libc::kill(pid as i32, 0) == 0 },
+    }
+}
+
+/// The session of a pane's child (it `setsid()`s onto its PTY, so the
+/// session id is the child's pid): every member SIGKILLed on drop — the
+/// child, a `sleep` it runs in the foreground, a job it put in the background.
+/// While any member lives the id is pinned to this session (POSIX), so the
+/// sweep reaches only processes this test's holder spawned.
+struct PaneSession(u32);
+
+impl Drop for PaneSession {
+    fn drop(&mut self) {
+        let _ = qontinui_pty_holder::reap::reap_session_of_exited_child(self.0);
+    }
+}
+
+/// A pane's holder: ended through its verified lock on drop (a no-op once it
+/// is gone).
+struct HolderGuard<'a> {
+    dir: &'a Path,
+    pane: &'a PaneId,
+    pid: u32,
+}
+
+impl Drop for HolderGuard<'_> {
+    fn drop(&mut self) {
+        let _ = terminate_verified_holder(self.dir, self.pane, self.pid);
     }
 }
 
@@ -120,20 +151,64 @@ fn background_pid(dir: &Path, pane: &PaneId, wait_for_exit: bool) -> u32 {
     bg.expect("the child reported its background job")
 }
 
-/// D8, holder side: when the pane ends, its holder ends what the child left
-/// running in its session.
+/// D8 as decided 2026-10-14: a child that EXITS ON ITS OWN leaves what it
+/// started running — the holder ends the pane without reaping it, exactly as
+/// an in-process PTY never did.
 #[test]
-fn pty_holder_reap_holder_ends_its_child_tree_when_the_pane_ends() {
+fn pty_holder_reap_normal_exit_leaves_detached_jobs_running() {
     let dir = pane_dir("end");
     let pane = PaneId::new("p1").unwrap();
     let h = spawn(&dir, &pane, &spec_with_background_job("exit 0"));
+    let _session = PaneSession(h.child_pid);
+    let _holder = HolderGuard {
+        dir: &dir,
+        pane: &pane,
+        pid: h.holder_pid,
+    };
     let holder = h.holder_pid;
     // Reading to the exit frame delivers it, which is what lets the holder
     // end the pane.
     let bg = background_pid(&dir, &pane, true);
     h.reap_in_background();
     wait_dead(holder, "the holder after its pane ended");
-    wait_dead(bg, "the child's SIGHUP-immune background job");
+    assert!(
+        alive(bg),
+        "a normal exit must not reap the child's detached job"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D8, kill path: a pane that is KILLED (a tab closed) has its tree reaped —
+/// the `SIGHUP`-immune background job included.
+#[test]
+fn pty_holder_reap_kill_ends_the_child_tree() {
+    let dir = pane_dir("kill");
+    let pane = PaneId::new("p1").unwrap();
+    let h = spawn(&dir, &pane, &spec_with_background_job("sleep 300"));
+    let _holder = HolderGuard {
+        dir: &dir,
+        pane: &pane,
+        pid: h.holder_pid,
+    };
+    let (holder, child) = (h.holder_pid, h.child_pid);
+    let _session = PaneSession(child);
+    let bg = background_pid(&dir, &pane, false);
+    h.reap_in_background();
+    let mut s = connect(&dir, &pane, soon())
+        .unwrap()
+        .attach(None, soon())
+        .unwrap();
+    s.writer.kill(soon()).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(ev)) = s.reader.next_event(Some(end)) {
+        if matches!(ev, Event::Exit(_)) {
+            break;
+        }
+    }
+    drop(s);
+    wait_dead(child, "the killed child");
+    wait_dead(bg, "the killed pane's SIGHUP-immune background job");
+    wait_dead(holder, "the holder after its pane was killed");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -143,7 +218,21 @@ fn pty_holder_boot_sweep_leaves_a_live_holder_running_and_lists_it() {
     let dir = pane_dir("live");
     let pane = PaneId::new("p1").unwrap();
     let h = spawn(&dir, &pane, &spec_with_background_job("sleep 300"));
-    let report = boot_sweep(&dir, Duration::from_secs(10), &[]).unwrap();
+    let _holder = HolderGuard {
+        dir: &dir,
+        pane: &pane,
+        pid: h.holder_pid,
+    };
+    let _session = PaneSession(h.child_pid);
+    let mut adopted = Vec::new();
+    let report = boot_sweep(&dir, Duration::from_secs(10), &[], |entries| {
+        adopted = entries
+            .iter()
+            .map(|e| e.pane_id.clone())
+            .collect::<Vec<_>>();
+    })
+    .unwrap();
+    assert_eq!(adopted, vec!["p1".to_string()], "classified before reaping");
     let live: Vec<_> = report
         .live()
         .map(|(id, ack)| (id.to_string(), ack.holder_pid))
@@ -170,6 +259,7 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
     let pane = PaneId::new("p1").unwrap();
     let h = spawn(&dir, &pane, &spec_with_background_job("sleep 300"));
     let (holder, child) = (h.holder_pid, h.child_pid);
+    let _session = PaneSession(child);
     let bg = background_pid(&dir, &pane, false);
     h.reap_in_background();
 
@@ -182,13 +272,14 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
     assert!(alive(child), "fixture: the child survives its holder");
     assert!(alive(bg), "fixture: the background job survives its holder");
 
-    let report = boot_sweep(&dir, Duration::from_secs(10), &[]).unwrap();
+    let report = boot_sweep(&dir, Duration::from_secs(10), &[], |_| {}).unwrap();
     assert_eq!(report.entries.len(), 1, "{report:?}");
     match &report.entries[0].outcome {
         SweepOutcome::Reaped {
             record: Some(record),
             reap,
             lock_removed: true,
+            orphan_kept: false,
         } => {
             assert_eq!(record.holder_pid, holder);
             if cfg!(target_os = "linux") {
@@ -201,14 +292,9 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
     if cfg!(target_os = "linux") {
         wait_dead(child, "the orphaned child");
         wait_dead(bg, "the orphaned background job");
-    } else {
-        // No start token off Linux: nothing is provable, so nothing was
-        // signalled. Clean up the fixture by hand.
-        // SAFETY: the process groups of children this test's holder spawned.
-        unsafe {
-            libc::kill(-(child as i32), libc::SIGKILL);
-        }
     }
+    // Off Linux there is no start token, so nothing was provable and nothing
+    // signalled: the `PaneSession` guard cleans the fixture up.
     assert!(
         !lock_path(&dir, &pane).exists(),
         "the dead pane's lock is gone"
