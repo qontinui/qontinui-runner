@@ -4,6 +4,7 @@ import { evaluateTransitions } from "./transitionAutomation";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { SessionState } from "./useZoneLayout";
 import { playNeedsInputChime, playCompletionChime, playErrorAlert } from "./notificationSound";
+import { audibleNeedsInput } from "./sessionMute";
 
 export interface UseStateTransitionEffectsParams {
   sessionStates: Record<string, SessionState>;
@@ -25,6 +26,13 @@ export interface UseStateTransitionEffectsParams {
   setFocusedZone: (z: number) => void;
   handleRestartInZone: (zoneIdx: number) => void;
   addHistoryEvent: (type: string, session: string, zone?: number, color?: string) => void;
+  /**
+   * Tabs whose session the operator muted (`sessionMute.ts`). Their
+   * needs-input sound and desktop notification are suppressed; nothing else
+   * about the transition is. Read through a ref, so a mute toggle does not
+   * re-run the transition effect.
+   */
+  mutedTabIds?: ReadonlySet<string>;
 }
 
 export interface UseStateTransitionEffectsReturn {
@@ -62,7 +70,13 @@ export function useStateTransitionEffects(
     setFocusedZone,
     handleRestartInZone,
     addHistoryEvent,
+    mutedTabIds,
   } = params;
+
+  const mutedTabIdsRef = useRef<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    mutedTabIdsRef.current = mutedTabIds ?? new Set();
+  });
 
   // ── State ─────────────────────────────────────────────────────────────────
 
@@ -276,8 +290,13 @@ export function useStateTransitionEffects(
         }
       }
 
+      // Sound and desktop notification: every new needs-input tab except a
+      // muted one. Flashing, auto-focus and the counts above stay — mute stops
+      // the interruption, never the state.
+      const audible = audibleNeedsInput(newFlashing, mutedTabIdsRef.current);
+
       // Play notification sound
-      if (soundEnabled) {
+      if (soundEnabled && audible.length > 0) {
         playNeedsInputChime();
       }
 
@@ -288,7 +307,7 @@ export function useStateTransitionEffects(
         "Notification" in window &&
         Notification.permission === "granted"
       ) {
-        for (const tabId of newFlashing) {
+        for (const tabId of audible) {
           const tab = tabs.find((t) => t.id === tabId);
           const zoneNum = Object.entries(assignments).find(([, tid]) => tid === tabId)?.[0];
           new Notification("Session needs input", {
