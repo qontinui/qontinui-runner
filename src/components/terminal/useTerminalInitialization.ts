@@ -275,23 +275,24 @@ export interface HolderRelaunchWithheld {
 
 /**
  * Hand a released session to the restore (Phase 3's {@link onHolderSessionReleased},
- * which re-checks liveness), and settle the dead pane it lived in: when a
- * relaunch was scheduled, close the dead pane (`close`) so the relaunch takes
- * its place; when it was not — a live process hosts the session, or liveness
- * is unreadable — put the not-relaunched banner on it (`markWithheld`).
- * Returns whether a relaunch was scheduled. Exported for tests.
+ * which re-checks liveness). When a relaunch was scheduled, remember the dead
+ * pane it replaces (`rememberDeadPane`): the re-run closes it only once the
+ * replacement tab EXISTS, or banners it if the re-run declines (review r2,
+ * N3). When it was not — a live process hosts the session, or liveness is
+ * unreadable — put the not-relaunched banner on it (`markWithheld`). Returns
+ * whether a relaunch was scheduled. Exported for tests.
  */
 export async function releaseAndRelaunch(
   payload: HolderSessionReleased,
   schedule: (pageId: string, sessionIds: string[]) => void,
-  close: (terminalId: string) => void,
+  rememberDeadPane: (sessionId: string, terminalId: string) => void,
   markWithheld: (w: HolderRelaunchWithheld) => void,
   withheldReason: RelaunchWithheldReason = "still-hosted",
   liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
 ): Promise<boolean> {
   const scheduled = await onHolderSessionReleased(payload, schedule, liveIds);
   if (scheduled) {
-    close(payload.terminalId);
+    rememberDeadPane(payload.sessionId, payload.terminalId);
   } else {
     markWithheld({
       sessionId: payload.sessionId,
@@ -301,6 +302,29 @@ export async function releaseAndRelaunch(
     });
   }
   return scheduled;
+}
+
+/**
+ * After a restore re-run that completed (not aborted, not deferred): every
+ * session it was asked to relaunch (`recheckOnly`) that still has a remembered
+ * dead pane and got NO replacement tab (`created`) was declined — skipped as
+ * live, past its restorable window, refused by the resource guard. Banner its
+ * dead pane instead of leaving it silently (review r2, N3), and forget it.
+ * Pure + exported for tests.
+ */
+export function declineLeftoverDeadPanes(
+  recheckOnly: ReadonlySet<string>,
+  created: ReadonlySet<string>,
+  deadPaneFor: Map<string, string>,
+  pageId: string,
+  markWithheld: (w: HolderRelaunchWithheld) => void,
+): void {
+  for (const sessionId of recheckOnly) {
+    const terminalId = deadPaneFor.get(sessionId);
+    if (terminalId === undefined || created.has(sessionId)) continue;
+    deadPaneFor.delete(sessionId);
+    markWithheld({ sessionId, terminalId, pageId, reason: "restore-declined" });
+  }
 }
 
 /** How many times an ABORTED restore re-runs on its own for ids it still owes (review V1). */
@@ -624,11 +648,12 @@ export function recordBelongsToRestore(
 
 /**
  * One argument the restore may TYPE into a shell as-is: the runner's
- * shell-inert set (`session::resume_argv::is_inert_char` — inert in bash, zsh,
- * POSIX sh and PowerShell alike), at most 256 bytes. Plan
+ * shell-inert set (`session::resume_argv::is_shell_inert` — inert in bash, zsh,
+ * POSIX sh and PowerShell alike), at most 256 bytes, and the runner's
+ * first-character rule (alphanumeric, `-`, `/` or `.`; never zsh's `=`). Plan
  * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, D11.
  */
-const SHELL_INERT_ARG_RE = /^[A-Za-z0-9_./:=+-]{1,256}$/;
+const SHELL_INERT_ARG_RE = /^[A-Za-z0-9/.-][A-Za-z0-9_./:=+-]{0,255}$/;
 
 /** Whether `arg` may be typed into a shell unquoted. Exported for tests. */
 export function isShellInertArg(arg: unknown): arg is string {
@@ -675,11 +700,9 @@ export function resumePlanFor(
 
 /** A flag that already says how the resumed session handles permissions. */
 function choosesPermissionMode(arg: string): boolean {
-  return (
-    arg === "--permission-mode" ||
-    arg.startsWith("--permission-mode=") ||
-    arg === "--dangerously-skip-permissions"
-  );
+  // The runner replays at most one `--permission-mode`, and never the
+  // dangerous-skip flags (review r2, permission rule).
+  return arg === "--permission-mode" || arg.startsWith("--permission-mode=");
 }
 
 /**
@@ -1565,19 +1588,32 @@ export function useTerminalInitialization({
     },
     [updateTab],
   );
+  // Released sessions whose relaunch is scheduled → the dead pane it
+  // replaces. The re-run closes the pane once the replacement tab exists, or
+  // banners it when it declines (review r2, N3).
+  const deadPaneFor = useRef<Map<string, string>>(new Map());
+  const rememberDeadPane = useCallback((sessionId: string, terminalId: string) => {
+    deadPaneFor.current.set(sessionId, terminalId);
+  }, []);
   const relaunchReleased = useCallback(
     (payload: HolderSessionReleased, withheldReason?: RelaunchWithheldReason) => {
       releasedTerminalIds.current.add(payload.terminalId);
       return releaseAndRelaunch(
         payload,
         scheduleRecheckRerun,
-        closeDeadPane,
+        rememberDeadPane,
         markWithheld,
         withheldReason,
       );
     },
-    [scheduleRecheckRerun, closeDeadPane, markWithheld],
+    [scheduleRecheckRerun, rememberDeadPane, markWithheld],
   );
+  // The effect below runs restores with a stale closure; reach the current
+  // dead-pane handlers through a ref.
+  const deadPaneActions = useRef({ closeDeadPane, markWithheld });
+  useEffect(() => {
+    deadPaneActions.current = { closeDeadPane, markWithheld };
+  }, [closeDeadPane, markWithheld]);
   useEffect(() => {
     let disposed = false;
     const unlistens: Array<() => void> = [];
@@ -1653,6 +1689,8 @@ export function useTerminalInitialization({
     const recheckOnly = beginRestoreRun(rerun, initPageId);
     // Sessions this run claimed for a cold resume; released when it ends.
     const coldClaims: string[] = [];
+    // Sessions this run created a replacement tab for (review r2, N3).
+    const createdThisRun = new Set<string>();
     // The drain withheld the restore set: this run restored nothing.
     let restoreDeferred = false;
     // Sessions THIS run refuses as live while the sweep is unsettled, and
@@ -1937,6 +1975,7 @@ export function useTerminalInitialization({
             queued: openRecords.length - recIndex,
           });
           if (!tabId) continue;
+          createdThisRun.add(rec.claudeSessionId);
           // A record with no recorded zone (`UNZONED_INDEX`) is NOT force-placed
           // here, and is deliberately not clamped to zone 0: zone 0 belongs to
           // whichever tab actually holds it, and `assignTabToZone` RESERVES the
@@ -1986,6 +2025,13 @@ export function useTerminalInitialization({
             restoreTerminalOnly: restoreAction === "terminal-only" && rec.confirmedAt != null,
           });
           rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
+          // A lost holder's dead pane is closed only NOW, once its replacement
+          // exists and holds its zone (review r2, N3).
+          const deadPane = deadPaneFor.current.get(rec.claudeSessionId);
+          if (deadPane !== undefined && deadPane !== tabId) {
+            deadPaneFor.current.delete(rec.claudeSessionId);
+            deadPaneActions.current.closeDeadPane(deadPane);
+          }
 
           // Re-point the record at the tab we JUST created for it.
           //
@@ -2256,6 +2302,17 @@ export function useTerminalInitialization({
         // fewer tabs than expected" (recoverable, and the console carries the
         // cause) instead of a permanently blank window.
         setInitialized(true);
+        // A completed re-run that declined a released session: banner its
+        // dead pane rather than leave it silently (review r2, N3).
+        if (recheckOnly && !restoreAborted && !restoreDeferred) {
+          declineLeftoverDeadPanes(
+            recheckOnly,
+            createdThisRun,
+            deadPaneFor.current,
+            initPageId,
+            deadPaneActions.current.markWithheld,
+          );
+        }
         // The PTY-holder boot sweep had not settled, and this run refused
         // some sessions as live or held some back for an adoption in flight:
         // once it settles, re-run the restore (merging, like a drain re-run)

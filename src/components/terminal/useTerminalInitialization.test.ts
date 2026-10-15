@@ -50,6 +50,7 @@ import {
   withoutReleasedHolders,
   pruneReleasedTerminalIds,
   releaseAndRelaunch,
+  declineLeftoverDeadPanes,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -677,7 +678,7 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
 // it was launched with — every typed token shell-inert, or nothing typed.
 describe("relaunch from the persisted launch argv (Phase 6)", () => {
   it("isShellInertArg accepts only the runner's inert set", () => {
-    for (const ok of ["--model", "opus", "/srv/a", "--model=sonnet", "a.b:c+d_e-f"]) {
+    for (const ok of ["--model", "opus", "/srv/a", "--model=sonnet", "a.b:c+d_e-f", ".x", "-x"]) {
       expect(isShellInertArg(ok)).toBe(true);
     }
     for (const bad of [
@@ -694,6 +695,11 @@ describe("relaunch from the persisted launch argv (Phase 6)", () => {
       'q"',
       "a\nb",
       "x".repeat(257),
+      // The runner's first-character rule (review r2 nit): never zsh `=`.
+      "=cmd",
+      ":x",
+      "+x",
+      "_x",
       7,
       null,
     ]) {
@@ -749,9 +755,13 @@ describe("relaunch from the persisted launch argv (Phase 6)", () => {
     expect(
       buildResumeCmd("sess-1", undefined, "summary", undefined, ["--permission-mode", "plan"]),
     ).toBe("claude --permission-mode plan --resume sess-1\r");
+    // The runner never replays the dangerous-skip flags; if one arrived it
+    // would not stand in for a permission choice.
     expect(
       buildResumeCmd("sess-1", undefined, "summary", undefined, ["--dangerously-skip-permissions"]),
-    ).toBe("claude --dangerously-skip-permissions --resume sess-1\r");
+    ).toBe(
+      "claude --permission-mode bypassPermissions --dangerously-skip-permissions --resume sess-1\r",
+    );
     expect(
       buildResumeCmd("sess-1", undefined, "summary", undefined, ["--model", "$(rm -rf ~)"]),
     ).not.toContain("$(");
@@ -787,33 +797,58 @@ describe("a lost holder's dead pane (Phase 6)", () => {
     expect([...released]).toEqual(["dead"]);
   });
 
-  it("releaseAndRelaunch: not hosted → scheduled and the dead pane closed", async () => {
+  it("releaseAndRelaunch: not hosted → scheduled, and the dead pane REMEMBERED (closed only once replaced)", async () => {
     const scheduled: Array<[string, string[]]> = [];
-    const closed: string[] = [];
+    const remembered: Array<[string, string]> = [];
     const withheld: unknown[] = [];
     const out = await releaseAndRelaunch(
       { sessionId: "s-1", terminalId: "dead", pageId: "p" },
       (page, ids) => scheduled.push([page, ids]),
-      (id) => closed.push(id),
+      (sid, tid) => remembered.push([sid, tid]),
       (w) => withheld.push(w),
       undefined,
       async () => new Set(["other"]),
     );
     expect(out).toBe(true);
     expect(scheduled).toEqual([["p", ["s-1"]]]);
-    expect(closed).toEqual(["dead"]);
+    expect(remembered).toEqual([["s-1", "dead"]]);
     expect(withheld).toEqual([]);
+  });
+
+  it("declineLeftoverDeadPanes banners only the declined sessions' dead panes", () => {
+    const deadPaneFor = new Map([
+      ["s-made", "dead-1"],
+      ["s-declined", "dead-2"],
+      ["s-other-run", "dead-3"],
+    ]);
+    const marked: unknown[] = [];
+    declineLeftoverDeadPanes(
+      new Set(["s-made", "s-declined", "s-no-pane"]),
+      new Set(["s-made"]),
+      deadPaneFor,
+      "page-1",
+      (w) => marked.push(w),
+    );
+    expect(marked).toEqual([
+      {
+        sessionId: "s-declined",
+        terminalId: "dead-2",
+        pageId: "page-1",
+        reason: "restore-declined",
+      },
+    ]);
+    expect([...deadPaneFor.keys()].sort()).toEqual(["s-made", "s-other-run"]);
   });
 
   it("releaseAndRelaunch: still hosted (or unreadable) → no relaunch, the banner instead", async () => {
     for (const live of [new Set(["s-1"]), null]) {
       const scheduled: unknown[] = [];
-      const closed: string[] = [];
+      const closed: unknown[] = [];
       const withheld: unknown[] = [];
       const out = await releaseAndRelaunch(
         { sessionId: "s-1", terminalId: "dead", pageId: null },
         (page, ids) => scheduled.push([page, ids]),
-        (id) => closed.push(id),
+        (sid, tid) => closed.push([sid, tid]),
         (w) => withheld.push(w),
         "liveness-unknown",
         async () => live,

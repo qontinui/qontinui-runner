@@ -82,6 +82,8 @@ export function relaunchWithheldText(reason: RelaunchWithheldReason): string {
       return "not relaunched: whether the session is still running could not be read";
     case "holder-unreachable":
       return "not relaunched: its PTY holder stopped answering — the session may still be running";
+    case "restore-declined":
+      return "not relaunched: the restore did not resume it (skipped, or past its restore window)";
   }
 }
 
