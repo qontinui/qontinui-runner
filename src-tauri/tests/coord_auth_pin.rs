@@ -877,11 +877,11 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("coord_http.rs", "escalated", 1),
     ("coord_http.rs", "session-noop", 1),
     ("coord_questions.rs", "session-noop", 1),
-    ("fleet.rs", "device", 5),
+    ("fleet.rs", "device", 4),
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 5),
     ("mcp/probe_executor.rs", "device", 1),
-    ("repo_tenant.rs", "device", 1),
+    ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
     ("session/handoff.rs", "escalated", 1),
 ];
@@ -974,6 +974,18 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// waits on escalation E3, not on another credential-threading phase. (The two
 /// Phase-5 `mcp/plan_library.rs` forwards are among those that remain: they are
 /// qontinui-web-bound, so Phase 6's coord-side seam does not reach them.)
+///
+/// Plan `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// (review finding 1) then moved `fleet.rs`'s register heartbeat onto the
+/// stating seam: its bearer follows the binding set's source
+/// (`LocalBindingSet::bearer_scope` — the default's own per-tenant slot when
+/// the set came from those slots), so `device` 22 -> 21.
+///
+/// Plan `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 4 then added `repo_tenant::fetch_repo_tenants`, the cwd resolver's
+/// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
+/// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
+/// refuses any principal that does not prove a device. So `device` 21 -> 22.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
     ("session-noop", 10),
@@ -1180,7 +1192,15 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          its stacked base #1447 ff-landed): the branch carried 40 off a narrative that stopped \
          at 51, because its base predated Phase 5's two plan_library forwards. main's 53 is the \
          current derivation, so the count is main's 43 minus the ONE site this commit moves, \
-         never either side's literal. Found {sites}. A change here \
+         never either side's literal. Plan \
+         2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential \
+         (review finding 1) then moved fleet.rs's register heartbeat onto the stating seam \
+         (its bearer follows the binding set's source): 42 - 1 = 41. Plan \
+         2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant \
+         Phase 4 then added repo_tenant.rs's fetch_repo_tenants, the cwd resolver's \
+         `GET /coord/repos/tenants` read (device: coord answers it over the caller DEVICE's own \
+         bindings and refuses any principal that does not prove a device): 41 + 1 = 42. \
+         Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \

@@ -113,6 +113,12 @@ pub async fn terminal_create(
     // that omit the argument keep working — Tauri/serde pass a missing arg as
     // `None`, which resolves to "no override", the safe answer.
     resource_override: Option<bool>,
+    // Plan 2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits
+    // Phase 2 — the repos this session will EDIT beside its intent repo
+    // (`editSiblings` from the frontend). Absent on every legacy caller, which
+    // declares none. A bad or unresolvable entry is refused with an `Err`
+    // before anything is allocated.
+    edit_siblings: Option<Vec<String>>,
 ) -> Result<CommandResponse, String> {
     // Spawn-time resource gate, EARLY-OUT arm (§Part D). The authority is still
     // the gate inside `TerminalSession::spawn` — every unattended seam reaches
@@ -189,12 +195,23 @@ pub async fn terminal_create(
     // it identifies the coord row, not the spawning agent. None is correct.
     // The spawn tenant rides along because this allocate runs before the
     // session exists, so no registry tenant can answer for it (P5b).
+    //
+    // The declared edit siblings are validated against the EFFECTIVE intent
+    // repo (derived from `working_dir` when none was passed) before the
+    // allocate, so a typo is an `Err` rather than the helper's fail-open
+    // fallback into the shared checkout (vet V9).
+    let edit_siblings = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+        effective_intent_repo.as_deref(),
+        edit_siblings.as_deref().unwrap_or_default(),
+    )
+    .map_err(|refusal| refusal.to_string())?;
     let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
         effective_intent_repo.as_deref(),
         title.as_deref().unwrap_or("Terminal edit session"),
         working_dir,
         None,
         spawn_tenant_id,
+        &edit_siblings,
     )
     .await;
 
@@ -1032,6 +1049,7 @@ pub fn terminal_get_scrollback(
     session.reset_flow_control();
     let (data, start_offset) = session.get_scrollback_buffer();
     let end_offset = start_offset + data.len() as u64;
+    crate::terminal::transport_stats::record_ring_replay(data.len());
     let encoded = STANDARD.encode(&data);
 
     Ok(CommandResponse {

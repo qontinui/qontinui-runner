@@ -24,7 +24,8 @@ import type {
   AssertableField,
 } from "./types";
 import { createLogger } from "../logger";
-import { runScript, DEFAULT_SCRIPT_TIMEOUT_MS, ScriptWorkerError } from "./script-worker";
+import { describeThrown } from "../utils";
+import { runScript, DEFAULT_SCRIPT_TIMEOUT_MS } from "./script-worker";
 import { getScriptEmitter } from "./script-emitter";
 import { emitScriptedOutputEvent } from "./scripted-output-telemetry";
 
@@ -149,7 +150,7 @@ export abstract class ScriptedOutputHandler<
       log.warn(
         "Script emitter rejected; falling back to truncation. goal=%s err=%s",
         goal,
-        describeError(err),
+        describeThrown(err, "unknown error"),
       );
       return this.truncationFallback(rawOutput);
     }
@@ -179,7 +180,7 @@ export abstract class ScriptedOutputHandler<
         goal,
         schemaHint ? JSON.stringify(Object.keys(schemaHint)) : "none",
         truncateForLog(expr),
-        err instanceof ScriptWorkerError ? err.message : describeError(err),
+        describeThrown(err, "unknown error"),
       );
       return this.truncationFallback(rawOutput);
     }
@@ -210,13 +211,4 @@ function approximateJsonByteLength(value: unknown): number {
 function truncateForLog(s: string): string {
   if (s.length <= 120) return s;
   return s.slice(0, 117) + "...";
-}
-
-function describeError(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  try {
-    return String(err);
-  } catch {
-    return "<unknown error>";
-  }
 }
