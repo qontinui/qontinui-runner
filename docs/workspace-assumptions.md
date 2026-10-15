@@ -12,7 +12,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `dev_ports` | 26 | 26 | 26 | 0 | 0 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
-| `machine_path` | 5 | 5 | 0 | 4 | 1 | 0 |
+| `machine_path` | 4 | 4 | 0 | 3 | 1 | 0 |
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
@@ -199,11 +199,10 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 _No hits._
 
-## `machine_path` (5 rows)
+## `machine_path` (4 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
-| `src/commands/setup_wizard.rs` | `discover_claude_config_dirs` | `let claude_root = std::path::Path::new("C:\\claude");` | 1 | fallback_correct — Probes the fleet's C:\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply. |
 | `src/mcp/test_fixtures.rs` | `const DEFAULT_TEST_CONFIG_DIR` | `const DEFAULT_TEST_CONFIG_DIR: &str = "C:\\claude\\.claude-test-fixture";` | 1 | dev_only_surface — Debug-gated test-fixture injection endpoints for manual UI testing. |
 | `src/projects/snapshot.rs` | `const NOISE_PREFIXES` | `const NOISE_PREFIXES: [&str; 1] = ["c:\\claude\\"];` | 1 | fallback_correct — Filters the operator's C:\claude agent-scratch rows out of project attribution; on another box it filters nothing, which only leaves some noise rows in the view. |
 | `src/session_archive/discovery.rs` | `claude_root_for` | `Some(PathBuf::from("C:\\claude"))` | 1 | fallback_correct — The Windows arm of the account-home scan root (the fleet's C:/claude layout); every other OS scans $HOME instead (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account Phase 1). |

@@ -32,16 +32,6 @@ unreviewed_ceiling = 238
 
 [[disposition]]
 class = "machine_path"
-file = "src/commands/setup_wizard.rs"
-symbol = "discover_claude_config_dirs"
-disposition = "fallback_correct"
-note = "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
-reviewed = [
-    "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
-]
-
-[[disposition]]
-class = "machine_path"
 file = "src/mcp/test_fixtures.rs"
 symbol = "const DEFAULT_TEST_CONFIG_DIR"
 disposition = "dev_only_surface"
