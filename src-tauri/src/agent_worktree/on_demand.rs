@@ -450,6 +450,13 @@ pub struct SurveyItem {
     /// Junction reparse points that must be unlinked BEFORE any recursive
     /// delete (INV-W4). Rendered so the operator sees they are links.
     pub junctioned_paths: Vec<String>,
+    /// HEAD the cached census saw for this worktree. Not part of the wire;
+    /// it is the echoed incarnation the on-demand removal re-checks live.
+    #[serde(skip)]
+    pub census_head_sha: Option<String>,
+    /// Birth time the cached census recorded (see `reclaim::dir_birth_time`).
+    #[serde(skip)]
+    pub census_dir_created_at: Option<String>,
     /// coord's own reason string for the instruction (e.g.
     /// `worktree:lifecycle:pr_merged`) — provenance for a reapable item.
     pub coord_reason: Option<String>,
@@ -1358,6 +1365,8 @@ fn build_survey_items(
                 landed_in_main: a.census.landed_in_main,
                 attributable_bytes: a.census.attributable_bytes,
                 junctioned_paths: a.junctioned_paths,
+                census_head_sha: a.census.head_sha.clone(),
+                census_dir_created_at: a.census.dir_created_at.clone(),
                 coord_reason: a.coord_reason,
                 session_label: a.attribution.session_label,
                 session_id: a.attribution.session_id,
@@ -1707,12 +1716,16 @@ fn execute_targets(targets: Vec<SurveyItem>, dry_run: bool) -> ReclaimOutcome {
             junctioned_paths: item.junctioned_paths.clone(),
             retention: None,
             observed_at: None,
-            head_sha: None,
-            dir_created_at: None,
+            // The cached census row this survey item came from is the
+            // incarnation the operator judged; the guard re-reads both live. A
+            // census that could not read a value leaves `None`, which skips
+            // that comparison (compat fail-open; only a value that WAS
+            // recorded and now differs, or is unreadable, refuses).
+            head_sha: item.census_head_sha.clone(),
+            dir_created_at: item.census_dir_created_at.clone(),
         };
         // Incarnation guard — the same shared helper as `execute_pull` and the
-        // backstop. A survey item carries no echoed incarnation, so the
-        // comparisons are skipped today; the call keeps the paths uniform.
+        // backstop.
         if reclaim::check_instruction_incarnation(&path, &instr).is_err() {
             outcome.skipped.push(SkippedItem {
                 id: item.id.clone(),
@@ -2448,6 +2461,8 @@ mod tests {
             landed_in_main: None,
             attributable_bytes: 0,
             junctioned_paths: Vec::new(),
+            census_head_sha: None,
+            census_dir_created_at: None,
             coord_reason: None,
             session_label: "unattributed".to_string(),
             session_id: None,
@@ -3139,6 +3154,8 @@ mod tests {
             landed_in_main: Some(true),
             attributable_bytes: 4096,
             junctioned_paths: Vec::new(),
+            census_head_sha: None,
+            census_dir_created_at: None,
             coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
             ..unattributed_item_fields()
         };
@@ -3198,6 +3215,8 @@ mod tests {
             landed_in_main: Some(true),
             attributable_bytes: 4096,
             junctioned_paths: Vec::new(),
+            census_head_sha: None,
+            census_dir_created_at: None,
             coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
             ..unattributed_item_fields()
         };

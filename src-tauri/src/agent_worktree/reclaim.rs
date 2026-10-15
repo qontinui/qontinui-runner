@@ -871,37 +871,113 @@ fn resolve_git_dir(checkout: &Path) -> Option<PathBuf> {
         return Some(dot_git);
     }
     let text = std::fs::read_to_string(&dot_git).ok()?;
-    let rel = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?;
+    let rel = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?;
     let p = PathBuf::from(rel.trim());
     Some(if p.is_absolute() { p } else { checkout.join(p) })
 }
 
-/// Is the run record at `record` an in-flight build? Fresh (mtime within
-/// `stale`) AND `finished_at` null. A fresh record that cannot be read or
-/// parsed fails CLOSED (`true`); a stale or absent one is not a build.
-fn run_record_is_active(record: &Path, stale: Duration) -> bool {
+/// Liveness of the process a run record names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidState {
+    /// A live process whose start is consistent with the record.
+    Alive,
+    /// No such process, or the pid was reused by a later process.
+    Dead,
+    /// Cannot be established (unparseable pid; on Windows an absent pid, since
+    /// the wrapper records a MSYS `$$` that need not be a Windows pid).
+    Unknown,
+}
+
+/// Hard ceiling for an unfinished record whose pid is Alive or Unknown. The
+/// longest wrapper lock wait is 14400 s (cargo-verify), so 6 h bounds a record
+/// nothing will ever finish.
+const DEFAULT_BUILD_RECORD_MAX_SECS: u64 = 6 * 3600;
+
+fn build_record_max_secs() -> u64 {
+    std::env::var("QONTINUI_WORKTREE_RECLAIM_BUILD_RECORD_MAX_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BUILD_RECORD_MAX_SECS)
+}
+
+/// Real pid probe. `started_at` is the record's RFC3339 start; a live process
+/// that started AFTER it (plus slack) is a reused pid, i.e. Dead.
+fn probe_record_pid(pid: u32, started_at: Option<&str>) -> PidState {
+    let spid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
+    match sys.process(spid) {
+        Some(p) => {
+            let rec_start = started_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.timestamp());
+            match rec_start {
+                Some(rs) if (p.start_time() as i64) > rs + 5 => PidState::Dead,
+                _ => PidState::Alive,
+            }
+        }
+        None if cfg!(windows) => PidState::Unknown,
+        None => PidState::Dead,
+    }
+}
+
+/// Is the run record at `record` an in-flight build?
+///
+/// `finished_at` null is required. A record whose mtime is within `stale` is
+/// active (the wrapper's heartbeat, claude-config PR #1838 and not yet merged
+/// when this was written, keeps a live run's mtime fresh). A record that is
+/// mtime-stale is NOT assumed dead, because a build without the heartbeat is
+/// silent for its whole length: the recorded pid (with `started_at`) is the
+/// independent backstop. Alive or Unknown pid holds (fail closed) up to
+/// `max_age`; a Dead pid does not. A fresh record that cannot be read or parsed
+/// fails CLOSED; an absent one is not a build.
+fn run_record_is_active_with(
+    record: &Path,
+    stale: Duration,
+    max_age: Duration,
+    probe: &dyn Fn(u32, Option<&str>) -> PidState,
+) -> bool {
     let meta = match std::fs::metadata(record) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
         Err(_) => return true, // present but unstat-able: fail closed
     };
     // An mtime in the future or unreadable cannot be shown stale -> fresh.
-    if let Ok(Ok(age)) = meta.modified().map(|m| m.elapsed()) {
-        if age > stale {
-            return false;
-        }
-    }
+    let age = meta.modified().ok().and_then(|m| m.elapsed().ok());
+    let is_stale = age.is_some_and(|a| a > stale);
     let Ok(text) = std::fs::read_to_string(record) else {
         return true;
     };
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => match v.get("finished_at") {
-            Some(serde_json::Value::Null) => true,
-            Some(_) => false,
-            None => true, // malformed (no finished_at key): fail closed
-        },
-        Err(_) => true,
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return !is_stale || age.is_some_and(|a| a <= max_age);
+    };
+    match v.get("finished_at") {
+        Some(serde_json::Value::Null) | None => {}
+        Some(_) => return false,
     }
+    if !is_stale {
+        return true;
+    }
+    // Unfinished and mtime-stale: ask whether the run is still alive.
+    if age.is_some_and(|a| a > max_age) {
+        return false;
+    }
+    let state = match v.get("pid").and_then(|p| p.as_u64()).and_then(|p| u32::try_from(p).ok()) {
+        Some(pid) => probe(pid, v.get("started_at").and_then(|s| s.as_str())),
+        None => PidState::Unknown,
+    };
+    state != PidState::Dead
+}
+
+fn run_record_is_active(record: &Path, stale: Duration) -> bool {
+    run_record_is_active_with(
+        record,
+        stale,
+        Duration::from_secs(build_record_max_secs()),
+        &probe_record_pid,
+    )
 }
 
 /// [`shared_build_active_for`] with the staleness bound injected.
@@ -955,7 +1031,11 @@ fn live_head_sha(worktree: &Path) -> Option<String> {
     let wt = worktree.to_str()?;
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["-C", wt, "rev-parse", "HEAD"]);
-    match run_probe(cmd, RECLAIM_CMD_TIMEOUT, "worktree_reclaim: git rev-parse HEAD") {
+    match run_probe(
+        cmd,
+        RECLAIM_CMD_TIMEOUT,
+        "worktree_reclaim: git rev-parse HEAD",
+    ) {
         ProbeOutcome::Captured(out) => {
             let s = String::from_utf8_lossy(&out).trim().to_string();
             (!s.is_empty()).then_some(s)
@@ -966,8 +1046,9 @@ fn live_head_sha(worktree: &Path) -> Option<String> {
 
 /// Pure incarnation decision. `Ok(())` = proceed; `Err(msg)` = refuse.
 /// `None` echoed => that comparison is skipped; unreadable live with `Some`
-/// echoed => refuse. Birth times compare to within 1 ms (coord stores
-/// microseconds; the runner reads 100 ns).
+/// echoed => refuse. Birth times compare to within 1 ms, which absorbs
+/// sub-microsecond/microsecond truncation if the value round-tripped through a
+/// store of lower precision (assumed, not verified against coord).
 fn incarnation_verdict(
     echoed_born: Option<&str>,
     echoed_head: Option<&str>,
@@ -1763,9 +1844,12 @@ fn backstop_consider_one(repo_dir: &Path, ceiling: u64, coord_ever_live: bool) {
         log_busy_sibling_skip(repo_dir, &sibling, busy);
         return;
     }
-    // Incarnation guard (no coord echo on this path, so the echoed fields are
-    // `None` and the comparisons are skipped; the shared call keeps all three
-    // removal paths on one guard).
+    // Incarnation guard, DELIBERATELY compare-nothing here: this age-ceiling
+    // path acts on no coord/census judgement of a specific directory, so there
+    // is no echoed incarnation to compare (compat fail-open, like an older
+    // coord that echoes nothing). Only `execute_pull` (coord's echoed fields)
+    // and on-demand (the cached census row) perform a real comparison. The
+    // call keeps all three removal paths on the one shared guard.
     if check_incarnation(repo_dir, None, None).is_err() {
         return;
     }
@@ -3292,6 +3376,10 @@ mod incarnation_and_shared_build_tests {
             None
         )
         .is_ok());
+        // 2 ms and 5 ms apart must be refused.
+        for echoed in ["2026-10-14T10:00:00.125457+00:00", "2026-10-14T10:00:00.128457+00:00"] {
+            assert!(incarnation_verdict(Some(echoed), None, Some(live), None).is_err());
+        }
     }
 
     // ---- real tempdir ----------------------------------------------------
@@ -3315,17 +3403,24 @@ mod incarnation_and_shared_build_tests {
     #[test]
     fn birth_time_of_an_absent_path_is_none() {
         let d = tempfile::tempdir().unwrap();
-        // No `.git` at all: created() fallback (None only on filesystems
-        // without birth time, in which case the guard fails closed anyway).
-        let _ = dir_birth_time(d.path());
         assert!(dir_birth_time(&d.path().join("absent")).is_none());
+        // No `.git`: falls back to created() of the directory itself. Some
+        // filesystems expose no birth time; then None is a census-time
+        // "unknown" (the guard refuses only when a value WAS echoed and the
+        // live read fails).
+        let fallback = dir_birth_time(d.path());
+        assert_eq!(
+            fallback.is_some(),
+            std::fs::metadata(d.path()).unwrap().created().is_ok()
+        );
     }
 
     #[test]
     fn recreated_directory_within_seconds_is_not_the_judged_incarnation() {
-        // NTFS name tunneling: delete a name and re-create it within ~15 s and
-        // Windows hands back the old creation time. The gitlink mtime is not
-        // tunneled, so the guard still tells the two incarnations apart.
+        // Assumption (from the plan, not re-measured here): NTFS name tunneling
+        // can give a quickly re-created name its old creation time. The
+        // gitlink mtime is a fresh write, so the guard separates incarnations
+        // even then. This test pins the mtime-based behavior, not tunneling.
         let d = tempfile::tempdir().unwrap();
         let wt = make_checkout(d.path(), "wt");
         let echoed = dir_birth_time(&wt).unwrap().to_rfc3339();
@@ -3366,6 +3461,8 @@ mod incarnation_and_shared_build_tests {
         let od = body_of(SRC_ON_DEMAND, "fn execute_targets(", 8000);
         assert!(od.contains("reclaim::check_instruction_incarnation(&path, &instr)"));
         assert!(od.contains("reclaim::probe_building(&path)"));
+        assert!(od.contains("head_sha: item.census_head_sha.clone()"));
+        assert!(od.contains("dir_created_at: item.census_dir_created_at.clone()"));
         // probe_building / the sibling scan both reach the shared signal
         // through worktree_is_building.
         assert!(body_of(SRC_RECLAIM, "pub(super) fn probe_building(", 300)
@@ -3434,7 +3531,8 @@ mod incarnation_and_shared_build_tests {
     fn stale_record_does_not_hold() {
         let d = tempfile::tempdir().unwrap();
         let (a, _b, bgd) = allocation(d.path(), UUID_A);
-        write_record(&bgd, RUNNING, 600);
+        // pid reused by a later process (this one) => Dead
+        write_record(&bgd, &format!(r#"{{"pid":{},"started_at":"2000-01-01T00:00:00Z","finished_at":null}}"#, std::process::id()), 600);
         assert!(!building(&a));
     }
 
@@ -3467,10 +3565,16 @@ mod incarnation_and_shared_build_tests {
     fn staleness_bound_is_injectable() {
         let d = tempfile::tempdir().unwrap();
         let (a, _b, bgd) = allocation(d.path(), UUID_A);
-        write_record(&bgd, RUNNING, 30);
+        write_record(&bgd, &format!(r#"{{"pid":{},"started_at":"2000-01-01T00:00:00Z","finished_at":null}}"#, std::process::id()), 30);
         let agent = a.parent().unwrap();
-        assert!(shared_build_active_for_with(agent, Duration::from_secs(120)));
-        assert!(!shared_build_active_for_with(agent, Duration::from_secs(10)));
+        assert!(shared_build_active_for_with(
+            agent,
+            Duration::from_secs(120)
+        ));
+        assert!(!shared_build_active_for_with(
+            agent,
+            Duration::from_secs(10)
+        ));
     }
 
     #[test]
@@ -3483,5 +3587,92 @@ mod incarnation_and_shared_build_tests {
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gd.display())).unwrap();
         write_record(&gd, RUNNING, 1);
         assert!(!building(&wt));
+    }
+
+    // ---- pid backstop for mtime-stale unfinished records -----------------
+
+    fn rec_with(gitdir: &Path, pid: u64, age_secs: u64) -> PathBuf {
+        let body = format!(
+            r#"{{"pid":{pid},"started_at":"2026-10-14T10:00:00Z","finished_at":null}}"#
+        );
+        write_record(gitdir, &body, age_secs)
+    }
+
+    fn active_with(rec: &Path, state: PidState) -> bool {
+        run_record_is_active_with(
+            rec,
+            Duration::from_secs(120),
+            Duration::from_secs(6 * 3600),
+            &move |_, _| state,
+        )
+    }
+
+    #[test]
+    fn stale_record_with_live_pid_still_holds() {
+        let d = tempfile::tempdir().unwrap();
+        let (_a, _b, bgd) = allocation(d.path(), UUID_A);
+        let rec = rec_with(&bgd, 4242, 3000);
+        assert!(active_with(&rec, PidState::Alive));
+    }
+
+    #[test]
+    fn stale_record_with_dead_pid_does_not_hold() {
+        let d = tempfile::tempdir().unwrap();
+        let (_a, _b, bgd) = allocation(d.path(), UUID_A);
+        let rec = rec_with(&bgd, 4242, 3000);
+        assert!(!active_with(&rec, PidState::Dead));
+    }
+
+    #[test]
+    fn stale_record_with_unreadable_pid_fails_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let (_a, _b, bgd) = allocation(d.path(), UUID_A);
+        let rec = rec_with(&bgd, 4242, 3000);
+        assert!(active_with(&rec, PidState::Unknown));
+        // No pid field at all.
+        let rec = write_record(&bgd, r#"{"finished_at":null}"#, 3000);
+        assert!(run_record_is_active_with(
+            &rec,
+            Duration::from_secs(120),
+            Duration::from_secs(6 * 3600),
+            &|_, _| PidState::Dead
+        ));
+    }
+
+    #[test]
+    fn record_older_than_the_ceiling_does_not_hold_even_if_pid_alive() {
+        let d = tempfile::tempdir().unwrap();
+        let (_a, _b, bgd) = allocation(d.path(), UUID_A);
+        let rec = rec_with(&bgd, 4242, 7 * 3600);
+        assert!(!active_with(&rec, PidState::Alive));
+    }
+
+    #[test]
+    fn real_probe_sees_this_process_alive_and_a_later_start_as_reuse() {
+        let me = std::process::id();
+        // started_at long before this process started: process started later
+        // than the record -> a reused pid.
+        assert_eq!(
+            probe_record_pid(me, Some("2000-01-01T00:00:00Z")),
+            PidState::Dead
+        );
+        // started_at in the future: consistent -> alive.
+        assert_eq!(
+            probe_record_pid(me, Some("2100-01-01T00:00:00Z")),
+            PidState::Alive
+        );
+    }
+
+    #[test]
+    fn worktree_is_building_holds_on_stale_record_with_live_pid() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b, bgd) = allocation(d.path(), UUID_A);
+        // This test process's own pid, started_at in the future => Alive.
+        let body = format!(
+            r#"{{"pid":{},"started_at":"2100-01-01T00:00:00Z","finished_at":null}}"#,
+            std::process::id()
+        );
+        write_record(&bgd, &body, 3000);
+        assert!(building(&a));
     }
 }
