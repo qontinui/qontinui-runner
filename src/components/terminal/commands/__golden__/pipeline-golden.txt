@@ -31,8 +31,78 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 2696
+# tier: golden   inputs: 3064
 
+/admin	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/admin "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+/admin "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+/admin "3 best"	literal	terminal.elevated	[]	unbound	-
+/admin "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+/admin --tenant	literal	terminal.elevated	[]	unbound	-
+/admin 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+/admin 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+/admin 3 best	literal	terminal.elevated	[]	unbound	-
+/admin 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+/admin powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/admin powershell "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+/admin powershell "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+/admin powershell "3 best"	literal	terminal.elevated	[]	unbound	-
+/admin powershell "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+/admin powershell --tenant	literal	terminal.elevated	[]	unbound	-
+/admin powershell 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+/admin powershell 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+/admin powershell 3 best	literal	terminal.elevated	[]	unbound	-
+/admin powershell 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+/admin shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/admin shell "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+/admin shell "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+/admin shell "3 best"	literal	terminal.elevated	[]	unbound	-
+/admin shell "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+/admin shell --tenant	literal	terminal.elevated	[]	unbound	-
+/admin shell 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+/admin shell 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+/admin shell 3 best	literal	terminal.elevated	[]	unbound	-
+/admin shell 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+/admin terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/admin terminal "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+/admin terminal "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+/admin terminal "3 best"	literal	terminal.elevated	[]	unbound	-
+/admin terminal "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+/admin terminal --tenant	literal	terminal.elevated	[]	unbound	-
+/admin terminal 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+/admin terminal 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+/admin terminal 3 best	literal	terminal.elevated	[]	unbound	-
+/admin terminal 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+/administrator powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/administrator powershell "1 gmail fix the bug"	none	-	null	none	-
+/administrator powershell "1 gmail fix the bug" --tenant	none	-	null	none	-
+/administrator powershell "3 best"	none	-	null	none	-
+/administrator powershell "3 best" --tenant	none	-	null	none	-
+/administrator powershell --tenant	none	-	null	none	-
+/administrator powershell 1 gmail fix the bug	none	-	null	none	-
+/administrator powershell 1 gmail fix the bug --tenant	none	-	null	none	-
+/administrator powershell 3 best	none	-	null	none	-
+/administrator powershell 3 best --tenant	none	-	null	none	-
+/administrator shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/administrator shell "1 gmail fix the bug"	none	-	null	none	-
+/administrator shell "1 gmail fix the bug" --tenant	none	-	null	none	-
+/administrator shell "3 best"	none	-	null	none	-
+/administrator shell "3 best" --tenant	none	-	null	none	-
+/administrator shell --tenant	none	-	null	none	-
+/administrator shell 1 gmail fix the bug	none	-	null	none	-
+/administrator shell 1 gmail fix the bug --tenant	none	-	null	none	-
+/administrator shell 3 best	none	-	null	none	-
+/administrator shell 3 best --tenant	none	-	null	none	-
+/administrator terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/administrator terminal "1 gmail fix the bug"	none	-	null	none	-
+/administrator terminal "1 gmail fix the bug" --tenant	none	-	null	none	-
+/administrator terminal "3 best"	none	-	null	none	-
+/administrator terminal "3 best" --tenant	none	-	null	none	-
+/administrator terminal --tenant	none	-	null	none	-
+/administrator terminal 1 gmail fix the bug	none	-	null	none	-
+/administrator terminal 1 gmail fix the bug --tenant	none	-	null	none	-
+/administrator terminal 3 best	none	-	null	none	-
+/administrator terminal 3 best --tenant	none	-	null	none	-
 /analyze	literal	terminal.analyze	[]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
 /analyze "1 gmail fix the bug"	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
 /analyze "1 gmail fix the bug" --tenant	literal	terminal.analyze	[["type","1 gmail fix the bug --tenant"]]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
@@ -275,6 +345,46 @@
 /docs 1 gmail fix the bug --tenant	literal	terminal.doc-finder	[]	unbound	-
 /docs 3 best	literal	terminal.doc-finder	[]	unbound	-
 /docs 3 best --tenant	literal	terminal.doc-finder	[]	unbound	-
+/elevated	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/elevated "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+/elevated "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated "3 best"	literal	terminal.elevated	[]	unbound	-
+/elevated "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+/elevated 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated 3 best	literal	terminal.elevated	[]	unbound	-
+/elevated 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/elevated powershell "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+/elevated powershell "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated powershell "3 best"	literal	terminal.elevated	[]	unbound	-
+/elevated powershell "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated powershell --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated powershell 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+/elevated powershell 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated powershell 3 best	literal	terminal.elevated	[]	unbound	-
+/elevated powershell 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/elevated shell "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+/elevated shell "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated shell "3 best"	literal	terminal.elevated	[]	unbound	-
+/elevated shell "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated shell --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated shell 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+/elevated shell 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated shell 3 best	literal	terminal.elevated	[]	unbound	-
+/elevated shell 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/elevated terminal "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+/elevated terminal "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated terminal "3 best"	literal	terminal.elevated	[]	unbound	-
+/elevated terminal "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated terminal --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated terminal 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+/elevated terminal 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+/elevated terminal 3 best	literal	terminal.elevated	[]	unbound	-
+/elevated terminal 3 best --tenant	literal	terminal.elevated	[]	unbound	-
 /events	pattern	terminal.history	[]	ok	noop /history · no events showed
 /events "1 gmail fix the bug"	literal	terminal.history	[]	unbound	-
 /events "1 gmail fix the bug" --tenant	literal	terminal.history	[]	unbound	-
@@ -567,6 +677,76 @@
 /notifications 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound	-
 /notifications 3 best	literal	terminal.toggle-desktop-notify	[]	unbound	-
 /notifications 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound	-
+/open admin powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/open admin powershell "1 gmail fix the bug"	none	-	null	none	-
+/open admin powershell "1 gmail fix the bug" --tenant	none	-	null	none	-
+/open admin powershell "3 best"	none	-	null	none	-
+/open admin powershell "3 best" --tenant	none	-	null	none	-
+/open admin powershell --tenant	none	-	null	none	-
+/open admin powershell 1 gmail fix the bug	none	-	null	none	-
+/open admin powershell 1 gmail fix the bug --tenant	none	-	null	none	-
+/open admin powershell 3 best	none	-	null	none	-
+/open admin powershell 3 best --tenant	none	-	null	none	-
+/open admin shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/open admin shell "1 gmail fix the bug"	none	-	null	none	-
+/open admin shell "1 gmail fix the bug" --tenant	none	-	null	none	-
+/open admin shell "3 best"	none	-	null	none	-
+/open admin shell "3 best" --tenant	none	-	null	none	-
+/open admin shell --tenant	none	-	null	none	-
+/open admin shell 1 gmail fix the bug	none	-	null	none	-
+/open admin shell 1 gmail fix the bug --tenant	none	-	null	none	-
+/open admin shell 3 best	none	-	null	none	-
+/open admin shell 3 best --tenant	none	-	null	none	-
+/open admin terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/open admin terminal "1 gmail fix the bug"	none	-	null	none	-
+/open admin terminal "1 gmail fix the bug" --tenant	none	-	null	none	-
+/open admin terminal "3 best"	none	-	null	none	-
+/open admin terminal "3 best" --tenant	none	-	null	none	-
+/open admin terminal --tenant	none	-	null	none	-
+/open admin terminal 1 gmail fix the bug	none	-	null	none	-
+/open admin terminal 1 gmail fix the bug --tenant	none	-	null	none	-
+/open admin terminal 3 best	none	-	null	none	-
+/open admin terminal 3 best --tenant	none	-	null	none	-
+/open administrator terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/open administrator terminal "1 gmail fix the bug"	none	-	null	none	-
+/open administrator terminal "1 gmail fix the bug" --tenant	none	-	null	none	-
+/open administrator terminal "3 best"	none	-	null	none	-
+/open administrator terminal "3 best" --tenant	none	-	null	none	-
+/open administrator terminal --tenant	none	-	null	none	-
+/open administrator terminal 1 gmail fix the bug	none	-	null	none	-
+/open administrator terminal 1 gmail fix the bug --tenant	none	-	null	none	-
+/open administrator terminal 3 best	none	-	null	none	-
+/open administrator terminal 3 best --tenant	none	-	null	none	-
+/open elevated powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/open elevated powershell "1 gmail fix the bug"	none	-	null	none	-
+/open elevated powershell "1 gmail fix the bug" --tenant	none	-	null	none	-
+/open elevated powershell "3 best"	none	-	null	none	-
+/open elevated powershell "3 best" --tenant	none	-	null	none	-
+/open elevated powershell --tenant	none	-	null	none	-
+/open elevated powershell 1 gmail fix the bug	none	-	null	none	-
+/open elevated powershell 1 gmail fix the bug --tenant	none	-	null	none	-
+/open elevated powershell 3 best	none	-	null	none	-
+/open elevated powershell 3 best --tenant	none	-	null	none	-
+/open elevated shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/open elevated shell "1 gmail fix the bug"	none	-	null	none	-
+/open elevated shell "1 gmail fix the bug" --tenant	none	-	null	none	-
+/open elevated shell "3 best"	none	-	null	none	-
+/open elevated shell "3 best" --tenant	none	-	null	none	-
+/open elevated shell --tenant	none	-	null	none	-
+/open elevated shell 1 gmail fix the bug	none	-	null	none	-
+/open elevated shell 1 gmail fix the bug --tenant	none	-	null	none	-
+/open elevated shell 3 best	none	-	null	none	-
+/open elevated shell 3 best --tenant	none	-	null	none	-
+/open elevated terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+/open elevated terminal "1 gmail fix the bug"	none	-	null	none	-
+/open elevated terminal "1 gmail fix the bug" --tenant	none	-	null	none	-
+/open elevated terminal "3 best"	none	-	null	none	-
+/open elevated terminal "3 best" --tenant	none	-	null	none	-
+/open elevated terminal --tenant	none	-	null	none	-
+/open elevated terminal 1 gmail fix the bug	none	-	null	none	-
+/open elevated terminal 1 gmail fix the bug --tenant	none	-	null	none	-
+/open elevated terminal 3 best	none	-	null	none	-
+/open elevated terminal 3 best --tenant	none	-	null	none	-
 /orchestrate	literal	terminal.orchestrate	[]	error:invalid-args	error /orchestrate: a goal (or recipe-id + args) is required
 /orchestrate "1 gmail fix the bug"	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 /orchestrate "1 gmail fix the bug" --tenant	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
@@ -1221,6 +1401,76 @@
 /yes all 1 gmail fix the bug --tenant	none	-	null	none	-
 /yes all 3 best	none	-	null	none	-
 /yes all 3 best --tenant	none	-	null	none	-
+admin	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+admin "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+admin "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+admin "3 best"	literal	terminal.elevated	[]	unbound	-
+admin "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+admin --tenant	literal	terminal.elevated	[]	unbound	-
+admin 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+admin 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+admin 3 best	literal	terminal.elevated	[]	unbound	-
+admin 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+admin powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+admin powershell "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+admin powershell "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+admin powershell "3 best"	literal	terminal.elevated	[]	unbound	-
+admin powershell "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+admin powershell --tenant	literal	terminal.elevated	[]	unbound	-
+admin powershell 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+admin powershell 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+admin powershell 3 best	literal	terminal.elevated	[]	unbound	-
+admin powershell 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+admin shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+admin shell "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+admin shell "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+admin shell "3 best"	literal	terminal.elevated	[]	unbound	-
+admin shell "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+admin shell --tenant	literal	terminal.elevated	[]	unbound	-
+admin shell 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+admin shell 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+admin shell 3 best	literal	terminal.elevated	[]	unbound	-
+admin shell 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+admin terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+admin terminal "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+admin terminal "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+admin terminal "3 best"	literal	terminal.elevated	[]	unbound	-
+admin terminal "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+admin terminal --tenant	literal	terminal.elevated	[]	unbound	-
+admin terminal 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+admin terminal 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+admin terminal 3 best	literal	terminal.elevated	[]	unbound	-
+admin terminal 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+administrator powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+administrator powershell "1 gmail fix the bug"	none	-	null	none	-
+administrator powershell "1 gmail fix the bug" --tenant	none	-	null	none	-
+administrator powershell "3 best"	none	-	null	none	-
+administrator powershell "3 best" --tenant	none	-	null	none	-
+administrator powershell --tenant	none	-	null	none	-
+administrator powershell 1 gmail fix the bug	none	-	null	none	-
+administrator powershell 1 gmail fix the bug --tenant	none	-	null	none	-
+administrator powershell 3 best	none	-	null	none	-
+administrator powershell 3 best --tenant	none	-	null	none	-
+administrator shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+administrator shell "1 gmail fix the bug"	none	-	null	none	-
+administrator shell "1 gmail fix the bug" --tenant	none	-	null	none	-
+administrator shell "3 best"	none	-	null	none	-
+administrator shell "3 best" --tenant	none	-	null	none	-
+administrator shell --tenant	none	-	null	none	-
+administrator shell 1 gmail fix the bug	none	-	null	none	-
+administrator shell 1 gmail fix the bug --tenant	none	-	null	none	-
+administrator shell 3 best	none	-	null	none	-
+administrator shell 3 best --tenant	none	-	null	none	-
+administrator terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+administrator terminal "1 gmail fix the bug"	none	-	null	none	-
+administrator terminal "1 gmail fix the bug" --tenant	none	-	null	none	-
+administrator terminal "3 best"	none	-	null	none	-
+administrator terminal "3 best" --tenant	none	-	null	none	-
+administrator terminal --tenant	none	-	null	none	-
+administrator terminal 1 gmail fix the bug	none	-	null	none	-
+administrator terminal 1 gmail fix the bug --tenant	none	-	null	none	-
+administrator terminal 3 best	none	-	null	none	-
+administrator terminal 3 best --tenant	none	-	null	none	-
 analyze	literal	terminal.analyze	[]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
 analyze "1 gmail fix the bug"	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
 analyze "1 gmail fix the bug" --tenant	literal	terminal.analyze	[["type","1 gmail fix the bug --tenant"]]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
@@ -1463,6 +1713,46 @@ docs 1 gmail fix the bug	literal	terminal.doc-finder	[]	unbound	-
 docs 1 gmail fix the bug --tenant	literal	terminal.doc-finder	[]	unbound	-
 docs 3 best	literal	terminal.doc-finder	[]	unbound	-
 docs 3 best --tenant	literal	terminal.doc-finder	[]	unbound	-
+elevated	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+elevated "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+elevated "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+elevated "3 best"	literal	terminal.elevated	[]	unbound	-
+elevated "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+elevated --tenant	literal	terminal.elevated	[]	unbound	-
+elevated 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+elevated 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+elevated 3 best	literal	terminal.elevated	[]	unbound	-
+elevated 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+elevated powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+elevated powershell "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+elevated powershell "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+elevated powershell "3 best"	literal	terminal.elevated	[]	unbound	-
+elevated powershell "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+elevated powershell --tenant	literal	terminal.elevated	[]	unbound	-
+elevated powershell 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+elevated powershell 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+elevated powershell 3 best	literal	terminal.elevated	[]	unbound	-
+elevated powershell 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+elevated shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+elevated shell "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+elevated shell "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+elevated shell "3 best"	literal	terminal.elevated	[]	unbound	-
+elevated shell "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+elevated shell --tenant	literal	terminal.elevated	[]	unbound	-
+elevated shell 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+elevated shell 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+elevated shell 3 best	literal	terminal.elevated	[]	unbound	-
+elevated shell 3 best --tenant	literal	terminal.elevated	[]	unbound	-
+elevated terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+elevated terminal "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
+elevated terminal "1 gmail fix the bug" --tenant	literal	terminal.elevated	[]	unbound	-
+elevated terminal "3 best"	literal	terminal.elevated	[]	unbound	-
+elevated terminal "3 best" --tenant	literal	terminal.elevated	[]	unbound	-
+elevated terminal --tenant	literal	terminal.elevated	[]	unbound	-
+elevated terminal 1 gmail fix the bug	literal	terminal.elevated	[]	unbound	-
+elevated terminal 1 gmail fix the bug --tenant	literal	terminal.elevated	[]	unbound	-
+elevated terminal 3 best	literal	terminal.elevated	[]	unbound	-
+elevated terminal 3 best --tenant	literal	terminal.elevated	[]	unbound	-
 events	pattern	terminal.history	[]	ok	noop /history · no events showed
 events "1 gmail fix the bug"	literal	terminal.history	[]	unbound	-
 events "1 gmail fix the bug" --tenant	literal	terminal.history	[]	unbound	-
@@ -1755,6 +2045,76 @@ notifications 1 gmail fix the bug	literal	terminal.toggle-desktop-notify	[]	unbo
 notifications 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound	-
 notifications 3 best	literal	terminal.toggle-desktop-notify	[]	unbound	-
 notifications 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound	-
+open admin powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+open admin powershell "1 gmail fix the bug"	none	-	null	none	-
+open admin powershell "1 gmail fix the bug" --tenant	none	-	null	none	-
+open admin powershell "3 best"	none	-	null	none	-
+open admin powershell "3 best" --tenant	none	-	null	none	-
+open admin powershell --tenant	none	-	null	none	-
+open admin powershell 1 gmail fix the bug	none	-	null	none	-
+open admin powershell 1 gmail fix the bug --tenant	none	-	null	none	-
+open admin powershell 3 best	none	-	null	none	-
+open admin powershell 3 best --tenant	none	-	null	none	-
+open admin shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+open admin shell "1 gmail fix the bug"	none	-	null	none	-
+open admin shell "1 gmail fix the bug" --tenant	none	-	null	none	-
+open admin shell "3 best"	none	-	null	none	-
+open admin shell "3 best" --tenant	none	-	null	none	-
+open admin shell --tenant	none	-	null	none	-
+open admin shell 1 gmail fix the bug	none	-	null	none	-
+open admin shell 1 gmail fix the bug --tenant	none	-	null	none	-
+open admin shell 3 best	none	-	null	none	-
+open admin shell 3 best --tenant	none	-	null	none	-
+open admin terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+open admin terminal "1 gmail fix the bug"	none	-	null	none	-
+open admin terminal "1 gmail fix the bug" --tenant	none	-	null	none	-
+open admin terminal "3 best"	none	-	null	none	-
+open admin terminal "3 best" --tenant	none	-	null	none	-
+open admin terminal --tenant	none	-	null	none	-
+open admin terminal 1 gmail fix the bug	none	-	null	none	-
+open admin terminal 1 gmail fix the bug --tenant	none	-	null	none	-
+open admin terminal 3 best	none	-	null	none	-
+open admin terminal 3 best --tenant	none	-	null	none	-
+open administrator terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+open administrator terminal "1 gmail fix the bug"	none	-	null	none	-
+open administrator terminal "1 gmail fix the bug" --tenant	none	-	null	none	-
+open administrator terminal "3 best"	none	-	null	none	-
+open administrator terminal "3 best" --tenant	none	-	null	none	-
+open administrator terminal --tenant	none	-	null	none	-
+open administrator terminal 1 gmail fix the bug	none	-	null	none	-
+open administrator terminal 1 gmail fix the bug --tenant	none	-	null	none	-
+open administrator terminal 3 best	none	-	null	none	-
+open administrator terminal 3 best --tenant	none	-	null	none	-
+open elevated powershell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+open elevated powershell "1 gmail fix the bug"	none	-	null	none	-
+open elevated powershell "1 gmail fix the bug" --tenant	none	-	null	none	-
+open elevated powershell "3 best"	none	-	null	none	-
+open elevated powershell "3 best" --tenant	none	-	null	none	-
+open elevated powershell --tenant	none	-	null	none	-
+open elevated powershell 1 gmail fix the bug	none	-	null	none	-
+open elevated powershell 1 gmail fix the bug --tenant	none	-	null	none	-
+open elevated powershell 3 best	none	-	null	none	-
+open elevated powershell 3 best --tenant	none	-	null	none	-
+open elevated shell	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+open elevated shell "1 gmail fix the bug"	none	-	null	none	-
+open elevated shell "1 gmail fix the bug" --tenant	none	-	null	none	-
+open elevated shell "3 best"	none	-	null	none	-
+open elevated shell "3 best" --tenant	none	-	null	none	-
+open elevated shell --tenant	none	-	null	none	-
+open elevated shell 1 gmail fix the bug	none	-	null	none	-
+open elevated shell 1 gmail fix the bug --tenant	none	-	null	none	-
+open elevated shell 3 best	none	-	null	none	-
+open elevated shell 3 best --tenant	none	-	null	none	-
+open elevated terminal	pattern	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+open elevated terminal "1 gmail fix the bug"	none	-	null	none	-
+open elevated terminal "1 gmail fix the bug" --tenant	none	-	null	none	-
+open elevated terminal "3 best"	none	-	null	none	-
+open elevated terminal "3 best" --tenant	none	-	null	none	-
+open elevated terminal --tenant	none	-	null	none	-
+open elevated terminal 1 gmail fix the bug	none	-	null	none	-
+open elevated terminal 1 gmail fix the bug --tenant	none	-	null	none	-
+open elevated terminal 3 best	none	-	null	none	-
+open elevated terminal 3 best --tenant	none	-	null	none	-
 orchestrate	literal	terminal.orchestrate	[]	error:invalid-args	error /orchestrate: a goal (or recipe-id + args) is required
 orchestrate "1 gmail fix the bug"	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 orchestrate "1 gmail fix the bug" --tenant	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
@@ -2433,6 +2793,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.doc-finder [bool] do the thing	ai	terminal.doc-finder	[]	refused	error /doc-finder: "count" must be text or a number (got true/false)
 «ai» terminal.doc-finder [empty] do the thing	ai	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
 «ai» terminal.doc-finder [valid] do the thing	ai	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
+«ai» terminal.elevated [alien] do the thing	ai	terminal.elevated	[["nonsense","x"]]	refused	error /elevated: takes no arguments (got "nonsense")
+«ai» terminal.elevated [bool] do the thing	ai	terminal.elevated	[]	refused	error /elevated: "count" must be text or a number (got true/false)
+«ai» terminal.elevated [empty] do the thing	ai	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+«ai» terminal.elevated [valid] do the thing	ai	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
 «ai» terminal.export-all [alien] do the thing	ai	terminal.export-all	[["nonsense","x"]]	refused	error /export-all: takes no arguments (got "nonsense")
 «ai» terminal.export-all [bool] do the thing	ai	terminal.export-all	[]	refused	error /export-all: "count" must be text or a number (got true/false)
 «ai» terminal.export-all [empty] do the thing	ai	terminal.export-all	[]	ok	ok /export-all ✓ exported 2 sessions
@@ -2593,6 +2957,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.doc-finder [bool]	direct	terminal.doc-finder	[["count",true]]	threw	error /doc-finder: "count" must be text or a number (got true/false)
 «direct» terminal.doc-finder [empty]	direct	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
 «direct» terminal.doc-finder [valid]	direct	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
+«direct» terminal.elevated [alien]	direct	terminal.elevated	[["nonsense","x"]]	threw	error /elevated: takes no arguments (got "nonsense")
+«direct» terminal.elevated [bool]	direct	terminal.elevated	[["count",true]]	threw	error /elevated: "count" must be text or a number (got true/false)
+«direct» terminal.elevated [empty]	direct	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
+«direct» terminal.elevated [valid]	direct	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
 «direct» terminal.export-all [alien]	direct	terminal.export-all	[["nonsense","x"]]	threw	error /export-all: takes no arguments (got "nonsense")
 «direct» terminal.export-all [bool]	direct	terminal.export-all	[["count",true]]	threw	error /export-all: "count" must be text or a number (got true/false)
 «direct» terminal.export-all [empty]	direct	terminal.export-all	[]	ok	ok /export-all ✓ exported 2 sessions

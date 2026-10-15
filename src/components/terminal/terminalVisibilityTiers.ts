@@ -150,6 +150,21 @@ export function publishRoster(scopeId: string, ids: readonly string[]): void {
   scheduleReconcile();
 }
 
+/**
+ * Does anything in THIS window own `terminalId` — a page scope's published
+ * roster or a pane's live tier declaration? Module state is per webview, so
+ * this is a per-window answer. Used by the transport counters
+ * (`transportStats.ts`) to classify a delivered `terminal-output` event as
+ * foreign: broadcast to this window, used by nothing in it.
+ */
+export function isOwnedByThisWindow(terminalId: string): boolean {
+  if (declarations.has(terminalId)) return true;
+  for (const roster of rosters.values()) {
+    if (roster.has(terminalId)) return true;
+  }
+  return false;
+}
+
 /** Drop a scope's roster (its page unmounted). */
 export function releaseRoster(scopeId: string): void {
   if (!rosters.delete(scopeId)) return;

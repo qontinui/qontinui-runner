@@ -24145,6 +24145,13 @@ CREATE INDEX ix_work_artifact_edges_from_id ON agent.work_artifact_edges USING b
 
 
 --
+-- Name: ix_work_artifact_edges_open_followups_created_id; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE INDEX ix_work_artifact_edges_open_followups_created_id ON agent.work_artifact_edges USING btree (created_at, id) WHERE ((relation = 'spawned_followup'::text) AND (to_id IS NULL));
+
+
+--
 -- Name: ix_work_artifact_edges_to_id; Type: INDEX; Schema: agent; Owner: -
 --
 
@@ -24177,6 +24184,13 @@ CREATE INDEX ix_work_artifacts_kind_slug ON agent.work_artifacts USING btree (ki
 --
 
 CREATE INDEX ix_work_artifacts_kind_status ON agent.work_artifacts USING btree (kind, status);
+
+
+--
+-- Name: ix_work_artifacts_org_created_id; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE INDEX ix_work_artifacts_org_created_id ON agent.work_artifacts USING btree (COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid), created_at, id);
 
 
 --
