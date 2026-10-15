@@ -313,7 +313,16 @@ impl std::fmt::Display for PaneUpgradeError {
 /// A holder built before the verb existed rejects it as an unknown verb;
 /// that is reported as [`UpgradeOutcome::Unsupported`], not as a failure. Any
 /// other rejection is a definite answer that nothing was done:
-/// [`UpgradeOutcome::Failed`].
+/// [`UpgradeOutcome::Rejected`].
+///
+/// **Incompatible holders: a weaker identity check (TOCTOU, accepted).**
+/// `no_common_version` carries no pid, so for `expected_holder_pid: None` this
+/// proves only that the pane is STILL served by some incompatible holder, not
+/// the same one the caller probed. One incompatible holder replaced by another
+/// in between goes undetected; the request still reaches only whichever holder
+/// serves this pane, which is then upgraded as the caller intended. Closing it
+/// needs the pid in `no_common_version` — a frozen-envelope change left to a
+/// later protocol revision.
 ///
 /// `expected_holder_pid` is what the caller's own check saw: `Some(pid)` — the
 /// handshake must be answered by that holder — or `None` — it must be answered
@@ -372,7 +381,7 @@ pub fn upgrade_pane(
         } => UpgradeOutcome::Unsupported(format!(
             "this holder build predates in-place upgrade ({detail})"
         )),
-        Reply::Rejected { reason, detail } => UpgradeOutcome::Failed(format!(
+        Reply::Rejected { reason, detail } => UpgradeOutcome::Rejected(format!(
             "the holder rejected prepare_upgrade ({reason:?}: {detail}) and did not act on it"
         )),
         other => {
@@ -567,28 +576,29 @@ impl Client {
         self.attach_with(from_offset, restore, None, deadline)
     }
 
-    /// A RESUME at `from_offset` of a stream this consumer was reading from
-    /// holder `stream_of` (the `hello_ack.holder_pid` it last attached to) —
-    /// [`Client::attach`], or [`Client::attach_restoring`] with `restoring`,
-    /// plus that identity (plan Phase 8, H1): a holder that took its pane back
-    /// after a declared loss then knows whether `from_offset` is on its own
-    /// stream, and resumes its own consumer without a loss report.
+    /// A RESUME at `from_offset` of a stream this consumer counted on
+    /// `stream_epoch` (the `attached.stream_epoch` of the connection whose
+    /// frames it last read) — [`Client::attach`], or
+    /// [`Client::attach_restoring`] with `restoring`, plus that identity
+    /// (plan Phase 8, H1): a holder that took its pane back after a declared
+    /// loss then knows whether `from_offset` is on its own stream, and resumes
+    /// its own consumer without a loss report.
     pub fn attach_continuing(
         self,
         from_offset: u64,
-        stream_of: u32,
+        stream_epoch: u64,
         restoring: bool,
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
         let restore = restoring && self.ack.version >= RESTORE_VERSION;
-        self.attach_with(Some(from_offset), restore, Some(stream_of), deadline)
+        self.attach_with(Some(from_offset), restore, Some(stream_epoch), deadline)
     }
 
     fn attach_with(
         mut self,
         from_offset: Option<u64>,
         restore: bool,
-        stream_of: Option<u32>,
+        stream_epoch: Option<u64>,
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
         self.check()?;
@@ -602,7 +612,7 @@ impl Client {
         let request = Request::Attach {
             from_offset,
             restore,
-            stream_of,
+            stream_epoch,
         };
         let info = match self.request(&request, deadline)? {
             Reply::Attached(a) => a,
@@ -639,6 +649,9 @@ pub enum UpgradeOutcome {
     },
     /// Rolled back: the old holder keeps serving; nothing was lost.
     Failed(String),
+    /// The holder REJECTED the request (`rejected`) and did nothing: no
+    /// successor was started, nothing was rolled back ([`upgrade_pane`]).
+    Rejected(String),
     /// This holder cannot be upgraded in place — a Windows holder (plan D12:
     /// leave it running, or end and resume it) or one built before Phase 8.
     Unsupported(String),

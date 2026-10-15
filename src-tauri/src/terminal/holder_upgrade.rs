@@ -10,11 +10,13 @@
 //!
 //! # When an upgrade is offered and allowed ([`gate`])
 //!
-//! 1. **The platform supports it** — `server::upgrade_supported()`, which is
-//!    Unix (D12: a ConPTY cannot be handed to another process). The runner and
-//!    its holders run on one machine, so the runner's own build answers for
-//!    them; a holder that disagrees still answers `unsupported`, which is
-//!    reported as such.
+//! 1. **The platform supports it** — [`upgrade_supported_here`]: Linux. The
+//!    holder answers on every Unix (`server::upgrade_supported()`; D12: a
+//!    ConPTY cannot be handed to another process), but its input drain works
+//!    only with Linux's `SHUT_RD`, so elsewhere every upgrade of a pane this
+//!    runner is attached to rolls back and is not offered. The runner and its
+//!    holders run on one machine, so the runner's own build answers for them;
+//!    a holder that disagrees still answers `unsupported`, reported as such.
 //! 2. **The pane is holder-backed and its holder answers** — a census probe of
 //!    that one pane, never a guess. A pane this runner is spawning right now is
 //!    not probed (a probe can steal a starting holder's lock).
@@ -78,10 +80,48 @@ const READ_BACK_WINDOW: Duration = Duration::from_secs(3);
 /// "Leave running" alone where an upgrade is unsupported, and says why.
 pub const END_AND_RESUME_AVAILABLE: bool = false;
 
-/// Whether a holder upgrade can run on this platform at all.
+/// Whether a holder upgrade can WORK on this platform (review p8f r1, #5).
+/// The holder answers `prepare_upgrade` on every Unix, but its input drain
+/// needs Linux's `SHUT_RD` semantics: on other Unix it refuses while any input
+/// connection is open, and a runner keeps one open for its pane's whole life —
+/// so there every upgrade of a pane this runner is attached to rolls back.
+/// The action is offered only where it can succeed.
 pub fn upgrade_supported_here() -> bool {
-    qontinui_pty_holder::server::upgrade_supported()
+    upgrade_offered_on(
+        qontinui_pty_holder::server::upgrade_supported(),
+        cfg!(target_os = "linux"),
+    )
 }
+
+/// [`upgrade_supported_here`] as a pure rule.
+fn upgrade_offered_on(holder_supports: bool, linux: bool) -> bool {
+    holder_supports && linux
+}
+
+/// Why an upgrade is not offered here, for the page's note and the gate's
+/// `unsupported` outcome. `None` where it is offered.
+pub fn upgrade_unsupported_reason() -> Option<String> {
+    unsupported_reason_on(
+        qontinui_pty_holder::server::upgrade_supported(),
+        cfg!(target_os = "linux"),
+    )
+}
+
+/// [`upgrade_unsupported_reason`] as a pure rule.
+fn unsupported_reason_on(holder_supports: bool, linux: bool) -> Option<String> {
+    if !holder_supports {
+        Some(qontinui_pty_holder::server::UPGRADE_UNSUPPORTED_ON_THIS_OS.to_string())
+    } else if !linux {
+        Some(UPGRADE_CANNOT_DRAIN_HERE.to_string())
+    } else {
+        None
+    }
+}
+
+/// The non-Linux Unix reason ([`upgrade_supported_here`]).
+pub const UPGRADE_CANNOT_DRAIN_HERE: &str = "holder upgrade cannot complete on this platform \
+     while the runner is attached: the holder's input drain needs Linux's SHUT_RD, so with this \
+     runner's input connection open every upgrade rolls back; leave this holder running";
 
 /// The holder build this runner ships (its linked `qontinui-pty-holder`).
 pub fn runner_holder_build() -> String {
@@ -136,6 +176,8 @@ pub struct AttentionPane {
 pub struct HolderAttention {
     /// "Upgrade holder" may be offered at all ([`upgrade_supported_here`]).
     pub upgrade_supported: bool,
+    /// Why it is not ([`upgrade_unsupported_reason`]); `None` where offered.
+    pub upgrade_unsupported_reason: Option<String>,
     /// "End and resume" may be offered ([`END_AND_RESUME_AVAILABLE`]).
     pub end_and_resume_available: bool,
     pub runner_holder_build: String,
@@ -179,6 +221,13 @@ pub fn attention_from_census(
         .collect();
     HolderAttention {
         upgrade_supported,
+        upgrade_unsupported_reason: if upgrade_supported {
+            None
+        } else {
+            upgrade_unsupported_reason().or_else(|| {
+                Some(qontinui_pty_holder::server::UPGRADE_UNSUPPORTED_ON_THIS_OS.to_string())
+            })
+        },
         end_and_resume_available: END_AND_RESUME_AVAILABLE,
         runner_holder_build: runner_build.to_string(),
         panes,
@@ -241,7 +290,9 @@ pub enum Gate {
 fn pre_gate(supported: bool, in_flight: bool) -> Option<HolderUpgradeOutcome> {
     if !supported {
         return Some(HolderUpgradeOutcome::Unsupported {
-            reason: qontinui_pty_holder::server::UPGRADE_UNSUPPORTED_ON_THIS_OS.to_string(),
+            reason: upgrade_unsupported_reason().unwrap_or_else(|| {
+                qontinui_pty_holder::server::UPGRADE_UNSUPPORTED_ON_THIS_OS.to_string()
+            }),
         });
     }
     in_flight.then(|| HolderUpgradeOutcome::Refused {
@@ -256,6 +307,14 @@ pub fn gate(supported: bool, in_flight: bool, probe: &Probe, runner_build: &str)
     }
     let refuse = |reason: String| Gate::Stop(HolderUpgradeOutcome::Refused { reason });
     match probe {
+        // TOCTOU, accepted (review p8f r1, #7): `no_common_version` carries
+        // no pid, so `expected_pid: None` re-checks only that the pane is
+        // STILL served by SOME incompatible holder when the request is sent
+        // (`client::upgrade_pane`) — one incompatible holder swapped for
+        // another in between is not detected. The request still reaches only
+        // whichever holder serves this pane, and upgrading it is what was
+        // asked. Closing it needs the pid in `no_common_version`, a frozen-
+        // envelope change left to a later protocol revision.
         Probe::Incompatible { .. } => Gate::Proceed {
             previous_build: None,
             expected_pid: None,
@@ -302,6 +361,10 @@ pub fn map_outcome(
                     .map(|(_, build)| build),
             },
             UpgradeOutcome::Failed(reason) => HolderUpgradeOutcome::RolledBack { reason },
+            // Rejected before anything started: nothing to roll back.
+            UpgradeOutcome::Rejected(reason) => HolderUpgradeOutcome::Failed {
+                reason: format!("{reason}; nothing changed"),
+            },
             UpgradeOutcome::Unsupported(reason) => HolderUpgradeOutcome::Unsupported { reason },
         },
         Err(PaneUpgradeError::NotSent(e)) => HolderUpgradeOutcome::Failed {
@@ -412,6 +475,23 @@ mod tests {
                 child_pid: Some(11),
             },
         }
+    }
+
+    /// Review p8f r1, #5: offered only where it can succeed (Linux); other
+    /// Unix gets the reason, Windows the holder's own.
+    #[test]
+    fn pty_holder_upgrade_offered_only_on_linux() {
+        assert!(upgrade_offered_on(true, true));
+        assert!(!upgrade_offered_on(true, false), "macOS/BSD: drain refuses");
+        assert!(!upgrade_offered_on(false, false), "Windows");
+        assert_eq!(unsupported_reason_on(true, true), None);
+        assert!(unsupported_reason_on(true, false)
+            .unwrap()
+            .contains("SHUT_RD"));
+        assert!(unsupported_reason_on(false, false)
+            .unwrap()
+            .contains("Unix-only"));
+        assert_eq!(upgrade_supported_here(), cfg!(target_os = "linux"));
     }
 
     #[test]
@@ -551,6 +631,13 @@ mod tests {
             }
         ));
         let no_read = |_: Option<u32>| -> Option<(u32, String)> { panic!("no read-back owed") };
+        match map_outcome(sent(UpgradeOutcome::Rejected("busy".into())), None, no_read) {
+            HolderUpgradeOutcome::Failed { reason } => {
+                assert!(reason.starts_with("busy"), "{reason}");
+                assert!(reason.contains("nothing changed"), "{reason}");
+            }
+            other => panic!("a rejection is not a rollback: {other:?}"),
+        }
         assert_eq!(
             map_outcome(sent(UpgradeOutcome::Failed("nak".into())), None, no_read),
             HolderUpgradeOutcome::RolledBack {
