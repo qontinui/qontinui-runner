@@ -26,6 +26,15 @@
  *      the user must SEE the conversation is fresh and is never misled into
  *      thinking it came back. There is nothing to retry.
  *
+ *   3. NOT RELAUNCHED (`relaunchWithheld`) — the tab's PTY holder was lost
+ *      and the runner did NOT relaunch its session (plan
+ *      `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+ *      Phase 6): a live process still hosts it, its liveness could not be
+ *      read, or the holder could not be ended (the session may still be
+ *      running behind it). "Resume" re-checks liveness before anything is
+ *      typed, so it can never fork a live session. Shown for the DEAD tab
+ *      (no `isAlive` filter): a dead tab is exactly where it belongs.
+ *
  * An auto-resumed (silent, conversation restored) tab and a plain shell surface
  * in NONE of the lists — exactly the no-clutter common case.
  *
@@ -37,7 +46,7 @@
 import { AlertTriangle, MessageSquareDashed, RotateCcw, X } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import { AdvisorySlot } from "./AdvisoryStack";
-import type { TerminalTab } from "./useTerminalManager";
+import type { RelaunchWithheldReason, TerminalTab } from "./useTerminalManager";
 import { TabTitle } from "./displayTitle";
 
 export interface ResumeFailedBannerProps {
@@ -51,6 +60,31 @@ export interface ResumeFailedBannerProps {
    * note is shown without a dismiss button (still honest, just sticky).
    */
   onDismissTerminalOnly?: (tabId: string) => void;
+  /**
+   * Resume the session a lost PTY holder's dead tab hosted (plan Phase 6):
+   * the restore's release path, which re-checks liveness first. Optional:
+   * when omitted the not-relaunched note is shown without the action.
+   */
+  onResumeWithheld?: (tabId: string) => void;
+}
+
+/** The dead tabs whose session was not relaunched — exported for unit tests. */
+export function relaunchWithheldTabs(tabs: TerminalTab[]): TerminalTab[] {
+  return tabs.filter((t) => t.relaunchWithheld !== undefined);
+}
+
+/** The operator-facing reason a lost holder's session was not relaunched. Exported for tests. */
+export function relaunchWithheldText(reason: RelaunchWithheldReason): string {
+  switch (reason) {
+    case "still-hosted":
+      return "not relaunched: a live process still hosts this session";
+    case "liveness-unknown":
+      return "not relaunched: whether the session is still running could not be read";
+    case "holder-unreachable":
+      return "not relaunched: its PTY holder stopped answering — the session may still be running";
+    case "restore-declined":
+      return "not relaunched: the restore did not resume it (skipped, or past its restore window)";
+  }
 }
 
 /** The failed-resume tabs this banner surfaces — exported for unit tests. */
@@ -72,15 +106,17 @@ export function ResumeFailedBanner({
   tabs,
   onRetryResume,
   onDismissTerminalOnly,
+  onResumeWithheld,
 }: ResumeFailedBannerProps) {
   const failed = failedResumeTabs(tabs);
   const terminalOnly = terminalOnlyRestoreTabs(tabs);
+  const withheld = relaunchWithheldTabs(tabs);
   const { ref } = useUIElement({
     id: "terminal-resume-failed-banner",
     type: "generic",
     label: "Resume failed banner",
   });
-  if (failed.length === 0 && terminalOnly.length === 0) return null;
+  if (failed.length === 0 && terminalOnly.length === 0 && withheld.length === 0) return null;
 
   return (
     <AdvisorySlot>
@@ -163,6 +199,53 @@ export function ResumeFailedBanner({
                       >
                         <X className="w-2.5 h-2.5" />
                         Got it
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+
+        {withheld.length > 0 && (
+          <div
+            className={`flex items-start gap-2 ${failed.length + terminalOnly.length > 0 ? "mt-2" : ""}`}
+          >
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#e0af68]" />
+            <div className="flex-1 min-w-0">
+              <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">
+                {withheld.length === 1
+                  ? "Session not relaunched"
+                  : `${withheld.length} sessions not relaunched`}
+              </div>
+              <ul className="mt-1.5 space-y-1">
+                {withheld.map((t) => (
+                  <li
+                    key={t.id}
+                    data-ui-bridge-id="terminal.relaunch-withheld-item"
+                    data-terminal-id={t.id}
+                    className="flex items-center gap-2 text-[11px] leading-snug"
+                  >
+                    <span className="flex-1 min-w-0">
+                      <span className="text-[#c0caf5] font-medium truncate block">
+                        <TabTitle tab={t} />
+                      </span>
+                      <span className="text-[10px] text-[#a9b1d6] block">
+                        {t.relaunchWithheld ? relaunchWithheldText(t.relaunchWithheld.reason) : ""}
+                      </span>
+                    </span>
+                    {onResumeWithheld && (
+                      <button
+                        type="button"
+                        data-ui-bridge-id="terminal.relaunch-withheld-resume"
+                        data-terminal-id={t.id}
+                        onClick={() => onResumeWithheld(t.id)}
+                        className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#e0af68]/40 text-[#e0af68] hover:bg-[#e0af68]/15 text-[10px]"
+                        title="Re-check that no live process hosts this session, then resume it in a new pane"
+                      >
+                        <RotateCcw className="w-2.5 h-2.5" />
+                        Resume
                       </button>
                     )}
                   </li>

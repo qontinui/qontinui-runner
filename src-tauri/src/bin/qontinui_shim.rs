@@ -77,6 +77,18 @@ const OVERRIDE_ENV: &str = "QONTINUI_INSTALL_OVERRIDE";
 /// the "real" tool (self-spawn loop).
 const SHIM_DIR_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR";
 
+/// Env var carrying this launch's argv, as a JSON array, to the `claude` the
+/// identity straddle launches (plan
+/// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 6 /
+/// D11). Mirrors `session::resume_argv::LAUNCH_ARGV_ENV` in the runner bin
+/// crate, which this bin cannot import. See [`launch_argv_json`].
+const LAUNCH_ARGV_ENV: &str = "QONTINUI_LAUNCH_ARGV";
+
+/// Largest [`LAUNCH_ARGV_ENV`] value exported; a longer one is not exported at
+/// all (the relaunch then uses the default resume command). Same bound as the
+/// bash identity shim and the SessionStart hook's OSC check.
+const LAUNCH_ARGV_MAX_BYTES: usize = 4096;
+
 /// Override, in whole seconds, for how long a real-tool MISS is re-scanned
 /// before falling through (`0` disables the wait). Shared with the bash and
 /// `.cmd` shim templates. See [`resolve_real_waiting`].
@@ -574,8 +586,10 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let real = resolve_real_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
+    // Nor does it inherit its parent's launch argv: its own SessionStart hook
+    // would report the parent's flags under the nested session's id.
     if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
-        return exec_real(&real, tool.program(), args);
+        return exec_real_child_env(&real, tool.program(), args, &[LAUNCH_ARGV_ENV], &[]);
     }
 
     let pinned = env::var(PINNED_SESSION_ENV)
@@ -661,7 +675,20 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     } else {
         &[POLICY_DELIVERED_SHA_ENV, POLICY_DELIVERED_FILE_ENV]
     };
-    let code = exec_real_child_env(&real, tool.program(), &final_args, env_remove);
+    // The argv this launch RECEIVED (before the appends above), for a tier-2
+    // relaunch should the pane's PTY holder die. Claude only: it is the
+    // provider whose SessionStart hook reports it.
+    let mut env_remove = env_remove.to_vec();
+    env_remove.push(LAUNCH_ARGV_ENV);
+    let launch_argv = match tool {
+        IdentityTool::Claude => launch_argv_json(args),
+        IdentityTool::Gemini => None,
+    };
+    let env_set: Vec<(&str, &str)> = launch_argv
+        .as_deref()
+        .map(|v| vec![(LAUNCH_ARGV_ENV, v)])
+        .unwrap_or_default();
+    let code = exec_real_child_env(&real, tool.program(), &final_args, &env_remove, &env_set);
     // Explicit, not incidental: the minted config holds a live device credential
     // and is deleted HERE — after the child that read it has exited. Dropping it
     // any earlier would delete the file before `claude` reads it at launch.
@@ -887,6 +914,118 @@ fn json_escape(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The replay allowlist — a COPY of the runner's
+/// `session::resume_argv::REPLAY_ALLOWLIST_*`, pinned equal to it by the
+/// runner's test `the_shim_allowlists_match_the_runners` (this bin cannot
+/// import the bin crate). Flags taking exactly one value:
+const REPLAY_ALLOWLIST_ONE: &[&str] = &["--model", "--fallback-model", "--permission-mode"];
+/// Flags taking every following plain token.
+const REPLAY_ALLOWLIST_MANY: &[&str] = &["--add-dir"];
+/// Flags taking the next token unless it is a flag.
+const REPLAY_ALLOWLIST_OPTIONAL: &[&str] = &["--debug"];
+/// Flags taking no value.
+const REPLAY_ALLOWLIST_BOOL: &[&str] = &["--verbose", "--ide", "--chrome", "--no-chrome"];
+
+/// [`LAUNCH_ARGV_ENV`]'s value for a launch that received `args`: a JSON array
+/// of ONLY the replay-allowlisted flags and their values (review r2, N1) —
+/// never the initial prompt, any other flag, or another flag's value, because
+/// every child of `claude` (Bash-tool shells, hooks, MCP servers) inherits
+/// this variable. Print mode exports the marker `--print` and a combined short
+/// flag (`-pc`) the marker `-??`, so the runner can refuse them without seeing
+/// the token. Every string is escaped by [`json_escape_ascii`] (printable
+/// ASCII only). `None` over [`LAUNCH_ARGV_MAX_BYTES`]. Mirrors
+/// `qs_launch_flags_json` in `resources/intercept/identity_shim.bash`.
+fn launch_argv_json(args: &[String]) -> Option<String> {
+    let is_flag = |t: &str| t.len() > 1 && t.starts_with('-');
+    let mut kept: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if a == "--" {
+            break;
+        }
+        if !is_flag(a) {
+            continue; // a positional: the prompt, or a dropped flag's value
+        }
+        if !a.starts_with("--") && a.chars().count() > 2 {
+            kept.push("-??");
+            continue;
+        }
+        if a == "-p" || a == "--print" {
+            kept.push("--print");
+            continue;
+        }
+        let name = a.split('=').next().unwrap_or(a);
+        if REPLAY_ALLOWLIST_BOOL.contains(&name) {
+            kept.push(a);
+            continue;
+        }
+        let one = REPLAY_ALLOWLIST_ONE.contains(&name);
+        let many = REPLAY_ALLOWLIST_MANY.contains(&name);
+        let optional = REPLAY_ALLOWLIST_OPTIONAL.contains(&name);
+        if !(one || many || optional) {
+            continue; // not on the allowlist: dropped, and its value with it
+        }
+        kept.push(a);
+        if a.starts_with("--") && a.contains('=') {
+            continue;
+        }
+        if one {
+            // A required value is taken greedily, as claude takes it.
+            if let Some(v) = args.get(i) {
+                kept.push(v);
+                i += 1;
+            }
+        } else if optional {
+            if let Some(v) = args.get(i).filter(|v| !is_flag(v)) {
+                kept.push(v);
+                i += 1;
+            }
+        } else {
+            while let Some(v) = args.get(i).filter(|v| !is_flag(v)) {
+                kept.push(v);
+                i += 1;
+            }
+        }
+    }
+    let mut out = String::from("[");
+    for (n, a) in kept.iter().enumerate() {
+        if n > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&json_escape_ascii(a));
+        out.push('"');
+        if out.len() > LAUNCH_ARGV_MAX_BYTES {
+            return None;
+        }
+    }
+    out.push(']');
+    (out.len() <= LAUNCH_ARGV_MAX_BYTES).then_some(out)
+}
+
+/// JSON-escape `s` into PRINTABLE ASCII: `"` and `\` escaped, printable ASCII
+/// kept, everything else — C0 controls, DEL, every non-ASCII character — as
+/// `\uXXXX` UTF-16 units (a surrogate pair above U+FFFF).
+fn json_escape_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            ' '..='~' => out.push(c),
+            _ => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
         }
     }
     out
@@ -1202,17 +1341,19 @@ fn exec_real(real: &Option<PathBuf>, name: &str, args: &[String]) -> Option<i32>
 /// Unix.) A spawn failure fails open to a non-fatal surrogate code so the shell
 /// is never bricked.
 fn exec_real_child(real: &Option<PathBuf>, name: &str, args: &[String]) -> Option<i32> {
-    exec_real_child_env(real, name, args, &[])
+    exec_real_child_env(real, name, args, &[], &[])
 }
 
 /// [`exec_real_child`] with `env_remove` variables stripped from the child's
 /// inherited environment (the identity straddle's policy-marker rule, see
-/// [`keeps_policy_delivered_sha`]).
+/// [`keeps_policy_delivered_sha`]) and `env_set` pairs set on it (after the
+/// removals, so a variable in both is set).
 fn exec_real_child_env(
     real: &Option<PathBuf>,
     name: &str,
     args: &[String],
     env_remove: &[&str],
+    env_set: &[(&str, &str)],
 ) -> Option<i32> {
     let mut cmd = match real {
         Some(p) => Command::new(p),
@@ -1232,6 +1373,9 @@ fn exec_real_child_env(
     };
     for var in env_remove {
         cmd.env_remove(var);
+    }
+    for (k, v) in env_set {
+        cmd.env(k, v);
     }
     cmd.args(args)
         .env(GUARD_ENV, "1")
@@ -1405,6 +1549,107 @@ mod tests {
         );
         // And 127 survives the ExitCode clamp (never collapses to exit 0).
         assert_eq!(code_to_u8(Some(127)), 127);
+    }
+
+    /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+    /// Phase 6 (review r2, N1): the exported value holds ONLY the allowlisted
+    /// flags and their values — never the prompt, never a `--settings` /
+    /// `--mcp-config` value — as printable-ASCII JSON (review r1, M1).
+    #[test]
+    fn launch_argv_json_exports_only_allowlisted_flags_as_ascii_json() {
+        let args: Vec<String> = [
+            "PROMPT-summarize",
+            "--model",
+            "opus\u{9c}x",
+            "--settings",
+            "{\"env\":{\"KEY\":\"SECRET\"}}",
+            "--mcp-config",
+            "MCPSECRET.json",
+            "other.json",
+            "--append-system-prompt",
+            "ctx\nline",
+            "--add-dir",
+            "/a",
+            "/b\u{1f600}",
+            "--permission-mode=plan",
+            "--verbose",
+            "--debug",
+            "-pc",
+            "-p",
+            "--unknown",
+            "UNKNOWNVAL",
+            "--",
+            "--model",
+            "after-dashdash",
+        ]
+        .map(String::from)
+        .to_vec();
+        let json = launch_argv_json(&args).expect("under the bound");
+        for never in [
+            "PROMPT",
+            "SECRET",
+            "--settings",
+            "--mcp-config",
+            "ctx",
+            "UNKNOWN",
+            "after",
+        ] {
+            assert!(!json.contains(never), "{never} exported: {json}");
+        }
+        assert!(
+            json.bytes().all(|b| (b' '..=b'~').contains(&b)),
+            "printable ASCII only: {json:?}"
+        );
+        assert!(
+            json.contains("\\u009c") && json.contains("\\ud83d\\ude00"),
+            "{json}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                "--model",
+                "opus\u{9c}x",
+                "--add-dir",
+                "/a",
+                "/b\u{1f600}",
+                "--permission-mode=plan",
+                "--verbose",
+                "--debug",
+                "-??",
+                "--print"
+            ])
+        );
+        assert_eq!(launch_argv_json(&[]).as_deref(), Some("[]"));
+        let huge = vec!["--model".to_string(), "x".repeat(LAUNCH_ARGV_MAX_BYTES)];
+        assert_eq!(launch_argv_json(&huge), None);
+    }
+
+    /// Review r2, L3: the env the identity straddle sets reaches the child,
+    /// and a removed variable does not.
+    #[cfg(unix)]
+    #[test]
+    fn exec_real_child_env_sets_and_removes_child_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let script = format!(
+            "printf '%s|%s' \"${{{LAUNCH_ARGV_ENV}-unset}}\" \"${{QS_TEST_REMOVED-unset}}\" > '{}'",
+            out.display()
+        );
+        std::env::set_var("QS_TEST_REMOVED", "present");
+        let code = exec_real_child_env(
+            &Some(PathBuf::from("/bin/sh")),
+            "sh",
+            &["-c".to_string(), script.clone()],
+            &["QS_TEST_REMOVED"],
+            &[(LAUNCH_ARGV_ENV, "[\"--verbose\"]")],
+        );
+        std::env::remove_var("QS_TEST_REMOVED");
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "[\"--verbose\"]|unset"
+        );
     }
 
     #[test]

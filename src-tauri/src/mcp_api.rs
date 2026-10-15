@@ -15131,6 +15131,7 @@ mod self_id_chain_tests {
     /// tests override it explicitly.
     fn rec(csid: &str, working_dir: Option<&str>, last_seen_at: i64) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: csid.to_string(),
             config_dir: None,
             working_dir: working_dir.map(str::to_string),

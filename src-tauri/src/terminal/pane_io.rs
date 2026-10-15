@@ -82,6 +82,19 @@ pub enum CredentialScrub {
     ScrubbedOutOfProcess,
 }
 
+/// How a pane's PTY holder was lost ([`PaneIo::holder_loss`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolderLoss {
+    /// The holder is gone: dead with its lock released, or ended (its child
+    /// killed through it, or the verified holder terminated) after it stopped
+    /// answering. Its `claude` has lost its terminal.
+    Ended,
+    /// The holder stopped answering and NEITHER its `kill` nor terminating it
+    /// landed: it — and the `claude` it hosts — may still be alive, merely
+    /// unreachable. Never relaunched automatically; the operator is told.
+    Unreachable,
+}
+
 /// A byte source and sink for one terminal pane.
 ///
 /// Constructed once, inside `TerminalSession::spawn`, and shared with the
@@ -155,6 +168,21 @@ pub trait PaneIo: Send + Sync {
     /// the emission gate's backpressure is projected onto such a source.
     fn unwatched_pauses_source(&self) -> bool {
         true
+    }
+
+    /// Whether — and how — the pane ended because the process OWNING its PTY
+    /// was lost: an out-of-process holder that died, or had to be ended,
+    /// without reporting its child's exit. `None` for a child exit, a close
+    /// that killed it, a detach, and an incompatible holder left running.
+    /// Read by the waiter thread after [`Self::wait`] returns: a lost holder's
+    /// session is relaunched with `--resume`, or — when its `claude` may still
+    /// be alive — surfaced to the operator instead (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6 — tier 2, for when tier 1 itself dies). `None` for every pane
+    /// whose PTY lives in this process: when that owner dies, so does the
+    /// runner reading this.
+    fn holder_loss(&self) -> Option<HolderLoss> {
+        None
     }
 
     /// How this implementation discharged the credential-scrub obligation.

@@ -958,7 +958,7 @@ function TerminalPageInner({
     // useKeyboardShortcuts.
   } = useUIStateCx();
 
-  useTerminalInitialization({
+  const { resumeWithheld } = useTerminalInitialization({
     pageId,
     authenticated: authStatus?.authenticated,
     tabs,
@@ -1707,6 +1707,7 @@ function TerminalPageInner({
               tabs={tabs}
               onRetryResume={handleRetryResume}
               onDismissTerminalOnly={handleDismissTerminalOnly}
+              onResumeWithheld={resumeWithheld}
             />
 
             {/* Remote tabs from before a restart (remote-session-tabs plan,

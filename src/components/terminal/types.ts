@@ -108,4 +108,21 @@ export interface TerminalSessionRecord {
    * this field for exactly that reason.
    */
   transcriptExists?: boolean;
+  /**
+   * DERIVED by the runner from the flags it persisted for this session (never
+   * the raw launch argv, which is never stored — plan
+   * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+   * Phase 6): the allowlisted flags a relaunch types between `claude` and
+   * `--resume <id>`, every token shell-inert. Absent when none were derived:
+   * the default resume command applies.
+   */
+  resumeArgs?: string[];
+  /**
+   * DERIVED: why the launch argv must NOT be replayed (a surviving token is
+   * not shell-inert, combined short flags, print mode). Present ⇒ the
+   * whole replay is refused, never escaped (plan D11), and the restore types the
+   * DEFAULT resume command instead — only the extra flags are dropped — and
+   * logs this reason (it names a flag, never a value).
+   */
+  resumeRefusal?: string;
 }

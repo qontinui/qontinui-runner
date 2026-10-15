@@ -1490,6 +1490,15 @@ pub struct TerminalSession {
     /// ([`crate::terminal::agent_status_sideband::dispatch`]); read by wind-down
     /// eligibility through [`Self::last_agent_status`].
     agent_status_last: Arc<Mutex<Option<ObservedAgentState>>>,
+    /// The latest OSC 9999 `session_start` report this pane's PTY carried —
+    /// the provider session id (and launch argv) its `SessionStart` hook
+    /// wrote (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6 / D11). Written by the reader thread
+    /// ([`crate::terminal::session_start_sideband::dispatch`]); read by the
+    /// waiter when the pane's PTY holder is lost, to pick the session to
+    /// relaunch ([`crate::terminal::holder_relaunch`]).
+    session_start_report:
+        Arc<Mutex<Option<crate::terminal::session_start_sideband::SessionStartReport>>>,
     /// Grid-idle continuity for wind-down: extends an idle window only while the
     /// grid generation has not moved between observations
     /// ([`qontinui_runner_lib::wind_down::GridIdleTracker`]).
@@ -1949,6 +1958,9 @@ impl TerminalSession {
         // Runner-local last OSC 9999 state, written by the reader thread even
         // when there is no coord mirror (wind-down reads it, not coord).
         let agent_status_last: Arc<Mutex<Option<ObservedAgentState>>> = Arc::new(Mutex::new(None));
+        let session_start_report: Arc<
+            Mutex<Option<crate::terminal::session_start_sideband::SessionStartReport>>,
+        > = Arc::new(Mutex::new(None));
 
         // Spawn reader thread: reads PTY output → interceptor → scrollback + Tauri event
         let reader_id = id.clone();
@@ -1970,6 +1982,7 @@ impl TerminalSession {
         let reader_grid_generation = grid_generation.clone();
         let reader_coord_session_id = coord_session_id.clone();
         let reader_agent_status_last = agent_status_last.clone();
+        let reader_session_start_report = session_start_report.clone();
         // Per-session OSC 9999 coalescer — see
         // `terminal::agent_status_sideband::SidebandRateLimiter`. Lives on the
         // reader thread (plus its deferred-flush tasks), NOT in a
@@ -2244,10 +2257,27 @@ impl TerminalSession {
                             // runtime, so the PTY hot path is never stalled by a
                             // coord write.
                             if sideband_seq_after != sideband_seq_before {
-                                let payload = reader_grid
+                                let (payload, session_start) = reader_grid
                                     .lock()
                                     .ok()
-                                    .and_then(|mut g| g.take_agent_status_sideband());
+                                    .map(|mut g| {
+                                        (
+                                            g.take_agent_status_sideband(),
+                                            g.take_session_start_sideband(),
+                                        )
+                                    })
+                                    .unwrap_or((None, None));
+                                // A `SessionStart` hook's report (plan Phase 6,
+                                // D11): the id a lost holder's session is
+                                // relaunched under. Parsed in-thread; the argv
+                                // write goes to the async runtime.
+                                if let Some(raw) = session_start {
+                                    crate::terminal::session_start_sideband::dispatch(
+                                        &reader_id,
+                                        &reader_session_start_report,
+                                        raw,
+                                    );
+                                }
                                 if let Some(payload) = payload {
                                     crate::terminal::agent_status_sideband::dispatch(
                                         &reader_id,
@@ -2341,6 +2371,7 @@ impl TerminalSession {
         let waiter_coord_session_id = coord_session_id.clone();
         let waiter_on_exit = on_exit.clone();
         let waiter_io = io.clone();
+        let waiter_session_start_report = session_start_report.clone();
         let waiter_handle = thread::Builder::new()
             .name(format!("terminal-waiter-{}", &id))
             .spawn(move || {
@@ -2373,6 +2404,25 @@ impl TerminalSession {
                 }
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
+
+                // Tier 2 (plan Phase 6, D11): when the pane ended because its
+                // PTY HOLDER was lost — not because its child exited, a close
+                // killed it, or the runner detached — hand the session it
+                // hosted back for a `--resume` relaunch, gated on no live
+                // process still hosting it (or tell the operator why not).
+                // Fire-and-forget.
+                crate::terminal::holder_relaunch::after_pane_exit(
+                    waiter_io.as_ref(),
+                    &waiter_session_start_report,
+                    |loss, reported| {
+                        crate::terminal::holder_relaunch::on_holder_lost(
+                            &waiter_app,
+                            &waiter_id,
+                            reported,
+                            loss,
+                        )
+                    },
+                );
 
                 // "The child process ended" — the Tauri event plus its WS
                 // re-broadcast. NOT the only notice a pane sends: the
@@ -2475,6 +2525,7 @@ impl TerminalSession {
             coord_session_id,
             spawn_name: std::sync::OnceLock::new(),
             agent_status_last,
+            session_start_report,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
             exit_snapshot,
@@ -5484,6 +5535,7 @@ pub(crate) mod tests {
             coord_session_id: Arc::new(Mutex::new(None)),
             spawn_name: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
+            session_start_report: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),
             isolated_edit_ctx: Arc::new(Mutex::new(None)),

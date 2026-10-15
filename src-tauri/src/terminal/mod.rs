@@ -22,6 +22,7 @@ pub mod graceful_exit;
 pub mod grid;
 pub mod holder_boot_sweep;
 pub mod holder_census;
+pub mod holder_relaunch; // Tier 2: a lost PTY holder's session handed to the restore for a `--resume` relaunch (plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6)
 pub mod interceptor;
 pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
@@ -33,6 +34,7 @@ pub mod remote_pane_io;
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;
+pub mod session_start_sideband; // OSC 9999 `session_start` report: the SessionStart hook's id + launch argv over the PTY (plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6 / D11)
 pub mod transcript;
 pub mod transcript_watcher;
 #[cfg(test)]

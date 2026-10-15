@@ -211,6 +211,120 @@ pub struct SessionOpenRequest {
     /// The session working dir, if the hook reports it.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The launch argv the identity shim exported (`QONTINUI_LAUNCH_ARGV`),
+    /// when the hook carries it (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6). It rides THIS loopback body and never the PTY (review r1,
+    /// H1). It is consumed, never stored: only the relaunch flags derived
+    /// from it are persisted ([`apply_launch_argv`]). Its `Debug` is redacted.
+    ///
+    /// ABSENT (`None`) and `null` (`Some(LaunchArgvBody(Null))`) are
+    /// different reports (review r3, R1): the identity shim's early POST
+    /// omits the key, and leaves the flag slot for the hook's POST; the hook
+    /// ALWAYS sends it, `null` when it has none, which closes the slot.
+    #[serde(default, deserialize_with = "present_argv")]
+    pub argv: Option<LaunchArgvBody>,
+}
+
+/// A launch argv in a request body. Deserialized as the raw JSON value, and
+/// `Debug`-printed as a placeholder: an argv can hold an initial prompt or an
+/// inline secret, so a `{:?}` of a request must never print it.
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+pub struct LaunchArgvBody(pub serde_json::Value);
+
+/// `argv` when the key is PRESENT — `null` included, as
+/// `Some(LaunchArgvBody(Null))`. An absent key is `None` (`#[serde(default)]`).
+fn present_argv<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<LaunchArgvBody>, D::Error> {
+    <serde_json::Value as serde::Deserialize>::deserialize(d).map(|v| Some(LaunchArgvBody(v)))
+}
+
+impl std::fmt::Debug for LaunchArgvBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<launch argv redacted>")
+    }
+}
+
+/// Derive and persist the relaunch flags for the session a
+/// `/control/session-open` confirmed, from the launch argv its body carried
+/// (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+/// Phase 6). Only the derived [`crate::session::resume_argv::ResumeFlags`] are
+/// written, and only under `SessionLifecycleStore::set_resume_flags`'s rules
+/// (startup only, first write wins, the reporting terminal's open record). A
+/// refusal is logged at warn naming a flag, never a value; nothing here logs
+/// the argv.
+fn apply_launch_argv(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    req: &SessionOpenRequest,
+) {
+    use crate::session::resume_argv::{derive_resume_flags, parse_argv_value, ResumeFlags};
+    let Some(body) = req.argv.as_ref() else {
+        // No argv: a non-startup first report still CLOSES the slot, so a
+        // later spoofed startup cannot fill it (review r2, N4).
+        let outcome =
+            store.close_resume_flags(&req.session_id, &req.terminal_id, req.source.as_deref());
+        info!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            ?outcome,
+            "control/session-open: relaunch flags (no argv in the report)"
+        );
+        return;
+    };
+    if body.0.is_null() {
+        // The hook reported no argv (no identity shim in the chain): close the
+        // slot, so a later spoofed report cannot fill it (review r3, R1).
+        let outcome = store.set_resume_flags(
+            &req.session_id,
+            &req.terminal_id,
+            req.source.as_deref(),
+            ResumeFlags::Refused {
+                reason: crate::session::resume_argv::NO_ARGV_REPORTED.to_string(),
+            },
+        );
+        info!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            ?outcome,
+            "control/session-open: relaunch flags (the hook reported no argv)"
+        );
+        return;
+    }
+    let Some(argv) = parse_argv_value(&body.0) else {
+        warn!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            "control/session-open: the launch argv is not a bounded array of strings — no \
+             relaunch flags derived (a relaunch uses the default resume command)"
+        );
+        return;
+    };
+    let Some(flags) = derive_resume_flags(&argv, &req.session_id, req.cwd.as_deref()) else {
+        return;
+    };
+    if let ResumeFlags::Refused { reason } = &flags {
+        warn!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            refusal = %reason,
+            "control/session-open: the launch argv cannot be replayed — a relaunch will use the \
+             default resume command, its extra flags dropped"
+        );
+    }
+    let outcome = store.set_resume_flags(
+        &req.session_id,
+        &req.terminal_id,
+        req.source.as_deref(),
+        flags,
+    );
+    info!(
+        terminal_id = %req.terminal_id,
+        session_id = %req.session_id,
+        ?outcome,
+        "control/session-open: relaunch flags"
+    );
 }
 
 /// Why a `POST /control/session-open` body must be refused, or `None` to accept.
@@ -1390,6 +1504,10 @@ fn record_session_open_into(
     {
         store.update_identity(&req.session_id, &live.identity_update());
     }
+
+    // Phase 6: the relaunch flags, derived from the launch argv the body
+    // carried — AFTER the record above exists and is bound to this terminal.
+    apply_launch_argv(store, req);
 }
 
 /// `POST /install-effects/run`.
@@ -2327,6 +2445,7 @@ mod tests {
 
     fn session_open_req(terminal_id: &str, session_id: &str) -> SessionOpenRequest {
         SessionOpenRequest {
+            argv: None,
             terminal_id: terminal_id.to_string(),
             session_id: session_id.to_string(),
             source: Some("startup".to_string()),
@@ -2453,6 +2572,7 @@ mod tests {
         confirmed: bool,
     ) -> crate::session::session_lifecycle_store::TerminalSessionRecord {
         crate::session::session_lifecycle_store::TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: id.to_string(),
             config_dir: None,
             working_dir: Some("D:/qontinui-root".to_string()),
@@ -2913,6 +3033,7 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
 
         let req = SessionOpenRequest {
+            argv: None,
             terminal_id: "term-77".to_string(),
             session_id: "sess-deadbeef".to_string(),
             source: Some("startup".to_string()),
@@ -2956,6 +3077,131 @@ mod tests {
         );
     }
 
+    /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+    /// Phase 6 (review r1, H1): the launch argv rides the session-open BODY,
+    /// and only the relaunch flags derived from it are persisted — never the
+    /// prompt, a dropped flag's value, or the raw argv; a later report cannot
+    /// swap the flags; the request's `Debug` never prints the argv.
+    #[test]
+    fn session_open_persists_only_derived_relaunch_flags_from_the_body_argv() {
+        use crate::session::resume_argv::ResumeFlags;
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let body = serde_json::json!({
+            "terminal_id": "term-9",
+            "session_id": "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0",
+            "source": "startup",
+            "cwd": "/home/op/proj",
+            "argv": [
+                "PROMPT-TEXT summarize the repo",
+                "--model",
+                "opus",
+                "--settings",
+                "{\"env\":{\"KEY\":\"sk-SECRET\"}}",
+                "--add-dir",
+                "lib"
+            ],
+        });
+        let req: SessionOpenRequest = serde_json::from_value(body).unwrap();
+        assert!(
+            !format!("{req:?}").contains("SECRET"),
+            "Debug never prints the argv: {req:?}"
+        );
+        record_session_open_into(&store, &req, "claude");
+        let rec = store.get("0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0").unwrap();
+        assert_eq!(
+            rec.resume_flags,
+            Some(ResumeFlags::Replay {
+                flags: ["--model", "opus", "--add-dir", "/home/op/proj/lib"]
+                    .map(String::from)
+                    .to_vec()
+            })
+        );
+        drop(store);
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default()
+            + &std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+                .collect::<String>();
+        for leaked in ["SECRET", "PROMPT-TEXT", "--settings"] {
+            assert!(!on_disk.contains(leaked), "{leaked} reached disk");
+        }
+
+        // A later (non-startup) report on the same session cannot swap them.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let mut later: SessionOpenRequest = serde_json::from_value(serde_json::json!({
+            "terminal_id": "term-9",
+            "session_id": "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0",
+            "source": "startup",
+            "argv": ["--ide"],
+        }))
+        .unwrap();
+        record_session_open_into(&store, &later, "claude");
+        later.source = Some("resume".into());
+        record_session_open_into(&store, &later, "claude");
+        assert_eq!(
+            store
+                .get("0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0")
+                .unwrap()
+                .resume_flags
+                .map(|f| matches!(f, ResumeFlags::Replay { ref flags } if flags[0] == "--model")),
+            Some(true),
+            "first write wins"
+        );
+    }
+
+    /// Review r3, R1: the hook's `"argv": null` CLOSES the flag slot; the
+    /// identity shim's early POST, which omits the key, leaves it open for the
+    /// hook's report that follows.
+    #[test]
+    fn session_open_tells_an_absent_argv_from_a_null_one() {
+        use crate::session::resume_argv::{ResumeFlags, NO_ARGV_REPORTED};
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let req = |argv: Option<serde_json::Value>| -> SessionOpenRequest {
+            let mut body = serde_json::json!({
+                "terminal_id": "term-r1",
+                "session_id": sid,
+                "source": "startup",
+            });
+            if let Some(a) = argv {
+                body["argv"] = a;
+            }
+            serde_json::from_value(body).unwrap()
+        };
+
+        // The shim's early POST: no key → the slot stays open.
+        let early = req(None);
+        assert!(early.argv.is_none());
+        record_session_open_into(&store, &early, "claude");
+        assert_eq!(store.get(sid).unwrap().resume_flags, None);
+
+        // The hook with no argv: explicit null → closed.
+        let hook = req(Some(serde_json::Value::Null));
+        assert!(hook.argv.as_ref().is_some_and(|a| a.0.is_null()));
+        record_session_open_into(&store, &hook, "claude");
+        assert_eq!(
+            store.get(sid).unwrap().resume_flags,
+            Some(ResumeFlags::Refused {
+                reason: NO_ARGV_REPORTED.into()
+            })
+        );
+        // A later report with flags cannot fill it.
+        record_session_open_into(&store, &req(Some(serde_json::json!(["--ide"]))), "claude");
+        assert_eq!(
+            store.get(sid).unwrap().resume_flags,
+            Some(ResumeFlags::Refused {
+                reason: NO_ARGV_REPORTED.into()
+            })
+        );
+    }
+
     /// The hook is a confirmation signal, not a layout authority: confirming an
     /// EXISTING record must preserve its page/zone/cwd/title (the hook runs
     /// under bash — "default" page + MSYS cwd — and clobbering these stranded
@@ -2971,6 +3217,7 @@ mod tests {
 
         // A binder/frontend-written record with REAL layout fields.
         store.record_open(TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: "sess-1".to_string(),
             config_dir: Some("C:\\claude\\.claude-gmail".to_string()),
             working_dir: Some("D:\\qontinui-root".to_string()),
@@ -3008,6 +3255,7 @@ mod tests {
 
         // The confirming hook fires with bash-flavored context.
         let req = SessionOpenRequest {
+            argv: None,
             terminal_id: "term-1".to_string(),
             session_id: "sess-1".to_string(),
             source: Some("startup".to_string()),
@@ -3053,6 +3301,7 @@ mod tests {
         let config = dir.path().join("cfg").to_string_lossy().into_owned();
         let open = |id: &str, term: &str, source: Option<&str>| {
             let req = SessionOpenRequest {
+                argv: None,
                 terminal_id: term.to_string(),
                 session_id: id.to_string(),
                 source: source.map(str::to_string),
@@ -3112,6 +3361,7 @@ mod tests {
             let config = dir.path().join("cfg").to_string_lossy().into_owned();
             let hook = |id: &str, source: &str| {
                 let req = SessionOpenRequest {
+                    argv: None,
                     terminal_id: "term-pane".to_string(),
                     session_id: id.to_string(),
                     source: Some(source.to_string()),
@@ -3173,6 +3423,7 @@ mod tests {
             let config = dir.path().join("cfg").to_string_lossy().into_owned();
             let seed = |id: &str, terminal: &str, confirmed_at: i64| {
                 store.record_open(TerminalSessionRecord {
+                    resume_flags: None,
                     claude_session_id: id.to_string(),
                     config_dir: Some(config.clone()),
                     working_dir: None,
@@ -3210,6 +3461,7 @@ mod tests {
             };
             let hook = |id: &str, source: &str| {
                 let req = SessionOpenRequest {
+                    argv: None,
                     terminal_id: "term-pane".to_string(),
                     session_id: id.to_string(),
                     source: Some(source.to_string()),
@@ -3268,6 +3520,7 @@ mod tests {
 
         // The runner's spawn-time PREDICTION, on the real page/zone.
         store.record_open(TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: "predicted-id".to_string(),
             config_dir: Some("C:\\claude\\.claude-gmail".to_string()),
             working_dir: Some("D:\\qontinui-root".to_string()),
@@ -3305,6 +3558,7 @@ mod tests {
 
         // The provider reports a DIFFERENT id about itself, from bash.
         let req = SessionOpenRequest {
+            argv: None,
             terminal_id: "term-1".to_string(),
             session_id: "provider-adopted-id".to_string(),
             source: Some("startup".to_string()),
@@ -3354,6 +3608,7 @@ mod tests {
 
         // A record on a DIFFERENT terminal — must not be borrowed from.
         store.record_open(TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: "elsewhere".to_string(),
             config_dir: None,
             working_dir: Some("D:\\other".to_string()),
@@ -3390,6 +3645,7 @@ mod tests {
         });
 
         let req = SessionOpenRequest {
+            argv: None,
             terminal_id: "term-fresh".to_string(),
             session_id: "fresh-id".to_string(),
             source: Some("startup".to_string()),
@@ -3438,6 +3694,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         let req = SessionOpenRequest {
+            argv: None,
             terminal_id: "t".to_string(),
             session_id: "s".to_string(),
             source: None,

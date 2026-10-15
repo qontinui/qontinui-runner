@@ -2251,6 +2251,7 @@ mod tests {
     /// authoritatively, and confirmed by a provider's SessionStart hook.
     fn open_record(claude_session_id: &str, terminal_id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: claude_session_id.to_string(),
             config_dir: None,
             working_dir: Some("/repo".to_string()),
