@@ -22,11 +22,16 @@
 //!
 //! Adopted from tty7 (`cli_agent.rs`, idea only): every token that SURVIVES
 //! the filter below must be shell-inert — characters from [`is_inert_char`]
-//! only — or the relaunch is refused outright. Escaping is not attempted: the
+//! only — or the REPLAY is refused outright. Escaping is not attempted: the
 //! command is typed into whichever shell the pane runs (bash, zsh, PowerShell),
-//! and a quoting scheme correct for one is an injection for another. A refusal
-//! is honest and recoverable (the operator can resume by hand); a mis-quoted
-//! token is neither.
+//! and a quoting scheme correct for one is an injection for another.
+//!
+//! A refused replay does NOT mean no relaunch (coordinator decision,
+//! 2026-10-15): the session is still resumed with the DEFAULT resume command —
+//! exactly the pre-Phase-6 behaviour — and only the extra flags are dropped
+//! ([`Relaunch::Fallback`]). The refusal is logged at warn naming the flag the
+//! offending token belongs to, never its value. Only a missing or unsafe
+//! session id means no relaunch at all.
 //!
 //! # What survives, and what is dropped
 //!
@@ -49,7 +54,8 @@
 //!   conversation to come back to in a pane.
 //!
 //! Refusals never carry a token's text: an argv is operator input and can
-//! hold anything; the refusal names a position.
+//! hold anything; the refusal names a position and, when it is itself inert,
+//! the FLAG the token belongs to.
 
 use crate::session::session_id::is_valid_session_id;
 
@@ -76,11 +82,13 @@ pub const MAX_REPLAY_TOKEN_BYTES: usize = 256;
 pub enum ReplayRefusal {
     /// The session id is not shell-safe (`session_id::is_valid_session_id`).
     InvalidSessionId,
-    /// Token `index` survives the filter but is not shell-inert.
-    NotShellInert { index: usize },
+    /// Token `index` survives the filter but is not shell-inert. `flag` is the
+    /// flag it belongs to (itself, or the flag whose value it is), named only
+    /// when that name is itself inert — never the token's value.
+    NotShellInert { index: usize, flag: Option<String> },
     /// Bare unknown flag at `index` is followed by a plain token: its value
     /// and the initial prompt cannot be told apart.
-    AmbiguousFlag { index: usize },
+    AmbiguousFlag { index: usize, flag: Option<String> },
     /// The session was launched in print mode (`-p`/`--print`).
     PrintMode,
     /// More than [`MAX_ARGV_TOKENS`] tokens.
@@ -93,15 +101,17 @@ impl std::fmt::Display for ReplayRefusal {
             ReplayRefusal::InvalidSessionId => {
                 write!(f, "the session id is not shell-safe")
             }
-            ReplayRefusal::NotShellInert { index } => write!(
+            ReplayRefusal::NotShellInert { index, flag } => write!(
                 f,
-                "launch argument {index} is not shell-inert; the relaunch is refused rather \
-                 than escaped"
+                "launch argument {index} (flag {}) is not shell-inert; its replay is refused \
+                 rather than escaped",
+                flag.as_deref().unwrap_or("<unnamed>")
             ),
-            ReplayRefusal::AmbiguousFlag { index } => write!(
+            ReplayRefusal::AmbiguousFlag { index, flag } => write!(
                 f,
-                "launch argument {index} is a flag this runner does not know, followed by a \
-                 value it cannot tell from a prompt"
+                "launch argument {index} (flag {}) is a flag this runner does not know, \
+                 followed by a value it cannot tell from a prompt",
+                flag.as_deref().unwrap_or("<unnamed>")
             ),
             ReplayRefusal::PrintMode => {
                 write!(f, "the session was launched in print mode (-p/--print)")
@@ -213,7 +223,8 @@ pub fn replay_args(launch_argv: &[String], session_id: &str) -> Result<Vec<Strin
     if launch_argv.len() > MAX_ARGV_TOKENS {
         return Err(ReplayRefusal::TooLong);
     }
-    let mut kept: Vec<(usize, String)> = Vec::new();
+    // (position, token, the flag it belongs to — for the refusal's message).
+    let mut kept: Vec<(usize, String, &str)> = Vec::new();
     let mut i = 0;
     while i < launch_argv.len() {
         let token = &launch_argv[i];
@@ -235,7 +246,7 @@ pub fn replay_args(launch_argv: &[String], session_id: &str) -> Result<Vec<Strin
             Some((arity, disposition)) => {
                 let keep = disposition == Disposition::Keep;
                 if keep {
-                    kept.push((i, token.clone()));
+                    kept.push((i, token.clone(), name));
                 }
                 i += 1;
                 if inline_value {
@@ -247,7 +258,7 @@ pub fn replay_args(launch_argv: &[String], session_id: &str) -> Result<Vec<Strin
                     Arity::One => {
                         if let Some(v) = launch_argv.get(i) {
                             if keep {
-                                kept.push((i, v.clone()));
+                                kept.push((i, v.clone(), name));
                             }
                             i += 1;
                         }
@@ -255,7 +266,7 @@ pub fn replay_args(launch_argv: &[String], session_id: &str) -> Result<Vec<Strin
                     Arity::Optional => {
                         if launch_argv.get(i).is_some_and(takes) {
                             if keep {
-                                kept.push((i, launch_argv[i].clone()));
+                                kept.push((i, launch_argv[i].clone(), name));
                             }
                             i += 1;
                         }
@@ -263,7 +274,7 @@ pub fn replay_args(launch_argv: &[String], session_id: &str) -> Result<Vec<Strin
                     Arity::Many => {
                         while launch_argv.get(i).is_some_and(takes) {
                             if keep {
-                                kept.push((i, launch_argv[i].clone()));
+                                kept.push((i, launch_argv[i].clone(), name));
                             }
                             i += 1;
                         }
@@ -278,19 +289,31 @@ pub fn replay_args(launch_argv: &[String], session_id: &str) -> Result<Vec<Strin
                         .get(i + 1)
                         .is_some_and(|t| !is_flag(t) && t != "--")
                 {
-                    return Err(ReplayRefusal::AmbiguousFlag { index: i });
+                    return Err(ReplayRefusal::AmbiguousFlag {
+                        index: i,
+                        flag: inert_name(name),
+                    });
                 }
-                kept.push((i, token.clone()));
+                kept.push((i, token.clone(), name));
                 i += 1;
             }
         }
     }
-    for (index, token) in &kept {
+    for (index, token, flag) in &kept {
         if !is_shell_inert(token) {
-            return Err(ReplayRefusal::NotShellInert { index: *index });
+            return Err(ReplayRefusal::NotShellInert {
+                index: *index,
+                flag: inert_name(flag),
+            });
         }
     }
-    Ok(kept.into_iter().map(|(_, t)| t).collect())
+    Ok(kept.into_iter().map(|(_, t, _)| t).collect())
+}
+
+/// A flag name fit for a log line: only when it is itself shell-inert (a flag
+/// token can be anything an operator typed).
+fn inert_name(name: &str) -> Option<String> {
+    is_shell_inert(name).then(|| name.to_string())
 }
 
 /// How a session with persisted argv `launch_argv` is relaunched — the two
@@ -302,8 +325,11 @@ pub enum Relaunch {
     Default,
     /// Replay these flags before `--resume <id>`.
     Replay(Vec<String>),
-    /// An argv was reported and must not be replayed: NO relaunch.
-    Refused(ReplayRefusal),
+    /// An argv was reported and must not be replayed: the DEFAULT resume
+    /// command is used instead, and only the extra flags are dropped.
+    Fallback(ReplayRefusal),
+    /// The session id is not shell-safe: NO relaunch.
+    NoRelaunch,
 }
 
 impl Relaunch {
@@ -313,19 +339,24 @@ impl Relaunch {
             None => Relaunch::Default,
             Some(argv) => match replay_args(argv, session_id) {
                 Ok(flags) => Relaunch::Replay(flags),
-                Err(why) => Relaunch::Refused(why),
+                Err(ReplayRefusal::InvalidSessionId) => Relaunch::NoRelaunch,
+                Err(why) => Relaunch::Fallback(why),
             },
         }
     }
 
     /// `(resumeArgs, resumeRefusal)` for the wire: both absent for
     /// [`Relaunch::Default`], so a webview that predates them — and a record
-    /// that predates argv persistence — behaves exactly as before.
+    /// that predates argv persistence — behaves exactly as before. A
+    /// [`Relaunch::Fallback`] carries NO args (the webview then types the
+    /// default resume) plus the refusal, for its log line. [`Relaunch::NoRelaunch`]
+    /// carries neither: the webview's own session-id gate (`skip-invalid`)
+    /// already refuses that record.
     pub fn wire_fields(&self) -> (Option<Vec<String>>, Option<String>) {
         match self {
-            Relaunch::Default => (None, None),
+            Relaunch::Default | Relaunch::NoRelaunch => (None, None),
             Relaunch::Replay(flags) => (Some(flags.clone()), None),
-            Relaunch::Refused(why) => (None, Some(why.to_string())),
+            Relaunch::Fallback(why) => (None, Some(why.to_string())),
         }
     }
 }
@@ -400,7 +431,10 @@ mod tests {
         );
         assert_eq!(
             replay_args(&argv(&["--add-dir", "/a", "fix the build"]), SID),
-            Err(ReplayRefusal::NotShellInert { index: 2 })
+            Err(ReplayRefusal::NotShellInert {
+                index: 2,
+                flag: Some("--add-dir".into())
+            })
         );
     }
 
@@ -457,7 +491,10 @@ mod tests {
             let launch = argv(&["--verbose", "--add-dir", bad]);
             assert_eq!(
                 replay_args(&launch, SID),
-                Err(ReplayRefusal::NotShellInert { index: 2 }),
+                Err(ReplayRefusal::NotShellInert {
+                    index: 2,
+                    flag: Some("--add-dir".into())
+                }),
                 "{bad:?} must refuse the replay"
             );
         }
@@ -465,7 +502,10 @@ mod tests {
         let long = "a".repeat(MAX_REPLAY_TOKEN_BYTES + 1);
         assert_eq!(
             replay_args(&argv(&["--model", &long]), SID),
-            Err(ReplayRefusal::NotShellInert { index: 1 })
+            Err(ReplayRefusal::NotShellInert {
+                index: 1,
+                flag: Some("--model".into())
+            })
         );
     }
 
@@ -511,7 +551,10 @@ mod tests {
         );
         assert_eq!(
             replay_args(&argv(&["--model", "x", "--future-flag", "value"]), SID),
-            Err(ReplayRefusal::AmbiguousFlag { index: 2 })
+            Err(ReplayRefusal::AmbiguousFlag {
+                index: 2,
+                flag: Some("--future-flag".into())
+            })
         );
     }
 
@@ -534,6 +577,9 @@ mod tests {
         let secret = "sk-secret-token value";
         let err = replay_args(&argv(&["--model", secret]), SID).unwrap_err();
         assert!(!err.to_string().contains("sk-secret"), "{err}");
+        // A flag NAME that is not inert is not named either.
+        let err = replay_args(&argv(&["--x$(id)=v"]), SID).unwrap_err();
+        assert!(!err.to_string().contains("$(id)"), "{err}");
     }
 
     #[test]
@@ -543,10 +589,25 @@ mod tests {
             Relaunch::for_record(Some(&argv(&["--model", "opus", "hi"])), SID).wire_fields(),
             (Some(argv(&["--model", "opus"])), None)
         );
-        let (args, refusal) =
-            Relaunch::for_record(Some(&argv(&["--add-dir", "a b"])), SID).wire_fields();
-        assert_eq!(args, None, "a refused replay types nothing");
-        assert!(refusal.unwrap().contains("not shell-inert"));
+        // An unsafe argv falls back to the DEFAULT resume: no args (the
+        // webview types its default command), and the refusal — naming the
+        // flag, never the value — for the warn line.
+        let relaunch = Relaunch::for_record(Some(&argv(&["--add-dir", "a b"])), SID);
+        assert!(matches!(relaunch, Relaunch::Fallback(_)), "{relaunch:?}");
+        let (args, refusal) = relaunch.wire_fields();
+        assert_eq!(args, None, "the extra flags are dropped, the resume is not");
+        let refusal = refusal.unwrap();
+        assert!(refusal.contains("--add-dir"), "{refusal}");
+        assert!(!refusal.contains("a b"), "{refusal}");
+        // A missing or unsafe session id: no relaunch at all.
+        assert_eq!(
+            Relaunch::for_record(Some(&argv(&["--model", "opus"])), "a b"),
+            Relaunch::NoRelaunch
+        );
+        assert_eq!(
+            Relaunch::for_record(Some(&argv(&["--model", "opus"])), ""),
+            Relaunch::NoRelaunch
+        );
         // A persisted argv with no flags still relaunches — with none.
         assert_eq!(
             Relaunch::for_record(Some(&[]), SID).wire_fields(),

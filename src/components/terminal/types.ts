@@ -125,8 +125,9 @@ export interface TerminalSessionRecord {
   /**
    * DERIVED: why the persisted argv must NOT be replayed (a surviving token is
    * not shell-inert, an unknown flag is ambiguous, print mode). Present ⇒ the
-   * restore relaunches NOTHING for this record (the whole replay is refused,
-   * never escaped — plan D11) and the tab says so.
+   * whole replay is refused, never escaped (plan D11), and the restore types the
+   * DEFAULT resume command instead — only the extra flags are dropped — and
+   * logs this reason (it names a flag, never a value).
    */
   resumeRefusal?: string;
 }
