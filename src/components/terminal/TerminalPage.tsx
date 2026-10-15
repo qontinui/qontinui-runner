@@ -58,6 +58,7 @@ import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
+import { HolderUpgradeBanner } from "./HolderUpgradeBanner";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
@@ -1713,6 +1714,13 @@ function TerminalPageInner({
                 Phase 4): placeholders with a Reattach action, never a
                 respawned local shell. */}
             <RemoteRestoreBanner />
+
+            {/* PTY holders needing a decision (pty-holder plan D15 + Phase 8
+                follow-up): an incompatible or older-build holder, with
+                "Upgrade holder" (Unix, operator-initiated only) and "Leave
+                running". Reads the holder census itself; never upgrades
+                anything unless its button is clicked. */}
+            <HolderUpgradeBanner />
           </div>
 
           {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list
