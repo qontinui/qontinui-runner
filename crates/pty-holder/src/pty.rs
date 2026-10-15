@@ -805,17 +805,9 @@ impl Pane {
             {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    if cfg!(target_os = "linux") {
-                        "the input connections did not drain in time"
-                    } else {
-                        "an input connection is still open, and on this OS it cannot be \
-                         drained without risking silent input loss (plan Phase 8 drains \
-                         by shutdown(SHUT_RD) on Linux only)"
-                    },
-                ));
+            if let Some(why) = drain_refusal(Instant::now() >= deadline, cfg!(target_os = "linux"))
+            {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, why));
             }
             std::thread::sleep(INPUT_QUEUE_POLL);
         }
@@ -843,6 +835,15 @@ impl Pane {
             input.held = held;
         }
         self.unfreeze_input();
+    }
+
+    /// Put `bytes` into the pane's STREAM as if the PTY had produced them, at
+    /// the current end — a notice every client sees, at its true position
+    /// (plan Phase 8: a take-back after a successor that may have consumed
+    /// output declares it in-band).
+    #[cfg(unix)]
+    pub fn inject_stream_notice(&self, bytes: &[u8]) {
+        self.absorb_output(bytes);
     }
 
     /// An adopted pane: the child's exit code its predecessor observed.
@@ -1476,6 +1477,23 @@ impl Pane {
     }
 }
 
+/// The input drain's verdict while connections are still open (review r3
+/// nit: a pure function, so the non-Linux branch is tested on Linux too):
+/// keep waiting (`None`) until the bound passes, then refuse with the reason
+/// that fits the platform — on Linux a drain that stalled, elsewhere an open
+/// connection that cannot be drained without risking silent input loss.
+pub fn drain_refusal(bound_passed: bool, shut_rd_drains: bool) -> Option<&'static str> {
+    if !bound_passed {
+        return None;
+    }
+    Some(if shut_rd_drains {
+        "the input connections did not drain in time"
+    } else {
+        "an input connection is still open, and on this OS it cannot be drained without \
+         risking silent input loss (plan Phase 8 drains by shutdown(SHUT_RD) on Linux only)"
+    })
+}
+
 /// The holder's own exit status for a child exit: the child's code, `128 +
 /// signal` for a signal death (the shell convention), 1 when unknown.
 pub fn holder_exit_code(exit: &ExitReply) -> u8 {
@@ -1606,5 +1624,25 @@ mod win_job {
                 CloseHandle(self.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review r3 nit: the drain's refusal decision, both platform branches,
+    /// on any OS. Before the bound it waits; after it, Linux reports a stall
+    /// and other Unix refuses an open connection as unsafe to drain.
+    #[test]
+    fn pty_holder_handoff_drain_refusal_decision() {
+        assert_eq!(drain_refusal(false, true), None);
+        assert_eq!(drain_refusal(false, false), None);
+        assert!(drain_refusal(true, true)
+            .unwrap()
+            .contains("did not drain in time"));
+        let other = drain_refusal(true, false).unwrap();
+        assert!(other.contains("cannot be drained without risking silent input loss"));
+        assert!(other.contains("Linux only"));
     }
 }
