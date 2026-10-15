@@ -283,11 +283,13 @@ are not removable, so a withheld citation was recorded anyway — measured
 is the supported way to say "this PR delivered phases 2 and 3 and no more"
 *(plan `2026-09-13-coord-delivery-cannot-express-partial-delivery`)*.
 **Never `gh pr merge`, never `--admin`** — coord is the sole merge authority.
-The marker is an **indexability** claim, not a delivery one: once plan
+The marker is an **indexability** claim, not a delivery one: now that plan
 `2026-09-04-docs-only-plan-marker-prs-derive-shipped` Phase 1 is deployed
-(authored 2026-09-04, not deployed as of that date), coord classifies a citation
-whose PR changed only plan documents as a *document citation*, which neither
-derives nor blocks `shipped` — so marking a plan-file-only PR cannot forge it.
+(qontinui-coord#1924, `483659578` on `origin/main`; the plan is stamped SHIPPED
+2026-09-07), coord classifies a citation whose PR changed only plan documents as
+a *document citation* (`document_citation: true` on
+`coord_work_unit_list_citations`), which neither derives nor blocks `shipped` —
+so marking a plan-file-only PR cannot forge it.
 Runbook:
 `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
@@ -396,7 +398,7 @@ regressed: report the measured number, do not quietly raise the floor.
 takes over the first's reservation — the identical bug that plan
 `2026-06-03-coord-session-scoped-claim-owner-plan` (SHIPPED 2026-06-03; coord
 PR #271 makes `acquire` SET/compare the owner token and the heartbeat/release Lua
-match on it, qontinui-claude-config PR #49 sends it) fixed for phase claims. It is
+match on it, and the client-side config change sends it) fixed for phase claims. It is
 also what makes the nested renewals below work at all: without an owner token,
 `/vet-plan`'s own reserve would be indistinguishable from a peer's.
 
@@ -426,6 +428,26 @@ also what makes the nested renewals below work at all: without an owner token,
   Another session on THIS machine (session <current_holder_session>) already
   holds plan:<plan-stem>.
   ```
+
+  **Coordinating with the holder on the session bus — how a SENDER sees the
+  reply.** `coord_send_message` returns a `message_id` in its receipt; watch
+  THAT message with `coord_message_status {message_id}` (sender-only; once served, it returns
+  `delivered_at`, `read_at`, `acked_at` and `ack_response`). Do **not** poll
+  `coord_inbox` for the answer: it is recipient-scoped and never shows a sender
+  the ack on its own message — on 2026-09-17 a sender watched it for 22 minutes
+  while the peer's "still implementing" ack sat on the message. Until
+  `coord_message_status` is served (absent from your tool list, or
+  `GET /coord/session-messages/<message_id>` answering 404 for a `message_id` your own receipt holds — that one 404 also covers wrong device, wrong tenant and unknown id), the ack is UNKNOWN,
+  and silence is never consent to proceed or to adopt (`/vet-plan`, "Case 2
+  across machines": a positive signal stands in for the transcript-tail check
+  only, IN ADDITION to the worktree, PR and branch checks). Send under the plan's tenant: on a `recon-tenant.sh`
+  `MULTI`, over `POST https://coord.qontinui.io/mcp` with the plan tenant's
+  bearer — and then read `coord_message_status` back over that SAME bearer. Once
+  served, a message is visible only to its sending tenant and device (the plan's
+  D1 design), so a status read over any other door or tenant 404s, which is
+  UNKNOWN, not "no ack". Delete the
+  bearers when done (`rm -rf` the directory the printed bearer paths sit in —
+  recon-tenant.sh's own per-run directory).
 
 - **`fork_risk`, or a non-empty `forking_siblings`** — **the reserve no longer
   carries this.** Reserve answers **exclusion only**: `granted` / `claimed`,
@@ -586,7 +608,8 @@ spellings.
 Read the loop at any point with `status`, which prints one line per row plus a
 verdict on its **exit code**: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
 `LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
-`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`).
+`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`),
+`OWNER_GONE` (11 — the owning session died and the loop released every row).
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"
@@ -774,7 +797,8 @@ Let `/vet-plan` run to completion — it audits the claims, edits the plan in
 place, resolves open questions via its Decision policy, and stamps the plan
 `Status: VETTED <date>` (and, under this chain, registers the `time_elapsed`
 safety-net gate — **not** a `unit_ready` record gate; see the table below —
-unless it took its §5.4 step 6 **hold-gate skip**, which registers neither). Do
+unless it took its §5.4 step 6 **hold-gate skip**, which registers neither, or
+its **delivery skip**, which registers neither and makes no `→ vetted` transition). Do
 not short-circuit any of it.
 
 **Collect its report; do not emit it.** `/vet-plan` Step 6 produces a complete,
@@ -793,15 +817,17 @@ point, so do not reintroduce it as a "quick summary of the vet" either.
 about the MIDPOINT, not a cap on output.)
 
 **`/vet-plan` registers exactly ONE gate for a `/vet-imp` run — the net
-(changed 2026-09-04) — or NONE when it takes its §5.4 step 6 hold-gate skip**
+(changed 2026-09-04) — or NONE when it takes its §5.4 step 6 hold-gate skip or
+§5.4 delivery skip**
 (the plan is held behind a live trigger gate that already dispatches back to
-it; see Step 3's VETTED-HELD arm). If this chain drops after vetting, coord dispatches a
+it; see Step 3's VETTED-HELD arm; or, under the delivery skip, the plan landed
+mid-vet and Step 3's arm-1 read routes to closeout). If this chain drops after vetting, coord dispatches a
 fresh visible session to implement the plan instead of leaving it stranded.
 
 | Gate | `phase_name` | Predicate | Continuation | Registered under `/vet-imp`? |
 |---|---|---|---|---|
 | **Record** | the plan title, or `"vet→implement handoff"` | `unit_ready` `{work_unit_id, ready_status}` | **NEVER** — unconditional | **NO — standalone `/vet-plan` only** |
-| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always**, except under `/vet-plan` §5.4 step 6's hold-gate skip |
+| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always**, except under `/vet-plan` §5.4's delivery skip or step 6's hold-gate skip |
 
 > **The net's continuation carries a brief; `/vet-plan` §5.4 shows the shape in
 > step 5 and step 6 registers it.** The session coord dispatches has never read the plan and does
@@ -871,8 +897,8 @@ fresh visible session to implement the plan instead of leaving it stranded.
 > pre-2026-08-30 `/vet-plan`: the record gate came back
 > `continuation_dropped_born_cleared`, and the run finished with no net armed.
 > Staleness is the delivery risk here — this fix cannot help a session reading an
-> old checkout, so `git -C <workspace>/qontinui-claude-config status` is worth a
-> glance when a documented mechanism does not behave as written.
+> old checkout, so a `git status` in the checkout that supplies this session's
+> `.claude/` is worth a glance when a documented mechanism does not behave as written.
 
 The net's window is genuinely unsatisfied for its whole 30 minutes, which is the
 property `unit_ready` could not provide: it is false the instant it is armed and
@@ -948,6 +974,17 @@ states that legitimately stop the lifecycle must stop it here too:
      below)
   7. `evidence_gaps` carries no `NO PHASE ATTRIBUTION` entry
 
+  **Before routing to closeout, retire this run's net.** If Step 2's `/vet-plan`
+  registered a `vet→implement safety net` (its §5.4 step 6) that is still OPEN —
+  its `gate_id` is in `/vet-plan`'s step-6 report and step-8 read-back row
+  (`phase_name` `vet→implement safety net`), or read
+  `coord_gate_list {work_unit_id, open_only: true}` — withdraw it — `coord_withdraw_gate {gate_id, reason}`, or the bare
+  device-authed `POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw {reason}`;
+  on `NotRegistrant`, cancel then mute, exactly as `/implement-plan` Step 0.5 —
+  and name its `gate_id` in full in the Step 5 report. Left armed, it
+  dispatches an implement session onto delivered work in 30 minutes; nothing
+  else on this path retires it.
+
   Short of all seven it is a fall-through, not a stop. Read the response
   through `/vet-plan`'s arm table in its stated order — **4, 3, 2, 1, 5, then
   6** — with these seven as arm 1 here (a NON-EMPTY `phases_remaining` beside
@@ -959,7 +996,8 @@ states that legitimately stop the lifecycle must stop it here too:
   **unidentified default**
   (an `IN PROGRESS` stamp with no session marker, or one that cannot be
   positively attributed at all, is a STOP, not an overwrite; a marker naming a
-  probed-dead peer is case 2, adopt), before it rewrote the stamp.
+  probed-dead peer is case 2, adopt, or the hold gate's own continuation is
+  case 2b, adopt), before it rewrote the stamp.
 
   **Conjunct 3 is carried explicitly even though that arm order already
   enforces it** — `/vet-plan`'s arm 3 pre-empts arm 1 on a
@@ -983,7 +1021,35 @@ states that legitimately stop the lifecycle must stop it here too:
 
   Treat `evidence_complete: false`, or a top-level
   `merged_degraded_reason`, as **UNKNOWN rather than "undelivered"**, and a
-  `no work-unit with that slug` error as *not-found* (say so; proceed).
+  `no work-unit with that slug` error as *not-found* (say so; proceed) — **but
+  only for the tenant the read answered for.** The read is tenant-scoped, and on
+  a device bound to several tenants the session's credential resolves the DEFAULT
+  binding while the unit may sit under any bound tenant, so first run
+  `bash <workspace-root>/qontinui-claude-config/scripts/recon-tenant.sh <owner/repo>...` (every one of the plan's Repo(s))
+  from the same cwd whose `.mcp.json` serves this session's coord tools, and
+  record every tenant consulted beside the verdict. Under `MATCH` read the one
+  answer as written. Under `MULTI` re-issue this delivery read in EVERY listed
+  tenant (each printed `bearer <tenant>=<path>`,
+  `POST https://coord.qontinui.io/mcp`, `-H "@<path>"`), classify each answer
+  by its RESPONSE SHAPE with `/vet-plan` §0.25's shape table (a not-found body
+  or a clean arm-5 body is `clear`; a body meeting all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response ∧ no `NO PHASE ATTRIBUTION` gap — is `found`; any body carrying a top-level
+  `merged_degraded_reason` is `unknown` whatever else it says; anything else or no answer is `unknown` — by shape, not by the arm
+  rows, whose recon conjunct applies only to the folded result), and fold with
+  `recon-tenant.sh --union --tenants <…> --set <h>`. `FOUND` is the closeout STOP above, and it wins over
+  any UNKNOWN; `CLEAR` means proceed; `UNKNOWN` is arm 6. A clean "not
+  delivered" from the session's tenant alone is not a clean "not delivered"
+  while another bound tenant may hold the `shipped` unit. Until every tenant has
+  answered — and under recon `UNKNOWN` — a not-found or a single-tenant "not
+  delivered" is `/vet-plan`'s **arm 6 (UNKNOWN), never "the unit does not
+  exist"**. Arm 6 gives this delivery read NO permission to proceed and is not
+  evidence either way: fall through to the stamp arms only, and say in the
+  Step 5 report that the delivery read was inconclusive across tenants, naming
+  each tenant that could not be read (or that the tenant set itself could not
+  be established). Delete the bearers afterwards (`rm -rf`
+  the directory the printed bearer paths sit in — recon-tenant.sh's own per-run
+  directory). Even a `CLEAR` across
+  every listed tenant cannot see a peer writing under a tenant this device is NOT
+  bound to, so it is never adoption evidence.
   **Everything else is UNKNOWN too — that is the DEFAULT, not a gap.** Any other
   error (coord's `citation surface unavailable for work-unit …`, whose own text
   says it is NOT "this unit has no citations"; its generic
@@ -1331,7 +1397,8 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
-  its `COORD_REVIVE_CALL_TIMEOUT` total bound; `unknown_budget_expired` — this
+  its `COORD_REVIVE_CALL_TIMEOUT` total bound, and the detail quotes the bound the
+  door named, or says UNKNOWN-bound when the door's line names none; `unknown_budget_expired` — this
   script's `REVIEW_ARM_CORROBORATE_TIMEOUT` expired before the door exited; the
   row's detail names the budgets involved and the elapsed time), the card reads `confidence:
   unknown`, the artifact predates `reviewed_head_sha`
@@ -1422,6 +1489,15 @@ getting this wrong ("I cannot vet my own plan"). **The release is the `finally`;
 the verdict above is the `try`** — an INCOMPLETE chain releases on exactly the
 same line a complete one does. There is no branch of Step 5 that reaches its end
 without this call having run.
+
+**Before the release, confirm the implement→ship net is withdrawn.**
+`/implement-plan` Step 0.5 arms a `claim_terminal` net on this same
+`plan:<plan-stem>` key. Its Step 6 item 4a and its stop paths withdraw it, but a
+chain that aborted between that arm and those withdrawals leaves it open. Releasing
+then CLEARS the net and dispatches a duplicate session. Read
+`coord_gate_list {work_unit_id, open_only: true}`. If an open row's `phase_name`
+begins `implement→ship safety net`, withdraw it first and name its `gate_id`
+in the report.
 
 Two things wrap that release, both specified in Step 1.1:
 

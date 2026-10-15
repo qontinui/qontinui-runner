@@ -59,8 +59,11 @@ Launch one Agent (subagent_type: `general-purpose`) with this contract:
 > 7. **Build provenance** — for every finding that says a previously-landed fix is
 >    NOT visible on the page, the sha you tested against and the `commit_provenance.contains`
 >    answer for it (`true` / `false` / `null`), read from
->    `GET http://127.0.0.1:9875/lkg/coverage?contains=<sha>` (or `build_sha` on the
->    runner-status payload for a live runner). A finding of that shape with no
+>    `GET $SPAWNER/lkg/coverage?contains=<sha>` — your deployment's temp-runner
+>    spawner, per `/manual-test` — (or `build_sha` on the runner-status payload for
+>    a live runner; with no spawner, `/manual-test`'s binary-freshness probe:
+>    `/health` `gitSha`, then `git merge-base --is-ancestor <sha> <gitSha>` — rc 1 is
+>    UNVERIFIED, rc 128 or a failed probe UNKNOWN). A finding of that shape with no
 >    provenance line is **not reportable as a bug** — see the classification rule
 >    below.
 >
@@ -94,8 +97,9 @@ landed as:
 git merge-base --is-ancestor <fix-sha> <lkg_sha or build_sha>
 ```
 
-Ask the supervisor rather than running git yourself — it computes exactly that,
-server-side: `GET http://127.0.0.1:9875/lkg/coverage?contains=<fix-sha>` →
+Where your deployment has a temp-runner spawner (`$SPAWNER`, per `/manual-test`),
+ask it rather than running git yourself — it computes exactly that,
+server-side: `GET $SPAWNER/lkg/coverage?contains=<fix-sha>` →
 `data.commit_provenance.contains`. (For a live runner instead of the LKG, the same
 comparison against `build_sha` on the runner-status payload; `build_source_warning`
 is non-null whenever the compiled tree is behind or diverged from `origin/main`.)
@@ -203,7 +207,7 @@ Three response shapes you must handle, or the call is worse than useless:
 > - Fix the root cause, not symptoms. Don't add scaffolding the items don't ask for.
 > - After each item, run the verification step from the table. Report `PASS | FAIL | DEFERRED` per item with a one-line note.
 > - Run the repo's standard typecheck/lint after all items in your group (`cargo check --all-targets` + `cargo clippy --all-targets -D warnings` for Rust, `npx tsc --noEmit` for TS, `ruff check` + `mypy` for Python). Fix any new warnings introduced by your changes.
-> - If a verification step requires a temp runner, spawn one via supervisor port 9875 with LKG-first per `/manual-test` Phase 0, then stop it when done. Never touch the primary runner.
+> - If a verification step requires a temp runner, spawn one via your deployment's temp-runner spawner (`$SPAWNER`) with LKG-first per `/manual-test` Phase 0, then stop it when done. With no spawner, your fix is uncommitted and unbuilt, so the running primary cannot hold it: an item whose fix changes the runner binary is `DEFERRED` (UNVERIFIED), never `PASS`, and any check you do make on the primary is read-only per `/manual-test`'s own-runner arm. Never restart, rebuild or stop the primary runner.
 > - **Do NOT commit.** The coordinator commits per-iteration after all repo Agents return.
 > - Report back: changed files (with line counts), per-item PASS/FAIL/DEFERRED, any items deferred and why, any verification step that needed adjustment.
 
@@ -356,7 +360,7 @@ Do NOT regenerate per-iteration plans, transcripts, or evaluations — those liv
 
 - **Coord claims (per `/implement-plan` Step 0.6):** This skill operates on no specific plan file, so claim keys use `resource_key=manual-test-loop:session:<UTC-iso8601-start>`. Acquire once at loop entry, heartbeat from the main session every 30 min, release on exit. If `held` is returned, surface the holder and ask abort/wait/steal via `AskUserQuestion`. Skip-and-warn for non-coord environments (no `QONTINUI_MACHINE_ID`).
 - **Memory pressure:** Each repo Agent should be launched in its own subagent — do NOT batch multiple repos into one Agent prompt. UI Bridge data per element is heavy; one repo per agent keeps each subagent's working set bounded.
-- **Don't restart primary runners.** All test runners are temp runners via supervisor port 9875 with LKG-first. Per memory, "spawn temp runners — never block on primary."
+- **Don't restart primary runners.** All test runners are temp runners via your deployment's temp-runner spawner (`$SPAWNER`) with LKG-first, or, where there is no spawner, your own runner driven READ-ONLY (`/manual-test`'s own-runner arm: snapshot, discover and navigation only; anything that persists is always skipped, and non-persisting interactions only run when `/restart-readiness` answers `safe_to_restart: true`). Per memory, "spawn temp runners — never block on primary."
 - **Mobile target needs an active transport** — if `$ARGUMENTS` mentions mobile and no transport probe (USB/LAN/cloud) succeeds, manual-test will fall back to AAB artifact verification per its own gotcha doc. The loop trusts that and proceeds.
 - **Cross-repo dependencies surface as DEFERRED items.** If a repo Agent reports `DEFERRED: blocked on <other-repo> change` for an item, the next iteration's test-and-plan subagent will rediscover the deficiency once the blocker lands — don't try to chain dependencies manually in the loop.
 
@@ -366,8 +370,8 @@ Do NOT regenerate per-iteration plans, transcripts, or evaluations — those liv
 - **NEVER inline `/manual-test` or remediation work in the main context** — always via Agent. The main context is a thin coordinator.
 - **NEVER ask the operator to confirm a fix, restart a service, or look at a log** — the loop is autonomous end-to-end.
 - **NEVER use `--no-verify`, `core.hooksPath=/dev/null`, or any hook bypass** without explicit operator instruction. Surface hook failures verbatim and stop.
-- **Commit trailers follow the harness attribution rule** — the commit subagent ends the message with the `Co-Authored-By: <model>` and `Claude-Session:` lines the harness supplies and adds no other attribution. (No hook in qontinui-claude-config blocks those trailers; the earlier claim that one did was wrong for this repo — aligned 2026-09-09. The `no-claude-attribution` `commit-msg` pre-commit hook that `qontinui-mcp`, `qontinui-hal-mcp`, `qontinui-prm` and `ui-bridge-mcp` declared — it rejected any message containing `claude`, `anthropic` or `co-authored-by` — was retired by operator decision on 2026-09-25: served `git-operations` clause `commit-trailers-are-the-harness's` says a repo must not reject the harness trailers (it may still reject a "generated by" line in the subject or body). The hook is being removed from those four repos, and `scripts/git-hooks-doctor.sh` flags any reintroduction as `REJECTS_HARNESS_TRAILERS`.)
-- **NEVER restart, kill, or rebuild the primary runner** — always spawn temp runners via supervisor port 9875.
+- **Commit trailers follow the harness attribution rule** — the commit subagent ends the message with the `Co-Authored-By: <model>` and `Claude-Session:` lines the harness supplies and adds no other attribution. (No hook shipped with these commands blocks those trailers; the earlier claim that one did was wrong for this repo — aligned 2026-09-09. The `no-claude-attribution` `commit-msg` pre-commit hook that `qontinui-mcp`, `qontinui-hal-mcp`, `qontinui-prm` and `ui-bridge-mcp` declared — it rejected any message containing `claude`, `anthropic` or `co-authored-by` — was retired by operator decision on 2026-09-25: served `git-operations` clause `commit-trailers-are-the-harness's` says a repo must not reject the harness trailers (it may still reject a "generated by" line in the subject or body). The hook is being removed from those four repos, and `scripts/git-hooks-doctor.sh` flags any reintroduction as `REJECTS_HARNESS_TRAILERS`.)
+- **NEVER restart, kill, or rebuild the primary runner** — always spawn temp runners via your deployment's temp-runner spawner (`$SPAWNER`), or, where there is none, drive your own runner READ-ONLY per `/manual-test`'s own-runner arm.
 - **Edit work runs in an allocated worktree, never the primary checkout** — see "Worktree isolation — bound rule" under the Remediation subagent section. Sibling to the temp-runner rule: same shape ("never touch the shared primary"), different substrate (git worktree vs supervisor temp runner). Allocate it with `scripts/allocate-worktree.sh --repo <repo> --intent "<what for>"` (it POSTs the literal, anonymous `https://coord.qontinui.io/agents/allocate` and materialises the result) — see the bound rule for the response shapes and the one legitimate fallback. A plain `git worktree add` produces an undeclared worktree coord cannot attribute, pin, or drain (the HTTP allocate-local endpoint was removed in runner #443).
 - **NEVER let one iteration's transcript leak into the next** — the test-and-plan subagent returns a fingerprint + table, not narration. If a subagent returns a multi-page transcript, summarize it down to the contract above in the main session before continuing.
 - **Always ship after committing, but NEVER to the default branch directly** — per the autonomous-commit-ship feedback there's no "ready to push?" gating, but shipping means branch-first → push the branch → open the PR — and stop there. Coord is the sole merge authority for `qontinui/*` repos; the loop never merges its own PRs ([[feedback_no_direct_pushes_to_main_loops_use_branches]]). See the commit subagent's branch-first contract above.

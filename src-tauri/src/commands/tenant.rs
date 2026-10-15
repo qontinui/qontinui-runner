@@ -276,6 +276,14 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
                  resolver per registration)",
     },
     PinSurface {
+        surface: "transcript_autobind_mint",
+        timing: PinTiming::Live,
+        readers: &["session/transcript_autobind.rs::mint_gate"],
+        detail: "the tenant a transcript-bound row is MINTED under, read on every mint \
+                 attempt (an unpinned multi-tenant device mints nothing); no running session \
+                 moves",
+    },
+    PinSurface {
         surface: "coord_mcp_mint_and_provisioning",
         timing: PinTiming::Live,
         readers: &[
