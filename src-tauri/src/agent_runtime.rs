@@ -7733,6 +7733,11 @@ async fn acquire_continuation_workdir(
             // tenant, and its session id resolves its own.
             spawn_tenant: None,
             shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
+            // A coord gate continuation's payload carries no edit siblings yet
+            // (plan 2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits,
+            // "Not done here"); such a session uses the mid-session
+            // `POST /agent-worktrees/edit-sibling` door.
+            edit_siblings: &[],
         })
         .await;
         let ctx = match settle_continuation_acquire(acquired) {
