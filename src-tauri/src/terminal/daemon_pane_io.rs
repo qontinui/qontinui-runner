@@ -1186,6 +1186,14 @@ struct PumpCtx {
     /// `Some` when the first attach asked for the restore envelope and the
     /// holder answered it; the pump carries it across reattaches.
     restore: Option<RestoreProgress>,
+    /// The holder whose stream `out.offset()` is counted on, 0 while unknown
+    /// (plan Phase 8, H1) — what a reattach sends as `attach.stream_of`.
+    /// NOT `holder_pid`: that moves to a new holder the moment an attach
+    /// succeeds, while the offset joins the new holder's stream only once a
+    /// frame from it has been consumed (a leading `output_lost` that moves the
+    /// offset, or output that continues it). A connection that drops before
+    /// then leaves the offset on the old stream, and must still say so.
+    stream_holder: AtomicU32,
 }
 
 /// Where a restoring attach's envelope stands (plan D14).
@@ -1452,6 +1460,7 @@ impl DaemonPaneIo {
             rows: rows.clone(),
             paused: paused.clone(),
             restore: (restore_at.is_some() && info.restore.is_some()).then(RestoreProgress::new),
+            stream_holder: AtomicU32::new(0),
         };
         if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-holder-pump-{}", ctx.key))
@@ -1733,6 +1742,9 @@ impl PumpCtx {
                     r.saw_output();
                 }
                 self.out.splice(offset, &bytes);
+                // The offset now continues THIS holder's stream.
+                self.stream_holder
+                    .store(self.holder_pid(), Ordering::Release);
             }
             Event::Lost {
                 from_offset,
@@ -1753,6 +1765,9 @@ impl PumpCtx {
                         .push_local(&holder_stream_replaced_notice(from_offset));
                 }
                 self.out.note_lost(from_offset, to_offset);
+                // The loss moved the offset onto THIS holder's stream.
+                self.stream_holder
+                    .store(self.holder_pid(), Ordering::Release);
             }
             // The restore envelope: displayed, never counted — the stream
             // offset stays the holder's (plan D14).
@@ -1832,10 +1847,14 @@ impl PumpCtx {
                     // on — so a holder that took the pane back after a failed
                     // upgrade resumes its OWN stream here without a loss
                     // report (plan Phase 8, H1).
-                    let stream_of = self.holder_pid();
-                    match connect(&self.pane_dir, &self.pane_id, deadline)
-                        .and_then(|c| c.attach_continuing(from, stream_of, restoring, deadline))
-                    {
+                    let stream_of = self.stream_holder.load(Ordering::Acquire);
+                    match connect(&self.pane_dir, &self.pane_id, deadline).and_then(|c| {
+                        match (stream_of, restoring) {
+                            (0, true) => c.attach_restoring(Some(from), deadline),
+                            (0, false) => c.attach(Some(from), deadline),
+                            (pid, _) => c.attach_continuing(from, pid, restoring, deadline),
+                        }
+                    }) {
                         Ok(stream) => {
                             if restoring && stream.info.restore.is_none() {
                                 warn!(pane = %self.key, holder_pid = self.holder_pid(), "pty holder: the reattach could not ask for a restore — the owed postamble is lost; modes set before the replayed tail may be wrong");
@@ -2551,7 +2570,63 @@ mod tests {
             rows: Arc::new(AtomicU16::new(24)),
             paused: Arc::new(AtomicBool::new(false)),
             restore,
+            stream_holder: AtomicU32::new(0),
         }
+    }
+
+    /// Plan Phase 8, H1 (review r2, R1): the offset joins a holder's stream
+    /// only when a frame from it is CONSUMED — not when its attach succeeds —
+    /// so a connection that drops before its leading `output_lost` still
+    /// reattaches naming the old stream. A loss that starts behind the pane's
+    /// offset (the holder took the pane back from a dead successor) is
+    /// declared in-band, even when it ends at or behind the offset.
+    #[test]
+    fn pty_holder_stream_holder_moves_only_with_a_consumed_frame() {
+        let out = Arc::new(PaneOutput::new(
+            "t-pump",
+            Vec::new(),
+            0,
+            holder_lost_output_marker,
+        ));
+        let pump = bare_pump(out.clone(), None);
+        let mut restore = None;
+        // Counting on the dead successor (pid 200), at offset 10.
+        pump.holder_pid.store(200, Ordering::Release);
+        pump.on_event(
+            Event::Output {
+                offset: 0,
+                bytes: b"0123456789".to_vec(),
+            },
+            &mut restore,
+        );
+        assert_eq!(pump.stream_holder.load(Ordering::Acquire), 200);
+        // Reattached to the predecessor (pid 100): the attach alone moves
+        // nothing.
+        pump.holder_pid.store(100, Ordering::Release);
+        assert_eq!(
+            pump.stream_holder.load(Ordering::Acquire),
+            200,
+            "an attach is not a consumed frame"
+        );
+        // Its leading loss: from X=4 (behind us) to 10 (= our offset).
+        pump.on_event(
+            Event::Lost {
+                from_offset: 4,
+                to_offset: 10,
+            },
+            &mut restore,
+        );
+        assert_eq!(pump.stream_holder.load(Ordering::Acquire), 100);
+        assert_eq!(out.offset(), 10);
+        out.settle(Ok(0));
+        let mut got = Vec::new();
+        out.take_reader().unwrap().read_to_end(&mut got).unwrap();
+        let mut want = b"0123456789".to_vec();
+        want.extend_from_slice(&holder_stream_replaced_notice(4));
+        assert_eq!(
+            got, want,
+            "the break is declared though the loss ends at our offset"
+        );
     }
 
     fn synthetic(part: SyntheticPart, bytes: &[u8]) -> Event {
