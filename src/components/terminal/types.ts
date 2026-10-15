@@ -108,4 +108,25 @@ export interface TerminalSessionRecord {
    * this field for exactly that reason.
    */
   transcriptExists?: boolean;
+  /**
+   * The argv this session's `claude` was launched with, as its SessionStart
+   * hook reported it over the PTY (plan
+   * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+   * Phase 6). Informational: the restore types {@link resumeArgs}, never this.
+   */
+  launchArgv?: string[];
+  /**
+   * DERIVED by the runner from {@link launchArgv}: the flags a relaunch types
+   * between `claude` and `--resume <id>` — filtered (no session selector, no
+   * runner plumbing, no initial prompt) and every token shell-inert. Absent
+   * when no argv was ever reported: the default resume command applies.
+   */
+  resumeArgs?: string[];
+  /**
+   * DERIVED: why the persisted argv must NOT be replayed (a surviving token is
+   * not shell-inert, an unknown flag is ambiguous, print mode). Present ⇒ the
+   * restore relaunches NOTHING for this record (the whole replay is refused,
+   * never escaped — plan D11) and the tab says so.
+   */
+  resumeRefusal?: string;
 }

@@ -44,6 +44,9 @@ import {
   decideColdResume,
   decideDrainSkipDisposition,
   applyDrainSkip,
+  isShellInertArg,
+  resumePlanFor,
+  liveTabShowsSession,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -663,6 +666,89 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
     const unbound = buildResumeCmd("sess-1", undefined, "summary");
     expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
     expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  });
+});
+
+// Plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+// Phase 6 (D11): a session whose PTY holder died is relaunched with the flags
+// it was launched with — every typed token shell-inert, or nothing typed.
+describe("relaunch from the persisted launch argv (Phase 6)", () => {
+  it("isShellInertArg accepts only the runner's inert set", () => {
+    for (const ok of ["--model", "opus", "/srv/a", "--model=sonnet", "a.b:c+d_e-f"]) {
+      expect(isShellInertArg(ok)).toBe(true);
+    }
+    for (const bad of [
+      "",
+      "a b",
+      "$(id)",
+      "a;b",
+      "`x`",
+      "a|b",
+      "~/x",
+      "@splat",
+      "a,b",
+      "50%",
+      'q"',
+      "a\nb",
+      "x".repeat(257),
+      7,
+      null,
+    ]) {
+      expect(isShellInertArg(bad)).toBe(false);
+    }
+  });
+
+  it("resumePlanFor: no argv → default; offered args → replay; a refusal or an unsafe arg → refused", () => {
+    expect(resumePlanFor(rec({}))).toEqual({ kind: "default" });
+    expect(resumePlanFor(rec({ resumeArgs: ["--model", "opus"] }))).toEqual({
+      kind: "replay",
+      args: ["--model", "opus"],
+    });
+    expect(resumePlanFor(rec({ resumeArgs: [] }))).toEqual({ kind: "replay", args: [] });
+    expect(resumePlanFor(rec({ resumeRefusal: "launch argument 2 is not shell-inert" }))).toEqual({
+      kind: "refused",
+      reason: "launch argument 2 is not shell-inert",
+    });
+    // Defense in depth: the webview re-checks what the runner offered.
+    expect(resumePlanFor(rec({ resumeArgs: ["--add-dir", "/srv/my project"] })).kind).toBe(
+      "refused",
+    );
+  });
+
+  it("buildResumeCmd replays the flags before --resume, keeping the autonomous default", () => {
+    expect(buildResumeCmd("sess-1", undefined, "summary", undefined, ["--model", "opus"])).toBe(
+      "claude --permission-mode bypassPermissions --model opus --resume sess-1\r",
+    );
+    // An empty replay is the default command.
+    expect(buildResumeCmd("sess-1", undefined, "summary", undefined, [])).toBe(
+      "claude --permission-mode bypassPermissions --resume sess-1\r",
+    );
+  });
+
+  it("buildResumeCmd lets the launch's own permission choice win, and never types a non-inert arg", () => {
+    expect(
+      buildResumeCmd("sess-1", undefined, "summary", undefined, ["--permission-mode", "plan"]),
+    ).toBe("claude --permission-mode plan --resume sess-1\r");
+    expect(
+      buildResumeCmd("sess-1", undefined, "summary", undefined, ["--dangerously-skip-permissions"]),
+    ).toBe("claude --dangerously-skip-permissions --resume sess-1\r");
+    expect(
+      buildResumeCmd("sess-1", undefined, "summary", undefined, ["--model", "$(rm -rf ~)"]),
+    ).not.toContain("$(");
+  });
+
+  it("liveTabShowsSession ignores the dead pane whose holder was lost", () => {
+    const tabs = [{ id: "dead-pane", claudeSessionId: "s-1" }];
+    expect(liveTabShowsSession(tabs, "s-1", new Set())).toBe(true);
+    expect(liveTabShowsSession(tabs, "s-1", new Set(["dead-pane"]))).toBe(false);
+    // Another live tab still showing it does block a second relaunch.
+    expect(
+      liveTabShowsSession(
+        [...tabs, { id: "live", claudeSessionId: "s-1" }],
+        "s-1",
+        new Set(["dead-pane"]),
+      ),
+    ).toBe(true);
   });
 });
 

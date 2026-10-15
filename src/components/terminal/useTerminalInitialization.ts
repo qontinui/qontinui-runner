@@ -216,6 +216,22 @@ export function ownsReleasedPage(
   return !bindings[pageId];
 }
 
+/**
+ * Whether a LIVE tab already shows `sessionId`, so a merging re-run must not
+ * restore it a second time. A tab in `releasedTerminalIds` does not count: its
+ * PTY holder was lost and the runner handed its session back for a relaunch
+ * (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+ * Phase 6) — that dead pane is exactly the one the relaunch replaces, and
+ * counting it would block the relaunch forever. Pure + exported for tests.
+ */
+export function liveTabShowsSession(
+  tabs: ReadonlyArray<{ id: string; claudeSessionId?: string }>,
+  sessionId: string,
+  releasedTerminalIds: ReadonlySet<string>,
+): boolean {
+  return tabs.some((t) => t.claudeSessionId === sessionId && !releasedTerminalIds.has(t.id));
+}
+
 /** How many times an ABORTED restore re-runs on its own for ids it still owes (review V1). */
 export const ABORT_RETRY_LIMIT = 3;
 /**
@@ -536,6 +552,79 @@ export function recordBelongsToRestore(
 }
 
 /**
+ * One argument the restore may TYPE into a shell as-is: the runner's
+ * shell-inert set (`session::resume_argv::is_inert_char` — inert in bash, zsh,
+ * POSIX sh and PowerShell alike), at most 256 bytes. Plan
+ * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, D11.
+ */
+const SHELL_INERT_ARG_RE = /^[A-Za-z0-9_./:=+-]{1,256}$/;
+
+/** Whether `arg` may be typed into a shell unquoted. Exported for tests. */
+export function isShellInertArg(arg: unknown): arg is string {
+  return typeof arg === "string" && SHELL_INERT_ARG_RE.test(arg);
+}
+
+/**
+ * How a cold-restored session is relaunched (plan
+ * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 6):
+ *
+ * - `"default"` — no launch argv was ever reported: the default resume, as
+ *   before argv persistence existed;
+ * - `"replay"` — type these flags (the runner's `resumeArgs`, re-checked
+ *   shell-inert here) before `--resume <id>`, so the session comes back the way
+ *   its operator launched it;
+ * - `"refused"` — the persisted argv must not be replayed (the runner's
+ *   `resumeRefusal`, or an argument that fails the inert re-check here). D11:
+ *   the WHOLE replay is rejected rather than escaped, so the restore types
+ *   NOTHING and the tab shows its resume-failed banner; the operator's Retry
+ *   then types the default resume, as an explicit choice.
+ *
+ * Pure + exported for unit tests.
+ */
+export type ResumePlan =
+  | { kind: "default" }
+  | { kind: "replay"; args: readonly string[] }
+  | { kind: "refused"; reason: string };
+
+export function resumePlanFor(
+  rec: Pick<TerminalSessionRecord, "resumeArgs" | "resumeRefusal">,
+): ResumePlan {
+  if (typeof rec.resumeRefusal === "string" && rec.resumeRefusal.length > 0) {
+    return { kind: "refused", reason: rec.resumeRefusal };
+  }
+  if (rec.resumeArgs === undefined || rec.resumeArgs === null) return { kind: "default" };
+  if (!Array.isArray(rec.resumeArgs) || !rec.resumeArgs.every(isShellInertArg)) {
+    return {
+      kind: "refused",
+      reason: "the runner offered a relaunch argument that is not shell-inert",
+    };
+  }
+  return { kind: "replay", args: rec.resumeArgs };
+}
+
+/** A flag that already says how the resumed session handles permissions. */
+function choosesPermissionMode(arg: string): boolean {
+  return (
+    arg === "--permission-mode" ||
+    arg.startsWith("--permission-mode=") ||
+    arg === "--dangerously-skip-permissions"
+  );
+}
+
+/**
+ * `claude [--permission-mode bypassPermissions] [args...] --resume <id>`. The
+ * autonomous permission mode is added unless the replayed launch chose one of
+ * its own — the operator's explicit choice wins over the restore's default.
+ * Non-inert `args` never reach here ({@link resumePlanFor}); they are dropped
+ * defensively all the same, never quoted.
+ */
+function claudeResumeBase(sessionId: string, resumeArgs?: readonly string[]): string {
+  const args = (resumeArgs ?? []).filter(isShellInertArg);
+  const perm = args.some(choosesPermissionMode) ? [] : ["--permission-mode", "bypassPermissions"];
+  return ["claude", ...perm, ...args, "--resume", sessionId].join(" ");
+}
+
+/**
  * Build a `claude --resume <id>` command, optionally prefixed with
  * CLAUDE_CONFIG_DIR and (under the default full-resume policy) with the CLI's
  * resume-size thresholds raised so the interactive "Resume from summary?"
@@ -570,6 +659,7 @@ export function buildResumeCmd(
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
   provider?: string,
+  resumeArgs?: readonly string[],
 ): string {
   // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
   // ["gemini","--resume",id]. The descriptor owns the program + flags so the
@@ -577,9 +667,7 @@ export function buildResumeCmd(
   const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
   const program = argv[0];
   const isClaude = program === "claude";
-  const base = isClaude
-    ? `claude --permission-mode bypassPermissions --resume ${sessionId}`
-    : argv.join(" ");
+  const base = isClaude ? claudeResumeBase(sessionId, resumeArgs) : argv.join(" ");
   const env: Array<[string, string]> = [];
   if (configDir && isClaude) env.push(["CLAUDE_CONFIG_DIR", configDir]);
   if (isClaude && policy === "full") {
@@ -614,6 +702,11 @@ export async function runVerifiedResume(params: {
   configDir?: string;
   /** Provider owning the session — selects the adapter resume + handshake. */
   provider?: string;
+  /**
+   * Flags to replay before `--resume <id>` — a {@link resumePlanFor} `"replay"`
+   * plan's args (plan Phase 6). Omitted: the default resume command.
+   */
+  resumeArgs?: readonly string[];
   updateTab: (
     id: string,
     updates: Partial<{ isReconnecting?: boolean; resumeFailed?: boolean }>,
@@ -637,12 +730,13 @@ export async function runVerifiedResume(params: {
     claudeSessionId,
     configDir,
     provider,
+    resumeArgs,
     updateTab,
     recordOpen,
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider, resumeArgs);
   // Per-adapter handshake patterns (Phase 4): the verification loop matches the
   // resume success/failure against the descriptor's patterns instead of the
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
@@ -1334,6 +1428,10 @@ export function useTerminalInitialization({
   useEffect(() => {
     liveTabsRef.current = tabs;
   }, [tabs]);
+  // Terminals whose PTY holder the runner reported lost (the released event
+  // below): their dead tab must not count as "already showing" the session a
+  // re-run is about to relaunch (see `liveTabShowsSession`).
+  const releasedTerminalIds = useRef<Set<string>>(new Set());
   const [drainResumeEpoch, setDrainResumeEpoch] = useState(0);
   // Sessions a restore refused as "live" BEFORE the PTY-holder boot sweep
   // settled, which the sweep's settle then showed to be resumable (see
@@ -1380,6 +1478,7 @@ export function useTerminalInitialization({
       // Broadcast to every window: only the one that restores the page acts.
       const releasedPage = event.payload.pageId ?? "default";
       if (!ownsReleasedPage(releasedPage, readPinnedPageId(), getPageBindings())) return;
+      releasedTerminalIds.current.add(event.payload.terminalId);
       console.warn(
         `[TerminalPage] a PTY holder died before adoption; re-deciding session ${event.payload.sessionId}`,
       );
@@ -1441,6 +1540,8 @@ export function useTerminalInitialization({
       claudeConfigDir?: string;
       /** Which provider owns this session — drives the adapter resume. */
       provider?: string;
+      /** How the session is relaunched — default, a replayed argv, or refused (Phase 6). */
+      resumePlan?: ResumePlan;
       /** Deferred registry re-assert — applied only on VERIFIED resume. */
       recordOpen?: SessionOpenArgs;
     }> = [];
@@ -1672,7 +1773,11 @@ export function useTerminalInitialization({
           // A drain re-run never duplicates a session a live tab already shows.
           if (
             isDrainRerun &&
-            liveTabsRef.current.some((t) => t.claudeSessionId === rec.claudeSessionId)
+            liveTabShowsSession(
+              liveTabsRef.current,
+              rec.claudeSessionId,
+              releasedTerminalIds.current,
+            )
           ) {
             continue;
           }
@@ -1802,6 +1907,8 @@ export function useTerminalInitialization({
               // Provider drives the adapter-supplied resume command + handshake
               // patterns (Phase 4) — defaults to "claude" on pre-provider rows.
               provider: rec.provider,
+              // The persisted launch argv's relaunch (plan Phase 6).
+              resumePlan: resumePlanFor(rec),
               // Deferred re-assert payload: applied by `runVerifiedResume`
               // on VERIFIED handshake only. No `origin` — the backend
               // preserves the existing (authoritative) origin on unasserted writes.
@@ -1924,6 +2031,21 @@ export function useTerminalInitialization({
                     });
                     continue;
                   }
+                  // A refused replay (plan Phase 6, D11): the persisted launch
+                  // argv cannot be typed safely, so NOTHING is typed — never an
+                  // escaped variant, never a silently different command. The
+                  // tab gets its resume-failed banner; the restore-pending
+                  // marker stays set so the open record survives for the
+                  // operator's Retry (which types the default resume).
+                  const plan = restore.resumePlan ?? { kind: "default" };
+                  if (plan.kind === "refused") {
+                    console.warn(
+                      `[TerminalPage] not relaunching session ${restore.claudeSessionId}: ` +
+                        `its launch argv was refused (${plan.reason})`,
+                    );
+                    updateTab(restore.tabId, { isReconnecting: false, resumeFailed: true });
+                    continue;
+                  }
                   // Type the resume and VERIFY the handshake (retry once on
                   // failure). Fire-and-forget per tab so one slow/failed
                   // verification (up to ~30s) doesn't serialize the drain;
@@ -1935,6 +2057,7 @@ export function useTerminalInitialization({
                     claudeSessionId: restore.claudeSessionId,
                     configDir: restore.claudeConfigDir,
                     provider: restore.provider,
+                    resumeArgs: plan.kind === "replay" ? plan.args : undefined,
                     updateTab,
                     recordOpen: restore.recordOpen,
                     // The pane was created as a plain shell just above, so no
