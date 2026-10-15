@@ -844,4 +844,86 @@ mod unix {
         }
         assert!(expect > 100, "enough lines to span the swap: {expect}");
     }
+
+    /// Review r2, finding D: a successor that dies AFTER the commit but
+    /// before `serving` — at either point: before it touched the lock record,
+    /// or after its endpoint rename — leaves the pane with the predecessor,
+    /// which takes it back: same child, the lock and the endpoint name it
+    /// again, the input held across the swap reaches the child exactly once,
+    /// and the stream continues with no loss marker.
+    #[test]
+    fn pty_holder_handoff_successor_dying_after_commit_gives_the_pane_back() {
+        for fault in ["exit-after-commit", "exit-after-publish"] {
+            let mut pane = start_with(
+                &fault[11..],
+                echo_spec(7),
+                Some(fault),
+                &[(COMMIT_DELAY_ENV, "1500")],
+            );
+            let dir = pane.dir.clone();
+            served_by(&dir, pane.holder_pid);
+            let mut live = attach(&dir, None);
+            let from = live.info.start_offset;
+            let r = read_until(&mut live, from, Duration::from_secs(10), |r| {
+                count(&r.bytes, b"before-swap") > 0
+            });
+            let req_dir = dir.clone();
+            let request = std::thread::spawn(move || {
+                connect(&req_dir, &p1(), soon())
+                    .unwrap()
+                    .prepare_upgrade(upgrade_deadline())
+            });
+            let successor = logged_pid(&dir, "adopt: acked");
+            pane.adopt_cleanup(successor);
+            send_input(&dir, b"held\n");
+            let outcome = request.join().unwrap().expect("prepare_upgrade answered");
+            assert!(
+                matches!(&outcome, UpgradeOutcome::Failed(why) if why.contains("took its pane back")),
+                "{fault}: {outcome:?}"
+            );
+            assert!(
+                pane.holder.try_wait().unwrap().is_none(),
+                "{fault}: the predecessor still runs"
+            );
+            let hello = served_by(&dir, pane.holder_pid);
+            assert_eq!(hello.child_pid, Some(pane.child_pid), "{fault}: same child");
+            let record = read_record(&lock_path(&dir, &p1())).expect("a lock record");
+            assert_eq!(
+                record.holder_pid, pane.holder_pid,
+                "{fault}: the lock names it again"
+            );
+            send_input(&dir, b"after\n");
+            let r2 = read_until(&mut live, r.next, Duration::from_secs(10), |r| {
+                count(&r.bytes, b"got:after") > 0
+            });
+            assert!(!r2.lost, "{fault}: no loss marker");
+            assert_eq!(count(&r2.bytes, b"got:held"), 1, "{fault}: held input once");
+            no_snapshot_left(&dir);
+            assert!(
+                !dir.join("p1.sock.upg").exists(),
+                "{fault}: no staged socket left"
+            );
+            // The upgrade is not stuck "in progress": a second request runs
+            // the whole exchange again (and meets the same fault).
+            let again = connect(&dir, &p1(), soon())
+                .unwrap()
+                .prepare_upgrade(upgrade_deadline())
+                .unwrap();
+            assert!(
+                matches!(&again, UpgradeOutcome::Failed(why) if why.contains("took its pane back")),
+                "{fault}: {again:?}"
+            );
+            if let Ok(pid) = std::fs::read_to_string(dir.join("p1.log")) {
+                for l in pid.lines().filter(|l| l.contains("adopt: acked")) {
+                    if let Some(p) = l
+                        .split_whitespace()
+                        .find_map(|t| t.strip_prefix("pid="))
+                        .and_then(|p| p.parse().ok())
+                    {
+                        pane.adopt_cleanup(p);
+                    }
+                }
+            }
+        }
+    }
 }

@@ -76,9 +76,13 @@ impl Conn {
         Conn { stream }
     }
 
-    /// Stop READING this connection: data already queued stays readable, then
-    /// reads return EOF, and the peer's further writes fail (`EPIPE`). A
-    /// committing holder upgrade drains input connections this way.
+    /// Stop READING this connection. **Linux** semantics, on which a holder
+    /// upgrade's input drain relies: data already queued stays readable,
+    /// then reads return EOF, and the peer's further writes fail (`EPIPE`).
+    /// BSD-family kernels (macOS included) may instead discard the queued
+    /// data and accept later writes silently, so this is Linux-only and the
+    /// drain elsewhere never shuts a connection down (`Pane::drain_input_for_handoff`).
+    #[cfg(target_os = "linux")]
     pub fn shutdown_read(&self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Read);
     }

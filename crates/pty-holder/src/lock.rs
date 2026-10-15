@@ -313,20 +313,7 @@ impl PaneLock {
     /// `flock` belongs to this inode, and a rename would hand every later
     /// locker a different, unlocked file.
     pub fn rewrite_record(&mut self, record: &LockRecord) -> io::Result<()> {
-        let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
-        let old_len = self.file.metadata()?.len();
-        if (bytes.len() as u64) < old_len {
-            bytes.resize(old_len as usize, b' ');
-        }
-        if bytes.len() as u64 > MAX_RECORD_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "lock record would exceed MAX_RECORD_LEN",
-            ));
-        }
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&bytes)?;
-        self.file.sync_data()
+        rewrite_record_in(&mut self.file, record)
     }
 
     /// Take over the lock a holder upgrade's predecessor passed down as an
@@ -376,6 +363,26 @@ impl PaneLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// [`PaneLock::rewrite_record`] on any open handle of a held lock file — a
+/// `dup` of the holder's own lock fd, for a predecessor that takes its pane
+/// back after its successor died (plan Phase 8).
+pub fn rewrite_record_in(file: &mut File, record: &LockRecord) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+    let old_len = file.metadata()?.len();
+    if (bytes.len() as u64) < old_len {
+        bytes.resize(old_len as usize, b' ');
+    }
+    if bytes.len() as u64 > MAX_RECORD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lock record would exceed MAX_RECORD_LEN",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&bytes)?;
+    file.sync_data()
 }
 
 /// Read the record from a lock file WITHOUT taking the lock. `None` when the

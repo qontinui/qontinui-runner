@@ -36,16 +36,25 @@
 //! On the ack it **commits**:
 //!
 //! 6. **Drain input** ([`Pane::drain_input_for_handoff`]): new input
-//!    connections are refused before their `ok`, the hold cap is lifted, and
-//!    every open input connection is `shutdown(SHUT_RD)` — what its socket
-//!    already carries is read into the held input, after which a client's
-//!    write to it FAILS (`EPIPE`) rather than vanishing.
+//!    connections are refused before their `ok` and the hold cap is lifted.
+//!    **Linux:** every open input connection is `shutdown(SHUT_RD)` — what
+//!    its socket already carries is read into the held input, after which a
+//!    client's write to it FAILS (`EPIPE`) rather than vanishing. **Other
+//!    Unix:** `SHUT_RD` there may silently discard, so nothing is shut down;
+//!    an input connection still open after the drain bound fails the drain
+//!    and the upgrade is rolled back with that reason.
 //! 7. **Commit**: sends `commit` with the held input (and the child's exit,
 //!    if the child exited mid-swap and this holder — its parent — reaped it),
 //!    then retires its reader for good ([`Pane::hand_off_reads`]).
 //! 8. **Wait for `serving`** — the successor's report that its endpoint is in
-//!    place — at most [`SERVING_WAIT`], answers the requester `upgraded`, and
-//!    exits with `_exit`: closing its copy of the master WITHOUT signalling the
+//!    place — at most [`SERVING_WAIT`], with its own reader still PARKED. If
+//!    the successor dies in that wait (`try_wait` proves it: it is this
+//!    holder's child), it had read nothing and written no held input — it
+//!    does both only after `serving` — so this holder takes the pane back:
+//!    it restores its lock record, re-binds its endpoint if the successor's
+//!    rename had replaced it, returns the held input to its writer, resumes
+//!    at X, and answers `upgrade_failed`. Otherwise it answers the requester
+//!    `upgraded` and exits with `_exit`: closing its copy of the master WITHOUT signalling the
 //!    child (the child is a session leader on its own PTY; the holder is not
 //!    its controlling process, so nothing hangs it up), and running none of the
 //!    pane-end work a normal exit does. A `serving` that does not come in time
@@ -71,8 +80,10 @@
 //! rewrites the lock record to name itself (`PaneLock::rewrite_record`, never
 //! an empty file; on failure the record is CLEARED, which reads UNKNOWN —
 //! nothing is killed), `rename`s its staged socket over the pane's endpoint,
-//! resumes reading at X and reports `serving`. Nothing after the commit can
-//! end the child.
+//! reports `serving` — only if the rename succeeded — and only THEN queues the
+//! held input and resumes reading at X. After a failed rename it sends no
+//! `serving`, and waits for the predecessor to leave before it reads. Nothing
+//! after the commit can end the child.
 //!
 //! **The endpoint gap.** Until the rename, the path names the predecessor's
 //! socket, which answers until the predecessor exits — and it exits only after
@@ -101,8 +112,11 @@
 //!
 //! # Input across the swap — the residual bound
 //!
-//! Every input byte a client's write DELIVERED to a predecessor socket before
-//! the drain's `shutdown(SHUT_RD)` reaches the child, in order: frames queued
+//! **This bound is established for Linux**, whose `SHUT_RD` keeps queued data
+//! readable and fails later writes; on other Unix an upgrade with an open
+//! input connection is refused instead (see step 6). On Linux, every input
+//! byte a client's write DELIVERED to a predecessor socket before the drain's
+//! `shutdown(SHUT_RD)` reaches the child, in order: frames queued
 //! to the writer are written first (the freeze waits for that), frames that
 //! arrive later are held — over the normal hold cap they wait, and during the
 //! drain the cap is lifted, so none is dropped — and travel in `commit`. What
@@ -113,7 +127,12 @@
 //! itself. A runner-side resend of the failed chunk on the new connection
 //! would make the swap lossless for input, and belongs with the runner change
 //! that first sends `prepare_upgrade`. A predecessor that dies mid-commit
-//! loses the held frames it had not yet sent.
+//! loses the held frames it had not yet sent. **A rollback after the drain**
+//! (the commit write failed, or the successor died before `serving`) keeps
+//! every held frame, but the drained connections stay shut: writes a client
+//! makes on them after the drain fail at the writer exactly as in a swap,
+//! and so do `open_input` attempts refused while the commit was in flight —
+//! the same residual, fixed by the same runner-side resend.
 //!
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
@@ -174,26 +193,38 @@ pub const INPUT_DRAIN_BOUND: Duration = Duration::from_secs(2);
 
 /// TEST SEAM, read only by a SUCCESSOR (`--adopt`): `nak` makes it refuse the
 /// adoption after validating everything; `stall` makes it log its pid and
-/// never answer (a test then SIGKILLs it before its ack). Any other value, or
-/// none, is ignored. It can only make an upgrade FAIL, which is always safe:
-/// the predecessor rolls back.
+/// never answer (a test then SIGKILLs it before its ack); `exit-after-commit`
+/// and `exit-after-publish` make it exit right after the commit (before it
+/// touches the lock record, or after its endpoint rename) and before
+/// `serving`. Any other value, or none, is ignored. None of them can cost the
+/// pane: the predecessor rolls back, or takes the pane back (review r2, D).
 pub const ADOPT_FAULT_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ADOPT_FAULT";
 
 /// TEST SEAM, read by a PREDECESSOR: replaces [`ACK_TIMEOUT`] (milliseconds),
-/// so the ack-timeout rollback can be exercised. Only shortens or lengthens a
-/// wait whose expiry is a rollback.
+/// so the ack-timeout rollback can be exercised. Clamped to
+/// [`MAX_TEST_ACK_TIMEOUT`]: the variable is read in every build, and an
+/// unbounded value would freeze a pane (output parked, input held) for as
+/// long behind a stalled successor.
 pub const ACK_TIMEOUT_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ACK_TIMEOUT_MS";
 
 /// TEST SEAM, read by a PREDECESSOR: sleep this many milliseconds between the
 /// successor's ack and the commit — the window in which a starved predecessor
-/// must not cost the pane, and in which input is held.
+/// must not cost the pane, and in which input is held. It is NOT a bound on a
+/// rollback: it lengthens every upgrade's freeze (output parked, input held)
+/// by that much, so it is clamped to [`MAX_TEST_COMMIT_DELAY`].
 pub const COMMIT_DELAY_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_COMMIT_DELAY_MS";
 
-fn env_ms(name: &str) -> Option<Duration> {
+/// Largest [`ACK_TIMEOUT_ENV`] honoured.
+pub const MAX_TEST_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest [`COMMIT_DELAY_ENV`] honoured.
+pub const MAX_TEST_COMMIT_DELAY: Duration = Duration::from_secs(30);
+
+/// A test-seam duration from the environment, clamped to `max`.
+fn env_ms(name: &str, max: Duration) -> Option<Duration> {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
+        .map(|ms| Duration::from_millis(ms).min(max))
 }
 
 /// Leads every snapshot file.
@@ -387,6 +418,10 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
         }
     };
     let snap = snapshot_path(&ctx.pane_dir, &info.pane_id);
+    // Which socket file serves the pane now — to tell, if the successor dies
+    // after the commit, whether it already replaced it (review r2, D).
+    let sock = crate::pane::socket_path(&ctx.pane_dir, &info.pane_id);
+    let sock_ino_before = socket_inode(&sock);
     let rollback = |child: Option<&mut Child>, why: String| {
         if let Some(c) = child {
             let _ = c.kill();
@@ -416,7 +451,8 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
         Err(e) => return rollback(None, format!("spawn successor: {e}")),
     };
     let successor_pid = child.id();
-    let deadline = Instant::now() + env_ms(ACK_TIMEOUT_ENV).unwrap_or(ACK_TIMEOUT);
+    let deadline =
+        Instant::now() + env_ms(ACK_TIMEOUT_ENV, MAX_TEST_ACK_TIMEOUT).unwrap_or(ACK_TIMEOUT);
     match recv_msg(&mut ours, deadline) {
         Ok(Some(ControlMsg::UpgradeAck { successor_pid: p })) if p == successor_pid => {}
         Ok(Some(ControlMsg::UpgradeAck { successor_pid: p })) => {
@@ -443,7 +479,7 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
         }
         Err(e) => return rollback(Some(&mut child), format!("waiting for the ack: {e}")),
     }
-    if let Some(delay) = env_ms(COMMIT_DELAY_ENV) {
+    if let Some(delay) = env_ms(COMMIT_DELAY_ENV, MAX_TEST_COMMIT_DELAY) {
         std::thread::sleep(delay);
     }
     // COMMIT. First drain the input connections into the held input (review
@@ -476,24 +512,154 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
             format!("commit could not be delivered: {e}"),
         );
     }
-    // Committed: this process never reads the master again.
-    pane.hand_off_reads();
-    // Keep this endpoint answering until the successor's is in place.
-    match recv_msg(&mut ours, Instant::now() + SERVING_WAIT) {
-        Ok(Some(ControlMsg::Serving)) => {}
-        other => log_line(
+    // Committed — but this process does not retire its reader until the
+    // successor reports `serving`: a successor that dies before that has
+    // read nothing from the master and written none of the held input (it
+    // does both only after `serving`), so this holder can take its pane back
+    // losslessly (review r2, D). Meanwhile this endpoint keeps answering.
+    match await_serving(&mut ours, &mut child) {
+        AfterCommit::Serving => {}
+        AfterCommit::SuccessorDied(status) => {
+            let why = format!(
+                "successor {successor_pid} died after the commit, before `serving` ({status}); \
+                 this holder took its pane back"
+            );
+            take_pane_back(ctx, info, pane, &sock, sock_ino_before, held, &why);
+            return UpgradeResult::Failed(why);
+        }
+        AfterCommit::NoServing(detail) => log_line(
             &ctx.log,
             &format!(
                 "upgrade: no `serving` from successor {successor_pid} within {SERVING_WAIT:?} \
-                 ({other:?}); exiting anyway — the commit is final, and a connect may be \
-                 refused until its endpoint is in place"
+                 ({detail}); it is alive, so the commit stands and this holder exits — a \
+                 connect may be refused until its endpoint is in place"
             ),
         ),
     }
+    pane.hand_off_reads();
     UpgradeResult::Committed {
         successor_pid,
         handoff_offset,
     }
+}
+
+/// The inode `path` names, if any.
+fn socket_inode(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// What a committed predecessor learned while waiting for `serving`.
+enum AfterCommit {
+    Serving,
+    /// The successor exited (it is our child: `try_wait` proves it), before
+    /// `serving` — so before it read the master or wrote any held input.
+    SuccessorDied(String),
+    /// The successor is alive but did not report `serving` within
+    /// [`SERVING_WAIT`].
+    NoServing(String),
+}
+
+fn await_serving(ours: &mut UnixStream, child: &mut Child) -> AfterCommit {
+    let deadline = Instant::now() + SERVING_WAIT;
+    let mut channel_closed = false;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return AfterCommit::SuccessorDied(status.to_string());
+        }
+        if Instant::now() >= deadline {
+            return AfterCommit::NoServing(if channel_closed {
+                "its control channel closed".into()
+            } else {
+                "timed out".into()
+            });
+        }
+        if channel_closed {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        match recv_msg(ours, Instant::now() + Duration::from_millis(100)) {
+            Ok(Some(ControlMsg::Serving)) => return AfterCommit::Serving,
+            Ok(Some(other)) => {
+                return AfterCommit::NoServing(format!("unexpected {other:?}"));
+            }
+            // EOF: the successor closed its end — exiting, most likely; the
+            // next `try_wait` says.
+            Ok(None) => channel_closed = true,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(_) => channel_closed = true,
+        }
+    }
+}
+
+/// The successor died after the commit and before `serving`: this holder
+/// serves its pane again. Its lock record is rewritten to name it (the
+/// successor may already have named itself), its endpoint is re-bound if the
+/// successor's rename had replaced it, the held input goes back to its
+/// writer, and its reader resumes at X — the successor read nothing.
+fn take_pane_back(
+    ctx: &UpgradeCtx,
+    info: &HolderInfo,
+    pane: &Arc<Pane>,
+    sock: &Path,
+    sock_ino_before: Option<(u64, u64)>,
+    held: Vec<Vec<u8>>,
+    why: &str,
+) {
+    log_line(&ctx.log, &format!("upgrade: {why}"));
+    let record = LockRecord {
+        holder_pid: info.holder_pid,
+        child_pid: info.child_pid,
+        versions: PROTOCOL_VERSIONS.to_vec(),
+        started_at_unix_ms: info.started_at_unix_ms,
+        holder_build: holder_build(),
+        child_start: pane.child_start().map(str::to_string),
+        holder_start: crate::proc_identity::start_token(info.holder_pid),
+        scope_unit: crate::server::own_scope_unit(),
+        ended: None,
+    };
+    let rewritten = dup_cloexec(ctx.lock_fd, 0)
+        .map(File::from)
+        .and_then(|mut f| crate::lock::rewrite_record_in(&mut f, &record));
+    if let Err(e) = rewritten {
+        log_line(
+            &ctx.log,
+            &format!("upgrade: ERROR: lock record not restored: {e}"),
+        );
+    }
+    if socket_inode(sock) != sock_ino_before {
+        // The dead successor's socket sits at the path: bind a fresh one and
+        // accept on it (the old listener keeps an orphaned inode).
+        let rebound =
+            crate::transport::bind_staged(&ctx.pane_dir, &info.pane_id).and_then(|staged| {
+                let (listener, published) = staged.publish();
+                published?;
+                crate::server::spawn_accept_loop(
+                    listener,
+                    Arc::new(info.clone()),
+                    Arc::clone(pane),
+                    ctx.log.clone(),
+                )
+            });
+        if let Err(e) = rebound {
+            log_line(
+                &ctx.log,
+                &format!("upgrade: ERROR: endpoint not re-bound ({e}); the pane is unreachable"),
+            );
+        }
+    }
+    let _ = std::fs::remove_file(crate::transport::staged_socket_path(
+        &ctx.pane_dir,
+        &info.pane_id,
+    ));
+    pane.restore_handed_input(held);
+    pane.resume_reads();
 }
 
 fn write_snapshot(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Pane, x: u64) -> io::Result<()> {
@@ -671,13 +837,9 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         return Err(7);
     }
     log_line(&log, "adopt: acked; waiting for the commit");
-    match await_commit(&mut control, header.predecessor_pid, &log) {
-        Ok(commit) => {
-            pane.inject_input(commit.held);
-            if let Some(exit) = commit.child_exit {
-                pane.set_known_exit(exit);
-            }
-        }
+    let fault = std::env::var(ADOPT_FAULT_ENV).ok();
+    let commit = match await_commit(&mut control, header.predecessor_pid, &log) {
+        Ok(commit) => commit,
         Err(why) => {
             log_line(
                 &log,
@@ -685,6 +847,10 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
             );
             return Err(8);
         }
+    };
+    if fault.as_deref() == Some("exit-after-commit") {
+        log_line(&log, "adopt: test fault: exit-after-commit");
+        return Err(10);
     }
     // Committed: the pane is ours now.
     let info = HolderInfo {
@@ -725,20 +891,40 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         record.holder_start = None;
     }
     let (listener, published) = staged.publish();
-    if let Err(e) = &published {
-        log_line(
-            &log,
-            &format!(
-                "adopt: ERROR: endpoint not moved into place ({e}); the pane keeps running \
-                 UNREACHABLE (its lock held, so it reads UNKNOWN)"
-            ),
-        );
+    if fault.as_deref() == Some("exit-after-publish") {
+        log_line(&log, "adopt: test fault: exit-after-publish");
+        return Err(10);
+    }
+    match &published {
+        // Tell the predecessor it may go. Only now, and only before this
+        // process reads the master or writes any held input: until
+        // `serving`, a successor death leaves the pane to the predecessor
+        // losslessly (review r2, D).
+        Ok(()) => {
+            let _ = send_msg(&mut control, &ControlMsg::Serving);
+        }
+        // No `serving` on a false report (review r2, C). The predecessor
+        // waits out its bound, logs it, and exits; this process must not
+        // touch the master until it has: wait for its end of the channel to
+        // close.
+        Err(e) => {
+            log_line(
+                &log,
+                &format!(
+                    "adopt: ERROR: endpoint not moved into place ({e}); the pane keeps running \
+                     UNREACHABLE (its lock held, so it reads UNKNOWN)"
+                ),
+            );
+            let _ = control.set_read_timeout(None);
+            while let Ok(Some(_)) = read_frame(&mut control) {}
+        }
+    }
+    drop(control);
+    pane.inject_input(commit.held);
+    if let Some(exit) = commit.child_exit {
+        pane.set_known_exit(exit);
     }
     pane.resume_reads();
-    // Tell the predecessor it may go (best effort: it exits after a bound
-    // anyway).
-    let _ = send_msg(&mut control, &ControlMsg::Serving);
-    drop(control);
     log_line(
         &log,
         &format!(
@@ -1018,4 +1204,33 @@ fn await_commit(
         }
     }
     Ok(Commit { held, child_exit })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review r2, finding E: the test seams are read in every build, so an
+    /// absurd value is clamped rather than freezing a pane for that long.
+    #[test]
+    fn pty_holder_handoff_test_seams_are_clamped() {
+        let name = "QONTINUI_PTY_HOLDER_TEST_CLAMP_PROBE_MS";
+        std::env::set_var(name, "999999999");
+        assert_eq!(
+            env_ms(name, MAX_TEST_ACK_TIMEOUT),
+            Some(MAX_TEST_ACK_TIMEOUT)
+        );
+        assert_eq!(
+            env_ms(name, MAX_TEST_COMMIT_DELAY),
+            Some(MAX_TEST_COMMIT_DELAY)
+        );
+        std::env::set_var(name, "1500");
+        assert_eq!(
+            env_ms(name, MAX_TEST_ACK_TIMEOUT),
+            Some(Duration::from_millis(1500))
+        );
+        std::env::set_var(name, "not-a-number");
+        assert_eq!(env_ms(name, MAX_TEST_ACK_TIMEOUT), None);
+        std::env::remove_var(name);
+    }
 }
