@@ -919,43 +919,92 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// The replay allowlist — a COPY of the runner's
+/// `session::resume_argv::REPLAY_ALLOWLIST_*`, pinned equal to it by the
+/// runner's test `the_shim_allowlists_match_the_runners` (this bin cannot
+/// import the bin crate). Flags taking exactly one value:
+const REPLAY_ALLOWLIST_ONE: &[&str] = &["--model", "--fallback-model", "--permission-mode"];
+/// Flags taking every following plain token.
+const REPLAY_ALLOWLIST_MANY: &[&str] = &["--add-dir"];
+/// Flags taking the next token unless it is a flag.
+const REPLAY_ALLOWLIST_OPTIONAL: &[&str] = &["--debug"];
+/// Flags taking no value.
+const REPLAY_ALLOWLIST_BOOL: &[&str] = &["--verbose", "--ide", "--chrome", "--no-chrome"];
+
 /// [`LAUNCH_ARGV_ENV`]'s value for a launch that received `args`: a JSON array
-/// of them, minus the runner's own plumbing — the shell integration's
-/// `--append-system-prompt[-file] <value>`, which the relaunched pane re-adds
-/// and whose inline value is multi-kilobyte. Every string is escaped by
-/// [`json_escape_ascii`], so the value is printable ASCII only — control
-/// characters, DEL and every non-ASCII character (C1 controls such as U+009C
-/// included) become `\uXXXX`. The hook sends it in its loopback POST body,
-/// never over the PTY. `None` over [`LAUNCH_ARGV_MAX_BYTES`]. Mirrors
-/// `launch_argv_json` in `resources/intercept/identity_shim.bash`.
+/// of ONLY the replay-allowlisted flags and their values (review r2, N1) —
+/// never the initial prompt, any other flag, or another flag's value, because
+/// every child of `claude` (Bash-tool shells, hooks, MCP servers) inherits
+/// this variable. Print mode exports the marker `--print` and a combined short
+/// flag (`-pc`) the marker `-??`, so the runner can refuse them without seeing
+/// the token. Every string is escaped by [`json_escape_ascii`] (printable
+/// ASCII only). `None` over [`LAUNCH_ARGV_MAX_BYTES`]. Mirrors
+/// `qs_launch_flags_json` in `resources/intercept/identity_shim.bash`.
 fn launch_argv_json(args: &[String]) -> Option<String> {
-    let mut out = String::from("[");
-    let mut skip = false;
-    let mut first = true;
-    for a in args {
-        if skip {
-            skip = false;
+    let is_flag = |t: &str| t.len() > 1 && t.starts_with('-');
+    let mut kept: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if a == "--" {
+            break;
+        }
+        if !is_flag(a) {
+            continue; // a positional: the prompt, or a dropped flag's value
+        }
+        if !a.starts_with("--") && a.chars().count() > 2 {
+            kept.push("-??");
             continue;
         }
-        match a.as_str() {
-            "--append-system-prompt" | "--append-system-prompt-file" => {
-                skip = true;
-                continue;
-            }
-            s if s.starts_with("--append-system-prompt=")
-                || s.starts_with("--append-system-prompt-file=") =>
-            {
-                continue
-            }
-            _ => {}
+        if a == "-p" || a == "--print" {
+            kept.push("--print");
+            continue;
         }
-        if !first {
+        let name = a.split('=').next().unwrap_or(a);
+        if REPLAY_ALLOWLIST_BOOL.contains(&name) {
+            kept.push(a);
+            continue;
+        }
+        let one = REPLAY_ALLOWLIST_ONE.contains(&name);
+        let many = REPLAY_ALLOWLIST_MANY.contains(&name);
+        let optional = REPLAY_ALLOWLIST_OPTIONAL.contains(&name);
+        if !(one || many || optional) {
+            continue; // not on the allowlist: dropped, and its value with it
+        }
+        kept.push(a);
+        if a.starts_with("--") && a.contains('=') {
+            continue;
+        }
+        if one {
+            // A required value is taken greedily, as claude takes it.
+            if let Some(v) = args.get(i) {
+                kept.push(v);
+                i += 1;
+            }
+        } else if optional {
+            if let Some(v) = args.get(i).filter(|v| !is_flag(v)) {
+                kept.push(v);
+                i += 1;
+            }
+        } else {
+            while let Some(v) = args.get(i).filter(|v| !is_flag(v)) {
+                kept.push(v);
+                i += 1;
+            }
+        }
+    }
+    let mut out = String::from("[");
+    for (n, a) in kept.iter().enumerate() {
+        if n > 0 {
             out.push(',');
         }
-        first = false;
         out.push('"');
         out.push_str(&json_escape_ascii(a));
         out.push('"');
+        if out.len() > LAUNCH_ARGV_MAX_BYTES {
+            return None;
+        }
     }
     out.push(']');
     (out.len() <= LAUNCH_ARGV_MAX_BYTES).then_some(out)
@@ -1503,54 +1552,104 @@ mod tests {
     }
 
     /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
-    /// Phase 6: the exported launch argv is valid JSON, carries every
-    /// user-given token, leaves out the runner's prompt plumbing, escapes
-    /// control bytes, and is not exported at all over the bound.
+    /// Phase 6 (review r2, N1): the exported value holds ONLY the allowlisted
+    /// flags and their values — never the prompt, never a `--settings` /
+    /// `--mcp-config` value — as printable-ASCII JSON (review r1, M1).
     #[test]
-    fn launch_argv_json_is_escaped_json_without_the_runner_plumbing() {
+    fn launch_argv_json_exports_only_allowlisted_flags_as_ascii_json() {
         let args: Vec<String> = [
+            "PROMPT-summarize",
             "--model",
-            "opus",
+            "opus\u{9c}x",
+            "--settings",
+            "{\"env\":{\"KEY\":\"SECRET\"}}",
+            "--mcp-config",
+            "MCPSECRET.json",
+            "other.json",
             "--append-system-prompt",
             "ctx\nline",
-            "--append-system-prompt-file=/tmp/c.md",
-            "a\"b\\c",
-            "esc\u{1b}del\u{7f}",
-            // Review r1, M1: C1 controls (ST, CSI) and other non-ASCII.
-            "c1\u{9c}end",
-            "csi\u{9b}6n",
-            "\u{fc}n\u{ef}",
-            "emoji\u{1f600}",
+            "--add-dir",
+            "/a",
+            "/b\u{1f600}",
+            "--permission-mode=plan",
+            "--verbose",
+            "--debug",
+            "-pc",
+            "-p",
+            "--unknown",
+            "UNKNOWNVAL",
+            "--",
+            "--model",
+            "after-dashdash",
         ]
         .map(String::from)
         .to_vec();
         let json = launch_argv_json(&args).expect("under the bound");
+        for never in [
+            "PROMPT",
+            "SECRET",
+            "--settings",
+            "--mcp-config",
+            "ctx",
+            "UNKNOWN",
+            "after",
+        ] {
+            assert!(!json.contains(never), "{never} exported: {json}");
+        }
         assert!(
             json.bytes().all(|b| (b' '..=b'~').contains(&b)),
             "printable ASCII only: {json:?}"
         );
         assert!(
-            json.contains("\\u009c") && json.contains("\\u009b6n"),
+            json.contains("\\u009c") && json.contains("\\ud83d\\ude00"),
             "{json}"
         );
-        assert!(json.contains("\\ud83d\\ude00"), "a surrogate pair: {json}");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(
             parsed,
             serde_json::json!([
                 "--model",
-                "opus",
-                "a\"b\\c",
-                "esc\u{1b}del\u{7f}",
-                "c1\u{9c}end",
-                "csi\u{9b}6n",
-                "\u{fc}n\u{ef}",
-                "emoji\u{1f600}"
+                "opus\u{9c}x",
+                "--add-dir",
+                "/a",
+                "/b\u{1f600}",
+                "--permission-mode=plan",
+                "--verbose",
+                "--debug",
+                "-??",
+                "--print"
             ])
         );
         assert_eq!(launch_argv_json(&[]).as_deref(), Some("[]"));
-        let huge = vec!["x".repeat(LAUNCH_ARGV_MAX_BYTES)];
+        let huge = vec!["--model".to_string(), "x".repeat(LAUNCH_ARGV_MAX_BYTES)];
         assert_eq!(launch_argv_json(&huge), None);
+    }
+
+    /// Review r2, L3: the env the identity straddle sets reaches the child,
+    /// and a removed variable does not.
+    #[cfg(unix)]
+    #[test]
+    fn exec_real_child_env_sets_and_removes_child_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let script = format!(
+            "printf '%s|%s' \"${{{LAUNCH_ARGV_ENV}-unset}}\" \"${{QS_TEST_REMOVED-unset}}\" > '{}'",
+            out.display()
+        );
+        std::env::set_var("QS_TEST_REMOVED", "present");
+        let code = exec_real_child_env(
+            &Some(PathBuf::from("/bin/sh")),
+            "sh",
+            &["-c".to_string(), script.clone()],
+            &["QS_TEST_REMOVED"],
+            &[(LAUNCH_ARGV_ENV, "[\"--verbose\"]")],
+        );
+        std::env::remove_var("QS_TEST_REMOVED");
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "[\"--verbose\"]|unset"
+        );
     }
 
     #[test]

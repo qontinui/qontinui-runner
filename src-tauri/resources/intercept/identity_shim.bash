@@ -168,50 +168,68 @@ fi
 PINNED="${QONTINUI_PINNED_SESSION_ID:-}"
 
 # ---------------------------------------------------------------------------
-# Launch argv for a tier-2 relaunch (plan
+# Launch flags for a tier-2 relaunch (plan
 # 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6 /
-# D11). For TOOL=claude, export the argv this launch received as a JSON array
-# in QONTINUI_LAUNCH_ARGV. The runner-bundled SessionStart hook — a child of
-# that claude, so it inherits the variable — sends it in the body of its
-# LOOPBACK POST /control/session-open (never over the PTY, whose bytes are
-# relayed and stored), and the runner derives and persists only the relaunch
-# flags from it — allowlisted and shell-inert, or a refusal under which the
-# relaunch uses the default resume command (`session::resume_argv`).
+# D11). For TOOL=claude, export in QONTINUI_LAUNCH_ARGV — as a JSON array —
+# ONLY the replay-allowlisted flags this launch received, with their values:
+# never the initial prompt, never any other flag, never another flag's value
+# (review r2, N1). Every child of claude inherits this variable (its Bash-tool
+# shells, hooks, MCP servers), so an `env` in a tool would print it; an inline
+# `--settings` / `--mcp-config` JSON with a credential must never be in it.
+# The runner-bundled SessionStart hook sends it in the body of its LOOPBACK
+# POST /control/session-open (never over the PTY), and the runner re-derives
+# and persists only the relaunch flags from it — it stays the authority
+# (`session::resume_argv`), and refuses what it must.
 #
-# The runner's own plumbing is left out: the shell integration's
-# `--append-system-prompt[-file] <value>` (re-added in the relaunched pane, and
-# an inline value is multi-kilobyte) — and so is everything this shim appends
-# below, which comes after "$@". Every value is JSON-escaped here so the
-# result is printable ASCII only: control characters AND every non-ASCII
-# character become `\uXXXX` (UTF-16 surrogate pairs above U+FFFF; a byte that
-# is not valid UTF-8 becomes U+FFFD). C1 controls such as U+009C would
-# otherwise survive a C0-only escape. Fail-open: an array over 4 KiB is not
-# exported at all, and a relaunch then uses the default resume command.
-qs_json_str() {
+# The allowlist below is a COPY of the runner's (`resume_argv::
+# REPLAY_ALLOWLIST_*`), pinned equal to it by the runner's test
+# `the_shim_allowlists_match_the_runners`. Two markers carry what the runner
+# must refuse without carrying the token itself: print mode exports
+# `--print`, and a combined short flag (`-pc`, `-rID`) exports `-??`.
+#
+# Every value is JSON-escaped into printable ASCII: control characters AND
+# every non-ASCII character become `\uXXXX` (UTF-16 surrogate pairs above
+# U+FFFF; a byte that is not valid UTF-8 becomes U+FFFD), so C1 controls such
+# as U+009C cannot survive. Fail-open: past 4 KiB the encoding stops at once
+# and nothing is exported; a relaunch then uses the default resume command.
+QS_REPLAY_ONE=" --model --fallback-model --permission-mode "
+QS_REPLAY_MANY=" --add-dir "
+QS_REPLAY_OPTIONAL=" --debug "
+QS_REPLAY_BOOL=" --verbose --ide --chrome --no-chrome "
+QS_ARGV_MAX=4096
+
+# Append `$1`, JSON-escaped, to QS_OUT (with a comma when it is not the first
+# element). Returns 1 — leaving QS_OUT unusable — as soon as QS_OUT passes
+# QS_ARGV_MAX bytes, so a huge value is never escaped in full.
+qs_json_push() {
   # C locale: every comparison below is on BYTES (`'$c` yields a byte value,
   # `${#s}` a byte count), whatever the operator's locale.
   local LC_ALL=C
-  local s="$1" out="" i=0 n b c cp need k u
+  local s="$1" i=0 n b c cp need k u
+  [ "$QS_OUT" = "[" ] || QS_OUT+=","
+  QS_OUT+='"'
   # Fast path: printable ASCII with no quote or backslash needs no escaping.
   if [[ $s != *[^\ -~]* && $s != *[\"\\]* ]]; then
-    printf '"%s"' "$s"
-    return 0
+    QS_OUT+="$s\""
+    [ "${#QS_OUT}" -le "$QS_ARGV_MAX" ]
+    return
   fi
   n=${#s}
   while [ "$i" -lt "$n" ]; do
+    [ "${#QS_OUT}" -le "$QS_ARGV_MAX" ] || return 1
     c="${s:i:1}"
     printf -v b '%d' "'$c"
     (( b < 0 )) && b=$((b + 256))
     i=$((i + 1))
     if (( b == 34 )); then
-      out+='\"'
+      QS_OUT+='\"'
     elif (( b == 92 )); then
-      out+='\\'
+      QS_OUT+='\\'
     elif (( b >= 32 && b < 127 )); then
-      out+="$c"
+      QS_OUT+="$c"
     elif (( b < 128 )); then
       printf -v u '\\u%04x' "$b"
-      out+="$u"
+      QS_OUT+="$u"
     else
       if (( b >= 0xC2 && b <= 0xDF )); then
         need=1; cp=$((b & 0x1F))
@@ -239,36 +257,71 @@ qs_json_str() {
       else
         printf -v u '\\u%04x' "$cp"
       fi
-      out+="$u"
+      QS_OUT+="$u"
     fi
   done
-  printf '"%s"' "$out"
+  QS_OUT+='"'
+  [ "${#QS_OUT}" -le "$QS_ARGV_MAX" ]
 }
 
-launch_argv_json() {
-  local out="[" sep="" skip=0 a
-  for a in "$@"; do
-    if [ "$skip" -eq 1 ]; then
-      skip=0
+# Build QS_OUT: the allowlisted flags of "$@" with their values, as a JSON
+# array. Returns 1 when it would pass QS_ARGV_MAX bytes.
+qs_launch_flags_json() {
+  local args=("$@") n=$# i=0 a name next
+  QS_OUT="["
+  while (( i < n )); do
+    a="${args[i]}"
+    i=$((i + 1))
+    [ "$a" = "--" ] && break
+    # A positional — the initial prompt, or a dropped flag's value: never.
+    [[ $a == -?* ]] || continue
+    if [[ $a != --* && ${#a} -gt 2 ]]; then
+      qs_json_push "-??" || return 1
       continue
     fi
     case "$a" in
-      --append-system-prompt|--append-system-prompt-file) skip=1; continue ;;
-      --append-system-prompt=*|--append-system-prompt-file=*) continue ;;
+      -p | --print) qs_json_push "--print" || return 1; continue ;;
     esac
-    out="$out$sep$(qs_json_str "$a")"
-    sep=","
+    name="${a%%=*}"
+    if [[ $QS_REPLAY_BOOL == *" $name "* ]]; then
+      qs_json_push "$a" || return 1
+      continue
+    fi
+    if [[ $QS_REPLAY_ONE != *" $name "* && $QS_REPLAY_MANY != *" $name "* \
+        && $QS_REPLAY_OPTIONAL != *" $name "* ]]; then
+      continue # not on the allowlist: dropped, and its value with it
+    fi
+    qs_json_push "$a" || return 1
+    [[ $a == --*=* ]] && continue
+    if [[ $QS_REPLAY_ONE == *" $name "* ]]; then
+      # A required value is taken greedily, as claude takes it.
+      if (( i < n )); then
+        qs_json_push "${args[i]}" || return 1
+        i=$((i + 1))
+      fi
+    elif [[ $QS_REPLAY_OPTIONAL == *" $name "* ]]; then
+      if (( i < n )) && [[ ${args[i]} != -?* ]]; then
+        qs_json_push "${args[i]}" || return 1
+        i=$((i + 1))
+      fi
+    else
+      while (( i < n )); do
+        next="${args[i]}"
+        [[ $next == -?* ]] && break
+        qs_json_push "$next" || return 1
+        i=$((i + 1))
+      done
+    fi
   done
-  printf '%s]' "$out"
+  QS_OUT+="]"
+  [ "${#QS_OUT}" -le "$QS_ARGV_MAX" ]
 }
 
 unset QONTINUI_LAUNCH_ARGV
-if [ "$TOOL" = "claude" ]; then
-  qs_launch_argv="$(launch_argv_json "$@")"
-  if [ "${#qs_launch_argv}" -le 4096 ]; then
-    export QONTINUI_LAUNCH_ARGV="$qs_launch_argv"
-  fi
+if [ "$TOOL" = "claude" ] && qs_launch_flags_json "$@"; then
+  export QONTINUI_LAUNCH_ARGV="$QS_OUT"
 fi
+unset QS_OUT
 
 # ---------------------------------------------------------------------------
 # Claude SessionStart hook delivery (plan §4, Phase 2).
