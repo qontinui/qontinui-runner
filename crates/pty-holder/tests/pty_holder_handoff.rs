@@ -439,6 +439,27 @@ mod unix {
         };
         pane.adopt_cleanup(successor_pid);
         served_by(&dir, successor_pid);
+        // An ADOPTED pane can itself be handed on: a second generation.
+        let outcome = connect(&dir, &p1(), soon())
+            .unwrap()
+            .prepare_upgrade(upgrade_deadline())
+            .unwrap();
+        let UpgradeOutcome::Upgraded {
+            successor_pid: second,
+            ..
+        } = outcome
+        else {
+            panic!("expected a second upgrade, got {outcome:?}");
+        };
+        pane.adopt_cleanup(second);
+        let hello = served_by(&dir, second);
+        assert_eq!(hello.child_pid, Some(pane.child_pid));
+        let end = Instant::now() + Duration::from_secs(10);
+        while is_same_process(successor_pid, pane.extra[0].1.as_deref()) {
+            assert!(Instant::now() < end, "the first successor did not leave");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let successor_pid = second;
         let mut s = attach(&dir, None);
         send_input(&dir, b"quit\n");
         let from = s.info.start_offset;
@@ -452,7 +473,7 @@ mod unix {
         assert!(count(&r.bytes, b"got:quit") == 1);
         // The successor then leaves (its exit was delivered).
         let end = Instant::now() + Duration::from_secs(10);
-        while alive(successor_pid) && is_same_process(successor_pid, pane.extra[0].1.as_deref()) {
+        while alive(successor_pid) && is_same_process(successor_pid, pane.extra[1].1.as_deref()) {
             assert!(
                 Instant::now() < end,
                 "the successor did not exit after delivering the exit"
