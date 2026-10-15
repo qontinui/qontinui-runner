@@ -291,6 +291,7 @@ struct InputState {
     /// buffers), so a frame is held, never dropped (review r1, finding 3).
     draining: bool,
     /// No new input connection is accepted (a committing upgrade).
+    #[cfg(unix)]
     refuse_new: bool,
     /// The pane was handed to a successor: nothing more is accepted here.
     handed_off: bool,
@@ -735,7 +736,10 @@ impl Pane {
         }
         input.frozen = false;
         input.draining = false;
-        input.refuse_new = false;
+        #[cfg(unix)]
+        {
+            input.refuse_new = false;
+        }
     }
 
     /// Register an input connection (`open_input`), so a committing upgrade
