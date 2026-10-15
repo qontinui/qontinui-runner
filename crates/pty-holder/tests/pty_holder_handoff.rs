@@ -35,6 +35,8 @@ mod unix {
     use qontinui_pty_holder::protocol::{parse_reply, to_payload, Reply, Request};
     use qontinui_pty_holder::spec::{write_spec, ChildSpec};
 
+    // The debug-built holder: the post-commit test faults some tests use
+    // exist in debug builds only (`handoff::POST_COMMIT_FAULTS`).
     const BIN: &str = env!("CARGO_BIN_EXE_qontinui-pty-holder");
 
     fn soon() -> Instant {
@@ -1014,7 +1016,19 @@ mod unix {
             count(&r.bytes, b"got:after") > 0
         });
         let marker: &[u8] = b"holder upgrade: the successor holder died after taking over";
-        assert!(count(&upgrade_loss_notice(0), marker) == 1);
+        let n0 = upgrade_loss_notice(0);
+        assert!(count(&n0, marker) == 1);
+        // CAN first: a sequence cut at X is aborted before the text.
+        assert_eq!(n0.first(), Some(&0x18));
+        let at = r2
+            .bytes
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap();
+        assert!(
+            r2.bytes[..at].ends_with(b"\x18\r\n[qontinui pty holder] "),
+            "the notice in the stream starts with CAN"
+        );
         assert_eq!(
             count(&r2.bytes, marker),
             1,
@@ -1111,5 +1125,19 @@ mod unix {
             "unreachable but held: UNKNOWN, never dead"
         );
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Review r4, H2: the faults several tests here rely on exist only in a
+    /// debug-built holder. `cargo test` builds `CARGO_BIN_EXE_*` with the
+    /// test's own profile, so this crate being built with debug assertions
+    /// means the holder under test is too — a release test run fails HERE,
+    /// by name, instead of in the fault tests.
+    #[test]
+    fn pty_holder_handoff_tests_drive_a_debug_holder() {
+        assert!(
+            std::hint::black_box(cfg!(debug_assertions)),
+            "the handoff fault tests need a debug-built holder (post-commit faults are \
+             compiled out of release builds)"
+        );
     }
 }

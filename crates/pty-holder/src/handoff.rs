@@ -209,7 +209,8 @@ pub const INPUT_DRAIN_BOUND: Duration = Duration::from_secs(2);
 /// touches the lock record, or after its endpoint rename) and before
 /// `serving`; `exit-after-serving` makes it take over (held input written,
 /// output read) and exit 300 ms later; `fail-publish` makes its endpoint
-/// rename fail. Any other value, or none, is ignored. None of them can cost
+/// rename fail. Those four act after the commit ([`POST_COMMIT_FAULTS`]) and
+/// exist in DEBUG builds only; a release holder ignores and logs them. Any other value, or none, is ignored. None of them can cost
 /// the child: the predecessor rolls back, takes the pane back (declaring a
 /// loss after `exit-after-serving`), or leaves it to the successor.
 pub const ADOPT_FAULT_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ADOPT_FAULT";
@@ -624,16 +625,45 @@ enum Back {
     DeclaredLoss { handoff_offset: u64 },
 }
 
-/// The in-stream notice of a [`Back::DeclaredLoss`] take-back. Plain text, no
-/// escape sequences: it lands in every client's display and passes through
-/// the mode tracker without changing a mode.
+/// The in-stream notice of a [`Back::DeclaredLoss`] take-back. It starts with
+/// CAN (0x18), which aborts any escape, CSI or OSC sequence the stream was in
+/// the middle of at X — so the text is displayed, not swallowed into a
+/// half-received sequence (review r4 nit). The rest is plain text: it passes
+/// through the mode tracker without changing a mode.
 pub fn upgrade_loss_notice(handoff_offset: u64) -> Vec<u8> {
     format!(
-        "\r\n[qontinui pty holder] holder upgrade: the successor holder died after taking \
+        "\x18\r\n[qontinui pty holder] holder upgrade: the successor holder died after taking \
          over; output since offset {handoff_offset} may be missing, and input sent during the \
          upgrade may not have reached the program\r\n"
     )
     .into_bytes()
+}
+
+/// Successor faults that act AFTER the commit — the ones that can cost a
+/// pane's input or output, or leave it unreachable. Compiled into debug
+/// builds only (review r4, H2); a release holder ignores them.
+pub const POST_COMMIT_FAULTS: &[&str] = &[
+    "exit-after-commit",
+    "exit-after-publish",
+    "exit-after-serving",
+    "fail-publish",
+];
+
+/// Release builds: a post-commit fault value in the environment is ignored —
+/// and said so in the pane's log, so a test that expected it can tell.
+#[cfg(not(debug_assertions))]
+fn ignore_post_commit_fault(log: &Path) {
+    if let Ok(v) = std::env::var(ADOPT_FAULT_ENV) {
+        if POST_COMMIT_FAULTS.contains(&v.as_str()) {
+            log_line(
+                log,
+                &format!(
+                    "adopt: ignoring test fault {v:?}: post-commit faults exist in debug \
+                     builds only"
+                ),
+            );
+        }
+    }
 }
 
 /// What a committed predecessor learned while waiting for `serving`.
@@ -945,7 +975,11 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         return Err(7);
     }
     log_line(&log, "adopt: acked; waiting for the commit");
+    // The post-commit faults exist in debug builds only (review r4, H2).
+    #[cfg(debug_assertions)]
     let fault = std::env::var(ADOPT_FAULT_ENV).ok();
+    #[cfg(not(debug_assertions))]
+    ignore_post_commit_fault(&log);
     let commit = match await_commit(&mut control, header.predecessor_pid, &log) {
         Ok(commit) => commit,
         Err(why) => {
@@ -956,6 +990,7 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
             return Err(8);
         }
     };
+    #[cfg(debug_assertions)]
     if fault.as_deref() == Some("exit-after-commit") {
         log_line(&log, "adopt: test fault: exit-after-commit");
         return Err(10);
@@ -998,11 +1033,13 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         );
         record.holder_start = None;
     }
+    #[cfg(debug_assertions)]
     if fault.as_deref() == Some("fail-publish") {
         // Take the staged socket away, so the rename fails (path C).
         let _ = std::fs::remove_file(crate::transport::staged_socket_path(&pane_dir, &pane_id));
     }
     let (listener, published) = staged.publish();
+    #[cfg(debug_assertions)]
     if fault.as_deref() == Some("exit-after-publish") {
         log_line(&log, "adopt: test fault: exit-after-publish");
         return Err(10);
@@ -1042,6 +1079,7 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         pane.set_known_exit(exit);
     }
     pane.resume_reads();
+    #[cfg(debug_assertions)]
     if fault.as_deref() == Some("exit-after-serving") {
         // Take over for real — held input written, output read past X —
         // then die before the predecessor notices (review r3, G).
