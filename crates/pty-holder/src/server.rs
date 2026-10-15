@@ -359,12 +359,7 @@ impl Holder {
             mut lock,
             mut record,
         } = self;
-        let accept_pane = Arc::clone(&pane);
-        let accept_log = log.clone();
-        let spawned = std::thread::Builder::new()
-            .name("pty-holder-accept".into())
-            .spawn(move || accept_loop(&listener, &info, &accept_pane, &accept_log));
-        if let Err(e) = spawned {
+        if let Err(e) = spawn_accept_loop(listener, info, Arc::clone(&pane), log.clone()) {
             // No accept loop: the pane runs on, unreachable but alive and
             // counted (its lock is held), until the child exits.
             eprintln!("pty-holder: accept thread: {e}");
@@ -428,6 +423,21 @@ pub(crate) fn own_scope_unit() -> Option<String> {
     {
         None
     }
+}
+
+/// Run [`accept_loop`] on a thread of its own. A holder upgrade's predecessor
+/// that takes its pane back after a dead successor replaced its socket starts
+/// a second one on a fresh listener (plan Phase 8).
+pub(crate) fn spawn_accept_loop(
+    listener: Listener,
+    info: Arc<HolderInfo>,
+    pane: Arc<Pane>,
+    log: PathBuf,
+) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("pty-holder-accept".into())
+        .spawn(move || accept_loop(&listener, &info, &pane, &log))
+        .map(|_| ())
 }
 
 /// Accept forever, one thread per connection, at most [`MAX_CONNECTIONS`] at

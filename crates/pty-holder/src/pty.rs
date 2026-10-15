@@ -763,19 +763,30 @@ impl Pane {
     }
 
     /// The commit's input drain (review r1, finding 3): refuse new input
-    /// connections, lift the hold cap, `shutdown(SHUT_RD)` every open one and
-    /// wait — at most `bound` — until each dispatch has read what its socket
-    /// already held (into the held input) and ended. From then on a client
-    /// write to one of them fails (`EPIPE`) instead of vanishing; a frame cut
-    /// in half by the shutdown is discarded whole, and its writer saw the
-    /// failure. A drain that does not finish in time fails (`unfreeze_input`
-    /// re-opens input on a rollback).
+    /// connections, lift the hold cap, and wait — at most `bound` — until
+    /// every open input connection has ended, its frames read into the held
+    /// input.
+    ///
+    /// **Linux:** each open connection is `shutdown(SHUT_RD)`, so its dispatch
+    /// reads what the socket already holds and then sees EOF; a client write
+    /// after that FAILS (`EPIPE`) instead of vanishing, and a frame cut in
+    /// half is discarded whole while its writer saw the failure.
+    ///
+    /// **Other Unix (review r2, finding A):** `SHUT_RD` there may discard
+    /// queued data and accept later writes silently, so nothing is shut down:
+    /// the dispatch threads keep reading (into the held input) and the drain
+    /// only succeeds if every input connection has CLOSED by itself within
+    /// `bound`. One still open fails the drain — the upgrade is rolled back,
+    /// with that reason, rather than risk a silent loss.
+    ///
+    /// A failed drain re-opens input through `unfreeze_input` on the rollback.
     #[cfg(unix)]
     pub fn drain_input_for_handoff(&self, bound: Duration) -> io::Result<()> {
         {
             let mut input = self.input.lock().unwrap_or_else(|p| p.into_inner());
             input.refuse_new = true;
             input.draining = true;
+            #[cfg(target_os = "linux")]
             for (_, conn) in &input.conns {
                 conn.shutdown_read();
             }
@@ -794,7 +805,13 @@ impl Pane {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "the input connections did not drain in time",
+                    if cfg!(target_os = "linux") {
+                        "the input connections did not drain in time"
+                    } else {
+                        "an input connection is still open, and on this OS it cannot be \
+                         drained without risking silent input loss (plan Phase 8 drains \
+                         by shutdown(SHUT_RD) on Linux only)"
+                    },
                 ));
             }
             std::thread::sleep(INPUT_QUEUE_POLL);
