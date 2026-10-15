@@ -136,6 +136,14 @@ pub struct PaneState {
     /// The reader is parked at the gate: no read is in flight, and none will
     /// start until the gate is [`ReadGate::Run`] again.
     pub read_parked: bool,
+    /// X, once this holder took its pane back from a successor that died
+    /// AFTER `serving` (a declared-loss take-back, plan Phase 8 / coord
+    /// finding f4672ed2): that successor may have streamed output past X that
+    /// this holder never produced, so a client's offset past X may belong to
+    /// the dead successor's stream. Every attach asking for an offset past X
+    /// gets an explicit `output_lost` from X instead of a replay of this
+    /// holder's own, differently-numbered bytes (`server::attach_start`).
+    pub stream_replaced_at: Option<u64>,
 }
 
 /// The PTY master a pane drives.
@@ -491,6 +499,7 @@ impl Pane {
                 size: (spec.cols, spec.rows),
                 read_gate: ReadGate::Run,
                 read_parked: false,
+                stream_replaced_at: None,
                 observed_exit: None,
             }),
             changed: Condvar::new(),
@@ -592,6 +601,7 @@ impl Pane {
                 size,
                 read_gate: ReadGate::Quiesce,
                 read_parked: false,
+                stream_replaced_at: None,
                 observed_exit: None,
             }),
             changed: Condvar::new(),
@@ -841,6 +851,16 @@ impl Pane {
     #[cfg(unix)]
     pub fn inject_stream_notice(&self, bytes: &[u8]) {
         self.absorb_output(bytes);
+    }
+
+    /// A declared-loss take-back at stream offset `x` (see
+    /// [`PaneState::stream_replaced_at`]). Kept at the EARLIEST such offset:
+    /// a client's offset past any of them may come from a dead successor, and
+    /// over-reporting a loss is the honest direction.
+    #[cfg(unix)]
+    pub fn record_stream_replaced_at(&self, x: u64) {
+        let mut st = self.lock_state();
+        st.stream_replaced_at = Some(st.stream_replaced_at.map_or(x, |was| was.min(x)));
     }
 
     /// An adopted pane: the child's exit code its predecessor observed.

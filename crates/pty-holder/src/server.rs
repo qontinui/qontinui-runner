@@ -850,34 +850,103 @@ fn start_attach(
     from: Option<u64>,
     restore: bool,
 ) -> io::Result<()> {
-    let reply = {
+    let (reply, plan) = {
         let st = pane.lock_state();
         let ring_start = st.ring.start_offset();
         let end = st.ring.end_offset();
-        let start = match from {
-            None => end.saturating_sub(ATTACH_TAIL_BYTES).max(ring_start),
-            Some(x) => x.min(end),
-        };
+        let plan = attach_start(from, ring_start, end, st.stream_replaced_at);
         let meta = restore.then(|| {
             crate::metadata::restore_meta(st.modes.cwd(), pane.spawn_cwd(), st.modes.title())
         });
-        AttachedReply {
-            start_offset: start,
+        let reply = AttachedReply {
+            start_offset: plan.start_offset,
             ring_start_offset: ring_start,
             end_offset: end,
             child_pid: pane.child_pid(),
             cols: st.size.0,
             rows: st.size.1,
             restore: meta,
-        }
+        };
+        (reply, plan)
     };
-    let next = reply.start_offset;
     send_reply(writer, &Reply::Attached(reply))?;
     let (pane, writer, flow) = (Arc::clone(pane), Arc::clone(writer), Arc::clone(flow));
     std::thread::Builder::new()
         .name("pty-holder-pump".into())
-        .spawn(move || pump(&pane, &writer, &flow, next, restore))?;
+        .spawn(move || {
+            pump(
+                &pane,
+                &writer,
+                &flow,
+                plan.next,
+                plan.stream_replaced,
+                restore,
+            )
+        })?;
     Ok(())
+}
+
+/// Where an attach's stream begins ([`attach_start`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachStart {
+    /// `attached.start_offset`.
+    start_offset: u64,
+    /// The pump's first offset.
+    next: u64,
+    /// H1: an `output_lost {from, to}` the pump sends FIRST, because the
+    /// requested offset may belong to a dead successor's stream.
+    stream_replaced: Option<(u64, u64)>,
+}
+
+/// The attach rule, as a pure function of the pane's offsets.
+///
+/// - A fresh consumer (`None`) gets the ring's last [`ATTACH_TAIL_BYTES`].
+/// - A resume at `Some(y)` starts at `y`, clamped to the stream's end (an
+///   offset this holder never produced belongs to another stream, and
+///   `start_offset < from_offset` says so).
+/// - **H1 (coord finding f4672ed2).** After a declared-loss take-back at X
+///   (`replaced_at`), a `y` PAST X may come from the dead successor, whose
+///   bytes after X are not this holder's bytes after X. Replaying from `y`
+///   would splice this holder's stream into the client's at a misaligned
+///   offset with no loss marker. Instead the attach starts at X, the pump
+///   first sends `output_lost {X, T}` with `T = max(y, end)`, and streams
+///   from `T` — so nothing the client cannot place is replayed, the client's
+///   offset never moves backwards, and the break is explicit. The cost is
+///   also explicit: a client that legitimately reached `y > X` on THIS holder
+///   (after the take-back) and reconnects is told that `[y, end)` is lost,
+///   because no offset alone can tell the two clients apart.
+fn attach_start(
+    from: Option<u64>,
+    ring_start: u64,
+    end: u64,
+    replaced_at: Option<u64>,
+) -> AttachStart {
+    match (from, replaced_at) {
+        (None, _) => {
+            let start = end.saturating_sub(ATTACH_TAIL_BYTES).max(ring_start);
+            AttachStart {
+                start_offset: start,
+                next: start,
+                stream_replaced: None,
+            }
+        }
+        (Some(y), Some(x)) if y > x => {
+            let to = y.max(end);
+            AttachStart {
+                start_offset: x,
+                next: to,
+                stream_replaced: Some((x, to)),
+            }
+        }
+        (Some(y), _) => {
+            let start = y.min(end);
+            AttachStart {
+                start_offset: start,
+                next: start,
+                stream_replaced: None,
+            }
+        }
+    }
 }
 
 fn send_synthetic(
@@ -979,6 +1048,9 @@ enum PumpStep {
 
 /// Stream the pane's output to one connection from absolute offset `next`.
 ///
+/// `stream_replaced` (H1, [`attach_start`]) is an `output_lost` sent before
+/// anything else: the client's offset may belong to a dead successor's stream.
+///
 /// With `restore` (a version-3 `attach {restore: true}`), the pump first
 /// reports any loss already known (the requested offset left the ring), then
 /// sends the PREAMBLE and holds the POSTAMBLE, both from one look at the mode
@@ -992,8 +1064,30 @@ enum PumpStep {
 /// client too slow to keep up — the preamble still names the position the
 /// stream resumed from, never a byte the client is later sent as if it were
 /// the first.
-fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64, restore: bool) {
+fn pump(
+    pane: &Arc<Pane>,
+    writer: &Mutex<Conn>,
+    flow: &ConnFlow,
+    mut next: u64,
+    stream_replaced: Option<(u64, u64)>,
+    restore: bool,
+) {
     let mut postamble: Option<(u64, Vec<u8>)> = None;
+    // H1: the break comes before anything else — before a preamble, whose
+    // state is the state at `next`, past the break.
+    if let Some((from, to)) = stream_replaced {
+        let sent = to_payload(&Reply::OutputLost {
+            from_offset: from,
+            to_offset: to,
+        })
+        .map_err(io::Error::other)
+        .and_then(|p| send_frame(writer, KIND_CONTROL, &p, PUMP_WRITE_TIMEOUT));
+        if sent.is_err() {
+            flow.closed.store(true, Ordering::SeqCst);
+            writer.lock().unwrap_or_else(|p| p.into_inner()).shutdown();
+            return;
+        }
+    }
     if restore {
         let (lost, env) = {
             let st = pane.lock_state();
@@ -1276,6 +1370,51 @@ fn reject(writer: &Mutex<Conn>, reason: RejectReason, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_holder_attach_start_without_a_take_back() {
+        // Fresh: the ring's tail.
+        let a = attach_start(None, 0, 100, None);
+        assert_eq!((a.start_offset, a.next, a.stream_replaced), (0, 0, None));
+        let big = ATTACH_TAIL_BYTES + 500;
+        let a = attach_start(None, 0, big, None);
+        assert_eq!(a.start_offset, 500);
+        // A resume starts where it asked; past the end it is clamped.
+        let a = attach_start(Some(40), 0, 100, None);
+        assert_eq!((a.start_offset, a.next, a.stream_replaced), (40, 40, None));
+        let a = attach_start(Some(400), 0, 100, None);
+        assert_eq!(
+            (a.start_offset, a.next, a.stream_replaced),
+            (100, 100, None)
+        );
+    }
+
+    /// H1 (coord finding f4672ed2): after a declared-loss take-back at X, an
+    /// offset past X gets an explicit loss from X and is never replayed into;
+    /// an offset at or before X, and a fresh attach, are untouched.
+    #[test]
+    fn pty_holder_attach_start_after_a_declared_loss_take_back() {
+        let x = 50;
+        // At or before X: the normal resume (the notice at X is replayed).
+        let a = attach_start(Some(x), 0, 100, Some(x));
+        assert_eq!((a.start_offset, a.next, a.stream_replaced), (x, x, None));
+        let a = attach_start(Some(10), 0, 100, Some(x));
+        assert_eq!((a.start_offset, a.next, a.stream_replaced), (10, 10, None));
+        // Past X, inside what this holder produced: lost [X, end), resume at
+        // the end — this holder's bytes in (X, end) are not the client's.
+        let a = attach_start(Some(60), 0, 100, Some(x));
+        assert_eq!(a.start_offset, x);
+        assert_eq!(a.next, 100);
+        assert_eq!(a.stream_replaced, Some((x, 100)));
+        // Past this holder's end: lost [X, y), resume at y — the client's
+        // offset never moves backwards.
+        let a = attach_start(Some(300), 0, 100, Some(x));
+        assert_eq!((a.start_offset, a.next), (x, 300));
+        assert_eq!(a.stream_replaced, Some((x, 300)));
+        // A fresh attach has no offset to misplace.
+        let a = attach_start(None, 0, 100, Some(x));
+        assert_eq!(a.stream_replaced, None);
+    }
 
     fn info() -> HolderInfo {
         HolderInfo {
