@@ -3167,6 +3167,66 @@ mod tests {
         assert!(!outcome.skipped[0].detail.is_empty(), "never a silent drop");
     }
 
+    /// Build a clean, aged, git-initialised target and a survey item for it.
+    fn incarnation_fixture(
+        head: Option<&str>,
+        born: Option<&str>,
+    ) -> (tempfile::TempDir, PathBuf, SurveyItem) {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("qontinui-runner");
+        std::fs::create_dir_all(&target).unwrap();
+        let out = crate::agent_worktree::reclaim::tests::hermetic_git()
+            .args(["-c", "init.defaultBranch=main", "init", "-q"])
+            .arg(&target)
+            .output()
+            .expect("git on PATH");
+        assert!(out.status.success(), "git init: {out:?}");
+        filetime::set_file_mtime(&target, filetime::FileTime::from_unix_time(1_000_000_000, 0))
+            .unwrap();
+        let wt = target.to_string_lossy().to_string();
+        let item = SurveyItem {
+            id: norm_path(&wt),
+            worktree_path: wt,
+            repo: "qontinui-runner".to_string(),
+            branch: None,
+            status: "reapable",
+            reason: None,
+            reason_detail: None,
+            is_dirty: false,
+            building: false,
+            pinned: false,
+            landed_in_main: Some(true),
+            attributable_bytes: 4096,
+            junctioned_paths: Vec::new(),
+            census_head_sha: head.map(str::to_string),
+            census_dir_created_at: born.map(str::to_string),
+            coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
+            ..unattributed_item_fields()
+        };
+        (dir, target, item)
+    }
+
+    #[test]
+    fn removal_refuses_a_census_head_that_no_longer_matches() {
+        let (_d, target, item) =
+            incarnation_fixture(Some("0000000000000000000000000000000000000000"), None);
+        let outcome = execute_targets(vec![item], /* dry_run */ false);
+        assert!(outcome.removed.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.skipped[0].reason, "incarnation_mismatch");
+        assert!(target.exists(), "the target must not be touched");
+    }
+
+    #[test]
+    fn removal_refuses_a_census_birth_time_that_no_longer_matches() {
+        let (_d, target, item) = incarnation_fixture(None, Some("2000-01-01T00:00:00+00:00"));
+        let outcome = execute_targets(vec![item], /* dry_run */ false);
+        assert!(outcome.removed.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.skipped[0].reason, "incarnation_mismatch");
+        assert!(target.exists(), "the target must not be touched");
+    }
+
     /// The allocation-sibling guard on the on-demand path: a target that
     /// passes every one of its OWN live guards (clean, idle, present) is still
     /// refused while another checkout of the same allocation holds work — as
