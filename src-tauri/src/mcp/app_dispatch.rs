@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use super::app_registry::{AppRegistry, AppTransport};
-use super::command_relay::{CommandRelay, CommandRelayError};
+use super::command_relay::{CommandRelay, CommandRelayError, WrapperFailure};
 use super::sdk_client::SdkConnectionManager;
 
 /// Default timeout for HTTP dispatches to registered apps. WebSocket
@@ -73,8 +73,10 @@ pub enum DispatchError {
 
     /// The app ANSWERED over HTTP with `{success:false, error, code?}` — an
     /// app-reported failure, not a transport one. `code` is the app's own
-    /// machine-readable code (`code`, else `errorCode`) when it sent one, so a
-    /// caller can hand it on instead of flattening it into a message. Display
+    /// machine-readable code (`code`, else `errorCode`, at the top level or
+    /// inside an object `error`) when it sent one, so a caller can hand it on
+    /// instead of flattening it into a message. `retryable` is the app's own
+    /// retry verdict when it sent a boolean one, else `None`: UNKNOWN. Display
     /// matches the `HttpStatus` form this case used to be reported as.
     #[error("http dispatch to '{url}' returned status {status}: {error}")]
     AppAnswered {
@@ -82,31 +84,50 @@ pub enum DispatchError {
         status: u16,
         error: String,
         code: Option<String>,
+        retryable: Option<bool>,
     },
 }
 
 /// Map an HTTP reply the app ANSWERED with `{success:false, error, code?}` to
-/// [`DispatchError::AppAnswered`], carrying the app's own `code` (else
-/// `errorCode`). `None` for any reply that is not an explicit `success:false`.
-/// Pure, so the mapping is unit-testable without an HTTP round trip.
+/// [`DispatchError::AppAnswered`]. `None` for any reply that is not an
+/// explicit `success:false`. Pure, so the mapping is unit-testable without an
+/// HTTP round trip.
+///
+/// `error` is read through [`WrapperFailure::from_wire`], the same parser the
+/// WebSocket arm uses for a wrapper's failure frame. So a string `error` is
+/// the message, and the wrapper's object shape `{code, message, retryable}`
+/// gives its message, code and retry verdict. A top-level `code` (else
+/// `errorCode`) wins over the object's, and a top-level boolean `retryable`
+/// wins over the object's.
 fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Option<DispatchError> {
     if json.get("success").and_then(|v| v.as_bool()) != Some(false) {
         return None;
     }
-    let error = json
+    let failure = json
         .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Unknown error from SDK app")
-        .to_string();
-    let code = ["code", "errorCode"]
+        .cloned()
+        .and_then(WrapperFailure::from_wire);
+    let top_code = ["code", "errorCode"]
         .into_iter()
         .find_map(|k| json.get(k).and_then(|v| v.as_str()))
         .map(String::from);
+    let (error, code, retryable) = match failure {
+        Some(failure) => (
+            failure.message,
+            top_code.or(failure.code),
+            failure.retryable,
+        ),
+        None => ("Unknown error from SDK app".to_string(), top_code, None),
+    };
     Some(DispatchError::AppAnswered {
         url: url.to_string(),
         status,
         error,
         code,
+        retryable: json
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            .or(retryable),
     })
 }
 
@@ -766,6 +787,47 @@ mod tests {
         assert_eq!(
             answered(json!({"success": false})),
             Some(("Unknown error from SDK app".to_string(), None))
+        );
+    }
+
+    /// The wrapper's object `error` shape, `{code, message, retryable}`,
+    /// reads exactly as the WebSocket arm reads a failure frame
+    /// (`WrapperFailure::from_wire`): message, code and retry verdict.
+    #[test]
+    fn app_answered_failure_reads_the_wrappers_object_error() {
+        let read = |json: serde_json::Value| match app_answered_failure("u", 200, &json) {
+            Some(DispatchError::AppAnswered {
+                error,
+                code,
+                retryable,
+                ..
+            }) => (error, code, retryable),
+            other => panic!("expected AppAnswered, got {other:?}"),
+        };
+        assert_eq!(
+            read(json!({"success": false,
+                        "error": {"code": "NO_HANDLER", "message": "no handler", "retryable": false}})),
+            (
+                "no handler".to_string(),
+                Some("NO_HANDLER".to_string()),
+                Some(false)
+            )
+        );
+        // A top-level code and retryable win over the object's.
+        assert_eq!(
+            read(json!({"success": false, "code": "TOP", "retryable": true,
+                        "error": {"code": "INNER", "message": "m", "retryable": false}})),
+            ("m".to_string(), Some("TOP".to_string()), Some(true))
+        );
+        // `errorCode` inside the object, and no retry verdict: UNKNOWN.
+        assert_eq!(
+            read(json!({"success": false, "error": {"errorCode": "E", "message": "m"}})),
+            ("m".to_string(), Some("E".to_string()), None)
+        );
+        // A string error keeps its shape and has no retry verdict.
+        assert_eq!(
+            read(json!({"success": false, "error": "plain"})),
+            ("plain".to_string(), None, None)
         );
     }
 
