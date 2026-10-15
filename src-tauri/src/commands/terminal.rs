@@ -113,6 +113,12 @@ pub async fn terminal_create(
     // that omit the argument keep working — Tauri/serde pass a missing arg as
     // `None`, which resolves to "no override", the safe answer.
     resource_override: Option<bool>,
+    // Plan 2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits
+    // Phase 2 — the repos this session will EDIT beside its intent repo
+    // (`editSiblings` from the frontend). Absent on every legacy caller, which
+    // declares none. A bad or unresolvable entry is refused with an `Err`
+    // before anything is allocated.
+    edit_siblings: Option<Vec<String>>,
 ) -> Result<CommandResponse, String> {
     // Spawn-time resource gate, EARLY-OUT arm (§Part D). The authority is still
     // the gate inside `TerminalSession::spawn` — every unattended seam reaches
@@ -189,12 +195,23 @@ pub async fn terminal_create(
     // it identifies the coord row, not the spawning agent. None is correct.
     // The spawn tenant rides along because this allocate runs before the
     // session exists, so no registry tenant can answer for it (P5b).
+    //
+    // The declared edit siblings are validated against the EFFECTIVE intent
+    // repo (derived from `working_dir` when none was passed) before the
+    // allocate, so a typo is an `Err` rather than the helper's fail-open
+    // fallback into the shared checkout (vet V9).
+    let edit_siblings = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+        effective_intent_repo.as_deref(),
+        edit_siblings.as_deref().unwrap_or_default(),
+    )
+    .map_err(|refusal| refusal.to_string())?;
     let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
         effective_intent_repo.as_deref(),
         title.as_deref().unwrap_or("Terminal edit session"),
         working_dir,
         None,
         spawn_tenant_id,
+        &edit_siblings,
     )
     .await;
 
@@ -573,6 +590,11 @@ pub async fn terminal_close(
     })
 }
 
+/// Event announcing a runner-spawned session's `claude --name`:
+/// `{ terminalId, spawnName }`, emitted right after `terminal-created`. The
+/// frontend stores it as the immutable `TerminalTab.spawnName`.
+pub const SPAWN_NAME_EVENT: &str = "terminal-spawn-name";
+
 /// List all terminal sessions.
 ///
 /// Alongside the `terminals` array (`TerminalInfo`, which structurally does
@@ -605,6 +627,18 @@ pub fn terminal_list(
 ) -> Result<CommandResponse, String> {
     let terminals = terminal_manager.list();
 
+    // `{ terminal_id -> spawnName }` for runner-spawned sessions, so a
+    // reconnecting webview that missed `terminal-spawn-name` still gets it.
+    let spawn_names_by_terminal: serde_json::Map<String, serde_json::Value> = terminals
+        .iter()
+        .filter_map(|info| {
+            terminal_manager
+                .get(&info.id)
+                .and_then(|s| s.spawn_name())
+                .map(|n| (info.id.clone(), serde_json::Value::String(n)))
+        })
+        .collect();
+
     let mut session_ids_by_terminal = serde_json::Map::new();
     if let Some(store) = app.try_state::<Arc<SessionLifecycleStore>>() {
         for info in &terminals {
@@ -626,6 +660,7 @@ pub fn terminal_list(
         data: Some(serde_json::json!({
             "terminals": terminals,
             "sessionIdsByTerminal": serde_json::Value::Object(session_ids_by_terminal),
+            "spawnNamesByTerminal": serde_json::Value::Object(spawn_names_by_terminal),
         })),
     })
 }
@@ -1014,6 +1049,7 @@ pub fn terminal_get_scrollback(
     session.reset_flow_control();
     let (data, start_offset) = session.get_scrollback_buffer();
     let end_offset = start_offset + data.len() as u64;
+    crate::terminal::transport_stats::record_ring_replay(data.len());
     let encoded = STANDARD.encode(&data);
 
     Ok(CommandResponse {
@@ -1589,6 +1625,9 @@ pub(crate) fn close_outcome_response(outcome: &CloseOutcome) -> CommandResponse 
     }
 }
 
+/// The `purpose` value the boot restore passes to [`terminal_session_list_open`].
+pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
+
 /// List every RESTORABLE Claude terminal session from the lifecycle registry.
 /// The grid hydrates its session tiles from this on boot instead of
 /// `localStorage`.
@@ -1602,10 +1641,20 @@ pub(crate) fn close_outcome_response(outcome: &CloseOutcome) -> CommandResponse 
 /// `handleExit` flipped every live PTY to `closed`). User-closed, orphan
 /// (`no-terminal`) and stale-ghost records are excluded so the restore path
 /// resurrects exactly the sessions that died with the runner.
+///
+/// `purpose`: `Some("restore")` ONLY from the boot restore itself
+/// (`fetchRestoreSet`). Several other frontend readers (page reconcile, the
+/// worker-adoption probe, tree-reset reporting) call this same command; only
+/// the restore's own call may tell the lifecycle poll that the boot restore
+/// was withheld or has run (see `BootRestorePhase`). A reader that merely
+/// LOOKS at the set must not release the poll's hold on records nobody has
+/// restored yet.
 #[tauri::command]
 pub fn terminal_session_list_open(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    purpose: Option<String>,
 ) -> Result<CommandResponse, String> {
+    let is_boot_restore = purpose.as_deref() == Some(LIST_OPEN_PURPOSE_RESTORE);
     // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     // D3): restoring tabs respawns `claude --resume` sessions autonomously, so
     // while the device is drained (or its drain state is unknown) the restore
@@ -1619,6 +1668,17 @@ pub fn terminal_session_list_open(
         )
     {
         tracing::warn!("terminal_session_list_open: restore deferred — {reason}");
+        // Tell the lifecycle poll the boot restore is WITHHELD, so it does not
+        // sweep the very records this deferral promises to restore later as
+        // `no-terminal` orphans (plan
+        // `2026-10-01-drain-deferred-restore-is-swept-as-orphans`). No-op once
+        // the restore has run.
+        crate::session::session_lifecycle_store::apply_boot_restore_latch_event(
+            crate::session::session_lifecycle_store::boot_restore_latch_event(
+                is_boot_restore,
+                true,
+            ),
+        );
         return Ok(CommandResponse {
             success: true,
             message: Some(reason.clone()),
@@ -1644,7 +1704,22 @@ pub fn terminal_session_list_open(
     // 2026-07-19 anchor ~1h46m past the crash band and stranded 81 sessions).
     // Only a CLEAN shutdown marker is an honest last-moment-of-life signal.
     let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
-    let rows = restore_candidates(&store, now, prior_marker_at, boot_was_clean);
+    // The boot instant partitions the anchor: rows last seen BEFORE this
+    // process booted are judged against the prior boot's own last moment of
+    // life, so a restore that ran hours late (a coord drain withheld it) admits
+    // the same crash cohort it would have admitted at boot, however much this
+    // process has touched since. See `restorable_records`.
+    let boot_at_ms = boot.map(|c| c.booted_at_ms);
+    let rows = restore_candidates(&store, now, prior_marker_at, boot_was_clean, boot_at_ms);
+    // The boot restore is no longer withheld: it has RUN. From here the
+    // lifecycle poll's normal orphan handling applies again (the rows the
+    // restore takes are about to carry `restore_pending_at` or be rebound to a
+    // live terminal). Rows of pages whose restore has not run yet are judged as
+    // on an undrained boot — the same footing, including its known per-page gap
+    // (plan follow-up). Monotonic — a later drain cannot re-arm it.
+    crate::session::session_lifecycle_store::apply_boot_restore_latch_event(
+        crate::session::session_lifecycle_store::boot_restore_latch_event(is_boot_restore, false),
+    );
 
     Ok(CommandResponse {
         success: true,
@@ -1689,9 +1764,10 @@ fn restore_candidates(
     now_ms: i64,
     prior_marker_at: Option<i64>,
     boot_was_clean: bool,
+    boot_at_ms: Option<i64>,
 ) -> Vec<RestoreCandidate> {
     store
-        .restorable_records(now_ms, prior_marker_at, boot_was_clean)
+        .restorable_records(now_ms, prior_marker_at, boot_was_clean, boot_at_ms)
         .into_iter()
         .map(|rec| {
             let transcript_exists =
@@ -1963,6 +2039,13 @@ pub(crate) struct SessionCaptureHint {
     pub working_dir: String,
     /// Human-readable title for the restored grid tile.
     pub title: String,
+    /// The `claude --name` this spawn was launched with (already sanitised), or
+    /// `None` when it carries no name. At spawn it is (a) recorded as the commit
+    /// `Session-Name` trailer file for `claude_session_id`, (b) parked on the
+    /// terminal session, and (c) announced to the webview as
+    /// [`SPAWN_NAME_EVENT`] / `terminal_list`'s `spawnNamesByTerminal`, which the
+    /// frontend folds into the immutable `TerminalTab.spawnName`.
+    pub spawn_name: Option<String>,
     /// Page the session should land on (and be durably recorded against) so a
     /// restart re-lands the continuation on its page. `None` → `"default"`.
     pub page_id: Option<String>,
@@ -2280,6 +2363,7 @@ pub(crate) fn create_terminal_session_backend(
     // Keep a handle for the (optional) durable-record poller below, since the
     // `create` call consumes `app_handle`. `AppHandle` is a cheap Arc clone.
     let app_state = capture_hint.as_ref().map(|_| app_handle.clone());
+    let app_handle_for_spawn_name = app_handle.clone();
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(working_dir.clone()),
@@ -2299,6 +2383,30 @@ pub(crate) fn create_terminal_session_backend(
         // A gate continuation is coord-spawned: no picker chose a tenant.
         None,
     )?;
+
+    // Spawn name: park it on the session (so `terminal_list` and a reconnecting
+    // webview can read it), record the commit `Session-Name` trailer file for the
+    // pinned id, and announce it to the webview beside `terminal-created`.
+    if let Some(name) = capture_hint.as_ref().and_then(|h| h.spawn_name.clone()) {
+        if let Some(session) = terminal_manager.get(&info.id) {
+            session.set_spawn_name(name.clone());
+        }
+        if let Some(sid) = capture_hint
+            .as_ref()
+            .and_then(|h| h.claude_session_id.as_deref())
+        {
+            if let Err(e) = crate::agent_worktree::custody::write_session_name(sid, &name) {
+                warn!(session_id = %sid, error = %e, "spawn name: trailer file write failed");
+            }
+        }
+        if let Err(e) = tauri::Emitter::emit(
+            &app_handle_for_spawn_name,
+            SPAWN_NAME_EVENT,
+            serde_json::json!({ "terminalId": info.id, "spawnName": name }),
+        ) {
+            warn!(error = %e, "spawn name: terminal-spawn-name emit failed");
+        }
+    }
 
     // Park the pre-acquired isolated edit context on the session so its
     // heartbeat + claim live as long as the PTY and release on close — the
@@ -2421,6 +2529,8 @@ pub(crate) fn create_terminal_session_backend(
                 config_dir,
                 working_dir,
                 title,
+                // Consumed earlier (session park + trailer file + event).
+                spawn_name: _,
                 page_id: hint_page_id,
                 claude_session_id: pinned_session_id,
                 zone_index: hint_zone_index,
@@ -2993,12 +3103,12 @@ mod tests {
         store.record_open(restore_candidate_record("registry-sess"));
         let now = chrono::Utc::now().timestamp_millis();
 
-        let offered: Vec<String> = restore_candidates(&store, now, None, false)
+        let offered: Vec<String> = restore_candidates(&store, now, None, false, None)
             .into_iter()
             .map(|c| c.record.claude_session_id)
             .collect();
         let registry: Vec<String> = store
-            .restorable_records(now, None, false)
+            .restorable_records(now, None, false, None)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -3094,6 +3204,7 @@ mod tests {
             config_dir: None,
             working_dir: "/work/dir".to_string(),
             title: "t".to_string(),
+            spawn_name: None,
             page_id: None,
             claude_session_id: Some("pinned-1".to_string()),
             zone_index: None,
@@ -3140,6 +3251,7 @@ mod tests {
             config_dir: None,
             working_dir: "/work/dir".to_string(),
             title: "Hinted".to_string(),
+            spawn_name: None,
             page_id: None,
             claude_session_id: Some("pinned-1".to_string()),
             zone_index: None,

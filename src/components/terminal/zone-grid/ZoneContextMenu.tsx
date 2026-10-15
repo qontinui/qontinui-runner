@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { ChevronDown } from "lucide-react";
 import type { TerminalTab } from "../useTerminalManager";
 import type { SessionState } from "../useZoneLayout";
+import { TabTitle } from "../displayTitle";
 
 function ZoneMenuItem({
   label,
@@ -96,7 +97,12 @@ export function ZoneContextMenu({
     >
       <div className="px-3 py-1 text-[9px] text-[#565f89] uppercase tracking-wider border-b border-[#2a2d3d] mb-1">
         Zone {zoneIndex + 1}
-        {tab ? ` \u2014 ${tab.title}` : ""}
+        {tab ? (
+          <>
+            {" \u2014 "}
+            <TabTitle tab={tab} />
+          </>
+        ) : null}
       </div>
 
       <ZoneMenuItem label="Focus" onClick={onFocus} onClose={onClose} />

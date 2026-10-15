@@ -70,7 +70,11 @@ export async function fetchRestoreSet(
 ): Promise<RestoreSet> {
   let resp: CommandResponse | null;
   try {
-    resp = await invoke<CommandResponse>("terminal_session_list_open");
+    // `purpose: "restore"` marks THIS as the boot restore's own read: only it
+    // may tell the backend's lifecycle poll that the restore was withheld or
+    // has run (plan `2026-10-01-drain-deferred-restore-is-swept-as-orphans`).
+    // The other readers of this command must not.
+    resp = await invoke<CommandResponse>("terminal_session_list_open", { purpose: "restore" });
   } catch (err) {
     console.warn("[TerminalPage] terminal_session_list_open failed:", err);
     return { records: [], deferredByDrain: null };

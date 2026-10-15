@@ -24,17 +24,17 @@
 //! otherwise have cloned it again. There is now one implementation, and adding
 //! a chain to a new call site is an import rather than a copy.
 //!
-//! # Compiled into BOTH crates, from ONE file
+//! # Owned by the lib, re-exported by the bin
 //!
 //! The runner is a lib crate (`qontinui_runner_lib`) plus a bin crate that
 //! share a source tree. `env_agent` lives in the lib; `fleet`,
-//! `agent_worktree` and the coord proxies live in the bin. `util` is declared
-//! in `main.rs` and — as an inline `pub mod util { pub mod error_chain; }` —
-//! in `lib.rs`, so **this file** is the single source of truth reachable from
-//! either crate under the same spelling, `crate::util::error_chain::…`. That
-//! is the established pattern here (`coord_doctor`, `process_helpers`), and it
-//! is what keeps the promotion from re-introducing a fourth copy by the back
-//! door.
+//! `agent_worktree` and the coord proxies live in the bin. The lib declares
+//! this file (inline `pub mod util { pub mod error_chain; }` in `lib.rs`) and
+//! the bin's `util/mod.rs` re-exports it
+//! (`pub use qontinui_runner_lib::util::error_chain;`), so it compiles once and
+//! is reachable from either crate under the same spelling,
+//! `crate::util::error_chain::…`. That is what keeps the promotion from
+//! re-introducing a fourth copy by the back door.
 
 /// Render `e` followed by every nested `source()`, joined with `": "`.
 ///
@@ -43,7 +43,7 @@
 /// the human string, it never rewrites its head.
 ///
 /// Allocation: one `String`, grown in place. Safe on a failure path.
-pub(crate) fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+pub fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     use std::fmt::Write as _;
     let mut out = e.to_string();
     let mut source = e.source();
@@ -62,7 +62,7 @@ pub(crate) fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 /// repeating the generic `error sending request for url (…)` head in `cause`
 /// spends the field on the one part that is never informative. What a reader
 /// needs there is `os error 10053` / `operation timed out`.
-pub(crate) fn error_chain_tail(e: &(dyn std::error::Error + 'static)) -> String {
+pub fn error_chain_tail(e: &(dyn std::error::Error + 'static)) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let mut source = e.source();

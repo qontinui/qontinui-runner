@@ -5,6 +5,7 @@ import { Search } from "lucide-react";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { TerminalTab } from "./useTerminalManager";
 import { fuzzyScore } from "./commands/fuzzy";
+import { useDisplayTitleResolver } from "./displayTitle";
 import {
   getAll as getRegistrySnapshot,
   getRegistryPaletteActions,
@@ -126,6 +127,7 @@ export function CommandPalette({
   const registrySnapshot = useSyncExternalStore(subscribeToRegistry, getRegistrySnapshot);
 
   // Build action list
+  const resolveTitle = useDisplayTitleResolver();
   const actions = useMemo(() => {
     const list: PaletteAction[] = [];
 
@@ -147,7 +149,7 @@ export function CommandPalette({
       const tab = tabs.find((t) => t.id === tabId);
       const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
       const label = zoneLabels[z];
-      const name = tab?.title ?? `Zone ${z + 1}`;
+      const name = tab ? resolveTitle(tab) : `Zone ${z + 1}`;
       const isPinned = pinnedZones.has(z);
 
       list.push({
@@ -349,7 +351,7 @@ export function CommandPalette({
           const otherTab = tabs.find((t) => t.id === assignments[other]);
           list.push({
             id: `compare-${focusedZone}-${other}`,
-            label: `Compare focused with zone ${other + 1}: ${otherTab?.title ?? "unknown"}`,
+            label: `Compare focused with zone ${other + 1}: ${otherTab ? resolveTitle(otherTab) : "unknown"}`,
             category: "Compare",
             priority: 3,
             action: () => onCompareZones(focusedZone, other),
@@ -361,6 +363,7 @@ export function CommandPalette({
     return list.sort((a, b) => a.priority - b.priority);
   }, [
     registrySnapshot, // Phase 7 — re-run projection when actions register/unregister
+    resolveTitle,
     tabs,
     assignments,
     sessionStates,

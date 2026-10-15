@@ -18,6 +18,7 @@ import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 import { useHotField } from "./useTerminalHotStore";
 import { SpawnTenantPicker } from "./SpawnTenantPicker";
 import { tabsForIds } from "./useZoneLayout";
+import { TabTitle, useDisplayTitleResolver } from "./displayTitle";
 import {
   LayoutGrid,
   ChevronLeft,
@@ -914,6 +915,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   // -----------------------------------------------------------------------
   // Build a lookup from tabId -> tab object
   // -----------------------------------------------------------------------
+  const resolveTitle = useDisplayTitleResolver();
   const tabMap = useMemo(() => {
     const m = new Map<string, (typeof tabs)[number]>();
     for (const t of tabs) m.set(t.id, t);
@@ -1154,7 +1156,9 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
                     className="w-1.5 h-1.5 rounded-full shrink-0"
                     style={{ backgroundColor: STATE_COLORS[state] }}
                   />
-                  <span className="flex-1 text-[11px] truncate">{tab.title}</span>
+                  <span className="flex-1 text-[11px] truncate">
+                    <TabTitle tab={tab} />
+                  </span>
                 </div>
               );
             })}
@@ -1177,7 +1181,9 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[#565f89]/70 group"
               >
                 <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-[#f7768e]/60" />
-                <span className="flex-1 text-[11px] truncate">{tab.title}</span>
+                <span className="flex-1 text-[11px] truncate">
+                  <TabTitle tab={tab} />
+                </span>
                 <span className="text-[9px] text-[#f7768e]/50 shrink-0">
                   exited ({tab.exitCode ?? "?"})
                 </span>
@@ -1186,7 +1192,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
                   onClick={() => closeTerminal(tab.id)}
                   data-ui-bridge-id={`terminal.dismiss-exited-${tab.id}`}
                   title="Dismiss this exited session"
-                  aria-label={`Dismiss exited session ${tab.title}`}
+                  aria-label={`Dismiss exited session ${resolveTitle(tab)}`}
                   className="shrink-0 p-0.5 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#2a2d3d] transition-colors"
                 >
                   <X className="w-3 h-3" />

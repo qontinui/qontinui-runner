@@ -181,6 +181,18 @@ cargo_build_jobs = 1
 #   `cargo test` also runs the doctests the Actions split drops, a broken
 #   doctest reds THIS lane alone: that red is a real doctest defect, not drift.
 #
+# - ci.yml's `test` job checks out with `fetch-depth: 0` + `filter: blob:none`
+#   so the workspace-assumption roster's SWAP RULE
+#   (src-tauri/tests/workspace_assumptions_are_enumerated.rs, merge_base_roster)
+#   can read the roster at `merge-base HEAD origin/main`. This lane fetches only
+#   the candidate ref (src-tauri/src/ci_node/checkout.rs), which updates no
+#   remote-tracking ref, so its base is whatever `origin/main` (else local
+#   `main`) the host last fetched — UNPINNED. A stale base can red a key main
+#   already carries, and can also let through a key main has since removed and
+#   this change re-adds; the Actions leg is the authority for this rule. An
+#   unreadable base is a loud `SWAP RULE UNKNOWN`. A swap-rule red here with
+#   the Actions leg green is this divergence, not a defect.
+#
 # DECLARED DIVERGENCES — ci.yml runs these in the `test` job, this lane does
 # not. The manifest has NO per-OS step selector (CiManifest is a flat
 # `steps` list with deny_unknown_fields) and no shell strings, so an

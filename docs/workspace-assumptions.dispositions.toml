@@ -14,45 +14,21 @@
 # After editing, regenerate the roster:
 #   UPDATE_WORKSPACE_ASSUMPTIONS=1 cargo-guard.sh test --test workspace_assumptions_are_enumerated
 #
+# THE RATCHET (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+# Phase A6): the roster's `unreviewed` ROW count must EQUAL this. A new
+# unreviewed row reds the test, naming it — review it here, or remove the
+# assumption; raising this number instead is a visible choice that needs its
+# reason in the PR. When triage brings the count down, the test asks for this
+# number to come down with it, so the gain is held.
+# 237 -> 239 (rebase onto main eefa3a189): main re-split plans_dir_migration's
+# seed log lines into `outcome_message` (3 rows replacing 1), +2 unreviewed
+# plans_dir rows landed by main, not by this PR. Exact count, not a loosening.
+unreviewed_ceiling = 238
+
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
 # supervisor is dev-only; a user-facing path that depends on :9875 is a defect
 # (src-tauri/src/webview_recovery.rs module doc).
-
-[[disposition]]
-class = "machine_path"
-file = "src/commands/accessibility.rs"
-symbol = "get_default_chrome_paths"
-disposition = "fallback_correct"
-note = "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
-reviewed = [
-    "r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\",",
-    "r\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\",",
-    "r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\",",
-    "r\"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe\",",
-    "r\"C:\\Users\\%USERNAME%\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe\",",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/commands/global_log_sources.rs"
-symbol = "find_log_sources_with_ai"
-disposition = "fallback_correct"
-note = "Example paths in an AI prompt's prose, not a path the runner reads."
-reviewed = [
-    "\"C:/ProgramData, %APPDATA%, etc.\"",
-    "{{\\\"name\\\": \\\"Application Log\\\", \\\"type\\\": \\\"file\\\", \\\"path\\\": \\\"C:/ProgramData/AppName/logs/app.log\\\", \\\"description\\\": \\\"Main applicati...",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/commands/mobile.rs"
-symbol = "find_adb_path"
-disposition = "fallback_correct"
-note = "Last-resort candidate after the configured adb_path and PATH; existence-checked."
-reviewed = [
-    "PathBuf::from(r\"C:\\Android\\sdk\\platform-tools\\adb.exe\"),",
-]
 
 [[disposition]]
 class = "machine_path"
@@ -62,27 +38,6 @@ disposition = "fallback_correct"
 note = "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
 reviewed = [
     "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/demo_workflows.rs"
-symbol = "update_workspace_paths"
-disposition = "fallback_correct"
-note = "Placeholder text REPLACED by the resolved temp dir; the literal is never used as a path."
-reviewed = [
-    "script.replace(\"C:/temp/qontinui-demo\", &demo_base_str)",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/mcp/misc.rs"
-symbol = "launch_debug_chrome"
-disposition = "fallback_correct"
-note = "Standard Windows Chrome install locations, existence-checked candidates."
-reviewed = [
-    "r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\",",
-    "r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\",",
 ]
 
 [[disposition]]
@@ -97,16 +52,6 @@ reviewed = [
 
 [[disposition]]
 class = "machine_path"
-file = "src/mcp/test_fixtures.rs"
-symbol = "record_from_seed"
-disposition = "dev_only_surface"
-note = "Debug-gated test-fixture injection endpoints; C:/repo is a fake session's working dir."
-reviewed = [
-    "working_dir: seed.working_dir.clone().or(Some(\"C:/repo\".to_string())),",
-]
-
-[[disposition]]
-class = "machine_path"
 file = "src/projects/snapshot.rs"
 symbol = "const NOISE_PREFIXES"
 disposition = "fallback_correct"
@@ -117,35 +62,12 @@ reviewed = [
 
 [[disposition]]
 class = "machine_path"
-file = "src/reflection/workflow.rs"
-symbol = "build_execution_analysis_steps"
-disposition = "fallback_correct"
-note = "Example path inside an AI prompt's prose."
-reviewed = [
-    "Reasoning: The AI spent 3 iterations searching for project files because it didn't know the workspace root. The conversation output shows...",
-]
-
-[[disposition]]
-class = "machine_path"
 file = "src/session_archive/discovery.rs"
 symbol = "discover_account_homes_from_env"
 disposition = "fallback_correct"
 note = "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
 reviewed = [
     "Some(PathBuf::from(\"C:\\\\claude\")),",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/step_executor/handlers/shell_command.rs"
-symbol = "ShellCommandHandler::find_git_bash"
-disposition = "fallback_correct"
-note = "Standard Git-for-Windows install locations, existence-checked candidates."
-reviewed = [
-    "r\"C:\\Program Files (x86)\\Git\\bin\\bash.exe\",",
-    "r\"C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe\",",
-    "r\"C:\\Program Files\\Git\\bin\\bash.exe\",",
-    "r\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\",",
 ]
 
 [[disposition]]
@@ -219,16 +141,6 @@ disposition = "dev_only_surface"
 note = "Registered only when <workspace-root>/qontinui-supervisor/frontend exists, i.e. only on a developer workspace."
 reviewed = [
     "\"http://localhost:9875\",",
-]
-
-[[disposition]]
-class = "supervisor_dependency"
-file = "src/env_agent/collectors.rs"
-symbol = "const KNOWN_DEV_PORTS"
-disposition = "dev_only_surface"
-note = "Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box."
-reviewed = [
-    "(\"supervisor\", 9875),",
 ]
 
 [[disposition]]
@@ -442,13 +354,13 @@ reviewed = [
 ]
 
 [[disposition]]
-class = "tenant_literal"
-file = "src/ai_provider/oauth_refresh.rs"
-symbol = "const CLIENT_ID"
-disposition = "fallback_correct"
-note = "Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install."
+class = "supervisor_dependency"
+file = "src/env_agent/collectors.rs"
+symbol = "const KNOWN_DEV_PORTS"
+disposition = "dev_only_surface"
+note = "Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box."
 reviewed = [
-    "const CLIENT_ID: &str = \"9d1c250a-e61b-44d9-88ed-5944d1962f5e\";",
+    "(\"supervisor\", 9875),",
 ]
 
 [[disposition]]
@@ -511,4 +423,162 @@ disposition = "fallback_correct"
 note = "Runs check_supervisor_available on a blocking thread and passes == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent, unknown (None) or a failed join selects the supervisor-DOWN rules block."
 reviewed = [
     "spawn_blocking_tracked(super::auto_continue::check_supervisor_available)",
+]
+
+[[disposition]]
+class = "dev_ports"
+file = "src/database/embedding_client.rs"
+symbol = "const DEFAULT_EMBEDDING_URL"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "dev_ports"
+file = "src/unified_workflow_executor/phase_helpers.rs"
+symbol = "compute_embedding_sync"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_skills/self_path.rs"
+symbol = "self_path_hit"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_skills/self_path.rs"
+symbol = "static CONFIG_REPO_CLAUDE_RE"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_skills/self_path.rs"
+symbol = "static ROOTED_TOKEN_RE"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_worktree/census.rs"
+symbol = "build_and_publish"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_worktree/fs_backstop.rs"
+symbol = "tick_once"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/capability_manifest.rs"
+symbol = "Rung::describe"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/coord_doctor.rs"
+symbol = "render_onboarding_doc"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/env_agent/collectors.rs"
+symbol = "claude_md_plain_ok"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/fleet.rs"
+symbol = "SkillParityViolation::describe"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/mcp/plan_library.rs"
+symbol = "const WRITE_CONTRACT"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/mcp/session_recap.rs"
+symbol = "analyze_handler"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/reflection/workflow.rs"
+symbol = "build_ui_bridge_completion_steps"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "resolve_url"
+disposition = "fallback_correct"
+note = "Middle rung of the canonical mirror's clone-URL resolution: read the workspace qontinui-claude-config checkout's remote.origin.url when that checkout exists; absent, the https://github.com/qontinui/qontinui-claude-config.git default answers. Off the spawn path; no checkout is read or written beyond that one bounded git config."
+reviewed = [
+    ".map(|root| root.join(\"qontinui-claude-config\"))",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/provenance.rs"
+symbol = "const CANONICAL_REPO"
+disposition = "fallback_correct"
+note = "The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk."
+reviewed = [
+    "const CANONICAL_REPO: &str = \"qontinui-claude-config\";",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "const DEFAULT_URL"
+disposition = "fallback_correct"
+note = "Last rung of the canonical mirror's clone-URL resolution, after QONTINUI_CANONICAL_CORPUS_URL and the workspace checkout's remote.origin.url: a remote URL in the same https://github.com/qontinui/<repo>.git form ci_node uses, never a local path. Absent network, the mirror fails closed and the spawn falls to the next corpus rung."
+reviewed = [
+    "const DEFAULT_URL: &str = \"https://github.com/qontinui/qontinui-claude-config.git\";",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "const MIRROR_DIR"
+disposition = "fallback_correct"
+note = "The bare mirror's path UNDER the per-instance runner config dir — a directory the runner owns and creates, not an assumption about the workspace layout; the repo name is only the directory's label."
+reviewed = [
+    "const MIRROR_DIR: &str = \"canonical/qontinui-claude-config.git\";",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "refresh_into"
+disposition = "fallback_correct"
+note = "A log message naming which repo@sha the mirror is serving — diagnostic text, never a path resolved on disk."
+reviewed = [
+    "\"canonical_corpus: serving qontinui-claude-config@{} ({} of {} bundled \\",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/capability_manifest.rs"
+symbol = "Rung::from_command_source"
+disposition = "fallback_correct"
+note = "A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk."
+reviewed = [
+    "qontinui-claude-config origin/main), not an account-layer arm\",",
 ]

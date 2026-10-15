@@ -367,15 +367,20 @@ const READ_TOOLS: &[&str] = &[
     "coord_diff_impact",
     "coord_inbox",
     "coord_layering_triage",
+    "coord_memory_get",
     "coord_memory_overview",
     "coord_memory_search",
     "coord_merge_order",
+    "coord_message_status",
     "coord_migration_queue",
     "coord_orient",
+    "coord_overlord_interventions",
     "coord_pr_status",
     "coord_reevaluate_dry",
+    "coord_session_obligations",
     "coord_session_worktrees",
     "coord_verification_queue",
+    "coord_watch_verdict",
     "coord_who_is_working_on",
 ];
 
@@ -942,6 +947,35 @@ mod tests {
         assert_eq!(
             operation_for_call("tools/call", Some("coord_can")),
             OPERATION_READ
+        );
+        // The sender's receipt read matches no read prefix, so only its
+        // exact `READ_TOOLS` entry keeps it from defaulting to a write.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_message_status")),
+            OPERATION_READ
+        );
+        // The by-id memory read-back is an exact read, while its write
+        // siblings (`coord_memory_record` / `_supersede`) stay writes.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_memory_get")),
+            OPERATION_READ
+        );
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_memory_record")),
+            OPERATION_WRITE
+        );
+        // The overlord's proof reads and ledger read are reads; the ledger
+        // append (`coord_overlord_record`) stays a write.
+        for tool in [
+            "coord_watch_verdict",
+            "coord_session_obligations",
+            "coord_overlord_interventions",
+        ] {
+            assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
+        }
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_overlord_record")),
+            OPERATION_WRITE
         );
         // `coord_can` is exact, so the cancel WRITE is not swallowed by it.
         assert_eq!(

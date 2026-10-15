@@ -35,6 +35,7 @@ import {
   THREAD_CEILING_ABS_MAX,
   THREAD_CEILING_INPUT_MIN,
   parseThreadCeilingInput,
+  threadCeilingPlaceholder,
   threadCeilingSourceText,
   threadCeilingsAreInverted,
   type ThreadCeilingsReport,
@@ -296,6 +297,48 @@ describe("thread ceilings — the panel renders the runner's fold, never its own
         }),
       ),
     ).toMatch(/census disagreed/);
+  });
+
+  it("quotes a number in the placeholder only when it IS the machine default", () => {
+    expect(threadCeilingPlaceholder("warn", report())).toBe("machine default (555)");
+    expect(threadCeilingPlaceholder("critical", report())).toBe("machine default (747)");
+    expect(threadCeilingPlaceholder("warn", null)).toBe("machine default");
+    expect(
+      threadCeilingPlaceholder(
+        "critical",
+        report({
+          warn: 276,
+          critical: 420,
+          provenance: { warn: "census_misread", critical: "census_misread" },
+          scaled: null,
+          scaledUnknown: "session_census_misread",
+        }),
+      ),
+    ).toBe("machine default (420)");
+    expect(
+      threadCeilingPlaceholder(
+        "warn",
+        report({ warn: 276, provenance: { warn: "floor", critical: "floor" } }),
+      ),
+    ).toBe("machine default (276)");
+    // The 2026-10-02 nit: a typed warn of 1000 raises an unset critical to
+    // 1000 via the ladder, which is not this machine's default.
+    expect(
+      threadCeilingPlaceholder(
+        "critical",
+        report({
+          warn: 1000,
+          critical: 1000,
+          provenance: { warn: "local", critical: "ladder" },
+          ladderCoerced: true,
+        }),
+      ),
+    ).toBe("machine default");
+    for (const src of ["fleet", "clamp_min", "clamp_max", "local"] as const) {
+      expect(
+        threadCeilingPlaceholder("warn", report({ provenance: { warn: src, critical: "scaled" } })),
+      ).toBe("machine default");
+    }
   });
 });
 

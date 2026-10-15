@@ -169,6 +169,17 @@ pub struct AdapterMetrics {
     /// record — a secondary/temp runner (it runs no register heartbeat), or a
     /// primary whose heartbeat is not succeeding.
     pub work_unit_writes_withheld_unknown_total: AtomicU64,
+    /// The work-unit write posture the loop decided on its last ARMED tick
+    /// (gauge) — see [`work_unit_write_posture`]. The two counters above say
+    /// how often writes were withheld; only this says whether they are being
+    /// withheld NOW, which is what a surface claiming "work units reach coord"
+    /// has to read.
+    ///
+    /// `None` before the first armed tick, and reset to `None` on every idle
+    /// (tier-off) tick: the posture is decided only when something is scanned,
+    /// so a reading left over from before the tier went off would describe a
+    /// cycle that is no longer running.
+    pub work_unit_write_posture: std::sync::Mutex<Option<WorkUnitWritePosture>>,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -197,6 +208,9 @@ pub struct MetricsSnapshot {
     pub seed_errors_total: u64,
     pub work_unit_writes_withheld_total: u64,
     pub work_unit_writes_withheld_unknown_total: u64,
+    /// The last armed tick's posture; `None` before one, or while the tier is
+    /// off — see [`AdapterMetrics::work_unit_write_posture`].
+    pub work_unit_write_posture: Option<WorkUnitWritePosture>,
 }
 
 impl AdapterMetrics {
@@ -237,6 +251,10 @@ impl AdapterMetrics {
             work_unit_writes_withheld_unknown_total: self
                 .work_unit_writes_withheld_unknown_total
                 .load(Ordering::Relaxed),
+            work_unit_write_posture: *self
+                .work_unit_write_posture
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
         }
     }
 }
@@ -443,7 +461,7 @@ impl ScanDivergence {
     }
 
     /// UNKNOWN with a named reason. Used for the failures that happen OUTSIDE
-    /// [`measure_scan_divergence`] — a probe task that could not be joined —
+    /// [`measure_scan_divergence_pinned`] — a probe task that could not be joined —
     /// so those never degrade into silence either.
     pub fn unknown(plans_dir: Option<String>, detail: impl Into<String>) -> Self {
         Self {
@@ -527,7 +545,7 @@ impl ScanDivergence {
     }
 }
 
-/// The four git reads [`measure_scan_divergence`] needs, behind a trait so the
+/// The four git reads [`measure_scan_divergence_pinned`] needs, behind a trait so the
 /// measurement is a pure function of its answers.
 ///
 /// Injected rather than called directly because the interesting cases — no
@@ -708,23 +726,15 @@ pub fn combine_refresh_stamps(
     }
 }
 
-/// Measure the scan source against the ref it should be reading.
+/// Measure the scan source against the ref it should be reading, resolving the
+/// default ref through the cycle's [`CycleRefPin`] — the tick's door, so the
+/// reading's `ref_sha` / `behind` / `ahead` / `ref_age_secs` describe the
+/// commit the cycle's `ref` census is listed at (plan
+/// `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`).
 ///
 /// Pure over `git` and the clock: every branch is reachable from a fake
 /// reader, which is what makes the four states testable without a repo on
-/// disk, and `now_unix` is a parameter so the ref's age is too.
-pub fn measure_scan_divergence(
-    plans_dir: Option<&Path>,
-    git: &dyn GitRefReader,
-    now_unix: i64,
-) -> ScanDivergence {
-    measure_scan_divergence_pinned(plans_dir, git, None, &|| now_unix)
-}
-
-/// [`measure_scan_divergence`] resolving the default ref through the cycle's
-/// [`CycleRefPin`] — the tick's door, so the reading's `ref_sha` / `behind` /
-/// `ahead` / `ref_age_secs` describe the commit the cycle's `ref` census is
-/// listed at (plan `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`).
+/// disk, and the clock is a parameter so the ref's age is too.
 ///
 /// `clock` is read AFTER the pin resolves, never before: on a writing pin the
 /// first resolution performs the cycle's fetch (up to `SCAN_FETCH_TIMEOUT`), and
@@ -752,13 +762,13 @@ pub fn measure_scan_divergence_pinned(
     reading.observed_at(now_unix)
 }
 
-/// The tick's measurement: [`measure_scan_divergence`] plus the reading's
+/// The tick's measurement: [`measure_scan_divergence_pinned`] plus the reading's
 /// plan-library `source_repo` key.
 ///
 /// Run on the blocking pool with the git probes because
 /// [`super::body_push::derive_source_repo`] walks the filesystem for a `.git`
 /// — work that does not belong on the single-worker runtime the scan-root
-/// report is later posted from. Kept out of [`measure_scan_divergence`] so
+/// report is later posted from. Kept out of [`measure_scan_divergence_pinned`] so
 /// that stays pure over its fake reader.
 fn measure_scan_source(
     dir: &Path,
@@ -3870,6 +3880,12 @@ impl LoopState {
                 ScanDivergence::not_scanning().observed_at(chrono::Utc::now().timestamp()),
                 metrics,
             );
+            // No posture is decided on an idle tick, so none may stand: see
+            // [`AdapterMetrics::work_unit_write_posture`].
+            *metrics
+                .work_unit_write_posture
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
             // Nothing is scanned — but a device whose plans dir was just
             // cleared must SAY so to the read side, or its last `measured` row
             // keeps being quoted until it ages out. The body sync's library
@@ -3955,6 +3971,10 @@ impl LoopState {
             self.bulk_seeded = false;
         }
         self.last_write_posture = Some(posture);
+        *metrics
+            .work_unit_write_posture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(posture);
 
         // ONE ref state for this whole cycle (see [`CycleRefPin`]). Created
         // here, after the posture and BEFORE the scan-divergence probe, so the
@@ -5691,6 +5711,20 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use std::sync::Mutex;
+
+    /// [`measure_scan_divergence_pinned`] with no pin and a constant clock —
+    /// the shape most probe tests want. Test-only: since the probe reads the
+    /// cycle's pin (plan
+    /// `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`) production
+    /// has no unpinned caller, and a public unpinned door would invite one
+    /// that re-creates the probe-vs-census commit mismatch.
+    fn measure_scan_divergence(
+        plans_dir: Option<&Path>,
+        git: &dyn GitRefReader,
+        now_unix: i64,
+    ) -> ScanDivergence {
+        measure_scan_divergence_pinned(plans_dir, git, None, &|| now_unix)
+    }
 
     /// W2: [`read_device_binding_count`] fills `local` from
     /// `auth::device_binding_count`, and nothing else observes WHICH auth
@@ -13783,6 +13817,11 @@ Body.
         assert_eq!(snap.work_unit_writes_withheld_total, 2);
         assert_eq!(snap.work_unit_writes_withheld_unknown_total, 0);
         assert_eq!(snap.cycles_total, 2, "a withheld cycle is still a cycle");
+        assert_eq!(
+            snap.work_unit_write_posture,
+            Some(WorkUnitWritePosture::WithheldMultiBound(3)),
+            "the gauge says withheld NOW, not just that it once was"
+        );
         let logged = logs.text();
         assert_eq!(
             logged.matches("bound to 3 tenants").count(),
@@ -13801,6 +13840,19 @@ Body.
             "the active plan and the archive stamp both push when single-bound"
         );
         assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 0);
+        assert_eq!(
+            metrics.snapshot().work_unit_write_posture,
+            Some(WorkUnitWritePosture::Write)
+        );
+
+        // Tier switched off: no posture is decided, so none may stand.
+        *cell.lock().unwrap() = PathInputs::default();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            metrics.snapshot().work_unit_write_posture,
+            None,
+            "an idle tick clears the posture rather than leaving the last one standing"
+        );
     }
 
     /// **A WITHHELD cycle still LISTS the ref, and still reports both stem

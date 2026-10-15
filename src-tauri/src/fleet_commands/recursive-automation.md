@@ -137,8 +137,8 @@ After completing all state visits, read the relevant logs:
 ```bash
 BASE="$PWD"
 # The runner writes its own sink and jsonl streams next to its app-data dir,
-# NOT into the workspace .dev-logs/ — read both. See
-# qontinui-claude-config/knowledge-base/qontinui-specific/debugging-logs.md
+# NOT into the workspace .dev-logs/ — read both. Exact dir:
+# GET http://127.0.0.1:9876/log-sources/runner-log-sink
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
 
 # The runner's own tracing sink (there is no runner-backend.log — that name
@@ -172,10 +172,16 @@ If any errors were found:
 1. Identify the root cause from logs and screenshots
 2. Read the relevant source code
 3. Make the fix
-4. Restart affected services if needed:
-   ```bash
-   $PWD/qontinui-claude-config/scripts/restart-services.sh frontend clean
-   ```
+4. Restart affected services if needed: restart your project's services the
+   way your project documents (its `CLAUDE.md`, `README`, dev script or process
+   manager) — e.g. the frontend with a build-cache clean. Never stop or restart
+   a runner that hosts live agent sessions.
+5. If the fix touched runner code, ask the user to restart the runner; do not
+   restart it yourself. This loop navigates through the `mcp__qontinui__*`
+   tools, which reach the runner they are configured for, so the next
+   iteration verifies the fix only after that runner has restarted. Wait for
+   the user's confirmation; an iteration run before it grades a build without
+   the fix and must not count as SUCCESS.
 
 ### Step 7: Record the Round, Then Continue / Succeed / Escalate
 

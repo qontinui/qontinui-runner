@@ -345,6 +345,32 @@ export function threadCeilingSourceText(
 }
 
 /**
+ * The empty thread-ceiling input's placeholder.
+ *
+ * It quotes the enforced number only when that number IS this machine's
+ * default — provenance `scaled`, `floor` or `census_misread`, the three arms
+ * that name the default the runner chose. Under every other arm the enforced
+ * value is something else: a fleet ceiling, a clamp, or the warn ceiling the
+ * ladder raised critical to. Labelling it "machine default (N)" would be the
+ * lie the line under the input exists to correct. The bare words are honest
+ * there, and that line still states the number and its reason.
+ */
+export function threadCeilingPlaceholder(
+  which: "warn" | "critical",
+  report: ThreadCeilingsReport | null,
+): string {
+  if (!report) return "machine default";
+  switch (report.provenance[which]) {
+    case "scaled":
+    case "floor":
+    case "census_misread":
+      return `machine default (${report[which]})`;
+    default:
+      return "machine default";
+  }
+}
+
+/**
  * Split a comma/newline-separated allowlist textarea into repo entries.
  *
  * Blank entries are dropped rather than persisted: `ci_node`'s contract is that

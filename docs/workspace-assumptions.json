@@ -5,17 +5,18 @@
   "rows": [
     {
       "class": "dev_ports",
-      "file": "src/database/pg/apps.rs",
-      "symbol": "const DEV_SIBLING_APPS",
-      "excerpt": "\"http://localhost:3001\",",
+      "file": "src/database/embedding_client.rs",
+      "symbol": "const DEFAULT_EMBEDDING_URL",
+      "excerpt": "const DEFAULT_EMBEDDING_URL: &str = \"http://127.0.0.1:8001/api/embeddings/compute-text\";",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "dev_ports",
       "file": "src/database/pg/apps.rs",
       "symbol": "const DEV_SIBLING_APPS",
-      "excerpt": "\"http://localhost:9875\",",
+      "excerpt": "\"http://localhost:3001\",",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -29,9 +30,17 @@
     },
     {
       "class": "dev_ports",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "generate_mcp_tool_context",
+      "excerpt": "{\"tool\": \"mcp__qontinui__sdk_cross_app_compare\", \"source_url\": \"http://localhost:1420\", \"target_url\": \"http://localhost:3001\", \"include_c...",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "dev_ports",
       "file": "src/mcp/backend_relay.rs",
       "symbol": "relay_loop",
-      "excerpt": "http://127.0.0.1:8000 on a DEBUG build) and that it is up.",
+      "excerpt": "http://127.0.0.1:8000 on a DEBUG build) and that it is up.\"",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -47,23 +56,7 @@
       "class": "dev_ports",
       "file": "src/mcp/origin_guard.rs",
       "symbol": "const DEFAULT_TRUSTED_ORIGINS",
-      "excerpt": "\"http://127.0.0.1:9875\",",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "dev_ports",
-      "file": "src/mcp/origin_guard.rs",
-      "symbol": "const DEFAULT_TRUSTED_ORIGINS",
       "excerpt": "\"http://localhost:3001\",",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "dev_ports",
-      "file": "src/mcp/origin_guard.rs",
-      "symbol": "const DEFAULT_TRUSTED_ORIGINS",
-      "excerpt": "\"http://localhost:9875\",",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -71,7 +64,7 @@
       "class": "dev_ports",
       "file": "src/mcp/ui_bridge/exploration.rs",
       "symbol": "start_ui_bridge_exploration",
-      "excerpt": "Example: {{\\\"connection_url\\\": \\\"http://localhost:3001\\\", \\\"target_type\\\": \\\"web\\\"}}",
+      "excerpt": "Example: {{\\\"connection_url\\\": \\\"http://localhost:3001\\\", \\\"target_type\\\": \\\"web\\\"}}\",",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -98,6 +91,15 @@
       "excerpt": "\"outputPreview: \\\"State Recv-Q Send-Q Local Address:Port Peer Address:Port\\\\nLISTEN 0 128 0.0.0.0:22 0.0.0.0:*\\\\nLISTEN 0 128 *:443 *:*\\\\...",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "dev_ports",
+      "file": "src/unified_workflow_executor/phase_helpers.rs",
+      "symbol": "compute_embedding_sync",
+      "excerpt": ".post(\"http://127.0.0.1:8001/api/embeddings/compute-text\")",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "dev_ports",
@@ -213,111 +215,12 @@
     },
     {
       "class": "machine_path",
-      "file": "src/commands/accessibility.rs",
-      "symbol": "get_default_chrome_paths",
-      "excerpt": "r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/commands/accessibility.rs",
-      "symbol": "get_default_chrome_paths",
-      "excerpt": "r\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/commands/accessibility.rs",
-      "symbol": "get_default_chrome_paths",
-      "excerpt": "r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/commands/accessibility.rs",
-      "symbol": "get_default_chrome_paths",
-      "excerpt": "r\"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/commands/accessibility.rs",
-      "symbol": "get_default_chrome_paths",
-      "excerpt": "r\"C:\\Users\\%USERNAME%\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/commands/global_log_sources.rs",
-      "symbol": "find_log_sources_with_ai",
-      "excerpt": "\"C:/ProgramData, %APPDATA%, etc.\"",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Example paths in an AI prompt's prose, not a path the runner reads."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/commands/global_log_sources.rs",
-      "symbol": "find_log_sources_with_ai",
-      "excerpt": "{{\\\"name\\\": \\\"Application Log\\\", \\\"type\\\": \\\"file\\\", \\\"path\\\": \\\"C:/ProgramData/AppName/logs/app.log\\\", \\\"description\\\": \\\"Main applicati...",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Example paths in an AI prompt's prose, not a path the runner reads."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/commands/mobile.rs",
-      "symbol": "find_adb_path",
-      "excerpt": "PathBuf::from(r\"C:\\Android\\sdk\\platform-tools\\adb.exe\"),",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Last-resort candidate after the configured adb_path and PATH; existence-checked."
-    },
-    {
-      "class": "machine_path",
       "file": "src/commands/setup_wizard.rs",
       "symbol": "discover_claude_config_dirs",
       "excerpt": "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/demo_workflows.rs",
-      "symbol": "update_workspace_paths",
-      "excerpt": "script.replace(\"C:/temp/qontinui-demo\", &demo_base_str)",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Placeholder text REPLACED by the resolved temp dir; the literal is never used as a path."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/mcp/misc.rs",
-      "symbol": "launch_debug_chrome",
-      "excerpt": "r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Windows Chrome install locations, existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/mcp/misc.rs",
-      "symbol": "launch_debug_chrome",
-      "excerpt": "r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Windows Chrome install locations, existence-checked candidates."
     },
     {
       "class": "machine_path",
@@ -330,15 +233,6 @@
     },
     {
       "class": "machine_path",
-      "file": "src/mcp/test_fixtures.rs",
-      "symbol": "record_from_seed",
-      "excerpt": "working_dir: seed.working_dir.clone().or(Some(\"C:/repo\".to_string())),",
-      "count": 1,
-      "disposition": "dev_only_surface",
-      "note": "Debug-gated test-fixture injection endpoints; C:/repo is a fake session's working dir."
-    },
-    {
-      "class": "machine_path",
       "file": "src/projects/snapshot.rs",
       "symbol": "const NOISE_PREFIXES",
       "excerpt": "const NOISE_PREFIXES: [&str; 1] = [\"c:\\\\claude\\\\\"];",
@@ -348,57 +242,12 @@
     },
     {
       "class": "machine_path",
-      "file": "src/reflection/workflow.rs",
-      "symbol": "build_execution_analysis_steps",
-      "excerpt": "Reasoning: The AI spent 3 iterations searching for project files because it didn't know the workspace root. The conversation output shows...",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Example path inside an AI prompt's prose."
-    },
-    {
-      "class": "machine_path",
       "file": "src/session_archive/discovery.rs",
       "symbol": "discover_account_homes_from_env",
       "excerpt": "Some(PathBuf::from(\"C:\\\\claude\")),",
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/step_executor/handlers/shell_command.rs",
-      "symbol": "ShellCommandHandler::find_git_bash",
-      "excerpt": "r\"C:\\Program Files (x86)\\Git\\bin\\bash.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Git-for-Windows install locations, existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/step_executor/handlers/shell_command.rs",
-      "symbol": "ShellCommandHandler::find_git_bash",
-      "excerpt": "r\"C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Git-for-Windows install locations, existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/step_executor/handlers/shell_command.rs",
-      "symbol": "ShellCommandHandler::find_git_bash",
-      "excerpt": "r\"C:\\Program Files\\Git\\bin\\bash.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Git-for-Windows install locations, existence-checked candidates."
-    },
-    {
-      "class": "machine_path",
-      "file": "src/step_executor/handlers/shell_command.rs",
-      "symbol": "ShellCommandHandler::find_git_bash",
-      "excerpt": "r\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\",",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Standard Git-for-Windows install locations, existence-checked candidates."
     },
     {
       "class": "machine_path",
@@ -1533,7 +1382,15 @@
       "class": "repo_layout",
       "file": "src/agent_runtime.rs",
       "symbol": "provision_agent_definitions",
-      "excerpt": "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \\",
+      "excerpt": "\"agent_runtime: no qontinui-root resolved; skipping .claude/agents \\",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_runtime.rs",
+      "symbol": "provision_agent_definitions",
+      "excerpt": "\"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1556,11 +1413,56 @@
     },
     {
       "class": "repo_layout",
+      "file": "src/agent_skills/self_path.rs",
+      "symbol": "self_path_hit",
+      "excerpt": "\"reaches its own tree through a `qontinui-claude-config` checkout\".to_string(),",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_skills/self_path.rs",
+      "symbol": "static CONFIG_REPO_CLAUDE_RE",
+      "excerpt": "Lazy::new(|| Regex::new(r\"qontinui-claude-config[/\\\\]+\\.claude\\b\").expect(\"arm A regex\"));",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_skills/self_path.rs",
+      "symbol": "static ROOTED_TOKEN_RE",
+      "excerpt": "r\"^(?:<workspace-root>\",",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_worktree/census.rs",
+      "symbol": "build_and_publish",
+      "excerpt": "debug!(\"worktree_census: no qontinui-root dir resolved — skipping\");",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
       "file": "src/agent_worktree/disk_survey.rs",
       "symbol": "survey",
       "excerpt": "\"the workspace root could not be resolved (set QONTINUI_ROOT, or the \\",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/agent_worktree/fs_backstop.rs",
+      "symbol": "tick_once",
+      "excerpt": "debug!(\"fs_backstop: no qontinui-root dir resolved — skipping\");",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1604,9 +1506,80 @@
     },
     {
       "class": "repo_layout",
+      "file": "src/canonical_corpus.rs",
+      "symbol": "const DEFAULT_URL",
+      "excerpt": "const DEFAULT_URL: &str = \"https://github.com/qontinui/qontinui-claude-config.git\";",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Last rung of the canonical mirror's clone-URL resolution, after QONTINUI_CANONICAL_CORPUS_URL and the workspace checkout's remote.origin.url: a remote URL in the same https://github.com/qontinui/<repo>.git form ci_node uses, never a local path. Absent network, the mirror fails closed and the spawn falls to the next corpus rung."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/canonical_corpus.rs",
+      "symbol": "const MIRROR_DIR",
+      "excerpt": "const MIRROR_DIR: &str = \"canonical/qontinui-claude-config.git\";",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The bare mirror's path UNDER the per-instance runner config dir — a directory the runner owns and creates, not an assumption about the workspace layout; the repo name is only the directory's label."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/canonical_corpus.rs",
+      "symbol": "refresh_into",
+      "excerpt": "\"canonical_corpus: serving qontinui-claude-config@{} ({} of {} bundled \\",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "A log message naming which repo@sha the mirror is serving — diagnostic text, never a path resolved on disk."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/canonical_corpus.rs",
+      "symbol": "resolve_url",
+      "excerpt": ".map(|root| root.join(\"qontinui-claude-config\"))",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Middle rung of the canonical mirror's clone-URL resolution: read the workspace qontinui-claude-config checkout's remote.origin.url when that checkout exists; absent, the https://github.com/qontinui/qontinui-claude-config.git default answers. Off the spawn path; no checkout is read or written beyond that one bounded git config."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/capability_manifest.rs",
+      "symbol": "Rung::describe",
+      "excerpt": "\"found under `<workspace-root>/qontinui-runner/src-tauri/…` — this \\",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/capability_manifest.rs",
+      "symbol": "Rung::describe",
+      "excerpt": "`qontinui-claude-config`) — answers only where that repo exists\"",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/capability_manifest.rs",
+      "symbol": "Rung::from_command_source",
+      "excerpt": "qontinui-claude-config origin/main), not an account-layer arm\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk."
+    },
+    {
+      "class": "repo_layout",
       "file": "src/capability_manifest.rs",
       "symbol": "const CAPABILITY_SPECS",
-      "excerpt": "Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` \\",
+      "excerpt": "`<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off \\",
+      "count": 2,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/capability_manifest.rs",
+      "symbol": "const CAPABILITY_SPECS",
+      "excerpt": "copy is a no-op that logs \\\"no qontinui-root resolved; skipping \\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1614,7 +1587,7 @@
       "class": "repo_layout",
       "file": "src/capability_manifest.rs",
       "symbol": "const CAPABILITY_SPECS",
-      "excerpt": "`<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off \\",
+      "excerpt": "description: \"Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` \\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1700,9 +1673,18 @@
     },
     {
       "class": "repo_layout",
+      "file": "src/coord_doctor.rs",
+      "symbol": "render_onboarding_doc",
+      "excerpt": "consts, and `coord-gates-and-access.md` in `qontinui-claude-config`.\\n\\n\",",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
       "file": "src/coord_mcp.rs",
       "symbol": "probe_stdio_shim",
-      "excerpt": "no workspace root resolved, so <root>/qontinui-claude-config/scripts/\\",
+      "excerpt": "\"no workspace root resolved, so <root>/qontinui-claude-config/scripts/\\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1765,6 +1747,15 @@
     {
       "class": "repo_layout",
       "file": "src/env_agent/collectors.rs",
+      "symbol": "claude_md_plain_ok",
+      "excerpt": "(Some(\"@qontinui-claude-config/CLAUDE.md\"), None)",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/env_agent/collectors.rs",
       "symbol": "const HARNESS_CONFIG_REPO_DIR",
       "excerpt": "const HARNESS_CONFIG_REPO_DIR: &str = \"qontinui-claude-config\";",
       "count": 1,
@@ -1805,8 +1796,34 @@
     {
       "class": "repo_layout",
       "file": "src/fleet.rs",
+      "symbol": "SkillParityViolation::describe",
+      "excerpt": "qontinui-claude-config has no readable .claude/skills/{rel} — \\",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/fleet.rs",
+      "symbol": "SkillParityViolation::describe",
+      "excerpt": "qontinui-claude-config/.claude/skills/{rel} — sessions read the \\",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/fleet.rs",
       "symbol": "const SKILL_SOURCE_REL",
       "excerpt": "const SKILL_SOURCE_REL: &[&str] = &[\"qontinui-claude-config\", \".claude\", \"skills\"];",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/fleet.rs",
+      "symbol": "publish_tree_state",
+      "excerpt": "\"fleet::tree_publisher: no qontinui-root directory found (set \\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1850,6 +1867,24 @@
       "excerpt": "\"Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \\",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/mcp/plan_library.rs",
+      "symbol": "const WRITE_CONTRACT",
+      "excerpt": "with (a runner scan uses `<repo>/<dir>`, e.g. `qontinui-dev-notes/prompts`). \\",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/mcp/session_recap.rs",
+      "symbol": "analyze_handler",
+      "excerpt": "Json(api_error(format!(\"Cannot find qontinui-root: {}\", e))),",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1909,6 +1944,24 @@
     },
     {
       "class": "repo_layout",
+      "file": "src/provenance.rs",
+      "symbol": "const CANONICAL_REPO",
+      "excerpt": "const CANONICAL_REPO: &str = \"qontinui-claude-config\";",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/reflection/workflow.rs",
+      "symbol": "build_ui_bridge_completion_steps",
+      "excerpt": "- Write the full plan to `qontinui-dev-notes/ui-bridge-implementation-plan.md`",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
       "file": "src/routing/q_router.rs",
       "symbol": "Domain::from_domain_tags",
       "excerpt": "if lower.contains(\"frontend\") || lower.contains(\"ui-bridge\") {",
@@ -1920,6 +1973,15 @@
       "file": "src/slash_commands.rs",
       "symbol": "find_commands_directory_reported",
       "excerpt": "\"<workspace-root>/qontinui-claude-config/.claude/commands\",",
+      "count": 1,
+      "disposition": "unreviewed",
+      "capability": "slash_commands"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/slash_commands.rs",
+      "symbol": "find_commands_directory_reported",
+      "excerpt": "\"this device has no qontinui-claude-config checkout, and this import has \\",
       "count": 1,
       "disposition": "unreviewed",
       "capability": "slash_commands"
@@ -2478,15 +2540,6 @@
       "count": 1,
       "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
       "note": "The supervisor HTTP client used by the user-facing orchestration loop."
-    },
-    {
-      "class": "tenant_literal",
-      "file": "src/ai_provider/oauth_refresh.rs",
-      "symbol": "const CLIENT_ID",
-      "excerpt": "const CLIENT_ID: &str = \"9d1c250a-e61b-44d9-88ed-5944d1962f5e\";",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install."
     }
   ]
 }

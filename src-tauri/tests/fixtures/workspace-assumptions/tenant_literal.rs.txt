@@ -1,4 +1,4 @@
 // Planted fixture for class `tenant_literal`.
 fn planted_tenant_literal() -> &'static str {
-    "0f8fad5b-d9cb-469f-a165-70867728950e"
+    "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
 }

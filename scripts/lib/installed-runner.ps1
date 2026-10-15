@@ -65,9 +65,73 @@
 #      measured on the first run rather than guessed at. There is no return
 #      path that yields $null, so a caller cannot mistake "not found" for a
 #      usable exe.
+#
+# LINUX (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# Phase 6). Find-InstalledRunnerExe takes a -Platform that defaults to the host,
+# and on linux it delegates to Find-PublishedLinuxRunner, below. There is no
+# install directory to probe there: the leg unpacks the release asset into a
+# temp prefix without root, so -InstallRoot is REQUIRED and names that prefix.
+# Measured on v1.0.11 (2026-10-04, `dpkg-deb -c` of the .deb, and the AppImage
+# run with --appimage-extract), the two shapes put the binary at the same
+# relative path:
+#
+#   dpkg -x Qontinui.Runner_<v>_amd64.deb <prefix>   <prefix>/usr/bin/qontinui-runner
+#   <AppImage> --appimage-extract  (cwd <prefix>)    <prefix>/squashfs-root/usr/bin/qontinui-runner
+#
+# with the sidecars (qontinui-pr, qontinui_profile, ...) beside it in usr/bin
+# and the bundled resources under "usr/lib/Qontinui Runner/".
+#
+# ON LINUX THE PATH RULE IS A GUARD, NOT A PROOF OF PROVENANCE. Neither shape
+# has a product-named parent, so the structural property is usr/bin: the binary
+# must sit directly in a `bin` directory whose parent is `usr`, which the dev
+# binary (target/debug/qontinui-runner) does not. The CI build tree carries
+# usr/bin layouts of its own (target/<triple>/release/bundle/appimage/
+# Qontinui Runner.AppDir/usr/bin/, and the deb staging dir beside it), so
+# Assert-PublishedLinuxRunner also refuses any path with a `target` or
+# `target-*` segment (the shared target-agent/ dir included) and any path inside
+# this repo's own checkout -- on the path as given and on its realpath, so a
+# symlink planted in the prefix cannot point back at one of those. That refuses
+# the KNOWN build and checkout shapes and nothing more: a build under a
+# CARGO_TARGET_DIR with another name, or a dev binary hard-linked or copied
+# into a well-shaped prefix, is FOUND (test-installed-runner.ps1 pins this).
+# What proves the prefix came from the release is Confirm-PublishedLinuxAssetHash
+# on the downloaded .deb / AppImage, matched by sha256 against the release's
+# checksums-linux-x64.txt BEFORE it is unpacked. A leg that skips that call has
+# a guard and no provenance.
+#
+# A Linux leg that cannot locate the binary is not a parity number. Its throws
+# start `unknown(<reason>)` with <reason> from $LinuxUnknownReasons, and
+# Get-LinuxUnknownReason reads it back, so the caller can record the typed
+# UNKNOWN instead of a 0 or a red run. A fact about the RELEASE is an unknown
+# too, and it is decided from the release's asset LIST, never from a missing
+# local file: no Linux asset (Select-PublishedLinuxAsset), or no
+# checksums-linux-x64.txt to prove one against (Select-PublishedLinuxChecksums).
+# The other throws are NOT unknowns, and all of them mean the run is red:
+#   `Refusing`      the guard fired; the asset or checksums file the harness
+#                   downloaded is not on disk (a failed download is a harness
+#                   fault, not a release fact); or the asset's hash matched no
+#                   checksums line -- the harness was pointed at the wrong
+#                   thing, or the download is incomplete
+#   `environment:`  the box lacks what the guard needs, e.g. GNU realpath
+#   plain error     the CALLER passed nothing to work with (an empty -Version,
+#                   a $null -AssetNames, an empty -ChecksumsPath), which no
+#                   release fact can explain
 # ---------------------------------------------------------------------------
 $InstalledExeName = 'qontinui-runner.exe'
 $InstalledDirName = 'Qontinui Runner'
+$LinuxBinaryName = 'qontinui-runner'
+# The enumerated set. A reason outside it is an internal error, never a soft UNKNOWN.
+#   no_linux_asset_on_release  the release carries neither a .deb nor an AppImage
+#                              (the Linux release leg is continue-on-error; v1.0.6
+#                              and v1.0.7 shipped none)
+#   no_checksums_on_release    the release's asset list has no checksums-linux-x64.txt,
+#                              so the asset's provenance cannot be proven
+#   no_prefix_given            -InstallRoot was empty, so nothing was unpacked to look in
+#   prefix_missing             the prefix does not exist (the unpack never ran or failed)
+#   binary_absent              the prefix exists but holds the binary in neither shape
+$LinuxUnknownReasons = @('no_linux_asset_on_release', 'no_checksums_on_release', 'no_prefix_given', 'prefix_missing', 'binary_absent')
+# lib/ -> scripts/ -> the checkout this harness runs from.
+$GuardRepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 function Assert-InstalledRunnerExe {
     param([string]$Path)
@@ -94,7 +158,13 @@ function Assert-InstalledRunnerExe {
 }
 
 function Find-InstalledRunnerExe {
-    param([string]$InstallRoot)
+    param([string]$InstallRoot, [ValidateSet('windows', 'linux')] [string]$Platform = '')
+
+    if (-not $Platform) {
+        # $IsLinux does not exist on Windows PowerShell 5.1, and $null is false.
+        if ($IsLinux) { $Platform = 'linux' } else { $Platform = 'windows' }
+    }
+    if ($Platform -eq 'linux') { return (Find-PublishedLinuxRunner -Prefix $InstallRoot) }
 
     $candidates = New-Object System.Collections.Generic.List[string]
     $notes = New-Object System.Collections.Generic.List[string]
@@ -155,6 +225,214 @@ function Find-InstalledRunnerExe {
     $lines += ""
     $lines += "This harness does NOT fall back to target/debug/qontinui-runner.exe: running"
     $lines += "the dev build here would compare it against itself and report perfect parity,"
+    $lines += "hiding exactly the drift this gate exists to catch."
+    throw ($lines -join [Environment]::NewLine)
+}
+
+function New-LinuxUnknown {
+    param([string]$Reason, [string]$Detail)
+
+    if ($LinuxUnknownReasons -notcontains $Reason) {
+        throw ("internal: '$Reason' is not one of the enumerated Linux unknown reasons (" +
+               ($LinuxUnknownReasons -join ', ') + ").")
+    }
+    return ("unknown($Reason): $Detail")
+}
+
+# Reads the typed reason back out of a thrown message; $null when the message is
+# not one of ours (a refusal, or any other failure), which the caller must then
+# treat as a failure and not as an UNKNOWN.
+function Get-LinuxUnknownReason {
+    param([string]$Message)
+
+    if ($Message -match '^unknown\((?<r>[a-z_]+)\)' -and $LinuxUnknownReasons -contains $Matches['r']) {
+        return $Matches['r']
+    }
+    return $null
+}
+
+# Picks the Linux asset to unpack from a release's asset names: the .deb, else
+# the AppImage. GitHub stores "Qontinui Runner_<v>_amd64.deb" as
+# "Qontinui.Runner_<v>_amd64.deb" (measured on v1.0.11), so both spellings match.
+# -Version may carry the tag's leading `v`; the asset names never do.
+function Select-PublishedLinuxAsset {
+    param([string[]]$AssetNames, [string]$Version)
+
+    if ($null -eq $AssetNames) {
+        throw ("Select-PublishedLinuxAsset: -AssetNames is null. That is a listing that never ran, " +
+               "not a release with no Linux asset; pass @() only for a release that has no assets.")
+    }
+    $bare = ([string]$Version).Trim() -replace '^v', ''
+    if ([string]::IsNullOrWhiteSpace($bare)) {
+        throw ("Select-PublishedLinuxAsset: -Version is empty ('$Version'). An empty version would " +
+               "match no asset and read as no_linux_asset_on_release, which it is not.")
+    }
+    $v = [regex]::Escape($bare)
+    foreach ($kind in @(@{ Kind = 'deb'; Ext = 'deb' }, @{ Kind = 'appimage'; Ext = 'AppImage' })) {
+        foreach ($n in @($AssetNames)) {
+            if ($n -cmatch ('^Qontinui[. ]Runner_' + $v + '_amd64\.' + $kind.Ext + '$')) {
+                return @{ Kind = $kind.Kind; Name = $n }
+            }
+        }
+    }
+    $listed = '(none)'
+    if (@($AssetNames).Count -gt 0) { $listed = (@($AssetNames) -join ', ') }
+    throw (New-LinuxUnknown 'no_linux_asset_on_release' ("release $bare carries no " +
+           "Qontinui.Runner_${bare}_amd64.deb and no _amd64.AppImage. Assets: $listed"))
+}
+
+# Names the checksums asset to download from a release's asset names, or throws
+# unknown(no_checksums_on_release) when the release carries none. This, not a
+# missing local file, is where that reason is decided.
+function Select-PublishedLinuxChecksums {
+    param([string[]]$AssetNames)
+
+    if ($null -eq $AssetNames) {
+        throw ("Select-PublishedLinuxChecksums: -AssetNames is null. That is a listing that never ran, " +
+               "not a release with no checksums; pass @() only for a release that has no assets.")
+    }
+    foreach ($n in @($AssetNames)) {
+        if ($n -ceq 'checksums-linux-x64.txt') { return $n }
+    }
+    $listed = '(none)'
+    if (@($AssetNames).Count -gt 0) { $listed = (@($AssetNames) -join ', ') }
+    throw (New-LinuxUnknown 'no_checksums_on_release' ("the release carries no checksums-linux-x64.txt, " +
+           "so no Linux asset's provenance can be proven. Assets: $listed"))
+}
+
+# The provenance check. Call it on the DOWNLOADED .deb / AppImage before
+# unpacking it. Matched by sha256, never by name: checksums-linux-x64.txt names
+# the pre-upload path ("deb/Qontinui Runner_1.0.11_amd64.deb", with a space)
+# while the asset is "Qontinui.Runner_1.0.11_amd64.deb", so a name match would
+# never succeed. Returns the matched checksums line. Both paths are files the
+# harness downloaded, so either one missing throws `Refusing` (a failed download
+# is a harness fault; whether the release HAS a checksums file is
+# Select-PublishedLinuxChecksums' question), as does a hash that matches no line,
+# because an asset that cannot be proven published must not be measured. An
+# empty -ChecksumsPath is a plain caller error.
+function Confirm-PublishedLinuxAssetHash {
+    param([string]$AssetPath, [string]$ChecksumsPath)
+
+    if ([string]::IsNullOrWhiteSpace($AssetPath) -or -not (Test-Path -LiteralPath $AssetPath -PathType Leaf)) {
+        throw ("Refusing '$AssetPath': cannot check its provenance, it is not a file.")
+    }
+    if ([string]::IsNullOrWhiteSpace($ChecksumsPath)) {
+        throw ("Confirm-PublishedLinuxAssetHash: -ChecksumsPath is empty ('$ChecksumsPath').")
+    }
+    if (-not (Test-Path -LiteralPath $ChecksumsPath -PathType Leaf)) {
+        throw ("Refusing '$AssetPath': the checksums file '$ChecksumsPath' is not on disk, so its " +
+               "provenance cannot be proven. The download failed; that is a harness fault, not a release fact.")
+    }
+    $hash = (Get-FileHash -LiteralPath $AssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    foreach ($line in @(Get-Content -LiteralPath $ChecksumsPath)) {
+        if ($line -match '^\s*(?<h>[0-9A-Fa-f]{64})\s') {
+            if ($Matches['h'].ToLowerInvariant() -eq $hash) { return $line.Trim() }
+        }
+    }
+    throw ("Refusing '$AssetPath': its sha256 $hash matches no line in '$ChecksumsPath'. It is not " +
+           "an asset this release published, or the download is incomplete; re-download before treating " +
+           "this as a defect. Nothing unpacked from it may stand for the published build.")
+}
+
+# GNU realpath -m canonicalizes without requiring the path to exist, so the
+# guard can run on a candidate before it is probed. Linux-only by construction.
+# A missing or non-GNU realpath is the BOX's problem, not the candidate's, so it
+# throws `environment:` rather than `Refusing`.
+function Resolve-LinuxRealPath {
+    param([string]$Path)
+
+    if (-not (Get-Command realpath -CommandType Application -ErrorAction SilentlyContinue)) {
+        throw ("environment: no realpath on PATH. The never-the-dev-binary guard needs GNU " +
+               "coreutils realpath (-m) and cannot run without it.")
+    }
+    $out = & realpath -m -- $Path 2>&1
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$out)) {
+        throw ("environment: ``realpath -m`` exited $LASTEXITCODE (" + ([string]$out).Trim() + "). " +
+               "The guard needs GNU coreutils realpath; a non-GNU one has no -m.")
+    }
+    return ([string]$out).Trim()
+}
+
+function Assert-PublishedLinuxRunner {
+    param([string]$Path)
+
+    $repo = Resolve-LinuxRealPath -Path $GuardRepoRoot
+    $real = Resolve-LinuxRealPath -Path $Path
+    foreach ($p in @($Path, $real)) {
+        $leaf = Split-Path -Leaf $p
+        if ($leaf -cne $LinuxBinaryName) {
+            throw ("Refusing '$Path': the published Linux runner is named '$LinuxBinaryName', not '$leaf'.")
+        }
+        $bin = Split-Path -Parent $p
+        if ((Split-Path -Leaf $bin) -cne 'bin' -or (Split-Path -Leaf (Split-Path -Parent $bin)) -cne 'usr') {
+            throw ("Refusing '$Path' (as '$p'): the published Linux runner lives directly under usr/bin " +
+                   "of an unpacked .deb or AppImage. The published-build parity leg must never run the " +
+                   "dev binary -- that would compare the dev build against itself and report perfect parity.")
+        }
+        if ($p -match '(^|/)target(-[^/]*)?/') {
+            throw ("Refusing '$Path' (as '$p'): it lives under a cargo build directory. The published-build " +
+                   "parity leg must run the PUBLISHED artifact, never anything out of target/.")
+        }
+        if ($p -eq $repo -or $p.StartsWith($repo.TrimEnd('/') + '/')) {
+            throw ("Refusing '$Path' (as '$p'): it lives inside this repo's checkout ('$repo'). The " +
+                   "published prefix must be unpacked outside it, so nothing built here can stand in for it.")
+        }
+    }
+    # The canonical path is the one every check above passed, so it is the one
+    # the caller runs.
+    return $real
+}
+
+function Find-PublishedLinuxRunner {
+    param([string]$Prefix)
+
+    if ([string]::IsNullOrWhiteSpace($Prefix)) {
+        throw (New-LinuxUnknown 'no_prefix_given' ("no prefix to probe. Unpack the release asset first " +
+               "(dpkg -x <deb> <prefix>, or <AppImage> --appimage-extract in <prefix>) and pass " +
+               "-InstallRoot <prefix>. There is no default location and no fallback to target/."))
+    }
+
+    # An explicit path may name the binary itself -- but only an existing FILE
+    # is taken as that; a prefix DIRECTORY that happens to be named
+    # qontinui-runner (dpkg -x into /tmp/qontinui-runner) is probed like any other.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ((Split-Path -Leaf $Prefix) -ceq $LinuxBinaryName -and (Test-Path -LiteralPath $Prefix -PathType Leaf)) {
+        $candidates.Add($Prefix)
+    } else {
+        $candidates.Add((Join-Path (Join-Path (Join-Path $Prefix 'usr') 'bin') $LinuxBinaryName))
+        $candidates.Add((Join-Path (Join-Path (Join-Path (Join-Path $Prefix 'squashfs-root') 'usr') 'bin') $LinuxBinaryName))
+    }
+
+    # Guard BEFORE probing: a candidate in a known build dir is refused whether
+    # or not anything is there yet, so it cannot even reach the unknown arm.
+    $checked = @{}
+    foreach ($c in $candidates) { $checked[$c] = Assert-PublishedLinuxRunner -Path $c }
+
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c -PathType Leaf) {
+            return $checked[$c]
+        }
+    }
+    $reason = 'binary_absent'
+    if (-not (Test-Path -LiteralPath $Prefix)) { $reason = 'prefix_missing' }
+    $lines = @()
+    $lines += (New-LinuxUnknown $reason "could not locate the PUBLISHED Linux runner ('$LinuxBinaryName').")
+    $lines += "Probed, in order:"
+    foreach ($c in $candidates) { $lines += "  $c" }
+    if ($reason -eq 'binary_absent' -and (Test-Path -LiteralPath $Prefix -PathType Container)) {
+        $entries = @(Get-ChildItem -LiteralPath $Prefix -Force -ErrorAction SilentlyContinue)
+        if ($entries.Count -eq 0) {
+            $lines += "Prefix '$Prefix' EXISTS and is EMPTY -- the unpack wrote nothing."
+        } else {
+            $lines += "Prefix '$Prefix' EXISTS; its top-level entries:"
+            foreach ($e in $entries) {
+                $lines += ("  {0}{1}" -f $e.Name, $(if ($e.PSIsContainer) { '/' } else { '' }))
+            }
+        }
+    }
+    $lines += ""
+    $lines += "This harness does NOT fall back to target/debug/qontinui-runner: running the"
+    $lines += "dev build here would compare it against itself and report perfect parity,"
     $lines += "hiding exactly the drift this gate exists to catch."
     throw ($lines -join [Environment]::NewLine)
 }

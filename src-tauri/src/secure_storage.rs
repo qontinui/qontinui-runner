@@ -103,7 +103,7 @@ thread_local! {
 /// D4: a tenant slot vanished from the shared `auth_tokens.enc` with no log line
 /// naming the writer. Every slot write and clear now carries this, so the next
 /// foreign writer (CLI, instance runner, test binary) is named by the log.
-pub(crate) fn process_attribution() -> String {
+pub fn process_attribution() -> String {
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let exe = EXE.get_or_init(|| match std::env::current_exe() {
         Ok(p) => p.display().to_string(),
@@ -467,6 +467,19 @@ pub struct StoredGracedNonce {
     /// The pin's provenance — see [`StoredNonceBinding::session_tenant_origin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_tenant_origin: Option<StoredPinOrigin>,
+    /// The evicted binding's SETTLED repo expectation — see
+    /// [`StoredNonceBinding::expected_tenant`]. A superseded key is still
+    /// presented by a live session for the grace window, and row 1d of the
+    /// session-tenant authority order needs the same repo answer the live key
+    /// was served by, or one session gets two tenants. `None` for an entry
+    /// written before the field, or evicted before its resolution settled; the
+    /// restore reads that as PENDING and re-resolves from `workdir`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_expected_tenant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_tenant: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
 }
 
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
@@ -721,7 +734,14 @@ impl SecureStorage {
     /// Creates a SecureStorage instance with a custom storage path.
     ///
     /// This is primarily used for testing to ensure test isolation.
-    #[cfg(test)]
+    ///
+    /// Gated on `any(test, debug_assertions)` rather than `cfg(test)` because
+    /// the runner BIN's tests call it and this module is a lib module: `cargo
+    /// test` builds the bin's dependencies (this rlib included) without
+    /// `cfg(test)` but WITH `debug_assertions` — the same boundary as
+    /// `ambient::test_support`. A release build compiles none of it.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     pub fn with_path(storage_path: PathBuf) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = storage_path.parent() {
@@ -1845,12 +1865,11 @@ impl Default for SecureStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     /// Create an isolated storage instance for testing.
     /// Each test gets its own unique storage file to avoid test interference.
     fn create_test_storage(test_name: &str) -> SecureStorage {
-        let temp_dir = env::temp_dir().join("qontinui_test_storage");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_storage");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
@@ -3013,6 +3032,7 @@ mod tests {
                 grace_until_unix: 1_700_021_600,
                 session_tenant: None,
                 session_tenant_origin: None,
+                expected_tenant: None,
             },
         )]);
         storage

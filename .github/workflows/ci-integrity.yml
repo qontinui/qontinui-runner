@@ -72,7 +72,10 @@
 #   * Any change to an EXISTING gate surface needs `ci:gate-change=alters-a-gate`
 #     AND a line in the PR body naming each altered item —
 #     `Gate-Change: <stem>#<job-key>` or `Gate-Removal: <stem>#<job-key>`, and
-#     `<stem>#workflow` for a change outside `jobs:`. Matched
+#     `<stem>#workflow` for a change outside `jobs:`, and
+#     `check_untimed_subprocess#file` for scripts/check_untimed_subprocess.py, the
+#     one non-YAML gating path (WHOLE_FILE_GATES; compared as a whole file, so any
+#     edit to it counts). Matched
 #     WHOLE-LINE, so a body cannot satisfy it by containing the token inside a
 #     longer name, an HTML comment, or a pasted CI log.
 #
@@ -509,37 +512,79 @@ jobs:
               # lines in the posted record.
               leaf = " ".join(str(leaf).split())[:120]
               return f"{stem}#{leaf}"
-          for path in [p for p in os.environ["HIT_PATHS"].splitlines() if p.strip()]:
-              b = surface(content_at(path, os.environ["MERGE_BASE"]))
-              head_text = content_at(path, os.environ["HEAD_SHA"])
-              h = surface(head_text)
+          #: The ONLY non-YAML gating path. Matched EXACTLY: every other path the
+          #: trigger hits is a workflow or action file and must parse as YAML, so a
+          #: non-YAML file there (a composite action's run.sh, a README) still fails
+          #: CLOSED as `!PARSE` rather than being waved through a whole-file compare.
+          WHOLE_FILE_GATES = {"scripts/check_untimed_subprocess.py": "check_untimed_subprocess#file"}
+          def file_findings(path, base_text, head_text):
+              """[(kind, token)] for a WHOLE_FILE_GATES path.
+
+              `scripts/check_untimed_subprocess.py` is gating (it IS
+              forbid-untimed-subprocess.yml's whole verdict), but it is Python, so
+              surface() cannot parse it -- and a None from surface() is the hard
+              `!PARSE` error. Until this existed that made the script UNCHANGEABLE:
+              every PR touching it went red with "An unverifiable gate cannot be
+              declared away", whatever it declared, while the script itself FAILS any
+              PR that links a new crate without adding it to EXPECTED_SCAN_ROOTS. The
+              two gates deadlocked every such PR.
+
+              The whole file is the gate surface, compared byte for byte -- there is
+              no structure to be cosmetic about, so ANY edit (a comment included) is
+              an alteration and needs `alters-a-gate` plus `Gate-Change: <token>`. The
+              token is fixed per path in WHOLE_FILE_GATES, never derived, so it cannot
+              collide with a `<stem>#<job>` token. Absent at base is a brand-new gate
+              (additive, nothing to name); absent at head is `Gate-Removal: <token>`."""
+              tok = WHOLE_FILE_GATES[path]
+              if base_text is None:
+                  return []
+              if head_text is None:
+                  return [("REMOVED", tok)]
+              if base_text != head_text:
+                  return [("CHANGED", tok)]
+              return []
+          def path_findings(path, base_text, head_text):
+              """Every finding row (kind, path, token) for ONE hit path.
+
+              The whole per-path decision lives here rather than inline in the loop so
+              test-surface.py can lift and exercise it -- including the routing between
+              the whole-file and the YAML branch, which is the part a regression would
+              silently undo."""
               # A tab or newline in a path would forge a column or a row in this TSV.
-              path = " ".join(str(path).split())
+              clean = " ".join(str(path).split())
+              if path in WHOLE_FILE_GATES:
+                  return [(kind, clean, tok) for kind, tok in file_findings(path, base_text, head_text)]
               if head_text is not None and uses_yaml_aliases(head_text):
-                  print(f"!ALIAS{TAB}{path}{TAB}-")
-                  continue
+                  return [("!ALIAS", clean, "-")]
+              b = surface(base_text)
+              h = surface(head_text)
               if b is None or h is None:
-                  print(f"!PARSE{TAB}{path}{TAB}-")
-                  continue
+                  return [("!PARSE", clean, "-")]
+              rows = []
               (b_wf, b_jobs), (h_wf, h_jobs) = b, h
               # A file absent at base is a brand-new gate: additive, not an alteration.
               if b_wf or b_jobs:
                   if digest(b_wf) != digest(h_wf):
-                      print(f"CHANGED{TAB}{path}{TAB}{token(path, 'workflow')}")
+                      rows.append(("CHANGED", clean, token(clean, "workflow")))
                   # Two distinct job keys that stringify alike would share one token, so a
                   # single body line would authorise both changes. Refuse instead.
                   seen = {}
                   for key in list(b_jobs) + list(h_jobs):
                       prior = seen.setdefault(str(key), key)
                       if prior != key:
-                          print(f"!PARSE{TAB}{path}{TAB}-")
-                          break
-                  else:
-                    for key, spec in b_jobs.items():
-                        if key not in h_jobs:
-                            print(f"REMOVED{TAB}{path}{TAB}{token(path, key)}")
-                        elif digest(spec) != digest(h_jobs[key]):
-                            print(f"CHANGED{TAB}{path}{TAB}{token(path, key)}")
+                          rows.append(("!PARSE", clean, "-"))
+                          return rows
+                  for key, spec in b_jobs.items():
+                      if key not in h_jobs:
+                          rows.append(("REMOVED", clean, token(clean, key)))
+                      elif digest(spec) != digest(h_jobs[key]):
+                          rows.append(("CHANGED", clean, token(clean, key)))
+              return rows
+          for path in [p for p in os.environ["HIT_PATHS"].splitlines() if p.strip()]:
+              base_text = content_at(path, os.environ["MERGE_BASE"])
+              head_text = content_at(path, os.environ["HEAD_SHA"])
+              for kind, clean, tok in path_findings(path, base_text, head_text):
+                  print(f"{kind}{TAB}{clean}{TAB}{tok}")
           PY
 
           FINDINGS="$(cat "${RUNNER_TEMP}/findings.tsv")"

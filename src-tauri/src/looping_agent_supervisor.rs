@@ -1108,14 +1108,23 @@ async fn spawn_looping_agent_terminal(
     // `--append-system-prompt-file` when that cache exists, inline otherwise
     // (plan `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`).
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-        crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+        crate::terminal::runner_context(
+            crate::terminal::spawn_seam_api_port(),
+            coord_mcp,
+            &crate::served_corpus::probe_async(workdir.as_str()).await,
+        ),
     ));
     // Carried to the child env by the capture hint below; from the SAME
     // carrier the argv uses.
     let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
+    // One string for `--name`, the tab title and the trailer file.
+    let spawn_name =
+        crate::claude_session::launch_spec::sanitize_session_name(&format!("loop-{}", def.name));
+    let tab_title = spawn_name.clone().unwrap_or_else(|| def.name.clone());
     let argv = crate::agent_runtime::build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
+        spawn_name.as_deref(),
         Vec::new(),
         prompt,
         prompt_carrier,
@@ -1156,7 +1165,8 @@ async fn spawn_looping_agent_terminal(
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
         working_dir: workdir.clone(),
-        title: def.name.clone(),
+        title: tab_title.clone(),
+        spawn_name: spawn_name.clone(),
         page_id: Some(target_page.clone()),
         claude_session_id: Some(pinned_session_id.clone()),
         zone_index: None,
@@ -1183,7 +1193,7 @@ async fn spawn_looping_agent_terminal(
             &terminal_manager,
             &session_registry,
             app.clone(),
-            def.name.clone(),
+            tab_title,
             workdir,
             None,
             Some(format!("looping-agent:{}", def.id)),

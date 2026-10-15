@@ -216,7 +216,10 @@ export function shouldShowAuthBanner(
  *   rungs, so re-running the refresher would complete with no error and leave
  *   the banner standing. Sign-in is the only rung that can re-pair.
  * - `kick_refresher` — the headless retry (`kick_device_jwt_refresher_cmd`),
- *   for `retry_refresh` ("Retry refresh now") only.
+ *   for `retry_refresh` ("Retry refresh now") only. It waits for the kicked
+ *   pass and reports its result ({@link makeRetryRefreshHandler}), so a retry
+ *   that cannot recover the credential says so instead of silently changing
+ *   nothing.
  */
 export interface CredentialDarkPresentation {
   title: string;
@@ -256,13 +259,42 @@ export function formatSince(since: number): string {
   });
 }
 
-const CREDENTIAL_DARK_TITLES: Record<string, string> = {
+/**
+ * Every cause the runner can emit on the `autonomy-credential-dark` event or
+ * the posture snapshot: the Cognito cause, each non-answering posture, and each
+ * `dark` cause (`DarkCause::as_str` in `device_jwt_refresher.rs`). A cause
+ * added to this union without a title fails to compile, because the titles
+ * `Record` is typed over it. The union itself mirrors the Rust wire strings BY
+ * HAND; the Rust test `the_banner_union_names_every_cause_the_runner_emits`
+ * reads this file and fails when a cause the runner emits is missing here.
+ */
+export type CredentialDarkCause =
+  | "cognito_hard"
+  | "expired"
+  | "unrefreshable"
+  | "absent"
+  | "upstream_401"
+  | "no_default_binding";
+
+const CREDENTIAL_DARK_TITLES: Record<CredentialDarkCause, string> = {
   cognito_hard: "Autonomous sessions paused",
   expired: "Coord credential expired",
   unrefreshable: "Coord credential expired — automatic refresh failed",
   absent: "This runner has no coord credential",
   upstream_401: "Coord is rejecting this runner's credential",
+  // Plan 2026-09-29-vanished-paired-user-json-…-no-coord-credential Phase 3:
+  // a valid per-tenant credential IS held; what is missing is the default
+  // binding (paired_user.json) that points at it. Rendering this as `absent`
+  // was the 2026-09-28 misreport.
+  no_default_binding: "Coord credential present, but no default binding points at it",
 };
+
+/** Title for a cause, or `null` for one this build does not know. */
+function credentialDarkTitle(cause: string): string | null {
+  return Object.prototype.hasOwnProperty.call(CREDENTIAL_DARK_TITLES, cause)
+    ? CREDENTIAL_DARK_TITLES[cause as CredentialDarkCause]
+    : null;
+}
 
 const CREDENTIAL_DARK_CTA_LABELS: Record<CredentialDarkCta, string> = {
   sign_in: "Sign in",
@@ -410,7 +442,7 @@ export function credentialDarkPresentation(
   const title =
     namesTenant && signal.cause === "absent"
       ? `No usable coord credential for tenant ${signal.tenantId}`
-      : (CREDENTIAL_DARK_TITLES[signal.cause] ?? "Coord credential problem");
+      : (credentialDarkTitle(signal.cause) ?? "Coord credential problem");
   const prefix =
     typeof signal.since === "number" && Number.isFinite(signal.since)
       ? `Since ${formatTime(signal.since)} — `
@@ -503,6 +535,109 @@ export function makeRePairClickHandler(
   return async () => {
     await invoker(KICK_DEVICE_JWT_REFRESHER_CMD, {});
   };
+}
+
+// ---------------------------------------------------------------------------
+// "Retry refresh now" reports what happened (plan
+// 2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover D5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Args the retry CTA passes: wait (bounded, runner-side) for the kicked pass to
+ * conclude and return `{ concluded, posture }`. The other kick callers (the
+ * re-pair CTA, the tenant switch) stay fire-and-forget with `{}`.
+ */
+export const RETRY_REFRESH_ARGS = { awaitConclusion: true } as const;
+
+/** Shown when the kicked pass concluded and the credential is still dark. */
+export const RETRY_DID_NOT_RECOVER = "Refresh did not recover the credential.";
+
+/** Appended when the concluded posture's only remedy is a sign-in. */
+export const RETRY_SIGN_IN_SUFFIX = " Sign in to re-pair.";
+
+/** Shown when the bounded wait ended before the pass concluded — UNKNOWN. */
+export const RETRY_STILL_RUNNING =
+  "The refresh is still running — this banner updates when it finishes.";
+
+/** What the banner does with a retry's answer. */
+export interface RetryRefreshResult {
+  /** The posture signal to fold into the banner, or `null` to leave it as is. */
+  signal: CredentialDarkSignal | null;
+  /** The inline error to show beside the CTA, or `null`. */
+  error: string | null;
+}
+
+/**
+ * Interpret `kick_device_jwt_refresher_cmd`'s `{ concluded, posture }`.
+ *
+ * Before this the button returned nothing, so a retry that could never work
+ * (no Cognito session, an expired device JWT) looked exactly like one that
+ * had not finished. Now:
+ *
+ * - concluded, `live` → the recovery signal (clears the banner), no error;
+ * - concluded, still dark → the concluded posture (so an `unrefreshable`
+ *   verdict swaps the button to "Sign in to re-pair" immediately) plus an
+ *   inline error saying the retry did not recover it;
+ * - NOT concluded (the runner's bounded wait ran out) → "still running". Only
+ *   a dark posture is applied: a timeout is UNKNOWN and must never render as
+ *   a recovery;
+ * - an older runner that answers nothing → nothing to apply, nothing to say.
+ */
+export function retryRefreshResult(raw: unknown): RetryRefreshResult {
+  if (raw === null || typeof raw !== "object") return { signal: null, error: null };
+  const r = raw as Record<string, unknown>;
+  if (typeof r.concluded !== "boolean") return { signal: null, error: null };
+  const signal = credentialDarkFromPostureSnapshot(r.posture);
+  if (!r.concluded) {
+    return { signal: signal?.dark ? signal : null, error: RETRY_STILL_RUNNING };
+  }
+  if (signal === null) {
+    // Concluded, yet no posture to read: UNKNOWN, so say the retry did not
+    // demonstrably recover anything rather than imply it did.
+    return { signal: null, error: RETRY_DID_NOT_RECOVER };
+  }
+  if (!signal.dark) return { signal, error: null };
+  const needsSignIn = signal.cta === "re_pair" || signal.cta === "sign_in";
+  return {
+    signal,
+    error: needsSignIn ? `${RETRY_DID_NOT_RECOVER}${RETRY_SIGN_IN_SUFFIX}` : RETRY_DID_NOT_RECOVER,
+  };
+}
+
+/**
+ * Does a retry's inline error still describe the banner after `incoming`
+ * arrives (a posture event, or a mount-time snapshot)?
+ *
+ * Only while `incoming` says the same thing the retry's own answer said. Any
+ * other signal is newer information the error was not written about: a
+ * timed-out retry's "still running" must go when that pass's `unrefreshable`
+ * event lands, and a "did not recover" must not resurface on a later dark
+ * episode after the operator signed in elsewhere (the recovery in between is a
+ * different signal, so it already cleared the error).
+ */
+export function retryErrorSurvives(
+  retrySignal: CredentialDarkSignal | null,
+  incoming: CredentialDarkSignal,
+): boolean {
+  return (
+    retrySignal !== null &&
+    retrySignal.source === incoming.source &&
+    retrySignal.dark === incoming.dark &&
+    retrySignal.cause === incoming.cause &&
+    retrySignal.cta === incoming.cta
+  );
+}
+
+/**
+ * Build the "Retry refresh now" click handler: kick the refresher, wait for
+ * the pass it triggers, and return what the banner should do with the answer.
+ * Extracted so the contract is unit-testable in node.
+ */
+export function makeRetryRefreshHandler(
+  invoker: (cmd: string, args: Record<string, unknown>) => Promise<unknown>,
+): () => Promise<RetryRefreshResult> {
+  return async () =>
+    retryRefreshResult(await invoker(KICK_DEVICE_JWT_REFRESHER_CMD, { ...RETRY_REFRESH_ARGS }));
 }
 
 /**
