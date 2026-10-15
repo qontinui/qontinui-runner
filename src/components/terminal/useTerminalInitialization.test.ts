@@ -51,6 +51,7 @@ import {
   pruneReleasedTerminalIds,
   releaseAndRelaunch,
   declineLeftoverDeadPanes,
+  replacesDeadPane,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -813,6 +814,24 @@ describe("a lost holder's dead pane (Phase 6)", () => {
     expect(scheduled).toEqual([["p", ["s-1"]]]);
     expect(remembered).toEqual([["s-1", "dead"]]);
     expect(withheld).toEqual([]);
+  });
+
+  it("only an auto-resume tab replaces a dead pane (review r3, R2)", () => {
+    expect(replacesDeadPane("auto-resume")).toBe(true);
+    expect(replacesDeadPane("terminal-only")).toBe(false);
+    expect(replacesDeadPane("skip-invalid")).toBe(false);
+    // An UNCONFIRMED authoritative record classifies terminal-only: no replacement.
+    expect(
+      replacesDeadPane(
+        classifyRestoreAction(rec({ origin: "authoritative", confirmedAt: undefined })),
+      ),
+    ).toBe(false);
+  });
+
+  it("a slot-closure refusal is the plain default resume, not a warned fallback (review r3)", () => {
+    for (const reason of ["first report was not startup", "no argv reported"]) {
+      expect(resumePlanFor(rec({ resumeRefusal: reason }))).toEqual({ kind: "default" });
+    }
   });
 
   it("declineLeftoverDeadPanes banners only the declined sessions' dead panes", () => {

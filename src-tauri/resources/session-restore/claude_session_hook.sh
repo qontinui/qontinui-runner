@@ -312,9 +312,11 @@ sid_json="$(qh_json_escape "$sid")"
 # ringed and stored, and an argv can carry a prompt or an inline secret. The
 # runner keeps only the relaunch flags it derives from it, never the argv.
 # Spliced in only when it is a JSON array of PRINTABLE ASCII (the shims escape
-# everything else as \uXXXX) of at most 4 KiB; anything else is left out and a
-# relaunch uses the default resume command.
-argv_field=""
+# everything else as \uXXXX) of at most 4 KiB. The key is ALWAYS sent — `null`
+# when there is no usable argv — so the runner can tell this report from the
+# identity shim's early POST, which omits it (review r3, R1); a relaunch then
+# uses the default resume command.
+argv_field=",\"argv\":null"
 qh_argv="${QONTINUI_LAUNCH_ARGV:-}"
 if [ -n "$qh_argv" ] && [ "$(LC_ALL=C; printf '%s' "${#qh_argv}")" -le 4096 ] \
     && [[ $qh_argv == "["*"]" ]] && ! (LC_ALL=C; [[ $qh_argv == *[^\ -~]* ]]); then

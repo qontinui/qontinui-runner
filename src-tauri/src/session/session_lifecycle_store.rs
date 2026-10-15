@@ -829,9 +829,7 @@ pub struct TerminalSessionRecord {
     pub resume_flags: Option<crate::session::resume_argv::ResumeFlags>,
 }
 
-/// The refusal a relaunch-flag slot is closed with when a session's first
-/// report was not a `startup` (review r2, N4).
-pub const CLOSED_NOT_STARTUP: &str = "first report was not startup";
+pub use crate::session::resume_argv::CLOSED_NOT_STARTUP;
 
 /// What [`SessionLifecycleStore::set_resume_flags`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

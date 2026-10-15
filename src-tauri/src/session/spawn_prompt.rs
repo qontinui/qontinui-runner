@@ -2784,8 +2784,8 @@ mod script_tests {
                 "the POST still goes: {body}"
             );
             assert!(
-                body.get("argv").is_none(),
-                "{hostile:?} must be left out: {body}"
+                body.get("argv").is_some_and(serde_json::Value::is_null),
+                "{hostile:?} must be left out — sent as an explicit null (review r3, R1): {body}"
             );
             assert!(
                 !String::from_utf8_lossy(&out).contains("pwned"),
@@ -2793,6 +2793,14 @@ mod script_tests {
                 String::from_utf8_lossy(&out)
             );
         }
+
+        // No argv at all: the key is still sent, as null, so the runner tells
+        // this report from the identity shim's early POST (review r3, R1).
+        let (_, body) = run(&session_start_payload("startup"), "");
+        assert!(
+            body.get("argv").is_some_and(serde_json::Value::is_null),
+            "{body}"
+        );
 
         // Not a UUID: no report at all.
         for id in [
