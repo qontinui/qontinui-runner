@@ -126,6 +126,42 @@ impl Listener {
         })
     }
 
+    /// Bind at `path` WITHOUT a moment in which `path` names no socket: bind
+    /// a sibling `<path>.upg`, tighten it, then `rename` it over `path` — one
+    /// atomic step. A holder upgrade's successor (plan Phase 8) binds this way
+    /// while its predecessor's socket still sits at `path`: a client connects
+    /// to the old holder or the new one, never to nothing. Falls back to
+    /// unlink-then-bind when the sibling name would exceed `sun_path`.
+    pub fn bind_replacing(path: &Path) -> io::Result<Listener> {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".upg");
+        let tmp = PathBuf::from(tmp);
+        if check_path_len(&tmp).is_err() {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            return Listener::bind(path);
+        }
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let inner = UnixListener::bind(&tmp)?;
+        let placed = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = placed {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(Listener {
+            inner,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn accept(&self) -> io::Result<Conn> {
         let (stream, _) = self.inner.accept()?;
         Ok(Conn { stream })
