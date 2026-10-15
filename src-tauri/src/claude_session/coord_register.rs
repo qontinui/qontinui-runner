@@ -77,6 +77,25 @@ use crate::session::SessionEventKind;
 /// Default-ON env gate for AI-session coord registration (P0.3). Any of
 /// `0` / `false` / `off` (case-insensitive) disables it; anything else
 /// (including unset) leaves it ON.
+/// A tenant answer for a new session: the tenant (`None` = an unresolvable
+/// machine), or the proxy's refusal.
+pub(crate) type TenantAnswer = Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>;
+
+/// The re-resolve schedule for a registration refused RETRYABLY (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5): 15s, 30s, 60s,
+/// 120s — 3m45s of waiting plus at most one resolve budget per attempt, so a
+/// session's fate is settled within ~4.5 minutes. Doubling backoff keeps a
+/// boot-time storm (every resumed chat retrying at once) to four reads per
+/// session. The window covers a coord blip or a slow first tenants-for-repo
+/// read; an outage longer than that is not a blip, and the session is then
+/// logged UNREGISTERED for good rather than retried forever.
+pub(crate) const REGISTRATION_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(120),
+];
+
 fn registration_enabled() -> bool {
     match std::env::var("QONTINUI_SESSION_AUTOMATION_REGISTER") {
         Ok(v) => !matches!(
@@ -194,6 +213,18 @@ struct Inner {
     /// a session coord has no row for. Evicted by
     /// [`AiCoordRegistrar::close_session`].
     refused: Mutex<HashMap<String, crate::coord_mcp::ProxyRefusal>>,
+    /// Sessions whose registration got a RETRYABLE refusal and are being
+    /// re-resolved in the background ([`AiCoordRegistrar::register_session_in`]):
+    /// key → (retry generation, the refusal so far). While an entry is here the
+    /// session has no coord record and [`federation_session_tenant`] skips its
+    /// federation with that refusal — so it can end registered-but-unfederated
+    /// (benign), never federated under a tenant it is not recorded under.
+    /// [`AiCoordRegistrar::close_session`] removes the entry, which turns the
+    /// in-flight retry into a no-op: a closed session is never registered.
+    pending: Mutex<HashMap<String, (u64, crate::coord_mcp::ProxyRefusal)>>,
+    /// Source of the generations in `pending`, so a retry superseded by a
+    /// close (or by a newer registration of the same key) recognises itself.
+    retry_generation: std::sync::atomic::AtomicU64,
     /// Resolves a new session's tenant. [`crate::session::resolve_new_session_tenant`]
     /// in production (the same source `SessionRegistry` stamps from); tests
     /// that assert on tenants inject a fixed answer
@@ -302,6 +333,8 @@ impl AiCoordRegistrar {
                 reverse: Mutex::new(HashMap::new()),
                 tenants: Mutex::new(HashMap::new()),
                 refused: Mutex::new(HashMap::new()),
+                pending: Mutex::new(HashMap::new()),
+                retry_generation: std::sync::atomic::AtomicU64::new(0),
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 terminal_coord_lookup: OnceLock::new(),
@@ -527,9 +560,19 @@ impl AiCoordRegistrar {
     /// but has no row anywhere; on a single-tenant device the drain would file
     /// it under the default slot — the guess the refusal exists to refuse.
     /// So a refused session gets no coord id (`None`, which also seeds no
-    /// agent-log emitter), is logged UNREGISTERED and UNFEDERATED with the
-    /// refusal's code, and its refusal is remembered so its federation is
-    /// skipped with the same answer rather than re-resolved.
+    /// agent-log emitter) and is logged UNREGISTERED with the refusal's code.
+    ///
+    /// - A NON-retryable refusal (the repo's tenant is not paired here, several
+    ///   owners without the default, an unusable declaration) is final: it is
+    ///   remembered, and any federation not already bound at spawn is skipped
+    ///   with the same answer rather than re-resolved.
+    /// - A RETRYABLE one (the repo not settled yet on a multi-tenant device:
+    ///   coord slow past the budget, a credential store briefly unreadable) is
+    ///   re-resolved in the background on [`REGISTRATION_RETRY_DELAYS`]. When
+    ///   it settles to a tenant the session is registered under it then (with
+    ///   no agent-log emitter, which is seeded only from a spawn-time id); when
+    ///   it settles to a final refusal, or never settles, that refusal is
+    ///   remembered as above. Federation is skipped while it is pending.
     pub async fn register_session_in(
         &self,
         task_run_id: &str,
@@ -537,6 +580,35 @@ impl AiCoordRegistrar {
         repo: Option<String>,
         workdir: &str,
     ) -> Option<Uuid> {
+        let workdir = workdir.to_string();
+        self.register_session_in_with(
+            task_run_id,
+            purpose,
+            repo,
+            move || {
+                let workdir = workdir.clone();
+                async move { crate::session::resolve_new_session_tenant_at(&workdir).await }
+            },
+            REGISTRATION_RETRY_DELAYS,
+        )
+        .await
+    }
+
+    /// [`Self::register_session_in`] with the resolver and the retry schedule
+    /// injected (tests drive both).
+    pub(crate) async fn register_session_in_with<R, Fut>(
+        &self,
+        task_run_id: &str,
+        purpose: &str,
+        repo: Option<String>,
+        resolve: R,
+        retry_delays: &'static [std::time::Duration],
+    ) -> Option<Uuid>
+    where
+        R: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = TenantAnswer> + Send + 'static,
+    {
+        // The gate first: with registration off nothing is resolved at all.
         if !registration_enabled() {
             debug!(
                 "ai_coord_register: disabled via QONTINUI_SESSION_AUTOMATION_REGISTER — skipping {}",
@@ -544,34 +616,39 @@ impl AiCoordRegistrar {
             );
             return None;
         }
-        let tenant = crate::session::resolve_new_session_tenant_at(workdir).await;
-        self.register_session_with_tenant(task_run_id, purpose, repo, tenant)
+        match resolve().await {
+            Ok(tenant) => self.register_resolved(task_run_id, purpose, repo, tenant),
+            Err(refusal) if refusal.retryable && !retry_delays.is_empty() => {
+                self.start_registration_retry(
+                    task_run_id,
+                    purpose,
+                    repo,
+                    refusal,
+                    resolve,
+                    retry_delays,
+                );
+                None
+            }
+            Err(refusal) => {
+                self.remember_refusal(task_run_id, refusal, "refused");
+                None
+            }
+        }
     }
 
-    /// [`Self::register_session_in`] with the tenant answer supplied.
-    pub(crate) fn register_session_with_tenant(
+    /// Register under a RESOLVED tenant (`None` = an unresolvable machine,
+    /// recorded as such), clearing any stale refusal for the key first so an
+    /// old refusal can never block this session's federation after a success.
+    fn register_resolved(
         &self,
         task_run_id: &str,
         purpose: &str,
         repo: Option<String>,
-        tenant: Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
+        tenant: Option<Uuid>,
     ) -> Option<Uuid> {
-        let tenant = match tenant {
-            Ok(t) => t,
-            Err(refusal) => {
-                warn!(
-                    "ai_coord_register: session {} is UNREGISTERED and UNFEDERATED — its tenant \
-                     resolution refused ({}): {} No coord session is recorded for it (a record \
-                     with no tenant would be dropped or filed under the default tenant), and its \
-                     federation is skipped with the same refusal.",
-                    task_run_id, refusal.code, refusal.message
-                );
-                if let Ok(mut refused) = self.inner.refused.lock() {
-                    refused.insert(task_run_id.to_string(), refusal);
-                }
-                return None;
-            }
-        };
+        if let Ok(mut refused) = self.inner.refused.lock() {
+            refused.remove(task_run_id);
+        }
         self.register_inner(
             task_run_id,
             Some(task_run_id),
@@ -586,6 +663,129 @@ impl AiCoordRegistrar {
         .ok()
     }
 
+    /// Remember a FINAL refusal for the key and say what it means.
+    fn remember_refusal(
+        &self,
+        task_run_id: &str,
+        refusal: crate::coord_mcp::ProxyRefusal,
+        how: &str,
+    ) {
+        warn!(
+            "ai_coord_register: session {} is UNREGISTERED — its tenant resolution {} ({}): {} \
+             No coord session is recorded for it (a record with no tenant would be dropped or \
+             filed under the default tenant), and any federation not already bound at its spawn \
+             is skipped with the same refusal.",
+            task_run_id, how, refusal.code, refusal.message
+        );
+        if let Ok(mut refused) = self.inner.refused.lock() {
+            refused.insert(task_run_id.to_string(), refusal);
+        }
+    }
+
+    /// Start the bounded background re-resolve for a RETRYABLE refusal — see
+    /// [`Self::register_session_in`] and [`Inner::pending`].
+    fn start_registration_retry<R, Fut>(
+        &self,
+        task_run_id: &str,
+        purpose: &str,
+        repo: Option<String>,
+        refusal: crate::coord_mcp::ProxyRefusal,
+        resolve: R,
+        retry_delays: &'static [std::time::Duration],
+    ) where
+        R: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = TenantAnswer> + Send + 'static,
+    {
+        let generation = self
+            .inner
+            .retry_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        warn!(
+            "ai_coord_register: session {} is NOT REGISTERED YET — its tenant resolution refused \
+             ({}, retryable): {} Re-resolving in the background ({} attempts over {}s); any \
+             federation not already bound at its spawn is skipped meanwhile.",
+            task_run_id,
+            refusal.code,
+            refusal.message,
+            retry_delays.len(),
+            retry_delays.iter().map(|d| d.as_secs()).sum::<u64>()
+        );
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.insert(task_run_id.to_string(), (generation, refusal.clone()));
+        }
+        let this = self.clone();
+        let key = task_run_id.to_string();
+        let purpose = purpose.to_string();
+        tokio::spawn(async move {
+            let mut last = refusal;
+            for delay in retry_delays {
+                tokio::time::sleep(*delay).await;
+                if !this.retry_is_current(&key, generation) {
+                    return; // closed (or superseded): never register it
+                }
+                match resolve().await {
+                    Ok(tenant) => {
+                        this.finish_retry(&key, generation, Ok(tenant), &purpose, repo);
+                        return;
+                    }
+                    Err(r) if r.retryable => last = r,
+                    Err(r) => {
+                        this.finish_retry(&key, generation, Err((r, "refused")), &purpose, repo);
+                        return;
+                    }
+                }
+            }
+            this.finish_retry(
+                &key,
+                generation,
+                Err((last, "never settled within its retry window")),
+                &purpose,
+                repo,
+            );
+        });
+    }
+
+    fn retry_is_current(&self, key: &str, generation: u64) -> bool {
+        self.inner
+            .pending
+            .lock()
+            .ok()
+            .and_then(|g| g.get(key).map(|(g, _)| *g == generation))
+            .unwrap_or(false)
+    }
+
+    /// Settle a background retry — under the `pending` lock, so a concurrent
+    /// [`Self::close_session`] either removes the entry first (and this is a
+    /// no-op) or waits until the registration is in place (and closes it).
+    fn finish_retry(
+        &self,
+        key: &str,
+        generation: u64,
+        outcome: Result<Option<Uuid>, (crate::coord_mcp::ProxyRefusal, &str)>,
+        purpose: &str,
+        repo: Option<String>,
+    ) {
+        let Ok(mut pending) = self.inner.pending.lock() else {
+            return;
+        };
+        if pending.get(key).map(|(g, _)| *g) != Some(generation) {
+            return;
+        }
+        pending.remove(key);
+        match outcome {
+            Ok(tenant) => {
+                if self.register_resolved(key, purpose, repo, tenant).is_some() {
+                    info!(
+                        "ai_coord_register: session {} registered after its tenant settled \
+                         (tenant {:?}); it stays unfederated if it spawned while pending",
+                        key, tenant
+                    );
+                }
+            }
+            Err((refusal, how)) => self.remember_refusal(key, refusal, how),
+        }
+    }
+
     /// The refusal a session's registration was answered with, if any — see
     /// [`Inner::refused`].
     pub(crate) fn registration_refusal(
@@ -597,6 +797,19 @@ impl AiCoordRegistrar {
             .lock()
             .ok()
             .and_then(|g| g.get(session_key).cloned())
+    }
+
+    /// The retryable refusal a session's registration is still being
+    /// re-resolved past, if any — see [`Inner::pending`].
+    pub(crate) fn registration_pending(
+        &self,
+        session_key: &str,
+    ) -> Option<crate::coord_mcp::ProxyRefusal> {
+        self.inner
+            .pending
+            .lock()
+            .ok()
+            .and_then(|g| g.get(session_key).map(|(_, r)| r.clone()))
     }
 
     /// Session-identity fabric Phase 3 — register a SNIFFED interactive
@@ -1495,6 +1708,10 @@ impl AiCoordRegistrar {
     /// `claude_session_id`. A key from neither plane is an index miss, which is
     /// the documented no-op.
     pub fn close_session(&self, session_key: &str) {
+        // A pending registration retry for this key becomes a no-op.
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.remove(session_key);
+        }
         if let Ok(mut refused) = self.inner.refused.lock() {
             refused.remove(session_key);
         }
@@ -1587,7 +1804,10 @@ pub(crate) fn federation_session_tenant(
         if let Some(recorded) = session_keys.iter().find_map(|k| r.recorded_tenant(k)) {
             return Ok(Some(recorded));
         }
-        if let Some(refusal) = session_keys.iter().find_map(|k| r.registration_refusal(k)) {
+        if let Some(refusal) = session_keys.iter().find_map(|k| {
+            r.registration_refusal(k)
+                .or_else(|| r.registration_pending(k))
+        }) {
             return Err(refusal);
         }
     }
@@ -2349,8 +2569,8 @@ mod tests {
     /// a recorded tenant and never runs its own repo read; the record must
     /// therefore already be the repo's tenant, not the machine pin the
     /// cwd-blind resolver answers. (A refusal: the test below.)
-    #[test]
-    fn registration_in_a_repo_records_the_repos_tenant_and_federation_binds_it() {
+    #[tokio::test]
+    async fn registration_in_a_repo_records_the_repos_tenant_and_federation_binds_it() {
         use crate::coord_mcp::SpawnTenantRefusal;
         use crate::session::tenant_pin::TenantPin;
         use crate::session::workspace_tenant::WorkspaceDeclaration;
@@ -2362,7 +2582,7 @@ mod tests {
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         // The cwd-blind resolver answers the machine pin.
         let (reg, _dir) = registrar_with_tenant(|| Some(MACHINE));
-        let resolve = |admit: fn(Uuid) -> Result<(), SpawnTenantRefusal>| {
+        let decide = |admit: fn(Uuid) -> Result<(), SpawnTenantRefusal>| {
             crate::session::new_session_tenant_from(
                 || WorkspaceDeclaration::Absent,
                 || CwdTenant::Resolved {
@@ -2380,8 +2600,15 @@ mod tests {
         };
 
         let trid = Uuid::new_v4().to_string();
-        reg.register_session_with_tenant(&trid, "New Chat", None, resolve(|_| Ok(())))
-            .unwrap();
+        reg.register_session_in_with(
+            &trid,
+            "New Chat",
+            None,
+            answering(decide(|_| Ok(()))),
+            NO_RETRY,
+        )
+        .await
+        .unwrap();
         assert_eq!(reg.recorded_tenant(&trid), Some(REPO_OWNER));
         assert_eq!(
             federation_session_tenant(Some(&reg), &[&trid], recorded_arm_never_falls_back),
@@ -2390,54 +2617,249 @@ mod tests {
         );
     }
 
-    /// Review round 2: a REFUSED tenant does not register at all. A tenantless
-    /// record is dropped as a permanent 401 on a multi-tenant device (a
-    /// session that looks registered and has no row anywhere) and filed under
-    /// the default slot on a single-tenant one — so: no coord id (and so no
-    /// emitter), no `Started` row, nothing recorded; and its federation is
-    /// answered with the SAME refusal, never re-resolved (B2: "neither" is
-    /// agreement).
-    #[test]
-    fn a_refused_tenant_registers_nothing_and_its_federation_is_refused_without_re_resolving() {
-        const MACHINE: Uuid = Uuid::from_u128(0xA);
-        let _env = env_lock();
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-        let (reg, _dir) = registrar_with_tenant(|| Some(MACHINE));
-        let refusal = crate::coord_mcp::ProxyRefusal {
+    const NO_RETRY: &[std::time::Duration] = &[];
+    const TEST_RETRY: &[std::time::Duration] = &[
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
+    ];
+    const LATER_TENANT: Uuid = Uuid::from_u128(0xB);
+
+    /// A resolver that always gives `answer`.
+    fn answering(
+        answer: TenantAnswer,
+    ) -> impl Fn() -> std::future::Ready<TenantAnswer> + Send + Sync + 'static {
+        move || std::future::ready(answer.clone())
+    }
+
+    /// A resolver that gives `answers[n]` on its n-th call (the last one
+    /// repeats), counting calls.
+    fn scripted(
+        answers: Vec<TenantAnswer>,
+    ) -> (
+        impl Fn() -> std::future::Ready<TenantAnswer> + Send + Sync + 'static,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let resolve = move || {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(answers[n.min(answers.len() - 1)].clone())
+        };
+        (resolve, calls)
+    }
+
+    fn retryable_refusal() -> crate::coord_mcp::ProxyRefusal {
+        crate::coord_mcp::ProxyRefusal {
             status: 503,
             code: crate::coord_mcp::TENANT_REPO_UNSETTLED_CODE,
             retryable: true,
             message: "test: repo not settled".to_string(),
-        };
+        }
+    }
+
+    fn final_refusal() -> crate::coord_mcp::ProxyRefusal {
+        crate::coord_mcp::ProxyRefusal {
+            status: 403,
+            code: "terminal:tenant_not_paired",
+            retryable: false,
+            message: "test: repo tenant not paired".to_string(),
+        }
+    }
+
+    /// Let the paused clock run past `secs` and the spawned retry finish.
+    async fn advance(secs: u64) {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn panicking_fallback() -> TenantAnswer {
+        panic!("federation must not re-resolve a refused or pending registration")
+    }
+
+    /// Review round 2: a FINAL (non-retryable) refusal does not register at
+    /// all — no coord id (so no emitter), no `Started` row, nothing recorded —
+    /// is remembered, and is NEVER retried; its federation is answered with
+    /// the same refusal, never re-resolved (B2: "neither" is agreement).
+    #[tokio::test(start_paused = true)]
+    async fn a_final_refusal_registers_nothing_is_remembered_and_never_retried() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let (resolve, calls) = scripted(vec![Err(final_refusal()), Ok(Some(LATER_TENANT))]);
 
         let trid = Uuid::new_v4().to_string();
         assert_eq!(
-            reg.register_session_with_tenant(&trid, "New Chat", None, Err(refusal.clone())),
-            None,
-            "a refused session gets no coord id, so no agent-log emitter is seeded"
+            reg.register_session_in_with(&trid, "New Chat", None, resolve, TEST_RETRY)
+                .await,
+            None
+        );
+        advance(600).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "never retried"
         );
         assert_eq!(reg.session_id_for(&trid), None, "nothing was registered");
-        assert_eq!(reg.recorded_tenant(&trid), None);
         assert!(
             reg.inner.outbox.pending().unwrap().is_empty(),
             "no tenant-less Started row may reach the outbox"
         );
+        assert_eq!(reg.registration_refusal(&trid), Some(final_refusal()));
 
-        // Federation for it — by its own id, or as a phase session of the run —
-        // is the same refusal, and the re-resolving fallback never runs.
         let phase_id = format!("{trid}-agentic-1");
         for keys in [vec![trid.as_str()], vec![phase_id.as_str(), trid.as_str()]] {
             assert_eq!(
-                federation_session_tenant(Some(&reg), &keys, || {
-                    panic!("a refused registration must not be re-resolved for federation")
-                }),
-                Err(refusal.clone())
+                federation_session_tenant(Some(&reg), &keys, panicking_fallback),
+                Err(final_refusal())
             );
         }
-
-        // Closing the session forgets the refusal with the rest of its state.
         reg.close_session(&trid);
         assert_eq!(reg.registration_refusal(&trid), None);
+    }
+
+    /// Review round 3 (a): a RETRYABLE refusal is re-resolved in the
+    /// background; when it settles the session is registered under the tenant
+    /// it settled to. While pending, federation is skipped (never re-resolved
+    /// to a possibly different tenant); afterwards it binds the recorded one.
+    #[tokio::test(start_paused = true)]
+    async fn a_retryable_refusal_registers_once_the_tenant_settles() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let (resolve, calls) = scripted(vec![Err(retryable_refusal()), Ok(Some(LATER_TENANT))]);
+
+        let trid = Uuid::new_v4().to_string();
+        assert_eq!(
+            reg.register_session_in_with(&trid, "New Chat", None, resolve, TEST_RETRY)
+                .await,
+            None,
+            "nothing is registered (and no emitter seeded) while the tenant is unsettled"
+        );
+        assert_eq!(reg.session_id_for(&trid), None);
+        assert_eq!(
+            reg.registration_refusal(&trid),
+            None,
+            "a retryable refusal is not final"
+        );
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&trid], panicking_fallback),
+            Err(retryable_refusal()),
+            "federation is skipped while the registration is pending"
+        );
+
+        advance(16).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            reg.session_id_for(&trid).is_some(),
+            "registered once settled"
+        );
+        assert_eq!(reg.recorded_tenant(&trid), Some(LATER_TENANT));
+        assert_eq!(reg.registration_pending(&trid), None);
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&trid], recorded_arm_never_falls_back),
+            Ok(Some(LATER_TENANT))
+        );
+        reg.close_session(&trid);
+    }
+
+    /// A retryable refusal that never settles ends as a remembered refusal,
+    /// after exactly the scheduled attempts.
+    #[tokio::test(start_paused = true)]
+    async fn a_retryable_refusal_that_never_settles_is_remembered_after_its_window() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let (resolve, calls) = scripted(vec![Err(retryable_refusal())]);
+
+        let trid = Uuid::new_v4().to_string();
+        reg.register_session_in_with(&trid, "New Chat", None, resolve, TEST_RETRY)
+            .await;
+        advance(600).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1 + TEST_RETRY.len()
+        );
+        assert_eq!(reg.session_id_for(&trid), None);
+        assert_eq!(reg.registration_pending(&trid), None);
+        assert_eq!(reg.registration_refusal(&trid), Some(retryable_refusal()));
+        reg.close_session(&trid);
+    }
+
+    /// Review round 3 (c): a session closed while its registration retry is
+    /// pending is never registered.
+    #[tokio::test(start_paused = true)]
+    async fn closing_during_a_pending_retry_registers_nothing() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let (resolve, calls) = scripted(vec![Err(retryable_refusal()), Ok(Some(LATER_TENANT))]);
+
+        let trid = Uuid::new_v4().to_string();
+        reg.register_session_in_with(&trid, "New Chat", None, resolve, TEST_RETRY)
+            .await;
+        reg.close_session(&trid);
+        advance(600).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a closed session's retry does not even re-resolve"
+        );
+        assert_eq!(reg.session_id_for(&trid), None);
+        assert_eq!(reg.recorded_tenant(&trid), None);
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+        assert_eq!(reg.registration_pending(&trid), None);
+        assert_eq!(reg.registration_refusal(&trid), None);
+    }
+
+    /// Review round 3 NIT 1: a success clears a stale refusal for the key, so
+    /// an old refusal can never block federation after a later success.
+    #[tokio::test]
+    async fn a_later_success_clears_a_stale_refusal() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let trid = Uuid::new_v4().to_string();
+        reg.register_session_in_with(&trid, "c", None, answering(Err(final_refusal())), NO_RETRY)
+            .await;
+        assert!(reg.registration_refusal(&trid).is_some());
+        reg.register_session_in_with(
+            &trid,
+            "c",
+            None,
+            answering(Ok(Some(LATER_TENANT))),
+            NO_RETRY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reg.registration_refusal(&trid), None);
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&trid], recorded_arm_never_falls_back),
+            Ok(Some(LATER_TENANT))
+        );
+        reg.close_session(&trid);
+    }
+
+    /// Review round 3 NIT 3a: with registration gated off nothing is resolved.
+    #[tokio::test]
+    async fn the_register_gate_is_checked_before_any_tenant_resolution() {
+        let _env = env_lock();
+        std::env::set_var("QONTINUI_SESSION_AUTOMATION_REGISTER", "0");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let got = reg
+            .register_session_in_with(
+                "gated",
+                "c",
+                None,
+                || -> std::future::Ready<TenantAnswer> {
+                    panic!("resolved a tenant with registration gated off")
+                },
+                TEST_RETRY,
+            )
+            .await;
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        assert_eq!(got, None);
     }
 
     #[test]

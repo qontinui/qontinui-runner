@@ -655,8 +655,6 @@ pub(crate) async fn resolve_new_session_tenant_at(
     workdir: &str,
 ) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
     use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
-    use workspace_tenant::WorkspaceDeclaration;
-
     // The workspace declaration first (rows 1a-1c, a file read): when it
     // answers, the repo is never consulted — no coord read, no wait.
     let wd = workdir.to_string();
@@ -668,21 +666,16 @@ pub(crate) async fn resolve_new_session_tenant_at(
         Ok(d) => d,
         Err(e) => return Err(crate::coord_mcp::tenant_selection_failed_error(&e)),
     };
-    let repo = match declaration {
-        WorkspaceDeclaration::Absent => {
-            let path = std::path::PathBuf::from(workdir);
-            Some(
-                cwd_tenant_retrying(
-                    || qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(&path),
-                    CWD_TENANT_RETRY_IF_FASTER_THAN,
-                    CWD_TENANT_RETRY_DELAY,
-                    qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET,
-                )
-                .await,
-            )
-        }
-        _ => None,
-    };
+    let path = std::path::PathBuf::from(workdir);
+    let repo = repo_unless_declared(&declaration, || {
+        cwd_tenant_retrying(
+            || qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(&path),
+            CWD_TENANT_RETRY_IF_FASTER_THAN,
+            CWD_TENANT_RETRY_DELAY,
+            qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET,
+        )
+    })
+    .await;
     // The decision reads the credential store: the blocking pool, as on the
     // proxy. A join failure is the proxy's retryable selection refusal.
     match spawn_blocking_tracked(move || {
@@ -701,6 +694,23 @@ pub(crate) async fn resolve_new_session_tenant_at(
     {
         Ok(answer) => answer,
         Err(e) => Err(crate::coord_mcp::tenant_selection_failed_error(&e)),
+    }
+}
+
+/// Read the repo only when the workspace declared nothing: a declaration
+/// (rows 1a-1c) outranks the repo, so reading it then would only wait on coord
+/// for an answer the decision never looks at.
+async fn repo_unless_declared<F, Fut>(
+    declaration: &workspace_tenant::WorkspaceDeclaration,
+    read_repo: F,
+) -> Option<qontinui_runner_lib::repo_tenant::CwdTenant>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = qontinui_runner_lib::repo_tenant::CwdTenant>,
+{
+    match declaration {
+        workspace_tenant::WorkspaceDeclaration::Absent => Some(read_repo().await),
+        _ => None,
     }
 }
 
@@ -1104,6 +1114,39 @@ mod new_session_tenant_tests {
         assert_eq!(run(REPO_OWNER, DEFAULT), Ok(Some(REPO_OWNER)));
         // The claim is not an owner: refused, whatever the default binding is.
         assert!(run(DEFAULT, REPO_OWNER).is_err());
+    }
+
+    /// Review round 3 NIT 3b: a workspace that declares a tenant (or states
+    /// an unusable one) never waits on the repo read; only an absent
+    /// declaration reads it.
+    #[tokio::test]
+    async fn a_declaration_skips_the_repo_read() {
+        for declaration in [
+            WorkspaceDeclaration::Declared {
+                tenant: OTHER,
+                source: TenantDeclarationSource::Env,
+            },
+            WorkspaceDeclaration::Unusable {
+                source: TenantDeclarationSource::Env,
+                detail: "not a uuid".to_string(),
+            },
+        ] {
+            let got = repo_unless_declared(&declaration, || async {
+                if true {
+                    panic!("the repo was read although the workspace declared a tenant");
+                }
+                CwdTenant::NoRepo
+            })
+            .await;
+            assert_eq!(got, None);
+        }
+        assert_eq!(
+            repo_unless_declared(&WorkspaceDeclaration::Absent, || async {
+                CwdTenant::NoRepo
+            })
+            .await,
+            Some(CwdTenant::NoRepo)
+        );
     }
 
     /// The retry: once, only for a FAST transient answer, never past budget.
