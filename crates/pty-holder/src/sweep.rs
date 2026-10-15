@@ -580,7 +580,12 @@ fn stray_kind(file_name: &str) -> Option<(&str, Duration)> {
     }
     let (pane, extension) = file_name.rsplit_once('.')?;
     match extension {
-        "sock" | "spec" | "report" | "report-tmp" => Some((pane, STRAY_MIN_AGE)),
+        // `upgrade` / `upgrade-tmp`: a holder upgrade's snapshot (plan Phase
+        // 8) left by a predecessor that died mid-handoff — it carries the
+        // pane's ring, so it is not kept.
+        "sock" | "spec" | "report" | "report-tmp" | "upgrade" | "upgrade-tmp" => {
+            Some((pane, STRAY_MIN_AGE))
+        }
         "log" | "scrollback" => Some((pane, DEAD_LOG_RETENTION)),
         _ => None,
     }

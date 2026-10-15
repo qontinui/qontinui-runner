@@ -49,6 +49,14 @@ pub fn bind(pane_dir: &Path, pane: &PaneId) -> io::Result<Listener> {
     }
 }
 
+/// [`bind`] for a holder upgrade's successor (plan Phase 8): the endpoint
+/// path is taken over atomically from the predecessor's socket
+/// (`Listener::bind_replacing`). The caller holds the pane lock.
+#[cfg(unix)]
+pub fn bind_replacing(pane_dir: &Path, pane: &PaneId) -> io::Result<Listener> {
+    Listener::bind_replacing(&crate::pane::socket_path(pane_dir, pane))
+}
+
 /// Connect to the pane's endpoint, giving up at `deadline`.
 ///
 /// A successful connect says NOTHING about health — a wedged holder's socket
