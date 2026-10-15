@@ -789,12 +789,14 @@ pub async fn dispatch_subtask(
         // Its tenant is resolved from the directory the worker was spawned
         // into (its worktree, or the runner cwd) — plan
         // `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5.
-        registrar.register_session_with_tenant(
-            &task_run_id.to_string(),
-            &format!("orchestration worker {} (run {})", subtask.task_id, run_id),
-            subtask.repo.clone(),
-            crate::session::resolve_new_session_tenant_at(&working_dir).await,
-        );
+        registrar
+            .register_session_in(
+                &task_run_id.to_string(),
+                &format!("orchestration worker {} (run {})", subtask.task_id, run_id),
+                subtask.repo.clone(),
+                &working_dir,
+            )
+            .await;
     } else {
         warn!("dispatch_subtask: AiCoordRegistrar not available; skipping coord identity binding");
     }

@@ -190,8 +190,8 @@ impl LoopController {
             // answers as before.
             match config.project_path.as_deref() {
                 Some(dir) => {
-                    let tenant = crate::session::resolve_new_session_tenant_at(dir).await;
-                    reg.register_session_with_tenant(&execution_id, &purpose, None, tenant);
+                    reg.register_session_in(&execution_id, &purpose, None, dir)
+                        .await;
                 }
                 None => {
                     reg.register_session(&execution_id, &purpose, None);

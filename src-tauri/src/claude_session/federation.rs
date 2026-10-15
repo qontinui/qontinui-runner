@@ -125,7 +125,26 @@ pub fn build_federation_ctx(
     cli_settings: &ClaudeCliSettings,
     session_tenant: impl FnOnce() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
 ) -> Result<SessionContext, FederationSkipReason> {
-    let device_id = match resolve_device_id() {
+    build_federation_ctx_with(
+        session_id,
+        working_dir,
+        resolve_device_id,
+        || crate::ai_provider::get_effective_config_dir(cli_settings).0,
+        session_tenant,
+    )
+}
+
+/// [`build_federation_ctx`] with its identity reads injected, so the ORDER —
+/// the instant skips before the (possibly slow) tenant closure — and the
+/// refusal mapping are unit-testable without a machine.json or a network.
+fn build_federation_ctx_with(
+    session_id: &str,
+    working_dir: &str,
+    device_id: impl FnOnce() -> Option<Uuid>,
+    config_dir: impl FnOnce() -> Option<String>,
+    session_tenant: impl FnOnce() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
+) -> Result<SessionContext, FederationSkipReason> {
+    let device_id = match device_id() {
         Some(d) => d,
         None => {
             warn!(
@@ -136,9 +155,7 @@ pub fn build_federation_ctx(
         }
     };
 
-    let (effective_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir(cli_settings);
-    let config_dir_str = match effective_config_dir {
+    let config_dir_str = match config_dir() {
         Some(s) => s,
         None => {
             warn!(
@@ -216,7 +233,7 @@ pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<Re
 /// RECORDED tenant wins (`session_tenant`, threaded by the spawn site from
 /// `coord_register::federation_session_tenant` — the tenant `AiCoordRegistrar`
 /// stamped the coord record and JWT slot with, else
-/// `session::resolve_new_session_tenant_in` — the coord-mcp proxy's authority
+/// `session::resolve_new_session_tenant_at` — the coord-mcp proxy's authority
 /// order for the spawn directory, its repo tier included), so the coord
 /// record, the JWT slot and the federated pool agree. Only when no tenant
 /// resolved (an unresolvable or unpaired machine) does this fall back to
@@ -285,6 +302,64 @@ pub(crate) fn derive_account_name(config_dir: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn refusal() -> crate::coord_mcp::ProxyRefusal {
+        crate::coord_mcp::ProxyRefusal {
+            status: 403,
+            code: "terminal:tenant_not_paired",
+            retryable: false,
+            message: "test refusal".to_string(),
+        }
+    }
+
+    fn tenant_closure_must_not_run() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+        panic!("the tenant closure (a possibly slow repo read) ran before an instant skip")
+    }
+
+    /// Review round 2 (NIT 4a): the instant skips run BEFORE the tenant
+    /// closure, so a box that cannot federate never pays for a repo read.
+    #[test]
+    fn instant_skips_never_run_the_tenant_closure() {
+        assert_eq!(
+            build_federation_ctx_with(
+                "s",
+                "/w",
+                || None,
+                || Some("/c".to_string()),
+                tenant_closure_must_not_run,
+            )
+            .err(),
+            Some(FederationSkipReason::DeviceIdMissing)
+        );
+        assert_eq!(
+            build_federation_ctx_with(
+                "s",
+                "/w",
+                || Some(Uuid::from_u128(1)),
+                || None,
+                tenant_closure_must_not_run,
+            )
+            .err(),
+            Some(FederationSkipReason::NoConfigDir)
+        );
+    }
+
+    /// Review round 2 (NIT 4b): a refused tenant is `TenantRefused` — the
+    /// default tenant is never substituted.
+    #[test]
+    fn a_refused_tenant_is_tenant_refused_not_the_default() {
+        assert_eq!(
+            build_federation_ctx_with(
+                "s",
+                "/w",
+                || Some(Uuid::from_u128(1)),
+                || Some("/c".to_string()),
+                || Err(refusal()),
+            )
+            .err(),
+            Some(FederationSkipReason::TenantRefused)
+        );
+    }
     use super::*;
 
     #[test]

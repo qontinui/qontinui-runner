@@ -545,12 +545,9 @@ pub async fn create_ai_session(
     let working_dir = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
-    let coord_session_id = ai_coord_registrar.register_session_with_tenant(
-        &task_run_id,
-        &name,
-        None,
-        crate::session::resolve_new_session_tenant_at(&working_dir).await,
-    );
+    let coord_session_id = ai_coord_registrar
+        .register_session_in(&task_run_id, &name, None, &working_dir)
+        .await;
 
     // Phase 1b/1c — build the interactive-agent log emitter when the
     // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON (the default) and the
@@ -2006,12 +2003,10 @@ pub async fn resume_ai_sessions(
         // `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5), so the
         // record and its federation follow that directory's repo.
         let coord_session_id = match ai_coord_registrar.as_ref() {
-            Some(reg) => reg.register_session_with_tenant(
-                &task_run_id,
-                &task_name,
-                None,
-                crate::session::resolve_new_session_tenant_at(&working_dir_for_spawn).await,
-            ),
+            Some(reg) => {
+                reg.register_session_in(&task_run_id, &task_name, None, &working_dir_for_spawn)
+                    .await
+            }
             None => None,
         };
         // Phase 1b/1c emitter — `None` (default) unless the

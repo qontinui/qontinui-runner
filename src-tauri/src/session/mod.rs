@@ -636,8 +636,10 @@ pub(crate) fn resolve_new_session_tenant() -> Option<Uuid> {
 /// the machine rows — the same precedence, the same admission rule
 /// ([`crate::coord_mcp::validate_spawn_tenant`]), the same refusals.
 ///
-/// The repo read is [`qontinui_runner_lib::repo_tenant::cwd_tenant_for_path`],
-/// the proxy's resolver and caches, bounded by its `CWD_TENANT_BUDGET` and
+/// The workspace declaration is read first; only when it is absent is the
+/// repo read at all. The repo read is
+/// [`qontinui_runner_lib::repo_tenant::cwd_tenant_for_path`], the proxy's
+/// resolver and caches, bounded by its `CWD_TENANT_BUDGET` and
 /// retried once on a FAST transient failure ([`cwd_tenant_retrying`]). The
 /// decision itself reads the credential store and so runs on the blocking pool;
 /// a join failure is the proxy's retryable selection refusal, never a default.
@@ -645,21 +647,55 @@ pub(crate) fn resolve_new_session_tenant() -> Option<Uuid> {
 /// `Err` is a refusal: a repo or declaration naming a tenant this device may
 /// not act as, several owners without the default, or a repo still unsettled
 /// on a multi-tenant device. A caller must never substitute the default tenant
-/// for it.
+/// for it — not even by recording NO tenant, which a single-tenant device's
+/// drain would file under the default slot anyway: the registrar does not
+/// register a refused session at all
+/// ([`crate::claude_session::coord_register::AiCoordRegistrar::register_session_in`]).
 pub(crate) async fn resolve_new_session_tenant_at(
     workdir: &str,
 ) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
-    let path = std::path::PathBuf::from(workdir);
-    let repo = cwd_tenant_retrying(
-        || qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(&path),
-        CWD_TENANT_RETRY_IF_FASTER_THAN,
-        CWD_TENANT_RETRY_DELAY,
-        qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET,
-    )
-    .await;
-    let workdir = workdir.to_string();
-    match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-        resolve_new_session_tenant_in(&workdir, || repo)
+    use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+    use workspace_tenant::WorkspaceDeclaration;
+
+    // The workspace declaration first (rows 1a-1c, a file read): when it
+    // answers, the repo is never consulted — no coord read, no wait.
+    let wd = workdir.to_string();
+    let declaration = match spawn_blocking_tracked(move || {
+        workspace_tenant::read_workspace_declaration(Some(&wd))
+    })
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => return Err(crate::coord_mcp::tenant_selection_failed_error(&e)),
+    };
+    let repo = match declaration {
+        WorkspaceDeclaration::Absent => {
+            let path = std::path::PathBuf::from(workdir);
+            Some(
+                cwd_tenant_retrying(
+                    || qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(&path),
+                    CWD_TENANT_RETRY_IF_FASTER_THAN,
+                    CWD_TENANT_RETRY_DELAY,
+                    qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET,
+                )
+                .await,
+            )
+        }
+        _ => None,
+    };
+    // The decision reads the credential store: the blocking pool, as on the
+    // proxy. A join failure is the proxy's retryable selection refusal.
+    match spawn_blocking_tracked(move || {
+        decide_new_session_tenant(
+            || declaration,
+            // Only reached when the declaration is Absent, which is exactly
+            // when the repo was read above.
+            || {
+                repo.unwrap_or_else(|| {
+                    qontinui_runner_lib::repo_tenant::CwdTenant::unknown("repo not consulted")
+                })
+            },
+        )
     })
     .await
     {
@@ -709,15 +745,16 @@ where
     }
 }
 
-/// The synchronous decision behind [`resolve_new_session_tenant_at`], with the
-/// repo answer supplied. `repo` is called only when no workspace declaration
-/// answered (the proxy's laziness too).
-pub(crate) fn resolve_new_session_tenant_in(
-    workdir: &str,
+/// The decision behind [`resolve_new_session_tenant_at`] over this machine's
+/// live inputs, with the workspace declaration and the repo answer supplied.
+/// `repo` is called only when `declaration` is `Absent` (the proxy's laziness
+/// too).
+fn decide_new_session_tenant(
+    declaration: impl FnOnce() -> workspace_tenant::WorkspaceDeclaration,
     repo: impl FnOnce() -> qontinui_runner_lib::repo_tenant::CwdTenant,
 ) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
     new_session_tenant_from(
-        || workspace_tenant::read_workspace_declaration(Some(workdir)),
+        declaration,
         repo,
         tenant_pin::resolve_tenant_pin(),
         crate::auth::default_binding_tenant,
@@ -727,7 +764,7 @@ pub(crate) fn resolve_new_session_tenant_in(
     )
 }
 
-/// Pure core of [`resolve_new_session_tenant_in`]: every input injected.
+/// Pure core of [`decide_new_session_tenant`]: every input injected.
 ///
 /// Mapping from the proxy's decision to a recorded tenant:
 /// - a named tenant (declared, repo-derived, live machine pin) → that tenant;
