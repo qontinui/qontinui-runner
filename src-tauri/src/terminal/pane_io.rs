@@ -157,6 +157,20 @@ pub trait PaneIo: Send + Sync {
         true
     }
 
+    /// Whether the pane ended because the process OWNING its PTY was lost —
+    /// an out-of-process holder that died (or had to be ended) without
+    /// reporting its child's exit — rather than because the child exited, a
+    /// close killed it, or the runner detached. Read by the waiter thread
+    /// after [`Self::wait`] returns: such a pane's session is relaunched with
+    /// `--resume` (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6 — tier 2, for when tier 1 itself dies). `false` for every pane
+    /// whose PTY lives in this process: when that owner dies, so does the
+    /// runner reading this.
+    fn ended_by_holder_loss(&self) -> bool {
+        false
+    }
+
     /// How this implementation discharged the credential-scrub obligation.
     fn credential_scrub(&self) -> CredentialScrub;
 
