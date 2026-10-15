@@ -9,6 +9,10 @@ Usage:
     python search_rag.py --project-id <id> --query "search" --limit 5 --min-score 0.7
 """
 
+import os_trust  # noqa: F401  # side effect: outbound TLS trusts the OS store (os_trust.py)
+
+# isort: split
+
 import argparse
 import asyncio
 import json

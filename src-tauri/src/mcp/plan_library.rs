@@ -1811,6 +1811,11 @@ pub async fn correct_link_handler(
 
 /// Query parameters this door forwards to the web list route. Anything else is
 /// dropped rather than passed through, so a typo cannot silently widen a read.
+///
+/// Paging is by the opaque `cursor` the previous response's `next_cursor`
+/// carried; `offset` no longer exists upstream (plan
+/// 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus D2) and is
+/// dropped here. The response's `BoundedReadMeta` rides through untouched.
 const SEARCH_PARAMS: [&str; 9] = [
     "q",
     "kind",
@@ -1819,7 +1824,7 @@ const SEARCH_PARAMS: [&str; 9] = [
     "repo",
     "since",
     "work_unit_slug",
-    "offset",
+    "cursor",
     "limit",
 ];
 
@@ -1837,7 +1842,7 @@ pub async fn search_handler(Query(params): Query<HashMap<String, String>>) -> Re
 }
 
 /// Query parameters forwarded to the web candidates route.
-const CANDIDATE_PARAMS: [&str; 3] = ["offset", "limit", "include_coord"];
+const CANDIDATE_PARAMS: [&str; 3] = ["cursor", "limit", "include_coord"];
 
 /// `GET /plan-library/candidates` — unshipped plans with the ranking INPUTS
 /// attached and **no score** (D6: the agent ranks). **Ungated**, and advertises
@@ -3173,6 +3178,40 @@ mod tests {
     fn the_candidate_params_are_the_documented_three() {
         assert!(CANDIDATE_PARAMS.contains(&"include_coord"));
         assert!(!CANDIDATE_PARAMS.contains(&"organization_id"));
+        assert!(CANDIDATE_PARAMS.contains(&"cursor"));
+        assert!(!CANDIDATE_PARAMS.contains(&"offset"));
+    }
+
+    /// `offset` was deleted upstream; both list doors forward `cursor` and drop
+    /// `offset`.
+    #[test]
+    fn offset_is_not_forwarded_and_cursor_is() {
+        let raw: HashMap<String, String> = [("offset", "10"), ("cursor", "abc"), ("limit", "5")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for allow in [&SEARCH_PARAMS[..], &CANDIDATE_PARAMS[..]] {
+            let forwarded = forward_only(raw.clone(), allow);
+            assert_eq!(forwarded.get("cursor").map(String::as_str), Some("abc"));
+            assert_eq!(forwarded.get("limit").map(String::as_str), Some("5"));
+            assert!(!forwarded.contains_key("offset"));
+        }
+    }
+
+    /// The proxy adds its capability keys but must leave the upstream
+    /// `BoundedReadMeta` keys exactly as sent.
+    #[test]
+    fn bounded_read_meta_passes_through_untouched() {
+        let meta = serde_json::json!({
+            "items": [], "count": 0, "limit": 50, "shown": 0, "total": 7,
+            "truncated": true, "bound_kind": "page", "next_cursor": "c2",
+            "available": 7, "filter_narrowed": false,
+            "enumerate_via": "GET /plan-library/candidates?cursor=c2",
+        });
+        let out = with_write_capability(meta.clone());
+        for (k, v) in meta.as_object().unwrap() {
+            assert_eq!(out.get(k), Some(v), "{k} must pass through untouched");
+        }
     }
 
     /// The exact-`slug` filter the web list route gains
