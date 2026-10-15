@@ -47,6 +47,9 @@ import {
   isShellInertArg,
   resumePlanFor,
   liveTabShowsSession,
+  withoutReleasedHolders,
+  pruneReleasedTerminalIds,
+  releaseAndRelaunch,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -766,6 +769,62 @@ describe("relaunch from the persisted launch argv (Phase 6)", () => {
         new Set(["dead-pane"]),
       ),
     ).toBe(true);
+  });
+});
+
+// Phase 6, review r1 (L1/M3): the dead pane of a released session is closed so
+// the relaunch takes its zone, or carries the not-relaunched banner.
+describe("a lost holder's dead pane (Phase 6)", () => {
+  it("withoutReleasedHolders frees exactly the zones dead panes hold", () => {
+    expect(withoutReleasedHolders({ 0: "dead", 1: "live" }, new Set(["dead"]))).toEqual({
+      1: "live",
+    });
+  });
+
+  it("pruneReleasedTerminalIds keeps only ids that still have a tab", () => {
+    const released = new Set(["dead", "gone", "never-a-tab"]);
+    pruneReleasedTerminalIds(released, [{ id: "dead" }, { id: "live" }]);
+    expect([...released]).toEqual(["dead"]);
+  });
+
+  it("releaseAndRelaunch: not hosted → scheduled and the dead pane closed", async () => {
+    const scheduled: Array<[string, string[]]> = [];
+    const closed: string[] = [];
+    const withheld: unknown[] = [];
+    const out = await releaseAndRelaunch(
+      { sessionId: "s-1", terminalId: "dead", pageId: "p" },
+      (page, ids) => scheduled.push([page, ids]),
+      (id) => closed.push(id),
+      (w) => withheld.push(w),
+      undefined,
+      async () => new Set(["other"]),
+    );
+    expect(out).toBe(true);
+    expect(scheduled).toEqual([["p", ["s-1"]]]);
+    expect(closed).toEqual(["dead"]);
+    expect(withheld).toEqual([]);
+  });
+
+  it("releaseAndRelaunch: still hosted (or unreadable) → no relaunch, the banner instead", async () => {
+    for (const live of [new Set(["s-1"]), null]) {
+      const scheduled: unknown[] = [];
+      const closed: string[] = [];
+      const withheld: unknown[] = [];
+      const out = await releaseAndRelaunch(
+        { sessionId: "s-1", terminalId: "dead", pageId: null },
+        (page, ids) => scheduled.push([page, ids]),
+        (id) => closed.push(id),
+        (w) => withheld.push(w),
+        "liveness-unknown",
+        async () => live,
+      );
+      expect(out).toBe(false);
+      expect(scheduled).toEqual([]);
+      expect(closed).toEqual([]);
+      expect(withheld).toEqual([
+        { sessionId: "s-1", terminalId: "dead", pageId: null, reason: "liveness-unknown" },
+      ]);
+    }
   });
 });
 
