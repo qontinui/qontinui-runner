@@ -1205,15 +1205,23 @@ async fn dispatch_to_app_inner(
 /// - `hint.retryable` is the wrapper's own retry verdict when it sent one,
 ///   else `null`: UNKNOWN, never `false`.
 ///
-/// These are the SDK proxy's spellings (`sdk_client::ipc_fallback_refusal`),
-/// so one failure reads the same through either door.
+/// The field NAMES and VALUES are the SDK proxy's
+/// (`sdk_client::ipc_fallback_refusal`), so one failure carries the same
+/// `code`, `failure_origin` and `retryable` through either door. Their PLACE
+/// differs: this door answers in the `ApiResponse` envelope, so
+/// `failure_origin` and `retryable` sit under `hint`, while the SDK proxy's
+/// refusal is a bare JSON body with both at its top level. A reader that
+/// handles both doors reads `hint.failure_origin` here and `failure_origin`
+/// there.
 fn app_failure_response(err: &DispatchError) -> ApiResponse<serde_json::Value> {
     use crate::mcp::command_relay::CommandRelayError;
     let (origin, code, retryable) = match err {
         DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
             ("app", failure.code.clone(), failure.retryable)
         }
-        DispatchError::AppAnswered { code, .. } => ("app", code.clone(), None),
+        DispatchError::AppAnswered {
+            code, retryable, ..
+        } => ("app", code.clone(), *retryable),
         _ => ("transport", None, None),
     };
     let mut body = match code {
