@@ -39,25 +39,35 @@ pub(crate) struct TenantMismatch {
     pub returned: Option<Uuid>,
 }
 
-/// Refresh the device-JWT once we're within TTL/3 of expiry.
+/// Refresh the device-JWT once we're within TTL/2 of expiry.
 ///
-/// Coord mints 4-hour device-JWTs (14_400s). TTL/3 = 4_800s = 80 min.
+/// Coord mints 4-hour device-JWTs (14_400s). TTL/2 = 7_200s = 120 min.
 /// The refresher loop calls `device_jwt_needs_refresh` to decide whether
 /// to call `pair_with_auth_token` and replace the stored JWT.
+///
+/// TTL/2, not the historical TTL/3 (80 min): the refresh window is the only
+/// time a credential can be renewed, and a coord outage longer than the window
+/// expired the credential outright (plan
+/// `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
+/// — spaceship 2026-10-07 and 2026-10-09). Coord's refresh route
+/// (`tokens::post_refresh_device`) has no minimum-remaining-lifetime check and
+/// no rate limit, so refreshing earlier costs one request per two hours.
 ///
 /// This constant is sized for the DEVICE JWT and nothing else. The Cognito
 /// access token has its own, much shorter TTL and its own threshold —
 /// [`COGNITO_REFRESH_BEFORE_EXPIRY_SECS`]. Reusing this one for Cognito is
-/// the bug fixed below: 4_800s exceeds the Cognito token's entire 3_600s
-/// lifetime, so the staleness predicate was true the instant a refresh
+/// the bug fixed below: this threshold (7_200s; 4_800s when that bug was
+/// found) exceeds the Cognito token's entire 3_600s lifetime, so the
+/// staleness predicate was true the instant a refresh
 /// completed and every auth check paid a fresh `refresh_token` grant.
-pub const REFRESH_BEFORE_EXPIRY_SECS: i64 = 4 * 60 * 60 / 3;
+pub const REFRESH_BEFORE_EXPIRY_SECS: i64 = 4 * 60 * 60 / 2;
 
 /// Refresh the Cognito access token once we're within TTL/3 of expiry.
 ///
 /// Cognito mints 1-hour access tokens (`expires_in: 3600` — see
 /// `cognito::TokenResponse` and its parse tests). TTL/3 = 1_200s = 20 min,
-/// the same one-third convention as [`REFRESH_BEFORE_EXPIRY_SECS`].
+/// a one-third lead (the device JWT's [`REFRESH_BEFORE_EXPIRY_SECS`] has since
+/// widened to one half; Cognito's refresh is not the outage-exposed one).
 ///
 /// The invariant that matters is `COGNITO_REFRESH_BEFORE_EXPIRY_SECS <
 /// COGNITO_ACCESS_TOKEN_TTL_SECS`: a threshold at or above the token's own
@@ -992,10 +1002,10 @@ impl AuthManager {
     /// supervised device-JWT refresher re-mints from the Cognito session, and
     /// coord re-verifies on every WS handshake. Gating on freshness here used to
     /// sign the operator out automatically — [`Self::device_jwt_needs_refresh`]
-    /// flips to `true` a full [`REFRESH_BEFORE_EXPIRY_SECS`] (80 min) BEFORE the
-    /// JWT actually expires, so an install with no stored Cognito refresh token
-    /// (legacy pair-code pairing) was reported unauthenticated 80 minutes early
-    /// and dropped to the LoginScreen.
+    /// flips to `true` a full [`REFRESH_BEFORE_EXPIRY_SECS`] (80 min then, 120 min
+    /// now) BEFORE the JWT actually expires, so an install with no stored Cognito
+    /// refresh token (legacy pair-code pairing) was reported unauthenticated 80
+    /// minutes early and dropped to the LoginScreen.
     ///
     /// Also deliberately NOT a `/api/v1/auth/users/me` round-trip: the web
     /// backend's `users/me` can return 401/403 for a federated Cognito identity
@@ -1287,6 +1297,11 @@ impl AuthManager {
     /// refresher loop deciding "should I pair again?". Coord re-verifies
     /// the JWT on every WS handshake; a forged exp at most causes one
     /// extra pair call.
+    ///
+    /// This is a REFRESH-SCHEDULING predicate, not a liveness one: it is true
+    /// for the last [`REFRESH_BEFORE_EXPIRY_SECS`] of a perfectly valid JWT.
+    /// "Does this runner hold a usable device JWT?" is
+    /// [`Self::device_jwt_is_live`].
     pub fn device_jwt_needs_refresh(&self) -> Result<bool> {
         let token = match self.get_access_token() {
             Ok(t) => t,
@@ -1406,14 +1421,37 @@ impl AuthManager {
         self.secure_storage.get_device_machine_key()
     }
 
+    /// `Ok(true)` iff the access_token slot holds a decodable device JWT that
+    /// has not EXPIRED (with [`EXPIRY_LEEWAY_SECS`] of skew) — the same test
+    /// [`slot_jwt_is_usable`] applies to tenant slots. `Ok(false)` for an
+    /// absent, opaque or expired token; `Err` when the store cannot be read
+    /// (UNKNOWN, never "no credential").
+    ///
+    /// Keyed on actual expiry, NOT on the refresh threshold: a JWT inside its
+    /// refresh window still authenticates, and during a coord outage that window
+    /// is two hours long (plan
+    /// `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`).
+    /// The provisioning gate and the UI-Bridge session surface ask this.
+    pub fn device_jwt_is_live(&self) -> Result<bool> {
+        use crate::secure_storage::StoredTokenRead;
+        match self.probe_access_token() {
+            StoredTokenRead::Present(t) => Ok(slot_jwt_is_usable(&t)),
+            StoredTokenRead::Absent => Ok(false),
+            StoredTokenRead::Unreadable(e) => {
+                Err(anyhow::anyhow!("credential store unreadable: {e}"))
+            }
+        }
+    }
+
     /// `true` iff the Cognito access token is missing OR within
     /// [`COGNITO_REFRESH_BEFORE_EXPIRY_SECS`] of expiry. Used by the device-JWT
     /// refresher to refresh the Cognito token *first* when it's stale (so the
     /// subsequent device re-bind presents a fresh user bearer).
     ///
     /// Deliberately NOT [`REFRESH_BEFORE_EXPIRY_SECS`]: that threshold is
-    /// TTL/3 of coord's 4-hour DEVICE JWT (4_800s), which is longer than the
-    /// Cognito access token lives (3_600s). Borrowing it made this predicate
+    /// TTL/2 of coord's 4-hour DEVICE JWT (7_200s; TTL/3 = 4_800s when this was
+    /// written), which is longer than the Cognito access token lives (3_600s).
+    /// Borrowing it made this predicate
     /// return `true` even 80ms after a successful refresh, so every
     /// `check_auth_status` forced a blocking Cognito `refresh_token` grant —
     /// which then consumed the caller's whole enrichment budget and left the
@@ -5744,7 +5782,7 @@ mod device_jwt_tests {
     fn needs_refresh_when_jwt_within_threshold() {
         let mgr = create_test_auth_manager("needs_refresh_when_jwt_within_threshold");
         let now = chrono::Utc::now().timestamp();
-        // exp 30 minutes from now — well inside the 80-minute refresh threshold.
+        // exp 30 minutes from now — well inside the 120-minute refresh threshold.
         let jwt = synth_jwt(now + 30 * 60);
         mgr.store_tokens(&jwt, "").unwrap();
         assert!(
@@ -5757,13 +5795,34 @@ mod device_jwt_tests {
     fn does_not_need_refresh_when_jwt_fresh() {
         let mgr = create_test_auth_manager("does_not_need_refresh_when_jwt_fresh");
         let now = chrono::Utc::now().timestamp();
-        // exp 3 hours from now — comfortably outside the 80-minute threshold.
+        // exp 3 hours from now — comfortably outside the 120-minute threshold.
         let jwt = synth_jwt(now + 3 * 60 * 60);
         mgr.store_tokens(&jwt, "").unwrap();
         assert!(
             !mgr.device_jwt_needs_refresh().unwrap(),
-            "JWT with >80min until expiry must NOT report needs-refresh"
+            "JWT with >120min until expiry must NOT report needs-refresh"
         );
+    }
+
+    /// Liveness is NOT the refresh threshold: a JWT 100 minutes from expiry is
+    /// inside the TTL/2 refresh window and still LIVE; only a past-`exp`,
+    /// opaque or absent token is not.
+    #[test]
+    fn device_jwt_is_live_keys_on_expiry_not_the_refresh_threshold() {
+        let mgr = no_keychain_auth_manager("device_jwt_is_live_expiry");
+        let now = chrono::Utc::now().timestamp();
+        assert!(!mgr.device_jwt_is_live().unwrap(), "absent is not live");
+        mgr.store_tokens(&synth_jwt(now + 100 * 60), "").unwrap();
+        assert!(mgr.device_jwt_needs_refresh().unwrap());
+        assert!(
+            mgr.device_jwt_is_live().unwrap(),
+            "inside the refresh window is still live"
+        );
+        mgr.store_tokens(&synth_jwt(now - 120), "").unwrap();
+        assert!(!mgr.device_jwt_is_live().unwrap(), "expired is not live");
+        mgr.store_tokens("qontinui_runner_legacy_opaque", "")
+            .unwrap();
+        assert!(!mgr.device_jwt_is_live().unwrap(), "opaque is not live");
     }
 
     #[test]
@@ -5780,9 +5839,40 @@ mod device_jwt_tests {
     }
 
     #[test]
-    fn refresh_threshold_is_ttl_over_three() {
-        // Pin the constant — coord mints 4h JWTs, refresh threshold = TTL/3.
-        assert_eq!(REFRESH_BEFORE_EXPIRY_SECS, 4_800);
+    fn refresh_threshold_is_ttl_over_two() {
+        // Pin the constant — coord mints 4h JWTs, refresh threshold = TTL/2, so
+        // a coord outage of up to two hours inside the window cannot expire the
+        // credential (plan 2026-10-09-runner-credential-expires-when-coord-is-
+        // down-across-its-only-refresh-window, Phase 2 step 4).
+        assert_eq!(REFRESH_BEFORE_EXPIRY_SECS, 7_200);
+        assert_eq!(REFRESH_BEFORE_EXPIRY_SECS, 4 * 60 * 60 / 2);
+    }
+
+    /// The TTL/2 boundary on the predicate itself, not only on the constant:
+    /// a JWT 100 minutes from expiry was "fresh" under TTL/3 and is inside
+    /// the window now; one 130 minutes out is still fresh.
+    /// As `create_test_auth_manager`, but never touching the OS keychain.
+    fn no_keychain_auth_manager(test_name: &str) -> AuthManager {
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_device_jwt");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        let _ = fs::remove_file(&storage_path);
+        AuthManager::with_storage_no_keychain(SecureStorage::with_path(storage_path).unwrap())
+    }
+
+    #[test]
+    fn needs_refresh_boundary_moves_to_ttl_over_two() {
+        let mgr = no_keychain_auth_manager("needs_refresh_boundary_ttl_over_two");
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_tokens(&synth_jwt(now + 100 * 60), "").unwrap();
+        assert!(
+            mgr.device_jwt_needs_refresh().unwrap(),
+            "100 min left is inside the TTL/2 window"
+        );
+        mgr.store_tokens(&synth_jwt(now + 130 * 60), "").unwrap();
+        assert!(
+            !mgr.device_jwt_needs_refresh().unwrap(),
+            "130 min left is outside the TTL/2 window"
+        );
     }
 
     #[test]
@@ -5794,7 +5884,7 @@ mod device_jwt_tests {
 
     /// The invariant the whole fix rests on. A threshold at or above the
     /// token's own lifetime makes `cognito_token_needs_refresh` permanently
-    /// true. The device-JWT constant (4_800s) violates it, which is exactly
+    /// true. The device-JWT constant (7_200s) violates it, which is exactly
     /// why Cognito may not borrow it.
     #[test]
     fn cognito_threshold_is_below_token_ttl() {
