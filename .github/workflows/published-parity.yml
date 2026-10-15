@@ -133,6 +133,8 @@ on:
       # parses and the unit-test step runs.
       - "scripts/published-parity.ps1"
       - "scripts/contract-smoke.ps1"
+      # The behavioural axis both legs run (it was inline in this file).
+      - "scripts/behavioural-diff.sh"
       - "scripts/lib/*.ps1"
       - "scripts/tests/test-parity-diff.ps1"
       - "scripts/tests/test-invoke-ps51-detached.ps1"
