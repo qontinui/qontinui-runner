@@ -284,6 +284,12 @@ pub struct SnapshotHeader {
     pub handoff_offset: u64,
     pub exit_linger_ms: u64,
     pub modes: ModeSnapshot,
+    /// The predecessor's declared-loss take-back offset, if it ever took its
+    /// pane back from a successor that died after serving (H1). Carried so a
+    /// client still holding that dead successor's offset is told the loss by
+    /// this successor too. Absent in a snapshot from an older predecessor.
+    #[serde(default)]
+    pub stream_replaced_at: Option<u64>,
 }
 
 /// Control-channel messages, one `KIND_CONTROL` frame each. `commit` is
@@ -835,6 +841,7 @@ fn write_snapshot(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Pane, x: u64) -> i
             handoff_offset: x,
             exit_linger_ms: pane.exit_linger().as_millis() as u64,
             modes: st.modes.snapshot(),
+            stream_replaced_at: st.stream_replaced_at,
         };
         (header, ring)
     };
@@ -1178,6 +1185,7 @@ fn prepare_adoption(snap: &Path, master: File, lockf: File) -> Result<Prepared, 
         modes,
         size: (header.cols, header.rows),
         exit_linger: Duration::from_millis(header.exit_linger_ms),
+        stream_replaced_at: header.stream_replaced_at,
     })
     .map_err(|e| format!("adopted pane: {e}"))?;
     let staged =

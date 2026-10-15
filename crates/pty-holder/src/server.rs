@@ -529,6 +529,9 @@ pub(crate) enum Action {
     Attach {
         from: Option<u64>,
         restore: bool,
+        /// `attach.stream_of` names THIS holder: the offset is on its own
+        /// stream (H1, [`attach_start`]).
+        own_stream: bool,
     },
     /// Write these bytes to the child.
     Input(Vec<u8>),
@@ -721,12 +724,16 @@ pub(crate) fn serve_conn_with(
                 reject(&writer, reason, &detail);
                 break;
             }
-            Action::Attach { from, restore } => {
+            Action::Attach {
+                from,
+                restore,
+                own_stream,
+            } => {
                 let Some(pane) = pane else { break };
                 let ConnState::Negotiated(v) = state else {
                     break;
                 };
-                if start_attach(pane, &writer, &flow, from, restore).is_err() {
+                if start_attach(pane, &writer, &flow, from, restore, own_stream).is_err() {
                     break;
                 }
                 state = ConnState::Attached(v);
@@ -849,12 +856,16 @@ fn start_attach(
     flow: &Arc<ConnFlow>,
     from: Option<u64>,
     restore: bool,
+    own_stream: bool,
 ) -> io::Result<()> {
     let (reply, plan) = {
         let st = pane.lock_state();
         let ring_start = st.ring.start_offset();
         let end = st.ring.end_offset();
-        let plan = attach_start(from, ring_start, end, st.stream_replaced_at);
+        // An offset counted on THIS holder's own stream is never one of a
+        // dead successor's (H1): the take-back rule does not apply to it.
+        let replaced_at = st.stream_replaced_at.filter(|_| !own_stream);
+        let plan = attach_start(from, ring_start, end, replaced_at);
         let meta = restore.then(|| {
             crate::metadata::restore_meta(st.modes.cwd(), pane.spawn_cwd(), st.modes.title())
         });
@@ -911,10 +922,13 @@ struct AttachStart {
 ///   offset with no loss marker. Instead the attach starts at X, the pump
 ///   first sends `output_lost {X, T}` with `T = max(y, end)`, and streams
 ///   from `T` — so nothing the client cannot place is replayed, the client's
-///   offset never moves backwards, and the break is explicit. The cost is
-///   also explicit: a client that legitimately reached `y > X` on THIS holder
-///   (after the take-back) and reconnects is told that `[y, end)` is lost,
-///   because no offset alone can tell the two clients apart.
+///   offset never moves backwards, and the break is explicit. A client that
+///   reached `y > X` on THIS holder (after the take-back) says so with
+///   `attach.stream_of` naming this holder's pid, and resumes normally (the
+///   caller passes `replaced_at: None` for it). One that does not say — an
+///   older runner, or a consumer that cannot know — is told `[y, end)` is
+///   lost: no offset alone can tell it from the dead successor's client, and
+///   over-reporting a loss is the honest direction.
 fn attach_start(
     from: Option<u64>,
     ring_start: u64,
@@ -1273,9 +1287,11 @@ fn handle_request(state: &mut ConnState, req: Request, info: &HolderInfo) -> Act
             Request::Attach {
                 from_offset,
                 restore,
+                stream_of,
             },
         ) if v >= DATA_PATH_VERSION => Action::Attach {
             from: from_offset,
+            own_stream: stream_of == Some(info.holder_pid),
             // A version-2 connection never gets the envelope, whatever a
             // confused client put in the field.
             restore: restore && v >= RESTORE_VERSION,
@@ -1370,6 +1386,31 @@ fn reject(writer: &Mutex<Conn>, reason: RejectReason, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H1: `attach.stream_of` naming this holder marks the offset as its own.
+    #[test]
+    fn pty_holder_attach_stream_of_names_this_holder() {
+        let i = info();
+        for (stream_of, own) in [(Some(7), true), (Some(8), false), (None, false)] {
+            let mut s = ConnState::Negotiated(DATA_PATH_VERSION);
+            assert_eq!(
+                handle_request(
+                    &mut s,
+                    Request::Attach {
+                        from_offset: Some(3),
+                        restore: false,
+                        stream_of,
+                    },
+                    &i
+                ),
+                Action::Attach {
+                    from: Some(3),
+                    restore: false,
+                    own_stream: own,
+                }
+            );
+        }
+    }
 
     #[test]
     fn pty_holder_attach_start_without_a_take_back() {
@@ -1630,12 +1671,14 @@ mod tests {
                 Request::Attach {
                     from_offset: Some(5),
                     restore: true,
+                    stream_of: None,
                 },
                 &i
             ),
             Action::Attach {
                 from: Some(5),
                 restore: false,
+                own_stream: false,
             },
             "a version-2 connection never gets the restore envelope"
         );
@@ -1668,6 +1711,7 @@ mod tests {
                 Request::Attach {
                     from_offset: None,
                     restore: false,
+                    stream_of: None,
                 },
                 &i
             ),
@@ -1683,6 +1727,7 @@ mod tests {
             Request::Attach {
                 from_offset: None,
                 restore: false,
+                stream_of: None,
             },
             Request::Resize { cols: 1, rows: 1 },
             Request::Kill,
@@ -1752,6 +1797,7 @@ mod tests {
             Request::Attach {
                 from_offset: None,
                 restore: false,
+                stream_of: None,
             },
             Request::OpenInput,
         ] {
@@ -1787,12 +1833,14 @@ mod tests {
                 Request::Attach {
                     from_offset: None,
                     restore: true,
+                    stream_of: None,
                 },
                 &i
             ),
             Action::Attach {
                 from: None,
                 restore: true,
+                own_stream: false,
             }
         );
     }

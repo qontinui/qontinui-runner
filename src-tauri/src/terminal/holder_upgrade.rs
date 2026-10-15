@@ -51,7 +51,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use qontinui_pty_holder::client::{
-    probe, upgrade_pane, PaneUpgrade, PaneUpgradeError, Probe, UpgradeOutcome,
+    probe, upgrade_pane, ConnectError, PaneUpgrade, PaneUpgradeError, Probe, UpgradeOutcome,
 };
 use qontinui_pty_holder::pane::PaneId;
 use serde::Serialize;
@@ -225,9 +225,13 @@ pub enum HolderUpgradeOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gate {
     /// Send `prepare_upgrade`. `previous_build` is the holder's build when it
-    /// answered a handshake (an incompatible holder answers none).
+    /// answered a handshake (an incompatible holder answers none);
+    /// `expected_pid` is the holder the check saw (`None`: an incompatible
+    /// one), so a pane that changed hands since is not asked
+    /// (`client::upgrade_pane`).
     Proceed {
         previous_build: Option<String>,
+        expected_pid: Option<u32>,
     },
     Stop(HolderUpgradeOutcome),
 }
@@ -254,10 +258,12 @@ pub fn gate(supported: bool, in_flight: bool, probe: &Probe, runner_build: &str)
     match probe {
         Probe::Incompatible { .. } => Gate::Proceed {
             previous_build: None,
+            expected_pid: None,
         },
         Probe::Healthy { hello_ack } if older_build(&hello_ack.holder_build, runner_build) => {
             Gate::Proceed {
                 previous_build: Some(hello_ack.holder_build.clone()),
+                expected_pid: Some(hello_ack.holder_pid),
             }
         }
         Probe::Healthy { hello_ack } => refuse(format!(
@@ -301,13 +307,24 @@ pub fn map_outcome(
         Err(PaneUpgradeError::NotSent(e)) => HolderUpgradeOutcome::Failed {
             reason: format!("the upgrade request did not reach the holder ({e}); nothing changed"),
         },
-        Err(PaneUpgradeError::Unanswered(e)) => HolderUpgradeOutcome::UnknownOnTimeout {
-            reason: format!(
-                "the holder did not answer the upgrade within {UPGRADE_DEADLINE:?} ({e}); it \
-                 may have committed, rolled back, or still be running"
-            ),
-            holder_pid_now: read_back(None).map(|(pid, _)| pid),
-        },
+        Err(PaneUpgradeError::Unanswered(e)) => {
+            let timed_out = matches!(
+                &e,
+                ConnectError::Io(io) if matches!(
+                    io.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            );
+            let what = if timed_out {
+                format!("the holder did not answer the upgrade within {UPGRADE_DEADLINE:?} ({e})")
+            } else {
+                format!("the holder's answer to the upgrade could not be read ({e})")
+            };
+            HolderUpgradeOutcome::UnknownOnTimeout {
+                reason: format!("{what}; it may have committed, rolled back, or still be running"),
+                holder_pid_now: read_back(None).map(|(pid, _)| pid),
+            }
+        }
     }
 }
 
@@ -355,8 +372,11 @@ pub fn upgrade_blocking_with(
         return stop;
     }
     let seen = probe(pane_dir, pane, Instant::now() + PROBE_DEADLINE);
-    let previous_build = match gate(supported, in_flight, &seen, runner_build) {
-        Gate::Proceed { previous_build } => previous_build,
+    let (previous_build, expected_pid) = match gate(supported, in_flight, &seen, runner_build) {
+        Gate::Proceed {
+            previous_build,
+            expected_pid,
+        } => (previous_build, expected_pid),
         Gate::Stop(outcome) => return outcome,
     };
     tracing::info!(pane = %pane, ?previous_build, "pty holder: operator-initiated in-place upgrade requested");
@@ -364,6 +384,7 @@ pub fn upgrade_blocking_with(
     let result = upgrade_pane(
         pane_dir,
         pane,
+        expected_pid,
         now + HANDSHAKE_DEADLINE,
         now + HANDSHAKE_DEADLINE + UPGRADE_DEADLINE,
     );
@@ -378,7 +399,6 @@ pub fn upgrade_blocking_with(
 mod tests {
     use super::*;
     use crate::session::tracking_health::HolderPane;
-    use qontinui_pty_holder::client::ConnectError;
     use qontinui_pty_holder::protocol::HelloAck;
 
     const RUNNER: &str = "qontinui-pty-holder 0.2.0";
@@ -436,13 +456,15 @@ mod tests {
                 RUNNER
             ),
             Gate::Proceed {
-                previous_build: None
+                previous_build: None,
+                expected_pid: None,
             }
         );
         assert_eq!(
             gate(true, false, &healthy("qontinui-pty-holder 0.1.0"), RUNNER),
             Gate::Proceed {
-                previous_build: Some("qontinui-pty-holder 0.1.0".into())
+                previous_build: Some("qontinui-pty-holder 0.1.0".into()),
+                expected_pid: Some(10),
             }
         );
         let refused = |g: Gate| matches!(g, Gate::Stop(HolderUpgradeOutcome::Refused { .. }));
@@ -559,7 +581,21 @@ mod tests {
                 reason,
             } => {
                 assert_eq!(holder_pid_now, Some(33));
+                assert!(reason.contains("did not answer"), "{reason}");
                 assert!(reason.contains("may have committed"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Not a timeout: still UNKNOWN, but the reason does not claim one.
+        let garbled = PaneUpgradeError::Unanswered(ConnectError::Protocol("garbled".into()));
+        match map_outcome(Err(garbled), None, |_| None) {
+            HolderUpgradeOutcome::UnknownOnTimeout {
+                reason,
+                holder_pid_now,
+            } => {
+                assert!(reason.contains("could not be read"), "{reason}");
+                assert!(!reason.contains("within"), "{reason}");
+                assert_eq!(holder_pid_now, None);
             }
             other => panic!("{other:?}"),
         }

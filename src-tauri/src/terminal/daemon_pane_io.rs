@@ -1828,13 +1828,14 @@ impl PumpCtx {
                     if restoring {
                         info!(pane = %self.key, holder_pid = self.holder_pid(), from, "pty holder: the connection dropped before the restore postamble arrived — reattaching WITH a restore");
                     }
-                    match connect(&self.pane_dir, &self.pane_id, deadline).and_then(|c| {
-                        if restoring {
-                            c.attach_restoring(Some(from), deadline)
-                        } else {
-                            c.attach(Some(from), deadline)
-                        }
-                    }) {
+                    // `stream_of`: the holder this pane's offset was counted
+                    // on — so a holder that took the pane back after a failed
+                    // upgrade resumes its OWN stream here without a loss
+                    // report (plan Phase 8, H1).
+                    let stream_of = self.holder_pid();
+                    match connect(&self.pane_dir, &self.pane_id, deadline)
+                        .and_then(|c| c.attach_continuing(from, stream_of, restoring, deadline))
+                    {
                         Ok(stream) => {
                             if restoring && stream.info.restore.is_none() {
                                 warn!(pane = %self.key, holder_pid = self.holder_pid(), "pty holder: the reattach could not ask for a restore — the owed postamble is lost; modes set before the replayed tail may be wrong");

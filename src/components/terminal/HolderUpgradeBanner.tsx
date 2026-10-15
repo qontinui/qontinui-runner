@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, ArrowUpCircle, RefreshCw, X } from "lucide-react";
 import { AdvisorySlot } from "./AdvisoryStack";
 import {
   attentionLabel,
+  bannerHeadline,
   describeOutcome,
   holderActions,
   invokeErrorText,
@@ -42,11 +43,18 @@ export function HolderUpgradeBanner() {
   const [outcomes, setOutcomes] = useState<Record<string, HolderUpgradeOutcome | string>>({});
   const [leftRunning, setLeftRunning] = useState<Set<string>>(new Set());
 
+  // Census reads can overlap (the interval, Refresh, the post-upgrade read):
+  // only the newest request's answer is applied.
+  const latest = useRef(0);
   const refresh = useCallback(async () => {
+    const seq = ++latest.current;
     try {
-      setAttention(await invoke<HolderAttention>("pty_holder_attention"));
+      const next = await invoke<HolderAttention>("pty_holder_attention");
+      if (seq !== latest.current) return;
+      setAttention(next);
       setReadError(null);
     } catch (err) {
+      if (seq !== latest.current) return;
       setReadError(invokeErrorText(err));
     }
   }, []);
@@ -78,7 +86,9 @@ export function HolderUpgradeBanner() {
   // visible until dismissed, so the operator sees what happened.
   const orphanOutcomes = Object.keys(outcomes).filter((id) => !panes.some((p) => p.paneId === id));
   const censusError = attention?.censusError ?? null;
-  if (panes.length === 0 && orphanOutcomes.length === 0 && !censusError) return null;
+  // A census that could not be read is UNKNOWN, never "nothing needs a
+  // decision": it is shown.
+  if (panes.length === 0 && orphanOutcomes.length === 0 && !censusError && !readError) return null;
 
   const actions = holderActions(
     attention ?? { upgradeSupported: false, endAndResumeAvailable: false },
@@ -111,9 +121,7 @@ export function HolderUpgradeBanner() {
         <div className="flex items-center gap-1.5 mb-1">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-[#e0af68]" />
           <span className="font-semibold flex-1">
-            {panes.length === 1
-              ? "1 pane's PTY holder needs a decision"
-              : `${panes.length} panes' PTY holders need a decision`}
+            {bannerHeadline(panes.length, censusError !== null || readError !== null)}
           </span>
           <button
             type="button"
