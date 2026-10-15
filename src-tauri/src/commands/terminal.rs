@@ -1513,6 +1513,10 @@ pub fn terminal_session_clear_restore_pending(
     claude_session_id: String,
 ) -> Result<CommandResponse, String> {
     store.clear_restore_pending(&claude_session_id);
+    // The restore resumed this session (or settled why not): a lost holder's
+    // relaunch decision for it still waiting must not fire later (plan
+    // 2026-09-12 Phase 6; review r2, N2).
+    crate::terminal::holder_relaunch::cancel_for_session(&claude_session_id);
     Ok(CommandResponse {
         success: true,
         message: None,

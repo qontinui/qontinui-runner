@@ -851,6 +851,9 @@ impl TerminalManager {
 
     /// Remove and close a terminal session.
     pub fn close(&self, id: &str) -> Result<(), String> {
+        // A lost PTY holder's relaunch decision for this pane is moot once
+        // the pane is closed (plan 2026-09-12 Phase 6; review r2, N2).
+        super::holder_relaunch::cancel_for_terminal(id);
         let session = {
             let mut sessions = self
                 .sessions

@@ -43,6 +43,13 @@
 //!   ([`HolderLoss::Unreachable`]) is never released: its `claude` may still
 //!   be running behind it. The operator is told (`holder-unreachable`).
 //!
+//! The loop is CANCELLED (review r2, N2) when the dead pane is closed
+//! (`TerminalManager::close` → [`cancel_for_terminal`]) or the session is
+//! resumed elsewhere (`terminal_session_clear_restore_pending` →
+//! [`cancel_for_session`]), and before it emits `Released` it re-checks that
+//! the session's record is still bound to the dead terminal — a session
+//! rebound to a live pane meanwhile is not relaunched a second time.
+//!
 //! The webview re-checks the oracle before it types anything. That second read
 //! is LATER, not independent — a `claude` the registry cannot see (an
 //! undiscovered config dir, a build that writes no registry file) is invisible
@@ -60,7 +67,8 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter};
@@ -115,6 +123,70 @@ pub struct RelaunchWithheld {
 pub enum Emission {
     Released(SessionReleased),
     Withheld(RelaunchWithheld),
+}
+
+/// One running relaunch decision: its dead terminal, its session, and the
+/// flag that cancels it.
+struct Pending {
+    terminal_id: String,
+    session_id: String,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Every relaunch decision in flight (review r2, N2). Entries are removed
+/// when their decision ends.
+static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+
+fn pending() -> std::sync::MutexGuard<'static, Vec<Pending>> {
+    PENDING.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Register a decision for `terminal_id` / `session_id`; the returned flag is
+/// set when it is cancelled. A second loss on the same terminal cancels the
+/// first decision.
+fn register(terminal_id: &str, session_id: &str) -> Arc<AtomicBool> {
+    cancel_for_terminal(terminal_id);
+    let cancel = Arc::new(AtomicBool::new(false));
+    pending().push(Pending {
+        terminal_id: terminal_id.to_string(),
+        session_id: session_id.to_string(),
+        cancel: cancel.clone(),
+    });
+    cancel
+}
+
+fn unregister(cancel: &Arc<AtomicBool>) {
+    pending().retain(|p| !Arc::ptr_eq(&p.cancel, cancel));
+}
+
+/// Cancel the relaunch decision for dead terminal `terminal_id` — its pane
+/// was closed. Returns how many were cancelled.
+pub fn cancel_for_terminal(terminal_id: &str) -> usize {
+    let mut list = pending();
+    let before = list.len();
+    list.retain(|p| {
+        let hit = p.terminal_id == terminal_id;
+        if hit {
+            p.cancel.store(true, Ordering::Release);
+        }
+        !hit
+    });
+    before - list.len()
+}
+
+/// Cancel every relaunch decision for `session_id` — it was resumed (or
+/// deliberately not resumed) by the restore. Returns how many were cancelled.
+pub fn cancel_for_session(session_id: &str) -> usize {
+    let mut list = pending();
+    let before = list.len();
+    list.retain(|p| {
+        let hit = p.session_id == session_id;
+        if hit {
+            p.cancel.store(true, Ordering::Release);
+        }
+        !hit
+    });
+    before - list.len()
 }
 
 /// The session a lost holder's pane hosted, and where to restore it.
@@ -204,21 +276,29 @@ pub fn retry_delays(grace: Duration) -> Vec<Duration> {
 /// the webview through `emit`. Generic, so the whole policy — the settle
 /// window, the withheld banner, the retry of an unknown verdict — is tested
 /// without a process table, a clock or a Tauri app.
-pub async fn decide_relaunch<R, RF, P, PF, E>(
+#[allow(clippy::too_many_arguments)]
+pub async fn decide_relaunch<R, RF, P, PF, E, C, B>(
     terminal_id: &str,
     target: &RelaunchTarget,
     loss: HolderLoss,
     mut read: R,
     mut pause: P,
     emit: &E,
+    cancelled: &C,
+    still_bound: &B,
 ) where
     E: Fn(Emission),
+    C: Fn() -> bool,
+    B: Fn() -> bool,
     R: FnMut() -> RF,
     RF: Future<Output = Option<HashSet<String>>>,
     P: FnMut(Duration) -> PF,
     PF: Future<Output = ()>,
 {
     let withheld = |reason| {
+        if cancelled() {
+            return;
+        }
         emit(Emission::Withheld(RelaunchWithheld {
             session_id: target.session_id.clone(),
             terminal_id: terminal_id.to_string(),
@@ -227,6 +307,19 @@ pub async fn decide_relaunch<R, RF, P, PF, E>(
         }))
     };
     let released = || {
+        if cancelled() {
+            return;
+        }
+        // The record must still be bound to the dead terminal: a session
+        // resumed into a live pane meanwhile is not relaunched again.
+        if !still_bound() {
+            info!(
+                terminal_id,
+                session = %target.session_id,
+                "holder relaunch: the session is no longer bound to the dead pane — not released"
+            );
+            return;
+        }
         emit(Emission::Released(SessionReleased {
             session_id: target.session_id.clone(),
             terminal_id: terminal_id.to_string(),
@@ -242,6 +335,9 @@ pub async fn decide_relaunch<R, RF, P, PF, E>(
     for attempt in 0..settle_reads {
         if attempt > 0 {
             pause(LIVE_POLL_EVERY).await;
+        }
+        if cancelled() {
+            return;
         }
         last = live_gate(read().await.as_ref(), &target.session_id);
         if last == LiveGate::NotHosted {
@@ -259,6 +355,9 @@ pub async fn decide_relaunch<R, RF, P, PF, E>(
         Duration::from_millis(RESTORABLE_PTY_EXIT_MS as u64).saturating_sub(LIVE_SETTLE_WINDOW);
     for delay in retry_delays(grace) {
         pause(delay).await;
+        if cancelled() {
+            return;
+        }
         match live_gate(read().await.as_ref(), &target.session_id) {
             LiveGate::NotHosted => {
                 released();
@@ -352,8 +451,15 @@ pub fn on_holder_lost(
         }
     };
     let (app, terminal_id) = (app.clone(), terminal_id.to_string());
+    let cancel = register(&terminal_id, &target.session_id);
     tauri::async_runtime::spawn(async move {
         let emit = |e: Emission| emit_to_webview(&app, &e);
+        let cancelled = || cancel.load(Ordering::Acquire);
+        let still_bound = || {
+            store
+                .get(&target.session_id)
+                .is_some_and(|r| r.terminal_id == terminal_id)
+        };
         decide_relaunch(
             &terminal_id,
             &target,
@@ -361,8 +467,11 @@ pub fn on_holder_lost(
             live_session_ids,
             tokio::time::sleep,
             &emit,
+            &cancelled,
+            &still_bound,
         )
         .await;
+        unregister(&cancel);
     });
 }
 
@@ -539,6 +648,8 @@ mod tests {
                 async {}
             },
             &|e| emitted.borrow_mut().push(e),
+            &|| false,
+            &|| true,
         )
         .await;
         let pauses = *pauses.borrow();
@@ -647,6 +758,12 @@ mod tests {
             || async { Some(HashSet::new()) },
             |_| async {},
             &|e| emitted.borrow_mut().push(e),
+            &|| false,
+            &|| {
+                store
+                    .get("0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0")
+                    .is_some_and(|r| r.terminal_id == TERM)
+            },
         )
         .await;
         assert_eq!(
@@ -662,6 +779,69 @@ mod tests {
             target_from_store(&store, "t-plain-shell", None),
             Err(NoRelaunch::NoSession)
         );
+    }
+
+    /// Review r2, N2: a decision CANCELLED mid-wait (its pane closed, its
+    /// session resumed elsewhere) emits nothing more, and one whose session
+    /// was rebound to another pane meanwhile never releases it.
+    #[tokio::test]
+    async fn holder_relaunch_a_cancelled_or_rebound_decision_releases_nothing() {
+        let gone: HashSet<String> = HashSet::new();
+        // Cancelled during the settle window: unreadable, then the pane closes.
+        let reads = RefCell::new(0usize);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emitted = RefCell::new(Vec::new());
+        decide_relaunch(
+            TERM,
+            &target(),
+            HolderLoss::Ended,
+            || {
+                *reads.borrow_mut() += 1;
+                if *reads.borrow() == 3 {
+                    cancel.store(true, Ordering::Release);
+                }
+                async { None }
+            },
+            |_| async {},
+            &|e| emitted.borrow_mut().push(e),
+            &|| cancel.load(Ordering::Acquire),
+            &|| true,
+        )
+        .await;
+        assert!(emitted.borrow().is_empty(), "{:?}", emitted.borrow());
+        assert_eq!(*reads.borrow(), 3, "no read after the cancel");
+
+        // Rebound to a live pane before release: nothing released.
+        let emitted = RefCell::new(Vec::new());
+        decide_relaunch(
+            TERM,
+            &target(),
+            HolderLoss::Ended,
+            || {
+                let g = gone.clone();
+                async move { Some(g) }
+            },
+            |_| async {},
+            &|e| emitted.borrow_mut().push(e),
+            &|| false,
+            &|| false,
+        )
+        .await;
+        assert!(emitted.borrow().is_empty());
+
+        // The registry: cancel by terminal and by session.
+        let a = register("t-cancel-a", "s-cancel");
+        let b = register("t-cancel-b", "s-cancel");
+        assert_eq!(cancel_for_terminal("t-cancel-a"), 1);
+        assert!(a.load(Ordering::Acquire) && !b.load(Ordering::Acquire));
+        assert_eq!(cancel_for_session("s-cancel"), 1);
+        assert!(b.load(Ordering::Acquire));
+        // A second loss on the same terminal cancels the first decision.
+        let first = register("t-cancel-c", "s1");
+        let second = register("t-cancel-c", "s2");
+        assert!(first.load(Ordering::Acquire) && !second.load(Ordering::Acquire));
+        unregister(&second);
+        assert_eq!(cancel_for_terminal("t-cancel-c"), 0);
     }
 
     /// A pane whose holder was lost — and only such a pane — reaches

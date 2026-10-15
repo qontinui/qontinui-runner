@@ -248,6 +248,16 @@ fn apply_launch_argv(
 ) {
     use crate::session::resume_argv::{derive_resume_flags, parse_argv_value, ResumeFlags};
     let Some(body) = req.argv.as_ref() else {
+        // No argv: a non-startup first report still CLOSES the slot, so a
+        // later spoofed startup cannot fill it (review r2, N4).
+        let outcome =
+            store.close_resume_flags(&req.session_id, &req.terminal_id, req.source.as_deref());
+        info!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            ?outcome,
+            "control/session-open: relaunch flags (no argv in the report)"
+        );
         return;
     };
     let Some(argv) = parse_argv_value(&body.0) else {
