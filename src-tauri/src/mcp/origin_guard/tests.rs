@@ -1270,6 +1270,23 @@ fn resume_door_is_a_credential_door_and_on_no_allowlist() {
     ));
 }
 
+/// Vet V4 of plan
+/// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`:
+/// the mid-session edit-sibling route writes under a caller-named path, so it
+/// is a door — and a registered route, so the entry covers something. Its
+/// read-only siblings stay off the list.
+#[test]
+fn the_edit_sibling_route_is_a_registered_door() {
+    assert!(is_credential_door("POST", "/agent-worktrees/edit-sibling"));
+    assert!(!is_credential_door("GET", "/agent-worktrees/edit-sibling"));
+    assert!(!is_credential_door("GET", "/agent-worktrees/reclaimable"));
+    let registered = crate::mcp::relay_path_policy::tests::registered_routes();
+    assert!(registered.contains(&(
+        "POST".to_string(),
+        "/agent-worktrees/edit-sibling".to_string()
+    )));
+}
+
 /// Grace tripwire: every graced route is a door and a registered route, and
 /// nothing is both extension-only and allowlisted or a door.
 #[test]
