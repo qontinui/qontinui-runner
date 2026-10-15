@@ -922,10 +922,12 @@ fn json_escape(s: &str) -> String {
 /// [`LAUNCH_ARGV_ENV`]'s value for a launch that received `args`: a JSON array
 /// of them, minus the runner's own plumbing — the shell integration's
 /// `--append-system-prompt[-file] <value>`, which the relaunched pane re-adds
-/// and whose inline value is multi-kilobyte. Every string is escaped
-/// ([`json_escape`], plus DEL), so no raw control byte reaches the hook's OSC
-/// sequence. `None` over [`LAUNCH_ARGV_MAX_BYTES`]. Mirrors `launch_argv_json`
-/// in `resources/intercept/identity_shim.bash`.
+/// and whose inline value is multi-kilobyte. Every string is escaped by
+/// [`json_escape_ascii`], so the value is printable ASCII only — control
+/// characters, DEL and every non-ASCII character (C1 controls such as U+009C
+/// included) become `\uXXXX`. The hook sends it in its loopback POST body,
+/// never over the PTY. `None` over [`LAUNCH_ARGV_MAX_BYTES`]. Mirrors
+/// `launch_argv_json` in `resources/intercept/identity_shim.bash`.
 fn launch_argv_json(args: &[String]) -> Option<String> {
     let mut out = String::from("[");
     let mut skip = false;
@@ -952,11 +954,32 @@ fn launch_argv_json(args: &[String]) -> Option<String> {
         }
         first = false;
         out.push('"');
-        out.push_str(&json_escape(a).replace('\u{7f}', "\\u007f"));
+        out.push_str(&json_escape_ascii(a));
         out.push('"');
     }
     out.push(']');
     (out.len() <= LAUNCH_ARGV_MAX_BYTES).then_some(out)
+}
+
+/// JSON-escape `s` into PRINTABLE ASCII: `"` and `\` escaped, printable ASCII
+/// kept, everything else — C0 controls, DEL, every non-ASCII character — as
+/// `\uXXXX` UTF-16 units (a surrogate pair above U+FFFF).
+fn json_escape_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            ' '..='~' => out.push(c),
+            _ => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Best-effort grab of `"correlation_id":"…"` from a JSON response without a
@@ -1493,15 +1516,37 @@ mod tests {
             "--append-system-prompt-file=/tmp/c.md",
             "a\"b\\c",
             "esc\u{1b}del\u{7f}",
+            // Review r1, M1: C1 controls (ST, CSI) and other non-ASCII.
+            "c1\u{9c}end",
+            "csi\u{9b}6n",
+            "\u{fc}n\u{ef}",
+            "emoji\u{1f600}",
         ]
         .map(String::from)
         .to_vec();
         let json = launch_argv_json(&args).expect("under the bound");
-        assert!(!json.chars().any(|c| c.is_control()), "{json:?}");
+        assert!(
+            json.bytes().all(|b| (b' '..=b'~').contains(&b)),
+            "printable ASCII only: {json:?}"
+        );
+        assert!(
+            json.contains("\\u009c") && json.contains("\\u009b6n"),
+            "{json}"
+        );
+        assert!(json.contains("\\ud83d\\ude00"), "a surrogate pair: {json}");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(
             parsed,
-            serde_json::json!(["--model", "opus", "a\"b\\c", "esc\u{1b}del\u{7f}"])
+            serde_json::json!([
+                "--model",
+                "opus",
+                "a\"b\\c",
+                "esc\u{1b}del\u{7f}",
+                "c1\u{9c}end",
+                "csi\u{9b}6n",
+                "\u{fc}n\u{ef}",
+                "emoji\u{1f600}"
+            ])
         );
         assert_eq!(launch_argv_json(&[]).as_deref(), Some("[]"));
         let huge = vec!["x".repeat(LAUNCH_ARGV_MAX_BYTES)];

@@ -797,7 +797,7 @@ mod tests {
 
     fn rec(state: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
-            launch_argv: None,
+            resume_flags: None,
             claude_session_id: ID.to_string(),
             config_dir: Some("/cfg".to_string()),
             working_dir: Some("/work".to_string()),

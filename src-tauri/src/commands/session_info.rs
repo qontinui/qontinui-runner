@@ -1428,7 +1428,7 @@ mod tests {
 
     fn record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
-            launch_argv: None,
+            resume_flags: None,
             claude_session_id: id.to_string(),
             config_dir: Some("C:/Users/x/.claude-paktis".to_string()),
             working_dir: Some("C:/qontinui-root/qontinui-runner".to_string()),

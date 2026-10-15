@@ -1879,7 +1879,7 @@ fn record_from_seed(
         (None, None)
     };
     Ok(TerminalSessionRecord {
-        launch_argv: None,
+        resume_flags: None,
         claude_session_id: seed.session_id.clone(),
         // Absent means absent — the old hardcoded `None`, kept as the default
         // so every pre-existing caller's rows are byte-for-byte unchanged.

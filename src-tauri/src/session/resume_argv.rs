@@ -1,30 +1,48 @@
-//! The persisted launch argv of a provider session, and the `--resume`
-//! relaunch built from it — with the shell-inert gate the relaunch must pass.
+//! The `--resume` relaunch flags of a provider session, derived ONCE from its
+//! launch argv — with the allowlist and shell-inert gate a relaunch must pass.
 //!
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
 //! Phase 6, D11. When a pane's PTY holder itself dies (tier 1 lost), the
 //! session in it is relaunched in a fresh pane as `claude <flags> --resume
-//! <id>`, TYPED INTO A SHELL by the webview's restore. The flags are the ones
-//! the session was launched with (`--model`, `--add-dir`, …), so a relaunched
-//! session runs the way its operator started it rather than under a default.
+//! <id>`, TYPED INTO A SHELL by the webview's restore. The flags are the
+//! harmless ones the session was launched with (`--model`, `--add-dir`, …), so
+//! a relaunched session runs the way its operator started it.
 //!
-//! # Where the argv comes from
+//! # Where the argv comes from, and what is kept of it
 //!
 //! The identity shim (`resources/intercept/identity_shim.bash`, and the native
 //! `qontinui-shim` on Windows) sees the argv a `claude` launch received and
-//! exports it to that `claude` as [`LAUNCH_ARGV_ENV`]; the bundled
-//! `SessionStart` hook — a child of that `claude` — puts it in its OSC 9999
-//! `session_start` report (`terminal::session_start_sideband`); the runner
-//! persists it on the session's lifecycle record
-//! (`SessionLifecycleStore::set_launch_argv`).
+//! exports it to that `claude` as [`LAUNCH_ARGV_ENV`]. The bundled
+//! `SessionStart` hook — a child of that `claude` — sends it in the body of
+//! its LOOPBACK `POST /control/session-open`, never over the PTY: the PTY
+//! stream is relayed, kept in rings and shipped to coord, and an argv can hold
+//! an initial prompt or an inline secret (review r1, H1). On receipt the
+//! runner derives the flags with [`derive_resume_flags`] and persists ONLY
+//! that result ([`ResumeFlags`]: the allowlisted flags, or a refusal) — never
+//! the raw argv, the prompt, or the value of any flag not on the allowlist.
+//!
+//! # The allowlist: flags that load no code or config
+//!
+//! Only `--model`, `--fallback-model`, `--permission-mode`, `--add-dir`,
+//! `--verbose`, `--ide`, `--chrome` / `--no-chrome` and `--debug` are replayed
+//! (review r1, M2). Every other flag is DROPPED with its value: flags such as
+//! `--settings`, `--mcp-config` or `--plugin-dir` load hooks, servers or code,
+//! and a relaunch must not run something the operator does not see. Unknown
+//! flags are dropped too. The arity table still names the dropped flags this
+//! runner knows, so their values are skipped rather than mistaken for prompts.
+//!
+//! A relative `--add-dir` is resolved against the launch's working directory
+//! (the hook's `cwd`); when that is unknown or not absolute the replay is
+//! refused, because the relaunch's pane starts in the RECORD's directory,
+//! which need not be where `claude` was launched.
 //!
 //! # The gate: reject the whole replay, never escape it
 //!
 //! Adopted from tty7 (`cli_agent.rs`, idea only): every token that SURVIVES
-//! the filter below must be shell-inert — characters from [`is_inert_char`]
-//! only — or the REPLAY is refused outright. Escaping is not attempted: the
-//! command is typed into whichever shell the pane runs (bash, zsh, PowerShell),
-//! and a quoting scheme correct for one is an injection for another.
+//! the filter must be shell-inert ([`is_shell_inert`]) or the REPLAY is
+//! refused outright. Escaping is not attempted: the command is typed into
+//! whichever shell the pane runs (bash, zsh, PowerShell), and a quoting scheme
+//! correct for one is an injection for another.
 //!
 //! A refused replay does NOT mean no relaunch (coordinator decision,
 //! 2026-10-15): the session is still resumed with the DEFAULT resume command —
@@ -33,51 +51,44 @@
 //! offending token belongs to, never its value. Only a missing or unsafe
 //! session id means no relaunch at all.
 //!
-//! # What survives, and what is dropped
-//!
-//! - **Session selection** (`--resume`/`-r`, `--continue`/`-c`,
-//!   `--session-id`, `--fork-session`) — dropped: the relaunch adds its own
-//!   `--resume <id>`, and a second selector would fight it.
-//! - **Runner plumbing** (`--append-system-prompt`,
-//!   `--append-system-prompt-file`) — dropped: the runner's shell integration
-//!   adds the session context again in the new pane, and its inline form is a
-//!   multi-line value no shell-inert gate would pass.
-//! - **Positional arguments** — dropped: `claude`'s positional is the INITIAL
-//!   PROMPT, and replaying it into a resumed conversation would send it again.
-//! - **Known flags** — kept with their values (see [`flag_arity`]).
-//! - **Unknown flags** — kept only when unambiguous: a `--flag=value` token, or
-//!   a bare flag followed by another flag or by nothing. A bare unknown flag
-//!   followed by a plain token cannot be split into "flag value" and "initial
-//!   prompt" without knowing the flag, so the relaunch is refused rather than
-//!   guessed ([`ReplayRefusal::AmbiguousFlag`]).
-//! - **Print mode** (`-p`/`--print`) — refused: a non-interactive run has no
-//!   conversation to come back to in a pane.
-//!
-//! Refusals never carry a token's text: an argv is operator input and can
-//! hold anything; the refusal names a position and, when it is itself inert,
-//! the FLAG the token belongs to.
+//! Print mode (`-p`/`--print`) and combined short flags (`-pc`, `-rID`: a
+//! single-dash token longer than two characters) are refused, since either
+//! can smuggle a second mode or session selector past the filter.
 
 use crate::session::session_id::is_valid_session_id;
 
 /// The environment variable the identity shim sets on the `claude` it launches:
 /// a JSON array of the argv that launch received (minus the runner plumbing
-/// the shim strips first). Read by the bundled `SessionStart` hook.
+/// the shim strips first), every non-ASCII character `\u`-escaped. Read by the
+/// bundled `SessionStart` hook, which sends it in its loopback POST.
 pub const LAUNCH_ARGV_ENV: &str = "QONTINUI_LAUNCH_ARGV";
 
-/// Most tokens a persisted argv may carry. A longer one is not stored (the
-/// report's `argv` is dropped whole, never truncated — a truncated argv is a
-/// different argv).
+/// Most tokens an argv may carry for a replay to be derived from it.
 pub const MAX_ARGV_TOKENS: usize = 64;
 
-/// Longest single token a persisted argv may carry, in characters.
-pub const MAX_ARGV_TOKEN_CHARS: usize = 1024;
+/// Longest single argv token accepted, in BYTES (the same unit the shims and
+/// the hook count in). A longer one makes the whole argv unknown — never a
+/// truncated token.
+pub const MAX_ARGV_TOKEN_BYTES: usize = 1024;
 
 /// Longest token a REPLAY may type, in bytes. A replayed token is a flag or a
 /// short value; anything longer is not something an operator typed by hand.
 pub const MAX_REPLAY_TOKEN_BYTES: usize = 256;
 
-/// Why a persisted argv cannot be replayed. Typed so the webview can say why a
-/// session was not relaunched, and so no variant carries a token's text.
+/// What a session's relaunch replays, as derived once from its launch argv and
+/// persisted on its lifecycle record. Never the raw argv.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResumeFlags {
+    /// Type these allowlisted, shell-inert flags before `--resume <id>`.
+    Replay { flags: Vec<String> },
+    /// The argv must not be replayed: the relaunch uses the default resume
+    /// command. `reason` names a position and a flag, never a value.
+    Refused { reason: String },
+}
+
+/// Why a launch argv cannot be replayed. Typed so the webview can say why its
+/// flags were dropped, and so no variant carries a token's value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayRefusal {
     /// The session id is not shell-safe (`session_id::is_valid_session_id`).
@@ -86,9 +97,12 @@ pub enum ReplayRefusal {
     /// flag it belongs to (itself, or the flag whose value it is), named only
     /// when that name is itself inert — never the token's value.
     NotShellInert { index: usize, flag: Option<String> },
-    /// Bare unknown flag at `index` is followed by a plain token: its value
-    /// and the initial prompt cannot be told apart.
-    AmbiguousFlag { index: usize, flag: Option<String> },
+    /// A relative `--add-dir` value at `index`, and no absolute launch
+    /// directory to resolve it against.
+    RelativePath { index: usize },
+    /// A single-dash token longer than two characters at `index` (`-pc`,
+    /// `-rID`): combined short flags the filter cannot read safely.
+    CombinedShortFlags { index: usize },
     /// The session was launched in print mode (`-p`/`--print`).
     PrintMode,
     /// More than [`MAX_ARGV_TOKENS`] tokens.
@@ -107,11 +121,14 @@ impl std::fmt::Display for ReplayRefusal {
                  rather than escaped",
                 flag.as_deref().unwrap_or("<unnamed>")
             ),
-            ReplayRefusal::AmbiguousFlag { index, flag } => write!(
+            ReplayRefusal::RelativePath { index } => write!(
                 f,
-                "launch argument {index} (flag {}) is a flag this runner does not know, \
-                 followed by a value it cannot tell from a prompt",
-                flag.as_deref().unwrap_or("<unnamed>")
+                "launch argument {index} (flag --add-dir) is a relative path and the launch \
+                 directory is unknown"
+            ),
+            ReplayRefusal::CombinedShortFlags { index } => write!(
+                f,
+                "launch argument {index} combines short flags, which the replay does not read"
             ),
             ReplayRefusal::PrintMode => {
                 write!(f, "the session was launched in print mode (-p/--print)")
@@ -136,9 +153,17 @@ pub fn is_inert_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '=' | '+' | '-')
 }
 
-/// Whether `token` may be typed into a shell as one argument as-is.
+/// Whether `token` may be typed into a shell as one argument as-is: inert
+/// characters only, at most [`MAX_REPLAY_TOKEN_BYTES`], and a first character
+/// that is alphanumeric, `-`, `/` or `.` — a leading `=` is zsh's EQUALS
+/// expansion (`=foo` → the path of `foo`).
 pub fn is_shell_inert(token: &str) -> bool {
-    !token.is_empty() && token.len() <= MAX_REPLAY_TOKEN_BYTES && token.chars().all(is_inert_char)
+    let Some(first) = token.chars().next() else {
+        return false;
+    };
+    (first.is_ascii_alphanumeric() || matches!(first, '-' | '/' | '.'))
+        && token.len() <= MAX_REPLAY_TOKEN_BYTES
+        && token.chars().all(is_inert_char)
 }
 
 /// How a known flag consumes the tokens after it.
@@ -157,30 +182,37 @@ enum Arity {
 /// What the replay does with a known flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Disposition {
+    /// On the allowlist: replayed.
     Keep,
+    /// Known, and dropped with its value.
     Drop,
+    /// Print mode: the replay is refused.
     RefusePrint,
 }
 
-/// The `claude` flags this runner knows. Anything else is "unknown" and is
-/// kept only when unambiguous (module docs).
+/// The `claude` flags this runner knows. `Keep` is the allowlist (module
+/// docs); `Drop` entries exist so their VALUES are consumed rather than read
+/// as positionals. Anything else is unknown and dropped.
 fn flag_arity(flag: &str) -> Option<(Arity, Disposition)> {
     use Arity::*;
     use Disposition::*;
     Some(match flag {
+        // The allowlist: flags that load no code or config.
+        "--model" | "--fallback-model" | "--permission-mode" => (One, Keep),
+        "--add-dir" => (Many, Keep),
+        "--debug" => (Optional, Keep),
+        "--verbose" | "--ide" | "--chrome" | "--no-chrome" => (Bool, Keep),
+        // Print mode — not a conversation a pane can resume.
+        "--print" | "-p" => (Bool, RefusePrint),
         // Session selection — the relaunch supplies its own.
-        "--resume" | "-r" => (Optional, Drop),
+        "--resume" | "-r" | "--from-pr" => (Optional, Drop),
         "--continue" | "-c" | "--fork-session" => (Bool, Drop),
         "--session-id" => (One, Drop),
         // Runner plumbing — re-added by the shell integration in the new pane.
         "--append-system-prompt" | "--append-system-prompt-file" => (One, Drop),
-        // Print mode — not a conversation a pane can resume.
-        "--print" | "-p" => (Bool, RefusePrint),
-        // Value flags kept as the operator gave them.
-        "--model"
-        | "--fallback-model"
-        | "--permission-mode"
-        | "--agent"
+        // Known, and NOT replayed: they load code or config, or change what
+        // the session may do, out of the operator's sight.
+        "--agent"
         | "--agents"
         | "--settings"
         | "--setting-sources"
@@ -190,20 +222,14 @@ fn flag_arity(flag: &str) -> Option<(Arity, Disposition)> {
         | "--output-format"
         | "--input-format"
         | "--max-turns"
-        | "--permission-prompt-tool" => (One, Keep),
-        "--add-dir" | "--allowedTools" | "--allowed-tools" | "--disallowedTools"
-        | "--disallowed-tools" | "--mcp-config" | "--betas" => (Many, Keep),
-        "--debug" => (Optional, Keep),
-        // Boolean flags kept as given.
+        | "--permission-prompt-tool" => (One, Drop),
+        "--allowedTools" | "--allowed-tools" | "--disallowedTools" | "--disallowed-tools"
+        | "--mcp-config" | "--betas" => (Many, Drop),
         "--dangerously-skip-permissions"
         | "--allow-dangerously-skip-permissions"
-        | "--verbose"
-        | "--ide"
         | "--strict-mcp-config"
-        | "--chrome"
-        | "--no-chrome"
         | "--include-partial-messages"
-        | "--replay-user-messages" => (Bool, Keep),
+        | "--replay-user-messages" => (Bool, Drop),
         _ => return None,
     })
 }
@@ -212,11 +238,21 @@ fn is_flag(token: &str) -> bool {
     token.len() > 1 && token.starts_with('-')
 }
 
+/// A flag name fit for a message: only when it is itself shell-inert (a flag
+/// token can be anything an operator typed).
+fn inert_name(name: &str) -> Option<String> {
+    is_shell_inert(name).then(|| name.to_string())
+}
+
 /// The flags to type between `claude` and `--resume <session_id>` when
-/// relaunching a session launched with `launch_argv` — or why it must not be
-/// relaunched. `Ok(vec![])` is a launch with no replayable flags (a bare
-/// `claude`), which still relaunches.
-pub fn replay_args(launch_argv: &[String], session_id: &str) -> Result<Vec<String>, ReplayRefusal> {
+/// relaunching a session launched with `launch_argv` from `launch_cwd` — or why
+/// they must not be replayed. `Ok(vec![])` is a launch with no replayable
+/// flags (a bare `claude`).
+pub fn replay_args(
+    launch_argv: &[String],
+    session_id: &str,
+    launch_cwd: Option<&str>,
+) -> Result<Vec<String>, ReplayRefusal> {
     if !is_valid_session_id(session_id) {
         return Err(ReplayRefusal::InvalidSessionId);
     }
@@ -237,133 +273,164 @@ pub fn replay_args(launch_argv: &[String], session_id: &str) -> Result<Vec<Strin
             i += 1;
             continue;
         }
+        if !token.starts_with("--") && token.chars().count() > 2 {
+            return Err(ReplayRefusal::CombinedShortFlags { index: i });
+        }
         let (name, inline_value) = match token.split_once('=') {
             Some((n, _)) if n.starts_with("--") => (n, true),
             _ => (token.as_str(), false),
         };
-        match flag_arity(name) {
-            Some((_, Disposition::RefusePrint)) => return Err(ReplayRefusal::PrintMode),
-            Some((arity, disposition)) => {
-                let keep = disposition == Disposition::Keep;
-                if keep {
-                    kept.push((i, token.clone(), name));
-                }
-                i += 1;
-                if inline_value {
-                    continue;
-                }
-                let takes = |t: &String| !is_flag(t) && t != "--";
-                match arity {
-                    Arity::Bool => {}
-                    Arity::One => {
-                        if let Some(v) = launch_argv.get(i) {
-                            if keep {
-                                kept.push((i, v.clone(), name));
-                            }
-                            i += 1;
-                        }
-                    }
-                    Arity::Optional => {
-                        if launch_argv.get(i).is_some_and(takes) {
-                            if keep {
-                                kept.push((i, launch_argv[i].clone(), name));
-                            }
-                            i += 1;
-                        }
-                    }
-                    Arity::Many => {
-                        while launch_argv.get(i).is_some_and(takes) {
-                            if keep {
-                                kept.push((i, launch_argv[i].clone(), name));
-                            }
-                            i += 1;
-                        }
-                    }
+        // Unknown flags are dropped. Their value, if any, is a plain token and
+        // is dropped as a positional on the next turn.
+        let Some((arity, disposition)) = flag_arity(name) else {
+            i += 1;
+            continue;
+        };
+        if disposition == Disposition::RefusePrint {
+            return Err(ReplayRefusal::PrintMode);
+        }
+        let keep = disposition == Disposition::Keep;
+        if keep {
+            kept.push((i, token.clone(), name));
+        }
+        i += 1;
+        if inline_value {
+            continue;
+        }
+        let takes = |t: &String| !is_flag(t) && t != "--";
+        let mut values: Vec<usize> = Vec::new();
+        match arity {
+            Arity::Bool => {}
+            Arity::One => {
+                if launch_argv.get(i).is_some() {
+                    values.push(i);
                 }
             }
-            None => {
-                // Unknown flag: unambiguous only as `--flag=value`, or bare
-                // when the next token is another flag or nothing.
-                if !inline_value
-                    && launch_argv
-                        .get(i + 1)
-                        .is_some_and(|t| !is_flag(t) && t != "--")
-                {
-                    return Err(ReplayRefusal::AmbiguousFlag {
-                        index: i,
-                        flag: inert_name(name),
-                    });
+            Arity::Optional => {
+                if launch_argv.get(i).is_some_and(takes) {
+                    values.push(i);
                 }
-                kept.push((i, token.clone(), name));
-                i += 1;
+            }
+            Arity::Many => {
+                let mut j = i;
+                while launch_argv.get(j).is_some_and(takes) {
+                    values.push(j);
+                    j += 1;
+                }
             }
         }
+        for &v in &values {
+            if keep {
+                kept.push((v, launch_argv[v].clone(), name));
+            }
+        }
+        i += values.len();
     }
-    for (index, token, flag) in &kept {
-        if !is_shell_inert(token) {
+    let mut out = Vec::with_capacity(kept.len());
+    for (index, token, flag) in kept {
+        let token = if flag == "--add-dir" && token != "--add-dir" {
+            resolve_add_dir(&token, index, launch_cwd)?
+        } else {
+            token
+        };
+        if !is_shell_inert(&token) {
             return Err(ReplayRefusal::NotShellInert {
-                index: *index,
+                index,
                 flag: inert_name(flag),
             });
         }
+        out.push(token);
     }
-    Ok(kept.into_iter().map(|(_, t, _)| t).collect())
+    Ok(out)
 }
 
-/// A flag name fit for a log line: only when it is itself shell-inert (a flag
-/// token can be anything an operator typed).
-fn inert_name(name: &str) -> Option<String> {
-    is_shell_inert(name).then(|| name.to_string())
+/// An `--add-dir` value (bare, or the whole `--add-dir=<dir>` token) with a
+/// relative directory resolved against the absolute launch directory.
+fn resolve_add_dir(
+    token: &str,
+    index: usize,
+    launch_cwd: Option<&str>,
+) -> Result<String, ReplayRefusal> {
+    let (prefix, dir) = match token.strip_prefix("--add-dir=") {
+        Some(dir) => ("--add-dir=", dir),
+        None => ("", token),
+    };
+    if dir.starts_with('/') {
+        return Ok(token.to_string());
+    }
+    match launch_cwd.filter(|c| c.starts_with('/')) {
+        Some(cwd) => Ok(format!("{prefix}{}/{dir}", cwd.trim_end_matches('/'))),
+        None => Err(ReplayRefusal::RelativePath { index }),
+    }
 }
 
-/// How a session with persisted argv `launch_argv` is relaunched — the two
-/// derived fields the restore set carries (`terminal_session_list_open`).
+/// What to persist for a session launched with `launch_argv` from
+/// `launch_cwd`: the replay flags, or a refusal (the relaunch then falls back
+/// to the default command). `None` when the session id itself is unsafe —
+/// such a session is never relaunched, so there is nothing to persist.
+pub fn derive_resume_flags(
+    launch_argv: &[String],
+    session_id: &str,
+    launch_cwd: Option<&str>,
+) -> Option<ResumeFlags> {
+    match replay_args(launch_argv, session_id, launch_cwd) {
+        Ok(flags) => Some(ResumeFlags::Replay { flags }),
+        Err(ReplayRefusal::InvalidSessionId) => None,
+        Err(why) => Some(ResumeFlags::Refused {
+            reason: why.to_string(),
+        }),
+    }
+}
+
+/// How a session is relaunched — the two derived fields the restore set
+/// carries (`terminal_session_list_open`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Relaunch {
-    /// No argv was ever reported: the default resume command, exactly as
-    /// before argv persistence existed.
+    /// No flags were ever derived: the default resume command, exactly as
+    /// before Phase 6.
     Default,
     /// Replay these flags before `--resume <id>`.
     Replay(Vec<String>),
-    /// An argv was reported and must not be replayed: the DEFAULT resume
-    /// command is used instead, and only the extra flags are dropped.
-    Fallback(ReplayRefusal),
-    /// The session id is not shell-safe: NO relaunch.
-    NoRelaunch,
+    /// The argv was refused: the DEFAULT resume command is used instead, and
+    /// only the extra flags are dropped. Carries the refusal's message.
+    Fallback(String),
 }
 
 impl Relaunch {
-    /// Decide for one record.
-    pub fn for_record(launch_argv: Option<&[String]>, session_id: &str) -> Self {
-        match launch_argv {
+    /// Decide for one record from its persisted [`ResumeFlags`]. Every
+    /// replayed flag is re-checked shell-inert here, so a record file edited
+    /// by hand cannot get a token typed.
+    pub fn for_record(flags: Option<&ResumeFlags>) -> Self {
+        match flags {
             None => Relaunch::Default,
-            Some(argv) => match replay_args(argv, session_id) {
-                Ok(flags) => Relaunch::Replay(flags),
-                Err(ReplayRefusal::InvalidSessionId) => Relaunch::NoRelaunch,
-                Err(why) => Relaunch::Fallback(why),
-            },
+            Some(ResumeFlags::Replay { flags }) => {
+                if flags.iter().all(|f| is_shell_inert(f)) {
+                    Relaunch::Replay(flags.clone())
+                } else {
+                    Relaunch::Fallback("a stored relaunch flag is not shell-inert".into())
+                }
+            }
+            Some(ResumeFlags::Refused { reason }) => Relaunch::Fallback(reason.clone()),
         }
     }
 
     /// `(resumeArgs, resumeRefusal)` for the wire: both absent for
     /// [`Relaunch::Default`], so a webview that predates them — and a record
-    /// that predates argv persistence — behaves exactly as before. A
+    /// that predates Phase 6 — behaves exactly as before. A
     /// [`Relaunch::Fallback`] carries NO args (the webview then types the
-    /// default resume) plus the refusal, for its log line. [`Relaunch::NoRelaunch`]
-    /// carries neither: the webview's own session-id gate (`skip-invalid`)
-    /// already refuses that record.
+    /// default resume) plus the refusal, for its log line.
     pub fn wire_fields(&self) -> (Option<Vec<String>>, Option<String>) {
         match self {
-            Relaunch::Default | Relaunch::NoRelaunch => (None, None),
+            Relaunch::Default => (None, None),
             Relaunch::Replay(flags) => (Some(flags.clone()), None),
-            Relaunch::Fallback(why) => (None, Some(why.to_string())),
+            Relaunch::Fallback(why) => (None, Some(why.clone())),
         }
     }
 }
 
 /// Parse the JSON array [`LAUNCH_ARGV_ENV`] carries into a bounded argv:
 /// `None` unless it is an array of at most [`MAX_ARGV_TOKENS`] strings of at
-/// most [`MAX_ARGV_TOKEN_CHARS`] characters each. Never a partial argv.
+/// most [`MAX_ARGV_TOKEN_BYTES`] bytes each. Never a partial argv.
 pub fn parse_argv_value(value: &serde_json::Value) -> Option<Vec<String>> {
     let items = value.as_array()?;
     if items.len() > MAX_ARGV_TOKENS {
@@ -373,7 +440,7 @@ pub fn parse_argv_value(value: &serde_json::Value) -> Option<Vec<String>> {
         .iter()
         .map(|v| {
             v.as_str()
-                .filter(|s| s.chars().count() <= MAX_ARGV_TOKEN_CHARS)
+                .filter(|s| s.len() <= MAX_ARGV_TOKEN_BYTES)
                 .map(str::to_string)
         })
         .collect()
@@ -384,31 +451,36 @@ mod tests {
     use super::*;
 
     const SID: &str = "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0";
+    const CWD: Option<&str> = Some("/home/op/proj");
 
     fn argv(tokens: &[&str]) -> Vec<String> {
         tokens.iter().map(|t| t.to_string()).collect()
     }
 
+    fn replay(tokens: &[&str]) -> Result<Vec<String>, ReplayRefusal> {
+        replay_args(&argv(tokens), SID, CWD)
+    }
+
     #[test]
-    fn resume_argv_keeps_known_flags_and_drops_selection_plumbing_and_prompt() {
-        let launch = argv(&[
-            "--model",
-            "opus",
-            "--resume",
-            "old-id",
-            "--append-system-prompt-file",
-            "/tmp/ctx.md",
-            "--add-dir",
-            "/srv/a",
-            "/srv/b",
-            "--verbose",
-            "--session-id",
-            "pinned",
-            "-c",
-            "fix the build",
-        ]);
+    fn resume_argv_keeps_only_the_allowlist_and_drops_selection_plumbing_and_prompt() {
         assert_eq!(
-            replay_args(&launch, SID).unwrap(),
+            replay(&[
+                "--model",
+                "opus",
+                "--resume",
+                "old-id",
+                "--append-system-prompt-file",
+                "/tmp/ctx.md",
+                "--add-dir",
+                "/srv/a",
+                "/srv/b",
+                "--verbose",
+                "--session-id",
+                "pinned",
+                "-c",
+                "fix the build",
+            ])
+            .unwrap(),
             argv(&[
                 "--model",
                 "opus",
@@ -420,35 +492,48 @@ mod tests {
         );
     }
 
-    /// A variadic flag takes every following plain token, as `claude`'s own
-    /// parser does — so a prompt typed AFTER `--add-dir` is one more directory,
-    /// and one with a space refuses the replay rather than being guessed away.
+    /// Review r1, M2: flags that load code or config are never replayed, with
+    /// their values; unknown flags are dropped too.
     #[test]
-    fn resume_argv_a_variadic_flag_reads_like_claude_does() {
+    fn resume_argv_drops_flags_that_load_code_or_config_and_unknown_flags() {
         assert_eq!(
-            replay_args(&argv(&["--add-dir", "/a", "/b", "--verbose"]), SID).unwrap(),
-            argv(&["--add-dir", "/a", "/b", "--verbose"])
-        );
-        assert_eq!(
-            replay_args(&argv(&["--add-dir", "/a", "fix the build"]), SID),
-            Err(ReplayRefusal::NotShellInert {
-                index: 2,
-                flag: Some("--add-dir".into())
-            })
+            replay(&[
+                "--settings",
+                "/tmp/s.json",
+                "--mcp-config",
+                "/tmp/a.json",
+                "/tmp/b.json",
+                "--plugin-dir",
+                "/tmp/p",
+                "--system-prompt-file",
+                "/tmp/sp.md",
+                "--agents",
+                "x",
+                "--permission-prompt-tool",
+                "t",
+                "--dangerously-skip-permissions",
+                "--future-flag",
+                "value",
+                "--other=v",
+                "--model",
+                "opus",
+            ])
+            .unwrap(),
+            argv(&["--model", "opus"])
         );
     }
 
     #[test]
     fn resume_argv_a_bare_launch_relaunches_with_no_flags() {
-        assert_eq!(replay_args(&[], SID).unwrap(), Vec::<String>::new());
+        assert_eq!(replay(&[]).unwrap(), Vec::<String>::new());
         // An initial prompt alone is dropped, not replayed.
         assert_eq!(
-            replay_args(&argv(&["write a poem; rm -rf ~"]), SID).unwrap(),
+            replay(&["write a poem; rm -rf ~"]).unwrap(),
             Vec::<String>::new()
         );
         // Everything after `--` is positional.
         assert_eq!(
-            replay_args(&argv(&["--verbose", "--", "--model", "x"]), SID).unwrap(),
+            replay(&["--verbose", "--", "--model", "x"]).unwrap(),
             argv(&["--verbose"])
         );
     }
@@ -456,74 +541,132 @@ mod tests {
     #[test]
     fn resume_argv_inline_values_and_optional_resume() {
         assert_eq!(
-            replay_args(
-                &argv(&["--model=sonnet", "--resume=abc", "-r", "--verbose"]),
-                SID
-            )
-            .unwrap(),
+            replay(&["--model=sonnet", "--resume=abc", "-r", "--verbose"]).unwrap(),
             argv(&["--model=sonnet", "--verbose"])
         );
         // `-r` followed by a plain token takes it as the id (dropped with it).
+        assert_eq!(replay(&["-r", "abc", "--ide"]).unwrap(), argv(&["--ide"]));
+    }
+
+    /// A variadic flag takes every following plain token, as `claude`'s own
+    /// parser does — so a prompt typed AFTER `--add-dir` is one more directory,
+    /// and one with a space refuses the replay rather than being guessed away.
+    #[test]
+    fn resume_argv_a_variadic_flag_reads_like_claude_does() {
         assert_eq!(
-            replay_args(&argv(&["-r", "abc", "--ide"]), SID).unwrap(),
-            argv(&["--ide"])
+            replay(&["--add-dir", "/a", "/b", "--verbose"]).unwrap(),
+            argv(&["--add-dir", "/a", "/b", "--verbose"])
+        );
+        assert_eq!(
+            replay(&["--add-dir", "/a", "fix the build"]),
+            Err(ReplayRefusal::NotShellInert {
+                index: 2,
+                flag: Some("--add-dir".into())
+            })
+        );
+    }
+
+    /// Review r1, nit: a relative `--add-dir` resolves against the LAUNCH
+    /// directory; without an absolute one the replay is refused.
+    #[test]
+    fn resume_argv_relative_add_dir_resolves_against_the_launch_directory() {
+        assert_eq!(
+            replay(&["--add-dir", "../lib", "--add-dir=docs"]).unwrap(),
+            argv(&[
+                "--add-dir",
+                "/home/op/proj/../lib",
+                "--add-dir=/home/op/proj/docs"
+            ])
+        );
+        for cwd in [None, Some("relative/cwd")] {
+            assert_eq!(
+                replay_args(&argv(&["--add-dir", "lib"]), SID, cwd),
+                Err(ReplayRefusal::RelativePath { index: 1 })
+            );
+        }
+        // An absolute one needs no launch directory.
+        assert_eq!(
+            replay_args(&argv(&["--add-dir", "/abs"]), SID, None).unwrap(),
+            argv(&["--add-dir", "/abs"])
         );
     }
 
     /// D11's gate: a token that would be TYPED and is not shell-inert refuses
-    /// the whole relaunch — it is never escaped, and never silently dropped.
+    /// the whole replay — it is never escaped, and never silently dropped.
     #[test]
     fn resume_argv_an_unsafe_surviving_token_refuses_the_whole_replay() {
         for bad in [
             "/srv/my project",
-            "$(touch /tmp/pwned)",
-            "a;b",
-            "`id`",
-            "x|y",
+            "/$(touch /tmp/pwned)",
+            "/a;b",
+            "/`id`",
+            "/x|y",
             "~/dir",
             "@splat",
-            "a,b",
-            "50%",
-            "a\nb",
-            "q\"uote",
-            "",
+            "/a,b",
+            "/50%",
+            "/a\nb",
+            "/q\"uote",
         ] {
-            let launch = argv(&["--verbose", "--add-dir", bad]);
-            assert_eq!(
-                replay_args(&launch, SID),
-                Err(ReplayRefusal::NotShellInert {
-                    index: 2,
-                    flag: Some("--add-dir".into())
-                }),
+            assert!(
+                matches!(
+                    replay(&["--verbose", "--add-dir", bad]),
+                    Err(ReplayRefusal::NotShellInert { index: 2, .. })
+                        | Err(ReplayRefusal::RelativePath { index: 2 })
+                ),
                 "{bad:?} must refuse the replay"
             );
         }
-        // Over the length bound.
+        assert_eq!(
+            replay(&["--model", "=opus"]),
+            Err(ReplayRefusal::NotShellInert {
+                index: 1,
+                flag: Some("--model".into())
+            }),
+            "a leading `=` is zsh's EQUALS expansion"
+        );
         let long = "a".repeat(MAX_REPLAY_TOKEN_BYTES + 1);
         assert_eq!(
-            replay_args(&argv(&["--model", &long]), SID),
+            replay(&["--model", &long]),
             Err(ReplayRefusal::NotShellInert {
                 index: 1,
                 flag: Some("--model".into())
             })
         );
+        // An empty value is not inert either.
+        assert!(matches!(
+            replay(&["--model", ""]),
+            Err(ReplayRefusal::NotShellInert { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn resume_argv_is_shell_inert_requires_a_safe_first_character() {
+        for ok in ["opus", "-x", "/srv", "./x", "--model=a"] {
+            assert!(is_shell_inert(ok), "{ok}");
+        }
+        for bad in ["", "=x", ":x", "+x", "_x", "a b"] {
+            assert!(!is_shell_inert(bad), "{bad:?}");
+        }
     }
 
     /// A non-inert token that is NOT typed — the prompt, a plumbing value, an
-    /// old session id — does not block the relaunch.
+    /// old session id, a dropped flag's value — does not block the relaunch.
     #[test]
     fn resume_argv_unsafe_tokens_that_are_dropped_do_not_refuse() {
-        let launch = argv(&[
-            "--append-system-prompt",
-            "You are inside the runner.\nBe careful; really.",
-            "--resume",
-            "../$(bad)",
-            "do the thing && more",
-            "--model",
-            "opus",
-        ]);
         assert_eq!(
-            replay_args(&launch, SID).unwrap(),
+            replay(&[
+                "--append-system-prompt",
+                "You are inside the runner.\nBe careful; really.",
+                "--resume",
+                "../$(bad)",
+                "do the thing && more",
+                "--settings",
+                "{\"env\":{\"K\":\"v\"}}",
+                "--model",
+                "opus",
+            ])
+            .unwrap(),
             argv(&["--model", "opus"])
         );
     }
@@ -532,85 +675,91 @@ mod tests {
     fn resume_argv_a_missing_or_unsafe_session_id_refuses() {
         for bad in ["", "abc def", "a;b", "$(id)", "x\n"] {
             assert_eq!(
-                replay_args(&[], bad),
+                replay_args(&[], bad, CWD),
                 Err(ReplayRefusal::InvalidSessionId),
                 "{bad:?}"
+            );
+            assert_eq!(
+                derive_resume_flags(&[], bad, CWD),
+                None,
+                "nothing to persist"
             );
         }
     }
 
+    /// Review r1, nit: `-pc` / `-rID` would let print mode or a second session
+    /// selector through as an "unknown flag".
     #[test]
-    fn resume_argv_unknown_flags_are_kept_only_when_unambiguous() {
-        assert_eq!(
-            replay_args(&argv(&["--future-flag", "--verbose", "--other=v"]), SID).unwrap(),
-            argv(&["--future-flag", "--verbose", "--other=v"])
-        );
-        assert_eq!(
-            replay_args(&argv(&["--future-flag"]), SID).unwrap(),
-            argv(&["--future-flag"])
-        );
-        assert_eq!(
-            replay_args(&argv(&["--model", "x", "--future-flag", "value"]), SID),
-            Err(ReplayRefusal::AmbiguousFlag {
-                index: 2,
-                flag: Some("--future-flag".into())
-            })
-        );
-    }
-
-    #[test]
-    fn resume_argv_print_mode_and_oversize_refuse() {
-        assert_eq!(
-            replay_args(&argv(&["-p", "hello"]), SID),
-            Err(ReplayRefusal::PrintMode)
-        );
-        assert_eq!(
-            replay_args(&argv(&["--print"]), SID),
-            Err(ReplayRefusal::PrintMode)
-        );
+    fn resume_argv_combined_short_flags_print_mode_and_oversize_refuse() {
+        for combined in ["-pc", "-rabc", "-vd"] {
+            assert_eq!(
+                replay(&["--model", "x", combined]),
+                Err(ReplayRefusal::CombinedShortFlags { index: 2 }),
+                "{combined}"
+            );
+        }
+        assert_eq!(replay(&["-p", "hello"]), Err(ReplayRefusal::PrintMode));
+        assert_eq!(replay(&["--print"]), Err(ReplayRefusal::PrintMode));
         let many: Vec<String> = (0..=MAX_ARGV_TOKENS).map(|_| "--verbose".into()).collect();
-        assert_eq!(replay_args(&many, SID), Err(ReplayRefusal::TooLong));
+        assert_eq!(replay_args(&many, SID, CWD), Err(ReplayRefusal::TooLong));
     }
 
     #[test]
     fn resume_argv_refusals_never_carry_token_text() {
-        let secret = "sk-secret-token value";
-        let err = replay_args(&argv(&["--model", secret]), SID).unwrap_err();
+        let err = replay(&["--model", "sk-secret-token value"]).unwrap_err();
         assert!(!err.to_string().contains("sk-secret"), "{err}");
-        // A flag NAME that is not inert is not named either.
-        let err = replay_args(&argv(&["--x$(id)=v"]), SID).unwrap_err();
+        assert!(err.to_string().contains("--model"), "names the flag: {err}");
+        let err = replay(&["--add-dir", "/a/$(id)"]).unwrap_err();
         assert!(!err.to_string().contains("$(id)"), "{err}");
     }
 
     #[test]
-    fn resume_argv_relaunch_wire_fields_three_ways() {
-        assert_eq!(Relaunch::for_record(None, SID).wire_fields(), (None, None));
+    fn resume_argv_derive_persists_flags_or_a_refusal_never_the_argv() {
         assert_eq!(
-            Relaunch::for_record(Some(&argv(&["--model", "opus", "hi"])), SID).wire_fields(),
+            derive_resume_flags(&argv(&["--model", "opus", "secret prompt"]), SID, CWD),
+            Some(ResumeFlags::Replay {
+                flags: argv(&["--model", "opus"])
+            })
+        );
+        let refused = derive_resume_flags(&argv(&["--model", "a b"]), SID, CWD).unwrap();
+        let ResumeFlags::Refused { reason } = &refused else {
+            panic!("{refused:?}")
+        };
+        assert!(!reason.contains("a b"), "{reason}");
+        let json = serde_json::to_string(&refused).unwrap();
+        assert!(!json.contains("a b"), "{json}");
+    }
+
+    #[test]
+    fn resume_argv_relaunch_wire_fields_three_ways() {
+        assert_eq!(Relaunch::for_record(None).wire_fields(), (None, None));
+        let replay = ResumeFlags::Replay {
+            flags: argv(&["--model", "opus"]),
+        };
+        assert_eq!(
+            Relaunch::for_record(Some(&replay)).wire_fields(),
             (Some(argv(&["--model", "opus"])), None)
         );
-        // An unsafe argv falls back to the DEFAULT resume: no args (the
-        // webview types its default command), and the refusal — naming the
-        // flag, never the value — for the warn line.
-        let relaunch = Relaunch::for_record(Some(&argv(&["--add-dir", "a b"])), SID);
-        assert!(matches!(relaunch, Relaunch::Fallback(_)), "{relaunch:?}");
-        let (args, refusal) = relaunch.wire_fields();
+        // A refusal falls back to the DEFAULT resume: no args, the refusal
+        // for the warn line.
+        let refused = ResumeFlags::Refused {
+            reason: "launch argument 2 (flag --add-dir) is not shell-inert".into(),
+        };
+        let (args, refusal) = Relaunch::for_record(Some(&refused)).wire_fields();
         assert_eq!(args, None, "the extra flags are dropped, the resume is not");
-        let refusal = refusal.unwrap();
-        assert!(refusal.contains("--add-dir"), "{refusal}");
-        assert!(!refusal.contains("a b"), "{refusal}");
-        // A missing or unsafe session id: no relaunch at all.
+        assert!(refusal.unwrap().contains("--add-dir"));
+        // A hand-edited record cannot get a token typed.
+        let tampered = ResumeFlags::Replay {
+            flags: argv(&["--model", "$(id)"]),
+        };
+        assert!(matches!(
+            Relaunch::for_record(Some(&tampered)),
+            Relaunch::Fallback(_)
+        ));
+        // An empty replay still relaunches — with no flags.
+        let empty = ResumeFlags::Replay { flags: vec![] };
         assert_eq!(
-            Relaunch::for_record(Some(&argv(&["--model", "opus"])), "a b"),
-            Relaunch::NoRelaunch
-        );
-        assert_eq!(
-            Relaunch::for_record(Some(&argv(&["--model", "opus"])), ""),
-            Relaunch::NoRelaunch
-        );
-        // A persisted argv with no flags still relaunches — with none.
-        assert_eq!(
-            Relaunch::for_record(Some(&[]), SID).wire_fields(),
+            Relaunch::for_record(Some(&empty)).wire_fields(),
             (Some(vec![]), None)
         );
     }
@@ -626,7 +775,10 @@ mod tests {
         assert_eq!(parse_argv_value(&serde_json::json!("--model")), None);
         let too_many: Vec<&str> = vec!["a"; MAX_ARGV_TOKENS + 1];
         assert_eq!(parse_argv_value(&serde_json::json!(too_many)), None);
-        let too_long = "a".repeat(MAX_ARGV_TOKEN_CHARS + 1);
+        let too_long = "a".repeat(MAX_ARGV_TOKEN_BYTES + 1);
         assert_eq!(parse_argv_value(&serde_json::json!([too_long])), None);
+        // Bytes, not characters.
+        let multibyte = "é".repeat(MAX_ARGV_TOKEN_BYTES / 2 + 1);
+        assert_eq!(parse_argv_value(&serde_json::json!([multibyte])), None);
     }
 }

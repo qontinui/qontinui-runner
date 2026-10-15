@@ -822,7 +822,7 @@ mod tests {
         working_dir: &str,
     ) -> super::super::session_lifecycle_store::TerminalSessionRecord {
         super::super::session_lifecycle_store::TerminalSessionRecord {
-            launch_argv: None,
+            resume_flags: None,
             claude_session_id: claude_session_id.to_string(),
             config_dir: None,
             working_dir: Some(working_dir.to_string()),
