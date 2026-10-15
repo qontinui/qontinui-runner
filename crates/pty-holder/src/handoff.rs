@@ -53,7 +53,12 @@
 //!    does both only after `serving` — so this holder takes the pane back:
 //!    it restores its lock record, re-binds its endpoint if the successor's
 //!    rename had replaced it, returns the held input to its writer, resumes
-//!    at X, and answers `upgrade_failed`. Otherwise it answers the requester
+//!    at X, and answers `upgrade_failed`. A successor found dead with a
+//!    `serving` already QUEUED had taken over (it may have written the held
+//!    input and read output past X): the pane is taken back all the same —
+//!    the child must keep a holder — but the held input is NOT replayed, an
+//!    in-stream notice declares that output since X may be missing
+//!    ([`upgrade_loss_notice`]), and the log says so at error level. Otherwise it answers the requester
 //!    `upgraded` and exits with `_exit`: closing its copy of the master WITHOUT signalling the
 //!    child (the child is a session leader on its own PTY; the holder is not
 //!    its controlling process, so nothing hangs it up), and running none of the
@@ -111,6 +116,12 @@
 //! start-token check, since the pid is no longer pinned by a zombie.
 //!
 //! # Input across the swap — the residual bound
+//!
+//! **Effectively Linux-only.** On macOS/BSD the drain refuses whenever an
+//! input connection is open, and a runner keeps its pane's input connection
+//! open for the pane's whole life — so there, in practice, every upgrade of a
+//! pane a runner is attached to rolls back. The feature is unavailable on
+//! those platforms until a drain that does not depend on `SHUT_RD` exists.
 //!
 //! **This bound is established for Linux**, whose `SHUT_RD` keeps queued data
 //! readable and fails later writes; on other Unix an upgrade with an open
@@ -196,8 +207,11 @@ pub const INPUT_DRAIN_BOUND: Duration = Duration::from_secs(2);
 /// never answer (a test then SIGKILLs it before its ack); `exit-after-commit`
 /// and `exit-after-publish` make it exit right after the commit (before it
 /// touches the lock record, or after its endpoint rename) and before
-/// `serving`. Any other value, or none, is ignored. None of them can cost the
-/// pane: the predecessor rolls back, or takes the pane back (review r2, D).
+/// `serving`; `exit-after-serving` makes it take over (held input written,
+/// output read) and exit 300 ms later; `fail-publish` makes its endpoint
+/// rename fail. Any other value, or none, is ignored. None of them can cost
+/// the child: the predecessor rolls back, takes the pane back (declaring a
+/// loss after `exit-after-serving`), or leaves it to the successor.
 pub const ADOPT_FAULT_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ADOPT_FAULT";
 
 /// TEST SEAM, read by a PREDECESSOR: replaces [`ACK_TIMEOUT`] (milliseconds),
@@ -213,6 +227,12 @@ pub const ACK_TIMEOUT_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ACK_TIMEOUT_MS";
 /// rollback: it lengthens every upgrade's freeze (output parked, input held)
 /// by that much, so it is clamped to [`MAX_TEST_COMMIT_DELAY`].
 pub const COMMIT_DELAY_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_COMMIT_DELAY_MS";
+
+/// TEST SEAM, read by a PREDECESSOR: stall this many milliseconds after the
+/// commit before it first looks for `serving` — so a successor can report
+/// `serving` and die before the predecessor notices either (review r3, G).
+/// Clamped to [`MAX_TEST_COMMIT_DELAY`].
+pub const SERVING_POLL_DELAY_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_SERVING_POLL_DELAY_MS";
 
 /// Largest [`ACK_TIMEOUT_ENV`] honoured.
 pub const MAX_TEST_ACK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -524,7 +544,36 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
                 "successor {successor_pid} died after the commit, before `serving` ({status}); \
                  this holder took its pane back"
             );
-            take_pane_back(ctx, info, pane, &sock, sock_ino_before, held, &why);
+            take_pane_back(
+                ctx,
+                info,
+                pane,
+                &sock,
+                sock_ino_before,
+                Back::Lossless(held),
+                &why,
+            );
+            return UpgradeResult::Failed(why);
+        }
+        AfterCommit::SuccessorDiedServing(status) => {
+            // Review r3, G: it DID take over — it may have written the held
+            // input and read output past X. The child still needs a holder,
+            // so take the pane back anyway, but declare what may be lost.
+            let why = format!(
+                "successor {successor_pid} died AFTER reporting `serving` ({status}); this \
+                 holder took its pane back, but output since offset {handoff_offset} may be \
+                 missing and the input held across the upgrade may or may not have reached \
+                 the child"
+            );
+            take_pane_back(
+                ctx,
+                info,
+                pane,
+                &sock,
+                sock_ino_before,
+                Back::DeclaredLoss { handoff_offset },
+                &why,
+            );
             return UpgradeResult::Failed(why);
         }
         AfterCommit::NoServing(detail) => log_line(
@@ -551,9 +600,47 @@ fn socket_inode(path: &Path) -> Option<(u64, u64)> {
         .map(|m| (m.dev(), m.ino()))
 }
 
+/// Whether a `serving` is queued on the control channel of a successor that
+/// has exited (so nothing more can arrive): read until EOF, never waiting.
+fn serving_queued(ours: &mut UnixStream) -> bool {
+    loop {
+        match recv_msg(ours, Instant::now() + Duration::from_millis(10)) {
+            Ok(Some(ControlMsg::Serving)) => return true,
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
+/// How [`take_pane_back`] treats what the dead successor may have touched.
+enum Back {
+    /// It died before `serving`: it read nothing and wrote nothing, so the
+    /// held input goes to this holder's writer and the stream is continuous.
+    Lossless(Vec<Vec<u8>>),
+    /// It died after `serving`: it may have written the held input (so it is
+    /// NOT replayed — a duplicate would be worse than a declared loss) and
+    /// read output past X (so the stream gets an explicit notice at the
+    /// resume point).
+    DeclaredLoss { handoff_offset: u64 },
+}
+
+/// The in-stream notice of a [`Back::DeclaredLoss`] take-back. Plain text, no
+/// escape sequences: it lands in every client's display and passes through
+/// the mode tracker without changing a mode.
+pub fn upgrade_loss_notice(handoff_offset: u64) -> Vec<u8> {
+    format!(
+        "\r\n[qontinui pty holder] holder upgrade: the successor holder died after taking \
+         over; output since offset {handoff_offset} may be missing, and input sent during the \
+         upgrade may not have reached the program\r\n"
+    )
+    .into_bytes()
+}
+
 /// What a committed predecessor learned while waiting for `serving`.
 enum AfterCommit {
     Serving,
+    /// The successor exited AFTER queuing `serving`: it had taken over.
+    SuccessorDiedServing(String),
     /// The successor exited (it is our child: `try_wait` proves it), before
     /// `serving` — so before it read the master or wrote any held input.
     SuccessorDied(String),
@@ -563,11 +650,22 @@ enum AfterCommit {
 }
 
 fn await_serving(ours: &mut UnixStream, child: &mut Child) -> AfterCommit {
+    if let Some(stall) = env_ms(SERVING_POLL_DELAY_ENV, MAX_TEST_COMMIT_DELAY) {
+        std::thread::sleep(stall);
+    }
     let deadline = Instant::now() + SERVING_WAIT;
     let mut channel_closed = false;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            return AfterCommit::SuccessorDied(status.to_string());
+            // Dead — but did it report `serving` first (review r3, G)? A
+            // `serving` can be queued after the last receive timed out. The
+            // successor is gone, so everything it wrote is already queued:
+            // drain the channel without waiting.
+            return if serving_queued(ours) {
+                AfterCommit::SuccessorDiedServing(status.to_string())
+            } else {
+                AfterCommit::SuccessorDied(status.to_string())
+            };
         }
         if Instant::now() >= deadline {
             return AfterCommit::NoServing(if channel_closed {
@@ -609,10 +707,14 @@ fn take_pane_back(
     pane: &Arc<Pane>,
     sock: &Path,
     sock_ino_before: Option<(u64, u64)>,
-    held: Vec<Vec<u8>>,
+    back: Back,
     why: &str,
 ) {
-    log_line(&ctx.log, &format!("upgrade: {why}"));
+    let level = match back {
+        Back::Lossless(_) => "",
+        Back::DeclaredLoss { .. } => "ERROR: ",
+    };
+    log_line(&ctx.log, &format!("upgrade: {level}{why}"));
     let record = LockRecord {
         holder_pid: info.holder_pid,
         child_pid: info.child_pid,
@@ -658,7 +760,13 @@ fn take_pane_back(
         &ctx.pane_dir,
         &info.pane_id,
     ));
-    pane.restore_handed_input(held);
+    match back {
+        Back::Lossless(held) => pane.restore_handed_input(held),
+        Back::DeclaredLoss { handoff_offset } => {
+            pane.restore_handed_input(Vec::new());
+            pane.inject_stream_notice(&upgrade_loss_notice(handoff_offset));
+        }
+    }
     pane.resume_reads();
 }
 
@@ -890,6 +998,10 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         );
         record.holder_start = None;
     }
+    if fault.as_deref() == Some("fail-publish") {
+        // Take the staged socket away, so the rename fails (path C).
+        let _ = std::fs::remove_file(crate::transport::staged_socket_path(&pane_dir, &pane_id));
+    }
     let (listener, published) = staged.publish();
     if fault.as_deref() == Some("exit-after-publish") {
         log_line(&log, "adopt: test fault: exit-after-publish");
@@ -915,8 +1027,13 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
                      UNREACHABLE (its lock held, so it reads UNKNOWN)"
                 ),
             );
+            log_line(
+                &log,
+                "adopt: no `serving` sent; waiting for the predecessor to leave before reading",
+            );
             let _ = control.set_read_timeout(None);
             while let Ok(Some(_)) = read_frame(&mut control) {}
+            log_line(&log, "adopt: the predecessor left; reading");
         }
     }
     drop(control);
@@ -925,6 +1042,13 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         pane.set_known_exit(exit);
     }
     pane.resume_reads();
+    if fault.as_deref() == Some("exit-after-serving") {
+        // Take over for real — held input written, output read past X —
+        // then die before the predecessor notices (review r3, G).
+        std::thread::sleep(Duration::from_millis(300));
+        log_line(&log, "adopt: test fault: exit-after-serving");
+        return Err(10);
+    }
     log_line(
         &log,
         &format!(

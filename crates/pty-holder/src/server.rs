@@ -425,6 +425,12 @@ pub(crate) fn own_scope_unit() -> Option<String> {
     }
 }
 
+/// Connections being served, across EVERY accept loop of this holder — a
+/// predecessor that re-bound its endpoint after a dead successor runs two
+/// (review r3 nit), and [`MAX_CONNECTIONS`] bounds them together. A holder
+/// process serves exactly one pane, so the count is process-wide.
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
 /// Run [`accept_loop`] on a thread of its own. A holder upgrade's predecessor
 /// that takes its pane back after a dead successor replaced its socket starts
 /// a second one on a fresh listener (plan Phase 8).
@@ -449,7 +455,7 @@ pub(crate) fn spawn_accept_loop(
 /// `transport::windows::STUCK_INSTANCE_FATAL_AFTER`) is logged and retried
 /// every [`ACCEPT_BACKOFF_FATAL`].
 fn accept_loop(listener: &Listener, info: &Arc<HolderInfo>, pane: &Arc<Pane>, log: &Path) {
-    let active = Arc::new(AtomicUsize::new(0));
+    let active = &ACTIVE_CONNECTIONS;
     let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
         let conn = match listener.accept() {
@@ -480,7 +486,7 @@ fn accept_loop(listener: &Listener, info: &Arc<HolderInfo>, pane: &Arc<Pane>, lo
         }
         let info = Arc::clone(info);
         let pane = Arc::clone(pane);
-        let slot = Arc::clone(&active);
+        let slot = active;
         let spawned = std::thread::Builder::new()
             .name("pty-holder-conn".into())
             .spawn(move || {
