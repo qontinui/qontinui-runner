@@ -574,7 +574,9 @@ fn stray_age(extension: &str) -> Option<Duration> {
         // `upgrade` / `upgrade-tmp`: a holder upgrade's snapshot (plan Phase
         // 8) left by a predecessor that died mid-handoff — it carries the
         // pane's ring, so it is not kept.
-        "sock" | "spec" | "report" | "report-tmp" | "upgrade" | "upgrade-tmp" => {
+        // `upg`: a successor's staged socket (`<pane-id>.sock.upg`) left by
+        // one that died between its bind and its rename.
+        "sock" | "spec" | "report" | "report-tmp" | "upgrade" | "upgrade-tmp" | "upg" => {
             Some(STRAY_MIN_AGE)
         }
         "log" => Some(DEAD_LOG_RETENTION),
@@ -596,6 +598,11 @@ fn remove_strays(pane_dir: &Path, now: SystemTime, skip: &[PaneId], report: &mut
             path.extension().and_then(|s| s.to_str()),
         ) else {
             continue;
+        };
+        // `<pane-id>.sock.upg`: the pane id is the stem's stem.
+        let stem = match ext {
+            "upg" => stem.strip_suffix(".sock").unwrap_or(stem),
+            _ => stem,
         };
         let (Some(min_age), Ok(pane)) = (stray_age(ext), PaneId::new(stem)) else {
             continue;
@@ -771,6 +778,39 @@ mod tests {
         for kept in [young_spec, skipped_spec, recent_log, foreign] {
             assert!(kept.exists(), "{} was removed", kept.display());
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Plan Phase 8 (review r1, finding 2): a holder upgrade's leftovers — a
+    /// snapshot, its temp, a successor's staged socket — are strays like any
+    /// other once old and lockless; a live pane's are never touched.
+    #[test]
+    fn pty_holder_handoff_sweep_removes_stray_upgrade_leftovers() {
+        let d = dir("upgstray");
+        let strays = [
+            d.join("a.upgrade"),
+            d.join("a.upgrade-tmp"),
+            d.join("a.sock.upg"),
+        ];
+        let live = d.join("b.sock.upg");
+        for p in strays.iter().chain([&live]) {
+            std::fs::write(p, b"x").unwrap();
+            age(p, STRAY_MIN_AGE * 2);
+        }
+        // Pane b is live: its lock is HELD for the whole sweep.
+        let held =
+            match crate::lock::PaneLock::try_acquire(&lock_path(&d, &PaneId::new("b").unwrap()))
+                .unwrap()
+            {
+                crate::lock::TryLock::Acquired(l) => l,
+                crate::lock::TryLock::Held => panic!("fresh lock held"),
+            };
+        let report = boot_sweep(&d, Duration::from_millis(300), &[], |_, _| {}).unwrap();
+        drop(held);
+        for p in &strays {
+            assert!(!p.exists(), "{} was kept: {report:?}", p.display());
+        }
+        assert!(live.exists(), "a pane with a lock keeps its staged socket");
         let _ = std::fs::remove_dir_all(&d);
     }
 

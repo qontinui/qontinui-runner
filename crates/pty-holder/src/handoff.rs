@@ -33,52 +33,87 @@
 //!    target explicitly (D12a rule 4: `portable-pty` sets it on the master).
 //! 5. **Wait for `ack {successor_pid}`** under [`ACK_TIMEOUT`].
 //!
-//! On the ack it **commits**: it retires its reader for good
-//! ([`Pane::hand_off_reads`]), sends `commit` with the input it held, answers
-//! the requester `upgraded`, and exits with `_exit` — closing its copy of the
-//! master WITHOUT signalling the child (the child is a session leader on its
-//! own PTY; the holder is not its controlling process, so nothing hangs it
-//! up), and running none of the pane-end work a normal exit does. On ANYTHING
-//! else — `nak`, a timeout, the successor's exit, a closed channel, a wrong
-//! pid, a failed commit write — it **rolls back**: SIGKILLs and reaps the
-//! successor (which never read the master — it reads only after a complete
-//! `commit`), unlinks the snapshot, resumes reading at X, and releases the
-//! held input to its own writer. The pane is served exactly as before
-//! (D12a rule 2).
+//! On the ack it **commits**:
+//!
+//! 6. **Drain input** ([`Pane::drain_input_for_handoff`]): new input
+//!    connections are refused before their `ok`, the hold cap is lifted, and
+//!    every open input connection is `shutdown(SHUT_RD)` — what its socket
+//!    already carries is read into the held input, after which a client's
+//!    write to it FAILS (`EPIPE`) rather than vanishing.
+//! 7. **Commit**: sends `commit` with the held input (and the child's exit,
+//!    if the child exited mid-swap and this holder — its parent — reaped it),
+//!    then retires its reader for good ([`Pane::hand_off_reads`]).
+//! 8. **Wait for `serving`** — the successor's report that its endpoint is in
+//!    place — at most [`SERVING_WAIT`], answers the requester `upgraded`, and
+//!    exits with `_exit`: closing its copy of the master WITHOUT signalling the
+//!    child (the child is a session leader on its own PTY; the holder is not
+//!    its controlling process, so nothing hangs it up), and running none of the
+//!    pane-end work a normal exit does. A `serving` that does not come in time
+//!    is logged and the exit happens anyway: the commit is final.
+//!
+//! On ANYTHING before the commit is delivered — `nak`, the ack timeout, the
+//! successor's exit, a closed channel, a wrong pid, a failed drain, a failed
+//! commit write — it **rolls back**: SIGKILLs and reaps the successor (which
+//! never read the master — it reads only after a complete `commit`), unlinks
+//! the snapshot and the successor's staged socket, resumes reading at X, and
+//! releases the held input to its own writer. The pane is served exactly as
+//! before (D12a rule 2).
 //!
 //! SUCCESSOR ([`adopt`], `main --adopt`): consumes the snapshot (unlinked on
 //! open), verifies the inherited lock (`PaneLock::adopt_inherited`), the master
 //! (`TIOCGWINSZ`) and that the child is still the process its start token
-//! names, builds an adopted [`Pane`] whose reader starts PARKED, and only then
-//! acks; any failure is a `nak` and an exit that signals nothing. On `commit`
-//! it queues the held input, rewrites the lock record to name itself
-//! (`PaneLock::rewrite_record`, never an empty file), takes the endpoint over
-//! with an atomic rename (`transport::bind_replacing`: a client reaches the old
-//! holder or the new one, never nothing — so no retry loop is needed while the
-//! predecessor lets go), and resumes reading at X. A connected client's
-//! connection to the predecessor ends; the runner's `DaemonPaneIo` probes, finds
-//! the lock held and the endpoint answering, and reattaches at its own last
-//! offset — so a late attach sees both sides of the swap with no loss marker
-//! and no duplicate.
+//! names, builds an adopted [`Pane`] whose reader starts PARKED, and binds its
+//! endpoint at a STAGED path beside the pane's socket — and only then acks;
+//! any failure is a `nak` and an exit that signals nothing. It then waits for
+//! `commit` with NO timeout of its own while its predecessor lives: a
+//! predecessor that gives up always kills it, so a timeout here could only
+//! race a late commit and lose the pane. On `commit` it queues the held input,
+//! rewrites the lock record to name itself (`PaneLock::rewrite_record`, never
+//! an empty file; on failure the record is CLEARED, which reads UNKNOWN —
+//! nothing is killed), `rename`s its staged socket over the pane's endpoint,
+//! resumes reading at X and reports `serving`. Nothing after the commit can
+//! end the child.
+//!
+//! **The endpoint gap.** Until the rename, the path names the predecessor's
+//! socket, which answers until the predecessor exits — and it exits only after
+//! `serving` (or [`SERVING_WAIT`]). So a client reaches one holder or the
+//! other, except when `serving` times out: then, between the predecessor's
+//! exit and the successor's rename, a connect is refused. A prober never reads
+//! that as a dead pane — the lock is held throughout — but as UNKNOWN, and the
+//! runner's `DaemonPaneIo` retries. A connected client's connection to the
+//! predecessor ends at its exit; the runner probes, finds the lock held and the
+//! endpoint answering, and reattaches at its own last offset — so a late
+//! attach sees both sides of the swap with no loss marker and no duplicate.
 //!
 //! If the PREDECESSOR dies after the ack but before a complete `commit`, the
-//! successor takes the pane over anyway: a predecessor that rolled back always
-//! kills and reaps its successor before it reads again, so a successor that is
-//! alive while its parent is gone knows nobody else reads the master.
+//! successor takes the pane over anyway — with whatever held input it had
+//! received: a predecessor that rolled back always kills and reaps its
+//! successor before it reads again, so a successor that is alive while its
+//! parent is gone knows nobody else reads the master.
 //!
 //! # What an adopted pane cannot know
 //!
 //! The successor is not the child's parent. Its exit detection is master
 //! EOF/`EIO`, and its exit code is `None` — UNKNOWN, never 0 (D12a rule 3;
-//! the runner's `exit_result` renders it as unknown). A `kill` is preceded by
-//! a start-token check, since the pid is no longer pinned by a zombie.
+//! the runner's `exit_result` renders it as unknown) — unless the child exited
+//! during the swap and the commit carried the code. A `kill` is preceded by a
+//! start-token check, since the pid is no longer pinned by a zombie.
 //!
-//! **Input in the window is not lost:** frames that arrive between the freeze
-//! and the commit are held and travel in `commit`. A frame the requester's
-//! runner writes to the predecessor's socket AFTER the commit is lost with
-//! that connection — the window is the predecessor's last few instructions
-//! before `_exit`, and the runner reopens its input connection to the
-//! successor.
+//! # Input across the swap — the residual bound
+//!
+//! Every input byte a client's write DELIVERED to a predecessor socket before
+//! the drain's `shutdown(SHUT_RD)` reaches the child, in order: frames queued
+//! to the writer are written first (the freeze waits for that), frames that
+//! arrive later are held — over the normal hold cap they wait, and during the
+//! drain the cap is lifted, so none is dropped — and travel in `commit`. What
+//! is NOT delivered: a frame whose write the shutdown cut in half (discarded
+//! whole) and any write after it. Both FAIL at the writer (`EPIPE`), never
+//! silently; today's runner `HolderConn::input` reports that failure to its
+//! caller and reopens its connection, but does not retry the failed write
+//! itself. A runner-side resend of the failed chunk on the new connection
+//! would make the swap lossless for input, and belongs with the runner change
+//! that first sends `prepare_upgrade`. A predecessor that dies mid-commit
+//! loses the held frames it had not yet sent.
 //!
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
@@ -101,7 +136,7 @@ use crate::modes::{ModeSnapshot, ModeTracker};
 use crate::pane::{
     check_private_dir, lock_path, log_path, snapshot_path, snapshot_tmp_path, PaneId,
 };
-use crate::protocol::{holder_build, Reply, PROTOCOL_VERSIONS};
+use crate::protocol::{holder_build, ExitReply, Reply, PROTOCOL_VERSIONS};
 use crate::pty::{dup_cloexec, get_winsize, AdoptedParts, Pane};
 use crate::ring::OutputRing;
 use crate::server::{log_line, Holder, HolderInfo};
@@ -120,8 +155,17 @@ pub const SUCCESSOR_FDS: [RawFd; 3] =
 
 /// How long the predecessor waits for the successor's `ack` (or `nak`).
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long a successor that acked waits for `commit`.
-pub const COMMIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often a successor waiting for `commit` re-checks that its
+/// predecessor is alive (it has no timeout of its own; see the module docs).
+pub const COMMIT_POLL: Duration = Duration::from_millis(250);
+/// After its control channel closed, how long a successor waits to see its
+/// predecessor gone (its fds close before it is reparented) before reading the
+/// close as a rollback.
+pub const PREDECESSOR_EXIT_GRACE: Duration = Duration::from_secs(5);
+/// How long the input connections may take to drain at the commit.
+pub const INPUT_CONN_DRAIN_BOUND: Duration = Duration::from_secs(2);
+/// How long a committed predecessor waits for the successor's `serving`.
+pub const SERVING_WAIT: Duration = Duration::from_secs(5);
 /// How long the reader may take to park.
 pub const QUIESCE_BOUND: Duration = Duration::from_secs(2);
 /// How long queued input may take to reach the child before the upgrade is
@@ -134,6 +178,23 @@ pub const INPUT_DRAIN_BOUND: Duration = Duration::from_secs(2);
 /// none, is ignored. It can only make an upgrade FAIL, which is always safe:
 /// the predecessor rolls back.
 pub const ADOPT_FAULT_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ADOPT_FAULT";
+
+/// TEST SEAM, read by a PREDECESSOR: replaces [`ACK_TIMEOUT`] (milliseconds),
+/// so the ack-timeout rollback can be exercised. Only shortens or lengthens a
+/// wait whose expiry is a rollback.
+pub const ACK_TIMEOUT_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ACK_TIMEOUT_MS";
+
+/// TEST SEAM, read by a PREDECESSOR: sleep this many milliseconds between the
+/// successor's ack and the commit — the window in which a starved predecessor
+/// must not cost the pane, and in which input is held.
+pub const COMMIT_DELAY_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_COMMIT_DELAY_MS";
+
+fn env_ms(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
 
 /// Leads every snapshot file.
 const SNAPSHOT_MAGIC: &[u8] = b"QPTYHOLDER-SNAPSHOT-1\n";
@@ -168,13 +229,25 @@ pub struct SnapshotHeader {
 
 /// Control-channel messages, one `KIND_CONTROL` frame each. `commit` is
 /// followed by `held_frames` `KIND_DATA` frames: the input the predecessor
-/// held while frozen, in order.
+/// held while frozen, in order. `serving` goes successor → predecessor once
+/// the successor's endpoint is in place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMsg {
-    UpgradeAck { successor_pid: u32 },
-    UpgradeNak { reason: String },
-    Commit { held_frames: usize },
+    UpgradeAck {
+        successor_pid: u32,
+    },
+    UpgradeNak {
+        reason: String,
+    },
+    Commit {
+        held_frames: usize,
+        /// The child's exit, when it exited mid-swap and the predecessor (its
+        /// parent) observed it.
+        #[serde(default)]
+        child_exit: Option<ExitReply>,
+    },
+    Serving,
 }
 
 fn send_msg(w: &mut UnixStream, msg: &ControlMsg) -> io::Result<()> {
@@ -321,6 +394,12 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
         }
         let _ = std::fs::remove_file(snapshot_tmp_path(&ctx.pane_dir, &info.pane_id));
         let _ = std::fs::remove_file(&snap);
+        // A successor killed between its staged bind and its exit leaves the
+        // staged socket behind.
+        let _ = std::fs::remove_file(crate::transport::staged_socket_path(
+            &ctx.pane_dir,
+            &info.pane_id,
+        ));
         pane.resume_reads();
         pane.unfreeze_input();
         UpgradeResult::Failed(why)
@@ -337,7 +416,7 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
         Err(e) => return rollback(None, format!("spawn successor: {e}")),
     };
     let successor_pid = child.id();
-    let deadline = Instant::now() + ACK_TIMEOUT;
+    let deadline = Instant::now() + env_ms(ACK_TIMEOUT_ENV).unwrap_or(ACK_TIMEOUT);
     match recv_msg(&mut ours, deadline) {
         Ok(Some(ControlMsg::UpgradeAck { successor_pid: p })) if p == successor_pid => {}
         Ok(Some(ControlMsg::UpgradeAck { successor_pid: p })) => {
@@ -364,15 +443,22 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
         }
         Err(e) => return rollback(Some(&mut child), format!("waiting for the ack: {e}")),
     }
-    // COMMIT. From the moment the reader is retired, only the successor may
-    // read; the held input travels with the commit.
-    pane.hand_off_reads();
+    if let Some(delay) = env_ms(COMMIT_DELAY_ENV) {
+        std::thread::sleep(delay);
+    }
+    // COMMIT. First drain the input connections into the held input (review
+    // r1, finding 3); a drain that does not finish is still a rollback.
+    if let Err(e) = pane.drain_input_for_handoff(INPUT_CONN_DRAIN_BOUND) {
+        return rollback(Some(&mut child), format!("input drain: {e}"));
+    }
     let held = pane.take_input_for_handoff();
+    let child_exit = pane.lock_state().observed_exit;
     let sent = ours.set_write_timeout(Some(ACK_TIMEOUT)).and_then(|()| {
         send_msg(
             &mut ours,
             &ControlMsg::Commit {
                 held_frames: held.len(),
+                child_exit,
             },
         )?;
         for frame in &held {
@@ -382,12 +468,27 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
     });
     if let Err(e) = sent {
         // The successor did not get a complete commit, so it never reads.
-        // `rollback` kills and reaps it BEFORE this reader resumes.
+        // `rollback` kills and reaps it BEFORE this reader resumes (the
+        // reader is still parked, never retired).
         pane.restore_handed_input(held);
         return rollback(
             Some(&mut child),
             format!("commit could not be delivered: {e}"),
         );
+    }
+    // Committed: this process never reads the master again.
+    pane.hand_off_reads();
+    // Keep this endpoint answering until the successor's is in place.
+    match recv_msg(&mut ours, Instant::now() + SERVING_WAIT) {
+        Ok(Some(ControlMsg::Serving)) => {}
+        other => log_line(
+            &ctx.log,
+            &format!(
+                "upgrade: no `serving` from successor {successor_pid} within {SERVING_WAIT:?} \
+                 ({other:?}); exiting anyway — the commit is final, and a connect may be \
+                 refused until its endpoint is in place"
+            ),
+        ),
     }
     UpgradeResult::Committed {
         successor_pid,
@@ -445,8 +546,9 @@ fn write_snapshot(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Pane, x: u64) -> i
         f.write_all(SNAPSHOT_MAGIC)?;
         f.write_all(&header_len.to_be_bytes())?;
         f.write_all(&json)?;
-        f.write_all(&ring)?;
-        f.sync_data()
+        // No fsync: the file lives for milliseconds, carries the pane's
+        // output, and is worthless after a reboot (review r1 nit).
+        f.write_all(&ring)
     })();
     drop(f);
     if let Err(e) =
@@ -554,6 +656,7 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         header,
         pane,
         mut lock,
+        staged,
     } = prepared;
     let log = log_path(&pane_dir, &pane_id);
     if send_msg(
@@ -567,8 +670,14 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         // No ack delivered: the predecessor rolls back. Signal nothing.
         return Err(7);
     }
+    log_line(&log, "adopt: acked; waiting for the commit");
     match await_commit(&mut control, header.predecessor_pid, &log) {
-        Ok(held) => pane.inject_input(held),
+        Ok(commit) => {
+            pane.inject_input(commit.held);
+            if let Some(exit) = commit.child_exit {
+                pane.set_known_exit(exit);
+            }
+        }
         Err(why) => {
             log_line(
                 &log,
@@ -577,7 +686,6 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
             return Err(8);
         }
     }
-    drop(control);
     // Committed: the pane is ours now.
     let info = HolderInfo {
         pane_id: pane_id.clone(),
@@ -601,23 +709,36 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         scope_unit: crate::server::own_scope_unit(),
         ended: None,
     };
-    let bound = lock
-        .rewrite_record(&record)
-        .and_then(|()| crate::transport::bind_replacing(&pane_dir, &pane_id));
-    let listener = match bound {
-        Ok(l) => l,
-        Err(e) => {
-            // As at a first start: an unreachable pane is a leak, not a
-            // session. The predecessor is gone; end the child.
-            log_line(
-                &log,
-                &format!("adopt: endpoint after commit failed ({e}); ending the pane"),
-            );
-            pane.kill_now();
-            return Err(9);
-        }
-    };
+    // From here on NOTHING may end the child (review r1, finding 2): every
+    // step that could fail without a fallback ran before the ack.
+    let mut record = record;
+    if let Err(e) = lock.rewrite_record(&record) {
+        // The lock is still held: an EMPTY record reads UNKNOWN (and a sweep
+        // signals nothing for it) — never a wrong holder, never a kill.
+        let cleared = lock.clear_record();
+        log_line(
+            &log,
+            &format!(
+                "adopt: ERROR: lock record not rewritten ({e}); cleared it instead: {cleared:?}"
+            ),
+        );
+        record.holder_start = None;
+    }
+    let (listener, published) = staged.publish();
+    if let Err(e) = &published {
+        log_line(
+            &log,
+            &format!(
+                "adopt: ERROR: endpoint not moved into place ({e}); the pane keeps running \
+                 UNREACHABLE (its lock held, so it reads UNKNOWN)"
+            ),
+        );
+    }
     pane.resume_reads();
+    // Tell the predecessor it may go (best effort: it exits after a bound
+    // anyway).
+    let _ = send_msg(&mut control, &ControlMsg::Serving);
+    drop(control);
     log_line(
         &log,
         &format!(
@@ -634,6 +755,9 @@ struct Prepared {
     header: SnapshotHeader,
     pane: Arc<Pane>,
     lock: PaneLock,
+    /// The successor's endpoint, bound at the staged path BEFORE the ack, so
+    /// a bind failure is a `nak` — never a failure after the commit.
+    staged: crate::transport::StagedListener,
 }
 
 /// Everything a successor checks before it acks. Builds the adopted pane with
@@ -696,12 +820,15 @@ fn prepare_adoption(snap: &Path, master: File, lockf: File) -> Result<Prepared, 
         exit_linger: Duration::from_millis(header.exit_linger_ms),
     })
     .map_err(|e| format!("adopted pane: {e}"))?;
+    let staged =
+        crate::transport::bind_staged(&pane_dir, &pane_id).map_err(|e| format!("endpoint: {e}"))?;
     Ok(Prepared {
         pane_dir,
         pane_id,
         header,
         pane,
         lock,
+        staged,
     })
 }
 
@@ -762,45 +889,127 @@ fn consume_snapshot(path: &Path) -> io::Result<(SnapshotHeader, Vec<u8>)> {
     Ok((header, ring))
 }
 
+/// What a complete `commit` carried.
+struct Commit {
+    held: Vec<Vec<u8>>,
+    child_exit: Option<ExitReply>,
+}
+
+/// Block until `fd` is readable, re-checking every [`COMMIT_POLL`] — with NO
+/// deadline while `predecessor_gone` is false. `Ok(true)` readable (data or
+/// EOF), `Ok(false)` the predecessor is gone.
+fn wait_readable(fd: RawFd, predecessor_gone: &dyn Fn() -> bool) -> io::Result<bool> {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll over one valid pollfd.
+        let rc = unsafe { libc::poll(&mut pfd, 1, COMMIT_POLL.as_millis() as libc::c_int) };
+        if rc > 0 {
+            return Ok(true);
+        }
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+        if predecessor_gone() {
+            return Ok(false);
+        }
+    }
+}
+
+/// One control-channel frame, waiting with no deadline of its own while the
+/// predecessor lives. `Ok(None)`: EOF, or the predecessor is gone.
+fn recv_while_alive(
+    control: &mut UnixStream,
+    predecessor_gone: &dyn Fn() -> bool,
+) -> io::Result<Option<crate::frame::Frame>> {
+    if !wait_readable(control.as_raw_fd(), predecessor_gone)? {
+        return Ok(None);
+    }
+    // Readable: the frame is being written by a live (or just-died) peer,
+    // whose death is an EOF — a blocking read cannot hang on a dead writer.
+    control.set_read_timeout(None)?;
+    read_frame(control)
+}
+
 /// Wait for a complete `commit` (the control frame and every held input
-/// frame). A channel that ends without one means the predecessor rolled back
-/// — unless the predecessor itself is gone, in which case nobody else will
-/// ever read the master: it is taken over (module docs).
+/// frame), with no timeout while the predecessor lives (review r1, finding 1:
+/// a successor that gave up could race a late commit, and then both holders
+/// leave and the pane is lost — while a predecessor that gives up always
+/// kills its successor). A channel that ends without a commit means the
+/// predecessor rolled back — unless the predecessor itself is gone, in which
+/// case nobody else will ever read the master: it is taken over (module docs),
+/// with the held input frames received so far.
 fn await_commit(
     control: &mut UnixStream,
     predecessor_pid: u32,
     log: &Path,
-) -> Result<Vec<Vec<u8>>, String> {
-    let deadline = Instant::now() + COMMIT_TIMEOUT;
+) -> Result<Commit, String> {
     let predecessor_gone = || {
         // SAFETY: getppid has no preconditions.
         let parent = unsafe { libc::getppid() };
         u32::try_from(parent).ok() != Some(predecessor_pid)
     };
-    let take_over = |why: &str| {
+    // A predecessor's fds close BEFORE it is reparented away: an EOF from a
+    // dying predecessor can be seen while getppid still names it. Wait for
+    // the reparenting before reading an EOF as a rollback.
+    let gone_soon = || {
+        let end = Instant::now() + PREDECESSOR_EXIT_GRACE;
+        loop {
+            if predecessor_gone() {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let take_over = |why: &str, held: Vec<Vec<u8>>| {
         log_line(
             log,
-            &format!("adopt: {why}, and predecessor pid {predecessor_pid} is gone — taking the pane over"),
+            &format!(
+                "adopt: {why}, and predecessor pid {predecessor_pid} is gone — taking the pane \
+                 over with {} held input frame(s)",
+                held.len()
+            ),
         );
-        Ok(Vec::new())
+        Ok(Commit {
+            held,
+            child_exit: None,
+        })
     };
-    let held_frames = match recv_msg(control, deadline) {
-        Ok(Some(ControlMsg::Commit { held_frames })) => held_frames,
-        Ok(Some(other)) => return Err(format!("unexpected {other:?}")),
-        Ok(None) if predecessor_gone() => return take_over("the control channel closed"),
+    let first = recv_while_alive(control, &predecessor_gone);
+    let (held_frames, child_exit) = match first {
+        Ok(Some(f)) if f.kind == KIND_CONTROL => match serde_json::from_slice(&f.payload) {
+            Ok(ControlMsg::Commit {
+                held_frames,
+                child_exit,
+            }) => (held_frames, child_exit),
+            Ok(other) => return Err(format!("unexpected {other:?}")),
+            Err(e) => return Err(format!("malformed control message: {e}")),
+        },
+        Ok(Some(f)) => return Err(format!("unexpected frame kind 0x{:02x}", f.kind)),
+        Ok(None) | Err(_) if gone_soon() => {
+            return take_over("the control channel closed", Vec::new())
+        }
         Ok(None) => return Err("the predecessor closed the control channel (rolled back)".into()),
-        Err(e) if predecessor_gone() => return take_over(&format!("control channel: {e}")),
         Err(e) => return Err(format!("control channel: {e}")),
     };
     let mut held = Vec::with_capacity(held_frames.min(crate::pty::INPUT_QUEUE_FRAMES));
     for _ in 0..held_frames {
-        match recv_frame(control, deadline) {
+        match recv_while_alive(control, &predecessor_gone) {
             Ok(Some(f)) if f.kind == KIND_DATA => held.push(f.payload),
-            // An incomplete commit: the predecessor saw its write fail and is
-            // rolling back — never read. Unless it DIED mid-commit: then the
-            // input it held is lost, and the pane is not.
-            Ok(_) | Err(_) if predecessor_gone() => {
-                return take_over("the commit was cut short").map(|_: Vec<Vec<u8>>| held)
+            // An incomplete commit: a live predecessor saw its write fail and
+            // is rolling back — never read. A predecessor that DIED
+            // mid-commit leaves the pane to us, with the frames that arrived.
+            Ok(_) | Err(_) if gone_soon() => {
+                return take_over("the commit was cut short", held);
             }
             Ok(other) => {
                 return Err(format!("incomplete commit ({:?})", other.map(|f| f.kind)));
@@ -808,5 +1017,5 @@ fn await_commit(
             Err(e) => return Err(format!("incomplete commit: {e}")),
         }
     }
-    Ok(held)
+    Ok(Commit { held, child_exit })
 }

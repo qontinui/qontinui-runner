@@ -129,6 +129,10 @@ pub struct PaneState {
     pub size: (u16, u16),
     /// Whether the reader may read (plan Phase 8).
     pub read_gate: ReadGate,
+    /// The child's exit as the waiter observed it, recorded BEFORE the exit
+    /// is settled — so a holder upgrade that commits while the settle waits
+    /// on a parked reader can still hand the real code to its successor.
+    pub observed_exit: Option<ExitReply>,
     /// The reader is parked at the gate: no read is in flight, and none will
     /// start until the gate is [`ReadGate::Run`] again.
     pub read_parked: bool,
@@ -282,8 +286,20 @@ struct InputState {
     frozen: bool,
     held: Vec<Vec<u8>>,
     held_bytes: usize,
+    /// A committing upgrade is DRAINING the input connections: the hold cap
+    /// is lifted (what the sockets already carry is bounded by their
+    /// buffers), so a frame is held, never dropped (review r1, finding 3).
+    draining: bool,
+    /// No new input connection is accepted (a committing upgrade).
+    refuse_new: bool,
     /// The pane was handed to a successor: nothing more is accepted here.
     handed_off: bool,
+    /// Unix: every open input connection, so a committing upgrade can stop
+    /// their reads and drain what they carry (`Pane::drain_input_for_handoff`).
+    #[cfg(unix)]
+    conns: Vec<(u64, crate::transport::Conn)>,
+    #[cfg(unix)]
+    next_conn: u64,
 }
 
 /// The pane a holder owns.
@@ -315,6 +331,10 @@ pub struct Pane {
     /// unknown — and every signal is preceded by a start-token check.
     #[cfg(unix)]
     adopted: bool,
+    /// An adopted pane's child exit as its predecessor observed it (it exited
+    /// mid-swap and the predecessor, its parent, reaped it).
+    #[cfg(unix)]
+    known_exit: Mutex<Option<ExitReply>>,
     #[cfg(windows)]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     /// Windows: a holder-owned `KILL_ON_JOB_CLOSE` job holding the child, so
@@ -470,6 +490,7 @@ impl Pane {
                 size: (spec.cols, spec.rows),
                 read_gate: ReadGate::Run,
                 read_parked: false,
+                observed_exit: None,
             }),
             changed: Condvar::new(),
             master: Mutex::new(Master::Portable(master)),
@@ -480,6 +501,8 @@ impl Pane {
             wake: WakePipe::new()?,
             #[cfg(unix)]
             adopted: false,
+            #[cfg(unix)]
+            known_exit: Mutex::new(None),
             #[cfg(windows)]
             killer: Mutex::new(killer),
             #[cfg(windows)]
@@ -568,6 +591,7 @@ impl Pane {
                 size,
                 read_gate: ReadGate::Quiesce,
                 read_parked: false,
+                observed_exit: None,
             }),
             changed: Condvar::new(),
             master: Mutex::new(Master::Adopted(parts.master)),
@@ -576,6 +600,7 @@ impl Pane {
             pending_input: AtomicUsize::new(0),
             wake: WakePipe::new()?,
             adopted: true,
+            known_exit: Mutex::new(None),
             exit_linger: parts.exit_linger,
             ring_capacity: parts.ring_capacity,
             child_start: parts.child_start,
@@ -706,6 +731,70 @@ impl Pane {
             }
         }
         input.frozen = false;
+        input.draining = false;
+        input.refuse_new = false;
+    }
+
+    /// Register an input connection (`open_input`), so a committing upgrade
+    /// can drain it. `None` while an upgrade is committing: the connection is
+    /// then refused BEFORE its `ok`, so its client sends nothing here and
+    /// reconnects — to the successor.
+    #[cfg(unix)]
+    pub fn register_input_conn(&self, conn: crate::transport::Conn) -> Option<u64> {
+        let mut input = self.input.lock().unwrap_or_else(|p| p.into_inner());
+        if input.refuse_new || input.handed_off {
+            return None;
+        }
+        input.next_conn += 1;
+        let id = input.next_conn;
+        input.conns.push((id, conn));
+        Some(id)
+    }
+
+    /// The input connection `id` has ended (its dispatch loop left).
+    #[cfg(unix)]
+    pub fn unregister_input_conn(&self, id: u64) {
+        let mut input = self.input.lock().unwrap_or_else(|p| p.into_inner());
+        input.conns.retain(|(i, _)| *i != id);
+    }
+
+    /// The commit's input drain (review r1, finding 3): refuse new input
+    /// connections, lift the hold cap, `shutdown(SHUT_RD)` every open one and
+    /// wait — at most `bound` — until each dispatch has read what its socket
+    /// already held (into the held input) and ended. From then on a client
+    /// write to one of them fails (`EPIPE`) instead of vanishing; a frame cut
+    /// in half by the shutdown is discarded whole, and its writer saw the
+    /// failure. A drain that does not finish in time fails (`unfreeze_input`
+    /// re-opens input on a rollback).
+    #[cfg(unix)]
+    pub fn drain_input_for_handoff(&self, bound: Duration) -> io::Result<()> {
+        {
+            let mut input = self.input.lock().unwrap_or_else(|p| p.into_inner());
+            input.refuse_new = true;
+            input.draining = true;
+            for (_, conn) in &input.conns {
+                conn.shutdown_read();
+            }
+        }
+        let deadline = Instant::now() + bound;
+        loop {
+            if self
+                .input
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .conns
+                .is_empty()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the input connections did not drain in time",
+                ));
+            }
+            std::thread::sleep(INPUT_QUEUE_POLL);
+        }
     }
 
     /// Commit point of a holder upgrade: take the held input (it travels to
@@ -730,6 +819,12 @@ impl Pane {
             input.held = held;
         }
         self.unfreeze_input();
+    }
+
+    /// An adopted pane: the child's exit code its predecessor observed.
+    #[cfg(unix)]
+    pub fn set_known_exit(&self, exit: ExitReply) {
+        *self.known_exit.lock().unwrap_or_else(|p| p.into_inner()) = Some(exit);
     }
 
     /// An adopted pane: queue the input its predecessor held during the
@@ -869,11 +964,13 @@ impl Pane {
         if self.adopted {
             // D12a rule 3: this holder is not the child's parent, so master
             // EOF/EIO IS the exit, and its code is UNKNOWN — never 0, never
-            // a fabricated failure.
-            self.settle(ExitReply {
+            // a fabricated failure — unless the predecessor observed it
+            // during the swap and sent it with the commit.
+            let known = *self.known_exit.lock().unwrap_or_else(|p| p.into_inner());
+            self.settle(known.unwrap_or(ExitReply {
                 code: None,
                 signal: None,
-            });
+            }));
         }
     }
 
@@ -883,6 +980,7 @@ impl Pane {
         st.child_gone = true;
         let killed = self.kill_reached.load(Ordering::SeqCst);
         st.ended_by_kill.get_or_insert(killed);
+        st.observed_exit = Some(exit);
         // Plan Phase 8: while a holder upgrade has the reader parked, the
         // child's last output may still be in the kernel, unread. The exit is
         // not settled until the reader runs again (a rolled-back upgrade) —
@@ -1057,8 +1155,9 @@ impl Pane {
                     // A holder upgrade is in progress: HOLD the frame (it
                     // goes to the successor, or back to this writer on a
                     // rollback). Past the bound, wait like a full queue.
-                    if input.held.len() < INPUT_QUEUE_FRAMES
-                        && input.held_bytes + chunk.len() <= MAX_HELD_INPUT_BYTES
+                    if input.draining
+                        || (input.held.len() < INPUT_QUEUE_FRAMES
+                            && input.held_bytes + chunk.len() <= MAX_HELD_INPUT_BYTES)
                     {
                         input.held_bytes += chunk.len();
                         input.held.push(chunk);
