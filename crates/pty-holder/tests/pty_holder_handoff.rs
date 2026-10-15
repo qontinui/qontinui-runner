@@ -441,6 +441,10 @@ mod unix {
         );
 
         // End the pane through the successor: its exit is reported, as UNKNOWN.
+        // Only one attached connection remains: a holder leaves once its exit
+        // reached ANY client, so a second one (`late`) could take the exit
+        // frame and the holder's departure would end `again` first.
+        drop(late);
         send_input(&dir, b"quit\n");
         let fin = read_until(&mut again, r3.next, Duration::from_secs(10), |_| false);
         assert_eq!(
