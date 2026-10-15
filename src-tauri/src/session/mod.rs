@@ -619,6 +619,293 @@ pub(crate) fn resolve_new_session_tenant() -> Option<Uuid> {
     tenant_for_new_session(tenant_pin::resolve_tenant_pin())
 }
 
+/// [`resolve_new_session_tenant`] for a session whose SPAWN DIRECTORY is
+/// known — the federation path (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 5, the half #2029 deferred).
+///
+/// The cwd-blind resolver answers "machine pin, else paired default", so a
+/// session spawned into tenant B's repo on a machine pinned to A federated A's
+/// pool while its coord-mcp proxy — which since Phase 5 consults the repo —
+/// answered from B. This runs the proxy's own authority order
+/// ([`crate::coord_mcp::decide_session_tenant`]) for a binding nobody named a
+/// tenant for, so the two paths cannot disagree about the same session: the
+/// workspace declarations (rows 1a-1c), then the session's REPO (row 1d), then
+/// the machine rows — the same precedence, the same admission rule
+/// ([`crate::coord_mcp::validate_spawn_tenant`]), the same refusals.
+///
+/// `repo` is called only when no workspace declaration answered (the proxy's
+/// laziness too), and is the caller's to supply because resolving it is async
+/// and the federation spawn sites are blocking; see
+/// [`crate::claude_session::coord_register::federation_session_tenant`].
+///
+/// `Err` is TERMINAL for federation: a repo or declaration naming a tenant this
+/// device may not act as must never fall through to the default tenant's pool.
+pub(crate) fn resolve_new_session_tenant_in(
+    workdir: &str,
+    repo: impl FnOnce() -> qontinui_runner_lib::repo_tenant::CwdTenant,
+) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+    new_session_tenant_from(
+        || workspace_tenant::read_workspace_declaration(Some(workdir)),
+        repo,
+        tenant_pin::resolve_tenant_pin(),
+        crate::auth::default_binding_tenant,
+        crate::coord_mcp::device_jwt_claim_tenant,
+        crate::coord_mcp::validate_spawn_tenant,
+        crate::coord_mcp::device_is_multi_bound,
+    )
+}
+
+/// Pure core of [`resolve_new_session_tenant_in`]: every input injected.
+///
+/// Mapping from the proxy's decision to a recorded tenant:
+/// - a named tenant (declared, repo-derived, live machine pin) → that tenant;
+/// - the default slot → the paired default binding, exactly as
+///   [`tenant_for_new_session`] answers an `Unpinned` machine;
+/// - an `Unresolvable` machine (with or without a JWT claim) → `None`, exactly
+///   as [`tenant_for_new_session`] answers it today: the federation builder's
+///   own fallback takes over, unchanged. Row 4 is the proxy's slot choice, not
+///   a recording rule;
+/// - every refusal → `Err`, including the multi-tenant "repo not settled yet"
+///   guard ([`crate::coord_mcp::repo_unsettled_refusal`]).
+pub(crate) fn new_session_tenant_from(
+    declaration: impl FnOnce() -> workspace_tenant::WorkspaceDeclaration,
+    repo: impl FnOnce() -> qontinui_runner_lib::repo_tenant::CwdTenant,
+    live_pin: tenant_pin::TenantPin,
+    default_binding: impl FnOnce() -> Option<Uuid>,
+    jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
+    admit: impl FnOnce(Uuid) -> Result<(), crate::coord_mcp::SpawnTenantRefusal>,
+    multi_bound: impl FnOnce() -> bool,
+) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+    use crate::coord_mcp::{PinOrigin, SessionDecisionInputs, SessionTenantDecision};
+
+    // A new binding nobody named a tenant for: no pin of its own, and what a
+    // mint would record is SAMPLED (row 1e), never chosen (row 1).
+    let mut seen_repo = None;
+    let decision = crate::coord_mcp::decide_session_tenant(
+        tenant_pin::TenantPin::Unpinned,
+        PinOrigin::MachineSampled,
+        declaration,
+        || {
+            let r = repo();
+            seen_repo = Some(r.clone());
+            Some(r)
+        },
+        live_pin,
+        jwt_claim_tenant,
+        admit,
+    );
+    let inputs = SessionDecisionInputs {
+        binding_pin: tenant_pin::TenantPin::Unpinned,
+        binding_origin: PinOrigin::MachineSampled,
+        workdir: None,
+        repo: seen_repo,
+        // A device session: its repo steers it, as on the proxy.
+        repo_steers: true,
+    };
+    let decision = crate::coord_mcp::repo_unsettled_refusal(&inputs, &decision, multi_bound)
+        .unwrap_or(decision);
+    match decision {
+        SessionTenantDecision::DefaultSlot => Ok(default_binding()),
+        SessionTenantDecision::JwtClaim(_) | SessionTenantDecision::Unresolvable => Ok(None),
+        other => other.into_result(),
+    }
+}
+
+#[cfg(test)]
+mod new_session_tenant_tests {
+    //! Plan `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5, the
+    //! federation half: [`new_session_tenant_from`] gives a session spawned in
+    //! a repo the repo's tenant, refuses exactly where the proxy refuses, and
+    //! leaves every non-repo spawn on the old pin/default answer.
+    use super::*;
+    use crate::coord_mcp::{PinOrigin, SpawnTenantRefusal};
+    use qontinui_runner_lib::repo_tenant::{CwdTenant, REPO_TENANTS_SOURCE};
+    use tenant_pin::TenantPin;
+    use workspace_tenant::{TenantDeclarationSource, WorkspaceDeclaration};
+
+    const MACHINE: Uuid = Uuid::from_u128(0xA);
+    const DEFAULT: Uuid = Uuid::from_u128(0xD);
+    const REPO_OWNER: Uuid = Uuid::from_u128(0xB);
+    const OTHER: Uuid = Uuid::from_u128(0xC);
+
+    fn owned_by(t: Uuid) -> CwdTenant {
+        CwdTenant::Resolved {
+            tenant_id: t,
+            repo: "acme/widgets".to_string(),
+            source: REPO_TENANTS_SOURCE.to_string(),
+            observed_at: "2026-10-15T00:00:00Z".to_string(),
+        }
+    }
+
+    fn admit_all(_: Uuid) -> Result<(), SpawnTenantRefusal> {
+        Ok(())
+    }
+
+    fn admit_none(tenant: Uuid) -> Result<(), SpawnTenantRefusal> {
+        Err(SpawnTenantRefusal::NotPaired { tenant })
+    }
+
+    /// Run the resolver with no workspace declaration, the default binding and
+    /// JWT claim both `DEFAULT`.
+    fn resolve(
+        repo: CwdTenant,
+        live: TenantPin,
+        admit: fn(Uuid) -> Result<(), SpawnTenantRefusal>,
+        multi_bound: bool,
+    ) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+        new_session_tenant_from(
+            || WorkspaceDeclaration::Absent,
+            || repo,
+            live,
+            || Some(DEFAULT),
+            || Some(DEFAULT),
+            admit,
+            || multi_bound,
+        )
+    }
+
+    /// What the coord-mcp proxy answers for the same new, unnamed session.
+    fn proxy_answer(
+        repo: CwdTenant,
+        live: TenantPin,
+        admit: fn(Uuid) -> Result<(), SpawnTenantRefusal>,
+    ) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+        crate::coord_mcp::decide_session_tenant(
+            TenantPin::Unpinned,
+            PinOrigin::MachineSampled,
+            || WorkspaceDeclaration::Absent,
+            || Some(repo),
+            live,
+            || Some(DEFAULT),
+            admit,
+        )
+        .into_result()
+    }
+
+    /// (a) A repo that resolves to tenant T gives the session T — over the
+    /// machine pin, over the paired default, and on an unresolvable machine.
+    #[test]
+    fn a_session_in_a_repo_federates_the_repos_tenant() {
+        for live in [
+            TenantPin::Pinned(MACHINE),
+            TenantPin::Unpinned,
+            TenantPin::Unresolvable,
+        ] {
+            assert_eq!(
+                resolve(owned_by(REPO_OWNER), live, admit_all, true),
+                Ok(Some(REPO_OWNER)),
+                "live pin {live:?}: the repo's tenant must win over the machine rows"
+            );
+        }
+    }
+
+    /// The precedence is the proxy's: a workspace declaration (rows 1a-1c)
+    /// still outranks the repo, and the repo is then never even resolved.
+    #[test]
+    fn a_workspace_declaration_outranks_the_repo_as_on_the_proxy() {
+        let got = new_session_tenant_from(
+            || WorkspaceDeclaration::Declared {
+                tenant: OTHER,
+                source: TenantDeclarationSource::Env,
+            },
+            || panic!("the repo must not be resolved when the workspace declared a tenant"),
+            TenantPin::Pinned(MACHINE),
+            || Some(DEFAULT),
+            || Some(DEFAULT),
+            admit_all,
+            || true,
+        );
+        assert_eq!(got, Ok(Some(OTHER)));
+    }
+
+    /// (b) A repo owned by a tenant this device is not bound to REFUSES, with
+    /// the proxy's own refusal — never the machine pin, never the default.
+    #[test]
+    fn a_repo_owned_by_an_unbound_tenant_refuses_exactly_as_the_proxy_does() {
+        for live in [TenantPin::Pinned(MACHINE), TenantPin::Unpinned] {
+            let got = resolve(owned_by(REPO_OWNER), live, admit_none, false);
+            assert!(
+                got.is_err(),
+                "live pin {live:?}: got {got:?}, want a refusal"
+            );
+            assert_eq!(got, proxy_answer(owned_by(REPO_OWNER), live, admit_none));
+        }
+
+        // Several owners, the default not among them: the proxy's ambiguity
+        // refusal. With the default among them: the default.
+        let several = |ids: Vec<Uuid>| CwdTenant::Several {
+            repo: "acme/widgets".to_string(),
+            tenant_ids: ids,
+        };
+        let got = resolve(
+            several(vec![REPO_OWNER, OTHER]),
+            TenantPin::Unpinned,
+            admit_all,
+            true,
+        );
+        assert!(got.is_err());
+        assert_eq!(
+            got,
+            proxy_answer(
+                several(vec![REPO_OWNER, OTHER]),
+                TenantPin::Unpinned,
+                admit_all
+            )
+        );
+        assert_eq!(
+            resolve(
+                several(vec![REPO_OWNER, DEFAULT]),
+                TenantPin::Unpinned,
+                admit_all,
+                true
+            ),
+            Ok(Some(DEFAULT))
+        );
+
+        // A repo still transiently unknown on a multi-tenant device is the
+        // proxy's retryable "unsettled" refusal, not the machine default.
+        let unsettled = resolve(
+            CwdTenant::unknown_transient("coord unreachable"),
+            TenantPin::Pinned(MACHINE),
+            admit_all,
+            true,
+        );
+        assert_eq!(
+            unsettled.map_err(|r| r.code),
+            Err(crate::coord_mcp::TENANT_REPO_UNSETTLED_CODE)
+        );
+    }
+
+    /// (c) No resolvable repo: the answer is the cwd-blind
+    /// [`tenant_for_new_session`]'s, unchanged — machine pin, else the paired
+    /// default, and nothing on an unresolvable machine.
+    #[test]
+    fn no_resolvable_repo_keeps_the_pin_or_default_answer() {
+        for repo in [
+            CwdTenant::NoRepo,
+            CwdTenant::RepoUnregistered {
+                repo: "acme/widgets".to_string(),
+            },
+            CwdTenant::unknown("no workdir"),
+            // A single-tenant device keeps the fall-through on a transient one.
+            CwdTenant::unknown_transient("coord unreachable"),
+        ] {
+            for (live, want) in [
+                (TenantPin::Pinned(MACHINE), Some(MACHINE)),
+                (TenantPin::Unpinned, Some(DEFAULT)),
+                (TenantPin::Unresolvable, None),
+            ] {
+                assert_eq!(
+                    resolve(repo.clone(), live, admit_none, false),
+                    Ok(want),
+                    "repo {repo:?}, live pin {live:?}"
+                );
+            }
+        }
+    }
+}
+
 fn stamp_session_tenant(mut intent: Intent) -> Intent {
     if intent.tenant_id.is_none() {
         intent.tenant_id = resolve_new_session_tenant();

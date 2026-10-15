@@ -190,9 +190,10 @@ pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<Re
 /// that populates [`SessionContext::tenant_id`] (B2). The session's
 /// RECORDED tenant wins (`session_tenant`, threaded by the spawn site from
 /// `coord_register::federation_session_tenant` — the tenant `AiCoordRegistrar`
-/// stamped the coord record and JWT slot with, else the registrar's own
-/// resolver `session::resolve_new_session_tenant`), so the coord record + JWT
-/// slot + federated pool agree. Only when no tenant
+/// stamped the coord record and JWT slot with, else
+/// `session::resolve_new_session_tenant_in` — the coord-mcp proxy's authority
+/// order for the spawn directory, its repo tier included), so the coord
+/// record, the JWT slot and the federated pool agree. Only when no tenant
 /// resolved (an unresolvable or unpaired machine) does this fall back to
 /// [`resolve_tenant_id`] (paired file, then the OAuth claim). Split out so the B2 precedence is
 /// hermetically testable without the file/home-dir reads the rest of

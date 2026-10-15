@@ -1446,20 +1446,32 @@ impl AiCoordRegistrar {
 /// (`{task_run_id}-agentic-N`, …), so the spawn site passes the owning
 /// `task_run_id` after its own id.
 ///
-/// Falls back to the registrar's own resolver
-/// ([`crate::session::resolve_new_session_tenant`]) when no key is registered
-/// yet (the orchestration worker registers after it spawns) or registration
-/// resolved no tenant — nothing is recorded then, so an unpaired device that
-/// pairs between the two can still disagree.
+/// Falls back, when no key is registered yet (the orchestration worker
+/// registers after it spawns) or registration resolved no tenant, to the
+/// resolver that knows the session's SPAWN DIRECTORY
+/// ([`crate::session::resolve_new_session_tenant_in`]): the proxy's own
+/// authority order, so a session in tenant B's repo federates B's pool on a
+/// machine pinned to A — the tenant its coord-mcp proxy answers from (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5).
+///
+/// `repo` resolves the spawn directory's repo → tenant
+/// ([`qontinui_runner_lib::repo_tenant::cwd_tenant_for_path`], the proxy's
+/// resolver and cache). It is a closure because that read is async and both
+/// spawn sites are blocking: each passes its own block-on, and it runs only on
+/// the fallback arm, and only when no workspace declaration answered first.
+///
+/// `Err` is a refusal (the repo's tenant is not one this device may act as, or
+/// several tenants own it and the default is not one of them): the spawn site
+/// SKIPS federation rather than federating the default tenant's pool.
 pub(crate) fn federation_session_tenant(
     registrar: Option<&AiCoordRegistrar>,
     session_keys: &[&str],
-) -> Option<Uuid> {
-    federation_session_tenant_with(
-        registrar,
-        session_keys,
-        crate::session::resolve_new_session_tenant,
-    )
+    working_dir: &str,
+    repo: impl FnOnce() -> qontinui_runner_lib::repo_tenant::CwdTenant,
+) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+    federation_session_tenant_with(registrar, session_keys, || {
+        crate::session::resolve_new_session_tenant_in(working_dir, repo)
+    })
 }
 
 /// The registrar keys a spawn's federation looks its tenant up by, in order
@@ -1486,11 +1498,12 @@ pub(crate) fn federation_session_keys<'a>(
 fn federation_session_tenant_with(
     registrar: Option<&AiCoordRegistrar>,
     session_keys: &[&str],
-    fallback: fn() -> Option<Uuid>,
-) -> Option<Uuid> {
-    registrar
-        .and_then(|r| session_keys.iter().find_map(|k| r.recorded_tenant(k)))
-        .or_else(fallback)
+    fallback: impl FnOnce() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
+) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+    match registrar.and_then(|r| session_keys.iter().find_map(|k| r.recorded_tenant(k))) {
+        Some(recorded) => Ok(Some(recorded)),
+        None => fallback(),
+    }
 }
 
 use crate::session::SessionKind;
@@ -2233,24 +2246,24 @@ mod tests {
 
         assert_eq!(reg.recorded_tenant(&trid), Some(OWNING_TENANT));
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&trid], || Some(REPINNED)),
-            Some(OWNING_TENANT)
+            federation_session_tenant_with(Some(&reg), &[&trid], || Ok(Some(REPINNED))),
+            Ok(Some(OWNING_TENANT))
         );
         // A unified-workflow phase session spawns under a suffixed id the
         // registrar never saw; the owning task_run_id, tried next, still hits.
         let phase_id = format!("{trid}-agentic-1");
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&phase_id, &trid], || Some(REPINNED)),
-            Some(OWNING_TENANT)
+            federation_session_tenant_with(Some(&reg), &[&phase_id, &trid], || Ok(Some(REPINNED))),
+            Ok(Some(OWNING_TENANT))
         );
         // No key registered (or no registrar): the fallback answers.
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&phase_id], || Some(REPINNED)),
-            Some(REPINNED)
+            federation_session_tenant_with(Some(&reg), &[&phase_id], || Ok(Some(REPINNED))),
+            Ok(Some(REPINNED))
         );
         assert_eq!(
-            federation_session_tenant_with(None, &[&trid], || Some(REPINNED)),
-            Some(REPINNED)
+            federation_session_tenant_with(None, &[&trid], || Ok(Some(REPINNED))),
+            Ok(Some(REPINNED))
         );
 
         // Closing evicts it along with the rest of the R4 index.

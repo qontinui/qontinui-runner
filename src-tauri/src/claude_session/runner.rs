@@ -556,40 +556,59 @@ fn run_claude_session_inline(
     // bridge — federation is best-effort and never blocks the spawn.
     let federation_ctx_opt = {
         let ai_settings = crate::settings::get_ai_settings();
-        match crate::claude_session::federation::build_federation_ctx(
-            session_id,
-            working_dir,
-            &ai_settings.claude_cli,
-            // Phase 8b (B2): thread the session's RECORDED tenant so the
-            // federated pool agrees with the coord record + JWT slot: the
-            // tenant `AiCoordRegistrar` stamped them with, looked up by this
-            // spawn's own id, then by the owning task run's id (a workflow
-            // phase session's id is suffixed; the run is what registered).
-            // Neither registered yet, or no tenant recorded: the registrar's
-            // own resolver. `None` on an unresolvable or unpaired machine.
-            crate::claude_session::coord_register::federation_session_tenant(
-                tauri::Manager::try_state::<
-                    std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
-                >(app_handle)
-                .as_deref()
-                .map(|r| &**r),
-                &crate::claude_session::coord_register::federation_session_keys(
-                    session_id,
-                    task_run_id,
-                    session_ctx.as_ref(),
-                ),
+        // Phase 8b (B2): thread the session's RECORDED tenant so the
+        // federated pool agrees with the coord record + JWT slot: the
+        // tenant `AiCoordRegistrar` stamped them with, looked up by this
+        // spawn's own id, then by the owning task run's id (a workflow
+        // phase session's id is suffixed; the run is what registered).
+        // Neither registered yet, or no tenant recorded: the proxy's own
+        // authority order for this spawn directory (workspace, then repo,
+        // then the machine), the repo read blocking here like the pull below.
+        // `None` on an unresolvable or unpaired machine; a refusal skips
+        // federation rather than federating the default tenant's pool.
+        let session_tenant = crate::claude_session::coord_register::federation_session_tenant(
+            tauri::Manager::try_state::<
+                std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+            >(app_handle)
+            .as_deref()
+            .map(|r| &**r),
+            &crate::claude_session::coord_register::federation_session_keys(
+                session_id,
+                task_run_id,
+                session_ctx.as_ref(),
             ),
-        ) {
-            Ok(ctx) => Some(ctx),
-            Err(reason) => {
-                // warn! already logged inside build_federation_ctx;
-                // proceed locally.
-                debug!(
-                    "federation skipped for session {} ({}); proceeding locally",
-                    session_id, reason
+            working_dir,
+            || {
+                run_async_inline(qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(
+                    std::path::Path::new(working_dir),
+                ))
+            },
+        );
+        match session_tenant {
+            Err(refusal) => {
+                warn!(
+                    "federation refused for session {} ({}): {}; proceeding locally",
+                    session_id, refusal.code, refusal.message
                 );
                 None
             }
+            Ok(session_tenant) => match crate::claude_session::federation::build_federation_ctx(
+                session_id,
+                working_dir,
+                &ai_settings.claude_cli,
+                session_tenant,
+            ) {
+                Ok(ctx) => Some(ctx),
+                Err(reason) => {
+                    // warn! already logged inside build_federation_ctx;
+                    // proceed locally.
+                    debug!(
+                        "federation skipped for session {} ({}); proceeding locally",
+                        session_id, reason
+                    );
+                    None
+                }
+            },
         }
     };
     let federation_ctx_opt = if let Some(mut ctx) = federation_ctx_opt {
