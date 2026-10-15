@@ -311,10 +311,18 @@ impl std::fmt::Display for PaneUpgradeError {
 /// [`Client::prepare_upgrade`] — give it at least 45 s).
 ///
 /// A holder built before the verb existed rejects it as an unknown verb;
-/// that is reported as [`UpgradeOutcome::Unsupported`], not as a failure.
+/// that is reported as [`UpgradeOutcome::Unsupported`], not as a failure. Any
+/// other rejection is a definite answer that nothing was done:
+/// [`UpgradeOutcome::Failed`].
+///
+/// `expected_holder_pid` is what the caller's own check saw: `Some(pid)` — the
+/// handshake must be answered by that holder — or `None` — it must be answered
+/// `no_common_version`. Anything else means the pane changed hands since the
+/// check (another upgrade landed, say), and `prepare_upgrade` is NOT sent.
 pub fn upgrade_pane(
     pane_dir: &Path,
     pane: &PaneId,
+    expected_holder_pid: Option<u32>,
     handshake_deadline: Instant,
     upgrade_deadline: Instant,
 ) -> Result<PaneUpgrade, PaneUpgradeError> {
@@ -334,6 +342,17 @@ pub fn upgrade_pane(
                 ))))
             }
         };
+    if asked_holder_pid != expected_holder_pid {
+        let seen = |p: Option<u32>| match p {
+            Some(pid) => format!("holder pid {pid}"),
+            None => "a holder with no common protocol version".to_string(),
+        };
+        return Err(PaneUpgradeError::NotSent(ConnectError::Protocol(format!(
+            "the pane's holder changed since it was checked: expected {}, found {}",
+            seen(expected_holder_pid),
+            seen(asked_holder_pid)
+        ))));
+    }
     // A failed write may have delivered part of the request — or all of it.
     send(&mut conn, &Request::PrepareUpgrade, upgrade_deadline)
         .map_err(|e| PaneUpgradeError::Unanswered(e.into()))?;
@@ -352,6 +371,9 @@ pub fn upgrade_pane(
             detail,
         } => UpgradeOutcome::Unsupported(format!(
             "this holder build predates in-place upgrade ({detail})"
+        )),
+        Reply::Rejected { reason, detail } => UpgradeOutcome::Failed(format!(
+            "the holder rejected prepare_upgrade ({reason:?}: {detail}) and did not act on it"
         )),
         other => {
             return Err(PaneUpgradeError::Unanswered(ConnectError::Protocol(
@@ -525,7 +547,7 @@ impl Client {
         from_offset: Option<u64>,
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
-        self.attach_with(from_offset, false, deadline)
+        self.attach_with(from_offset, false, None, deadline)
     }
 
     /// [`Client::attach`] for a consumer with NO mode state of its own — a
@@ -542,13 +564,31 @@ impl Client {
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
         let restore = self.ack.version >= RESTORE_VERSION;
-        self.attach_with(from_offset, restore, deadline)
+        self.attach_with(from_offset, restore, None, deadline)
+    }
+
+    /// A RESUME at `from_offset` of a stream this consumer was reading from
+    /// holder `stream_of` (the `hello_ack.holder_pid` it last attached to) —
+    /// [`Client::attach`], or [`Client::attach_restoring`] with `restoring`,
+    /// plus that identity (plan Phase 8, H1): a holder that took its pane back
+    /// after a declared loss then knows whether `from_offset` is on its own
+    /// stream, and resumes its own consumer without a loss report.
+    pub fn attach_continuing(
+        self,
+        from_offset: u64,
+        stream_of: u32,
+        restoring: bool,
+        deadline: Instant,
+    ) -> Result<AttachedStream, ConnectError> {
+        let restore = restoring && self.ack.version >= RESTORE_VERSION;
+        self.attach_with(Some(from_offset), restore, Some(stream_of), deadline)
     }
 
     fn attach_with(
         mut self,
         from_offset: Option<u64>,
         restore: bool,
+        stream_of: Option<u32>,
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
         self.check()?;
@@ -562,6 +602,7 @@ impl Client {
         let request = Request::Attach {
             from_offset,
             restore,
+            stream_of,
         };
         let info = match self.request(&request, deadline)? {
             Reply::Attached(a) => a,

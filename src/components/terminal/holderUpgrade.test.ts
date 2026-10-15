@@ -3,6 +3,7 @@ import {
   END_AND_RESUME_MISSING_NOTE,
   UPGRADE_UNSUPPORTED_NOTE,
   attentionLabel,
+  bannerHeadline,
   describeOutcome,
   holderActions,
   invokeErrorText,
@@ -123,5 +124,14 @@ describe("invokeErrorText", () => {
     expect(invokeErrorText("boom")).toBe("boom");
     expect(invokeErrorText(new Error("bad"))).toBe("bad");
     expect(invokeErrorText({ a: 1 })).toBe('{"a":1}');
+  });
+});
+
+describe("bannerHeadline", () => {
+  it("counts panes, and never reads 0 panes as a decision", () => {
+    expect(bannerHeadline(1, false)).toBe("1 pane's PTY holder needs a decision");
+    expect(bannerHeadline(3, true)).toBe("3 panes' PTY holders need a decision");
+    expect(bannerHeadline(0, true)).toBe("PTY holder census unavailable");
+    expect(bannerHeadline(0, false)).toBe("PTY holder upgrade");
   });
 });

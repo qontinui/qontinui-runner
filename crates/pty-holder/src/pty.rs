@@ -428,6 +428,9 @@ pub struct AdoptedParts {
     /// The size the predecessor recorded; the master's own is preferred.
     pub size: (u16, u16),
     pub exit_linger: Duration,
+    /// The predecessor's [`PaneState::stream_replaced_at`]: a dead
+    /// successor's offsets are no more this holder's than its predecessor's.
+    pub stream_replaced_at: Option<u64>,
 }
 
 impl Pane {
@@ -604,7 +607,7 @@ impl Pane {
                 size,
                 read_gate: ReadGate::Quiesce,
                 read_parked: false,
-                stream_replaced_at: None,
+                stream_replaced_at: parts.stream_replaced_at,
                 observed_exit: None,
             }),
             changed: Condvar::new(),

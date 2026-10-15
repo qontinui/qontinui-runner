@@ -140,6 +140,13 @@ export function describeOutcome(outcome: HolderUpgradeOutcome): {
   }
 }
 
+/** The banner's headline. With nothing listed it names why it is shown. */
+export function bannerHeadline(paneCount: number, censusUnreadable: boolean): string {
+  if (paneCount === 1) return "1 pane's PTY holder needs a decision";
+  if (paneCount > 1) return `${paneCount} panes' PTY holders need a decision`;
+  return censusUnreadable ? "PTY holder census unavailable" : "PTY holder upgrade";
+}
+
 /** The text of a command that threw instead of answering. */
 export function invokeErrorText(err: unknown): string {
   if (typeof err === "string") return err;

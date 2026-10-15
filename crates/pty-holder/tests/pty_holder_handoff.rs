@@ -1214,6 +1214,28 @@ mod unix {
         assert!(!r4.lost);
         assert!(r4.next > ahead, "output resumed at the client's offset");
 
+        // 2b. The SAME offset from a consumer that says it was counting on
+        //     THIS holder's stream (`stream_of`, the runner's reattach) is its
+        //     own: a normal resume, no loss report.
+        let mut own = connect(&dir, &p1(), soon())
+            .expect("handshake")
+            .attach_continuing(x + 1, pane.holder_pid, false, soon())
+            .expect("attach");
+        assert_eq!(own.info.start_offset, x + 1);
+        match first_event(&mut own) {
+            Event::Output { offset, .. } => assert_eq!(offset, x + 1),
+            other => panic!("expected output at X+1, got {other:?}"),
+        }
+        // Naming ANOTHER holder (the dead successor) is not its own.
+        let mut other = connect(&dir, &p1(), soon())
+            .expect("handshake")
+            .attach_continuing(x + 1, successor, false, soon())
+            .expect("attach");
+        assert_eq!(other.info.start_offset, x);
+        assert!(
+            matches!(first_event(&mut other), Event::Lost { from_offset, .. } if from_offset == x)
+        );
+
         // 3. An attach AT X is a normal resume: no loss, the notice first.
         let mut at_x = attach(&dir, Some(x));
         assert_eq!(at_x.info.start_offset, x);

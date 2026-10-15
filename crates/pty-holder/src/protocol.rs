@@ -156,6 +156,16 @@ pub enum Request {
         from_offset: Option<u64>,
         #[serde(default, skip_serializing_if = "is_false")]
         restore: bool,
+        /// The pid of the holder whose stream `from_offset` was counted on —
+        /// the holder this consumer last attached to (plan Phase 8, H1). A
+        /// holder that took its pane back after a declared loss answers an
+        /// offset past the take-back with `output_lost` UNLESS it names this
+        /// holder itself: then the offset is on its own stream and resumes
+        /// normally. `None` (an older runner, or a consumer that does not
+        /// know) reads as "may be the dead successor's". Omitted when `None`,
+        /// and ignored by holders built before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_of: Option<u32>,
     },
     /// Version 2. Resize the PTY. Answered `ok`.
     Resize { cols: u16, rows: u16 },
@@ -567,6 +577,7 @@ mod tests {
                 frame_of(&Request::Attach {
                     from_offset: None,
                     restore: false,
+                    stream_of: None,
                 }),
                 r#"{"type":"attach","from_offset":null}"#,
             ),
@@ -574,6 +585,7 @@ mod tests {
                 frame_of(&Request::Attach {
                     from_offset: Some(4096),
                     restore: false,
+                    stream_of: None,
                 }),
                 r#"{"type":"attach","from_offset":4096}"#,
             ),
@@ -646,6 +658,7 @@ mod tests {
             Request::Attach {
                 from_offset: None,
                 restore: false,
+                stream_of: None,
             }
         );
     }
@@ -660,6 +673,7 @@ mod tests {
                 frame_of(&Request::Attach {
                     from_offset: None,
                     restore: true,
+                    stream_of: None,
                 }),
                 r#"{"type":"attach","from_offset":null,"restore":true}"#,
             ),
@@ -667,6 +681,7 @@ mod tests {
                 frame_of(&Request::Attach {
                     from_offset: Some(7),
                     restore: false,
+                    stream_of: None,
                 }),
                 r#"{"type":"attach","from_offset":7}"#,
             ),
@@ -689,12 +704,22 @@ mod tests {
         for (got, json) in cases {
             assert_eq!(got, expected(json), "v3 restore message moved: {json}");
         }
+        // H1: `stream_of` rides the wire only when set.
+        assert_eq!(
+            frame_of(&Request::Attach {
+                from_offset: Some(7),
+                restore: false,
+                stream_of: Some(42),
+            }),
+            expected(r#"{"type":"attach","from_offset":7,"stream_of":42}"#)
+        );
         // A version-2 runner's attach (no field) parses as no restore.
         assert_eq!(
             parse_request(br#"{"type":"attach","from_offset":null}"#).unwrap(),
             Request::Attach {
                 from_offset: None,
                 restore: false,
+                stream_of: None,
             }
         );
     }
@@ -772,6 +797,7 @@ mod tests {
                 "attach" => Request::Attach {
                     from_offset: Some(3),
                     restore: true,
+                    stream_of: None,
                 },
                 "resize" => Request::Resize { cols: 80, rows: 24 },
                 "pause" => Request::Pause,
