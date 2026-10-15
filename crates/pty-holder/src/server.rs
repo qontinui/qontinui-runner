@@ -529,9 +529,10 @@ pub(crate) enum Action {
     Attach {
         from: Option<u64>,
         restore: bool,
-        /// `attach.stream_of` names THIS holder: the offset is on its own
-        /// stream (H1, [`attach_start`]).
-        own_stream: bool,
+        /// `attach.stream_epoch`: the epoch the offset was counted on (H1,
+        /// [`attach_start`]); compared with this holder's lineage under the
+        /// pane lock.
+        stream_epoch: Option<u64>,
     },
     /// Write these bytes to the child.
     Input(Vec<u8>),
@@ -727,13 +728,13 @@ pub(crate) fn serve_conn_with(
             Action::Attach {
                 from,
                 restore,
-                own_stream,
+                stream_epoch,
             } => {
                 let Some(pane) = pane else { break };
                 let ConnState::Negotiated(v) = state else {
                     break;
                 };
-                if start_attach(pane, &writer, &flow, from, restore, own_stream).is_err() {
+                if start_attach(pane, &writer, &flow, from, restore, stream_epoch).is_err() {
                     break;
                 }
                 state = ConnState::Attached(v);
@@ -856,14 +857,16 @@ fn start_attach(
     flow: &Arc<ConnFlow>,
     from: Option<u64>,
     restore: bool,
-    own_stream: bool,
+    stream_epoch: Option<u64>,
 ) -> io::Result<()> {
     let (reply, plan) = {
         let st = pane.lock_state();
         let ring_start = st.ring.start_offset();
         let end = st.ring.end_offset();
-        // An offset counted on THIS holder's own stream is never one of a
-        // dead successor's (H1): the take-back rule does not apply to it.
+        // An offset counted on an epoch of THIS holder's lineage is on its own
+        // stream, never a dead successor's (H1): the take-back rule does not
+        // apply to it.
+        let own_stream = stream_epoch.is_some_and(|e| st.lineage_epochs.contains(&e));
         let replaced_at = st.stream_replaced_at.filter(|_| !own_stream);
         let plan = attach_start(from, ring_start, end, replaced_at);
         let meta = restore.then(|| {
@@ -877,6 +880,7 @@ fn start_attach(
             cols: st.size.0,
             rows: st.size.1,
             restore: meta,
+            stream_epoch: Some(st.stream_epoch),
         };
         (reply, plan)
     };
@@ -922,10 +926,10 @@ struct AttachStart {
 ///   offset with no loss marker. Instead the attach starts at X, the pump
 ///   first sends `output_lost {X, T}` with `T = max(y, end)`, and streams
 ///   from `T` — so nothing the client cannot place is replayed, the client's
-///   offset never moves backwards, and the break is explicit. A client that
-///   reached `y > X` on THIS holder (after the take-back) says so with
-///   `attach.stream_of` naming this holder's pid, and resumes normally (the
-///   caller passes `replaced_at: None` for it). One that does not say — an
+///   offset never moves backwards, and the break is explicit. A client whose
+///   offset was counted on an epoch of THIS holder's lineage (its own, or a
+///   predecessor it took over losslessly) says so with `attach.stream_epoch`,
+///   and resumes normally (the caller passes `replaced_at: None` for it). One that does not say — an
 ///   older runner, or a consumer that cannot know — is told `[y, end)` is
 ///   lost: no offset alone can tell it from the dead successor's client, and
 ///   over-reporting a loss is the honest direction.
@@ -1287,11 +1291,11 @@ fn handle_request(state: &mut ConnState, req: Request, info: &HolderInfo) -> Act
             Request::Attach {
                 from_offset,
                 restore,
-                stream_of,
+                stream_epoch,
             },
         ) if v >= DATA_PATH_VERSION => Action::Attach {
             from: from_offset,
-            own_stream: stream_of == Some(info.holder_pid),
+            stream_epoch,
             // A version-2 connection never gets the envelope, whatever a
             // confused client put in the field.
             restore: restore && v >= RESTORE_VERSION,
@@ -1387,11 +1391,13 @@ fn reject(writer: &Mutex<Conn>, reason: RejectReason, detail: &str) {
 mod tests {
     use super::*;
 
-    /// H1: `attach.stream_of` naming this holder marks the offset as its own.
+    /// H1: `attach.stream_epoch` is carried to the attach action untouched
+    /// (it is compared with the lineage under the pane lock, in
+    /// `start_attach`).
     #[test]
-    fn pty_holder_attach_stream_of_names_this_holder() {
+    fn pty_holder_attach_carries_the_stream_epoch() {
         let i = info();
-        for (stream_of, own) in [(Some(7), true), (Some(8), false), (None, false)] {
+        for stream_epoch in [Some(7), None] {
             let mut s = ConnState::Negotiated(DATA_PATH_VERSION);
             assert_eq!(
                 handle_request(
@@ -1399,14 +1405,14 @@ mod tests {
                     Request::Attach {
                         from_offset: Some(3),
                         restore: false,
-                        stream_of,
+                        stream_epoch,
                     },
                     &i
                 ),
                 Action::Attach {
                     from: Some(3),
                     restore: false,
-                    own_stream: own,
+                    stream_epoch,
                 }
             );
         }
@@ -1671,14 +1677,14 @@ mod tests {
                 Request::Attach {
                     from_offset: Some(5),
                     restore: true,
-                    stream_of: None,
+                    stream_epoch: None,
                 },
                 &i
             ),
             Action::Attach {
                 from: Some(5),
                 restore: false,
-                own_stream: false,
+                stream_epoch: None,
             },
             "a version-2 connection never gets the restore envelope"
         );
@@ -1711,7 +1717,7 @@ mod tests {
                 Request::Attach {
                     from_offset: None,
                     restore: false,
-                    stream_of: None,
+                    stream_epoch: None,
                 },
                 &i
             ),
@@ -1727,7 +1733,7 @@ mod tests {
             Request::Attach {
                 from_offset: None,
                 restore: false,
-                stream_of: None,
+                stream_epoch: None,
             },
             Request::Resize { cols: 1, rows: 1 },
             Request::Kill,
@@ -1797,7 +1803,7 @@ mod tests {
             Request::Attach {
                 from_offset: None,
                 restore: false,
-                stream_of: None,
+                stream_epoch: None,
             },
             Request::OpenInput,
         ] {
@@ -1833,14 +1839,14 @@ mod tests {
                 Request::Attach {
                     from_offset: None,
                     restore: true,
-                    stream_of: None,
+                    stream_epoch: None,
                 },
                 &i
             ),
             Action::Attach {
                 from: None,
                 restore: true,
-                own_stream: false,
+                stream_epoch: None,
             }
         );
     }

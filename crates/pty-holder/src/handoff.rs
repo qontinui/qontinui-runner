@@ -143,8 +143,11 @@
 //! (`client::InputFailure::not_delivered`). The runner's `HolderConn::input`
 //! resends such a frame, and the rest of its write, exactly once on a
 //! reopened input connection — to the successor, or to this holder after a
-//! rollback — so the swap is lossless for input; a frame whose delivery is
-//! unknown is reported, never resent. A predecessor that dies mid-commit
+//! rollback. The reopen waits for the rest of the runner's 60 s input
+//! deadline (`INPUT_DEADLINE`), longer than this exchange's own bounds, so
+//! the swap is lossless for input on Linux unless no holder serves the pane
+//! within that deadline — then the chunk is reported NOT delivered, never
+//! sent late. A frame whose delivery is unknown is reported, never resent. A predecessor that dies mid-commit
 //! loses the held frames it had not yet sent. **A rollback after the drain**
 //! (the commit write failed, or the successor died before `serving`) keeps
 //! every held frame, but the drained connections stay shut: writes a client
@@ -222,6 +225,24 @@ pub const INPUT_DRAIN_BOUND: Duration = Duration::from_secs(2);
 /// loss after `exit-after-serving`), or leaves it to the successor.
 pub const ADOPT_FAULT_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ADOPT_FAULT";
 
+/// TEST SEAM, debug builds only, read by a SUCCESSOR: a path. When set, a
+/// POST-COMMIT [`ADOPT_FAULT_ENV`] fault applies only to the one successor
+/// that manages to unlink this file — so a test can make the first upgrade
+/// fail after `serving` and a later one in the same lineage succeed (every
+/// successor inherits its predecessor's environment).
+pub const ADOPT_FAULT_ONCE_ENV: &str = "QONTINUI_PTY_HOLDER_TEST_ADOPT_FAULT_ONCE";
+
+/// The post-commit fault this successor applies, honouring
+/// [`ADOPT_FAULT_ONCE_ENV`].
+#[cfg(debug_assertions)]
+fn post_commit_fault() -> Option<String> {
+    let fault = std::env::var(ADOPT_FAULT_ENV).ok()?;
+    match std::env::var_os(ADOPT_FAULT_ONCE_ENV) {
+        Some(token) => std::fs::remove_file(token).ok().map(|()| fault),
+        None => Some(fault),
+    }
+}
+
 /// TEST SEAM, read by a PREDECESSOR: replaces [`ACK_TIMEOUT`] (milliseconds),
 /// so the ack-timeout rollback can be exercised. Clamped to
 /// [`MAX_TEST_ACK_TIMEOUT`]: the variable is read in every build, and an
@@ -290,6 +311,12 @@ pub struct SnapshotHeader {
     /// this successor too. Absent in a snapshot from an older predecessor.
     #[serde(default)]
     pub stream_replaced_at: Option<u64>,
+    /// The predecessor's stream-epoch lineage (H1): the successor serves the
+    /// same stream, so a consumer's offset counted on any of these epochs is
+    /// its own. Empty from an older predecessor (then such a consumer is told
+    /// a loss only if a take-back is also recorded — the safe direction).
+    #[serde(default)]
+    pub lineage_epochs: Vec<u64>,
 }
 
 /// Control-channel messages, one `KIND_CONTROL` frame each. `commit` is
@@ -810,7 +837,10 @@ fn take_pane_back(
             // H1 (coord finding f4672ed2): record X BEFORE the notice enters
             // the stream, so no attach can see this holder's bytes past X
             // without the rule that refuses to replay them to a client whose
-            // offset came from the dead successor.
+            // offset came from the dead successor. The dead successor minted
+            // its own epoch at adoption and this holder's lineage never
+            // included it, so its consumers are told the loss, while this
+            // holder's own consumers (its epoch) resume normally.
             pane.record_stream_replaced_at(handoff_offset);
             pane.inject_stream_notice(&upgrade_loss_notice(handoff_offset));
         }
@@ -842,6 +872,7 @@ fn write_snapshot(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Pane, x: u64) -> i
             exit_linger_ms: pane.exit_linger().as_millis() as u64,
             modes: st.modes.snapshot(),
             stream_replaced_at: st.stream_replaced_at,
+            lineage_epochs: st.lineage_epochs.clone(),
         };
         (header, ring)
     };
@@ -996,7 +1027,7 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
     log_line(&log, "adopt: acked; waiting for the commit");
     // The post-commit faults exist in debug builds only (review r4, H2).
     #[cfg(debug_assertions)]
-    let fault = std::env::var(ADOPT_FAULT_ENV).ok();
+    let fault = post_commit_fault();
     #[cfg(not(debug_assertions))]
     ignore_post_commit_fault(&log);
     let commit = match await_commit(&mut control, header.predecessor_pid, &log) {
@@ -1186,6 +1217,7 @@ fn prepare_adoption(snap: &Path, master: File, lockf: File) -> Result<Prepared, 
         size: (header.cols, header.rows),
         exit_linger: Duration::from_millis(header.exit_linger_ms),
         stream_replaced_at: header.stream_replaced_at,
+        lineage_epochs: header.lineage_epochs.clone(),
     })
     .map_err(|e| format!("adopted pane: {e}"))?;
     let staged =

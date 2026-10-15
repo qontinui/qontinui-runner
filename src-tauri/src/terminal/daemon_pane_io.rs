@@ -92,7 +92,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -822,7 +822,8 @@ impl ChunkSink for InputStream {
 trait InputSlot {
     type Stream: ChunkSink;
     /// The open input connection, opening one first if there is none.
-    fn ensure(&mut self, deadline: Instant) -> Result<&mut Self::Stream, String>;
+    /// `open_deadline` bounds opening one when there is none.
+    fn ensure(&mut self, open_deadline: Instant) -> Result<&mut Self::Stream, String>;
     /// End the current connection (its stream position is unknown).
     fn discard(&mut self);
     /// The pane was released: nothing more is sent.
@@ -839,11 +840,9 @@ struct InputSlotGuard<'a> {
 impl InputSlot for InputSlotGuard<'_> {
     type Stream = InputStream;
 
-    fn ensure(&mut self, deadline: Instant) -> Result<&mut InputStream, String> {
+    fn ensure(&mut self, open_deadline: Instant) -> Result<&mut InputStream, String> {
         if self.slot.is_none() {
-            let stream = self
-                .conn
-                .open_input(deadline.min(Instant::now() + INPUT_OPEN_WAIT))?;
+            let stream = self.conn.open_input(open_deadline)?;
             *lock_slot(&self.conn.input_shutdown) = stream.shutdown_handle().ok();
             *self.slot = Some(stream);
             // Round 3, L1: a `close` that ran while this connection was being
@@ -924,7 +923,16 @@ fn send_input_resending_once(
     let mut sent = 0usize;
     let mut resends_left: u32 = 1;
     loop {
-        let stream = match slot.ensure(deadline) {
+        // A first open waits [`INPUT_OPEN_WAIT`]; a RESEND's reopen waits for
+        // the rest of the write's [`INPUT_DEADLINE`] — the holder may be in
+        // the middle of an upgrade whose commit and `serving` bounds sum to
+        // ~41 s, and the chunk is owed to whichever holder serves next.
+        let open_deadline = if resends_left == 0 {
+            deadline
+        } else {
+            deadline.min(Instant::now() + INPUT_OPEN_WAIT)
+        };
+        let stream = match slot.ensure(open_deadline) {
             Ok(stream) => stream,
             // A resend whose connection could not be reopened: say what it
             // cost.
@@ -1186,14 +1194,33 @@ struct PumpCtx {
     /// `Some` when the first attach asked for the restore envelope and the
     /// holder answered it; the pump carries it across reattaches.
     restore: Option<RestoreProgress>,
-    /// The holder whose stream `out.offset()` is counted on, 0 while unknown
-    /// (plan Phase 8, H1) — what a reattach sends as `attach.stream_of`.
-    /// NOT `holder_pid`: that moves to a new holder the moment an attach
-    /// succeeds, while the offset joins the new holder's stream only once a
-    /// frame from it has been consumed (a leading `output_lost` that moves the
-    /// offset, or output that continues it). A connection that drops before
-    /// then leaves the offset on the old stream, and must still say so.
-    stream_holder: AtomicU32,
+    /// The STREAM EPOCH `out.offset()` is counted on, 0 while unknown (plan
+    /// Phase 8, H1) — what a reattach sends as `attach.stream_epoch`. It
+    /// becomes the current connection's epoch ([`PumpCtx::conn_epoch`]) only
+    /// once a frame from that connection has been CONSUMED (a leading
+    /// `output_lost` that moves the offset, or output that continues it): a
+    /// connection that drops before then leaves the offset on the old stream,
+    /// and the next reattach must still say so.
+    stream_epoch: AtomicU64,
+    /// The `attached.stream_epoch` of the CURRENT connection (0: the holder
+    /// reports none).
+    conn_epoch: AtomicU64,
+}
+
+/// The stream epoch a pane's offset is on right after its FIRST attach,
+/// before any frame is consumed (plan Phase 8, H1; review p8f r1, #4). A fresh
+/// consumer — the ring's tail (`None`), or a fresh spawn's byte 0 — has an
+/// offset defined BY this attach's reply, so it is on this holder's stream
+/// already: a connection that drops before its first frame must reattach
+/// naming that epoch, not "unknown" (which a holder past a take-back would
+/// answer with a false loss). A resume at an offset counted elsewhere is
+/// unknown (0) until a frame is consumed.
+fn initial_stream_epoch(from_offset: Option<u64>, attached_epoch: u64) -> u64 {
+    if from_offset.is_none() || from_offset == FRESH_SPAWN_FROM_OFFSET {
+        attached_epoch
+    } else {
+        0
+    }
 }
 
 /// Where a restoring attach's envelope stands (plan D14).
@@ -1384,6 +1411,8 @@ impl DaemonPaneIo {
                 reason: format!("PTY holder {pane_id}: attach failed: {e}"),
             })?;
         let info = stream.info.clone();
+        let attached_epoch = info.stream_epoch.unwrap_or(0);
+        let initial_epoch = initial_stream_epoch(from_offset, attached_epoch);
         if restore_at.is_some() && info.restore.is_none() {
             // An older holder (protocol < 3): the tail is replayed bare, so a
             // mode it set before the tail is unknown to this consumer.
@@ -1460,7 +1489,11 @@ impl DaemonPaneIo {
             rows: rows.clone(),
             paused: paused.clone(),
             restore: (restore_at.is_some() && info.restore.is_some()).then(RestoreProgress::new),
-            stream_holder: AtomicU32::new(0),
+            // A fresh consumer's offset (the ring tail, or byte 0 of a fresh
+            // spawn) is defined BY this attach's reply, so it is on this
+            // holder's stream before any frame arrives (review p8f r1, #4).
+            stream_epoch: AtomicU64::new(initial_epoch),
+            conn_epoch: AtomicU64::new(attached_epoch),
         };
         if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-holder-pump-{}", ctx.key))
@@ -1742,9 +1775,8 @@ impl PumpCtx {
                     r.saw_output();
                 }
                 self.out.splice(offset, &bytes);
-                // The offset now continues THIS holder's stream.
-                self.stream_holder
-                    .store(self.holder_pid(), Ordering::Release);
+                // The offset now continues THIS connection's stream.
+                self.adopt_conn_epoch();
             }
             Event::Lost {
                 from_offset,
@@ -1765,9 +1797,8 @@ impl PumpCtx {
                         .push_local(&holder_stream_replaced_notice(from_offset));
                 }
                 self.out.note_lost(from_offset, to_offset);
-                // The loss moved the offset onto THIS holder's stream.
-                self.stream_holder
-                    .store(self.holder_pid(), Ordering::Release);
+                // The loss moved the offset onto THIS connection's stream.
+                self.adopt_conn_epoch();
             }
             // The restore envelope: displayed, never counted — the stream
             // offset stays the holder's (plan D14).
@@ -1801,6 +1832,13 @@ impl PumpCtx {
             Event::Reply(_) => {}
         }
         false
+    }
+
+    /// A frame from the current connection was consumed: the offset is on
+    /// its stream now.
+    fn adopt_conn_epoch(&self) {
+        self.stream_epoch
+            .store(self.conn_epoch.load(Ordering::Acquire), Ordering::Release);
     }
 
     /// The holder serving the pane now (see [`DaemonPaneIo::holder_pid`]).
@@ -1843,16 +1881,16 @@ impl PumpCtx {
                     if restoring {
                         info!(pane = %self.key, holder_pid = self.holder_pid(), from, "pty holder: the connection dropped before the restore postamble arrived — reattaching WITH a restore");
                     }
-                    // `stream_of`: the holder this pane's offset was counted
-                    // on — so a holder that took the pane back after a failed
-                    // upgrade resumes its OWN stream here without a loss
-                    // report (plan Phase 8, H1).
-                    let stream_of = self.stream_holder.load(Ordering::Acquire);
+                    // The epoch this pane's offset was counted on — so a holder
+                    // that took the pane back after a failed upgrade, or a
+                    // later successor in its lossless lineage, resumes its OWN
+                    // stream here without a loss report (plan Phase 8, H1).
+                    let epoch = self.stream_epoch.load(Ordering::Acquire);
                     match connect(&self.pane_dir, &self.pane_id, deadline).and_then(|c| {
-                        match (stream_of, restoring) {
+                        match (epoch, restoring) {
                             (0, true) => c.attach_restoring(Some(from), deadline),
                             (0, false) => c.attach(Some(from), deadline),
-                            (pid, _) => c.attach_continuing(from, pid, restoring, deadline),
+                            (e, _) => c.attach_continuing(from, e, restoring, deadline),
                         }
                     }) {
                         Ok(stream) => {
@@ -1860,6 +1898,8 @@ impl PumpCtx {
                                 warn!(pane = %self.key, holder_pid = self.holder_pid(), "pty holder: the reattach could not ask for a restore — the owed postamble is lost; modes set before the replayed tail may be wrong");
                                 *restore = None;
                             }
+                            self.conn_epoch
+                                .store(stream.info.stream_epoch.unwrap_or(0), Ordering::Release);
                             let now_pid = stream.hello_ack.holder_pid;
                             let was_pid = self.holder_pid.swap(now_pid, Ordering::AcqRel);
                             if was_pid != now_pid {
@@ -2227,6 +2267,8 @@ mod tests {
         open_fails_after: Option<usize>,
         closed: bool,
         stream: Option<FakeStream>,
+        /// The `open_deadline` of every open.
+        open_deadlines: Vec<Instant>,
     }
 
     struct FakeStream {
@@ -2265,6 +2307,7 @@ mod tests {
                 open_fails_after: None,
                 closed: false,
                 stream: None,
+                open_deadlines: Vec::new(),
             }
         }
         fn give_back(&mut self) {
@@ -2277,8 +2320,9 @@ mod tests {
 
     impl InputSlot for FakeSlot {
         type Stream = FakeStream;
-        fn ensure(&mut self, _deadline: Instant) -> Result<&mut FakeStream, String> {
+        fn ensure(&mut self, open_deadline: Instant) -> Result<&mut FakeStream, String> {
             if self.stream.is_none() {
+                self.open_deadlines.push(open_deadline);
                 if self.open_fails_after.is_some_and(|n| self.opens >= n) {
                     return Err("input connection could not be opened".into());
                 }
@@ -2327,6 +2371,27 @@ mod tests {
             "every byte reached the holder exactly once, in order"
         );
         assert_eq!(slot.accepted.len(), 3, "no chunk was sent twice");
+    }
+
+    /// Review p8f r1, #6: a first open waits `INPUT_OPEN_WAIT`; the RESEND's
+    /// reopen waits for the rest of `INPUT_DEADLINE`, so a successor that
+    /// serves slowly (an upgrade's bounds sum to ~41 s) still gets the chunk.
+    #[test]
+    fn pty_holder_input_resend_reopen_waits_for_the_whole_input_deadline() {
+        let mut slot = FakeSlot::new(&[Fate::Refuse]);
+        let start = Instant::now();
+        let deadline = start + INPUT_DEADLINE;
+        send_input_resending_once(&mut slot, "pane", b"x", deadline).unwrap();
+        slot.give_back();
+        assert_eq!(slot.open_deadlines.len(), 2);
+        assert!(
+            slot.open_deadlines[0] <= Instant::now() + INPUT_OPEN_WAIT,
+            "a first open is bounded by INPUT_OPEN_WAIT"
+        );
+        assert_eq!(
+            slot.open_deadlines[1], deadline,
+            "the resend's reopen may use the whole input deadline"
+        );
     }
 
     #[test]
@@ -2570,18 +2635,57 @@ mod tests {
             rows: Arc::new(AtomicU16::new(24)),
             paused: Arc::new(AtomicBool::new(false)),
             restore,
-            stream_holder: AtomicU32::new(0),
+            stream_epoch: AtomicU64::new(0),
+            conn_epoch: AtomicU64::new(0),
         }
     }
 
-    /// Plan Phase 8, H1 (review r2, R1): the offset joins a holder's stream
-    /// only when a frame from it is CONSUMED — not when its attach succeeds —
-    /// so a connection that drops before its leading `output_lost` still
-    /// reattaches naming the old stream. A loss that starts behind the pane's
-    /// offset (the holder took the pane back from a dead successor) is
-    /// declared in-band, even when it ends at or behind the offset.
+    /// Review p8f r1, #4: a FRESH consumer's first connection drops before
+    /// its first frame — the reattach still names the epoch of the stream its
+    /// offset (the attach reply's) is on, never "unknown".
     #[test]
-    fn pty_holder_stream_holder_moves_only_with_a_consumed_frame() {
+    fn pty_holder_fresh_attach_dropped_before_its_first_frame_keeps_its_epoch() {
+        assert_eq!(initial_stream_epoch(None, 77), 77, "ring-tail attach");
+        assert_eq!(
+            initial_stream_epoch(FRESH_SPAWN_FROM_OFFSET, 77),
+            77,
+            "fresh spawn"
+        );
+        assert_eq!(
+            initial_stream_epoch(Some(4096), 77),
+            0,
+            "a resume at an offset counted elsewhere is unknown"
+        );
+        // Drive the pump as the attach builds it: no frame consumed, then the
+        // reattach reads the epoch it will send.
+        let out = Arc::new(PaneOutput::new(
+            "t-pump",
+            Vec::new(),
+            0,
+            holder_lost_output_marker,
+        ));
+        let pump = bare_pump(out, None);
+        pump.stream_epoch
+            .store(initial_stream_epoch(None, 77), Ordering::Release);
+        pump.conn_epoch.store(77, Ordering::Release);
+        // The connection drops; a reattach lands on a holder with epoch 99.
+        pump.conn_epoch.store(99, Ordering::Release);
+        assert_eq!(
+            pump.stream_epoch.load(Ordering::Acquire),
+            77,
+            "the reattach names the fresh attach's epoch"
+        );
+    }
+
+    /// Plan Phase 8, H1 (review r2, R1; p8f r1 #1): the offset joins a
+    /// connection's STREAM EPOCH only when a frame from it is CONSUMED — not
+    /// when its attach succeeds — so a connection that drops before its
+    /// leading `output_lost` still reattaches naming the old epoch. A loss
+    /// that starts behind the pane's offset (the holder took the pane back
+    /// from a dead successor) is declared in-band, even when it ends at or
+    /// behind the offset.
+    #[test]
+    fn pty_holder_stream_epoch_moves_only_with_a_consumed_frame() {
         let out = Arc::new(PaneOutput::new(
             "t-pump",
             Vec::new(),
@@ -2590,8 +2694,8 @@ mod tests {
         ));
         let pump = bare_pump(out.clone(), None);
         let mut restore = None;
-        // Counting on the dead successor (pid 200), at offset 10.
-        pump.holder_pid.store(200, Ordering::Release);
+        // Counting on the dead successor's epoch 200, at offset 10.
+        pump.conn_epoch.store(200, Ordering::Release);
         pump.on_event(
             Event::Output {
                 offset: 0,
@@ -2599,12 +2703,12 @@ mod tests {
             },
             &mut restore,
         );
-        assert_eq!(pump.stream_holder.load(Ordering::Acquire), 200);
-        // Reattached to the predecessor (pid 100): the attach alone moves
+        assert_eq!(pump.stream_epoch.load(Ordering::Acquire), 200);
+        // Reattached to the predecessor (epoch 100): the attach alone moves
         // nothing.
-        pump.holder_pid.store(100, Ordering::Release);
+        pump.conn_epoch.store(100, Ordering::Release);
         assert_eq!(
-            pump.stream_holder.load(Ordering::Acquire),
+            pump.stream_epoch.load(Ordering::Acquire),
             200,
             "an attach is not a consumed frame"
         );
@@ -2616,7 +2720,7 @@ mod tests {
             },
             &mut restore,
         );
-        assert_eq!(pump.stream_holder.load(Ordering::Acquire), 100);
+        assert_eq!(pump.stream_epoch.load(Ordering::Acquire), 100);
         assert_eq!(out.offset(), 10);
         out.settle(Ok(0));
         let mut got = Vec::new();

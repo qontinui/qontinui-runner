@@ -144,6 +144,50 @@ pub struct PaneState {
     /// gets an explicit `output_lost` from X instead of a replay of this
     /// holder's own, differently-numbered bytes (`server::attach_start`).
     pub stream_replaced_at: Option<u64>,
+    /// This holder's STREAM EPOCH (H1): a random token minted when this
+    /// process started serving the pane — at spawn, or at adoption by a
+    /// successor. Reported in `attached`; a consumer echoes it on a reattach.
+    pub stream_epoch: u64,
+    /// Every epoch whose offsets are offsets of THIS holder's stream: its own,
+    /// plus those of every predecessor it took over LOSSLESSLY (carried in the
+    /// upgrade snapshot). A declared-loss take-back adds nothing — the dead
+    /// successor's epoch is precisely the one whose offsets are not ours.
+    /// Bounded to [`MAX_LINEAGE_EPOCHS`], oldest dropped (a dropped epoch only
+    /// over-reports a loss).
+    pub lineage_epochs: Vec<u64>,
+}
+
+/// Most epochs a holder remembers in [`PaneState::lineage_epochs`].
+pub const MAX_LINEAGE_EPOCHS: usize = 64;
+
+/// A fresh random, nonzero stream epoch (std's per-instance random hash keys;
+/// no dependency, and not a secret — it only has to differ between holders).
+pub fn mint_stream_epoch() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    loop {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let e = h.finish();
+        if e != 0 {
+            return e;
+        }
+    }
+}
+
+/// `inherited` plus a fresh epoch for this holder, bounded.
+#[cfg(unix)]
+pub fn lineage_with_new_epoch(mut inherited: Vec<u64>) -> (u64, Vec<u64>) {
+    let epoch = mint_stream_epoch();
+    inherited.push(epoch);
+    let excess = inherited.len().saturating_sub(MAX_LINEAGE_EPOCHS);
+    inherited.drain(..excess);
+    (epoch, inherited)
 }
 
 /// The PTY master a pane drives.
@@ -431,6 +475,9 @@ pub struct AdoptedParts {
     /// The predecessor's [`PaneState::stream_replaced_at`]: a dead
     /// successor's offsets are no more this holder's than its predecessor's.
     pub stream_replaced_at: Option<u64>,
+    /// The predecessor's [`PaneState::lineage_epochs`]: this handoff is
+    /// lossless, so its consumers' offsets are this holder's too.
+    pub lineage_epochs: Vec<u64>,
 }
 
 impl Pane {
@@ -487,6 +534,7 @@ impl Pane {
         let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE_FRAMES);
         // Before the waiter thread exists: the child cannot have been reaped.
         let child_start = crate::proc_identity::start_token(child_pid);
+        let spawn_epoch = mint_stream_epoch();
 
         let pane = Arc::new(Pane {
             child_pid,
@@ -503,6 +551,8 @@ impl Pane {
                 read_gate: ReadGate::Run,
                 read_parked: false,
                 stream_replaced_at: None,
+                stream_epoch: spawn_epoch,
+                lineage_epochs: vec![spawn_epoch],
                 observed_exit: None,
             }),
             changed: Condvar::new(),
@@ -584,6 +634,7 @@ impl Pane {
     /// the child is not ours, and its exit is the master's EOF.
     #[cfg(unix)]
     pub fn adopt(parts: AdoptedParts) -> io::Result<Arc<Pane>> {
+        let (adopted_epoch, adopted_lineage) = lineage_with_new_epoch(parts.lineage_epochs.clone());
         use std::os::unix::io::AsRawFd;
         let fd = parts.master.as_raw_fd();
         let reader = std::fs::File::from(dup_cloexec(fd, 0)?);
@@ -605,6 +656,8 @@ impl Pane {
                 read_gate: ReadGate::Quiesce,
                 read_parked: false,
                 stream_replaced_at: parts.stream_replaced_at,
+                stream_epoch: adopted_epoch,
+                lineage_epochs: adopted_lineage,
                 observed_exit: None,
             }),
             changed: Condvar::new(),
