@@ -1,4 +1,12 @@
 //! `qontinui-pty-holder --pane-dir <abs> --pane-id <id> [--report]`
+//! `qontinui-pty-holder --adopt <abs snapshot path>` (Unix; plan Phase 8)
+//!
+//! **`--adopt`** is a holder upgrade's SUCCESSOR, started only by a running
+//! holder answering `prepare_upgrade` (`qontinui_pty_holder::handoff`). It
+//! inherits the pane's PTY master, lock and control channel at fds 3/4/5,
+//! keeps exactly those, prints nothing (its stdio is `/dev/null`), and either
+//! takes the pane over or exits signalling nothing (exit 2 bad fds, 6 nak,
+//! 7/8 no commit, 9 endpoint failed after the commit).
 //!
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
 //! Phase 2: a holder that OWNS its pane's PTY. In order, it
@@ -43,8 +51,7 @@ use qontinui_pty_holder::pty::holder_exit_code;
 use qontinui_pty_holder::server::{Holder, StartError};
 use qontinui_pty_holder::startup;
 
-const USAGE: &str =
-    "usage: qontinui-pty-holder --pane-dir <absolute dir> --pane-id <id> [--report]";
+const USAGE: &str = "usage: qontinui-pty-holder --pane-dir <absolute dir> --pane-id <id> [--report] | --adopt <snapshot>";
 
 /// Where the one report line goes besides stdout: `Some` under `--report`.
 type ReportTo<'a> = Option<(&'a Path, &'a PaneId)>;
@@ -65,28 +72,67 @@ fn fail(kind: &str, detail: &str, code: u8, to: ReportTo<'_>) -> ExitCode {
     ExitCode::from(code)
 }
 
-fn main() -> ExitCode {
-    #[cfg(unix)]
-    {
-        startup::close_inherited_fds();
-        startup::reset_sigchld();
+/// `--adopt <snapshot>`: a holder upgrade's successor (Unix only).
+#[cfg(unix)]
+fn adopt_main(snapshot: &Path) -> ExitCode {
+    startup::close_inherited_fds_except(&qontinui_pty_holder::handoff::SUCCESSOR_FDS);
+    startup::reset_sigchld();
+    if startup::detach_from_spawner().is_err() {
+        return ExitCode::from(1);
     }
+    match qontinui_pty_holder::handoff::adopt(snapshot) {
+        Ok(holder) => {
+            startup::silence_stdio();
+            let exit = holder.run();
+            ExitCode::from(holder_exit_code(&exit))
+        }
+        Err(code) => ExitCode::from(code),
+    }
+}
 
+fn main() -> ExitCode {
+    // Arguments first (reading them opens nothing): an `--adopt` successor
+    // must KEEP the fds it inherited, every other start closes them all.
     let mut pane_dir: Option<PathBuf> = None;
     let mut pane_id: Option<String> = None;
     let mut to_file = false;
+    let mut adopt: Option<PathBuf> = None;
+    let mut bad_usage = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--pane-dir") => pane_dir = args.next().map(PathBuf::from),
             Some("--pane-id") => pane_id = args.next().and_then(|v| v.into_string().ok()),
             Some("--report") => to_file = true,
+            Some("--adopt") => adopt = args.next().map(PathBuf::from),
             Some("--help") | Some("-h") => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
-            _ => return fail("usage", USAGE, 2, None),
+            _ => bad_usage = true,
         }
+    }
+    if let Some(snapshot) = adopt {
+        #[cfg(unix)]
+        {
+            if bad_usage || pane_dir.is_some() || pane_id.is_some() || to_file {
+                return ExitCode::from(2);
+            }
+            return adopt_main(&snapshot);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = snapshot;
+            return fail("usage", "--adopt is Unix-only (plan D12a)", 2, None);
+        }
+    }
+    #[cfg(unix)]
+    {
+        startup::close_inherited_fds();
+        startup::reset_sigchld();
+    }
+    if bad_usage {
+        return fail("usage", USAGE, 2, None);
     }
     let (Some(pane_dir), Some(pane_id)) = (pane_dir, pane_id) else {
         return fail("usage", USAGE, 2, None);

@@ -11,7 +11,10 @@
 //! - `hello {versions}` and its answers `hello_ack {version, holder_build,
 //!   holder_pid, child_pid}` / `no_common_version {holder_versions}`,
 //! - `census` and its answer `census_reply`,
-//! - `prepare_upgrade` (answered `unsupported` in this build),
+//! - `prepare_upgrade` and its answers `upgraded {successor_pid,
+//!   handoff_offset}` / `upgrade_failed {reason}` (plan Phase 8, Unix; a
+//!   Windows holder — and every holder built before Phase 8 — answers
+//!   `unsupported`),
 //! - `unsupported` and `rejected`.
 //!
 //! Frozen is what lets a runner arbitrarily far ahead still IDENTIFY, COUNT and
@@ -130,8 +133,13 @@ pub enum Request {
     Hello { versions: Vec<u32> },
     /// FROZEN. Answerable after any `hello`, even with no common version.
     Census,
-    /// FROZEN. Answerable after any `hello`. Phase 8 builds the handler; this
-    /// build answers [`Reply::Unsupported`].
+    /// FROZEN. Answerable after any `hello`. Hand this pane to a successor
+    /// holder started from the holder's own executable (plan Phase 8, D12a):
+    /// answered [`Reply::Upgraded`] — after which THIS holder exits and the
+    /// connection closes — or [`Reply::UpgradeFailed`], after which this
+    /// holder keeps serving exactly as before. Unix only: a Windows holder
+    /// answers [`Reply::Unsupported`] (a ConPTY cannot be handed over, D12),
+    /// as does any holder built before Phase 8.
     PrepareUpgrade,
     /// Version 1. A liveness round trip after the handshake.
     Ping,
@@ -340,6 +348,17 @@ pub enum Reply {
     OutputLost { from_offset: u64, to_offset: u64 },
     /// Version 2: the child exited. The last frame on the connection.
     Exit(ExitReply),
+    /// FROZEN (Phase 8): `prepare_upgrade` succeeded. `successor_pid` now
+    /// serves the pane — same child, same stream; it resumed reading at
+    /// `handoff_offset`, so every offset a client holds stays valid. This
+    /// holder exits right after sending it.
+    Upgraded {
+        successor_pid: u32,
+        handoff_offset: u64,
+    },
+    /// FROZEN (Phase 8): `prepare_upgrade` failed and was rolled back. This
+    /// holder still owns the pane and keeps serving it; nothing was lost.
+    UpgradeFailed { reason: String },
 }
 
 /// Serialize a message to its control-frame payload.
@@ -466,6 +485,17 @@ mod tests {
                     detail: "d".into(),
                 }),
                 r#"{"type":"rejected","reason":"unknown_verb","detail":"d"}"#,
+            ),
+            (
+                frame_of(&Reply::Upgraded {
+                    successor_pid: 4300,
+                    handoff_offset: 12345,
+                }),
+                r#"{"type":"upgraded","successor_pid":4300,"handoff_offset":12345}"#,
+            ),
+            (
+                frame_of(&Reply::UpgradeFailed { reason: "r".into() }),
+                r#"{"type":"upgrade_failed","reason":"r"}"#,
             ),
         ];
         for (got, json) in cases {

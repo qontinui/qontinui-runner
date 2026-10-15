@@ -48,9 +48,14 @@
 //!   and a dead holder's proven remainder by the boot sweep (Phase 3, D8).
 //! - [`sweep`] — the boot sweep: the per-pane lock directory IS the orphan
 //!   ledger; live panes are handed to the caller to adopt (Phase 3).
+//! - `handoff` (Unix only) — the in-place holder upgrade: `prepare_upgrade`
+//!   hands a live pane to a successor holder by an inherited master fd, ack
+//!   before dispose (Phase 8, D12a). Windows has none (D12).
 
 pub mod client;
 pub mod frame;
+#[cfg(unix)]
+pub mod handoff;
 pub mod lock;
 pub mod metadata;
 pub mod modes;
