@@ -79,6 +79,20 @@ use crate::protocol::{
 use crate::pty::Pane;
 use crate::transport::{self, Conn, DeadlineIo, Listener};
 
+/// Why a non-Unix holder answers `prepare_upgrade` with `unsupported` (plan
+/// D12 / Phase 8): a ConPTY handle cannot be handed to another process. The
+/// honest actions for an incompatible or defective holder there are "leave it
+/// running" and "end it and resume" (Phase 6) — never "upgrade".
+pub const UPGRADE_UNSUPPORTED_ON_THIS_OS: &str = "holder upgrade is Unix-only (plan D12a): a \
+     ConPTY cannot be handed to another process; leave this holder running, or end the pane \
+     and resume it";
+
+/// Whether a holder on THIS platform can be upgraded in place (plan Phase 8).
+/// What a UI offering "upgrade the holder" must check: only `true` on Unix.
+pub const fn upgrade_supported() -> bool {
+    cfg!(unix)
+}
+
 /// Most concurrent connections one holder serves. Each costs a thread (two
 /// once attached); the runner needs one or two. Past this a client gets
 /// `rejected {busy}`.
@@ -168,6 +182,10 @@ pub struct HolderInfo {
     pub holder_pid: u32,
     pub child_pid: Option<u32>,
     pub started_at_unix_ms: u64,
+    /// What `prepare_upgrade` needs (plan Phase 8, Unix). `None` in a holder
+    /// with no pane (dispatch unit tests), which answers `unsupported`.
+    #[cfg(unix)]
+    pub upgrade: Option<crate::handoff::UpgradeCtx>,
 }
 
 /// A holder that holds its lock, owns its pane's child, and has bound its
@@ -187,7 +205,7 @@ pub struct Holder {
     record: LockRecord,
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -240,6 +258,12 @@ impl Holder {
             holder_pid: std::process::id(),
             child_pid: Some(pane.child_pid()),
             started_at_unix_ms: now_unix_ms(),
+            #[cfg(unix)]
+            upgrade: Some(crate::handoff::UpgradeCtx {
+                pane_dir: pane_dir.to_path_buf(),
+                lock_fd: lock.as_raw_fd(),
+                log: log_path(pane_dir, pane_id),
+            }),
         };
         let record = LockRecord {
             holder_pid: info.holder_pid,
@@ -288,6 +312,34 @@ impl Holder {
 
     pub fn info(&self) -> &HolderInfo {
         &self.info
+    }
+
+    /// A holder assembled by a holder upgrade's successor (plan Phase 8,
+    /// `crate::handoff::adopt`): the lock it inherited, the pane it adopted
+    /// and the endpoint it took over. It then [`Holder::run`]s like any other.
+    #[cfg(unix)]
+    pub(crate) fn from_parts(
+        info: HolderInfo,
+        pane: Arc<Pane>,
+        listener: Listener,
+        log: PathBuf,
+        lock: PaneLock,
+        record: LockRecord,
+    ) -> Holder {
+        // Its own durable-tail writer for the same child (plan D7); the log
+        // sits in the pane dir.
+        let pane_dir = log.parent().map(Path::to_path_buf).unwrap_or_default();
+        let scrollback =
+            crate::scrollback::ScrollbackWriter::new(&pane_dir, &info.pane_id, pane.child_pid());
+        Holder {
+            info: Arc::new(info),
+            pane,
+            listener,
+            log,
+            scrollback: Arc::new(Mutex::new(scrollback)),
+            lock,
+            record,
+        }
     }
 
     pub fn pane(&self) -> &Arc<Pane> {
@@ -396,7 +448,7 @@ impl Holder {
 /// The transient scope unit this holder runs in, when the spawner put it in
 /// one (`crate::spawn`'s scope route). Recorded in the lock so a boot sweep can
 /// stop what a dead holder left in it.
-fn own_scope_unit() -> Option<String> {
+pub(crate) fn own_scope_unit() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let cgroup = crate::reap::own_holder_scope_cgroup()?;
@@ -504,6 +556,9 @@ pub(crate) enum Action {
     },
     Kill,
     Detach,
+    /// Hand the pane to a successor holder (plan Phase 8, Unix).
+    #[cfg(unix)]
+    PrepareUpgrade,
 }
 
 /// One connection's flow flags, shared with its pump.
@@ -733,6 +788,30 @@ pub(crate) fn serve_conn_with(
             Action::Detach => {
                 let _ = send_reply(&writer, &ok("detach"));
                 break;
+            }
+            #[cfg(unix)]
+            Action::PrepareUpgrade => {
+                let reply = match (pane, &info.upgrade) {
+                    (Some(pane), Some(ctx)) => {
+                        let result = crate::handoff::prepare_upgrade(ctx, info, pane);
+                        let reply = result.reply();
+                        if matches!(result, crate::handoff::UpgradeResult::Committed { .. }) {
+                            // The successor owns the pane: tell the requester,
+                            // then leave at once (no pane-end work, no
+                            // destructor — `handoff::exit_after_handoff`).
+                            let _ = send_reply(&writer, &reply);
+                            crate::handoff::exit_after_handoff();
+                        }
+                        reply
+                    }
+                    _ => Reply::Unsupported {
+                        verb: "prepare_upgrade".into(),
+                        reason: "this holder has no pane to hand over".into(),
+                    },
+                };
+                if send_reply(&writer, &reply).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -1070,9 +1149,14 @@ fn handle_request(state: &mut ConnState, req: Request, info: &HolderInfo) -> Act
             versions: PROTOCOL_VERSIONS.to_vec(),
             started_at_unix_ms: info.started_at_unix_ms,
         })),
+        // Envelope verb (D15): answerable whatever was negotiated, so a runner
+        // far ahead of this holder can still replace it.
+        #[cfg(unix)]
+        (_, Request::PrepareUpgrade) => Action::PrepareUpgrade,
+        #[cfg(not(unix))]
         (_, Request::PrepareUpgrade) => Action::Reply(Reply::Unsupported {
             verb: "prepare_upgrade".into(),
-            reason: "holder upgrade is plan Phase 8; this build does not implement it".into(),
+            reason: UPGRADE_UNSUPPORTED_ON_THIS_OS.into(),
         }),
         // Version 1 verbs.
         (Negotiated(v) | Attached(v) | InputOnly(v), Request::Ping) if v >= 1 => {
@@ -1188,6 +1272,8 @@ mod tests {
             holder_pid: 7,
             child_pid: None,
             started_at_unix_ms: 1,
+            #[cfg(unix)]
+            upgrade: None,
         }
     }
 
@@ -1229,6 +1315,14 @@ mod tests {
             handle_request(&mut s, Request::Census, &i),
             Action::Reply(Reply::CensusReply(_))
         ));
+        // Unix: a handoff action (served as `unsupported` by a holder with no
+        // pane); elsewhere `unsupported` straight away (plan D12).
+        #[cfg(unix)]
+        assert_eq!(
+            handle_request(&mut s, Request::PrepareUpgrade, &i),
+            Action::PrepareUpgrade
+        );
+        #[cfg(not(unix))]
         assert!(matches!(
             handle_request(&mut s, Request::PrepareUpgrade, &i),
             Action::Reply(Reply::Unsupported { .. })

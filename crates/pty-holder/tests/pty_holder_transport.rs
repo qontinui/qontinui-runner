@@ -203,10 +203,15 @@ fn pty_holder_handshake_ping_census_and_lock_record() {
     assert_eq!(cen.holder_pid, h.pid());
     assert_eq!(cen.versions, PROTOCOL_VERSIONS.to_vec());
 
-    // prepare_upgrade is in the envelope and answered typed, connection kept.
-    match c.request(&Request::PrepareUpgrade, soon()).unwrap() {
-        Reply::Unsupported { verb, .. } => assert_eq!(verb, "prepare_upgrade"),
-        other => panic!("{other:?}"),
+    // prepare_upgrade is in the envelope and answered typed. Windows: always
+    // `unsupported` (plan D12), connection kept. Unix: it really upgrades
+    // the holder (plan Phase 8) — that is `pty_holder_handoff`'s suite.
+    #[cfg(not(unix))]
+    {
+        match c.request(&Request::PrepareUpgrade, soon()).unwrap() {
+            Reply::Unsupported { verb, .. } => assert_eq!(verb, "prepare_upgrade"),
+            other => panic!("{other:?}"),
+        }
     }
     c.ping(soon()).unwrap();
 
