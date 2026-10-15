@@ -2405,22 +2405,24 @@ impl TerminalSession {
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
-                // Tier 2 (plan Phase 6, D11): the pane ended because its PTY
-                // HOLDER was lost — not because its child exited, a close
-                // killed it, or the runner detached. Hand the session it
+                // Tier 2 (plan Phase 6, D11): when the pane ended because its
+                // PTY HOLDER was lost — not because its child exited, a close
+                // killed it, or the runner detached — hand the session it
                 // hosted back for a `--resume` relaunch, gated on no live
-                // process still hosting it. Fire-and-forget.
-                if waiter_io.ended_by_holder_loss() {
-                    let reported = waiter_session_start_report
-                        .lock()
-                        .ok()
-                        .and_then(|slot| slot.clone());
-                    crate::terminal::holder_relaunch::on_holder_lost(
-                        &waiter_app,
-                        &waiter_id,
-                        reported,
-                    );
-                }
+                // process still hosting it (or tell the operator why not).
+                // Fire-and-forget.
+                crate::terminal::holder_relaunch::after_pane_exit(
+                    waiter_io.as_ref(),
+                    &waiter_session_start_report,
+                    |loss, reported| {
+                        crate::terminal::holder_relaunch::on_holder_lost(
+                            &waiter_app,
+                            &waiter_id,
+                            reported,
+                            loss,
+                        )
+                    },
+                );
 
                 // "The child process ended" — the Tauri event plus its WS
                 // re-broadcast. NOT the only notice a pane sends: the

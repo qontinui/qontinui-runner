@@ -1320,7 +1320,7 @@ fn registry_record_from_restore_payload(
     };
 
     TerminalSessionRecord {
-        launch_argv: None,
+        resume_flags: None,
         claude_session_id,
         config_dir: None,
         working_dir: cwd,

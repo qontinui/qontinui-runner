@@ -124,7 +124,7 @@ pub(crate) fn apply_typed_resume_effects(
     match store {
         Some(store) => {
             store.record_open(TerminalSessionRecord {
-                launch_argv: None,
+                resume_flags: None,
                 claude_session_id: parsed.claude_session_id.clone(),
                 // config_dir None → restore scans every known config dir.
                 // Zone unknown backend-side → 0 (wrong zone beats a lost

@@ -30,8 +30,8 @@
 #   QONTINUI_TERMINAL_ID            the per-PTY terminal id to correlate on
 #   QONTINUI_INSTALL_INTERCEPT_PORT the bound runner loopback API port
 #   QONTINUI_LAUNCH_ARGV            (set by the identity shim) this launch's
-#                                   argv as a JSON array — reported over the
-#                                   PTY, see `qh_emit_session_start` below
+#                                   argv as a JSON array — sent in the POST
+#                                   body below, NEVER over the PTY
 set -u
 
 # Drain stdin with a BUILTIN, not `cat` — the same drain the policy and stop
@@ -306,7 +306,21 @@ fi
 # produce a body the route rejects as malformed, silently.
 term_json="$(qh_json_escape "$term")"
 sid_json="$(qh_json_escape "$sid")"
-body="{\"terminal_id\":\"$term_json\",\"session_id\":\"$sid_json\"$src_field,\"provider\":\"claude\",\"cwd\":\"$cwd_json\"$cfg_field}"
+# The launch argv the identity shim exported, for a tier-2 relaunch (plan
+# 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6).
+# It rides THIS loopback body, never the PTY: the PTY stream is relayed,
+# ringed and stored, and an argv can carry a prompt or an inline secret. The
+# runner keeps only the relaunch flags it derives from it, never the argv.
+# Spliced in only when it is a JSON array of PRINTABLE ASCII (the shims escape
+# everything else as \uXXXX) of at most 4 KiB; anything else is left out and a
+# relaunch uses the default resume command.
+argv_field=""
+qh_argv="${QONTINUI_LAUNCH_ARGV:-}"
+if [ -n "$qh_argv" ] && [ "$(LC_ALL=C; printf '%s' "${#qh_argv}")" -le 4096 ] \
+    && [[ $qh_argv == "["*"]" ]] && ! (LC_ALL=C; [[ $qh_argv == *[^\ -~]* ]]); then
+  argv_field=",\"argv\":$qh_argv"
+fi
+body="{\"terminal_id\":\"$term_json\",\"session_id\":\"$sid_json\"$src_field,\"provider\":\"claude\",\"cwd\":\"$cwd_json\"$cfg_field$argv_field}"
 if [ "$qh_can_post" = 1 ]; then
   curl -fsS --connect-timeout 3 --max-time 10 \
     -X POST "http://127.0.0.1:${port}/control/session-open" \
@@ -320,35 +334,27 @@ fi
 # D11; transport idea from tty7, which reports the id the same way). It needs
 # no port, socket or file — whoever reads the pane's PTY sees it: the runner's
 # grid parses it (`terminal::session_start_sideband`) and keeps the id a
-# relaunch uses if the pane's PTY holder dies, plus the launch argv the
-# identity shim exported (QONTINUI_LAUNCH_ARGV). Written AFTER the POST, so
-# the record the argv lands on normally exists already.
+# relaunch uses if the pane's PTY holder dies, including after a /clear.
 #
-# Nothing goes to stdout: a SessionStart hook's stdout becomes session
-# context. Every value is checked before it is spliced in, because a byte out
-# of place inside an OSC sequence ends it early and prints the rest:
-#   - the id must be [A-Za-z0-9_-] (the runner's own session-id predicate);
-#   - the source must be a plain lowercase word, else it is left out;
-#   - the argv must be a JSON array the shim escaped — no raw control byte,
-#     ESC, BEL or DEL — and at most 4 KiB, else it is left out (the id still
-#     goes).
+# It carries the session id and source ONLY — never the argv, which went in
+# the POST above: the PTY stream is relayed and stored. Nothing goes to
+# stdout (a SessionStart hook's stdout becomes session context). The id must
+# be a hyphenated UUID and the source one of four words, so the sequence is
+# fixed-shape printable ASCII with nothing that could end it early. It is
+# built first and written with ONE printf of under 1 KiB — a single write(2)
+# to the terminal — so the TUI's own drawing cannot land inside it.
 # No controlling terminal (a headless run, a test harness) is a silent no-op.
 qh_emit_session_start() {
   local LC_ALL=C
-  local osc_src="" osc_argv="" argv="${QONTINUI_LAUNCH_ARGV:-}"
-  case "$sid" in
-    "" | *[!A-Za-z0-9_-]*) return 0 ;;
-  esac
+  local osc_src="" osc=""
+  [[ $sid =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+    || return 0
   case "$src" in
-    "" | *[!a-z_]*) ;;
-    *) osc_src=",\"source\":\"$src\"" ;;
+    startup | resume | clear | compact) osc_src=",\"source\":\"$src\"" ;;
   esac
-  if [ -n "$argv" ] && [ "${#argv}" -le 4096 ] && [[ $argv == "["*"]" ]] \
-      && ! [[ $argv =~ [$'\x01'-$'\x1f'$'\x7f'] ]]; then
-    osc_argv=",\"argv\":$argv"
-  fi
-  { printf '\033]9999;session_start;{"session_id":"%s"%s%s}\007' \
-      "$sid" "$osc_src" "$osc_argv" >/dev/tty; } 2>/dev/null || true
+  printf -v osc '\033]9999;session_start;{"session_id":"%s"%s}\007' "$sid" "$osc_src"
+  [ "${#osc}" -le 1024 ] || return 0
+  { printf '%s' "$osc" >/dev/tty; } 2>/dev/null || true
   return 0
 }
 qh_emit_session_start

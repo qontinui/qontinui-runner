@@ -172,37 +172,77 @@ PINNED="${QONTINUI_PINNED_SESSION_ID:-}"
 # 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6 /
 # D11). For TOOL=claude, export the argv this launch received as a JSON array
 # in QONTINUI_LAUNCH_ARGV. The runner-bundled SessionStart hook — a child of
-# that claude, so it inherits the variable — writes it to the PTY in its OSC
-# 9999 `session_start` report, and the runner persists it on the session's
-# record. If the pane's PTY holder later dies, the session is relaunched with
-# these flags plus `--resume <id>` (when a surviving token is not shell-inert
-# the runner drops the flags and resumes with the default command —
-# `session::resume_argv`).
+# that claude, so it inherits the variable — sends it in the body of its
+# LOOPBACK POST /control/session-open (never over the PTY, whose bytes are
+# relayed and stored), and the runner derives and persists only the relaunch
+# flags from it — allowlisted and shell-inert, or a refusal under which the
+# relaunch uses the default resume command (`session::resume_argv`).
 #
 # The runner's own plumbing is left out: the shell integration's
 # `--append-system-prompt[-file] <value>` (re-added in the relaunched pane, and
 # an inline value is multi-kilobyte) — and so is everything this shim appends
-# below, which comes after "$@". Every value is JSON-escaped here, control
-# characters included, so the hook can splice the array into its payload
-# without ever carrying a raw ESC or BEL into an OSC sequence. Fail-open: an
-# array over 4 KiB is not exported at all, and the relaunch then uses the
-# default resume command.
+# below, which comes after "$@". Every value is JSON-escaped here so the
+# result is printable ASCII only: control characters AND every non-ASCII
+# character become `\uXXXX` (UTF-16 surrogate pairs above U+FFFF; a byte that
+# is not valid UTF-8 becomes U+FFFD). C1 controls such as U+009C would
+# otherwise survive a C0-only escape. Fail-open: an array over 4 KiB is not
+# exported at all, and a relaunch then uses the default resume command.
 qs_json_str() {
-  # C locale: the control-character range below is an ERE, which honours
-  # LC_COLLATE; see `qh_json_escape` in claude_session_hook.sh.
+  # C locale: every comparison below is on BYTES (`'$c` yields a byte value,
+  # `${#s}` a byte count), whatever the operator's locale.
   local LC_ALL=C
-  local s="$1" c u
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  s="${s//$'\n'/\\n}"
-  s="${s//$'\r'/\\r}"
-  s="${s//$'\t'/\\t}"
-  while [[ $s =~ [$'\x01'-$'\x1f'$'\x7f'] ]]; do
-    c="${BASH_REMATCH[0]}"
-    printf -v u '\\u%04x' "'$c"
-    s="${s//"$c"/$u}"
+  local s="$1" out="" i=0 n b c cp need k u
+  # Fast path: printable ASCII with no quote or backslash needs no escaping.
+  if [[ $s != *[^\ -~]* && $s != *[\"\\]* ]]; then
+    printf '"%s"' "$s"
+    return 0
+  fi
+  n=${#s}
+  while [ "$i" -lt "$n" ]; do
+    c="${s:i:1}"
+    printf -v b '%d' "'$c"
+    (( b < 0 )) && b=$((b + 256))
+    i=$((i + 1))
+    if (( b == 34 )); then
+      out+='\"'
+    elif (( b == 92 )); then
+      out+='\\'
+    elif (( b >= 32 && b < 127 )); then
+      out+="$c"
+    elif (( b < 128 )); then
+      printf -v u '\\u%04x' "$b"
+      out+="$u"
+    else
+      if (( b >= 0xC2 && b <= 0xDF )); then
+        need=1; cp=$((b & 0x1F))
+      elif (( b >= 0xE0 && b <= 0xEF )); then
+        need=2; cp=$((b & 0x0F))
+      elif (( b >= 0xF0 && b <= 0xF4 )); then
+        need=3; cp=$((b & 0x07))
+      else
+        need=0; cp=$((0xFFFD))
+      fi
+      k=0
+      while (( k < need )); do
+        if (( i >= n )); then cp=$((0xFFFD)); break; fi
+        c="${s:i:1}"
+        printf -v b '%d' "'$c"
+        (( b < 0 )) && b=$((b + 256))
+        if (( b < 0x80 || b > 0xBF )); then cp=$((0xFFFD)); break; fi
+        cp=$(( (cp << 6) | (b & 0x3F) ))
+        i=$((i + 1))
+        k=$((k + 1))
+      done
+      if (( cp >= 0x10000 )); then
+        cp=$((cp - 0x10000))
+        printf -v u '\\u%04x\\u%04x' $((0xD800 + (cp >> 10))) $((0xDC00 + (cp & 0x3FF)))
+      else
+        printf -v u '\\u%04x' "$cp"
+      fi
+      out+="$u"
+    fi
   done
-  printf '"%s"' "$s"
+  printf '"%s"' "$out"
 }
 
 launch_argv_json() {
