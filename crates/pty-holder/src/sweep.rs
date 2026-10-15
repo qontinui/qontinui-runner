@@ -571,7 +571,12 @@ fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> S
 /// reach first.
 fn stray_age(extension: &str) -> Option<Duration> {
     match extension {
-        "sock" | "spec" | "report" | "report-tmp" => Some(STRAY_MIN_AGE),
+        // `upgrade` / `upgrade-tmp`: a holder upgrade's snapshot (plan Phase
+        // 8) left by a predecessor that died mid-handoff — it carries the
+        // pane's ring, so it is not kept.
+        "sock" | "spec" | "report" | "report-tmp" | "upgrade" | "upgrade-tmp" => {
+            Some(STRAY_MIN_AGE)
+        }
         "log" => Some(DEAD_LOG_RETENTION),
         _ => None,
     }
