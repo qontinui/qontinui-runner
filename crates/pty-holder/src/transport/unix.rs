@@ -25,10 +25,42 @@ pub struct Conn {
 impl Conn {
     /// Bound every subsequent read and write; `None` blocks indefinitely.
     pub fn set_timeout(&self, t: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(t)?;
+        self.set_write_timeout(t)
+    }
+
+    /// Bound every subsequent READ only.
+    ///
+    /// The socket option is per SOCKET, so it is shared with every
+    /// [`Conn::try_clone`] of this connection. The data path therefore keeps a
+    /// strict split: the connection's reading thread is the only one that sets
+    /// read timeouts and its writer the only one that sets write timeouts — a
+    /// combined [`Conn::set_timeout`] on either half would re-arm the other's.
+    pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
         // A zero Duration is an error to std; the caller meant "now".
-        let t = t.map(|d| d.max(Duration::from_millis(1)));
-        self.stream.set_read_timeout(t)?;
-        self.stream.set_write_timeout(t)
+        self.stream
+            .set_read_timeout(t.map(|d| d.max(Duration::from_millis(1))))
+    }
+
+    /// Bound every subsequent WRITE only. See [`Conn::set_read_timeout`].
+    pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
+        self.stream
+            .set_write_timeout(t.map(|d| d.max(Duration::from_millis(1))))
+    }
+
+    /// A second handle on the same connection, so one thread can read while
+    /// another writes (the attached data path: the holder's per-connection
+    /// output pump writes while the dispatch loop reads).
+    pub fn try_clone(&self) -> io::Result<Conn> {
+        Ok(Conn {
+            stream: self.stream.try_clone()?,
+        })
+    }
+
+    /// Nothing to drain on a Unix socket: bytes written before `close` are
+    /// still delivered to the peer. See the Windows twin for why it exists.
+    pub fn flush_to_peer(&self) -> io::Result<()> {
+        Ok(())
     }
 
     /// The uid of the process at the other end, as the kernel recorded it at

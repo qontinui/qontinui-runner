@@ -1281,6 +1281,44 @@ note_runner_credential() {
   RUNNER_CREDENTIAL_POSTURE="$(printf '%s' "${1%% *}" | sed 's/^RUNNER_CREDENTIAL_//' | tr '[:upper:]' '[:lower:]')"
 }
 
+# runner_credential_known_dead — 0 when THIS sweep has already measured that the
+# runner cannot present a coord credential: a loopback door SETTLED on
+# CREDENTIAL_REFRESHING (503 twice, see mark_upstream_refreshing) or answered
+# RUNNER_CREDENTIAL_<POSTURE> (note_runner_credential). Both are recorded in this
+# PARENT shell by probe_door, never inside classify()'s subshell. The answer
+# names which fact, for the one line that uses it.
+#
+# Its one consumer is the L5 gate. In this state every runner-served rung (L1,
+# L2, L4 sources 3 and 4) is carrying the same dead credential, and they spend
+# the sweep budget before L5 is reached - so the one runner-independent door was
+# reported SKIPPED_BUDGET_EXCEEDED in exactly the state it exists for. Measured
+# 2026-10-07 on one fleet device (32 h stranded; coord findings e70fd8cf and
+# 4d5a024f, dossier runner-coord-credential-stranded): a default-budget run
+# never reached L5, a 600 s run reached it LIVE.
+#
+# A TIMEOUT is deliberately NOT in the predicate. A hang says nothing about the
+# credential, and a slow, saturated box is exactly what the budget bounds.
+runner_credential_known_dead() {
+  if [ -n "$RUNNER_CREDENTIAL_POSTURE" ]; then
+    printf 'a loopback door answered RUNNER_CREDENTIAL_%s' \
+      "$(printf '%s' "$RUNNER_CREDENTIAL_POSTURE" | tr '[:lower:]' '[:upper:]')"
+    return 0
+  fi
+  # LOOPBACK entries only. mark_upstream_refreshing records any door that
+  # settled on a 503, and classify() reads a bare 503 as CREDENTIAL_REFRESHING
+  # on every rung - so coord itself answering 503 at L3/L4 would otherwise be
+  # blamed on the runner's credential.
+  local hp loop=""
+  for hp in $(printf '%s' "$REFRESHING_UPSTREAMS" | tr '|' ' '); do
+    is_loopback_endpoint "$hp" && loop="${loop:+$loop, }$hp"
+  done
+  if [ -n "$loop" ]; then
+    printf 'a loopback door settled on CREDENTIAL_REFRESHING (%s)' "$loop"
+    return 0
+  fi
+  return 1
+}
+
 # ----- the sweep's wall-clock bound -------------------------------------------
 # $SECONDS is bash's own monotonic counter, so the bound costs no subprocess and
 # cannot be skewed by a clock change. It is sampled BETWEEN doors, never inside a
@@ -4596,7 +4634,22 @@ done
 # the honest outcome of an exhausted cascade is the UNKNOWN or DEAD verdict
 # the axis table licenses, plus a DURABLY RECORDED BLOCKER - never a token
 # from that door.
-if budget_skip "L5" "bootstrap-credential"; then
+# THE ONE BUDGET EXEMPTION. A spent budget skips L5 like any other door, EXCEPT
+# when this sweep has already measured the runner's own credential dead (see
+# runner_credential_known_dead): then every rung the budget was spent on shared
+# that dead credential, and L5 is the only door left that does not. It is still
+# one bounded attempt - a POST and a control read, each under
+# $COORD_REVIVE_PROBE_TIMEOUT - so the sweep's bound grows by that, and only in
+# this state. BUDGET_TRIPPED is left as it is: if L5 fails too, the verdict is
+# still BUDGET_EXCEEDED naming the other skipped doors. The env opt-out below
+# still wins over the exemption: it is checked first, so an opted-out run never
+# prints the exemption line.
+L5_EXEMPT_WHY=""
+if [ -z "${COORD_REVIVE_NO_BOOTSTRAP:-}" ] && ! budget_left \
+  && L5_EXEMPT_WHY="$(runner_credential_known_dead)"; then
+  echo "L5: bootstrap-credential -> sweep budget (${PROBE_TOTAL_BUDGET}s) spent, probing anyway: $L5_EXEMPT_WHY, so every rung the budget was spent on carried the same dead runner credential and this runner-independent door is the one left" >&2
+fi
+if [ -z "$L5_EXEMPT_WHY" ] && budget_skip "L5" "bootstrap-credential"; then
   : # already recorded by budget_skip; L5 is not attempted on an exhausted budget
 elif [ -n "${COORD_REVIVE_NO_BOOTSTRAP:-}" ]; then
   echo "L5: bootstrap-credential -> SKIPPED_BY_ENV (\$COORD_REVIVE_NO_BOOTSTRAP is set, so the runner-independent credential was not attempted. That is a CHOICE, not a fault, and it says nothing about whether it would have worked)" >&2
