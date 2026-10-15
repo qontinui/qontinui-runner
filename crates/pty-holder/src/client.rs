@@ -31,14 +31,14 @@
 //!
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::frame::{
-    parse_output, parse_synthetic, read_frame, write_frame, Frame, SyntheticPart, KIND_CONTROL,
-    KIND_DATA, KIND_OUTPUT, KIND_SYNTHETIC,
+    encode_frame, parse_output, parse_synthetic, read_frame, write_frame, Frame, SyntheticPart,
+    KIND_CONTROL, KIND_DATA, KIND_OUTPUT, KIND_SYNTHETIC,
 };
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{check_private_dir, lock_path, PaneId};
@@ -209,7 +209,30 @@ pub fn connect_with_versions(
     deadline: Instant,
     versions: &[u32],
 ) -> Result<Client, ConnectError> {
-    let mut conn = transport::connect(pane_dir, pane, deadline)?;
+    let mut conn = open_verified(pane_dir, pane, deadline)?;
+    let hello = Request::Hello {
+        versions: versions.to_vec(),
+    };
+    send(&mut conn, &hello, deadline)?;
+    match recv(&mut conn, deadline)? {
+        Reply::HelloAck(ack) => Ok(Client {
+            conn,
+            ack,
+            poisoned: None,
+        }),
+        Reply::NoCommonVersion { holder_versions } => {
+            Err(ConnectError::Incompatible { holder_versions })
+        }
+        other => Err(ConnectError::Protocol(format!(
+            "expected hello_ack, got {other:?}"
+        ))),
+    }
+}
+
+/// Connect to a pane's endpoint and prove who serves it (Unix: the peer uid;
+/// Windows: the pipe server is the pid the lock record names). No handshake.
+fn open_verified(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> Result<Conn, ConnectError> {
+    let conn = transport::connect(pane_dir, pane, deadline)?;
     #[cfg(unix)]
     {
         // The pane dir is 0700, so nobody else can bind there; checked anyway,
@@ -241,23 +264,7 @@ pub fn connect_with_versions(
             }
         }
     }
-    let hello = Request::Hello {
-        versions: versions.to_vec(),
-    };
-    send(&mut conn, &hello, deadline)?;
-    match recv(&mut conn, deadline)? {
-        Reply::HelloAck(ack) => Ok(Client {
-            conn,
-            ack,
-            poisoned: None,
-        }),
-        Reply::NoCommonVersion { holder_versions } => {
-            Err(ConnectError::Incompatible { holder_versions })
-        }
-        other => Err(ConnectError::Protocol(format!(
-            "expected hello_ack, got {other:?}"
-        ))),
-    }
+    Ok(conn)
 }
 
 fn send(conn: &mut Conn, req: &Request, deadline: Instant) -> io::Result<()> {
@@ -721,12 +728,71 @@ impl InputStream {
         Ok(())
     }
 
+    /// [`InputStream::input`], saying on failure whether the frame provably
+    /// did NOT reach the holder — what a caller needs to resend it without
+    /// ever duplicating it ([`InputFailure::not_delivered`]).
+    pub fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), InputFailure> {
+        let frame = encode_frame(KIND_DATA, bytes).map_err(|e| InputFailure {
+            error: ConnectError::Io(e),
+            // Nothing was written.
+            not_delivered: true,
+        })?;
+        let mut io = DeadlineIo::new(&mut self.conn, deadline);
+        if let Err(e) = io.write_all(&frame) {
+            return Err(InputFailure {
+                error: ConnectError::Io(e),
+                not_delivered: frame_cut_means_not_delivered(),
+            });
+        }
+        io.flush().map_err(|e| InputFailure {
+            error: ConnectError::Io(e),
+            // Every byte of the frame was already written: the holder may
+            // have it. UNKNOWN, so never resent.
+            not_delivered: false,
+        })
+    }
+
     /// See [`StreamWriter::shutdown_handle`].
     pub fn shutdown_handle(&self) -> io::Result<ShutdownHandle> {
         Ok(ShutdownHandle {
             conn: self.conn.try_clone()?,
         })
     }
+}
+
+/// Why [`InputStream::send`] failed.
+#[derive(Debug)]
+pub struct InputFailure {
+    pub error: ConnectError,
+    /// The frame provably did not reach the holder, so resending it on a NEW
+    /// input connection cannot duplicate it.
+    ///
+    /// The proof (Unix): the write failed before the frame's last byte was
+    /// handed to the kernel, so the holder can hold at most a TRUNCATED frame
+    /// on this connection — and a holder discards a truncated frame whole
+    /// (its dispatch drops the connection on a short read; a holder upgrade's
+    /// drain reads what the socket carries and then EOF, plan Phase 8
+    /// `handoff.rs`). A write that DID complete is never marked here, even
+    /// when what follows it fails: its bytes may be in the holder's queue.
+    ///
+    /// Windows: always `false`. A named-pipe write's completion is not that
+    /// proof, and no Windows holder is ever upgraded (plan D12), which is the
+    /// case a resend exists for.
+    pub not_delivered: bool,
+}
+
+impl std::fmt::Display for InputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.not_delivered {
+            write!(f, "{} (the frame did not reach the holder)", self.error)
+        } else {
+            write!(f, "{} (the holder may have the frame)", self.error)
+        }
+    }
+}
+
+const fn frame_cut_means_not_delivered() -> bool {
+    cfg!(unix)
 }
 
 /// Open a connection WITHOUT the handshake, for tests that must speak first

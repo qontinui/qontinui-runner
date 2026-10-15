@@ -1193,7 +1193,7 @@ mod unix {
 
         // 2. An offset past this holder's END (the dead successor ran ahead):
         //    lost from X to that offset; output resumes exactly there.
-        let mut h2 = attach(&dir, None);
+        let h2 = attach(&dir, None);
         let tail_end = h2.info.end_offset;
         drop(h2);
         let ahead = tail_end + 40;

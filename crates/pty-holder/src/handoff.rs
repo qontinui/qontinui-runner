@@ -138,11 +138,13 @@
 //! drain the cap is lifted, so none is dropped — and travel in `commit`. What
 //! is NOT delivered: a frame whose write the shutdown cut in half (discarded
 //! whole) and any write after it. Both FAIL at the writer (`EPIPE`), never
-//! silently; today's runner `HolderConn::input` reports that failure to its
-//! caller and reopens its connection, but does not retry the failed write
-//! itself. A runner-side resend of the failed chunk on the new connection
-//! would make the swap lossless for input, and belongs with the runner change
-//! that first sends `prepare_upgrade`. A predecessor that dies mid-commit
+//! silently — and a write that fails before the frame's last byte left the
+//! client PROVES the holder does not have that frame
+//! (`client::InputFailure::not_delivered`). The runner's `HolderConn::input`
+//! resends such a frame, and the rest of its write, exactly once on a
+//! reopened input connection — to the successor, or to this holder after a
+//! rollback — so the swap is lossless for input; a frame whose delivery is
+//! unknown is reported, never resent. A predecessor that dies mid-commit
 //! loses the held frames it had not yet sent. **A rollback after the drain**
 //! (the commit write failed, or the successor died before `serving`) keeps
 //! every held frame, but the drained connections stay shut: writes a client
