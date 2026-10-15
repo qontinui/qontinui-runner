@@ -5,7 +5,9 @@
 //! Phase 2. D2: the holder is the THIRD `PaneIo` impl, not a new subsystem —
 //! the reader thread, grid, scrollback ring, emission gate and waiter thread
 //! above it are the code a `LocalPty` drives. D13: one holder per pane. Shipped
-//! behind `terminal.pty_holder` (default OFF, `settings::TerminalSettings`);
+//! behind `terminal.pty_holder` (default ON on Linux since Phase 5, which made
+//! `/restart-readiness` count holder panes; OFF on Windows and macOS —
+//! `settings::TerminalSettings`);
 //! [`pane_backend_for`] is the one place that switch is read.
 //!
 //! # What is reused, and what is new
@@ -2295,16 +2297,25 @@ mod tests {
         );
     }
 
-    /// The setting OFF (the default) yields `LocalPty`; ON yields the holder.
+    /// ON yields the holder, OFF yields `LocalPty`; the DEFAULT is ON on
+    /// Linux only (plan Phase 5 as amended 2026-10-15).
     #[test]
-    fn pty_holder_backend_off_by_default_yields_local_pty() {
+    fn pty_holder_backend_default_is_the_holder_on_linux_only() {
         assert_eq!(
             pane_backend_for(&TerminalSettings::default()),
-            PaneBackend::LocalPty
+            if cfg!(target_os = "linux") {
+                PaneBackend::Holder
+            } else {
+                PaneBackend::LocalPty
+            }
         );
         assert_eq!(
             pane_backend_for(&TerminalSettings { pty_holder: true }),
             PaneBackend::Holder
+        );
+        assert_eq!(
+            pane_backend_for(&TerminalSettings { pty_holder: false }),
+            PaneBackend::LocalPty
         );
     }
 
@@ -2597,6 +2608,12 @@ mod tests {
                 began.store(true, Ordering::SeqCst);
                 let mut cmd = portable_pty::CommandBuilder::new("sh");
                 cmd.args(["-c", "true"]);
+                // An explicit cwd: without one portable-pty runs the child in
+                // the builder's captured `$HOME`, which a concurrently running
+                // `IsolatedAmbient` test points at a temp dir it then deletes
+                // — the fallback spawn then fails ENOENT and this test reads
+                // that as "never fell back".
+                cmd.cwd(std::env::temp_dir());
                 let pane = spawn_holder_pane_or_fallback_in(
                     Ok(fake2.as_path()),
                     Ok(panes2),
@@ -2742,6 +2759,9 @@ mod tests {
         } else {
             cmd.args(["-c", "echo FALLBACK_MARK"]);
         }
+        // See `pty_holder_spawn_door_does_not_park_a_tokio_worker`: never the
+        // captured `$HOME`, which a concurrent test may have deleted.
+        cmd.cwd(std::env::temp_dir());
         let pane = spawn_holder_pane_or_fallback_in(
             Err("no holder in this test".into()),
             Err("unused".into()),

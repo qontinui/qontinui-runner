@@ -1540,13 +1540,20 @@ mod tests {
             AdoptOutcome::Skipped("x".into()),
             AdoptOutcome::Deferred("x".into()),
         ] {
-            assert_eq!(released_session(&other, &adoption, &moved), None, "{other:?}");
+            assert_eq!(
+                released_session(&other, &adoption, &moved),
+                None,
+                "{other:?}"
+            );
         }
         let untracked = Adoption {
             pinned_session_id: String::new(),
             ..adoption
         };
-        assert_eq!(released_session(&outcome, &untracked, &SessionNow::Untracked), None);
+        assert_eq!(
+            released_session(&outcome, &untracked, &SessionNow::Untracked),
+            None
+        );
     }
 
     /// Review round 6, nit (a): the pending mark clears however its thread

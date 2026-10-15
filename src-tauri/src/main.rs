@@ -4740,6 +4740,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .allows();
                         let mut held_for_restore: usize = 0;
 
+                        // Review F1 (plan 2026-09-12 Phase 5): a pane a
+                        // restarted runner ADOPTED from its PTY holder runs a
+                        // shell and `claude` that predate this boot, so the
+                        // PID-reuse guard below would call them recycled and
+                        // close the record `poll-dead` — restorable, i.e. a
+                        // second `claude --resume` against a live session.
+                        // Its identity is proven instead by the holder's lock
+                        // record (`child_start` against the live pid), and a
+                        // proven pid is exempt from the boot-time comparison.
+                        let holder_verified: std::collections::HashSet<u32> =
+                            crate::terminal::holder_census::verified_holder_children(
+                                &live
+                                    .iter()
+                                    .filter_map(|i| i.pid.map(|p| (i.id.clone(), p)))
+                                    .collect::<Vec<_>>(),
+                            );
+
                         let mut live_by_id: StdHashMap<&str, &_> =
                             StdHashMap::with_capacity(live.len());
                         let mut live_by_triple: StdHashMap<(&str, &str, &str), &_> =
@@ -4811,7 +4828,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     let claude_present = crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
                                         pid,
                                         &snap,
-                                        primary_boot_unix_millis,
+                                        crate::session::tracking_health::pid_reuse_reference(
+                                            pid,
+                                            &holder_verified,
+                                            primary_boot_unix_millis,
+                                        ),
                                     );
                                     (Some(alive), claude_present, tick_snapshot_ok)
                                 }

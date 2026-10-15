@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::ai_router::RoutingConfig;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
@@ -2590,27 +2590,61 @@ mod session_guard_tests {
 mod pty_holder_setting_tests {
     use super::*;
 
-    /// Plan 2026-09-12 Phase 2: `terminal.pty_holder` defaults OFF for a
-    /// fresh install, an empty settings.json, and a `terminal` object that
-    /// names no field — every settings file that exists today.
+    /// Plan 2026-09-12 Phase 5 (as amended 2026-10-15): `terminal.pty_holder`
+    /// defaults ON on Linux and OFF on Windows and macOS, for a fresh install,
+    /// an empty settings.json, and a `terminal` object that names no field.
     #[test]
-    fn pty_holder_setting_defaults_off() {
+    fn pty_holder_setting_defaults_on_linux_only() {
+        let expected = cfg!(target_os = "linux");
+        assert_eq!(PTY_HOLDER_DEFAULT, expected);
         for s in [
             Settings::default(),
             serde_json::from_str::<Settings>("{}").expect("empty object"),
             serde_json::from_str::<Settings>(r#"{"terminal": {}}"#).expect("empty terminal"),
         ] {
-            assert!(!s.terminal.pty_holder);
+            assert_eq!(s.terminal.pty_holder, expected);
             assert_eq!(s.terminal, TerminalSettings::default());
         }
     }
 
-    /// The hand-edit the doc names turns it on and round-trips.
+    /// An explicit opt-IN round-trips too — what a Windows or macOS operator
+    /// writes to try the holder.
     #[test]
     fn pty_holder_setting_round_trips_when_on() {
         let parsed: Settings =
             serde_json::from_str(r#"{"terminal": {"pty_holder": true}}"#).expect("parse");
         assert!(parsed.terminal.pty_holder);
+        let back: Settings =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back.terminal, parsed.terminal);
+    }
+
+    /// Review F4: an unreadable settings file never turns the holder on —
+    /// its default placeholder must not override an explicit opt-out — while
+    /// a loaded or fresh-install read is honoured as written.
+    #[test]
+    fn pty_holder_setting_unreadable_file_means_local_pty() {
+        let load = |provenance, pty_holder| LoadedSettings {
+            settings: Settings {
+                terminal: TerminalSettings { pty_holder },
+                ..Settings::default()
+            },
+            provenance,
+            error: None,
+        };
+        assert!(!terminal_settings_from(load(SettingsProvenance::Unreadable, true)).pty_holder);
+        assert!(terminal_settings_from(load(SettingsProvenance::Loaded, true)).pty_holder);
+        assert!(!terminal_settings_from(load(SettingsProvenance::Loaded, false)).pty_holder);
+        assert!(terminal_settings_from(load(SettingsProvenance::FreshInstall, true)).pty_holder);
+    }
+
+    /// The hand-edit the doc names turns it OFF and round-trips — the
+    /// operator's opt-out survives a load/save.
+    #[test]
+    fn pty_holder_setting_round_trips_when_off() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"terminal": {"pty_holder": false}}"#).expect("parse");
+        assert!(!parsed.terminal.pty_holder);
         let back: Settings =
             serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(back.terminal, parsed.terminal);
@@ -3709,7 +3743,8 @@ pub struct Settings {
     #[serde(default)]
     pub api: ApiSettings,
     /// Terminal pane backend knobs. See [`TerminalSettings`]; the one field,
-    /// `terminal.pty_holder`, defaults OFF.
+    /// `terminal.pty_holder`, defaults to [`PTY_HOLDER_DEFAULT`] (ON on Linux only,
+    /// since plan 2026-09-12 Phase 5).
     #[serde(default)]
     pub terminal: TerminalSettings,
 }
@@ -3717,28 +3752,54 @@ pub struct Settings {
 /// `terminal.*` — how a LOCAL terminal pane is backed.
 ///
 /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
-/// Phase 2 (vetted 2026-09-27, "Missing — no default-on switch"). Struct-level
-/// `#[serde(default)]`, so a `settings.json` written before this key — every
-/// one today — loads with the switch OFF, and a hand-edit naming one field
-/// keeps the default for the rest.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Phase 2 (vetted 2026-09-27, "Missing — no default-on switch"), flipped ON
+/// for Linux by Phase 5. Struct-level `#[serde(default)]` over the
+/// hand-written [`Default`] below, so a `settings.json` written before this
+/// key — or an empty `terminal` object — loads with the platform default
+/// ([`PTY_HOLDER_DEFAULT`]), and a hand-edit naming one field keeps the
+/// default for the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
     /// Run each new local pane's PTY in its own out-of-process holder
     /// (`qontinui-pty-holder`, driven by `terminal::daemon_pane_io`) instead
-    /// of in this process (`LocalPty`). Default **false**, and it must stay
-    /// false until Phase 5 of that plan: a holder pane's processes leave the
-    /// runner's process subtree, and `/restart-readiness` does not count them
-    /// until the holder census lands — flipping this early makes a restart
-    /// read "safe" by making the sessions invisible (the plan's Risk 2). Phase
-    /// 5 flips the default in the same change that makes the census count
-    /// holder panes.
+    /// of in this process (`LocalPty`). Default [`PTY_HOLDER_DEFAULT`]: **true
+    /// on Linux** since Phase 5 of that plan, which flipped it in the same
+    /// change that makes
+    /// `/restart-readiness` count holder panes (`terminal::holder_census`,
+    /// the fifth class of `session::tracking_health`'s partition) — the
+    /// ordering the plan's Risk 2 requires: a holder pane's processes can
+    /// leave the runner's process subtree, and before that census a restart
+    /// would have read "safe" by making those sessions invisible. **false on
+    /// Windows and macOS** (coordinator decision recorded on the plan as a
+    /// Phase 5 amendment, 2026-10-15): the Windows holder paths — job
+    /// breakaway, the WMI fallback, the named-pipe census, Toolhelp reaping —
+    /// have only ever been type-checked, and macOS has never been built. The
+    /// setting is honoured everywhere: `{"terminal": {"pty_holder": true}}`
+    /// opts a Windows or macOS box in.
+    ///
+    /// A holder that cannot be started falls back, visibly, to an in-process
+    /// PTY (`daemon_pane_io::spawn_holder_pane_or_fallback`), so ON never
+    /// costs a working terminal. `{"terminal": {"pty_holder": false}}` turns
+    /// it off for new panes, on any platform.
     ///
     /// Read once per spawn, from the non-mutating cached settings read
     /// ([`get_terminal_settings`]), so a change applies to the next terminal;
     /// an open pane keeps the backend it was born with. No settings UI: a
-    /// hand-edit of `settings.json` (`{"terminal": {"pty_holder": true}}`).
+    /// hand-edit of `settings.json` (`{"terminal": {"pty_holder": false}}`).
     pub pty_holder: bool,
+}
+
+/// `terminal.pty_holder`'s default on this platform: ON on Linux only (see
+/// [`TerminalSettings::pty_holder`]).
+pub const PTY_HOLDER_DEFAULT: bool = cfg!(target_os = "linux");
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            pty_holder: PTY_HOLDER_DEFAULT,
+        }
+    }
 }
 
 /// The `terminal.*` settings for a spawn happening now.
@@ -3746,11 +3807,29 @@ pub struct TerminalSettings {
 /// Reads through [`read_settings_from_disk`] — the NON-MUTATING, cached read —
 /// rather than [`load_settings`], whose loader can write the operator's
 /// settings file, mint ids and touch the keyring: nothing a terminal spawn
-/// should do. An unreadable settings file yields the defaults, i.e. the switch
-/// OFF, which is the safe reading of UNKNOWN here (the census-invisibility
-/// failure stays unreachable).
+/// should do.
+///
+/// **An UNREADABLE settings file turns the holder OFF for the spawn**, whatever
+/// the platform default: its `Settings` is a default placeholder, and reading
+/// the default ON from it would override an operator's explicit
+/// `"pty_holder": false` the moment the file stops parsing. `LocalPty` is
+/// today's terminal, so OFF costs nothing but survival — the opt-out is never
+/// silently overridden. Logged at `warn`.
 pub fn get_terminal_settings() -> TerminalSettings {
-    read_settings_from_disk().settings.terminal
+    terminal_settings_from(read_settings_from_disk())
+}
+
+/// [`get_terminal_settings`]'s decision over one load — the testable seam.
+fn terminal_settings_from(loaded: LoadedSettings) -> TerminalSettings {
+    if loaded.provenance == SettingsProvenance::Unreadable {
+        warn!(
+            error = ?loaded.error,
+            "terminal.pty_holder: settings.json is unreadable — new panes use an in-process PTY \
+             so an operator's opt-out is never overridden by a default"
+        );
+        return TerminalSettings { pty_holder: false };
+    }
+    loaded.settings.terminal
 }
 
 /// Settings → Runner → "Allowed browser origins".
