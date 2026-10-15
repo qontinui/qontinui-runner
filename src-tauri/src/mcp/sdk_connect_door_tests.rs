@@ -51,7 +51,15 @@ struct Door {
 /// - the keychain is switched off, so `store_tokens` never writes the
 ///   operator's real one;
 /// - every proxy variable is cleared, so a proxy in the developer's shell is
-///   never handed a request;
+///   never handed a request, and `NO_PROXY` is then set to exactly what the
+///   runner exports at startup (`outbound_net::LOOPBACK_NO_PROXY`). The
+///   tests below point the process-global `HTTP_PROXY` at a recording proxy,
+///   and every OTHER test running in this process at that moment builds its
+///   clients from the same environment: with `NO_PROXY` empty, their
+///   `http://127.0.0.1` requests went through the recording proxy and failed
+///   (`forward_claims_get_unreachable_coord_is_502` read an empty 502 body).
+///   With the runner's own `NO_PROXY` they bypass it, as they do in
+///   production;
 /// - an unexpired device JWT is stored where `connect_sdk_app` will find it.
 fn door() -> Door {
     let ambient = crate::test_env::isolated_ambient();
@@ -61,6 +69,10 @@ fn door() -> Door {
     for key in PROXY_ENV {
         std::env::remove_var(key);
     }
+    std::env::set_var(
+        "NO_PROXY",
+        qontinui_runner_lib::outbound_net::LOOPBACK_NO_PROXY.join(","),
+    );
     crate::auth::AuthManager::new()
         .store_tokens(&a_stored_device_jwt(), "")
         .expect("the fixture stores a device JWT");
@@ -85,8 +97,13 @@ fn a_stored_device_jwt() -> String {
 /// A UI Bridge app on 127.0.0.1. It answers every path like a healthy app and
 /// records the `Host` and `Authorization` of each request.
 async fn spawn_app() -> (u16, Seen) {
+    spawn_app_on("127.0.0.1").await
+}
+
+/// [`spawn_app`] on a chosen loopback address.
+async fn spawn_app_on(ip: &str) -> (u16, Seen) {
     let seen: Seen = Arc::default();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let seen_by_app = seen.clone();
     let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
@@ -285,16 +302,22 @@ async fn a_foreign_host_behind_a_proxy_never_receives_the_stored_bearer() {
 /// A configured proxy never sees a loopback connect. The handshake dials a
 /// loopback relay DIRECT, so the proxy receives neither the request nor the
 /// operator's bearer, which would otherwise ride on it in forward-proxy form.
-/// `NO_PROXY` is cleared, so the only thing that keeps the request off the
-/// proxy is the connect's own client. The loopback relay is admitted, so it
-/// does get the bearer, and gets it directly.
+/// The relay is at `127.0.0.2`: a loopback address the runner's `NO_PROXY`
+/// (`127.0.0.1`, `::1`, `localhost`) does not cover, though the bearer's
+/// loopback class admits all of `127.0.0.0/8`. So the only thing that keeps
+/// the request off the proxy is the connect's own client. The loopback relay
+/// is admitted, so it does get the bearer, and gets it directly.
+///
+/// Not on macOS, which answers only `127.0.0.1` on its loopback interface
+/// unless an alias is configured.
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn a_configured_proxy_never_sees_a_loopback_connect() {
     let _door = door();
-    let (app_port, app_seen) = spawn_app().await;
+    let (app_port, app_seen) = spawn_app_on("127.0.0.2").await;
     let (proxy_port, proxy_seen) = spawn_proxy(String::new());
     let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
-    let relay = format!("127.0.0.1:{app_port}");
+    let relay = format!("127.0.0.2:{app_port}");
     std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"));
     let connected = connect_sdk_app(
         &manager,
