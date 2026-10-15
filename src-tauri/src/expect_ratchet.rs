@@ -115,7 +115,9 @@ mod tests {
             // 435 -> 434: graphql `task_run_output` moved to char-boundary
             // `str::get` slicing in `graphql::output_page` (plan
             // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
-            baseline: 434,
+            // 434 -> 430: the count measured on PR #2188's merge with main
+            // (`the_expect_count_only_falls` reported 430 < 434).
+            baseline: 430,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (
