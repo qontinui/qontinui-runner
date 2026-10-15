@@ -77,6 +77,18 @@ const OVERRIDE_ENV: &str = "QONTINUI_INSTALL_OVERRIDE";
 /// the "real" tool (self-spawn loop).
 const SHIM_DIR_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR";
 
+/// Env var carrying this launch's argv, as a JSON array, to the `claude` the
+/// identity straddle launches (plan
+/// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 6 /
+/// D11). Mirrors `session::resume_argv::LAUNCH_ARGV_ENV` in the runner bin
+/// crate, which this bin cannot import. See [`launch_argv_json`].
+const LAUNCH_ARGV_ENV: &str = "QONTINUI_LAUNCH_ARGV";
+
+/// Largest [`LAUNCH_ARGV_ENV`] value exported; a longer one is not exported at
+/// all (the relaunch then uses the default resume command). Same bound as the
+/// bash identity shim and the SessionStart hook's OSC check.
+const LAUNCH_ARGV_MAX_BYTES: usize = 4096;
+
 /// Override, in whole seconds, for how long a real-tool MISS is re-scanned
 /// before falling through (`0` disables the wait). Shared with the bash and
 /// `.cmd` shim templates. See [`resolve_real_waiting`].
@@ -574,8 +586,10 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let real = resolve_real_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
+    // Nor does it inherit its parent's launch argv: its own SessionStart hook
+    // would report the parent's flags under the nested session's id.
     if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
-        return exec_real(&real, tool.program(), args);
+        return exec_real_child_env(&real, tool.program(), args, &[LAUNCH_ARGV_ENV], &[]);
     }
 
     let pinned = env::var(PINNED_SESSION_ENV)
@@ -661,7 +675,20 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     } else {
         &[POLICY_DELIVERED_SHA_ENV, POLICY_DELIVERED_FILE_ENV]
     };
-    let code = exec_real_child_env(&real, tool.program(), &final_args, env_remove);
+    // The argv this launch RECEIVED (before the appends above), for a tier-2
+    // relaunch should the pane's PTY holder die. Claude only: it is the
+    // provider whose SessionStart hook reports it.
+    let mut env_remove = env_remove.to_vec();
+    env_remove.push(LAUNCH_ARGV_ENV);
+    let launch_argv = match tool {
+        IdentityTool::Claude => launch_argv_json(args),
+        IdentityTool::Gemini => None,
+    };
+    let env_set: Vec<(&str, &str)> = launch_argv
+        .as_deref()
+        .map(|v| vec![(LAUNCH_ARGV_ENV, v)])
+        .unwrap_or_default();
+    let code = exec_real_child_env(&real, tool.program(), &final_args, &env_remove, &env_set);
     // Explicit, not incidental: the minted config holds a live device credential
     // and is deleted HERE — after the child that read it has exited. Dropping it
     // any earlier would delete the file before `claude` reads it at launch.
@@ -890,6 +917,46 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// [`LAUNCH_ARGV_ENV`]'s value for a launch that received `args`: a JSON array
+/// of them, minus the runner's own plumbing — the shell integration's
+/// `--append-system-prompt[-file] <value>`, which the relaunched pane re-adds
+/// and whose inline value is multi-kilobyte. Every string is escaped
+/// ([`json_escape`], plus DEL), so no raw control byte reaches the hook's OSC
+/// sequence. `None` over [`LAUNCH_ARGV_MAX_BYTES`]. Mirrors `launch_argv_json`
+/// in `resources/intercept/identity_shim.bash`.
+fn launch_argv_json(args: &[String]) -> Option<String> {
+    let mut out = String::from("[");
+    let mut skip = false;
+    let mut first = true;
+    for a in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        match a.as_str() {
+            "--append-system-prompt" | "--append-system-prompt-file" => {
+                skip = true;
+                continue;
+            }
+            s if s.starts_with("--append-system-prompt=")
+                || s.starts_with("--append-system-prompt-file=") =>
+            {
+                continue
+            }
+            _ => {}
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push('"');
+        out.push_str(&json_escape(a).replace('\u{7f}', "\\u007f"));
+        out.push('"');
+    }
+    out.push(']');
+    (out.len() <= LAUNCH_ARGV_MAX_BYTES).then_some(out)
 }
 
 /// Best-effort grab of `"correlation_id":"…"` from a JSON response without a
@@ -1202,17 +1269,19 @@ fn exec_real(real: &Option<PathBuf>, name: &str, args: &[String]) -> Option<i32>
 /// Unix.) A spawn failure fails open to a non-fatal surrogate code so the shell
 /// is never bricked.
 fn exec_real_child(real: &Option<PathBuf>, name: &str, args: &[String]) -> Option<i32> {
-    exec_real_child_env(real, name, args, &[])
+    exec_real_child_env(real, name, args, &[], &[])
 }
 
 /// [`exec_real_child`] with `env_remove` variables stripped from the child's
 /// inherited environment (the identity straddle's policy-marker rule, see
-/// [`keeps_policy_delivered_sha`]).
+/// [`keeps_policy_delivered_sha`]) and `env_set` pairs set on it (after the
+/// removals, so a variable in both is set).
 fn exec_real_child_env(
     real: &Option<PathBuf>,
     name: &str,
     args: &[String],
     env_remove: &[&str],
+    env_set: &[(&str, &str)],
 ) -> Option<i32> {
     let mut cmd = match real {
         Some(p) => Command::new(p),
@@ -1232,6 +1301,9 @@ fn exec_real_child_env(
     };
     for var in env_remove {
         cmd.env_remove(var);
+    }
+    for (k, v) in env_set {
+        cmd.env(k, v);
     }
     cmd.args(args)
         .env(GUARD_ENV, "1")
@@ -1405,6 +1477,35 @@ mod tests {
         );
         // And 127 survives the ExitCode clamp (never collapses to exit 0).
         assert_eq!(code_to_u8(Some(127)), 127);
+    }
+
+    /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+    /// Phase 6: the exported launch argv is valid JSON, carries every
+    /// user-given token, leaves out the runner's prompt plumbing, escapes
+    /// control bytes, and is not exported at all over the bound.
+    #[test]
+    fn launch_argv_json_is_escaped_json_without_the_runner_plumbing() {
+        let args: Vec<String> = [
+            "--model",
+            "opus",
+            "--append-system-prompt",
+            "ctx\nline",
+            "--append-system-prompt-file=/tmp/c.md",
+            "a\"b\\c",
+            "esc\u{1b}del\u{7f}",
+        ]
+        .map(String::from)
+        .to_vec();
+        let json = launch_argv_json(&args).expect("under the bound");
+        assert!(!json.chars().any(|c| c.is_control()), "{json:?}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!(["--model", "opus", "a\"b\\c", "esc\u{1b}del\u{7f}"])
+        );
+        assert_eq!(launch_argv_json(&[]).as_deref(), Some("[]"));
+        let huge = vec!["x".repeat(LAUNCH_ARGV_MAX_BYTES)];
+        assert_eq!(launch_argv_json(&huge), None);
     }
 
     #[test]

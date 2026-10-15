@@ -2518,4 +2518,269 @@ mod script_tests {
         });
         assert_eq!(parsed["terminal_id"], HOSTILE, "under {locale}: {body}");
     }
+
+    // ---- Phase 6 (plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+    // D11): the launch argv and the session id travel shim → env → hook → PTY.
+
+    /// Run `program args` under a REAL pseudo-terminal (so `/dev/tty` exists,
+    /// as it does for a hook inside a pane) with exactly `envs`, and return
+    /// every byte the terminal received.
+    fn run_under_pty(program: &Path, args: &[&str], envs: &[(&str, &str)]) -> Vec<u8> {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::Read;
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("a pty");
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(args);
+        cmd.env_clear();
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn under the pty");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("pty reader");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+            }
+            let _ = tx.send(all);
+        });
+        let deadline = std::time::Instant::now() + SCRIPT_BUDGET;
+        loop {
+            if child.try_wait().expect("poll the child").is_some() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("{} hung under the pty", program.display());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(pair.master);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the pty reader finished")
+    }
+
+    /// The `session_start` report a terminal's grid would route, parsed —
+    /// the runner's own reader-thread path over the bytes a pane received.
+    fn report_from_pty(
+        bytes: &[u8],
+    ) -> Option<crate::terminal::session_start_sideband::SessionStartReport> {
+        let mut grid = crate::terminal::grid::Grid::new(200, 24);
+        let mut parser = vte::Parser::new();
+        grid.feed(&mut parser, bytes);
+        let raw = grid.take_session_start_sideband()?;
+        crate::terminal::session_start_sideband::parse_session_start(&raw)
+    }
+
+    /// The whole chain, with the real scripts: the identity shim exports the
+    /// argv it received (runner plumbing removed) to `claude`; `claude`'s
+    /// SessionStart hook writes the OSC 9999 `session_start` report to its
+    /// TTY; the runner's grid routes it and the parser yields the id and argv;
+    /// the relaunch keeps the flags and drops the prompt. No port, no curl —
+    /// the report needs neither.
+    #[test]
+    fn launch_argv_and_session_id_reach_the_runner_over_the_pty() {
+        let _serial = exe_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let bash = which_host("bash").expect("bash is on PATH");
+        let shim_dir = tmp.path().join("shim");
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let hook = tmp.path().join("claude_session_hook.sh");
+        write_exe(&hook, SESSION_HOOK);
+        let payload = tmp.path().join("payload.json");
+        std::fs::write(&payload, session_start_payload("startup")).unwrap();
+        // The "real" claude does what Claude Code does at startup: runs the
+        // SessionStart hook with the payload on stdin, in its own environment.
+        write_exe(
+            &real_dir.join("claude"),
+            &format!(
+                "#!{}\n'{}' '{}' < '{}'\n",
+                bash.display(),
+                bash.display(),
+                hook.display(),
+                payload.display()
+            ),
+        );
+        let rendered = IDENTITY_SHIM_BASH
+            .replace("@@TOOL@@", "claude")
+            .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy());
+        write_exe(&shim_dir.join("claude"), &rendered);
+        let path = format!(
+            "{}:{}:/usr/bin:/bin",
+            shim_dir.display(),
+            real_dir.display()
+        );
+        let out = run_under_pty(
+            &bash,
+            &[
+                shim_dir.join("claude").to_str().unwrap(),
+                // The prompt FIRST: after the variadic `--add-dir` it would be
+                // one more directory, exactly as `claude`'s own parser reads it.
+                "fix the build",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "You are in the runner.\nMulti-line context; with \"quotes\".",
+                "--add-dir",
+                "/srv/a",
+            ],
+            &[("PATH", path.as_str())],
+        );
+        let report = report_from_pty(&out).unwrap_or_else(|| {
+            panic!(
+                "no session_start report reached the pty: {:?}",
+                String::from_utf8_lossy(&out)
+            )
+        });
+        assert_eq!(report.session_id, SESSION_ID);
+        assert_eq!(report.source.as_deref(), Some("startup"));
+        let argv = report.argv.expect("the shim's argv rode the report");
+        assert_eq!(
+            argv,
+            ["fix the build", "--model", "opus", "--add-dir", "/srv/a"].map(String::from),
+            "the runner plumbing is left out at the source"
+        );
+        assert_eq!(
+            crate::session::resume_argv::replay_args(&argv, SESSION_ID).unwrap(),
+            ["--model", "opus", "--add-dir", "/srv/a"].map(String::from),
+            "the relaunch keeps the flags and never replays the prompt"
+        );
+    }
+
+    /// The hook alone: a launch argv that is not a clean escaped JSON array
+    /// (a raw ESC would end the OSC early and print the rest) is LEFT OUT —
+    /// the id still goes; an id that is not shell-safe sends no report at
+    /// all; and without a terminal the hook is a silent no-op.
+    #[test]
+    fn the_session_hook_reports_only_checked_values_over_the_pty() {
+        let _serial = exe_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let bash = which_host("bash").expect("bash is on PATH");
+        let hook = tmp.path().join("claude_session_hook.sh");
+        write_exe(&hook, SESSION_HOOK);
+        let run = |payload: &str, argv: &str| {
+            let file = tmp.path().join("payload.json");
+            std::fs::write(&file, payload).unwrap();
+            let script = format!(
+                "'{}' '{}' < '{}'",
+                bash.display(),
+                hook.display(),
+                file.display()
+            );
+            run_under_pty(
+                &bash,
+                &["-c", &script],
+                &[("PATH", "/usr/bin:/bin"), ("QONTINUI_LAUNCH_ARGV", argv)],
+            )
+        };
+
+        let out = run(
+            &session_start_payload("resume"),
+            "[\"--model\",\"x\u{1b}]0;pwned\u{7}\"]",
+        );
+        let report = report_from_pty(&out).expect("the id is still reported");
+        assert_eq!(report.session_id, SESSION_ID);
+        assert_eq!(report.source.as_deref(), Some("resume"));
+        assert_eq!(
+            report.argv, None,
+            "a raw control byte keeps the argv out of the OSC"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out).contains("pwned"),
+            "nothing leaked out of the sequence: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let out = run(
+            "{\"session_id\":\"abc;rm -rf\",\"source\":\"startup\"}",
+            "[]",
+        );
+        assert!(
+            !out.windows(5).any(|w| w == b"\x1b]9999"),
+            "an id that is not shell-safe sends no report: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // No controlling terminal: the existing harness's run, which asserts
+        // success, and nothing on stderr from the /dev/tty write. That harness
+        // takes the exe lock itself, and the lock is not re-entrant.
+        drop(_serial);
+        let headless = run_session_hook(&session_start_payload("startup"), &["python3"]);
+        assert!(headless.stderr.is_empty(), "{}", headless.stderr);
+    }
+
+    /// A NESTED `claude` (the recursion guard is set by the outer shim's exec)
+    /// must not inherit its parent's launch argv: its own hook would report
+    /// the parent's flags under the nested session's id.
+    #[test]
+    fn bash_identity_shim_exports_the_launch_argv_and_a_nested_launch_drops_it() {
+        let _serial = exe_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let shim_dir = tmp.path().join("shim");
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let out = real_dir.join("env.txt");
+        write_exe(
+            &real_dir.join("claude"),
+            &format!(
+                "#!/usr/bin/env bash\nprintf '%s' \"${{QONTINUI_LAUNCH_ARGV-<unset>}}\" > '{}'\n",
+                out.display()
+            ),
+        );
+        let rendered = IDENTITY_SHIM_BASH
+            .replace("@@TOOL@@", "claude")
+            .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy());
+        write_exe(&shim_dir.join("claude"), &rendered);
+        let run = |guard: bool| {
+            let mut cmd = Command::new("bash");
+            cmd.arg(shim_dir.join("claude"))
+                .args([
+                    "--model",
+                    "opus",
+                    "tab\there",
+                    "--append-system-prompt-file=/x",
+                ])
+                .env_clear()
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}:/usr/bin:/bin",
+                        shim_dir.display(),
+                        real_dir.display()
+                    ),
+                )
+                .env("QONTINUI_LAUNCH_ARGV", "[\"--from-the-parent\"]");
+            if guard {
+                cmd.env("QONTINUI_INSTALL_INTERCEPT_GUARD", "1");
+            }
+            let res = output_with_timeout(cmd, SCRIPT_BUDGET).expect("the shim runs");
+            assert!(
+                res.status.success(),
+                "{}",
+                String::from_utf8_lossy(&res.stderr)
+            );
+            std::fs::read_to_string(&out).expect("the real claude ran")
+        };
+        let exported = run(false);
+        let parsed: serde_json::Value = serde_json::from_str(&exported)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {exported}"));
+        assert_eq!(parsed, serde_json::json!(["--model", "opus", "tab\there"]));
+        assert_eq!(run(true), "<unset>", "a nested launch carries no argv");
+    }
 }

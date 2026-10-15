@@ -157,11 +157,77 @@ exec_real() {
 }
 
 # Recursion guard: a nested invocation is a pure passthrough — never re-pin.
+# It also must not inherit its PARENT's launch argv (below): its own
+# SessionStart hook would otherwise report the parent's flags under the nested
+# session's id.
 if [ "${QONTINUI_INSTALL_INTERCEPT_GUARD:-}" = "1" ]; then
+  unset QONTINUI_LAUNCH_ARGV
   exec_real "$@"
 fi
 
 PINNED="${QONTINUI_PINNED_SESSION_ID:-}"
+
+# ---------------------------------------------------------------------------
+# Launch argv for a tier-2 relaunch (plan
+# 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6 /
+# D11). For TOOL=claude, export the argv this launch received as a JSON array
+# in QONTINUI_LAUNCH_ARGV. The runner-bundled SessionStart hook — a child of
+# that claude, so it inherits the variable — writes it to the PTY in its OSC
+# 9999 `session_start` report, and the runner persists it on the session's
+# record. If the pane's PTY holder later dies, the session is relaunched with
+# these flags plus `--resume <id>` (the runner refuses any relaunch whose
+# surviving tokens are not shell-inert — `session::resume_argv`).
+#
+# The runner's own plumbing is left out: the shell integration's
+# `--append-system-prompt[-file] <value>` (re-added in the relaunched pane, and
+# an inline value is multi-kilobyte) — and so is everything this shim appends
+# below, which comes after "$@". Every value is JSON-escaped here, control
+# characters included, so the hook can splice the array into its payload
+# without ever carrying a raw ESC or BEL into an OSC sequence. Fail-open: an
+# array over 4 KiB is not exported at all, and the relaunch then uses the
+# default resume command.
+qs_json_str() {
+  # C locale: the control-character range below is an ERE, which honours
+  # LC_COLLATE; see `qh_json_escape` in claude_session_hook.sh.
+  local LC_ALL=C
+  local s="$1" c u
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  while [[ $s =~ [$'\x01'-$'\x1f'$'\x7f'] ]]; do
+    c="${BASH_REMATCH[0]}"
+    printf -v u '\\u%04x' "'$c"
+    s="${s//"$c"/$u}"
+  done
+  printf '"%s"' "$s"
+}
+
+launch_argv_json() {
+  local out="[" sep="" skip=0 a
+  for a in "$@"; do
+    if [ "$skip" -eq 1 ]; then
+      skip=0
+      continue
+    fi
+    case "$a" in
+      --append-system-prompt|--append-system-prompt-file) skip=1; continue ;;
+      --append-system-prompt=*|--append-system-prompt-file=*) continue ;;
+    esac
+    out="$out$sep$(qs_json_str "$a")"
+    sep=","
+  done
+  printf '%s]' "$out"
+}
+
+unset QONTINUI_LAUNCH_ARGV
+if [ "$TOOL" = "claude" ]; then
+  qs_launch_argv="$(launch_argv_json "$@")"
+  if [ "${#qs_launch_argv}" -le 4096 ]; then
+    export QONTINUI_LAUNCH_ARGV="$qs_launch_argv"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Claude SessionStart hook delivery (plan §4, Phase 2).

@@ -33,6 +33,7 @@ pub mod remote_pane_io;
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;
+pub mod session_start_sideband; // OSC 9999 `session_start` report: the SessionStart hook's id + launch argv over the PTY (plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6 / D11)
 pub mod transcript;
 pub mod transcript_watcher;
 #[cfg(test)]
