@@ -58,7 +58,12 @@
 //!    input and read output past X): the pane is taken back all the same —
 //!    the child must keep a holder — but the held input is NOT replayed, an
 //!    in-stream notice declares that output since X may be missing
-//!    ([`upgrade_loss_notice`]), and the log says so at error level. Otherwise it answers the requester
+//!    ([`upgrade_loss_notice`]), and the log says so at error level. X is
+//!    recorded (`Pane::record_stream_replaced_at`): a client that had attached
+//!    to the dead successor holds an offset on ITS stream, so any attach past
+//!    X gets an explicit `output_lost` from X, never this holder's own bytes
+//!    replayed at a misaligned offset (H1, coord finding f4672ed2;
+//!    `server::attach_start`). Otherwise it answers the requester
 //!    `upgraded` and exits with `_exit`: closing its copy of the master WITHOUT signalling the
 //!    child (the child is a session leader on its own PTY; the holder is not
 //!    its controlling process, so nothing hangs it up), and running none of the
@@ -801,6 +806,11 @@ fn take_pane_back(
         Back::Lossless(held) => pane.restore_handed_input(held),
         Back::DeclaredLoss { handoff_offset } => {
             pane.restore_handed_input(Vec::new());
+            // H1 (coord finding f4672ed2): record X BEFORE the notice enters
+            // the stream, so no attach can see this holder's bytes past X
+            // without the rule that refuses to replay them to a client whose
+            // offset came from the dead successor.
+            pane.record_stream_replaced_at(handoff_offset);
             pane.inject_stream_notice(&upgrade_loss_notice(handoff_offset));
         }
     }

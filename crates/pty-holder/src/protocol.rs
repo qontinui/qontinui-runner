@@ -214,6 +214,11 @@ pub struct AttachedReply {
     /// A requested offset past `end_offset` (one the holder never produced —
     /// the client's offset belongs to another stream) is clamped to
     /// `end_offset`, so `start_offset < from_offset` says exactly that.
+    /// After a holder took its pane back from a successor that died after
+    /// serving it (plan Phase 8, H1), a `from_offset` past that take-back's
+    /// offset X may be the dead successor's: the reply's `start_offset` is
+    /// then X, and an `output_lost {X, max(from_offset, end_offset)}` frame
+    /// comes first — the stream continues at its `to_offset`.
     pub start_offset: u64,
     /// Absolute offset of the oldest byte the holder's ring still holds.
     pub ring_start_offset: u64,

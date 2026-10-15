@@ -1099,6 +1099,132 @@ mod unix {
         assert!(!dir.join("p1.sock.upg").exists());
     }
 
+    /// The first event on a fresh attach, skipping nothing: it must be the
+    /// loss report when one is owed.
+    fn first_event(s: &mut AttachedStream) -> Event {
+        s.reader
+            .next_event(Some(soon()))
+            .expect("an event")
+            .expect("the stream is open")
+    }
+
+    /// H1 (coord finding f4672ed2): after a declared-loss take-back at X, a
+    /// client whose offset is past X — one that had attached to the dead
+    /// successor and read ITS output — reattaches to the predecessor with an
+    /// EXPLICIT `output_lost` from X and is never replayed the predecessor's
+    /// own bytes at its misaligned offset. An attach at X itself still
+    /// replays from X (the notice first), with no loss.
+    #[test]
+    fn pty_holder_handoff_attach_past_a_declared_loss_is_told_the_loss() {
+        let mut pane = start_with(
+            "h1",
+            echo_spec(0),
+            Some("exit-after-serving"),
+            &[(COMMIT_DELAY_ENV, "1500"), (SERVING_POLL_DELAY_ENV, "2500")],
+        );
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        let mut live = attach(&dir, None);
+        let from = live.info.start_offset;
+        let r = read_until(&mut live, from, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"before-swap") > 0
+        });
+        let req_dir = dir.clone();
+        let request = std::thread::spawn(move || {
+            connect(&req_dir, &p1(), soon())
+                .unwrap()
+                .prepare_upgrade(upgrade_deadline())
+        });
+        let successor = logged_pid(&dir, "adopt: acked");
+        pane.adopt_cleanup(successor);
+        // Held across the swap: the successor writes it and reads its echo,
+        // so its stream really does run past X before it dies.
+        send_input(&dir, b"held\n");
+        let outcome = request.join().unwrap().expect("prepare_upgrade answered");
+        let UpgradeOutcome::Failed(why) = &outcome else {
+            panic!("expected a declared-loss take-back, got {outcome:?}");
+        };
+        let x: u64 = why
+            .split("output since offset ")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no take-back offset in {why:?}"));
+        served_by(&dir, pane.holder_pid);
+        // The live connection (never on the successor) reads the notice AT X.
+        let marker: &[u8] = b"holder upgrade: the successor holder died after taking over";
+        let r2 = read_until(&mut live, r.next, Duration::from_secs(10), |r| {
+            count(&r.bytes, marker) > 0
+        });
+        assert!(
+            !r2.lost,
+            "the connection that stayed on this holder lost nothing"
+        );
+        assert_eq!(
+            r2.bytes.first(),
+            Some(&0x18),
+            "the stream after X starts with the notice (r.next {} == X {x})",
+            r.next
+        );
+        assert_eq!(r.next, x, "the live connection had read exactly to X");
+
+        // 1. An offset past X but inside this holder's stream: lost from X to
+        //    the end, and nothing at an offset below it is ever replayed.
+        let mut h1 = attach(&dir, Some(x + 1));
+        assert_eq!(h1.info.start_offset, x, "start_offset names the break");
+        let end = h1.info.end_offset;
+        assert!(end > x + 1, "the notice is in the ring: end {end}, X {x}");
+        match first_event(&mut h1) {
+            Event::Lost {
+                from_offset,
+                to_offset,
+            } => assert_eq!((from_offset, to_offset), (x, end)),
+            other => panic!("expected output_lost first, got {other:?}"),
+        }
+        send_input(&dir, b"after\n");
+        let r3 = read_until(&mut h1, end, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:after") > 0
+        });
+        assert!(
+            !r3.lost,
+            "one loss report, then contiguous output from {end}"
+        );
+        assert_eq!(count(&r3.bytes, marker), 0, "nothing before `end` replayed");
+
+        // 2. An offset past this holder's END (the dead successor ran ahead):
+        //    lost from X to that offset; output resumes exactly there.
+        let mut h2 = attach(&dir, None);
+        let tail_end = h2.info.end_offset;
+        drop(h2);
+        let ahead = tail_end + 40;
+        let mut h3 = attach(&dir, Some(ahead));
+        assert_eq!(h3.info.start_offset, x);
+        match first_event(&mut h3) {
+            Event::Lost {
+                from_offset,
+                to_offset,
+            } => assert_eq!((from_offset, to_offset), (x, ahead)),
+            other => panic!("expected output_lost first, got {other:?}"),
+        }
+        let long = format!("{}\n", "z".repeat(200));
+        send_input(&dir, long.as_bytes());
+        let r4 = read_until(&mut h3, ahead, Duration::from_secs(10), |r| {
+            r.bytes.len() > 10
+        });
+        assert!(!r4.lost);
+        assert!(r4.next > ahead, "output resumed at the client's offset");
+
+        // 3. An attach AT X is a normal resume: no loss, the notice first.
+        let mut at_x = attach(&dir, Some(x));
+        assert_eq!(at_x.info.start_offset, x);
+        let r5 = read_until(&mut at_x, x, Duration::from_secs(10), |r| {
+            count(&r.bytes, marker) > 0
+        });
+        assert!(!r5.lost, "an offset at X is this holder's own");
+        assert_eq!(r5.bytes.first(), Some(&0x18));
+        no_snapshot_left(&dir);
+    }
+
     /// Review r3 nit (path C): the successor's endpoint rename FAILS after the
     /// commit. It sends no `serving`, waits for the predecessor to leave
     /// before it touches the master or the held input, then serves the pane
