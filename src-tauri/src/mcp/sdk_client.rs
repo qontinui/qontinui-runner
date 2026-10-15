@@ -459,6 +459,10 @@ async fn select_app_payload(
 ///
 /// `http_body` falls back to `serde_json::Value::Null` when `None` to match
 /// the existing convention in `dispatch_app_request`.
+///
+/// An HTTP-transport app that answers `{success:false, error}` comes back as
+/// `Err(<the app's error>)`, whatever the status, the same as on
+/// `/apps/{id}/dispatch` (coord finding `fb3fb468`).
 pub async fn dispatch_app_request_by_id(
     state: &Arc<ApiState>,
     app_id: &str,
@@ -468,9 +472,34 @@ pub async fn dispatch_app_request_by_id(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let payload = select_app_payload(&state.app_registry, app_id, ws_payload, http_body).await;
-    state
-        .app_dispatcher
+    dispatch_app_request_by_id_with(
+        &state.app_registry,
+        &state.app_dispatcher,
+        app_id,
+        action,
+        ws_payload,
+        http_method,
+        http_path,
+        http_body,
+    )
+    .await
+}
+
+/// [`dispatch_app_request_by_id`] over the registry and dispatcher alone, so
+/// a test drives the real body without building an `ApiState`.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_app_request_by_id_with(
+    registry: &super::app_registry::AppRegistry,
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    app_id: &str,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let payload = select_app_payload(registry, app_id, ws_payload, http_body).await;
+    dispatcher
         .dispatch(app_id, action, http_method, http_path, payload)
         .await
         .map_err(dispatch_err_to_string)
@@ -535,7 +564,9 @@ fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::
     use super::command_relay::CommandRelayError;
     let (origin, app_code, retryable) = match err {
         DispatchError::NotConnected => return None,
-        DispatchError::AppAnswered { code, .. } => ("app", code.clone(), None),
+        DispatchError::AppAnswered {
+            code, retryable, ..
+        } => ("app", code.clone(), *retryable),
         DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
             ("app", failure.code.clone(), failure.retryable)
         }
@@ -8284,6 +8315,64 @@ mod tests {
         assert_eq!(chosen, serde_json::Value::Null);
     }
 
+    /// A caller OTHER than `/apps/{id}/dispatch` sees an HTTP app's own
+    /// failure too. `dispatch_app_request_by_id` (the `?app_id=` handlers)
+    /// shares `AppDispatcher::dispatch`'s HTTP arm with `/apps/{id}/dispatch`
+    /// and with the spec validator's live-snapshot fetch. An app answering
+    /// 200 `{success:false, error}` used to come back to it as `Ok` with the
+    /// failure inside the value. It is now `Err` carrying the app's error,
+    /// for the wrapper's string and object `error` shapes alike.
+    #[tokio::test]
+    async fn by_id_dispatch_returns_an_http_apps_answered_failure_as_err() {
+        use axum::routing::post;
+        for answer in [
+            serde_json::json!({"success": false, "error": "no handler for getControlSnapshot", "code": "NO_HANDLER"}),
+            serde_json::json!({"success": false, "error": {"code": "NO_HANDLER", "message": "no handler for getControlSnapshot", "retryable": false}}),
+        ] {
+            let app = axum::Router::new().route(
+                "/dispatch",
+                post(move || {
+                    let answer = answer.clone();
+                    async move { Json(answer) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let registry = AppRegistry::new();
+            let mut discovered = sample_discovered("happ");
+            discovered.url = format!("http://127.0.0.1:{port}");
+            discovered.base_path = String::new();
+            registry
+                .upsert(discovered, None, AppTransport::Http, None, None)
+                .await;
+            let dispatcher = crate::mcp::app_dispatch::AppDispatcher::new(
+                registry.clone(),
+                crate::mcp::command_relay::CommandRelay::new(
+                    crate::mcp::ws_relay::WsConnectionManager::new(),
+                ),
+            );
+            let got = dispatch_app_request_by_id_with(
+                &registry,
+                &dispatcher,
+                "happ",
+                "getControlSnapshot",
+                serde_json::json!({}),
+                Method::POST,
+                "/dispatch",
+                Some(serde_json::json!({})),
+            )
+            .await;
+            assert_eq!(
+                got,
+                Err("no handler for getControlSnapshot".to_string()),
+                "the app's own failure reaches a by-id caller as Err"
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // Per-tab routing (Item #4) — `?tabId=` thread-through
     // ------------------------------------------------------------------
@@ -8385,6 +8474,7 @@ mod tests {
                 status: 200,
                 error: "element not found".into(),
                 code: None,
+                retryable: None,
             },
             DispatchError::InvalidJson("<html>".into()),
         ]
@@ -8446,6 +8536,7 @@ mod tests {
             status: 200,
             error: "element not found: btn-7".into(),
             code: Some("ELEMENT_NOT_FOUND".into()),
+            retryable: None,
         };
         let refusal = ipc_fallback_refusal(&err, "element action").expect("refused");
         assert_eq!(refusal["failure_origin"], serde_json::json!("app"));
@@ -8543,6 +8634,7 @@ mod tests {
             status: 200,
             error: "element not found".into(),
             code: Some("X".into()),
+            retryable: None,
         };
         assert_eq!(dispatch_err_to_string(err), "element not found");
     }
