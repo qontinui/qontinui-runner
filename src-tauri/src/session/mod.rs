@@ -620,9 +620,11 @@ pub(crate) fn resolve_new_session_tenant() -> Option<Uuid> {
 }
 
 /// [`resolve_new_session_tenant`] for a session whose SPAWN DIRECTORY is
-/// known — the federation path (plan
+/// known (plan
 /// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
-/// Phase 5, the half #2029 deferred).
+/// Phase 5, the federation half #2029 deferred). Used where a session's tenant
+/// is RECORDED — [`crate::claude_session::coord_register::AiCoordRegistrar`]
+/// registration — and where its federation binds, so both follow the repo.
 ///
 /// The cwd-blind resolver answers "machine pin, else paired default", so a
 /// session spawned into tenant B's repo on a machine pinned to A federated A's
@@ -634,13 +636,82 @@ pub(crate) fn resolve_new_session_tenant() -> Option<Uuid> {
 /// the machine rows — the same precedence, the same admission rule
 /// ([`crate::coord_mcp::validate_spawn_tenant`]), the same refusals.
 ///
-/// `repo` is called only when no workspace declaration answered (the proxy's
-/// laziness too), and is the caller's to supply because resolving it is async
-/// and the federation spawn sites are blocking; see
-/// [`crate::claude_session::coord_register::federation_session_tenant`].
+/// The repo read is [`qontinui_runner_lib::repo_tenant::cwd_tenant_for_path`],
+/// the proxy's resolver and caches, bounded by its `CWD_TENANT_BUDGET` and
+/// retried once on a FAST transient failure ([`cwd_tenant_retrying`]). The
+/// decision itself reads the credential store and so runs on the blocking pool;
+/// a join failure is the proxy's retryable selection refusal, never a default.
 ///
-/// `Err` is TERMINAL for federation: a repo or declaration naming a tenant this
-/// device may not act as must never fall through to the default tenant's pool.
+/// `Err` is a refusal: a repo or declaration naming a tenant this device may
+/// not act as, several owners without the default, or a repo still unsettled
+/// on a multi-tenant device. A caller must never substitute the default tenant
+/// for it.
+pub(crate) async fn resolve_new_session_tenant_at(
+    workdir: &str,
+) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+    let path = std::path::PathBuf::from(workdir);
+    let repo = cwd_tenant_retrying(
+        || qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(&path),
+        CWD_TENANT_RETRY_IF_FASTER_THAN,
+        CWD_TENANT_RETRY_DELAY,
+        qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET,
+    )
+    .await;
+    let workdir = workdir.to_string();
+    match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        resolve_new_session_tenant_in(&workdir, || repo)
+    })
+    .await
+    {
+        Ok(answer) => answer,
+        Err(e) => Err(crate::coord_mcp::tenant_selection_failed_error(&e)),
+    }
+}
+
+/// A transient repo answer that came back faster than this is retried once:
+/// the fast transient failures (a worktree not materialised yet, a refused
+/// connection) can clear within a second. A slow one — the budget expiring —
+/// is not: retrying it would only double the stall.
+pub(crate) const CWD_TENANT_RETRY_IF_FASTER_THAN: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Pause before that one retry.
+pub(crate) const CWD_TENANT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Resolve the repo → tenant answer, retrying ONCE when the first answer is
+/// transient and came back within `retry_if_faster_than`. The retry is cut off
+/// so the whole call stays within `budget` measured from the start; if it does
+/// not finish, the first answer stands. Never more than two reads, never past
+/// `budget` (plus the resolver's own bound on the first read).
+pub(crate) async fn cwd_tenant_retrying<F, Fut>(
+    mut resolve: F,
+    retry_if_faster_than: std::time::Duration,
+    delay: std::time::Duration,
+    budget: std::time::Duration,
+) -> qontinui_runner_lib::repo_tenant::CwdTenant
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = qontinui_runner_lib::repo_tenant::CwdTenant>,
+{
+    let started = std::time::Instant::now();
+    let first = resolve().await;
+    if !first.is_transient() || started.elapsed() >= retry_if_faster_than {
+        return first;
+    }
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining <= delay {
+        return first;
+    }
+    tokio::time::sleep(delay).await;
+    match tokio::time::timeout(remaining - delay, resolve()).await {
+        Ok(second) => second,
+        Err(_) => first,
+    }
+}
+
+/// The synchronous decision behind [`resolve_new_session_tenant_at`], with the
+/// repo answer supplied. `repo` is called only when no workspace declaration
+/// answered (the proxy's laziness too).
 pub(crate) fn resolve_new_session_tenant_in(
     workdir: &str,
     repo: impl FnOnce() -> qontinui_runner_lib::repo_tenant::CwdTenant,
@@ -661,13 +732,20 @@ pub(crate) fn resolve_new_session_tenant_in(
 /// Mapping from the proxy's decision to a recorded tenant:
 /// - a named tenant (declared, repo-derived, live machine pin) → that tenant;
 /// - the default slot → the paired default binding, exactly as
-///   [`tenant_for_new_session`] answers an `Unpinned` machine;
+///   [`tenant_for_new_session`] answers an `Unpinned` machine — EXCEPT when the
+///   repo has several owners: there the proxy admitted the default slot only
+///   because the device JWT's tenant claim is one of them, so THAT validated
+///   tenant is what is recorded, never an unchecked `default_binding`;
 /// - an `Unresolvable` machine (with or without a JWT claim) → `None`, exactly
-///   as [`tenant_for_new_session`] answers it today: the federation builder's
-///   own fallback takes over, unchanged. Row 4 is the proxy's slot choice, not
-///   a recording rule;
+///   as [`tenant_for_new_session`] answers it: the federation builder's own
+///   fallback takes over. Row 4 is the proxy's slot choice, not a recording
+///   rule;
 /// - every refusal → `Err`, including the multi-tenant "repo not settled yet"
 ///   guard ([`crate::coord_mcp::repo_unsettled_refusal`]).
+///
+/// So with no workspace declaration and no resolvable repo the answer is the
+/// cwd-blind [`tenant_for_new_session`]'s. A workspace declaration (rows
+/// 1a-1c) now steers the recorded tenant as it steers the proxy — intended.
 pub(crate) fn new_session_tenant_from(
     declaration: impl FnOnce() -> workspace_tenant::WorkspaceDeclaration,
     repo: impl FnOnce() -> qontinui_runner_lib::repo_tenant::CwdTenant,
@@ -678,10 +756,13 @@ pub(crate) fn new_session_tenant_from(
     multi_bound: impl FnOnce() -> bool,
 ) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
     use crate::coord_mcp::{PinOrigin, SessionDecisionInputs, SessionTenantDecision};
+    use qontinui_runner_lib::repo_tenant::CwdTenant;
 
     // A new binding nobody named a tenant for: no pin of its own, and what a
     // mint would record is SAMPLED (row 1e), never chosen (row 1).
     let mut seen_repo = None;
+    // The claim the decision validated a several-owner default slot against.
+    let mut seen_claim = None;
     let decision = crate::coord_mcp::decide_session_tenant(
         tenant_pin::TenantPin::Unpinned,
         PinOrigin::MachineSampled,
@@ -692,7 +773,11 @@ pub(crate) fn new_session_tenant_from(
             Some(r)
         },
         live_pin,
-        jwt_claim_tenant,
+        || {
+            let c = jwt_claim_tenant();
+            seen_claim = Some(c);
+            c
+        },
         admit,
     );
     let inputs = SessionDecisionInputs {
@@ -706,7 +791,11 @@ pub(crate) fn new_session_tenant_from(
     let decision = crate::coord_mcp::repo_unsettled_refusal(&inputs, &decision, multi_bound)
         .unwrap_or(decision);
     match decision {
-        SessionTenantDecision::DefaultSlot => Ok(default_binding()),
+        SessionTenantDecision::DefaultSlot => match inputs.repo {
+            // Admitted only because the claim is one of the owners.
+            Some(CwdTenant::Several { .. }) => Ok(seen_claim.flatten()),
+            _ => Ok(default_binding()),
+        },
         SessionTenantDecision::JwtClaim(_) | SessionTenantDecision::Unresolvable => Ok(None),
         other => other.into_result(),
     }
@@ -877,9 +966,11 @@ mod new_session_tenant_tests {
         );
     }
 
-    /// (c) No resolvable repo: the answer is the cwd-blind
-    /// [`tenant_for_new_session`]'s, unchanged — machine pin, else the paired
-    /// default, and nothing on an unresolvable machine.
+    /// (c) No resolvable repo AND no workspace declaration (`resolve` passes
+    /// `Absent`): the answer is the cwd-blind [`tenant_for_new_session`]'s,
+    /// unchanged — machine pin, else the paired default, and nothing on an
+    /// unresolvable machine. (A declaration, rows 1a-1c, does steer it now —
+    /// see `a_workspace_declaration_outranks_the_repo_as_on_the_proxy`.)
     #[test]
     fn no_resolvable_repo_keeps_the_pin_or_default_answer() {
         for repo in [
@@ -903,6 +994,156 @@ mod new_session_tenant_tests {
                 );
             }
         }
+    }
+
+    /// The same three "nothing to steer by" repo answers on a MULTI-tenant
+    /// device. A settled answer (no repo, no owner of ours) keeps the
+    /// pin/default; a TRANSIENT one is the proxy's retryable "unsettled"
+    /// refusal for every machine-row answer — a guess between tenants is
+    /// never recorded. On an unresolvable machine the answer is still `None`
+    /// (the claim row is the proxy's slot choice, but it too came from the
+    /// machine rows, so it is refused).
+    #[test]
+    fn a_multi_tenant_device_keeps_settled_answers_and_refuses_transient_ones() {
+        for repo in [
+            CwdTenant::NoRepo,
+            CwdTenant::RepoUnregistered {
+                repo: "acme/widgets".to_string(),
+            },
+        ] {
+            for (live, want) in [
+                (TenantPin::Pinned(MACHINE), Some(MACHINE)),
+                (TenantPin::Unpinned, Some(DEFAULT)),
+                (TenantPin::Unresolvable, None),
+            ] {
+                assert_eq!(
+                    resolve(repo.clone(), live, admit_none, true),
+                    Ok(want),
+                    "repo {repo:?}, live pin {live:?}"
+                );
+            }
+        }
+        for live in [
+            TenantPin::Pinned(MACHINE),
+            TenantPin::Unpinned,
+            TenantPin::Unresolvable,
+        ] {
+            assert_eq!(
+                resolve(
+                    CwdTenant::unknown_transient("workdir does not exist: /tmp/x"),
+                    live,
+                    admit_none,
+                    true
+                )
+                .map_err(|r| (r.code, r.retryable)),
+                Err((crate::coord_mcp::TENANT_REPO_UNSETTLED_CODE, true)),
+                "live pin {live:?}"
+            );
+        }
+    }
+
+    /// Several owners and the default slot: what is RECORDED is the tenant
+    /// the ownership check validated (the device JWT's claim), never an
+    /// unchecked `default_binding` that may name someone else.
+    #[test]
+    fn several_owners_record_the_claim_the_check_validated() {
+        let several = CwdTenant::Several {
+            repo: "acme/widgets".to_string(),
+            tenant_ids: vec![REPO_OWNER, OTHER],
+        };
+        let run = |claim: Uuid, default_binding: Uuid| {
+            new_session_tenant_from(
+                || WorkspaceDeclaration::Absent,
+                || several.clone(),
+                TenantPin::Unpinned,
+                || Some(default_binding),
+                || Some(claim),
+                admit_all,
+                || true,
+            )
+        };
+        // The claim is an owner, the paired default binding is not: the
+        // owner is recorded, not the default binding.
+        assert_eq!(run(REPO_OWNER, DEFAULT), Ok(Some(REPO_OWNER)));
+        // The claim is not an owner: refused, whatever the default binding is.
+        assert!(run(DEFAULT, REPO_OWNER).is_err());
+    }
+
+    /// The retry: once, only for a FAST transient answer, never past budget.
+    #[tokio::test]
+    async fn a_fast_transient_repo_answer_is_retried_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let owned = owned_by(REPO_OWNER);
+        let calls = AtomicUsize::new(0);
+        let got = cwd_tenant_retrying(
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let answer = if n == 0 {
+                    CwdTenant::unknown_transient("workdir does not exist: /tmp/x")
+                } else {
+                    owned.clone()
+                };
+                async move { answer }
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(got, owned);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // A standing answer is not retried.
+        let calls = AtomicUsize::new(0);
+        let got = cwd_tenant_retrying(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { CwdTenant::NoRepo }
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(got, CwdTenant::NoRepo);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A SLOW transient answer (the budget expiring) is not retried: that
+        // would only double the stall.
+        let calls = AtomicUsize::new(0);
+        let got = cwd_tenant_retrying(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { CwdTenant::unknown_transient("did not finish within 10s") }
+            },
+            Duration::ZERO,
+            Duration::from_millis(10),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(got.is_transient());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A retry that would overrun the budget keeps the first answer.
+        let calls = AtomicUsize::new(0);
+        let got = cwd_tenant_retrying(
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n > 0 {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    CwdTenant::unknown_transient("coord unreachable")
+                }
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(got.is_transient());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
 

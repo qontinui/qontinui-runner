@@ -45,6 +45,11 @@ pub enum FederationSkipReason {
     DeviceIdMissing,
     /// No effective Claude config dir could be resolved.
     NoConfigDir,
+    /// The session's tenant resolution REFUSED (its repo or workspace names a
+    /// tenant this device may not act as, several owners without the default,
+    /// or a repo still unsettled on a multi-tenant device). The session runs
+    /// UNFEDERATED rather than federating the default tenant's pool.
+    TenantRefused,
 }
 
 impl FederationSkipReason {
@@ -54,6 +59,7 @@ impl FederationSkipReason {
             FederationSkipReason::TenantUnresolved => "tenant-unresolved",
             FederationSkipReason::DeviceIdMissing => "device-id-missing",
             FederationSkipReason::NoConfigDir => "no-config-dir",
+            FederationSkipReason::TenantRefused => "tenant-refused",
         }
     }
 }
@@ -106,25 +112,19 @@ pub fn session_uuid(session_id: &str) -> Uuid {
 ///
 /// The home-dir identity PIN (`federation.rs` device identity) is
 /// deliberately untouched (plan §6).
+///
+/// `session_tenant` is LAZY and runs last: it may read the session's repo →
+/// tenant from coord (bounded by `repo_tenant::CWD_TENANT_BUDGET`), so the
+/// instant skips — no device id, no config dir — are taken first and a box that
+/// cannot federate anyway pays nothing for it. An `Err` from it is a refusal:
+/// the session runs UNFEDERATED ([`FederationSkipReason::TenantRefused`]) and
+/// the default tenant is NOT substituted.
 pub fn build_federation_ctx(
     session_id: &str,
     working_dir: &str,
     cli_settings: &ClaudeCliSettings,
-    session_tenant: Option<Uuid>,
+    session_tenant: impl FnOnce() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
 ) -> Result<SessionContext, FederationSkipReason> {
-    let tenant_id = match resolve_session_context_tenant(session_tenant) {
-        Some(t) => t,
-        None => {
-            warn!(
-                "claude_session::federation: tenant_id unresolvable \
-                 (no session tenant, no paired_user.json::tenant_id, no claim in \
-                 cached device-token JWT); \
-                 skipping federation for session {session_id}"
-            );
-            return Err(FederationSkipReason::TenantUnresolved);
-        }
-    };
-
     let device_id = match resolve_device_id() {
         Some(d) => d,
         None => {
@@ -146,6 +146,31 @@ pub fn build_federation_ctx(
                  skipping federation for session {session_id}"
             );
             return Err(FederationSkipReason::NoConfigDir);
+        }
+    };
+
+    let session_tenant = match session_tenant() {
+        Ok(t) => t,
+        Err(refusal) => {
+            warn!(
+                "claude_session::federation: session {session_id} is UNFEDERATED — its tenant \
+                 resolution refused ({}): {}. Federation stays off for this session rather \
+                 than binding the device's default tenant.",
+                refusal.code, refusal.message
+            );
+            return Err(FederationSkipReason::TenantRefused);
+        }
+    };
+    let tenant_id = match resolve_session_context_tenant(session_tenant) {
+        Some(t) => t,
+        None => {
+            warn!(
+                "claude_session::federation: tenant_id unresolvable \
+                 (no session tenant, no paired_user.json::tenant_id, no claim in \
+                 cached device-token JWT); \
+                 skipping federation for session {session_id}"
+            );
+            return Err(FederationSkipReason::TenantUnresolved);
         }
     };
 

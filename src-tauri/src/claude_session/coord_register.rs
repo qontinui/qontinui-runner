@@ -112,6 +112,9 @@ struct RegisterOverrides {
     adopt: Option<Uuid>,
     /// Stamp this tenant instead of the resolver's answer.
     tenant: Option<Uuid>,
+    /// The caller already RESOLVED the tenant — `tenant` is the answer as-is
+    /// (`None` included), and the cwd-blind resolver is not consulted.
+    tenant_resolved: bool,
     /// Resume parameters stamped on a FRESH `Started` row.
     resume: ResumeParams,
 }
@@ -494,6 +497,51 @@ impl AiCoordRegistrar {
         .ok()
     }
 
+    /// [`Self::register_session`] for a session whose SPAWN DIRECTORY the
+    /// caller knows, with the tenant already resolved from it by
+    /// [`crate::session::resolve_new_session_tenant_at`] (plan
+    /// `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5). The cwd-blind
+    /// resolver is NOT consulted: a session in tenant B's repo on a machine
+    /// pinned to A is recorded under B, so the coord record, its JWT slot and
+    /// the federated pool (which reads this record first — B2) all follow the
+    /// repo.
+    ///
+    /// A refusal records NO tenant — never the default — and is logged. The
+    /// federation spawn then re-resolves (the repo answer is cached), refuses
+    /// again and leaves the session UNFEDERATED, saying so.
+    pub fn register_session_with_tenant(
+        &self,
+        task_run_id: &str,
+        purpose: &str,
+        repo: Option<String>,
+        tenant: Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
+    ) -> Option<Uuid> {
+        let tenant = match tenant {
+            Ok(t) => t,
+            Err(refusal) => {
+                warn!(
+                    "ai_coord_register: session {} tenant resolution refused ({}): {} — \
+                     recording no tenant rather than the device default; its federation \
+                     will be refused too",
+                    task_run_id, refusal.code, refusal.message
+                );
+                None
+            }
+        };
+        self.register_inner(
+            task_run_id,
+            Some(task_run_id),
+            purpose,
+            repo,
+            RegisterOverrides {
+                tenant,
+                tenant_resolved: true,
+                ..RegisterOverrides::default()
+            },
+        )
+        .ok()
+    }
+
     /// Session-identity fabric Phase 3 — register a SNIFFED interactive
     /// session (a `claude --resume <id>` / `--session-id <id>` line the
     /// operator typed into a plain terminal, lifted by
@@ -586,6 +634,7 @@ impl AiCoordRegistrar {
                 adopt,
                 tenant,
                 resume,
+                tenant_resolved: false,
             },
         )
     }
@@ -614,7 +663,11 @@ impl AiCoordRegistrar {
         // An adopted id names a coord row that already exists (see
         // `bind_transcript_session`); otherwise mint one.
         let session_id = adopt_coord_session.unwrap_or_else(crate::session::uuid_v7);
-        let tenant = overrides.tenant.or_else(|| (self.inner.tenant_resolver)());
+        let tenant = if overrides.tenant_resolved {
+            overrides.tenant
+        } else {
+            overrides.tenant.or_else(|| (self.inner.tenant_resolver)())
+        };
 
         // R6 — check-AND-reserve atomically under ONE reverse-map lock
         // acquisition (review W1). `spawn_register_typed_resume` dispatches a
@@ -1447,31 +1500,27 @@ impl AiCoordRegistrar {
 /// `task_run_id` after its own id.
 ///
 /// Falls back, when no key is registered yet (the orchestration worker
-/// registers after it spawns) or registration resolved no tenant, to the
-/// resolver that knows the session's SPAWN DIRECTORY
-/// ([`crate::session::resolve_new_session_tenant_in`]): the proxy's own
-/// authority order, so a session in tenant B's repo federates B's pool on a
-/// machine pinned to A — the tenant its coord-mcp proxy answers from (plan
-/// `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5).
+/// registers after it spawns) or registration recorded no tenant, to
+/// `fallback` — in production the spawn site's block-on of
+/// [`crate::session::resolve_new_session_tenant_at`] for its spawn directory:
+/// the proxy's own authority order, repo tier included (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5). Registration
+/// records through that same resolver wherever the caller knows the session's
+/// directory ([`AiCoordRegistrar::register_session_with_tenant`]), so on that
+/// arm too the recorded tenant agrees with the repo.
 ///
-/// `repo` resolves the spawn directory's repo → tenant
-/// ([`qontinui_runner_lib::repo_tenant::cwd_tenant_for_path`], the proxy's
-/// resolver and cache). It is a closure because that read is async and both
-/// spawn sites are blocking: each passes its own block-on, and it runs only on
-/// the fallback arm, and only when no workspace declaration answered first.
-///
-/// `Err` is a refusal (the repo's tenant is not one this device may act as, or
-/// several tenants own it and the default is not one of them): the spawn site
-/// SKIPS federation rather than federating the default tenant's pool.
+/// `fallback` runs only on that arm: a recorded tenant never pays for a repo
+/// read. `Err` is a refusal, and the federation builder then leaves the
+/// session UNFEDERATED rather than binding the default tenant.
 pub(crate) fn federation_session_tenant(
     registrar: Option<&AiCoordRegistrar>,
     session_keys: &[&str],
-    working_dir: &str,
-    repo: impl FnOnce() -> qontinui_runner_lib::repo_tenant::CwdTenant,
+    fallback: impl FnOnce() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
 ) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
-    federation_session_tenant_with(registrar, session_keys, || {
-        crate::session::resolve_new_session_tenant_in(working_dir, repo)
-    })
+    match registrar.and_then(|r| session_keys.iter().find_map(|k| r.recorded_tenant(k))) {
+        Some(recorded) => Ok(Some(recorded)),
+        None => fallback(),
+    }
 }
 
 /// The registrar keys a spawn's federation looks its tenant up by, in order
@@ -1492,18 +1541,6 @@ pub(crate) fn federation_session_keys<'a>(
     .into_iter()
     .flatten()
     .collect()
-}
-
-/// [`federation_session_tenant`] with the fallback resolver injected.
-fn federation_session_tenant_with(
-    registrar: Option<&AiCoordRegistrar>,
-    session_keys: &[&str],
-    fallback: impl FnOnce() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
-) -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
-    match registrar.and_then(|r| session_keys.iter().find_map(|k| r.recorded_tenant(k))) {
-        Some(recorded) => Ok(Some(recorded)),
-        None => fallback(),
-    }
 }
 
 use crate::session::SessionKind;
@@ -2230,6 +2267,69 @@ mod tests {
         assert!(reg.inner.tenants.lock().unwrap().is_empty());
     }
 
+    /// The fallback for an arm where a tenant IS recorded: running it at all —
+    /// and so resolving the session's repo — is the bug.
+    fn recorded_arm_never_falls_back() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+        panic!("a recorded tenant must win without consulting the fallback (or the repo)")
+    }
+
+    /// Plan `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5: the
+    /// REGISTRATION path. A chat registers before it spawns, so the spawn finds
+    /// a recorded tenant and never runs its own repo read; the record must
+    /// therefore already be the repo's tenant, not the machine pin the
+    /// cwd-blind resolver answers. A refusal records NO tenant — never the pin.
+    #[test]
+    fn registration_in_a_repo_records_the_repos_tenant_and_federation_binds_it() {
+        use crate::coord_mcp::SpawnTenantRefusal;
+        use crate::session::tenant_pin::TenantPin;
+        use crate::session::workspace_tenant::WorkspaceDeclaration;
+        use qontinui_runner_lib::repo_tenant::{CwdTenant, REPO_TENANTS_SOURCE};
+        const MACHINE: Uuid = Uuid::from_u128(0xA);
+        const REPO_OWNER: Uuid = Uuid::from_u128(0xB);
+
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        // The cwd-blind resolver answers the machine pin.
+        let (reg, _dir) = registrar_with_tenant(|| Some(MACHINE));
+        let resolve = |admit: fn(Uuid) -> Result<(), SpawnTenantRefusal>| {
+            crate::session::new_session_tenant_from(
+                || WorkspaceDeclaration::Absent,
+                || CwdTenant::Resolved {
+                    tenant_id: REPO_OWNER,
+                    repo: "acme/widgets".to_string(),
+                    source: REPO_TENANTS_SOURCE.to_string(),
+                    observed_at: "2026-10-15T00:00:00Z".to_string(),
+                },
+                TenantPin::Pinned(MACHINE),
+                || Some(MACHINE),
+                || Some(MACHINE),
+                admit,
+                || false,
+            )
+        };
+
+        let trid = Uuid::new_v4().to_string();
+        reg.register_session_with_tenant(&trid, "New Chat", None, resolve(|_| Ok(())))
+            .unwrap();
+        assert_eq!(reg.recorded_tenant(&trid), Some(REPO_OWNER));
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&trid], recorded_arm_never_falls_back),
+            Ok(Some(REPO_OWNER)),
+            "the spawn binds the recorded repo tenant (B2) without re-resolving"
+        );
+
+        let refused = Uuid::new_v4().to_string();
+        let answer = resolve(|tenant| Err(SpawnTenantRefusal::NotPaired { tenant }));
+        assert!(answer.is_err());
+        reg.register_session_with_tenant(&refused, "New Chat", None, answer)
+            .unwrap();
+        assert_eq!(
+            reg.recorded_tenant(&refused),
+            None,
+            "a refused repo tenant must not be recorded as the machine pin"
+        );
+    }
+
     #[test]
     fn federation_binds_the_tenant_the_registrar_recorded() {
         // #1708 residual: the federation context re-resolved the tenant at
@@ -2246,23 +2346,27 @@ mod tests {
 
         assert_eq!(reg.recorded_tenant(&trid), Some(OWNING_TENANT));
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&trid], || Ok(Some(REPINNED))),
+            federation_session_tenant(Some(&reg), &[&trid], recorded_arm_never_falls_back),
             Ok(Some(OWNING_TENANT))
         );
         // A unified-workflow phase session spawns under a suffixed id the
         // registrar never saw; the owning task_run_id, tried next, still hits.
         let phase_id = format!("{trid}-agentic-1");
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&phase_id, &trid], || Ok(Some(REPINNED))),
+            federation_session_tenant(
+                Some(&reg),
+                &[&phase_id, &trid],
+                recorded_arm_never_falls_back
+            ),
             Ok(Some(OWNING_TENANT))
         );
         // No key registered (or no registrar): the fallback answers.
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&phase_id], || Ok(Some(REPINNED))),
+            federation_session_tenant(Some(&reg), &[&phase_id], || Ok(Some(REPINNED))),
             Ok(Some(REPINNED))
         );
         assert_eq!(
-            federation_session_tenant_with(None, &[&trid], || Ok(Some(REPINNED))),
+            federation_session_tenant(None, &[&trid], || Ok(Some(REPINNED))),
             Ok(Some(REPINNED))
         );
 
