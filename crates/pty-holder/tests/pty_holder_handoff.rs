@@ -855,7 +855,7 @@ mod unix {
     fn pty_holder_handoff_successor_dying_after_commit_gives_the_pane_back() {
         for fault in ["exit-after-commit", "exit-after-publish"] {
             let mut pane = start_with(
-                &fault[11..],
+                fault.strip_prefix("exit-after-").unwrap_or(fault),
                 echo_spec(7),
                 Some(fault),
                 &[(COMMIT_DELAY_ENV, "1500")],
