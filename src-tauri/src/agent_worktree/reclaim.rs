@@ -326,6 +326,20 @@ pub struct ReclaimInstruction {
     /// the on-demand path.
     #[serde(default)]
     pub retention: Option<String>,
+    /// RFC3339 time of the census this instruction was decided on (echoed by
+    /// coord; plan `2026-10-14-declared-sibling-worktree-reaped-while-its-
+    /// allocation-is-held` Phase 2). Informational: the incarnation guard
+    /// compares `dir_created_at` and `head_sha`.
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    /// HEAD the census saw at `worktree_path`. `None` (older coord) skips the
+    /// head comparison.
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    /// RFC3339 birth time of the directory the census judged (see
+    /// [`dir_birth_time`]). `None` (older coord) skips the birth comparison.
+    #[serde(default)]
+    pub dir_created_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -808,10 +822,220 @@ fn worktree_is_building(worktree: &Path, window: Duration) -> bool {
     if cargo_lock_held(&target) {
         return true;
     }
+    // (c) a build running from ANY checkout of this allocation: all of them
+    // build into the one shared target, so it holds every remove in the
+    // allocation (Phase 4 of plan `2026-10-14-declared-sibling-worktree-
+    // reaped-while-its-allocation-is-held`). Every removal path reaches G6
+    // through this function (or `busy_allocation_sibling_with`, which calls it).
+    if let Some(agent_dir) = worktree.parent() {
+        if is_session_uuid_dir(agent_dir) && shared_build_active_for(agent_dir) {
+            info!(
+                "worktree_reclaim: {} — building(shared-target): an allocation checkout \
+                 has an in-flight cargo run record",
+                worktree.display()
+            );
+            return true;
+        }
+    }
     // Recent-activity window across the sink top-levels + the root.
     path_recently_touched(&target, window)
         || path_recently_touched(&worktree.join("node_modules"), window)
         || path_recently_touched(worktree, window)
+}
+
+// ---------------------------------------------------------------------------
+// Shared-target build signal (Phase 4b). `cargo-guard.sh` / `cargo-verify.sh`
+// write `<git-dir>/cargo-verify-last.json` with `finished_at: null` when a run
+// STARTS (before it queues for the build lock) and rewrite it at END; the
+// heartbeat (4a) keeps its mtime fresh while the run is in flight. A build in
+// one checkout of an allocation compiles against its declared siblings, so it
+// holds every remove in the allocation.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BUILD_RECORD_STALE_SECS: u64 = 120;
+
+fn build_record_stale_secs() -> u64 {
+    std::env::var("QONTINUI_WORKTREE_RECLAIM_BUILD_LOCK_STALE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BUILD_RECORD_STALE_SECS)
+}
+
+/// Resolve a checkout's git dir from its `.git`: a directory is itself the git
+/// dir; a gitlink file is `gitdir: <path>` (relative paths resolve against the
+/// checkout). `None` when there is no resolvable `.git`.
+fn resolve_git_dir(checkout: &Path) -> Option<PathBuf> {
+    let dot_git = checkout.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let rel = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?;
+    let p = PathBuf::from(rel.trim());
+    Some(if p.is_absolute() { p } else { checkout.join(p) })
+}
+
+/// Is the run record at `record` an in-flight build? Fresh (mtime within
+/// `stale`) AND `finished_at` null. A fresh record that cannot be read or
+/// parsed fails CLOSED (`true`); a stale or absent one is not a build.
+fn run_record_is_active(record: &Path, stale: Duration) -> bool {
+    let meta = match std::fs::metadata(record) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true, // present but unstat-able: fail closed
+    };
+    // An mtime in the future or unreadable cannot be shown stale -> fresh.
+    if let Ok(Ok(age)) = meta.modified().map(|m| m.elapsed()) {
+        if age > stale {
+            return false;
+        }
+    }
+    let Ok(text) = std::fs::read_to_string(record) else {
+        return true;
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => match v.get("finished_at") {
+            Some(serde_json::Value::Null) => true,
+            Some(_) => false,
+            None => true, // malformed (no finished_at key): fail closed
+        },
+        Err(_) => true,
+    }
+}
+
+/// [`shared_build_active_for`] with the staleness bound injected.
+fn shared_build_active_for_with(agent_dir: &Path, stale: Duration) -> bool {
+    let Ok(entries) = std::fs::read_dir(agent_dir) else {
+        return false; // an unreadable agent dir is reported by the sibling scan
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(git_dir) = resolve_git_dir(&entry.path()) else {
+            continue;
+        };
+        if run_record_is_active(&git_dir.join("cargo-verify-last.json"), stale) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is a cargo run in flight from any checkout under `agent_dir`?
+pub(super) fn shared_build_active_for(agent_dir: &Path) -> bool {
+    shared_build_active_for_with(agent_dir, Duration::from_secs(build_record_stale_secs()))
+}
+
+// ---------------------------------------------------------------------------
+// Incarnation guard (Phase 2c). A remove decided for one directory must not
+// delete a different directory re-created at the same path.
+// ---------------------------------------------------------------------------
+
+/// Birth time of the worktree directory: the mtime of its `.git` gitlink FILE
+/// (written once by `git worktree add`; NTFS name tunneling restores a deleted
+/// name's creation time but not its mtime), on every OS. Falls back to
+/// `metadata.created()` when `.git` is not a regular file. `None` = unreadable.
+pub(super) fn dir_birth_time(worktree: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(m) = std::fs::metadata(worktree.join(".git")) {
+        if m.is_file() {
+            return m.modified().ok().map(chrono::DateTime::<chrono::Utc>::from);
+        }
+    }
+    std::fs::metadata(worktree)
+        .ok()?
+        .created()
+        .ok()
+        .map(chrono::DateTime::<chrono::Utc>::from)
+}
+
+/// Bounded `git rev-parse HEAD`.
+fn live_head_sha(worktree: &Path) -> Option<String> {
+    let wt = worktree.to_str()?;
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", wt, "rev-parse", "HEAD"]);
+    match run_probe(cmd, RECLAIM_CMD_TIMEOUT, "worktree_reclaim: git rev-parse HEAD") {
+        ProbeOutcome::Captured(out) => {
+            let s = String::from_utf8_lossy(&out).trim().to_string();
+            (!s.is_empty()).then_some(s)
+        }
+        _ => None,
+    }
+}
+
+/// Pure incarnation decision. `Ok(())` = proceed; `Err(msg)` = refuse.
+/// `None` echoed => that comparison is skipped; unreadable live with `Some`
+/// echoed => refuse. Birth times compare to within 1 ms (coord stores
+/// microseconds; the runner reads 100 ns).
+fn incarnation_verdict(
+    echoed_born: Option<&str>,
+    echoed_head: Option<&str>,
+    live_born: Option<chrono::DateTime<chrono::Utc>>,
+    live_head: Option<&str>,
+) -> Result<(), String> {
+    let mut bad = false;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(echoed) = echoed_born {
+        let parsed = chrono::DateTime::parse_from_rfc3339(echoed)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let same = matches!((parsed, live_born), (Some(e), Some(l))
+            if (e - l).num_milliseconds().abs() <= 1);
+        bad |= !same;
+        parts.push(format!(
+            "born {} vs {echoed}",
+            live_born
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "<unreadable>".into())
+        ));
+    }
+    if let Some(echoed) = echoed_head {
+        bad |= live_head != Some(echoed);
+        parts.push(format!(
+            "head {} vs {echoed}",
+            live_head.unwrap_or("<unreadable>")
+        ));
+    }
+    if bad {
+        Err(format!(
+            "directory is not the incarnation the census judged ({})",
+            parts.join(", ")
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The ONE incarnation guard every removal path calls before an armed remove.
+/// Reads live values only for echoed fields that are `Some`. Logs the refusal.
+pub(super) fn check_incarnation(
+    worktree: &Path,
+    echoed_born: Option<&str>,
+    echoed_head: Option<&str>,
+) -> Result<(), String> {
+    let live_born = echoed_born.and_then(|_| dir_birth_time(worktree));
+    let live_head = echoed_head.and_then(|_| live_head_sha(worktree));
+    let r = incarnation_verdict(echoed_born, echoed_head, live_born, live_head.as_deref());
+    if let Err(msg) = &r {
+        warn!(
+            "worktree_reclaim: {} — skipping remove: {msg}",
+            worktree.display()
+        );
+    }
+    r
+}
+
+/// [`check_incarnation`] for an instruction.
+pub(super) fn check_instruction_incarnation(
+    worktree: &Path,
+    instr: &ReclaimInstruction,
+) -> Result<(), String> {
+    check_incarnation(
+        worktree,
+        instr.dir_created_at.as_deref(),
+        instr.head_sha.as_deref(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1263,15 @@ fn execute_pull(pull: &ReclaimPull) {
                     "worktree_reclaim: {} dirty at execution time — skipping remove (INV defense)",
                     instr.worktree_path
                 );
+                continue;
+            }
+
+            // Incarnation guard — the directory here must be the one the
+            // census judged, not one re-created at the same path since.
+            if instr.action == ReclaimAction::Remove
+                && root_exists
+                && check_instruction_incarnation(&wt, instr).is_err()
+            {
                 continue;
             }
 
@@ -1528,6 +1761,12 @@ fn backstop_consider_one(repo_dir: &Path, ceiling: u64, coord_ever_live: bool) {
     // Never remove one checkout of an allocation while another is busy.
     if let Some((sibling, busy)) = busy_allocation_sibling(repo_dir) {
         log_busy_sibling_skip(repo_dir, &sibling, busy);
+        return;
+    }
+    // Incarnation guard (no coord echo on this path, so the echoed fields are
+    // `None` and the comparisons are skipped; the shared call keeps all three
+    // removal paths on one guard).
+    if check_incarnation(repo_dir, None, None).is_err() {
         return;
     }
     // INV-W4: unlink every top-level junction (plus the Tauri-layout
@@ -2347,6 +2586,9 @@ pub(in crate::agent_worktree) mod tests {
             is_dirty,
             junctioned_paths: junctioned.iter().map(|s| s.to_string()).collect(),
             retention: None,
+            observed_at: None,
+            head_sha: None,
+            dir_created_at: None,
         }
     }
 
@@ -2974,5 +3216,272 @@ pub(in crate::agent_worktree) mod tests {
         // which one `target_dir_for` would pick.
         std::fs::create_dir_all(wt.join("target")).unwrap();
         assert_eq!(plan_reclaim(&i, true, true), expected);
+    }
+}
+
+/// Phase 2c (incarnation guard) and Phase 4b (shared-target build signal) of
+/// plan `2026-10-14-declared-sibling-worktree-reaped-while-its-allocation-is-held`.
+#[cfg(test)]
+mod incarnation_and_shared_build_tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    const SRC_RECLAIM: &str = include_str!("reclaim.rs");
+    const SRC_ON_DEMAND: &str = include_str!("on_demand.rs");
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    // ---- pure verdict ----------------------------------------------------
+
+    #[test]
+    fn verdict_allows_when_everything_matches() {
+        let born = "2026-10-14T10:00:00.123456+00:00";
+        assert!(incarnation_verdict(Some(born), Some("abc"), Some(t(born)), Some("abc")).is_ok());
+    }
+
+    #[test]
+    fn verdict_allows_when_both_echoed_none() {
+        // Even with unreadable live values: an older coord echoes nothing.
+        assert!(incarnation_verdict(None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn verdict_refuses_born_mismatch() {
+        let r = incarnation_verdict(
+            Some("2026-10-14T10:00:00+00:00"),
+            None,
+            Some(t("2026-10-14T10:00:05+00:00")),
+            None,
+        );
+        assert!(r.unwrap_err().contains("not the incarnation"));
+    }
+
+    #[test]
+    fn verdict_refuses_head_mismatch() {
+        let born = "2026-10-14T10:00:00+00:00";
+        assert!(incarnation_verdict(Some(born), Some("aaa"), Some(t(born)), Some("bbb")).is_err());
+    }
+
+    #[test]
+    fn verdict_refuses_unreadable_live_while_echoed_is_some() {
+        let born = "2026-10-14T10:00:00+00:00";
+        assert!(incarnation_verdict(Some(born), None, None, None).is_err());
+        assert!(incarnation_verdict(None, Some("aaa"), None, None).is_err());
+        // An echoed value that does not parse cannot be compared: refuse.
+        assert!(incarnation_verdict(Some("garbage"), None, Some(t(born)), None).is_err());
+    }
+
+    #[test]
+    fn verdict_none_echoed_field_skips_only_that_comparison() {
+        let born = "2026-10-14T10:00:00+00:00";
+        // born echoed + matching, head not echoed + unreadable: allowed.
+        assert!(incarnation_verdict(Some(born), None, Some(t(born)), None).is_ok());
+        // head echoed + matching, born not echoed + unreadable: allowed.
+        assert!(incarnation_verdict(None, Some("aaa"), None, Some("aaa")).is_ok());
+    }
+
+    #[test]
+    fn verdict_tolerates_microsecond_truncation_only() {
+        let live = t("2026-10-14T10:00:00.1234567+00:00");
+        assert!(incarnation_verdict(
+            Some("2026-10-14T10:00:00.123456+00:00"),
+            None,
+            Some(live),
+            None
+        )
+        .is_ok());
+    }
+
+    // ---- real tempdir ----------------------------------------------------
+
+    fn make_checkout(root: &Path, name: &str) -> PathBuf {
+        let wt = root.join(name);
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: nowhere\n").unwrap();
+        wt
+    }
+
+    #[test]
+    fn birth_time_is_the_gitlink_mtime() {
+        let d = tempfile::tempdir().unwrap();
+        let wt = make_checkout(d.path(), "wt");
+        let when = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(wt.join(".git"), when).unwrap();
+        assert_eq!(dir_birth_time(&wt).unwrap().timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn birth_time_of_an_absent_path_is_none() {
+        let d = tempfile::tempdir().unwrap();
+        // No `.git` at all: created() fallback (None only on filesystems
+        // without birth time, in which case the guard fails closed anyway).
+        let _ = dir_birth_time(d.path());
+        assert!(dir_birth_time(&d.path().join("absent")).is_none());
+    }
+
+    #[test]
+    fn recreated_directory_within_seconds_is_not_the_judged_incarnation() {
+        // NTFS name tunneling: delete a name and re-create it within ~15 s and
+        // Windows hands back the old creation time. The gitlink mtime is not
+        // tunneled, so the guard still tells the two incarnations apart.
+        let d = tempfile::tempdir().unwrap();
+        let wt = make_checkout(d.path(), "wt");
+        let echoed = dir_birth_time(&wt).unwrap().to_rfc3339();
+        assert!(check_incarnation(&wt, Some(&echoed), None).is_ok());
+
+        std::fs::remove_dir_all(&wt).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        let wt2 = make_checkout(d.path(), "wt");
+        assert_eq!(wt, wt2);
+        assert!(
+            check_incarnation(&wt2, Some(&echoed), None).is_err(),
+            "a directory re-created at the same path must be refused"
+        );
+    }
+
+    // ---- all three removal paths use the one guard -----------------------
+
+    fn body_of<'a>(src: &'a str, start_marker: &str, len: usize) -> &'a str {
+        let i = src.find(start_marker).expect(start_marker);
+        let mut end = (i + len).min(src.len());
+        while !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        src.get(i..end).expect("slice")
+    }
+
+    #[test]
+    fn all_three_removal_paths_call_the_shared_guards() {
+        // execute_pull
+        let pull = body_of(SRC_RECLAIM, "fn execute_pull(", 6000);
+        assert!(pull.contains("check_instruction_incarnation(&wt, instr)"));
+        assert!(pull.contains("worktree_is_building(&wt, window)"));
+        // backstop
+        let backstop = body_of(SRC_RECLAIM, "fn backstop_consider_one(", 3000);
+        assert!(backstop.contains("check_incarnation(repo_dir, None, None)"));
+        assert!(backstop.contains("probe_building(repo_dir)"));
+        // on-demand
+        let od = body_of(SRC_ON_DEMAND, "fn execute_targets(", 8000);
+        assert!(od.contains("reclaim::check_instruction_incarnation(&path, &instr)"));
+        assert!(od.contains("reclaim::probe_building(&path)"));
+        // probe_building / the sibling scan both reach the shared signal
+        // through worktree_is_building.
+        assert!(body_of(SRC_RECLAIM, "pub(super) fn probe_building(", 300)
+            .contains("worktree_is_building"));
+        assert!(body_of(SRC_RECLAIM, "fn worktree_is_building(", 1500)
+            .contains("shared_build_active_for(agent_dir)"));
+    }
+
+    #[test]
+    fn instruction_fields_default_to_none_when_absent() {
+        let i: ReclaimInstruction = serde_json::from_value(serde_json::json!({
+            "worktree_path": "x", "repo": "r", "action": "remove"
+        }))
+        .unwrap();
+        assert!(i.observed_at.is_none() && i.head_sha.is_none() && i.dir_created_at.is_none());
+    }
+
+    // ---- Phase 4b: shared-target build signal ----------------------------
+
+    const UUID_A: &str = "01a13e32-3f66-7713-a091-0ffc6ed09951";
+    const UUID_B: &str = "11a13e32-3f66-7713-a091-0ffc6ed09951";
+
+    /// `<root>/<uuid>/{repo,sib}` each with a gitlink to `<root>/gitdirs/..`.
+    /// Returns (target checkout, sibling checkout, sibling git dir).
+    fn allocation(root: &Path, uuid: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let agent = root.join(uuid);
+        let mk = |name: &str| {
+            let wt = agent.join(name);
+            std::fs::create_dir_all(&wt).unwrap();
+            let gd = root.join("gitdirs").join(format!("{uuid}-{name}"));
+            std::fs::create_dir_all(&gd).unwrap();
+            std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gd.display())).unwrap();
+            (wt, gd)
+        };
+        let (a, _) = mk("repo");
+        let (b, bgd) = mk("sib");
+        (a, b, bgd)
+    }
+
+    fn write_record(gitdir: &Path, body: &str, age_secs: u64) -> PathBuf {
+        let rec = gitdir.join("cargo-verify-last.json");
+        std::fs::write(&rec, body).unwrap();
+        let when = std::time::SystemTime::now() - Duration::from_secs(age_secs);
+        filetime::set_file_mtime(&rec, filetime::FileTime::from_system_time(when)).unwrap();
+        rec
+    }
+
+    fn building(wt: &Path) -> bool {
+        // Zero window: the activity heuristic can never fire, isolating (c).
+        worktree_is_building(wt, Duration::ZERO)
+    }
+
+    const RUNNING: &str = r#"{"pid":1,"finished_at":null}"#;
+    const FINISHED: &str = r#"{"pid":1,"finished_at":"2026-10-14T10:00:00Z"}"#;
+
+    #[test]
+    fn fresh_unfinished_record_holds_the_allocation() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b, bgd) = allocation(d.path(), UUID_A);
+        assert!(!building(&a), "no record -> not building");
+        write_record(&bgd, RUNNING, 5);
+        assert!(building(&a), "a build in the SIBLING holds the target");
+    }
+
+    #[test]
+    fn stale_record_does_not_hold() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b, bgd) = allocation(d.path(), UUID_A);
+        write_record(&bgd, RUNNING, 600);
+        assert!(!building(&a));
+    }
+
+    #[test]
+    fn finished_record_does_not_hold() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b, bgd) = allocation(d.path(), UUID_A);
+        write_record(&bgd, FINISHED, 1);
+        assert!(!building(&a));
+    }
+
+    #[test]
+    fn fresh_unparseable_record_fails_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b, bgd) = allocation(d.path(), UUID_A);
+        write_record(&bgd, "{not json", 1);
+        assert!(building(&a));
+    }
+
+    #[test]
+    fn fresh_record_in_another_allocation_does_not_hold() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b, _bgd) = allocation(d.path(), UUID_A);
+        let (_a2, _b2, other_gd) = allocation(d.path(), UUID_B);
+        write_record(&other_gd, RUNNING, 1);
+        assert!(!building(&a));
+    }
+
+    #[test]
+    fn staleness_bound_is_injectable() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b, bgd) = allocation(d.path(), UUID_A);
+        write_record(&bgd, RUNNING, 30);
+        let agent = a.parent().unwrap();
+        assert!(shared_build_active_for_with(agent, Duration::from_secs(120)));
+        assert!(!shared_build_active_for_with(agent, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn non_session_parent_is_never_scanned() {
+        // A sibling-scan worktree at the workspace root: parent is not a uuid dir.
+        let d = tempfile::tempdir().unwrap();
+        let wt = make_checkout(d.path(), "repo-wt");
+        let gd = d.path().join("gd");
+        std::fs::create_dir_all(&gd).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gd.display())).unwrap();
+        write_record(&gd, RUNNING, 1);
+        assert!(!building(&wt));
     }
 }

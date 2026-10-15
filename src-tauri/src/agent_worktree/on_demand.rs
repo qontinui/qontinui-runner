@@ -1706,7 +1706,22 @@ fn execute_targets(targets: Vec<SurveyItem>, dry_run: bool) -> ReclaimOutcome {
             is_dirty: false,
             junctioned_paths: item.junctioned_paths.clone(),
             retention: None,
+            observed_at: None,
+            head_sha: None,
+            dir_created_at: None,
         };
+        // Incarnation guard — the same shared helper as `execute_pull` and the
+        // backstop. A survey item carries no echoed incarnation, so the
+        // comparisons are skipped today; the call keeps the paths uniform.
+        if reclaim::check_instruction_incarnation(&path, &instr).is_err() {
+            outcome.skipped.push(SkippedItem {
+                id: item.id.clone(),
+                worktree_path: item.worktree_path.clone(),
+                reason: "incarnation_mismatch",
+                detail: "directory is not the incarnation the census judged".to_string(),
+            });
+            continue;
+        }
         let steps: Vec<ReclaimStep> = reclaim::plan_reclaim(
             &instr, /* remove_armed */ true, /* root_exists */ true,
         );
@@ -2474,6 +2489,7 @@ mod tests {
             build_target_dir: None,
             build_slot: None,
             last_access_mtime: None,
+            dir_created_at: None,
             attributable_bytes: 4096,
             landed_in_main: Some(true),
             building,
@@ -2523,6 +2539,9 @@ mod tests {
             is_dirty: false,
             junctioned_paths: vec!["node_modules".to_string()],
             retention: None,
+            observed_at: None,
+            head_sha: None,
+            dir_created_at: None,
         }
     }
 
