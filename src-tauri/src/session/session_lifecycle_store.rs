@@ -810,6 +810,35 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
+    /// The argv this session's `claude` was launched with, as its own
+    /// `SessionStart` hook reported it over the OSC 9999 `session_start`
+    /// sideband (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6 / D11). The source of the relaunch's flags when the pane's PTY
+    /// holder dies — see [`crate::session::resume_argv::replay_args`], which
+    /// filters it and refuses a relaunch whose surviving tokens are not
+    /// shell-inert.
+    ///
+    /// Written ONLY by [`SessionLifecycleStore::set_launch_argv`], and never by
+    /// `record_open`: a re-record carries no argv and must not erase one.
+    /// `None` = never reported (a record that predates the field, a launch
+    /// with no identity shim in the chain, a hook that could not reach the
+    /// PTY) — the relaunch then uses the default resume command, exactly as
+    /// before this field existed. `Some(vec![])` = reported, and the launch
+    /// had no arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_argv: Option<Vec<String>>,
+}
+
+/// What [`SessionLifecycleStore::set_launch_argv`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchArgvWrite {
+    /// Persisted.
+    Written,
+    /// The record already carried exactly this argv — no write.
+    Unchanged,
+    /// No OPEN record for that session on that terminal — nothing written.
+    NoOpenRecordOnTerminal,
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -2548,6 +2577,50 @@ impl SessionLifecycleStore {
                 }],
             );
         }
+    }
+
+    /// Persist the launch argv `claude_session_id` reported over the OSC 9999
+    /// `session_start` sideband (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6). See [`TerminalSessionRecord::launch_argv`].
+    ///
+    /// Written only onto an OPEN record bound to `terminal_id`: the report came
+    /// off that terminal's PTY, so a record elsewhere (or closed) is not the one
+    /// that process launched — and a report replayed out of a holder's ring
+    /// after a runner restart must not rewrite a record that has since moved
+    /// on. NEVER creates a record (an argv-only row would be a phantom restore
+    /// candidate), and writes only on a change.
+    pub fn set_launch_argv(
+        &self,
+        claude_session_id: &str,
+        terminal_id: &str,
+        argv: &[String],
+    ) -> LaunchArgvWrite {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on set_launch_argv");
+                return LaunchArgvWrite::NoOpenRecordOnTerminal;
+            }
+        };
+        let Some(rec) = m
+            .get_mut(claude_session_id)
+            .filter(|r| r.state == "open" && r.terminal_id == terminal_id)
+        else {
+            return LaunchArgvWrite::NoOpenRecordOnTerminal;
+        };
+        if rec.launch_argv.as_deref() == Some(argv) {
+            return LaunchArgvWrite::Unchanged;
+        }
+        rec.launch_argv = Some(argv.to_vec());
+        let changed = rec.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        LaunchArgvWrite::Written
     }
 
     /// Merge a best-effort identity overlay onto an existing record — the D1
@@ -4542,6 +4615,7 @@ pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
 #[cfg(test)]
 pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
     TerminalSessionRecord {
+        launch_argv: None,
         claude_session_id: id.to_string(),
         config_dir: None,
         working_dir: None,
@@ -4764,6 +4838,7 @@ mod tests {
 
     fn rec(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: id.to_string(),
             config_dir: Some("C:/cfg".to_string()),
             working_dir: Some("C:/repo".to_string()),
@@ -8612,6 +8687,7 @@ mod tests {
         close_reason: Option<&str>,
     ) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: id.to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),

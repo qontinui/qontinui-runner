@@ -722,6 +722,7 @@ pub async fn dispatch_subtask(
         let trid_str = task_run_id.to_string();
         store.record_open(
             crate::session::session_lifecycle_store::TerminalSessionRecord {
+                launch_argv: None,
                 claude_session_id: trid_str.clone(),
                 config_dir: None,
                 working_dir: Some(working_dir.clone()),

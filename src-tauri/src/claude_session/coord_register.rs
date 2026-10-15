@@ -3191,6 +3191,7 @@ mod tests {
         let csid = "not-a-uuid-marked-early";
         store.record_open(
             crate::session::session_lifecycle_store::TerminalSessionRecord {
+                launch_argv: None,
                 claude_session_id: csid.to_string(),
                 config_dir: None,
                 working_dir: Some("C:/repo".to_string()),
@@ -3292,6 +3293,7 @@ mod tests {
         let csid = Uuid::new_v4().to_string();
         store.record_open(
             crate::session::session_lifecycle_store::TerminalSessionRecord {
+                launch_argv: None,
                 claude_session_id: csid.clone(),
                 config_dir: None,
                 working_dir: Some("C:/repo".to_string()),

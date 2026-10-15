@@ -2127,6 +2127,7 @@ mod tests {
 
         store.record_open(
             crate::session::session_lifecycle_store::TerminalSessionRecord {
+                launch_argv: None,
                 claude_session_id: "s1".to_string(),
                 config_dir: None,
                 working_dir: None,
