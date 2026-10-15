@@ -2608,6 +2608,12 @@ mod tests {
                 began.store(true, Ordering::SeqCst);
                 let mut cmd = portable_pty::CommandBuilder::new("sh");
                 cmd.args(["-c", "true"]);
+                // An explicit cwd: without one portable-pty runs the child in
+                // the builder's captured `$HOME`, which a concurrently running
+                // `IsolatedAmbient` test points at a temp dir it then deletes
+                // — the fallback spawn then fails ENOENT and this test reads
+                // that as "never fell back".
+                cmd.cwd(std::env::temp_dir());
                 let pane = spawn_holder_pane_or_fallback_in(
                     Ok(fake2.as_path()),
                     Ok(panes2),
@@ -2753,6 +2759,9 @@ mod tests {
         } else {
             cmd.args(["-c", "echo FALLBACK_MARK"]);
         }
+        // See `pty_holder_spawn_door_does_not_park_a_tokio_worker`: never the
+        // captured `$HOME`, which a concurrent test may have deleted.
+        cmd.cwd(std::env::temp_dir());
         let pane = spawn_holder_pane_or_fallback_in(
             Err("no holder in this test".into()),
             Err("unused".into()),
