@@ -17,6 +17,9 @@
 //! - `<pane-id>.log` — the holder's own, size-capped diagnostic log. A holder
 //!   has no stderr once it is detached, so this is where it says why an
 //!   endpoint failed without ending the pane;
+//! - `<pane-id>.upgrade` — a holder upgrade's snapshot (plan Phase 8, Unix),
+//!   alive only between the predecessor writing it and the successor
+//!   consuming it (or the predecessor's rollback unlinking it);
 //! - `<pane-id>.report` — the holder's one-line ready/error report, written
 //!   (atomically, 0600) only when it was started with `--report`: the Windows
 //!   WMI spawn route gives the holder no stdout pipe to print it on (Phase 3).
@@ -110,6 +113,19 @@ pub fn report_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// holder whose leftovers could not be attributed (`crate::sweep`).
 pub fn orphan_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.orphan", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.upgrade` — a holder upgrade's snapshot (plan Phase
+/// 8): written 0600 by the predecessor, consumed (unlinked on open) by the
+/// successor, and unlinked by the predecessor on every rollback.
+pub fn snapshot_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.upgrade", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.upgrade-tmp` — where a snapshot is written before it
+/// is renamed over [`snapshot_path`].
+pub fn snapshot_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.upgrade-tmp", pane.as_str()))
 }
 
 /// `<pane-dir>/<pane-id>.log` — the holder's diagnostic log.
