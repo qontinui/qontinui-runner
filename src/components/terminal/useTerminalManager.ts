@@ -46,10 +46,7 @@ export function renameTabIn(tabs: TerminalTab[], id: string, title: string): Ter
  * name is immutable — and returns the SAME array when nothing changed so
  * callers do not churn renders.
  */
-export function applySpawnNames(
-  tabs: TerminalTab[],
-  names: Record<string, string>,
-): TerminalTab[] {
+export function applySpawnNames(tabs: TerminalTab[], names: Record<string, string>): TerminalTab[] {
   let changed = false;
   const next = tabs.map((t) => {
     if (t.spawnName) return t;
@@ -67,6 +64,9 @@ function spawnNamesFrom(data: unknown): SpawnNamesByTerminal {
   const m = (data as { spawnNamesByTerminal?: unknown } | null | undefined)?.spawnNamesByTerminal;
   return m && typeof m === "object" ? (m as SpawnNamesByTerminal) : {};
 }
+
+/** Why a lost PTY holder's session was not relaunched (runner: `WithheldReason`). */
+export type RelaunchWithheldReason = "still-hosted" | "liveness-unknown" | "holder-unreachable";
 
 export interface TerminalTab {
   id: string;
@@ -114,6 +114,20 @@ export interface TerminalTab {
    * Cleared once the user dismisses the note or the tab is otherwise used.
    */
   restoreTerminalOnly?: boolean;
+  /**
+   * Set on a DEAD tab whose PTY holder was lost and whose session the runner
+   * did NOT hand back for a relaunch (plan
+   * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+   * Phase 6): a live process still hosts the session, its liveness could not
+   * be read, or the holder could not be ended (its `claude` may still be
+   * running). `ResumeFailedBanner` shows it with a Resume action, which
+   * re-checks liveness before anything is typed.
+   */
+  relaunchWithheld?: {
+    sessionId: string;
+    pageId: string | null;
+    reason: RelaunchWithheldReason;
+  };
   /**
    * F1/F2 — the tenant this session was spawned under, as sent to
    * `terminal_create` (and therefore exactly what the Rust registry stamped

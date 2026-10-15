@@ -14,7 +14,7 @@ import {
   type TypeAndVerifyOptions,
 } from "./resumeVerification";
 import { providerDescriptorFor } from "./providerAdapter";
-import type { TerminalTab } from "./useTerminalManager";
+import type { RelaunchWithheldReason, TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
@@ -230,6 +230,77 @@ export function liveTabShowsSession(
   releasedTerminalIds: ReadonlySet<string>,
 ): boolean {
   return tabs.some((t) => t.claudeSessionId === sessionId && !releasedTerminalIds.has(t.id));
+}
+
+/**
+ * The zone assignments with every zone a released (dead) holder pane holds
+ * treated as FREE, so the relaunch that replaces that pane claims its zone
+ * (review r1, L1). Pure + exported for tests.
+ */
+export function withoutReleasedHolders(
+  assignments: Record<number, string>,
+  releasedTerminalIds: ReadonlySet<string>,
+): Record<number, string> {
+  const out: Record<number, string> = {};
+  for (const [zone, tabId] of Object.entries(assignments)) {
+    if (!releasedTerminalIds.has(tabId)) out[Number(zone)] = tabId;
+  }
+  return out;
+}
+
+/**
+ * Drop the released ids whose tab is gone (closed, or never had one — a holder
+ * the boot sweep found dead), so the set stays bounded by the live tabs.
+ * Pure + exported for tests.
+ */
+export function pruneReleasedTerminalIds(
+  released: Set<string>,
+  tabs: ReadonlyArray<{ id: string }>,
+): void {
+  for (const id of [...released]) {
+    if (!tabs.some((t) => t.id === id)) released.delete(id);
+  }
+}
+
+/** The runner's event for a lost holder's session it did NOT release (Rust: `RELAUNCH_WITHHELD_EVENT`). */
+export const HOLDER_RELAUNCH_WITHHELD_EVENT = "pty-holder-relaunch-withheld";
+
+/** Its payload. */
+export interface HolderRelaunchWithheld {
+  sessionId: string;
+  terminalId: string;
+  pageId: string | null;
+  reason: RelaunchWithheldReason;
+}
+
+/**
+ * Hand a released session to the restore (Phase 3's {@link onHolderSessionReleased},
+ * which re-checks liveness), and settle the dead pane it lived in: when a
+ * relaunch was scheduled, close the dead pane (`close`) so the relaunch takes
+ * its place; when it was not — a live process hosts the session, or liveness
+ * is unreadable — put the not-relaunched banner on it (`markWithheld`).
+ * Returns whether a relaunch was scheduled. Exported for tests.
+ */
+export async function releaseAndRelaunch(
+  payload: HolderSessionReleased,
+  schedule: (pageId: string, sessionIds: string[]) => void,
+  close: (terminalId: string) => void,
+  markWithheld: (w: HolderRelaunchWithheld) => void,
+  withheldReason: RelaunchWithheldReason = "still-hosted",
+  liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+): Promise<boolean> {
+  const scheduled = await onHolderSessionReleased(payload, schedule, liveIds);
+  if (scheduled) {
+    close(payload.terminalId);
+  } else {
+    markWithheld({
+      sessionId: payload.sessionId,
+      terminalId: payload.terminalId,
+      pageId: payload.pageId,
+      reason: withheldReason,
+    });
+  }
+  return scheduled;
 }
 
 /** How many times an ABORTED restore re-runs on its own for ids it still owes (review V1). */
@@ -1276,6 +1347,7 @@ interface UseTerminalInitializationParams {
       isReconnecting?: boolean;
       resumeFailed?: boolean;
       restoreTerminalOnly?: boolean;
+      relaunchWithheld?: TerminalTab["relaunchWithheld"];
     }>,
   ) => void;
   zoneLayout: {
@@ -1425,13 +1497,15 @@ export function useTerminalInitialization({
   // Live tabs, for the re-run's "already open" check (the init effect does not
   // re-run on every tab change, so it cannot close over `tabs`).
   const liveTabsRef = useRef(tabs);
-  useEffect(() => {
-    liveTabsRef.current = tabs;
-  }, [tabs]);
   // Terminals whose PTY holder the runner reported lost (the released event
   // below): their dead tab must not count as "already showing" the session a
-  // re-run is about to relaunch (see `liveTabShowsSession`).
+  // re-run is about to relaunch (see `liveTabShowsSession`), and its zone is
+  // the relaunch's to claim (`withoutReleasedHolders`). Pruned as tabs go.
   const releasedTerminalIds = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    liveTabsRef.current = tabs;
+    pruneReleasedTerminalIds(releasedTerminalIds.current, tabs);
+  }, [tabs]);
   const [drainResumeEpoch, setDrainResumeEpoch] = useState(0);
   // Sessions a restore refused as "live" BEFORE the PTY-holder boot sweep
   // settled, which the sweep's settle then showed to be resumable (see
@@ -1471,27 +1545,84 @@ export function useTerminalInitialization({
     },
     [rerun],
   );
+  // A released session's dead pane: closed once its relaunch is scheduled, or
+  // given the not-relaunched banner when it is not (plan Phase 6; review r1,
+  // L1/M3). The pane's PTY is gone either way — only its tab remains.
+  const closeDeadPane = useCallback(
+    (terminalId: string) => {
+      updateTab(terminalId, { relaunchWithheld: undefined });
+      invoke("terminal_close", { terminalId }).catch(() => {
+        // A holder the boot sweep found dead never had a tab: nothing to close.
+      });
+    },
+    [updateTab],
+  );
+  const markWithheld = useCallback(
+    (w: HolderRelaunchWithheld) => {
+      updateTab(w.terminalId, {
+        relaunchWithheld: { sessionId: w.sessionId, pageId: w.pageId, reason: w.reason },
+      });
+    },
+    [updateTab],
+  );
+  const relaunchReleased = useCallback(
+    (payload: HolderSessionReleased, withheldReason?: RelaunchWithheldReason) => {
+      releasedTerminalIds.current.add(payload.terminalId);
+      return releaseAndRelaunch(
+        payload,
+        scheduleRecheckRerun,
+        closeDeadPane,
+        markWithheld,
+        withheldReason,
+      );
+    },
+    [scheduleRecheckRerun, closeDeadPane, markWithheld],
+  );
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
     let disposed = false;
+    const unlistens: Array<() => void> = [];
+    const keep = (fn: () => void) => {
+      if (disposed) fn();
+      else unlistens.push(fn);
+    };
     void listen<HolderSessionReleased>(HOLDER_SESSION_RELEASED_EVENT, (event) => {
       // Broadcast to every window: only the one that restores the page acts.
       const releasedPage = event.payload.pageId ?? "default";
       if (!ownsReleasedPage(releasedPage, readPinnedPageId(), getPageBindings())) return;
-      releasedTerminalIds.current.add(event.payload.terminalId);
       console.warn(
-        `[TerminalPage] a PTY holder died before adoption; re-deciding session ${event.payload.sessionId}`,
+        `[TerminalPage] a PTY holder was lost; re-deciding session ${event.payload.sessionId}`,
       );
-      void onHolderSessionReleased(event.payload, scheduleRecheckRerun);
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    });
+      void relaunchReleased(event.payload);
+    }).then(keep);
+    void listen<HolderRelaunchWithheld>(HOLDER_RELAUNCH_WITHHELD_EVENT, (event) => {
+      const page = event.payload.pageId ?? "default";
+      if (!ownsReleasedPage(page, readPinnedPageId(), getPageBindings())) return;
+      console.warn(
+        `[TerminalPage] session ${event.payload.sessionId} was not relaunched after its PTY ` +
+          `holder was lost (${event.payload.reason})`,
+      );
+      markWithheld(event.payload);
+    }).then(keep);
     return () => {
       disposed = true;
-      unlisten?.();
+      for (const fn of unlistens) fn();
     };
-  }, [scheduleRecheckRerun]);
+  }, [relaunchReleased, markWithheld]);
+  // The banner's Resume on a withheld dead pane: the same release path, so
+  // liveness is re-checked before anything is typed.
+  const resumeWithheld = useCallback(
+    (tabId: string) => {
+      const tab = liveTabsRef.current.find((t) => t.id === tabId);
+      const w = tab?.relaunchWithheld;
+      if (!w) return;
+      updateTab(tabId, { relaunchWithheld: undefined });
+      void relaunchReleased(
+        { sessionId: w.sessionId, terminalId: tabId, pageId: w.pageId },
+        w.reason,
+      );
+    },
+    [relaunchReleased, updateTab],
+  );
   useEffect(
     () =>
       subscribeCoordDrainState(
@@ -1729,7 +1860,14 @@ export function useTerminalInitialization({
           //    the zone + re-attach the claudeSessionId; no resume needed.
           if (reconnectedSet.has(rec.terminalId)) {
             const tabId = rec.terminalId;
-            if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
+            if (
+              mayClaimRecordedZone(
+                isDrainRerun,
+                rec.zoneIndex,
+                tabId,
+                withoutReleasedHolders(zoneLayout.assignments, releasedTerminalIds.current),
+              )
+            ) {
               zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
               applyZoneCosmetics(rec.zoneIndex);
             }
@@ -1812,7 +1950,14 @@ export function useTerminalInitialization({
           // `runVerifiedResume`). What is NOT done is re-asserting the record
           // from here: that refreshes `last_seen_at` and is what made ghost
           // rows immortal.
-          if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
+          if (
+            mayClaimRecordedZone(
+              isDrainRerun,
+              rec.zoneIndex,
+              tabId,
+              withoutReleasedHolders(zoneLayout.assignments, releasedTerminalIds.current),
+            )
+          ) {
             zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
           }
@@ -2273,4 +2418,6 @@ export function useTerminalInitialization({
       unlisten?.();
     };
   }, [handleWindowClose]);
+
+  return { resumeWithheld };
 }
