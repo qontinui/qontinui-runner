@@ -2044,9 +2044,10 @@ mod tests {
         };
         assert!(apply_network_edit(None, &missing_bundle, &no_files).is_err());
         let ok = apply_network_edit(None, &missing_bundle, &|_: &Path| true).unwrap();
+        // `absolute` adds a drive prefix on Windows; compare against it.
         assert_eq!(
             ok.0.unwrap().ca_bundle,
-            Some(PathBuf::from("/nope/root.pem"))
+            Some(std::path::absolute("/nope/root.pem").unwrap())
         );
         let err = apply_network_edit(None, &both, &no_files).unwrap_err();
         assert!(err.contains("--proxy-url"), "names the flag: {err}");
