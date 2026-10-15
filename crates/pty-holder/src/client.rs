@@ -267,6 +267,104 @@ fn open_verified(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> Result<Co
     Ok(conn)
 }
 
+/// What [`upgrade_pane`] asked, and what came of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneUpgrade {
+    /// The holder that was asked: its `hello_ack` pid, or — for a holder that
+    /// answered `no_common_version` — `None`.
+    pub asked_holder_pid: Option<u32>,
+    pub outcome: UpgradeOutcome,
+}
+
+/// Why [`upgrade_pane`] produced no outcome.
+#[derive(Debug)]
+pub enum PaneUpgradeError {
+    /// `prepare_upgrade` was never sent (connect or handshake failed):
+    /// nothing happened to the pane.
+    NotSent(ConnectError),
+    /// `prepare_upgrade` was sent and no answer arrived by the deadline, or
+    /// the connection failed while waiting. The upgrade may have committed,
+    /// rolled back, or still be running — UNKNOWN; probe the pane to learn
+    /// which holder serves it.
+    Unanswered(ConnectError),
+}
+
+impl std::fmt::Display for PaneUpgradeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaneUpgradeError::NotSent(e) => write!(f, "prepare_upgrade not sent: {e}"),
+            PaneUpgradeError::Unanswered(e) => {
+                write!(
+                    f,
+                    "prepare_upgrade sent but not answered (outcome unknown): {e}"
+                )
+            }
+        }
+    }
+}
+
+/// `prepare_upgrade` on one pane, WHATEVER protocol version its holder
+/// speaks: the verb is in the frozen envelope (plan D15), so a holder that
+/// answers `no_common_version` is still asked on the same connection — the
+/// case an upgrade exists for. `handshake_deadline` bounds the connect and
+/// `hello`; `upgrade_deadline` the exchange itself (see
+/// [`Client::prepare_upgrade`] — give it at least 45 s).
+///
+/// A holder built before the verb existed rejects it as an unknown verb;
+/// that is reported as [`UpgradeOutcome::Unsupported`], not as a failure.
+pub fn upgrade_pane(
+    pane_dir: &Path,
+    pane: &PaneId,
+    handshake_deadline: Instant,
+    upgrade_deadline: Instant,
+) -> Result<PaneUpgrade, PaneUpgradeError> {
+    let mut conn =
+        open_verified(pane_dir, pane, handshake_deadline).map_err(PaneUpgradeError::NotSent)?;
+    let hello = Request::Hello {
+        versions: PROTOCOL_VERSIONS.to_vec(),
+    };
+    send(&mut conn, &hello, handshake_deadline).map_err(|e| PaneUpgradeError::NotSent(e.into()))?;
+    let asked_holder_pid =
+        match recv(&mut conn, handshake_deadline).map_err(PaneUpgradeError::NotSent)? {
+            Reply::HelloAck(ack) => Some(ack.holder_pid),
+            Reply::NoCommonVersion { .. } => None,
+            other => {
+                return Err(PaneUpgradeError::NotSent(ConnectError::Protocol(format!(
+                    "expected hello_ack, got {other:?}"
+                ))))
+            }
+        };
+    // A failed write may have delivered part of the request — or all of it.
+    send(&mut conn, &Request::PrepareUpgrade, upgrade_deadline)
+        .map_err(|e| PaneUpgradeError::Unanswered(e.into()))?;
+    let outcome = match recv(&mut conn, upgrade_deadline).map_err(PaneUpgradeError::Unanswered)? {
+        Reply::Upgraded {
+            successor_pid,
+            handoff_offset,
+        } => UpgradeOutcome::Upgraded {
+            successor_pid,
+            handoff_offset,
+        },
+        Reply::UpgradeFailed { reason } => UpgradeOutcome::Failed(reason),
+        Reply::Unsupported { reason, .. } => UpgradeOutcome::Unsupported(reason),
+        Reply::Rejected {
+            reason: RejectReason::UnknownVerb,
+            detail,
+        } => UpgradeOutcome::Unsupported(format!(
+            "this holder build predates in-place upgrade ({detail})"
+        )),
+        other => {
+            return Err(PaneUpgradeError::Unanswered(ConnectError::Protocol(
+                format!("expected upgraded / upgrade_failed / unsupported, got {other:?}"),
+            )))
+        }
+    };
+    Ok(PaneUpgrade {
+        asked_holder_pid,
+        outcome,
+    })
+}
+
 fn send(conn: &mut Conn, req: &Request, deadline: Instant) -> io::Result<()> {
     let payload = to_payload(req).map_err(io::Error::other)?;
     write_frame(&mut DeadlineIo::new(conn, deadline), KIND_CONTROL, &payload)
