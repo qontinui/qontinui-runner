@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   END_AND_RESUME_MISSING_NOTE,
   UPGRADE_UNSUPPORTED_NOTE,
@@ -8,9 +8,11 @@ import {
   holderActions,
   invokeErrorText,
   nextCensusDelayMs,
+  createCensusPoller,
   CENSUS_IDLE_REFRESH_MS,
   CENSUS_REFRESH_MS,
   type AttentionPane,
+  type HolderAttention,
 } from "./holderUpgrade";
 
 describe("holderActions", () => {
@@ -171,5 +173,72 @@ describe("nextCensusDelayMs", () => {
     );
     expect(nextCensusDelayMs({ panes: [], censusError: null }, "boom")).toBe(CENSUS_REFRESH_MS);
     expect(nextCensusDelayMs(null, null)).toBe(CENSUS_REFRESH_MS);
+  });
+});
+
+describe("createCensusPoller", () => {
+  it("two equal read errors in a row still schedule a third read (review p8f r2, N1)", async () => {
+    vi.useFakeTimers();
+    try {
+      let reads = 0;
+      const applied: string[] = [];
+      const p = createCensusPoller(
+        async () => {
+          reads += 1;
+          throw new Error("census unavailable");
+        },
+        (r) => applied.push(r.ok ? "ok" : r.error),
+      );
+      await p.refresh();
+      expect(reads).toBe(1);
+      await vi.advanceTimersByTimeAsync(CENSUS_REFRESH_MS);
+      expect(reads).toBe(2);
+      expect(applied).toEqual(["census unavailable", "census unavailable"]);
+      await vi.advanceTimersByTimeAsync(CENSUS_REFRESH_MS);
+      expect(reads).toBe(3);
+      p.stop();
+      await vi.advanceTimersByTimeAsync(CENSUS_IDLE_REFRESH_MS);
+      expect(reads).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("backs off after an empty clean census and applies only the newest read", async () => {
+    vi.useFakeTimers();
+    try {
+      let reads = 0;
+      const resolvers: Array<(a: HolderAttention) => void> = [];
+      const applied: number[] = [];
+      const p = createCensusPoller(
+        () =>
+          new Promise<HolderAttention>((res) => {
+            reads += 1;
+            resolvers.push(res);
+          }),
+        (r) => applied.push(r.ok ? r.attention.panes.length : -1),
+      );
+      const empty: HolderAttention = {
+        upgradeSupported: true,
+        upgradeUnsupportedReason: null,
+        endAndResumeAvailable: false,
+        runnerHolderBuild: "h",
+        panes: [],
+        censusError: null,
+      };
+      const first = p.refresh();
+      const second = p.refresh();
+      resolvers[1](empty);
+      resolvers[0]({ ...empty, panes: [] });
+      await Promise.all([first, second]);
+      expect(applied).toEqual([0]);
+      await vi.advanceTimersByTimeAsync(CENSUS_REFRESH_MS);
+      expect(reads).toBe(2);
+      await vi.advanceTimersByTimeAsync(CENSUS_IDLE_REFRESH_MS - CENSUS_REFRESH_MS);
+      expect(reads).toBe(3);
+      p.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
