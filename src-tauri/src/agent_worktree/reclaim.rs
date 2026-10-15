@@ -921,6 +921,12 @@ fn build_record_max_secs() -> u64 {
 /// `$$`, which is NOT a Windows pid, so a Windows process that merely shares
 /// the number says nothing about the build: there a present process is never
 /// Dead (the max-age ceiling bounds the hold) and an absent one is Unknown.
+/// Slack, in seconds, between the record's `started_at` and a pid holder's start
+/// before the holder counts as a REUSED pid. Wide on purpose: Linux/WSL clock
+/// steps can shift either timestamp by minutes, and misreading a live build as
+/// Dead releases its allocation.
+const PID_REUSE_SLACK_SECS: i64 = 300;
+
 fn classify_pid(
     present_start: Option<i64>,
     rec_start: Option<i64>,
@@ -930,7 +936,7 @@ fn classify_pid(
         Some(start) => match rec_start {
             // A later-started holder of the number is a reused pid, but only
             // where that inference is sound.
-            Some(rs) if shared_pid_namespace && start > rs + 5 => PidState::Dead,
+            Some(rs) if shared_pid_namespace && start > rs + PID_REUSE_SLACK_SECS => PidState::Dead,
             _ => PidState::Alive,
         },
         None if shared_pid_namespace => PidState::Dead,
@@ -986,10 +992,11 @@ fn run_record_is_active_with(
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return !is_stale || age.is_some_and(|a| a <= max_age);
     };
-    // Only a non-empty STRING timestamp means finished. null, absent, or any
-    // other shape (false, 0, "") is treated as unfinished: fail closed.
+    // Only a STRING that parses as an RFC3339 timestamp means finished. null,
+    // absent, or any other shape (false, 0, "", garbage) is treated as
+    // unfinished: fail closed.
     if let Some(serde_json::Value::String(f)) = v.get("finished_at") {
-        if !f.is_empty() {
+        if chrono::DateTime::parse_from_rfc3339(f).is_ok() {
             return false;
         }
     }
@@ -3636,8 +3643,18 @@ mod incarnation_and_shared_build_tests {
         let agent = a.parent().unwrap();
         let max = Duration::from_secs(6 * 3600);
         let dead = |_: u32, _: Option<&str>| PidState::Dead;
-        assert!(shared_build_active_for_probed(agent, Duration::from_secs(120), max, &dead));
-        assert!(!shared_build_active_for_probed(agent, Duration::from_secs(10), max, &dead));
+        assert!(shared_build_active_for_probed(
+            agent,
+            Duration::from_secs(120),
+            max,
+            &dead
+        ));
+        assert!(!shared_build_active_for_probed(
+            agent,
+            Duration::from_secs(10),
+            max,
+            &dead
+        ));
     }
 
     #[test]
@@ -3716,6 +3733,10 @@ mod incarnation_and_shared_build_tests {
         assert_eq!(classify_pid(None, Some(1000), true), PidState::Dead);
         assert_eq!(classify_pid(Some(2000), Some(1000), true), PidState::Dead);
         assert_eq!(classify_pid(Some(900), Some(1000), true), PidState::Alive);
+        // Within the reuse slack (60 s after the record) is still Alive;
+        // 600 s after it is a reused pid.
+        assert_eq!(classify_pid(Some(1060), Some(1000), true), PidState::Alive);
+        assert_eq!(classify_pid(Some(1600), Some(1000), true), PidState::Dead);
         assert_eq!(classify_pid(Some(2000), None, true), PidState::Alive);
         // Windows-like (MSYS pid is not a Windows pid): a present process that
         // started later must NOT be Dead; absent is Unknown.
@@ -3727,9 +3748,19 @@ mod incarnation_and_shared_build_tests {
     #[test]
     fn real_probe_follows_the_platform_namespace() {
         let me = std::process::id();
-        let expect_later = if cfg!(windows) { PidState::Alive } else { PidState::Dead };
-        assert_eq!(probe_record_pid(me, Some("2000-01-01T00:00:00Z")), expect_later);
-        assert_eq!(probe_record_pid(me, Some("2100-01-01T00:00:00Z")), PidState::Alive);
+        let expect_later = if cfg!(windows) {
+            PidState::Alive
+        } else {
+            PidState::Dead
+        };
+        assert_eq!(
+            probe_record_pid(me, Some("2000-01-01T00:00:00Z")),
+            expect_later
+        );
+        assert_eq!(
+            probe_record_pid(me, Some("2100-01-01T00:00:00Z")),
+            PidState::Alive
+        );
     }
 
     #[test]
@@ -3755,8 +3786,14 @@ mod incarnation_and_shared_build_tests {
         let rec = rec_with(&bgd, 4242, 300);
         // ceiling 10 s < stale 120 s: floored to 120, so a 300 s record is
         // past it and released; a 60 s record is still fresh and held.
-        let f = |r: &Path| run_record_is_active_with(
-            r, Duration::from_secs(120), Duration::from_secs(10), &|_, _| PidState::Alive);
+        let f = |r: &Path| {
+            run_record_is_active_with(
+                r,
+                Duration::from_secs(120),
+                Duration::from_secs(10),
+                &|_, _| PidState::Alive,
+            )
+        };
         assert!(!f(&rec));
         let fresh = rec_with(&bgd, 4242, 60);
         assert!(f(&fresh));
@@ -3766,7 +3803,7 @@ mod incarnation_and_shared_build_tests {
     fn only_a_string_finished_at_counts_as_finished() {
         let d = tempfile::tempdir().unwrap();
         let (a, _b, bgd) = allocation(d.path(), UUID_A);
-        for bad in ["false", "0", "\"\"", "[]", "{}"] {
+        for bad in ["false", "0", "\"\"", "[]", "{}", "\"garbage\""] {
             write_record(&bgd, &format!(r#"{{"pid":1,"finished_at":{bad}}}"#), 1);
             assert!(building(&a), "finished_at={bad} must hold");
         }

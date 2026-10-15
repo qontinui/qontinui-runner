@@ -3181,8 +3181,30 @@ mod tests {
             .output()
             .expect("git on PATH");
         assert!(out.status.success(), "git init: {out:?}");
-        filetime::set_file_mtime(&target, filetime::FileTime::from_unix_time(1_000_000_000, 0))
+        // One commit, so HEAD is READABLE and a bogus census head exercises
+        // the MISMATCH arm rather than the unreadable arm.
+        let out = crate::agent_worktree::reclaim::tests::hermetic_git()
+            .arg("-C")
+            .arg(&target)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .output()
             .unwrap();
+        assert!(out.status.success(), "git commit: {out:?}");
+        filetime::set_file_mtime(
+            &target,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )
+        .unwrap();
         let wt = target.to_string_lossy().to_string();
         let item = SurveyItem {
             id: norm_path(&wt),
