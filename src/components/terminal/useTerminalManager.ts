@@ -66,7 +66,12 @@ function spawnNamesFrom(data: unknown): SpawnNamesByTerminal {
 }
 
 /** Why a lost PTY holder's session was not relaunched (runner: `WithheldReason`). */
-export type RelaunchWithheldReason = "still-hosted" | "liveness-unknown" | "holder-unreachable";
+export type RelaunchWithheldReason =
+  | "still-hosted"
+  | "liveness-unknown"
+  | "holder-unreachable"
+  /** The webview's restore re-run declined the relaunch (review r2, N3). */
+  | "restore-declined";
 
 export interface TerminalTab {
   id: string;
