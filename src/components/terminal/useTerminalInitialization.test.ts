@@ -698,21 +698,38 @@ describe("relaunch from the persisted launch argv (Phase 6)", () => {
     }
   });
 
-  it("resumePlanFor: no argv → default; offered args → replay; a refusal or an unsafe arg → refused", () => {
+  it("resumePlanFor: no argv → default; offered args → replay; a refusal or an unsafe arg → default resume", () => {
     expect(resumePlanFor(rec({}))).toEqual({ kind: "default" });
     expect(resumePlanFor(rec({ resumeArgs: ["--model", "opus"] }))).toEqual({
       kind: "replay",
       args: ["--model", "opus"],
     });
     expect(resumePlanFor(rec({ resumeArgs: [] }))).toEqual({ kind: "replay", args: [] });
-    expect(resumePlanFor(rec({ resumeRefusal: "launch argument 2 is not shell-inert" }))).toEqual({
-      kind: "refused",
-      reason: "launch argument 2 is not shell-inert",
+    // An unsafe argv falls back to the DEFAULT resume — the session is still
+    // resumed, only the extra flags are dropped.
+    const refusal = "launch argument 2 (flag --add-dir) is not shell-inert";
+    expect(resumePlanFor(rec({ resumeRefusal: refusal }))).toEqual({
+      kind: "default",
+      fallbackReason: refusal,
     });
     // Defense in depth: the webview re-checks what the runner offered.
     expect(resumePlanFor(rec({ resumeArgs: ["--add-dir", "/srv/my project"] })).kind).toBe(
-      "refused",
+      "default",
     );
+    // And a default plan types exactly the pre-Phase-6 command.
+    expect(buildResumeCmd("sess-1", undefined, "summary", undefined, undefined)).toBe(
+      "claude --permission-mode bypassPermissions --resume sess-1\r",
+    );
+  });
+
+  it("a missing or unsafe session id still relaunches nothing (classifyRestoreAction gate)", () => {
+    for (const id of ["", "a b", "x;rm", "$(id)"]) {
+      expect(
+        classifyRestoreAction(
+          rec({ claudeSessionId: id, origin: "authoritative", confirmedAt: 1, resumeArgs: [] }),
+        ),
+      ).toBe("skip-invalid");
+    }
   });
 
   it("buildResumeCmd replays the flags before --resume, keeping the autonomous default", () => {

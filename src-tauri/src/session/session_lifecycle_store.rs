@@ -816,8 +816,8 @@ pub struct TerminalSessionRecord {
     /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
     /// Phase 6 / D11). The source of the relaunch's flags when the pane's PTY
     /// holder dies — see [`crate::session::resume_argv::replay_args`], which
-    /// filters it and refuses a relaunch whose surviving tokens are not
-    /// shell-inert.
+    /// filters it, and whose refusal (a surviving token that is not
+    /// shell-inert) drops the flags and falls back to the default resume.
     ///
     /// Written ONLY by [`SessionLifecycleStore::set_launch_argv`], and never by
     /// `record_open`: a re-record carries no argv and must not erase one.

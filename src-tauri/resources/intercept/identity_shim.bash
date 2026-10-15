@@ -175,8 +175,9 @@ PINNED="${QONTINUI_PINNED_SESSION_ID:-}"
 # that claude, so it inherits the variable — writes it to the PTY in its OSC
 # 9999 `session_start` report, and the runner persists it on the session's
 # record. If the pane's PTY holder later dies, the session is relaunched with
-# these flags plus `--resume <id>` (the runner refuses any relaunch whose
-# surviving tokens are not shell-inert — `session::resume_argv`).
+# these flags plus `--resume <id>` (when a surviving token is not shell-inert
+# the runner drops the flags and resumes with the default command —
+# `session::resume_argv`).
 #
 # The runner's own plumbing is left out: the shell integration's
 # `--append-system-prompt[-file] <value>` (re-added in the relaunched pane, and

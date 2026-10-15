@@ -568,35 +568,35 @@ export function isShellInertArg(arg: unknown): arg is string {
  * How a cold-restored session is relaunched (plan
  * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 6):
  *
- * - `"default"` — no launch argv was ever reported: the default resume, as
- *   before argv persistence existed;
+ * - `"default"` — the default resume command, as before argv persistence
+ *   existed. Used when no launch argv was ever reported, AND when the persisted
+ *   argv must not be replayed (the runner's `resumeRefusal`, or an argument that
+ *   fails the inert re-check here): D11 rejects the WHOLE replay rather than
+ *   escaping it, but the session is still resumed — only its extra flags are
+ *   dropped. `fallbackReason` then says why, for a warn line (it names a flag,
+ *   never a value);
  * - `"replay"` — type these flags (the runner's `resumeArgs`, re-checked
  *   shell-inert here) before `--resume <id>`, so the session comes back the way
- *   its operator launched it;
- * - `"refused"` — the persisted argv must not be replayed (the runner's
- *   `resumeRefusal`, or an argument that fails the inert re-check here). D11:
- *   the WHOLE replay is rejected rather than escaped, so the restore types
- *   NOTHING and the tab shows its resume-failed banner; the operator's Retry
- *   then types the default resume, as an explicit choice.
+ *   its operator launched it.
  *
- * Pure + exported for unit tests.
+ * A missing or unsafe session id is not decided here: `classifyRestoreAction`
+ * (`skip-invalid`) relaunches nothing for it. Pure + exported for unit tests.
  */
 export type ResumePlan =
-  | { kind: "default" }
-  | { kind: "replay"; args: readonly string[] }
-  | { kind: "refused"; reason: string };
+  | { kind: "default"; fallbackReason?: string }
+  | { kind: "replay"; args: readonly string[] };
 
 export function resumePlanFor(
   rec: Pick<TerminalSessionRecord, "resumeArgs" | "resumeRefusal">,
 ): ResumePlan {
   if (typeof rec.resumeRefusal === "string" && rec.resumeRefusal.length > 0) {
-    return { kind: "refused", reason: rec.resumeRefusal };
+    return { kind: "default", fallbackReason: rec.resumeRefusal };
   }
   if (rec.resumeArgs === undefined || rec.resumeArgs === null) return { kind: "default" };
   if (!Array.isArray(rec.resumeArgs) || !rec.resumeArgs.every(isShellInertArg)) {
     return {
-      kind: "refused",
-      reason: "the runner offered a relaunch argument that is not shell-inert",
+      kind: "default",
+      fallbackReason: "the runner offered a relaunch argument that is not shell-inert",
     };
   }
   return { kind: "replay", args: rec.resumeArgs };
@@ -1540,7 +1540,7 @@ export function useTerminalInitialization({
       claudeConfigDir?: string;
       /** Which provider owns this session — drives the adapter resume. */
       provider?: string;
-      /** How the session is relaunched — default, a replayed argv, or refused (Phase 6). */
+      /** How the session is relaunched — the default resume or a replayed argv (Phase 6). */
       resumePlan?: ResumePlan;
       /** Deferred registry re-assert — applied only on VERIFIED resume. */
       recordOpen?: SessionOpenArgs;
@@ -2032,19 +2032,14 @@ export function useTerminalInitialization({
                     continue;
                   }
                   // A refused replay (plan Phase 6, D11): the persisted launch
-                  // argv cannot be typed safely, so NOTHING is typed — never an
-                  // escaped variant, never a silently different command. The
-                  // tab gets its resume-failed banner; the restore-pending
-                  // marker stays set so the open record survives for the
-                  // operator's Retry (which types the default resume).
-                  const plan = restore.resumePlan ?? { kind: "default" };
-                  if (plan.kind === "refused") {
+                  // argv cannot be typed safely, so its flags are dropped —
+                  // never escaped — and the DEFAULT resume is typed instead.
+                  const plan: ResumePlan = restore.resumePlan ?? { kind: "default" };
+                  if (plan.kind === "default" && plan.fallbackReason) {
                     console.warn(
-                      `[TerminalPage] not relaunching session ${restore.claudeSessionId}: ` +
-                        `its launch argv was refused (${plan.reason})`,
+                      `[TerminalPage] session ${restore.claudeSessionId}: its launch argv cannot ` +
+                        `be replayed (${plan.fallbackReason}) — resuming with the default command`,
                     );
-                    updateTab(restore.tabId, { isReconnecting: false, resumeFailed: true });
-                    continue;
                   }
                   // Type the resume and VERIFY the handshake (retry once on
                   // failure). Fire-and-forget per tab so one slow/failed

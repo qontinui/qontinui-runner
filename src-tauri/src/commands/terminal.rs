@@ -1790,19 +1790,30 @@ struct RestoreCandidate {
     #[serde(rename = "resumeArgs", skip_serializing_if = "Option::is_none")]
     resume_args: Option<Vec<String>>,
     /// Why the persisted argv must NOT be replayed (D11: the whole replay is
-    /// refused rather than escaped). Present ⇒ the webview relaunches nothing
-    /// for this record and says why.
+    /// refused rather than escaped). Present ⇒ the webview types the DEFAULT
+    /// resume command instead (its extra flags dropped) and logs why.
     #[serde(rename = "resumeRefusal", skip_serializing_if = "Option::is_none")]
     resume_refusal: Option<String>,
 }
 
 impl RestoreCandidate {
     fn new(record: TerminalSessionRecord, transcript_exists: Option<bool>) -> Self {
-        let (resume_args, resume_refusal) = crate::session::resume_argv::Relaunch::for_record(
+        let relaunch = crate::session::resume_argv::Relaunch::for_record(
             record.launch_argv.as_deref(),
             &record.claude_session_id,
-        )
-        .wire_fields();
+        );
+        // A refused replay still RESUMES — with the default command; only the
+        // extra flags are dropped. Say so at warn, naming the flag (the
+        // refusal's text never carries a token's value).
+        if let crate::session::resume_argv::Relaunch::Fallback(why) = &relaunch {
+            tracing::warn!(
+                session = %record.claude_session_id,
+                refusal = %why,
+                "restore: the session's launch argv cannot be replayed — resuming with the \
+                 default resume command, its extra flags dropped"
+            );
+        }
+        let (resume_args, resume_refusal) = relaunch.wire_fields();
         RestoreCandidate {
             record,
             transcript_exists,
@@ -3158,7 +3169,7 @@ mod tests {
         let v = serde_json::to_value(RestoreCandidate::new(rec, None)).unwrap();
         assert!(
             v.get("resumeArgs").is_none(),
-            "a refused replay offers no args: {v}"
+            "a refused replay offers no args, so the webview types the default resume: {v}"
         );
         assert!(
             v["resumeRefusal"]
