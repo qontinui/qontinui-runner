@@ -24,7 +24,7 @@ mod unix {
         connect, connect_raw, probe, AttachedStream, Event, Probe, UpgradeOutcome,
     };
     use qontinui_pty_holder::frame::KIND_CONTROL;
-    use qontinui_pty_holder::handoff::ADOPT_FAULT_ENV;
+    use qontinui_pty_holder::handoff::{ACK_TIMEOUT_ENV, ADOPT_FAULT_ENV, COMMIT_DELAY_ENV};
     use qontinui_pty_holder::lock::read_record;
     use qontinui_pty_holder::pane::{lock_path, snapshot_path, snapshot_tmp_path, PaneId};
     use qontinui_pty_holder::proc_identity::{is_same_process, start_token};
@@ -41,7 +41,7 @@ mod unix {
     /// Long enough for a whole upgrade exchange (`handoff::ACK_TIMEOUT` plus
     /// the quiesce and input-drain bounds).
     fn upgrade_deadline() -> Instant {
-        Instant::now() + Duration::from_secs(40)
+        Instant::now() + Duration::from_secs(60)
     }
 
     fn pane_dir(tag: &str) -> PathBuf {
@@ -124,7 +124,7 @@ mod unix {
         );
         let mut spec = ChildSpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()]);
         spec.env = std::env::vars_os()
-            .filter(|(k, _)| k != ADOPT_FAULT_ENV)
+            .filter(|(k, _)| k != ADOPT_FAULT_ENV && k != ACK_TIMEOUT_ENV && k != COMMIT_DELAY_ENV)
             .collect();
         spec.cwd = Some(OsString::from("/tmp"));
         spec
@@ -133,6 +133,11 @@ mod unix {
     /// Spawn the holder (with `fault` in ITS environment, which a successor
     /// inherits) and read its ready line.
     fn start(tag: &str, spec: ChildSpec, fault: Option<&str>) -> Pane {
+        start_with(tag, spec, fault, &[])
+    }
+
+    /// [`start`] with further test-seam variables in the holder's environment.
+    fn start_with(tag: &str, spec: ChildSpec, fault: Option<&str>, seams: &[(&str, &str)]) -> Pane {
         let dir = pane_dir(tag);
         write_spec(&dir, &p1(), &spec).unwrap();
         let mut cmd = Command::new(BIN);
@@ -147,6 +152,10 @@ mod unix {
             Some(f) => cmd.env(ADOPT_FAULT_ENV, f),
             None => cmd.env_remove(ADOPT_FAULT_ENV),
         };
+        cmd.env_remove(ACK_TIMEOUT_ENV).env_remove(COMMIT_DELAY_ENV);
+        for (k, v) in seams {
+            cmd.env(k, v);
+        }
         let mut holder = cmd.spawn().unwrap();
         let out = holder.stdout.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -272,6 +281,26 @@ mod unix {
             !snapshot_tmp_path(dir, &p1()).exists(),
             "snapshot temp left behind"
         );
+    }
+
+    /// The pid on the first line of the pane's log that contains `needle`
+    /// (`<ms> pid=<n> <message>`).
+    fn logged_pid(dir: &Path, needle: &str) -> u32 {
+        let log = dir.join("p1.log");
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&log) {
+                if let Some(pid) = text.lines().filter(|l| l.contains(needle)).find_map(|l| {
+                    l.split_whitespace()
+                        .find_map(|t| t.strip_prefix("pid="))
+                        .and_then(|p| p.parse().ok())
+                }) {
+                    return pid;
+                }
+            }
+            assert!(Instant::now() < end, "no {needle:?} logged within 20 s");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The successor's pid, from the line a `stall`-faulted successor writes to
@@ -599,5 +628,216 @@ mod unix {
         pane.adopt_cleanup(successor_pid);
         let hello = served_by(&dir, successor_pid);
         assert_eq!(hello.child_pid, Some(pane.child_pid));
+    }
+
+    /// Review r1, findings 1 and 3: a predecessor starved for LONGER than the
+    /// successor's old 15 s commit timeout still hands the pane over (the
+    /// successor waits as long as its predecessor lives) — and input written
+    /// while the swap is in flight is held and reaches the child through the
+    /// commit, exactly once.
+    #[test]
+    fn pty_holder_handoff_slow_commit_and_held_input_survive_a_committed_swap() {
+        let mut pane = start_with("slow", echo_spec(7), None, &[(COMMIT_DELAY_ENV, "16000")]);
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        let req_dir = dir.clone();
+        let request = std::thread::spawn(move || {
+            connect(&req_dir, &p1(), soon())
+                .unwrap()
+                .prepare_upgrade(upgrade_deadline())
+        });
+        let successor = logged_pid(&dir, "adopt: acked");
+        pane.adopt_cleanup(successor);
+        // Held: the predecessor is frozen between ack and commit.
+        send_input(&dir, b"held-one\n");
+        // Then an input connection that stays OPEN across the swap (the
+        // newest one: an older input connection is superseded by design).
+        // The commit's drain must read what it carries and end it.
+        let mut kept = connect(&dir, &p1(), soon())
+            .unwrap()
+            .open_input(soon())
+            .unwrap();
+        kept.input(b"held-kept\n", soon())
+            .expect("written while frozen");
+        kept.input(b"held-two\n", soon())
+            .expect("written while frozen");
+        let outcome = request.join().unwrap().expect("prepare_upgrade answered");
+        assert!(
+            matches!(outcome, UpgradeOutcome::Upgraded { successor_pid, .. } if successor_pid == successor),
+            "{outcome:?}"
+        );
+        let hello = served_by(&dir, successor);
+        assert_eq!(hello.child_pid, Some(pane.child_pid));
+        let mut s = attach(&dir, Some(0));
+        let r = read_until(&mut s, 0, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:held-two") > 0
+        });
+        assert_eq!(
+            count(&r.bytes, b"got:held-one"),
+            1,
+            "held input delivered once"
+        );
+        assert_eq!(
+            count(&r.bytes, b"got:held-kept"),
+            1,
+            "the open connection was drained"
+        );
+        assert_eq!(count(&r.bytes, b"got:held-two"), 1);
+        let pos = |n: &[u8]| r.bytes.windows(n.len()).position(|w| w == n).unwrap();
+        assert!(pos(b"got:held-one") < pos(b"got:held-kept"));
+        assert!(pos(b"got:held-kept") < pos(b"got:held-two"));
+        assert!(!r.lost);
+        // A write on the drained connection now FAILS — never vanishes.
+        let late = (0..20).try_for_each(|_| kept.input(b"late\n", soon()));
+        assert!(
+            late.is_err(),
+            "a write after the drain must fail at the writer"
+        );
+    }
+
+    /// Review r1, finding 6: SIGKILL the PREDECESSOR after the successor's ack
+    /// and before its commit — the successor takes the pane over, same child.
+    #[test]
+    fn pty_holder_handoff_predecessor_killed_after_ack_successor_takes_over() {
+        let mut pane = start_with("pkill", echo_spec(7), None, &[(COMMIT_DELAY_ENV, "30000")]);
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        let req_dir = dir.clone();
+        let request = std::thread::spawn(move || {
+            connect(&req_dir, &p1(), soon())
+                .unwrap()
+                .prepare_upgrade(upgrade_deadline())
+        });
+        let successor = logged_pid(&dir, "adopt: acked");
+        pane.adopt_cleanup(successor);
+        // The predecessor is this test's own child: kill it exactly.
+        pane.holder.kill().unwrap();
+        let _ = pane.holder.wait();
+        assert!(
+            request.join().unwrap().is_err(),
+            "the requester's holder died"
+        );
+        let hello = served_by(&dir, successor);
+        assert_eq!(hello.child_pid, Some(pane.child_pid), "same child pid");
+        assert!(is_same_process(pane.child_pid, pane.child_token.as_deref()));
+        let record = read_record(&lock_path(&dir, &p1())).expect("a lock record");
+        assert_eq!(record.holder_pid, successor);
+        let mut s = attach(&dir, Some(0));
+        send_input(&dir, b"alive\n");
+        let r = read_until(&mut s, 0, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:alive") > 0
+        });
+        assert_eq!(count(&r.bytes, b"before-swap"), 1);
+        assert!(!r.lost);
+        no_snapshot_left(&dir);
+    }
+
+    /// Review r1, finding 6: the ack TIMEOUT itself — a successor that never
+    /// answers is killed when the (shortened) timeout runs out, and the
+    /// predecessor keeps serving.
+    #[test]
+    fn pty_holder_handoff_ack_timeout_rolls_back() {
+        let mut pane = start_with(
+            "ackto",
+            echo_spec(7),
+            Some("stall"),
+            &[(ACK_TIMEOUT_ENV, "1500")],
+        );
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        let started = Instant::now();
+        let outcome = connect(&dir, &p1(), soon())
+            .unwrap()
+            .prepare_upgrade(upgrade_deadline())
+            .unwrap();
+        let successor = stalled_successor_pid(&dir);
+        pane.adopt_cleanup(successor);
+        assert!(
+            matches!(&outcome, UpgradeOutcome::Failed(why) if why.contains("waiting for the ack")),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the shortened timeout applied"
+        );
+        assert!(
+            !is_same_process(successor, pane.extra[0].1.as_deref()),
+            "the silent successor was killed"
+        );
+        let hello = served_by(&dir, pane.holder_pid);
+        assert_eq!(hello.child_pid, Some(pane.child_pid));
+        no_snapshot_left(&dir);
+        assert!(
+            !dir.join("p1.sock.upg").exists(),
+            "no staged socket left behind"
+        );
+        let mut s = attach(&dir, None);
+        send_input(&dir, b"still\n");
+        let from = s.info.start_offset;
+        let r = read_until(&mut s, from, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:still") > 0
+        });
+        assert_eq!(count(&r.bytes, b"got:still"), 1);
+    }
+
+    /// Review r1, finding 6: a child that writes CONTINUOUSLY across the swap
+    /// (so output sits in the kernel while reads are quiesced): a late replay
+    /// from offset 0 is a gap-free, duplicate-free counter on both sides of X.
+    #[test]
+    fn pty_holder_handoff_continuous_output_is_contiguous_across_the_swap() {
+        let mut spec = ChildSpec::new(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "i=0; while :; do echo \"n=$i\"; i=$((i+1)); sleep 0.002; done".into(),
+        ]);
+        spec.env = std::env::vars_os()
+            .filter(|(k, _)| k != ADOPT_FAULT_ENV && k != ACK_TIMEOUT_ENV && k != COMMIT_DELAY_ENV)
+            .collect();
+        spec.cwd = Some(OsString::from("/tmp"));
+        let mut pane = start("count", spec, None);
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        std::thread::sleep(Duration::from_millis(300));
+        let outcome = connect(&dir, &p1(), soon())
+            .unwrap()
+            .prepare_upgrade(upgrade_deadline())
+            .unwrap();
+        let UpgradeOutcome::Upgraded {
+            successor_pid,
+            handoff_offset,
+        } = outcome
+        else {
+            panic!("expected upgraded, got {outcome:?}");
+        };
+        pane.adopt_cleanup(successor_pid);
+        assert!(
+            handoff_offset > 0,
+            "the counter had produced output before X"
+        );
+        served_by(&dir, successor_pid);
+        let mut late = attach(&dir, Some(0));
+        let all = read_until(&mut late, 0, Duration::from_secs(15), |r| {
+            r.next > handoff_offset + 4096
+        });
+        assert!(!all.lost, "no loss marker");
+        assert!(
+            all.next > handoff_offset + 4096,
+            "output continued after the swap"
+        );
+        let mut expect = 0u64;
+        let mut lines = all.bytes.split(|b| *b == b'\n').peekable();
+        while let Some(line) = lines.next() {
+            if lines.peek().is_none() {
+                break; // the last, possibly partial, line
+            }
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let n: u64 = std::str::from_utf8(line.strip_prefix(b"n=").expect("a counter line"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(n, expect, "counter gap or duplicate at line {expect}");
+            expect += 1;
+        }
+        assert!(expect > 100, "enough lines to span the swap: {expect}");
     }
 }
