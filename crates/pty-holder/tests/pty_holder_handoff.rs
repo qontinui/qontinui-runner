@@ -24,7 +24,10 @@ mod unix {
         connect, connect_raw, probe, AttachedStream, Event, Probe, UpgradeOutcome,
     };
     use qontinui_pty_holder::frame::KIND_CONTROL;
-    use qontinui_pty_holder::handoff::{ACK_TIMEOUT_ENV, ADOPT_FAULT_ENV, COMMIT_DELAY_ENV};
+    use qontinui_pty_holder::handoff::{
+        upgrade_loss_notice, ACK_TIMEOUT_ENV, ADOPT_FAULT_ENV, COMMIT_DELAY_ENV,
+        SERVING_POLL_DELAY_ENV,
+    };
     use qontinui_pty_holder::lock::read_record;
     use qontinui_pty_holder::pane::{lock_path, snapshot_path, snapshot_tmp_path, PaneId};
     use qontinui_pty_holder::proc_identity::{is_same_process, start_token};
@@ -115,6 +118,32 @@ mod unix {
         }
     }
 
+    /// A test-seam variable, kept out of every CHILD's environment.
+    fn is_seam(k: &std::ffi::OsStr) -> bool {
+        [
+            ADOPT_FAULT_ENV,
+            ACK_TIMEOUT_ENV,
+            COMMIT_DELAY_ENV,
+            SERVING_POLL_DELAY_ENV,
+        ]
+        .iter()
+        .any(|s| k == *s)
+    }
+
+    /// [`echo_spec`] that ALSO appends every input line to `file`, so a test
+    /// can count what the child received whatever happened to its output.
+    fn echo_and_log_spec(file: &Path) -> ChildSpec {
+        let script = format!(
+            "stty -echo; echo before-swap; while read line; do echo \"got:$line\"; \
+             echo \"$line\" >> '{}'; done",
+            file.display()
+        );
+        let mut spec = ChildSpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()]);
+        spec.env = std::env::vars_os().filter(|(k, _)| !is_seam(k)).collect();
+        spec.cwd = Some(OsString::from("/tmp"));
+        spec
+    }
+
     /// The pane's child: echoes a marker, then answers every input line with
     /// `got:<line>`, and exits with `code` on `quit`.
     fn echo_spec(code: u8) -> ChildSpec {
@@ -123,9 +152,7 @@ mod unix {
              [ \"$line\" = quit ] && exit {code}; done"
         );
         let mut spec = ChildSpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()]);
-        spec.env = std::env::vars_os()
-            .filter(|(k, _)| k != ADOPT_FAULT_ENV && k != ACK_TIMEOUT_ENV && k != COMMIT_DELAY_ENV)
-            .collect();
+        spec.env = std::env::vars_os().filter(|(k, _)| !is_seam(k)).collect();
         spec.cwd = Some(OsString::from("/tmp"));
         spec
     }
@@ -152,7 +179,9 @@ mod unix {
             Some(f) => cmd.env(ADOPT_FAULT_ENV, f),
             None => cmd.env_remove(ADOPT_FAULT_ENV),
         };
-        cmd.env_remove(ACK_TIMEOUT_ENV).env_remove(COMMIT_DELAY_ENV);
+        cmd.env_remove(ACK_TIMEOUT_ENV)
+            .env_remove(COMMIT_DELAY_ENV)
+            .env_remove(SERVING_POLL_DELAY_ENV);
         for (k, v) in seams {
             cmd.env(k, v);
         }
@@ -794,9 +823,7 @@ mod unix {
             "-c".into(),
             "i=0; while :; do echo \"n=$i\"; i=$((i+1)); sleep 0.002; done".into(),
         ]);
-        spec.env = std::env::vars_os()
-            .filter(|(k, _)| k != ADOPT_FAULT_ENV && k != ACK_TIMEOUT_ENV && k != COMMIT_DELAY_ENV)
-            .collect();
+        spec.env = std::env::vars_os().filter(|(k, _)| !is_seam(k)).collect();
         spec.cwd = Some(OsString::from("/tmp"));
         let mut pane = start("count", spec, None);
         let dir = pane.dir.clone();
@@ -925,5 +952,164 @@ mod unix {
                 }
             }
         }
+    }
+
+    /// Review r3, G: the successor reports `serving` — it has taken over: the
+    /// held input is written, output past X read — and dies before the
+    /// predecessor notices either. The predecessor takes the pane back (the
+    /// child must keep a holder), does NOT replay the held input, and puts an
+    /// explicit loss notice into the stream at the resume point.
+    #[test]
+    fn pty_holder_handoff_successor_dying_after_serving_declares_the_loss() {
+        let out = pane_dir("srvout");
+        std::fs::create_dir_all(&out).unwrap();
+        let file = out.join("lines");
+        let mut pane = start_with(
+            "srvdie",
+            echo_and_log_spec(&file),
+            Some("exit-after-serving"),
+            &[(COMMIT_DELAY_ENV, "1500"), (SERVING_POLL_DELAY_ENV, "2500")],
+        );
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        let mut live = attach(&dir, None);
+        let from = live.info.start_offset;
+        let r = read_until(&mut live, from, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"before-swap") > 0
+        });
+        let req_dir = dir.clone();
+        let request = std::thread::spawn(move || {
+            connect(&req_dir, &p1(), soon())
+                .unwrap()
+                .prepare_upgrade(upgrade_deadline())
+        });
+        let successor = logged_pid(&dir, "adopt: acked");
+        pane.adopt_cleanup(successor);
+        send_input(&dir, b"held\n");
+        let outcome = request.join().unwrap().expect("prepare_upgrade answered");
+        let UpgradeOutcome::Failed(why) = &outcome else {
+            panic!("expected a declared-loss take-back, got {outcome:?}");
+        };
+        assert!(why.contains("AFTER reporting `serving`"), "{why}");
+        let log = std::fs::read_to_string(dir.join("p1.log")).unwrap();
+        assert!(
+            log.contains("adopt: test fault: exit-after-serving"),
+            "{log}"
+        );
+        assert!(
+            log.contains("upgrade: ERROR: successor"),
+            "logged at error: {log}"
+        );
+        assert!(
+            pane.holder.try_wait().unwrap().is_none(),
+            "the predecessor still runs"
+        );
+        let hello = served_by(&dir, pane.holder_pid);
+        assert_eq!(hello.child_pid, Some(pane.child_pid), "same child");
+        assert!(is_same_process(pane.child_pid, pane.child_token.as_deref()));
+        let record = read_record(&lock_path(&dir, &p1())).expect("a lock record");
+        assert_eq!(record.holder_pid, pane.holder_pid);
+        send_input(&dir, b"after\n");
+        let r2 = read_until(&mut live, r.next, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:after") > 0
+        });
+        let marker: &[u8] = b"holder upgrade: the successor holder died after taking over";
+        assert!(count(&upgrade_loss_notice(0), marker) == 1);
+        assert_eq!(
+            count(&r2.bytes, marker),
+            1,
+            "the loss is declared in the stream: {:?}",
+            String::from_utf8_lossy(&r2.bytes)
+        );
+        // The held input reached the child exactly once — written by the
+        // successor, never replayed by the predecessor.
+        let got = std::fs::read_to_string(&file).unwrap_or_default();
+        assert_eq!(got.matches("held").count(), 1, "held input once: {got:?}");
+        assert_eq!(got.matches("after").count(), 1, "{got:?}");
+        let _ = std::fs::remove_dir_all(&out);
+        no_snapshot_left(&dir);
+        assert!(!dir.join("p1.sock.upg").exists());
+    }
+
+    /// Review r3 nit (path C): the successor's endpoint rename FAILS after the
+    /// commit. It sends no `serving`, waits for the predecessor to leave
+    /// before it touches the master or the held input, then serves the pane
+    /// (unreachable: the lock is held, so a probe reads UNKNOWN). The held
+    /// input reaches the child exactly once.
+    #[test]
+    fn pty_holder_handoff_failed_publish_waits_for_the_predecessor_then_takes_over() {
+        let out = pane_dir("pubout");
+        std::fs::create_dir_all(&out).unwrap();
+        let file = out.join("lines");
+        let mut spec = ChildSpec::new(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "stty -echo; while read l; do echo \"$l\" >> '{}'; done",
+                file.display()
+            )
+            .into(),
+        ]);
+        spec.env = std::env::vars_os().filter(|(k, _)| !is_seam(k)).collect();
+        spec.cwd = Some(OsString::from("/tmp"));
+        let mut pane = start_with(
+            "pubfail",
+            spec,
+            Some("fail-publish"),
+            &[(COMMIT_DELAY_ENV, "1500")],
+        );
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        let req_dir = dir.clone();
+        let request = std::thread::spawn(move || {
+            connect(&req_dir, &p1(), soon())
+                .unwrap()
+                .prepare_upgrade(upgrade_deadline())
+        });
+        let successor = logged_pid(&dir, "adopt: acked");
+        pane.adopt_cleanup(successor);
+        send_input(&dir, b"held-c\n");
+        let outcome = request.join().unwrap().expect("prepare_upgrade answered");
+        assert!(
+            matches!(outcome, UpgradeOutcome::Upgraded { successor_pid, .. } if successor_pid == successor),
+            "the successor is alive, so the commit stands: {outcome:?}"
+        );
+        pane.holder_exits_within(Duration::from_secs(10))
+            .expect("the predecessor exits after its serving wait");
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = std::fs::read_to_string(&file).unwrap_or_default();
+            if got.contains("held-c") {
+                assert_eq!(got.matches("held-c").count(), 1, "held input once");
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "held input never reached the child: {got:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let log = std::fs::read_to_string(dir.join("p1.log")).unwrap();
+        let at = |n: &str| {
+            log.find(n)
+                .unwrap_or_else(|| panic!("{n:?} not logged: {log}"))
+        };
+        assert!(at("waiting for the predecessor to leave") < at("the predecessor left; reading"));
+        assert!(at("no `serving` from successor") < at("the predecessor left; reading"));
+        assert!(
+            is_same_process(successor, pane.extra[0].1.as_deref()),
+            "the successor serves on"
+        );
+        assert!(
+            is_same_process(pane.child_pid, pane.child_token.as_deref()),
+            "same child"
+        );
+        let record = read_record(&lock_path(&dir, &p1())).expect("a lock record");
+        assert_eq!(record.holder_pid, successor);
+        assert!(
+            matches!(probe(&dir, &p1(), soon()), Probe::Unknown { .. }),
+            "unreachable but held: UNKNOWN, never dead"
+        );
+        let _ = std::fs::remove_dir_all(&out);
     }
 }
