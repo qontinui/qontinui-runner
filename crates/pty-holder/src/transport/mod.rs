@@ -28,7 +28,7 @@ use crate::pane::PaneId;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::{own_uid, Conn, Listener};
+pub use unix::{own_uid, Conn, Listener, StagedListener};
 
 #[cfg(windows)]
 mod windows;
@@ -49,12 +49,18 @@ pub fn bind(pane_dir: &Path, pane: &PaneId) -> io::Result<Listener> {
     }
 }
 
-/// [`bind`] for a holder upgrade's successor (plan Phase 8): the endpoint
-/// path is taken over atomically from the predecessor's socket
-/// (`Listener::bind_replacing`). The caller holds the pane lock.
+/// Bind a holder upgrade's successor endpoint at the STAGED path beside the
+/// pane's socket (plan Phase 8; `Listener::bind_staged`). The caller holds the
+/// pane lock (inherited).
 #[cfg(unix)]
-pub fn bind_replacing(pane_dir: &Path, pane: &PaneId) -> io::Result<Listener> {
-    Listener::bind_replacing(&crate::pane::socket_path(pane_dir, pane))
+pub fn bind_staged(pane_dir: &Path, pane: &PaneId) -> io::Result<StagedListener> {
+    Listener::bind_staged(&crate::pane::socket_path(pane_dir, pane))
+}
+
+/// The staged successor socket's path, `<pane-id>.sock.upg`.
+#[cfg(unix)]
+pub fn staged_socket_path(pane_dir: &Path, pane: &PaneId) -> std::path::PathBuf {
+    unix::staged_path(&crate::pane::socket_path(pane_dir, pane))
 }
 
 /// Connect to the pane's endpoint, giving up at `deadline`.

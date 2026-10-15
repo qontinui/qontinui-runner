@@ -654,6 +654,10 @@ pub(crate) fn serve_conn_with(
     let mut state = ConnState::AwaitHello;
     // This connection's input generation, once it became the input stream.
     let mut input_gen: Option<u64> = None;
+    // Unix: this connection's registration as an input stream, so a
+    // committing holder upgrade can drain it (`Pane::drain_input_for_handoff`).
+    #[cfg(unix)]
+    let mut input_reg: Option<u64> = None;
     loop {
         let read = if state == ConnState::AwaitHello {
             // One deadline for the whole first frame (DeadlineIo re-arms it
@@ -704,6 +708,23 @@ pub(crate) fn serve_conn_with(
                 // nothing the client sends after the `ok` can be overtaken by
                 // an older connection's input.
                 if matches!(state, ConnState::InputOnly(_)) && input_gen.is_none() {
+                    #[cfg(unix)]
+                    if let Some(p) = pane {
+                        // Refused while an upgrade commits: no `ok`, so the
+                        // client sends nothing here and reconnects to the
+                        // successor.
+                        match conn.try_clone().ok().and_then(|c| p.register_input_conn(c)) {
+                            Some(id) => input_reg = Some(id),
+                            None => {
+                                reject(
+                                    &writer,
+                                    RejectReason::Busy,
+                                    "this holder is handing its pane to a successor",
+                                );
+                                break;
+                            }
+                        }
+                    }
                     input_gen = pane.map(|p| p.supersede_input());
                 }
                 if send_reply(&writer, &reply).is_err() {
@@ -816,6 +837,10 @@ pub(crate) fn serve_conn_with(
         }
     }
     // Teardown: stop this connection's pump (if any) and close both halves.
+    #[cfg(unix)]
+    if let (Some(p), Some(id)) = (pane, input_reg) {
+        p.unregister_input_conn(id);
+    }
     flow.closed.store(true, Ordering::SeqCst);
     if let Some(p) = pane {
         p.notify();

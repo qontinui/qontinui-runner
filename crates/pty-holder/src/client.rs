@@ -348,9 +348,12 @@ impl Client {
     /// `prepare_upgrade` (plan Phase 8, a FROZEN envelope verb, so it works
     /// on a holder that speaks none of this runner's data-path versions):
     /// hand the pane to a successor holder started from the holder's own
-    /// executable path. Waits for the whole exchange, which can take the
-    /// holder up to `handoff::ACK_TIMEOUT` plus its quiesce and input-drain
-    /// bounds — give `deadline` at least 25 s.
+    /// executable path. Waits for the whole exchange. Its worst case is the
+    /// sum of the holder's bounds — input freeze 2 s, quiesce 2 s, ack 15 s,
+    /// input drain 2 s, commit write 15 s, `serving` 5 s: about 41 s — so give
+    /// `deadline` at least 45 s. A client that gives up first gets an error
+    /// for an upgrade whose outcome is UNKNOWN: it may have committed or been
+    /// rolled back; probe the pane (`hello_ack.holder_pid`) to learn which.
     ///
     /// After [`UpgradeOutcome::Upgraded`] this connection is dead (the old
     /// holder exits) and every other connection to the pane drops; a client

@@ -578,6 +578,11 @@ fn stray_kind(file_name: &str) -> Option<(&str, Duration)> {
     if let Some(pane) = file_name.strip_suffix(".scrollback.tmp") {
         return Some((pane, STRAY_MIN_AGE));
     }
+    // A successor's staged socket (`<pane-id>.sock.upg`, plan Phase 8) left
+    // by one that died between its bind and its rename.
+    if let Some(pane) = file_name.strip_suffix(".sock.upg") {
+        return Some((pane, STRAY_MIN_AGE));
+    }
     let (pane, extension) = file_name.rsplit_once('.')?;
     match extension {
         // `upgrade` / `upgrade-tmp`: a holder upgrade's snapshot (plan Phase
@@ -799,6 +804,39 @@ mod tests {
         for kept in [young_spec, skipped_spec, recent_log, foreign, recent_tail] {
             assert!(kept.exists(), "{} was removed", kept.display());
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Plan Phase 8 (review r1, finding 2): a holder upgrade's leftovers — a
+    /// snapshot, its temp, a successor's staged socket — are strays like any
+    /// other once old and lockless; a live pane's are never touched.
+    #[test]
+    fn pty_holder_handoff_sweep_removes_stray_upgrade_leftovers() {
+        let d = dir("upgstray");
+        let strays = [
+            d.join("a.upgrade"),
+            d.join("a.upgrade-tmp"),
+            d.join("a.sock.upg"),
+        ];
+        let live = d.join("b.sock.upg");
+        for p in strays.iter().chain([&live]) {
+            std::fs::write(p, b"x").unwrap();
+            age(p, STRAY_MIN_AGE * 2);
+        }
+        // Pane b is live: its lock is HELD for the whole sweep.
+        let held =
+            match crate::lock::PaneLock::try_acquire(&lock_path(&d, &PaneId::new("b").unwrap()))
+                .unwrap()
+            {
+                crate::lock::TryLock::Acquired(l) => l,
+                crate::lock::TryLock::Held => panic!("fresh lock held"),
+            };
+        let report = boot_sweep(&d, Duration::from_millis(300), &[], |_, _| {}).unwrap();
+        drop(held);
+        for p in &strays {
+            assert!(!p.exists(), "{} was kept: {report:?}", p.display());
+        }
+        assert!(live.exists(), "a pane with a lock keeps its staged socket");
         let _ = std::fs::remove_dir_all(&d);
     }
 
