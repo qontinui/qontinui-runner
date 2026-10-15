@@ -7,6 +7,9 @@ import {
   describeOutcome,
   holderActions,
   invokeErrorText,
+  nextCensusDelayMs,
+  CENSUS_IDLE_REFRESH_MS,
+  CENSUS_REFRESH_MS,
   type AttentionPane,
 } from "./holderUpgrade";
 
@@ -133,5 +136,40 @@ describe("bannerHeadline", () => {
     expect(bannerHeadline(3, true)).toBe("3 panes' PTY holders need a decision");
     expect(bannerHeadline(0, true)).toBe("PTY holder census unavailable");
     expect(bannerHeadline(0, false)).toBe("PTY holder upgrade");
+  });
+});
+
+describe("holderActions with the runner's reason", () => {
+  it("shows a non-Linux Unix reason: Leave running only, no Upgrade", () => {
+    const a = holderActions({
+      upgradeSupported: false,
+      upgradeUnsupportedReason: "needs Linux's SHUT_RD",
+      endAndResumeAvailable: false,
+    });
+    expect(a.upgrade).toBe(false);
+    expect(a.leaveRunning).toBe(true);
+    expect(a.note).toContain("needs Linux's SHUT_RD");
+    expect(a.note).toContain(END_AND_RESUME_MISSING_NOTE);
+  });
+});
+
+describe("nextCensusDelayMs", () => {
+  const pane: AttentionPane = {
+    paneId: "p",
+    reason: "incompatible",
+    holderPid: 1,
+    childPid: 2,
+    holderBuild: null,
+    holderVersions: [],
+    detail: null,
+  };
+  it("backs off only after an empty, error-free census", () => {
+    expect(nextCensusDelayMs({ panes: [], censusError: null }, null)).toBe(CENSUS_IDLE_REFRESH_MS);
+    expect(nextCensusDelayMs({ panes: [pane], censusError: null }, null)).toBe(CENSUS_REFRESH_MS);
+    expect(nextCensusDelayMs({ panes: [], censusError: "unreadable" }, null)).toBe(
+      CENSUS_REFRESH_MS,
+    );
+    expect(nextCensusDelayMs({ panes: [], censusError: null }, "boom")).toBe(CENSUS_REFRESH_MS);
+    expect(nextCensusDelayMs(null, null)).toBe(CENSUS_REFRESH_MS);
   });
 });

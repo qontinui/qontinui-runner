@@ -28,6 +28,8 @@ export interface AttentionPane {
 /** `pty_holder_attention`'s answer (`holder_upgrade::HolderAttention`). */
 export interface HolderAttention {
   upgradeSupported: boolean;
+  /** Why "Upgrade holder" is not offered here; `null` where it is. */
+  upgradeUnsupportedReason: string | null;
   endAndResumeAvailable: boolean;
   runnerHolderBuild: string;
   panes: AttentionPane[];
@@ -68,21 +70,49 @@ export const END_AND_RESUME_MISSING_NOTE =
 
 export const UPGRADE_UNSUPPORTED_NOTE =
   "This platform cannot upgrade a holder in place (a Windows ConPTY cannot be handed to another " +
-  "process).";
+  "process; on macOS/BSD the upgrade cannot drain input while the runner is attached).";
 
 /** The actions for one pane, given what the runner says it can do. */
 export function holderActions(
-  attention: Pick<HolderAttention, "upgradeSupported" | "endAndResumeAvailable">,
+  attention: Pick<HolderAttention, "upgradeSupported" | "endAndResumeAvailable"> & {
+    upgradeUnsupportedReason?: string | null;
+  },
 ): HolderActions {
   const upgrade = attention.upgradeSupported;
   const endAndResume = attention.endAndResumeAvailable;
+  // The runner's own reason (Windows ConPTY, or a non-Linux Unix that cannot
+  // drain input while attached) when it gives one.
+  const why = attention.upgradeUnsupportedReason
+    ? `Upgrade holder is not offered: ${attention.upgradeUnsupportedReason}.`
+    : UPGRADE_UNSUPPORTED_NOTE;
   let note: string | null = null;
   if (!upgrade && !endAndResume) {
-    note = `${UPGRADE_UNSUPPORTED_NOTE} ${END_AND_RESUME_MISSING_NOTE}`;
+    note = `${why} ${END_AND_RESUME_MISSING_NOTE}`;
   } else if (!upgrade) {
-    note = UPGRADE_UNSUPPORTED_NOTE;
+    note = why;
   }
   return { upgrade, leaveRunning: true, endAndResume, note };
+}
+
+/** Normal census cadence while something needs (or may need) a decision. */
+export const CENSUS_REFRESH_MS = 60_000;
+/** Backed-off cadence once a census came back empty and error-free. */
+export const CENSUS_IDLE_REFRESH_MS = 300_000;
+
+/**
+ * When to take the census next. A census is a connect + hello per holder pane,
+ * so it backs off while the last one read cleanly with nothing to decide; any
+ * listed pane, an unreadable directory, a failed read, or no answer yet keeps
+ * the normal cadence.
+ */
+export function nextCensusDelayMs(
+  attention: Pick<HolderAttention, "panes" | "censusError"> | null,
+  readError: string | null,
+): number {
+  if (attention === null || readError !== null || attention.censusError !== null) {
+    return CENSUS_REFRESH_MS;
+  }
+  return attention.panes.length === 0 ? CENSUS_IDLE_REFRESH_MS : CENSUS_REFRESH_MS;
 }
 
 /** One line on why the row is listed. */
