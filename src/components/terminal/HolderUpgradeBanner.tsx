@@ -8,6 +8,7 @@ import {
   describeOutcome,
   holderActions,
   invokeErrorText,
+  nextCensusDelayMs,
   type HolderAttention,
   type HolderUpgradeOutcome,
 } from "./holderUpgrade";
@@ -23,12 +24,13 @@ import {
  *
  * "Upgrade holder" is the ONLY trigger of `pty_holder_upgrade`: nothing here
  * upgrades on mount, on a timer, or implicitly. The census read
- * (`pty_holder_attention`) is read-only; it is taken on mount, every
- * {@link REFRESH_MS}, on "Refresh", and after an action.
+ * (`pty_holder_attention`) is read-only; it is taken on mount, then every
+ * `CENSUS_REFRESH_MS` — backed off to `CENSUS_IDLE_REFRESH_MS` while the last
+ * one was empty and error-free (`nextCensusDelayMs`) — on "Refresh", and after
+ * an action.
  *
  * Lives in the top-right advisory column with the other terminal banners.
  */
-export const REFRESH_MS = 60_000;
 
 const TONE_CLASS = {
   ok: "text-[#9ece6a]",
@@ -59,11 +61,15 @@ export function HolderUpgradeBanner() {
     }
   }, []);
 
+  // First census on mount; each later one is scheduled from the last result
+  // (an empty, error-free census backs off).
   useEffect(() => {
     void refresh();
-    const t = setInterval(() => void refresh(), REFRESH_MS);
-    return () => clearInterval(t);
   }, [refresh]);
+  useEffect(() => {
+    const t = setTimeout(() => void refresh(), nextCensusDelayMs(attention, readError));
+    return () => clearTimeout(t);
+  }, [attention, readError, refresh]);
 
   const upgrade = useCallback(
     async (paneId: string) => {
@@ -91,7 +97,11 @@ export function HolderUpgradeBanner() {
   if (panes.length === 0 && orphanOutcomes.length === 0 && !censusError && !readError) return null;
 
   const actions = holderActions(
-    attention ?? { upgradeSupported: false, endAndResumeAvailable: false },
+    attention ?? {
+      upgradeSupported: false,
+      upgradeUnsupportedReason: null,
+      endAndResumeAvailable: false,
+    },
   );
 
   const renderOutcome = (paneId: string) => {
