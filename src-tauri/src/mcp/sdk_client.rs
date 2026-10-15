@@ -730,6 +730,15 @@ enum BearerTarget {
 /// are foreign, and so is `http://qontinui.io`, whose plaintext hop would carry
 /// the bearer across the network in the clear. Loopback is the one host class
 /// admitted on any scheme and port — see [`is_loopback_relay_host`].
+///
+/// A LAN address is FOREIGN by design. A physical device found over mDNS is
+/// dialled at `http://<lan-ip>:<port>` (the LAN transport in `mcp_api.rs`,
+/// connected through `physical_device_api::connect_device`), and that connect
+/// now carries no bearer. The hop is plaintext over a shared network, and the
+/// address is whatever an mDNS answer announced. A LAN UI Bridge wrapper that
+/// relied on the operator's `Authorization` header therefore fails its auth
+/// after this change, and it has to authenticate another way (its pairing
+/// token) rather than on the operator's credential.
 fn classify_bearer_target(
     url: &str,
     qontinui_origins: impl FnOnce() -> Vec<url::Origin>,
@@ -920,6 +929,34 @@ async fn load_operator_bearer() -> BearerChoice {
     BearerChoice { bearer, auth_path }
 }
 
+/// The redirect policy of a client that carries the operator's bearer.
+///
+/// reqwest drops `Authorization` on a redirect only when the host or the
+/// port changes (the locked 0.13.2 does not compare schemes). So an admitted
+/// `https` origin that redirects to `http` on the same host and the same
+/// effective port, say `https://h:8443` to `http://h:8443`, would send the
+/// bearer in plaintext. This policy refuses any `https` to `http` hop. Every
+/// other hop is followed as before, up to reqwest's default limit of 10, so a
+/// cross-host redirect still goes through with the header stripped by
+/// reqwest.
+fn bearer_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let downgrade = attempt
+            .previous()
+            .last()
+            .is_some_and(|from| from.scheme() == "https")
+            && attempt.url().scheme() == "http";
+        if downgrade {
+            attempt.error("refusing an https -> http redirect while carrying the operator's bearer")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 /// [`connect_sdk_app`] with the bearer already chosen and the client builder
 /// supplied — the seam the bearer tests drive with a builder that resolves
 /// their test host names to a local recorder.
@@ -952,7 +989,9 @@ async fn connect_sdk_app_with(
                     value.set_sensitive(true);
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert(reqwest::header::AUTHORIZATION, value);
-                    builder = builder.default_headers(headers);
+                    builder = builder
+                        .default_headers(headers)
+                        .redirect(bearer_redirect_policy());
                     info!("SDK relay client: attached {kind} bearer for {}", url);
                 }
                 Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
@@ -9115,6 +9154,144 @@ mod connect_bearer_scope_tests {
             landed.last().cloned().flatten(),
             None,
             "a cross-host redirect must not carry the operator bearer"
+        );
+    }
+
+    /// One port that answers TLS and plaintext alike, so an `https` to `http`
+    /// redirect keeps the host AND the effective port. Over TLS it answers
+    /// every request with a 302 to the same path over `http` on the same
+    /// host and port. In plaintext it records the `Authorization` it was sent
+    /// and answers as a UI Bridge app. The first byte of a TLS connection is
+    /// a handshake record (0x16), which is how a connection is told apart.
+    async fn spawn_downgrading_origin(
+        host: &'static str,
+    ) -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_head<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> String {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 16 * 1024 {
+                match stream.read(&mut byte).await {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            String::from_utf8_lossy(&head).into_owned()
+        }
+
+        let cert = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
+        let identity = native_tls::Identity::from_pkcs8(
+            cert.cert.pem().as_bytes(),
+            cert.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let acceptor =
+            tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+        let plaintext_auth: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let redirects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = plaintext_auth.clone();
+        let redirected = redirects.clone();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let seen = seen.clone();
+                let redirected = redirected.clone();
+                tokio::spawn(async move {
+                    let mut first = [0u8; 1];
+                    if tcp.peek(&mut first).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if first[0] == 0x16 {
+                        let Ok(mut tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
+                        let head = read_head(&mut tls).await;
+                        let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        let reply = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{host}:{port}{path}\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        redirected.fetch_add(1, Ordering::SeqCst);
+                        let _ = tls.write_all(reply.as_bytes()).await;
+                        let _ = tls.shutdown().await;
+                    } else {
+                        let head = read_head(&mut tcp).await;
+                        let auth = head.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().to_string())
+                        });
+                        seen.lock().unwrap().push(auth);
+                        let body = r#"{"uiBridge":{"appId":"fixture","appName":"Fixture","appType":"web"}}"#;
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = tcp.write_all(reply.as_bytes()).await;
+                        let _ = tcp.shutdown().await;
+                    }
+                });
+            }
+        });
+        (port, redirects, plaintext_auth)
+    }
+
+    /// An admitted `https` Qontinui origin that redirects to `http` on the
+    /// same host and the same port never gets the operator's bearer in
+    /// plaintext. reqwest keeps `Authorization` across that hop, because host
+    /// and port are unchanged, so only the bearer client's redirect policy
+    /// ([`bearer_redirect_policy`]) stands between the token and the wire.
+    #[tokio::test]
+    async fn an_https_origin_redirecting_to_http_never_gets_the_bearer_in_plaintext() {
+        const HOST: &str = "qontinui-web.test";
+        let (port, redirects, plaintext_auth) = spawn_downgrading_origin(HOST).await;
+        let url = format!("https://{HOST}:{port}");
+        let admitted = vec![origin(&url)];
+        let (target, choice) = choose_connect_bearer(
+            &url,
+            move || admitted,
+            || async {
+                BearerChoice {
+                    bearer: Some(("test-operator-token".to_string(), "test")),
+                    auth_path: AUTH_PATH_COGNITO,
+                }
+            },
+        )
+        .await;
+        assert_eq!(target, BearerTarget::QontinuiOrigin);
+        // Test-only: trust the throwaway certificate and resolve the test
+        // host to the fixture. The redirect policy is the production one,
+        // installed by `connect_sdk_app_with` with the bearer.
+        let builder = reqwest::Client::builder()
+            .no_proxy()
+            .danger_accept_invalid_certs(true)
+            .resolve(HOST, SocketAddr::from(([127, 0, 0, 1], port)));
+        let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
+        let _ =
+            connect_sdk_app_with(&manager, &url, ConnectHints::default(), choice, builder).await;
+
+        assert!(
+            redirects.load(Ordering::SeqCst) > 0,
+            "the handshake never reached the https origin, so no redirect was offered"
+        );
+        let leaked: Vec<_> = plaintext_auth
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|auth| auth.is_some())
+            .cloned()
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the operator bearer went out over plaintext http after an https -> http redirect: {leaked:?}"
         );
     }
 }
