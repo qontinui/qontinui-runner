@@ -3743,7 +3743,8 @@ pub struct Settings {
     #[serde(default)]
     pub api: ApiSettings,
     /// Terminal pane backend knobs. See [`TerminalSettings`]; the one field,
-    /// `terminal.pty_holder`, defaults ON (since plan 2026-09-12 Phase 5).
+    /// `terminal.pty_holder`, defaults to [`PTY_HOLDER_DEFAULT`] (ON on Linux only,
+    /// since plan 2026-09-12 Phase 5).
     #[serde(default)]
     pub terminal: TerminalSettings,
 }

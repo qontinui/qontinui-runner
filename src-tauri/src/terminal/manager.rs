@@ -742,7 +742,6 @@ impl TerminalManager {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
     }
 
-    /// Test seam: hold `session` under `id` without spawning a PTY.
     /// Test seam: mark `id` as being built, as `create` does for the length
     /// of a spawn.
     #[cfg(test)]
@@ -753,6 +752,7 @@ impl TerminalManager {
             .insert(id.to_string());
     }
 
+    /// Test seam: hold `session` under `id` without spawning a PTY.
     #[cfg(test)]
     pub(crate) fn insert_for_test(&self, id: &str, session: Arc<TerminalSession>) {
         if let Ok(mut sessions) = self.sessions.lock() {
