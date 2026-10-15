@@ -2453,6 +2453,7 @@ mod tests {
         confirmed: bool,
     ) -> crate::session::session_lifecycle_store::TerminalSessionRecord {
         crate::session::session_lifecycle_store::TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: id.to_string(),
             config_dir: None,
             working_dir: Some("D:/qontinui-root".to_string()),
@@ -2971,6 +2972,7 @@ mod tests {
 
         // A binder/frontend-written record with REAL layout fields.
         store.record_open(TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: "sess-1".to_string(),
             config_dir: Some("C:\\claude\\.claude-gmail".to_string()),
             working_dir: Some("D:\\qontinui-root".to_string()),
@@ -3173,6 +3175,7 @@ mod tests {
             let config = dir.path().join("cfg").to_string_lossy().into_owned();
             let seed = |id: &str, terminal: &str, confirmed_at: i64| {
                 store.record_open(TerminalSessionRecord {
+                    launch_argv: None,
                     claude_session_id: id.to_string(),
                     config_dir: Some(config.clone()),
                     working_dir: None,
@@ -3268,6 +3271,7 @@ mod tests {
 
         // The runner's spawn-time PREDICTION, on the real page/zone.
         store.record_open(TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: "predicted-id".to_string(),
             config_dir: Some("C:\\claude\\.claude-gmail".to_string()),
             working_dir: Some("D:\\qontinui-root".to_string()),
@@ -3354,6 +3358,7 @@ mod tests {
 
         // A record on a DIFFERENT terminal — must not be borrowed from.
         store.record_open(TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: "elsewhere".to_string(),
             config_dir: None,
             working_dir: Some("D:\\other".to_string()),

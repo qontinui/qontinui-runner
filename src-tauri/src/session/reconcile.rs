@@ -363,6 +363,7 @@ fn bind_record(
     zone_index: i32,
 ) -> TerminalSessionRecord {
     TerminalSessionRecord {
+        launch_argv: None,
         claude_session_id: session_id.to_string(),
         config_dir: Some(config_dir.to_string()),
         working_dir: Some(pty.working_dir.clone()),
@@ -1544,6 +1545,7 @@ mod tests {
     /// A registry record fixture — `id` on `terminal`, titled `title`.
     fn title_rec(id: &str, terminal: &str, title: Option<&str>) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: id.to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),
@@ -1961,6 +1963,7 @@ mod tests {
         // A phantom provisional record (spawn-time pin for a plain shell that
         // never ran a provider): authoritative, unconfirmed, terminal long gone.
         let phantom = TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: "phantom".to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),
@@ -2129,6 +2132,7 @@ mod tests {
         // The identity seam's spawn-time pin on the LIVE terminal: authoritative,
         // never confirmed (the absolute-path claude bypassed the shim + hook).
         store.record_open(TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: "seam-pin".to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),
@@ -2217,6 +2221,7 @@ mod tests {
         // The seam's spawn-time row, already resolved into a real zone by the
         // frontend backstop.
         store.record_open(TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: "seam-pin".to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),

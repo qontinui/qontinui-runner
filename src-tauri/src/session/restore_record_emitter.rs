@@ -378,6 +378,7 @@ mod tests {
 
     fn rec(id: &str, terminal_id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: id.to_string(),
             config_dir: Some("C:/accounts/hotmail".to_string()),
             working_dir: Some("C:/repo".to_string()),

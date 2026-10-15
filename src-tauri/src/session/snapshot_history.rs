@@ -988,6 +988,7 @@ mod tests {
     #[test]
     fn snapshot_session_projects_registry_record() {
         let rec = TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: "sess-1".to_string(),
             config_dir: Some("C:/cfg".to_string()),
             working_dir: Some("D:/repo".to_string()),
@@ -1055,6 +1056,7 @@ mod tests {
 
     fn probe_rec(id: &str, confirmed: bool) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: id.to_string(),
             config_dir: Some("C:/cfg".to_string()),
             working_dir: Some("D:/repo".to_string()),

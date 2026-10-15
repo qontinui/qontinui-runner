@@ -1325,6 +1325,7 @@ pub fn terminal_session_record_open(
     // and for why `config_dir` is deliberately not among them.
     validate_record_open_identity(&claude_session_id, &terminal_id)?;
     let record = TerminalSessionRecord {
+        launch_argv: None,
         claude_session_id,
         config_dir,
         working_dir,
@@ -1781,6 +1782,34 @@ struct RestoreCandidate {
     /// rather than "no transcript".
     #[serde(rename = "transcriptExists", skip_serializing_if = "Option::is_none")]
     transcript_exists: Option<bool>,
+    /// The flags to replay before `--resume <id>`, DERIVED from the record's
+    /// persisted `launchArgv` by `session::resume_argv` (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6): filtered, and every token shell-inert. Absent when no argv
+    /// was ever reported — the webview then types its default resume.
+    #[serde(rename = "resumeArgs", skip_serializing_if = "Option::is_none")]
+    resume_args: Option<Vec<String>>,
+    /// Why the persisted argv must NOT be replayed (D11: the whole replay is
+    /// refused rather than escaped). Present ⇒ the webview relaunches nothing
+    /// for this record and says why.
+    #[serde(rename = "resumeRefusal", skip_serializing_if = "Option::is_none")]
+    resume_refusal: Option<String>,
+}
+
+impl RestoreCandidate {
+    fn new(record: TerminalSessionRecord, transcript_exists: Option<bool>) -> Self {
+        let (resume_args, resume_refusal) = crate::session::resume_argv::Relaunch::for_record(
+            record.launch_argv.as_deref(),
+            &record.claude_session_id,
+        )
+        .wire_fields();
+        RestoreCandidate {
+            record,
+            transcript_exists,
+            resume_args,
+            resume_refusal,
+        }
+    }
 }
 
 /// The boot-restore set [`terminal_session_list_open`] returns: exactly the
@@ -1813,10 +1842,7 @@ fn restore_candidates(
         .map(|rec| {
             let transcript_exists =
                 store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
-            RestoreCandidate {
-                record: rec,
-                transcript_exists,
-            }
+            RestoreCandidate::new(rec, transcript_exists)
         })
         .collect()
 }
@@ -2722,6 +2748,7 @@ async fn poll_and_record_session<F>(
     loop {
         if let Some(claude_session_id) = resolve() {
             let record = TerminalSessionRecord {
+                launch_argv: None,
                 claude_session_id: claude_session_id.clone(),
                 config_dir: config_dir.clone(),
                 working_dir: Some(working_dir.clone()),
@@ -2816,6 +2843,7 @@ pub(crate) fn record_pinned_session_open(
         .as_deref()
         .map(|d| crate::session::past_sessions::account_from_config_dir(Some(d)));
     store.record_open(TerminalSessionRecord {
+        launch_argv: None,
         claude_session_id: claude_session_id.clone(),
         config_dir,
         working_dir: Some(working_dir),
@@ -3017,6 +3045,7 @@ mod tests {
 
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            launch_argv: None,
             claude_session_id: id.to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),
@@ -3062,10 +3091,10 @@ mod tests {
     /// would silently disable auto-resume for every session.
     #[test]
     fn restore_candidate_flattens_record_and_omits_unprobed_transcript_bit() {
-        let probed_absent = serde_json::to_value(RestoreCandidate {
-            record: restore_candidate_record("sess-absent"),
-            transcript_exists: Some(false),
-        })
+        let probed_absent = serde_json::to_value(RestoreCandidate::new(
+            restore_candidate_record("sess-absent"),
+            Some(false),
+        ))
         .expect("probed-absent candidate serializes");
         assert_eq!(probed_absent["claudeSessionId"], "sess-absent");
         assert_eq!(
@@ -3074,20 +3103,20 @@ mod tests {
             "a probed-absent transcript must be reported as an explicit false"
         );
 
-        let probed_present = serde_json::to_value(RestoreCandidate {
-            record: restore_candidate_record("sess-present"),
-            transcript_exists: Some(true),
-        })
+        let probed_present = serde_json::to_value(RestoreCandidate::new(
+            restore_candidate_record("sess-present"),
+            Some(true),
+        ))
         .expect("probed-present candidate serializes");
         assert_eq!(
             probed_present["transcriptExists"],
             serde_json::Value::Bool(true)
         );
 
-        let unprobed = serde_json::to_value(RestoreCandidate {
-            record: restore_candidate_record("sess-unprobed"),
-            transcript_exists: None,
-        })
+        let unprobed = serde_json::to_value(RestoreCandidate::new(
+            restore_candidate_record("sess-unprobed"),
+            None,
+        ))
         .expect("unprobed candidate serializes");
         assert_eq!(
             unprobed["claudeSessionId"], "sess-unprobed",
@@ -3096,6 +3125,47 @@ mod tests {
         assert!(
             unprobed.get("transcriptExists").is_none(),
             "no probe attached must OMIT the field, never emit false: {unprobed}"
+        );
+        assert!(
+            unprobed.get("resumeArgs").is_none() && unprobed.get("resumeRefusal").is_none(),
+            "no persisted argv: neither relaunch field, so the default resume is unchanged"
+        );
+    }
+
+    /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+    /// Phase 6: the persisted argv rides the record (`launchArgv`), and the
+    /// restore set derives the relaunch from it — the filtered, shell-inert
+    /// flags, or a refusal that types nothing.
+    #[test]
+    fn restore_candidate_derives_the_relaunch_from_the_persisted_argv() {
+        let mut rec = restore_candidate_record("sess-argv");
+        rec.launch_argv = Some(vec![
+            "--model".into(),
+            "opus".into(),
+            "--resume".into(),
+            "old".into(),
+            "fix it".into(),
+        ]);
+        let v = serde_json::to_value(RestoreCandidate::new(rec.clone(), None)).unwrap();
+        assert_eq!(
+            v["launchArgv"],
+            serde_json::json!(["--model", "opus", "--resume", "old", "fix it"])
+        );
+        assert_eq!(v["resumeArgs"], serde_json::json!(["--model", "opus"]));
+        assert!(v.get("resumeRefusal").is_none());
+
+        rec.launch_argv = Some(vec!["--add-dir".into(), "/srv/my project".into()]);
+        let v = serde_json::to_value(RestoreCandidate::new(rec, None)).unwrap();
+        assert!(
+            v.get("resumeArgs").is_none(),
+            "a refused replay offers no args: {v}"
+        );
+        assert!(
+            v["resumeRefusal"]
+                .as_str()
+                .unwrap()
+                .contains("not shell-inert"),
+            "{v}"
         );
     }
 
