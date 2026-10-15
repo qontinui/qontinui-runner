@@ -103,6 +103,15 @@ pub enum ReplayRefusal {
     /// A single-dash token longer than two characters at `index` (`-pc`,
     /// `-rID`): combined short flags the filter cannot read safely.
     CombinedShortFlags { index: usize },
+    /// The allowlisted value-taking flag at `index` has no value, or its value
+    /// starts with `-` — replayed bare, `claude --model --resume <id>` would
+    /// take `--resume` as the model and the id as a new prompt (review r2, N6).
+    MissingValue { index: usize, flag: Option<String> },
+    /// A `--permission-mode` at `index` names none of the four known modes.
+    UnknownPermissionMode { index: usize },
+    /// A relative `--add-dir` on Windows whose launch directory is an MSYS
+    /// path (`/c/...`): a PowerShell pane cannot resolve it (review r2, N5).
+    MsysLaunchDirectory { index: usize },
     /// The session was launched in print mode (`-p`/`--print`).
     PrintMode,
     /// More than [`MAX_ARGV_TOKENS`] tokens.
@@ -129,6 +138,20 @@ impl std::fmt::Display for ReplayRefusal {
             ReplayRefusal::CombinedShortFlags { index } => write!(
                 f,
                 "launch argument {index} combines short flags, which the replay does not read"
+            ),
+            ReplayRefusal::MissingValue { index, flag } => write!(
+                f,
+                "launch argument {index} (flag {}) has no value, or a value that starts with `-`",
+                flag.as_deref().unwrap_or("<unnamed>")
+            ),
+            ReplayRefusal::UnknownPermissionMode { index } => write!(
+                f,
+                "launch argument {index} (flag --permission-mode) names no known permission mode"
+            ),
+            ReplayRefusal::MsysLaunchDirectory { index } => write!(
+                f,
+                "launch argument {index} (flag --add-dir) is relative and the launch directory is \
+                 an MSYS path"
             ),
             ReplayRefusal::PrintMode => {
                 write!(f, "the session was launched in print mode (-p/--print)")
@@ -190,18 +213,41 @@ enum Disposition {
     RefusePrint,
 }
 
+/// The replay ALLOWLIST: flags that load no code or config, and how each
+/// consumes the tokens after it. The ONE list — the identity shims carry a
+/// copy (they export only these flags), pinned equal to this by
+/// `tests::the_shim_allowlists_match_the_runners` (review r2, N1).
+pub const REPLAY_ALLOWLIST_ONE: &[&str] = &["--model", "--fallback-model", "--permission-mode"];
+/// See [`REPLAY_ALLOWLIST_ONE`]: flags taking every following plain token.
+pub const REPLAY_ALLOWLIST_MANY: &[&str] = &["--add-dir"];
+/// See [`REPLAY_ALLOWLIST_ONE`]: flags taking the next token unless it is a flag.
+pub const REPLAY_ALLOWLIST_OPTIONAL: &[&str] = &["--debug"];
+/// See [`REPLAY_ALLOWLIST_ONE`]: flags taking no value.
+pub const REPLAY_ALLOWLIST_BOOL: &[&str] = &["--verbose", "--ide", "--chrome", "--no-chrome"];
+
+/// The permission modes a replay may name. Any other value refuses the
+/// replay (review r2, permission rule).
+pub const PERMISSION_MODES: &[&str] = &["default", "acceptEdits", "plan", "bypassPermissions"];
+
 /// The `claude` flags this runner knows. `Keep` is the allowlist (module
 /// docs); `Drop` entries exist so their VALUES are consumed rather than read
 /// as positionals. Anything else is unknown and dropped.
 fn flag_arity(flag: &str) -> Option<(Arity, Disposition)> {
     use Arity::*;
     use Disposition::*;
+    if REPLAY_ALLOWLIST_ONE.contains(&flag) {
+        return Some((One, Keep));
+    }
+    if REPLAY_ALLOWLIST_MANY.contains(&flag) {
+        return Some((Many, Keep));
+    }
+    if REPLAY_ALLOWLIST_OPTIONAL.contains(&flag) {
+        return Some((Optional, Keep));
+    }
+    if REPLAY_ALLOWLIST_BOOL.contains(&flag) {
+        return Some((Bool, Keep));
+    }
     Some(match flag {
-        // The allowlist: flags that load no code or config.
-        "--model" | "--fallback-model" | "--permission-mode" => (One, Keep),
-        "--add-dir" => (Many, Keep),
-        "--debug" => (Optional, Keep),
-        "--verbose" | "--ide" | "--chrome" | "--no-chrome" => (Bool, Keep),
         // Print mode — not a conversation a pane can resume.
         "--print" | "-p" => (Bool, RefusePrint),
         // Session selection — the relaunch supplies its own.
@@ -253,14 +299,30 @@ pub fn replay_args(
     session_id: &str,
     launch_cwd: Option<&str>,
 ) -> Result<Vec<String>, ReplayRefusal> {
+    replay_args_on(launch_argv, session_id, launch_cwd, cfg!(windows))
+}
+
+/// One kept allowlisted flag and its values, as `(position, token)`.
+struct KeptFlag<'a> {
+    name: &'a str,
+    tokens: Vec<(usize, String)>,
+}
+
+/// [`replay_args`] for an explicit platform (`windows`), so both arms of the
+/// Windows path rules are tested on any host.
+pub fn replay_args_on(
+    launch_argv: &[String],
+    session_id: &str,
+    launch_cwd: Option<&str>,
+    windows: bool,
+) -> Result<Vec<String>, ReplayRefusal> {
     if !is_valid_session_id(session_id) {
         return Err(ReplayRefusal::InvalidSessionId);
     }
     if launch_argv.len() > MAX_ARGV_TOKENS {
         return Err(ReplayRefusal::TooLong);
     }
-    // (position, token, the flag it belongs to — for the refusal's message).
-    let mut kept: Vec<(usize, String, &str)> = Vec::new();
+    let mut kept: Vec<KeptFlag> = Vec::new();
     let mut i = 0;
     while i < launch_argv.len() {
         let token = &launch_argv[i];
@@ -276,9 +338,9 @@ pub fn replay_args(
         if !token.starts_with("--") && token.chars().count() > 2 {
             return Err(ReplayRefusal::CombinedShortFlags { index: i });
         }
-        let (name, inline_value) = match token.split_once('=') {
-            Some((n, _)) if n.starts_with("--") => (n, true),
-            _ => (token.as_str(), false),
+        let (name, inline) = match token.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+            _ => (token.as_str(), None),
         };
         // Unknown flags are dropped. Their value, if any, is a plain token and
         // is dropped as a positional on the next turn.
@@ -290,77 +352,151 @@ pub fn replay_args(
             return Err(ReplayRefusal::PrintMode);
         }
         let keep = disposition == Disposition::Keep;
-        if keep {
-            kept.push((i, token.clone(), name));
-        }
-        i += 1;
-        if inline_value {
-            continue;
-        }
-        let takes = |t: &String| !is_flag(t) && t != "--";
-        let mut values: Vec<usize> = Vec::new();
-        match arity {
-            Arity::Bool => {}
-            Arity::One => {
-                if launch_argv.get(i).is_some() {
-                    values.push(i);
-                }
-            }
-            Arity::Optional => {
-                if launch_argv.get(i).is_some_and(takes) {
-                    values.push(i);
-                }
-            }
-            Arity::Many => {
-                let mut j = i;
-                while launch_argv.get(j).is_some_and(takes) {
-                    values.push(j);
-                    j += 1;
-                }
-            }
-        }
-        for &v in &values {
-            if keep {
-                kept.push((v, launch_argv[v].clone(), name));
-            }
-        }
-        i += values.len();
-    }
-    let mut out = Vec::with_capacity(kept.len());
-    for (index, token, flag) in kept {
-        let token = if flag == "--add-dir" && token != "--add-dir" {
-            resolve_add_dir(&token, index, launch_cwd)?
-        } else {
-            token
+        let flag_index = i;
+        let missing = || ReplayRefusal::MissingValue {
+            index: flag_index,
+            flag: inert_name(name),
         };
-        if !is_shell_inert(&token) {
-            return Err(ReplayRefusal::NotShellInert {
-                index,
-                flag: inert_name(flag),
-            });
+        i += 1;
+        let mut group = KeptFlag {
+            name,
+            tokens: vec![(flag_index, token.clone())],
+        };
+        if let Some(v) = inline {
+            if keep && arity != Arity::Bool && (v.is_empty() || v.starts_with('-')) {
+                return Err(missing());
+            }
+        } else {
+            let takes = |t: &String| !is_flag(t) && t != "--";
+            let mut values: Vec<usize> = Vec::new();
+            match arity {
+                Arity::Bool => {}
+                Arity::One => {
+                    // `claude` takes a required value greedily, flag-shaped
+                    // or not; a replay refuses one that is absent or a flag.
+                    if launch_argv.get(i).is_some() {
+                        values.push(i);
+                    }
+                }
+                Arity::Optional => {
+                    if launch_argv.get(i).is_some_and(takes) {
+                        values.push(i);
+                    }
+                }
+                Arity::Many => {
+                    let mut j = i;
+                    while launch_argv.get(j).is_some_and(takes) {
+                        values.push(j);
+                        j += 1;
+                    }
+                }
+            }
+            if keep
+                && matches!(arity, Arity::One | Arity::Many)
+                && (values.is_empty() || values.iter().any(|&v| launch_argv[v].starts_with('-')))
+            {
+                return Err(missing());
+            }
+            i += values.len();
+            group
+                .tokens
+                .extend(values.into_iter().map(|v| (v, launch_argv[v].clone())));
         }
-        out.push(token);
+        if keep {
+            kept.push(group);
+        }
+    }
+    // The permission rule (review r2): every mode must be a known one, and
+    // only the LAST `--permission-mode` is replayed, so the typed command
+    // carries exactly one permission choice.
+    for g in kept.iter().filter(|g| g.name == "--permission-mode") {
+        let (index, value) = match g.tokens.as_slice() {
+            [(i, t)] => (*i, t.split_once('=').map(|(_, v)| v).unwrap_or("")),
+            [_, (i, v)] => (*i, v.as_str()),
+            _ => (g.tokens[0].0, ""),
+        };
+        if !PERMISSION_MODES.contains(&value) {
+            return Err(ReplayRefusal::UnknownPermissionMode { index });
+        }
+    }
+    if let Some(last) = kept.iter().rposition(|g| g.name == "--permission-mode") {
+        let mut n = 0;
+        kept.retain(|g| {
+            let keep = g.name != "--permission-mode" || n == last;
+            n += 1;
+            keep
+        });
+    }
+    let mut out = Vec::new();
+    for g in kept {
+        for (index, token) in g.tokens {
+            let token = if g.name == "--add-dir" && token != "--add-dir" {
+                resolve_add_dir(&token, index, launch_cwd, windows)?
+            } else {
+                token
+            };
+            if !is_shell_inert(&token) {
+                return Err(ReplayRefusal::NotShellInert {
+                    index,
+                    flag: inert_name(g.name),
+                });
+            }
+            out.push(token);
+        }
     }
     Ok(out)
 }
 
+/// Whether `dir` is a Windows drive-letter path (`C:/x`, `C:\x`, `C:`).
+fn is_drive_path(dir: &str) -> bool {
+    let b = dir.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\')
+}
+
+/// Whether `cwd` is an MSYS path (`/c/...`, `/c`): Git Bash's spelling of a
+/// Windows directory, which a PowerShell pane cannot use.
+fn is_msys_path(cwd: &str) -> bool {
+    let b = cwd.as_bytes();
+    b.len() >= 2 && b[0] == b'/' && b[1].is_ascii_alphabetic() && (b.len() == 2 || b[2] == b'/')
+}
+
 /// An `--add-dir` value (bare, or the whole `--add-dir=<dir>` token) with a
-/// relative directory resolved against the absolute launch directory.
+/// relative directory resolved against the absolute launch directory. On
+/// Windows a drive-letter path is absolute, and a relative one under an MSYS
+/// launch directory is refused (review r2, N5).
 fn resolve_add_dir(
     token: &str,
     index: usize,
     launch_cwd: Option<&str>,
+    windows: bool,
 ) -> Result<String, ReplayRefusal> {
     let (prefix, dir) = match token.strip_prefix("--add-dir=") {
         Some(dir) => ("--add-dir=", dir),
         None => ("", token),
     };
-    if dir.starts_with('/') {
+    if dir.starts_with('/') || (windows && is_drive_path(dir)) {
         return Ok(token.to_string());
     }
-    match launch_cwd.filter(|c| c.starts_with('/')) {
-        Some(cwd) => Ok(format!("{prefix}{}/{dir}", cwd.trim_end_matches('/'))),
-        None => Err(ReplayRefusal::RelativePath { index }),
+    let Some(cwd) = launch_cwd else {
+        return Err(ReplayRefusal::RelativePath { index });
+    };
+    if windows {
+        if is_msys_path(cwd) {
+            return Err(ReplayRefusal::MsysLaunchDirectory { index });
+        }
+        if is_drive_path(cwd) {
+            let cwd = cwd.replace('\\', "/");
+            return Ok(format!("{prefix}{}/{dir}", cwd.trim_end_matches('/')));
+        }
+        return Err(ReplayRefusal::RelativePath { index });
+    }
+    if cwd.starts_with('/') {
+        Ok(format!("{prefix}{}/{dir}", cwd.trim_end_matches('/')))
+    } else {
+        Err(ReplayRefusal::RelativePath { index })
     }
 }
 
@@ -762,6 +898,153 @@ mod tests {
             Relaunch::for_record(Some(&empty)).wire_fields(),
             (Some(vec![]), None)
         );
+    }
+
+    /// Review r2, N6: a value-taking allowlisted flag with no value, or with
+    /// a flag-shaped value, is refused — never replayed bare.
+    #[test]
+    fn resume_argv_a_value_flag_without_a_value_is_refused() {
+        for bad in [
+            &["--model"][..],
+            &["--model", "--resume"][..],
+            &["--model="][..],
+            &["--model=-x"][..],
+            &["--add-dir"][..],
+            &["--add-dir", "--verbose"][..],
+            &["--fallback-model", "-c"][..],
+        ] {
+            assert!(
+                matches!(
+                    replay(bad),
+                    Err(ReplayRefusal::MissingValue { index: 0, .. })
+                ),
+                "{bad:?}: {:?}",
+                replay(bad)
+            );
+        }
+        // An optional value may be absent.
+        assert_eq!(
+            replay(&["--debug", "--verbose"]).unwrap(),
+            argv(&["--debug", "--verbose"])
+        );
+    }
+
+    /// Review r2, permission rule: one known mode, the LAST one; never the
+    /// dangerous-skip flags.
+    #[test]
+    fn resume_argv_replays_exactly_one_known_permission_mode() {
+        assert_eq!(
+            replay(&[
+                "--permission-mode",
+                "plan",
+                "--model",
+                "m",
+                "--permission-mode=acceptEdits"
+            ])
+            .unwrap(),
+            argv(&["--model", "m", "--permission-mode=acceptEdits"])
+        );
+        for mode in PERMISSION_MODES {
+            assert_eq!(
+                replay(&["--permission-mode", mode]).unwrap(),
+                argv(&["--permission-mode", mode])
+            );
+        }
+        for bad in ["dontAsk", "BYPASS", "auto"] {
+            assert_eq!(
+                replay(&["--permission-mode", bad]),
+                Err(ReplayRefusal::UnknownPermissionMode { index: 1 })
+            );
+        }
+        // An unknown EARLIER mode refuses too: every mode must be known.
+        assert!(replay(&["--permission-mode", "weird", "--permission-mode", "plan"]).is_err());
+        assert_eq!(
+            replay(&[
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions"
+            ])
+            .unwrap(),
+            Vec::<String>::new(),
+            "never replayed"
+        );
+    }
+
+    /// Review r2, N5: on Windows a drive-letter `--add-dir` is absolute, and a
+    /// relative one under an MSYS launch directory is refused.
+    #[test]
+    fn resume_argv_windows_add_dir_paths() {
+        let w = |a: &[&str], cwd: Option<&str>| replay_args_on(&argv(a), SID, cwd, true);
+        assert_eq!(
+            w(&["--add-dir", "C:/work", "--add-dir=D:/x"], None).unwrap(),
+            argv(&["--add-dir", "C:/work", "--add-dir=D:/x"])
+        );
+        assert_eq!(
+            w(&["--add-dir", "lib"], Some("C:/proj")).unwrap(),
+            argv(&["--add-dir", "C:/proj/lib"])
+        );
+        assert_eq!(
+            w(&["--add-dir", "lib"], Some("/c/proj")),
+            Err(ReplayRefusal::MsysLaunchDirectory { index: 1 })
+        );
+        assert_eq!(
+            w(&["--add-dir", "lib"], None),
+            Err(ReplayRefusal::RelativePath { index: 1 })
+        );
+        // Off Windows a drive letter is just a relative name.
+        assert_eq!(
+            replay_args_on(
+                &argv(&["--add-dir", "C:/work"]),
+                SID,
+                Some("/home/p"),
+                false
+            )
+            .unwrap(),
+            argv(&["--add-dir", "/home/p/C:/work"])
+        );
+    }
+
+    /// Review r2, N1: the identity shims export only the allowlisted flags,
+    /// from a copy of this module's allowlist. Pin the copies equal to it.
+    #[test]
+    fn the_shim_allowlists_match_the_runners() {
+        const BASH: &str = include_str!("../../resources/intercept/identity_shim.bash");
+        const NATIVE: &str = include_str!("../bin/qontinui_shim.rs");
+        let bash_list = |var: &str| -> Vec<String> {
+            let line = BASH
+                .lines()
+                .find(|l| l.starts_with(&format!("{var}=\"")))
+                .unwrap_or_else(|| panic!("{var} is not in the bash shim"));
+            let inner = line.split('"').nth(1).unwrap();
+            inner.split_whitespace().map(str::to_string).collect()
+        };
+        let native_list = |name: &str| -> Vec<String> {
+            let (_, rest) = NATIVE
+                .split_once(&format!("const {name}: &[&str] = &["))
+                .unwrap_or_else(|| panic!("{name} is not in the native shim"));
+            let (body, _) = rest.split_once("];").unwrap();
+            body.split(',')
+                .map(|t| t.trim().trim_matches('"').to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        for (suffix, runner) in [
+            ("ONE", REPLAY_ALLOWLIST_ONE),
+            ("MANY", REPLAY_ALLOWLIST_MANY),
+            ("OPTIONAL", REPLAY_ALLOWLIST_OPTIONAL),
+            ("BOOL", REPLAY_ALLOWLIST_BOOL),
+        ] {
+            let runner: Vec<String> = runner.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                bash_list(&format!("QS_REPLAY_{suffix}")),
+                runner,
+                "bash {suffix}"
+            );
+            assert_eq!(
+                native_list(&format!("REPLAY_ALLOWLIST_{suffix}")),
+                runner,
+                "native {suffix}"
+            );
+        }
     }
 
     #[test]

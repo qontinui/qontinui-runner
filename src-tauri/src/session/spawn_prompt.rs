@@ -2687,22 +2687,27 @@ mod script_tests {
         assert_eq!(
             argv,
             [
-                "PROMPT-fix the build",
                 "--model",
                 "opus",
-                "--settings",
-                "{\"env\":{\"KEY\":\"sk-SECRET\"}}",
                 "--add-dir",
                 "/srv/a",
-                "c1\u{9c}csi\u{9b}6n",
+                "c1\u{9c}csi\u{9b}6n"
             ]
             .map(String::from),
-            "the runner plumbing is left out at the source; C1 controls arrive escaped and intact"
+            "only the allowlisted flags leave the shim (review r2, N1): no prompt, no \
+             --settings value, no runner plumbing; C1 controls arrive escaped and intact"
         );
+        let raw_body = std::fs::read_to_string(&posted).unwrap();
+        for never in ["PROMPT", "SECRET", "--settings"] {
+            assert!(
+                !raw_body.contains(never),
+                "{never} left the shim: {raw_body}"
+            );
+        }
         assert_eq!(
             crate::session::resume_argv::derive_resume_flags(&argv, SESSION_ID, Some("/w")),
             Some(crate::session::resume_argv::ResumeFlags::Refused {
-                reason: "launch argument 7 (flag --add-dir) is not shell-inert; its replay is \
+                reason: "launch argument 4 (flag --add-dir) is not shell-inert; its replay is \
                          refused rather than escaped"
                     .into()
             }),
@@ -2843,12 +2848,18 @@ mod script_tests {
             let mut cmd = Command::new("bash");
             cmd.arg(shim_dir.join("claude"))
                 .args([
+                    "PROMPT first",
                     "--model",
-                    "opus",
-                    "tab\there",
+                    "opus\u{9c}6n",
+                    "--mcp-config",
+                    "{\"mcpServers\":{\"x\":{\"headers\":{\"Authorization\":\"Bearer SECRET\"}}}}",
+                    "--settings",
+                    "SETTINGSVALUE",
                     "--append-system-prompt-file=/x",
-                    "st\u{9c}csi\u{9b}6n",
+                    "--add-dir",
+                    "tab\there",
                     "\u{fc}n\u{ef}\u{1f600}",
+                    "--verbose",
                 ])
                 .env_clear()
                 .env(
@@ -2877,10 +2888,17 @@ mod script_tests {
             exported.bytes().all(|b| (b' '..=b'~').contains(&b)),
             "printable ASCII only: {exported:?}"
         );
-        assert!(
-            exported.contains("\\u009c") && exported.contains("\\u009b6n"),
-            "{exported}"
-        );
+        for never in [
+            "PROMPT",
+            "SECRET",
+            "SETTINGSVALUE",
+            "--mcp-config",
+            "--settings",
+            "/x",
+        ] {
+            assert!(!exported.contains(never), "{never} exported: {exported}");
+        }
+        assert!(exported.contains("\\u009c6n"), "{exported}");
         assert!(
             exported.contains("\\ud83d\\ude00"),
             "a surrogate pair: {exported}"
@@ -2891,10 +2909,11 @@ mod script_tests {
             parsed,
             serde_json::json!([
                 "--model",
-                "opus",
+                "opus\u{9c}6n",
+                "--add-dir",
                 "tab\there",
-                "st\u{9c}csi\u{9b}6n",
-                "\u{fc}n\u{ef}\u{1f600}"
+                "\u{fc}n\u{ef}\u{1f600}",
+                "--verbose"
             ])
         );
         assert_eq!(run(true), "<unset>", "a nested launch carries no argv");
