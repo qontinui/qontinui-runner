@@ -518,6 +518,23 @@ pub fn derive_resume_flags(
     }
 }
 
+/// The refusal a relaunch-flag slot is closed with when a session's first
+/// report was not a `startup` (review r2, N4). Means "no flags known", not
+/// "flags refused": [`Relaunch::for_record`] maps it to [`Relaunch::Default`].
+pub const CLOSED_NOT_STARTUP: &str = "first report was not startup";
+
+/// The refusal a relaunch-flag slot is closed with when the hook's report
+/// carried `"argv": null` — a launch with no identity shim in the chain
+/// (review r3, R1). Also mapped to [`Relaunch::Default`].
+pub const NO_ARGV_REPORTED: &str = "no argv reported";
+
+/// Whether a stored refusal only CLOSES the slot (no flags were ever known)
+/// rather than refusing flags that were: those relaunch with the default
+/// command silently (debug), not with a warning (review r3).
+pub fn is_slot_closure(reason: &str) -> bool {
+    reason == CLOSED_NOT_STARTUP || reason == NO_ARGV_REPORTED
+}
+
 /// How a session is relaunched — the two derived fields the restore set
 /// carries (`terminal_session_list_open`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,6 +562,13 @@ impl Relaunch {
                 } else {
                     Relaunch::Fallback("a stored relaunch flag is not shell-inert".into())
                 }
+            }
+            Some(ResumeFlags::Refused { reason }) if is_slot_closure(reason) => {
+                tracing::debug!(
+                    reason = %reason,
+                    "resume_argv: no launch flags known — the default resume command"
+                );
+                Relaunch::Default
             }
             Some(ResumeFlags::Refused { reason }) => Relaunch::Fallback(reason.clone()),
         }
@@ -884,6 +908,18 @@ mod tests {
         let (args, refusal) = Relaunch::for_record(Some(&refused)).wire_fields();
         assert_eq!(args, None, "the extra flags are dropped, the resume is not");
         assert!(refusal.unwrap().contains("--add-dir"));
+        // A CLOSED slot (no flags were ever known) is the plain default —
+        // neither a refusal on the wire nor a warning (review r3).
+        for closed in [CLOSED_NOT_STARTUP, NO_ARGV_REPORTED] {
+            let flags = ResumeFlags::Refused {
+                reason: closed.into(),
+            };
+            assert_eq!(Relaunch::for_record(Some(&flags)), Relaunch::Default);
+            assert_eq!(
+                Relaunch::for_record(Some(&flags)).wire_fields(),
+                (None, None)
+            );
+        }
         // A hand-edited record cannot get a token typed.
         let tampered = ResumeFlags::Replay {
             flags: argv(&["--model", "$(id)"]),

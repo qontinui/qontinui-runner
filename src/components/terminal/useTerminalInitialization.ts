@@ -23,6 +23,7 @@ import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
 import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
+import { createLogger } from "@/lib/logger";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
 
 /**
@@ -682,10 +683,27 @@ export type ResumePlan =
   | { kind: "default"; fallbackReason?: string }
   | { kind: "replay"; args: readonly string[] };
 
+/**
+ * Refusals that only mean "no launch flags are known" — the runner closed the
+ * slot because the first report was not a startup, or it carried no argv. The
+ * runner already serves these as the plain default; the webview maps them the
+ * same way (debug, no warning) for a runner that predates that (review r3).
+ */
+const resumeLog = createLogger("TerminalRestore");
+
+const SLOT_CLOSURE_REASONS: ReadonlySet<string> = new Set([
+  "first report was not startup",
+  "no argv reported",
+]);
+
 export function resumePlanFor(
   rec: Pick<TerminalSessionRecord, "resumeArgs" | "resumeRefusal">,
 ): ResumePlan {
   if (typeof rec.resumeRefusal === "string" && rec.resumeRefusal.length > 0) {
+    if (SLOT_CLOSURE_REASONS.has(rec.resumeRefusal)) {
+      resumeLog.debug(`no launch flags known (${rec.resumeRefusal}) — default resume`);
+      return { kind: "default" };
+    }
     return { kind: "default", fallbackReason: rec.resumeRefusal };
   }
   if (rec.resumeArgs === undefined || rec.resumeArgs === null) return { kind: "default" };
@@ -696,6 +714,16 @@ export function resumePlanFor(
     };
   }
   return { kind: "replay", args: rec.resumeArgs };
+}
+
+/**
+ * Whether a restored tab REPLACES a lost holder's dead pane: only when it will
+ * type a resume (`auto-resume`). A `terminal-only` or invalid record gets a tab
+ * that does not bring the session back, so the dead pane stays, with the
+ * `restore-declined` banner (review r3, R2). Pure + exported for tests.
+ */
+export function replacesDeadPane(action: RestoreAction): boolean {
+  return action === "auto-resume";
 }
 
 /** A flag that already says how the resumed session handles permissions. */
@@ -1975,7 +2003,9 @@ export function useTerminalInitialization({
             queued: openRecords.length - recIndex,
           });
           if (!tabId) continue;
-          createdThisRun.add(rec.claudeSessionId);
+          // Only a tab that will type a resume replaces a dead pane (review
+          // r3, R2); any other leaves it for the restore-declined banner.
+          if (replacesDeadPane(restoreAction)) createdThisRun.add(rec.claudeSessionId);
           // A record with no recorded zone (`UNZONED_INDEX`) is NOT force-placed
           // here, and is deliberately not clamped to zone 0: zone 0 belongs to
           // whichever tab actually holds it, and `assignTabToZone` RESERVES the
@@ -2028,7 +2058,7 @@ export function useTerminalInitialization({
           // A lost holder's dead pane is closed only NOW, once its replacement
           // exists and holds its zone (review r2, N3).
           const deadPane = deadPaneFor.current.get(rec.claudeSessionId);
-          if (deadPane !== undefined && deadPane !== tabId) {
+          if (deadPane !== undefined && deadPane !== tabId && replacesDeadPane(restoreAction)) {
             deadPaneFor.current.delete(rec.claudeSessionId);
             deadPaneActions.current.closeDeadPane(deadPane);
           }

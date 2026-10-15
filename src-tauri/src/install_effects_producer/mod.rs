@@ -217,7 +217,12 @@ pub struct SessionOpenRequest {
     /// Phase 6). It rides THIS loopback body and never the PTY (review r1,
     /// H1). It is consumed, never stored: only the relaunch flags derived
     /// from it are persisted ([`apply_launch_argv`]). Its `Debug` is redacted.
-    #[serde(default)]
+    ///
+    /// ABSENT (`None`) and `null` (`Some(LaunchArgvBody(Null))`) are
+    /// different reports (review r3, R1): the identity shim's early POST
+    /// omits the key, and leaves the flag slot for the hook's POST; the hook
+    /// ALWAYS sends it, `null` when it has none, which closes the slot.
+    #[serde(default, deserialize_with = "present_argv")]
     pub argv: Option<LaunchArgvBody>,
 }
 
@@ -227,6 +232,14 @@ pub struct SessionOpenRequest {
 #[derive(serde::Deserialize)]
 #[serde(transparent)]
 pub struct LaunchArgvBody(pub serde_json::Value);
+
+/// `argv` when the key is PRESENT — `null` included, as
+/// `Some(LaunchArgvBody(Null))`. An absent key is `None` (`#[serde(default)]`).
+fn present_argv<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<LaunchArgvBody>, D::Error> {
+    <serde_json::Value as serde::Deserialize>::deserialize(d).map(|v| Some(LaunchArgvBody(v)))
+}
 
 impl std::fmt::Debug for LaunchArgvBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -260,6 +273,25 @@ fn apply_launch_argv(
         );
         return;
     };
+    if body.0.is_null() {
+        // The hook reported no argv (no identity shim in the chain): close the
+        // slot, so a later spoofed report cannot fill it (review r3, R1).
+        let outcome = store.set_resume_flags(
+            &req.session_id,
+            &req.terminal_id,
+            req.source.as_deref(),
+            ResumeFlags::Refused {
+                reason: crate::session::resume_argv::NO_ARGV_REPORTED.to_string(),
+            },
+        );
+        info!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            ?outcome,
+            "control/session-open: relaunch flags (the hook reported no argv)"
+        );
+        return;
+    }
     let Some(argv) = parse_argv_value(&body.0) else {
         warn!(
             terminal_id = %req.terminal_id,
@@ -3118,6 +3150,55 @@ mod tests {
                 .map(|f| matches!(f, ResumeFlags::Replay { ref flags } if flags[0] == "--model")),
             Some(true),
             "first write wins"
+        );
+    }
+
+    /// Review r3, R1: the hook's `"argv": null` CLOSES the flag slot; the
+    /// identity shim's early POST, which omits the key, leaves it open for the
+    /// hook's report that follows.
+    #[test]
+    fn session_open_tells_an_absent_argv_from_a_null_one() {
+        use crate::session::resume_argv::{ResumeFlags, NO_ARGV_REPORTED};
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let req = |argv: Option<serde_json::Value>| -> SessionOpenRequest {
+            let mut body = serde_json::json!({
+                "terminal_id": "term-r1",
+                "session_id": sid,
+                "source": "startup",
+            });
+            if let Some(a) = argv {
+                body["argv"] = a;
+            }
+            serde_json::from_value(body).unwrap()
+        };
+
+        // The shim's early POST: no key → the slot stays open.
+        let early = req(None);
+        assert!(early.argv.is_none());
+        record_session_open_into(&store, &early, "claude");
+        assert_eq!(store.get(sid).unwrap().resume_flags, None);
+
+        // The hook with no argv: explicit null → closed.
+        let hook = req(Some(serde_json::Value::Null));
+        assert!(hook.argv.as_ref().is_some_and(|a| a.0.is_null()));
+        record_session_open_into(&store, &hook, "claude");
+        assert_eq!(
+            store.get(sid).unwrap().resume_flags,
+            Some(ResumeFlags::Refused {
+                reason: NO_ARGV_REPORTED.into()
+            })
+        );
+        // A later report with flags cannot fill it.
+        record_session_open_into(&store, &req(Some(serde_json::json!(["--ide"]))), "claude");
+        assert_eq!(
+            store.get(sid).unwrap().resume_flags,
+            Some(ResumeFlags::Refused {
+                reason: NO_ARGV_REPORTED.into()
+            })
         );
     }
 
