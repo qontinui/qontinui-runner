@@ -344,6 +344,9 @@ pub struct ModeTracker {
     unterminated: usize,
     /// How often the parser was replaced for a runaway OSC.
     parser_resets: u64,
+    /// Stream offset at which the CURRENT parser started from the ground
+    /// state (0, or the last runaway-OSC reset).
+    parser_born_at: u64,
     screens: ChangeLog<Screen>,
     titles: ChangeLog<Option<Vec<u8>>>,
 }
@@ -391,6 +394,7 @@ impl ModeTracker {
             seq: 0,
             unterminated: 0,
             parser_resets: 0,
+            parser_born_at: 0,
             screens: ChangeLog::new(Screen::Primary, MAX_SCREEN_LOG),
             titles: ChangeLog::new(None, MAX_TITLE_LOG),
         }
@@ -411,6 +415,7 @@ impl ModeTracker {
                 self.parser = vte::Parser::new();
                 self.unterminated = 0;
                 self.parser_resets += 1;
+                self.parser_born_at = self.fed;
             }
         }
     }
@@ -513,6 +518,7 @@ impl ModeTracker {
             seq: self.seq,
             unterminated: self.unterminated,
             parser_resets: self.parser_resets,
+            parser_born_at: self.parser_born_at,
             screens: self.screens.clone(),
             titles: self.titles.clone(),
         }
@@ -527,16 +533,30 @@ impl ModeTracker {
     /// feeding the last [`PARSER_RESYNC_BYTES`] of `recent` to a fresh parser
     /// whose performer DISCARDS everything: the recorded modes are the
     /// snapshot's, and only the parser's position in the grammar is
-    /// re-derived. Any sequence opened within that window is reproduced
-    /// exactly; one opened earlier is either an OSC (which the tracker already
-    /// abandons past [`MAX_UNTERMINATED_BYTES`], smaller than the window) or a
-    /// DCS/SOS string longer than the window, whose continuation the
-    /// successor then parses from the ground state — the same thing the
-    /// tracker does after a runaway-OSC reset.
+    /// re-derived. When the live parser was last (re)born inside `recent`,
+    /// the replay starts exactly there and is EXACT, runaway-OSC resets
+    /// included. Otherwise any sequence opened within that window is
+    /// reproduced exactly; one opened earlier is either an OSC (which the
+    /// tracker abandons past [`MAX_UNTERMINATED_BYTES`], smaller than the
+    /// window) or a DCS/SOS string longer than the window, whose
+    /// continuation the successor parses from the ground state.
     pub fn restore(snap: ModeSnapshot, recent: &[u8]) -> ModeTracker {
         let mut parser = vte::Parser::new();
-        let from = recent.len().saturating_sub(PARSER_RESYNC_BYTES);
-        if let Some(window) = recent.get(from..) {
+        // `recent` ends at `snap.fed`, so it starts at `fed - len`. When the
+        // live parser was born (fresh, at the ground state) inside `recent`,
+        // replaying from exactly there reproduces it byte for byte — `vte`'s
+        // state depends only on the bytes, not on how they were sliced. That
+        // includes a runaway-OSC reset the replay would otherwise not repeat
+        // (review r1 nit: a replay from before the reset stays inside the
+        // OSC). Only when its birth is older than `recent` does the window
+        // heuristic apply.
+        let recent_start = snap.fed.saturating_sub(recent.len() as u64);
+        let window_start = recent.len().saturating_sub(PARSER_RESYNC_BYTES) as u64;
+        let from = match snap.parser_born_at.checked_sub(recent_start) {
+            Some(born) => born.max(window_start),
+            None => window_start,
+        };
+        if let Some(window) = usize::try_from(from).ok().and_then(|f| recent.get(f..)) {
             parser.advance(&mut DiscardAll, window);
         }
         ModeTracker {
@@ -546,6 +566,7 @@ impl ModeTracker {
             seq: snap.seq,
             unterminated: snap.unterminated,
             parser_resets: snap.parser_resets,
+            parser_born_at: snap.parser_born_at,
             screens: snap.screens,
             titles: snap.titles,
         }
@@ -566,6 +587,8 @@ pub struct ModeSnapshot {
     seq: u64,
     unterminated: usize,
     parser_resets: u64,
+    #[serde(default)]
+    parser_born_at: u64,
     screens: ChangeLog<Screen>,
     titles: ChangeLog<Option<Vec<u8>>>,
 }
@@ -1109,5 +1132,31 @@ mod tests {
                 original.preamble_state_at(at)
             );
         }
+    }
+
+    /// Review r1 nit: a runaway OSC that made the live tracker reset its
+    /// parser BEFORE the handoff must not leave the successor's parser inside
+    /// that OSC — the next ESC would dispatch it as a title the pane never
+    /// set.
+    #[test]
+    fn pty_holder_handoff_restore_repeats_a_runaway_osc_reset() {
+        let mut before = b"\x1b]0;".to_vec();
+        before.extend(std::iter::repeat_n(
+            b'a',
+            MAX_UNTERMINATED_BYTES + FEED_SLICE,
+        ));
+        before.extend_from_slice(b"plain");
+        let original = fed(&before);
+        assert_eq!(original.parser_resets(), 1);
+        let mut restored = ModeTracker::restore(original.snapshot(), &before);
+        restored.feed(b"\x1b[?2004h");
+        let mut original = original;
+        original.feed(b"\x1b[?2004h");
+        assert!(contains(&original.postamble(), b"\x1b[?2004h"));
+        assert_eq!(restored.postamble(), original.postamble());
+        // A replay from before the reset would still be inside the OSC, and
+        // the ESC above would dispatch it as a bogus title.
+        assert_eq!(original.title(), None);
+        assert_eq!(restored.title(), original.title());
     }
 }
