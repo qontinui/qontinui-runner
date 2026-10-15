@@ -46,7 +46,7 @@ Advisory: a failure here is a **warning**, not a blocker — it does not stop ga
 
 ### 7. Coord device JWT live (`device_jwt_live`)
 
-Verifies: a live coord device JWT is present in the access-token slot and is not near expiry
+Verifies: a live coord device JWT is present in the access-token slot and has not expired
 
 **Fix:** kick refresher / re-pair
 
