@@ -74,9 +74,6 @@ use crate::session::local_store::OutboxWriter;
 use crate::session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
 use crate::session::SessionEventKind;
 
-/// Default-ON env gate for AI-session coord registration (P0.3). Any of
-/// `0` / `false` / `off` (case-insensitive) disables it; anything else
-/// (including unset) leaves it ON.
 /// A tenant answer for a new session: the tenant (`None` = an unresolvable
 /// machine), or the proxy's refusal.
 pub(crate) type TenantAnswer = Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>;
@@ -96,6 +93,28 @@ pub(crate) const REGISTRATION_RETRY_DELAYS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(120),
 ];
 
+/// When a retryably refused registration is re-resolved: the nominal delays,
+/// and the jitter applied to each so the sessions a single boot blip refused
+/// do not all retry in lockstep. Injected so paused-time tests stay exact.
+#[derive(Clone, Copy)]
+pub(crate) struct RetrySchedule {
+    pub(crate) delays: &'static [std::time::Duration],
+    pub(crate) jitter: fn(std::time::Duration) -> std::time::Duration,
+}
+
+/// The production schedule: [`REGISTRATION_RETRY_DELAYS`], each ±20%.
+pub(crate) const REGISTRATION_RETRY: RetrySchedule = RetrySchedule {
+    delays: REGISTRATION_RETRY_DELAYS,
+    jitter: jitter_twenty_percent,
+};
+
+fn jitter_twenty_percent(delay: std::time::Duration) -> std::time::Duration {
+    delay.mul_f64(rand::random_range(0.8..=1.2))
+}
+
+/// Default-ON env gate for AI-session coord registration (P0.3). Any of
+/// `0` / `false` / `off` (case-insensitive) disables it; anything else
+/// (including unset) leaves it ON.
 fn registration_enabled() -> bool {
     match std::env::var("QONTINUI_SESSION_AUTOMATION_REGISTER") {
         Ok(v) => !matches!(
@@ -589,7 +608,7 @@ impl AiCoordRegistrar {
                 let workdir = workdir.clone();
                 async move { crate::session::resolve_new_session_tenant_at(&workdir).await }
             },
-            REGISTRATION_RETRY_DELAYS,
+            REGISTRATION_RETRY,
         )
         .await
     }
@@ -602,7 +621,7 @@ impl AiCoordRegistrar {
         purpose: &str,
         repo: Option<String>,
         resolve: R,
-        retry_delays: &'static [std::time::Duration],
+        retry: RetrySchedule,
     ) -> Option<Uuid>
     where
         R: Fn() -> Fut + Send + Sync + 'static,
@@ -617,22 +636,33 @@ impl AiCoordRegistrar {
             return None;
         }
         match resolve().await {
-            Ok(tenant) => self.register_resolved(task_run_id, purpose, repo, tenant),
-            Err(refusal) if refusal.retryable && !retry_delays.is_empty() => {
-                self.start_registration_retry(
-                    task_run_id,
-                    purpose,
-                    repo,
-                    refusal,
-                    resolve,
-                    retry_delays,
-                );
+            // A settled answer supersedes any retry still pending for this key
+            // (a same-key re-registration): the old retry becomes a no-op and
+            // cannot later register over, or refuse after, this answer.
+            Ok(tenant) => {
+                self.supersede_pending(task_run_id);
+                self.register_resolved(task_run_id, purpose, repo, tenant)
+            }
+            // A new retry supersedes an older one by replacing its entry.
+            Err(refusal) if refusal.retryable && !retry.delays.is_empty() => {
+                self.start_registration_retry(task_run_id, purpose, repo, refusal, resolve, retry);
                 None
             }
             Err(refusal) => {
+                self.supersede_pending(task_run_id);
                 self.remember_refusal(task_run_id, refusal, "refused");
                 None
             }
+        }
+    }
+
+    /// End any registration retry pending for `key`: its task finds its
+    /// generation gone and does nothing. Callers settling a key outside
+    /// [`Self::finish_retry`] (which clears the entry itself, under its lock)
+    /// call this before [`Self::register_resolved`] / [`Self::remember_refusal`].
+    fn supersede_pending(&self, key: &str) {
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.remove(key);
         }
     }
 
@@ -691,7 +721,7 @@ impl AiCoordRegistrar {
         repo: Option<String>,
         refusal: crate::coord_mcp::ProxyRefusal,
         resolve: R,
-        retry_delays: &'static [std::time::Duration],
+        retry: RetrySchedule,
     ) where
         R: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = TenantAnswer> + Send + 'static,
@@ -707,8 +737,8 @@ impl AiCoordRegistrar {
             task_run_id,
             refusal.code,
             refusal.message,
-            retry_delays.len(),
-            retry_delays.iter().map(|d| d.as_secs()).sum::<u64>()
+            retry.delays.len(),
+            retry.delays.iter().map(|d| d.as_secs()).sum::<u64>()
         );
         if let Ok(mut pending) = self.inner.pending.lock() {
             pending.insert(task_run_id.to_string(), (generation, refusal.clone()));
@@ -718,8 +748,8 @@ impl AiCoordRegistrar {
         let purpose = purpose.to_string();
         tokio::spawn(async move {
             let mut last = refusal;
-            for delay in retry_delays {
-                tokio::time::sleep(*delay).await;
+            for delay in retry.delays {
+                tokio::time::sleep((retry.jitter)(*delay)).await;
                 if !this.retry_is_current(&key, generation) {
                     return; // closed (or superseded): never register it
                 }
@@ -777,7 +807,9 @@ impl AiCoordRegistrar {
                 if self.register_resolved(key, purpose, repo, tenant).is_some() {
                     info!(
                         "ai_coord_register: session {} registered after its tenant settled \
-                         (tenant {:?}); it stays unfederated if it spawned while pending",
+                         (tenant {:?}); it has no agent-log stream until it respawns (the \
+                         stream is seeded only from a spawn-time coord id), and it stays \
+                         unfederated if it spawned while pending",
                         key, tenant
                     );
                 }
@@ -2617,11 +2649,20 @@ mod tests {
         );
     }
 
-    const NO_RETRY: &[std::time::Duration] = &[];
-    const TEST_RETRY: &[std::time::Duration] = &[
-        std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(30),
-    ];
+    fn no_jitter(d: std::time::Duration) -> std::time::Duration {
+        d
+    }
+    const NO_RETRY: RetrySchedule = RetrySchedule {
+        delays: &[],
+        jitter: no_jitter,
+    };
+    const TEST_RETRY: RetrySchedule = RetrySchedule {
+        delays: &[
+            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(30),
+        ],
+        jitter: no_jitter,
+    };
     const LATER_TENANT: Uuid = Uuid::from_u128(0xB);
 
     /// A resolver that always gives `answer`.
@@ -2779,7 +2820,7 @@ mod tests {
         advance(600).await;
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
-            1 + TEST_RETRY.len()
+            1 + TEST_RETRY.delays.len()
         );
         assert_eq!(reg.session_id_for(&trid), None);
         assert_eq!(reg.registration_pending(&trid), None);
@@ -2811,6 +2852,83 @@ mod tests {
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
         assert_eq!(reg.registration_pending(&trid), None);
         assert_eq!(reg.registration_refusal(&trid), None);
+    }
+
+    /// Review round 4 NIT-4: the generation is re-checked when the retry
+    /// SETTLES, not only before it resolves. A session closed while its retry
+    /// is inside `resolve()` must not be registered by that retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_during_the_retrys_resolve_registers_nothing() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let trid = Uuid::new_v4().to_string();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolve = {
+            let reg = reg.clone();
+            let trid = trid.clone();
+            let calls = calls.clone();
+            move || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    return std::future::ready(Err(retryable_refusal()));
+                }
+                // The retry passed its pre-resolve check; the session closes
+                // while it is resolving.
+                reg.close_session(&trid);
+                std::future::ready(Ok(Some(LATER_TENANT)))
+            }
+        };
+        reg.register_session_in_with(&trid, "New Chat", None, resolve, TEST_RETRY)
+            .await;
+        advance(600).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            reg.session_id_for(&trid),
+            None,
+            "a superseded retry registered"
+        );
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+        assert_eq!(reg.registration_pending(&trid), None);
+        assert_eq!(reg.registration_refusal(&trid), None);
+    }
+
+    /// Review round 4 NIT-3: a same-key re-registration that settles while a
+    /// retry is pending supersedes the retry, which then neither registers
+    /// over the new answer nor memoises a stale refusal after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_settled_re_registration_supersedes_a_pending_retry() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let trid = Uuid::new_v4().to_string();
+        // The first registration is refused retryably; its retry would then
+        // settle to a FINAL refusal if it were still current.
+        let (stale, stale_calls) = scripted(vec![Err(retryable_refusal()), Err(final_refusal())]);
+        reg.register_session_in_with(&trid, "New Chat", None, stale, TEST_RETRY)
+            .await;
+        assert!(reg.registration_pending(&trid).is_some());
+
+        reg.register_session_in_with(
+            &trid,
+            "New Chat",
+            None,
+            answering(Ok(Some(LATER_TENANT))),
+            NO_RETRY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reg.registration_pending(&trid), None);
+
+        advance(600).await;
+        assert_eq!(
+            stale_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the superseded retry does not even re-resolve"
+        );
+        assert_eq!(reg.registration_refusal(&trid), None, "no stale refusal");
+        assert_eq!(reg.recorded_tenant(&trid), Some(LATER_TENANT));
+        reg.close_session(&trid);
     }
 
     /// Review round 3 NIT 1: a success clears a stale refusal for the key, so
