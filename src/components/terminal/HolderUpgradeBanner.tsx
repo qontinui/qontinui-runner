@@ -6,9 +6,10 @@ import {
   attentionLabel,
   bannerHeadline,
   describeOutcome,
+  createCensusPoller,
   holderActions,
   invokeErrorText,
-  nextCensusDelayMs,
+  type CensusPoller,
   type HolderAttention,
   type HolderUpgradeOutcome,
 } from "./holderUpgrade";
@@ -45,31 +46,33 @@ export function HolderUpgradeBanner() {
   const [outcomes, setOutcomes] = useState<Record<string, HolderUpgradeOutcome | string>>({});
   const [leftRunning, setLeftRunning] = useState<Set<string>>(new Set());
 
-  // Census reads can overlap (the interval, Refresh, the post-upgrade read):
-  // only the newest request's answer is applied.
-  const latest = useRef(0);
-  const refresh = useCallback(async () => {
-    const seq = ++latest.current;
-    try {
-      const next = await invoke<HolderAttention>("pty_holder_attention");
-      if (seq !== latest.current) return;
-      setAttention(next);
-      setReadError(null);
-    } catch (err) {
-      if (seq !== latest.current) return;
-      setReadError(invokeErrorText(err));
-    }
+  // One poller per mount: it applies only the newest read's answer and
+  // schedules the next read from INSIDE each read, so polling never depends on
+  // a state change re-rendering this component (review p8f r2, N1: two equal
+  // read errors in a row do not re-render).
+  const poller = useRef<CensusPoller | null>(null);
+  useEffect(() => {
+    const p = createCensusPoller(
+      () => invoke<HolderAttention>("pty_holder_attention"),
+      (r) => {
+        if (r.ok) {
+          setAttention(r.attention);
+          setReadError(null);
+        } else {
+          setReadError(r.error);
+        }
+      },
+    );
+    poller.current = p;
+    void p.refresh();
+    return () => {
+      p.stop();
+      poller.current = null;
+    };
   }, []);
-
-  // First census on mount; each later one is scheduled from the last result
-  // (an empty, error-free census backs off).
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-  useEffect(() => {
-    const t = setTimeout(() => void refresh(), nextCensusDelayMs(attention, readError));
-    return () => clearTimeout(t);
-  }, [attention, readError, refresh]);
+  const refresh = useCallback(async () => {
+    await poller.current?.refresh();
+  }, []);
 
   const upgrade = useCallback(
     async (paneId: string) => {

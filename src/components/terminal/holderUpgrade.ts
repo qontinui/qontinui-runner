@@ -177,6 +177,79 @@ export function bannerHeadline(paneCount: number, censusUnreadable: boolean): st
   return censusUnreadable ? "PTY holder census unavailable" : "PTY holder upgrade";
 }
 
+/** One census read's result, as the poller hands it to the page. */
+export type CensusResult = { ok: true; attention: HolderAttention } | { ok: false; error: string };
+
+/** The banner's census loop ({@link createCensusPoller}). */
+export interface CensusPoller {
+  /** Read now (Refresh, after an action, or the schedule). */
+  refresh(): Promise<void>;
+  /** Unmount: cancel the pending read; nothing is applied or scheduled after. */
+  stop(): void;
+}
+
+/**
+ * The census loop. Overlapping reads (the schedule, Refresh, a post-upgrade
+ * read) are allowed; only the NEWEST one's result is applied, and only it
+ * schedules the next read — always, whatever it returned, after
+ * {@link nextCensusDelayMs}. Scheduling lives here, not in a React effect keyed
+ * on state: an identical result (two equal errors) causes no re-render, and an
+ * effect would then never fire again (review p8f r2, N1).
+ */
+export function createCensusPoller(
+  read: () => Promise<HolderAttention>,
+  apply: (r: CensusResult) => void,
+  timers: {
+    set: (f: () => void, ms: number) => unknown;
+    clear: (t: unknown) => void;
+  } = {
+    set: (f, ms) => setTimeout(f, ms),
+    clear: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
+  },
+): CensusPoller {
+  let seq = 0;
+  let stopped = false;
+  let pending: unknown = null;
+  let last: { attention: HolderAttention | null; error: string | null } = {
+    attention: null,
+    error: null,
+  };
+  const refresh = async (): Promise<void> => {
+    if (stopped) return;
+    const mine = ++seq;
+    if (pending !== null) {
+      timers.clear(pending);
+      pending = null;
+    }
+    let result: CensusResult;
+    try {
+      result = { ok: true, attention: await read() };
+    } catch (err) {
+      result = { ok: false, error: invokeErrorText(err) };
+    }
+    if (stopped || mine !== seq) return;
+    last = result.ok
+      ? { attention: result.attention, error: null }
+      : { attention: last.attention, error: result.error };
+    apply(result);
+    pending = timers.set(
+      () => {
+        pending = null;
+        void refresh();
+      },
+      nextCensusDelayMs(last.attention, last.error),
+    );
+  };
+  return {
+    refresh,
+    stop: () => {
+      stopped = true;
+      if (pending !== null) timers.clear(pending);
+      pending = null;
+    },
+  };
+}
+
 /** The text of a command that threw instead of answering. */
 export function invokeErrorText(err: unknown): string {
   if (typeof err === "string") return err;
