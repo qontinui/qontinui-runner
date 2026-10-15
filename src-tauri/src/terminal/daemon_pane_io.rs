@@ -92,13 +92,13 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use qontinui_pty_holder::client::{
-    connect, probe, ConnectError, Event, FailureDisposition, InputStream, Probe, ShutdownHandle,
-    StreamReader, StreamWriter,
+    connect, probe, ConnectError, Event, FailureDisposition, InputFailure, InputStream, Probe,
+    ShutdownHandle, StreamReader, StreamWriter,
 };
 use qontinui_pty_holder::frame::SyntheticPart;
 use qontinui_pty_holder::protocol::{ExitReply, Reply, Request, RestoreMeta};
@@ -518,6 +518,19 @@ pub fn holder_lost_output_marker(lost_bytes: u64) -> Vec<u8> {
     .into_bytes()
 }
 
+/// In-band notice for a holder stream that does not continue the one this tab
+/// showed: the holder took its pane back after a failed in-place upgrade, and
+/// the output this tab showed since `from_offset` came from the successor that
+/// died (plan Phase 8, H1).
+pub fn holder_stream_replaced_notice(from_offset: u64) -> Vec<u8> {
+    format!(
+        "\r\n\x1b[1;33m[qontinui] this pane's PTY holder took the pane back after a failed \
+         holder upgrade — output shown since stream offset {from_offset} came from the holder \
+         that died and may not match what the program printed\x1b[0m\r\n"
+    )
+    .into_bytes()
+}
+
 /// In-band notice for a holder that went away without reporting its child's
 /// exit (SIGKILL, crash). Names the holder: the tab must say WHAT died.
 pub fn holder_gone_notice(holder_pid: u32, child_pid: u32) -> Vec<u8> {
@@ -580,7 +593,11 @@ pub trait HolderLink: Send + Sync {
     /// read its stdin cannot queue the attached connection's control verbs).
     /// The input connection is opened on demand and reopened after any
     /// failure, waiting up to [`INPUT_OPEN_WAIT`] for the holder, so input is
-    /// not refused while the ATTACHED connection is between reattaches.
+    /// not refused while the ATTACHED connection is between reattaches. A
+    /// frame whose write failed BEFORE it reached the holder (an in-place
+    /// holder upgrade's input drain, plan Phase 8) is sent once more on the
+    /// reopened connection; one that may have arrived is never resent
+    /// ([`send_input_resending_once`]).
     fn input(&self, bytes: &[u8]) -> Result<(), String>;
     /// One control request on the attached connection (`resize`, `pause`,
     /// `resume`, `detach`), bounded by `budget`. Its `ok` arrives on the
@@ -724,7 +741,7 @@ impl HolderLink for HolderConn {
         // its own PTY writer thread and pushes back only when that queue is
         // full) — the same contract as a local PTY write — but bounded.
         let deadline = Instant::now() + INPUT_DEADLINE;
-        let Some(mut slot) =
+        let Some(slot) =
             crate::safe_lock::lock_with_deadline(&self.input, "pty holder input", INPUT_DEADLINE)
         else {
             return Err(format!(
@@ -732,42 +749,12 @@ impl HolderLink for HolderConn {
                 self.key
             ));
         };
-        if slot.is_none() {
-            let stream = self.open_input(deadline.min(Instant::now() + INPUT_OPEN_WAIT))?;
-            *lock_slot(&self.input_shutdown) = stream.shutdown_handle().ok();
-            *slot = Some(stream);
-            // Round 3, L1: a `close` that ran while this connection was being
-            // opened could not reach it (it was not installed yet, and this
-            // call holds the slot). Re-check AFTER installing, as the pump
-            // does for a reattach, and end it rather than leak it.
-            if self.closed.load(Ordering::Acquire) {
-                slot.take();
-                if let Some(h) = lock_slot(&self.input_shutdown).take() {
-                    h.shutdown();
-                }
-                return Err(format!("pty holder {}: pane released", self.key));
-            }
-        }
-        let Some(stream) = slot.as_mut() else {
-            return Err(format!("pty holder {}: no input connection", self.key));
-        };
-        let written = bytes
-            .chunks(MAX_INPUT_CHUNK)
-            .try_for_each(|chunk| stream.input(chunk, deadline));
-        if let Err(e) = written {
-            // Position unknown: drop it; the next write opens a fresh one.
-            *slot = None;
-            drop(slot);
-            if let Some(h) = lock_slot(&self.input_shutdown).take() {
-                h.shutdown();
-            }
-            return Err(format!(
-                "pty holder {}: input write failed ({e}); the next write reopens the input \
-                 connection",
-                self.key
-            ));
-        }
-        Ok(())
+        send_input_resending_once(
+            &mut InputSlotGuard { conn: self, slot },
+            &self.key,
+            bytes,
+            deadline,
+        )
     }
 
     fn control(&self, op: HolderControl, budget: Duration) -> Result<(), String> {
@@ -815,6 +802,189 @@ impl HolderLink for HolderConn {
 
     fn terminate(&self, holder_pid: u32) -> Termination {
         terminate_verified_holder(&self.pane_dir, &self.pane_id, holder_pid)
+    }
+}
+
+/// One input frame's write ([`InputStream::send`]), as the resend logic sees
+/// it — a seam so the logic is testable without a holder.
+trait ChunkSink {
+    fn send_chunk(&mut self, chunk: &[u8], deadline: Instant) -> Result<(), InputFailure>;
+}
+
+impl ChunkSink for InputStream {
+    fn send_chunk(&mut self, chunk: &[u8], deadline: Instant) -> Result<(), InputFailure> {
+        self.send(chunk, deadline)
+    }
+}
+
+/// The pane's input connection slot, as [`send_input_resending_once`] drives
+/// it: open on demand, discard after a failure.
+trait InputSlot {
+    type Stream: ChunkSink;
+    /// The open input connection, opening one first if there is none.
+    /// `open_deadline` bounds opening one when there is none.
+    fn ensure(&mut self, open_deadline: Instant) -> Result<&mut Self::Stream, String>;
+    /// End the current connection (its stream position is unknown).
+    fn discard(&mut self);
+    /// The pane was released: nothing more is sent.
+    fn closed(&self) -> bool;
+}
+
+/// The production [`InputSlot`]: [`HolderConn`]'s input slot, held locked for
+/// the whole write so no other input can interleave with a resend.
+struct InputSlotGuard<'a> {
+    conn: &'a HolderConn,
+    slot: std::sync::MutexGuard<'a, Option<InputStream>>,
+}
+
+impl InputSlot for InputSlotGuard<'_> {
+    type Stream = InputStream;
+
+    fn ensure(&mut self, open_deadline: Instant) -> Result<&mut InputStream, String> {
+        if self.slot.is_none() {
+            let stream = self.conn.open_input(open_deadline)?;
+            *lock_slot(&self.conn.input_shutdown) = stream.shutdown_handle().ok();
+            *self.slot = Some(stream);
+            // Round 3, L1: a `close` that ran while this connection was being
+            // opened could not reach it (it was not installed yet, and this
+            // call holds the slot). Re-check AFTER installing, as the pump
+            // does for a reattach, and end it rather than leak it.
+            if self.conn.closed.load(Ordering::Acquire) {
+                self.discard();
+                return Err(format!("pty holder {}: pane released", self.conn.key));
+            }
+        }
+        self.slot
+            .as_mut()
+            .ok_or_else(|| format!("pty holder {}: no input connection", self.conn.key))
+    }
+
+    fn discard(&mut self) {
+        *self.slot = None;
+        if let Some(h) = lock_slot(&self.conn.input_shutdown).take() {
+            h.shutdown();
+        }
+    }
+
+    fn closed(&self) -> bool {
+        self.conn.closed.load(Ordering::Acquire)
+    }
+}
+
+/// Write `bytes[*sent..]` as [`MAX_INPUT_CHUNK`] frames, moving `*sent` past
+/// every frame whose write COMPLETED — so on failure `*sent` is the first
+/// byte of the frame that failed, and nothing before it is ever written again.
+fn write_input_chunks(
+    sink: &mut impl ChunkSink,
+    bytes: &[u8],
+    sent: &mut usize,
+    deadline: Instant,
+) -> Result<(), InputFailure> {
+    while *sent < bytes.len() {
+        let end = (*sent + MAX_INPUT_CHUNK).min(bytes.len());
+        sink.send_chunk(&bytes[*sent..end], deadline)?;
+        *sent = end;
+    }
+    Ok(())
+}
+
+/// Whether a failed input frame is sent again on a fresh connection (plan
+/// Phase 8, `handoff.rs`'s residual bound): a frame the holder upgrade's
+/// drain cut with `SHUT_RD`, or a write refused while the upgrade commits,
+/// fails at the writer — and is NEVER in the holder. Resent only when
+///
+/// - the failure PROVES the frame did not reach the holder
+///   ([`InputFailure::not_delivered`]) — a frame that may have arrived is
+///   never resent: a duplicate keystroke is worse than a reported loss;
+/// - no resend has been spent on this write yet (exactly once);
+/// - the write's deadline has not passed, and the pane was not released.
+fn resend_failed_chunk(
+    failure: &InputFailure,
+    resends_left: u32,
+    now: Instant,
+    deadline: Instant,
+    closed: bool,
+) -> bool {
+    failure.not_delivered && resends_left > 0 && now < deadline && !closed
+}
+
+/// [`HolderLink::input`]'s body: write every chunk; when one fails in a way
+/// that proves it was not delivered, reopen the input connection (the holder
+/// may be mid-upgrade — the reopen waits for whichever holder serves the pane
+/// next) and send that chunk, and the rest, ONCE more. Every chunk reaches the
+/// holder at most once; a chunk whose delivery is unknown is reported, never
+/// resent.
+fn send_input_resending_once(
+    slot: &mut impl InputSlot,
+    key: &str,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut sent = 0usize;
+    let mut resends_left: u32 = 1;
+    loop {
+        // A first open waits [`INPUT_OPEN_WAIT`]; a RESEND's reopen waits for
+        // the rest of the write's [`INPUT_DEADLINE`] — the holder may be in
+        // the middle of an upgrade whose commit and `serving` bounds sum to
+        // ~41 s, and the chunk is owed to whichever holder serves next.
+        let open_deadline = if resends_left == 0 {
+            deadline
+        } else {
+            deadline.min(Instant::now() + INPUT_OPEN_WAIT)
+        };
+        let stream = match slot.ensure(open_deadline) {
+            Ok(stream) => stream,
+            // A resend whose connection could not be reopened: say what it
+            // cost.
+            Err(e) if resends_left == 0 => {
+                return Err(format!(
+                    "{e}; the last {} byte(s) of this input did NOT reach the pane",
+                    bytes.len() - sent
+                ))
+            }
+            Err(e) => return Err(e),
+        };
+        let failure = match write_input_chunks(stream, bytes, &mut sent, deadline) {
+            Ok(()) => return Ok(()),
+            Err(f) => f,
+        };
+        // Position unknown: drop the connection either way.
+        slot.discard();
+        if resend_failed_chunk(
+            &failure,
+            resends_left,
+            Instant::now(),
+            deadline,
+            slot.closed(),
+        ) {
+            resends_left -= 1;
+            warn!(
+                pane = %key,
+                resend_from = sent,
+                total = bytes.len(),
+                "pty holder: an input frame was refused before it reached the holder ({failure}) \
+                 — reopening the input connection and sending it once more"
+            );
+            continue;
+        }
+        let tail = bytes.len() - sent;
+        return Err(if failure.not_delivered {
+            let why = if resends_left == 0 {
+                "even after one resend"
+            } else {
+                "and were not resent (deadline passed, or the pane was released)"
+            };
+            format!(
+                "pty holder {key}: input write failed ({failure}); the last {tail} byte(s) did NOT \
+                 reach the pane, {why}"
+            )
+        } else {
+            format!(
+                "pty holder {key}: input write failed ({failure}); the last {tail} byte(s) may or \
+                 may not have reached the pane, so they were not resent (a resend could duplicate \
+                 them)"
+            )
+        });
     }
 }
 
@@ -1024,6 +1194,33 @@ struct PumpCtx {
     /// `Some` when the first attach asked for the restore envelope and the
     /// holder answered it; the pump carries it across reattaches.
     restore: Option<RestoreProgress>,
+    /// The STREAM EPOCH `out.offset()` is counted on, 0 while unknown (plan
+    /// Phase 8, H1) — what a reattach sends as `attach.stream_epoch`. It
+    /// becomes the current connection's epoch ([`PumpCtx::conn_epoch`]) only
+    /// once a frame from that connection has been CONSUMED (a leading
+    /// `output_lost` that moves the offset, or output that continues it): a
+    /// connection that drops before then leaves the offset on the old stream,
+    /// and the next reattach must still say so.
+    stream_epoch: AtomicU64,
+    /// The `attached.stream_epoch` of the CURRENT connection (0: the holder
+    /// reports none).
+    conn_epoch: AtomicU64,
+}
+
+/// The stream epoch a pane's offset is on right after its FIRST attach,
+/// before any frame is consumed (plan Phase 8, H1; review p8f r1, #4). A fresh
+/// consumer — the ring's tail (`None`), or a fresh spawn's byte 0 — has an
+/// offset defined BY this attach's reply, so it is on this holder's stream
+/// already: a connection that drops before its first frame must reattach
+/// naming that epoch, not "unknown" (which a holder past a take-back would
+/// answer with a false loss). A resume at an offset counted elsewhere is
+/// unknown (0) until a frame is consumed.
+fn initial_stream_epoch(from_offset: Option<u64>, attached_epoch: u64) -> u64 {
+    if from_offset.is_none() || from_offset == FRESH_SPAWN_FROM_OFFSET {
+        attached_epoch
+    } else {
+        0
+    }
 }
 
 /// Where a restoring attach's envelope stands (plan D14).
@@ -1214,6 +1411,8 @@ impl DaemonPaneIo {
                 reason: format!("PTY holder {pane_id}: attach failed: {e}"),
             })?;
         let info = stream.info.clone();
+        let attached_epoch = info.stream_epoch.unwrap_or(0);
+        let initial_epoch = initial_stream_epoch(from_offset, attached_epoch);
         if restore_at.is_some() && info.restore.is_none() {
             // An older holder (protocol < 3): the tail is replayed bare, so a
             // mode it set before the tail is unknown to this consumer.
@@ -1290,6 +1489,11 @@ impl DaemonPaneIo {
             rows: rows.clone(),
             paused: paused.clone(),
             restore: (restore_at.is_some() && info.restore.is_some()).then(RestoreProgress::new),
+            // A fresh consumer's offset (the ring tail, or byte 0 of a fresh
+            // spawn) is defined BY this attach's reply, so it is on this
+            // holder's stream before any frame arrives (review p8f r1, #4).
+            stream_epoch: AtomicU64::new(initial_epoch),
+            conn_epoch: AtomicU64::new(attached_epoch),
         };
         if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-holder-pump-{}", ctx.key))
@@ -1571,6 +1775,8 @@ impl PumpCtx {
                     r.saw_output();
                 }
                 self.out.splice(offset, &bytes);
+                // The offset now continues THIS connection's stream.
+                self.adopt_conn_epoch();
             }
             Event::Lost {
                 from_offset,
@@ -1579,7 +1785,20 @@ impl PumpCtx {
                 if let Some(r) = restore.as_mut() {
                     r.saw_loss();
                 }
+                // A loss that STARTS behind what this pane already shows: the
+                // holder took its pane back from a successor that died after
+                // serving it (plan Phase 8, H1), and what this pane showed
+                // since `from_offset` came from that dead successor's stream.
+                // `note_lost` alone ignores a range ending at or behind our
+                // offset, so the break is declared here.
+                if from_offset < self.out.offset() {
+                    warn!(pane = %self.key, from_offset, to_offset, have = self.out.offset(), "pty holder: the stream this pane showed since the reported offset was a dead successor holder's");
+                    self.out
+                        .push_local(&holder_stream_replaced_notice(from_offset));
+                }
                 self.out.note_lost(from_offset, to_offset);
+                // The loss moved the offset onto THIS connection's stream.
+                self.adopt_conn_epoch();
             }
             // The restore envelope: displayed, never counted — the stream
             // offset stays the holder's (plan D14).
@@ -1613,6 +1832,13 @@ impl PumpCtx {
             Event::Reply(_) => {}
         }
         false
+    }
+
+    /// A frame from the current connection was consumed: the offset is on
+    /// its stream now.
+    fn adopt_conn_epoch(&self) {
+        self.stream_epoch
+            .store(self.conn_epoch.load(Ordering::Acquire), Ordering::Release);
     }
 
     /// The holder serving the pane now (see [`DaemonPaneIo::holder_pid`]).
@@ -1655,11 +1881,16 @@ impl PumpCtx {
                     if restoring {
                         info!(pane = %self.key, holder_pid = self.holder_pid(), from, "pty holder: the connection dropped before the restore postamble arrived — reattaching WITH a restore");
                     }
+                    // The epoch this pane's offset was counted on — so a holder
+                    // that took the pane back after a failed upgrade, or a
+                    // later successor in its lossless lineage, resumes its OWN
+                    // stream here without a loss report (plan Phase 8, H1).
+                    let epoch = self.stream_epoch.load(Ordering::Acquire);
                     match connect(&self.pane_dir, &self.pane_id, deadline).and_then(|c| {
-                        if restoring {
-                            c.attach_restoring(Some(from), deadline)
-                        } else {
-                            c.attach(Some(from), deadline)
+                        match (epoch, restoring) {
+                            (0, true) => c.attach_restoring(Some(from), deadline),
+                            (0, false) => c.attach(Some(from), deadline),
+                            (e, _) => c.attach_continuing(from, e, restoring, deadline),
                         }
                     }) {
                         Ok(stream) => {
@@ -1667,6 +1898,8 @@ impl PumpCtx {
                                 warn!(pane = %self.key, holder_pid = self.holder_pid(), "pty holder: the reattach could not ask for a restore — the owed postamble is lost; modes set before the replayed tail may be wrong");
                                 *restore = None;
                             }
+                            self.conn_epoch
+                                .store(stream.info.stream_epoch.unwrap_or(0), Ordering::Release);
                             let now_pid = stream.hello_ack.holder_pid;
                             let was_pid = self.holder_pid.swap(now_pid, Ordering::AcqRel);
                             if was_pid != now_pid {
@@ -2011,6 +2244,232 @@ pub fn kill_failed_notice(holder_pid: u32, child_pid: u32) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    // ── Input resend (plan Phase 8 follow-up) ──────────────────────────────
+
+    /// What the fake holder side does with the next frame written to it.
+    #[derive(Clone, Copy, Debug)]
+    enum Fate {
+        Accept,
+        /// The write failed before the frame reached the holder.
+        Refuse,
+        /// The write failed after every byte was written: the holder MAY have
+        /// it — this fake says it does.
+        Ambiguous,
+    }
+
+    /// A fake input slot: every connection shares one "holder" log of the
+    /// frames it accepted, and a script says what happens to each write.
+    struct FakeSlot {
+        script: std::collections::VecDeque<Fate>,
+        accepted: Vec<Vec<u8>>,
+        opens: usize,
+        discards: usize,
+        open_fails_after: Option<usize>,
+        closed: bool,
+        stream: Option<FakeStream>,
+        /// The `open_deadline` of every open.
+        open_deadlines: Vec<Instant>,
+    }
+
+    struct FakeStream {
+        script: std::collections::VecDeque<Fate>,
+        accepted: Vec<Vec<u8>>,
+    }
+
+    impl ChunkSink for FakeStream {
+        fn send_chunk(&mut self, chunk: &[u8], _deadline: Instant) -> Result<(), InputFailure> {
+            let fate = self.script.pop_front().unwrap_or(Fate::Accept);
+            let fail = |not_delivered| InputFailure {
+                error: ConnectError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                not_delivered,
+            };
+            match fate {
+                Fate::Accept => {
+                    self.accepted.push(chunk.to_vec());
+                    Ok(())
+                }
+                Fate::Refuse => Err(fail(true)),
+                Fate::Ambiguous => {
+                    self.accepted.push(chunk.to_vec());
+                    Err(fail(false))
+                }
+            }
+        }
+    }
+
+    impl FakeSlot {
+        fn new(script: &[Fate]) -> Self {
+            Self {
+                script: script.iter().copied().collect(),
+                accepted: Vec::new(),
+                opens: 0,
+                discards: 0,
+                open_fails_after: None,
+                closed: false,
+                stream: None,
+                open_deadlines: Vec::new(),
+            }
+        }
+        fn give_back(&mut self) {
+            if let Some(s) = self.stream.take() {
+                self.script = s.script;
+                self.accepted = s.accepted;
+            }
+        }
+    }
+
+    impl InputSlot for FakeSlot {
+        type Stream = FakeStream;
+        fn ensure(&mut self, open_deadline: Instant) -> Result<&mut FakeStream, String> {
+            if self.stream.is_none() {
+                self.open_deadlines.push(open_deadline);
+                if self.open_fails_after.is_some_and(|n| self.opens >= n) {
+                    return Err("input connection could not be opened".into());
+                }
+                self.opens += 1;
+                self.stream = Some(FakeStream {
+                    script: std::mem::take(&mut self.script),
+                    accepted: std::mem::take(&mut self.accepted),
+                });
+            }
+            Ok(self.stream.as_mut().unwrap())
+        }
+        fn discard(&mut self) {
+            self.discards += 1;
+            self.give_back();
+        }
+        fn closed(&self) -> bool {
+            self.closed
+        }
+    }
+
+    fn run(slot: &mut FakeSlot, bytes: &[u8]) -> Result<(), String> {
+        let r =
+            send_input_resending_once(slot, "pane", bytes, Instant::now() + Duration::from_secs(5));
+        slot.give_back();
+        r
+    }
+
+    /// The bytes the fake holder accepted, in order.
+    fn delivered(slot: &FakeSlot) -> Vec<u8> {
+        slot.accepted.concat()
+    }
+
+    #[test]
+    fn pty_holder_input_refused_chunk_is_resent_exactly_once() {
+        // Three chunks; the SECOND is refused (cut by an upgrade's drain).
+        let bytes: Vec<u8> = (0..(MAX_INPUT_CHUNK * 2 + 10))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut slot = FakeSlot::new(&[Fate::Accept, Fate::Refuse]);
+        run(&mut slot, &bytes).expect("the resend delivers");
+        assert_eq!(slot.opens, 2, "the input connection was reopened once");
+        assert_eq!(slot.discards, 1);
+        assert_eq!(
+            delivered(&slot),
+            bytes,
+            "every byte reached the holder exactly once, in order"
+        );
+        assert_eq!(slot.accepted.len(), 3, "no chunk was sent twice");
+    }
+
+    /// Review p8f r1, #6: a first open waits `INPUT_OPEN_WAIT`; the RESEND's
+    /// reopen waits for the rest of `INPUT_DEADLINE`, so a successor that
+    /// serves slowly (an upgrade's bounds sum to ~41 s) still gets the chunk.
+    #[test]
+    fn pty_holder_input_resend_reopen_waits_for_the_whole_input_deadline() {
+        let mut slot = FakeSlot::new(&[Fate::Refuse]);
+        let start = Instant::now();
+        let deadline = start + INPUT_DEADLINE;
+        send_input_resending_once(&mut slot, "pane", b"x", deadline).unwrap();
+        slot.give_back();
+        assert_eq!(slot.open_deadlines.len(), 2);
+        assert!(
+            slot.open_deadlines[0] <= Instant::now() + INPUT_OPEN_WAIT,
+            "a first open is bounded by INPUT_OPEN_WAIT"
+        );
+        assert_eq!(
+            slot.open_deadlines[1], deadline,
+            "the resend's reopen may use the whole input deadline"
+        );
+    }
+
+    #[test]
+    fn pty_holder_input_ambiguous_failure_is_never_resent() {
+        let mut slot = FakeSlot::new(&[Fate::Ambiguous]);
+        let err = run(&mut slot, b"rm -rf build\n").unwrap_err();
+        assert!(err.contains("may or may not have reached"), "{err}");
+        assert_eq!(slot.opens, 1, "no reopen: a resend could duplicate");
+        assert_eq!(
+            delivered(&slot),
+            b"rm -rf build\n",
+            "delivered once, not twice"
+        );
+    }
+
+    #[test]
+    fn pty_holder_input_resend_is_spent_once() {
+        // Refused, resent, refused again: reported, never a third send.
+        let mut slot = FakeSlot::new(&[Fate::Refuse, Fate::Refuse]);
+        let err = run(&mut slot, b"abc").unwrap_err();
+        assert!(err.contains("did NOT reach the pane"), "{err}");
+        assert_eq!(slot.opens, 2);
+        assert!(delivered(&slot).is_empty());
+        // The NEXT write is a new write: it gets its own resend.
+        let mut slot2 = FakeSlot::new(&[Fate::Refuse]);
+        run(&mut slot2, b"def").unwrap();
+        assert_eq!(delivered(&slot2), b"def");
+    }
+
+    #[test]
+    fn pty_holder_input_resend_that_cannot_reopen_says_what_was_lost() {
+        let mut slot = FakeSlot::new(&[Fate::Accept, Fate::Refuse]);
+        slot.open_fails_after = Some(1);
+        let bytes = vec![b'x'; MAX_INPUT_CHUNK + 5];
+        let err = run(&mut slot, &bytes).unwrap_err();
+        assert!(
+            err.contains("the last 5 byte(s) of this input did NOT reach the pane"),
+            "{err}"
+        );
+        assert_eq!(delivered(&slot).len(), MAX_INPUT_CHUNK);
+    }
+
+    #[test]
+    fn pty_holder_input_resend_decision() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let refused = InputFailure {
+            error: ConnectError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            not_delivered: true,
+        };
+        let maybe = InputFailure {
+            error: ConnectError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            not_delivered: false,
+        };
+        assert!(resend_failed_chunk(&refused, 1, now, later, false));
+        assert!(!resend_failed_chunk(&refused, 0, now, later, false), "once");
+        assert!(
+            !resend_failed_chunk(&refused, 1, later, later, false),
+            "deadline"
+        );
+        assert!(
+            !resend_failed_chunk(&refused, 1, now, later, true),
+            "released"
+        );
+        assert!(
+            !resend_failed_chunk(&maybe, 1, now, later, false),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn pty_holder_released_slot_is_not_resent() {
+        let mut slot = FakeSlot::new(&[Fate::Refuse]);
+        slot.closed = true;
+        assert!(run(&mut slot, b"q").is_err());
+        assert_eq!(slot.opens, 1);
+    }
+
     /// Records everything a pane sends.
     #[derive(Default)]
     struct RecordingLink {
@@ -2176,7 +2635,102 @@ mod tests {
             rows: Arc::new(AtomicU16::new(24)),
             paused: Arc::new(AtomicBool::new(false)),
             restore,
+            stream_epoch: AtomicU64::new(0),
+            conn_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Review p8f r1, #4: a FRESH consumer's first connection drops before
+    /// its first frame — the reattach still names the epoch of the stream its
+    /// offset (the attach reply's) is on, never "unknown".
+    #[test]
+    fn pty_holder_fresh_attach_dropped_before_its_first_frame_keeps_its_epoch() {
+        assert_eq!(initial_stream_epoch(None, 77), 77, "ring-tail attach");
+        assert_eq!(
+            initial_stream_epoch(FRESH_SPAWN_FROM_OFFSET, 77),
+            77,
+            "fresh spawn"
+        );
+        assert_eq!(
+            initial_stream_epoch(Some(4096), 77),
+            0,
+            "a resume at an offset counted elsewhere is unknown"
+        );
+        // Drive the pump as the attach builds it: no frame consumed, then the
+        // reattach reads the epoch it will send.
+        let out = Arc::new(PaneOutput::new(
+            "t-pump",
+            Vec::new(),
+            0,
+            holder_lost_output_marker,
+        ));
+        let pump = bare_pump(out, None);
+        pump.stream_epoch
+            .store(initial_stream_epoch(None, 77), Ordering::Release);
+        pump.conn_epoch.store(77, Ordering::Release);
+        // The connection drops; a reattach lands on a holder with epoch 99.
+        pump.conn_epoch.store(99, Ordering::Release);
+        assert_eq!(
+            pump.stream_epoch.load(Ordering::Acquire),
+            77,
+            "the reattach names the fresh attach's epoch"
+        );
+    }
+
+    /// Plan Phase 8, H1 (review r2, R1; p8f r1 #1): the offset joins a
+    /// connection's STREAM EPOCH only when a frame from it is CONSUMED — not
+    /// when its attach succeeds — so a connection that drops before its
+    /// leading `output_lost` still reattaches naming the old epoch. A loss
+    /// that starts behind the pane's offset (the holder took the pane back
+    /// from a dead successor) is declared in-band, even when it ends at or
+    /// behind the offset.
+    #[test]
+    fn pty_holder_stream_epoch_moves_only_with_a_consumed_frame() {
+        let out = Arc::new(PaneOutput::new(
+            "t-pump",
+            Vec::new(),
+            0,
+            holder_lost_output_marker,
+        ));
+        let pump = bare_pump(out.clone(), None);
+        let mut restore = None;
+        // Counting on the dead successor's epoch 200, at offset 10.
+        pump.conn_epoch.store(200, Ordering::Release);
+        pump.on_event(
+            Event::Output {
+                offset: 0,
+                bytes: b"0123456789".to_vec(),
+            },
+            &mut restore,
+        );
+        assert_eq!(pump.stream_epoch.load(Ordering::Acquire), 200);
+        // Reattached to the predecessor (epoch 100): the attach alone moves
+        // nothing.
+        pump.conn_epoch.store(100, Ordering::Release);
+        assert_eq!(
+            pump.stream_epoch.load(Ordering::Acquire),
+            200,
+            "an attach is not a consumed frame"
+        );
+        // Its leading loss: from X=4 (behind us) to 10 (= our offset).
+        pump.on_event(
+            Event::Lost {
+                from_offset: 4,
+                to_offset: 10,
+            },
+            &mut restore,
+        );
+        assert_eq!(pump.stream_epoch.load(Ordering::Acquire), 100);
+        assert_eq!(out.offset(), 10);
+        out.settle(Ok(0));
+        let mut got = Vec::new();
+        out.take_reader().unwrap().read_to_end(&mut got).unwrap();
+        let mut want = b"0123456789".to_vec();
+        want.extend_from_slice(&holder_stream_replaced_notice(4));
+        assert_eq!(
+            got, want,
+            "the break is declared though the loss ends at our offset"
+        );
     }
 
     fn synthetic(part: SyntheticPart, bytes: &[u8]) -> Event {
@@ -3083,6 +3637,81 @@ mod tests {
             t.join().unwrap();
             pane.release(Duration::from_secs(1)).unwrap();
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Plan Phase 8 follow-up (input resend): the pane's INPUT connection
+        /// is open to the predecessor when the upgrade commits; the commit's
+        /// drain shuts it (`SHUT_RD`) and the predecessor exits, so the next
+        /// write on it is refused before it reaches any holder. The pane
+        /// reopens its input connection — to the successor — and sends that
+        /// chunk once more: it reaches the child EXACTLY once, and the input
+        /// written before the upgrade is not repeated.
+        #[test]
+        fn pty_holder_input_refused_across_an_upgrade_is_delivered_exactly_once() {
+            let dir = pane_dir("rsnd");
+            let files = pane_dir("rsnd-files");
+            std::fs::create_dir_all(&files).unwrap();
+            let log = files.join("lines");
+            let pane_id = PaneId::new("rsnd").unwrap();
+            let script = format!(
+                "stty -echo; printf UP; while read x; do echo \"got:$x\"; echo \"$x\" >> '{}'; done",
+                log.display()
+            );
+            let pane = Arc::new(
+                DaemonPaneIo::spawn(&holder(), &dir, &pane_id, &sh(&script), 80, 24)
+                    .expect("spawn + attach"),
+            );
+            let (collected, t) = drain(&pane);
+            until(&collected, Duration::from_secs(10), |c| contains(c, b"UP"));
+            // Opens the input connection to the PREDECESSOR.
+            pane.writer().unwrap().write_all(b"one\n").unwrap();
+            until(&collected, Duration::from_secs(10), |c| {
+                contains(c, b"got:one")
+            });
+            let before = pane.holder_pid();
+            let outcome = qontinui_pty_holder::client::connect(
+                &dir,
+                &pane_id,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .expect("handshake")
+            .prepare_upgrade(Instant::now() + Duration::from_secs(60))
+            .expect("prepare_upgrade answered");
+            let qontinui_pty_holder::client::UpgradeOutcome::Upgraded { successor_pid, .. } =
+                outcome
+            else {
+                panic!("expected upgraded, got {outcome:?}");
+            };
+            assert_ne!(successor_pid, before);
+            let end = Instant::now() + Duration::from_secs(20);
+            while pane.holder_pid() != successor_pid {
+                assert!(Instant::now() < end, "the pane never followed the upgrade");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // The input connection still points at the drained predecessor:
+            // this write is refused there, and must be resent — once.
+            pane.writer()
+                .unwrap()
+                .write_all(b"two\n")
+                .expect("the refused chunk is resent on a reopened connection");
+            until(&collected, Duration::from_secs(10), |c| {
+                contains(c, b"got:two")
+            });
+            pane.writer().unwrap().write_all(b"three\n").unwrap();
+            until(&collected, Duration::from_secs(10), |c| {
+                contains(c, b"got:three")
+            });
+            let lines = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(
+                lines, "one\ntwo\nthree\n",
+                "every input line reached the child exactly once, in order"
+            );
+            pane.kill(Duration::from_secs(5)).unwrap();
+            let _ = wait_within(&pane, Duration::from_secs(10));
+            t.join().unwrap();
+            pane.release(Duration::from_secs(1)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&files);
         }
 
         /// SIGKILL the holder under a live pane: `wait` settles within a bound,

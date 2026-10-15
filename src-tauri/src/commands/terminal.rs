@@ -2927,6 +2927,60 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// The PTY-holder panes that need an operator decision — an incompatible
+/// holder (D15) or one of an older build than this runner ships — and which
+/// actions may be offered for them (plan `2026-09-12-out-of-process-pty-owner-
+/// for-terminal-hosted-sessions`, Phase 8 runner follow-up). A fresh census
+/// (`holder_census::take`); read-only — it never upgrades, kills or touches a
+/// holder.
+#[tauri::command]
+pub async fn pty_holder_attention(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+) -> Result<crate::terminal::holder_upgrade::HolderAttention, String> {
+    use crate::terminal::holder_upgrade::{
+        attention_from_census, runner_holder_build, upgrade_supported_here,
+    };
+    let census = crate::terminal::holder_census::take(terminal_manager.inner()).await;
+    Ok(attention_from_census(
+        &census,
+        &runner_holder_build(),
+        upgrade_supported_here(),
+    ))
+}
+
+/// Upgrade ONE pane's PTY holder in place — the operator's "Upgrade holder"
+/// action, and the only production caller of `prepare_upgrade`. Never invoked
+/// implicitly. Gated (`holder_upgrade::gate`): a supported platform, a
+/// holder-backed pane whose holder answers, and a holder that is incompatible
+/// or older than this runner's. Returns the typed outcome; runs off the async
+/// workers (the exchange can take up to 45 s).
+#[tauri::command]
+pub async fn pty_holder_upgrade(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    pane_id: String,
+) -> Result<crate::terminal::holder_upgrade::HolderUpgradeOutcome, String> {
+    use crate::terminal::holder_upgrade::{upgrade_blocking, HolderUpgradeOutcome};
+    let pane = qontinui_pty_holder::pane::PaneId::new(&pane_id)
+        .map_err(|e| format!("pty_holder_upgrade: invalid pane id {pane_id:?}: {e}"))?;
+    let in_flight = terminal_manager
+        .in_flight_ids()
+        .iter()
+        .any(|id| id == &pane_id);
+    let dir = match crate::terminal::daemon_pane_io::runner_pane_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Ok(HolderUpgradeOutcome::Failed {
+                reason: format!(
+                    "no pane directory resolves for this runner ({e}); nothing changed"
+                ),
+            })
+        }
+    };
+    tokio::task::spawn_blocking(move || upgrade_blocking(&dir, &pane, in_flight))
+        .await
+        .map_err(|e| format!("pty_holder_upgrade: the upgrade task did not complete: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

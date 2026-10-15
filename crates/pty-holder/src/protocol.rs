@@ -156,6 +156,16 @@ pub enum Request {
         from_offset: Option<u64>,
         #[serde(default, skip_serializing_if = "is_false")]
         restore: bool,
+        /// The STREAM EPOCH `from_offset` was counted on — the
+        /// `attached.stream_epoch` of the connection whose frames this
+        /// consumer last read (plan Phase 8, H1). A holder that took its pane
+        /// back after a declared loss answers an offset past the take-back
+        /// with `output_lost` UNLESS this epoch is in its lineage (its own, or
+        /// a predecessor's it took over losslessly). `None` (an older runner,
+        /// or a consumer that does not know) reads as "may be the dead
+        /// successor's". Omitted when `None`; ignored by older holders.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_epoch: Option<u64>,
     },
     /// Version 2. Resize the PTY. Answered `ok`.
     Resize { cols: u16, rows: u16 },
@@ -214,6 +224,11 @@ pub struct AttachedReply {
     /// A requested offset past `end_offset` (one the holder never produced —
     /// the client's offset belongs to another stream) is clamped to
     /// `end_offset`, so `start_offset < from_offset` says exactly that.
+    /// After a holder took its pane back from a successor that died after
+    /// serving it (plan Phase 8, H1), a `from_offset` past that take-back's
+    /// offset X may be the dead successor's: the reply's `start_offset` is
+    /// then X, and an `output_lost {X, max(from_offset, end_offset)}` frame
+    /// comes first — the stream continues at its `to_offset`.
     pub start_offset: u64,
     /// Absolute offset of the oldest byte the holder's ring still holds.
     pub ring_start_offset: u64,
@@ -227,6 +242,11 @@ pub struct AttachedReply {
     /// reply keeps its exact bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore: Option<RestoreMeta>,
+    /// The holder's STREAM EPOCH at this attach (plan Phase 8, H1): what a
+    /// consumer echoes as `attach.stream_epoch` once it has read a frame on
+    /// this connection. Absent from holders that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_epoch: Option<u64>,
 }
 
 /// `attached.restore` — version 3. Pane metadata for a consumer rebuilding its
@@ -562,6 +582,7 @@ mod tests {
                 frame_of(&Request::Attach {
                     from_offset: None,
                     restore: false,
+                    stream_epoch: None,
                 }),
                 r#"{"type":"attach","from_offset":null}"#,
             ),
@@ -569,6 +590,7 @@ mod tests {
                 frame_of(&Request::Attach {
                     from_offset: Some(4096),
                     restore: false,
+                    stream_epoch: None,
                 }),
                 r#"{"type":"attach","from_offset":4096}"#,
             ),
@@ -593,6 +615,7 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     restore: None,
+                    stream_epoch: None,
                 })),
                 r#"{"type":"attached","start_offset":10,"ring_start_offset":5,"end_offset":99,"child_pid":4243,"cols":80,"rows":24}"#,
             ),
@@ -641,6 +664,7 @@ mod tests {
             Request::Attach {
                 from_offset: None,
                 restore: false,
+                stream_epoch: None,
             }
         );
     }
@@ -655,6 +679,7 @@ mod tests {
                 frame_of(&Request::Attach {
                     from_offset: None,
                     restore: true,
+                    stream_epoch: None,
                 }),
                 r#"{"type":"attach","from_offset":null,"restore":true}"#,
             ),
@@ -662,6 +687,7 @@ mod tests {
                 frame_of(&Request::Attach {
                     from_offset: Some(7),
                     restore: false,
+                    stream_epoch: None,
                 }),
                 r#"{"type":"attach","from_offset":7}"#,
             ),
@@ -677,6 +703,7 @@ mod tests {
                         cwd: Some("/tmp".into()),
                         title: None,
                     }),
+                    stream_epoch: None,
                 })),
                 r#"{"type":"attached","start_offset":10,"ring_start_offset":5,"end_offset":99,"child_pid":4243,"cols":80,"rows":24,"restore":{"cwd":"/tmp","title":null}}"#,
             ),
@@ -684,12 +711,37 @@ mod tests {
         for (got, json) in cases {
             assert_eq!(got, expected(json), "v3 restore message moved: {json}");
         }
+        // H1: `stream_epoch` rides the wire only when set, both ways.
+        assert_eq!(
+            frame_of(&Reply::Attached(AttachedReply {
+                start_offset: 1,
+                ring_start_offset: 0,
+                end_offset: 2,
+                child_pid: 3,
+                cols: 80,
+                rows: 24,
+                restore: None,
+                stream_epoch: Some(9),
+            })),
+            expected(
+                r#"{"type":"attached","start_offset":1,"ring_start_offset":0,"end_offset":2,"child_pid":3,"cols":80,"rows":24,"stream_epoch":9}"#
+            )
+        );
+        assert_eq!(
+            frame_of(&Request::Attach {
+                from_offset: Some(7),
+                restore: false,
+                stream_epoch: Some(42),
+            }),
+            expected(r#"{"type":"attach","from_offset":7,"stream_epoch":42}"#)
+        );
         // A version-2 runner's attach (no field) parses as no restore.
         assert_eq!(
             parse_request(br#"{"type":"attach","from_offset":null}"#).unwrap(),
             Request::Attach {
                 from_offset: None,
                 restore: false,
+                stream_epoch: None,
             }
         );
     }
@@ -767,6 +819,7 @@ mod tests {
                 "attach" => Request::Attach {
                     from_offset: Some(3),
                     restore: true,
+                    stream_epoch: None,
                 },
                 "resize" => Request::Resize { cols: 80, rows: 24 },
                 "pause" => Request::Pause,
