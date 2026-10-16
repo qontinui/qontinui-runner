@@ -1,11 +1,11 @@
 /**
  * termhost-bench environments (plan D6): numbers compare only within one.
  *
- * Phase 3 built `linux-xvfb`; Phase 4 builds `windows-hosted` (GitHub's hosted
- * windows-latest, for the runner's A/B and the VS Code smoke). `windows-desktop`
- * arrives with Phase 5; until then `run` refuses it with that reason, while
- * `doctor` already reports what a Windows machine offers through the probe's own
- * doctor.
+ * Phase 3 built `linux-xvfb`; Phase 4 `windows-hosted` (GitHub's hosted
+ * windows-latest, for the runner's A/B and the VS Code smoke); Phase 5
+ * `windows-desktop` (a workstation's interactive desktop with a GPU — the
+ * operator's comparison). A spec's `notBuilt` names why `run` refuses an
+ * environment that is not built; every environment is built today.
  *
  * Optional spec fields:
  *   doctorFacts(env)   extra doctor verdicts the environment itself decides, merged
@@ -21,6 +21,7 @@
 
 import { CROSSCHECK_PROFILES, ENVIRONMENTS } from "../kpi-catalog.mjs";
 import { SCREEN as XVFB_SCREEN, startLinuxXvfb } from "./linux-xvfb.mjs";
+import { desktopVerdict, startWindowsDesktop } from "./windows-desktop.mjs";
 import { hostedRunnerVerdict, startWindowsHosted } from "./windows-hosted.mjs";
 
 /**
@@ -63,12 +64,13 @@ export const ENVIRONMENT_SPECS = Object.freeze({
   "windows-desktop": Object.freeze({
     id: "windows-desktop",
     platform: "win32",
-    start: null,
-    notBuilt: "the windows-desktop environment arrives with Phase 5 (Windows Terminal, tmux-wsl and the desktop run)",
+    start: startWindowsDesktop,
+    notBuilt: null,
     setups: Object.freeze(["runner", "vscode", "windows-terminal", "tmux-wsl"]),
     softwareRendered: false,
     screen: null,
     crosscheckProfile: "strict",
+    doctorFacts: (env) => ({ "env.desktop": desktopVerdict(env) }),
     setupLabels: Object.freeze({}),
   }),
 });

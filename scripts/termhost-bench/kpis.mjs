@@ -45,6 +45,7 @@
 import { KPI_CATALOG, REASON_CODES, getKpi, minSamplesForStatistic } from "./kpi-catalog.mjs";
 import { SEQ_MODULUS } from "./marker.mjs";
 import { measureKpi, notApplicableKpi, slope, unknownKpi } from "./stats.mjs";
+import { vmKpis, wslHostKpis } from "./wsl.mjs";
 
 const NS_PER_MS = 1_000_000n;
 const MIB = 1024 * 1024;
@@ -1356,6 +1357,13 @@ export function computeRowKpis(p) {
 
   // --- process accounting -------------------------------------------------
   computeProcessKpis(p, seg, win, set, notes);
+  // tmux-wsl (Phase 5): the host also runs inside WSL — the private tmux server
+  // and its clients, sampled through /proc in the distro (`p.wsl`, wsl.mjs). A
+  // probe-side reading that is not measured keeps its own reason.
+  if (p.setupId === "tmux-wsl" && p.wsl) {
+    const host = wslHostKpis({ probeCpu: seg ? groupSeries(seg, "host", "cpu_pct") : [], probeMemEnd: seg?.summary?.processes?.host?.memory_mb_end ?? null, wslRecords: p.wsl.wslRecords ?? [], win });
+    for (const id of ["cpu_pct", "memory_mb"]) if (kpis[id]?.state === "measured") set(id, host[id]);
+  }
 
   // --- generator self-timing -----------------------------------------------
   if (!win) {
@@ -1420,7 +1428,9 @@ export function computeRowKpis(p) {
     set(
       id,
       p.setupId === "tmux-wsl"
-        ? unknownKpi(id, "not_instrumented", { detail: "the WSL VM sampler arrives with the tmux-wsl adapter (Phase 5)" })
+        ? p.wsl
+          ? vmKpis(p.wsl.vmRecords ?? [], win)[id]
+          : unknownKpi(id, "not_instrumented", { detail: "the run passed no WSL samples (the tmux-wsl adapter records them)" })
         : notApplicableKpi(id, "not_applicable_to_setup"),
     );
   }

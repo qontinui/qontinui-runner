@@ -2,8 +2,8 @@
  * The termhost-bench setup-adapter interface (plan
  * `2026-10-11-terminal-page-performance-kpis-across-setups`, Phase 3) and the
  * registry of adapters. One adapter drives one terminal host; Phase 4 added
- * `vscode`, and Phase 5 adds `windows-terminal` and the `tmux-wsl` variant behind
- * the same calls.
+ * `vscode`, and Phase 5 `windows-terminal` (`windows-terminal.mjs`) and the
+ * `tmux-wsl` variant of the tmux adapter (`tmux-wsl.mjs`), behind the same calls.
  *
  * The run loop drives one UNIT — one host launch for one (run index, N, setup,
  * variant, build role) — through these methods, in this order:
@@ -33,6 +33,10 @@
  * Optional extensions every Phase 3 adapter also implements:
  *   windowTarget()               how the probe finds the window: {pid} | {hwnd} | {title}
  *   diagnostics()                runner-only diagnostics (every one non-comparable, D1)
+ *
+ * One setup-specific extension the run loop uses when present:
+ *   wslSamples()                 tmux-wsl only: the WSL-side /proc and WSL VM samples
+ *                                  the KPIs join (`wsl.mjs`)
  *   hostIdKey                    the env var the host exports into each session
  *                                  (`slot-<k>.host_terminal_id[<key>]`), so the run
  *                                  loop maps slots to host sessions exactly
@@ -140,9 +144,14 @@ export async function createAdapter(setupId, options) {
       const { VscodeAdapter } = await import("./vscode.mjs");
       return assertAdapter(new VscodeAdapter(options));
     }
-    case "windows-terminal":
-    case "tmux-wsl":
-      throw new RangeError(`the ${setupId} adapter arrives with Phase 5 of the plan`);
+    case "windows-terminal": {
+      const { WindowsTerminalAdapter } = await import("./windows-terminal.mjs");
+      return assertAdapter(new WindowsTerminalAdapter(options));
+    }
+    case "tmux-wsl": {
+      const { TmuxWslAdapter } = await import("./tmux-wsl.mjs");
+      return assertAdapter(new TmuxWslAdapter(options));
+    }
     default:
       throw new RangeError(`unknown setup "${setupId}"`);
   }

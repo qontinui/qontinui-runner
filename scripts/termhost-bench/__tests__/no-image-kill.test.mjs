@@ -45,9 +45,20 @@ function harnessSources() {
   return out;
 }
 
-test("the scan reaches the VS Code harness extension and the VS Code adapter", () => {
+test("the scan reaches the VS Code harness extension and every adapter, the Windows Terminal and WSL ones included", () => {
   const files = harnessSources().map((f) => relative(BENCH, f).replace(/\\/g, "/"));
-  for (const f of ["vscode-harness-extension/harness.js", "vscode-harness-extension/extension.js", "vscode-harness-extension/protocol.js", "adapters/vscode.mjs", "adapters/vscode-install.mjs"]) {
+  for (const f of [
+    "vscode-harness-extension/harness.js",
+    "vscode-harness-extension/extension.js",
+    "vscode-harness-extension/protocol.js",
+    "adapters/vscode.mjs",
+    "adapters/vscode-install.mjs",
+    "adapters/windows-terminal.mjs",
+    "adapters/windows-terminal-install.mjs",
+    "adapters/tmux-wsl.mjs",
+    "wsl.mjs",
+    "wsl-sampler.mjs",
+  ]) {
     assert.ok(files.includes(f), `${f} is scanned`);
   }
 });

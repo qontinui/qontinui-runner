@@ -122,6 +122,11 @@ export function findEnclosingRepo(dir, { exists = existsSync } = {}) {
   }
 }
 
+/** The log-line prefix for a product: `vscode`, `windows-terminal`. */
+export function logTag(what) {
+  return what === "VS Code" ? "vscode" : String(what).toLowerCase().replace(/\s+/g, "-");
+}
+
 /** SHA-256 of a file, streamed. */
 export function sha256File(path) {
   return new Promise((resolveHash, reject) => {
@@ -142,19 +147,21 @@ export function sha256File(path) {
  * @param {{urls: string[], dest: string, expected: string, fetch?: typeof fetch,
  *   log?: (s: string) => void, timeoutMs?: number, signal?: AbortSignal | null}} o
  *   `signal` is the run's abort: it ends the download (the partial file is removed)
- *   and no fallback URL is tried after it.
+ *   and no fallback URL is tried after it. `what` names the product in messages
+ *   (the Windows Terminal installer shares this code).
  * @returns {Promise<{path: string, bytes: number, url: string, sha256: string}>}
  */
-export async function downloadVerified({ urls, dest, expected, fetch = globalThis.fetch, log = () => {}, timeoutMs = 15 * 60000, maxBytes = null, signal = null }) {
+export async function downloadVerified({ urls, dest, expected, fetch = globalThis.fetch, log = () => {}, timeoutMs = 15 * 60000, maxBytes = null, signal = null, what = "VS Code" }) {
+  const tag = logTag(what);
   if (!/^[0-9a-f]{64}$/.test(expected ?? "")) throw new TypeError(`expected SHA-256 must be 64 lowercase hex, got ${expected}`);
   mkdirSync(dirname(dest), { recursive: true });
   const errors = [];
   for (const url of urls.filter(Boolean)) {
-    if (signal?.aborted) throw new WaitAborted(`the VS Code archive download (${url})`);
+    if (signal?.aborted) throw new WaitAborted(`the ${what} archive download (${url})`);
     const part = `${dest}.part-${process.pid}-${randomBytes(3).toString("hex")}`;
     let fh = null;
     try {
-      log(`vscode: downloading ${url}`);
+      log(`${tag}: downloading ${url}`);
       const timeout = AbortSignal.timeout(timeoutMs);
       const res = await fetch(url, { redirect: "follow", signal: signal ? AbortSignal.any([timeout, signal]) : timeout });
       if (!res.ok || !res.body) {
@@ -180,8 +187,8 @@ export async function downloadVerified({ urls, dest, expected, fetch = globalThi
       renameSync(part, dest);
       // Verbatim on purpose (not a reading, D7): the byte count and digest are
       // facts of the PINNED public archive, the evidence the download matched
-      // its pin, and say nothing about how VS Code performs.
-      log(`vscode: ${bytes} bytes, SHA-256 ${actual} verified`);
+      // its pin, and say nothing about how the product performs.
+      log(`${tag}: ${bytes} bytes, SHA-256 ${actual} verified`);
       return { path: dest, bytes, url, sha256: actual };
     } catch (e) {
       if (fh) await fh.close().catch(() => {});
@@ -189,11 +196,11 @@ export async function downloadVerified({ urls, dest, expected, fetch = globalThi
       if (e instanceof ArchiveIntegrityError) throw e;
       // An abort mid-download is the run ending, not a failed URL — on the last URL
       // too, where the loop's own check would never run again.
-      if (signal?.aborted) throw new WaitAborted(`the VS Code archive download (${url})`);
+      if (signal?.aborted) throw new WaitAborted(`the ${what} archive download (${url})`);
       errors.push(`${url}: ${e?.message ?? e}`);
     }
   }
-  throw new Error(`could not download the pinned VS Code archive (${errors.join("; ") || "no URL"})`);
+  throw new Error(`could not download the pinned ${what} archive (${errors.join("; ") || "no URL"})`);
 }
 
 /**
@@ -208,7 +215,7 @@ export async function downloadVerified({ urls, dest, expected, fetch = globalThi
  *   verified?: {path: string, size: number, mtimeMs: number, sha256: string} | null, stat?: typeof statSync}} o
  * @returns {Promise<{path: string, cached: boolean, sha256: string}>}
  */
-export async function ensureArchive({ build, cacheDir, version = VSCODE_PIN.version, fetch, log = () => {}, hash = sha256File, exists = existsSync, verified = null, stat = statSync, signal = null }) {
+export async function ensureArchive({ build, cacheDir, version = VSCODE_PIN.version, fetch, log = () => {}, hash = sha256File, exists = existsSync, verified = null, stat = statSync, signal = null, what = "VS Code" }) {
   const repo = findEnclosingRepo(cacheDir, { exists });
   if (repo) throw new Error(`the archive cache ${cacheDir} is inside the git checkout ${repo}; caches live outside any repository (D5)`);
   const dest = join(cacheDir, version, build.archive);
@@ -218,10 +225,10 @@ export async function ensureArchive({ build, cacheDir, version = VSCODE_PIN.vers
     const actual = reuse ? verified.sha256 : await hash(dest);
     if (actual === build.sha256) return { path: dest, cached: true, sha256: actual };
     // Verbatim on purpose: digests of the cached and pinned archive (harness facts).
-    log(`vscode: cached ${dest} hashes to ${actual}, not the pinned ${build.sha256}: discarding it`);
+    log(`${logTag(what)}: cached ${dest} hashes to ${actual}, not the pinned ${build.sha256}: discarding it`);
     rmSync(dest, { force: true });
   }
-  const r = await downloadVerified({ urls: [build.url, build.fallbackUrl], dest, expected: build.sha256, fetch, log, maxBytes: Number.isInteger(build.bytes) ? build.bytes : null, signal });
+  const r = await downloadVerified({ urls: [build.url, build.fallbackUrl], dest, expected: build.sha256, fetch, log, maxBytes: Number.isInteger(build.bytes) ? build.bytes : null, signal, what });
   return { path: r.path, cached: false, sha256: r.sha256 };
 }
 

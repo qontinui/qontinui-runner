@@ -180,14 +180,36 @@ export const USAGE =
 // ---------------------------------------------------------------------------
 
 /**
- * process.hrtime clock. `sleepUntil` uses setTimeout and `yield` uses setImmediate, so
- * stdin data, EOF and signal handlers run whenever the driver waits or yields.
+ * The environment variable that shifts the generator's clock into the host's
+ * timebase. A generator running inside WSL (the `tmux-wsl` setup, plan Phase 5)
+ * reads the Linux VM's CLOCK_MONOTONIC, which is not the Windows QPC clock the
+ * probe and the harness read; the adapter measures the offset and hands it over
+ * here, through the tmux server's environment, so the generator's command line
+ * stays the one every host runs (D13). Absent everywhere else.
  */
-export function createRealClock() {
+export const CLOCK_OFFSET_ENV = "TERMHOST_BENCH_CLOCK_OFFSET_NS";
+
+/** The offset from `env` as a BigInt (0n when absent; a malformed value throws). */
+export function clockOffsetFromEnv(env = process.env) {
+  const v = env[CLOCK_OFFSET_ENV];
+  if (v === undefined || v === "") return 0n;
+  if (!/^-?\d{1,20}$/.test(v)) throw new UsageError(`${CLOCK_OFFSET_ENV} must be an integer nanosecond offset, got ${v}`);
+  return BigInt(v);
+}
+
+/**
+ * process.hrtime clock, shifted by `offsetNs` (0 unless the host's timebase is
+ * another machine's, see CLOCK_OFFSET_ENV). `sleepUntil` uses setTimeout and
+ * `yield` uses setImmediate, so stdin data, EOF and signal handlers run whenever
+ * the driver waits or yields.
+ */
+export function createRealClock({ offsetNs = 0n } = {}) {
+  const now = () => process.hrtime.bigint() + offsetNs;
   return {
-    nowNs: () => process.hrtime.bigint(),
+    offsetNs,
+    nowNs: now,
     sleepUntil(tNs) {
-      const ms = Number(tNs - process.hrtime.bigint()) / 1e6;
+      const ms = Number(tNs - now()) / 1e6;
       return new Promise((r) => setTimeout(r, Math.max(0, Math.ceil(ms))));
     },
     yield: () => new Promise((r) => setImmediate(r)),
@@ -451,7 +473,7 @@ class GeneratorRun {
       geometry: { ...this.geometry },
       marker_hz: profile.marker_hz,
       echo: this.echo,
-      clock: "process.hrtime",
+      clock: opts.clock?.offsetNs ? `process.hrtime+${opts.clock.offsetNs}ns` : "process.hrtime",
       t0_ns: String(this.t0),
       ...(opts.startExtra ?? {}),
     });
@@ -935,7 +957,13 @@ async function main(argv) {
     process.stderr.write(`ai-session: ${e.message}\n`);
     return 1;
   }
-  const clock = createRealClock();
+  let clock;
+  try {
+    clock = createRealClock({ offsetNs: clockOffsetFromEnv() });
+  } catch (e) {
+    process.stderr.write(`ai-session: ${e.message}\n`);
+    return 2;
+  }
   const { slot, path: slotPath } = claimSlot(runDir, {
     run_id: opts.runId,
     pid: process.pid,

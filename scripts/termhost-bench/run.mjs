@@ -281,6 +281,7 @@ export function abortAwareSleep(signal, inner = null) {
 function fallbackLaunchMode(setupId, o) {
   if (setupId === "runner") return o.runnerMode === "supervisor" ? "supervisor_spawn_test" : "subject_instance_root";
   if (setupId === "vscode") return o.vscodeAppPath ? "installed_app_path" : "portable_pinned";
+  if (setupId === "windows-terminal") return "portable_pinned";
   return "private_server";
 }
 
@@ -602,6 +603,9 @@ export function adapterOptionsFor(unit, o, log) {
   if (unit.setup === "vscode") {
     return { variant: unit.variant, log, appPath: o.vscodeAppPath ?? null, cacheDir: o.vscodeCacheDir ?? null };
   }
+  if (unit.setup === "windows-terminal" || unit.setup === "tmux-wsl") {
+    return { variant: unit.variant, log, cacheDir: o.wtCacheDir ?? null, ...(unit.setup === "tmux-wsl" ? { distro: o.wslDistro ?? null } : {}) };
+  }
   return { variant: unit.variant, log };
 }
 
@@ -843,6 +847,8 @@ export async function runUnit(unit, ctx) {
   }
   const gens = arms.size > 0 ? indexGenerators(readGeneratorLogs(genDir)) : new Map();
   const baseGens = new Map([...gens].filter(([s]) => baseSessions.has(s)));
+  // tmux-wsl: the WSL-side and WSL VM samples its adapter recorded (wsl.mjs).
+  const wslSamples = typeof adapter?.wslSamples === "function" ? adapter.wslSamples() : null;
   const rows = [];
   for (const arm of o.arms) {
     const a = arms.get(arm);
@@ -876,6 +882,7 @@ export async function runUnit(unit, ctx) {
       spawns: a.spawns ? { ...a.spawns } : null,
       switchTimeoutMs: 5000,
       spawnTimeoutMs: o.spawnTimeoutMs,
+      wsl: wslSamples,
     });
     noteRefresh(ctx.refreshSeen, a.soak);
     for (const st of computed.stalls ?? []) {

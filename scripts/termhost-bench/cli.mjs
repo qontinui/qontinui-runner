@@ -80,6 +80,11 @@ vscode options (D5):
                              default %LOCALAPPDATA%\\termhost-bench\\cache\\vscode or ~/.cache/termhost-bench/vscode)
   --vscode-app-path <path>   measure an installed VS Code "as configured" instead of the pinned build
 
+windows-terminal and tmux-wsl options (D5, Phase 5):
+  --wt-cache-dir <dir>       where the pinned portable Windows Terminal ZIP is cached (outside any
+                             repository; default %LOCALAPPDATA%\\termhost-bench\\cache\\windows-terminal)
+  --wsl-distro <name>        tmux-wsl: the WSL 2 distro (default: WSL's default distro)
+
 report options:
   --require-measured-if-operative <mechanism>:<kpi,...>
                              these KPIs must read measured at --at-n only where the results'
@@ -132,6 +137,8 @@ const FLAGS_WITH_VALUES = new Set([
   "variant",
   "vscode-app-path",
   "vscode-cache-dir",
+  "wt-cache-dir",
+  "wsl-distro",
   "require-measured-if-operative",
 ]);
 const BOOLEAN_FLAGS = new Set(["json", "help"]);
@@ -272,6 +279,8 @@ export async function normaliseRunOptions(flags, deps = {}) {
     supervisorUrl,
     vscodeAppPath: flags["vscode-app-path"] ? resolve(flags["vscode-app-path"]) : null,
     vscodeCacheDir: flags["vscode-cache-dir"] ? resolve(flags["vscode-cache-dir"]) : null,
+    wtCacheDir: flags["wt-cache-dir"] ? resolve(flags["wt-cache-dir"]) : null,
+    wslDistro: flags["wsl-distro"] ?? null,
     repoRoot: REPO_ROOT,
     command: ["node", relative(REPO_ROOT, fileURLToPath(import.meta.url)).replace(/\\/g, "/"), ...(deps.argv ?? [])],
   };
@@ -301,7 +310,9 @@ async function cmdDoctor(flags, io, deps = {}) {
                   appPath: flags["vscode-app-path"] ? resolve(flags["vscode-app-path"]) : null,
                   cacheDir: flags["vscode-cache-dir"] ? resolve(flags["vscode-cache-dir"]) : null,
                 }
-              : { variant: "default" },
+              : setup === "windows-terminal" || setup === "tmux-wsl"
+                ? { variant: "default", cacheDir: flags["wt-cache-dir"] ? resolve(flags["wt-cache-dir"]) : null, distro: flags["wsl-distro"] ?? null }
+                : { variant: "default" },
         ),
       );
     } catch (e) {

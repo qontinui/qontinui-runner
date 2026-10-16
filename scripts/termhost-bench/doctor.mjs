@@ -105,6 +105,17 @@ export function mapDoctor(f) {
   for (const [id, verdict] of Object.entries(f.setupMechanisms ?? {})) {
     m[id] = DOCTOR_STATES.includes(verdict?.state) ? v(verdict.state, String(verdict.reason || "(no reason given)")) : v(UNKNOWN, `malformed verdict for ${id}`);
   }
+  // windows-desktop (Phase 5): the desktop run needs an interactive, unlocked
+  // session and per-window capture; without them it cannot measure the
+  // operator's question, so it does not start (input.safe gates the input arm
+  // alone, D9).
+  if (f.environment === "windows-desktop") {
+    const missing = ["session.interactive", "capture.wgc"].filter((id) => m[id]?.state !== OPERATIVE);
+    m["env.desktop_ready"] =
+      missing.length === 0
+        ? v(OPERATIVE, "session.interactive and capture.wgc are OPERATIVE")
+        : v(INOPERATIVE, `the desktop run needs ${missing.map((id) => `${id} OPERATIVE (it is ${m[id]?.state ?? UNKNOWN}: ${m[id]?.reason ?? "no verdict"})`).join("; ")}`);
+  }
   // Read before any unit, so a drained (or unknown-drain) box spawns nothing.
   m["device.drain"] = drainMechanism(f.drain);
   return m;
@@ -115,7 +126,7 @@ export function mapDoctor(f) {
  * with its reason instead of stopping the run).
  */
 export function blockingMechanisms(mechanisms) {
-  return ["env.platform", "env.harness", "env.xvfb", "env.hosted_runner", "probe.binary", "probe.foreground_safety", "node.version", "device.drain"]
+  return ["env.platform", "env.harness", "env.xvfb", "env.hosted_runner", "env.desktop", "env.desktop_ready", "probe.binary", "probe.foreground_safety", "node.version", "device.drain"]
     .filter((id) => mechanisms[id] && mechanisms[id].state !== OPERATIVE)
     .map((id) => ({ id, ...mechanisms[id] }));
 }

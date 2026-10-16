@@ -59,17 +59,20 @@ function dirs(t) {
 // The interface
 // ---------------------------------------------------------------------------
 
-test("every built adapter (runner, tmux, vscode) implements every interface method, and the optional extensions", async () => {
+test("every built adapter (runner, tmux, vscode, windows-terminal, tmux-wsl) implements every interface method, and the optional extensions", async () => {
   const tmux = await createAdapter("tmux", { platform: "linux" });
   const runner = await createAdapter("runner", { mode: "subject", build: { role: "single", commit: null, exe: null }, repoRoot: "." });
   const vscode = await createAdapter("vscode", { platform: "linux", cacheDir: tmpdir() });
-  for (const a of [tmux, runner, vscode]) {
+  const wt = await createAdapter("windows-terminal", { platform: "win32", cacheDir: tmpdir() });
+  const wsl = await createAdapter("tmux-wsl", { platform: "win32", cacheDir: tmpdir() });
+  for (const a of [tmux, runner, vscode, wt, wsl]) {
     for (const m of [...REQUIRED_METHODS, ...OPTIONAL_METHODS]) assert.equal(typeof a[m], "function", `${a.id}.${m}`);
     assert.equal(typeof a.hostIdKey, "string");
   }
+  assert.deepEqual([wt.id, wsl.id], ["windows-terminal", "tmux-wsl"]);
+  assert.equal(typeof wsl.wslSamples, "function", "tmux-wsl hands the run loop its WSL-side samples");
   assert.throws(() => assertAdapter({ id: "x", check() {} }), /lacks launch/);
-  await assert.rejects(createAdapter("windows-terminal", {}), /Phase 5/);
-  await assert.rejects(createAdapter("tmux-wsl", {}), /Phase 5/);
+  await assert.rejects(createAdapter("nope", {}), /unknown setup/);
 });
 
 test("row-major order clusters markers by row, then column", () => {

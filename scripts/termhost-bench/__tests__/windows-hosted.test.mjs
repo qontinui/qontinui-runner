@@ -70,13 +70,14 @@ test("the screen is measured read-only: the adapter's current mode and the appli
   assert.equal(blind.screen, null, "an unreadable screen is absent, not guessed");
 });
 
-test("the environment registry: windows-hosted built, windows-desktop still Phase 5's, linux-xvfb labels VS Code rows", () => {
+test("the environment registry: windows-hosted and windows-desktop built, linux-xvfb labels VS Code rows", () => {
   const hosted = environmentSpec("windows-hosted");
   assert.equal(hosted.notBuilt, null);
   assert.equal(hosted.start, startWindowsHosted);
   assert.ok(hosted.setups.includes("vscode") && hosted.setups.includes("runner"));
   assert.deepEqual(hosted.doctorFacts(HOSTED), { "env.hosted_runner": hostedRunnerVerdict(HOSTED) });
-  assert.match(environmentSpec("windows-desktop").notBuilt, /Phase 5/);
+  assert.equal(environmentSpec("windows-desktop").notBuilt, null, "Phase 5 builds windows-desktop");
+  assert.ok(environmentSpec("windows-hosted").setups.includes("windows-terminal"), "the hosted job smokes Windows Terminal");
   assert.deepEqual(environmentSpec("linux-xvfb").setupLabels.vscode, ["dom_renderer_fallback"]);
   for (const spec of Object.values(ENVIRONMENT_SPECS)) {
     for (const labels of Object.values(spec.setupLabels ?? {})) for (const l of labels) assert.ok(Object.hasOwn(ROW_LABELS, l), `${l} is a catalog row label`);

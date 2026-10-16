@@ -32,8 +32,13 @@ import { AdapterRefusal } from "./index.mjs";
 /** Most panes the tiled arm puts in one window (D4: V ~ min(N, 9)). */
 export const TILED_MAX_PANES = 9;
 
-/** The private config. Generous history, no status line, 256-colour and RGB. */
-export function tmuxConf({ version = "3.2" } = {}) {
+/**
+ * The private config. Generous history, no status line, 256-colour and RGB.
+ * `env` becomes the server's global environment (`set-environment -g`), which
+ * every pane inherits — how the tmux-wsl variant hands its sessions the clock
+ * offset without changing their command line (D13).
+ */
+export function tmuxConf({ version = "3.2", env = {} } = {}) {
   const [major, minor] = String(version).match(/(\d+)\.(\d+)/)?.slice(1).map(Number) ?? [3, 2];
   const lines = [
     "# termhost-bench private tmux config (written per unit; never the operator's)",
@@ -57,6 +62,10 @@ export function tmuxConf({ version = "3.2" } = {}) {
   if (major > 3 || (major === 3 && minor >= 2)) {
     lines.push('set -as terminal-features ",xterm*:RGB:256"');
     lines.push("set -g window-size latest");
+  }
+  for (const [k, v] of Object.entries(env)) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(k) || !/^[A-Za-z0-9_.:/-]*$/.test(String(v))) throw new RangeError(`unsafe tmux environment entry ${k}=${v}`);
+    lines.push(`set-environment -g ${k} ${v}`);
   }
   return `${lines.join("\n")}\n`;
 }
@@ -162,13 +171,22 @@ export class TmuxAdapter {
     this.versions = { tmux: null, xterm: null };
   }
 
+  /**
+   * Run tmux with `args` as given (the `-L` socket included). The tmux-wsl
+   * variant runs it inside its WSL distro instead.
+   */
+  tmuxRaw(args) {
+    return this.run(this.tmuxPath, args, { encoding: "utf8", env: this.env ?? cleanEnv(this.baseEnv), timeout: 20000 });
+  }
+
+  /** The private config's path as tmux sees it. */
+  confArg() {
+    return this.confPath;
+  }
+
   /** A tmux command against the private server. */
   tmux(args, { allowFail = false } = {}) {
-    const res = this.run(this.tmuxPath, ["-L", this.socket, ...args], {
-      encoding: "utf8",
-      env: this.env ?? cleanEnv(this.baseEnv),
-      timeout: 20000,
-    });
+    const res = this.tmuxRaw(["-L", this.socket, ...args]);
     if (!allowFail && (res.error || res.status !== 0)) {
       throw new Error(
         `tmux ${args.join(" ")} failed (${res.error?.message ?? `exit ${res.status}`}): ${String(res.stderr ?? "").trim().slice(0, 300)}`,
@@ -231,31 +249,27 @@ export class TmuxAdapter {
       const tCmdNs = hrtime();
       const res =
         i === 0
-          ? this.run(
-              this.tmuxPath,
-              [
-                "-L",
-                this.socket,
-                "-f",
-                this.confPath,
-                "new-session",
-                "-d",
-                "-s",
-                "bench",
-                "-x",
-                String(this.cols),
-                "-y",
-                String(this.rows),
-                "-n",
-                "s0",
-                "-P",
-                "-F",
-                "#{pane_id}",
-                "--",
-                ...shellArgv,
-              ],
-              { encoding: "utf8", env: this.env, timeout: 20000 },
-            )
+          ? this.tmuxRaw([
+              "-L",
+              this.socket,
+              "-f",
+              this.confArg(),
+              "new-session",
+              "-d",
+              "-s",
+              "bench",
+              "-x",
+              String(this.cols),
+              "-y",
+              String(this.rows),
+              "-n",
+              "s0",
+              "-P",
+              "-F",
+              "#{pane_id}",
+              "--",
+              ...shellArgv,
+            ])
           : this.tmux(["new-window", "-d", "-t", "bench:", "-n", `s${i}`, "-P", "-F", "#{pane_id}", "--", ...shellArgv]);
       if (res.error || res.status !== 0) {
         throw new Error(`tmux could not start session ${i}: ${res.error?.message ?? String(res.stderr).trim()}`);
@@ -263,8 +277,24 @@ export class TmuxAdapter {
       sessions.push({ hostId: String(res.stdout).trim(), tCmdNs });
     }
     this.serverPid = Number.parseInt(String(this.tmux(["display-message", "-p", "#{pid}"]).stdout).trim(), 10);
-    await this.startXterm();
+    await this.startHost();
     return { sessions, admission: null };
+  }
+
+  /** The terminal emulator the private server is shown in: xterm on Linux. */
+  async startHost() {
+    await this.startXterm();
+  }
+
+  /** Wait for a client to attach to the private server; its PID, or null. */
+  async waitForClient(timeoutMs, exited = () => false) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && !exited()) {
+      const out = String(this.tmux(["list-clients", "-F", "#{client_pid}"], { allowFail: true }).stdout ?? "").trim();
+      if (out) return Number.parseInt(out.split("\n")[0], 10);
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return null;
   }
 
   async startXterm() {
@@ -280,16 +310,7 @@ export class TmuxAdapter {
     this.xterm.on?.("exit", (code, signal) => {
       this.xtermExit = { code, signal };
     });
-    const deadline = Date.now() + 15000;
-    let clientPid = null;
-    while (Date.now() < deadline && !this.xtermExit) {
-      const out = String(this.tmux(["list-clients", "-F", "#{client_pid}"], { allowFail: true }).stdout ?? "").trim();
-      if (out) {
-        clientPid = Number.parseInt(out.split("\n")[0], 10);
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 200));
-    }
+    const clientPid = await this.waitForClient(15000, () => Boolean(this.xtermExit));
     if (!clientPid) {
       throw new Error(`xterm never attached to the private tmux server (${JSON.stringify(this.xtermExit ?? "no exit")})`);
     }

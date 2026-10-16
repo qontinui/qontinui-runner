@@ -1,0 +1,435 @@
+/**
+ * The `tmux-wsl` setup (`adapters/tmux-wsl.mjs`, `wsl.mjs`, `wsl-sampler.mjs`)
+ * and the `windows-desktop` environment without Windows or WSL: the doctor's WSL
+ * verdicts, the `wsl.exe --exec` argv of every tmux command, the generator argv
+ * translated into the distro with its flags unchanged (D13), the clock offset
+ * handed to the panes through the private server's environment, the samplers,
+ * the KPIs they feed (the WSL-side tmux server joined into the host, the shared
+ * VM recorded apart), teardown that reports what it cannot prove instead of
+ * signalling it, and the generator's clock offset.
+ *
+ *   node --test scripts/termhost-bench/__tests__/tmux-wsl.test.mjs
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { AdapterRefusal } from "../adapters/index.mjs";
+import { CLOCK_OFFSET_ENV, MAX_CLOCK_RTT_NS, TmuxWslAdapter, WSL_FLAG_SCAN, attachCommand, samplerArgv } from "../adapters/tmux-wsl.mjs";
+import { REQUIRED_FILES, WT_PIN, wtBuildFor } from "../adapters/windows-terminal-install.mjs";
+import { blockingMechanisms, mapDoctor } from "../doctor.mjs";
+import { desktopVerdict, startWindowsDesktop } from "../envs/windows-desktop.mjs";
+import { CLOCK_OFFSET_ENV as GEN_OFFSET_ENV, clockOffsetFromEnv, createRealClock } from "../generator/ai-session.mjs";
+import { computeRowKpis, indexGenerators } from "../kpis.mjs";
+import { generatorArgv } from "../rundir.mjs";
+import {
+  CLOCK_ECHO_SCRIPT,
+  VM_PROCESS_QUERY,
+  VM_SAMPLER_SCRIPT,
+  chooseDistro,
+  estimateClockOffset,
+  isWindowsPath,
+  mapWslFacts,
+  measureClockOffset,
+  parseWslList,
+  pickVmProcess,
+  toWslPath,
+  vmKpis,
+  wslGeneratorArgv,
+  wslHostKpis,
+  wslInvocation,
+} from "../wsl.mjs";
+import { classify, cpuTicks, groupReading, parseArgs as samplerParseArgs, pssKb } from "../wsl-sampler.mjs";
+import { MS, genLog, operativeCapabilities, watchSegment } from "./helpers/bench-fixtures.mjs";
+import { createFakeWt } from "./helpers/fake-wt.mjs";
+import { healthyFacts } from "./helpers/fake-bench.mjs";
+
+const WIN_ENV = { SystemRoot: "C:\\Windows", PATH: "C:\\Windows\\System32", LOCALAPPDATA: "C:\\Users\\bench\\AppData\\Local" };
+const INOP = "INOPERATIVE-ON-THIS-MACHINE";
+
+function tmp(t, prefix = "tb-wsl-") {
+  const d = mkdtempSync(join(tmpdir(), prefix));
+  t.after(() => rmSync(d, { recursive: true, force: true }));
+  return d;
+}
+
+// ---------------------------------------------------------------------------
+// The distro, and the doctor's verdicts
+// ---------------------------------------------------------------------------
+
+test("wsl.exe -l -v is UTF-16LE: parsed with or without a BOM, the default marked", () => {
+  const text = "  NAME            STATE           VERSION\r\n* Ubuntu-24.04    Running         2\r\n  Debian          Stopped         1\r\n";
+  for (const buf of [Buffer.from(text, "utf16le"), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]), text]) {
+    const l = parseWslList(buf);
+    assert.deepEqual(l, [
+      { name: "Ubuntu-24.04", isDefault: true, state: "Running", version: 2 },
+      { name: "Debian", isDefault: false, state: "Stopped", version: 1 },
+    ]);
+  }
+  const l = parseWslList(text);
+  assert.equal(chooseDistro(l).name, "Ubuntu-24.04");
+  assert.equal(chooseDistro(l, "Debian").name, "Debian");
+  assert.equal(chooseDistro(l, "Arch"), null);
+});
+
+test("the doctor checks the distro (WSL 2), tmux and node inside it; an absence is INOPERATIVE, an unasked tool UNKNOWN", () => {
+  const list = [{ name: "Ubuntu", isDefault: true, state: "Running", version: 2 }];
+  const ok = mapWslFacts({ list, tmux: "tmux 3.4", node: "v22.11.0", clkTck: "100", bash: true });
+  assert.deepEqual(Object.values(ok).map((x) => x.state), ["OPERATIVE", "OPERATIVE", "OPERATIVE"]);
+  const none = mapWslFacts({ list: null, listError: "ENOENT" });
+  assert.equal(none["setup.wsl"].state, INOP);
+  assert.equal(none["setup.wsl_tmux"].state, "UNKNOWN");
+  assert.match(mapWslFacts({ list, wanted: "Arch" })["setup.wsl"].reason, /no WSL distro named Arch \(installed: Ubuntu\)/);
+  assert.match(mapWslFacts({ list: [{ ...list[0], isDefault: false }] })["setup.wsl"].reason, /--wsl-distro/);
+  assert.equal(mapWslFacts({ list: [{ ...list[0], version: 1 }], tmux: "tmux 3.4", node: "v22.0.0" })["setup.wsl"].state, INOP);
+  assert.equal(mapWslFacts({ list, tmux: null, node: "v22.0.0" })["setup.wsl_tmux"].state, INOP);
+  assert.match(mapWslFacts({ list, tmux: "tmux 3.4", node: "v18.19.0" })["setup.wsl_node"].reason, /older than v20/);
+  assert.equal(mapWslFacts({ list, tmux: "tmux 3.4", node: null })["setup.wsl_node"].state, INOP);
+  assert.equal(mapWslFacts({ list, tmux: "tmux 3.4", node: "v22.0.0", bash: false })["setup.wsl"].state, INOP);
+});
+
+test("every WSL command is wsl.exe -d <distro> --exec <argv>: no shell inside the distro reinterprets an argument", () => {
+  assert.deepEqual(wslInvocation("Ubuntu", ["tmux", "-L", "s", "kill-server"]), ["wsl.exe", ["-d", "Ubuntu", "--exec", "tmux", "-L", "s", "kill-server"]]);
+  assert.throws(() => wslInvocation("", ["x"]), /needs a distro/);
+});
+
+test("D13 inside WSL: the distro's node, Windows paths translated, every flag and its order unchanged", () => {
+  assert.equal(toWslPath("C:\\Users\\a b\\gen"), "/mnt/c/Users/a b/gen");
+  assert.equal(toWslPath("D:/x/"), "/mnt/d/x");
+  assert.throws(() => toWslPath("relative\\p"), /not an absolute Windows path/);
+  const argv = generatorArgv({ node: "C:\\node\\node.exe", script: "C:\\r\\scripts\\termhost-bench\\generator\\ai-session.mjs", genDir: "C:\\Temp\\run\\gen", profile: "claude-tui", seed: 3, genRunId: "r1-u0" });
+  const w = wslGeneratorArgv(argv, { node: "node", translate: toWslPath });
+  assert.deepEqual(w, ["node", "/mnt/c/r/scripts/termhost-bench/generator/ai-session.mjs", "--run-dir", "/mnt/c/Temp/run/gen", ...argv.slice(4)]);
+  assert.deepEqual(w.filter((a) => a.startsWith("--")), argv.filter((a) => a.startsWith("--")));
+});
+
+// ---------------------------------------------------------------------------
+// The clock
+// ---------------------------------------------------------------------------
+
+test("the clock offset comes from the fastest round trip, bounded by half of it", () => {
+  const est = estimateClockOffset([
+    { t0: 1000n, t1: 9000n, remote: 50_000n },
+    { t0: 20_000n, t1: 21_000n, remote: 70_600n },
+    { t0: 30_000n, t1: 34_000n, remote: 80_000n },
+  ]);
+  assert.deepEqual(est, { offsetNs: 50_100n, rttNs: 1000n, n: 3 });
+  assert.equal(estimateClockOffset([]), null);
+  assert.equal(estimateClockOffset([{ t0: 5n, t1: 1n, remote: 3n }]), null, "a reversed pair is no sample");
+});
+
+test("measureClockOffset pings the distro's node over a pipe and keeps the best round trip", async () => {
+  const spawned = [];
+  const spawnFn = (cmd, args) => {
+    spawned.push([cmd, args]);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stdin = {
+      write: () => setImmediate(() => child.stdout.emit("data", Buffer.from(`${remote}\n`))),
+      end: () => {},
+    };
+    return child;
+  };
+  let host = 0n;
+  let remote = 0n;
+  const now = () => {
+    host += 100n;
+    remote = host + 5_000n;
+    return host;
+  };
+  const est = await measureClockOffset({ distro: "Ubuntu", spawnFn, now, rounds: 5 });
+  assert.equal(est.n, 5);
+  assert.ok(est.offsetNs > 4_000n && est.offsetNs < 5_100n, String(est.offsetNs));
+  assert.deepEqual(spawned[0], ["wsl.exe", ["-d", "Ubuntu", "--exec", "node", "-e", CLOCK_ECHO_SCRIPT]]);
+});
+
+test("the generator reads its clock offset from the environment, never its command line, and refuses a malformed one", () => {
+  assert.equal(GEN_OFFSET_ENV, CLOCK_OFFSET_ENV);
+  assert.equal(clockOffsetFromEnv({}), 0n);
+  assert.equal(clockOffsetFromEnv({ [CLOCK_OFFSET_ENV]: "-123456" }), -123456n);
+  assert.throws(() => clockOffsetFromEnv({ [CLOCK_OFFSET_ENV]: "12ms" }), /integer nanosecond offset/);
+  const c = createRealClock({ offsetNs: 10n ** 12n });
+  const plain = process.hrtime.bigint();
+  assert.ok(c.nowNs() - plain >= 10n ** 12n - 10n ** 9n, "the offset is applied");
+  assert.equal(createRealClock().offsetNs, 0n);
+});
+
+// ---------------------------------------------------------------------------
+// The adapter, over fakes
+// ---------------------------------------------------------------------------
+
+function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, scan = () => "", wslFacts = null } = {}) {
+  const runDir = tmp(t, "tb-wsl-run-");
+  const unitDir = join(runDir, "units", "u000-tmux-wsl-default-none-n3-r0");
+  const genDir = join(unitDir, "gen");
+  mkdirSync(genDir, { recursive: true });
+  const bytes = Buffer.from("zip");
+  const build = { ...wtBuildFor("win32", "x64"), url: "https://example.invalid/wt.zip", sha256: createHash("sha256").update(bytes).digest("hex"), bytes: 3 };
+  const pin = { ...WT_PIN, builds: { "win32-x64": build } };
+  const appDir = join(runDir, "wt-app", `${WT_PIN.version}-win32-x64`, build.topDir);
+  const wt = createFakeWt({ appDir, genDir: null, operator: true });
+  const wslCalls = [];
+  const spawns = [];
+  let windows = 0;
+  const tmuxReply = (args) => {
+    const sub = args.find((a) => /^[a-z]+-[a-z]+$|^kill-server$/.test(a));
+    if (args.includes("new-session")) return "%0";
+    if (sub === "new-window") return `%${++windows}`;
+    if (sub === "display-message" && args.includes("#{pid}")) return "4242";
+    if (sub === "list-clients") return wt.state.pid ? "5151" : "";
+    if (sub === "list-panes") return "%0\t@1\t0\t100\t40\t1";
+    return "";
+  };
+  const run = (cmd, args, opts) => {
+    if (String(cmd).endsWith("wt.exe")) return wt.run(cmd, args, opts);
+    if (cmd === "wsl.exe" || String(cmd).endsWith("wsl.exe")) {
+      wslCalls.push(args);
+      const inner = args.slice(3);
+      if (inner[0] === "tmux") return { status: 0, stdout: `${tmuxReply(inner)}\n`, stderr: "" };
+      if (inner[0] === "wslpath") return { status: 0, stdout: `${translate(inner[2])}\n` };
+      if (inner[0] === "node" && inner[2] === WSL_FLAG_SCAN) return { status: 0, stdout: scan(inner.slice(4)) };
+      return { status: 0, stdout: "" };
+    }
+    if (cmd === "powershell.exe" && args.at(-1) === VM_PROCESS_QUERY) return { status: 0, stdout: '{"p":9100,"n":"vmmemWSL","t":"3"}' };
+    // the unpack
+    const dest = opts?.env?.TERMHOST_UNPACK_DEST ?? args[args.indexOf("-C") + 1];
+    mkdirSync(join(dest, build.topDir), { recursive: true });
+    for (const f of REQUIRED_FILES) writeFileSync(join(dest, build.topDir, f), f === "TerminalApp.dll" ? "--sessionId" : "x");
+    return { status: 0, stdout: "" };
+  };
+  const spawnFn = (cmd, args, opts) => {
+    const child = new EventEmitter();
+    child.pid = 8000 + spawns.length;
+    child.stdin = { end: () => setImmediate(() => child.emit("exit", 0)) };
+    spawns.push({ cmd, args, opts, child });
+    return child;
+  };
+  const adapter = new TmuxWslAdapter({
+    platform: "win32",
+    arch: "x64",
+    env: WIN_ENV,
+    pin,
+    cacheDir: tmp(t),
+    fetch: async () => ({ ok: true, status: 200, body: (async function* () { yield bytes; })() }),
+    run,
+    spawnFn,
+    list: wt.list,
+    kill: wt.kill,
+    queryWt: wt.queryWt,
+    queryWindows: wt.queryWindows,
+    postClose: wt.postClose,
+    exists: (p) => existsSync(p),
+    sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5))),
+    wslFacts: () => wslFacts ?? { list: [{ name: "Ubuntu", isDefault: true, state: "Running", version: 2 }], tmux: "tmux 3.4", node: "v22.11.0", clkTck: "100", bash: true },
+    clockOffset: async () => {
+      if (clock instanceof Error) throw clock;
+      return clock;
+    },
+    translate,
+    launchTimeoutMs: 2000,
+    closeTimeoutMs: 50,
+    generatorWaitMs: 10,
+  });
+  const argv = generatorArgv({ node: "C:\\node\\node.exe", script: "C:\\r\\ai-session.mjs", genDir: "C:\\Temp\\gen", profile: "claude-tui", seed: 1, genRunId: "r1-u0" });
+  return { runDir, unitDir, genDir, wt, adapter, wslCalls, spawns, argv, ctx: { runDir, unitDir, genDir, genRunId: "r1-u0" } };
+}
+
+/** The tests' paths are POSIX already; a Windows one is translated as the default automount would. */
+const translate = (p) => (isWindowsPath(p) ? toWslPath(p) : p);
+
+test("tmux-wsl on Linux is the tmux setup: its doctor says so", async () => {
+  const a = new TmuxWslAdapter({ platform: "linux" });
+  assert.equal((await a.check()).mechanisms["setup.wsl"].state, INOP);
+});
+
+test("launch: a clock that cannot be bounded refuses the unit as clock_unaligned; the offset reaches the panes through the private server's environment", async (t) => {
+  const slow = rig(t, { clock: { offsetNs: 1n, rttNs: MAX_CLOCK_RTT_NS + 1n, n: 3 } });
+  await assert.rejects(slow.adapter.launch(slow.ctx), (e) => e instanceof AdapterRefusal && e.reason === "clock_unaligned");
+  const broken = rig(t, { clock: new Error("no node") });
+  await assert.rejects(broken.adapter.launch(broken.ctx), (e) => e instanceof AdapterRefusal && e.reason === "clock_unaligned" && /no node/.test(e.detail));
+  const noTmux = rig(t, { wslFacts: { list: [{ name: "Ubuntu", isDefault: true, state: "Running", version: 2 }], tmux: null, node: "v22.0.0" } });
+  await assert.rejects(noTmux.adapter.launch(noTmux.ctx), (e) => e instanceof AdapterRefusal && /setup\.wsl_tmux/.test(e.detail));
+  const r = rig(t);
+  await r.adapter.launch(r.ctx);
+  const conf = readFileSync(join(r.unitDir, "tmux.conf"), "utf8");
+  assert.match(conf, new RegExp(`^set-environment -g ${CLOCK_OFFSET_ENV} 7000000$`, "m"), "WSL time plus 7 ms is the host's");
+});
+
+test("end to end: tmux in the distro through wsl.exe --exec, the portable Windows Terminal attached, samplers started, teardown by socket and WM_CLOSE", async (t) => {
+  const r = rig(t, { scan: ([flag]) => (flag === "-L" ? "777\n" : "") });
+  await r.adapter.launch(r.ctx);
+  const s = await r.adapter.spawnSessions(3, r.argv);
+  assert.equal(s.sessions.length, 3);
+  const created = r.wslCalls.find((a) => a.includes("new-session"));
+  assert.deepEqual(created.slice(0, 7), ["-d", "Ubuntu", "--exec", "tmux", "-L", "termhost-r1-u0", "-f"]);
+  assert.equal(created[7], translate(join(r.unitDir, "tmux.conf")), "the config by its WSL path");
+  const shellArgv = created.slice(created.indexOf("--") + 1);
+  assert.deepEqual(shellArgv.slice(0, 3), ["/bin/bash", "-i", "-c"]);
+  assert.match(shellArgv[3], /^node \/mnt\/c\/r\/ai-session\.mjs --run-dir \/mnt\/c\/Temp\/gen --profile claude-tui --seed 1 --echo --termhost-bench-generator r1-u0; exec \/bin\/bash -i$/);
+  // The window: one tab running the tmux client.
+  const tab = r.wt.sessions[0].cmd;
+  assert.deepEqual(tab, attachCommand({ wslExe: r.adapter.wslExe, distro: "Ubuntu", socket: "termhost-r1-u0" }));
+  assert.deepEqual(tab.slice(1), ["-d", "Ubuntu", "--exec", "tmux", "-L", "termhost-r1-u0", "attach-session", "-t", "bench"], "no shell in the distro between wsl.exe and tmux");
+  assert.match(tab[0], /System32[\\/]wsl\.exe$/);
+  assert.deepEqual(r.adapter.processRoots(), [r.wt.state.pid]);
+  assert.deepEqual(r.adapter.windowTarget(), { hwnd: r.wt.state.hwnd });
+  // The samplers.
+  const wslSampler = r.spawns.find((x) => x.args.includes("--server-pid"));
+  assert.ok(wslSampler, "the /proc sampler runs inside the distro");
+  assert.deepEqual(wslSampler.args.slice(0, 4), ["-d", "Ubuntu", "--exec", "node"]);
+  const sa = wslSampler.args.slice(5);
+  assert.deepEqual(sa.slice(0, 2), ["--server-pid", "4242"]);
+  assert.equal(sa[sa.indexOf("--clock-offset-ns") + 1], "7000000");
+  const vm = r.spawns.find((x) => x.cmd === "powershell.exe");
+  assert.equal(vm.opts.env.TB_VM_PID, "9100");
+  assert.equal(vm.args.at(-1), VM_SAMPLER_SCRIPT);
+  const d = r.adapter.describe();
+  assert.equal(d.id, "tmux-wsl");
+  assert.equal(d.launch_mode, "private_server");
+  assert.equal(d.session_shell, "bash -i");
+  assert.match(d.app_version, /tmux 3\.4 in WSL Ubuntu \(node v22\.11\.0\) in Windows Terminal .*clock offset 7000000 ns/);
+  assert.match(d.settings_digest, /^sha256:/);
+  // Teardown.
+  const td = await r.adapter.teardown();
+  const kill = r.wslCalls.find((a) => a.includes("kill-server"));
+  assert.deepEqual(kill, ["-d", "Ubuntu", "--exec", "tmux", "-L", "termhost-r1-u0", "kill-server"]);
+  assert.ok(existsSync(join(r.unitDir, "wsl", "stop")), "the samplers' stop file");
+  assert.deepEqual(r.wt.posted, [[r.wt.state.pid ?? r.wt.posted[0][0], r.wt.state.hwnd]]);
+  assert.ok(td.survivors.some((x) => x.pid === 777 && /tmux -L termhost-r1-u0/.test(x.what)), "a WSL-side survivor is reported");
+  assert.ok(!td.survivors.some((x) => /sampler/.test(x.what)), "both samplers stopped on their stop file / stdin EOF");
+  assert.ok(!r.wt.signalled.some(([pid]) => pid === 777), "and never signalled: no PID door reaches into the distro");
+  assert.ok(!r.wt.signalled.some(([pid]) => pid === r.wt.operatorPid));
+});
+
+test("the scan for WSL survivors reads /proc and passes its flag after `--`, so node does not take `-L` as its own", () => {
+  assert.match(WSL_FLAG_SCAN, /readdirSync\('\/proc'\)/);
+  assert.doesNotMatch(WSL_FLAG_SCAN, /kill/);
+  const argv = samplerArgv({ script: "/s.mjs", serverPid: 5, socket: "s", runId: "r", out: "/o", stopFile: "/x", clkTck: 100, clockOffsetNs: -3n });
+  const parsed = samplerParseArgs(argv.slice(2));
+  assert.deepEqual([parsed.serverPid, parsed.socket, parsed.runId, parsed.clockOffsetNs, parsed.clkTck], [5, "s", "r", -3n, 100]);
+  assert.throws(() => samplerParseArgs(["--socket", "s"]), /is required/);
+});
+
+// ---------------------------------------------------------------------------
+// The WSL-side sampler
+// ---------------------------------------------------------------------------
+
+test("the sampler parses CPU ticks after the last ')' and PSS from smaps_rollup", () => {
+  assert.equal(cpuTicks("42 (tmux: server) S 1 42 42 0 -1 4194560 100 0 0 0 7 3 0 0 20 0 1 0 900 1 1"), 10);
+  assert.equal(cpuTicks("42 (a) b) S 1 42 42 0 -1 0 0 0 0 0 5 6 0 0 20 0 1 0 1 1 1"), 11, "a ')' in the name");
+  assert.equal(cpuTicks("garbage"), null);
+  assert.equal(pssKb("Rss: 10 kB\nPss:                1234 kB\n"), 1234);
+  assert.equal(pssKb(""), null);
+});
+
+test("classify: the server, its non-workload descendants and its clients are host; generators and their shells are workload; another socket is neither", () => {
+  const p = (pid, ppid, argv, startKey = "100") => [pid, { pid, ppid, argv, startKey, name: argv[0], cmdline: argv.join(" ") }];
+  const table = new Map([
+    p(10, 1, ["tmux", "-L", "termhost-r1", "-f", "/c", "new-session"], "50"),
+    p(11, 10, ["/bin/bash", "-i", "-c", "node g"]),
+    p(12, 11, ["node", "/g.mjs", "--termhost-bench-generator", "r1-u0"]),
+    p(13, 10, ["/bin/bash", "-i"]),
+    p(20, 5, ["tmux", "-L", "termhost-r1", "attach-session", "-t", "bench"]),
+    p(30, 1, ["tmux", "-L", "operator", "attach"]),
+    p(31, 10, ["stale"], "10"),
+  ]);
+  const c = classify(table, { serverPid: 10, serverStartKey: "50", socket: "termhost-r1", runId: "r1-u0" });
+  assert.deepEqual(c.host, [10, 13, 20], "a 'child' started before the server is a recycled link, not ours");
+  assert.deepEqual(c.workload, [11, 12]);
+  assert.equal(c.serverAlive, true);
+  assert.equal(classify(table, { serverPid: 10, serverStartKey: "49", socket: "termhost-r1", runId: "r1-u0" }).serverAlive, false, "a recycled server PID is not the server");
+});
+
+test("a group's reading: tick deltas per interval; an unreadable member makes the reading null, never a smaller number", () => {
+  const prev = new Map([[1, 100], [2, 50]]);
+  const now = new Map([[1, 110], [2, 55], [3, 4]]);
+  const pss = new Map([[1, 1024], [2, 2048], [3, 1024]]);
+  const g = groupReading([1, 2, 3], prev, now, pss, { dtMs: 500, clkTck: 100 });
+  assert.deepEqual([g.cpu_ms, g.cpu_pct, g.pss_mb, g.unreadable], [190, 38, 4, 0]);
+  const bad = groupReading([1, 9], prev, now, pss, { dtMs: 500, clkTck: 100 });
+  assert.deepEqual([bad.cpu_ms, bad.cpu_pct, bad.pss_mb, bad.unreadable], [null, null, null, 1]);
+  assert.equal(groupReading([1], prev, now, pss, { dtMs: null, clkTck: 100 }).cpu_pct, null, "the first sample has no interval");
+});
+
+// ---------------------------------------------------------------------------
+// The KPIs
+// ---------------------------------------------------------------------------
+
+const T0 = 1_000_000_000_000n;
+const win = { t0: T0, t1: T0 + 20_000n * MS };
+const wslSeries = (pct, { from = 0, to = 41, shift = 100n } = {}) =>
+  Array.from({ length: to - from }, (_, i) => ({ type: "sample", t_ns: String(T0 + BigInt(from + i) * 500n * MS + shift * MS), dt_ms: 500, host: { cpu_pct: pct, pss_mb: 12 } }));
+
+test("the host's cpu_pct joins each probe sample with the nearest WSL-side one; too many unpaired samples is unknown", () => {
+  const probeCpu = Array.from({ length: 40 }, (_, i) => ({ t: T0 + BigInt(i + 1) * 500n * MS, v: 20 }));
+  const ok = wslHostKpis({ probeCpu, probeMemEnd: 300, wslRecords: wslSeries(5), win });
+  assert.equal(ok.cpu_pct.state, "measured");
+  assert.equal(ok.cpu_pct.stats.mean, 25, "Windows-side 20 % plus the tmux server's 5 %");
+  assert.equal(ok.memory_mb.value, 312);
+  const gap = wslHostKpis({ probeCpu, probeMemEnd: 300, wslRecords: wslSeries(5, { from: 0, to: 20 }), win });
+  assert.equal(gap.cpu_pct.state, "unknown", "half the window has no WSL-side sample");
+  const none = wslHostKpis({ probeCpu, probeMemEnd: 300, wslRecords: [], win });
+  assert.match(none.cpu_pct.detail, /wrote nothing/);
+  assert.equal(wslHostKpis({ probeCpu, probeMemEnd: null, wslRecords: wslSeries(5), win }).memory_mb.state, "unknown");
+});
+
+test("the shared WSL VM: CPU from its cumulative time, memory from its last private bytes; a refused read is unknown, never 0", () => {
+  const rec = (i, cpu) => ({ type: "vm", t_ns: String(T0 + BigInt(i) * 500n * MS), cpu_ms: cpu, private_mb: 2048 + i });
+  const vm = Array.from({ length: 30 }, (_, i) => rec(i, 1000 + i * 50));
+  const k = vmKpis(vm, win);
+  assert.equal(k.wsl_vm_cpu_pct.state, "measured");
+  assert.equal(k.wsl_vm_cpu_pct.stats.mean, 10);
+  assert.equal(k.wsl_vm_memory_mb.value, 2048 + 29);
+  const denied = vmKpis([{ type: "error", t_ns: String(T0 + 500n * MS), detail: "Access is denied" }], win);
+  assert.equal(denied.wsl_vm_cpu_pct.state, "unknown");
+  assert.match(denied.wsl_vm_cpu_pct.detail, /Access is denied/);
+  assert.equal(vmKpis(vm, null).wsl_vm_memory_mb.reason, "harness_error");
+  assert.match(VM_PROCESS_QUERY, /vmmemWSL/);
+  assert.doesNotMatch(VM_SAMPLER_SCRIPT, /Stop-Process|Kill\(/);
+  assert.deepEqual(pickVmProcess('[{"p":1,"n":"vmmem","t":"1"},{"p":2,"n":"vmmemWSL","t":"2"}]'), { pid: 2, name: "vmmemWSL", startKey: "2" });
+  assert.equal(pickVmProcess('[{"p":1,"n":"vmmem","t":"1"},{"p":3,"n":"vmmem","t":"1"}]'), null, "two Hyper-V VMs: which is WSL's is unknown");
+});
+
+test("a tmux-wsl row: the samples reach cpu_pct and wsl_vm_*; without them wsl_vm_* is not_instrumented, and other setups never carry it", () => {
+  const gen = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: 40_000 });
+  const records = watchSegment({ t0: T0, durationMs: 20_000, sessions: [{ session: 0, gen, latencyMs: 20 }], primary: "wgc" });
+  const base = { environment: "windows-desktop", n: 1, arm: "focus", vTarget: 1, capabilities: operativeCapabilities(), gens: indexGenerators(new Map([[0, gen]])), soak: { records } };
+  const vm = Array.from({ length: 41 }, (_, i) => ({ type: "vm", t_ns: String(T0 + BigInt(i) * 500n * MS), cpu_ms: i * 50, private_mb: 4096 }));
+  const withWsl = computeRowKpis({ ...base, setupId: "tmux-wsl", wsl: { wslRecords: wslSeries(5), vmRecords: vm } });
+  const without = computeRowKpis({ ...base, setupId: "tmux-wsl" });
+  assert.equal(withWsl.kpis.wsl_vm_cpu_pct.state, "measured");
+  assert.equal(withWsl.kpis.wsl_vm_memory_mb.value, 4096);
+  assert.equal(without.kpis.wsl_vm_cpu_pct.reason, "not_instrumented");
+  assert.equal(without.kpis.cpu_pct.stats.mean, 26, "the probe's Windows-side host alone");
+  assert.equal(withWsl.kpis.cpu_pct.stats.mean, 31, "plus the WSL-side tmux server's 5 %");
+  assert.equal(withWsl.kpis.cpu_pct.n, without.kpis.cpu_pct.n);
+  const tmux = computeRowKpis({ ...base, setupId: "tmux", wsl: { wslRecords: wslSeries(5), vmRecords: vm } });
+  assert.equal(tmux.kpis.wsl_vm_cpu_pct.state, "not_applicable");
+});
+
+// ---------------------------------------------------------------------------
+// windows-desktop
+// ---------------------------------------------------------------------------
+
+test("windows-desktop: never a GitHub-hosted runner, and a run needs session.interactive and capture.wgc OPERATIVE", async () => {
+  assert.equal(desktopVerdict({ GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted" }).state, INOP);
+  assert.equal(desktopVerdict({}).state, "OPERATIVE");
+  const facts = { ...healthyFacts(), environment: "windows-desktop", envPlatform: "win32", platform: "win32", envNotBuilt: null };
+  const probe = (interactive) => ({ record: { mechanisms: [{ id: "session.interactive", ...interactive }, { id: "capture.wgc", state: "OPERATIVE", reason: "ok" }], violations: [] }, error: null });
+  const ready = mapDoctor({ ...facts, probeDoctor: probe({ state: "OPERATIVE", reason: "unlocked" }) });
+  assert.equal(ready["env.desktop_ready"].state, "OPERATIVE");
+  assert.ok(!blockingMechanisms(ready).some((b) => b.id === "env.desktop_ready"));
+  const locked = mapDoctor({ ...facts, probeDoctor: probe({ state: INOP, reason: "the input desktop is locked" }) });
+  assert.equal(locked["env.desktop_ready"].state, INOP);
+  assert.match(locked["env.desktop_ready"].reason, /session\.interactive OPERATIVE \(it is INOPERATIVE-ON-THIS-MACHINE: the input desktop is locked\)/);
+  assert.ok(blockingMechanisms(locked).some((b) => b.id === "env.desktop_ready"), "the run does not start");
+  assert.equal(mapDoctor({ ...facts, environment: "windows-hosted" })["env.desktop_ready"], undefined, "a hosted run is not gated on it");
+  await assert.rejects(startWindowsDesktop({ platform: "linux" }), /Windows only/);
+  const env = await startWindowsDesktop({ platform: "win32", run: () => ({ status: 0, stdout: '{"w":2560,"h":1440,"dpi":144}' }) });
+  assert.deepEqual(env.screen, { width: 2560, height: 1440, scalePct: 150 });
+});
