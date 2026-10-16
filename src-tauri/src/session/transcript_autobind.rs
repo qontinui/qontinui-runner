@@ -27,10 +27,12 @@
 //!    unsent prefix on first bind and stamps `account_label` / `config_dir` on
 //!    a minted row.
 //!
-//! Consent is unchanged: Gate 1 (`cloud_sync_enabled`) is checked here before
-//! any coord traffic and again inside `bind_and_replay`; the tenant's
-//! `transcript_sync_enabled` is enforced downstream by the emitter exactly as
-//! for a sniffed pane. Attempts are throttled per session ([`AttemptLedger`])
+//! Consent: transcript sync's gate (the user's toggle AND the tenant's
+//! `egress_transcript_sync` switch, [`crate::egress::transcript_sync_gate_for`])
+//! is checked here before any coord traffic — in the default scope, then again
+//! in the minting tenant's scope once a mint names it — and again inside
+//! `bind_and_replay`; the tenant's `transcript_sync_enabled` is enforced
+//! downstream by the emitter exactly as for a sniffed pane. Attempts are throttled per session ([`AttemptLedger`])
 //! so a coord outage costs one bounded probe per window, not one per append.
 
 use std::collections::HashMap;
@@ -249,7 +251,7 @@ pub fn apply_decision(
     identity: &TranscriptIdentity,
     path: &Path,
     decision: &Decision,
-    cloud_sync_enabled: bool,
+    transcript_sync_permitted: bool,
 ) -> Option<AutoBindKind> {
     let adopt = match decision {
         Decision::Adopt(id) => Some(*id),
@@ -273,7 +275,7 @@ pub fn apply_decision(
             config_dir: Some(identity.config_dir.clone()),
         },
     };
-    match tailer.bind_and_replay(&identity.claude_session_id, path, req, cloud_sync_enabled) {
+    match tailer.bind_and_replay(&identity.claude_session_id, path, req, transcript_sync_permitted) {
         Ok(o) if o.already_bound => None,
         Ok(o) => {
             info!(
@@ -354,9 +356,9 @@ pub fn spawn_ensure_bound(tailer: &Arc<SessionTranscriptTailer>, path: &Path) {
         return;
     }
     tailer.note_seen_unbound(&identity.claude_session_id);
-    let cloud_sync = crate::settings::get_cloud_sync_enabled();
-    if !cloud_sync {
-        // Consent withheld: no coord traffic, no binding.
+    if !crate::egress::transcript_sync_permitted() {
+        // Consent withheld (the user's toggle or the tenant switch): no coord
+        // traffic, no binding.
         return;
     }
     if !LEDGER.try_begin(&identity.claude_session_id, Instant::now()) {
@@ -364,7 +366,7 @@ pub fn spawn_ensure_bound(tailer: &Arc<SessionTranscriptTailer>, path: &Path) {
     }
     let (tailer, path) = (tailer.clone(), path.to_path_buf());
     tokio::spawn(async move {
-        bind_one(&tailer, identity, &path, cloud_sync).await;
+        bind_one(&tailer, identity, &path).await;
     });
 }
 
@@ -372,14 +374,20 @@ async fn bind_one(
     tailer: &Arc<SessionTranscriptTailer>,
     identity: TranscriptIdentity,
     path: &Path,
-    cloud_sync: bool,
 ) {
     let resolution =
         crate::mcp::session_work_status::resolve_coord_row(&identity.claude_session_id).await;
     let decision = settle(tailer, &identity, &resolution).await;
+    // A mint names the tenant that will own the row: re-ask the gate in THAT
+    // tenant's scope, so one tenant's open switch cannot carry another's
+    // transcript. An adoption has no tenant on hand; the default scope applies.
+    let permitted = match &decision {
+        Decision::Mint(t) => crate::egress::transcript_sync_gate_for(Some(*t)).is_open(),
+        _ => crate::egress::transcript_sync_permitted(),
+    };
     let (t, p) = (tailer.clone(), path.to_path_buf());
     let joined = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-        apply_decision(&t, &identity, &p, &decision, cloud_sync).inspect(|k| t.note_autobind(*k))
+        apply_decision(&t, &identity, &p, &decision, permitted).inspect(|k| t.note_autobind(*k))
     })
     .await;
     if let Err(e) = joined {
