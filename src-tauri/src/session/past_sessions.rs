@@ -36,7 +36,9 @@ use crate::terminal::transcript;
 const COHORT_GAP_MS: i64 = 5 * 60 * 1000;
 
 /// Which Claude account a session belongs to, derived from its `config_dir`
-/// (`.claude-<x>` suffix). `wrapper` is the CLI launcher command.
+/// (`.claude-<x>` suffix). `wrapper` is the CLI launcher command — kept as a
+/// recorded fact about the account, and NEVER used to build a resume line
+/// (see [`crate::session::session_ledger::resume_command_for`]).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PastSessionAccount {
@@ -59,8 +61,18 @@ pub struct PastSession {
     /// → auto summary → first-message preview → registry title →
     /// `"Session <date>"`).
     pub resume_name: String,
-    /// Ready-to-run resume command: `"<wrapper> --resume <id>"`.
-    pub resume_command: String,
+    /// Ready-to-run resume line, from the shared
+    /// [`crate::session::session_ledger::resume_command_for`]:
+    /// `cd "<dir>" && CLAUDE_CONFIG_DIR="<config>" claude --resume <id>`.
+    /// `None` when the account is UNKNOWN (no recorded `config_dir` and no
+    /// unique transcript holder) or there is no working dir — omitted rather
+    /// than guessed.
+    pub resume_command: Option<String>,
+    /// The account a ONE-CLICK resume (a typed `--resume` in a new tab) runs
+    /// under — the same resolved account as [`Self::resume_command`].
+    /// `known: false` means the account is unknown and the UI must not resume
+    /// under the default one.
+    pub resume_account: crate::session::session_ledger::ResumeAccount,
     /// Account derived from `config_dir`.
     pub account: PastSessionAccount,
     /// Grid page the session's tile belonged to.
@@ -78,6 +90,12 @@ pub struct PastSession {
     pub config_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// The directory a resume opens in — THE resume-dir rule
+    /// ([`crate::session::session_ledger::resume_dir_of`]: the launch dir,
+    /// else its worktree root), the same dir [`Self::resume_command`] `cd`s
+    /// into. `None` when neither is known. Always serialized (`null`), so the
+    /// one-click Resume reads the same dir the copy line uses.
+    pub resume_dir: Option<String>,
     /// AI-CLI provider (`"claude"`, `"gemini"`).
     pub provider: String,
     /// Unix millis of the most recent liveness/touch (snapshot rows use
@@ -213,6 +231,29 @@ pub(crate) fn resolve_transcript_path(
     None
 }
 
+/// The config dir a past session resumes under —
+/// [`crate::session::session_ledger::resolve_config_dir`] fed with the config
+/// dirs whose transcript for the session exists. The scan runs only when the
+/// record carries no `config_dir` of its own.
+fn resume_config_dir(
+    recorded: Option<&str>,
+    working_dir: Option<&str>,
+    session_id: &str,
+) -> Option<String> {
+    let has_recorded = recorded.is_some_and(|d| !d.trim().is_empty());
+    let holders: Option<Vec<PathBuf>> = if has_recorded {
+        None
+    } else {
+        working_dir.filter(|wd| !wd.trim().is_empty()).map(|wd| {
+            transcript::find_claude_config_dirs()
+                .into_iter()
+                .filter(|dir| transcript::session_transcript_path(dir, wd, session_id).exists())
+                .collect()
+        })
+    };
+    crate::session::session_ledger::resolve_config_dir(recorded, holders.as_deref())
+}
+
 /// Format a unix-millis timestamp into a short human date for the `"Session
 /// <date>"` fallback name.
 fn short_date(ts_ms: i64) -> String {
@@ -264,7 +305,25 @@ fn build_enriched(
     let restorable = confirmed && transcript_exists;
 
     let account = account_from_config_dir(config_dir.as_deref());
-    let resume_command = format!("{} --resume {}", account.wrapper, claude_session_id);
+    let resolved_config_dir = resume_config_dir(
+        config_dir.as_deref(),
+        working_dir.as_deref(),
+        &claude_session_id,
+    );
+    let worktree = working_dir
+        .as_deref()
+        .and_then(crate::session::session_ledger::worktree_root_of)
+        .map(|p| p.to_string_lossy().replace('\\', "/"));
+    let resume_dir =
+        crate::session::session_ledger::resume_dir_of(working_dir.as_deref(), worktree.as_deref())
+            .map(str::to_string);
+    let resume_command = crate::session::session_ledger::resume_command_for(
+        resume_dir.as_deref(),
+        resolved_config_dir.as_deref(),
+        &claude_session_id,
+    );
+    let resume_account =
+        crate::session::session_ledger::resume_account_for(resolved_config_dir.as_deref());
 
     // resume name: on-disk resume/preview name → registry title → date default.
     let resume_name = transcript_path
@@ -277,6 +336,7 @@ fn build_enriched(
         claude_session_id,
         resume_name,
         resume_command,
+        resume_account,
         account,
         page_id,
         zone_index,
@@ -285,6 +345,7 @@ fn build_enriched(
         terminal_id,
         config_dir,
         working_dir,
+        resume_dir,
         provider,
         last_seen_at,
         opened_at,
@@ -315,7 +376,8 @@ fn past_from_record(rec: &TerminalSessionRecord) -> PastSession {
         rec.zone_index,
         rec.state.clone(),
         rec.close_reason.clone(),
-        Some(rec.terminal_id.clone()),
+        // Blank = unbound (a row held for an account choice): no terminal.
+        Some(rec.terminal_id.clone()).filter(|t| !t.trim().is_empty()),
         rec.provider.clone(),
         rec.last_seen_at,
         rec.opened_at,
@@ -460,11 +522,11 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_uses_account_wrapper() {
+    fn resume_command_names_the_config_dir_not_the_wrapper() {
         let ps = build_enriched(
             "sess-1".to_string(),
             Some("C:/claude/.claude-hotmail".to_string()),
-            None,
+            Some("D:/repo".to_string()),
             "default".to_string(),
             0,
             "closed".to_string(),
@@ -481,12 +543,61 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(ps.resume_command, "clh --resume sess-1");
+        assert_eq!(
+            ps.resume_command.as_deref(),
+            Some("cd \"D:/repo\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-hotmail\" claude --resume sess-1")
+        );
+        assert_eq!(
+            ps.resume_account,
+            crate::session::session_ledger::ResumeAccount {
+                known: true,
+                config_dir: Some("C:/claude/.claude-hotmail".to_string()),
+            },
+            "the one-click resume runs under the same account as the copy line"
+        );
+        assert_eq!(
+            ps.resume_dir.as_deref(),
+            Some("D:/repo"),
+            "the one-click Resume opens in the dir the copy line cds into"
+        );
         assert_eq!(ps.account.label, "hotmail");
+        assert_eq!(ps.account.wrapper, "clh", "the wrapper is still recorded");
         // No transcript on disk → not restorable, title used as the name.
         assert!(!ps.transcript_exists);
         assert!(!ps.restorable);
         assert_eq!(ps.resume_name, "Fix build");
+    }
+
+    /// No recorded `config_dir` and no transcript anywhere ⇒ the account is
+    /// unknown, so there is NO resume line — never a bare `claude --resume`
+    /// that would run under the default account.
+    #[test]
+    fn resume_command_is_omitted_when_the_account_is_unknown() {
+        let ps = build_enriched(
+            "sess-unknown-acct".to_string(),
+            None,
+            Some("/no/such/project/for/this/test".to_string()),
+            "default".to_string(),
+            0,
+            "closed".to_string(),
+            None,
+            None,
+            "claude".to_string(),
+            1_000,
+            1_000,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(ps.resume_command, None);
+        assert!(
+            !ps.resume_account.known,
+            "an unknown account is never resumed under the default"
+        );
     }
 
     /// The raw `restore_tier` is stamped `failed` the moment a resume is
@@ -540,7 +651,11 @@ mod tests {
         let mk = |id: &str, seen: i64| PastSession {
             claude_session_id: id.to_string(),
             resume_name: "n".to_string(),
-            resume_command: "c".to_string(),
+            resume_command: Some("c".to_string()),
+            resume_account: crate::session::session_ledger::ResumeAccount {
+                known: true,
+                config_dir: None,
+            },
             account: PastSessionAccount {
                 label: "gmail".to_string(),
                 wrapper: "clg".to_string(),
@@ -552,6 +667,7 @@ mod tests {
             terminal_id: None,
             config_dir: None,
             working_dir: None,
+            resume_dir: None,
             provider: "claude".to_string(),
             last_seen_at: seen,
             opened_at: seen,
