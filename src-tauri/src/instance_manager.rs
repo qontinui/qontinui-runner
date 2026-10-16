@@ -72,21 +72,27 @@ impl DeregisterResult {
 // =============================================================================
 
 /// The instance root a runner-launched secondary is given:
-/// `<this runner's config dir>/instances/<sanitized id>`.
+/// `<this runner's config dir>/instances/runner-<sanitized id>`, made absolute
+/// and lexically normalized.
 ///
-/// For a primary that is `<config_dir>/com.qontinui.runner/instances/<id>` —
-/// the same layout the supervisor gives its temp and named runners. For a
-/// launcher that is itself a subject, its config dir lies inside its own root,
-/// so its children's roots nest inside it too.
+/// For a primary that is under `<config_dir>/com.qontinui.runner/instances/` —
+/// the supervisor's layout. The `runner-` prefix keeps it out of the
+/// supervisor's namespace (its ids are `test-*` / `named-*`, and its reaper
+/// removes `instances/<id>` by id). For a launcher that is itself a subject,
+/// its config dir lies inside its own root, so its children's roots nest inside
+/// it too. On Windows the platform config dir is the ROAMING profile
+/// (`%APPDATA%`), so a subject's cluster and WebView data live there.
 ///
-/// The id comes from the UI, so it is sanitized to `[A-Za-z0-9_-]` (anything
-/// else becomes `_`); an id with nothing left is refused rather than collapsing
-/// onto the shared `instances/` parent.
+/// The id comes from the UI, so it is sanitized to `[A-Za-z0-9_-]`, capped at 48
+/// characters, and — whenever sanitizing changed it — suffixed with a hash of
+/// the raw id, so two ids that sanitize alike (`a.b`, `a b`) never share a root.
+/// An id with nothing usable left is refused rather than collapsing onto the
+/// shared `instances/` parent.
 pub(crate) fn subject_instance_root(
     launcher_config_dir: &std::path::Path,
     instance_id: &str,
 ) -> Result<std::path::PathBuf, String> {
-    let safe: String = instance_id
+    let mut safe: String = instance_id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -95,13 +101,48 @@ pub(crate) fn subject_instance_root(
                 '_'
             }
         })
+        .take(48)
         .collect();
     if safe.trim_matches('_').is_empty() {
         return Err(format!(
             "instance id {instance_id:?} yields no usable instance-root directory name"
         ));
     }
-    Ok(launcher_config_dir.join("instances").join(safe))
+    if safe != instance_id {
+        // FNV-1a 64: stable across builds and platforms (unlike `DefaultHasher`).
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in instance_id.as_bytes() {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        safe = format!("{safe}-{h:016x}");
+    }
+    let joined = launcher_config_dir
+        .join("instances")
+        .join(format!("runner-{safe}"));
+    let absolute = std::path::absolute(&joined)
+        .map_err(|e| format!("cannot make the instance root {joined:?} absolute: {e}"))?;
+    Ok(qontinui_runner_lib::instance_env::lexically_normalized(
+        &absolute,
+    ))
+}
+
+/// Check `root` and `port` against the child's own startup contract
+/// (`instance_env::validate_instance_root`) BEFORE spawning, so a launch that
+/// the child would refuse with exit 78 fails here, with its reason, instead of
+/// reporting a PID that dies a moment later.
+pub(crate) fn check_subject_root(root: &std::path::Path, port: u16) -> Result<(), String> {
+    use qontinui_runner_lib::instance_env::{
+        machine_global_dirs, validate_instance_root, PortCheck, PLATFORM_PATH_CASE,
+    };
+    let port = port.to_string();
+    validate_instance_root(
+        root,
+        PortCheck::Required(Some(&port)),
+        &[],
+        &machine_global_dirs(),
+        PLATFORM_PATH_CASE,
+    )
 }
 
 /// A secondary may not bind `0`, the primary's port, or this launcher's own:
@@ -126,9 +167,15 @@ pub(crate) fn check_subject_port(port: u16, launcher_port: u16) -> Result<(), St
 ///
 /// Mirrors the supervisor's spawn-test default (the primary's pairing snapshot
 /// plus `machine.json` / `profiles.json`): without them a launched instance
-/// would come up unpaired and with no device identity. No credential the child
-/// can mint for itself (device JWT, loopback keys) and no ledger is copied, and
-/// `profiles.json` is PROJECTED ([`project_profiles_json`]) rather than copied.
+/// would come up unpaired and with no device identity. Copying `auth_tokens.enc`
+/// DUPLICATES the launcher's token store — its per-tenant device-JWT slots and
+/// its OAuth refresh token (the AES key derives from host and user, so the
+/// child can decrypt it). That is accepted, as it is for the supervisor's
+/// spawn-test: if the identity provider rotates refresh tokens, a refresh by
+/// either side can invalidate the other's copy, and the loser re-signs in.
+/// Nothing ELSE the child could mint for itself (the `coord-device-jwt` file,
+/// loopback keys) and no ledger is copied, and `profiles.json` is PROJECTED
+/// ([`project_profiles_json`]) rather than copied.
 const SUBJECT_SECURE_FILES: [&str; 2] = ["paired_user.json", "auth_tokens.enc"];
 const SUBJECT_HOME_FILES: [&str; 2] = ["machine.json", "profiles.json"];
 
@@ -141,7 +188,7 @@ const PROJECTED_PROFILE_KEYS: [&str; 2] = ["coord_url", "api_url"];
 /// its `database_url` / `redis_url` / `blob` name THIS runner's stores, which a
 /// subject must not use — with no `database_url` it boots its own private
 /// embedded cluster under its root. `Err` when the bytes are not a JSON object;
-/// the caller then copies nothing rather than the raw file.
+/// provisioning then skips the file (with a WARN) rather than copy it raw.
 pub(crate) fn project_profiles_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let doc: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("profiles.json is not JSON: {e}"))?;
@@ -188,17 +235,27 @@ fn copy_absent_files(
         if !src.is_file() || dst.exists() {
             continue;
         }
-        if *file == "profiles.json" {
-            let bytes =
-                std::fs::read(&src).map_err(|e| format!("read {} failed: {e}", src.display()))?;
-            let projected =
-                project_profiles_json(&bytes).map_err(|e| format!("{}: {e}", src.display()))?;
-            std::fs::write(&dst, projected)
-                .map_err(|e| format!("write {} failed: {e}", dst.display()))?;
+        let bytes =
+            std::fs::read(&src).map_err(|e| format!("read {} failed: {e}", src.display()))?;
+        let bytes = if *file == "profiles.json" {
+            match project_profiles_json(&bytes) {
+                Ok(projected) => projected,
+                Err(e) => {
+                    // Skipped, not fatal: the child then runs with its tier's
+                    // default coordinator, exactly as a fresh box would.
+                    warn!("not provisioning {}: {e}", src.display());
+                    continue;
+                }
+            }
         } else {
-            std::fs::copy(&src, &dst)
-                .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
-        }
+            bytes
+        };
+        // Temp file + rename, so an interrupted copy never leaves a truncated
+        // file that skip-if-present would then keep forever.
+        let tmp = dest_dir.join(format!(".{file}.provisioning"));
+        std::fs::write(&tmp, bytes)
+            .and_then(|()| std::fs::rename(&tmp, &dst))
+            .map_err(|e| format!("write {} failed: {e}", dst.display()))?;
         copied.push((*file).to_string());
     }
     Ok(copied)
@@ -245,8 +302,29 @@ pub(crate) fn apply_subject_root_env(cmd: &mut std::process::Command, root: &std
     for key in ROOT_CONFINED_ENV_KEYS {
         cmd.env_remove(key);
     }
+    for key in HARNESS_STORE_ENV_KEYS {
+        cmd.env_remove(key);
+    }
     cmd.env(INSTANCE_ROOT_ENV, root);
 }
+
+/// Inherited variables that would hand a subject the LAUNCHER's stores or
+/// credentials, so the launch command removes them: `profiles::load` falls back
+/// to `RUNNER_DATABASE_URL` / `REDIS_URL` when a profile names no database
+/// (which a projected `profiles.json` never does), a device JWT is read from
+/// `COORD_DEVICE_JWT`, and `QONTINUI_DISABLE_EMBEDDED_PG` /
+/// `QONTINUI_ALLOW_NO_DB` would leave the child with no database at all instead
+/// of its private cluster. Same list as the supervisor's
+/// `process::instance_root::HARNESS_STORE_ENV_KEYS`.
+pub(crate) const HARNESS_STORE_ENV_KEYS: [&str; 7] = [
+    "RUNNER_DATABASE_URL",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "COORD_DEVICE_JWT",
+    "QONTINUI_RUNNER_TOKEN",
+    "QONTINUI_DISABLE_EMBEDDED_PG",
+    "QONTINUI_ALLOW_NO_DB",
+];
 
 #[cfg(test)]
 mod subject_root_tests {
@@ -255,20 +333,43 @@ mod subject_root_tests {
     use std::path::Path;
 
     #[test]
-    fn root_is_the_supervisor_layout_under_the_launchers_config_dir() {
-        let cfg = Path::new("/c/com.qontinui.runner");
+    fn root_is_namespaced_under_the_launchers_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("com.qontinui.runner");
         assert_eq!(
-            subject_instance_root(cfg, "inst-1").unwrap(),
-            cfg.join("instances").join("inst-1")
+            subject_instance_root(&cfg, "inst-1").unwrap(),
+            cfg.join("instances").join("runner-inst-1")
         );
-        // Separators and `..` cannot escape `instances/`.
-        assert_eq!(
-            subject_instance_root(cfg, "../a/b").unwrap(),
-            cfg.join("instances").join("___a_b")
+        // Separators and `..` cannot escape `instances/`, and ids that sanitize
+        // alike still get distinct roots.
+        let escaped = subject_instance_root(&cfg, "../a/b").unwrap();
+        assert_eq!(escaped.parent(), Some(cfg.join("instances").as_path()));
+        assert_ne!(
+            subject_instance_root(&cfg, "a.b").unwrap(),
+            subject_instance_root(&cfg, "a b").unwrap()
         );
         for bad in ["", "..", "/", "  "] {
-            assert!(subject_instance_root(cfg, bad).is_err(), "{bad:?}");
+            assert!(subject_instance_root(&cfg, bad).is_err(), "{bad:?}");
         }
+        // A relative or `..`-carrying config dir still yields an absolute,
+        // normalized root.
+        let rel = subject_instance_root(Path::new("rel/cfg/../cfg"), "inst-1").unwrap();
+        assert!(rel.is_absolute(), "{rel:?}");
+        assert!(!rel
+            .components()
+            .any(|c| c == std::path::Component::ParentDir));
+    }
+
+    /// The root the launcher computes for a primary passes the child's own
+    /// startup contract — the property the launcher exists to provide.
+    #[test]
+    fn the_produced_root_passes_the_childs_startup_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root =
+            subject_instance_root(&tmp.path().join("com.qontinui.runner"), "inst-1").unwrap();
+        check_subject_root(&root, 9877).expect("a fresh root on a free port must validate");
+        assert!(check_subject_root(&root, 9876).is_err());
+        assert!(check_subject_root(Path::new("relative/root"), 9877).is_err());
     }
 
     #[test]
@@ -346,10 +447,13 @@ mod subject_root_tests {
     #[test]
     fn launch_command_carries_the_root_and_removes_inherited_confined_keys() {
         let mut cmd = std::process::Command::new("true");
-        for key in ROOT_CONFINED_ENV_KEYS {
+        for key in ROOT_CONFINED_ENV_KEYS
+            .iter()
+            .chain(HARNESS_STORE_ENV_KEYS.iter())
+        {
             cmd.env(key, "/launcher/elsewhere");
         }
-        let root = Path::new("/c/com.qontinui.runner/instances/inst-1");
+        let root = Path::new("/c/com.qontinui.runner/instances/runner-inst-1");
         apply_subject_root_env(&mut cmd, root);
         let envs: std::collections::HashMap<String, Option<String>> = cmd
             .get_envs()
@@ -364,7 +468,10 @@ mod subject_root_tests {
             envs.get(INSTANCE_ROOT_ENV).cloned().flatten().as_deref(),
             Some(root.to_str().unwrap())
         );
-        for key in ROOT_CONFINED_ENV_KEYS {
+        for key in ROOT_CONFINED_ENV_KEYS
+            .iter()
+            .chain(HARNESS_STORE_ENV_KEYS.iter())
+        {
             assert_eq!(
                 envs.get(*key),
                 Some(&None),
@@ -694,8 +801,6 @@ impl InstanceManager {
             config.name, config.port, exe_path
         );
 
-        // Propagate the primary runner's port so secondaries can proxy
-        // process capture requests back and send heartbeats.
         let own_port = crate::mcp::types::get_mcp_api_port();
         check_subject_port(config.port, own_port)
             .map_err(|e| format!("Cannot launch instance '{}': {e}", config.name))?;
@@ -704,22 +809,32 @@ impl InstanceManager {
         // `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`,
         // Phase 4): everything the child owns — settings, pairing, `~/.qontinui`,
         // logs, embedded PG, WebView data — resolves under it, so it can never
-        // read, absorb or overwrite this runner's stores. Provisioned from this
-        // runner's own pairing and box files before the child starts.
+        // read, absorb or overwrite this runner's stores. Validated against the
+        // child's own startup contract, then provisioned from this runner's own
+        // pairing and box files, before the child starts. Off the async worker:
+        // it is filesystem work, done while the instances lock is held.
         let (launcher_config_dir, _) = crate::settings::resolve_config_dir()
             .map_err(|e| format!("Cannot launch instance '{}': {e}", config.name))?;
         let root = subject_instance_root(&launcher_config_dir, &config.id)
+            .and_then(|root| check_subject_root(&root, config.port).map(|()| root))
             .map_err(|e| format!("Cannot launch instance '{}': {e}", config.name))?;
         let launcher_secure_dir = qontinui_runner_lib::pair::binding_store_candidate_paths()
             .into_iter()
             .next()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         let launcher_home = qontinui_runner_lib::ambient::qontinui_dir();
-        let provisioned = provision_subject_root(
-            &root,
-            launcher_secure_dir.as_deref(),
-            launcher_home.as_deref(),
-        )
+        let provisioned = {
+            let root = root.clone();
+            spawn_blocking_tracked(move || {
+                provision_subject_root(
+                    &root,
+                    launcher_secure_dir.as_deref(),
+                    launcher_home.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("instance-root provisioning task failed: {e}"))?
+        }
         .map_err(|e| {
             format!(
                 "Cannot launch instance '{}': provisioning its instance root failed: {e}",
@@ -737,6 +852,8 @@ impl InstanceManager {
         apply_subject_root_env(&mut cmd, &root);
         cmd.env("QONTINUI_PORT", config.port.to_string());
         cmd.env("QONTINUI_INSTANCE_NAME", &config.name);
+        // Propagate the primary runner's port so secondaries can proxy
+        // process capture requests back and send heartbeats.
         cmd.env("QONTINUI_PRIMARY_PORT", own_port.to_string());
 
         // Apply spawn-window placement if configured. This is best-effort:
