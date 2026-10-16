@@ -33,6 +33,7 @@ import {
   type SessionLocation,
 } from "./sessionStatusModel";
 import type { UnifiedSession, UseSessionManagerReturn } from "./useSessionManager";
+import type { UnseenVerdict } from "./sessionUnseen";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -126,6 +127,8 @@ function managerOver(
     viewTranscript: noop,
     openSession: noop,
     copySessionId: noop,
+    // Phase 7: every row asks the manager whether it has unseen activity.
+    unseenOf: (): UnseenVerdict => ({ state: "seen" }),
     closableTabId: close.closableTabId ?? (() => null),
     closeSessions: close.closeSessions ?? (() => Promise.resolve([])),
     forceCloseSessions: () => Promise.resolve([]),

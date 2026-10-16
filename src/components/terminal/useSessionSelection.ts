@@ -49,10 +49,13 @@ export function useSessionSelection({
 
   // Selected rows that are no longer rendered drop out — adjusted while
   // rendering, when the rendered list changes, so no render ever shows (or
-  // the bulk bar counts) a selection over rows that are gone.
-  const [prunedFor, setPrunedFor] = useState(visibleIds);
-  if (prunedFor !== visibleIds) {
-    setPrunedFor(visibleIds);
+  // the bulk bar counts) a selection over rows that are gone. Keyed on the
+  // list's CONTENT, not its identity: a caller that rebuilds an equal list
+  // every render would otherwise set state on every render, forever.
+  const visibleKey = visibleIds.join("\n");
+  const [prunedFor, setPrunedFor] = useState(visibleKey);
+  if (prunedFor !== visibleKey) {
+    setPrunedFor(visibleKey);
     setState((prev) => pruneSelection(prev, new Set(visibleIds)));
   }
 
