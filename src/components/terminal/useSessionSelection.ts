@@ -52,7 +52,8 @@ export function useSessionSelection({
   // the bulk bar counts) a selection over rows that are gone. Keyed on the
   // list's CONTENT, not its identity: a caller that rebuilds an equal list
   // every render would otherwise set state on every render, forever.
-  const visibleKey = visibleIds.join("\n");
+  // JSON keeps the key one-to-one ([] vs [""], ids containing separators).
+  const visibleKey = JSON.stringify(visibleIds);
   const [prunedFor, setPrunedFor] = useState(visibleKey);
   if (prunedFor !== visibleKey) {
     setPrunedFor(visibleKey);

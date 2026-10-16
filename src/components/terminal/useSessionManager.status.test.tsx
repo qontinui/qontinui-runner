@@ -3,7 +3,8 @@
  * Wiring: the REAL `useSessionManager`, mounted in React, classifies every row
  * through `sessionStatusModel` from the sources the runner serves — the live
  * registry (`terminal_claude_session_list_live`, with `runnerManaged`), the
- * external scan, the session history's finished marker, and digests requested
+ * external scan, the lifecycle record's finished marker (`session_info_list`),
+ * and digests requested
  * BY ID (plan
  * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
  * Phase 1). Only the Tauri boundary is faked.
@@ -25,6 +26,7 @@ vi.mock("@/lib/instance-storage", () => ({
   },
 }));
 
+import type { SessionInfoBody } from "./useSessionInfo";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import { useSessionManager, type UseSessionManagerReturn } from "./useSessionManager";
@@ -60,7 +62,10 @@ function transcript(id: string, i = 0): TranscriptSession {
 }
 
 /** One available `session_info_list` envelope for `id`. */
-function infoEnvelope(id: string, finishedAt: number | null) {
+function infoEnvelope(
+  id: string,
+  finishedAt: number | null,
+): SessionInfoBody & { available: true } {
   return {
     available: true,
     identity: {
@@ -299,7 +304,8 @@ describe("useSessionManager → sessionStatusModel wiring", () => {
     const get = await mount([transcript("s-1"), transcript("s-2", 1)]);
     const act_ = (id: string) => get().sessions.find((s) => s.sessionId === id)!.status.activity;
     expect(act_("s-1")).toBe("finished");
-    // No marker recorded ⇒ not a claim of "not finished": the process is gone.
+    // A recorded "not finished" (`finishedAt: null`): the process is gone,
+    // so it reads Exited, not Finished.
     expect(act_("s-2")).toBe("exited");
   });
 
