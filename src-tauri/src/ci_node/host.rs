@@ -80,6 +80,12 @@ fn runner_host() -> Host {
         volume: Arc::new(RunnerVolume),
         identity: Arc::new(RunnerIdentity),
         canonical: Arc::new(EnvAgentCanonical),
+        // No model invoker yet: ci-exec refuses a `model = true` step's model
+        // access with `host_has_no_broker` and still runs the step, which is the
+        // runner's behaviour today. The runner's invoker is Phase 5 of plan
+        // 2026-10-13-ci-node-runs-model-dependent-eval-steps, gated on this
+        // PR landing.
+        model: None,
     }
 }
 
@@ -447,10 +453,9 @@ mod tests {
     /// the runner's launcher cannot point a CI step or a checkout at another
     /// repo. This is the runner half of what `build_step_command`'s test pinned
     /// before the executor moved into ci-exec (qontinui-runner 0aca8ff42).
-    /// ci-exec builds its git, tool and container commands through this method.
-    /// It does NOT yet build manifest STEP commands through it at the pinned
-    /// schemas commit: that is qontinui-schemas#242 (c98b5258), which reaches
-    /// the runner with the next schemas pin. A bare `Command::new` fails this.
+    /// ci-exec builds every process through this method, manifest STEP
+    /// commands included (qontinui-schemas#242, c98b5258, which ports
+    /// 238439693). A bare `Command::new` fails this.
     #[test]
     fn a_git_command_is_scrubbed_of_the_repo_local_env() {
         let cmd = RunnerProcess.command("git");
