@@ -21,6 +21,7 @@ import { AdapterRefusal } from "../adapters/index.mjs";
 import { RunnerAdapter } from "../adapters/runner.mjs";
 import { RESTORE_CHECK_MIN_FRAMES, RunAbort, RunFailed, abortAwareSleep, measureOrder, planUnits, restoreCoverageGap, runBench } from "../run.mjs";
 import { stallSegment } from "./helpers/bench-fixtures.mjs";
+import { paneStalls, stallCoverage } from "../kpis.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
 
@@ -914,18 +915,22 @@ test("SF1: at N = 12 the restored (focus) session must be among the judged, else
   assert.match(check(other.focus).notes[0], /0: \d+ kept frame\(s\) .* \(judged\), .*11: no kept frame \(not judged: no kept frame\)\)$/);
 });
 
-test("nit: the restore check's judging boundaries — frames 9/10, span >= 2000, end <= 2000, >= 2 seqs (review r13 nit)", () => {
-  const ok = { frames: RESTORE_CHECK_MIN_FRAMES, seqs: 2, firstMs: 0, lastMs: 3000 };
+test("nit: the restore check's judging boundaries — frames 9/10, span >= 2000, end <= 2000, final still run < 2000 (review r13 nit, r14 MF2)", () => {
+  const ok = { frames: RESTORE_CHECK_MIN_FRAMES, seqs: 2, firstMs: 0, lastMs: 3000, finalSeq: 9, finalFromMs: 1001 };
   assert.equal(RESTORE_CHECK_MIN_FRAMES, 10);
-  assert.equal(restoreCoverageGap(ok, 5000), null, "exactly 10 frames, end exactly 2000 ms before the watch's end");
+  assert.equal(restoreCoverageGap(ok, 5000), null, "exactly 10 frames, end exactly 2000 ms before the watch's end, final run 1999 ms");
   assert.equal(restoreCoverageGap({ ...ok, frames: 9 }, 5000), "fewer than 10 kept frames");
   assert.equal(restoreCoverageGap({ ...ok, lastMs: 2000 }, 4000), null, "span exactly 2000 ms");
   assert.equal(restoreCoverageGap({ ...ok, lastMs: 1999 }, 3999), "kept frames span under 2000 ms");
   assert.equal(restoreCoverageGap(ok, 5001), "last kept frame over 2000 ms before the watch's end");
-  assert.equal(restoreCoverageGap({ ...ok, seqs: 1 }, 5000), "marker did not advance and the generator wrote < 20 markers");
-  assert.equal(restoreCoverageGap({ frames: 0, seqs: 0, firstMs: null, lastMs: null }, 5000), "no kept frame");
+  assert.equal(
+    restoreCoverageGap({ ...ok, finalFromMs: 1000 }, 5000, 12),
+    "marker did not advance in the final 2000 ms of its kept frames (seq 9 from +1000 ms; its generator wrote 12 marker(s) meanwhile)",
+    "a final still run of exactly 2000 ms",
+  );
+  assert.match(restoreCoverageGap({ ...ok, seqs: 1, finalFromMs: 0 }, 5000), /final 3000 ms .*no generator log, so how many markers it wrote is unknown\)$/);
+  assert.equal(restoreCoverageGap({ frames: 0, seqs: 0, firstMs: null, lastMs: null, finalSeq: null, finalFromMs: null }, 5000), "no kept frame");
 });
-
 test("MF1: a 2.4 s whole-screen freeze at the soak's end is a pane_stalled incident, not a void (review r13 MF1)", async (t) => {
   const { res } = await fakeRun(t, {
     opts: { ns: [1], setups: ["tmux"] },
@@ -983,5 +988,69 @@ test("at N = 12 a tail-dependent stall on an unjudged, non-restored session leav
   const { focus } = await restoreRun(t, { n: 12, zone: { visibleAll: true }, wrapProbe: freezeThenNoFrame(11, 1500, 2900) });
   assert.equal(focus.incidents.filter((i) => i.kind === "pane_stalled").length, 1, JSON.stringify(focus.incidents));
   assert.equal(check(focus).data?.outcome, "clean", JSON.stringify(check(focus)));
+  assert.deepEqual(check(focus).data.unresolved, [11]);
+  assert.match(check(focus).notes[0], /^restore check: observed, clean \(1 session\(s\) unresolved: 11\) \(/);
   assert.match(check(focus).notes[0], /11: \d+ kept frame\(s\) .*\(not judged: still at the watch's end on a short frameless tail\)\)$/);
+});
+
+// --- review r14 (scenarios D-F of review5/r1.mjs, r2.mjs) ------------------------
+
+const T0R = 1_000_000_000_000n;
+const atR = (ms) => T0R + BigInt(ms) * 1_000_000n;
+const frR = (ms, seq) => ({ source: "x11", t_ns: String(atR(ms)), markers: [{ kind: "output", session: 0, seq }] });
+const everyR = (a, b, st) => Array.from({ length: Math.floor((b - a) / st) + 1 }, (_, i) => a + i * st);
+const segR = (frames) => ({ captures: [{ type: "capture", source: "x11", state: "started" }], summary: { primary: "x11" }, frames, intervals: [], firstSeen: [], incidents: [] });
+const genR = (ms) => new Map([[0, { markers: everyR(0, ms, 100).map((t, i) => ({ kind: "output", seq: i, tEmit: atR(t) })) }]]);
+const win5 = { t0: atR(0), t1: atR(5000) };
+const judgeR = (frames, gens) => {
+  const c = stallCoverage(segR(frames), win5, [0]).get(0);
+  const g = gens.get(0);
+  const emitted = g ? g.markers.filter((m) => m.tEmit > atR(c.finalFromMs) && m.tEmit <= atR(c.lastMs)).length : null;
+  return restoreCoverageGap(c, 5000, emitted);
+};
+
+test("r14 F: a restored pane that advanced once and then froze, its generator blocked, is not judged (review r14 MF2)", () => {
+  const frames = [frR(0, 641), ...everyR(100, 5000, 50).map((t) => frR(t, 642))];
+  const blocked = new Map([[0, { markers: Array.from({ length: 15 }, (_, i) => ({ kind: "output", seq: 642 + i, tEmit: atR(i * 100) })) }]]);
+  assert.deepEqual(paneStalls(segR(frames), blocked, win5, new Set([0])), [], "15 markers: no stall");
+  assert.equal(stallCoverage(segR(frames), win5, [0]).get(0).seqs, 2, "two sequences seen");
+  assert.equal(judgeR(frames, blocked), "marker did not advance in the final 4900 ms of its kept frames (seq 642 from +100 ms; its generator wrote 13 marker(s) meanwhile)");
+  // Advancing up to 3.001 s, still after: a final run of 1999 ms is judged; from 3.0 s, 2000 ms is not.
+  const until = (ms) => [...everyR(0, ms, 50).map((t) => frR(t, Math.floor(t / 50))), ...everyR(ms + 50, 5000, 50).map((t) => frR(t, 9999))];
+  assert.equal(judgeR([...everyR(0, 2950, 50).map((t) => frR(t, t / 50)), frR(3001, 9999), ...everyR(3050, 5000, 50).map((t) => frR(t, 9999))], genR(5000)), null);
+  assert.match(judgeR(until(2950), genR(5000)), /^marker did not advance in the final 2000 ms /);
+});
+
+test("r14 D/E: in a 5 s restore watch a whole-screen freeze never voids, and a seen wedge's report counts real markers (review r14 nit 6, SF3)", () => {
+  // D: frames advance to 1 s, then nothing: tail-dependent, under the 10 s tail floor.
+  const d = paneStalls(segR(everyR(0, 1000, 100).map((t) => frR(t, t / 100))), genR(5000), win5, new Set([0]));
+  assert.deepEqual(d.map((x) => [x.basis, x.voids]), [["tail", false]]);
+  // E: one seq 0.5-4.5 s while the generator writes 10 Hz: a seen wedge, and the gap text gives the count.
+  const e = everyR(500, 4500, 100).map((t) => frR(t, 7));
+  assert.deepEqual(paneStalls(segR(e), genR(5000), win5, new Set([0])).map((x) => [x.emitted, x.basis, x.voids]), [[45, "seen", true]]);
+  assert.equal(judgeR(e, genR(5000)), "marker did not advance in the final 4000 ms of its kept frames (seq 7 from +500 ms; its generator wrote 40 marker(s) meanwhile)");
+  assert.match(judgeR(e, new Map()), /no generator log, so how many markers it wrote is unknown\)$/);
+});
+
+test("r14 SF3: a restored session not judged for a long final still run reports how many markers its generator really wrote (review r14 SF3)", async (t) => {
+  // Session 0 frozen from 2.0 s to the end of a 5 s watch, occluded 2.5-4.3 s: seen ~1.2 s, so no stall.
+  const { focus } = await restoreRun(t, {
+    restoreCheckMs: 5000,
+    wrapProbe: editRestoreWatch((rs) => {
+      const start = BigInt(rs.find((r) => r.type === "start").t0_ns) + 5_000_000n;
+      const ms = (x) => start + BigInt(x) * 1_000_000n;
+      let seq = null;
+      return rs.map((r) => {
+        if (r.type === "interval" && BigInt(r.t_start_ns) >= ms(2500) && BigInt(r.t_start_ns) < ms(4300)) return { ...r, valid: false, exclusion_class: "occluded" };
+        if (r.type !== "frame" || BigInt(r.t_ns) < ms(2000)) return r;
+        return { ...r, markers: r.markers.map((m) => (m.kind === "output" && m.session === 0 ? { ...m, seq: (seq ??= m.seq) } : m)) };
+      });
+    }),
+  });
+  assert.equal(focus.incidents.filter((i) => i.kind === "pane_stalled").length, 0, JSON.stringify(focus.incidents));
+  assert.equal(check(focus).state, "unknown", JSON.stringify(check(focus)));
+  const inc = focus.incidents.find((i) => /restore check UNKNOWN/.test(i.detail));
+  const m = /not judged: marker did not advance in the final \d+ ms of its kept frames \(seq \d+ from \+\d+ ms; its generator wrote (\d+) marker\(s\) meanwhile\)/.exec(inc?.detail ?? "");
+  assert.ok(m, inc?.detail);
+  assert.ok(Number(m[1]) >= 20 && Number(m[1]) <= 35, m[1]);
 });

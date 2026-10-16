@@ -597,20 +597,37 @@ export function excludedSpans(seg) {
 }
 
 /**
- * The spans of the probe's intervals in which it took no sample at all
- * (`excluded` holds `no_samples`, class `harness_error`): a probe blackout. A
- * stretch with no frame inside one says nothing about the pane — the probe was
- * not looking — so a frameless tail never counts it.
- *
- * @returns {{a: bigint, b: bigint, cls: string}[]}
+ * A capture-lost incident is placed this much EARLIER than its wall-clock time
+ * says, when deciding whether it follows a run's last frame: the incident carries
+ * only `at` (RFC 3339, ms), mapped onto the probe's clock through the start
+ * record's `at` / `t0_ns`, so it is not exact.
  */
-export function blackoutSpans(seg) {
+export const CAPTURE_LOST_SLACK_MS = 1000;
+
+/**
+ * When the PRIMARY capture source stopped looking: the probe's `capture_lost`
+ * incidents (`engine.rs`: "capture lost (re-establishing)" or "capture ended")
+ * whose `data.source` is the primary source. Each carries only a wall-clock `at`,
+ * placed on the probe's clock as start.t0_ns + (at - start.at); `t` is null when
+ * that cannot be done (no start record, an unparseable time), and the loss then
+ * ends every frameless tail. A frameless stretch after a loss is not a
+ * frozen screen: the probe was not capturing. (The interval records' `no_samples`
+ * is a different signal — the window-STATE inspector took no sample — and says
+ * nothing about frames.)
+ *
+ * @returns {{t: bigint | null, detail: string}[]}
+ */
+export function captureLosses(seg) {
+  const primary = seg ? captureInfo(seg).primary : null;
+  if (!primary) return [];
+  const t0 = toNs(seg.start?.t0_ns);
+  const wall0 = Date.parse(seg.start?.at ?? "");
   const out = [];
-  for (const r of seg?.intervals ?? []) {
-    if (!(Array.isArray(r.excluded) && r.excluded.includes("no_samples")) && r.samples !== 0) continue;
-    const a = toNs(r.t_start_ns);
-    const b = toNs(r.t_end_ns);
-    if (a !== null && b !== null && b > a) out.push({ a, b, cls: "no_samples" });
+  for (const r of seg.incidents ?? []) {
+    if (r?.kind !== "capture_lost" || r?.data?.source !== primary) continue;
+    const wall = Date.parse(r.at ?? "");
+    const t = t0 !== null && Number.isFinite(wall0) && Number.isFinite(wall) && wall >= wall0 ? t0 + BigInt(wall - wall0) * NS_PER_MS : null;
+    out.push({ t, detail: String(r.detail ?? "") });
   }
   return out;
 }
@@ -619,18 +636,13 @@ export function blackoutSpans(seg) {
 const inSpans = (spans, t) => spans.some((x) => t >= x.a && t < x.b);
 /** Does a span lie (even in part) strictly between two frames at `p` < `q`? */
 const spanBetween = (spans, p, q) => spans.some((x) => x.a < q && x.b > p);
-/** Nanoseconds of [p, q] not inside any span (spans may overlap). */
+/** Nanoseconds of [p, q] not inside any span (the probe's interval slices never overlap). */
 function unexcludedNs(spans, p, q) {
-  const cut = spans
-    .map((x) => ({ lo: x.a > p ? x.a : p, hi: x.b < q ? x.b : q }))
-    .filter((x) => x.hi > x.lo)
-    .sort((x, y) => (x.lo < y.lo ? -1 : x.lo > y.lo ? 1 : 0));
   let ns = q - p;
-  let reach = p;
-  for (const x of cut) {
-    const lo = x.lo > reach ? x.lo : reach;
-    if (x.hi > lo) ns -= x.hi - lo;
-    if (x.hi > reach) reach = x.hi;
+  for (const x of spans) {
+    const lo = x.a > p ? x.a : p;
+    const hi = x.b < q ? x.b : q;
+    if (hi > lo) ns -= hi - lo;
   }
   return ns > 0n ? ns : 0n;
 }
@@ -659,10 +671,13 @@ export function stallFrames(seg, win) {
  * the window's start. A session the rule saw in few frames, over a short span, or
  * not near the window's end, gives an empty stall list that proves nothing.
  *
- * `seqs` is the number of distinct output-marker sequences those frames show: a
- * pane seen at one sequence throughout was not observed repainting.
+ * `seqs` is the number of distinct output-marker sequences those frames show;
+ * `finalSeq` / `finalFromMs` are the sequence of the last of them and when the
+ * trailing run of frames at that sequence began: a pane whose final run is long
+ * was not observed repainting at the end.
  *
- * @returns {Map<number, {frames: number, seqs: number, firstMs: number | null, lastMs: number | null}> | null}
+ * @returns {Map<number, {frames: number, seqs: number, firstMs: number | null, lastMs: number | null,
+ *   finalSeq: number | null, finalFromMs: number | null}> | null}
  */
 export function stallCoverage(seg, win, sessions) {
   const sf = stallFrames(seg, win);
@@ -670,12 +685,19 @@ export function stallCoverage(seg, win, sessions) {
   const out = new Map();
   for (const k of sessions) {
     const shown = sf.kept.filter((f) => (f.markers ?? []).some((m) => m.kind === "output" && m.session === k));
-    const seqs = new Set(shown.flatMap((f) => f.markers.filter((m) => m.kind === "output" && m.session === k && Number.isInteger(m.seq)).map((m) => m.seq)));
+    const seqOf = (f) => f.markers.find((m) => m.kind === "output" && m.session === k && Number.isInteger(m.seq))?.seq ?? null;
+    const seqs = new Set(shown.map(seqOf).filter((x) => x !== null));
+    // The final still run: the trailing kept frames that show the last frame's seq.
+    let i = shown.length - 1;
+    const finalSeq = i >= 0 ? seqOf(shown[i]) : null;
+    while (i > 0 && seqOf(shown[i - 1]) === finalSeq) i -= 1;
     out.set(k, {
       frames: shown.length,
       seqs: seqs.size,
       firstMs: shown.length > 0 ? nsToMs(shown[0].t - win.t0) : null,
       lastMs: shown.length > 0 ? nsToMs(shown.at(-1).t - win.t0) : null,
+      finalSeq,
+      finalFromMs: shown.length > 0 ? nsToMs(shown[i].t - win.t0) : null,
     });
   }
   return out;
@@ -696,8 +718,8 @@ export function stallCoverage(seg, win, sessions) {
  * its last frame is the last primary frame in the window, so no later frame
  * contradicts it — the frameless stretch from there to the window's end
  * (`framelessMs`; a frozen whole screen produces no frames), outside excluded
- * spans and outside probe blackouts ({@link blackoutSpans}: the probe took no
- * sample, so it was not looking). Hidden and excluded time are never counted.
+ * spans, and never past a loss of the primary capture ({@link captureLosses}:
+ * the probe was not capturing). Hidden and excluded time are never counted.
  * `emitted` counts the generator's output markers emitted within that same seen
  * time ((first, last] of each piece, then the frameless stretch: `tailEmitted`).
  * It qualifies at >= {@link STALL_MIN_MS} and >= {@link STALL_MIN_EMITTED}.
@@ -706,7 +728,8 @@ export function stallCoverage(seg, win, sessions) {
  * else `tail` (it qualifies only with the frameless tail). `voids` is true for a
  * `seen` one, and for a `tail` one only when the tail is >= `tailBarMs`
  * (max({@link STALL_TAIL_MIN_MS}, {@link STALL_TAIL_GAP_FACTOR} x the longest
- * inter-frame gap of the primary source)) with >= {@link STALL_MIN_EMITTED}
+ * gap between consecutive primary frames with no excluded span and no capture
+ * loss between them)) with >= {@link STALL_MIN_EMITTED}
  * markers emitted in it. Only a voiding wedge makes the marker KPIs unknown.
  *
  * A qualifying run is `recovered` iff ANY later primary frame in the window —
@@ -741,10 +764,19 @@ export function paneStalls(seg, gens, win, visible) {
   const { all, kept, spans } = sf;
   const gapNs = BigInt(STALL_HIDDEN_GAP_MS) * NS_PER_MS;
   const lastFrameT = all.length > 0 ? all.at(-1).t : null;
-  // A frameless tail is read outside excluded spans AND outside probe blackouts.
-  const tailSpans = [...spans, ...blackoutSpans(seg)];
+  // A frameless tail is read outside excluded spans, and never past a loss of the
+  // primary capture (a loss that cannot be placed in time ends every tail).
+  const losses = captureLosses(seg).map((x) => x.t);
+  const slackNs = BigInt(CAPTURE_LOST_SLACK_MS) * NS_PER_MS;
+  // The host's own frame cadence: gaps between consecutive primary frames with
+  // neither an excluded span nor a capture loss between them.
   let maxGapNs = 0n;
-  for (let i = 1; i < all.length; i += 1) if (all[i].t - all[i - 1].t > maxGapNs) maxGapNs = all[i].t - all[i - 1].t;
+  for (let i = 1; i < all.length; i += 1) {
+    const p = all[i - 1].t;
+    const q = all[i].t;
+    if (spanBetween(spans, p, q) || losses.some((t) => t !== null && t > p && t <= q)) continue;
+    if (q - p > maxGapNs) maxGapNs = q - p;
+  }
   const tailBarNs = (() => {
     const floor = BigInt(STALL_TAIL_MIN_MS) * NS_PER_MS;
     const byGap = BigInt(STALL_TAIL_GAP_FACTOR) * maxGapNs;
@@ -794,11 +826,18 @@ export function paneStalls(seg, gens, win, visible) {
     for (const run of runs) {
       const end = run.pieces.at(-1).t1;
       // No later primary frame at all: the screen sent nothing more, nothing contradicts the still marker.
-      const frameless = end === lastFrameT ? unexcludedNs(tailSpans, end, win.t1) : 0n;
+      // The tail ends at the window's end or at the first capture loss after the run's last frame.
+      let tailEnd = win.t1;
+      for (const t of losses) {
+        if (t !== null && t <= end - slackNs) continue; // before the last frame: re-established
+        const cutAt = t === null || t < end ? end : t;
+        if (cutAt < tailEnd) tailEnd = cutAt;
+      }
+      const frameless = end === lastFrameT ? unexcludedNs(spans, end, tailEnd) : 0n;
       const seenNs = run.pieces.reduce((acc, p) => acc + (p.t1 - p.t0), 0n);
       const ms = Number(seenNs + frameless) / 1e6;
       const seenEmitted = emits.filter((t) => run.pieces.some((p) => t > p.t0 && t <= p.t1)).length;
-      const tailEmitted = frameless > 0n ? emits.filter((t) => t > end && t <= win.t1 && !inSpans(tailSpans, t)).length : 0;
+      const tailEmitted = frameless > 0n ? emits.filter((t) => t > end && t <= tailEnd && !inSpans(spans, t)).length : 0;
       const emitted = seenEmitted + tailEmitted;
       if (ms < STALL_MIN_MS || emitted < STALL_MIN_EMITTED) continue;
       const recovered = all.some((f) => f.t > end && (f.markers ?? []).some((m) => m.kind === "output" && m.session === session && Number.isInteger(m.seq) && seqAdvanced(m.seq, run.seq)));
@@ -1059,7 +1098,16 @@ export function computeRowKpis(p) {
   // Panes that did not repaint (paneStalls). The rule compares the generators'
   // emission times with the probe's frame times, so it runs only on an aligned
   // clock (and output_latency_ms already reads clock_unaligned otherwise).
-  const stalls = captureGate || clockGate(p, "output_latency_ms") ? [] : paneStalls(seg, p.gens, win, visible);
+  const stallRuleRan = !captureGate && !clockGate(p, "output_latency_ms");
+  const stalls = stallRuleRan ? paneStalls(seg, p.gens, win, visible) : [];
+  // A primary capture loss ends what the stall rule can read as a frozen screen.
+  if (stallRuleRan) {
+    for (const x of captureLosses(seg)) {
+      if (x.t !== null && (x.t < win.t0 || x.t > win.t1)) continue;
+      const when = x.t === null ? "at a time that could not be placed on the probe's clock (read as ending every frameless tail)" : `at +${Math.round(nsToMs(x.t - win.t0))} ms`;
+      notes.push(`output_latency_ms: the primary capture (${cap.primary}) was lost ${when}: ${x.detail}; no frameless stretch after that counts toward a pane stall`);
+    }
+  }
   // A wedge (frozen to the end of the soak) leaves the per-marker KPIs measured
   // from the live part only: they become unknown(pane_stalled). A reason the KPI
   // already had is kept — only a bare sample shortfall, which the wedge explains,

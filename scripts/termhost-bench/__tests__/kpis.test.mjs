@@ -25,7 +25,8 @@ import {
   STALL_MIN_MS,
   STALL_TAIL_MIN_MS,
   STALL_VOIDED_KPIS,
-  blackoutSpans,
+  captureLosses,
+  CAPTURE_LOST_SLACK_MS,
   describeStall,
   excludedSpans,
   stallCoverage,
@@ -1081,7 +1082,7 @@ test("a pane frozen when the screen stops sending frames is a wedge: the framele
 test("excluded spans are half-open: a frame at a span's start is dropped, one at its end is kept (review r12 nit)", () => {
   const frames = [fr(1000, 1), fr(2000, 2), fr(2500, 3)];
   const cov = stallCoverage(synthSeg(frames, [ivx(1000, 2000, "occluded")]), winTo(3000), [0]);
-  assert.deepEqual(cov.get(0), { frames: 2, seqs: 2, firstMs: 2000, lastMs: 2500 });
+  assert.deepEqual(cov.get(0), { frames: 2, seqs: 2, firstMs: 2000, lastMs: 2500, finalSeq: 3, finalFromMs: 2500 });
   assert.deepEqual(excludedSpans({ intervals: [ivx(1000, 1000, "occluded")] }), [], "an empty span excludes nothing");
 });
 
@@ -1155,21 +1156,6 @@ test("MF1: the tail bar is max(10 s, 3 x the longest earlier frame gap), and nee
   assert.deepEqual(paneStalls(synthSeg(dense), tailEmits(20), winTo(19_999), V0).map((x) => x.voids), [false], "9.999 s");
 });
 
-test("MF1(a): a frameless tail over intervals with no probe sample is not pane evidence (review r13 MF1, SF3)", () => {
-  const frames = every(0, 45_000, 100).map((t) => fr(t, t / 100));
-  const blackout = (a, b) => ({ type: "interval", t_start_ns: String(at(a)), t_end_ns: String(at(b)), samples: 0, valid: false, excluded: ["no_samples", "monitor_absent"], exclusion_class: "harness_error" });
-  const ivs = every(45_000, 59_500, 500).map((t) => blackout(t, t + 500));
-  assert.equal(paneStalls(synthSeg(frames), gens100(60_000), winTo(60_000), V0)[0]?.voids, true, "without the blackout: a 15 s tail voids");
-  assert.deepEqual(paneStalls(synthSeg(frames, ivs), gens100(60_000), winTo(60_000), V0), [], "the probe was not looking for any of it");
-  // Blackout from 47 s: 2 s of usable tail, 20 markers: reported, does not void.
-  const st = paneStalls(synthSeg(frames, ivs.slice(4)), gens100(60_000), winTo(60_000), V0);
-  assert.deepEqual(st.map((x) => [x.framelessMs, x.voids]), [[2000, false]]);
-  // A harness_error interval WITH samples (no input monitor on Xvfb) is not a blackout.
-  const xvfb = ivs.map((r) => ({ ...r, samples: 4, excluded: ["monitor_absent"] }));
-  assert.equal(paneStalls(synthSeg(frames, xvfb), gens100(60_000), winTo(60_000), V0)[0]?.voids, true);
-  assert.deepEqual(blackoutSpans({ intervals: [blackout(0, 500), { ...blackout(500, 1000), excluded: [] }, xvfb[0]] }).map((x) => Number((x.a - T0) / MS)), [0, 500]);
-});
-
 test("SF2(i): a later frame of any kind ends the tail, even one inside an excluded span (review r13 SF2)", () => {
   const frames = [...r12Before, ...every(1000, 1500, 100).map((t) => fr(t, 500)), fr(3000, null)];
   const span = [ivx(2500, 3500, "occluded")];
@@ -1203,15 +1189,7 @@ test("nit: frozen-blocked — a pane at one sequence whose generator wrote < 20 
   const frames = every(0, 5000, 50).map((t) => fr(t, 641));
   const gens = new Map([[0, { markers: Array.from({ length: 15 }, (_, i) => ({ kind: "output", seq: 642 + i, tEmit: at(i * 100) })) }]]);
   assert.deepEqual(paneStalls(synthSeg(frames), gens, winTo(5000), V0), []);
-  assert.deepEqual(stallCoverage(synthSeg(frames), winTo(5000), [0]).get(0), { frames: 101, seqs: 1, firstMs: 0, lastMs: 5000 });
-});
-
-test("MF1(a): a tail interval that is both excluded and a blackout is subtracted once (review r13 MF1)", () => {
-  // Advancing to 10 s; tail 10-25 s; 12-14 s is operator input with no probe sample (both lists).
-  const frames = every(0, 10_000, 100).map((t) => fr(t, t / 100));
-  const both = { type: "interval", t_start_ns: String(at(12_000)), t_end_ns: String(at(14_000)), samples: 0, valid: false, excluded: ["no_samples", "operator_input"], exclusion_class: "operator_activity" };
-  const st = paneStalls(synthSeg(frames, [both]), gens100(30_000), winTo(25_000), V0);
-  assert.deepEqual(st.map((x) => [x.framelessMs, x.voids]), [[13_000, true]]);
+  assert.deepEqual(stallCoverage(synthSeg(frames), winTo(5000), [0]).get(0), { frames: 101, seqs: 1, firstMs: 0, lastMs: 5000, finalSeq: 641, finalFromMs: 0 });
 });
 
 test("MF1(b/c): the seen basis needs BOTH bars on the seen part alone, 2000 ms inclusive (review r13 MF1)", () => {
@@ -1234,13 +1212,74 @@ test("MF1: per session the wedge reported is a voiding one first, then the longe
   assert.deepEqual(paneStalls(synthSeg(two), r12Gens([0]), winTo(6300), V0).map((x) => [x.seq, x.ms]), [[500, 3000]]);
 });
 
-test("MF1(a): a no_samples interval is a blackout whether or not it carries its sample count (review r13 MF1)", () => {
-  const iv = (a, b, extra) => ({ type: "interval", t_start_ns: String(at(a)), t_end_ns: String(at(b)), valid: false, exclusion_class: "harness_error", ...extra });
-  const spans = blackoutSpans({ intervals: [iv(0, 500, { excluded: ["no_samples"] }), iv(500, 1000, { samples: 0 }), iv(1000, 1500, { samples: 3, excluded: ["state_unknown"] })] });
-  assert.deepEqual(spans.map((x) => Number((x.a - T0) / MS)), [0, 500]);
-});
-
 test("stallCoverage counts only frames showing the session's OUTPUT marker (review r13)", () => {
   const frames = [fr(0, 1), fr(100, 2), { source: "x11", t_ns: String(at(200)), markers: [{ kind: "echo", session: 0, seq: 9 }] }];
-  assert.deepEqual(stallCoverage(synthSeg(frames), winTo(300), [0]).get(0), { frames: 2, seqs: 2, firstMs: 0, lastMs: 100 });
+  assert.deepEqual(stallCoverage(synthSeg(frames), winTo(300), [0]).get(0), { frames: 2, seqs: 2, firstMs: 0, lastMs: 100, finalSeq: 2, finalFromMs: 100 });
+});
+
+// --- review r14 ---------------------------------------------------------------
+
+/** A synthetic segment with a start record (t0 = T0 at wall 2026-10-16T00:00:00.000Z) and these incidents. */
+function lostSeg(frames, incidents, intervals = []) {
+  return { ...synthSeg(frames, intervals), start: { type: "start", t0_ns: String(T0), at: "2026-10-16T00:00:00.000Z" }, incidents };
+}
+const lostAt = (ms, source = "x11") => ({ type: "incident", kind: "capture_lost", at: new Date(Date.parse("2026-10-16T00:00:00.000Z") + ms).toISOString(), detail: `${source} capture ended: the window is gone`, stops_run: true, data: { source } });
+
+test("r14 A: an absent window-state inspector (every interval no_samples) does not hide a 15 s end freeze (review r14 MF1)", () => {
+  const frames = every(0, 45_000, 100).map((t) => fr(t, t / 100));
+  const noInsp = every(0, 59_500, 500).map((t) => ({ type: "interval", t_start_ns: String(at(t)), t_end_ns: String(at(t + 500)), samples: 0, valid: false, excluded: ["no_samples"], exclusion_class: "harness_error" }));
+  assert.deepEqual(paneStalls(synthSeg(frames, noInsp), gens100(60_000), winTo(60_000), V0).map((x) => [x.framelessMs, x.basis, x.voids]), [[15_000, "tail", true]]);
+});
+
+test("r14 B: a primary capture lost at 45 s is not a frozen screen: no void, and the row says so (review r14 MF1)", () => {
+  const frames = every(0, 45_000, 100).map((t) => fr(t, t / 100));
+  assert.deepEqual(paneStalls(lostSeg(frames, [lostAt(45_000)]), gens100(60_000), winTo(60_000), V0), []);
+  // Lost at 50 s: the 5 s before it still count, and do not void.
+  assert.deepEqual(paneStalls(lostSeg(frames, [lostAt(50_000)]), gens100(60_000), winTo(60_000), V0).map((x) => [x.framelessMs, x.voids]), [[5000, false]]);
+  // A loss that cannot be placed in time (no start record) ends every tail; a non-primary source's loss is ignored.
+  assert.deepEqual(paneStalls({ ...synthSeg(frames), incidents: [lostAt(50_000)] }, gens100(60_000), winTo(60_000), V0), []);
+  assert.equal(paneStalls(lostSeg(frames, [lostAt(45_000, "dda")]), gens100(60_000), winTo(60_000), V0)[0]?.voids, true);
+  assert.deepEqual(captureLosses({ ...synthSeg(frames), incidents: [lostAt(50_000)] }).map((x) => x.t), [null]);
+  // The row: KPIs stay measured, with a note naming the loss.
+  const f0 = focusFixture();
+  const f = { ...f0, soak: { records: f0.soak.records.map((r) => (r.type === "start" ? { ...r, at: "2026-10-16T00:00:00.000Z" } : r)) } };
+  const start = f.soak.records.find((r) => r.type === "start");
+  const t0 = BigInt(start.t0_ns) + 5n * MS;
+  const cutT = t0 + BigInt(SOAK_MS - 15_000) * MS;
+  const wallCut = Date.parse(start.at) + Number((cutT - BigInt(start.t0_ns)) / MS);
+  const records = [
+    ...f.soak.records.filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= cutT),
+    { type: "incident", kind: "capture_lost", at: new Date(wallCut).toISOString(), detail: "x11 capture ended: gone", stops_run: true, data: { source: captureInfo(indexProbeSegment(f.soak.records)).primary } },
+  ];
+  const r = computeRowKpis({ ...f, soak: { records } });
+  assert.deepEqual(r.stalls, [], JSON.stringify(r.stalls));
+  assert.equal(r.kpis.output_latency_ms.state, "measured");
+  assert.ok((r.kpis.output_latency_ms.notes ?? []).some((n) => /^the primary capture \(\w+\) was lost at \+\d+ ms: x11 capture ended: gone; no frameless stretch after that counts toward a pane stall$/.test(n)), JSON.stringify(r.kpis.output_latency_ms.notes));
+  // Without the incident the same row voids.
+  const bare = computeRowKpis({ ...f, soak: { records: records.filter((x) => x.type !== "incident") } });
+  assertUnknown(bare.kpis.output_latency_ms, "pane_stalled");
+});
+
+test("r14 B: a capture loss counts when placed up to CAPTURE_LOST_SLACK_MS before the run's last frame (review r14 MF1)", () => {
+  const frames = every(0, 45_000, 100).map((t) => fr(t, t / 100));
+  assert.equal(CAPTURE_LOST_SLACK_MS, 1000);
+  assert.deepEqual(paneStalls(lostSeg(frames, [lostAt(44_001)]), gens100(60_000), winTo(60_000), V0), [], "999 ms before: the tail ends at the last frame");
+  assert.equal(paneStalls(lostSeg(frames, [lostAt(44_000)]), gens100(60_000), winTo(60_000), V0)[0]?.voids, true, "1000 ms before: an earlier, re-established loss");
+});
+
+test("r14 C: the tail bar's frame gap is measured only where no excluded span or capture loss lies between frames (review r14 SF4)", () => {
+  // Frames 0-10 s and 30-45 s, minimized 10-30 s, then a 15 s end freeze.
+  const frames = [...every(0, 10_000, 100), ...every(30_000, 45_000, 100)].map((t) => fr(t, t / 100));
+  const occ = [{ type: "interval", t_start_ns: String(at(10_000)), t_end_ns: String(at(30_000)), samples: 40, valid: false, excluded: ["minimized"], exclusion_class: "occluded" }];
+  assert.deepEqual(paneStalls(synthSeg(frames, occ), gens100(60_000), winTo(60_000), V0).map((x) => [x.tailBarMs, x.voids]), [[10_000, true]]);
+  assert.deepEqual(paneStalls(synthSeg(frames), gens100(60_000), winTo(60_000), V0).map((x) => [x.tailBarMs, x.voids]), [[60_000, false]], "a real 20 s gap does raise the bar");
+  // A capture lost at 15 s and re-established: the 20 s gap is the probe's, not the host's.
+  assert.deepEqual(paneStalls(lostSeg(frames, [lostAt(15_000)]), gens100(60_000), winTo(60_000), V0).map((x) => [x.tailBarMs, x.voids]), [[10_000, true]]);
+});
+
+test("r14 B: markers emitted after a capture loss do not count toward the tail (review r14 MF1)", () => {
+  const frames = every(0, 45_000, 100).map((t) => fr(t, t / 100));
+  // The generator wrote nothing between the last frame and the loss at 55 s, then 50 markers.
+  const quiet = gensAt([...every(0, 45_000, 100), ...every(55_100, 60_000, 100)]);
+  assert.deepEqual(paneStalls(lostSeg(frames, [lostAt(55_000)]), quiet, winTo(60_000), V0), []);
 });

@@ -48,7 +48,6 @@ import {
   primaryFrames,
   segmentWindow,
   stallCoverage,
-  STALL_MIN_EMITTED,
   STALL_MIN_MS,
 } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
@@ -70,14 +69,21 @@ export const RESTORE_CHECK_MIN_FRAMES = 10;
  * Why the restore check cannot judge a session from its {@link stallCoverage}
  * entry over a watch of `windowMs`, or null when it can: >= RESTORE_CHECK_MIN_FRAMES
  * kept frames, spanning >= STALL_MIN_MS, the last within STALL_MIN_MS of the
- * watch's end, at >= 2 distinct sequences (observed repainting).
+ * watch's end, and the marker observed ADVANCING within the final STALL_MIN_MS
+ * of those frames (its final still run is shorter than that). `emitted` is how
+ * many output markers the session's generator wrote during that final run, or
+ * null without a generator log; it is only reported.
  */
-export function restoreCoverageGap(c, windowMs) {
+export function restoreCoverageGap(c, windowMs, emitted = null) {
   if (!c || c.frames === 0) return "no kept frame";
   if (c.frames < RESTORE_CHECK_MIN_FRAMES) return `fewer than ${RESTORE_CHECK_MIN_FRAMES} kept frames`;
   if (c.lastMs - c.firstMs < STALL_MIN_MS) return `kept frames span under ${STALL_MIN_MS} ms`;
   if (windowMs - c.lastMs > STALL_MIN_MS) return `last kept frame over ${STALL_MIN_MS} ms before the watch's end`;
-  if (c.seqs < 2) return `marker did not advance and the generator wrote < ${STALL_MIN_EMITTED} markers`;
+  const held = c.lastMs - c.finalFromMs;
+  if (held >= STALL_MIN_MS) {
+    const wrote = emitted === null ? "no generator log, so how many markers it wrote is unknown" : `its generator wrote ${emitted} marker(s) meanwhile`;
+    return `marker did not advance in the final ${Math.round(held)} ms of its kept frames (seq ${c.finalSeq} from +${Math.round(c.finalFromMs)} ms; ${wrote})`;
+  }
   return null;
 }
 
@@ -1165,13 +1171,23 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       // An empty stall list proves nothing about a session the rule barely saw:
       // a clean verdict needs each judged session's KEPT frames (outside excluded
       // intervals) to number RESTORE_CHECK_MIN_FRAMES, span STALL_MIN_MS, reach
-      // within STALL_MIN_MS of the watch's end, and show at least two distinct
-      // sequences (observed repainting: a pane frozen while its generator is
-      // blocked emits too few markers to be a stall, and is not clean either). A
-      // frozen screen that stops sending frames fails the end term.
+      // within STALL_MIN_MS of the watch's end, and show the marker advancing
+      // within the final STALL_MIN_MS of them (observed repainting at the end: a
+      // pane frozen while its generator is blocked emits too few markers to be a
+      // stall, and is not clean either). A frozen screen that stops sending frames
+      // fails the end term.
       const cov = stallCoverage(idx, win, expected);
       const windowMs = nsToMs(win.t1 - win.t0);
-      const whyNot = (k) => restoreCoverageGap(cov.get(k), windowMs) ?? (unresolved.has(k) ? "still at the watch's end on a short frameless tail" : null);
+      const emittedInFinal = (k) => {
+        const c = cov.get(k);
+        const g = gens?.get?.(k);
+        if (!g || c?.finalFromMs === null || c?.finalFromMs === undefined) return null;
+        const a = win.t0 + BigInt(Math.round(c.finalFromMs * 1e6));
+        const b = win.t0 + BigInt(Math.round(c.lastMs * 1e6));
+        return (g.markers ?? []).filter((m) => m.kind === "output" && typeof m.tEmit === "bigint" && m.tEmit > a && m.tEmit <= b).length;
+      };
+      const whyNot = (k) =>
+        restoreCoverageGap(cov.get(k), windowMs, emittedInFinal(k)) ?? (unresolved.has(k) ? "still at the watch's end on a short frameless tail" : null);
       const judged = expected.filter((k) => whyNot(k) === null);
       const seen = expected
         .map((k) => {
@@ -1192,7 +1208,7 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       if (wedged === 0 && judged.length < need) {
         return unknownCheck(
           `${judged.length} of the ${need} session(s) the restored layout should show could be judged ` +
-            `(>= ${RESTORE_CHECK_MIN_FRAMES} kept frames spanning >= ${STALL_MIN_MS} ms, reaching within ${STALL_MIN_MS} ms of the end of a ${Math.round(windowMs)} ms watch, at >= 2 seqs; ${seen})`,
+            `(>= ${RESTORE_CHECK_MIN_FRAMES} kept frames spanning >= ${STALL_MIN_MS} ms, reaching within ${STALL_MIN_MS} ms of the end of a ${Math.round(windowMs)} ms watch, advancing within their final ${STALL_MIN_MS} ms; ${seen})`,
         );
       }
       if (wedged === 0 && !judged.includes(restoredSession)) {
@@ -1201,13 +1217,15 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       }
       const outcome = wedged > 0 ? "not repainting" : stalls.some((x) => x.recovered) ? "recovered from a hitch" : "clean";
       const total = primaryFrames(idx, primary, win).length;
-      const note = `restore check: observed, ${outcome} (${total} primary frame(s); ${seen})`;
+      const unresolvedList = [...unresolved].sort((x, y) => x - y);
+      const shownOutcome = unresolvedList.length > 0 && wedged === 0 ? `${outcome} (${unresolvedList.length} session(s) unresolved: ${unresolvedList.join(",")})` : outcome;
+      const note = `restore check: observed, ${shownOutcome} (${total} primary frame(s); ${seen})`;
       log(`unit ${name} arm ${arm}: ${note}`);
       return {
         comparable: false,
         source,
         state: "measured",
-        data: { outcome, frames: total, sessions: expected, judged, restored: restoredSession, stalls },
+        data: { outcome, frames: total, sessions: expected, judged, unresolved: unresolvedList, restored: restoredSession, stalls },
         notes: [note],
       };
     } catch (e) {

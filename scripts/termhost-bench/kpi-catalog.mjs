@@ -120,7 +120,7 @@ export const REASON_CODES = Object.freeze({
   zone_unresolved: "the runner focus arm could not resolve the session's zone",
   pane_not_mounted: "the focused pane refused keyboard focus (TERMINAL_NO_MOUNTED_VIEW)",
   pane_stalled:
-    "a displayed session's output marker stayed still for >= 2 s seen while its generator kept writing, and did not advance in any later frame of the soak; `detail` says when it was last shown",
+    "a displayed session's output marker did not advance in any later frame of the soak while its generator kept writing: still for >= 2 s seen, or for a shorter seen stretch followed by a long frameless tail at the soak's end (>= 10 s, and >= 3x the host's longest frame gap); `detail` says which, and when it was last shown",
   device_drained: "the device is drained, or its drain state is unknown",
   admission_refused: "the runner's spawn-time resource guard refused sessions at this N",
   host_crashed: "a host process exited during the run",
@@ -164,7 +164,7 @@ export const INCIDENT_KINDS = Object.freeze({
   operator_input: "real operator input was detected and the input arm aborted (D9)",
   host_crashed: "a host process exited during the run",
   pane_stalled:
-    "a displayed session's output marker stayed still for >= 2 s while its generator kept writing, in a soak or the focus arm's restore check; `detail` says whether the pane recovered (a hitch: the marker KPIs stay measured) or did not advance in any later frame (a wedge), and when it was last shown",
+    "a displayed session's output marker stayed still for >= 2 s while its generator kept writing, in a soak or the focus arm's restore check; `detail` says whether the pane recovered (a hitch: the marker KPIs stay measured), did not advance in any later frame (a wedge, which voids them), or was still at the end only through a frameless tail too short to call a wedge (they stay measured), and when it was last shown",
   harness_error: "an internal harness failure",
 });
 
