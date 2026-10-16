@@ -137,17 +137,24 @@ fn is_process(kind: Option<ThreadKind>) -> bool {
 /// Parse one `slot-<k>` file (Phase 1's `termhost-bench/slot/v1`); `None` for
 /// another run's slot or an unreadable one.
 pub fn parse_slot(text: &str, run_id: Option<&str>) -> Option<Slot> {
-    parse_slot_on(text, run_id, NATIVE_PLATFORM)
+    parse_slot_on(text, run_id, native_platform())
 }
 
-/// The generator's `process.platform` for this build of the probe.
-pub const NATIVE_PLATFORM: &str = if cfg!(windows) {
-    "win32"
-} else if cfg!(target_os = "macos") {
-    "darwin"
-} else {
-    "linux"
-};
+/// Node's `process.platform` name for the OS this probe runs on: Rust's
+/// `std::env::consts::OS` with Node's two renamings (windows -> win32,
+/// macos -> darwin); every other OS name is the same in both.
+pub fn native_platform() -> &'static str {
+    node_platform(std::env::consts::OS)
+}
+
+/// Rust's OS name as Node's `process.platform` spells it.
+pub fn node_platform(rust_os: &'static str) -> &'static str {
+    match rust_os {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    }
+}
 
 /// `parse_slot` against an explicit platform. A slot whose generator declares
 /// another platform names PIDs of another OS — a generator inside WSL (the
@@ -833,7 +840,11 @@ mod tests {
             parse_slot_on(legacy, Some("run-7"), "win32").is_some(),
             "no platform: this one's"
         );
-        let foreign = if NATIVE_PLATFORM == "win32" {
+        assert_eq!(node_platform("windows"), "win32");
+        assert_eq!(node_platform("macos"), "darwin");
+        assert_eq!(node_platform("linux"), "linux");
+        assert_eq!(node_platform("freebsd"), "freebsd");
+        let foreign = if native_platform() == "win32" {
             "linux"
         } else {
             "win32"

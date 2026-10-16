@@ -441,10 +441,11 @@ export function wslRowAdjustments(kpis, wsl, win) {
       : end?.state === "unknown"
         ? `; its drift by teardown is UNKNOWN (${end.reason})`
         : "; its drift by teardown was not re-measured";
+  const loadText = end?.under_load ? ` (re-measured under possible load: ${end.load})` : "";
   const clockNote =
     rtt === null
       ? "generator times were taken on the WSL VM's clock; the offset into the probe's timebase is unknown"
-      : `generator times were shifted from the WSL VM's clock into the probe's; the offset's error bound is ±${Number(rtt / 2n) / 1e6} ms (half the fastest round trip)${driftText}`;
+      : `generator times were shifted from the WSL VM's clock into the probe's; the offset's error bound is ±${Number(rtt / 2n) / 1e6} ms (half the fastest round trip)${driftText}${loadText}`;
   for (const id of ["output_latency_ms", "input_latency_ms"]) if (kpis[id]?.state === "measured") out[id] = withNote(kpis[id], clockNote);
   const ioNote =
     "the tmux-wsl generators' logs, slot files and stop-file checks go over WSL's 9P to the Windows run directory: " +

@@ -52,7 +52,7 @@ import { machineBlock } from "../machine.mjs";
 import { runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
 import { incident } from "../results.mjs";
-import { classify, cpuTicks, groupReading, parseArgs as samplerParseArgs, pssKb } from "../wsl-sampler.mjs";
+import { classify, cpuTicks, groupReading, parseArgs as samplerParseArgs, pssKb, readReadings, statReading } from "../wsl-sampler.mjs";
 import { MS, genLog, operativeCapabilities, watchSegment } from "./helpers/bench-fixtures.mjs";
 import { createFakeWt } from "./helpers/fake-wt.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
@@ -214,7 +214,10 @@ function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, clo
       const inner = args.slice(3);
       if (inner[0] === "tmux") return { status: 0, stdout: `${tmuxReply(inner)}\n`, stderr: "" };
       if (inner[0] === "wslpath") return { status: 0, stdout: `${translate(inner[2])}\n` };
-      if (inner[0] === "node" && inner[2] === WSL_FLAG_SCAN) return { status: 0, stdout: scan(inner.slice(4)) };
+      if (inner[0] === "node" && inner[2] === WSL_FLAG_SCAN) {
+        const out = scan(inner.slice(4));
+        return out === null ? { status: 1, stdout: "", stderr: "scan failed" } : { status: 0, stdout: out };
+      }
       return { status: 0, stdout: "" };
     }
     const script = cmd === "powershell.exe" && args.at(-2) === "-EncodedCommand" ? Buffer.from(args.at(-1), "base64").toString("utf16le") : null;
@@ -262,7 +265,7 @@ function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, clo
     generatorWaitMs: 10,
   });
   const argv = generatorArgv({ node: "C:\\node\\node.exe", script: "C:\\r\\ai-session.mjs", genDir: "C:\\Temp\\gen", profile: "claude-tui", seed: 1, genRunId: "r1-u0" });
-  return { runDir, unitDir, genDir, wt, adapter, wslCalls, spawns, argv, ctx: { runDir, unitDir, genDir, genRunId: "r1-u0" } };
+  return { runDir, unitDir, genDir, wt, adapter, wslCalls, spawns, argv, ctx: { runDir, unitDir, genDir, genRunId: "r1-u0" }, clockCalls: () => clockCalls };
 }
 
 /** The tests' paths are POSIX already; a Windows one is translated as the default automount would. */
@@ -272,6 +275,11 @@ test("the doctor reports the measured WSL clock round trip beside the 2 ms thres
   const r = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 1_250_000n, n: 60 } });
   const m = (await r.adapter.check()).mechanisms;
   assert.equal(m["setup.wsl_clock"].state, "OPERATIVE");
+  assert.equal(r.clockCalls(), 1);
+  // launch runs check() again and uses ITS reading: exactly one more measurement, none of its own.
+  const l = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 1_250_000n, n: 60 } });
+  await l.adapter.launch(l.ctx);
+  assert.equal(l.clockCalls(), 1, "one round-trip measurement serves the doctor's verdict and the launch");
   assert.match(m["setup.wsl_clock"].reason, /fastest of 60 round trips through Ubuntu: 1\.25 ms \(offset bound ±0\.625 ms\); threshold 2 ms/);
   const slow = rig(t, { clock: { offsetNs: 0n, rttNs: 3_000_000n, n: 60 } });
   const ms = (await slow.adapter.check()).mechanisms["setup.wsl_clock"];
@@ -619,7 +627,9 @@ test("teardown re-measures the clock only after the generators have left", async
   r.adapter.generatorWaitMs = 5000;
   await r.adapter.teardown();
   const clock = order.indexOf("clock");
+  assert.ok(order.includes("scan:0"), `the teardown saw the generators gone: ${order.join(" ")}`);
   assert.ok(clock > order.indexOf("scan:0"), `the re-measure came after the scan that found no generator: ${order.join(" ")}`);
+  assert.equal(r.adapter.wslSamples().clockEnd.under_load, undefined, "taken without the generators' load");
 });
 
 test("a tmux-wsl row: workload from inside the distro, the clock bound on both latencies, the 9P note on the producer KPIs", () => {
@@ -686,4 +696,69 @@ test("the run loop records an adapter's teardown incidents with its setup and un
   assert.equal(v.valid, true, JSON.stringify(v.errors.slice(0, 3)));
   const row = res.doc.rows.find((r) => r.setup.id === "tmux-wsl");
   assert.equal(row.kpis.workload_cpu_pct.state, "unknown", "no WSL-side workload samples: unknown, never the probe's empty Windows group");
+});
+
+test("a teardown re-measure taken while generators may still run says so, in clockEnd and in the latency note", async (t) => {
+  const stuck = rig(t, { clockEnd: { offsetNs: -7_000_000n, rttNs: 400_000n, n: 60 }, scan: ([flag]) => (flag === "--termhost-bench-generator" ? "4300\n" : "") });
+  await stuck.adapter.launch(stuck.ctx);
+  await stuck.adapter.spawnSessions(1, stuck.argv);
+  stuck.adapter.generatorWaitMs = 1;
+  await stuck.adapter.teardown();
+  const end = stuck.adapter.wslSamples().clockEnd;
+  assert.equal(end.state, "measured");
+  assert.equal(end.under_load, true);
+  assert.match(end.load, /1 generator\(s\) were still running/);
+  const note = wslRowAdjustments({ output_latency_ms: { state: "measured", unit: "ms", n: 1, stats: {} } }, { wslRecords: [], clockRttNs: "400000", clockEnd: end }, win).output_latency_ms.notes.join(" ");
+  assert.match(note, /re-measured under possible load: 1 generator\(s\) were still running/);
+  const blind = rig(t, { clockEnd: { offsetNs: -7_000_000n, rttNs: 400_000n, n: 60 }, scan: ([flag]) => (flag === "--termhost-bench-generator" ? null : "") });
+  await blind.adapter.launch(blind.ctx);
+  await blind.adapter.spawnSessions(1, blind.argv);
+  await blind.adapter.teardown();
+  assert.match(blind.adapter.wslSamples().clockEnd.load, /read-back of the generators inside the distro failed/);
+});
+
+test("9P: the resize watcher's log writes share the run's I/O timer, so they land in io_ns too", async () => {
+  const { createIoTimer, watchResize } = await import("../generator/ai-session.mjs");
+  let now = 0n;
+  const clock = { nowNs: () => now };
+  const io = createIoTimer(clock);
+  const slow = io.wrap(() => (now += 700_000_000n));
+  const stream = new EventEmitter();
+  const off = watchResize(stream, io.wrap(() => (now += 900_000_000n)), clock, () => ({ cols: 80, rows: 24 }));
+  stream.emit("resize");
+  slow();
+  off();
+  assert.equal(io.ns(), 1_600_000_000n, "the resize record's 900 ms and another log's 700 ms, one total");
+  // main() wires that one timer to both (a real resize needs a TTY, so the wiring is read from the source).
+  const src = readFileSync(join(import.meta.dirname, "..", "generator", "ai-session.mjs"), "utf8");
+  assert.match(src, /const io = createIoTimer\(clock\);\n\s+const unwatchResize = watchResize\(process\.stdout, io\.wrap\(log\), clock, terminalSize\);/);
+  assert.match(src, /runGenerator\(\{[\s\S]{0,400}?\n\s+clock,\n\s+io,\n/, "and hands it to the run");
+});
+
+test("the sampler takes a process's identity and its ticks from ONE stat read", () => {
+  const stat = (pid, start, ticks) => `${pid} (node) S 1 ${pid} ${pid} 0 -1 0 0 0 0 0 ${ticks} 0 0 0 20 0 1 0 ${start} 1 1`;
+  assert.deepEqual(statReading(42, stat(42, 900, 7)), { key: "42:900", ticks: 7 });
+  // The PID is reused between the table read and this read: the key is the new process's.
+  const reads = new Map([["/p/42/stat", stat(42, 950, 3)], ["/p/42/smaps_rollup", "Pss: 10 kB\n"]]);
+  const r = readReadings([42], "/p", { read: (p) => reads.get(p) });
+  assert.equal(r.keys.get(42), "42:950");
+  assert.equal(r.ticks.get("42:950"), 3);
+  const prev = new Map([["42:900", 100]]);
+  assert.equal(groupReading([42], prev, r.ticks, r.pss, { dtMs: 500, clkTck: 100, keyOf: (p) => r.keys.get(p) }).cpu_ms, 0, "a new process: nothing, never 3 - 100");
+  const gone = readReadings([43], "/p", { read: () => { throw new Error("ENOENT"); } });
+  assert.equal(gone.ticks.get(gone.keys.get(43)), null);
+});
+
+test("producer_stall_pct at a window edge: only the I/O that cannot fit outside the window is attributed inside it (review repro edge.mjs)", () => {
+  // a at 0 (io 0), b at 2500 ms (io 1000 ms: a's log write took 0..1000 ms, then a 1500 ms pane block); the window opens at 1000 ms.
+  const pts = [];
+  for (let t = -5000n * MS; t < 0n; t += 500n * MS) pts.push({ t, blocked: 0, io: 0, written: 0, scheduled: 0 });
+  pts.push({ t: 0n, blocked: 0, io: 0, written: 0, scheduled: 0 });
+  pts.push({ t: 2500n * MS, blocked: 0, io: 1000e6, written: 0, scheduled: 0 });
+  for (let t = 3000n * MS; t <= 6000n * MS; t += 500n * MS) pts.push({ t, blocked: 0, io: 1000e6, written: 0, scheduled: 0 });
+  const r = generatorWindow(new Map([[0, { points: pts }]]), { t0: 1000n * MS, t1: 6000n * MS });
+  assert.equal(r.stall[0], 30, "the 1500 ms pane block in a 5000 ms window — not 18 %, from spreading the I/O evenly");
+  // The I/O could all fall in the window: a gap wholly inside it still subtracts all of it.
+  const whole = generatorWindow(new Map([[0, { points: pts }]]), { t0: -2000n * MS, t1: 6000n * MS });
+  assert.equal(whole.stall[0], (1500 / 8000) * 100);
 });

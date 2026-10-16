@@ -36,8 +36,12 @@
  *   marker    {seq, t_sched_ns, t_emit_ns, t_written_ns, bytes, phase} on each tick
  *   echo      {seq, byte, t_read_ns, t_emit_ns, t_written_ns, bytes} (--echo);
  *             t_read_ns is the string "unknown" when the read time is not known
- *   progress  cumulative counters every 500 ms (window any interval by differencing)
- *   exit      reason and final counters
+ *   progress  cumulative counters every 500 ms (window any interval by differencing),
+ *             among them blocked_ns (time inside the pane write) and io_ns (time in
+ *             the generator's own file I/O: every log record, resize ones included,
+ *             and every stop-file check)
+ *   resize    the pane size the host gave the session, as it changes
+ *   exit      reason and final counters (blocked_ns, io_ns among them)
  *
  * --echo puts stdin in raw mode and answers each received byte with an echo marker in
  * row 1. Flags beyond D13's: --calibration (a static calibration marker, no load),
@@ -178,6 +182,27 @@ export const USAGE =
 // ---------------------------------------------------------------------------
 // Clocks, writers, logs
 // ---------------------------------------------------------------------------
+
+/**
+ * A timer for the generator's own file I/O: `wrap(fn)` returns `fn` timed on
+ * `clock`, adding each call's duration to the one total `ns()` reports.
+ *
+ * @param {{nowNs: () => bigint}} clock
+ */
+export function createIoTimer(clock) {
+  let total = 0n;
+  return {
+    wrap: (fn) => (...a) => {
+      const t = clock.nowNs();
+      try {
+        return fn(...a);
+      } finally {
+        total += clock.nowNs() - t;
+      }
+    },
+    ns: () => total,
+  };
+}
 
 /**
  * The environment variable that shifts the generator's clock into the host's
@@ -431,18 +456,12 @@ class GeneratorRun {
     // Windows run directory over WSL's 9P) a slow log write can hold the generator
     // past a progress interval; the harness then subtracts this time from the gap
     // instead of calling it producer stall.
-    this.ioNs = 0n;
-    const timed = (fn) => (...a) => {
-      const t = this.clock.nowNs();
-      try {
-        return fn(...a);
-      } finally {
-        this.ioNs += this.clock.nowNs() - t;
-      }
-    };
-    this.log = timed(opts.log);
+    // One timer for the run: the caller passes its own (`opts.io`) when it logs
+    // outside this object too (the resize watcher), so all of it is counted once.
+    this.io = opts.io ?? createIoTimer(this.clock);
+    this.log = this.io.wrap(opts.log);
     this.echo = opts.echo ?? false;
-    this.shouldStop = timed(opts.shouldStop ?? (() => null));
+    this.shouldStop = this.io.wrap(opts.shouldStop ?? (() => null));
     this.control = opts.control ?? createControl();
     this.t0 = this.clock.nowNs();
     this.endNs =
@@ -566,7 +585,7 @@ class GeneratorRun {
       bytes_written: st.bytesWritten,
       writes: st.writes,
       blocked_ns: Number(st.blockedNs),
-      io_ns: Number(this.ioNs),
+      io_ns: Number(this.io.ns()),
       echo_bytes: st.echoBytes,
       queued: this.queue.length,
     });
@@ -766,7 +785,7 @@ class GeneratorRun {
       bytes_written: st.bytesWritten,
       writes: st.writes,
       blocked_ns: Number(st.blockedNs),
-      io_ns: Number(this.ioNs),
+      io_ns: Number(this.io.ns()),
       markers: st.markers,
       echoes: st.echoes,
       echo_bytes: st.echoBytes,
@@ -789,6 +808,7 @@ class GeneratorRun {
  *   write: (buf: Buffer) => void, log: (record: object) => void,
  *   echo?: boolean, calibration?: boolean, durationMs?: number|null,
  *   shouldStop?: () => string|null, control?: ReturnType<typeof createControl>,
+ *   io?: ReturnType<typeof createIoTimer> (a timer the caller shares, e.g. with the resize watcher),
  *   startExtra?: object,
  * }} opts
  * @returns {Promise<object>} the exit record
@@ -1003,7 +1023,10 @@ async function main(argv) {
   // session out after starting it): `resize` records beside the start record's
   // `terminal_size`, so a harness can tell whether frames wrapped. Not part of
   // the deterministic output.
-  const unwatchResize = watchResize(process.stdout, log, clock, terminalSize);
+  // The run's I/O timer, shared with the resize watcher: a resize record is file
+  // I/O like any other and lands in the same io_ns.
+  const io = createIoTimer(clock);
+  const unwatchResize = watchResize(process.stdout, io.wrap(log), clock, terminalSize);
   const control = createControl();
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
     try {
@@ -1035,6 +1058,7 @@ async function main(argv) {
       session: slot,
       runId: opts.runId,
       clock,
+      io,
       write: createFdWriter({ fd: 1 }),
       log,
       echo: opts.echo,

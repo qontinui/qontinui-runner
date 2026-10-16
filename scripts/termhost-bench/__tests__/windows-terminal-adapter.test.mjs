@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep, win32 } from "node:path";
 
 import { AdapterRefusal } from "../adapters/index.mjs";
 import { d13Shell } from "../adapters/vscode.mjs";
@@ -539,10 +539,43 @@ test("one rule for harness PowerShell: every script travels -EncodedCommand; the
     assert.equal(call[0], "powershell.exe");
     assert.deepEqual(call.slice(1, 4), ["-NoProfile", "-NonInteractive", "-EncodedCommand"], call.slice(0, 4).join(" "));
   }
-  // Static: no harness source passes "-Command" except the session shell's own command line (D13).
+});
+
+/**
+ * Every argv element that PowerShell would read as -Command: the parameter is
+ * case-insensitive and takes any unambiguous prefix (`-c`, `-co`, … `-command`),
+ * so match each, as its own quoted element, in code with comments stripped.
+ */
+const COMMAND_FLAG = /["'`]-(c|co|com|comm|comma|comman|command)["'`]/i;
+const stripComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`\\])\/\/.*$/gm, "$1");
+
+/** `file: line` for every COMMAND_FLAG hit in `files`, paths relative to `root` with "/" separators on every OS. */
+function commandFlagHits(root, files) {
+  return files.flatMap((f) =>
+    stripComments(readFileSync(f, "utf8"))
+      .split("\n")
+      .filter((l) => COMMAND_FLAG.test(l))
+      .map((l) => `${relative(root, f).split(sep).join("/")}: ${l.trim()}`),
+  );
+}
+
+/**
+ * Where a quoted -c-like flag is allowed, and why: the D13 session shell's own
+ * command line, and flags of programs that are not PowerShell (git -C, tar -C,
+ * a POSIX shell's -c).
+ */
+const ALLOWED_COMMAND_FLAGS = [
+  [/^scripts\/termhost-bench\/adapters\/vscode\.mjs: shellArgs: \["-NoLogo", "-NoExit", "-Command", commandLine\(argv, "powershell"\)\],$/, "D13 session shell"],
+  [/^scripts\/termhost-bench\/adapters\/windows-terminal\.mjs: const out = \[shellPath, "-NoLogo", "-NoExit", "-Command", commandLine\(argv, "powershell"\)\];$/, "D13 session shell"],
+  [/^scripts\/termhost-bench\/(cli|run|adapters\/runner)\.mjs: .*run\("git", \["-C", /, "git -C"],
+  [/^scripts\/termhost-bench\/adapters\/vscode-install\.mjs: .*args: \["-xz?f", archive, "-C", dest\]/, "tar -C"],
+  [/^scripts\/termhost-bench\/adapters\/tmux\.mjs: return \[shell, "-i", "-c", /, "POSIX shell -c"],
+];
+
+test("one rule for harness PowerShell, scanned: no -Command (any case, any abbreviation) outside the D13 session shell, in the bench, scripts/lib and the frame builders", async () => {
   const { readdirSync, statSync: st } = await import("node:fs");
-  const bench = join(import.meta.dirname, "..");
-  const files = [];
+  const scripts = join(import.meta.dirname, "..", "..");
+  const files = [join(scripts, "tui-repaint-generator.mjs")];
   const walk = (d) => {
     for (const n of readdirSync(d)) {
       const p = join(d, n);
@@ -551,14 +584,33 @@ test("one rule for harness PowerShell: every script travels -EncodedCommand; the
       } else if (/\.(mjs|js|cjs)$/.test(n)) files.push(p);
     }
   };
-  walk(bench);
-  const hits = files.flatMap((f) => readFileSync(f, "utf8").split("\n").filter((l) => /["']-Command["']/.test(l)).map((l) => `${f.slice(bench.length + 1)}: ${l.trim()}`));
-  assert.deepEqual(
-    hits.map((h) => h.split(":")[0]).sort(),
-    ["adapters/vscode.mjs", "adapters/windows-terminal.mjs"],
-    hits.join("\n"),
-  );
-  for (const h of hits) assert.match(h, /"-NoLogo", "-NoExit", "-Command", commandLine\(argv, "powershell"\)/, "the D13 session shell only");
+  walk(join(scripts, "termhost-bench"));
+  walk(join(scripts, "lib"));
+  const root = join(scripts, "..");
+  const rel = files.map((f) => relative(root, f).split(sep).join("/"));
+  for (const want of ["scripts/termhost-bench/proc.mjs", "scripts/lib/runner-clients.mjs", "scripts/tui-repaint-generator.mjs", "scripts/termhost-bench/adapters/vscode.mjs"]) {
+    assert.ok(rel.includes(want), `${want} is scanned`);
+  }
+  const hits = commandFlagHits(root, files);
+  const unexplained = hits.filter((h) => !ALLOWED_COMMAND_FLAGS.some(([re]) => re.test(h)));
+  assert.deepEqual(unexplained, [], "a -Command outside the D13 session shell");
+  assert.equal(hits.filter((h) => /-NoExit", "-Command"/.test(h)).length, 2, "the two D13 session shells");
+});
+
+test("the -Command scan can fail: an abbreviated, lower-case, or Windows-separated hit is caught", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-cmdscan-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const bad = join(dir, "bad.mjs");
+  for (const flag of ["-Command", "-command", "-c", "-Comm", "-CO"]) {
+    writeFileSync(bad, `run("powershell.exe", ["-NoProfile", "${flag}", script]);\n// "-Command" in a comment is fine\n`);
+    const hits = commandFlagHits(dir, [bad]);
+    assert.equal(hits.length, 1, flag);
+    assert.ok(!ALLOWED_COMMAND_FLAGS.some(([re]) => re.test(hits[0])), `${flag} is not explained away`);
+  }
+  writeFileSync(bad, `const x = "ConvertTo-Json -Compress";\n`);
+  assert.deepEqual(commandFlagHits(dir, [bad]), [], "-Compress inside a string is not a flag element");
+  // The separator: a Windows path relative to the root reads with "/".
+  assert.equal(win32.relative("D:\\r", "D:\\r\\scripts\\a.mjs").split(win32.sep).join("/"), "scripts/a.mjs");
 });
 
 test("multi-line PowerShell travels as -EncodedCommand (UTF-16LE base64) and decodes to the same script", () => {

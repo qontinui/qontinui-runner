@@ -398,13 +398,15 @@ export class TmuxWslAdapter extends TmuxAdapter {
    *
    * @returns {Promise<object | null>} the incident, or null
    */
-  async recheckClock() {
+  async recheckClock(load = null) {
     if (!this.clock || !this.distro) return null;
+    // Recorded on every outcome: a re-measure taken while generators may still run.
+    const underLoad = load ? { under_load: true, load } : {};
     let again;
     try {
       again = await this.clockOffsetFn(this.distro);
     } catch (e) {
-      this.clockEnd = { state: "unknown", reason: `the teardown re-measure failed: ${e.message}` };
+      this.clockEnd = { state: "unknown", reason: `the teardown re-measure failed: ${e.message}`, ...underLoad };
       this.notes.push(`teardown: the WSL clock could not be re-measured: ${e.message}`);
       return null;
     }
@@ -413,13 +415,14 @@ export class TmuxWslAdapter extends TmuxAdapter {
         state: "unknown",
         rttNs: String(again.rttNs),
         reason: `the teardown re-measure's fastest round trip took ${Number(again.rttNs) / 1e6} ms, more than ${Number(MAX_CLOCK_RTT_NS) / 1e6} ms`,
+        ...underLoad,
       };
       return null;
     }
     const addNs = -again.offsetNs;
     const driftNs = addNs > this.clock.addNs ? addNs - this.clock.addNs : this.clock.addNs - addNs;
     const boundNs = clockBoundNs(this.clock.rttNs) + clockBoundNs(again.rttNs);
-    this.clockEnd = { state: "measured", addNs: String(addNs), rttNs: String(again.rttNs), driftNs: String(driftNs), boundNs: String(boundNs) };
+    this.clockEnd = { state: "measured", addNs: String(addNs), rttNs: String(again.rttNs), driftNs: String(driftNs), boundNs: String(boundNs), ...underLoad };
     if (driftNs <= boundNs) return null;
     return incident("harness_error", `the WSL clock offset drifted ${Number(driftNs) / 1e6} ms during the unit (bound ${Number(boundNs) / 1e6} ms): this unit's tmux-wsl latencies carry that much more error`, { data: { setup: "tmux-wsl", distro: this.distro, launch_add_ns: String(this.clock.addNs), teardown_add_ns: String(addNs) } });
   }
@@ -429,16 +432,25 @@ export class TmuxWslAdapter extends TmuxAdapter {
     const survivors = [];
     const incidents = [];
     // 1. The generators leave on the stop file (read back inside the distro).
+    let load = null;
     if (this.ctx?.genRunId && this.distro) {
       const deadline = Date.now() + this.generatorWaitMs;
       for (;;) {
         const live = this.wslPidsCarrying(GENERATOR_FLAG, this.ctx.genRunId);
-        if (live === null || live.length === 0 || Date.now() >= deadline) break;
+        if (live === null) {
+          load = "the read-back of the generators inside the distro failed, so they may still have been running";
+          break;
+        }
+        if (live.length === 0) break;
+        if (Date.now() >= deadline) {
+          load = `${live.length} generator(s) were still running ${Math.round(this.generatorWaitMs / 1000)} s after the stop file`;
+          break;
+        }
         await this.sleep(1000);
       }
     }
-    // 1b. The clock, re-measured without the generators' load.
-    const drift = await this.recheckClock();
+    // 1b. The clock, re-measured without the generators' load (or saying it was not).
+    const drift = await this.recheckClock(load);
     if (drift) incidents.push(drift);
     // 2. The private server, by its socket only.
     if (this.socket && this.distro) {

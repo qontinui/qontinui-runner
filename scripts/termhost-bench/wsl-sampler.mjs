@@ -165,23 +165,44 @@ export function parseArgs(argv) {
   return o;
 }
 
-/** Read ticks (by `keyOf(pid)`) and PSS (by pid) for `pids` from `/proc`. */
-function readReadings(pids, procRoot, keyOf) {
+/**
+ * One `/proc/<pid>/stat` read's identity key and ticks: the start time and the
+ * CPU come from the SAME read, so a PID reused between two reads can never pair
+ * one process's start time with another's ticks.
+ *
+ * @returns {{key: string, ticks: number | null} | null}
+ */
+export function statReading(pid, text) {
+  const st = parseProcStat(String(text));
+  if (!st) return null;
+  return { key: `${pid}:${st.starttime}`, ticks: cpuTicks(text) };
+}
+
+/**
+ * Read ticks (by identity key) and PSS (by pid) for `pids` from `/proc`;
+ * `keys` maps each pid to the identity its stat read gave.
+ */
+export function readReadings(pids, procRoot, { read = (p) => readFileSync(p, "utf8") } = {}) {
   const ticks = new Map();
   const pss = new Map();
+  const keys = new Map();
   for (const pid of pids) {
+    let r = null;
     try {
-      ticks.set(keyOf(pid), cpuTicks(readFileSync(`${procRoot}/${pid}/stat`, "utf8")));
+      r = statReading(pid, read(`${procRoot}/${pid}/stat`));
     } catch {
-      ticks.set(keyOf(pid), null);
+      r = null;
     }
+    const key = r?.key ?? `${pid}:unreadable`;
+    keys.set(pid, key);
+    ticks.set(key, r?.ticks ?? null);
     try {
-      pss.set(pid, pssKb(readFileSync(`${procRoot}/${pid}/smaps_rollup`, "utf8")));
+      pss.set(pid, pssKb(read(`${procRoot}/${pid}/smaps_rollup`)));
     } catch {
       pss.set(pid, null);
     }
   }
-  return { ticks, pss };
+  return { ticks, pss, keys };
 }
 
 async function main(argv) {
@@ -225,8 +246,8 @@ async function main(argv) {
       break;
     }
     const all = [...c.host, ...c.workload];
-    const keyOf = (pid) => `${pid}:${table.get(pid)?.startKey ?? "?"}`;
-    const r = readReadings(all, "/proc", keyOf);
+    const r = readReadings(all, "/proc");
+    const keyOf = (pid) => r.keys.get(pid);
     const dtMs = prev ? Number(t - prev.t) / 1e6 : null;
     const prevTicks = prev?.ticks ?? new Map();
     line({
