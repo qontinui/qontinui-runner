@@ -592,3 +592,10 @@ note = "A caveat string attached to the Canonical rung explaining it is the runn
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
 ]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/ci_node/host.rs"
+symbol = "RunnerIdentity::ci_root"
+disposition = "unreviewed"
+note = "New with the shared ci-exec host adapter (qontinui-schemas#213 follow-up): the CI node resolves its workspace root through qontinui_root_dir(); not yet triaged."

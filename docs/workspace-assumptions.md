@@ -8,17 +8,17 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 79 | 93 | 73 | 6 | 0 | 0 |
-| `dev_ports` | 27 | 27 | 26 | 0 | 1 | 0 |
+| `repo_layout` | 80 | 94 | 74 | 6 | 0 | 0 |
+| `dev_ports` | 26 | 26 | 26 | 0 | 0 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `machine_path` | 5 | 5 | 0 | 4 | 1 | 0 |
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 102 | 103 | 102 | 0 | 0 | 0 |
 
-## `repo_layout` (79 rows)
+## `repo_layout` (80 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
@@ -50,6 +50,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `description: "Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/check_executor/command_builder.rs` | `build_devtools_command` | `Ok(("qontinui-devtools".to_string(), args))` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ci_node/admission.rs` | `start_build` | `"QONTINUI_ROOT not resolvable on this device".to_string(),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/ci_node/host.rs` | `RunnerIdentity::ci_root` | `.ok_or_else(\|\| "QONTINUI_ROOT not resolvable on this device".to_string())` | 1 | unreviewed — New with the shared ci-exec host adapter (qontinui-schemas#213 follow-up): the CI node resolves its workspace root through qontinui_root_dir(); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/commands/config.rs` | `get_workspace_paths_impl` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/commands/terminal_analysis.rs` | `get_latest_plan_content` | `let dev_notes = parent.join("qontinui-dev-notes");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/context/builtins.rs` | `get_builtin_contexts` | `"qontinui-mobile".to_string(),` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -102,7 +103,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workspace_paths.rs` | `persist_resolved_workspace_root` | `'paths.workspace_root' was left unset. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workspace_paths.rs` | `runner_workspace_root` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | unreviewed | `workspace_root` |
 
-## `dev_ports` (27 rows)
+## `dev_ports` (26 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -113,7 +114,6 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/mcp/backend_relay.rs` | `relay_loop` | `http://127.0.0.1:8000 on a DEBUG build) and that it is up."` | 1 | unreviewed |
 | `src/mcp/origin_guard.rs` | `const DEFAULT_TRUSTED_ORIGINS` | `"http://127.0.0.1:3001",` | 1 | unreviewed |
 | `src/mcp/origin_guard.rs` | `const DEFAULT_TRUSTED_ORIGINS` | `"http://localhost:3001",` | 1 | unreviewed |
-| `src/mcp/origin_guard.rs` | `const GRACE_ORIGINS` | `pub const GRACE_ORIGINS: &[&str] = &["http://localhost:3001", "http://127.0.0.1:3001"];` | 1 | dev_only_surface — The transitional dev-origin grace: only the qontinui-web dev frontend on :3001 is admitted at TRUSTED_DOOR_GRACE doors. A dev-only surface that no published build serves from that origin; plan 2026-09-17-retire-the-runner-origin-guard-dev-grace retires it (Phase 6 deletes the constant). |
 | `src/mcp/ui_bridge/exploration.rs` | `start_ui_bridge_exploration` | `Example: {{\"connection_url\": \"http://localhost:3001\", \"target_type\": \"web\"}}",` | 1 | unreviewed |
 | `src/reflection/workflow.rs` | `build_ui_bridge_agentic_prompt` | `- **Web relay health**: 'curl http://localhost:3001/api/ui-bridge/health' — is a browser tab connected? Are there SSE listeners?` | 1 | unreviewed |
 | `src/step_executor/handlers/ui_bridge.rs` | `UiBridgeHandler::execute` | `.unwrap_or("http://localhost:3001");` | 1 | unreviewed |
@@ -257,7 +257,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (102 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -274,9 +274,6 @@ _No hits._
 | `src/ai_provider/pi_cli.rs` | `run_pi_cli_in_dir` | `pi prompt is {} chars — too long for the cmd.exe argv limit — and \` | 1 | unreviewed |
 | `src/capability_manifest.rs` | `render_manifest_doc` | `--capability-manifest-doc > docs/runner-capabilities.md'. NOT from PowerShell, \` | 1 | unreviewed |
 | `src/check_executor/analyzers/security/patterns.rs` | `const CMD_INJECTION_RUST` | `pattern: r#"Command::new\s*\(\s*['\"](?:sh\|bash\|cmd\|powershell)['\"]"#,` | 1 | unreviewed |
-| `src/ci_node/executor.rs` | `spawn_step_child` | `let mut shim = build_step_command("cmd.exe", &argv);` | 1 | unreviewed |
-| `src/ci_node/services.rs` | `reap_blocking` | `spawn("cmd.exe", &shim_argv)` | 1 | unreviewed |
-| `src/ci_node/tools.rs` | `run_capture_env` | `let mut shim = build("cmd.exe", &argv_ref, path_dir, envs);` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `is_drive_rooted` | `cfg(windows)-only fn 'is_drive_rooted' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `resolve_subst_once` | `cfg(windows)-only fn 'resolve_subst_once' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `rewrite_msys_root` | `cfg(windows)-only fn 'rewrite_msys_root' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

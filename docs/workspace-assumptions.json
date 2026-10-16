@@ -1598,7 +1598,8 @@
       "symbol": "RunnerIdentity::ci_root",
       "excerpt": ".ok_or_else(|| \"QONTINUI_ROOT not resolvable on this device\".to_string())",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "New with the shared ci-exec host adapter (qontinui-schemas#213 follow-up): the CI node resolves its workspace root through qontinui_root_dir(); not yet triaged."
     },
     {
       "class": "repo_layout",
