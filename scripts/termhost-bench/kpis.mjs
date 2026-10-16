@@ -213,9 +213,12 @@ export function captureInfo(seg) {
  * A watch whose cross-check was judged under another profile than the
  * environment declared — or whose summary does not say which (an absent or
  * empty `profile`: a probe that predates the argument, or one that lost it) —
- * answers a different question: its latency KPIs are unknown(harness_error).
- * Only when the environment declared a profile and the watch has a cross-check
- * block to judge.
+ * answers a different question. The profile chooses both the cross-check and
+ * the probe-lag bound whose `behind` verdict gates every capture KPI, so every
+ * KPI computed from that watch is unknown(harness_error): all of
+ * PROBE_CAPTURE_KPIS for the soak watch, and input, switch and spawn latency
+ * for their own phases' watches. Only when the environment declared a profile
+ * and the watch has a cross-check block to judge.
  *
  * @returns {{reason: string, detail: string} | null}
  */
@@ -1674,6 +1677,8 @@ export function switchLatencyKpi(p, notes) {
   const win = segmentWindow(seg);
   const cap = captureInfo(seg);
   if (!cap.primary || !win) return unknownKpi(id, "capture_unavailable", { detail: "the switch phase's watch captured nothing" });
+  const profileGate = crosscheckProfileGate(p, seg.summary, "switch");
+  if (profileGate) return unknownKpi(id, profileGate.reason, { detail: profileGate.detail });
   const health = probeHealthGate(seg);
   if (health) return unknownKpi(id, health.reason, { detail: health.detail });
   const frames = primaryFrames(seg, cap.primary, win);
@@ -1704,6 +1709,8 @@ export function spawnLatencyKpi(p, notes) {
   const win = segmentWindow(seg);
   const cap = captureInfo(seg);
   if (!cap.primary || !win) return unknownKpi(id, "capture_unavailable", { detail: "the spawn phase's watch captured nothing" });
+  const profileGate = crosscheckProfileGate(p, seg.summary, "spawn");
+  if (profileGate) return unknownKpi(id, profileGate.reason, { detail: profileGate.detail });
   const health = probeHealthGate(seg);
   if (health) return unknownKpi(id, health.reason, { detail: health.detail });
   const frames = primaryFrames(seg, cap.primary, win);

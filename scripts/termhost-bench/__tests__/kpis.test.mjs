@@ -227,6 +227,34 @@ test("a strict environment fed a software-compositor summary with 80 ms of lag g
   for (const id of PROBE_CAPTURE_KPIS) assert.equal(ok.kpis[id].state, "measured", `${id}: ${JSON.stringify(ok.kpis[id])}`);
 });
 
+test("the switch and spawn watches are held to the declared profile too (head confirmation of 8ead56656)", () => {
+  const t0 = T0 + BigInt(SOAK_MS + 1000) * MS;
+  const gen = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 30000 });
+  const watch = (profile) => watchSegment({ t0, durationMs: 13000, sessions: [{ session: 0, gen, latencyMs: 20 }], crosscheckProfile: profile });
+  const row = (switchProfile, spawnProfile) =>
+    computeRowKpis({
+      ...withSummary(focusFixture(), { crosscheck: { verdict: "agree", profile: "software-compositor" } }),
+      environment: "windows-hosted",
+      crosscheckProfile: "software-compositor",
+      n: 2,
+      gens: indexGenerators(new Map([[0, gen]])),
+      switches: { records: watch(switchProfile), list: [{ k: 0, tCmdNs: t0 + 1000n * MS }] },
+      spawns: { records: watch(spawnProfile), list: [{ session: 0, tCmdNs: t0 + 1000n * MS }] },
+    }).kpis;
+  const good = row("software-compositor", "software-compositor");
+  for (const id of ["switch_latency_ms", "spawn_latency_ms"]) {
+    assert.doesNotMatch(good[id].detail ?? "", /judged the capture cross-check/, `${id}: ${JSON.stringify(good[id])}`);
+  }
+  for (const [wrong, phase, id, other] of [
+    [row("strict", "software-compositor"), "switch", "switch_latency_ms", "spawn_latency_ms"],
+    [row("software-compositor", undefined), "spawn", "spawn_latency_ms", "switch_latency_ms"],
+  ]) {
+    assertUnknown(wrong[id], "harness_error");
+    assert.match(wrong[id].detail, new RegExp(`^the ${phase} watch judged the capture cross-check under (the strict|no recorded) profile; the windows-hosted environment declares software-compositor`));
+    assert.deepEqual(wrong[other], good[other], `${other} untouched by the ${phase} watch's profile`);
+  }
+});
+
 test("the input watch's cross-check is held to the declared profile too (round 4 S2)", () => {
   const injectT0 = T0 + BigInt(SOAK_MS + 1000) * MS;
   const keys = [];
