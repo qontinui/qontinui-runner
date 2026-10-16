@@ -623,16 +623,20 @@ export function renderComparison(cmp) {
 
 /**
  * Whether `argv1` names this module, through any symlink (a symlinked path must not run nothing, silently).
- * The NATIVE realpath: the JS one keeps a Windows 8.3 short name (`RUNNER~1`) that the module URL spells long.
+ * The NATIVE realpath first: the JS one keeps a Windows 8.3 short name (`RUNNER~1`) that either spelling may
+ * carry. Where the native call fails (some virtual volumes), the JS one still resolves symlinks.
  */
 export function isEntryPoint(argv1, moduleUrl = import.meta.url) {
   if (!argv1) return false;
   const real = (p) => {
-    try {
-      return realpathSync.native(p);
-    } catch {
-      return resolve(p);
+    for (const r of [realpathSync.native, realpathSync]) {
+      try {
+        return r(p);
+      } catch {
+        // try the next resolver
+      }
     }
+    return resolve(p);
   };
   return real(resolve(argv1)) === real(fileURLToPath(moduleUrl));
 }

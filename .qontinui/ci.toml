@@ -300,6 +300,7 @@ command = [
   "scripts/termhost-bench/__tests__/compare-report.test.mjs",
   "scripts/termhost-bench/__tests__/crosscheck-replay.test.mjs",
   "scripts/termhost-bench/__tests__/doctor.test.mjs",
+  "scripts/termhost-bench/__tests__/entry-point.test.mjs",
   "scripts/termhost-bench/__tests__/generator.test.mjs",
   "scripts/termhost-bench/__tests__/kpi-catalog.test.mjs",
   "scripts/termhost-bench/__tests__/kpis.test.mjs",
