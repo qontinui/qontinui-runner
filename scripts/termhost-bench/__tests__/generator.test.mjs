@@ -1152,6 +1152,7 @@ test(
       "the slot names the parent (the session shell in a real host)",
     );
     assert.equal(slot.run_id, "ci-run-1");
+    assert.equal(slot.platform, process.platform, "whose PIDs these are: the probe ignores another OS's slots");
     const records = genRecords(h.dir, 0);
     assert.equal(records[0].type, "start");
     assert.equal(records[0].profile, "quiet-fixture");

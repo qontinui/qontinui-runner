@@ -137,11 +137,35 @@ fn is_process(kind: Option<ThreadKind>) -> bool {
 /// Parse one `slot-<k>` file (Phase 1's `termhost-bench/slot/v1`); `None` for
 /// another run's slot or an unreadable one.
 pub fn parse_slot(text: &str, run_id: Option<&str>) -> Option<Slot> {
+    parse_slot_on(text, run_id, NATIVE_PLATFORM)
+}
+
+/// The generator's `process.platform` for this build of the probe.
+pub const NATIVE_PLATFORM: &str = if cfg!(windows) {
+    "win32"
+} else if cfg!(target_os = "macos") {
+    "darwin"
+} else {
+    "linux"
+};
+
+/// `parse_slot` against an explicit platform. A slot whose generator declares
+/// another platform names PIDs of another OS — a generator inside WSL (the
+/// tmux-wsl setup) writes Linux PIDs into the run directory the Windows probe
+/// reads — so it names no process here at all. A slot that declares none (an
+/// older generator) is taken as this platform's.
+pub fn parse_slot_on(text: &str, run_id: Option<&str>, native: &str) -> Option<Slot> {
     let v: Value = serde_json::from_str(text.lines().next()?).ok()?;
     if let (Some(want), Some(got)) = (run_id, v.get("run_id").and_then(Value::as_str)) {
         if want != got {
             return None;
         }
+    }
+    if v.get("platform")
+        .and_then(Value::as_str)
+        .is_some_and(|p| p != native)
+    {
+        return None;
     }
     let pid = u32::try_from(v.get("pid")?.as_u64()?).ok()?;
     let ppid = u32::try_from(v.get("ppid")?.as_u64()?).ok()?;
@@ -790,6 +814,34 @@ mod tests {
             gone.iter().all(|e| e.session.is_none()),
             "the OpenConsole's exit names no generator session: {gone:?}"
         );
+    }
+
+    #[test]
+    fn a_slot_from_another_platform_names_no_process_here() {
+        let linux = r#"{"schema":"termhost-bench/slot/v1","slot":0,"run_id":"run-7","pid":103,"ppid":102,"platform":"linux"}"#;
+        let win = r#"{"schema":"termhost-bench/slot/v1","slot":0,"run_id":"run-7","pid":103,"ppid":102,"platform":"win32"}"#;
+        let legacy =
+            r#"{"schema":"termhost-bench/slot/v1","slot":0,"run_id":"run-7","pid":103,"ppid":102}"#;
+        assert_eq!(
+            parse_slot_on(linux, Some("run-7"), "win32"),
+            None,
+            "a WSL generator's Linux pid"
+        );
+        assert!(parse_slot_on(win, Some("run-7"), "win32").is_some());
+        assert!(parse_slot_on(linux, Some("run-7"), "linux").is_some());
+        assert!(
+            parse_slot_on(legacy, Some("run-7"), "win32").is_some(),
+            "no platform: this one's"
+        );
+        let foreign = if NATIVE_PLATFORM == "win32" {
+            "linux"
+        } else {
+            "win32"
+        };
+        let text = format!(
+            r#"{{"schema":"termhost-bench/slot/v1","slot":0,"run_id":"run-7","pid":103,"ppid":102,"platform":"{foreign}"}}"#
+        );
+        assert_eq!(parse_slot(&text, Some("run-7")), None);
     }
 
     #[test]

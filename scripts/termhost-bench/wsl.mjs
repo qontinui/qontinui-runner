@@ -396,9 +396,13 @@ function withNote(kpi, note) {
  *                   trip) and, when the teardown re-measure saw one, the drift;
  *   producer side   the generators' logs, slot files and stop-file poll live on the
  *                   Windows run directory, reached over WSL's 9P (/mnt/c): the run
- *                   loop and the probe read them there while the unit runs.
- *                   producer_stall_pct times only the write to the pane (fd 1), so
- *                   that I/O is outside it; delivered_ratio can carry its cost.
+ *                   loop and the probe read them there while the unit runs. The
+ *                   time inside that I/O is recorded by the generator (`io_ns`) and
+ *                   taken out of producer_stall_pct's record gaps (kpis.mjs
+ *                   generatorWindow); between records it was never in it (only the
+ *                   fd-1 pane write is timed as blocked). It still delays the
+ *                   generator's stdin service and its schedule, so input_latency_ms
+ *                   and delivered_ratio can carry it; all three say so.
  *
  * @param {Record<string, object>} kpis
  * @param {{wslRecords?: object[], clockRttNs?: string | null, clockEnd?: object | null} | null} wsl
@@ -430,13 +434,22 @@ export function wslRowAdjustments(kpis, wsl, win) {
         : unknownKpi("workload_memory_mb", inside.length === 0 ? "insufficient_samples" : "harness_error", { n: inside.length, detail: "no readable WSL-side workload memory at the end of the window" });
   }
   const rtt = wsl?.clockRttNs ? BigInt(wsl.clockRttNs) : null;
-  const drift = wsl?.clockEnd?.driftNs ? Number(BigInt(wsl.clockEnd.driftNs)) / 1e6 : null;
+  const end = wsl?.clockEnd ?? null;
+  const driftText =
+    end?.state === "measured"
+      ? `; by teardown it drifted ${Number(BigInt(end.driftNs)) / 1e6} ms (bound ±${Number(BigInt(end.boundNs)) / 1e6} ms)`
+      : end?.state === "unknown"
+        ? `; its drift by teardown is UNKNOWN (${end.reason})`
+        : "; its drift by teardown was not re-measured";
   const clockNote =
     rtt === null
       ? "generator times were taken on the WSL VM's clock; the offset into the probe's timebase is unknown"
-      : `generator times were shifted from the WSL VM's clock into the probe's; the offset's error bound is ±${Number(rtt / 2n) / 1e6} ms (half the fastest round trip)${drift === null ? "" : `, and it drifted ${drift} ms by teardown`}`;
+      : `generator times were shifted from the WSL VM's clock into the probe's; the offset's error bound is ±${Number(rtt / 2n) / 1e6} ms (half the fastest round trip)${driftText}`;
   for (const id of ["output_latency_ms", "input_latency_ms"]) if (kpis[id]?.state === "measured") out[id] = withNote(kpis[id], clockNote);
-  const ioNote = "the tmux-wsl generators' logs, slot files and stop-file poll go over WSL's 9P to the Windows run directory; producer_stall_pct times only the write to the pane, delivered_ratio can include that I/O";
-  for (const id of ["producer_stall_pct", "delivered_ratio"]) if (kpis[id]) out[id] = withNote(kpis[id], ioNote);
+  const ioNote =
+    "the tmux-wsl generators' logs, slot files and stop-file checks go over WSL's 9P to the Windows run directory: " +
+    "that I/O time (io_ns) is taken out of producer_stall_pct's record gaps, but it also delays the generator's stdin service and schedule, " +
+    "so input_latency_ms and delivered_ratio can include it";
+  for (const id of ["producer_stall_pct", "delivered_ratio", "input_latency_ms"]) if (kpis[id]) out[id] = withNote(out[id] ?? kpis[id], ioNote);
   return out;
 }

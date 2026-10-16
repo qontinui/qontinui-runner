@@ -9,9 +9,12 @@
  *
  * Provenance of the pin (observed 2026-10-16 by the implementing session, and
  * true of this pin only): microsoft/terminal release `v1.25.2733.0`, published
- * 2026-10-02T20:27:27Z, is the repository's Latest release (the
- * `releases/latest` URL redirects to it and its page carries the Latest badge);
- * `v1.26.2734.0`, published six seconds later, carries the Pre-release badge. Its
+ * 2026-10-02T20:27:27Z, is the repository's latest release and not a
+ * prerelease; `v1.26.2734.0`, published 2026-10-02T20:27:33Z, is a prerelease
+ * (`gh api repos/microsoft/terminal/releases/latest --jq .tag_name` and
+ * `gh api repos/microsoft/terminal/releases/tags/<tag> --jq
+ * '[.tag_name,.prerelease,.published_at]'`, 2026-10-16; the API also gives the
+ * x64 ZIP's size and `digest` as in the table below). Its
  * asset `Microsoft.WindowsTerminal_1.25.2733.0_x64.zip` (12 127 272 bytes) was
  * downloaded from the release URL below and hashed with `sha256sum` to the value
  * in the table; the release page's own asset digest

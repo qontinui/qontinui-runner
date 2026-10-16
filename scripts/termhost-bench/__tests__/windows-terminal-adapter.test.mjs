@@ -88,7 +88,8 @@ function response(bytes, status = 200) {
 function fakeUnpack({ build, calls = [], files = REQUIRED_FILES, sessionId = true }) {
   return (cmd, args, opts) => {
     calls.push({ cmd, args });
-    const dest = cmd.endsWith("tar.exe") ? args[args.indexOf("-C") + 1] : opts.env.TERMHOST_UNPACK_DEST;
+    const dest = cmd.endsWith("tar.exe") ? args[args.indexOf("-C") + 1] : opts?.env?.TERMHOST_UNPACK_DEST;
+    if (!dest) throw new Error(`fakeUnpack: unexpected command ${cmd} ${args.slice(0, 3).join(" ")}`);
     const app = join(dest, build.topDir);
     mkdirSync(app, { recursive: true });
     for (const f of files) writeFileSync(join(app, f), f === "TerminalApp.dll" ? Buffer.from(sessionId ? "..--title\0--sessionId\0--tabColor.." : "..--title\0--tabColor..", "latin1") : "x");
@@ -509,10 +510,55 @@ test("an earlier unit's instance that survived teardown: the next unit refuses B
     assert.match(e.detail, new RegExp(`pid ${survivor} is already running from`));
     assert.equal(e.incident?.kind, "harness_error");
     assert.deepEqual(e.incident.data.survivors, [survivor]);
+    assert.equal(e.incident.data.unit, "u001-windows-terminal-default-none-n5-r0", "the unit it refused");
+    assert.equal(e.incident.data.setup, "windows-terminal");
     return true;
   });
   assert.equal(first.wt.invocations.length, invocations, "wt.exe was never invoked: the survivor received no panes");
   assert.equal(first.wt.sessions.length, 1, "no pane of unit 2 exists anywhere");
+});
+
+test("one rule for harness PowerShell: every script travels -EncodedCommand; the only -Command left is the D13 session shell's", async () => {
+  const { WINDOWS_PROCESS_QUERY, readWindowsProcessTable } = await import("../proc.mjs");
+  const { GPU_QUERY, detectGpu } = await import("../machine.mjs");
+  const { SCREEN_QUERY, readScreen } = await import("../envs/windows-hosted.mjs");
+  const { VM_PROCESS_QUERY, VM_SAMPLER_SCRIPT } = await import("../wsl.mjs");
+  const { unpackCommand } = await import("../adapters/vscode-install.mjs");
+  for (const script of [WINDOWS_PROCESS_QUERY, GPU_QUERY, SCREEN_QUERY, VM_PROCESS_QUERY, VM_SAMPLER_SCRIPT]) {
+    assert.equal(Buffer.from(powershellArgv(script)[3], "base64").toString("utf16le"), script);
+  }
+  const seen = [];
+  const run = (cmd, args) => (seen.push([cmd, ...args]), { status: 0, stdout: "[]" });
+  readWindowsProcessTable({ run });
+  readScreen({ run: (cmd, args) => (seen.push([cmd, ...args]), { status: 0, stdout: "{}" }) });
+  detectGpu({ platform: "win32", run: (cmd, args) => (seen.push([cmd, ...args]), { status: 0, stdout: "[]" }) });
+  assert.equal(seen.length, 3);
+  const ps = unpackCommand({ kind: "zip", archive: "C:\\a.zip", dest: "C:\\d", platform: "win32", env: { SystemRoot: "C:\\Windows" }, exists: () => false });
+  seen.push([ps.cmd, ...ps.args]);
+  for (const call of seen) {
+    assert.equal(call[0], "powershell.exe");
+    assert.deepEqual(call.slice(1, 4), ["-NoProfile", "-NonInteractive", "-EncodedCommand"], call.slice(0, 4).join(" "));
+  }
+  // Static: no harness source passes "-Command" except the session shell's own command line (D13).
+  const { readdirSync, statSync: st } = await import("node:fs");
+  const bench = join(import.meta.dirname, "..");
+  const files = [];
+  const walk = (d) => {
+    for (const n of readdirSync(d)) {
+      const p = join(d, n);
+      if (st(p).isDirectory()) {
+        if (n !== "__tests__" && n !== "node_modules") walk(p);
+      } else if (/\.(mjs|js|cjs)$/.test(n)) files.push(p);
+    }
+  };
+  walk(bench);
+  const hits = files.flatMap((f) => readFileSync(f, "utf8").split("\n").filter((l) => /["']-Command["']/.test(l)).map((l) => `${f.slice(bench.length + 1)}: ${l.trim()}`));
+  assert.deepEqual(
+    hits.map((h) => h.split(":")[0]).sort(),
+    ["adapters/vscode.mjs", "adapters/windows-terminal.mjs"],
+    hits.join("\n"),
+  );
+  for (const h of hits) assert.match(h, /"-NoLogo", "-NoExit", "-Command", commandLine\(argv, "powershell"\)/, "the D13 session shell only");
 });
 
 test("multi-line PowerShell travels as -EncodedCommand (UTF-16LE base64) and decodes to the same script", () => {

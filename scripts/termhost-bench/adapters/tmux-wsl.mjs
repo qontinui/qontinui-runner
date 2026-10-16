@@ -35,7 +35,7 @@
 
 import { createHash } from "node:crypto";
 import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { listProcesses, terminatePid } from "../proc.mjs";
 import { ptyHostCensus, ptyHostImpl } from "../ptyhost.mjs";
@@ -79,6 +79,23 @@ export const CLOCK_ROUNDS = 60;
 
 /** The offset's error bound: half the fastest round trip. */
 export const clockBoundNs = (rttNs) => BigInt(rttNs) / 2n;
+
+/**
+ * The doctor's verdict on the WSL clock, naming the measured round trip (the
+ * reading that tunes MAX_CLOCK_RTT_NS) beside the threshold.
+ *
+ * @param {{offsetNs: bigint, rttNs: bigint, n: number} | Error | null} clock
+ * @returns {{state: string, reason: string}}
+ */
+export function wslClockVerdict(clock, distro) {
+  if (!clock) return { state: "UNKNOWN", reason: "not measured" };
+  if (clock instanceof Error) return { state: "UNKNOWN", reason: `the clock round trip through ${distro} failed: ${clock.message}` };
+  const ms = (ns) => Number(ns) / 1e6;
+  const seen = `fastest of ${clock.n} round trips through ${distro}: ${ms(clock.rttNs)} ms (offset bound ±${ms(clockBoundNs(clock.rttNs))} ms); threshold ${ms(MAX_CLOCK_RTT_NS)} ms (unmeasured requirement: tune it from readings like this one)`;
+  return clock.rttNs > MAX_CLOCK_RTT_NS
+    ? { state: "INOPERATIVE-ON-THIS-MACHINE", reason: `${seen}: a tmux-wsl unit refuses as clock_unaligned` }
+    : { state: "OPERATIVE", reason: seen };
+}
 
 /** The variable the generators read the offset from (`generator/ai-session.mjs` CLOCK_OFFSET_ENV). */
 export const CLOCK_OFFSET_ENV = "TERMHOST_BENCH_CLOCK_OFFSET_NS";
@@ -171,11 +188,27 @@ export class TmuxWslAdapter extends TmuxAdapter {
     this.facts = facts;
     const d = facts.list ? chooseDistro(facts.list, this.distroWanted) : null;
     this.distro = d?.name ?? null;
-    return { mechanisms: { "setup.windows_terminal": await this.wt.installFact(), ...mapWslFacts({ ...facts, wanted: this.distroWanted }) } };
+    const wsl = mapWslFacts({ ...facts, wanted: this.distroWanted });
+    const mechanisms = { "setup.windows_terminal": await this.wt.installFact(), ...wsl };
+    // The clock round trip, measured here so the doctor reports it (the 2 ms
+    // threshold is a requirement, not yet an observed wsl.exe round trip: this
+    // reading is what tunes it), and reused by the launch that called this.
+    this.doctorClock = null;
+    if (wsl["setup.wsl"]?.state === "OPERATIVE" && wsl["setup.wsl_node"]?.state === "OPERATIVE") {
+      try {
+        this.doctorClock = await this.clockOffsetFn(this.distro);
+      } catch (e) {
+        this.doctorClock = e instanceof Error ? e : new Error(String(e));
+      }
+      mechanisms["setup.wsl_clock"] = wslClockVerdict(this.doctorClock, this.distro);
+    } else {
+      mechanisms["setup.wsl_clock"] = { state: "UNKNOWN", reason: "not measured: no usable distro with node" };
+    }
+    return { mechanisms };
   }
 
   defaultQueryVm() {
-    const r = this.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", VM_PROCESS_QUERY], { encoding: "utf8", timeout: 60000, windowsHide: true });
+    const r = this.run("powershell.exe", powershellArgv(VM_PROCESS_QUERY), { encoding: "utf8", timeout: 60000, windowsHide: true });
     if (r.error || r.status !== 0) throw new Error(`the WSL VM process query failed (${r.error?.message ?? `exit ${r.status}`})`);
     return pickVmProcess(r.stdout);
   }
@@ -188,18 +221,22 @@ export class TmuxWslAdapter extends TmuxAdapter {
       if (facts[id]?.state !== "OPERATIVE") throw new AdapterRefusal("harness_error", `${id}: ${facts[id]?.reason ?? "no verdict"}`);
     }
     this.versions.tmux = this.facts.tmux;
-    let clock;
-    try {
-      clock = await this.clockOffsetFn(this.distro);
-    } catch (e) {
-      throw new AdapterRefusal("clock_unaligned", `the WSL clock's offset from the probe's could not be measured: ${e.message}`);
+    // The offset the doctor's check just measured (check() ran above).
+    let clock = this.doctorClock;
+    if (clock instanceof Error) throw new AdapterRefusal("clock_unaligned", `the WSL clock's offset from the probe's could not be measured: ${clock.message}`);
+    if (!clock) {
+      try {
+        clock = await this.clockOffsetFn(this.distro);
+      } catch (e) {
+        throw new AdapterRefusal("clock_unaligned", `the WSL clock's offset from the probe's could not be measured: ${e.message}`);
+      }
     }
     if (clock.rttNs > MAX_CLOCK_RTT_NS) {
       throw new AdapterRefusal("clock_unaligned", `the fastest of ${clock.n} clock round trips through ${this.distro} took ${Number(clock.rttNs) / 1e6} ms, more than ${Number(MAX_CLOCK_RTT_NS) / 1e6} ms: the offset (error up to half of it) is not bounded well enough to time markers`);
     }
     // A WSL reading plus this is the host's time.
     this.clock = { addNs: -clock.offsetNs, rttNs: clock.rttNs, n: clock.n };
-    await this.wt.prepare({ runDir: ctx.runDir, shellPath: windowsPowerShellPath(this.baseEnv), signal: ctx.signal ?? null });
+    await this.wt.prepare({ runDir: ctx.runDir, shellPath: windowsPowerShellPath(this.baseEnv), signal: ctx.signal ?? null, setup: this.id, unit: basename(ctx.unitDir) });
     this.socket = `termhost-${ctx.genRunId}`;
     this.title = windowName(ctx.genRunId);
     this.unitDir = ctx.unitDir;
@@ -352,9 +389,12 @@ export class TmuxWslAdapter extends TmuxAdapter {
   }
 
   /**
-   * Re-measure the offset and compare it with the launch's: a drift beyond the
-   * two measurements' combined bound means the generators' shifted times went
-   * stale during the unit, and is an incident.
+   * Re-measure the offset (after the generators have exited, so the round trip is
+   * not taken under their load) and compare it with the launch's. `clockEnd`
+   * records the outcome: `measured` with the drift and its bound — a drift beyond
+   * the two measurements' combined bound is an incident — or `unknown` with why,
+   * when the re-measure failed or its fastest round trip exceeds
+   * MAX_CLOCK_RTT_NS (its bound would then hide a real drift).
    *
    * @returns {Promise<object | null>} the incident, or null
    */
@@ -364,14 +404,22 @@ export class TmuxWslAdapter extends TmuxAdapter {
     try {
       again = await this.clockOffsetFn(this.distro);
     } catch (e) {
-      this.clockEnd = { error: e.message };
+      this.clockEnd = { state: "unknown", reason: `the teardown re-measure failed: ${e.message}` };
       this.notes.push(`teardown: the WSL clock could not be re-measured: ${e.message}`);
+      return null;
+    }
+    if (again.rttNs > MAX_CLOCK_RTT_NS) {
+      this.clockEnd = {
+        state: "unknown",
+        rttNs: String(again.rttNs),
+        reason: `the teardown re-measure's fastest round trip took ${Number(again.rttNs) / 1e6} ms, more than ${Number(MAX_CLOCK_RTT_NS) / 1e6} ms`,
+      };
       return null;
     }
     const addNs = -again.offsetNs;
     const driftNs = addNs > this.clock.addNs ? addNs - this.clock.addNs : this.clock.addNs - addNs;
     const boundNs = clockBoundNs(this.clock.rttNs) + clockBoundNs(again.rttNs);
-    this.clockEnd = { addNs: String(addNs), rttNs: String(again.rttNs), driftNs: String(driftNs), boundNs: String(boundNs) };
+    this.clockEnd = { state: "measured", addNs: String(addNs), rttNs: String(again.rttNs), driftNs: String(driftNs), boundNs: String(boundNs) };
     if (driftNs <= boundNs) return null;
     return incident("harness_error", `the WSL clock offset drifted ${Number(driftNs) / 1e6} ms during the unit (bound ${Number(boundNs) / 1e6} ms): this unit's tmux-wsl latencies carry that much more error`, { data: { setup: "tmux-wsl", distro: this.distro, launch_add_ns: String(this.clock.addNs), teardown_add_ns: String(addNs) } });
   }
@@ -380,8 +428,6 @@ export class TmuxWslAdapter extends TmuxAdapter {
     const closed = [];
     const survivors = [];
     const incidents = [];
-    const drift = await this.recheckClock();
-    if (drift) incidents.push(drift);
     // 1. The generators leave on the stop file (read back inside the distro).
     if (this.ctx?.genRunId && this.distro) {
       const deadline = Date.now() + this.generatorWaitMs;
@@ -391,6 +437,9 @@ export class TmuxWslAdapter extends TmuxAdapter {
         await this.sleep(1000);
       }
     }
+    // 1b. The clock, re-measured without the generators' load.
+    const drift = await this.recheckClock();
+    if (drift) incidents.push(drift);
     // 2. The private server, by its socket only.
     if (this.socket && this.distro) {
       const res = this.tmux(["kill-server"], { allowFail: true });

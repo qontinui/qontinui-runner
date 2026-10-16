@@ -10,6 +10,12 @@
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 
+import { powershellArgv } from "./proc.mjs";
+
+/** The video controllers, read-only, as compact JSON. */
+export const GPU_QUERY =
+  "Get-CimInstance Win32_VideoController | ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DriverVersion } } | ConvertTo-Json -Compress";
+
 const MIB = 1024 * 1024;
 
 /** Machine-wide CPU busy share (% of all logical cores) between two `os.cpus()` reads. */
@@ -56,12 +62,7 @@ export function detectGpu({ platform = process.platform, run = spawnSync } = {})
   }
   const res = run(
     "powershell.exe",
-    [
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      "Get-CimInstance Win32_VideoController | ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DriverVersion } } | ConvertTo-Json -Compress",
-    ],
+    powershellArgv(GPU_QUERY),
     { encoding: "utf8", windowsHide: true, timeout: 30000 },
   );
   if (res.status !== 0 || !res.stdout) {

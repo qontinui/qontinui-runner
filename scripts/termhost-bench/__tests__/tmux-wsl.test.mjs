@@ -21,12 +21,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AdapterRefusal } from "../adapters/index.mjs";
-import { CLOCK_OFFSET_ENV, CLOCK_ROUNDS, MAX_CLOCK_RTT_NS, TmuxWslAdapter, WSL_FLAG_SCAN, attachCommand, samplerArgv } from "../adapters/tmux-wsl.mjs";
+import { CLOCK_OFFSET_ENV, CLOCK_ROUNDS, MAX_CLOCK_RTT_NS, TmuxWslAdapter, wslClockVerdict, WSL_FLAG_SCAN, attachCommand, samplerArgv } from "../adapters/tmux-wsl.mjs";
 import { REQUIRED_FILES, WT_PIN, wtBuildFor } from "../adapters/windows-terminal-install.mjs";
 import { blockingMechanisms, mapDoctor } from "../doctor.mjs";
 import { desktopVerdict, startWindowsDesktop } from "../envs/windows-desktop.mjs";
-import { CLOCK_OFFSET_ENV as GEN_OFFSET_ENV, clockOffsetFromEnv, createRealClock } from "../generator/ai-session.mjs";
-import { computeRowKpis, indexGenerators } from "../kpis.mjs";
+import { CLOCK_OFFSET_ENV as GEN_OFFSET_ENV, clockOffsetFromEnv, createRealClock, runVirtual } from "../generator/ai-session.mjs";
+import { computeRowKpis, generatorWindow, indexGenerators } from "../kpis.mjs";
+import { loadProfile } from "../profile.mjs";
 import { generatorArgv } from "../rundir.mjs";
 import {
   CLOCK_ECHO_SCRIPT,
@@ -216,9 +217,11 @@ function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, clo
       if (inner[0] === "node" && inner[2] === WSL_FLAG_SCAN) return { status: 0, stdout: scan(inner.slice(4)) };
       return { status: 0, stdout: "" };
     }
-    if (cmd === "powershell.exe" && args.at(-1) === VM_PROCESS_QUERY) return { status: 0, stdout: '{"p":9100,"n":"vmmemWSL","t":"3"}' };
-    // the unpack
-    const dest = opts?.env?.TERMHOST_UNPACK_DEST ?? args[args.indexOf("-C") + 1];
+    const script = cmd === "powershell.exe" && args.at(-2) === "-EncodedCommand" ? Buffer.from(args.at(-1), "base64").toString("utf16le") : null;
+    if (script === VM_PROCESS_QUERY) return { status: 0, stdout: '{"p":9100,"n":"vmmemWSL","t":"3"}' };
+    // the unpack — and nothing else: an unrecognised command is a test bug, never a write into the cwd
+    const dest = opts?.env?.TERMHOST_UNPACK_DEST ?? (args.includes("-C") ? args[args.indexOf("-C") + 1] : null);
+    if (!dest) throw new Error(`rig: unexpected command ${cmd} ${args.slice(0, 3).join(" ")}`);
     mkdirSync(join(dest, build.topDir), { recursive: true });
     for (const f of REQUIRED_FILES) writeFileSync(join(dest, build.topDir, f), f === "TerminalApp.dll" ? "--sessionId" : "x");
     return { status: 0, stdout: "" };
@@ -249,8 +252,9 @@ function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, clo
     wslFacts: () => wslFacts ?? { list: [{ name: "Ubuntu", isDefault: true, state: "Running", version: 2 }], tmux: "tmux 3.4", node: "v22.11.0", clkTck: "100", bash: true },
     clockOffset: async () => {
       clockCalls += 1;
-      if (clock instanceof Error) throw clock;
-      return clockCalls > 1 && clockEnd ? clockEnd : clock;
+      const v = clockCalls > 1 && clockEnd ? clockEnd : clock;
+      if (v instanceof Error) throw v;
+      return v;
     },
     translate,
     launchTimeoutMs: 2000,
@@ -263,6 +267,20 @@ function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, clo
 
 /** The tests' paths are POSIX already; a Windows one is translated as the default automount would. */
 const translate = (p) => (isWindowsPath(p) ? toWslPath(p) : p);
+
+test("the doctor reports the measured WSL clock round trip beside the 2 ms threshold, and the launch reuses that reading", async (t) => {
+  const r = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 1_250_000n, n: 60 } });
+  const m = (await r.adapter.check()).mechanisms;
+  assert.equal(m["setup.wsl_clock"].state, "OPERATIVE");
+  assert.match(m["setup.wsl_clock"].reason, /fastest of 60 round trips through Ubuntu: 1\.25 ms \(offset bound ±0\.625 ms\); threshold 2 ms/);
+  const slow = rig(t, { clock: { offsetNs: 0n, rttNs: 3_000_000n, n: 60 } });
+  const ms = (await slow.adapter.check()).mechanisms["setup.wsl_clock"];
+  assert.equal(ms.state, "INOPERATIVE-ON-THIS-MACHINE");
+  assert.match(ms.reason, /3 ms .*refuses as clock_unaligned/);
+  assert.equal(wslClockVerdict(new Error("x"), "U").state, "UNKNOWN");
+  const noNode = rig(t, { wslFacts: { list: [{ name: "Ubuntu", isDefault: true, state: "Running", version: 2 }], tmux: "tmux 3.4", node: null } });
+  assert.equal((await noNode.adapter.check()).mechanisms["setup.wsl_clock"].state, "UNKNOWN");
+});
 
 test("tmux-wsl on Linux is the tmux setup: its doctor says so", async () => {
   const a = new TmuxWslAdapter({ platform: "linux" });
@@ -392,10 +410,36 @@ test("a group's reading: tick deltas per interval; an unreadable member makes th
   const now = new Map([[1, 110], [2, 55], [3, 4]]);
   const pss = new Map([[1, 1024], [2, 2048], [3, 1024]]);
   const g = groupReading([1, 2, 3], prev, now, pss, { dtMs: 500, clkTck: 100 });
-  assert.deepEqual([g.cpu_ms, g.cpu_pct, g.pss_mb, g.unreadable], [190, 38, 4, 0]);
+  assert.deepEqual([g.cpu_ms, g.cpu_pct, g.pss_mb, g.unreadable], [150, 30, 4, 0], "pid 3, first seen, contributes nothing");
   const bad = groupReading([1, 9], prev, now, pss, { dtMs: 500, clkTck: 100 });
   assert.deepEqual([bad.cpu_ms, bad.cpu_pct, bad.pss_mb, bad.unreadable], [null, null, null, 1]);
   assert.equal(groupReading([1], prev, now, pss, { dtMs: null, clkTck: 100 }).cpu_pct, null, "the first sample has no interval");
+});
+
+test("a process that appears mid-window adds only the ticks it spends after its first sample, not its lifetime", () => {
+  // Sample 1: generator 200 (1000 ticks). Sample 2: 200 at 1010, and 300 appears already holding 90000 ticks.
+  const key = (pid) => `${pid}:${pid === 300 ? "77" : "11"}`;
+  const s1 = new Map([["200:11", 1000]]);
+  const s2 = new Map([["200:11", 1010], ["300:77", 90000]]);
+  const s3 = new Map([["200:11", 1020], ["300:77", 90030]]);
+  const pss = new Map([[200, 1024], [300, 1024]]);
+  const first = groupReading([200, 300], s1, s2, pss, { dtMs: 500, clkTck: 100, keyOf: key });
+  assert.deepEqual([first.cpu_ms, first.cpu_pct], [100, 20], "300's 90000 lifetime ticks are not this interval's (was 180020 %)");
+  const next = groupReading([200, 300], s2, s3, pss, { dtMs: 500, clkTck: 100, keyOf: key });
+  assert.deepEqual([next.cpu_ms, next.cpu_pct], [400, 80], "from its second sample on, its delta counts");
+});
+
+test("a reused PID is a new process: its smaller tick count neither subtracts from the group nor carries the old process's ticks", () => {
+  const pss = new Map([[200, 1024], [201, 1024]]);
+  // 200 (start 11) had 5000 ticks; it exits and a new 200 (start 99) holds 3 ticks. 201 runs 10 ticks.
+  const before = new Map([["200:11", 5000], ["201:12", 100]]);
+  const after = new Map([["200:99", 3], ["201:12", 110]]);
+  const keys = { 200: "99", 201: "12" };
+  const g = groupReading([200, 201], before, after, pss, { dtMs: 500, clkTck: 100, keyOf: (pid) => `${pid}:${keys[pid]}` });
+  assert.deepEqual([g.cpu_ms, g.cpu_pct], [100, 20], "only 201's 10 ticks: the new 200 is first-seen, and nothing goes negative");
+  // Keyed by pid alone (the old behaviour) the reuse would subtract 4997 ticks from the group.
+  const byPid = groupReading([200, 201], new Map([[200, 5000], [201, 100]]), new Map([[200, 3], [201, 110]]), pss, { dtMs: 500, clkTck: 100 });
+  assert.equal(byPid.cpu_ms, 100, "and even keyed by pid, each delta is clamped on its own");
 });
 
 // ---------------------------------------------------------------------------
@@ -454,6 +498,45 @@ test("a tmux-wsl row: the samples reach cpu_pct and wsl_vm_*; without them wsl_v
   assert.equal(tmux.kpis.wsl_vm_cpu_pct.state, "not_applicable");
 });
 
+test("9P: a record gap the generator spent in its own file I/O is not producer stall (review repro gap.mjs)", () => {
+  // One session, progress every 500 ms, nothing inside the pane write; one record
+  // lands 1500 ms late because a log write blocked.
+  const points = (ioInGap) => {
+    const pts = [];
+    let t = 0n;
+    let io = 0;
+    for (let i = 0; i < 20; i += 1) {
+      pts.push({ t, blocked: 0, io, written: i * 100, scheduled: i * 100 });
+      if (i === 9) io += ioInGap;
+      t += i === 9 ? 2000n * MS : 500n * MS;
+    }
+    return pts;
+  };
+  const run = (pts) => generatorWindow(new Map([[0, { points: pts }]]), { t0: 0n, t1: pts.at(-1).t });
+  const legacy = run(points(0).map((p) => ({ ...p, io: null })));
+  assert.ok(Math.abs(legacy.stall[0] - 18.1818) < 0.001, "a generator that records no io_ns: the whole 2 s gap is stall, as before");
+  const all = run(points(2000 * 1e6));
+  assert.equal(all.stall[0], 0, "the whole gap was the generator's own log write");
+  assert.match(all.notes.join(" "), /own file I\/O inside record gaps was not counted as stall \(session 0: 2000 ms\)/);
+  const part = run(points(1500 * 1e6));
+  assert.ok(Math.abs(part.stall[0] - (500 / 11000) * 100) < 0.001, `only the 500 ms the I/O does not explain (${part.stall[0]})`);
+});
+
+test("9P end to end: a generator whose every log write takes 1.2 s records it as io_ns, and its stall stays 0, not 100 %", async () => {
+  const { profile } = loadProfile("claude-tui");
+  const r = await runVirtual({ profile, durationMs: 20000, logDelayNs: 1_200_000_000 });
+  assert.ok(r.exit.io_ns > 10e9, `io_ns ${r.exit.io_ns}`);
+  assert.equal(r.exit.blocked_ns, 0, "the pane write never blocked");
+  assert.ok(r.records.filter((x) => x.type === "progress").every((x) => Number.isFinite(x.io_ns)));
+  const g = indexGenerators(new Map([[0, r.records]])).get(0);
+  const win = { t0: g.points[1].t, t1: g.points.at(-2).t };
+  assert.deepEqual(generatorWindow(new Map([[0, g]]), win).stall, [0]);
+  const blind = { ...g, points: g.points.map((p) => ({ ...p, io: null })) };
+  assert.deepEqual(generatorWindow(new Map([[0, blind]]), win).stall, [100], "what the same records read before io_ns existed");
+  const fast = await runVirtual({ profile, durationMs: 2000 });
+  assert.equal(fast.exit.io_ns, 0, "on a virtual clock an instant log costs nothing");
+});
+
 // ---------------------------------------------------------------------------
 // windows-desktop
 // ---------------------------------------------------------------------------
@@ -489,7 +572,9 @@ test("the clock: 2 ms is the bound (±1 ms of bias at most); the fastest of many
   await steady.adapter.spawnSessions(1, steady.argv);
   const a = await steady.adapter.teardown();
   assert.deepEqual(a.incidents, []);
+  assert.equal(steady.adapter.wslSamples().clockEnd.state, "measured");
   assert.equal(steady.adapter.wslSamples().clockEnd.driftNs, "100000");
+  assert.equal(steady.adapter.wslSamples().clockEnd.boundNs, "400000");
   // Past it: an incident naming the drift.
   const drifting = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 400_000n, n: 60 }, clockEnd: { offsetNs: -9_000_000n, rttNs: 400_000n, n: 60 } });
   await drifting.adapter.launch(drifting.ctx);
@@ -498,18 +583,59 @@ test("the clock: 2 ms is the bound (±1 ms of bias at most); the fastest of many
   assert.equal(b.incidents.length, 1);
   assert.equal(b.incidents[0].kind, "harness_error");
   assert.match(b.incidents[0].detail, /drifted 2 ms during the unit \(bound 0\.4 ms\)/);
+  // A teardown round trip past the bound would hide a real drift: UNKNOWN, no incident.
+  const slow = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 400_000n, n: 60 }, clockEnd: { offsetNs: -30_000_000n, rttNs: 5_000_000n, n: 60 } });
+  await slow.adapter.launch(slow.ctx);
+  await slow.adapter.spawnSessions(1, slow.argv);
+  const c = await slow.adapter.teardown();
+  assert.deepEqual(c.incidents, []);
+  const endSlow = slow.adapter.wslSamples().clockEnd;
+  assert.equal(endSlow.state, "unknown");
+  assert.match(endSlow.reason, /fastest round trip took 5 ms, more than 2 ms/);
+  assert.equal(endSlow.driftNs, undefined, "no drift figure from an unbounded re-measure");
+  // A failed re-measure is UNKNOWN too.
+  const failing = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 400_000n, n: 60 }, clockEnd: new Error("node gone") });
+  await failing.adapter.launch(failing.ctx);
+  await failing.adapter.spawnSessions(1, failing.argv);
+  await failing.adapter.teardown();
+  assert.deepEqual(failing.adapter.wslSamples().clockEnd, { state: "unknown", reason: "the teardown re-measure failed: node gone" });
+});
+
+test("teardown re-measures the clock only after the generators have left", async (t) => {
+  let generatorsAlive = 2;
+  const order = [];
+  const r = rig(t, {
+    clockEnd: { offsetNs: -7_000_000n, rttNs: 400_000n, n: 60 },
+    scan: ([flag]) => {
+      if (flag !== "--termhost-bench-generator") return "";
+      order.push(`scan:${generatorsAlive}`);
+      return generatorsAlive-- > 0 ? "4300\n" : "";
+    },
+  });
+  await r.adapter.launch(r.ctx);
+  await r.adapter.spawnSessions(1, r.argv);
+  const inner = r.adapter.clockOffsetFn;
+  r.adapter.clockOffsetFn = async (d) => (order.push("clock"), inner(d));
+  r.adapter.generatorWaitMs = 5000;
+  await r.adapter.teardown();
+  const clock = order.indexOf("clock");
+  assert.ok(clock > order.indexOf("scan:0"), `the re-measure came after the scan that found no generator: ${order.join(" ")}`);
 });
 
 test("a tmux-wsl row: workload from inside the distro, the clock bound on both latencies, the 9P note on the producer KPIs", () => {
   const measured = (v) => ({ state: "measured", unit: "ms", n: 100, stats: { p50: v, p95: v, p99: v } });
   const kpis = { output_latency_ms: measured(20), input_latency_ms: measured(30), producer_stall_pct: { state: "measured", unit: "%", n: 3, stats: { mean: 1, max: 2 } }, delivered_ratio: { state: "unknown", unit: "ratio", reason: "harness_error" } };
   const records = Array.from({ length: 41 }, (_, i) => ({ type: "sample", t_ns: String(T0 + BigInt(i) * 500n * MS), dt_ms: i === 0 ? null : 500, host: { cpu_pct: 5, pss_mb: 12 }, workload: { cpu_pct: i === 0 ? null : 40, pss_mb: 300, unreadable: 0 } }));
-  const adj = wslRowAdjustments(kpis, { wslRecords: records, clockRttNs: "400000", clockEnd: { driftNs: "100000" } }, win);
+  const adj = wslRowAdjustments(kpis, { wslRecords: records, clockRttNs: "400000", clockEnd: { state: "measured", driftNs: "100000", boundNs: "400000" } }, win);
   assert.equal(adj.workload_cpu_pct.state, "measured");
   assert.equal(adj.workload_cpu_pct.stats.mean, 40);
   assert.equal(adj.workload_memory_mb.value, 300);
-  assert.match(adj.output_latency_ms.notes.at(-1), /error bound is ±0\.2 ms .*drifted 0\.1 ms by teardown/);
-  assert.match(adj.input_latency_ms.notes.at(-1), /±0\.2 ms/);
+  assert.match(adj.output_latency_ms.notes.at(-1), /error bound is ±0\.2 ms .*by teardown it drifted 0\.1 ms \(bound ±0\.4 ms\)/);
+  const unknownEnd = wslRowAdjustments(kpis, { wslRecords: records, clockRttNs: "400000", clockEnd: { state: "unknown", reason: "the teardown re-measure failed: x" } }, win);
+  assert.match(unknownEnd.output_latency_ms.notes.at(-1), /its drift by teardown is UNKNOWN \(the teardown re-measure failed: x\)/);
+  assert.match(wslRowAdjustments(kpis, { wslRecords: records, clockRttNs: "400000", clockEnd: null }, win).input_latency_ms.notes[0], /was not re-measured/);
+  assert.ok(adj.input_latency_ms.notes.some((n) => /±0\.2 ms/.test(n)), "the clock bound");
+  assert.ok(adj.input_latency_ms.notes.some((n) => /9P/.test(n) && /stdin service/.test(n)), "and the 9P delay to stdin service");
   assert.equal(kpis.output_latency_ms.notes, undefined, "the input values are not mutated");
   assert.match(adj.producer_stall_pct.notes.at(-1), /9P/);
   assert.match(adj.delivered_ratio.notes.at(-1), /9P/);

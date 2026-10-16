@@ -425,9 +425,24 @@ class GeneratorRun {
     this.session = opts.session;
     this.clock = opts.clock;
     this.write = opts.write;
-    this.log = opts.log;
+    // The generator's own file I/O — its log records and its stop-file checks —
+    // is timed apart from the pane write (`io_ns` on progress and exit records).
+    // On a host whose run directory is a network or 9P mount (tmux-wsl reaches the
+    // Windows run directory over WSL's 9P) a slow log write can hold the generator
+    // past a progress interval; the harness then subtracts this time from the gap
+    // instead of calling it producer stall.
+    this.ioNs = 0n;
+    const timed = (fn) => (...a) => {
+      const t = this.clock.nowNs();
+      try {
+        return fn(...a);
+      } finally {
+        this.ioNs += this.clock.nowNs() - t;
+      }
+    };
+    this.log = timed(opts.log);
     this.echo = opts.echo ?? false;
-    this.shouldStop = opts.shouldStop ?? (() => null);
+    this.shouldStop = timed(opts.shouldStop ?? (() => null));
     this.control = opts.control ?? createControl();
     this.t0 = this.clock.nowNs();
     this.endNs =
@@ -551,6 +566,7 @@ class GeneratorRun {
       bytes_written: st.bytesWritten,
       writes: st.writes,
       blocked_ns: Number(st.blockedNs),
+      io_ns: Number(this.ioNs),
       echo_bytes: st.echoBytes,
       queued: this.queue.length,
     });
@@ -750,6 +766,7 @@ class GeneratorRun {
       bytes_written: st.bytesWritten,
       writes: st.writes,
       blocked_ns: Number(st.blockedNs),
+      io_ns: Number(this.ioNs),
       markers: st.markers,
       echoes: st.echoes,
       echo_bytes: st.echoBytes,
@@ -799,7 +816,7 @@ function applyEvent(control, event, tNs) {
  *
  * @param {{profile: object, seed?: number, session?: number, durationMs: number,
  *   writeDelayNs?: number | bigint | ((buf: Buffer) => number | bigint),
- *   echo?: boolean, calibration?: boolean,
+ *   logDelayNs?: number | bigint, echo?: boolean, calibration?: boolean,
  *   inputs?: ({tNs: number|bigint, bytes: string|Buffer} | {tNs: number|bigint, eof: true}
  *     | {tNs: number|bigint, signal: string})[]}} opts
  * @returns {Promise<{writes: {tNs: bigint, bytes: Buffer}[], records: object[], exit: object,
@@ -811,6 +828,7 @@ export async function runVirtual({
   session = 0,
   durationMs,
   writeDelayNs = 0,
+  logDelayNs = 0,
   echo = false,
   calibration = false,
   inputs = [],
@@ -833,7 +851,11 @@ export async function runVirtual({
     runId: "virtual",
     clock,
     write,
-    log: (r) => records.push(r),
+    // `logDelayNs`: each log record takes this long to write (a slow run directory).
+    log: (r) => {
+      records.push(r);
+      if (logDelayNs) clock.advance(logDelayNs);
+    },
     echo,
     calibration,
     durationMs,
@@ -968,6 +990,10 @@ async function main(argv) {
     run_id: opts.runId,
     pid: process.pid,
     ppid: process.ppid,
+    // Whose PIDs these are: a generator inside WSL (tmux-wsl) writes Linux PIDs
+    // into a directory the Windows probe also reads, which must not take them
+    // for Windows processes.
+    platform: process.platform,
     host_terminal_id: hostTerminalIds(),
     claimed_at_ns: String(clock.nowNs()),
     argv: process.argv.slice(1),

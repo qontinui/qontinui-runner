@@ -310,6 +310,8 @@ export function indexGenerators(bySlot) {
             g.points.push({
               t,
               blocked: r.blocked_ns,
+              // The generator's own file I/O (absent from older generators).
+              io: Number.isFinite(r.io_ns) ? r.io_ns : null,
               written: r.bytes_written ?? 0,
               scheduled: r.bytes_scheduled ?? 0,
               kind: r.type,
@@ -451,6 +453,9 @@ export const RECORD_GAP_MS = 2 * PROGRESS_INTERVAL_MS;
  * ran no JavaScript: it was inside a write the host was not draining. That stretch
  * counts as blocked (to within one progress interval) whatever the counters say,
  * because a write that failed at teardown never credits its time to `blocked_ns`.
+ * The generator's own file I/O inside that stretch (`io_ns`: its log writes and
+ * stop-file checks, which on a 9P run directory can take a second) is subtracted
+ * first; it is not a pane that stopped draining.
  *
  * A session with no record at or before the window's start, or none at or after
  * its end, has no reading at all. It is returned in `silent`, and the caller makes
@@ -464,6 +469,7 @@ export function generatorWindow(gens, win) {
   const notes = [];
   const silent = [];
   const gaps = [];
+  const ioExcluded = [];
   let clamped = 0;
   const gapNs = BigInt(RECORD_GAP_MS) * NS_PER_MS;
   const spanNs = Number(win.t1 - win.t0);
@@ -477,6 +483,7 @@ export function generatorWindow(gens, win) {
     let written = 0;
     let scheduled = 0;
     let gapInWindow = 0n;
+    let ioInGaps = 0;
     for (let i = 0; i + 1 < pts.length; i += 1) {
       const a = pts[i];
       const b = pts[i + 1];
@@ -486,8 +493,13 @@ export function generatorWindow(gens, win) {
       const seg = b.t - a.t;
       const frac = Number(hi - lo) / Number(seg);
       if (seg > gapNs) {
-        blocked += Number(hi - lo);
-        gapInWindow += hi - lo;
+        // The gap minus the generator's own file I/O inside it (a slow log
+        // write on a 9P run directory is not a pane that stopped draining).
+        const io = a.io !== null && a.io !== undefined && b.io !== null && b.io !== undefined ? Math.max(0, (b.io - a.io) * frac) : 0;
+        const gapPart = Math.max(0, Number(hi - lo) - io);
+        blocked += gapPart;
+        gapInWindow += BigInt(Math.round(gapPart));
+        ioInGaps += Number(hi - lo) - gapPart;
       } else {
         blocked += (b.blocked - a.blocked) * frac;
       }
@@ -495,6 +507,7 @@ export function generatorWindow(gens, win) {
       scheduled += (b.scheduled - a.scheduled) * frac;
     }
     if (gapInWindow > 0n) gaps.push({ session, ms: nsToMs(gapInWindow) });
+    if (ioInGaps > 0) ioExcluded.push({ session, ms: ioInGaps / 1e6 });
     let pct = (blocked / spanNs) * 100;
     if (pct > 100) {
       pct = 100;
@@ -510,6 +523,12 @@ export function generatorWindow(gens, win) {
         `(${gaps.map((x) => `session ${x.session}: ${Math.round(x.ms)} ms`).join(", ")}): counted as blocked. ` +
         `Only gaps over ${RECORD_GAP_MS} ms are seen, so this is a lower bound on such stretches; each is most likely a write ` +
         "the host was not draining, but a GC pause or CPU starvation of the generator looks the same in its records",
+    );
+  }
+  if (ioExcluded.length > 0) {
+    notes.push(
+      `producer_stall_pct: the generator's own file I/O inside record gaps was not counted as stall ` +
+        `(${ioExcluded.map((x) => `session ${x.session}: ${Math.round(x.ms)} ms`).join(", ")})`,
     );
   }
   if (clamped > 0) notes.push(`producer_stall_pct: ${clamped} session stall reading(s) above 100% were clamped (a write straddling a record)`);

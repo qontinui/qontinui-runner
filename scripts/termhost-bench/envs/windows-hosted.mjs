@@ -17,6 +17,8 @@
 
 import { spawnSync } from "node:child_process";
 
+import { powershellArgv } from "../proc.mjs";
+
 export const ID = "windows-hosted";
 
 /**
@@ -68,7 +70,7 @@ export function parseScreen(stdout) {
 
 /** The primary screen, or null when it cannot be read. */
 export function readScreen({ run = spawnSync } = {}) {
-  const res = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", SCREEN_QUERY], { encoding: "utf8", windowsHide: true, timeout: 30000 });
+  const res = run("powershell.exe", powershellArgv(SCREEN_QUERY), { encoding: "utf8", windowsHide: true, timeout: 30000 });
   if (res.error || res.status !== 0) return null;
   return parseScreen(res.stdout);
 }

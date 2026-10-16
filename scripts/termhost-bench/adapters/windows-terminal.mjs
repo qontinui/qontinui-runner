@@ -51,10 +51,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, win32 } from "node:path";
+import { basename, join, win32 } from "node:path";
 
 import { WaitAborted } from "../../lib/runner-clients.mjs";
-import { carriesFlag, descendantsOf, listProcesses, terminatePid } from "../proc.mjs";
+import { carriesFlag, descendantsOf, encodePowerShell, listProcesses, powershellArgv, terminatePid } from "../proc.mjs";
 import { ptyHostCensus, ptyHostImpl } from "../ptyhost.mjs";
 import { readGeneratorLog, readSlots } from "../sessions.mjs";
 import { commandLine } from "../rundir.mjs";
@@ -404,19 +404,8 @@ export function pickWindow(windows) {
   return windows.find((w) => w.visible && w.cls === WT_WINDOW_CLASS) ?? null;
 }
 
-/**
- * `-EncodedCommand`'s argument: the script as UTF-16LE, base64. Multi-line
- * scripts (the Add-Type here-strings) travel this way, so no command-line quoting
- * layer can change them.
- */
-export function encodePowerShell(script) {
-  return Buffer.from(String(script), "utf16le").toString("base64");
-}
-
-/** Windows PowerShell's argv for `script`, encoded. */
-export function powershellArgv(script) {
-  return ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(script)];
-}
+/** Every harness script travels `-EncodedCommand` (proc.mjs); re-exported for the WSL variant. */
+export { encodePowerShell, powershellArgv };
 
 const powershell = (run, script, env) =>
   run("powershell.exe", powershellArgv(script), { encoding: "utf8", windowsHide: true, timeout: 60000, env, maxBuffer: 16 * 1024 * 1024 });
@@ -517,8 +506,10 @@ export class PortableWindowsTerminal {
    *
    * @param {{runDir: string, shellPath: string}} o
    */
-  async prepare({ runDir, shellPath, signal = null }) {
+  async prepare({ runDir, shellPath, signal = null, setup = "windows-terminal", unit = null }) {
     this.abortSignal = signal;
+    // Named in an incident this instance raises (the run loop adds no setup or unit to a refusal's).
+    this.owner = { setup, unit };
     const build = this.build();
     if (!build) throw new AdapterRefusal("harness_error", `no pinned Windows Terminal build for ${this.platform}-${this.arch}`);
     let archive;
@@ -613,7 +604,7 @@ export class PortableWindowsTerminal {
     const stale = before.filter((p) => samePath(p.exe, this.hostExe));
     if (stale.length > 0) {
       const detail = `WindowsTerminal.exe pid ${stale.map((p) => p.pid).join(", ")} is already running from ${this.hostExe} (an earlier unit's instance survived its teardown); wt.exe would hand it this unit's panes, so nothing was launched (D5)`;
-      throw new AdapterRefusal("shared_process", detail, { incident: incident("harness_error", detail, { data: { exe: this.hostExe, survivors: stale.map((p) => p.pid) } }) });
+      throw new AdapterRefusal("shared_process", detail, { incident: incident("harness_error", detail, { data: { ...this.owner, exe: this.hostExe, survivors: stale.map((p) => p.pid) } }) });
     }
     const tCmdNs = this.invoke(commands, { global: ["-M"] });
     const deadline = Date.now() + this.launchTimeoutMs;
@@ -799,7 +790,7 @@ export class WindowsTerminalAdapter {
     for (const id of ["setup.windows_terminal", "setup.windows_terminal_shell"]) {
       if (facts[id]?.state !== "OPERATIVE") throw new AdapterRefusal("harness_error", `${id}: ${facts[id]?.reason ?? "no verdict"}`);
     }
-    const r = await this.wt.prepare({ runDir: ctx.runDir, shellPath: this.shellPath, signal: ctx.signal ?? null });
+    const r = await this.wt.prepare({ runDir: ctx.runDir, shellPath: this.shellPath, signal: ctx.signal ?? null, setup: this.id, unit: basename(ctx.unitDir) });
     if (r.sessionId.supported !== true) this.notes.push(r.sessionId.detail);
     this.window = windowName(ctx.genRunId);
     return { ok: true };

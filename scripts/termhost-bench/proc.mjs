@@ -97,6 +97,22 @@ export function readLinuxProcessTable(procRoot = "/proc") {
   return table;
 }
 
+/**
+ * Windows PowerShell's argv for a script the harness runs: `-EncodedCommand`
+ * with the script as UTF-16LE base64, so no command-line quoting layer (Node's,
+ * or PowerShell's own `-Command` parsing) can change it. This is the one rule for
+ * every harness script; the only `-Command` left in the harness is the D13
+ * session shell's, whose argument is the session's own command line.
+ */
+export function encodePowerShell(script) {
+  return Buffer.from(String(script), "utf16le").toString("base64");
+}
+
+/** `["-NoProfile", "-NonInteractive", "-EncodedCommand", <script>]`. */
+export function powershellArgv(script) {
+  return ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(script)];
+}
+
 /** The PowerShell that lists `Win32_Process` as compact JSON (read-only). */
 export const WINDOWS_PROCESS_QUERY =
   "$ErrorActionPreference='Stop'; " +
@@ -114,7 +130,7 @@ export const WINDOWS_PROCESS_QUERY =
 export function readWindowsProcessTable({ run = spawnSync } = {}) {
   const res = run(
     "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROCESS_QUERY],
+    powershellArgv(WINDOWS_PROCESS_QUERY),
     { encoding: "utf8", maxBuffer: 256 * 1024 * 1024, windowsHide: true },
   );
   if (res.error) throw new Error(`process query failed: ${res.error.message}`);

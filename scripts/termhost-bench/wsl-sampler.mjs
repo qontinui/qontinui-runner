@@ -100,32 +100,37 @@ export function classify(table, { serverPid, serverStartKey = null, socket, runI
 }
 
 /**
- * One group's reading over an interval: CPU from the tick deltas of PIDs seen in
- * both samples (a PID new in this sample counts every tick it has — it started
- * inside the interval), PSS summed now.
+ * One group's reading over an interval, as `sampler.rs` reads its own: CPU from
+ * the tick deltas of processes seen in BOTH samples, keyed by (pid, start time) —
+ * a process seen for the first time contributes nothing (its lifetime CPU is not
+ * this interval's), a reused PID is a new process, and each delta is clamped at
+ * 0 on its own — and PSS summed now.
  *
  * @param {number[]} pids
- * @param {Map<number, number>} prevTicks
- * @param {Map<number, number>} nowTicks
- * @param {Map<number, number | null>} pss kB
- * @param {{dtMs: number | null, clkTck: number}} o
+ * @param {Map<string | number, number>} prevTicks ticks by `keyOf(pid)` at the previous sample
+ * @param {Map<string | number, number>} nowTicks ticks by `keyOf(pid)` now
+ * @param {Map<number, number | null>} pss kB by pid
+ * @param {{dtMs: number | null, clkTck: number, keyOf?: (pid: number) => string | number}} o
+ *   `keyOf`: the process identity, `${pid}:${startKey}` in the sampler (default: the pid)
  */
-export function groupReading(pids, prevTicks, nowTicks, pss, { dtMs, clkTck }) {
+export function groupReading(pids, prevTicks, nowTicks, pss, { dtMs, clkTck, keyOf = (pid) => pid }) {
   let ticks = 0;
   let unreadable = 0;
   let pssTotal = 0;
   for (const pid of pids) {
-    const t = nowTicks.get(pid);
+    const key = keyOf(pid);
+    const t = nowTicks.get(key);
     if (t === undefined || t === null) {
       unreadable += 1;
       continue;
     }
-    ticks += t - (prevTicks.get(pid) ?? 0);
+    const before = prevTicks.get(key);
+    if (typeof before === "number") ticks += Math.max(0, t - before);
     const kb = pss.get(pid);
     if (kb === null || kb === undefined) unreadable += 1;
     else pssTotal += kb;
   }
-  const cpuMs = dtMs === null ? null : (Math.max(0, ticks) * 1000) / clkTck;
+  const cpuMs = dtMs === null ? null : (ticks * 1000) / clkTck;
   return {
     pids,
     cpu_ms: unreadable > 0 ? null : cpuMs,
@@ -160,15 +165,15 @@ export function parseArgs(argv) {
   return o;
 }
 
-/** Read ticks and PSS for `pids` from `/proc`. */
-function readReadings(pids, procRoot) {
+/** Read ticks (by `keyOf(pid)`) and PSS (by pid) for `pids` from `/proc`. */
+function readReadings(pids, procRoot, keyOf) {
   const ticks = new Map();
   const pss = new Map();
   for (const pid of pids) {
     try {
-      ticks.set(pid, cpuTicks(readFileSync(`${procRoot}/${pid}/stat`, "utf8")));
+      ticks.set(keyOf(pid), cpuTicks(readFileSync(`${procRoot}/${pid}/stat`, "utf8")));
     } catch {
-      ticks.set(pid, null);
+      ticks.set(keyOf(pid), null);
     }
     try {
       pss.set(pid, pssKb(readFileSync(`${procRoot}/${pid}/smaps_rollup`, "utf8")));
@@ -220,15 +225,16 @@ async function main(argv) {
       break;
     }
     const all = [...c.host, ...c.workload];
-    const r = readReadings(all, "/proc");
+    const keyOf = (pid) => `${pid}:${table.get(pid)?.startKey ?? "?"}`;
+    const r = readReadings(all, "/proc", keyOf);
     const dtMs = prev ? Number(t - prev.t) / 1e6 : null;
     const prevTicks = prev?.ticks ?? new Map();
     line({
       type: "sample",
       t_ns: String(t),
       dt_ms: dtMs,
-      host: groupReading(c.host, prevTicks, r.ticks, r.pss, { dtMs, clkTck: o.clkTck }),
-      workload: groupReading(c.workload, prevTicks, r.ticks, r.pss, { dtMs, clkTck: o.clkTck }),
+      host: groupReading(c.host, prevTicks, r.ticks, r.pss, { dtMs, clkTck: o.clkTck, keyOf }),
+      workload: groupReading(c.workload, prevTicks, r.ticks, r.pss, { dtMs, clkTck: o.clkTck, keyOf }),
     });
     prev = { t, ticks: r.ticks };
     await new Promise((res) => setTimeout(res, o.intervalMs));

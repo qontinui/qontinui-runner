@@ -32,6 +32,7 @@ import { homedir } from "node:os";
 import { dirname, join, parse as parsePath, posix, resolve, win32 } from "node:path";
 
 import { WaitAborted } from "../../lib/runner-clients.mjs";
+import { powershellArgv } from "../proc.mjs";
 import { assertInside } from "../rundir.mjs";
 
 /** The pinned build. */
@@ -248,12 +249,7 @@ export function unpackCommand({ kind, archive, dest, platform = process.platform
     if (exists(tar)) return { cmd: tar, args: ["-xf", archive, "-C", dest] };
     return {
       cmd: "powershell.exe",
-      args: [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath $env:TERMHOST_UNPACK_ARCHIVE -DestinationPath $env:TERMHOST_UNPACK_DEST -Force",
-      ],
+      args: powershellArgv("$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath $env:TERMHOST_UNPACK_ARCHIVE -DestinationPath $env:TERMHOST_UNPACK_DEST -Force"),
       env: { ...env, TERMHOST_UNPACK_ARCHIVE: archive, TERMHOST_UNPACK_DEST: dest },
     };
   }
