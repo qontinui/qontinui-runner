@@ -1306,7 +1306,7 @@ test("a probe rewritten mid-run changes neither what runs nor what is recorded: 
       probeSource: "primary_shared",
       gatherDoctorFacts: async (a) => {
         doctorPaths.push(a.probePath);
-        return { ...healthyFacts(), probePath: a.probePath, probeTried: a.probeTried, probeSource: a.probeSource };
+        return { ...healthyFacts(), probePath: a.probePath, probeTried: a.probeTried, probeSource: a.probeSource, probeOriginalPath: a.probeOriginalPath };
       },
     },
   });
@@ -1330,7 +1330,7 @@ test("a probe found in the primary's shared target-agent runs DEGRADED, recorded
     deps: {
       probePath: undefined,
       locateProbe: () => ({ path: shared, source: "primary_shared", tried: [shared] }),
-      gatherDoctorFacts: async (a) => ({ ...healthyFacts(), probePath: a.probePath, probeTried: a.probeTried, probeSource: a.probeSource }),
+      gatherDoctorFacts: async (a) => ({ ...healthyFacts(), probePath: a.probePath, probeTried: a.probeTried, probeSource: a.probeSource, probeOriginalPath: a.probeOriginalPath }),
     },
   });
   assert.equal(res.doc.capabilities["probe.binary"].state, "DEGRADED");
@@ -1338,5 +1338,25 @@ test("a probe found in the primary's shared target-agent runs DEGRADED, recorded
   assert.ok(res.doc.rows.length > 0, "the run proceeded");
   assert.equal(res.doc.run.probe.source, "primary_shared");
   assert.equal(res.doc.run.probe.path, shared);
+  assert.ok(
+    res.doc.capabilities["probe.binary"].reason.startsWith(`termhost-probe at ${shared} (pinned copy ${res.doc.run.probe.executed_path}) is the primary checkout's shared build`),
+    res.doc.capabilities["probe.binary"].reason,
+  );
   assert.equal(validateResults(res.doc).valid, true);
+});
+
+test("a probe that cannot be pinned into the run directory aborts the run, before any unit (S1)", async (t) => {
+  const calls = [];
+  await assert.rejects(
+    fakeRun(t, {
+      deps: {
+        pinProbe: (src) => {
+          calls.push(src);
+          throw Object.assign(new Error(`EACCES: permission denied, copyfile '${src}'`), { code: "EACCES" });
+        },
+      },
+    }),
+    (e) => e instanceof RunAbort && /cannot pin the probe binary .+ into the run directory: EACCES/.test(e.message),
+  );
+  assert.equal(calls.length, 1);
 });

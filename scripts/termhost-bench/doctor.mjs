@@ -42,13 +42,22 @@ export const PROBE_MECHANISMS = Object.freeze([
 const v = (state, reason) => ({ state, reason });
 
 /**
+ * Where the probe is, as a doctor message names it: the original build (what
+ * "rebuild it" means), and the pinned copy the run executes when there is one.
+ */
+export function probeWhere(f) {
+  return f.probeOriginalPath && f.probeOriginalPath !== f.probePath ? `${f.probeOriginalPath} (pinned copy ${f.probePath})` : f.probePath;
+}
+
+/**
  * Facts -> verdicts. Pure.
  *
  * @param {{
  *   environment: string, envPlatform: string, envNotBuilt: string | null, platform: string,
  *   nodeVersion: string, xvfbPath?: string | null, windowManagerPath?: string | null,
  *   display?: {started: boolean, detail: string} | null,
- *   probePath: string | null, probeTried?: string[] | null, probeSource?: string | null, probeDoctor?: {record: object | null, error: string | null} | null,
+ *   probePath: string | null, probeTried?: string[] | null, probeSource?: string | null,
+ *   probeOriginalPath?: string | null, probeDoctor?: {record: object | null, error: string | null} | null,
  *   setupMechanisms?: Record<string, {state: string, reason: string}>,
  * }} f
  * @returns {Record<string, {state: string, reason: string}>}
@@ -78,17 +87,17 @@ export function mapDoctor(f) {
   } else if (!f.probePath) {
     m["probe.binary"] = v(INOPERATIVE, `termhost-probe is not built (cargo build -p termhost-probe) and no --probe was given${tried}`);
   } else if (!f.probeDoctor?.record) {
-    m["probe.binary"] = v(UNKNOWN, f.probeDoctor?.error ?? `termhost-probe at ${f.probePath} did not answer doctor`);
+    m["probe.binary"] = v(UNKNOWN, f.probeDoctor?.error ?? `termhost-probe at ${probeWhere(f)} did not answer doctor`);
   } else {
     // The probe compiles marker-golden.json in at build time; one built from
     // another commit would decode frames under different rules, silently.
     const drift = codecMismatch(f.probeDoctor.record.codec);
     if (drift.length > 0) {
-      m["probe.binary"] = v(INOPERATIVE, `termhost-probe at ${f.probePath} decodes a different codec than this harness's marker-golden.json (${drift.join("; ")}): rebuild it from this checkout`);
+      m["probe.binary"] = v(INOPERATIVE, `termhost-probe at ${probeWhere(f)} decodes a different codec than this harness's marker-golden.json (${drift.join("; ")}): rebuild it from this checkout`);
     } else if (f.probeSource === "primary_shared") {
-      m["probe.binary"] = v(DEGRADED, `termhost-probe at ${f.probePath} is the primary checkout's shared build (target-agent), built from whichever worktree built last: provenance unproven (its codec matches marker-golden.json)`);
+      m["probe.binary"] = v(DEGRADED, `termhost-probe at ${probeWhere(f)} is the primary checkout's shared build (target-agent), built from whichever worktree built last: provenance unproven (its codec matches marker-golden.json)`);
     } else {
-      m["probe.binary"] = v(OPERATIVE, `termhost-probe at ${f.probePath}`);
+      m["probe.binary"] = v(OPERATIVE, `termhost-probe at ${probeWhere(f)}`);
     }
   }
   const record = f.probeDoctor?.record ?? null;
@@ -213,6 +222,7 @@ export async function gatherDoctorFacts({
   probePath,
   probeTried = null,
   probeSource = null,
+  probeOriginalPath = null,
   adapters = [],
   envVars = null,
   display = null,
@@ -229,6 +239,7 @@ export async function gatherDoctorFacts({
     probePath,
     probeTried,
     probeSource,
+    probeOriginalPath,
     probeDoctor: null,
     display,
     setupMechanisms: {},

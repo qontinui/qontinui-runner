@@ -427,6 +427,7 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
       probePath,
       probeTried: probeFound.tried,
       probeSource: probeFound.source,
+      probeOriginalPath: probeFound.path,
       adapters: checkAdapters,
       envVars: environment.env,
       display: { started: true, detail: environment.display ?? "started" },

@@ -145,17 +145,29 @@ export function resolveProbeBinary(o = {}) {
  *
  * @param {string} src the found probe binary
  * @param {string} runDir
+ * `size` and `sha256` are the COPY's bytes (what runs); `source_mtime` is the
+ * original's mtime, read after the copy and checked unchanged across it, so all
+ * three describe the bytes that were hashed.
+ *
  * @returns {{path: string, size: number, sha256: string, source_mtime: string}}
  */
-export function pinProbe(src, runDir) {
-  const st = statSync(src);
+export function pinProbe(src, runDir, { stat = statSync } = {}) {
+  const before = stat(src);
   const dir = join(runDir, "probe-bin");
   mkdirSync(dir, { recursive: true });
   const dst = join(dir, basename(src));
   copyFileSync(src, dst);
-  chmodSync(dst, st.mode & 0o7777);
+  // copyFileSync keeps the mode on Linux already; this is belt-and-braces for
+  // platforms and filesystems that do not.
+  chmodSync(dst, before.mode & 0o7777);
+  const after = stat(src);
   const bytes = readFileSync(dst);
-  return { path: dst, size: bytes.length, sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, source_mtime: st.mtime.toISOString() };
+  // A build landing during the copy could tear it: the original must be the same
+  // file, unchanged, before and after, and the copy exactly its size.
+  if (after.mtimeMs !== before.mtimeMs || after.size !== before.size || bytes.length !== after.size) {
+    throw new Error(`${src} changed while it was being copied (size ${before.size} -> ${after.size}, copy ${bytes.length}); try again once the build is done`);
+  }
+  return { path: dst, size: bytes.length, sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, source_mtime: after.mtime.toISOString() };
 }
 
 /**

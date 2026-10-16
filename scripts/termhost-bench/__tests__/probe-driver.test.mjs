@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 
 import { WatchProcess, activate, codecMismatch, endChild, freshTag, goldenCodec, injectArgs, locateProbeBinary, pinProbe, primaryCheckoutRoot, probeCandidateList, probeCandidates, probeIdentity, raceTimeout, resolveProbeBinary, runProbe, setAside, takeRunFile, watchArgs } from "../probe.mjs";
-import { blockingMechanisms, mapDoctor } from "../doctor.mjs";
+import { blockingMechanisms, mapDoctor, probeWhere } from "../doctor.mjs";
 import { createHash } from "node:crypto";
 import { validateResults } from "../validate.mjs";
 import { linuxXvfbResults } from "./helpers/results.mjs";
@@ -300,6 +300,39 @@ test("the run pins its probe: a copy in the run directory, its sha256, the origi
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a probe rewritten WHILE it is copied is refused, not pinned half-written; size and sha256 are the copy's, mtime the original's after the copy", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-probe-torn-"));
+  try {
+    const bin = join(dir, "termhost-probe");
+    writeFileSync(bin, "probe-bytes", { mode: 0o755 });
+    let calls = 0;
+    const moving = (p) => {
+      const st = statSync(p);
+      calls += 1;
+      return calls === 1 ? st : { ...st, mode: st.mode, size: st.size, mtimeMs: st.mtimeMs + 1000, mtime: new Date(st.mtimeMs + 1000) };
+    };
+    assert.throws(() => pinProbe(bin, join(dir, "run"), { stat: moving }), /termhost-probe changed while it was being copied/);
+    const pinned = pinProbe(bin, join(dir, "run2"));
+    assert.equal(pinned.size, statSync(pinned.path).size);
+    assert.equal(pinned.source_mtime, statSync(bin).mtime.toISOString());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("doctor messages name the ORIGINAL build, with the pinned copy beside it, so 'rebuild it' points at the real build (S3)", () => {
+  const orig = "/r/primary/target-agent/release/termhost-probe";
+  const copy = "/runs/r1/probe-bin/termhost-probe";
+  assert.equal(probeWhere({ probePath: copy, probeOriginalPath: orig }), `${orig} (pinned copy ${copy})`);
+  assert.equal(probeWhere({ probePath: orig, probeOriginalPath: null }), orig, "unpinned (the doctor command): the build itself");
+  const drift = mapDoctor(doctorFacts({ probePath: copy, probeOriginalPath: orig, probeSource: "checkout", probeDoctor: { record: { codec: { ...goldenCodec(), version: 9 }, mechanisms: [] }, error: null } }));
+  assert.match(drift["probe.binary"].reason, new RegExp(`^termhost-probe at ${orig.replace(/[/.]/g, "\\$&")} \\(pinned copy ${copy.replace(/[/.]/g, "\\$&")}\\) decodes a different codec .+: rebuild it from this checkout$`));
+  const shared = mapDoctor(doctorFacts({ probePath: copy, probeOriginalPath: orig, probeSource: "primary_shared", probeDoctor: { record: { codec: goldenCodec(), mechanisms: [] }, error: null } }));
+  assert.ok(shared["probe.binary"].reason.startsWith(`termhost-probe at ${orig} (pinned copy ${copy}) is the primary checkout's shared build`), shared["probe.binary"].reason);
+  const silent = mapDoctor(doctorFacts({ probePath: copy, probeOriginalPath: orig, probeSource: "checkout", probeDoctor: null }));
+  assert.equal(silent["probe.binary"].reason, `termhost-probe at ${orig} (pinned copy ${copy}) did not answer doctor`);
 });
 
 test("a linked worktree resolves its primary checkout through git rev-parse --git-common-dir", () => {
