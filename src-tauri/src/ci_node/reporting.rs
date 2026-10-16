@@ -40,6 +40,7 @@ use std::time::Duration;
 use qontinui_ci_exec::canonical::Outcome as CanonicalOutcome;
 use qontinui_ci_exec::host::BoxFuture;
 use qontinui_ci_exec::junit::TestArtifact;
+use qontinui_ci_exec::model::ledger::{ModelLedger, ModelSection};
 use qontinui_ci_exec::report::{LogSink, Reporter, StepSummary, Verdict};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -355,6 +356,61 @@ async fn flusher_loop(
     }
 }
 
+/// The result POST's JSON body. Pure, so its wire shape is tested directly.
+///
+/// `summary.model` is ALWAYS present — ci-exec's contract
+/// (`qontinui_ci_exec::report::Verdict::model`) is that "no model access" is a
+/// stated reason, never an absent key. The ledger is a TOP-LEVEL field of its
+/// own and only when a broker ran: coord replaces an oversize `summary`
+/// wholesale, so the ledger must not live inside it.
+#[allow(clippy::too_many_arguments)]
+fn result_body(
+    conclusion: &str,
+    steps: &[StepSummary],
+    reason: Option<&str>,
+    log_tail: &str,
+    test_results: Option<&TestArtifact>,
+    canonical: Option<&CanonicalOutcome>,
+    model: &ModelSection,
+    model_ledger: Option<&ModelLedger>,
+) -> serde_json::Value {
+    let mut summary = serde_json::json!({ "steps": steps });
+    if let Some(r) = reason {
+        summary["reason"] = serde_json::Value::String(r.to_string());
+    }
+    // ALWAYS present, on every conclusion. This is what makes a green produced
+    // under a converged toolchain distinguishable from one produced at
+    // canonical, and both from one that never made the claim — coord persists
+    // `summary` with the dispatch result, so this is the surface an operator
+    // reads. Emitting it unconditionally is the point: an optional field would
+    // put the reader back to inferring a toolchain claim from an absence.
+    summary["canonical"] = match canonical {
+        Some(outcome) => outcome.to_json(),
+        None => serde_json::json!({ "status": "not_evaluated" }),
+    };
+    summary["model"] = serde_json::to_value(model)
+        .unwrap_or_else(|_| serde_json::json!({ "status": "not_evaluated" }));
+    let mut body = serde_json::json!({
+        "conclusion": conclusion,
+        "summary": summary,
+        "log_tail": log_tail,
+    });
+    if let Some(artifact) = test_results {
+        // Serialization of a `{format: &'static str, raw: String}` cannot fail;
+        // the `if let` is belt-and-braces so a future field can never turn a
+        // reportable verdict into a dropped one.
+        if let Ok(v) = serde_json::to_value(artifact) {
+            body["test_results"] = v;
+        }
+    }
+    if let Some(ledger) = model_ledger {
+        if let Ok(v) = serde_json::to_value(ledger) {
+            body["model_ledger"] = v;
+        }
+    }
+    body
+}
+
 /// POST the final result, retrying on the [`RESULT_RETRY_SECS`] schedule.
 /// `reason` adds a `reason` key next to `steps` (used for admission
 /// rejections).
@@ -388,39 +444,27 @@ pub(crate) async fn post_result(
     // as `not_evaluated` — a different statement from `not_requested`, and
     // neither of them an absence for a consumer to interpret.
     canonical: Option<&CanonicalOutcome>,
+    // The crate's `summary.model` block (always present) and its per-call
+    // ledger (`None` when no broker ran) — see [`result_body`].
+    model: &ModelSection,
+    model_ledger: Option<&ModelLedger>,
 ) {
     let url = format!(
         "{}/coord/ci/dispatches/{}/result",
         coord_base.trim_end_matches('/'),
         dispatch_id
     );
-    let mut summary = serde_json::json!({ "steps": steps });
-    if let Some(r) = reason {
-        summary["reason"] = serde_json::Value::String(r.to_string());
-    }
-    // ALWAYS present, on every conclusion. This is what makes a green produced
-    // under a converged toolchain distinguishable from one produced at
-    // canonical, and both from one that never made the claim — coord persists
-    // `summary` with the dispatch result, so this is the surface an operator
-    // reads. Emitting it unconditionally is the point: an optional field would
-    // put the reader back to inferring a toolchain claim from an absence.
-    summary["canonical"] = match canonical {
-        Some(outcome) => outcome.to_json(),
-        None => serde_json::json!({ "status": "not_evaluated" }),
-    };
-    let mut body = serde_json::json!({
-        "conclusion": conclusion,
-        "summary": summary,
-        "log_tail": log_tail,
-    });
-    if let Some(artifact) = test_results {
-        // Serialization of a `{format: &'static str, raw: String}` cannot fail;
-        // the `if let` is belt-and-braces so a future field can never turn a
-        // reportable verdict into a dropped one.
-        if let Ok(v) = serde_json::to_value(artifact) {
-            body["test_results"] = v;
-        }
-    }
+    let body = result_body(
+        conclusion,
+        steps,
+        reason,
+        log_tail,
+        test_results,
+        canonical,
+        model,
+        model_ledger,
+    );
+
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -578,6 +622,9 @@ pub(crate) fn post_cancelled_result_detached(
             // Admission rejected this before a manifest existed, so the gate
             // could not have run: `not_evaluated`.
             None,
+            // Nor the model checks.
+            &ModelSection::NotEvaluated,
+            None,
         )
         .await;
     });
@@ -629,6 +676,8 @@ impl Reporter for CoordReporter {
                 &tail,
                 verdict.test_results,
                 verdict.canonical,
+                verdict.model,
+                verdict.model_ledger,
             )
             .await;
         })
@@ -764,28 +813,67 @@ mod tests {
 
     /// The result body pins the artifact under `test_results` with exactly the
     /// two keys coord's `validate_test_artifact` reads — and the artifact is
-    /// absent from the body entirely when there is none.
+    /// absent from the body entirely when there is none. Built by the same
+    /// `result_body` the POST sends.
     #[test]
     fn result_body_carries_the_artifact_under_test_results() {
         let artifact = TestArtifact {
             format: qontinui_ci_exec::junit::FORMAT_JUNIT_XML,
             raw: "<testsuites/>".to_string(),
         };
-        let mut body = serde_json::json!({
-            "conclusion": "success",
-            "summary": {"steps": []},
-            "log_tail": "",
-        });
-        body["test_results"] = serde_json::to_value(&artifact).unwrap();
+        let body = result_body(
+            "success",
+            &[],
+            None,
+            "",
+            Some(&artifact),
+            None,
+            &ModelSection::NotRequested,
+            None,
+        );
         assert_eq!(body["test_results"]["format"], "junit_xml");
         assert_eq!(body["test_results"]["raw"], "<testsuites/>");
 
-        let without = serde_json::json!({
-            "conclusion": "success",
-            "summary": {"steps": []},
-            "log_tail": "",
-        });
+        let without = result_body(
+            "success",
+            &[],
+            None,
+            "",
+            None,
+            None,
+            &ModelSection::NotRequested,
+            None,
+        );
         assert!(without.get("test_results").is_none());
+    }
+
+    /// `summary.model` is ALWAYS present (ci-exec's contract: "no model access"
+    /// is a stated reason, never an absent key), and the ledger is a top-level
+    /// field that is absent when no broker ran. Dropping either from the POST
+    /// fails this.
+    #[test]
+    fn result_body_always_states_the_model_block() {
+        let refused = ModelSection::Refused {
+            reason: "host_has_no_broker".to_string(),
+        };
+        let body = result_body("success", &[], None, "", None, None, &refused, None);
+        assert_eq!(body["summary"]["model"]["status"], "refused");
+        assert_eq!(body["summary"]["model"]["reason"], "host_has_no_broker");
+        assert!(body.get("model_ledger").is_none());
+        assert!(body["summary"].get("model_ledger").is_none());
+
+        let admission = result_body(
+            "cancelled",
+            &[],
+            Some("disk_floor"),
+            "",
+            None,
+            None,
+            &ModelSection::NotEvaluated,
+            None,
+        );
+        assert_eq!(admission["summary"]["model"]["status"], "not_evaluated");
+        assert_eq!(admission["summary"]["canonical"]["status"], "not_evaluated");
     }
 
     #[test]

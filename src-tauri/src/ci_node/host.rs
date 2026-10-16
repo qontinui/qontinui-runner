@@ -160,6 +160,14 @@ impl ProcessSpawn for RunnerProcess {
     fn std_command(&self, program: &str) -> std::process::Command {
         crate::process_helpers::no_window(program)
     }
+    /// The runner's login passwords: never inherited by a CI step, exactly as
+    /// they are never inherited by a session child (`terminal` scrubs the same
+    /// list). A manifest step has no business reading the operator's
+    /// credentials, and ci-exec removes these before applying the step's own
+    /// env.
+    fn scrubbed_env(&self) -> &'static [&'static str] {
+        crate::terminal::CREDENTIAL_VALUE_ENV_VARS
+    }
     fn arm_tree(&self, cmd: &mut tokio::process::Command) {
         ChildTreeGuard::arm_tokio(cmd);
     }
@@ -456,6 +464,15 @@ mod tests {
     /// ci-exec builds every process through this method, manifest STEP
     /// commands included (qontinui-schemas#242, c98b5258, which ports
     /// 238439693). A bare `Command::new` fails this.
+    /// CI steps lose the runner's login passwords, the same list a session
+    /// child loses. An empty override (the trait default) fails this.
+    #[test]
+    fn ci_steps_are_scrubbed_of_the_runner_credentials() {
+        let scrubbed = RunnerProcess.scrubbed_env();
+        assert!(!scrubbed.is_empty());
+        assert_eq!(scrubbed, crate::terminal::CREDENTIAL_VALUE_ENV_VARS);
+    }
+
     #[test]
     fn a_git_command_is_scrubbed_of_the_repo_local_env() {
         let cmd = RunnerProcess.command("git");
