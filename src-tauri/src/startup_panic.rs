@@ -66,10 +66,12 @@ pub fn resolve_log_dir() -> PathBuf {
             return PathBuf::from(custom);
         }
     }
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-runner")
-        .join("dev-logs")
+    qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("qontinui-runner")
+    .join("dev-logs")
 }
 
 /// Full path to the panic log file.

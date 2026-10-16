@@ -449,7 +449,7 @@ struct CachedOverrides {
 /// Absolute path of the override cache for this runner instance, or `None`
 /// when the platform has no config dir.
 fn cache_path() -> Option<PathBuf> {
-    let base = dirs::config_dir()?.join("com.qontinui.runner");
+    let base = qontinui_runner_lib::instance_env::runner_config_base()?;
     Some(crate::instance::scope_path(&base).join(CACHE_FILE))
 }
 
