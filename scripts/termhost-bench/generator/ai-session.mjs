@@ -42,6 +42,8 @@
  *             and every stop-file check — as it stood BEFORE this record's own write)
  *             and io_after_prev_ns (io_ns right AFTER the previous start/progress
  *             record's own write: a record cannot carry its own, the next one does)
+ *             with prev_t_ns, that record's time (t_ns; t0_ns for the start record),
+ *             so a reader can tell whether the record it holds IS that one
  *   resize    the pane size the host gave the session, as it changes
  *   exit      reason and final counters (blocked_ns, io_ns among them)
  *
@@ -463,6 +465,8 @@ class GeneratorRun {
     this.io = opts.io ?? createIoTimer(this.clock);
     // The I/O total right after the last start/progress record's own write.
     this.ioAfterPoint = 0n;
+    // The t of that record (its t_ns; the start record's t0_ns).
+    this.prevPointT = null;
     this.log = this.io.wrap(opts.log);
     this.echo = opts.echo ?? false;
     this.shouldStop = this.io.wrap(opts.shouldStop ?? (() => null));
@@ -516,6 +520,7 @@ class GeneratorRun {
       ...(opts.startExtra ?? {}),
     });
     this.ioAfterPoint = this.io.ns();
+    this.prevPointT = String(this.t0);
   }
 
   /** One blocking write, timed on both sides; the time inside it is producer stall. */
@@ -592,11 +597,14 @@ class GeneratorRun {
       blocked_ns: Number(st.blockedNs),
       io_ns: Number(this.io.ns()),
       io_after_prev_ns: Number(this.ioAfterPoint),
+      prev_t_ns: this.prevPointT,
       echo_bytes: st.echoBytes,
       queued: this.queue.length,
     });
-    // A record cannot carry the I/O total after its own write; the next one does.
+    // A record cannot carry the I/O total after its own write; the next one does,
+    // with the time of the record it refers to (prev_t_ns).
     this.ioAfterPoint = this.io.ns();
+    this.prevPointT = String(now);
   }
 
   pollStop(now) {
@@ -795,6 +803,7 @@ class GeneratorRun {
       blocked_ns: Number(st.blockedNs),
       io_ns: Number(this.io.ns()),
       io_after_prev_ns: Number(this.ioAfterPoint),
+      prev_t_ns: this.prevPointT,
       markers: st.markers,
       echoes: st.echoes,
       echo_bytes: st.echoBytes,

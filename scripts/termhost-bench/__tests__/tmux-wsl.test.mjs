@@ -759,7 +759,7 @@ test("producer_stall_pct at a window edge: only the I/O that cannot fit outside 
   const r = generatorWindow(new Map([[0, { points: pts }]]), { t0: 1000n * MS, t1: 6000n * MS });
   assert.equal(r.stall[0], 30, "the 1500 ms pane block in a 5000 ms window — not 18 %, from spreading the I/O evenly");
   // The same with a's own write placed (io_after_prev_ns): still 30 %.
-  const placed = pts.map((p) => (p.t === 2500n * MS ? { ...p, ioAfterPrev: 1000e6 } : p));
+  const placed = pts.map((p) => (p.t === 2500n * MS ? { ...p, ioAfterPrev: 1000e6, prevT: 0n } : p));
   assert.equal(generatorWindow(new Map([[0, { points: placed }]]), { t0: 1000n * MS, t1: 6000n * MS }).stall[0], 30);
   // The I/O could all fall in the window: a gap wholly inside it still subtracts all of it.
   const whole = generatorWindow(new Map([[0, { points: pts }]]), { t0: -2000n * MS, t1: 6000n * MS });
@@ -772,8 +772,8 @@ test("producer_stall_pct at a window END: record a's own write is placed exactly
   const pts = (ioAfterPrev) => {
     const out = [];
     for (let t = -1000n * MS; t <= 3500n * MS; t += 500n * MS) out.push({ t, blocked: 0, io: 0, ioAfterPrev: 0, written: 0, scheduled: 0 });
-    out.push({ t: 5500n * MS, blocked: 0, io: 1200e6, ioAfterPrev, written: 0, scheduled: 0 });
-    out.push({ t: 6000n * MS, blocked: 0, io: 1200e6, ioAfterPrev: 1200e6, written: 0, scheduled: 0 });
+    out.push({ t: 5500n * MS, blocked: 0, io: 1200e6, ioAfterPrev, prevT: 3500n * MS, written: 0, scheduled: 0 });
+    out.push({ t: 6000n * MS, blocked: 0, io: 1200e6, ioAfterPrev: 1200e6, prevT: 5500n * MS, written: 0, scheduled: 0 });
     return out;
   };
   const r = generatorWindow(new Map([[0, { points: pts(1200e6) }]]), { t0: 0n, t1: 5000n * MS });
@@ -793,8 +793,8 @@ test("I/O on BOTH sides of a blocked pane write: the record's own write is place
   const pts = (ioAfterPrev) => {
     const out = [];
     for (let t = -1000n * MS; t <= 3500n * MS; t += 500n * MS) out.push({ t, blocked: 0, io: 0, ioAfterPrev: 0, written: 0, scheduled: 0 });
-    out.push({ t: 6200n * MS, blocked: 0, io: 1200e6, ioAfterPrev, written: 0, scheduled: 0 });
-    out.push({ t: 6700n * MS, blocked: 0, io: 1200e6, ioAfterPrev: 1200e6, written: 0, scheduled: 0 });
+    out.push({ t: 6200n * MS, blocked: 0, io: 1200e6, ioAfterPrev, prevT: 3500n * MS, written: 0, scheduled: 0 });
+    out.push({ t: 6700n * MS, blocked: 0, io: 1200e6, ioAfterPrev: 1200e6, prevT: 6200n * MS, written: 0, scheduled: 0 });
     return out;
   };
   const win = { t0: 0n, t1: 5000n * MS };
@@ -805,9 +805,9 @@ test("I/O on BOTH sides of a blocked pane write: the record's own write is place
   assert.equal(unplaced.stall[0], 30, "all 1200 ms of unplaced I/O fits in the 1200 ms of the gap outside the window");
   // gapIoInWindow directly: the own write's overlap plus the rest's unavoidable part.
   const a = { t: 3500n * MS, io: 0 };
-  assert.equal(gapIoInWindow(a, { t: 6200n * MS, io: 1200e6, ioAfterPrev: 600e6 }, 3500n * MS, 5000n * MS), 600e6);
+  assert.equal(gapIoInWindow(a, { t: 6200n * MS, io: 1200e6, ioAfterPrev: 600e6, prevT: 3500n * MS }, 3500n * MS, 5000n * MS), 600e6);
   assert.equal(gapIoInWindow(a, { t: 6200n * MS, io: 1200e6, ioAfterPrev: null }, 3500n * MS, 5000n * MS), 0);
-  assert.equal(gapIoInWindow(a, { t: 6200n * MS, io: 1200e6, ioAfterPrev: 5000e6 }, 3500n * MS, 5000n * MS), 0, "an io_after_prev_ns outside [a.io, b.io] is ignored");
+  assert.equal(gapIoInWindow(a, { t: 6200n * MS, io: 1200e6, ioAfterPrev: 5000e6, prevT: 3500n * MS }, 3500n * MS, 5000n * MS), 0, "an io_after_prev_ns outside [a.io, b.io] is ignored");
   assert.equal(gapIoInWindow({ t: 0n, io: null }, { t: 2500n * MS, io: 9 }, 0n, 2500n * MS), 0, "no io_ns: nothing subtracted");
 });
 
@@ -818,9 +818,40 @@ test("the generator writes io_after_prev_ns: the I/O total right after the previ
   assert.ok(progress.length >= 3);
   for (let i = 1; i < progress.length; i += 1) {
     assert.equal(progress[i].io_after_prev_ns, progress[i - 1].io_ns + 50_000_000, `record ${i}: the previous record's io_ns plus its own 50 ms write`);
+    assert.equal(progress[i].prev_t_ns, progress[i - 1].t_ns, `record ${i} names the record it refers to`);
     assert.ok(progress[i].io_after_prev_ns <= progress[i].io_ns);
   }
   assert.equal(r.exit.io_after_prev_ns, progress.at(-1).io_ns + 50_000_000);
+  assert.equal(r.exit.prev_t_ns, progress.at(-1).t_ns);
+  assert.equal(progress[0].prev_t_ns, r.records.find((x) => x.type === "start").t0_ns, "the first refers to the start record (its t0_ns, the start point's t)");
   const g = indexGenerators(new Map([[0, r.records]])).get(0);
-  assert.ok(g.points.filter((p) => p.kind === "progress").every((p) => Number.isFinite(p.ioAfterPrev)), "kpis carries it through");
+  assert.ok(g.points.filter((p) => p.kind === "progress").every((p) => Number.isFinite(p.ioAfterPrev) && typeof p.prevT === "bigint"), "kpis carries both through");
+  // In the indexed points, every progress/exit point's prevT is the point before it.
+  for (let i = 1; i < g.points.length; i += 1) assert.equal(g.points[i].prevT, g.points[i - 1].t, `point ${i}`);
+});
+
+test("a record dropped between a and b (malformed line, refused point): io_after_prev_ns then refers to it, so a's write is not placed and the stall is not hidden (review repro p5-dropped.mjs)", async () => {
+  // a at 0 (own write 1 ms); pane blocked to 1000; m at 1000 (its own write 400 ms), DROPPED;
+  // pane blocked again to 2000; b at 2000, whose io_after_prev_ns/prev_t_ns refer to m.
+  const a = { t: 0n, io: 0 };
+  const b = { t: 2000n * MS, io: 401e6, ioAfterPrev: 401e6, prevT: 1000n * MS };
+  assert.equal(gapIoInWindow(a, b, 0n, 900n * MS), 0, "m's write is not placed at [a.t, ...]: the window's 899 ms of stall stays");
+  // Had b been a's direct successor, a's 1 ms write would be placed.
+  assert.equal(gapIoInWindow(a, { ...b, ioAfterPrev: 1e6, prevT: 0n }, 0n, 900n * MS), 1e6);
+  // End to end through parseJsonl / indexGenerators: drop m's line from a real generator log.
+  const { profile } = loadProfile("claude-tui");
+  const r = await runVirtual({ profile, durationMs: 5000, logDelayNs: 20_000_000 });
+  const progress = r.records.filter((x) => x.type === "progress");
+  const dropped = progress[2];
+  const kept = r.records.filter((x) => x !== dropped);
+  const g = indexGenerators(new Map([[0, kept]])).get(0);
+  const i = g.points.findIndex((p) => p.t === BigInt(progress[3].t_ns));
+  assert.notEqual(g.points[i].prevT, g.points[i - 1].t, "the point after the gap names a record that is not there");
+  // A window that ends halfway through the gap (the case where placement matters).
+  const lo = g.points[i - 1].t;
+  const hi = lo + (g.points[i].t - lo) / 2n;
+  const withPlace = gapIoInWindow(g.points[i - 1], { ...g.points[i], prevT: g.points[i - 1].t }, lo, hi);
+  const guarded = gapIoInWindow(g.points[i - 1], g.points[i], lo, hi);
+  assert.ok(withPlace > 0, "the dropped record's write would have been placed at the gap's start");
+  assert.ok(guarded < withPlace, "the guard subtracts less: what is not provably a's own write stays stall");
 });

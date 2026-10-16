@@ -313,6 +313,7 @@ export function indexGenerators(bySlot) {
               // The generator's own file I/O (absent from older generators).
               io: Number.isFinite(r.io_ns) ? r.io_ns : null,
               ioAfterPrev: Number.isFinite(r.io_after_prev_ns) ? r.io_after_prev_ns : null,
+              prevT: toNs(r.prev_t_ns),
               written: r.bytes_written ?? 0,
               scheduled: r.bytes_scheduled ?? 0,
               kind: r.type,
@@ -446,30 +447,15 @@ export const PROGRESS_INTERVAL_MS = 500;
 export const RECORD_GAP_MS = 2 * PROGRESS_INTERVAL_MS;
 
 /**
- * Per session over the window: producer stall (share of wall time blocked inside
- * `write`), delivered ratio and bytes written. Each counter is integrated over the
- * record-to-record segments that overlap the window, linearly within a segment.
- *
- * A segment longer than {@link RECORD_GAP_MS} is a stretch in which the generator
- * ran no JavaScript: it was inside a write the host was not draining. That stretch
- * counts as blocked (to within one progress interval) whatever the counters say,
- * because a write that failed at teardown never credits its time to `blocked_ns`.
- * The generator's own file I/O inside that stretch (`io_ns`: its log writes and
- * stop-file checks, which on a 9P run directory can take a second) is subtracted
- * first; it is not a pane that stopped draining.
- *
- * A session with no record at or before the window's start, or none at or after
- * its end, has no reading at all. It is returned in `silent`, and the caller makes
- * the KPIs unknown: dropping it would shrink the sample to the sessions that kept
- * running, which is the opposite of what happened.
- */
-/**
  * The generator's own file I/O inside the window's part [lo, hi] of the record
  * gap a -> b, in ns, placed only where the records place it:
  *
  *   - record a's OWN log write is known exactly: a carries io_ns from before it,
  *     b carries io_after_prev_ns from after it, so it occupies
- *     [a.t, a.t + (b.ioAfterPrev - a.io)] and its overlap with [lo, hi] counts;
+ *     [a.t, a.t + (b.ioAfterPrev - a.io)] and its overlap with [lo, hi] counts —
+ *     but only when b's prev_t_ns IS a.t: if a record between them was dropped
+ *     (a malformed line, a point indexGenerators refused), io_after_prev_ns
+ *     refers to that record and would carry its write too;
  *   - the rest of the gap's I/O (marker records written after a blocked pane
  *     write, stop-file checks, resize records) has no known place, so only the
  *     part that cannot fit in the gap outside the window counts inside it.
@@ -490,7 +476,8 @@ export function gapIoInWindow(a, b, lo, hi) {
   const [l, h] = [Number(lo), Number(hi)];
   const overlap = (x0, x1) => Math.max(0, Math.min(h, x1) - Math.max(l, x0));
   // Record a's own write, when b says where it ended.
-  const own = num(b.ioAfterPrev) && b.ioAfterPrev >= a.io && b.ioAfterPrev <= b.io ? Math.min(b.ioAfterPrev - a.io, bt - at) : 0;
+  const predecessor = typeof b.prevT === "bigint" && b.prevT === a.t;
+  const own = predecessor && num(b.ioAfterPrev) && b.ioAfterPrev >= a.io && b.ioAfterPrev <= b.io ? Math.min(b.ioAfterPrev - a.io, bt - at) : 0;
   const ownIn = overlap(at, at + own);
   // The rest, somewhere in [a.t + own, b.t]: only what cannot fit outside the window.
   const restStart = at + own;
@@ -501,6 +488,24 @@ export function gapIoInWindow(a, b, lo, hi) {
   return ownIn + restIn;
 }
 
+/**
+ * Per session over the window: producer stall (share of wall time blocked inside
+ * `write`), delivered ratio and bytes written. Each counter is integrated over the
+ * record-to-record segments that overlap the window, linearly within a segment.
+ *
+ * A segment longer than {@link RECORD_GAP_MS} is a stretch in which the generator
+ * ran no JavaScript: it was inside a write the host was not draining. That stretch
+ * counts as blocked (to within one progress interval) whatever the counters say,
+ * because a write that failed at teardown never credits its time to `blocked_ns`.
+ * The generator's own file I/O inside that stretch (`io_ns`: its log writes and
+ * stop-file checks, which on a 9P run directory can take a second) is subtracted
+ * first; it is not a pane that stopped draining.
+ *
+ * A session with no record at or before the window's start, or none at or after
+ * its end, has no reading at all. It is returned in `silent`, and the caller makes
+ * the KPIs unknown: dropping it would shrink the sample to the sessions that kept
+ * running, which is the opposite of what happened.
+ */
 export function generatorWindow(gens, win) {
   const stall = [];
   const delivered = [];
