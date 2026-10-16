@@ -418,8 +418,10 @@ impl ClaudeSession {
             // tenant `AiCoordRegistrar` stamped them with, looked up by this
             // spawn's own id, then by the owning task run's id (a workflow
             // phase session's id is suffixed; the run is what registered).
-            // Neither registered yet, or no tenant recorded: the registrar's
-            // own resolver. `None` on an unresolvable or unpaired machine.
+            // Neither registered yet, or no tenant recorded: resolve it as
+            // a registration would, from the workspace and the repo in this
+            // spawn's working directory (plan 2026-09-20 Phase 5). A REFUSED
+            // decision skips federation rather than federating the default.
             crate::claude_session::coord_register::federation_session_tenant(
                 tauri::Manager::try_state::<
                     std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
@@ -431,6 +433,11 @@ impl ClaudeSession {
                     None,
                     session_ctx.as_ref(),
                 ),
+                || {
+                    Self::block_on_async(crate::session::resolve_new_session_tenant_in(Some(
+                        std::path::Path::new(working_dir),
+                    )))
+                },
             ),
         ) {
             Ok(ctx) => Some(ctx),
