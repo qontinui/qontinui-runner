@@ -4099,12 +4099,18 @@ fn redact_code_metadata(body: &[u8]) -> Vec<u8> {
 fn branch_worktree_path(repo: &str, branch: &str) -> Option<String> {
     // No console window on Windows, no inherited GIT_DIR redirecting it, and
     // a credential prompt fails rather than blocks.
-    let out = crate::process_helpers::scrubbed_git(std::ffi::OsStr::new("git"))
-        .arg("-C")
+    let mut cmd = crate::process_helpers::scrubbed_git(std::ffi::OsStr::new("git"));
+    cmd.arg("-C")
         .arg(repo)
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .output()
-        .ok()?;
+        .args(["worktree", "list", "--porcelain", "-z"]);
+    // Bounded: a relay read runs this per request, and an untimed wait on a
+    // hung git would park a blocking-pool thread forever.
+    let out = crate::process_helpers::output_with_timeout_labeled(
+        cmd,
+        std::time::Duration::from_secs(20),
+        "backend_relay: git worktree list",
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
