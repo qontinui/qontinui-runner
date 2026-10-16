@@ -309,6 +309,12 @@ impl Model {
         self.first_seen.get(&(source, marker)).copied()
     }
 
+    /// A primary frame was captured at some `t` with `from <= t < to`.
+    pub fn primary_frame_within(&self, from: u64, to: u64) -> bool {
+        let n = self.primary_frames.partition_point(|&f| f < from);
+        self.primary_frames.get(n).is_some_and(|&f| f < to)
+    }
+
     pub fn frames_of(&self, source: SourceId) -> u64 {
         self.frame_counts.get(&source).copied().unwrap_or(0)
     }
