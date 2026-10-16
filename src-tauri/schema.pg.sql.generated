@@ -28744,6 +28744,20 @@ CREATE INDEX idx_route_serving_observations_drift_status ON coord.route_serving_
 
 
 --
+-- Name: idx_route_serving_observations_host_path_method_observed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_route_serving_observations_host_path_method_observed ON coord.route_serving_observations USING btree (host, route_path, method, observed_at DESC);
+
+
+--
+-- Name: INDEX idx_route_serving_observations_host_path_method_observed; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON INDEX coord.idx_route_serving_observations_host_path_method_observed IS 'Serves the per-(host, route_path, method) latest reader of route_serving_observer (DISTINCT ON (route_path, method) for one host, ORDER BY route_path, method, observed_at DESC) and the table_retention latest-row guard keyed on (host, route_path, method), so both stay index-served once rows carry a method. Plan 2026-09-25-route-serving-observer-probes-mutating-routes-with-their-documented-verb, Phase 4. Hand-authored by alembic revision route_serving_method_idx_01.';
+
+
+--
 -- Name: idx_route_serving_observations_host_path_observed; Type: INDEX; Schema: coord; Owner: -
 --
 
