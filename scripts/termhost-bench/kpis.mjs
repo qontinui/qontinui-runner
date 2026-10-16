@@ -45,7 +45,7 @@
 import { KPI_CATALOG, REASON_CODES, getKpi, minSamplesForStatistic } from "./kpi-catalog.mjs";
 import { SEQ_MODULUS } from "./marker.mjs";
 import { measureKpi, notApplicableKpi, slope, unknownKpi } from "./stats.mjs";
-import { vmKpis, wslHostKpis } from "./wsl.mjs";
+import { vmKpis, wslHostKpis, wslRowAdjustments } from "./wsl.mjs";
 
 const NS_PER_MS = 1_000_000n;
 const MIB = 1024 * 1024;
@@ -1434,6 +1434,8 @@ export function computeRowKpis(p) {
         : notApplicableKpi(id, "not_applicable_to_setup"),
     );
   }
+  // tmux-wsl: workload from inside the distro, the clock bound, the 9P note (wsl.mjs).
+  if (p.setupId === "tmux-wsl") for (const [id, v] of Object.entries(wslRowAdjustments(kpis, p.wsl ?? null, win))) set(id, v);
   // Document-level KPIs (filled by results.mjs once every row exists).
   for (const k of KPI_CATALOG) {
     if (k.degradation_of) set(k.id, unknownKpi(k.id, "no_baseline_level"));

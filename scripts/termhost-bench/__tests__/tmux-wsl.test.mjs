@@ -14,13 +14,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AdapterRefusal } from "../adapters/index.mjs";
-import { CLOCK_OFFSET_ENV, MAX_CLOCK_RTT_NS, TmuxWslAdapter, WSL_FLAG_SCAN, attachCommand, samplerArgv } from "../adapters/tmux-wsl.mjs";
+import { CLOCK_OFFSET_ENV, CLOCK_ROUNDS, MAX_CLOCK_RTT_NS, TmuxWslAdapter, WSL_FLAG_SCAN, attachCommand, samplerArgv } from "../adapters/tmux-wsl.mjs";
 import { REQUIRED_FILES, WT_PIN, wtBuildFor } from "../adapters/windows-terminal-install.mjs";
 import { blockingMechanisms, mapDoctor } from "../doctor.mjs";
 import { desktopVerdict, startWindowsDesktop } from "../envs/windows-desktop.mjs";
@@ -43,11 +44,17 @@ import {
   wslGeneratorArgv,
   wslHostKpis,
   wslInvocation,
+  wslRowAdjustments,
 } from "../wsl.mjs";
+import { NeutralityGuard } from "../neutrality.mjs";
+import { machineBlock } from "../machine.mjs";
+import { runBench } from "../run.mjs";
+import { validateResults } from "../validate.mjs";
+import { incident } from "../results.mjs";
 import { classify, cpuTicks, groupReading, parseArgs as samplerParseArgs, pssKb } from "../wsl-sampler.mjs";
 import { MS, genLog, operativeCapabilities, watchSegment } from "./helpers/bench-fixtures.mjs";
 import { createFakeWt } from "./helpers/fake-wt.mjs";
-import { healthyFacts } from "./helpers/fake-bench.mjs";
+import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
 
 const WIN_ENV = { SystemRoot: "C:\\Windows", PATH: "C:\\Windows\\System32", LOCALAPPDATA: "C:\\Users\\bench\\AppData\\Local" };
 const INOP = "INOPERATIVE-ON-THIS-MACHINE";
@@ -148,6 +155,19 @@ test("measureClockOffset pings the distro's node over a pipe and keeps the best 
   assert.deepEqual(spawned[0], ["wsl.exe", ["-d", "Ubuntu", "--exec", "node", "-e", CLOCK_ECHO_SCRIPT]]);
 });
 
+test("a clock round trip that never answers ends the wsl.exe child it started, and fails", async () => {
+  const kills = [];
+  const spawnFn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stdin = { write: () => {}, end: () => {} };
+    child.kill = (sig) => kills.push(sig ?? "SIGTERM");
+    return child;
+  };
+  await assert.rejects(measureClockOffset({ distro: "Ubuntu", spawnFn, timeoutMs: 30 }), /did not finish within/);
+  assert.equal(kills.length, 1);
+});
+
 test("the generator reads its clock offset from the environment, never its command line, and refuses a malformed one", () => {
   assert.equal(GEN_OFFSET_ENV, CLOCK_OFFSET_ENV);
   assert.equal(clockOffsetFromEnv({}), 0n);
@@ -163,7 +183,8 @@ test("the generator reads its clock offset from the environment, never its comma
 // The adapter, over fakes
 // ---------------------------------------------------------------------------
 
-function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, scan = () => "", wslFacts = null } = {}) {
+function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, clockEnd = null, scan = () => "", wslFacts = null } = {}) {
+  let clockCalls = 0;
   const runDir = tmp(t, "tb-wsl-run-");
   const unitDir = join(runDir, "units", "u000-tmux-wsl-default-none-n3-r0");
   const genDir = join(unitDir, "gen");
@@ -227,8 +248,9 @@ function rig(t, { clock = { offsetNs: -7_000_000n, rttNs: 400_000n, n: 15 }, sca
     sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5))),
     wslFacts: () => wslFacts ?? { list: [{ name: "Ubuntu", isDefault: true, state: "Running", version: 2 }], tmux: "tmux 3.4", node: "v22.11.0", clkTck: "100", bash: true },
     clockOffset: async () => {
+      clockCalls += 1;
       if (clock instanceof Error) throw clock;
-      return clock;
+      return clockCalls > 1 && clockEnd ? clockEnd : clock;
     },
     translate,
     launchTimeoutMs: 2000,
@@ -287,7 +309,8 @@ test("end to end: tmux in the distro through wsl.exe --exec, the portable Window
   assert.equal(sa[sa.indexOf("--clock-offset-ns") + 1], "7000000");
   const vm = r.spawns.find((x) => x.cmd === "powershell.exe");
   assert.equal(vm.opts.env.TB_VM_PID, "9100");
-  assert.equal(vm.args.at(-1), VM_SAMPLER_SCRIPT);
+  assert.equal(vm.args.at(-2), "-EncodedCommand");
+  assert.equal(Buffer.from(vm.args.at(-1), "base64").toString("utf16le"), VM_SAMPLER_SCRIPT, "the multi-line script travels encoded");
   const d = r.adapter.describe();
   assert.equal(d.id, "tmux-wsl");
   assert.equal(d.launch_mode, "private_server");
@@ -313,6 +336,25 @@ test("the scan for WSL survivors reads /proc and passes its flag after `--`, so 
   const parsed = samplerParseArgs(argv.slice(2));
   assert.deepEqual([parsed.serverPid, parsed.socket, parsed.runId, parsed.clockOffsetNs, parsed.clkTck], [5, "s", "r", -3n, 100]);
   assert.throws(() => samplerParseArgs(["--socket", "s"]), /is required/);
+});
+
+test("the WSL survivor scan, EXECUTED with real node over this box's /proc: it finds a process carrying the pair, and never itself", { skip: process.platform !== "linux" && "reads /proc: Linux only" }, async (t) => {
+  const id = `scan-test-${process.pid}-${Date.now()}`;
+  const scan = (flag, value) => {
+    const r = spawnSync(process.execPath, ["-e", WSL_FLAG_SCAN, "--", flag, value], { encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.split("\n").filter(Boolean).map(Number);
+  };
+  assert.deepEqual(scan("--termhost-bench-generator", `${id}-nothing`), [], "a run id nothing carries finds nothing — the scan's own argv is not a hit");
+  assert.deepEqual(scan("-L", `termhost-${id}-nothing`), []);
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "--termhost-bench-generator", id, "-L", `termhost-${id}`], { stdio: "ignore" });
+  t.after(() => child.kill());
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(scan("--termhost-bench-generator", id), [child.pid]);
+  assert.deepEqual(scan("-L", `termhost-${id}`), [child.pid]);
+  // A shell wrapper around the scan carries the same pair: skipped as the scan's parent.
+  const wrapped = spawnSync("/bin/sh", ["-c", '"$0" -e "$1" -- "$2" "$3"; :', process.execPath, WSL_FLAG_SCAN, "--termhost-bench-generator", `${id}-nothing`], { encoding: "utf8" });
+  assert.equal(wrapped.stdout.trim(), "", "the wrapping shell is not reported");
 });
 
 // ---------------------------------------------------------------------------
@@ -432,4 +474,90 @@ test("windows-desktop: never a GitHub-hosted runner, and a run needs session.int
   await assert.rejects(startWindowsDesktop({ platform: "linux" }), /Windows only/);
   const env = await startWindowsDesktop({ platform: "win32", run: () => ({ status: 0, stdout: '{"w":2560,"h":1440,"dpi":144}' }) });
   assert.deepEqual(env.screen, { width: 2560, height: 1440, scalePct: 150 });
+});
+
+test("the clock: 2 ms is the bound (±1 ms of bias at most); the fastest of many round trips is kept; teardown re-measures and a drift past the bound is an incident", async (t) => {
+  assert.equal(MAX_CLOCK_RTT_NS, 2_000_000n);
+  assert.ok(CLOCK_ROUNDS >= 50);
+  const ok = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 1_900_000n, n: 60 } });
+  await ok.adapter.launch(ok.ctx);
+  const edge = rig(t, { clock: { offsetNs: 0n, rttNs: 2_000_001n, n: 60 } });
+  await assert.rejects(edge.adapter.launch(edge.ctx), (e) => e.reason === "clock_unaligned" && /fastest of 60 clock round trips/.test(e.detail) && /2\.000001 ms/.test(e.detail));
+  // Within the bound: no incident.
+  const steady = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 400_000n, n: 60 }, clockEnd: { offsetNs: -7_100_000n, rttNs: 400_000n, n: 60 } });
+  await steady.adapter.launch(steady.ctx);
+  await steady.adapter.spawnSessions(1, steady.argv);
+  const a = await steady.adapter.teardown();
+  assert.deepEqual(a.incidents, []);
+  assert.equal(steady.adapter.wslSamples().clockEnd.driftNs, "100000");
+  // Past it: an incident naming the drift.
+  const drifting = rig(t, { clock: { offsetNs: -7_000_000n, rttNs: 400_000n, n: 60 }, clockEnd: { offsetNs: -9_000_000n, rttNs: 400_000n, n: 60 } });
+  await drifting.adapter.launch(drifting.ctx);
+  await drifting.adapter.spawnSessions(1, drifting.argv);
+  const b = await drifting.adapter.teardown();
+  assert.equal(b.incidents.length, 1);
+  assert.equal(b.incidents[0].kind, "harness_error");
+  assert.match(b.incidents[0].detail, /drifted 2 ms during the unit \(bound 0\.4 ms\)/);
+});
+
+test("a tmux-wsl row: workload from inside the distro, the clock bound on both latencies, the 9P note on the producer KPIs", () => {
+  const measured = (v) => ({ state: "measured", unit: "ms", n: 100, stats: { p50: v, p95: v, p99: v } });
+  const kpis = { output_latency_ms: measured(20), input_latency_ms: measured(30), producer_stall_pct: { state: "measured", unit: "%", n: 3, stats: { mean: 1, max: 2 } }, delivered_ratio: { state: "unknown", unit: "ratio", reason: "harness_error" } };
+  const records = Array.from({ length: 41 }, (_, i) => ({ type: "sample", t_ns: String(T0 + BigInt(i) * 500n * MS), dt_ms: i === 0 ? null : 500, host: { cpu_pct: 5, pss_mb: 12 }, workload: { cpu_pct: i === 0 ? null : 40, pss_mb: 300, unreadable: 0 } }));
+  const adj = wslRowAdjustments(kpis, { wslRecords: records, clockRttNs: "400000", clockEnd: { driftNs: "100000" } }, win);
+  assert.equal(adj.workload_cpu_pct.state, "measured");
+  assert.equal(adj.workload_cpu_pct.stats.mean, 40);
+  assert.equal(adj.workload_memory_mb.value, 300);
+  assert.match(adj.output_latency_ms.notes.at(-1), /error bound is ±0\.2 ms .*drifted 0\.1 ms by teardown/);
+  assert.match(adj.input_latency_ms.notes.at(-1), /±0\.2 ms/);
+  assert.equal(kpis.output_latency_ms.notes, undefined, "the input values are not mutated");
+  assert.match(adj.producer_stall_pct.notes.at(-1), /9P/);
+  assert.match(adj.delivered_ratio.notes.at(-1), /9P/);
+  const none = wslRowAdjustments(kpis, null, win);
+  assert.equal(none.workload_cpu_pct.state, "unknown", "the Windows probe cannot see WSL processes: never its empty group");
+  assert.match(none.output_latency_ms.notes.at(-1), /offset into the probe's timebase is unknown/);
+  const gap = records.map((r, i) => (i === 7 ? { ...r, workload: { cpu_pct: null, pss_mb: null, unreadable: 1 } } : r));
+  assert.equal(wslRowAdjustments(kpis, { wslRecords: gap, clockRttNs: "1" }, win).workload_cpu_pct.state, "unknown");
+});
+
+test("the run loop records an adapter's teardown incidents with its setup and unit, and a tmux-wsl document with WSL samples stays schema-valid", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "tb-wsl-loop-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  mkdirSync(join(tmp, "primary"), { recursive: true });
+  const settings = join(tmp, "primary", "settings.json");
+  writeFileSync(settings, "{}");
+  const clock = new VirtualClock();
+  let current = null;
+  class WslFake extends FakeAdapter {
+    describe() {
+      return { ...super.describe(), id: "tmux-wsl" };
+    }
+    wslSamples() {
+      return { wslRecords: [], vmRecords: [], clockRttNs: "400000", clockEnd: null };
+    }
+    async teardown() {
+      const td = await super.teardown();
+      return { ...td, incidents: [incident("harness_error", "the WSL clock offset drifted 3 ms during the unit (bound 0.4 ms)")] };
+    }
+  }
+  const res = await runBench(fakeRunOptions(join(tmp, "work"), { setups: ["tmux-wsl"], ns: [1], smokeSetups: ["tmux-wsl"], out: join(tmp, "results.json") }), {
+    log: () => {},
+    sleep: clock.sleep,
+    startEnvironment: async () => ({ env: { DISPLAY: ":99" }, screen: { width: 1920, height: 1080, scalePct: 100 }, display: ":99", stop: async () => {} }),
+    probePath: "fake-probe",
+    createAdapter: async (setup, o) => (current = new WslFake({ id: setup, clock, variant: o.variant })),
+    probe: fakeProbe({ clock, current: () => current }),
+    gatherDoctorFacts: async () => healthyFacts(),
+    sampleBackgroundLoad: async () => ({ cpu_pct: 1, memory_used_mb: 100, sampled_ms: 1 }),
+    machineBlock: (o) => machineBlock({ ...o, gpu: { state: "unknown", reason: "not_instrumented", detail: "test" } }),
+    neutrality: new NeutralityGuard({ paths: [{ label: "settings.json", path: settings }] }),
+    reapGenerators: async () => ({ ended: [], survivors: [] }),
+  });
+  const drift = res.doc.incidents.filter((i) => /drifted 3 ms/.test(i.detail));
+  assert.equal(drift.length, 1);
+  assert.equal(drift[0].data.setup, "tmux-wsl");
+  const v = validateResults(res.doc);
+  assert.equal(v.valid, true, JSON.stringify(v.errors.slice(0, 3)));
+  const row = res.doc.rows.find((r) => r.setup.id === "tmux-wsl");
+  assert.equal(row.kpis.workload_cpu_pct.state, "unknown", "no WSL-side workload samples: unknown, never the probe's empty Windows group");
 });

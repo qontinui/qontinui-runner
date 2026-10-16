@@ -192,7 +192,16 @@ export function measureClockOffset({ distro, node = "node", wslExe = "wsl.exe", 
     const samples = [];
     let buf = "";
     let t0 = null;
-    const timer = setTimeout(() => finish(new Error(`the clock round trip through ${distro} did not finish within ${timeoutMs / 1000} s`)), timeoutMs);
+    // A round trip that never answers leaves wsl.exe (our own child) running:
+    // ended by its handle, then the measurement fails.
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+      finish(new Error(`the clock round trip through ${distro} did not finish within ${timeoutMs / 1000} s`));
+    }, timeoutMs);
     const finish = (err) => {
       clearTimeout(timer);
       try {
@@ -370,4 +379,64 @@ export function wslHostKpis({ probeCpu, probeMemEnd, wslRecords, win, maxGapMs =
       ? measureKpi("memory_mb", { value: probeMemEnd + lastWsl.host.pss_mb, n: 1 }, { notes: ["Windows-side private bytes plus the WSL-side tmux server's PSS"] })
       : unknownKpi("memory_mb", "harness_error", { detail: lastWsl ? "the probe's host group has no end-of-window memory" : "no readable WSL-side memory sample in the soak window" });
   return { cpu_pct: cpu, memory_mb: memory };
+}
+
+/** A note appended to a KPI value (its own copy). */
+function withNote(kpi, note) {
+  return kpi ? { ...kpi, notes: [...(kpi.notes ?? []), note] } : kpi;
+}
+
+/**
+ * The rest of a tmux-wsl row's WSL-specific readings, given the row's KPIs so far:
+ *
+ *   workload_*      the generators and their session shells run INSIDE the distro,
+ *                   where the probe (on Windows) cannot see them: taken from the
+ *                   WSL-side sampler's workload group, or unknown without it;
+ *   latencies       carry the clock offset's error bound (half the fastest round
+ *                   trip) and, when the teardown re-measure saw one, the drift;
+ *   producer side   the generators' logs, slot files and stop-file poll live on the
+ *                   Windows run directory, reached over WSL's 9P (/mnt/c): the run
+ *                   loop and the probe read them there while the unit runs.
+ *                   producer_stall_pct times only the write to the pane (fd 1), so
+ *                   that I/O is outside it; delivered_ratio can carry its cost.
+ *
+ * @param {Record<string, object>} kpis
+ * @param {{wslRecords?: object[], clockRttNs?: string | null, clockEnd?: object | null} | null} wsl
+ * @param {{t0: bigint, t1: bigint} | null} win
+ * @returns {Record<string, object>} the values to set
+ */
+export function wslRowAdjustments(kpis, wsl, win) {
+  const out = {};
+  if (!wsl) {
+    const detail = "the generators run inside WSL, where the Windows probe cannot see them, and the run passed no WSL-side samples";
+    out.workload_cpu_pct = unknownKpi("workload_cpu_pct", "harness_error", { detail });
+    out.workload_memory_mb = unknownKpi("workload_memory_mb", "harness_error", { detail });
+  } else if (!win) {
+    out.workload_cpu_pct = unknownKpi("workload_cpu_pct", "harness_error", { detail: "no soak window" });
+    out.workload_memory_mb = unknownKpi("workload_memory_mb", "harness_error", { detail: "no soak window" });
+  } else {
+    const inside = (wsl.wslRecords ?? []).filter((r) => r.type === "sample" && inWin(toNs(r.t_ns), win) && r.workload);
+    const note = "from the WSL-side sampler: the generators and their session shells run inside the distro";
+    const withheld = inside.filter((r) => r.dt_ms !== null && r.workload.cpu_pct === null).length;
+    const cpu = inside.map((r) => r.workload.cpu_pct).filter((v) => typeof v === "number" && Number.isFinite(v));
+    out.workload_cpu_pct =
+      withheld > 0
+        ? unknownKpi("workload_cpu_pct", "harness_error", { n: cpu.length, detail: `${withheld} WSL-side workload sample(s) in the window had an unreadable member` })
+        : measureKpi("workload_cpu_pct", cpu, { notes: [note] });
+    const last = [...inside].reverse().find((r) => r.workload.pss_mb !== undefined);
+    out.workload_memory_mb =
+      last && typeof last.workload.pss_mb === "number"
+        ? measureKpi("workload_memory_mb", { value: last.workload.pss_mb, n: inside.length }, { notes: [`${note} (PSS)`] })
+        : unknownKpi("workload_memory_mb", inside.length === 0 ? "insufficient_samples" : "harness_error", { n: inside.length, detail: "no readable WSL-side workload memory at the end of the window" });
+  }
+  const rtt = wsl?.clockRttNs ? BigInt(wsl.clockRttNs) : null;
+  const drift = wsl?.clockEnd?.driftNs ? Number(BigInt(wsl.clockEnd.driftNs)) / 1e6 : null;
+  const clockNote =
+    rtt === null
+      ? "generator times were taken on the WSL VM's clock; the offset into the probe's timebase is unknown"
+      : `generator times were shifted from the WSL VM's clock into the probe's; the offset's error bound is ±${Number(rtt / 2n) / 1e6} ms (half the fastest round trip)${drift === null ? "" : `, and it drifted ${drift} ms by teardown`}`;
+  for (const id of ["output_latency_ms", "input_latency_ms"]) if (kpis[id]?.state === "measured") out[id] = withNote(kpis[id], clockNote);
+  const ioNote = "the tmux-wsl generators' logs, slot files and stop-file poll go over WSL's 9P to the Windows run directory; producer_stall_pct times only the write to the pane, delivered_ratio can include that I/O";
+  for (const id of ["producer_stall_pct", "delivered_ratio"]) if (kpis[id]) out[id] = withNote(kpis[id], ioNote);
+  return out;
 }

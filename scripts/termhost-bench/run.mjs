@@ -819,6 +819,8 @@ export async function runUnit(unit, ctx) {
     try {
       const td = await adapter.teardown();
       ctx.live?.delete(adapter);
+      // An adapter's own teardown findings (tmux-wsl: a WSL clock drift).
+      incidents.push(...(td.incidents ?? []).map((i) => ({ ...i, data: { ...(i.data ?? {}), setup: unit.setup, unit: name } })));
       for (const s of td.survivors ?? []) {
         incidents.push(incident("harness_error", `unit ${name}: teardown left ${s.what ?? `pid ${s.pid}`}: ${s.detail ?? "still running"}`, { data: { setup: unit.setup, unit: name } }));
       }
