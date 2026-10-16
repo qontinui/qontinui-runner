@@ -59,6 +59,53 @@ function transcript(id: string, i = 0): TranscriptSession {
   } as TranscriptSession;
 }
 
+/** One available `session_info_list` envelope for `id`. */
+function infoEnvelope(id: string, finishedAt: number | null) {
+  return {
+    available: true,
+    identity: {
+      claudeSessionId: id,
+      terminalId: `t-${id}`,
+      fleetSessionHandle: null,
+      tenantId: null,
+      taskRunId: null,
+    },
+    name: { value: id, source: "operator" },
+    account: { label: "gmail", wrapper: "clg", configDir: "/home/u/.claude-gmail" },
+    placement: { pageId: "p1", zoneIndex: 0, workingDir: "/work/repo" },
+    lifecycle: {
+      state: "open",
+      provider: "claude",
+      origin: "authoritative",
+      openedAt: 1,
+      lastSeenAt: 2,
+      closedAt: null,
+      closeReason: null,
+      confirmed: true,
+      transcriptExists: true,
+      restorable: true,
+      restoredFromBootAt: null,
+      restoreTier: null,
+      bypassPermissions: null,
+      finishedAt,
+      finishReason: null,
+    },
+    prs: {
+      status: "ok",
+      reason: null,
+      opened: [],
+      landed: [],
+      unknown: [],
+      openCount: 0,
+      landedCount: 0,
+      unknownCount: 0,
+      scanned: true,
+      scannedRepos: ["/work/repo"],
+    },
+    tenancy: null,
+  };
+}
+
 function serve(backend: Backend) {
   invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
     switch (cmd) {
@@ -89,16 +136,18 @@ function serve(backend: Backend) {
             observed_at_ms: 0,
           },
         });
-      case "terminal_session_list_history":
+      case "session_info_list": {
+        // The finished marker is the lifecycle record's `finishedAt`, read
+        // through the batched listing (plan Phase 1, vet correction).
+        const ids = (args?.ids as string[]) ?? [];
         return Promise.resolve({
-          success: true,
-          data: {
-            sessions: Object.entries(backend.finished ?? {}).map(([claudeSessionId, finished]) => ({
-              claudeSessionId,
-              finished,
-            })),
-          },
+          status: "ok",
+          reason: null,
+          sessions: ids.map((id) => infoEnvelope(id, backend.finished?.[id] ? 1_000 : null)),
+          notFound: [],
+          branches: [],
         });
+      }
       case "transcript_session_digests": {
         const ids = (args?.sessionIds as string[]) ?? [];
         return Promise.resolve({
@@ -245,7 +294,7 @@ describe("useSessionManager → sessionStatusModel wiring", () => {
     expect(loc("s-b")).toBe("hidden-here");
   });
 
-  it("reads the finished marker from the session history", async () => {
+  it("reads the finished marker from the lifecycle record (session_info_list)", async () => {
     serve({ registry: [], externalPids: [], finished: { "s-1": true } });
     const get = await mount([transcript("s-1"), transcript("s-2", 1)]);
     const act_ = (id: string) => get().sessions.find((s) => s.sessionId === id)!.status.activity;
