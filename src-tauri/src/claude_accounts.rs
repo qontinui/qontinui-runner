@@ -11,7 +11,8 @@
 //! rotation across the configured accounts.
 //!
 //! This module owns the dedicated `claude-accounts.json` file at the
-//! UNSCOPED canonical path `dirs::config_dir()/com.qontinui.runner/`,
+//! UNSCOPED canonical path `<platform config dir>/com.qontinui.runner/`
+//! (a subject runner's platform dirs live inside its instance root),
 //! deliberately IGNORING `QONTINUI_CONFIG_DIR` — the same resolution rule
 //! as `active_instances.json` in `instance_manager.rs`. `load_settings()`
 //! overlays the roster fields from this file onto the in-memory
@@ -101,18 +102,25 @@ impl ClaudeAccountsFile {
 /// unit-testable without touching process env or the real config dir.
 fn accounts_path_under(config_root: &Path) -> PathBuf {
     config_root
-        .join("com.qontinui.runner")
+        .join(qontinui_runner_lib::instance_env::RUNNER_BUNDLE_ID)
         .join(CLAUDE_ACCOUNTS_FILE)
 }
 
 /// Canonical machine-global path to `claude-accounts.json`.
 ///
-/// ALWAYS rooted at `dirs::config_dir()` — `QONTINUI_CONFIG_DIR` is
+/// ALWAYS rooted at the platform config dir — `QONTINUI_CONFIG_DIR` is
 /// deliberately ignored (unlike `settings::get_settings_path`), so every
 /// instance on the machine resolves the SAME file. Mirrors the unscoped
-/// `session_file_path` resolver for `active_instances.json`.
+/// `session_file_path` resolver for `active_instances.json`. The one
+/// exception is a SUBJECT runner (`QONTINUI_INSTANCE_ROOT`): through
+/// `instance_env::platform_dir` its "machine" is its own root, so it neither
+/// reads nor overwrites the harness's roster (plan
+/// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`).
 pub fn claude_accounts_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| accounts_path_under(&d))
+    qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::Config,
+    )
+    .map(|d| accounts_path_under(&d))
 }
 
 /// Unscoped canonical `settings.json` (the PRIMARY runner's file) — the
@@ -120,7 +128,7 @@ pub fn claude_accounts_file_path() -> Option<PathBuf> {
 /// running the migration has to probe the primary's file, not its own
 /// instance-scoped copy.
 fn unscoped_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
+    qontinui_runner_lib::instance_env::runner_config_base().map(|d| d.join("settings.json"))
 }
 
 /// Load the roster from `path`. Fail-open: missing or corrupt file → `None`

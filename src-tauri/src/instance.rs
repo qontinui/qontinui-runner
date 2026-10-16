@@ -188,8 +188,29 @@ pub fn data_subdir() -> Option<String> {
 /// pane store) is on the boot path — aborting would turn a supervisor env slip
 /// into a dead runner, while quarantining keeps it working in isolation. The
 /// primary itself (default port, no primary to proxy to) is untouched.
+///
+/// **Under an instance root** a base the seam already placed INSIDE the root
+/// (`instance_env::platform_dir`, plan
+/// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+/// D1) is returned unchanged: the root is the subject's whole namespace, so a
+/// further `instance-<id>` level would only rename its own state. A base
+/// outside the root still gets the subdir — defence in depth for a site that
+/// was never routed through the seam.
 pub fn scope_path(base: &Path) -> PathBuf {
-    match data_subdir() {
+    scope_path_for(base, instance_root().as_deref(), data_subdir)
+}
+
+/// Env-free core of [`scope_path`]; `subdir` is consulted only when the base
+/// is not already inside `instance_root`.
+fn scope_path_for(
+    base: &Path,
+    instance_root: Option<&Path>,
+    subdir: impl FnOnce() -> Option<String>,
+) -> PathBuf {
+    if instance_root.is_some_and(|root| base.starts_with(root)) {
+        return base.to_path_buf();
+    }
+    match subdir() {
         Some(sub) => base.join(sub),
         None => base.to_path_buf(),
     }
@@ -236,8 +257,13 @@ pub fn api_ports_to_try(port: u16) -> Vec<u16> {
 pub(crate) fn enter_rooted_subject_for_test(
     amb: &crate::test_env::IsolatedAmbient,
 ) -> (PathBuf, crate::test_env::EnvVarRestore) {
-    let restore = crate::test_env::EnvVarRestore::capture(&["WEBVIEW2_USER_DATA_FOLDER"]);
+    let restore = crate::test_env::EnvVarRestore::capture(&[
+        "WEBVIEW2_USER_DATA_FOLDER",
+        // A D5 default with no runner reader, so not an ambient key.
+        "QONTINUI_TOUCH_LEDGER_DIR",
+    ]);
     std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
+    std::env::remove_var("QONTINUI_TOUCH_LEDGER_DIR");
     for key in [
         "QONTINUI_HOME",
         "QONTINUI_CONFIG_DIR",
@@ -304,9 +330,26 @@ pub fn webview2_data_dir() -> Option<std::path::PathBuf> {
     qontinui_types::wire::webview2_data_dir(&kind, &id)
 }
 
+/// Off Windows: `None` (the webview backend's own default) for every runner
+/// EXCEPT a subject under an instance root, which gets its root's webview dir —
+/// `WEBVIEW2_USER_DATA_FOLDER`, which startup always exports inside the root,
+/// else `<root>/webview`. Applied through the same `data_directory` path as
+/// Windows (`webview_recovery`), so WebKitGTK's cookies / localStorage are the
+/// subject's own too (plan
+/// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+/// D1).
 #[cfg(not(target_os = "windows"))]
 pub fn webview2_data_dir() -> Option<std::path::PathBuf> {
-    None
+    let root = instance_root()?;
+    Some(
+        std::env::var("WEBVIEW2_USER_DATA_FOLDER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                root.join(qontinui_runner_lib::instance_env::INSTANCE_ROOT_WEBVIEW_SUBDIR)
+            }),
+    )
 }
 
 /// Register this secondary instance with the primary runner.
@@ -373,6 +416,36 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_path_leaves_a_base_inside_the_instance_root_alone() {
+        let root = std::env::temp_dir().join("scope-subject-root");
+        let inside = root.join("data").join("config").join("com.qontinui.runner");
+        let outside = std::env::temp_dir()
+            .join("machine-config")
+            .join("com.qontinui.runner");
+        let sub = || Some("instance-root-0123456789abcdef".to_string());
+        assert_eq!(
+            scope_path_for(&inside, Some(&root), || panic!(
+                "not consulted inside the root"
+            )),
+            inside
+        );
+        assert_eq!(
+            scope_path_for(&outside, Some(&root), sub),
+            outside.join("instance-root-0123456789abcdef"),
+            "a base outside the root is still scoped"
+        );
+        assert_eq!(
+            scope_path_for(&outside, None, || None),
+            outside,
+            "the primary"
+        );
+        assert_eq!(
+            scope_path_for(&outside, None, || Some("instance-x".into())),
+            outside.join("instance-x")
+        );
+    }
     use crate::test_env::env_lock;
 
     #[test]

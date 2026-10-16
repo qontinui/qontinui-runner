@@ -2478,6 +2478,14 @@ async fn health(
         // populated only when unauthenticated (incl. the gh-not-installed
         // case). /health never blocks on the probe.
         "prCredential": pr_credential_health(),
+        // The instance root this runner was launched under
+        // (`QONTINUI_INSTANCE_ROOT`), or `null` for a runner that is not a
+        // subject. Plan
+        // 2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-
+        // runner D5: a client that reached this port can tell a subject from
+        // the harness, and find the subject's own `~/.qontinui` (loopback key,
+        // api-port records) under `<instanceRoot>/home`.
+        "instanceRoot": crate::instance::instance_root().map(|r| r.display().to_string()),
         // Session-fabric Phase 0: how each proxied coord call resolved the
         // caller's own coord agent_session_id, since this process booted.
         // coord sees only "header present / absent" — this is the ONLY place

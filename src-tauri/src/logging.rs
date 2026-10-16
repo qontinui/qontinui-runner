@@ -688,10 +688,12 @@ pub fn get_crash_dump_dir() -> PathBuf {
         .and_then(|exe_path| find_dev_logs_ancestor(&exe_path))
         .unwrap_or_else(|| {
             // Fallback to local app data
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("qontinui-runner")
-                .join("crash-dumps")
+            qontinui_runner_lib::instance_env::platform_dir(
+                qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+            )
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("qontinui-runner")
+            .join("crash-dumps")
         });
 
     crate::instance::scope_path(&base)

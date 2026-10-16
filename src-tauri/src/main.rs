@@ -380,6 +380,13 @@ mod env_test_lock_hierarchy_guard;
 // 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
 #[cfg(test)]
 mod expect_ratchet;
+// A harness runner and a subject runner (QONTINUI_INSTANCE_ROOT) on one host:
+// the subject driven through the real writers leaves the harness's files
+// byte-identical. Plan
+// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+// Phase 3.
+#[cfg(test)]
+mod subject_isolation_harness;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
@@ -5316,7 +5323,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // gets the same per-runner profile layout. The launch_env
                 // field delegates to crate::instance::webview2_data_dir(),
                 // which prefers the env var and falls back to the shared
-                // qontinui_types helper. Returns None on non-Windows.
+                // qontinui_types helper. Off Windows: None except under an
+                // instance root (a subject's own `<root>/webview`).
                 let data_dir: Option<std::path::PathBuf> =
                     setup_launch_env.webview2_user_data_dir.clone();
                 let is_secondary = instance::is_secondary();
@@ -5982,8 +5990,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     } else {
                         info!("Restate durable execution enabled — preparing server");
-                        let app_data_dir = dirs::data_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        let app_data_dir = qontinui_runner_lib::instance_env::platform_dir(
+                            qontinui_runner_lib::instance_env::PlatformDir::Data,
+                        )
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
                             .join("qontinui-runner");
                         match restate::lifecycle::ensure_restate_binary(
                             &restate_settings,

@@ -4337,7 +4337,9 @@ impl ConfigDirSource {
 pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
     resolve_config_dir_from(
         std::env::var("QONTINUI_CONFIG_DIR").ok(),
-        dirs::config_dir(),
+        qontinui_runner_lib::instance_env::platform_dir(
+            qontinui_runner_lib::instance_env::PlatformDir::Config,
+        ),
     )
 }
 
@@ -4350,16 +4352,14 @@ pub(crate) fn resolve_config_dir_from(
     env_config_dir: Option<String>,
     platform_config_dir: Option<PathBuf>,
 ) -> Result<(PathBuf, ConfigDirSource), String> {
-    env_config_dir
-        .filter(|s| !s.is_empty())
-        .map(|s| (PathBuf::from(s), ConfigDirSource::EnvConfigDir))
-        .or_else(|| {
-            platform_config_dir.map(|d| {
-                (
-                    d.join("com.qontinui.runner"),
-                    ConfigDirSource::PlatformConfigDir,
-                )
-            })
+    qontinui_runner_lib::instance_env::runner_config_dir_from(env_config_dir, platform_config_dir)
+        .map(|(dir, from_env)| {
+            let source = if from_env {
+                ConfigDirSource::EnvConfigDir
+            } else {
+                ConfigDirSource::PlatformConfigDir
+            };
+            (dir, source)
         })
         .ok_or_else(|| "Failed to get config directory".to_string())
 }

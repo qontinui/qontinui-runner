@@ -1085,14 +1085,11 @@ pub fn terminal_save_scrollback(
         });
     }
 
-    let scrollback_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| {
-            String::from(AppError::TauriError(format!(
-                "Failed to get app data dir: {}",
-                e
-            )))
+    let scrollback_dir = qontinui_runner_lib::instance_env::runner_app_data_dir()
+        .ok_or_else(|| {
+            String::from(AppError::TauriError(
+                "Failed to get app data dir".to_string(),
+            ))
         })?
         .join("terminal-scrollback");
 
@@ -1169,14 +1166,11 @@ pub fn terminal_get_saved_scrollback(file_path: String) -> Result<CommandRespons
 pub fn terminal_cleanup_scrollback(
     app_handle: tauri::AppHandle,
 ) -> Result<CommandResponse, String> {
-    let scrollback_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| {
-            String::from(AppError::TauriError(format!(
-                "Failed to get app data dir: {}",
-                e
-            )))
+    let scrollback_dir = qontinui_runner_lib::instance_env::runner_app_data_dir()
+        .ok_or_else(|| {
+            String::from(AppError::TauriError(
+                "Failed to get app data dir".to_string(),
+            ))
         })?
         .join("terminal-scrollback");
 

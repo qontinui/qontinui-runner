@@ -359,7 +359,9 @@ impl VideoRecordingService {
     /// Get output directory for recordings
     fn get_output_directory(&self) -> PathBuf {
         // Use user's videos directory or temp directory as fallback
-        if let Some(videos_dir) = dirs::video_dir() {
+        if let Some(videos_dir) = qontinui_runner_lib::instance_env::platform_dir(
+            qontinui_runner_lib::instance_env::PlatformDir::Videos,
+        ) {
             let qontinui_dir = videos_dir.join("qontinui-recordings");
             // Create directory if it doesn't exist
             let _ = std::fs::create_dir_all(&qontinui_dir);
