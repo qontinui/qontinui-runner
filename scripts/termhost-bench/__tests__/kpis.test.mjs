@@ -23,7 +23,9 @@ import {
   STALL_HIDDEN_GAP_MS,
   STALL_MIN_EMITTED,
   STALL_MIN_MS,
+  STALL_TAIL_MIN_MS,
   STALL_VOIDED_KPIS,
+  blackoutSpans,
   describeStall,
   excludedSpans,
   stallCoverage,
@@ -680,7 +682,7 @@ test("a pane frozen to the end of the soak, whole or from half way, voids the pe
   for (const r of [whole, half]) {
     for (const id of STALL_VOIDED_KPIS) {
       assertUnknown(r.kpis[id], "pane_stalled");
-      assert.match(r.kpis[id].detail, /^pane stalled: session 0 stayed at seq \d+ for \d+ ms \(\d+ frame\(s\), last shown at \+\d+ ms(, then no frame for \d+ ms)?\) while its generator wrote \d+ marker\(s\), and did not advance in any later frame$/);
+      assert.match(r.kpis[id].detail, /^pane stalled: session 0 stayed at seq \d+ for \d+ ms \(\d+ frame\(s\), last shown at \+\d+ ms(, then no frame for \d+ ms)?\) while its generator wrote \d+ marker\(s\), and did not advance in any later frame \(a wedge on what was seen: the still marker alone meets the bar\)$/);
     }
     assert.equal(r.kpis.frame_interval_ms.state, "measured", "the window's own cadence is not the pane's");
     assert.ok((r.kpis.output_latency_ms.notes ?? []).some((n) => /^pane stalled: session 0 /.test(n)), "the wedge note carries its KPI id");
@@ -778,7 +780,7 @@ test("the stall rule's boundaries: 2 s, 20 markers, the emission window's edges 
   assert.equal(paneStallsAt(synthSeg(runFrames(1000, 3000)), dense, WIN, V0).length, 1, "2000 ms exactly");
   const st = paneStallsAt(synthSeg(runFrames(1000, 3010)), dense, WIN, V0);
   assert.equal(st.length, 1, "2010 ms");
-  assert.deepEqual(st[0], { session: 0, seq: 500, ms: 2010, frames: 22, emitted: 201, recovered: true, lastShownMs: 3010, framelessMs: 0 });
+  assert.deepEqual(st[0], { session: 0, seq: 500, ms: 2010, frames: 22, emitted: 201, recovered: true, lastShownMs: 3010, framelessMs: 0, tailEmitted: 0, basis: "seen", voids: false, tailBarMs: 10000 });
   assert.ok(STALL_MIN_MS === 2000 && STALL_MIN_EMITTED === 20);
   // 19 markers emitted in the run is no stall; 20 is.
   const run = synthSeg(runFrames(1000, 3500));
@@ -1039,7 +1041,8 @@ test("R4: a marker never shown again is a wedge, and says when it was last seen,
   const st = paneStalls(synthSeg(frames), r12Gens([0]), winTo(20000), V0);
   assert.equal(st.length, 1);
   assert.deepEqual([st[0].recovered, st[0].lastShownMs, st[0].framelessMs, st[0].ms], [false, 3500, 0, 2500]);
-  assert.match(describeStall(st[0]), /last shown at \+3500 ms\) .*, and did not advance in any later frame$/);
+  assert.match(describeStall(st[0]), /last shown at \+3500 ms\) .*, and did not advance in any later frame \(a wedge on what was seen: the still marker alone meets the bar\)$/);
+  assert.deepEqual([st[0].basis, st[0].voids], ["seen", true]);
 });
 
 test("R5/R6/R7: several sessions, a single frame, an excluded span at the run's trailing edge (review r12)", () => {
@@ -1078,7 +1081,7 @@ test("a pane frozen when the screen stops sending frames is a wedge: the framele
 test("excluded spans are half-open: a frame at a span's start is dropped, one at its end is kept (review r12 nit)", () => {
   const frames = [fr(1000, 1), fr(2000, 2), fr(2500, 3)];
   const cov = stallCoverage(synthSeg(frames, [ivx(1000, 2000, "occluded")]), winTo(3000), [0]);
-  assert.deepEqual(cov.get(0), { frames: 2, firstMs: 2000, lastMs: 2500 });
+  assert.deepEqual(cov.get(0), { frames: 2, seqs: 2, firstMs: 2000, lastMs: 2500 });
   assert.deepEqual(excludedSpans({ intervals: [ivx(1000, 1000, "occluded")] }), [], "an empty span excludes nothing");
 });
 
@@ -1093,4 +1096,151 @@ test("a frameless tail counts only the markers emitted outside excluded spans (r
   const enough = emitsAt([...every(1600, 1900, 100), ...every(5050, 5950, 100), 6000]);
   const st = paneStalls(synthSeg(frames, span), enough, winTo(6000), V0);
   assert.deepEqual(st.map((x) => [x.ms, x.recovered, x.emitted]), [[2000, false, 5 + 4 + 11]]);
+});
+
+// --- review r13 ---------------------------------------------------------------
+
+/** A focus soak whose primary frames stop `tailMs` before the soak's end (a whole-screen freeze at the end). */
+function endFreeze(tailMs) {
+  const f = focusFixture();
+  const t0 = BigInt(f.soak.records.find((r) => r.type === "start").t0_ns) + 5n * MS;
+  const cut = t0 + BigInt(SOAK_MS - tailMs) * MS;
+  return { ...f, soak: { records: f.soak.records.filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= cut) } };
+}
+/** Session 0's generator at one output marker per 100 ms over [0, ms]. */
+const gens100 = (ms) => new Map([[0, { markers: every(0, ms, 100).map((t, i) => ({ kind: "output", seq: i, tEmit: at(t) })) }]]);
+
+test("MF1: a slow host (a frame every 2.5 or 3 s, marker advancing) whose window ends between frames is not a wedge (review r13 MF1)", () => {
+  for (const [period, end] of [[2500, 62_400], [3000, 62_900]]) {
+    const frames = every(0, end - (end % period), period).map((t) => fr(t, Math.floor(t / 100)));
+    const st = paneStalls(synthSeg(frames), gens100(end), winTo(end), V0);
+    assert.equal(st.length, 1, `${period}: the tail is reported`);
+    assert.deepEqual([st[0].recovered, st[0].basis, st[0].voids], [false, "tail", false], JSON.stringify(st[0]));
+    assert.equal(st[0].tailBarMs, Math.max(STALL_TAIL_MIN_MS, 3 * period), "the bar follows the host's own frame gap");
+    assert.match(describeStall(st[0]), /\(tail-dependent, not a wedge: the seen part is under the bar, and the frameless tail of \d+ ms with \d+ marker\(s\) emitted in it does not meet the \d+ ms \/ 20-marker tail bar\)$/);
+  }
+});
+
+test("MF1: a 2.4 s whole-screen freeze at the soak's end keeps the marker KPIs measured, with a note (review r13 MF1)", () => {
+  const r = computeRowKpis(endFreeze(2400));
+  assert.equal(r.stalls.length, 1, JSON.stringify(r.stalls));
+  assert.deepEqual([r.stalls[0].recovered, r.stalls[0].basis, r.stalls[0].voids], [false, "tail", false]);
+  for (const id of STALL_VOIDED_KPIS) assert.notEqual(r.kpis[id].reason, "pane_stalled", id);
+  assert.equal(r.kpis.output_latency_ms.state, "measured");
+  assert.ok(
+    (r.kpis.output_latency_ms.notes ?? []).some((n) => /^pane still at the window's end, tail-dependent \(the marker KPIs stay measured\): session 0 .*tail-dependent, not a wedge/.test(n)),
+    JSON.stringify(r.kpis.output_latency_ms.notes),
+  );
+});
+
+test("MF1: a 15 s freeze at the soak's end after a dense frame history voids the marker KPIs, as tail-dependent (review r13 MF1)", () => {
+  const r = computeRowKpis(endFreeze(15_000));
+  assert.equal(r.stalls.length, 1, JSON.stringify(r.stalls));
+  assert.deepEqual([r.stalls[0].recovered, r.stalls[0].basis, r.stalls[0].voids, r.stalls[0].tailBarMs], [false, "tail", true, STALL_TAIL_MIN_MS]);
+  for (const id of STALL_VOIDED_KPIS) assertUnknown(r.kpis[id], "pane_stalled");
+  assert.match(r.kpis.output_latency_ms.detail, /\(a tail-dependent wedge: the frameless tail of \d+ ms, with \d+ marker\(s\) emitted in it, meets the 10000 ms tail bar\)$/);
+});
+
+test("MF1: the tail bar is max(10 s, 3 x the longest earlier frame gap), and needs 20 markers in the tail (review r13 MF1)", () => {
+  // A frame every 4 s (bar 12 s), marker advancing; the last at 40 s.
+  const frames = every(0, 40_000, 4000).map((t) => fr(t, t / 100));
+  assert.deepEqual(paneStalls(synthSeg(frames), gens100(60_000), winTo(51_900), V0).map((x) => x.voids), [false], "11.9 s < 12 s");
+  assert.deepEqual(paneStalls(synthSeg(frames), gens100(60_000), winTo(52_000), V0).map((x) => x.voids), [true], "12 s");
+  // Dense frames, still at seq 90 for the last 1 s (10 markers seen), a 10 s tail:
+  // the run qualifies either way; it voids at 20 markers in the tail, not at 19.
+  const dense = [...every(0, 9000, 100).map((t) => fr(t, t / 100)), ...every(9100, 10_000, 100).map((t) => fr(t, 90))];
+  const tailEmits = (k) => new Map([[0, { markers: [...every(0, 10_000, 100), ...every(10_500, 10_500 + (k - 1) * 100, 100)].map((t, i) => ({ kind: "output", seq: i, tEmit: at(t) })) }]]);
+  assert.deepEqual(paneStalls(synthSeg(dense), tailEmits(20), winTo(20_000), V0).map((x) => [x.voids, x.tailEmitted]), [[true, 20]]);
+  assert.deepEqual(paneStalls(synthSeg(dense), tailEmits(19), winTo(20_000), V0).map((x) => [x.voids, x.tailEmitted]), [[false, 19]]);
+  assert.deepEqual(paneStalls(synthSeg(dense), tailEmits(20), winTo(19_999), V0).map((x) => x.voids), [false], "9.999 s");
+});
+
+test("MF1(a): a frameless tail over intervals with no probe sample is not pane evidence (review r13 MF1, SF3)", () => {
+  const frames = every(0, 45_000, 100).map((t) => fr(t, t / 100));
+  const blackout = (a, b) => ({ type: "interval", t_start_ns: String(at(a)), t_end_ns: String(at(b)), samples: 0, valid: false, excluded: ["no_samples", "monitor_absent"], exclusion_class: "harness_error" });
+  const ivs = every(45_000, 59_500, 500).map((t) => blackout(t, t + 500));
+  assert.equal(paneStalls(synthSeg(frames), gens100(60_000), winTo(60_000), V0)[0]?.voids, true, "without the blackout: a 15 s tail voids");
+  assert.deepEqual(paneStalls(synthSeg(frames, ivs), gens100(60_000), winTo(60_000), V0), [], "the probe was not looking for any of it");
+  // Blackout from 47 s: 2 s of usable tail, 20 markers: reported, does not void.
+  const st = paneStalls(synthSeg(frames, ivs.slice(4)), gens100(60_000), winTo(60_000), V0);
+  assert.deepEqual(st.map((x) => [x.framelessMs, x.voids]), [[2000, false]]);
+  // A harness_error interval WITH samples (no input monitor on Xvfb) is not a blackout.
+  const xvfb = ivs.map((r) => ({ ...r, samples: 4, excluded: ["monitor_absent"] }));
+  assert.equal(paneStalls(synthSeg(frames, xvfb), gens100(60_000), winTo(60_000), V0)[0]?.voids, true);
+  assert.deepEqual(blackoutSpans({ intervals: [blackout(0, 500), { ...blackout(500, 1000), excluded: [] }, xvfb[0]] }).map((x) => Number((x.a - T0) / MS)), [0, 500]);
+});
+
+test("SF2(i): a later frame of any kind ends the tail, even one inside an excluded span (review r13 SF2)", () => {
+  const frames = [...r12Before, ...every(1000, 1500, 100).map((t) => fr(t, 500)), fr(3000, null)];
+  const span = [ivx(2500, 3500, "occluded")];
+  assert.deepEqual(paneStalls(synthSeg(frames, span), r12Gens([0]), winTo(20_000), V0), [], "the screen sent a frame at 3 s");
+  assert.deepEqual(paneStalls(synthSeg(frames.slice(0, -1), span), r12Gens([0]), winTo(20_000), V0).map((x) => x.voids), [true], "without it, a wedge");
+});
+
+test("SF2(ii): an equal sequence inside an operator_activity interval after a still run is not recovery (review r13 SF2)", () => {
+  const frames = [...r12Before, ...every(1000, 3500, 100).map((t) => fr(t, 500)), ...every(3600, 5000, 100).map((t) => fr(t, 500))];
+  const st = paneStalls(synthSeg(frames, [ivx(3550, 5001, "operator_activity")]), r12Gens([0]), winTo(5000), V0);
+  assert.deepEqual(st.map((x) => [x.seq, x.recovered, x.basis, x.voids]), [[500, false, "seen", true]]);
+});
+
+test("nit: the hidden gap ends a piece only when OVER 900 ms (review r13 nit)", () => {
+  const dense = gensAt(every(0, 20_000, 10));
+  const gapped = (gapMs) => [
+    ...r12Before,
+    ...every(1000, 1500, 100).map((t) => fr(t, 500)),
+    ...every(1600, 1600 + gapMs - 100, 100).map((t) => fr(t, null)),
+    ...every(1600 + gapMs, 3000 + gapMs - 900, 100).map((t) => fr(t, 500)),
+    fr(3000 + gapMs - 800, 501),
+  ];
+  // Hidden exactly 900 ms (1.6 -> 2.5 s): one piece, 1.0-3.0 s, 2000 ms.
+  assert.deepEqual(paneStallsAt(synthSeg(gapped(900)), dense, WIN, V0).map((x) => x.ms), [2000]);
+  // Hidden 1000 ms: two pieces, 1.0-1.5 and 2.6-3.1 s, 1000 ms seen.
+  assert.deepEqual(paneStallsAt(synthSeg(gapped(1000)), dense, WIN, V0), []);
+  assert.equal(STALL_HIDDEN_GAP_MS, 900);
+});
+
+test("nit: frozen-blocked — a pane at one sequence whose generator wrote < 20 markers is no stall, and covers one seq (review r13 nit)", () => {
+  const frames = every(0, 5000, 50).map((t) => fr(t, 641));
+  const gens = new Map([[0, { markers: Array.from({ length: 15 }, (_, i) => ({ kind: "output", seq: 642 + i, tEmit: at(i * 100) })) }]]);
+  assert.deepEqual(paneStalls(synthSeg(frames), gens, winTo(5000), V0), []);
+  assert.deepEqual(stallCoverage(synthSeg(frames), winTo(5000), [0]).get(0), { frames: 101, seqs: 1, firstMs: 0, lastMs: 5000 });
+});
+
+test("MF1(a): a tail interval that is both excluded and a blackout is subtracted once (review r13 MF1)", () => {
+  // Advancing to 10 s; tail 10-25 s; 12-14 s is operator input with no probe sample (both lists).
+  const frames = every(0, 10_000, 100).map((t) => fr(t, t / 100));
+  const both = { type: "interval", t_start_ns: String(at(12_000)), t_end_ns: String(at(14_000)), samples: 0, valid: false, excluded: ["no_samples", "operator_input"], exclusion_class: "operator_activity" };
+  const st = paneStalls(synthSeg(frames, [both]), gens100(30_000), winTo(25_000), V0);
+  assert.deepEqual(st.map((x) => [x.framelessMs, x.voids]), [[13_000, true]]);
+});
+
+test("MF1(b/c): the seen basis needs BOTH bars on the seen part alone, 2000 ms inclusive (review r13 MF1)", () => {
+  // Seen exactly 2.0 s (1.0-3.0 s) with 20 seen emissions, then a 1 s tail: a seen wedge.
+  const frames = [...r12Before, ...every(1000, 3000, 100).map((t) => fr(t, 500))];
+  const seen20 = gensAt([...every(1100, 3000, 100), ...every(3100, 4000, 100)]);
+  assert.deepEqual(paneStalls(synthSeg(frames), seen20, winTo(4000), V0).map((x) => [x.ms, x.basis, x.voids]), [[3000, "seen", true]]);
+  // Seen 2.0 s with 15 seen emissions plus 10 in a 1 s tail: tail-dependent, no void.
+  const seen15 = gensAt([...every(1600, 3000, 100), ...every(3100, 4000, 100)]);
+  assert.deepEqual(paneStalls(synthSeg(frames), seen15, winTo(4000), V0).map((x) => [x.emitted, x.tailEmitted, x.basis, x.voids]), [[25, 10, "tail", false]]);
+});
+
+test("MF1: per session the wedge reported is a voiding one first, then the longest (review r13 MF1)", () => {
+  // seq 500 seen 1.0-3.0 s (a seen wedge), then seq 400 (backwards: no recovery) seen 3.1-4.6 s + a 1.4 s tail.
+  const frames = [...r12Before, ...every(1000, 3000, 100).map((t) => fr(t, 500)), ...every(3100, 4600, 100).map((t) => fr(t, 400))];
+  const st = paneStalls(synthSeg(frames), r12Gens([0]), winTo(6000), V0);
+  assert.deepEqual(st.map((x) => [x.seq, x.ms, x.voids]), [[500, 2000, true]], "the 2.9 s tail-dependent one is longer, but does not void");
+  // Two seen wedges: the longer is reported.
+  const two = [...r12Before, ...every(1000, 4000, 100).map((t) => fr(t, 500)), ...every(4100, 6300, 100).map((t) => fr(t, 400))];
+  assert.deepEqual(paneStalls(synthSeg(two), r12Gens([0]), winTo(6300), V0).map((x) => [x.seq, x.ms]), [[500, 3000]]);
+});
+
+test("MF1(a): a no_samples interval is a blackout whether or not it carries its sample count (review r13 MF1)", () => {
+  const iv = (a, b, extra) => ({ type: "interval", t_start_ns: String(at(a)), t_end_ns: String(at(b)), valid: false, exclusion_class: "harness_error", ...extra });
+  const spans = blackoutSpans({ intervals: [iv(0, 500, { excluded: ["no_samples"] }), iv(500, 1000, { samples: 0 }), iv(1000, 1500, { samples: 3, excluded: ["state_unknown"] })] });
+  assert.deepEqual(spans.map((x) => Number((x.a - T0) / MS)), [0, 500]);
+});
+
+test("stallCoverage counts only frames showing the session's OUTPUT marker (review r13)", () => {
+  const frames = [fr(0, 1), fr(100, 2), { source: "x11", t_ns: String(at(200)), markers: [{ kind: "echo", session: 0, seq: 9 }] }];
+  assert.deepEqual(stallCoverage(synthSeg(frames), winTo(300), [0]).get(0), { frames: 2, seqs: 2, firstMs: 0, lastMs: 100 });
 });

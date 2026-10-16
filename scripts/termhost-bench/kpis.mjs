@@ -529,6 +529,19 @@ export const STALL_MIN_MS = 2000;
 /** ... while its generator wrote at least this many output markers. */
 export const STALL_MIN_EMITTED = 20;
 /**
+ * A TAIL-DEPENDENT wedge — one whose seen part is under the bar, so it qualifies
+ * only with the frameless stretch to the window's end — voids the marker KPIs
+ * only when that usable tail lasts at least this long (and at least
+ * {@link STALL_TAIL_GAP_FACTOR} times the longest inter-frame gap the primary
+ * source showed before it) with >= {@link STALL_MIN_EMITTED} markers emitted in
+ * it. A host that sends a frame every 2.5 s, or a 2.4 s whole-screen stall that
+ * the window's end happens to cut, looks exactly like the start of a frozen
+ * screen; mid-window the same gap is nothing, so where t1 falls must not decide.
+ */
+export const STALL_TAIL_MIN_MS = 10_000;
+/** See {@link STALL_TAIL_MIN_MS}. */
+export const STALL_TAIL_GAP_FACTOR = 3;
+/**
  * A stretch of still marker (a "piece") ends where the session's marker was
  * absent from the kept primary frames for longer than this, measured from the
  * FIRST frame that lacked it to the next frame that shows it: frames kept
@@ -563,8 +576,9 @@ export const STALL_EXCLUDING_CLASSES = Object.freeze(["occluded", "operator_acti
  *   input monitor and an unknown window state, the standing condition on Xvfb,
  *   where excluding them would switch the stall rule off in CI, the place it was
  *   found;
- * - a `partial` trailing interval is NOT excluded: it is merely short, and a
- *   wedge runs to the end of the window by definition;
+ * - being `partial` does not by itself exclude an interval: a trailing
+ *   interval is merely short, and a wedge runs to the end of the window by
+ *   definition (a partial one with a visibility or input class is excluded);
  * - a MISSING interval (none recorded for a stretch) is NOT excluded: nothing
  *   says the pane was hidden or the operator was typing then.
  * A record whose `valid` is not exactly `false` is not excluded either.
@@ -582,17 +596,41 @@ export function excludedSpans(seg) {
   return out;
 }
 
+/**
+ * The spans of the probe's intervals in which it took no sample at all
+ * (`excluded` holds `no_samples`, class `harness_error`): a probe blackout. A
+ * stretch with no frame inside one says nothing about the pane — the probe was
+ * not looking — so a frameless tail never counts it.
+ *
+ * @returns {{a: bigint, b: bigint, cls: string}[]}
+ */
+export function blackoutSpans(seg) {
+  const out = [];
+  for (const r of seg?.intervals ?? []) {
+    if (!(Array.isArray(r.excluded) && r.excluded.includes("no_samples")) && r.samples !== 0) continue;
+    const a = toNs(r.t_start_ns);
+    const b = toNs(r.t_end_ns);
+    if (a !== null && b !== null && b > a) out.push({ a, b, cls: "no_samples" });
+  }
+  return out;
+}
+
 /** Is `t` inside one of the half-open spans? */
 const inSpans = (spans, t) => spans.some((x) => t >= x.a && t < x.b);
 /** Does a span lie (even in part) strictly between two frames at `p` < `q`? */
 const spanBetween = (spans, p, q) => spans.some((x) => x.a < q && x.b > p);
-/** Nanoseconds of [p, q] not inside any span. */
+/** Nanoseconds of [p, q] not inside any span (spans may overlap). */
 function unexcludedNs(spans, p, q) {
+  const cut = spans
+    .map((x) => ({ lo: x.a > p ? x.a : p, hi: x.b < q ? x.b : q }))
+    .filter((x) => x.hi > x.lo)
+    .sort((x, y) => (x.lo < y.lo ? -1 : x.lo > y.lo ? 1 : 0));
   let ns = q - p;
-  for (const x of spans) {
-    const lo = x.a > p ? x.a : p;
-    const hi = x.b < q ? x.b : q;
-    if (hi > lo) ns -= hi - lo;
+  let reach = p;
+  for (const x of cut) {
+    const lo = x.lo > reach ? x.lo : reach;
+    if (x.hi > lo) ns -= x.hi - lo;
+    if (x.hi > reach) reach = x.hi;
   }
   return ns > 0n ? ns : 0n;
 }
@@ -621,7 +659,10 @@ export function stallFrames(seg, win) {
  * the window's start. A session the rule saw in few frames, over a short span, or
  * not near the window's end, gives an empty stall list that proves nothing.
  *
- * @returns {Map<number, {frames: number, firstMs: number | null, lastMs: number | null}> | null}
+ * `seqs` is the number of distinct output-marker sequences those frames show: a
+ * pane seen at one sequence throughout was not observed repainting.
+ *
+ * @returns {Map<number, {frames: number, seqs: number, firstMs: number | null, lastMs: number | null}> | null}
  */
 export function stallCoverage(seg, win, sessions) {
   const sf = stallFrames(seg, win);
@@ -629,8 +670,10 @@ export function stallCoverage(seg, win, sessions) {
   const out = new Map();
   for (const k of sessions) {
     const shown = sf.kept.filter((f) => (f.markers ?? []).some((m) => m.kind === "output" && m.session === k));
+    const seqs = new Set(shown.flatMap((f) => f.markers.filter((m) => m.kind === "output" && m.session === k && Number.isInteger(m.seq)).map((m) => m.seq)));
     out.set(k, {
       frames: shown.length,
+      seqs: seqs.size,
       firstMs: shown.length > 0 ? nsToMs(shown[0].t - win.t0) : null,
       lastMs: shown.length > 0 ? nsToMs(shown.at(-1).t - win.t0) : null,
     });
@@ -652,11 +695,19 @@ export function stallCoverage(seg, win, sessions) {
  * A run's `ms` is the time it was SEEN: the sum of its pieces' spans, plus — when
  * its last frame is the last primary frame in the window, so no later frame
  * contradicts it — the frameless stretch from there to the window's end
- * (`framelessMs`; a frozen whole screen produces no frames). Hidden and excluded
- * time are never counted. `emitted` counts the generator's output markers emitted
- * within that same seen time ((first, last] of each piece, then the frameless
- * stretch outside excluded spans). It qualifies at >= {@link STALL_MIN_MS} and
- * >= {@link STALL_MIN_EMITTED}.
+ * (`framelessMs`; a frozen whole screen produces no frames), outside excluded
+ * spans and outside probe blackouts ({@link blackoutSpans}: the probe took no
+ * sample, so it was not looking). Hidden and excluded time are never counted.
+ * `emitted` counts the generator's output markers emitted within that same seen
+ * time ((first, last] of each piece, then the frameless stretch: `tailEmitted`).
+ * It qualifies at >= {@link STALL_MIN_MS} and >= {@link STALL_MIN_EMITTED}.
+ *
+ * An unrecovered run's `basis` is `seen` when its pieces alone meet both bars,
+ * else `tail` (it qualifies only with the frameless tail). `voids` is true for a
+ * `seen` one, and for a `tail` one only when the tail is >= `tailBarMs`
+ * (max({@link STALL_TAIL_MIN_MS}, {@link STALL_TAIL_GAP_FACTOR} x the longest
+ * inter-frame gap of the primary source)) with >= {@link STALL_MIN_EMITTED}
+ * markers emitted in it. Only a voiding wedge makes the marker KPIs unknown.
  *
  * A qualifying run is `recovered` iff ANY later primary frame in the window —
  * kept or inside an excluded interval, since a repaint proves itself whatever the
@@ -664,8 +715,9 @@ export function stallCoverage(seg, win, sessions) {
  * counter). Equal or backwards is not recovery. Otherwise the marker did not
  * advance in any later frame: the run reached the window's end still, or the
  * marker was never shown again. Per session the result holds:
- * - that WEDGE, `recovered: false`, if any (the longest): its marker KPIs are
- *   unknown(pane_stalled), since measured from the live part they would hide it;
+ * - that WEDGE, `recovered: false`, if any (a voiding one first, then the
+ *   longest): when it `voids`, its marker KPIs are unknown(pane_stalled), since
+ *   measured from the live part they would hide it; otherwise it is reported;
  * - the longest HITCH, `recovered: true`, if any: the KPIs stay measured (a hitch
  *   is exactly what they must show) and it is reported beside them.
  * Entries are in time order (session, then start). `lastShownMs` is when the
@@ -680,7 +732,8 @@ export function stallCoverage(seg, win, sessions) {
  * generators' emission times with the probe's frame times.
  *
  * @returns {{session: number, seq: number, ms: number, frames: number, emitted: number,
- *   recovered: boolean, lastShownMs: number, framelessMs: number}[]}
+ *   recovered: boolean, lastShownMs: number, framelessMs: number, tailEmitted: number,
+ *   basis: "seen" | "tail", voids: boolean, tailBarMs: number}[]}
  */
 export function paneStalls(seg, gens, win, visible) {
   const sf = stallFrames(seg, win);
@@ -688,6 +741,15 @@ export function paneStalls(seg, gens, win, visible) {
   const { all, kept, spans } = sf;
   const gapNs = BigInt(STALL_HIDDEN_GAP_MS) * NS_PER_MS;
   const lastFrameT = all.length > 0 ? all.at(-1).t : null;
+  // A frameless tail is read outside excluded spans AND outside probe blackouts.
+  const tailSpans = [...spans, ...blackoutSpans(seg)];
+  let maxGapNs = 0n;
+  for (let i = 1; i < all.length; i += 1) if (all[i].t - all[i - 1].t > maxGapNs) maxGapNs = all[i].t - all[i - 1].t;
+  const tailBarNs = (() => {
+    const floor = BigInt(STALL_TAIL_MIN_MS) * NS_PER_MS;
+    const byGap = BigInt(STALL_TAIL_GAP_FACTOR) * maxGapNs;
+    return byGap > floor ? byGap : floor;
+  })();
   const out = [];
   for (const session of [...visible].sort((a, b) => a - b)) {
     const emits = (gens?.get?.(session)?.markers ?? [])
@@ -732,14 +794,18 @@ export function paneStalls(seg, gens, win, visible) {
     for (const run of runs) {
       const end = run.pieces.at(-1).t1;
       // No later primary frame at all: the screen sent nothing more, nothing contradicts the still marker.
-      const frameless = end === lastFrameT ? unexcludedNs(spans, end, win.t1) : 0n;
-      const ns = run.pieces.reduce((acc, p) => acc + (p.t1 - p.t0), 0n) + frameless;
-      const ms = Number(ns) / 1e6;
-      const emitted = emits.filter(
-        (t) => run.pieces.some((p) => t > p.t0 && t <= p.t1) || (frameless > 0n && t > end && t <= win.t1 && !inSpans(spans, t)),
-      ).length;
+      const frameless = end === lastFrameT ? unexcludedNs(tailSpans, end, win.t1) : 0n;
+      const seenNs = run.pieces.reduce((acc, p) => acc + (p.t1 - p.t0), 0n);
+      const ms = Number(seenNs + frameless) / 1e6;
+      const seenEmitted = emits.filter((t) => run.pieces.some((p) => t > p.t0 && t <= p.t1)).length;
+      const tailEmitted = frameless > 0n ? emits.filter((t) => t > end && t <= win.t1 && !inSpans(tailSpans, t)).length : 0;
+      const emitted = seenEmitted + tailEmitted;
       if (ms < STALL_MIN_MS || emitted < STALL_MIN_EMITTED) continue;
       const recovered = all.some((f) => f.t > end && (f.markers ?? []).some((m) => m.kind === "output" && m.session === session && Number.isInteger(m.seq) && seqAdvanced(m.seq, run.seq)));
+      // A wedge whose SEEN part alone meets the bar is "seen"; one that needs the
+      // frameless tail to qualify is "tail", and voids only on a long tail.
+      const basis = Number(seenNs) / 1e6 >= STALL_MIN_MS && seenEmitted >= STALL_MIN_EMITTED ? "seen" : "tail";
+      const voids = !recovered && (basis === "seen" || (frameless >= tailBarNs && tailEmitted >= STALL_MIN_EMITTED));
       const entry = {
         session,
         seq: run.seq,
@@ -749,11 +815,18 @@ export function paneStalls(seg, gens, win, visible) {
         recovered,
         lastShownMs: Math.round(nsToMs(end - win.t0)),
         framelessMs: Math.round(Number(frameless) / 1e6),
+        tailEmitted,
+        basis,
+        voids,
+        tailBarMs: Math.round(Number(tailBarNs) / 1e6),
         rawMs: ms,
         start: run.pieces[0].t0,
       };
       if (!recovered) {
-        if (!wedge || ms > wedge.rawMs) wedge = entry;
+        // The wedge reported is a voiding one if any, else the longest. (Only the
+        // last run can be tail-dependent, so a voiding one is always met first; the
+        // preference is stated, not relied on.)
+        if (!wedge || (voids && !wedge.voids) || (voids === wedge.voids && ms > wedge.rawMs)) wedge = entry;
       } else if (!hitch || ms > hitch.rawMs) hitch = entry;
     }
     const picked = [hitch, wedge].filter(Boolean).sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
@@ -769,10 +842,19 @@ export function paneStalls(seg, gens, win, visible) {
  */
 export function describeStall(x) {
   const frameless = x.framelessMs > 0 ? `, then no frame for ${x.framelessMs} ms` : "";
+  let kind = "";
+  if (!x.recovered && x.basis === "seen") {
+    kind = " (a wedge on what was seen: the still marker alone meets the bar)";
+  } else if (!x.recovered && x.basis === "tail") {
+    kind = x.voids
+      ? ` (a tail-dependent wedge: the frameless tail of ${x.framelessMs} ms, with ${x.tailEmitted} marker(s) emitted in it, meets the ${x.tailBarMs} ms tail bar)`
+      : ` (tail-dependent, not a wedge: the seen part is under the bar, and the frameless tail of ${x.framelessMs} ms with ${x.tailEmitted} marker(s) emitted in it does not meet the ${x.tailBarMs} ms / ${STALL_MIN_EMITTED}-marker tail bar)`;
+  }
   return (
     `session ${x.session} stayed at seq ${x.seq ?? "?"} for ${x.ms} ms (${x.frames} frame(s), last shown at +${x.lastShownMs ?? "?"} ms${frameless}) ` +
     `while its generator wrote ${x.emitted} marker(s)` +
-    (x.recovered ? ", then advanced again" : ", and did not advance in any later frame")
+    (x.recovered ? ", then advanced again" : ", and did not advance in any later frame") +
+    kind
   );
 }
 
@@ -982,7 +1064,7 @@ export function computeRowKpis(p) {
   // from the live part only: they become unknown(pane_stalled). A reason the KPI
   // already had is kept — only a bare sample shortfall, which the wedge explains,
   // is replaced — and the wedge is noted on it instead.
-  const wedged = stalls.filter((x) => !x.recovered);
+  const wedged = stalls.filter((x) => !x.recovered && x.voids);
   if (wedged.length > 0) {
     const what = wedged.map(describeStall).join("; ");
     notes.push(`output_latency_ms: pane stalled: ${what}`);
@@ -1000,6 +1082,13 @@ export function computeRowKpis(p) {
   const hitches = stalls.filter((x) => x.recovered);
   if (hitches.length > 0) {
     notes.push(`output_latency_ms: pane hitch, recovered (the marker KPIs stay measured): ${hitches.map(describeStall).join("; ")}`);
+  }
+  // A still marker that qualifies only with a short frameless tail at the
+  // window's end: a slow host or a brief whole-screen stall looks the same, so
+  // it is reported, and the KPIs stay measured.
+  const tailOnly = stalls.filter((x) => !x.recovered && !x.voids);
+  if (tailOnly.length > 0) {
+    notes.push(`output_latency_ms: pane still at the window's end, tail-dependent (the marker KPIs stay measured): ${tailOnly.map(describeStall).join("; ")}`);
   }
   if (kpis.output_latency_ms.state === "measured") {
     // Which displayed sessions contributed: a session whose output marker never

@@ -19,7 +19,7 @@ import { NeutralityGuard } from "../neutrality.mjs";
 import { InvalidResults, convertProbeIncident, redactRunnerOnly } from "../results.mjs";
 import { AdapterRefusal } from "../adapters/index.mjs";
 import { RunnerAdapter } from "../adapters/runner.mjs";
-import { RunAbort, RunFailed, abortAwareSleep, measureOrder, planUnits, runBench } from "../run.mjs";
+import { RESTORE_CHECK_MIN_FRAMES, RunAbort, RunFailed, abortAwareSleep, measureOrder, planUnits, restoreCoverageGap, runBench } from "../run.mjs";
 import { stallSegment } from "./helpers/bench-fixtures.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
@@ -548,10 +548,10 @@ test("a stalled pane in a soak becomes a pane_stalled incident on its row and na
   });
   const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
   assert.equal(tiled.kpis.output_latency_ms.reason, "pane_stalled");
-  assert.match(tiled.kpis.output_latency_ms.detail, /^pane stalled: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame$/);
+  assert.match(tiled.kpis.output_latency_ms.detail, /^pane stalled: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame \(a wedge on what was seen: the still marker alone meets the bar\)$/);
   assert.ok(
     tiled.incidents.some(
-      (i) => i.kind === "pane_stalled" && /arm tiled: soak: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame: the pane did not repaint after that; its marker KPIs are unknown\(pane_stalled\)$/.test(i.detail),
+      (i) => i.kind === "pane_stalled" && /arm tiled: soak: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame \(a wedge on what was seen: the still marker alone meets the bar\): the pane did not repaint after that; its marker KPIs are unknown\(pane_stalled\)$/.test(i.detail),
     ),
     JSON.stringify(tiled.incidents),
   );
@@ -589,7 +589,7 @@ test("the spawn pass measures new sessions even when its arrangement shows no ea
  * `changed: false` when nothing was maximized; get-zone-view-state reads the
  * state back. The focus arm leaves zone 0 maximized unless `maximized` says not.
  */
-function realZoneView(a, { maximized = 0, viewAfter, events = null, throwOnRestore = null } = {}) {
+function realZoneView(a, { maximized = 0, viewAfter, events = null, throwOnRestore = null, visibleAll = false } = {}) {
   let current = maximized;
   a.restoreZone = async () => {
     events?.push("restore");
@@ -597,7 +597,8 @@ function realZoneView(a, { maximized = 0, viewAfter, events = null, throwOnResto
     const previous = current;
     current = null;
     // The tiled layout is back: the probe sees every session again.
-    a.visibleSet = new Set([...(a.slots?.keys() ?? [])].sort((x, y) => x - y).slice(0, 9));
+    const all = [...(a.slots?.keys() ?? [])].sort((x, y) => x - y);
+    a.visibleSet = new Set(visibleAll ? all : all.slice(0, 9));
     return { maximizedZone: null, previousMaximizedZone: previous, zoneCount: 4, changed: previous !== null };
   };
   a.zoneViewState = async () => {
@@ -644,15 +645,15 @@ test("after the focus arm, a restore-zone check records a frozen restored pane a
   const frozen = await restoreRun(t, { wrapProbe: editRestoreWatch((r) => stallSegment(r)) });
   const inc = frozen.focus.incidents.filter((i) => i.kind === "pane_stalled");
   assert.equal(inc.length, 1, JSON.stringify(frozen.focus.incidents));
-  assert.match(inc[0].detail, /arm focus: after restore-zone: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame: the restored pane did not repaint$/);
+  assert.match(inc[0].detail, /arm focus: after restore-zone: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame \(a wedge on what was seen: the still marker alone meets the bar\): the restored pane did not repaint$/);
   assert.equal(frozen.focus.kpis.output_latency_ms.state, "measured", "it gates nothing: the focus soak is unaffected");
-  assert.equal(check(frozen.focus).state, "measured");
+  assert.equal(check(frozen.focus).state, "measured", JSON.stringify(check(frozen.focus)));
   assert.equal(check(frozen.focus).data.outcome, "not repainting");
   // A clean check says so, positively.
   const clean = await restoreRun(t);
   assert.ok(!clean.res.doc.rows.some((r) => r.incidents.some((i) => i.kind === "pane_stalled" || /restore check/.test(i.detail))));
   assert.equal(check(clean.focus).state, "measured");
-  assert.match(check(clean.focus).notes[0], /^restore check: observed, clean \(\d+ primary frame\(s\); 0: \d+ kept frame\(s\) at \+\d+\.\.\+\d+ ms\)$/);
+  assert.match(check(clean.focus).notes[0], /^restore check: observed, clean \(\d+ primary frame\(s\); 0: \d+ kept frame\(s\) at \+\d+\.\.\+\d+ ms, \d+ seq\(s\) \(judged\)\)$/);
   assert.ok(clean.logs.some((l) => /restore check: observed, clean/.test(l)));
 });
 
@@ -801,7 +802,7 @@ test("a restored pane that came back blank is judged, not skipped: N = 2 (review
   const clean = await restoreRun(t, { n: 2 });
   assert.equal(check(clean.focus).state, "measured", JSON.stringify(check(clean.focus)));
   assert.deepEqual(check(clean.focus).data.judged, [0, 1]);
-  assert.match(check(clean.focus).notes[0], /^restore check: observed, clean \(\d+ primary frame\(s\); 0: \d+ kept frame\(s\) at .*, 1: \d+ kept frame\(s\) at /);
+  assert.match(check(clean.focus).notes[0], /^restore check: observed, clean \(\d+ primary frame\(s\); 0: \d+ kept frame\(s\) at .* \(judged\), 1: \d+ kept frame\(s\) at .* \(judged\)\)$/);
   // Session 1 absent from every frame and from sessions_seen.
   const blank = await restoreRun(t, {
     n: 2,
@@ -817,11 +818,11 @@ test("a restored pane that came back blank is judged, not skipped: N = 2 (review
         ),
     ),
   });
-  assert.ok(unknownIncident(blank.focus, /1 of the 2 session\(s\) the restored layout should show could be judged .*1: no kept frame/), JSON.stringify(blank.focus.incidents));
+  assert.ok(unknownIncident(blank.focus, /1 of the 2 session\(s\) the restored layout should show could be judged .*0: .* \(judged\), 1: no kept frame \(not judged: no kept frame\)/), JSON.stringify(blank.focus.incidents));
   assert.equal(check(blank.focus).state, "unknown");
 });
 
-test("a restored pane that froze and then the screen sent no frame is not clean (review r12 MF1)", async (t) => {
+test("a restored pane that froze and then the screen sent no frame is not clean (review r12 MF1, r13 MF1)", async (t) => {
   const { focus } = await restoreRun(t, {
     wrapProbe: editRestoreWatch((rs) => {
       const s = stallSegment(rs);
@@ -829,10 +830,14 @@ test("a restored pane that froze and then the screen sent no frame is not clean 
       return s.filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= t0 + 600_000_000n);
     }),
   });
-  assert.equal(check(focus).data?.outcome, "not repainting", JSON.stringify(check(focus)));
+  // Seen 0.6 s, then 3.4 s with no frame: tail-dependent, and a 3.4 s tail is under
+  // the 10 s tail bar, so it is no wedge (review r13 MF1) — but it is not clean either.
+  assert.equal(check(focus).state, "unknown", JSON.stringify(check(focus)));
+  assert.ok(unknownIncident(focus, /0: \d+ kept frame\(s\) .*\(not judged: kept frames span under 2000 ms\)/), JSON.stringify(focus.incidents));
   const inc = focus.incidents.filter((i) => i.kind === "pane_stalled");
   assert.equal(inc.length, 1);
-  assert.match(inc[0].detail, /then no frame for \d+ ms\) .*did not advance in any later frame: the restored pane did not repaint$/);
+  assert.match(inc[0].detail, /then no frame for \d+ ms\) .*did not advance in any later frame \(tail-dependent, not a wedge: .*\): the restored pane sent no later frame, on too short a tail to call a wedge$/);
+  assert.equal(inc[0].data.voids, false);
 });
 
 test("a signal before the restore check makes it UNKNOWN (review r12 SF7)", async (t) => {
@@ -866,7 +871,7 @@ test("a clean restore verdict needs ten kept frames per session, reaching near t
       return rs.map((r) => (r.type === "frame" && BigInt(r.t_ns) > t0 + 2_500_000_000n ? { ...r, markers: [] } : r));
     }),
   });
-  assert.ok(unknownIncident(early.focus, /0 of the 1 session\(s\) the restored layout should show could be judged .*0: \d+ kept frame\(s\) at \+\d+\.\.\+2\d{3} ms\)/), JSON.stringify(early.focus.incidents));
+  assert.ok(unknownIncident(early.focus, /0 of the 1 session\(s\) the restored layout should show could be judged .*0: \d+ kept frame\(s\) at \+\d+\.\.\+2\d{3} ms, \d+ seq\(s\) \(not judged: last kept frame over 2000 ms before the watch's end\)/), JSON.stringify(early.focus.incidents));
   assert.equal(check(early.focus).state, "unknown");
   // One frame per half second over the whole watch: span and end are fine, eight frames are too few.
   const sparse = await restoreRun(t, {
@@ -875,5 +880,108 @@ test("a clean restore verdict needs ten kept frames per session, reaching near t
       return rs.filter((r) => r.type !== "frame" || k++ % 30 === 0);
     }),
   });
-  assert.ok(unknownIncident(sparse.focus, /0 of the 1 session\(s\) .*0: [1-9] kept frame\(s\)/), JSON.stringify(sparse.focus.incidents));
+  assert.ok(unknownIncident(sparse.focus, /0 of the 1 session\(s\) .*0: [1-9] kept frame\(s\) .*\(not judged: fewer than 10 kept frames\)/), JSON.stringify(sparse.focus.incidents));
+});
+
+// --- review r13 ---------------------------------------------------------------
+
+/** Drop session `k` from every frame, first_seen and sessions_seen of the restore watch. */
+const blankRestored = (k) =>
+  editRestoreWatch((rs) =>
+    rs
+      .filter((r) => !(r.type === "first_seen" && r.session === k))
+      .map((r) =>
+        r.type === "frame"
+          ? { ...r, markers: (r.markers ?? []).filter((m) => m.session !== k) }
+          : r.type === "summary"
+            ? { ...r, sessions_seen: (r.sessions_seen ?? []).filter((x) => x !== k) }
+            : r,
+      ),
+  );
+
+test("SF1: at N = 12 the restored (focus) session must be among the judged, else UNKNOWN (review r13 SF1)", async (t) => {
+  const clean = await restoreRun(t, { n: 12, zone: { visibleAll: true } });
+  assert.equal(check(clean.focus).state, "measured", JSON.stringify(check(clean.focus)));
+  assert.equal(check(clean.focus).data.restored, 0);
+  assert.ok(check(clean.focus).data.judged.includes(0));
+  // Session 0 — the one restore-zone restored — came back blank; the other 11 suffice for the count of 9.
+  const blank = await restoreRun(t, { n: 12, zone: { visibleAll: true }, wrapProbe: blankRestored(0) });
+  assert.equal(check(blank.focus).state, "unknown", JSON.stringify(check(blank.focus)));
+  assert.ok(unknownIncident(blank.focus, /the restored session 0 could not be judged \(no kept frame\); 0: no kept frame \(not judged: no kept frame\), 1: .* \(judged\)/), JSON.stringify(blank.focus.incidents));
+  // A different blank session leaves the restored one judged: clean, and the note says who was not judged.
+  const other = await restoreRun(t, { n: 12, zone: { visibleAll: true }, wrapProbe: blankRestored(11) });
+  assert.equal(check(other.focus).data?.outcome, "clean", JSON.stringify(check(other.focus)));
+  assert.match(check(other.focus).notes[0], /0: \d+ kept frame\(s\) .* \(judged\), .*11: no kept frame \(not judged: no kept frame\)\)$/);
+});
+
+test("nit: the restore check's judging boundaries — frames 9/10, span >= 2000, end <= 2000, >= 2 seqs (review r13 nit)", () => {
+  const ok = { frames: RESTORE_CHECK_MIN_FRAMES, seqs: 2, firstMs: 0, lastMs: 3000 };
+  assert.equal(RESTORE_CHECK_MIN_FRAMES, 10);
+  assert.equal(restoreCoverageGap(ok, 5000), null, "exactly 10 frames, end exactly 2000 ms before the watch's end");
+  assert.equal(restoreCoverageGap({ ...ok, frames: 9 }, 5000), "fewer than 10 kept frames");
+  assert.equal(restoreCoverageGap({ ...ok, lastMs: 2000 }, 4000), null, "span exactly 2000 ms");
+  assert.equal(restoreCoverageGap({ ...ok, lastMs: 1999 }, 3999), "kept frames span under 2000 ms");
+  assert.equal(restoreCoverageGap(ok, 5001), "last kept frame over 2000 ms before the watch's end");
+  assert.equal(restoreCoverageGap({ ...ok, seqs: 1 }, 5000), "marker did not advance and the generator wrote < 20 markers");
+  assert.equal(restoreCoverageGap({ frames: 0, seqs: 0, firstMs: null, lastMs: null }, 5000), "no kept frame");
+});
+
+test("MF1: a 2.4 s whole-screen freeze at the soak's end is a pane_stalled incident, not a void (review r13 MF1)", async (t) => {
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["tmux"] },
+    wrapProbe: (inner) => ({
+      ...inner,
+      startWatch(o) {
+        const w = inner.startWatch(o);
+        if (o.label !== "tiled-soak") return w;
+        return { ...w, stop: async () => {
+          const seg = await w.stop();
+          const frames = seg.records.filter((r) => r.type === "frame").map((r) => BigInt(r.t_ns));
+          const cut = frames.reduce((m, x) => (x > m ? x : m), 0n) - 2_400_000_000n;
+          return { ...seg, records: seg.records.filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= cut) };
+        } };
+      },
+    }),
+  });
+  const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
+  assert.equal(tiled.kpis.output_latency_ms.state, "measured", JSON.stringify(tiled.kpis.output_latency_ms));
+  const inc = tiled.incidents.filter((i) => i.kind === "pane_stalled");
+  assert.equal(inc.length, 1, JSON.stringify(tiled.incidents));
+  assert.match(inc[0].detail, /\(tail-dependent, not a wedge: .*\): still at the soak's end on too short a frameless tail to call a wedge; its marker KPIs stay measured$/);
+  assert.deepEqual([inc[0].data.recovered, inc[0].data.voids], [false, false]);
+});
+
+/** Session `k`'s marker frozen over [fromMs, toMs] of the restore watch, and no frame at all after `toMs`. */
+const freezeThenNoFrame = (k, fromMs, toMs) =>
+  editRestoreWatch((rs) => {
+    const start = BigInt(rs.find((r) => r.type === "start").t0_ns) + 5_000_000n;
+    const a = start + BigInt(fromMs) * 1_000_000n;
+    const b = start + BigInt(toMs) * 1_000_000n;
+    let seq = null;
+    return rs
+      .filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= b)
+      .map((r) => {
+        if (r.type !== "frame" || BigInt(r.t_ns) < a) return r;
+        return { ...r, markers: r.markers.map((m) => {
+          if (m.kind !== "output" || m.session !== k) return m;
+          seq ??= m.seq;
+          return { ...m, seq };
+        }) };
+      });
+  });
+
+test("a restored session still at the watch's end on a short frameless tail is not judged (review r13 MF1)", async (t) => {
+  const { focus } = await restoreRun(t, { wrapProbe: freezeThenNoFrame(0, 1500, 2900) });
+  const inc = focus.incidents.filter((i) => i.kind === "pane_stalled");
+  assert.equal(inc.length, 1, JSON.stringify(focus.incidents));
+  assert.equal(inc[0].data.voids, false);
+  assert.equal(check(focus).state, "unknown", JSON.stringify(check(focus)));
+  assert.ok(unknownIncident(focus, /0: \d+ kept frame\(s\) .*\(not judged: still at the watch's end on a short frameless tail\)/), JSON.stringify(focus.incidents));
+});
+
+test("at N = 12 a tail-dependent stall on an unjudged, non-restored session leaves the outcome clean, not a hitch (review r13 MF1)", async (t) => {
+  const { focus } = await restoreRun(t, { n: 12, zone: { visibleAll: true }, wrapProbe: freezeThenNoFrame(11, 1500, 2900) });
+  assert.equal(focus.incidents.filter((i) => i.kind === "pane_stalled").length, 1, JSON.stringify(focus.incidents));
+  assert.equal(check(focus).data?.outcome, "clean", JSON.stringify(check(focus)));
+  assert.match(check(focus).notes[0], /11: \d+ kept frame\(s\) .*\(not judged: still at the watch's end on a short frameless tail\)\)$/);
 });
