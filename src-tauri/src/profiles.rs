@@ -718,7 +718,8 @@ pub enum SettingsJsonPathSource {
     PlatformConfigDir,
     /// Neither available — the platform config dir
     /// (`instance_env::platform_dir`, which always resolves under an instance
-    /// root) returned `None`, so there is no path at all. The value is `None`, never a guess.
+    /// root) returned `None`, so there is no path at all. The value is `None`,
+    /// never a guess.
     Unresolvable,
 }
 

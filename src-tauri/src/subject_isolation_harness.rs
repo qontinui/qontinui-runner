@@ -225,12 +225,7 @@ fn drive_every_store(mode: &str) -> Vec<PathBuf> {
             "tenant_id": tenant.to_string(),
         }))
         .expect("a pair response");
-    // Bound first: `tests/interactive_signout_marker_guard.rs` scans for the
-    // call text in every non-`#[cfg(test)]` region, and this whole file is an
-    // out-of-line test module it cannot see as one. A fixture pairing has no
-    // operator sign-out marker to clear.
-    let persist = qontinui_runner_lib::pair::persist_pairing;
-    persist(&resp, tenant).expect("persist the fixture pairing");
+    qontinui_runner_lib::pair::persist_pairing(&resp, tenant).expect("persist the fixture pairing");
     let _ = qontinui_runner_lib::pair::converge_binding_store();
     let secure = ie::secure_storage_dir().expect("a secure-storage dir");
     out.push(secure.join("paired_user.json"));
