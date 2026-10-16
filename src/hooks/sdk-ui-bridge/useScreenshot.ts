@@ -42,7 +42,11 @@ export function useScreenshot(): UseScreenshotReturn {
         },
       });
     } catch (e) {
-      console.warn("[useScreenshot] Screenshot capture error:", describeThrown(e, "unknown error"));
+      console.warn(
+        "[useScreenshot] Screenshot capture error:",
+        describeThrown(e, "unknown error"),
+        e,
+      );
     } finally {
       setIsCapturingScreenshot(false);
     }

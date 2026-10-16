@@ -10,7 +10,13 @@
 //!
 //! - `<pane-id>.lock` — the advisory lock, taken BEFORE any endpoint exists,
 //!   holding a JSON [`crate::lock::LockRecord`];
-//! - `<pane-id>.sock` — the Unix-domain socket (Unix only).
+//! - `<pane-id>.sock` — the Unix-domain socket (Unix only);
+//! - `<pane-id>.spec` — the child spec the RUNNER writes (0600) before it
+//!   spawns the holder, and the holder consumes and unlinks at start-up
+//!   (`crate::spec`);
+//! - `<pane-id>.log` — the holder's own, size-capped diagnostic log. A holder
+//!   has no stderr once it is detached, so this is where it says why an
+//!   endpoint failed without ending the pane.
 //!
 //! On Windows the endpoint is a named pipe, whose namespace is global rather
 //! than a directory, so [`pipe_name`] folds the pane directory into the name.
@@ -79,6 +85,61 @@ pub fn lock_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// `<pane-dir>/<pane-id>.sock` — the Unix endpoint.
 pub fn socket_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.sock", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.spec` — the child spec (`crate::spec`).
+pub fn spec_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.spec", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.log` — the holder's diagnostic log.
+pub fn log_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.log", pane.as_str()))
+}
+
+/// Create the pane dir if needed, and refuse one this user cannot trust. Used
+/// by BOTH sides: the runner before it writes a spec into it, the holder
+/// before it takes its lock there.
+///
+/// The path must be absolute — the runner resolves it and passes it whole
+/// (plan D13). Unix: a directory we CREATE is made 0700 (the umask can only
+/// narrow it). A PRE-EXISTING one must be a real directory (not a symlink),
+/// ours, and not group/other-writable — anyone who could write there could
+/// already have planted a lock file, a socket or a spec, so it is refused
+/// (`PermissionDenied`) rather than chmod-repaired. A pre-existing directory
+/// that is merely group/other-READABLE is tightened to 0700: nothing could
+/// have been planted, and the endpoint's path should not be listable.
+pub fn prepare_private_dir(pane_dir: &Path) -> io::Result<()> {
+    if !pane_dir.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not absolute; the runner resolves it and passes it whole",
+                pane_dir.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(pane_dir)?;
+        check_private_dir(pane_dir)?;
+        let md = std::fs::symlink_metadata(pane_dir)?;
+        if md.mode() & 0o077 != 0 {
+            std::fs::set_permissions(pane_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // The directory inherits the per-user app-data ACL it is created under;
+        // the Windows access barrier is the pipe's DACL (transport::windows).
+        std::fs::create_dir_all(pane_dir)?;
+        check_private_dir(pane_dir)?;
+    }
+    Ok(())
 }
 
 /// The Windows named-pipe name for a pane:
@@ -271,6 +332,8 @@ mod tests {
         let p = PaneId::new("p1").unwrap();
         assert_eq!(lock_path(dir, &p), dir.join("p1.lock"));
         assert_eq!(socket_path(dir, &p), dir.join("p1.sock"));
+        assert_eq!(spec_path(dir, &p), dir.join("p1.spec"));
+        assert_eq!(log_path(dir, &p), dir.join("p1.log"));
 
         let name = pipe_name(dir, &p);
         assert!(name.starts_with(r"\\.\pipe\qontinui-pty-holder-"), "{name}");

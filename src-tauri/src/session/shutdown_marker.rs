@@ -129,7 +129,7 @@ fn read_marker(path: &Path) -> Option<ShutdownMarker> {
 /// This must be called BEFORE [`mark_running`] overwrites the marker for the
 /// current process.
 pub fn was_unclean_shutdown(path: &Path) -> bool {
-    classify_prior_marker(read_marker(path).as_ref()).crash_recovery
+    classify_prior_marker(read_marker(path).as_ref(), 0).crash_recovery
 }
 
 /// The one-shot classification of THIS boot, derived from the PRIOR
@@ -148,14 +148,22 @@ pub struct BootClassification {
     /// boot instant. Used as one input to the restore path's anchored
     /// recency rule (the registry's "last moment of life").
     pub prior_marker_at: Option<i64>,
+    /// Epoch millis at which THIS process classified its boot — effectively
+    /// the boot instant. It partitions the lifecycle registry into rows whose
+    /// last sign of life predates this process (the prior boot's cohort, the
+    /// set a boot restore exists to bring back) and rows this process has
+    /// itself touched. See `SessionLifecycleStore::restorable_records` and
+    /// `withheld_boot_restore_candidate`.
+    pub booted_at_ms: i64,
 }
 
 /// Pure classification core for [`classify_boot`] (testable without the
 /// process-wide [`OnceLock`]).
-fn classify_prior_marker(prior: Option<&ShutdownMarker>) -> BootClassification {
+fn classify_prior_marker(prior: Option<&ShutdownMarker>, booted_at_ms: i64) -> BootClassification {
     BootClassification {
         crash_recovery: prior.map(|m| !m.clean).unwrap_or(true),
         prior_marker_at: prior.map(|m| m.at),
+        booted_at_ms,
     }
 }
 
@@ -169,7 +177,10 @@ static BOOT_CLASSIFICATION: OnceLock<BootClassification> = OnceLock::new();
 /// AI-session resume spawn) cannot double-classify or double-overwrite.
 pub fn classify_boot(path: &Path) -> BootClassification {
     *BOOT_CLASSIFICATION.get_or_init(|| {
-        let classification = classify_prior_marker(read_marker(path).as_ref());
+        let classification = classify_prior_marker(
+            read_marker(path).as_ref(),
+            chrono::Utc::now().timestamp_millis(),
+        );
         mark_running(path);
         classification
     })
@@ -299,24 +310,34 @@ mod tests {
     #[test]
     fn classify_prior_marker_covers_all_marker_shapes() {
         // Absent marker → crash recovery, no anchor.
-        let absent = classify_prior_marker(None);
+        let absent = classify_prior_marker(None, 7);
+        assert_eq!(
+            absent.booted_at_ms, 7,
+            "the boot instant is carried verbatim"
+        );
         assert!(absent.crash_recovery);
         assert!(absent.prior_marker_at.is_none());
 
         // Clean marker → planned restart, anchor = shutdown instant.
-        let clean = classify_prior_marker(Some(&ShutdownMarker {
-            clean: true,
-            at: 1_000,
-        }));
+        let clean = classify_prior_marker(
+            Some(&ShutdownMarker {
+                clean: true,
+                at: 1_000,
+            }),
+            7,
+        );
         assert!(!clean.crash_recovery);
         assert_eq!(clean.prior_marker_at, Some(1_000));
 
         // Running (clean:false) marker left by a crash → crash recovery, but
         // the prior `at` (the crashed process's boot instant) still anchors.
-        let crashed = classify_prior_marker(Some(&ShutdownMarker {
-            clean: false,
-            at: 2_000,
-        }));
+        let crashed = classify_prior_marker(
+            Some(&ShutdownMarker {
+                clean: false,
+                at: 2_000,
+            }),
+            7,
+        );
         assert!(crashed.crash_recovery);
         assert_eq!(crashed.prior_marker_at, Some(2_000));
     }

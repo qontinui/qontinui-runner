@@ -7,6 +7,9 @@ import {
   zoneBodyPadding,
   MIN_TERMINAL_BODY_PX,
   MIN_PROMPTS_STRIP_PX,
+  PROMPTS_PANEL_GEOMETRY,
+  REVIEW_PANEL_GEOMETRY,
+  toggleZonePanel,
 } from "./promptsPanelLayout";
 import { PROMPTS_PANEL_TOP_HEIGHT_PX, PROMPTS_PANEL_RIGHT_WIDTH_PX } from "./ZonePromptsPanel";
 
@@ -187,5 +190,99 @@ describe("zoneBodyPadding", () => {
       });
       expect(pad.top === 0 || pad.right === 0).toBe(true);
     }
+  });
+});
+
+describe("review panel geometry", () => {
+  it("is taller, wider and leaves the strip sooner than the prompts panel", () => {
+    expect(REVIEW_PANEL_GEOMETRY.topHeightPx).toBeGreaterThan(PROMPTS_PANEL_GEOMETRY.topHeightPx);
+    expect(REVIEW_PANEL_GEOMETRY.rightWidthPx).toBeGreaterThan(PROMPTS_PANEL_GEOMETRY.rightWidthPx);
+    expect(REVIEW_PANEL_GEOMETRY.minStripPx).toBeGreaterThan(PROMPTS_PANEL_GEOMETRY.minStripPx);
+  });
+
+  it("omitting the geometry is exactly the prompts panel's contract", () => {
+    for (const zoneHeightPx of [0, SHORT, TALL]) {
+      const opts = {
+        zoneHeaderPx: HEADER,
+        filterBarPx: 0,
+        promptsOpen: true,
+        isSingleView: false,
+        zoneHeightPx,
+      };
+      expect(zoneBodyPadding(opts)).toEqual(
+        zoneBodyPadding({ ...opts, geometry: PROMPTS_PANEL_GEOMETRY }),
+      );
+    }
+  });
+
+  it("sends a review panel to the column in a zone that would still fit a prompts strip", () => {
+    // SHORT leaves 172 - 20 - 100 = 52px: enough for a prompts strip (48),
+    // not for a review strip (160).
+    expect(
+      promptsPanelOrientation({ isSingleView: false, zoneHeightPx: SHORT, chromeTopPx: HEADER }),
+    ).toBe("top");
+    expect(
+      promptsPanelOrientation({
+        isSingleView: false,
+        zoneHeightPx: SHORT,
+        chromeTopPx: HEADER,
+        geometry: REVIEW_PANEL_GEOMETRY,
+      }),
+    ).toBe("right");
+    expect(
+      zoneBodyPadding({
+        zoneHeaderPx: HEADER,
+        filterBarPx: 0,
+        promptsOpen: true,
+        isSingleView: false,
+        zoneHeightPx: SHORT,
+        geometry: REVIEW_PANEL_GEOMETRY,
+      }),
+    ).toEqual({ top: HEADER, right: REVIEW_PANEL_GEOMETRY.rightWidthPx });
+  });
+
+  it("clamps a review strip to what the zone can spare and pads the body by the same amount", () => {
+    const tall = 600;
+    const strip = promptsStripHeight(tall, HEADER, REVIEW_PANEL_GEOMETRY);
+    expect(strip).toBe(REVIEW_PANEL_GEOMETRY.topHeightPx);
+    const mid = 420; // 420 - 20 - 100 = 300 available ≥ 160 → top, clamped to 260
+    expect(promptsStripHeight(mid, HEADER, REVIEW_PANEL_GEOMETRY)).toBe(260);
+    const pad = zoneBodyPadding({
+      zoneHeaderPx: HEADER,
+      filterBarPx: 0,
+      promptsOpen: true,
+      isSingleView: false,
+      zoneHeightPx: 330, // 210 available → top strip of 210
+      geometry: REVIEW_PANEL_GEOMETRY,
+    });
+    expect(pad).toEqual({ top: HEADER + 210, right: 0 });
+  });
+});
+
+describe("toggleZonePanel", () => {
+  const empty = { prompts: new Set<string>(), review: new Set<string>() };
+
+  it("opens and closes one panel for one tab", () => {
+    const opened = toggleZonePanel(empty, "t1", "review");
+    expect([...opened.review]).toEqual(["t1"]);
+    expect(opened.prompts.size).toBe(0);
+    const closed = toggleZonePanel(opened, "t1", "review");
+    expect(closed.review.size).toBe(0);
+  });
+
+  it("opening one panel closes the other for that tab only", () => {
+    const start = { prompts: new Set(["t1", "t2"]), review: new Set<string>() };
+    const next = toggleZonePanel(start, "t1", "review");
+    expect([...next.review]).toEqual(["t1"]);
+    expect([...next.prompts]).toEqual(["t2"]);
+    const back = toggleZonePanel(next, "t1", "prompts");
+    expect([...back.prompts].sort()).toEqual(["t1", "t2"]);
+    expect(back.review.size).toBe(0);
+  });
+
+  it("closing a panel leaves the other set untouched (same reference)", () => {
+    const start = { prompts: new Set(["t2"]), review: new Set(["t1"]) };
+    const next = toggleZonePanel(start, "t1", "review");
+    expect(next.prompts).toBe(start.prompts);
   });
 });

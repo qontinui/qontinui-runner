@@ -239,6 +239,13 @@ impl Server {
     // -- WebSocket wrappers ----------------------------------------------
 
     async fn ws_open(&self, origin: Option<&str>) -> Ws {
+        self.ws_open_try(origin)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::ws_open`] that reports a failed upgrade instead of panicking.
+    async fn ws_open_try(&self, origin: Option<&str>) -> Result<Ws, String> {
         let mut req = format!("ws://127.0.0.1:{}/ui-bridge/ws", self.port)
             .into_client_request()
             .unwrap();
@@ -248,17 +255,35 @@ impl Server {
         }
         let (stream, resp) = tokio::time::timeout(PROMPT, tokio_tungstenite::connect_async(req))
             .await
-            .expect("upgrade within 5s")
-            .expect("upgrade accepted");
-        assert_eq!(resp.status().as_u16(), 101, "upgrade status");
-        Ws { stream }
+            .map_err(|_| format!("no upgrade within {PROMPT:?}"))?
+            .map_err(|e| format!("upgrade refused: {e:?}"))?;
+        if resp.status().as_u16() != 101 {
+            return Err(format!("upgrade status {}", resp.status()));
+        }
+        Ok(Ws { stream })
     }
 
     /// Open a socket from `origin` and send the register frame the extension's
     /// live relay / a Node wrapper sends. Returns the socket and the runner's
     /// first reply frame.
     async fn ws_register(&self, origin: Option<&str>, app_id: &str) -> (Ws, Value) {
-        let mut ws = self.ws_open(origin).await;
+        let (ws, reply) = self
+            .ws_register_try(origin, app_id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let reply = reply.unwrap_or_else(|seen| panic!("no reply to the register frame: {seen}"));
+        (ws, reply)
+    }
+
+    /// [`Self::ws_register`] that never panics. `Err` when the socket could
+    /// not be opened or the frame not sent; otherwise the socket and either
+    /// the reply or what arrived instead of one ([`Ws::recv_reply`]).
+    async fn ws_register_try(
+        &self,
+        origin: Option<&str>,
+        app_id: &str,
+    ) -> Result<(Ws, Result<Value, String>), String> {
+        let mut ws = self.ws_open_try(origin).await?;
         let mut frame = json!({
             "type": "register",
             "transport": "websocket",
@@ -270,9 +295,12 @@ impl Server {
             frame["origin"] = json!(o);
             frame["pageUrl"] = json!(format!("{o}/page"));
         }
-        ws.send(frame).await;
-        let reply = ws.recv().await.expect("a reply to the register frame");
-        (ws, reply)
+        ws.stream
+            .send(WsMessage::Text(frame.to_string().into()))
+            .await
+            .map_err(|e| format!("register frame not sent: {e:?}"))?;
+        let reply = ws.recv_reply().await;
+        Ok((ws, reply))
     }
 
     // -- SSE relay tabs ----------------------------------------------------
@@ -484,6 +512,40 @@ impl Ws {
                 }
                 Ok(Some(Ok(_))) => continue,
             }
+        }
+    }
+
+    /// Next text frame as JSON, like [`Self::recv`], but on failure say WHAT
+    /// arrived instead — a Close frame, a transport error (and its kind), a
+    /// bare EOF, a non-JSON text, or nothing within [`PROMPT`] — and how long
+    /// it took. `recv` folds all five into `None`, which is all that Windows CI
+    /// job 115095200692 of `concurrent_claims_single_winner` could report, so
+    /// the mechanism behind its failure could not be told apart.
+    async fn recv_reply(&mut self) -> Result<Value, String> {
+        let started = tokio::time::Instant::now();
+        let mut skipped = Vec::new();
+        loop {
+            let left = PROMPT.saturating_sub(started.elapsed());
+            let seen = match tokio::time::timeout(left, self.stream.next()).await {
+                Ok(Some(Ok(WsMessage::Text(t)))) => {
+                    match serde_json::from_str::<Value>(t.as_str()) {
+                        Ok(v) => return Ok(v),
+                        Err(e) => format!("a non-JSON text frame ({e}): {t}"),
+                    }
+                }
+                Ok(Some(Ok(WsMessage::Close(frame)))) => format!("a Close frame {frame:?}"),
+                Ok(Some(Ok(other))) => {
+                    skipped.push(format!("{other:?}"));
+                    continue;
+                }
+                Ok(Some(Err(e))) => format!("a transport error: {e:?}"),
+                Ok(None) => "EOF with no Close frame".to_string(),
+                Err(_) => format!("nothing within {PROMPT:?}"),
+            };
+            return Err(format!(
+                "{seen} after {:?} (non-text frames skipped first: {skipped:?})",
+                started.elapsed()
+            ));
         }
     }
 
@@ -1675,35 +1737,58 @@ async fn sdk_switch_refused_to_foreign() {
 }
 
 /// R1 is checked and written under one lock.
+///
+/// Every attempt is collected before anything is asserted — including one
+/// whose socket could not be opened or whose frame could not be sent — so a
+/// failure reports all 50 and the server's own R1 refusal ledgers in ONE
+/// message. Windows CI job 115095200692 (run 38335714046, attempt 1) failed
+/// this test with 21 of 50 sockets getting no JSON reply (`recv` returned
+/// `None`), and the old `expect` could say neither what those sockets saw nor
+/// whether the server had refused their claims.
 #[tokio::test]
 async fn concurrent_claims_single_winner() {
+    const ATTEMPTS: usize = 50;
     let s = Arc::new(spawn(BindingConfig::default()).await);
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
     let holder_conn = ack["connId"].as_u64().unwrap();
 
     let mut attempts = Vec::new();
-    for _ in 0..50 {
+    for _ in 0..ATTEMPTS {
         let s = s.clone();
         attempts.push(tokio::spawn(async move {
-            let (ws, reply) = s.ws_register(Some(EVIL), "app").await;
-            (ws, reply)
+            s.ws_register_try(Some(EVIL), "app").await
         }));
     }
     let mut held = 0;
+    let mut other = Vec::new();
     let mut sockets = Vec::new();
-    for a in attempts {
-        let (ws, reply) = a.await.unwrap();
-        if ack_refusal_code(&reply) == Some("UIB_REGISTRATION_HELD") {
-            held += 1;
+    for (i, a) in attempts.into_iter().enumerate() {
+        match a.await.unwrap() {
+            Ok((ws, reply)) => {
+                sockets.push(ws);
+                match reply {
+                    Ok(r) if ack_refusal_code(&r) == Some("UIB_REGISTRATION_HELD") => held += 1,
+                    Ok(r) => other.push(format!("attempt {i}: unexpected reply {r}")),
+                    Err(seen) => other.push(format!("attempt {i}: no reply — {seen}")),
+                }
+            }
+            Err(e) => other.push(format!("attempt {i}: {e}")),
         }
-        sockets.push(ws);
-        assert_eq!(
-            conn_for(&s, "app").await,
-            Some(holder_conn),
-            "the routing slot moved"
-        );
     }
-    assert_eq!(held, 50, "every concurrent foreign claim must be refused");
+    let slot = conn_for(&s, "app").await;
+    // Read after every attempt finished. An attempt that timed out may not
+    // be counted YET, so a short ledger means "not counted", not "not seen".
+    let ledgers = json!({
+        RULE_R1_SLOT: s.rule(RULE_R1_SLOT).await,
+        RULE_R1: s.rule(RULE_R1).await,
+    });
+    assert!(
+        held == ATTEMPTS && slot == Some(holder_conn),
+        "every concurrent foreign claim must be refused and the routing slot must not move: \
+         {held}/{ATTEMPTS} replied UIB_REGISTRATION_HELD; slot {slot:?} (holder {holder_conn}); \
+         the server's refusal ledgers {ledgers}; the rest:\n{}",
+        other.join("\n")
+    );
 }
 
 /// R2's liveness arm.

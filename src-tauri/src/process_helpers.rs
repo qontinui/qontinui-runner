@@ -21,6 +21,12 @@ pub fn no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command
         for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
         }
+        // Repository-local env (`GIT_DIR`, `GIT_INDEX_FILE`, …) inherited from
+        // whoever launched the runner — a git hook, a shell that exported them —
+        // would point THIS git at the launcher's repo, whatever `-C` /
+        // `current_dir` says. Scrubbed here, at the one chokepoint, so no call
+        // site has to remember.
+        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
     }
     cmd
 }
@@ -40,7 +46,30 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
         for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
         }
+        // The same repository-local scrub as [`no_window`], through the same
+        // function, so the two constructors cannot drift.
+        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(cmd.as_std_mut());
     }
+    cmd
+}
+
+/// A git command that can only ever address the repository its caller names
+/// and whose messages are the untranslated C-locale text.
+///
+/// The caller's whole repository-local environment
+/// ([`qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV`] — `GIT_DIR`,
+/// `GIT_WORK_TREE`, `GIT_INDEX_FILE`, the object-store variables and the rest)
+/// is removed through the ONE scrub, so an inherited value can never redirect a
+/// read or a fetch at some other repository — or borrow its object store —
+/// and `LC_ALL` / `LANGUAGE` are `C`, so a stderr match is never defeated by a
+/// translation. [`no_window`] also applies the prompt-proof git posture, so a
+/// credential prompt fails instead of blocking.
+pub fn scrubbed_git(program: &std::ffi::OsStr) -> std::process::Command {
+    let mut cmd = no_window(program);
+    // Unconditional (no_window scrubs only when `program` is git): the same
+    // single list, so this constructor cannot drift from it.
+    qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
+    cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
     cmd
 }
 
@@ -1046,8 +1075,71 @@ pub fn run_with_timeout(
 /// INCOMPLETE. That is reported in [`TimedRun::truncation`] rather than
 /// silently folded into a successful `Output` — see [`Truncation`].
 pub fn run_with_timeout_detailed(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<TimedRun> {
+    run_bounded(cmd, timeout, None)
+}
+
+/// [`run_with_timeout_detailed`] for a child that reads a FIXED input on stdin
+/// — `git cat-file --batch`, which takes its object list there and nowhere
+/// else.
+///
+/// Every guarantee of [`run_with_timeout_detailed`] holds, with one change:
+/// stdin is a pipe that a detached writer thread fills with `input` and then
+/// CLOSES, so the child sees EOF exactly where a `/dev/null` stdin would have
+/// given it one, and can no more block waiting for input than before.
+///
+/// That writer adds one row to the resource table of
+/// [`run_with_timeout_detailed`]:
+///
+/// | Resource | Worst case |
+/// |---|---|
+/// | Stdin writer OS thread | 1, until the write completes or the pipe's READ end closes |
+///
+/// It is never joined. It ends when the write completes or fails, and the
+/// write fails with `EPIPE` (Rust ignores `SIGPIPE`) once every holder of the
+/// pipe's read end is gone — so its life is bounded by the read end's, not by
+/// this call. The holders are the child and any descendant that inherited its
+/// stdin. On the timeout path the tree reaper kills those; on the success path
+/// the tree is disarmed, so a descendant of a child that exited 0 WITHOUT
+/// consuming its input — and that neither reads nor closes the inherited
+/// stdin — keeps the writer blocked for as long as it lives. A child that
+/// reads its whole input (`git cat-file --batch` does) leaves no such case.
+///
+/// When the writer thread cannot be started at all (the process is at its
+/// thread ceiling), the child is killed and reaped and the spawn error is
+/// returned — it is never left waiting on input that will not come.
+pub fn run_with_timeout_input(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+    input: Vec<u8>,
+) -> std::io::Result<TimedRun> {
+    run_bounded(cmd, timeout, Some((input, spawn_stdin_writer)))
+}
+
+/// Starts the detached thread that fills a child's stdin and then closes it.
+/// A seam so a test can stand in for the thread ceiling.
+type StdinWriter = fn(std::process::ChildStdin, Vec<u8>) -> std::io::Result<()>;
+
+/// The production [`StdinWriter`]: a named, never-joined thread that writes
+/// `input` and drops `stdin` — the drop is the EOF the child waits for. Built
+/// with [`std::thread::Builder`] so a process at its thread ceiling gets an
+/// `Err` back instead of a panic on the caller's thread.
+fn spawn_stdin_writer(mut stdin: std::process::ChildStdin, input: Vec<u8>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("stdin-feed".to_string())
+        .spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        })
+        .map(drop)
+}
+
+fn run_bounded(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
+    input: Option<(Vec<u8>, StdinWriter)>,
 ) -> std::io::Result<TimedRun> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -1056,9 +1148,13 @@ pub fn run_with_timeout_detailed(
     // sweep that keeps [`start_detached`] thread-free.
     reap_detached_children();
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
     // Pre-spawn half of the tree reaper (Unix process group; no-op on Windows).
     ChildTreeGuard::arm(&mut cmd);
@@ -1079,6 +1175,26 @@ pub fn run_with_timeout_detailed(
     qontinui_runner_lib::util::resource_exhaustion::note_spawn_succeeded();
     let pid = child.id();
     let tree = ChildTreeGuard::attach_armed(&child);
+
+    if let (Some((input, writer)), Some(stdin)) = (input, child.stdin.take()) {
+        // Detached, never joined — see `run_with_timeout_input`. A writer that
+        // cannot start leaves a child that would wait on stdin until the
+        // deadline for input that never comes: kill and reap it (and fire the
+        // tree reaper) now, and hand the spawn error to the caller. No reader
+        // thread exists yet, so nothing else is left behind.
+        if let Err(e) = writer(stdin, input) {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(tree);
+            tracing::warn!(
+                child_pid = pid,
+                program = %program_label(&cmd),
+                error = %e,
+                "could not start the stdin writer thread; the child was killed"
+            );
+            return Err(e);
+        }
+    }
 
     let stdout_reader = PipeDrain::spawn(child.stdout.take());
     let stderr_reader = PipeDrain::spawn(child.stderr.take());
@@ -1484,6 +1600,77 @@ fn run_probe_inner(
 mod timeout_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// The input reaches the child's stdin in full and is followed by EOF.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_input_feeds_stdin_then_closes_it() {
+        let input: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let run = run_with_timeout_input(
+            std::process::Command::new("cat"),
+            Duration::from_secs(10),
+            input.clone(),
+        )
+        .expect("spawn cat");
+        assert!(run.truncation.is_none());
+        match run.outcome {
+            TimedOutput::Completed(out) => {
+                assert!(out.status.success());
+                assert_eq!(out.stdout, input, "every byte, then EOF");
+            }
+            TimedOutput::TimedOut { .. } => panic!("cat must see EOF and exit"),
+        }
+    }
+
+    /// A child that never reads its stdin neither blocks the call nor is
+    /// blocked by it: the writer's pipe fills, the child exits, the write
+    /// fails, and the call returns promptly.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_input_survives_a_child_that_ignores_stdin() {
+        let started = Instant::now();
+        let run = run_with_timeout_input(
+            std::process::Command::new("true"),
+            Duration::from_secs(10),
+            vec![b'x'; 1024 * 1024],
+        )
+        .expect("spawn true");
+        assert!(matches!(run.outcome, TimedOutput::Completed(ref o) if o.status.success()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A stdin writer that cannot start — the thread ceiling — is an `Err`,
+    /// not a panic, and the child it would have fed is killed at once rather
+    /// than left waiting on stdin until the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdin_writer_that_cannot_start_kills_the_child_and_is_an_error() {
+        fn at_the_ceiling(_: std::process::ChildStdin, _: Vec<u8>) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "no thread to spare",
+            ))
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("survived");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 0.5; touch '{}'", marker.display()));
+        let started = Instant::now();
+        let err = run_bounded(
+            cmd,
+            Duration::from_secs(30),
+            Some((vec![b'x'], at_the_ceiling)),
+        )
+        .expect_err("a writer that cannot start is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "returned at once, not at the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "the child was killed, not left running");
+    }
 
     /// A command that blocks for far longer than any budget we hand it.
     fn sleeper() -> std::process::Command {
@@ -2751,6 +2938,272 @@ mod console_window_guard {
     }
 }
 
+/// Every production git spawn goes through [`no_window`] / [`tokio_no_window`],
+/// because that is where BOTH git postures are applied: the prompt-closing env
+/// and the repository-local scrub. A raw `Command::new("git")` skips both — it
+/// can hang on a credential prompt, and under a `GIT_DIR` inherited from the
+/// runner's launcher it reads and WRITES the launcher's repo instead of the one
+/// `-C` names (`git reset --hard`, `worktree remove`, `git config --local`).
+///
+/// A deliberate exception carries a `git-env-ok: <reason>` marker on the line
+/// or just above it. Today there is exactly one: `bin/qontinui_cli.rs`, a
+/// console tool that acts on the user's OWN shell repo, where the inherited
+/// environment is what the user means.
+#[cfg(test)]
+mod raw_git_guard {
+    use std::path::{Path, PathBuf};
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// How far above a raw spawn a `git-env-ok:` marker still covers it — a
+    /// marker comment may run to several lines.
+    const MARKER_WINDOW: usize = 6;
+
+    /// Is this line a raw git spawn? Whitespace is removed first, so
+    /// `Command::new( "git" )`, `Command::new(r"git")`, `"git.exe"` and
+    /// `"git".to_string()` all count.
+    fn is_raw_git_spawn(line: &str) -> bool {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        [
+            "Command::new(\"git",
+            "Command::new(r\"git",
+            "Command::new(r#\"git",
+        ]
+        .iter()
+        .any(|needle| {
+            compact.match_indices(needle).any(|(i, _)| {
+                let rest = compact.get(i + needle.len()..).unwrap_or("");
+                rest.starts_with('"')
+                    || rest.starts_with(".exe\"")
+                    || rest.starts_with("\"#")
+                    || rest.starts_with(".exe\"#")
+            })
+        })
+    }
+
+    /// The production lines of `src`, as `(1-based line number, line)`.
+    ///
+    /// Skips exactly the item each column-0 `#[cfg(test)]` applies to — a
+    /// `mod` of any visibility, a helper fn, a `use` — then keeps scanning, so
+    /// a test module in the middle of a file hides neither the production
+    /// code before it nor after it. The item is the first non-attribute line
+    /// after the cfg: one ending in `;`, or opening and closing its braces on
+    /// that line, is the whole item; otherwise it runs to the next line that
+    /// is exactly `}` — rustfmt closes every top-level item that way, and
+    /// unlike brace counting this is not fooled by braces inside the string
+    /// literals source-scanning tests are full of. A head line with no brace
+    /// (a multi-line `static`, `use a::{..};`) ends at its first `;` line, and
+    /// a multi-line attribute is skipped by bracket depth. Only a column-0
+    /// `#[cfg(test)]` starts a skip: an indented one, or `cfg(all(test, ..))`,
+    /// is scanned as production — which can only fail loudly, never hide a
+    /// spawn.
+    fn production_lines(src: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut lines = src.lines().enumerate();
+        while let Some((i, line)) = lines.next() {
+            if !line.starts_with("#[cfg(test)]") {
+                out.push((i + 1, line));
+                continue;
+            }
+            // `attr_depth` > 0 while inside a multi-line attribute; `braced`
+            // once the item's head line opened a brace (it then ends at the
+            // next column-0 `}` / `};`), else the item ends at its first
+            // line ending in `;` (a multi-line `static`, `use a::{..};`).
+            let mut attr_depth: i64 = 0;
+            let mut head_seen = false;
+            let mut braced = false;
+            for (_, item) in lines.by_ref() {
+                let t = item.trim();
+                if !head_seen {
+                    if attr_depth > 0 || t.starts_with("#[") {
+                        attr_depth += t.matches('[').count() as i64;
+                        attr_depth -= t.matches(']').count() as i64;
+                        continue;
+                    }
+                    if t.is_empty() {
+                        continue;
+                    }
+                    head_seen = true;
+                    let opens = t.matches('{').count();
+                    let closes = t.matches('}').count();
+                    if opens == 0 {
+                        if t.ends_with(';') {
+                            break;
+                        }
+                        continue;
+                    }
+                    if opens == closes {
+                        break;
+                    }
+                    braced = true;
+                    continue;
+                }
+                if braced {
+                    if item == "}" || item == "};" {
+                        break;
+                    }
+                } else if t.contains('{')
+                    && !(t.ends_with(';') && t.matches('{').count() == t.matches('}').count())
+                {
+                    // A head that spans lines (a multi-line fn signature)
+                    // opens its body here — unless this line is a balanced,
+                    // `;`-terminated initializer, which ends the item below.
+                    braced = true;
+                } else if t.ends_with(';') {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Returns `(unmarked, marked)`: the 1-based lines of raw git spawns in
+    /// `src`'s production text without a `git-env-ok:` marker, and the count
+    /// of those that carry one.
+    pub(super) fn raw_git_spawns(src: &str) -> (Vec<usize>, usize) {
+        let lines = production_lines(src);
+        let mut unmarked = Vec::new();
+        let mut marked = 0;
+        for (idx, (n, line)) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !is_raw_git_spawn(line) {
+                continue;
+            }
+            let start = idx.saturating_sub(MARKER_WINDOW);
+            if lines[start..=idx]
+                .iter()
+                .any(|(_, l)| l.contains("git-env-ok:"))
+            {
+                marked += 1;
+            } else {
+                unmarked.push(*n);
+            }
+        }
+        (unmarked, marked)
+    }
+
+    #[test]
+    fn no_production_git_spawn_bypasses_the_chokepoint() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(
+            files.len() > 100,
+            "walked only {} files under {} — the guard scanned nothing",
+            files.len(),
+            root.display()
+        );
+        let mut violations = Vec::new();
+        let mut marked_cli = 0;
+        for file in files {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let (unmarked, marked) = raw_git_spawns(&src);
+            if rel == "bin/qontinui_cli.rs" {
+                marked_cli = marked;
+            } else if marked > 0 {
+                violations.push(format!(
+                    "{rel}: {marked} git-env-ok exception(s) outside the one allowlisted file"
+                ));
+            }
+            for n in unmarked {
+                violations.push(format!("{rel}:{n}"));
+            }
+        }
+        assert_eq!(
+            marked_cli, 1,
+            "bin/qontinui_cli.rs must carry exactly one marked raw git spawn (git_stdout) — \
+             if it moved, went away or gained a sibling, update this guard's allowlist note"
+        );
+        assert!(
+            violations.is_empty(),
+            "raw git spawn(s) that bypass process_helpers::no_window / tokio_no_window \
+             (the prompt posture AND the repository-local scrub):\n{}\n\nBuild them with \
+             `crate::process_helpers::no_window(\"git\")` instead. A deliberate exception \
+             carries a `// git-env-ok: <reason>` comment on the line or just above it.",
+            violations.join("\n")
+        );
+    }
+
+    /// The detector itself: a raw spawn is caught, a marked one and a test-only
+    /// one are not. Without this the guard could pass by matching nothing.
+    #[test]
+    fn the_detector_catches_a_raw_spawn_and_honours_the_marker() {
+        let raw = "fn f() {\n    let c = std::process::Command::new(\"git\");\n}\n";
+        assert_eq!(raw_git_spawns(raw), (vec![2], 0));
+        let marked = "fn f() {\n    // git-env-ok: user's own repo,\n    // a second line,\n    \
+                      // and a third.\n    let c = Command::new(\"git\");\n}\n";
+        assert_eq!(raw_git_spawns(marked), (vec![], 1));
+        let test_mod = "fn f() {}\n#[cfg(test)]\nmod t { fn g() { Command::new(\"git\"); } }\n";
+        assert_eq!(raw_git_spawns(test_mod), (vec![], 0));
+        // A test-only helper ITEM does not hide the production code after it.
+        let after_helper = "#[cfg(test)]\nfn helper() {}\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(after_helper), (vec![3], 0));
+        // Neither does a test module in the middle of a file, of any
+        // visibility — while its own raw spawns stay out of the scan.
+        let mid_file = "#[cfg(test)]\npub(crate) mod support {\n    fn g() {\n        \
+                        Command::new(\"git\");\n    }\n}\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(mid_file), (vec![7], 0));
+        // A test-only `use` ends at its `;`, and an attribute between the
+        // cfg and the item does not end the skip.
+        let use_then_prod =
+            "#[cfg(test)]\n#[allow(unused)]\nuse std::fmt;\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(use_then_prod), (vec![4], 0));
+        // A multi-line test-only `static` ends at its `;` — the production
+        // code after it is scanned.
+        let static_then_prod = "#[cfg(test)]\nstatic S: Vec<u8> =\n    Vec::new();\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(static_then_prod), (vec![4], 0));
+        // A multi-line attribute is not mistaken for the item's head.
+        let multi_attr = "#[cfg(test)]\n#[expect(\n    clippy::x,\n    reason = \"r\"\n)]\nstatic S: u8 =\n    0;\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(multi_attr), (vec![8], 0));
+        // A test-only fn whose signature spans lines ends at its closing
+        // `}`, not at the first `;` in its body.
+        let multi_sig = "#[cfg(test)]\nfn f(\n    a: u8,\n) {\n    let x = 1;\n    Command::new(\"git\");\n}\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(multi_sig), (vec![8], 0));
+        // A braceless head whose initializer line carries balanced braces
+        // and ends in `;` ends there.
+        let struct_init = "#[cfg(test)]\nstatic S: Foo =\n    Foo { a: 1 };\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(struct_init), (vec![4], 0));
+        for spelling in [
+            "tokio::process::Command::new(\"git\")",
+            "Command::new( \"git\" )",
+            "Command::new(\"git.exe\")",
+            "Command::new(r\"git\")",
+            "Command::new(\"git\".to_string())",
+        ] {
+            assert_eq!(
+                raw_git_spawns(&format!("fn f() {{ {spelling}; }}\n")),
+                (vec![1], 0),
+                "{spelling} must be caught"
+            );
+        }
+        for not_git in ["Command::new(\"gitk\")", "Command::new(\"git-lfs\")"] {
+            assert_eq!(
+                raw_git_spawns(&format!("fn f() {{ {not_git}; }}\n")),
+                (vec![], 0),
+                "{not_git} is not git"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod prompt_proof_tests {
     use super::*;
@@ -2840,6 +3293,74 @@ mod prompt_proof_tests {
                 "{program} must not receive the git posture"
             );
         }
+    }
+
+    /// The same chokepoint scrubs the REPOSITORY-LOCAL git environment: every
+    /// `REPO_LOCAL_GIT_ENV` name is REMOVED on the command (`get_envs` reports a
+    /// removal as `None`), so a `GIT_DIR` inherited from whoever launched the
+    /// runner never reaches a git child — while command-scope config
+    /// (`GIT_CONFIG_PARAMETERS` / `GIT_CONFIG_COUNT`) is left alone, because an
+    /// env-injected `safe.directory` or credential helper rides on it.
+    fn assert_repo_local_scrubbed(envs: &[(String, Option<String>)], what: &str) {
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.is_none()),
+                "{what}: {var} must be removed so an inherited value never reaches git; envs: {envs:?}"
+            );
+        }
+        for var in qontinui_runner_lib::git_posture::COMMAND_SCOPE_GIT_CONFIG_ENV {
+            assert!(
+                !envs.iter().any(|(k, _)| k == var),
+                "{what}: {var} is command-scope config and must not be touched; envs: {envs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_window_git_scrubs_the_repo_local_env() {
+        for program in [
+            "git",
+            "/usr/bin/git",
+            r"C:\Program Files\Git\cmd\git.exe",
+            "GIT.EXE",
+        ] {
+            assert_repo_local_scrubbed(&env_of(&no_window(program)), program);
+        }
+    }
+
+    #[test]
+    fn tokio_no_window_git_scrubs_the_repo_local_env() {
+        let cmd = tokio_no_window("git");
+        assert_repo_local_scrubbed(&env_of(cmd.as_std()), "tokio_no_window(git)");
+    }
+
+    /// Scoped like the prompt posture: a non-git child keeps whatever
+    /// repository env it inherited (a `claude` session the runner launches is
+    /// a different question, out of this chokepoint's scope).
+    #[test]
+    fn no_window_does_not_scrub_non_git_programs() {
+        for program in ["cmd.exe", "claude", "git-lfs", "node"] {
+            assert!(
+                !env_of(&no_window(program))
+                    .iter()
+                    .any(|(k, _)| k == "GIT_DIR"),
+                "{program} must not have GIT_DIR touched"
+            );
+        }
+    }
+
+    /// A caller that DELIBERATELY points git elsewhere still can: an explicit
+    /// `.env` after construction wins over the construction-time removal.
+    #[test]
+    fn an_explicit_env_after_construction_wins_over_the_scrub() {
+        let mut cmd = no_window("git");
+        cmd.env("GIT_INDEX_FILE", "/tmp/alt-index");
+        assert!(
+            env_of(&cmd)
+                .iter()
+                .any(|(k, v)| k == "GIT_INDEX_FILE" && v.as_deref() == Some("/tmp/alt-index")),
+            "a later explicit GIT_INDEX_FILE must survive"
+        );
     }
 
     /// The prompt-proof subset is DERIVED from the one posture, never restated:

@@ -60,7 +60,7 @@ describe("fetchOpenRecords", () => {
       },
     });
     const out = await fetchOpenRecords("default");
-    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_list_open");
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_list_open", { purpose: "restore" });
     expect(out.map((r) => r.claudeSessionId).sort()).toEqual(["A", "B"]);
   });
 

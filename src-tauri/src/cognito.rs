@@ -342,6 +342,11 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
             );
             let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
                 .map_err(|e| format!("tokio listener wrap failed: {e}"))?;
+            // Only this runner's own OS user may deliver the callback (plan
+            // 2026-10-04-runner-loopback-api-refuses-other-local-users).
+            let tokio_listener =
+                crate::peer_user_guard::GuardedListener::wrap(tokio_listener, "cognito-callback")
+                    .map_err(|e| format!("peer user guard wrap failed: {e}"))?;
             // Serve until EITHER the handler signals shutdown (code/error
             // captured) OR the 5-minute timeout elapses. `with_graceful_shutdown`
             // stops accepting + drains in-flight responses (so the "Signed in"

@@ -144,6 +144,12 @@ export interface ResolvedPaths {
    */
   plan_scan_divergence: ScanDivergenceView | null;
   /**
+   * Whether the adapter's last armed cycle decided to push work units to coord
+   * or to withhold them (a decision, not proof a push succeeded); `null` when no armed cycle has run (or the tier is off) —
+   * UNKNOWN, never "pushing". See {@link planScanStatusNote}.
+   */
+  plan_work_unit_posture: WorkUnitPostureView | null;
+  /**
    * The same three plan/prompt directories resolved FOR ONE NAMED TENANT —
    * present only when the caller passed a `tenantId` to `get_path_settings`
    * (plan P3). Absent means "nobody named a tenant", which is the panel's own
@@ -163,6 +169,16 @@ export interface ResolvedForTenant {
   plans_dir: string | null;
   plans_archive_dir: string | null;
   prompts_dir: string | null;
+}
+
+/**
+ * Wire shape of `WorkUnitPostureView` (`commands/path_settings.rs`): whether the
+ * plan adapter's last armed cycle pushed work units to coord or withheld them.
+ */
+export interface WorkUnitPostureView {
+  state: "write" | "withheld_multi_bound" | "withheld_bindings_unknown";
+  /** Present only on `withheld_multi_bound`: the tenants this device is bound to. */
+  tenants?: number;
 }
 
 /**
@@ -579,6 +595,38 @@ export function planScanStatusLabel(active: boolean, scanRoots: number | null): 
   if (!active) return "Plan scanning: off";
   if (scanRoots === null) return "Plan scanning: on (scan roots: unknown)";
   return `Plan scanning: on (${scanRoots} scan ${scanRoots === 1 ? "root" : "roots"})`;
+}
+
+/**
+ * The sentence under the plan-tier status line.
+ *
+ * "The tier is on" and "work units reach coord" are different claims. On a
+ * device bound to more than one tenant — the operator who sees the per-tenant
+ * rows — or one whose binding set coord has not echoed, the adapter scans every
+ * cycle and deliberately makes NO coord work-unit call. So the push half is read
+ * from the adapter's own posture, and a missing posture is said as unknown.
+ */
+export function planScanStatusNote(resolved: ResolvedPaths): string {
+  if (!resolved.plan_tier_active) {
+    return "No device-wide plans directory is in effect, so nothing is scanned and no work units reach coord. Set one below to turn the tier on.";
+  }
+  const scanning = "The adapter is scanning the device-wide plans directory";
+  const posture = resolved.plan_work_unit_posture;
+  switch (posture?.state) {
+    case "write":
+      return `${scanning} and pushing work units to coord.`;
+    case "withheld_multi_bound": {
+      const bound =
+        posture.tenants === undefined ? "more than one tenant" : `${posture.tenants} tenants`;
+      return `${scanning}, but pushes no work units to coord: this device is bound to ${bound} and a plan's owning tenant cannot be resolved here, so the adapter withholds them rather than filing them under the wrong one. A session can still register its own plan's work unit.`;
+    }
+    case "withheld_bindings_unknown":
+      return `${scanning}, but pushes no work units to coord: coord's record of this device's tenant bindings is missing or stale, so the adapter withholds them rather than assume one tenant. Only the primary runner's heartbeat writes that record; a secondary or temporary runner never has one.`;
+    default:
+      // Past tense only: on a runner whose adapter never started (no coord base
+      // resolves) no cycle is coming, so promising one would be false.
+      return `${scanning}, but has not completed a scan cycle since the runner started, so whether it pushes work units to coord is unknown.`;
+  }
 }
 
 /** `45s`, `12m`, `7h`, `3d` — whole units, rounded down. */

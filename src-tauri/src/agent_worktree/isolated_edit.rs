@@ -248,6 +248,9 @@ impl IsolatedEditContext {
             session_id,
             self.spawn_tenant,
             SharedBranchPolicy::Honor,
+            // A grow call is a separate allocation whose primary is never
+            // redirected: it declares no edit siblings.
+            &[],
         )
         .await?;
 
@@ -367,6 +370,18 @@ pub struct AcquireRequest<'a> {
     /// Whether coord's `shared_branch` directive is honored or refused before
     /// any branch switch — see [`SharedBranchPolicy`].
     pub shared_branch: SharedBranchPolicy,
+    /// Repos this session will EDIT rather than only build against (bare or
+    /// `owner/name`). [`acquire`] appends each one to the requested `repos`
+    /// (after the primary, deduped by bare name — vet V1: a coord-added
+    /// requested row the runner sent no canonical path for fails the whole
+    /// allocation) AND sends it as `edit_siblings`, so coord never redirects it
+    /// at the sibling store and the runner drops any store entry for it locally
+    /// (plan
+    /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
+    /// Under `isolation = shared_branch` an edit sibling is a requested repo,
+    /// so its canonical checkout gets the lease and the branch switch. Empty
+    /// for every caller that declares none.
+    pub edit_siblings: &'a [String],
 }
 
 /// Allocate isolated worktrees for the given repos.
@@ -396,10 +411,13 @@ pub async fn acquire(
     let device_id = read_device_id()
         .map_err(|e| AllocateError::Other(format!("device_id not available: {e}")))?;
 
+    // Vet V1: every edit sibling is REQUESTED too, after the primary.
+    let repos = super::edit_sibling::merge_edit_siblings_into_repos(req.repos, req.edit_siblings);
+
     let result = materialize_repos(
         &coord_http_base,
         device_id,
-        req.repos,
+        &repos,
         req.intent,
         req.declared_overlap_paths,
         req.plan_id,
@@ -407,6 +425,7 @@ pub async fn acquire(
         req.agent_session_id,
         req.spawn_tenant,
         req.shared_branch,
+        req.edit_siblings,
     )
     .await?;
 
@@ -486,6 +505,7 @@ async fn materialize_repos(
     agent_session_id: Option<uuid::Uuid>,
     spawn_tenant: Option<uuid::Uuid>,
     shared_branch: SharedBranchPolicy,
+    edit_siblings: &[String],
 ) -> Result<super::AllocateResult, AllocateError> {
     let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(repos.len());
     for repo in repos {
@@ -536,6 +556,7 @@ async fn materialize_repos(
         phase,
         spawn_tenant,
         shared_branch,
+        edit_siblings,
     )
     .await
     {
@@ -579,6 +600,7 @@ async fn materialize_repos(
                 phase,
                 spawn_tenant,
                 shared_branch,
+                edit_siblings,
             )
             .await?
         }
@@ -715,6 +737,17 @@ impl IsolatedEditContext {
     pub fn claude_add_dir_args(&self) -> Vec<String> {
         claude_add_dir_args(&self.worktrees)
     }
+
+    /// `(worktree_path, parent_sha)` for every worktree this context holds —
+    /// the allocation base coord recorded for each. Read by the
+    /// `/sessions/{id}/file-changes` route (`mcp::snapshots::BaseBlobs`) as
+    /// the first rung of a snapshot-less path's "before" side.
+    pub fn allocation_bases(&self) -> Vec<(PathBuf, String)> {
+        self.worktrees
+            .iter()
+            .map(|w| (w.worktree_path.clone(), w.parent_sha.clone()))
+            .collect()
+    }
 }
 
 /// Convenience helper for the runner terminal-spawn entry points
@@ -743,12 +776,20 @@ impl IsolatedEditContext {
 /// resolves no registry tenant and the allocate would otherwise declare none;
 /// the chosen tenant fills that gap. It also decides the in-cwd coord-mcp
 /// credential below — see the provisioning block.
+///
+/// `edit_siblings` are the repos the session will edit beside `intent_repo`
+/// (see [`AcquireRequest::edit_siblings`]). The spawn surfaces validate them
+/// with [`super::edit_sibling::validate_spawn_edit_siblings`] BEFORE calling
+/// here, so a typo is refused loudly rather than turned into this helper's
+/// fail-open fallback (vet V9). They apply only to a fresh allocation: the
+/// reuse arm below allocates nothing.
 pub async fn acquire_for_terminal(
     intent_repo: Option<&str>,
     purpose: &str,
     working_dir: Option<String>,
     agent_session_id: Option<uuid::Uuid>,
     spawn_tenant: Option<uuid::Uuid>,
+    edit_siblings: &[String],
 ) -> (Option<String>, Option<IsolatedEditContext>) {
     // ── REUSE BEFORE ALLOCATE (session restore) ────────────────────────────
     //
@@ -806,7 +847,11 @@ pub async fn acquire_for_terminal(
                         found,
                         std::path::Path::new(wd),
                     );
-                    same_repo && same_dir
+                    // A declared edit sibling the reused allocation holds no
+                    // worktree for cannot be applied to it; allocating fresh
+                    // is then the only way to honour the declaration, so the
+                    // reuse is skipped rather than the sibling silently dropped.
+                    same_repo && same_dir && allocation_holds_edit_siblings(found, edit_siblings)
                 })
                 .map(|p| p.to_string_lossy().to_string())
         }
@@ -821,10 +866,49 @@ pub async fn acquire_for_terminal(
                 "acquire_for_terminal: reusing the live agent worktree this session is \
                  already recorded in — not allocating a new one"
             );
+            // No allocation runs, so the spawn-time filter cannot apply the
+            // declared edit siblings; take each off the reused allocation's
+            // override through the mid-session door instead.
+            for sibling in edit_siblings {
+                // Off the async worker: file I/O plus a few bounded git reads.
+                let (root, name) = (reused.clone(), sibling.clone());
+                let applied = tokio::task::spawn_blocking(move || {
+                    super::edit_sibling::apply(std::path::Path::new(&root), &name)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(super::edit_sibling::EditSiblingError::Io(format!(
+                        "edit-sibling task failed: {e}"
+                    )))
+                });
+                match applied {
+                    Ok(outcome) => info!(
+                        reused_worktree = %reused,
+                        edit_sibling = %sibling,
+                        removed = outcome.removed.len(),
+                        "acquire_for_terminal: edit sibling applied to the reused allocation"
+                    ),
+                    Err(e) => warn!(
+                        reused_worktree = %reused,
+                        edit_sibling = %sibling,
+                        error = %e,
+                        "acquire_for_terminal: could not apply the edit sibling to the reused \
+                         allocation — its builds may still resolve the sibling store"
+                    ),
+                }
+            }
             (Some(reused), None)
         }
         (None, None) => (working_dir, None),
         (None, Some(repo)) => {
+            if !edit_siblings.is_empty() && !worktree_mode_enabled() {
+                warn!(
+                    intent_repo = %repo,
+                    edit_siblings = ?edit_siblings,
+                    "acquire_for_terminal: worktree mode is off — no allocation, so the declared \
+                     edit siblings have no override to apply to"
+                );
+            }
             let repos = vec![repo.to_string()];
             let acquired = acquire(AcquireRequest {
                 repos: &repos,
@@ -835,6 +919,7 @@ pub async fn acquire_for_terminal(
                 agent_session_id,
                 spawn_tenant,
                 shared_branch: SharedBranchPolicy::Honor,
+                edit_siblings,
             })
             .await;
             terminal_cwd_after_acquire(repo, acquired, working_dir, |ctx: &IsolatedEditContext| {
@@ -848,6 +933,22 @@ pub async fn acquire_for_terminal(
         provision_session_cwd(wd, out.1.is_some(), spawn_tenant);
     }
     out
+}
+
+/// Whether the allocation rooted at `allocation` (an `<agent_root>/<repo>`
+/// worktree) holds a git worktree for EVERY declared edit sibling — the same
+/// `<agent_root>/<bare>/.git` test the edit-sibling door refuses on. An invalid
+/// name never counts as held. Vacuously true when none is declared.
+fn allocation_holds_edit_siblings(allocation: &Path, edit_siblings: &[String]) -> bool {
+    edit_siblings.iter().all(|s| {
+        match (
+            allocation.parent(),
+            super::edit_sibling::bare_repo_name(s).ok(),
+        ) {
+            (Some(agent_root), Some(bare)) => agent_root.join(bare).join(".git").exists(),
+            _ => false,
+        }
+    })
 }
 
 /// The terminal half of [`acquire_for_terminal`]'s allocate arm: an operator's
@@ -919,6 +1020,10 @@ pub async fn acquire_for_worker(
         agent_session_id,
         spawn_tenant,
         shared_branch: SharedBranchPolicy::Refuse,
+        // The conductor's dispatch schema carries no edit siblings (plan
+        // "Not done here"); a worker that must edit one uses the mid-session
+        // `POST /agent-worktrees/edit-sibling` door.
+        edit_siblings: &[],
     })
     .await
     {
@@ -1041,16 +1146,66 @@ pub(crate) fn provision_session_cwd(
     // MANAGED_REPO_EXCLUDES roster forbids adding it, because excluding it
     // would hide an operator's intended new `.claude/commands/*.md` from
     // `git status`. So the guard lives here instead.
+    provision_fleet_for_cwd(wd);
+}
+
+/// The guarded fleet commands + skills provisioning for one session cwd.
+///
+/// Where the cwd's `.claude/` is repo-authored the skip is RECORDED, not only
+/// logged: one [`crate::capability_manifest::ProvisionReport`] per provisioner
+/// with every bundled unit skipped as [`SkipReason::RepoAuthored`], so the
+/// ledger — and the `[provisioned: …]` token of the session's served-corpus
+/// header line — say the session got none of them and why.
+///
+/// [`SkipReason::RepoAuthored`]: crate::capability_manifest::SkipReason::RepoAuthored
+fn provision_fleet_for_cwd(wd: &str) {
     if claude_tree_is_repo_authored(wd) {
         info!(
             workdir = %wd,
             "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
              authors its own skills/commands and the bundle must not clobber them"
         );
+        record_repo_authored_skip(wd);
     } else {
         crate::fleet_commands::provision_fleet_commands_for_session(wd);
         crate::fleet_skills::provision_fleet_skills_for_session(wd);
     }
+}
+
+/// Record the repo-authored skip against `wd` for both provisioners.
+///
+/// The roster is the EMBEDDED bundle — every `FLEET_COMMANDS` entry and every
+/// embedded skill file — not the account-resolved registry: resolving that
+/// would fetch overrides for a pass that writes nothing.
+fn record_repo_authored_skip(wd: &str) {
+    use crate::capability_manifest::{record_provision, ProvisionReport, Rung, SkipReason};
+
+    let commands_dir = Path::new(wd).join(".claude").join("commands");
+    let mut commands = ProvisionReport::new(
+        "fleet_commands",
+        crate::fleet_commands::FLEET_COMMANDS.len(),
+        Rung::Unresolved,
+    )
+    .with_destination(commands_dir.display().to_string());
+    for (name, _) in crate::fleet_commands::FLEET_COMMANDS {
+        commands.skip(format!("{name}.md"), SkipReason::RepoAuthored);
+    }
+    record_provision(wd, commands);
+
+    let skills_dir = Path::new(wd).join(".claude").join("skills");
+    let embedded = crate::fleet_skills::embedded_skills();
+    let mut skills = ProvisionReport::new(
+        "fleet_skills",
+        embedded.iter().map(|s| s.files.len()).sum(),
+        Rung::Unresolved,
+    )
+    .with_destination(skills_dir.display().to_string());
+    for skill in &embedded {
+        for rel in skill.files.keys() {
+            skills.skip(format!("{}/{rel}", skill.name), SkipReason::RepoAuthored);
+        }
+    }
+    record_provision(wd, skills);
 }
 
 /// What [`acquire_for_terminal`] does with the cwd `.mcp.json` for one spawn.
@@ -1409,6 +1564,61 @@ mod tests {
         ));
     }
 
+    /// The repo-authored skip is recorded in the ledger — every bundled unit,
+    /// with its own reason — and reaches the served-corpus header line.
+    #[test]
+    fn a_repo_authored_skip_is_recorded_not_only_logged() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
+        std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        std::fs::write(root.join(".claude/commands/policy.md"), b"canonical").unwrap();
+        git(root, &["add", ".claude"]);
+        git(root, &["commit", "-qm", "track .claude"]);
+        let wd = root.to_str().unwrap();
+
+        provision_fleet_for_cwd(wd);
+
+        assert_eq!(
+            std::fs::read(root.join(".claude/commands/policy.md")).unwrap(),
+            b"canonical",
+            "the repo's own file is untouched"
+        );
+        let ledger = crate::capability_manifest::session_provision_ledger(wd)
+            .expect("the skip is recorded against this workdir");
+        let commands = ledger
+            .reports
+            .iter()
+            .find(|r| r.capability == "fleet_commands")
+            .expect("a commands report");
+        let m_commands = crate::fleet_commands::FLEET_COMMANDS.len();
+        assert_eq!(commands.written, 0);
+        assert_eq!(commands.skipped.len(), m_commands);
+        assert!(commands
+            .skipped
+            .iter()
+            .all(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored));
+        let skills = ledger
+            .reports
+            .iter()
+            .find(|r| r.capability == "fleet_skills")
+            .expect("a skills report");
+        assert_eq!(skills.written, 0);
+        assert_eq!(skills.skipped.len(), skills.expected);
+
+        let line = crate::served_corpus::probe(root).render_line();
+        assert!(
+            line.contains(&format!(
+                "[provisioned: commands written=0/{m_commands} skipped-repo-authored={m_commands} as-of="
+            )),
+            "{line}"
+        );
+    }
+
     /// The provisioning arm must still fire on the case the feature exists for:
     /// a device with no `qontinui-claude-config` checkout, whose session cwd has
     /// no `.claude/` at all.
@@ -1756,6 +1966,41 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
+    /// Plan 2026-10-10: a restored pane is reused only when its allocation
+    /// holds a worktree for every declared edit sibling; otherwise a fresh
+    /// allocation is the only way to honour the declaration.
+    #[test]
+    fn reuse_requires_every_declared_edit_sibling_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_root = tmp.path().join("AGENT");
+        let primary = agent_root.join("qontinui-coord");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::write(primary.join(".git"), "gitdir: x\n").unwrap();
+        let schemas = agent_root.join("qontinui-schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        std::fs::write(schemas.join(".git"), "gitdir: y\n").unwrap();
+
+        assert!(allocation_holds_edit_siblings(&primary, &[]));
+        assert!(allocation_holds_edit_siblings(
+            &primary,
+            &["qontinui/qontinui-schemas".to_string()]
+        ));
+        assert!(!allocation_holds_edit_siblings(
+            &primary,
+            &["qontinui-schemas".to_string(), "ui-bridge".to_string()]
+        ));
+        assert!(!allocation_holds_edit_siblings(
+            &primary,
+            &["..".to_string()]
+        ));
+        // A directory that is not a git worktree does not count.
+        std::fs::create_dir_all(agent_root.join("ui-bridge")).unwrap();
+        assert!(!allocation_holds_edit_siblings(
+            &primary,
+            &["ui-bridge".to_string()]
+        ));
+    }
+
     #[tokio::test]
     async fn returns_none_when_flag_off() {
         // Companion to the `flag_on_by_default` test in `mod.rs` — if any
@@ -1773,6 +2018,7 @@ mod tests {
                 agent_session_id: None,
                 spawn_tenant: None,
                 shared_branch: SharedBranchPolicy::Honor,
+                edit_siblings: &[],
             })
             .await
             .expect("flag-off should return Ok(None), not Err");

@@ -83,6 +83,7 @@ import {
   type ThreadCeilingsReport,
   parseRepoAllowlist,
   sessionFloorsAreInverted,
+  threadCeilingPlaceholder,
   threadCeilingSourceText,
   threadCeilingsAreInverted,
 } from "./resourceGuardHelpers";
@@ -917,7 +918,6 @@ function ThreadCeilingInput({
   help,
 }: ThreadCeilingInputProps) {
   const id = `resource-guard-${tier}-threads`;
-  const enforced = report ? report[tier] : null;
   return (
     <div className="space-y-1.5">
       <label className="text-xs font-medium" htmlFor={id}>
@@ -931,13 +931,7 @@ function ThreadCeilingInput({
         max={THREAD_CEILING_ABS_MAX}
         step={1}
         value={draft ?? value ?? ""}
-        placeholder={
-          // Only when the report IS the machine default may its number be
-          // quoted as one; anything else would be re-deriving the fold here.
-          enforced !== null && report?.provenance[tier] !== "local"
-            ? `machine default (${enforced})`
-            : "machine default"
-        }
+        placeholder={threadCeilingPlaceholder(tier, report)}
         onChange={(e) => onDraft(e.target.value)}
         onBlur={() => {
           if (draft === null) return;

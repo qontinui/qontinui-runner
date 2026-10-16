@@ -3085,6 +3085,23 @@ impl SessionLifecycleStore {
     /// resumable by hand from the Past Sessions surface
     /// (`session::past_sessions`).
     ///
+    /// ## Boot-partitioned anchor (`boot_at_ms`)
+    ///
+    /// The single anchor above is only downtime-proof while THIS process has
+    /// written nothing: the restore normally runs seconds after boot. When it
+    /// is withheld — a coord device drain defers `BootResume` for hours — every
+    /// session this process hosts is touched each poll tick, the anchor walks
+    /// forward to "now", and the prior boot's crash cohort (last seen at the
+    /// crash instant) falls outside the grace window and is stranded (plan
+    /// `2026-10-01-drain-deferred-restore-is-swept-as-orphans`).
+    ///
+    /// So when the caller passes this process's boot instant, an open row last
+    /// seen BEFORE it is judged against the PRIOR-BOOT anchor — the same max,
+    /// restricted to timestamps `< boot_at_ms` (plus the clean-boot marker) —
+    /// which is exactly the anchor a restore at boot would have used. A row
+    /// last seen at or after the boot is judged against the full anchor, as
+    /// before. `None` reproduces the unpartitioned rule exactly.
+    ///
     /// ## One-live-session-per-terminal (open rows)
     ///
     /// A PTY hosts at most ONE live provider session, but the durable registry
@@ -3104,6 +3121,7 @@ impl SessionLifecycleStore {
         now_ms: i64,
         prior_marker_at: Option<i64>,
         boot_was_clean: bool,
+        boot_at_ms: Option<i64>,
     ) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
             Ok(m) => {
@@ -3123,6 +3141,22 @@ impl SessionLifecycleStore {
                     }))
                     .flatten()
                     .max();
+                // The PRIOR boot's own last moment of life: the same max, over
+                // only the timestamps that predate THIS process's boot. A row
+                // last seen before the boot is judged against this anchor, not
+                // the global one — see "Boot-partitioned anchor" above.
+                let prior_boot_anchor = boot_at_ms.and_then(|boot_at| {
+                    m.values()
+                        .flat_map(|r| [Some(r.last_seen_at), r.closed_at])
+                        .flatten()
+                        .filter(|t| *t < boot_at)
+                        .chain(if boot_was_clean {
+                            prior_marker_at
+                        } else {
+                            None
+                        })
+                        .max()
+                });
                 let admitted: Vec<TerminalSessionRecord> = m
                     .values()
                     .filter(|r| {
@@ -3144,7 +3178,13 @@ impl SessionLifecycleStore {
                             return false;
                         }
                         if r.state == "open" {
-                            return match anchor {
+                            let row_anchor = match (boot_at_ms, prior_boot_anchor) {
+                                (Some(boot_at), Some(prior)) if r.last_seen_at < boot_at => {
+                                    Some(prior)
+                                }
+                                _ => anchor,
+                            };
+                            return match row_anchor {
                                 Some(anchor) => {
                                     anchor - r.last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS
                                 }
@@ -4037,6 +4077,215 @@ fn replay_wal(wal_path: &Path, map: &mut HashMap<String, TerminalSessionRecord>)
         );
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Boot-restore phase latch (plan 2026-10-01-drain-deferred-restore-is-swept-as-orphans)
+// ---------------------------------------------------------------------------
+
+/// Where THIS process's boot restore stands, as recorded by the restore path
+/// itself (`commands::terminal::terminal_session_list_open`).
+///
+/// The lifecycle poll reads it so it cannot sweep, as `no-terminal` orphans,
+/// the very records a drain-deferred restore promised to bring back. On
+/// 2026-10-01 a crash-restarted primary under a coord drain had all 44 of its
+/// crash victims closed `no-terminal` ~3½ minutes after boot while
+/// `terminal_session_list_open` was still answering "restore deferred" — so
+/// when the drain lifted the restore set was empty.
+///
+/// Monotonic: `NotYetRun → Withheld → Ran`, or `NotYetRun → Ran`. Once the
+/// restore has run, normal orphan handling resumes for good; a later drain does
+/// not re-arm the hold. The restore runs per PAGE (the active one first), so
+/// records of pages not yet restored are then judged exactly as on an undrained
+/// boot — parity, not a full guarantee; that gap is the plan's recorded
+/// follow-up ("Non-active pages at an UNDRAINED boot").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootRestorePhase {
+    /// The restore path has not been asked yet (the frontend has not mounted)
+    /// — or this process has no restore consumer at all.
+    NotYetRun,
+    /// The restore path was asked and WITHHELD the restore set (the coord drain
+    /// gate deferred `BootResume`, drained or state unknown). Nothing has been
+    /// restored, and the withheld records must stay restorable.
+    Withheld,
+    /// The restore path returned a restore set. The boot restore has run.
+    Ran,
+}
+
+const BOOT_RESTORE_NOT_YET_RUN: u8 = 0;
+const BOOT_RESTORE_WITHHELD: u8 = 1;
+const BOOT_RESTORE_RAN: u8 = 2;
+
+static BOOT_RESTORE_PHASE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(BOOT_RESTORE_NOT_YET_RUN);
+
+/// This process's [`BootRestorePhase`].
+pub fn boot_restore_phase() -> BootRestorePhase {
+    match BOOT_RESTORE_PHASE.load(std::sync::atomic::Ordering::Acquire) {
+        BOOT_RESTORE_WITHHELD => BootRestorePhase::Withheld,
+        BOOT_RESTORE_RAN => BootRestorePhase::Ran,
+        _ => BootRestorePhase::NotYetRun,
+    }
+}
+
+/// Record that the boot restore was WITHHELD (drain-deferred). Only moves
+/// `NotYetRun → Withheld`: idempotent under the frontend's repeated asks, and
+/// a no-op once the restore has run.
+pub fn note_boot_restore_withheld() {
+    let moved = BOOT_RESTORE_PHASE
+        .compare_exchange(
+            BOOT_RESTORE_NOT_YET_RUN,
+            BOOT_RESTORE_WITHHELD,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok();
+    if moved {
+        info!(
+            "session_lifecycle_store: boot restore WITHHELD by the coord drain — the lifecycle poll will hold prior-boot records open until it runs"
+        );
+    }
+}
+
+/// Record that the boot restore has RUN (a restore set was returned).
+/// Terminal.
+pub fn note_boot_restore_ran() {
+    let prior = BOOT_RESTORE_PHASE.swap(BOOT_RESTORE_RAN, std::sync::atomic::Ordering::AcqRel);
+    if prior == BOOT_RESTORE_WITHHELD {
+        info!(
+            "session_lifecycle_store: withheld boot restore has now run — normal orphan handling resumes"
+        );
+    }
+}
+
+/// What one `terminal_session_list_open` call may do to [`BootRestorePhase`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootRestoreLatchEvent {
+    /// Not the boot restore's own read — the latch is left alone.
+    Untouched,
+    /// The boot restore asked and the drain gate withheld its set.
+    Withheld,
+    /// The boot restore asked and was handed its set.
+    Ran,
+}
+
+/// Which latch event a `terminal_session_list_open` call produces. Pure, so the
+/// rule is unit-testable without a Tauri `State`.
+///
+/// Only the boot restore's own read (`purpose: "restore"`) may move the latch,
+/// in EITHER direction (plan `2026-10-01-drain-deferred-restore-is-swept-as-orphans`,
+/// vet correction 1). The tree-reset report, the worker-adoption probe and the
+/// page reconcile read the same set; if their first non-deferred call after a
+/// drain lifted counted as `Ran`, the poll's hold would be released before
+/// anything had been restored.
+pub fn boot_restore_latch_event(is_boot_restore: bool, deferred: bool) -> BootRestoreLatchEvent {
+    match (is_boot_restore, deferred) {
+        (false, _) => BootRestoreLatchEvent::Untouched,
+        (true, true) => BootRestoreLatchEvent::Withheld,
+        (true, false) => BootRestoreLatchEvent::Ran,
+    }
+}
+
+/// Apply a [`BootRestoreLatchEvent`] to the process-global latch.
+pub fn apply_boot_restore_latch_event(event: BootRestoreLatchEvent) {
+    match event {
+        BootRestoreLatchEvent::Untouched => {}
+        BootRestoreLatchEvent::Withheld => note_boot_restore_withheld(),
+        BootRestoreLatchEvent::Ran => note_boot_restore_ran(),
+    }
+}
+
+/// Test-only reset of the process-global latch.
+#[cfg(test)]
+pub(crate) fn reset_boot_restore_phase_for_test() {
+    BOOT_RESTORE_PHASE.store(
+        BOOT_RESTORE_NOT_YET_RUN,
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Is this open record a boot-restore candidate whose restore is being
+/// WITHHELD — i.e. must the lifecycle poll leave it alone this tick?
+///
+/// - Only PRIOR-BOOT records qualify: `last_seen_at < boot_at_ms`. A record
+///   this process has touched carries this-boot evidence and is judged
+///   normally. With no boot instant (unclassified — tests only) nothing
+///   qualifies, which is the pre-fix behaviour.
+/// - `Ran` ⇒ never: the restore has run, so a prior-boot record matching no
+///   terminal now is a genuine orphan (or is `restore_pending`, already exempt).
+/// - `Withheld` ⇒ hold, even after the drain lifts, until the restore actually
+///   runs. If the frontend's re-run never comes the records simply stay `open`
+///   — the never-close-on-uncertainty direction; the 7-day open-stale prune
+///   still bounds them.
+/// - `NotYetRun` ⇒ hold iff the drain gate for `BootResume` defers right now
+///   (drained, or drain state unknown). This covers a poll tick that lands
+///   before the frontend's first ask; when the gate allows, today's handling
+///   applies (the restore is about to run, or there is no consumer for it).
+pub fn withheld_boot_restore_candidate(
+    last_seen_at: i64,
+    boot_at_ms: Option<i64>,
+    phase: BootRestorePhase,
+    drain_defers_boot_resume: bool,
+) -> bool {
+    let Some(boot_at) = boot_at_ms else {
+        return false;
+    };
+    if last_seen_at >= boot_at {
+        return false;
+    }
+    match phase {
+        BootRestorePhase::Ran => false,
+        BootRestorePhase::Withheld => true,
+        BootRestorePhase::NotYetRun => drain_defers_boot_resume,
+    }
+}
+
+/// Match an open record to a live terminal the way the lifecycle poll does: by
+/// `terminal_id` first, then by the `(page_id, title, working_dir)` triple —
+/// EXCEPT for a record whose boot restore is withheld (`held`), which gets the
+/// id match only.
+///
+/// A held record is from the PRIOR process, whose terminals all died with it,
+/// and terminal ids are fresh UUIDs per spawn, so nothing live can carry its
+/// id. A triple match is therefore necessarily a DIFFERENT, this-boot terminal
+/// that happens to share a page, a default title ("Claude 1") and a working
+/// directory — and accepting it would either close the record (`poll-dead`,
+/// whose grace has long expired after an hours-long drain, or
+/// `never-started`) or `touch` it into this boot, hijacking a session that is
+/// still waiting to be restored.
+pub fn match_live_terminal<'a, T: ?Sized>(
+    terminal_id: &str,
+    triple: Option<(&str, &str, &str)>,
+    by_id: &HashMap<&str, &'a T>,
+    by_triple: &HashMap<(&str, &str, &str), &'a T>,
+    held: bool,
+) -> Option<&'a T> {
+    by_id.get(terminal_id).copied().or_else(|| {
+        if held {
+            return None;
+        }
+        by_triple.get(&triple?).copied()
+    })
+}
+
+/// Rewrite a [`classify`] verdict for a record whose boot restore is withheld
+/// (see [`withheld_boot_restore_candidate`]). Modelled on the
+/// `restore_pending` guard inside `classify`: the no-match arms
+/// (`NoMatchWait`, `CloseNoTerminal`) become `Skip`, so a withheld record is
+/// never closed `"no-terminal"` (non-restorable) and accumulates no no-match
+/// ticks — the orphan debounce starts from zero once the hold lifts. Arms
+/// that saw a live terminal are this-tick evidence and pass through.
+pub fn hold_for_withheld_boot_restore(action: PollAction, held: bool) -> PollAction {
+    if held
+        && matches!(
+            action,
+            PollAction::NoMatchWait | PollAction::CloseNoTerminal
+        )
+    {
+        PollAction::Skip
+    } else {
+        action
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5943,7 +6192,7 @@ mod tests {
         assert!(store.get("phantom").is_none(), "stays removed after reload");
         assert!(
             store
-                .restorable_records(Utc::now().timestamp_millis(), None, true)
+                .restorable_records(Utc::now().timestamp_millis(), None, true, None)
                 .is_empty(),
             "a removed phantom is never restorable"
         );
@@ -6563,7 +6812,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let mut ids: Vec<String> = store
-            .restorable_records(now, None, true)
+            .restorable_records(now, None, true, None)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -6605,7 +6854,7 @@ mod tests {
 
         let now = Utc::now().timestamp_millis();
         let ids: Vec<String> = store
-            .restorable_records(now, None, true)
+            .restorable_records(now, None, true, None)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -8006,7 +8255,7 @@ mod tests {
 
         let now = Utc::now().timestamp_millis();
         assert!(
-            store.restorable_records(now, None, true).is_empty(),
+            store.restorable_records(now, None, true, None).is_empty(),
             "a never-started (bare shell) record must never be a restore candidate"
         );
     }
@@ -8024,7 +8273,7 @@ mod tests {
 
         let now = Utc::now().timestamp_millis();
         assert!(
-            store.restorable_records(now, None, true).is_empty(),
+            store.restorable_records(now, None, true, None).is_empty(),
             "a no-terminal close (even seconds old) must not be restorable"
         );
     }
@@ -8416,7 +8665,7 @@ mod tests {
         boot_was_clean: bool,
     ) -> Vec<String> {
         let mut ids: Vec<String> = store
-            .restorable_records(now, prior_marker_at, boot_was_clean)
+            .restorable_records(now, prior_marker_at, boot_was_clean, None)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -8603,7 +8852,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let ids: Vec<String> = store
-            .restorable_records(now, None, true)
+            .restorable_records(now, None, true, None)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -8879,5 +9128,497 @@ mod tests {
             "a closed record must not be rebound"
         );
         assert_eq!(after.state, "closed");
+    }
+
+    // --- withheld boot restore (plan 2026-10-01-drain-deferred-restore-is-swept-as-orphans)
+
+    /// Drive the lifecycle poll's no-match path for `ticks` ticks exactly as
+    /// `main.rs` does for records that match NO live terminal (every prior-boot
+    /// record after a crash): `classify` → `hold_for_withheld_boot_restore` →
+    /// the same counter bookkeeping and `record_close(.., "no-terminal")`.
+    fn simulate_no_terminal_poll_ticks(
+        store: &SessionLifecycleStore,
+        ticks: u32,
+        boot_at_ms: Option<i64>,
+        phase: BootRestorePhase,
+        drain_defers_boot_resume: bool,
+    ) {
+        let mut consecutive_no_match: HashMap<String, u32> = HashMap::new();
+        for _ in 0..ticks {
+            for rec in store.open_records() {
+                let prior_no_match = consecutive_no_match
+                    .get(&rec.claude_session_id)
+                    .copied()
+                    .unwrap_or(0);
+                let held = withheld_boot_restore_candidate(
+                    rec.last_seen_at,
+                    boot_at_ms,
+                    phase,
+                    drain_defers_boot_resume,
+                );
+                let action = hold_for_withheld_boot_restore(
+                    classify(
+                        None,
+                        false,
+                        0,
+                        prior_no_match,
+                        true,
+                        rec.restore_pending_at.is_some(),
+                        rec.confirmed_at.is_some(),
+                        WorkerPlane::NotWorker,
+                    ),
+                    held,
+                );
+                if held && action == PollAction::Skip {
+                    consecutive_no_match.remove(&rec.claude_session_id);
+                }
+                match action {
+                    PollAction::NoMatchWait => {
+                        consecutive_no_match
+                            .insert(rec.claude_session_id.clone(), prior_no_match + 1);
+                    }
+                    PollAction::CloseNoTerminal => {
+                        store.record_close(&rec.claude_session_id, "no-terminal");
+                        consecutive_no_match.remove(&rec.claude_session_id);
+                    }
+                    PollAction::Skip => {}
+                    other => panic!("no-match path produced {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The 2026-10-01 registry shape: a confirmed crash cohort last seen at the
+    /// crash, an old ghost, and (optionally) a session this boot has kept alive
+    /// for hours — which is what drags the unpartitioned anchor forward.
+    fn crash_cohort_store(
+        dir: &Path,
+        crash: i64,
+        this_boot_live_seen_at: Option<i64>,
+    ) -> SessionLifecycleStore {
+        let path = dir.join("terminal-sessions.json");
+        let confirmed = |mut r: TerminalSessionRecord| {
+            r.confirmed_at = Some(r.opened_at);
+            r
+        };
+        let mut recs = vec![
+            confirmed(fixture_rec("victim-a", "open", crash, None, None)),
+            confirmed(fixture_rec("victim-b", "open", crash - 40_000, None, None)),
+            confirmed(fixture_rec(
+                "ghost",
+                "open",
+                crash - 72 * 3_600_000,
+                None,
+                None,
+            )),
+        ];
+        if let Some(seen) = this_boot_live_seen_at {
+            recs.push(confirmed(fixture_rec(
+                "this-boot-live",
+                "open",
+                seen,
+                None,
+                None,
+            )));
+        }
+        write_fixture(&path, recs);
+        SessionLifecycleStore::open(&path).unwrap()
+    }
+
+    fn sorted_restorable(
+        store: &SessionLifecycleStore,
+        now: i64,
+        boot_at_ms: Option<i64>,
+    ) -> Vec<String> {
+        // A crash boot: the crashed process's marker never feeds the anchor.
+        let mut ids: Vec<String> = store
+            .restorable_records(now, None, false, boot_at_ms)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// (a) Drained boot: the crash cohort survives far more than
+    /// `NO_TERMINAL_ORPHAN_TICKS` poll ticks still `open` and still restorable
+    /// — both before the frontend first asks (`NotYetRun` + gate deferring) and
+    /// after the restore path recorded the deferral (`Withheld`).
+    #[test]
+    fn drained_boot_holds_crash_cohort_open_and_restorable() {
+        for phase in [BootRestorePhase::NotYetRun, BootRestorePhase::Withheld] {
+            let dir = tempdir().unwrap();
+            let crash = 1_700_000_000_000_i64;
+            let boot = crash + 30_000;
+            let store = crash_cohort_store(dir.path(), crash, None);
+
+            simulate_no_terminal_poll_ticks(
+                &store,
+                NO_TERMINAL_ORPHAN_TICKS * 10,
+                Some(boot),
+                phase,
+                true,
+            );
+
+            for id in ["victim-a", "victim-b", "ghost"] {
+                assert_eq!(
+                    store.get(id).unwrap().state,
+                    "open",
+                    "{phase:?}: {id} must not be closed while its restore is withheld"
+                );
+            }
+            assert_eq!(
+                sorted_restorable(&store, boot + 60_000, Some(boot)),
+                vec!["victim-a".to_string(), "victim-b".to_string()],
+                "{phase:?}: the crash cohort is still restorable (the ghost never was)"
+            );
+        }
+    }
+
+    /// The pre-fix behaviour this replaces, pinned so the test above is not a
+    /// coincidence: with no hold the same ticks close every victim
+    /// `no-terminal`, and the restore set comes back empty.
+    #[test]
+    fn without_the_hold_a_drained_boot_strands_the_cohort() {
+        let dir = tempdir().unwrap();
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let store = crash_cohort_store(dir.path(), crash, None);
+        // `Ran` disables the hold; nothing restored them, so they are swept.
+        simulate_no_terminal_poll_ticks(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 1,
+            Some(boot),
+            BootRestorePhase::Ran,
+            true,
+        );
+        let victim = store.get("victim-a").unwrap();
+        assert_eq!(victim.state, "closed");
+        assert_eq!(victim.close_reason.as_deref(), Some("no-terminal"));
+        assert!(sorted_restorable(&store, boot + 300_000, Some(boot)).is_empty());
+    }
+
+    /// (b) The drain lifts hours later, after this boot has kept a session
+    /// alive the whole time: the restore set still contains the crash cohort
+    /// (the boot-partitioned anchor), and once the restore marks them pending
+    /// the resumed poll (`Ran`) leaves them alone while still retiring the
+    /// genuine orphan it did not restore.
+    #[test]
+    fn after_the_drain_lifts_the_restore_set_contains_the_crash_cohort() {
+        let dir = tempdir().unwrap();
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let lift = boot + 4 * 3_600_000; // a four-hour drain
+        let store = crash_cohort_store(dir.path(), crash, None);
+
+        // Hours of drained ticks.
+        simulate_no_terminal_poll_ticks(&store, 300, Some(boot), BootRestorePhase::Withheld, true);
+
+        // Meanwhile this boot kept a session alive the whole time. It is added
+        // AFTER the simulated ticks because the simulator models every record
+        // as matching no terminal — a live this-boot row would be (correctly,
+        // see (c)) closed `no-terminal` by it, which is not this scenario.
+        let path = dir.path().join("terminal-sessions.json");
+        age_persisted_records(&store, &path, |m| {
+            let mut live = fixture_rec("this-boot-live", "open", lift - 20_000, None, None);
+            live.confirmed_at = Some(live.opened_at);
+            m.insert(live.claude_session_id.clone(), live);
+        });
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let restore_set = sorted_restorable(&store, lift, Some(boot));
+        assert_eq!(
+            restore_set,
+            vec![
+                "this-boot-live".to_string(),
+                "victim-a".to_string(),
+                "victim-b".to_string(),
+            ],
+            "the crash cohort is judged against the PRIOR boot's anchor"
+        );
+        // Unpartitioned, the hours-later live row drags the anchor past the
+        // cohort — the latent second strand this fix also closes.
+        assert_eq!(
+            sorted_restorable(&store, lift, None),
+            vec!["this-boot-live".to_string()],
+        );
+
+        // The frontend restores what it was handed.
+        store.mark_restore_pending("victim-a");
+        store.mark_restore_pending("victim-b");
+        simulate_no_terminal_poll_ticks(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 2,
+            Some(boot),
+            BootRestorePhase::Ran,
+            false,
+        );
+        assert_eq!(store.get("victim-a").unwrap().state, "open");
+        assert_eq!(store.get("victim-b").unwrap().state, "open");
+        let ghost = store.get("ghost").unwrap();
+        assert_eq!(ghost.state, "closed", "normal orphan handling resumed");
+        assert_eq!(ghost.close_reason.as_deref(), Some("no-terminal"));
+    }
+
+    /// (c) Genuine orphans still close when the restore is not being withheld:
+    /// an undrained boot that has not run its restore yet, and a this-boot
+    /// record even while the boot restore IS withheld.
+    #[test]
+    fn genuine_orphans_still_close_when_not_withheld() {
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+
+        // Not drained, restore not yet run: unchanged behaviour.
+        let dir = tempdir().unwrap();
+        let store = crash_cohort_store(dir.path(), crash, None);
+        simulate_no_terminal_poll_ticks(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 1,
+            Some(boot),
+            BootRestorePhase::NotYetRun,
+            false,
+        );
+        assert_eq!(store.get("ghost").unwrap().state, "closed");
+        assert_eq!(store.get("victim-a").unwrap().state, "closed");
+
+        // Withheld, but the record lived in THIS boot: judged normally.
+        let dir = tempdir().unwrap();
+        let store = crash_cohort_store(dir.path(), crash, Some(boot + 60_000));
+        simulate_no_terminal_poll_ticks(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 1,
+            Some(boot),
+            BootRestorePhase::Withheld,
+            true,
+        );
+        let live = store.get("this-boot-live").unwrap();
+        assert_eq!(live.state, "closed");
+        assert_eq!(live.close_reason.as_deref(), Some("no-terminal"));
+        assert_eq!(store.get("victim-a").unwrap().state, "open");
+    }
+
+    #[test]
+    fn withheld_boot_restore_candidate_truth_table() {
+        let boot = Some(1_000);
+        use BootRestorePhase::*;
+        // Prior-boot record.
+        assert!(withheld_boot_restore_candidate(999, boot, Withheld, false));
+        assert!(withheld_boot_restore_candidate(999, boot, Withheld, true));
+        assert!(withheld_boot_restore_candidate(999, boot, NotYetRun, true));
+        assert!(!withheld_boot_restore_candidate(
+            999, boot, NotYetRun, false
+        ));
+        assert!(!withheld_boot_restore_candidate(999, boot, Ran, true));
+        // This-boot record: never held.
+        assert!(!withheld_boot_restore_candidate(
+            1_000, boot, Withheld, true
+        ));
+        // No boot instant: nothing is provably prior-boot.
+        assert!(!withheld_boot_restore_candidate(999, None, Withheld, true));
+    }
+
+    #[test]
+    fn hold_rewrites_only_the_no_match_arms() {
+        use PollAction::*;
+        assert_eq!(hold_for_withheld_boot_restore(NoMatchWait, true), Skip);
+        assert_eq!(hold_for_withheld_boot_restore(CloseNoTerminal, true), Skip);
+        for a in [KeepAlive, NeedsConfirm, Close, CloseNeverStarted, Skip] {
+            assert_eq!(hold_for_withheld_boot_restore(a, true), a);
+        }
+        for a in [NoMatchWait, CloseNoTerminal, KeepAlive, Close] {
+            assert_eq!(hold_for_withheld_boot_restore(a, false), a);
+        }
+    }
+
+    /// The latch is monotonic: a repeated deferral is idempotent, `Ran` is
+    /// terminal, and a deferral after the restore ran does not re-arm the hold.
+    /// The only test that touches the process-global latch.
+    #[test]
+    fn boot_restore_phase_latch_is_monotonic() {
+        reset_boot_restore_phase_for_test();
+        assert_eq!(boot_restore_phase(), BootRestorePhase::NotYetRun);
+        note_boot_restore_withheld();
+        note_boot_restore_withheld();
+        assert_eq!(boot_restore_phase(), BootRestorePhase::Withheld);
+        note_boot_restore_ran();
+        assert_eq!(boot_restore_phase(), BootRestorePhase::Ran);
+        note_boot_restore_withheld();
+        assert_eq!(boot_restore_phase(), BootRestorePhase::Ran);
+        reset_boot_restore_phase_for_test();
+    }
+
+    /// Clean boot: the shutdown marker (written before this boot) joins the
+    /// PRIOR-boot anchor, so the cohort stays admitted however long this boot
+    /// has kept another session alive; unpartitioned, that session drags the
+    /// anchor past the cohort.
+    #[test]
+    fn clean_boot_partition_counts_the_marker_in_the_prior_anchor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let shutdown = 1_700_000_000_000_i64;
+        let boot = shutdown + 30_000;
+        let later = boot + 3 * 3_600_000;
+        let confirmed = |mut r: TerminalSessionRecord| {
+            r.confirmed_at = Some(r.opened_at);
+            r
+        };
+        write_fixture(
+            &path,
+            vec![
+                confirmed(fixture_rec("prior", "open", shutdown - 120_000, None, None)),
+                // 11 min before the marker: excluded ONLY because the marker
+                // counts. Without it the prior anchor is `prior`'s own stamp
+                // (9 min away) and this row would be admitted.
+                confirmed(fixture_rec(
+                    "stale-prior",
+                    "open",
+                    shutdown - 660_000,
+                    None,
+                    None,
+                )),
+                confirmed(fixture_rec("this-boot", "open", later, None, None)),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let ids = |boot_at: Option<i64>| {
+            let mut v: Vec<String> = store
+                .restorable_records(later, Some(shutdown), true, boot_at)
+                .into_iter()
+                .map(|r| r.claude_session_id)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            ids(Some(boot)),
+            vec!["prior".to_string(), "this-boot".to_string()]
+        );
+        assert_eq!(ids(None), vec!["this-boot".to_string()]);
+    }
+
+    /// Vet correction 1: only the boot restore's own read moves the latch, in
+    /// either direction. A tree-reset report, worker-adoption probe or page
+    /// reconcile read — deferred or not — leaves it untouched, so none of them
+    /// can release the poll's hold before anything was restored.
+    #[test]
+    fn only_the_boot_restore_read_moves_the_latch() {
+        for deferred in [true, false] {
+            assert_eq!(
+                boot_restore_latch_event(false, deferred),
+                BootRestoreLatchEvent::Untouched,
+                "a non-restore read (deferred={deferred}) must not move the latch"
+            );
+        }
+        assert_eq!(
+            boot_restore_latch_event(true, true),
+            BootRestoreLatchEvent::Withheld
+        );
+        assert_eq!(
+            boot_restore_latch_event(true, false),
+            BootRestoreLatchEvent::Ran
+        );
+    }
+
+    /// The hold's `drain_defers_boot_resume` input is `!drain_gate(BootResume)
+    /// .allows()`. Pin that BOTH a drain and an UNKNOWN drain state defer the
+    /// boot restore (so they hold), and that a clear/expired drain does not.
+    #[test]
+    fn boot_resume_gate_defers_on_drained_and_unknown_drain_state() {
+        use crate::coord_drain_state::{gate_for_at, CoordDrainState, SpawnOrigin};
+        let now = Utc::now();
+        let defers = |st: CoordDrainState| !gate_for_at(&st, SpawnOrigin::BootResume, now).allows();
+        assert!(defers(CoordDrainState::Drained {
+            until: Some(now + chrono::Duration::hours(3)),
+            reason: None,
+        }));
+        assert!(defers(CoordDrainState::Unknown {
+            since: now,
+            cause: "unreadable".to_string(),
+        }));
+        assert!(!defers(CoordDrainState::Clear));
+        assert!(!defers(CoordDrainState::Drained {
+            until: Some(now - chrono::Duration::minutes(1)),
+            reason: None,
+        }));
+    }
+
+    /// A held record gets the id match only: a this-boot terminal that merely
+    /// shares its page/title/working dir must not be taken for it.
+    #[test]
+    fn held_record_ignores_the_triple_fallback_match() {
+        let live = "live-terminal";
+        let mut by_id: HashMap<&str, &str> = HashMap::new();
+        by_id.insert("term-now", live);
+        let mut by_triple: HashMap<(&str, &str, &str), &str> = HashMap::new();
+        by_triple.insert(("default", "Claude 1", "/repo"), live);
+        let triple = Some(("default", "Claude 1", "/repo"));
+
+        assert_eq!(
+            match_live_terminal("term-dead", triple, &by_id, &by_triple, false),
+            Some("live-terminal"),
+            "unheld: the fallback still applies"
+        );
+        assert_eq!(
+            match_live_terminal("term-dead", triple, &by_id, &by_triple, true),
+            None,
+            "held: no fallback"
+        );
+        assert_eq!(
+            match_live_terminal("term-now", triple, &by_id, &by_triple, true),
+            Some("live-terminal"),
+            "held: an exact id match still counts"
+        );
+    }
+
+    /// A gone worker record's `CloseNoTerminal` is the same variant, so the hold
+    /// keeps a prior-boot worker row open through the drain too — parity with
+    /// an undrained boot, where the restore runs before the first poll tick.
+    #[test]
+    fn hold_covers_a_gone_prior_boot_worker_row() {
+        let action = classify(None, false, 0, 0, true, false, true, WorkerPlane::Gone);
+        assert_eq!(action, PollAction::CloseNoTerminal);
+        assert_eq!(
+            hold_for_withheld_boot_restore(action, true),
+            PollAction::Skip
+        );
+    }
+
+    /// This-boot CLOSES (the boot repair stamps `closed_at = now`, and any
+    /// session that ends during the drain) do not move the prior-boot anchor.
+    #[test]
+    fn this_boot_closes_do_not_move_the_prior_boot_anchor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let mut victim = fixture_rec("victim", "open", crash, None, None);
+        victim.confirmed_at = Some(victim.opened_at);
+        write_fixture(
+            &path,
+            vec![
+                victim,
+                fixture_rec(
+                    "repaired",
+                    "closed",
+                    crash - 600_000,
+                    Some(boot + 1_000),
+                    Some("superseded-terminal-reuse"),
+                ),
+                fixture_rec(
+                    "ended-during-drain",
+                    "closed",
+                    boot + 2 * 3_600_000,
+                    Some(boot + 2 * 3_600_000),
+                    Some("user-close"),
+                ),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let later = boot + 3 * 3_600_000;
+        assert_eq!(
+            sorted_restorable(&store, later, Some(boot)),
+            vec!["victim".to_string()]
+        );
+        assert!(sorted_restorable(&store, later, None).is_empty());
     }
 }

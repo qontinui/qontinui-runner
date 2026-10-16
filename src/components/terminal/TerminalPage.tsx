@@ -1550,6 +1550,8 @@ function TerminalPageInner({
               </div>
             )}
 
+            {/* Keep ZoneMinimap a DIRECT child of this positioned container:
+                it measures its `parentElement` to clamp a dragged position. */}
             {zoneLayout.isMultiZone && <ZoneMinimap />}
 
             {/* Bulk approve/reject/broadcast now lives inline in the top
