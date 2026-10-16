@@ -256,6 +256,15 @@ pub struct Model {
     finished: bool,
 }
 
+/// The frames of backlog the lag bound allows under the `software-compositor`
+/// profile: WGC's frame pool holds this many (`BUFFERS` in
+/// `platform/windows/wgc.rs`, `Direct3D11CaptureFramePool::CreateFreeThreaded`
+/// with 3 buffers). A probe whose oldest unread frame is younger than three
+/// frame intervals has not yet filled the pool, so no frame was dropped;
+/// `ModelConfig::lag_bound_ns` already encodes the same three, in refresh
+/// intervals (`3 * refresh_ns`, at least 50 ms).
+pub const LAG_BOUND_POOL_FRAMES: u64 = 3;
+
 /// Below this many frames with a known lag, `behind` gives no verdict.
 pub const LAG_VERDICT_MIN_FRAMES: usize = 10;
 
@@ -736,6 +745,47 @@ impl Model {
             .unwrap_or("insufficient_samples")
     }
 
+    /// The lag bound the probe's health is judged against, and why.
+    ///
+    /// `strict`: `cfg.lag_bound_ns` (three refresh intervals, at least 50 ms).
+    /// `software-compositor` (the hosted VM only, chosen by the environment
+    /// like the cross-check's profile): the larger of that and
+    /// [`LAG_BOUND_POOL_FRAMES`] frame intervals F, where F is the cross-check's
+    /// own compositor cadence — the secondary's frame-spacing p50 clamped to
+    /// one to two refresh intervals, R without 20 deltas. A compositor that
+    /// presents every other refresh fills WGC's three-buffer pool after three
+    /// of ITS frames, not three refreshes: on the hosted VM (F = 31.25 ms) the
+    /// bound is 93.75 ms, where CI job 117109384013's runner tiled soak judged
+    /// a p95 lag of 81.7 ms against the strict 50 ms.
+    fn lag_bound(&self) -> (u64, String) {
+        let strict = self.cfg.lag_bound_ns;
+        match self.cfg.crosscheck_profile {
+            analysis::CrosscheckProfile::Strict => (
+                strict,
+                format!("strict: {:.1} ms (three refresh intervals, at least 50 ms)", strict as f64 / 1e6),
+            ),
+            analysis::CrosscheckProfile::SoftwareCompositor => {
+                let r = self.cfg.refresh_ns as f64;
+                let f_ns = analysis::Cadence::from_secondary(&self.secondary_frames)
+                    .secondary_ms
+                    .filter(|f| f.is_finite() && *f > 0.0)
+                    .map_or(r, |f| f * 1e6)
+                    .clamp(r, analysis::CROSSCHECK_FRAME_MAX_REFRESHES * r);
+                let pool = (LAG_BOUND_POOL_FRAMES as f64 * f_ns).round() as u64;
+                let bound = strict.max(pool);
+                (
+                    bound,
+                    format!(
+                        "software-compositor: {:.1} ms, the larger of the strict {:.1} ms and {LAG_BOUND_POOL_FRAMES} frame intervals of {:.2} ms (WGC's frame pool)",
+                        bound as f64 / 1e6,
+                        strict as f64 / 1e6,
+                        f_ns / 1e6
+                    ),
+                )
+            }
+        }
+    }
+
     fn probe_health(&self) -> ProbeHealth {
         let mut lags = self.lags.clone();
         lags.sort_unstable();
@@ -752,10 +802,11 @@ impl Model {
             n if n < LAG_P95_MIN_FRAMES => (Some(lags[n - 2] as f64 / 1e6), Some("second_largest")),
             _ => (pct_ms(&lags, 95), Some("p95")),
         };
-        let bound_ms = self.cfg.lag_bound_ns as f64 / 1e6;
+        let (bound_ns, basis) = self.lag_bound();
+        let bound_ms = bound_ns as f64 / 1e6;
         ProbeHealth {
             lag_statistic: statistic,
-            frames_over_bound: lags.iter().filter(|&&l| l > self.cfg.lag_bound_ns).count() as u64,
+            frames_over_bound: lags.iter().filter(|&&l| l > bound_ns).count() as u64,
             frames: lags.len() as u64 + self.lag_unknown,
             frames_lag_unknown: self.lag_unknown,
             scan_ms_p50: pct_ms(&scans, 50),
@@ -764,6 +815,7 @@ impl Model {
             lag_ms_judged: judged,
             lag_ms_max: lags.last().map(|&l| l as f64 / 1e6),
             lag_bound_ms: bound_ms,
+            lag_bound_basis: basis,
             // Judged only over frames whose lag is known; with too few of
             // them, whether the probe kept up was never established.
             behind: judged.map(|j| j > bound_ms),
@@ -806,12 +858,13 @@ impl Model {
             Some((
                 "harness_error",
                 format!(
-                    "the probe fell behind: its {} frame lag was {:.1} ms ({} of {} frames over the {:.1} ms bound), so markers may have appeared only in later frames",
+                    "the probe fell behind: its {} frame lag was {:.1} ms ({} of {} frames over the {:.1} ms bound; {}), so markers may have appeared only in later frames",
                     probe.lag_statistic.unwrap_or("-"),
                     probe.lag_ms_judged.unwrap_or_default(),
                     probe.frames_over_bound,
                     probe.frames - probe.frames_lag_unknown,
-                    probe.lag_bound_ms
+                    probe.lag_bound_ms,
+                    probe.lag_bound_basis
                 ),
             ))
         } else if lag_unknown {

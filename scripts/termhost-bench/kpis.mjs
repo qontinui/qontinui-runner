@@ -254,7 +254,7 @@ export function probeHealthGate(seg) {
   if (p.behind === true) {
     return {
       reason: "harness_error",
-      detail: `the probe fell behind its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged${p.lag_statistic ? ` as the ${p.lag_statistic}` : ""}, bound ${p.lag_bound_ms ?? "?"} ms${Number.isInteger(p.frames_over_bound) ? `, ${p.frames_over_bound} frame(s) over it` : ""}), so first appearances may be late`,
+      detail: `the probe fell behind its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged${p.lag_statistic ? ` as the ${p.lag_statistic}` : ""}, bound ${p.lag_bound_ms ?? "?"} ms${p.lag_bound_basis ? ` — ${p.lag_bound_basis}` : ""}${Number.isInteger(p.frames_over_bound) ? `, ${p.frames_over_bound} frame(s) over it` : ""}), so first appearances may be late`,
     };
   }
   if (p.behind !== false && Number(p.frames ?? 0) > 0) {
@@ -1328,6 +1328,12 @@ export function computeRowKpis(p) {
         .map((fs) => fs.session),
     ).size;
     kpis.output_latency_ms.coverage = { observed, expected: Math.max(p.vTarget, visible.size, observed) };
+  }
+  // The probe-lag bound the soak was judged against, when the environment's
+  // profile widened it (software-compositor): the row says so.
+  const lagBasis = summary?.probe?.lag_bound_basis;
+  if (typeof lagBasis === "string" && lagBasis.startsWith("software-compositor") && kpis.output_latency_ms.state === "measured") {
+    notes.push(`output_latency_ms: probe lag ${summary.probe.lag_ms_judged ?? "?"} ms (${summary.probe.lag_statistic ?? "?"}) judged against ${lagBasis}`);
   }
   // A watch WITH a secondary source whose cross-check could not judge (too few
   // markers seen by both): the latency stands unchecked, and the row says so.

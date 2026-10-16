@@ -521,6 +521,8 @@ pub struct ProbeHealth {
     pub lag_ms_max: Option<f64>,
     /// Above this the probe was not keeping up with the source.
     pub lag_bound_ms: f64,
+    /// How `lag_bound_ms` was chosen: the profile and its arithmetic.
+    pub lag_bound_basis: String,
     /// The probe fell behind: latency, loss and cadence are
     /// unknown(harness_error). `null` when fewer than 10 primary frames had a
     /// known lag —

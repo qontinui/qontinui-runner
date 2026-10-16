@@ -227,6 +227,21 @@ test("the input watch's cross-check is held to the declared profile too (round 4
   }
 });
 
+test("the probe-lag bound's basis reaches the row: a note under software-compositor, the gate's detail when behind", () => {
+  const basis = "software-compositor: 93.8 ms, the larger of the strict 50.0 ms and 3 frame intervals of 31.25 ms (WGC's frame pool)";
+  const fx = focusFixture();
+  const probeOf = (rec) => fx.soak.records.find((r) => r.type === "summary").probe;
+  const withProbe = (patch) => withSummary(fx, { probe: { ...probeOf(), ...patch } });
+  const ok = computeRowKpis(withProbe({ behind: false, lag_ms_judged: 81.7, lag_statistic: "p95", lag_bound_ms: 93.75, lag_bound_basis: basis }));
+  assert.equal(ok.kpis.output_latency_ms.state, "measured", JSON.stringify(ok.kpis.output_latency_ms));
+  assert.ok(ok.kpis.output_latency_ms.notes.includes(`probe lag 81.7 ms (p95) judged against ${basis}`), JSON.stringify(ok.kpis.output_latency_ms.notes));
+  const strict = computeRowKpis(withProbe({ behind: false, lag_bound_ms: 50, lag_bound_basis: "strict: 50.0 ms (three refresh intervals, at least 50 ms)" }));
+  assert.ok(!(strict.kpis.output_latency_ms.notes ?? []).some((n) => /probe lag/.test(n)), "strict adds no note");
+  const gate = probeHealthGate({ summary: { probe: { behind: true, lag_ms_judged: 120, lag_statistic: "p95", lag_bound_ms: 93.75, lag_bound_basis: basis, frames_over_bound: 40 } } });
+  assert.equal(gate.reason, "harness_error");
+  assert.ok(gate.detail.includes(`bound 93.75 ms — ${basis}, 40 frame(s) over it`), gate.detail);
+});
+
 test("a measured latency whose cross-check was not performed says so in the row's notes (review N3)", () => {
   const cc = { verdict: "not_performed", compared: 2, agreed: 2, disagreed: 0, detail: "only 2 marker(s) seen cleanly by both sources; the median rule needs 3, so neither marker rule decides" };
   const { kpis } = computeRowKpis(withSummary(focusFixture(), { secondary: "dda", crosscheck: cc }));

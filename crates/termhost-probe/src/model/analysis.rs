@@ -189,7 +189,9 @@ pub enum CrosscheckProfile {
     Strict,
     /// `windows-hosted` only (plan D6: software rendering, no GPU): the same
     /// rule WITHOUT that coalescing fallback, because the hosted VM's DDA
-    /// coalesces on 22-63% of its frames as a matter of course. Its numbers are
+    /// coalesces on 22-63% of its frames as a matter of course. The probe-lag
+    /// bound follows it too: three of the compositor's frames, not three
+    /// refreshes (`Model::lag_bound`, `LAG_BOUND_POOL_FRAMES`). Its numbers are
     /// a same-VM regression signal and plumbing check (D6/D11), never compared
     /// across environments.
     SoftwareCompositor,

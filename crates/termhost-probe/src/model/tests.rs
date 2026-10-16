@@ -603,6 +603,8 @@ struct Presented {
     dda_max: u64,
     markers: u64,
     profile: analysis::CrosscheckProfile,
+    /// How late (ms) WGC frame `k` reaches the probe.
+    wgc_lag_ms: fn(u64) -> u64,
 }
 
 const EVERY: fn(u64) -> bool = |_| true;
@@ -618,6 +620,7 @@ impl Presented {
             dda_max: u64::MAX,
             markers: 200,
             profile: analysis::CrosscheckProfile::Strict,
+            wgc_lag_ms: |_| 0,
         }
     }
 
@@ -638,7 +641,8 @@ impl Presented {
                         index: u64,
                         t_ns: u64,
                         seq: Option<usize>,
-                        missed: Option<u32>| FrameObs {
+                        missed: Option<u32>,
+                        lag_ms: u64| FrameObs {
             source,
             index,
             t_ns,
@@ -649,7 +653,7 @@ impl Presented {
             rejected: 0,
             missed,
             scan_ns: 0,
-            lag_ns: Some(0),
+            lag_ns: Some(lag_ms * MS),
         };
         for (i, &e) in emit.iter().enumerate() {
             m.on_emitted(Emitted {
@@ -669,7 +673,7 @@ impl Presented {
                 break;
             }
             if (self.dda_keep)(k) && dda_frames < self.dda_max {
-                m.on_frame(frame_ns(SourceId::Dda, k, t, latest(t), Some(dda_missed)));
+                m.on_frame(frame_ns(SourceId::Dda, k, t, latest(t), Some(dda_missed), 0));
                 dda_frames += 1;
                 dda_missed = 0;
             } else {
@@ -683,6 +687,7 @@ impl Presented {
                     t + self.wgc_stamp_ms * MS,
                     shown,
                     None,
+                    (self.wgc_lag_ms)(k),
                 ));
             }
             k += 1;
@@ -967,6 +972,45 @@ fn a_vm_like_timeline_agrees_only_under_software_compositor() {
         strict.output_latency_ms.reason,
         Some("capture_disagreement")
     );
+}
+
+/// The probe-lag bound follows the same environment-chosen profile. A
+/// VM-shaped run — presenting every other refresh (F = 2R = 33.3 ms here),
+/// WGC frames reaching the probe 20 ms late and every tenth 82 ms late (a p95
+/// of 82 ms; CI job 117109384013's runner tiled soak judged 81.7 ms) — falls
+/// behind under `strict` (bound 50 ms) and keeps up under
+/// `software-compositor` (bound 3 F = 100 ms: WGC's three-buffer pool).
+#[test]
+fn the_lag_bound_follows_the_profile() {
+    let run = |profile, wgc_lag_ms: fn(u64) -> u64, dda_max| {
+        Presented {
+            present_every: 2,
+            wgc_lag_ms,
+            dda_max,
+            profile,
+            ..Presented::at_60hz()
+        }
+        .run()
+    };
+    let vm_lag: fn(u64) -> u64 = |k| if k % 10 == 0 { 82 } else { 20 };
+    let strict = run(analysis::CrosscheckProfile::Strict, vm_lag, u64::MAX);
+    assert_eq!(strict.probe.behind, Some(true), "{:?}", strict.probe);
+    assert!((strict.probe.lag_bound_ms - 50.0).abs() < 1e-3, "{:?}", strict.probe);
+    assert!(strict.probe.lag_bound_basis.starts_with("strict"), "{}", strict.probe.lag_bound_basis);
+    assert_eq!(strict.output_latency_ms.reason, Some("harness_error"));
+    let soft = run(analysis::CrosscheckProfile::SoftwareCompositor, vm_lag, u64::MAX);
+    assert_eq!(soft.probe.behind, Some(false), "{:?}", soft.probe);
+    assert!((soft.probe.lag_bound_ms - 6.0 * R_MS).abs() < 1e-3, "{:?}", soft.probe);
+    assert!(soft.probe.lag_ms_judged.is_some_and(|l| (l - 82.0).abs() < 1e-6), "{:?}", soft.probe);
+    assert!(soft.probe.lag_bound_basis.starts_with("software-compositor"), "{}", soft.probe.lag_bound_basis);
+    assert_eq!(soft.output_latency_ms.state, KpiState::Measured, "{:?}", soft.output_latency_ms);
+    // Past three frames it is still behind under software-compositor...
+    let worse = run(analysis::CrosscheckProfile::SoftwareCompositor, |k| if k % 10 == 0 { 120 } else { 20 }, u64::MAX);
+    assert_eq!(worse.probe.behind, Some(true), "{:?}", worse.probe);
+    // ...and with no secondary cadence measured, F is R and the bound the strict 50 ms.
+    let no_dda = run(analysis::CrosscheckProfile::SoftwareCompositor, vm_lag, 0);
+    assert!((no_dda.probe.lag_bound_ms - 50.0).abs() < 1e-3, "{:?}", no_dda.probe);
+    assert_eq!(no_dda.probe.behind, Some(true));
 }
 
 fn agreeing_run(c: ModelConfig) -> WatchSummary {
