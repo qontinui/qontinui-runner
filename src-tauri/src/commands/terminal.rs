@@ -670,22 +670,21 @@ pub fn terminal_list(
 /// Returns the parsed `GridSnapshot` rather than raw scrollback bytes, so the
 /// frontend can paint the final visible state in one synchronous write.
 /// See `plans/terminal-grid-snapshot.md`.
+///
+/// `reset_flow_control` (default false) also resets the session's flow-control
+/// counters, just before the snapshot. The reconnect path sets it once its
+/// `terminal-output` listener exists: see `TerminalSession::grid_snapshot`.
 #[tauri::command]
 pub fn terminal_get_grid(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     terminal_id: String,
+    reset_flow_control: Option<bool>,
 ) -> Result<CommandResponse, String> {
     let session = terminal_manager
         .get(&terminal_id)
         .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
 
-    let grid_handle = session.grid();
-    let snapshot = {
-        let g = grid_handle
-            .lock()
-            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
-        g.snapshot()
-    };
+    let snapshot = session.grid_snapshot(reset_flow_control.unwrap_or(false))?;
     let value = serde_json::to_value(&snapshot).map_err(|e| {
         String::from(AppError::EncodingError(format!(
             "Failed to serialize grid snapshot: {}",
