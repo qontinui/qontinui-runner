@@ -451,20 +451,6 @@ fn pr_create_payload(
     payload
 }
 
-/// Whether a create success body confirms a requested hold: a top-level
-/// `hold` object with non-empty `kind`, `reason` and `held_by`. The runner's
-/// forwarder checks the same thing; the CLI re-checks because a runner that
-/// predates that check passes coord's body through unexamined.
-fn hold_echo_confirmed(v: &serde_json::Value) -> bool {
-    v.get("hold").and_then(|h| h.as_object()).is_some_and(|h| {
-        ["kind", "reason", "held_by"].iter().all(|k| {
-            h.get(*k)
-                .and_then(|x| x.as_str())
-                .is_some_and(|x| !x.trim().is_empty())
-        })
-    })
-}
-
 /// When coord's hold echo says `created: false`, the branch already carried a
 /// live hold and the PR JOINED it rather than placing a new one — the caller's
 /// `--hold` reason is not the one on record. Returns the stderr note naming
@@ -511,13 +497,17 @@ fn pr_create_outcome(
     let pr_url = parsed
         .as_ref()
         .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from));
-    if hold_requested && !parsed.as_ref().is_some_and(hold_echo_confirmed) {
+    if hold_requested
+        && !parsed
+            .as_ref()
+            .is_some_and(qontinui_runner_lib::pr_hold_echo::hold_echo_confirmed)
+    {
         let shown = pr_url.as_deref().unwrap_or("<no url in the response>");
         return Err(format!(
             "PR {shown} was created UNHELD: the create answered {status} but did not confirm \
              the requested hold (no `hold` echo with kind/reason/held_by — coord likely \
-             predates PR holds). The merge train may land it: hold it with \
-             coord_set_pr_hold or close it now. Response: {}",
+             predates PR holds). The merge train may land it: close the PR now (a coord \
+             that serves coord_set_pr_hold could hold it instead). Response: {}",
             text.trim()
         ));
     }
