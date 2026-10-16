@@ -59,10 +59,20 @@ pub struct RestoreResult {
 /// Get the path to settings.json.
 ///
 /// `settings.json` is intentionally shared across all runners on the machine,
-/// so this path is NOT scoped to the current instance. A SUBJECT runner's
-/// "machine" is its instance root (`instance_env::runner_config_base`).
+/// so this path is NOT scoped to the current instance.
+///
+/// A SUBJECT runner's `settings.json` is its own (`QONTINUI_CONFIG_DIR`, which
+/// its startup always points inside the root), so that is the file it backs up.
 fn get_settings_path() -> Option<PathBuf> {
-    qontinui_runner_lib::instance_env::runner_config_base().map(|d| d.join("settings.json"))
+    settings_dir().map(|d| d.join("settings.json"))
+}
+
+/// The directory [`get_settings_path`] resolves in.
+fn settings_dir() -> Option<PathBuf> {
+    if qontinui_runner_lib::instance_env::instance_root().is_some() {
+        return qontinui_runner_lib::instance_env::runner_config_dir().map(|(d, _)| d);
+    }
+    qontinui_runner_lib::instance_env::runner_config_base()
 }
 
 /// Get the path to prompts.json.
@@ -242,6 +252,7 @@ pub fn restore_backup(data: &[u8]) -> Result<RestoreResult, String> {
                     let allowed_bases: Vec<PathBuf> = vec![
                         qontinui_runner_lib::instance_env::runner_config_base(),
                         qontinui_runner_lib::instance_env::runner_data_local_base(),
+                        settings_dir(),
                     ]
                     .into_iter()
                     .flatten()

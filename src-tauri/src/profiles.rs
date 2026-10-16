@@ -716,8 +716,9 @@ pub enum SettingsJsonPathSource {
     /// No `QONTINUI_CONFIG_DIR`; the platform config dir +
     /// `com.qontinui.runner` was used.
     PlatformConfigDir,
-    /// Neither available — `dirs::config_dir()` returned `None`, so there is no
-    /// path at all. The value is `None`, never a guess.
+    /// Neither available — the platform config dir
+    /// (`instance_env::platform_dir`, which always resolves under an instance
+    /// root) returned `None`, so there is no path at all. The value is `None`, never a guess.
     Unresolvable,
 }
 

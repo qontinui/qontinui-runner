@@ -2188,6 +2188,28 @@ mod tests {
         "app_log_dir",
     ];
 
+    /// Tauri `PathResolver` methods that resolve a machine-global directory,
+    /// matched only on `.path().<method>` — a positive list, so `Path::is_dir`
+    /// or `read_dir` on an `entry.path()` is never mistaken for one.
+    const TAURI_PATH_RESOLVER_DIR_METHODS: &[&str] = &[
+        "audio_dir",
+        "cache_dir",
+        "config_dir",
+        "data_dir",
+        "desktop_dir",
+        "document_dir",
+        "download_dir",
+        "executable_dir",
+        "font_dir",
+        "home_dir",
+        "local_data_dir",
+        "picture_dir",
+        "public_dir",
+        "runtime_dir",
+        "template_dir",
+        "video_dir",
+    ];
+
     /// The machine-global directory a call at `leaves[i]` resolves, if one
     /// starts there: `dirs::<x>_dir` (called or passed as a fn), a Tauri
     /// `.app_*_dir()`, or the seam's explicit `.machine_dir()` escape hatch.
@@ -2223,9 +2245,7 @@ mod tests {
             && leaves[i - 2].is_close(Delimiter::Parenthesis)
             && leaves[i - 3].is_open(Delimiter::Parenthesis)
             && leaves[i - 4].is_ident("path");
-        let resolver_dir = on_path_resolver
-            && ident.ends_with("_dir")
-            && !matches!(ident, "resource_dir" | "temp_dir");
+        let resolver_dir = on_path_resolver && TAURI_PATH_RESOLVER_DIR_METHODS.contains(&ident);
         if resolver_dir
             || (called && (TAURI_APP_DIR_METHODS.contains(&ident) || ident == "machine_dir"))
         {
@@ -2435,6 +2455,8 @@ mod tests {
                 let k = app.path().resolve("x", BaseDirectory::AppLocalData);
                 let l = app.path().resolve("x", BaseDirectory::Resource);
                 let m = app.path().temp_dir();
+                let n = entry.path().is_dir();
+                let o = entry.path().read_dir();
             }
         "#;
         let leaves = prod_tokens(src, "synthetic.rs").leaves;

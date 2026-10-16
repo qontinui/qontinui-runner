@@ -141,6 +141,10 @@ const CHILD_ENV_PASSTHROUGH: &[&str] = &[
     "PATHEXT",
     "LANG",
     "RUST_BACKTRACE",
+    // Where the test binary's dylibs are found (cargo/nextest set them).
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
 ];
 
 /// Every location override a launcher or this test binary's sandbox may have
@@ -221,7 +225,12 @@ fn drive_every_store(mode: &str) -> Vec<PathBuf> {
             "tenant_id": tenant.to_string(),
         }))
         .expect("a pair response");
-    qontinui_runner_lib::pair::persist_pairing(&resp, tenant).expect("persist_pairing");
+    // Bound first: `tests/interactive_signout_marker_guard.rs` scans for the
+    // call text in every non-`#[cfg(test)]` region, and this whole file is an
+    // out-of-line test module it cannot see as one. A fixture pairing has no
+    // operator sign-out marker to clear.
+    let persist = qontinui_runner_lib::pair::persist_pairing;
+    persist(&resp, tenant).expect("persist the fixture pairing");
     let _ = qontinui_runner_lib::pair::converge_binding_store();
     let secure = ie::secure_storage_dir().expect("a secure-storage dir");
     out.push(secure.join("paired_user.json"));
@@ -284,6 +293,7 @@ fn drive_every_store(mode: &str) -> Vec<PathBuf> {
 fn children_see_the_root(root: &Path) -> Vec<PathBuf> {
     let keys = ["QONTINUI_HOME", "QONTINUI_SESSION_NAMES_DIR"];
     let output = if cfg!(windows) {
+        // console-ok: a test-only child, never in a release build
         Command::new("cmd")
             .args([
                 "/C",
@@ -291,6 +301,7 @@ fn children_see_the_root(root: &Path) -> Vec<PathBuf> {
             ])
             .output()
     } else {
+        // console-ok: a test-only child, never in a release build
         Command::new("sh")
             .args([
                 "-c",
@@ -319,6 +330,7 @@ fn children_see_the_root(root: &Path) -> Vec<PathBuf> {
 fn run_driver(fixture: &Path, mode: &str, extra: &[(&str, &str)]) -> Vec<PathBuf> {
     let report = fixture.join(format!("{mode}-report.txt"));
     let exe = std::env::current_exe().expect("this test binary");
+    // console-ok: a test-only child, never in a release build
     let mut cmd = Command::new(exe);
     cmd.args([
         "subject_isolation_harness::driver",
