@@ -998,8 +998,9 @@ fn resolve_settings_json_second_reader(now: DateTime<Utc>) -> LayerReading {
     match path {
         Some(p) => LayerReading::known(p.display().to_string(), source.as_str(), now),
         // `Unresolvable` — the platform config dir yielded nothing (possible
-        // only without an instance root), so there is no path. UNKNOWN, not a guessed default: this reader has no fallback and
-        // inventing one here would be reporting a file nobody read.
+        // only without an instance root), so there is no path. UNKNOWN, not a
+        // guessed default: this reader has no fallback and inventing one here
+        // would be reporting a file nobody read.
         None => LayerReading::unknown(
             format!(
                 "the lib-side settings.json reader could not resolve a path \
