@@ -263,9 +263,10 @@ export function createFakeWt({ appDir, genDir = null, genRunId = "r1-u0", firstP
     },
     queryWt: () => [...procs.values()].filter((p) => p.name === "WindowsTerminal.exe").map((p) => ({ pid: p.pid, ppid: p.ppid, exe: p.exe, startKey: p.startKey })),
     queryWindows: (pid) => (pid === state.pid && state.windowOpen ? [{ hwnd: state.hwnd, visible: true, cls: "CASCADIA_HOSTING_WINDOW_CLASS", title: "s0" }] : pid === operatorPid ? [{ hwnd: 0x9000, visible: true, cls: "CASCADIA_HOSTING_WINDOW_CLASS", title: "operator" }] : []),
-    postClose: (pid, hwnd) => {
+    postClose: (pid, hwnd, startKey) => {
       posted.push([pid, hwnd]);
-      if (pid !== state.pid || hwnd !== state.hwnd || !state.windowOpen) return "mismatch";
+      // The script's own checks: owner, class, and the PID still the proven process.
+      if (pid !== state.pid || hwnd !== state.hwnd || !state.windowOpen || procs.get(pid)?.startKey !== startKey) return "mismatch";
       if (!faults.ignoreClose) closeWindow();
       return "posted";
     },

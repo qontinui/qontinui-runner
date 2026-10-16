@@ -9,7 +9,9 @@
  *
  * Provenance of the pin (observed 2026-10-16 by the implementing session, and
  * true of this pin only): microsoft/terminal release `v1.25.2733.0`, published
- * 2026-10-02 and marked Latest (stable; the same day's v1.26 is a Preview). Its
+ * 2026-10-02T20:27:27Z, is the repository's Latest release (the
+ * `releases/latest` URL redirects to it and its page carries the Latest badge);
+ * `v1.26.2734.0`, published six seconds later, carries the Pre-release badge. Its
  * asset `Microsoft.WindowsTerminal_1.25.2733.0_x64.zip` (12 127 272 bytes) was
  * downloaded from the release URL below and hashed with `sha256sum` to the value
  * in the table; the release page's own asset digest

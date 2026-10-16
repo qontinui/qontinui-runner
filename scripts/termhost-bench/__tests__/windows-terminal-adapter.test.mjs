@@ -29,6 +29,8 @@ import {
   WINDOW_CLOSE,
   WINDOW_QUERY,
   WT_PROCESS_QUERY,
+  encodePowerShell,
+  powershellArgv,
   WindowsTerminalAdapter,
   WtLayout,
   assertWtSafe,
@@ -319,6 +321,8 @@ test("the process and window queries read; only WINDOW_CLOSE posts a message, af
   assert.match(WINDOW_CLOSE, /Owner\(\$h\) -eq \[uint32\]\$env:TB_WT_PID -and \[TbWtWin\]::Cls\(\$h\) -eq 'CASCADIA_HOSTING_WINDOW_CLASS'/);
   assert.match(WINDOW_CLOSE, /\[TbWtPost\]::PostMessage\(\$h, 0x0010/, "WM_CLOSE");
   assert.match(WINDOW_CLOSE, /\$env:TB_WT_HWND/, "inputs arrive in the environment, never spliced");
+  assert.match(WINDOW_CLOSE, /CreationDate\.ToFileTimeUtc\(\) -eq \$env:TB_WT_START/, "the PID must still be the proven process");
+  assert.match(WINDOW_CLOSE, /if \(\$same -and /, "and the post is conditional on it");
   assert.deepEqual(parseWtProcesses('{"p":5,"pp":4,"x":"C:\\\\a\\\\WindowsTerminal.exe","t":"7"}'), [{ pid: 5, ppid: 4, exe: "C:\\a\\WindowsTerminal.exe", startKey: "7" }]);
   assert.deepEqual(parseWtProcesses(""), []);
   const w = parseWindows("123\t0\tCASCADIA_HOSTING_WINDOW_CLASS\tx\r\n456\t1\tCASCADIA_HOSTING_WINDOW_CLASS\ts0\njunk");
@@ -331,13 +335,12 @@ test("the process and window queries read; only WINDOW_CLOSE posts a message, af
 // The adapter end to end, over the simulator
 // ---------------------------------------------------------------------------
 
-function rig(t, { faults = {}, sessionId = true, operator = true } = {}) {
-  const dirs = unitDirs(t);
+function rig(t, { faults = {}, sessionId = true, operator = true, dirs = unitDirs(t), wtSim = null, genRunId = "r1-u0" } = {}) {
   const bytes = Buffer.from("a synthetic Windows Terminal zip");
   const build = { ...wtBuildFor("win32", "x64"), url: "https://example.invalid/wt.zip", sha256: sha(bytes), bytes: bytes.length };
   const pin = { ...WT_PIN, builds: { "win32-x64": build } };
   const appDir = join(dirs.runDir, "wt-app", `${WT_PIN.version}-win32-x64`, build.topDir);
-  const wt = createFakeWt({ appDir, genDir: dirs.genDir, genRunId: "r1-u0", faults, operator });
+  const wt = wtSim ?? createFakeWt({ appDir, genDir: dirs.genDir, genRunId, faults, operator });
   const unpack = fakeUnpack({ build, sessionId });
   let n = 0;
   const adapter = new WindowsTerminalAdapter({
@@ -360,8 +363,8 @@ function rig(t, { faults = {}, sessionId = true, operator = true } = {}) {
     closeTimeoutMs: 50,
     generatorWaitMs: 50,
   });
-  const argv = generatorArgv({ node: "C:\\node\\node.exe", script: "C:\\b\\ai-session.mjs", genDir: "C:\\Temp\\gen", profile: "claude-tui", seed: 1, genRunId: "r1-u0" });
-  return { ...dirs, wt, adapter, argv, ctx: { ...dirs, genRunId: "r1-u0" } };
+  const argv = generatorArgv({ node: "C:\\node\\node.exe", script: "C:\\b\\ai-session.mjs", genDir: "C:\\Temp\\gen", profile: "claude-tui", seed: 1, genRunId });
+  return { ...dirs, wt, adapter, argv, ctx: { ...dirs, genRunId } };
 }
 
 const slotMap = (wt, sessions) => new Map(sessions.map((s) => [wt.sessions.find((x) => x.sid === s.hostId).slot, s.hostId]));
@@ -474,20 +477,53 @@ test("a survivor is reported, and a recycled PID is never signalled", async (t) 
   const pid = q.adapter.wt.pid;
   q.wt.procs.set(pid, { ...q.wt.procs.get(pid), startKey: "999999999", exe: "C:\\other.exe" });
   q.wt.endGenerators();
+  const posted = q.wt.posted.length;
   await q.adapter.teardown();
   assert.ok(!q.wt.signalled.some(([p]) => p === pid), "a PID whose start key changed is not ours");
+  assert.equal(q.wt.posted.length, posted, "no WM_CLOSE to a window whose PID is a stranger's");
 });
 
-test("D5: a launch whose command line was handed to a Windows Terminal that is not this run's is unknown(shared_process) or refused", async (t) => {
+test("D5: a launch whose command line was handed to a Windows Terminal that is not this run's never yields a window to measure", async (t) => {
   const r = rig(t, { faults: { handoffToOperator: true } });
   await r.adapter.launch(r.ctx);
   await assert.rejects(r.adapter.spawnSessions(1, r.argv), (e) => e instanceof AdapterRefusal && e.reason === "harness_error" && /no window/.test(e.detail));
-  const q = rig(t);
-  await q.adapter.launch(q.ctx);
-  // A copy from this run's path already running before the launch is not provably ours.
-  q.wt.run(join(q.wt.exe, "..", "wt.exe"), ["-w", "termhost-r1-u0", "new-tab", "pwsh"]);
-  q.adapter.wt.pid = null;
-  await assert.rejects(q.adapter.wt.open("termhost-r1-u0", [["focus-tab", "-t", "0"]]), (e) => e instanceof AdapterRefusal && e.reason === "shared_process");
+});
+
+test("an earlier unit's instance that survived teardown: the next unit refuses BEFORE invoking wt.exe, with an incident naming it", async (t) => {
+  const first = rig(t, { faults: { ignoreClose: true, unkillable: ["WindowsTerminal.exe"] } });
+  await first.adapter.launch(first.ctx);
+  await first.adapter.spawnSessions(1, first.argv);
+  first.wt.endGenerators();
+  const td = await first.adapter.teardown();
+  const survivor = first.adapter.wt.pid;
+  assert.ok(td.survivors.some((x) => x.pid === survivor));
+  // Unit 2 of the same run: the same unpacked copy, so the same single-instance key.
+  const unit2 = join(first.runDir, "units", "u001-windows-terminal-default-none-n5-r0");
+  mkdirSync(join(unit2, "gen"), { recursive: true });
+  const second = rig(t, { dirs: { runDir: first.runDir, unitDir: unit2, genDir: join(unit2, "gen") }, wtSim: first.wt, genRunId: "r1-u1" });
+  await second.adapter.launch(second.ctx);
+  const invocations = first.wt.invocations.length;
+  await assert.rejects(second.adapter.spawnSessions(1, second.argv), (e) => {
+    assert.ok(e instanceof AdapterRefusal, String(e));
+    assert.equal(e.reason, "shared_process");
+    assert.match(e.detail, new RegExp(`pid ${survivor} is already running from`));
+    assert.equal(e.incident?.kind, "harness_error");
+    assert.deepEqual(e.incident.data.survivors, [survivor]);
+    return true;
+  });
+  assert.equal(first.wt.invocations.length, invocations, "wt.exe was never invoked: the survivor received no panes");
+  assert.equal(first.wt.sessions.length, 1, "no pane of unit 2 exists anywhere");
+});
+
+test("multi-line PowerShell travels as -EncodedCommand (UTF-16LE base64) and decodes to the same script", () => {
+  for (const script of [WINDOW_QUERY, WINDOW_CLOSE, WT_PROCESS_QUERY, "a 'quoted' \"double\" ü\n@'\nhere\n'@\n"]) {
+    const argv = powershellArgv(script);
+    assert.deepEqual(argv.slice(0, 3), ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+    assert.equal(Buffer.from(argv[3], "base64").toString("utf16le"), script);
+    assert.equal(argv[3], encodePowerShell(script));
+    assert.match(argv[3], /^[A-Za-z0-9+/]+=*$/, "nothing a command line could re-quote");
+  }
+  assert.ok(powershellArgv(WINDOW_CLOSE)[3].length < 32000, "inside Windows' 32 767-character command line");
 });
 
 test("without --sessionId the panes still launch, and the run loop falls back to slot order (noted)", async (t) => {

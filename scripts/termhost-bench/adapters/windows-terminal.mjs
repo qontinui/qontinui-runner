@@ -58,6 +58,7 @@ import { carriesFlag, descendantsOf, listProcesses, terminatePid } from "../proc
 import { ptyHostCensus, ptyHostImpl } from "../ptyhost.mjs";
 import { readGeneratorLog, readSlots } from "../sessions.mjs";
 import { commandLine } from "../rundir.mjs";
+import { incident } from "../results.mjs";
 import { AdapterRefusal } from "./index.mjs";
 import { ArchiveIntegrityError, ensureArchive, findEnclosingRepo, sha256File } from "./vscode-install.mjs";
 import { isDescendantOf, latestPaneSize, shellFacts, windowsPowerShellPath } from "./vscode.mjs";
@@ -373,7 +374,10 @@ export const WINDOW_QUERY = `$ErrorActionPreference='Stop'\n${WINDOW_TYPE}[TbWtW
 
 /**
  * Posts WM_CLOSE to `$env:TB_WT_HWND` only if that window is still a Windows
- * Terminal window owned by `$env:TB_WT_PID`: prints `posted`, or `mismatch`.
+ * Terminal window owned by `$env:TB_WT_PID`, and that PID is still the process
+ * the launch proved (its creation time, as a FILETIME, equals
+ * `$env:TB_WT_START` — the start key `proc.mjs` reads): prints `posted`, or
+ * `mismatch`.
  */
 export const WINDOW_CLOSE =
   `$ErrorActionPreference='Stop'\n${WINDOW_TYPE}` +
@@ -382,7 +386,9 @@ export const WINDOW_CLOSE =
   'public static class TbWtPost { [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l); }\n' +
   "'@\n" +
   "$h = [IntPtr][int64]$env:TB_WT_HWND\n" +
-  `if ([TbWtWin]::Owner($h) -eq [uint32]$env:TB_WT_PID -and [TbWtWin]::Cls($h) -eq '${WT_WINDOW_CLASS}') { [void][TbWtPost]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero); 'posted' } else { 'mismatch' }\n`;
+  "$p = Get-CimInstance -ClassName Win32_Process -Filter \"ProcessId=$([uint32]$env:TB_WT_PID)\"\n" +
+  "$same = $p -and $p.CreationDate -and ([string]$p.CreationDate.ToFileTimeUtc() -eq $env:TB_WT_START)\n" +
+  `if ($same -and [TbWtWin]::Owner($h) -eq [uint32]$env:TB_WT_PID -and [TbWtWin]::Cls($h) -eq '${WT_WINDOW_CLASS}') { [void][TbWtPost]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero); 'posted' } else { 'mismatch' }\n`;
 
 /** @returns {{hwnd: number, visible: boolean, cls: string, title: string}[]} */
 export function parseWindows(text) {
@@ -398,8 +404,22 @@ export function pickWindow(windows) {
   return windows.find((w) => w.visible && w.cls === WT_WINDOW_CLASS) ?? null;
 }
 
+/**
+ * `-EncodedCommand`'s argument: the script as UTF-16LE, base64. Multi-line
+ * scripts (the Add-Type here-strings) travel this way, so no command-line quoting
+ * layer can change them.
+ */
+export function encodePowerShell(script) {
+  return Buffer.from(String(script), "utf16le").toString("base64");
+}
+
+/** Windows PowerShell's argv for `script`, encoded. */
+export function powershellArgv(script) {
+  return ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(script)];
+}
+
 const powershell = (run, script, env) =>
-  run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true, timeout: 60000, env, maxBuffer: 16 * 1024 * 1024 });
+  run("powershell.exe", powershellArgv(script), { encoding: "utf8", windowsHide: true, timeout: 60000, env, maxBuffer: 16 * 1024 * 1024 });
 
 // ---------------------------------------------------------------------------
 // The portable instance: install, settings, open, drive, close
@@ -416,7 +436,7 @@ export class PortableWindowsTerminal {
    *   cacheDir?: string | null, fetch?: typeof fetch, run?: typeof spawnSync,
    *   list?: () => Map<number, object>, kill?: typeof process.kill, exists?: (p: string) => boolean,
    *   sleep?: (ms: number) => Promise<void>, hash?: (p: string) => Promise<string>,
-   *   queryWt?: () => object[], queryWindows?: (pid: number) => object[], postClose?: (pid: number, hwnd: number) => string,
+   *   queryWt?: () => object[], queryWindows?: (pid: number) => object[], postClose?: (pid: number, hwnd: number, startKey: string) => string,
    *   launchTimeoutMs?: number, closeTimeoutMs?: number, settleMs?: number, pin?: typeof WT_PIN}} [o]
    */
   constructor(o = {}) {
@@ -434,7 +454,7 @@ export class PortableWindowsTerminal {
     this.hashFn = o.hash ?? null;
     this.queryWt = o.queryWt ?? (() => this.defaultQueryWt());
     this.queryWindows = o.queryWindows ?? ((pid) => this.defaultQueryWindows(pid));
-    this.postClose = o.postClose ?? ((pid, hwnd) => this.defaultPostClose(pid, hwnd));
+    this.postClose = o.postClose ?? ((pid, hwnd, startKey) => this.defaultPostClose(pid, hwnd, startKey));
     this.launchTimeoutMs = o.launchTimeoutMs ?? 60000;
     this.closeTimeoutMs = o.closeTimeoutMs ?? 20000;
     this.settleMs = o.settleMs ?? 400;
@@ -546,8 +566,8 @@ export class PortableWindowsTerminal {
     return parseWindows(res.stdout);
   }
 
-  defaultPostClose(pid, hwnd) {
-    const res = powershell(this.run, WINDOW_CLOSE, { ...this.baseEnv, TB_WT_PID: String(pid), TB_WT_HWND: String(hwnd) });
+  defaultPostClose(pid, hwnd, startKey) {
+    const res = powershell(this.run, WINDOW_CLOSE, { ...this.baseEnv, TB_WT_PID: String(pid), TB_WT_HWND: String(hwnd), TB_WT_START: String(startKey) });
     if (res.error || res.status !== 0) return `error: ${res.error?.message ?? `exit ${res.status}`}: ${String(res.stderr ?? "").slice(0, 200)}`;
     return String(res.stdout ?? "").trim();
   }
@@ -586,6 +606,14 @@ export class PortableWindowsTerminal {
       before = this.queryWt();
     } catch (e) {
       throw new AdapterRefusal("shared_process", `the process table could not be read before the launch, so a new Windows Terminal process cannot be proven: ${e.message}`);
+    }
+    // A WindowsTerminal.exe already running from this copy (an earlier unit's
+    // instance that survived its teardown) holds the path-hashed single-instance
+    // key: wt.exe would hand it this unit's panes. Refuse before invoking anything.
+    const stale = before.filter((p) => samePath(p.exe, this.hostExe));
+    if (stale.length > 0) {
+      const detail = `WindowsTerminal.exe pid ${stale.map((p) => p.pid).join(", ")} is already running from ${this.hostExe} (an earlier unit's instance survived its teardown); wt.exe would hand it this unit's panes, so nothing was launched (D5)`;
+      throw new AdapterRefusal("shared_process", detail, { incident: incident("harness_error", detail, { data: { exe: this.hostExe, survivors: stale.map((p) => p.pid) } }) });
     }
     const tCmdNs = this.invoke(commands, { global: ["-M"] });
     const deadline = Date.now() + this.launchTimeoutMs;
@@ -659,7 +687,7 @@ export class PortableWindowsTerminal {
     if (!Number.isInteger(this.pid)) return { closed, survivors };
     const { owned } = this.provenTree("teardown");
     if (this.alive() && Number.isInteger(this.hwnd)) {
-      const r = this.postClose(this.pid, this.hwnd);
+      const r = this.postClose(this.pid, this.hwnd, this.startKey);
       if (r === "posted") closed.push(`WM_CLOSE to window ${this.hwnd}`);
       else this.notes.push(`teardown: WM_CLOSE not posted to window ${this.hwnd} (${r})`);
     }
