@@ -152,6 +152,31 @@ fn fails_when_keys_are_lost() {
     );
 }
 
+#[test]
+fn an_echo_no_frame_could_see_is_unobservable_not_lost() {
+    // One of the five echoes is on screen with no frame presented at all:
+    // the round trip still passes, and says so.
+    let o = run_with(Faults {
+        swallow_echo_mod: 4,
+        ..Faults::default()
+    });
+    let c = find(&o, "input_round_trip");
+    assert_eq!(c.passed, Some(true), "{}", report(&o));
+    assert!(c.detail.contains("4/5 echo markers seen, 1 unobservable"), "{}", c.detail);
+}
+
+#[test]
+fn fails_when_more_than_a_quarter_of_the_echoes_are_unobservable() {
+    // Two of five swallowed: the capture is too sparse to judge the round trip.
+    must_fail(
+        Faults {
+            swallow_echo_mod: 2,
+            ..Faults::default()
+        },
+        "input_round_trip",
+    );
+}
+
 fn no_frame() -> termhost_probe::doctor::CaptureFacts {
     termhost_probe::doctor::CaptureFacts::NoFrame("no frame within 2000 ms".into())
 }

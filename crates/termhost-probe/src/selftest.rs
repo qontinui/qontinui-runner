@@ -1109,14 +1109,17 @@ impl Selftest<'_> {
         if let Some(p) = primary {
             for (i, t) in t_injects.iter().enumerate() {
                 let m = Marker::new(MarkerKind::Echo, SESSION, marker_seq(echo_base + i as u64));
-                let seen = engine
-                    .model()
-                    .first_seen(p, m)
-                    .filter(|fs| fs.t_ns >= *t && fs.t_ns - t < 1000 * MS);
-                match seen {
-                    Some(fs) => echo_lat.push((fs.t_ns - t) as f64 / 1e6),
+                match engine.model().first_seen(p, m) {
+                    Some(fs) if fs.t_ns >= *t && fs.t_ns - t < 1000 * MS => {
+                        echo_lat.push((fs.t_ns - t) as f64 / 1e6)
+                    }
+                    // Seen, but early or over a second late: a failure, never
+                    // excused as unobservable.
+                    Some(_) => {}
                     None => {
-                        // An echo the window never painted is a real loss.
+                        // Excused only with a paint record to judge by; with
+                        // none (or, after an earlier lost key, the indices
+                        // shifted so the last key has none) it stays a loss.
                         if let Some(&at) = painted.get(i) {
                             let until = painted.get(i + 1).copied().unwrap_or(at + 1000 * MS);
                             if !engine.model().primary_frame_within(at + refresh, until) {
@@ -1148,7 +1151,7 @@ impl Selftest<'_> {
             &deps,
             Some(ok),
             format!(
-                "{sent}/{keys} keys injected with the foreground checked before each; {}/{keys} echo markers seen, {unobservable} unobservable (no capture frame landed while the echo was on screen; at most {} may be); the listener recognised {recognised} of the probe's {} key events as its own; outcome {outcome:?}",
+                "{sent}/{keys} keys injected with the foreground checked before each; {}/{keys} echo markers seen, {unobservable} unobservable (no capture frame landed from one refresh after the echo's paint until the next echo replaced it; at most {} may be); the listener recognised {recognised} of the probe's {} key events as its own; outcome {outcome:?}",
                 echo_lat.len(),
                 keys / MAX_UNOBSERVABLE_DIV,
                 2 * sent
@@ -1157,6 +1160,7 @@ impl Selftest<'_> {
                 "sent": sent,
                 "echoed": echo_lat.len(),
                 "unobservable": unobservable,
+                "unobservable_max": keys / MAX_UNOBSERVABLE_DIV,
                 "recognised": recognised,
                 "input_latency_p50_ms": median(&mut lat),
                 "input_latency_max_ms": echo_lat.iter().copied().fold(0.0, f64::max),
