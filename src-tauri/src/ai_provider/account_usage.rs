@@ -96,8 +96,12 @@ use tracing::info;
 /// (cold start), then to the soonest-to-expire cooldown when every account is
 /// rate-limited. Full key: the module doc.
 pub fn pick_best_account() {
-    let ai_settings = settings::get_ai_settings();
-    let mode = ai_settings.claude_cli.account_selection_mode;
+    // The EFFECTIVE mode — the local roster/settings mode resolved against the
+    // fleet's `account_selection_mode` policy and this machine's pin — never
+    // the raw settings field: the spawn path (`config::get_effective_config_dir`)
+    // and the per-device account report read the same resolver, so the picker
+    // cannot rotate under one mode while the spawn honours another.
+    let mode = crate::claude_accounts::effective_selection_mode();
     if mode == AccountSelectionMode::Manual {
         return;
     }
