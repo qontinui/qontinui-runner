@@ -441,6 +441,32 @@ mod tests {
     use qontinui_runner_lib::env_agent::pull::SectionPolicy;
     use std::collections::{BTreeMap, BTreeSet};
 
+    /// The runner's [`ProcessSpawn::command`] gives a `git` program the
+    /// runner's git posture: every repository-local variable is removed
+    /// (`get_envs` reports a removal as `None`), so a `GIT_DIR` inherited from
+    /// the runner's launcher cannot point a CI step or a checkout at another
+    /// repo. This is the runner half of what `build_step_command`'s test pinned
+    /// before the executor moved into ci-exec (qontinui-runner 0aca8ff42): ci-exec
+    /// builds its git, tool and container commands through this method, and
+    /// builds step commands through it from the qontinui-schemas change that
+    /// ports 238439693. A bare `Command::new` fails it.
+    #[test]
+    fn a_git_command_is_scrubbed_of_the_repo_local_env() {
+        let cmd = RunnerProcess.command("git");
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            assert!(
+                removed.iter().any(|r| r == var),
+                "a git command must not inherit {var}; removed: {removed:?}"
+            );
+        }
+    }
+
     fn section(
         changes: Vec<Change>,
         agreed: &[(&str, &str)],
