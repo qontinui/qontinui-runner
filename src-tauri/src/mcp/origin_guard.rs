@@ -261,6 +261,12 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // whose conversation leaves the machine. Authorized on the coord-mcp proxy
     // nonce in the handler; no browser caller has any business here.
     "POST /sessions/transcript-bind",
+    // The operator's review of that same content: hunk read marks and notes
+    // whose excerpts quote it (local source content again), and the send /
+    // insert routes, which TYPE the composed review prompt into a live PTY or
+    // task-run session — the same capability as `POST /terminals/{id}/write`.
+    "GET /sessions/{id}/review",
+    "/sessions/{id}/review/*",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",
@@ -301,6 +307,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /bridges/{id}/workflow",
     "POST /vcs/pull-requests",
     "POST /agent-worktrees/reclaim",
+    // Rewrites `<agent_root>/.cargo/config.toml` and writes the edit-siblings
+    // marker under a CALLER-NAMED path (plan
+    // 2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits,
+    // vet V4).
+    "POST /agent-worktrees/edit-sibling",
     "POST /ui/recover",
     "DELETE /security/audit/cleanup",
     "POST /ui-bridge/relay/dispatch",
@@ -309,6 +320,13 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /ui-bridge/ios/forward",
     "POST /system/windows/activate",
     "POST /control/session-open",
+    // Spawns `claude --resume` processes under the user's account for closed
+    // sessions (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-
+    // found-fleet-wide-and-resumed, Phase 4): it drives processes and spends
+    // quota, the same class as `POST /sessions/spawn` above. No browser origin
+    // has any business here; the caller is the coord-driven sweep or an
+    // operator's curl.
+    "POST /control/sessions/resume",
     "POST /install-effects/observe-verify",
     "POST /code-semantics/typecheck",
     "GET /sse/events",

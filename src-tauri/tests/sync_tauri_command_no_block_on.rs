@@ -61,6 +61,10 @@ const SCAN_ROOTS: &[&str] = &[
     "src/orchestration_loop",
     "src/spec_experimentation",
     "src/doctor",
+    // The children of the `mcp_api` module as it is split out of
+    // `src/mcp_api.rs` (which stays in `SCAN_FILES` below). Absent until the
+    // first move lands; a missing root is skipped, not an error.
+    "src/mcp_api",
 ];
 
 /// Extra standalone files that define Tauri commands outside the roots above.
@@ -70,6 +74,11 @@ const SCAN_FILES: &[&str] = &[
     "src/mcp_api.rs",
     "src/ui_bridge_plugin.rs",
     "src/lib.rs",
+    "src/config_report_cmd.rs",
+    "src/coord_doctor_cmd.rs",
+    "src/coord_drain_state.rs",
+    "src/prompt_library.rs",
+    "src/repo_detection.rs",
 ];
 
 fn crate_root() -> PathBuf {
