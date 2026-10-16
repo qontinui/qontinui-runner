@@ -20,7 +20,7 @@ import os from "node:os";
 
 import { drainMechanism, readDeviceDrain } from "./drain.mjs";
 import { DOCTOR_STATES } from "./kpi-catalog.mjs";
-import { probeDoctor } from "./probe.mjs";
+import { codecMismatch, probeDoctor } from "./probe.mjs";
 import { findOnPath } from "./envs/linux-xvfb.mjs";
 
 export const OPERATIVE = "OPERATIVE";
@@ -48,7 +48,7 @@ const v = (state, reason) => ({ state, reason });
  *   environment: string, envPlatform: string, envNotBuilt: string | null, platform: string,
  *   nodeVersion: string, xvfbPath?: string | null, windowManagerPath?: string | null,
  *   display?: {started: boolean, detail: string} | null,
- *   probePath: string | null, probeTried?: string[] | null, probeDoctor?: {record: object | null, error: string | null} | null,
+ *   probePath: string | null, probeTried?: string[] | null, probeSource?: string | null, probeDoctor?: {record: object | null, error: string | null} | null,
  *   setupMechanisms?: Record<string, {state: string, reason: string}>,
  * }} f
  * @returns {Record<string, {state: string, reason: string}>}
@@ -71,17 +71,25 @@ export function mapDoctor(f) {
       ? v(OPERATIVE, `matchbox-window-manager at ${f.windowManagerPath}: windows are maximised and focused`)
       : v(DEGRADED, "no matchbox-window-manager: windows are neither maximised nor focused by policy; the harness activates the measured window itself");
   }
-  if (!f.probePath) {
-    m["probe.binary"] = v(
-      INOPERATIVE,
-      `termhost-probe is not built (cargo build -p termhost-probe) and no --probe was given${
-        Array.isArray(f.probeTried) && f.probeTried.length > 0 ? `; tried ${f.probeTried.join(", ")}` : ""
-      }`,
-    );
+  const tried = Array.isArray(f.probeTried) && f.probeTried.length > 0 ? `; tried ${f.probeTried.join(", ")}` : "";
+  if (!f.probePath && (f.probeSource === "explicit" || f.probeSource === "env")) {
+    const how = f.probeSource === "explicit" ? "--probe" : "$TERMHOST_PROBE";
+    m["probe.binary"] = v(INOPERATIVE, `${how} names ${f.probeTried?.[0] ?? "a probe"}, which does not exist; no other build is tried in its place`);
+  } else if (!f.probePath) {
+    m["probe.binary"] = v(INOPERATIVE, `termhost-probe is not built (cargo build -p termhost-probe) and no --probe was given${tried}`);
   } else if (!f.probeDoctor?.record) {
     m["probe.binary"] = v(UNKNOWN, f.probeDoctor?.error ?? `termhost-probe at ${f.probePath} did not answer doctor`);
   } else {
-    m["probe.binary"] = v(OPERATIVE, `termhost-probe at ${f.probePath}`);
+    // The probe compiles marker-golden.json in at build time; one built from
+    // another commit would decode frames under different rules, silently.
+    const drift = codecMismatch(f.probeDoctor.record.codec);
+    if (drift.length > 0) {
+      m["probe.binary"] = v(INOPERATIVE, `termhost-probe at ${f.probePath} decodes a different codec than this harness's marker-golden.json (${drift.join("; ")}): rebuild it from this checkout`);
+    } else if (f.probeSource === "primary_shared") {
+      m["probe.binary"] = v(DEGRADED, `termhost-probe at ${f.probePath} is the primary checkout's shared build (target-agent), built from whichever worktree built last: provenance unproven (its codec matches marker-golden.json)`);
+    } else {
+      m["probe.binary"] = v(OPERATIVE, `termhost-probe at ${f.probePath}`);
+    }
   }
   const record = f.probeDoctor?.record ?? null;
   for (const id of PROBE_MECHANISMS) {
@@ -132,7 +140,9 @@ export function mapDoctor(f) {
  */
 export function blockingMechanisms(mechanisms) {
   return ["env.platform", "env.harness", "env.xvfb", "env.hosted_runner", "env.desktop", "env.desktop_ready", "probe.binary", "probe.foreground_safety", "node.version", "device.drain"]
-    .filter((id) => mechanisms[id] && mechanisms[id].state !== OPERATIVE)
+    // A shared probe build whose codec matches runs DEGRADED (recorded in the
+    // results' capabilities and run.probe), not blocked.
+    .filter((id) => mechanisms[id] && mechanisms[id].state !== OPERATIVE && !(id === "probe.binary" && mechanisms[id].state === DEGRADED))
     .map((id) => ({ id, ...mechanisms[id] }));
 }
 
@@ -202,6 +212,7 @@ export async function gatherDoctorFacts({
   spec,
   probePath,
   probeTried = null,
+  probeSource = null,
   adapters = [],
   envVars = null,
   display = null,
@@ -217,6 +228,7 @@ export async function gatherDoctorFacts({
     nodeVersion: process.version,
     probePath,
     probeTried,
+    probeSource,
     probeDoctor: null,
     display,
     setupMechanisms: {},

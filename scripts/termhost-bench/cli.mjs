@@ -355,7 +355,7 @@ async function cmdDoctor(flags, io, deps = {}) {
       spec,
       ...(() => {
         const probe = locateProbeBinary({ explicit: flags.probe ? resolve(flags.probe) : null });
-        return { probePath: probe.path, probeTried: probe.tried };
+        return { probePath: probe.path, probeTried: probe.tried, probeSource: probe.source };
       })(),
       adapters,
       envVars: environment?.env ?? null,

@@ -24,6 +24,7 @@ import { AdapterRefusal } from "../adapters/index.mjs";
 import { CLOCK_OFFSET_ENV, CLOCK_ROUNDS, MAX_CLOCK_RTT_NS, TmuxWslAdapter, wslClockVerdict, WSL_FLAG_SCAN, attachCommand, samplerArgv } from "../adapters/tmux-wsl.mjs";
 import { REQUIRED_FILES, WT_PIN, wtBuildFor } from "../adapters/windows-terminal-install.mjs";
 import { blockingMechanisms, mapDoctor } from "../doctor.mjs";
+import { goldenCodec } from "../probe.mjs";
 import { desktopVerdict, startWindowsDesktop } from "../envs/windows-desktop.mjs";
 import { CLOCK_OFFSET_ENV as GEN_OFFSET_ENV, clockOffsetFromEnv, createRealClock, runVirtual } from "../generator/ai-session.mjs";
 import { computeRowKpis, gapIoInWindow, generatorWindow, indexGenerators } from "../kpis.mjs";
@@ -553,7 +554,7 @@ test("windows-desktop: never a GitHub-hosted runner, and a run needs session.int
   assert.equal(desktopVerdict({ GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted" }).state, INOP);
   assert.equal(desktopVerdict({}).state, "OPERATIVE");
   const facts = { ...healthyFacts(), environment: "windows-desktop", envPlatform: "win32", platform: "win32", envNotBuilt: null };
-  const probe = (interactive) => ({ record: { mechanisms: [{ id: "session.interactive", ...interactive }, { id: "capture.wgc", state: "OPERATIVE", reason: "ok" }], violations: [] }, error: null });
+  const probe = (interactive) => ({ record: { codec: goldenCodec(), mechanisms: [{ id: "session.interactive", ...interactive }, { id: "capture.wgc", state: "OPERATIVE", reason: "ok" }], violations: [] }, error: null });
   const ready = mapDoctor({ ...facts, probeDoctor: probe({ state: "OPERATIVE", reason: "unlocked" }) });
   assert.equal(ready["env.desktop_ready"].state, "OPERATIVE");
   assert.ok(!blockingMechanisms(ready).some((b) => b.id === "env.desktop_ready"));

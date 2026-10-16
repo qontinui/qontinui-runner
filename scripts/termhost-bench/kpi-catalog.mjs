@@ -77,6 +77,13 @@ export const LAUNCH_MODES = Object.freeze([
 /** The ConPTY host a Windows setup actually runs, or a Unix pty (catalog diagnostics note). */
 export const PTY_HOST_IMPLS = Object.freeze(["system_conhost", "bundled_openconsole", "unix_pty"]);
 
+/**
+ * Where the run's termhost-probe binary was found (results `run.probe.source`):
+ * named by --probe or $TERMHOST_PROBE, this checkout's target dirs, or the
+ * primary checkout's shared target-agent (a build of unproven provenance).
+ */
+export const PROBE_SOURCES = Object.freeze(["explicit", "env", "checkout", "primary_shared"]);
+
 /** Where a profile's numbers come from (D3). */
 export const PROFILE_PROVENANCE = Object.freeze(["calibration", "assumption", "synthetic"]);
 

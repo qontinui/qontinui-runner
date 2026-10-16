@@ -114,6 +114,7 @@
         "started_at",
         "finished_at",
         "harness_commit",
+        "probe",
         "node_version",
         "command"
       ],
@@ -139,6 +140,101 @@
               "$ref": "#/$defs/absent"
             }
           ]
+        },
+        "probe": {
+          "description": "The termhost-probe binary that decoded this run's frames: it may be a shared build from another commit (source primary_shared), so it is identified by its file, not assumed to be harness_commit's.",
+          "type": "object",
+          "required": [
+            "path",
+            "source",
+            "size_bytes",
+            "mtime",
+            "sha256",
+            "codec_version",
+            "build"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "$ref": "#/$defs/absent"
+                }
+              ]
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "explicit",
+                    "env",
+                    "checkout",
+                    "primary_shared"
+                  ]
+                },
+                {
+                  "$ref": "#/$defs/absent"
+                }
+              ]
+            },
+            "size_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "$ref": "#/$defs/absent"
+                }
+              ]
+            },
+            "mtime": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/dateTime"
+                },
+                {
+                  "$ref": "#/$defs/absent"
+                }
+              ]
+            },
+            "sha256": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/sha256"
+                },
+                {
+                  "$ref": "#/$defs/absent"
+                }
+              ]
+            },
+            "codec_version": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "$ref": "#/$defs/absent"
+                }
+              ]
+            },
+            "build": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{40}$"
+                },
+                {
+                  "$ref": "#/$defs/absent"
+                }
+              ]
+            }
+          }
         },
         "node_version": {
           "type": "string",

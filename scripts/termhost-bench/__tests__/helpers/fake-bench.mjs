@@ -9,7 +9,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { watchArgs } from "../../probe.mjs";
+import { goldenCodec, watchArgs } from "../../probe.mjs";
 import { readSlots } from "../../sessions.mjs";
 import { MS, genLog, watchSegment } from "./bench-fixtures.mjs";
 
@@ -230,6 +230,7 @@ export function healthyFacts({ inputSafe = false } = {}) {
     probeDoctor: {
       record: {
         type: "doctor",
+        codec: goldenCodec(),
         mechanisms: [
           verdict("session.interactive"),
           verdict("capture.wgc", "INOPERATIVE-ON-THIS-MACHINE"),

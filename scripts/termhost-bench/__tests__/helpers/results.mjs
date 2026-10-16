@@ -130,6 +130,15 @@ export const RUN = {
   started_at: "2026-10-11T12:00:00Z",
   finished_at: "2026-10-11T12:42:10.500Z",
   harness_commit: "94d141a980a349c97b5f679e1f4745a2a9b9d919",
+  probe: {
+    path: "/work/qontinui-runner/target/release/termhost-probe",
+    source: "checkout",
+    size_bytes: 8123456,
+    mtime: "2026-10-11T11:30:00Z",
+    sha256: `sha256:${"9f".repeat(32)}`,
+    codec_version: 2,
+    build: { state: "unknown", reason: "not_instrumented", detail: "termhost-probe reports no build commit (only its crate version, in start records)" },
+  },
   node_version: "v22.20.0",
   command: ["node", "scripts/termhost-bench/cli.mjs", "run", "--env", "windows-desktop"],
 };

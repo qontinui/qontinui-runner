@@ -26,6 +26,7 @@ import {
   KPI_CATALOG,
   KPI_IDS,
   LAUNCH_MODES,
+  PROBE_SOURCES,
   PROFILE_PROVENANCE,
   PTY_HOST_IMPLS,
   REASON_CODES,
@@ -117,13 +118,30 @@ export function buildResultSchema() {
       sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
       run: {
         type: "object",
-        required: ["id", "started_at", "finished_at", "harness_commit", "node_version", "command"],
+        required: ["id", "started_at", "finished_at", "harness_commit", "probe", "node_version", "command"],
         additionalProperties: false,
         properties: {
           id: { type: "string", pattern: "^[A-Za-z0-9._-]{1,64}$" },
           started_at: ref("dateTime"),
           finished_at: ref("dateTime"),
           harness_commit: orAbsent({ type: "string", pattern: "^[0-9a-f]{40}$" }),
+          probe: {
+            description:
+              "The termhost-probe binary that decoded this run's frames: it may be a shared build from another " +
+              "commit (source primary_shared), so it is identified by its file, not assumed to be harness_commit's.",
+            type: "object",
+            required: ["path", "source", "size_bytes", "mtime", "sha256", "codec_version", "build"],
+            additionalProperties: false,
+            properties: {
+              path: orAbsent({ type: "string", minLength: 1 }),
+              source: orAbsent({ enum: [...PROBE_SOURCES] }),
+              size_bytes: orAbsent({ type: "integer", minimum: 0 }),
+              mtime: orAbsent(ref("dateTime")),
+              sha256: orAbsent(ref("sha256")),
+              codec_version: orAbsent({ type: "integer", minimum: 1 }),
+              build: orAbsent({ type: "string", pattern: "^[0-9a-f]{40}$" }),
+            },
+          },
           node_version: { type: "string", pattern: "^v\\d+\\.\\d+\\.\\d+" },
           command: { type: "array", minItems: 1, items: { type: "string" } },
         },

@@ -17,8 +17,11 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realp
 import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 
-import { WatchProcess, activate, endChild, freshTag, injectArgs, locateProbeBinary, primaryCheckoutRoot, probeCandidates, raceTimeout, resolveProbeBinary, runProbe, setAside, takeRunFile, watchArgs } from "../probe.mjs";
-import { mapDoctor } from "../doctor.mjs";
+import { WatchProcess, activate, codecMismatch, endChild, freshTag, goldenCodec, injectArgs, locateProbeBinary, primaryCheckoutRoot, probeCandidateList, probeCandidates, probeIdentity, raceTimeout, resolveProbeBinary, runProbe, setAside, takeRunFile, watchArgs } from "../probe.mjs";
+import { blockingMechanisms, mapDoctor } from "../doctor.mjs";
+import { createHash } from "node:crypto";
+import { validateResults } from "../validate.mjs";
+import { linuxXvfbResults } from "./helpers/results.mjs";
 
 function dir(t) {
   const d = mkdtempSync(join(tmpdir(), "tb-probe-"));
@@ -187,31 +190,107 @@ test("a child that ignores SIGTERM is killed, never waited on forever (review N6
 test("the probe is looked for at every candidate, in order, and the first that exists wins", () => {
   const repo = join("/r", "wt");
   const primary = join("/r", "primary");
-  const tried = probeCandidates({ explicit: "/x/probe", env: { TERMHOST_PROBE: "/e/probe" }, platform: "linux", repoRoot: repo, primaryRoot: primary });
-  assert.deepEqual(tried, [
-    "/x/probe",
-    "/e/probe",
-    join(repo, "target", "debug", "termhost-probe"),
-    join(repo, "target", "release", "termhost-probe"),
-    join(repo, "target-agent", "debug", "termhost-probe"),
-    join(repo, "target-agent", "release", "termhost-probe"),
-    join(primary, "target-agent", "debug", "termhost-probe"),
-    join(primary, "target-agent", "release", "termhost-probe"),
+  const list = probeCandidateList({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: primary });
+  assert.deepEqual(list, [
+    { path: join(repo, "target", "debug", "termhost-probe"), source: "checkout" },
+    { path: join(repo, "target", "release", "termhost-probe"), source: "checkout" },
+    { path: join(repo, "target-agent", "debug", "termhost-probe"), source: "checkout" },
+    { path: join(repo, "target-agent", "release", "termhost-probe"), source: "checkout" },
+    { path: join(primary, "target-agent", "debug", "termhost-probe"), source: "primary_shared" },
+    { path: join(primary, "target-agent", "release", "termhost-probe"), source: "primary_shared" },
   ]);
-  // Each candidate alone is found.
-  for (const c of tried) {
-    const got = locateProbeBinary({ explicit: "/x/probe", env: { TERMHOST_PROBE: "/e/probe" }, platform: "linux", repoRoot: repo, primaryRoot: primary, exists: (p) => p === c });
-    assert.equal(got.path, resolvePath(c), c);
-    assert.deepEqual(got.tried, tried);
+  const tried = list.map((c) => c.path);
+  assert.deepEqual(probeCandidates({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: primary }), tried);
+  // Each candidate alone is found, with its source.
+  for (const c of list) {
+    const got = locateProbeBinary({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: primary, exists: (p) => p === c.path });
+    assert.deepEqual([got.path, got.source, got.tried], [resolvePath(c.path), c.source, tried], c.path);
   }
-  // The primary's own target-agent/release, the cargo-guard release build, from a worktree.
-  const release = join(primary, "target-agent", "release", "termhost-probe");
-  assert.equal(resolveProbeBinary({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: primary, exists: (p) => p === release }), resolvePath(release));
-  // Not in the primary itself (no primary root), and .exe on Windows.
+  assert.equal(resolveProbeBinary({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: primary, exists: (p) => p === tried[5] }), resolvePath(tried[5]));
+  // In the primary itself (no primary root): four; .exe on Windows.
   assert.equal(probeCandidates({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: null }).length, 4);
   assert.ok(probeCandidates({ env: {}, platform: "win32", repoRoot: repo, primaryRoot: null }).every((p) => p.endsWith("termhost-probe.exe")));
   const none = locateProbeBinary({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: primary, exists: () => false });
-  assert.deepEqual([none.path, none.tried.length], [null, 6]);
+  assert.deepEqual([none.path, none.source, none.tried.length], [null, null, 6]);
+});
+
+test("--probe or $TERMHOST_PROBE is the ONLY path tried: a missing named probe is never replaced by another build (S1)", () => {
+  const repo = join("/r", "wt");
+  const everything = () => true;
+  assert.deepEqual(probeCandidateList({ explicit: "/x/probe", env: { TERMHOST_PROBE: "/e/probe" }, repoRoot: repo, primaryRoot: "/r/p" }), [{ path: "/x/probe", source: "explicit" }]);
+  assert.deepEqual(probeCandidateList({ env: { TERMHOST_PROBE: "/e/probe" }, repoRoot: repo, primaryRoot: "/r/p" }), [{ path: "/e/probe", source: "env" }]);
+  const missing = locateProbeBinary({ explicit: "/x/probe", env: {}, repoRoot: repo, primaryRoot: "/r/p", exists: (p) => p !== "/x/probe" });
+  assert.deepEqual(missing, { path: null, source: "explicit", tried: ["/x/probe"] });
+  const envMissing = locateProbeBinary({ env: { TERMHOST_PROBE: "/e/probe" }, repoRoot: repo, exists: (p) => p !== "/e/probe", gitCommonDir: () => { throw new Error("a named probe never asks git"); } });
+  assert.deepEqual(envMissing, { path: null, source: "env", tried: ["/e/probe"] });
+  assert.equal(locateProbeBinary({ explicit: "/x/probe", env: {}, repoRoot: repo, primaryRoot: null, exists: everything }).source, "explicit");
+  const m = mapDoctor({ environment: "linux-xvfb", envPlatform: "linux", platform: "linux", nodeVersion: process.version, probePath: null, probeTried: missing.tried, probeSource: "explicit", display: null, setupMechanisms: {}, drain: null });
+  assert.equal(m["probe.binary"].state, "INOPERATIVE-ON-THIS-MACHINE");
+  assert.equal(m["probe.binary"].reason, "--probe names /x/probe, which does not exist; no other build is tried in its place");
+  const e = mapDoctor({ environment: "linux-xvfb", envPlatform: "linux", platform: "linux", nodeVersion: process.version, probePath: null, probeTried: envMissing.tried, probeSource: "env", display: null, setupMechanisms: {}, drain: null });
+  assert.match(e["probe.binary"].reason, /^\$TERMHOST_PROBE names \/e\/probe, which does not exist/);
+});
+
+const doctorFacts = (over) => ({ environment: "linux-xvfb", envPlatform: "linux", platform: "linux", nodeVersion: process.version, display: null, setupMechanisms: {}, drain: null, ...over });
+
+test("the doctor holds the probe's codec to marker-golden.json: a drifted codec is INOPERATIVE and blocks the run (M1)", () => {
+  const golden = goldenCodec();
+  assert.deepEqual(codecMismatch(golden), []);
+  const ok = mapDoctor(doctorFacts({ probePath: "/p/termhost-probe", probeSource: "checkout", probeDoctor: { record: { codec: golden, mechanisms: [] }, error: null } }));
+  assert.equal(ok["probe.binary"].state, "OPERATIVE");
+  const cases = [
+    [{ ...golden, version: golden.version + 1 }, /version: probe 3, golden 2/],
+    [{ ...golden, pixel: { ...golden.pixel, channel_low_max: 70 } }, /pixel\.channel_low_max: probe 70, golden 63/],
+    [{ ...golden, decode_order: [...golden.decode_order].reverse() }, /decode_order: probe /],
+    [{ ...golden, row_reasons: ["wrong_length"] }, /row_reasons: probe \["wrong_length"\]/],
+    [undefined, /carries no codec/],
+  ];
+  for (const [codec, re] of cases) {
+    const m = mapDoctor(doctorFacts({ probePath: "/p/termhost-probe", probeSource: "checkout", probeDoctor: { record: { codec, mechanisms: [] }, error: null } }));
+    assert.equal(m["probe.binary"].state, "INOPERATIVE-ON-THIS-MACHINE", String(re));
+    assert.match(m["probe.binary"].reason, /^termhost-probe at \/p\/termhost-probe decodes a different codec than this harness's marker-golden\.json \(/);
+    assert.match(m["probe.binary"].reason, re);
+    assert.ok(blockingMechanisms(m).some((b) => b.id === "probe.binary"));
+  }
+});
+
+test("a probe from the primary checkout's shared target-agent is DEGRADED (provenance unproven), and does not block (M1)", () => {
+  const m = mapDoctor(doctorFacts({ probePath: "/r/primary/target-agent/release/termhost-probe", probeSource: "primary_shared", probeDoctor: { record: { codec: goldenCodec(), mechanisms: [] }, error: null } }));
+  assert.equal(m["probe.binary"].state, "DEGRADED");
+  assert.match(m["probe.binary"].reason, /shared build \(target-agent\).+provenance unproven/);
+  assert.ok(!blockingMechanisms(m).some((b) => b.id === "probe.binary"), "DEGRADED runs, and is recorded");
+  // A drifted shared build is still INOPERATIVE.
+  const drifted = mapDoctor(doctorFacts({ probePath: "/r/primary/target-agent/release/termhost-probe", probeSource: "primary_shared", probeDoctor: { record: { codec: { ...goldenCodec(), version: 9 }, mechanisms: [] }, error: null } }));
+  assert.equal(drifted["probe.binary"].state, "INOPERATIVE-ON-THIS-MACHINE");
+});
+
+test("the run records which probe binary it used: path, source, size, mtime, sha256, codec version, and no invented build commit (M1)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-probe-id-"));
+  try {
+    const bin = join(dir, "termhost-probe");
+    writeFileSync(bin, "probe-bytes");
+    const id = probeIdentity({ path: bin, source: "primary_shared" }, { codecVersion: 2 });
+    assert.equal(id.path, bin);
+    assert.equal(id.source, "primary_shared");
+    assert.equal(id.size_bytes, 11);
+    assert.match(id.mtime, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(id.sha256, `sha256:${createHash("sha256").update("probe-bytes").digest("hex")}`);
+    assert.equal(id.codec_version, 2);
+    assert.deepEqual([id.build.state, id.build.reason], ["unknown", "not_instrumented"]);
+    const gone = probeIdentity({ path: join(dir, "missing"), source: "checkout" });
+    assert.equal(gone.sha256.state, "unknown");
+    assert.equal(gone.codec_version.state, "unknown");
+    const none = probeIdentity({ path: null, source: null });
+    assert.deepEqual([none.path.state, none.source.state], ["unknown", "unknown"]);
+    // The identity is valid where the schema puts it.
+    const doc = linuxXvfbResults();
+    doc.run.probe = id;
+    assert.equal(validateResults(doc).valid, true, JSON.stringify(validateResults(doc).errors.slice(0, 3)));
+    delete doc.run.probe;
+    assert.equal(validateResults(doc).valid, false, "run.probe is required");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("a linked worktree resolves its primary checkout through git rev-parse --git-common-dir", () => {
@@ -235,12 +314,14 @@ test("a linked worktree resolves its primary checkout through git rev-parse --gi
     g(primary, "init", "-q");
     g(primary, "commit", "-q", "--allow-empty", "-m", "init");
     g(primary, "worktree", "add", "-q", "--detach", wt);
-    assert.equal(primaryCheckoutRoot(wt), primary);
+    assert.equal(realpathSync(primaryCheckoutRoot(wt)), realpathSync(primary), "realpath'd both sides (Windows 8.3 names and case)");
     assert.equal(primaryCheckoutRoot(primary), null);
     const release = join(primary, "target-agent", "release", "termhost-probe");
     mkdirSync(dirname(release), { recursive: true });
     writeFileSync(release, "");
-    assert.equal(locateProbeBinary({ env: {}, platform: "linux", repoRoot: wt }).path, release);
+    const found = locateProbeBinary({ env: {}, platform: "linux", repoRoot: wt });
+    assert.equal(realpathSync(found.path), realpathSync(release));
+    assert.equal(found.source, "primary_shared");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

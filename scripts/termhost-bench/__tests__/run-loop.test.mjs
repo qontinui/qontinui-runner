@@ -94,6 +94,11 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
   assert.equal(validateResults(res.doc).valid, true, JSON.stringify(validateResults(res.doc).errors.slice(0, 5)));
   assert.equal(res.doc.rows.length, 2 * 2 * 2, "2 setups x 2 levels x 2 arms");
   assert.equal(res.stopped, null);
+  // Which probe binary decoded the frames (M1): the injected one, its codec version from the doctor, no invented build commit.
+  assert.equal(res.doc.run.probe.path, "fake-probe");
+  assert.equal(res.doc.run.probe.source, "explicit");
+  assert.equal(res.doc.run.probe.codec_version, 2);
+  assert.equal(res.doc.run.probe.build.reason, "not_instrumented");
   // Every unit launched and torn down exactly once; the environment stopped once.
   const launches = calls.filter((c) => c[0] === "launch").map((c) => c[1]);
   const teardowns = calls.filter((c) => c[0] === "teardown").map((c) => c[1]);

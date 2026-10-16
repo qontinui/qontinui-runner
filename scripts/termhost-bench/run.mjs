@@ -398,7 +398,7 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
   const environment = await (deps.startEnvironment ?? spec.start)({ log });
   let outPath = o.out ?? join(runDir, "results.json");
   try {
-    const probeFound = deps.probePath ? { path: deps.probePath, tried: [deps.probePath] } : probeLib.locateProbeBinary({ explicit: o.probe });
+    const probeFound = deps.probePath ? { path: deps.probePath, source: "explicit", tried: [deps.probePath] } : probeLib.locateProbeBinary({ explicit: o.probe });
     const probePath = probeFound.path;
     const createAdapter = deps.createAdapter ?? defaultCreateAdapter;
     const adapterOptions = (unit) => adapterOptionsFor(unit, o, log);
@@ -414,6 +414,7 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
       spec,
       probePath,
       probeTried: probeFound.tried,
+      probeSource: probeFound.source,
       adapters: checkAdapters,
       envVars: environment.env,
       display: { started: true, detail: environment.display ?? "started" },
@@ -502,6 +503,8 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
           started_at: startedAt,
           finished_at: now().toISOString(),
           harness_commit: harnessCommit(o.repoRoot),
+          // Which probe binary decoded this run's frames (it may not be this checkout's build).
+          probe: (deps.probeIdentity ?? probeLib.probeIdentity)(probeFound, { codecVersion: facts.probeDoctor?.record?.codec?.version ?? null }),
           node_version: process.version,
           command: o.command ?? ["node", "scripts/termhost-bench/cli.mjs", "run"],
         },

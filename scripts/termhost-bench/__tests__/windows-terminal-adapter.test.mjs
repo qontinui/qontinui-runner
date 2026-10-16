@@ -567,7 +567,7 @@ function commandFlagHits(root, files) {
 const ALLOWED_COMMAND_FLAGS = [
   [/^scripts\/termhost-bench\/adapters\/vscode\.mjs: shellArgs: \["-NoLogo", "-NoExit", "-Command", commandLine\(argv, "powershell"\)\],$/, "D13 session shell"],
   [/^scripts\/termhost-bench\/adapters\/windows-terminal\.mjs: const out = \[shellPath, "-NoLogo", "-NoExit", "-Command", commandLine\(argv, "powershell"\)\];$/, "D13 session shell"],
-  [/^scripts\/termhost-bench\/(cli|run|adapters\/runner)\.mjs: .*run\("git", \["-C", /, "git -C"],
+  [/^scripts\/termhost-bench\/(cli|run|probe|adapters\/runner)\.mjs: .*run\("git", \["-C", /, "git -C"],
   [/^scripts\/termhost-bench\/adapters\/vscode-install\.mjs: .*args: \["-xz?f", archive, "-C", dest\]/, "tar -C"],
   [/^scripts\/termhost-bench\/adapters\/tmux\.mjs: return \[shell, "-i", "-c", /, "POSIX shell -c"],
 ];

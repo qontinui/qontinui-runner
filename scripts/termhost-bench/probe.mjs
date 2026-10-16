@@ -34,12 +34,15 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { PROBE_SOURCES } from "./kpi-catalog.mjs";
 import { parseJsonl } from "./kpis.mjs";
+
+export { PROBE_SOURCES };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, "..", "..");
@@ -61,43 +64,55 @@ export function primaryCheckoutRoot(repoRoot, { gitCommonDir = readGitCommonDir 
   return root === resolve(repoRoot) ? null : root;
 }
 
-function readGitCommonDir(dir) {
-  // cwd, not `git -C`: the harness's PowerShell scan reads any `-C` as an abbreviated -Command.
-  const r = spawnSync("git", ["rev-parse", "--git-common-dir"], { cwd: dir, encoding: "utf8", timeout: 10000 });
-  return r.status === 0 && r.stdout.trim() !== "" ? r.stdout.trim() : null;
+/** `git -C <dir> rev-parse --git-common-dir`, the same form run.mjs `harnessCommit` uses. */
+export function readGitCommonDir(dir, run = spawnSync) {
+  const r = run("git", ["-C", dir, "rev-parse", "--git-common-dir"], { encoding: "utf8", timeout: 10000 });
+  const out = String(r.stdout ?? "").trim();
+  return r.status === 0 && out !== "" ? out : null;
 }
 
+
 /**
- * Every path the probe binary is looked for at, in order: `--probe`,
- * `$TERMHOST_PROBE`, this checkout's `target/{debug,release}` and
+ * Every path the probe binary is looked for at, in order, each with its source.
+ * `--probe` or `$TERMHOST_PROBE`, when given, is the ONLY candidate: a named
+ * binary that is missing is an error, never a silent fallback to another build.
+ * Otherwise: this checkout's `target/{debug,release}` and
  * `target-agent/{debug,release}`, then — from a linked worktree — the primary
  * checkout's `target-agent/{debug,release}`, where cargo-guard.sh builds a
- * worktree's crates (its shared TARGET_DIR).
+ * worktree's crates (its shared TARGET_DIR, built from whichever worktree built
+ * last: `primary_shared`, provenance unproven).
  *
  * @param {{explicit?: string | null, env?: object, platform?: string, repoRoot?: string,
  *   primaryRoot?: string | null}} [o]
- * @returns {string[]}
+ * @returns {{path: string, source: string}[]}
  */
-export function probeCandidates({ explicit = null, env = process.env, platform = process.platform, repoRoot = REPO_ROOT, primaryRoot = null } = {}) {
+export function probeCandidateList({ explicit = null, env = process.env, platform = process.platform, repoRoot = REPO_ROOT, primaryRoot = null } = {}) {
+  if (explicit) return [{ path: explicit, source: "explicit" }];
+  if (env.TERMHOST_PROBE) return [{ path: env.TERMHOST_PROBE, source: "env" }];
   const exe = platform === "win32" ? "termhost-probe.exe" : "termhost-probe";
-  const roots = [
-    [repoRoot, ["target", "debug"]],
-    [repoRoot, ["target", "release"]],
-    [repoRoot, ["target-agent", "debug"]],
-    [repoRoot, ["target-agent", "release"]],
-    ...(primaryRoot
-      ? [
-          [primaryRoot, ["target-agent", "debug"]],
-          [primaryRoot, ["target-agent", "release"]],
-        ]
-      : []),
-  ];
-  return [explicit, env.TERMHOST_PROBE || null, ...roots.map(([root, parts]) => join(root, ...parts, exe))].filter(Boolean);
+  const own = [
+    ["target", "debug"],
+    ["target", "release"],
+    ["target-agent", "debug"],
+    ["target-agent", "release"],
+  ].map((parts) => ({ path: join(repoRoot, ...parts, exe), source: "checkout" }));
+  const shared = primaryRoot
+    ? [
+        ["target-agent", "debug"],
+        ["target-agent", "release"],
+      ].map((parts) => ({ path: join(primaryRoot, ...parts, exe), source: "primary_shared" }))
+    : [];
+  return [...own, ...shared];
+}
+
+/** The candidate paths alone (see `probeCandidateList`). */
+export function probeCandidates(o = {}) {
+  return probeCandidateList(o).map((c) => c.path);
 }
 
 /**
- * The probe binary: the first of `probeCandidates` that exists, else null.
- * `locateProbeBinary` also returns every path it tried (for the doctor).
+ * The probe binary: the first candidate that exists, with its source and every
+ * path tried (for the doctor); `path` null when none does.
  */
 export function locateProbeBinary({
   explicit = null,
@@ -108,15 +123,87 @@ export function locateProbeBinary({
   gitCommonDir,
   exists = existsSync,
 } = {}) {
-  const primary = primaryRoot !== undefined ? primaryRoot : primaryCheckoutRoot(repoRoot, gitCommonDir ? { gitCommonDir } : {});
-  const tried = probeCandidates({ explicit, env, platform, repoRoot, primaryRoot: primary });
-  for (const c of tried) if (exists(c)) return { path: resolve(c), tried };
-  return { path: null, tried };
+  const named = Boolean(explicit || env.TERMHOST_PROBE);
+  const primary = named ? null : primaryRoot !== undefined ? primaryRoot : primaryCheckoutRoot(repoRoot, gitCommonDir ? { gitCommonDir } : {});
+  const list = probeCandidateList({ explicit, env, platform, repoRoot, primaryRoot: primary });
+  const tried = list.map((c) => c.path);
+  for (const c of list) if (exists(c.path)) return { path: resolve(c.path), source: c.source, tried };
+  return { path: null, source: named ? list[0].source : null, tried };
 }
 
 /** The probe binary path, or null (see `locateProbeBinary`). */
 export function resolveProbeBinary(o = {}) {
   return locateProbeBinary(o).path;
+}
+
+/**
+ * Which probe binary a run used, for the results' `run.probe`: path, source,
+ * size, mtime and sha256 of the file, and the codec version its doctor reported.
+ * The probe reports no build commit (only its crate version, in start records),
+ * so `build` is an honest unknown rather than the harness's commit.
+ *
+ * @param {{path: string | null, source: string | null}} found `locateProbeBinary` output
+ * @param {{codecVersion?: number | null, read?: typeof readFileSync, stat?: typeof statSync}} [o]
+ */
+export function probeIdentity(found, { codecVersion = null, read = readFileSync, stat = statSync } = {}) {
+  const absent = (detail) => ({ state: "unknown", reason: "harness_error", detail });
+  let size = absent("not read");
+  let mtime = absent("not read");
+  let sha256 = absent("not read");
+  if (found?.path) {
+    try {
+      const st = stat(found.path);
+      size = st.size;
+      mtime = st.mtime.toISOString();
+      sha256 = `sha256:${createHash("sha256").update(read(found.path)).digest("hex")}`;
+    } catch (e) {
+      size = mtime = sha256 = absent(`cannot read ${found.path}: ${e.message}`);
+    }
+  }
+  return {
+    path: found?.path ?? absent("no probe binary found"),
+    source: PROBE_SOURCES.includes(found?.source) ? found.source : absent("unknown source"),
+    size_bytes: size,
+    mtime,
+    sha256,
+    codec_version: Number.isInteger(codecVersion) ? codecVersion : absent("the probe's doctor reported no codec"),
+    build: { state: "unknown", reason: "not_instrumented", detail: "termhost-probe reports no build commit (only its crate version, in start records)" },
+  };
+}
+
+/** The golden file's codec, in the shape the probe's doctor record reports it. */
+export function goldenCodec(golden = JSON.parse(readFileSync(join(HERE, "marker-golden.json"), "utf8"))) {
+  const c = golden.codec;
+  return {
+    version: c.version,
+    pixel: {
+      channel_low_max: c.pixel.channel_low_max,
+      channel_high_min: c.pixel.channel_high_min,
+      width_tolerance: c.pixel.width_tolerance,
+      boundary_gap_max: c.pixel.boundary_gap_max,
+    },
+    row_reasons: c.pixel.row_reasons,
+    decode_order: c.decode_order,
+  };
+}
+
+/**
+ * Where the probe's codec (its doctor record's `codec`, compiled in from
+ * marker-golden.json at its build) differs from this harness's golden file:
+ * one line per differing field, empty when they agree. A probe built from
+ * another commit would otherwise decode frames under the wrong rules, silently.
+ */
+export function codecMismatch(probeCodec, golden = goldenCodec()) {
+  if (!probeCodec || typeof probeCodec !== "object") return ["the probe's doctor record carries no codec"];
+  const out = [];
+  const cmp = (label, a, b) => {
+    if (JSON.stringify(a) !== JSON.stringify(b)) out.push(`${label}: probe ${JSON.stringify(a)}, golden ${JSON.stringify(b)}`);
+  };
+  cmp("version", probeCodec.version, golden.version);
+  for (const k of Object.keys(golden.pixel)) cmp(`pixel.${k}`, probeCodec.pixel?.[k], golden.pixel[k]);
+  cmp("row_reasons", probeCodec.row_reasons, golden.row_reasons);
+  cmp("decode_order", probeCodec.decode_order, golden.decode_order);
+  return out;
 }
 
 /** `--hwnd` / `--pid` / `--title`, exactly one. */
