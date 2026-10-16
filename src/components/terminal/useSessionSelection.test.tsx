@@ -43,8 +43,7 @@ function Probe({ ids }: { ids: readonly string[] }) {
 describe("useSessionSelection — pruning the selection to the rendered rows", () => {
   it("an equal list rebuilt on every render does not loop", () => {
     act(() => root.render(createElement(Probe, { ids: ["a", "b"] })));
-    act(() => root.render(createElement(Probe, { ids: ["a", "b"] })));
-    expect(probe.latest).not.toBeNull();
+    expect(() => act(() => root.render(createElement(Probe, { ids: ["a", "b"] })))).not.toThrow();
   });
 
   it("a row that leaves the rendered list leaves the selection", () => {
