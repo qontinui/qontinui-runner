@@ -122,11 +122,11 @@ export function EgressPrivacyPanel({ webAppUrl }: { webAppUrl: string | null }) 
 
       <ul className="space-y-2">
         {rows.map((row) => {
-          const link = tenantPolicyLink(webAppUrl, row.key);
+          const link = tenantPolicyLink(webAppUrl, row.id);
           return (
             <li
-              key={row.key}
-              id={`egress-flow-${row.key}`}
+              key={row.id}
+              id={`egress-flow-${row.id}`}
               className="rounded-lg bg-muted/30 p-3 space-y-1"
             >
               <div className="flex items-center justify-between gap-3">

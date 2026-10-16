@@ -10,7 +10,7 @@
  * decided it.
  */
 
-/** One flow as `/health` `data.egress.<key>` reports it. */
+/** One flow as `/health` `data.egress.<id>` reports it. */
 export interface EgressFlowReport {
   allowed: boolean;
   /** `coord` | `persisted` | `profile` | `product_default`. */
@@ -27,43 +27,43 @@ export interface EgressFlowReport {
 /** The six flows, in the runner's order, with their plain-language copy. */
 export const EGRESS_FLOWS = [
   {
-    key: "transcript_sync",
+    id: "transcript_sync",
     label: "Transcript sync",
     description:
       "AI session transcripts, tenant memory records and memory queries, sent to your coord tenant. Also needs your own AI content sync toggle.",
   },
   {
-    key: "code_mirror",
+    id: "code_mirror",
     label: "Code mirror",
     description:
       "Agent branches pushed to coord's git origin every few minutes. While it is off, that copy is not made, so work on this machine is not protected against loss.",
   },
   {
-    key: "terminal_stream",
+    id: "terminal_stream",
     label: "Terminal streaming",
     description:
       "Raw terminal output sent to coord and through the web relay, remote terminal attach in either direction, and AI session output streamed live to the web and mobile consoles.",
   },
   {
-    key: "telemetry",
+    id: "telemetry",
     label: "Telemetry",
     description:
       "Crash reports, OpenTelemetry traces, and UI-error / crash notices forwarded to the web console.",
   },
   {
-    key: "update_check",
+    id: "update_check",
     label: "Update check",
     description: "The request for the latest released version of this app.",
   },
   {
-    key: "skill_mirror",
+    id: "skill_mirror",
     label: "Skill mirror",
     description:
       "The fetch of the shared skills and commands. While it is off, sessions get the copy bundled with this build.",
   },
 ] as const;
 
-export type EgressFlowKey = (typeof EGRESS_FLOWS)[number]["key"];
+export type EgressFlowKey = (typeof EGRESS_FLOWS)[number]["id"];
 
 /** Where the tenant switches are written — the runner never writes them. */
 export const TENANT_POLICY_PATH = "/admin/coord/tenant-policy";
@@ -111,7 +111,7 @@ export function egressScope(egress: unknown): EgressScope | null {
 
 /** One rendered row. `state` is "unknown" when the runner reported nothing. */
 export interface EgressRow {
-  key: EgressFlowKey;
+  id: EgressFlowKey;
   label: string;
   description: string;
   state: "on" | "off" | "unknown";
@@ -130,11 +130,11 @@ export function buildEgressRows(egress: unknown): EgressRow[] {
   const block =
     egress && typeof egress === "object" ? (egress as Record<string, unknown>) : undefined;
   return EGRESS_FLOWS.map((flow) => {
-    const raw = block?.[flow.key];
+    const raw = block?.[flow.id];
     const report = isFlowReport(raw) ? raw : null;
     if (!report) {
       return {
-        key: flow.key,
+        id: flow.id,
         label: flow.label,
         description: flow.description,
         state: "unknown",
@@ -151,7 +151,7 @@ export function buildEgressRows(egress: unknown): EgressRow[] {
         : "applies at next start";
     }
     return {
-      key: flow.key,
+      id: flow.id,
       label: flow.label,
       description: flow.description,
       state: report.allowed ? "on" : "off",
@@ -177,9 +177,9 @@ function isFlowReport(raw: unknown): raw is EgressFlowReport {
  * The deep link to the web panel for one flow, or null when no web origin is
  * known (render plain text rather than a broken link).
  */
-export function tenantPolicyLink(webAppUrl: string | null, key: EgressFlowKey): string | null {
+export function tenantPolicyLink(webAppUrl: string | null, flow: EgressFlowKey): string | null {
   if (!webAppUrl) return null;
-  return `${webAppUrl.replace(/\/+$/, "")}${TENANT_POLICY_PATH}#egress-${key}`;
+  return `${webAppUrl.replace(/\/+$/, "")}${TENANT_POLICY_PATH}#egress-${flow}`;
 }
 
 /** Is a `check_for_updates` / `install_update` answer the egress refusal? */

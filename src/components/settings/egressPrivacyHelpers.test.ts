@@ -27,7 +27,7 @@ const report = (over: Record<string, unknown> = {}) => ({
 describe("buildEgressRows", () => {
   it("always renders the six flows in the runner's order", () => {
     const rows = buildEgressRows(undefined);
-    expect(rows.map((r) => r.key)).toEqual([
+    expect(rows.map((r) => r.id)).toEqual([
       "transcript_sync",
       "code_mirror",
       "terminal_stream",
@@ -43,11 +43,11 @@ describe("buildEgressRows", () => {
       expect(row.state).toBe("unknown");
     }
     const partial = buildEgressRows({ code_mirror: report({ allowed: false }) });
-    expect(partial.find((r) => r.key === "code_mirror")?.state).toBe("off");
-    expect(partial.find((r) => r.key === "telemetry")?.state).toBe("unknown");
+    expect(partial.find((r) => r.id === "code_mirror")?.state).toBe("off");
+    expect(partial.find((r) => r.id === "telemetry")?.state).toBe("unknown");
     // A malformed entry is not a report.
     const malformed = buildEgressRows({ telemetry: { allowed: "yes" } });
-    expect(malformed.find((r) => r.key === "telemetry")?.state).toBe("unknown");
+    expect(malformed.find((r) => r.id === "telemetry")?.state).toBe("unknown");
   });
 
   it("names the rung that decided each state", () => {
@@ -55,21 +55,21 @@ describe("buildEgressRows", () => {
       code_mirror: report({ allowed: false, source: "coord", refused: 3 }),
       skill_mirror: report({ source: "profile" }),
     });
-    const mirror = rows.find((r) => r.key === "code_mirror")!;
+    const mirror = rows.find((r) => r.id === "code_mirror")!;
     expect(mirror.state).toBe("off");
     expect(mirror.sourceText).toBe(describeEgressSource("coord"));
     const decided = buildEgressRows({
       code_mirror: report({ source: "coord", decided_by: "tenant_row" }),
       update_check: report({ source: "persisted", decided_by: "deployment_profile" }),
     });
-    expect(decided.find((r) => r.key === "code_mirror")!.sourceText).toBe(
+    expect(decided.find((r) => r.id === "code_mirror")!.sourceText).toBe(
       "set for this project in the web console",
     );
-    expect(decided.find((r) => r.key === "update_check")!.sourceText).toContain(
+    expect(decided.find((r) => r.id === "update_check")!.sourceText).toContain(
       "this deployment's default",
     );
     expect(mirror.refused).toBe(3);
-    expect(rows.find((r) => r.key === "skill_mirror")!.sourceText).toBe(
+    expect(rows.find((r) => r.id === "skill_mirror")!.sourceText).toBe(
       "this machine's profile default",
     );
   });
@@ -79,14 +79,14 @@ describe("buildEgressRows", () => {
       telemetry: report({ allowed: false, applies_at_next_start: true, in_effect: true }),
       update_check: report(),
     });
-    expect(rows.find((r) => r.key === "telemetry")!.nextStartNote).toBe(
+    expect(rows.find((r) => r.id === "telemetry")!.nextStartNote).toBe(
       "applies at next start (currently on)",
     );
-    expect(rows.find((r) => r.key === "update_check")!.nextStartNote).toBeNull();
+    expect(rows.find((r) => r.id === "update_check")!.nextStartNote).toBeNull();
     const settled = buildEgressRows({
       telemetry: report({ applies_at_next_start: true, in_effect: null }),
     });
-    expect(settled.find((r) => r.key === "telemetry")!.nextStartNote).toBe("applies at next start");
+    expect(settled.find((r) => r.id === "telemetry")!.nextStartNote).toBe("applies at next start");
   });
 });
 
@@ -95,7 +95,7 @@ describe("unknown and legacy sources", () => {
     const rows = buildEgressRows({
       code_mirror: report({ allowed: false, source: "unknown", decided_by: null }),
     });
-    const row = rows.find((r) => r.key === "code_mirror")!;
+    const row = rows.find((r) => r.id === "code_mirror")!;
     expect(row.state).toBe("off");
     expect(row.sourceText).toContain("refused until it does");
   });
@@ -137,7 +137,7 @@ describe("egressScope", () => {
   });
 
   it("says AI session output rides the terminal streaming switch", () => {
-    const flow = EGRESS_FLOWS.find((f) => f.key === "terminal_stream")!;
+    const flow = EGRESS_FLOWS.find((f) => f.id === "terminal_stream")!;
     expect(flow.description).toContain("AI session output");
   });
 });
