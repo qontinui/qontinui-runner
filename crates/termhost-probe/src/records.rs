@@ -580,9 +580,17 @@ pub struct CrosscheckSummary {
     pub disagreed: u64,
     /// The primary's declared stage offset minus the secondary's (ms).
     pub expected_offset_ms: f64,
-    /// The frame interval F both bands are sized in (ms): the primary's
-    /// measured frame-spacing p50 clamped to 1-2 refresh intervals.
+    /// The frame interval F both bands are sized in (ms): the secondary's
+    /// frame-spacing p50, clamped to 1-2 refresh intervals; one refresh
+    /// interval when either source's p50 is unknown.
     pub frame_ms: Option<f64>,
+    /// The primary's frame-spacing p50 (ms); `null` below 20 deltas.
+    pub primary_spacing_ms: Option<f64>,
+    /// The secondary's frame-spacing p50 (ms); `null` below 20 deltas.
+    pub secondary_spacing_ms: Option<f64>,
+    /// `primary_spacing_ms / secondary_spacing_ms`; above 1.5 or below 1/1.5
+    /// the run disagrees (one source kept a coarser cadence: missed frames).
+    pub cadence_ratio: Option<f64>,
     /// The per-marker band on the primary-minus-secondary gap (ms).
     pub marker_band_ms: Option<(f64, f64)>,
     /// The band the median gap must lie in (ms).

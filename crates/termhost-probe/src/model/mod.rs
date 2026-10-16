@@ -228,6 +228,8 @@ pub struct Model {
     seen_order: BTreeMap<SourceId, Vec<(Marker, FirstSeen)>>,
     frame_counts: BTreeMap<SourceId, u64>,
     primary_frames: Vec<u64>,
+    /// The secondary source's frame times (ns), for its frame cadence.
+    secondary_frames: Vec<u64>,
     last_markers: HashMap<SourceId, Vec<Marker>>,
     /// Per source: each session's displayed output marker rectangle.
     displayed: HashMap<SourceId, BTreeMap<u16, Rect>>,
@@ -276,6 +278,7 @@ impl Model {
             seen_order: BTreeMap::new(),
             frame_counts: BTreeMap::new(),
             primary_frames: Vec::new(),
+            secondary_frames: Vec::new(),
             last_markers: HashMap::new(),
             displayed: HashMap::new(),
             v_samples: Vec::new(),
@@ -342,6 +345,9 @@ impl Model {
             shown.insert(m.session, m.rect);
         }
         let v = shown.len() as u32;
+        if Some(f.source) == self.cfg.secondary {
+            self.secondary_frames.push(f.t_ns);
+        }
         if f.source == self.cfg.primary && self.cfg.capture_available {
             let at = self.primary_frames.partition_point(|&t| t <= f.t_ns);
             self.primary_frames.insert(at, f.t_ns);
@@ -901,12 +907,8 @@ impl Model {
         };
 
         // Cross-check before latencies: a disagreement makes them unknown.
-        // Its bands are sized in the primary's measured frame spacing (p50).
-        let frame_spacing_ms = (!deltas.is_empty()).then(|| {
-            let mut d = deltas.clone();
-            d.sort_by(f64::total_cmp);
-            d[stats::nearest_rank(50, d.len()) - 1]
-        });
+        // Its bands are sized in BOTH sources' measured frame cadence.
+        let cadence = analysis::Cadence::from_frames(&self.primary_frames, &self.secondary_frames);
         let primary_list = self
             .seen_order
             .get(&self.cfg.primary)
@@ -920,7 +922,7 @@ impl Model {
                     &[],
                     |_| None,
                     refresh_ns,
-                    None,
+                    analysis::Cadence::default(),
                     0.0,
                     false,
                 );
@@ -935,7 +937,7 @@ impl Model {
                     &sec_list,
                     |m| self.first_seen(self.cfg.primary, m),
                     refresh_ns,
-                    frame_spacing_ms,
+                    cadence,
                     crate::selftest::render_offset_ms(self.cfg.primary)
                         - crate::selftest::render_offset_ms(sec),
                     true,
@@ -947,7 +949,7 @@ impl Model {
                 &[],
                 |_| None,
                 refresh_ns,
-                None,
+                analysis::Cadence::default(),
                 0.0,
                 false,
             ),

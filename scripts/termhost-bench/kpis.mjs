@@ -1301,6 +1301,11 @@ export function computeRowKpis(p) {
     ).size;
     kpis.output_latency_ms.coverage = { observed, expected: Math.max(p.vTarget, visible.size, observed) };
   }
+  // A watch WITH a secondary source whose cross-check could not judge (too few
+  // markers seen by both): the latency stands unchecked, and the row says so.
+  if (summary?.secondary && summary?.crosscheck?.verdict === "not_performed" && kpis.output_latency_ms.state === "measured") {
+    notes.push(`output_latency_ms: the capture cross-check was not performed: ${summary.crosscheck.detail ?? "no detail"}`);
+  }
   if (Number(summary?.negative_latencies) > 0) {
     notes.push(`output_latency_ms: ${summary.negative_latencies} first appearance(s) before their emission excluded by the probe`);
   }

@@ -134,9 +134,9 @@ pub const CROSSCHECK_MARKER_BAND_FRAMES: f64 = 1.0;
 /// The median gap may lie at most this many frame intervals outside the
 /// declared offset band. A quarter frame: wide enough for the median's own
 /// sampling noise, narrow enough that a one-frame systematic lag of either
-/// source leaves it wherever a frame is longer than the declared band is wide
-/// divided by 0.75 (13.3 ms for the 10 ms WGC offset: any host at or below
-/// 75 Hz).
+/// source leaves it at every true offset inside the declared band wherever
+/// 0.75 F exceeds that band's width (F > 13.3 ms for the 10 ms WGC offset:
+/// any host at or below 75 Hz).
 pub const CROSSCHECK_MEDIAN_BAND_FRAMES: f64 = 0.25;
 /// The largest share of compared markers that may lie outside the per-marker
 /// band before the run disagrees.
@@ -149,15 +149,53 @@ pub const CROSSCHECK_TAIL_MIN_COMPARED: u64 = 20;
 /// the median is a middle marker, never an extreme one. Below it the
 /// cross-check is `not_performed`.
 pub const CROSSCHECK_MEDIAN_MIN_COMPARED: u64 = 3;
-/// The frame interval the bands are sized in is the primary's measured
-/// frame-spacing p50, clamped to `[1, 2]` refresh intervals. Never finer than
-/// the display can present. Never coarser than every other refresh, the
-/// slowest compositor cadence measured (the GPU-less hosted VM): WGC delivers
-/// a frame only when the window changed, so a sparser spacing measures a
-/// window that was idle, not the compositor, and must not open the bands up.
-/// A host that truly composes more slowly gets bands that are too tight, so it
-/// fails visibly (unknown(capture_disagreement)), never silently.
+/// F is never coarser than two refresh intervals, the slowest typical cadence
+/// measured (the GPU-less hosted VM: WGC spacings 35% one refresh, 47% two,
+/// DDA's p50 30.9-32.4 ms at R = 15.625 ms). A host that truly composes more slowly
+/// gets bands that are too tight, so it fails visibly
+/// (unknown(capture_disagreement)), never silently.
 pub const CROSSCHECK_FRAME_MAX_REFRESHES: f64 = 2.0;
+/// The fewest frame-to-frame deltas a source's spacing p50 is trusted from.
+/// Below it one long gap could set the widest band; F falls back to R, the
+/// narrowest, which fails visibly.
+pub const CROSSCHECK_FRAME_MIN_DELTAS: usize = 20;
+/// Neither source's spacing p50 may exceed this multiple of the other's.
+/// Beyond it one source kept a coarser cadence than the other saw: it missed
+/// frames (or, with the primary coarser, the desktop changed outside the
+/// window, which a benchmark run does not expect). This is also what stops a
+/// defective source from widening the bands that judge it.
+pub const CROSSCHECK_MAX_CADENCE_RATIO: f64 = 1.5;
+
+/// Each source's measured frame-spacing p50 (ms), or `None` when it had fewer
+/// than [`CROSSCHECK_FRAME_MIN_DELTAS`] deltas.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Cadence {
+    pub primary_ms: Option<f64>,
+    pub secondary_ms: Option<f64>,
+}
+
+impl Cadence {
+    /// From each source's frame times (ns, any order).
+    pub fn from_frames(primary_ns: &[u64], secondary_ns: &[u64]) -> Cadence {
+        Cadence {
+            primary_ms: spacing_p50_ms(primary_ns),
+            secondary_ms: spacing_p50_ms(secondary_ns),
+        }
+    }
+}
+
+/// The p50 of the deltas between consecutive frame times (ms); `None` below
+/// [`CROSSCHECK_FRAME_MIN_DELTAS`] deltas.
+pub fn spacing_p50_ms(frames_ns: &[u64]) -> Option<f64> {
+    let mut t = frames_ns.to_vec();
+    t.sort_unstable();
+    let mut d: Vec<f64> = t.windows(2).map(|w| (w[1] - w[0]) as f64 / 1e6).collect();
+    if d.len() < CROSSCHECK_FRAME_MIN_DELTAS {
+        return None;
+    }
+    d.sort_by(f64::total_cmp);
+    Some(d[crate::stats::nearest_rank(50, d.len()) - 1])
+}
 
 /// Compare two sources' first appearances (plan D2: two independent sources
 /// for one timestamp; a capture defect must be visible). The two are never
@@ -168,11 +206,18 @@ pub const CROSSCHECK_FRAME_MAX_REFRESHES: f64 = 2.0;
 /// secondary's time is only an upper bound where it coalesced frames at that
 /// marker, so such a marker is not compared when the bound is the later time.
 ///
-/// Units. The bands are sized in FRAME intervals F, not refresh intervals:
-/// F is `frame_spacing_ms` (the primary's measured frame-spacing p50) clamped
-/// to `[R, 2 R]`, or R when it is unknown. On real hardware F is about R; on
-/// the GPU-less hosted VM the compositor presents every other refresh, so F is
-/// 2 R (CI run 38362046020: WGC frame spacing p50 31.25 ms at R = 15.625 ms).
+/// Units. The bands are sized in FRAME intervals F, not refresh intervals R:
+/// F is the SECONDARY's (DDA's) measured frame-spacing p50, clamped to
+/// `[R, 2 R]`, and R when either source had fewer than 20 deltas. A source
+/// that misses frames widens its own spacing, so no source may widen the bands
+/// alone: the cadence rule below disagrees whenever either p50 exceeds 1.5
+/// times the other's, and F is only ever a spacing BOTH sources kept. Of the
+/// two, DDA's sets it because `LastPresentTime` is not quantized to the
+/// compositor tick: WGC's spacings are whole refresh intervals (CI run
+/// 38362046020, R = 15.625 ms: 35% one refresh, 47% two, the rest longer), so
+/// its p50 sits on a 1R/2R boundary and could flip between runs, while DDA's
+/// p50 (30.9-32.4 ms there) lies inside its distribution. On real hardware F
+/// is about R.
 ///
 /// The declared band: WGC's `SystemRelativeTime` stamps the compositor's
 /// render of the capture frame, DDA's `LastPresentTime` the desktop
@@ -184,21 +229,23 @@ pub const CROSSCHECK_FRAME_MAX_REFRESHES: f64 = 2.0;
 /// - a SYSTEMATIC offset: the median gap (of an even count, the LOWER of the
 ///   two middle gaps) lies more than F/4 outside the declared band. That is a
 ///   time-base or unit bug, or either source lagging by a whole frame on every
-///   marker — the latter only where 0.75 F exceeds the declared band's width
-///   (F > 13.3 ms for 10 ms: up to 75 Hz). At 144 Hz a one-frame lag (6.9 ms)
-///   is smaller than the declared WGC offset itself and is not caught by the
-///   median; the tail rule may still catch it;
-/// - the PRIMARY missing frames, or markers decoded from the wrong frame, on
-///   more than 5% of markers: more than 5% of compared markers lie more than
-///   one frame interval outside the declared band. Applied only from 20
-///   compared markers ([`CROSSCHECK_TAIL_MIN_COMPARED`]); below that the
-///   verdict rests on the median rule alone (a systematic defect moves every
-///   marker, so the median still shows it), and the summary says the tail rule
-///   was not applied. A secondary that coalesced frames is not a miss here: its
+///   marker — at every true offset inside the declared band only where 0.75 F
+///   exceeds that band's width (F > 13.3 ms for 10 ms: up to 75 Hz). At 144 Hz
+///   a one-frame lag is not caught at every true offset (it is at 7 ms);
+/// - a source missing frames by CADENCE: either source's spacing p50 more than
+///   1.5 times the other's (both from 20 deltas);
+/// - the PRIMARY missing frames by TAIL: from 20 compared markers
+///   ([`CROSSCHECK_TAIL_MIN_COMPARED`]), more than 5% of markers more than one
+///   frame outside the declared band (markers seen whole frames late, or read
+///   from the wrong frame). Below 20 markers the tail rule does not decide and
+///   the summary says so; a systematic defect moves every marker, so the median
+///   still shows it. A secondary that coalesced frames is not a miss here: its
 ///   marker is skipped (above);
-/// - below three compared markers neither rule decides: `not_performed`;
-/// - it does NOT catch a primary that misses an occasional frame (fewer than
-///   5% of markers), nor a misattribution confined to so few markers.
+/// - below three compared markers neither marker rule decides:
+///   `not_performed`;
+/// - it does NOT catch a primary that misses an occasional frame (its cadence
+///   intact and under 5% of markers late), nor a misattribution confined to so
+///   few markers.
 ///
 /// Every marker outside the per-marker band is a `crosscheck` record with
 /// verdict `outside_band`, whatever the run's verdict.
@@ -207,8 +254,8 @@ pub const CROSSCHECK_FRAME_MAX_REFRESHES: f64 = 2.0;
 /// interval apart voids the run"; there 22-104 of 206-698 markers per watch
 /// (11-15%) were more than one refresh interval apart — 359 of those 361 with
 /// WGC later, and none of the 359 with a WGC frame between the two times —
-/// while the median gap was 6.5-8.9 ms and 0.4-1.3% lay more than one frame
-/// (31.25 ms) outside the declared band.
+/// while the median gap was 6.5-8.9 ms. `scripts/termhost-bench/tools/
+/// crosscheck-replay.mjs` replays this rule over a probe watch file.
 ///
 /// `expected_offset_ms` is the primary's declared stage offset minus the
 /// secondary's.
@@ -219,13 +266,15 @@ pub fn crosscheck(
     secondary_markers: &[(Marker, FirstSeen)],
     primary_seen: impl Fn(Marker) -> Option<FirstSeen>,
     refresh_ns: u64,
-    frame_spacing_ms: Option<f64>,
+    cadence: Cadence,
     expected_offset_ms: f64,
     secondary_configured: bool,
 ) -> (CrosscheckSummary, Vec<CrosscheckRecord>) {
     let mut s = CrosscheckSummary {
         verdict: "not_performed",
         expected_offset_ms,
+        primary_spacing_ms: cadence.primary_ms,
+        secondary_spacing_ms: cadence.secondary_ms,
         ..Default::default()
     };
     let mut records = Vec::new();
@@ -234,11 +283,19 @@ pub fn crosscheck(
         return (s, records);
     }
     let refresh_ms = refresh_ns as f64 / 1e6;
-    let frame_ms = frame_spacing_ms
-        .filter(|f| f.is_finite() && *f > 0.0)
-        .unwrap_or(refresh_ms)
-        .clamp(refresh_ms, CROSSCHECK_FRAME_MAX_REFRESHES * refresh_ms);
+    let usable = |x: Option<f64>| x.filter(|f| f.is_finite() && *f > 0.0);
+    let (p_sp, s_sp) = (usable(cadence.primary_ms), usable(cadence.secondary_ms));
+    let frame_ms = match (p_sp, s_sp) {
+        (Some(_), Some(q)) => q,
+        _ => refresh_ms,
+    }
+    .clamp(refresh_ms, CROSSCHECK_FRAME_MAX_REFRESHES * refresh_ms);
+    let cadence_ratio = match (p_sp, s_sp) {
+        (Some(p), Some(q)) => Some(p / q),
+        _ => None,
+    };
     s.frame_ms = Some(frame_ms);
+    s.cadence_ratio = cadence_ratio;
     let (lo, hi) = (expected_offset_ms.min(0.0), expected_offset_ms.max(0.0));
     let marker_band = (
         lo - CROSSCHECK_MARKER_BAND_FRAMES * frame_ms,
@@ -306,14 +363,17 @@ pub fn crosscheck(
     s.tail_rule_applied = s.compared >= CROSSCHECK_TAIL_MIN_COMPARED;
     if s.compared < CROSSCHECK_MEDIAN_MIN_COMPARED {
         s.detail = format!(
-            "only {} marker(s) seen cleanly by both sources; the median rule needs {CROSSCHECK_MEDIAN_MIN_COMPARED}, so neither rule decides",
+            "only {} marker(s) seen cleanly by both sources; the median rule needs {CROSSCHECK_MEDIAN_MIN_COMPARED}, so neither marker rule decides",
             s.compared
         );
         return (s, records);
     }
     let systematic = !(median_band.0..=median_band.1).contains(&median);
-    let missed = s.tail_rule_applied && outside_share > CROSSCHECK_MAX_OUTSIDE_SHARE;
-    s.verdict = if systematic || missed {
+    let tail = s.tail_rule_applied && outside_share > CROSSCHECK_MAX_OUTSIDE_SHARE;
+    let slow_cadence = cadence_ratio.is_some_and(|r| {
+        r > CROSSCHECK_MAX_CADENCE_RATIO || r * CROSSCHECK_MAX_CADENCE_RATIO < 1.0
+    });
+    s.verdict = if systematic || tail || slow_cadence {
         "disagree"
     } else {
         "agree"
@@ -335,20 +395,28 @@ pub fn crosscheck(
             s.disagreed, s.compared, marker_band.0, marker_band.1
         )
     };
-    s.detail = match (systematic, missed) {
-        (true, true) => {
-            format!("systematic offset and a missed-frame tail: {median_text}; {tail_text}")
-        }
-        (true, false) => {
-            format!("systematic offset between the sources: {median_text}; {tail_text}")
-        }
-        (false, true) => {
-            format!(
-                "the primary missed frames or misattributed markers: {tail_text}; {median_text}"
-            )
-        }
-        (false, false) => format!("agreed: {median_text}; {tail_text}"),
+    let fmt_sp = |x: Option<f64>| x.map_or("unknown".to_string(), |v| format!("{v:.2} ms"));
+    let cadence_text = format!(
+        "frame spacing p50: primary {}, secondary {}",
+        fmt_sp(cadence.primary_ms),
+        fmt_sp(cadence.secondary_ms)
+    );
+    let mut causes = Vec::new();
+    if systematic {
+        causes.push("a systematic offset between the sources");
+    }
+    if slow_cadence {
+        causes.push("one source kept a coarser frame cadence than the other (more than 1.5 times its spacing p50): it missed frames, or the desktop changed outside the window");
+    }
+    if tail {
+        causes.push("the primary missed frames or misattributed markers (the tail)");
+    }
+    let head = if causes.is_empty() {
+        "agreed".to_string()
+    } else {
+        causes.join(" and ")
     };
+    s.detail = format!("{head}: {median_text}; {tail_text}; {cadence_text}");
     (s, records)
 }
 
@@ -435,7 +503,8 @@ mod tests {
 
     /// Run `crosscheck` with one output marker per gap (primary minus
     /// secondary, ms): the primary at `1 s + 100 ms * i`, the secondary `gap`
-    /// earlier. `frame_ms` is the primary's measured frame spacing.
+    /// earlier. `frame_ms` is both sources' measured frame spacing (a cadence
+    /// they agree on); `None` is a spacing neither source measured.
     fn run(
         gaps: &[f64],
         refresh_ns: u64,
@@ -464,7 +533,10 @@ mod tests {
             &sec_list,
             |k| primary_map.get(&k).copied(),
             refresh_ns,
-            frame_ms,
+            Cadence {
+                primary_ms: frame_ms,
+                secondary_ms: frame_ms,
+            },
             offset_ms,
             true,
         )
@@ -534,7 +606,7 @@ mod tests {
             &sec_list,
             |k| primary_map.get(&k).copied(),
             R64,
-            None,
+            Cadence::default(),
             10.0,
             true,
         );
@@ -591,7 +663,7 @@ mod tests {
             let g: Vec<f64> = healthy_60(offset).iter().map(|g| g + R60_MS).collect();
             let (s, _) = run(&g, R60, Some(R60_MS), 10.0);
             assert_eq!(s.verdict, "disagree", "offset {offset}: {}", s.detail);
-            assert!(s.detail.starts_with("systematic offset"), "{}", s.detail);
+            assert!(s.detail.starts_with("a systematic offset"), "{}", s.detail);
         }
     }
 
@@ -627,7 +699,7 @@ mod tests {
         let (s, _) = run(&[-15.0; 200], R64, Some(15.625), 10.0);
         assert_eq!(s.verdict, "disagree", "{}", s.detail);
         assert_eq!(s.disagreed, 0);
-        assert!(s.detail.starts_with("systematic offset"), "{}", s.detail);
+        assert!(s.detail.starts_with("a systematic offset"), "{}", s.detail);
         // Primary 20 ms later than the declared offset allows.
         assert_eq!(
             run(&[20.0; 200], R64, Some(15.625), 10.0).0.verdict,
@@ -713,7 +785,16 @@ mod tests {
 
     #[test]
     fn crosscheck_without_a_secondary_is_not_performed() {
-        let (s, _) = crosscheck(&[], |_| None, &[], |_| None, 16 * MS, None, 0.0, false);
+        let (s, _) = crosscheck(
+            &[],
+            |_| None,
+            &[],
+            |_| None,
+            16 * MS,
+            Cadence::default(),
+            0.0,
+            false,
+        );
         assert_eq!(s.verdict, "not_performed");
     }
 
@@ -721,8 +802,99 @@ mod tests {
     fn a_marker_only_the_secondary_saw_is_primary_unseen() {
         let m = Marker::new(MarkerKind::Output, 2, 5);
         let sec = vec![(m, fs(50))];
-        let (s, _) = crosscheck(&[], |_| None, &sec, |_| None, 16 * MS, None, 0.0, true);
+        let (s, _) = crosscheck(
+            &[],
+            |_| None,
+            &sec,
+            |_| None,
+            16 * MS,
+            Cadence::default(),
+            0.0,
+            true,
+        );
         assert_eq!(s.primary_unseen, 1);
         assert_eq!(s.verdict, "not_performed");
+    }
+
+    /// The run with the two sources' spacing p50s given apart.
+    fn run_cadence(gaps: &[f64], p: Option<f64>, q: Option<f64>) -> CrosscheckSummary {
+        let m = |i: usize| Marker::new(MarkerKind::Output, 1, i as u32);
+        let at = |i: usize| 1_000 * MS + 100 * MS * i as u64;
+        let first = |t_ns: u64| FirstSeen {
+            t_ns,
+            frame: 0,
+            missed: None,
+        };
+        let primary: Vec<(Marker, FirstSeen)> =
+            (0..gaps.len()).map(|i| (m(i), first(at(i)))).collect();
+        let sec: HashMap<Marker, FirstSeen> = gaps
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (m(i), first((at(i) as f64 - g * 1e6).round() as u64)))
+            .collect();
+        let (s, _) = crosscheck(
+            &primary,
+            |k| sec.get(&k).copied(),
+            &[],
+            |_| None,
+            R60,
+            Cadence {
+                primary_ms: p,
+                secondary_ms: q,
+            },
+            10.0,
+            true,
+        );
+        s
+    }
+
+    /// Second review M1: F is the SECONDARY's spacing, and neither source may
+    /// widen it alone: either one more than 1.5 times coarser disagrees.
+    #[test]
+    fn the_cadence_rule_and_f_come_from_both_sources() {
+        let g = healthy_60(5.0);
+        // The primary dropping every other frame: its p50 doubles.
+        let s = run_cadence(&g, Some(2.0 * R60_MS), Some(R60_MS));
+        assert_eq!(s.verdict, "disagree", "{}", s.detail);
+        assert!(
+            s.detail
+                .starts_with("one source kept a coarser frame cadence"),
+            "{}",
+            s.detail
+        );
+        assert_eq!(
+            s.frame_ms,
+            Some(R60_MS),
+            "the primary's own coarse spacing does not widen F"
+        );
+        // The secondary dropping every other frame.
+        let s = run_cadence(&g, Some(R60_MS), Some(2.0 * R60_MS));
+        assert_eq!(s.verdict, "disagree", "{}", s.detail);
+        // Within 1.5 times: agree, F from the secondary.
+        let s = run_cadence(&g, Some(20.0), Some(24.0));
+        assert_eq!(s.verdict, "agree", "{}", s.detail);
+        assert_eq!(s.frame_ms, Some(24.0));
+        // Either spacing unknown: F is R and the cadence rule does not decide.
+        let s = run_cadence(&g, None, Some(2.0 * R60_MS));
+        assert_eq!(s.frame_ms, Some(R60_MS));
+        assert_eq!(s.cadence_ratio, None);
+    }
+
+    /// Second review S4: a spacing p50 needs 20 deltas; one long delta never
+    /// sets the widest band.
+    #[test]
+    fn a_spacing_p50_needs_twenty_deltas() {
+        let every = |n: usize, step_ms: u64| -> Vec<u64> {
+            (0..n as u64).map(|i| i * step_ms * MS).collect()
+        };
+        assert_eq!(spacing_p50_ms(&every(20, 16)), None, "19 deltas");
+        assert_eq!(spacing_p50_ms(&every(21, 16)), Some(16.0), "20 deltas");
+        assert_eq!(spacing_p50_ms(&[0, 500 * MS]), None, "one 500 ms delta");
+        // Order does not matter (frames are sorted first).
+        let mut shuffled = every(21, 16);
+        shuffled.reverse();
+        assert_eq!(spacing_p50_ms(&shuffled), Some(16.0));
+        let c = Cadence::from_frames(&[0, 500 * MS], &every(41, 33));
+        assert_eq!((c.primary_ms, c.secondary_ms), (None, Some(33.0)));
     }
 }

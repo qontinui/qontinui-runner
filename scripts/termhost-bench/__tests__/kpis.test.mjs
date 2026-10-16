@@ -165,6 +165,15 @@ test("an unaligned clock or a capture disagreement makes latency unknown, never 
   assertUnknown(cc.kpis.output_latency_ms, "capture_disagreement");
 });
 
+test("a measured latency whose cross-check was not performed says so in the row's notes (review N3)", () => {
+  const cc = { verdict: "not_performed", compared: 2, agreed: 2, disagreed: 0, detail: "only 2 marker(s) seen cleanly by both sources; the median rule needs 3, so neither marker rule decides" };
+  const { kpis } = computeRowKpis(withSummary(focusFixture(), { secondary: "dda", crosscheck: cc }));
+  assert.equal(kpis.output_latency_ms.state, "measured");
+  assert.deepEqual(kpis.output_latency_ms.notes, [`the capture cross-check was not performed: ${cc.detail}`]);
+  const none = computeRowKpis(withSummary(focusFixture(), { secondary: null, crosscheck: { ...cc, detail: "no secondary capture source in this run" } }));
+  assert.ok(!(none.kpis.output_latency_ms.notes ?? []).some((n) => /cross-check was not performed/.test(n)), "no secondary source: nothing was skipped");
+});
+
 test("a focus arm showing two sessions is unknown(zone_unresolved) for the runner, sessions_not_rendered otherwise", () => {
   const gen0 = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 15000 });
   const gen1 = genLog({ session: 1, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 15000 });

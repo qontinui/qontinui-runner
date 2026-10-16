@@ -60,6 +60,7 @@ import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
 import { carriesFlag, listProcesses, terminatePid } from "./proc.mjs";
 import { loadProfile } from "./profile.mjs";
+import { readingFreeDetail } from "./report.mjs";
 import { buildDocument, convertProbeIncident, finalizeLadder, incident, redactRunnerOnly, unprovenBuild, writeResultsOrSetAside } from "./results.mjs";
 import { createRunDir, createUnitDir, generatorArgv, generatorRunId, makeRunId } from "./rundir.mjs";
 import { echoCount, readGeneratorLog, readGeneratorLogs, readSlots, slotForHostId, waitForGenerators, waitForNewSlot } from "./sessions.mjs";
@@ -232,6 +233,16 @@ export function rowLabels({ softwareRendered, setup, smoke, paneSizes, geometry,
  * logs carry these lines, and a third party's readings never leave the job (D7),
  * so only the runner's notes are logged — every other setup's stay in the file.
  */
+/**
+ * A free-text detail as the PUBLIC job log may carry it: the runner's verbatim, a
+ * third party's with every reading masked (D7, {@link readingFreeDetail}). The
+ * incident records keep the verbatim text; redaction drops a third party's from
+ * every upload.
+ */
+export function publicDetail(setupId, detail) {
+  return setupId === "runner" ? String(detail) : readingFreeDetail(detail);
+}
+
 export function noteLogLines(setupId, where, notes) {
   return setupId === "runner" ? notes.map((n) => `${where}: ${n}`) : [];
 }
@@ -659,11 +670,14 @@ export async function runUnit(unit, ctx) {
   const arrangeSeen = new Set();
   const recordArrangeFailure = (arm, f, pass = "") => {
     if (!f) return;
-    const key = `${arm}\u0000${f.detail}`;
+    // Keyed on the reading-free text: two passes failing the same way with
+    // different numbers in the message (a timeout's elapsed ms) are one cause.
+    const key = `${arm}\u0000${readingFreeDetail(f.detail)}`;
     if (arrangeSeen.has(key)) return;
     arrangeSeen.add(key);
-    const detail = `unit ${name} arm ${arm}${pass}: arrange: ${f.detail}`;
-    log(detail);
+    const where = `unit ${name} arm ${arm}${pass}: arrange: `;
+    const detail = `${where}${f.detail}`;
+    log(`${where}${publicDetail(unit.setup, f.detail)}`);
     incidents.push(incident("harness_error", detail, { data: { setup: unit.setup, unit: name, arm, phase: `${arm}/arrange` } }));
   };
   let adapter = null;
@@ -727,7 +741,7 @@ export async function runUnit(unit, ctx) {
         } catch (e) {
           const f = e instanceof AdapterRefusal ? { reason: e.reason, detail: e.detail } : { reason: "harness_error", detail: e?.message ?? String(e) };
           armErrors.set(arm, f);
-          log(`unit ${name} arm ${arm}: ${f.reason}: ${f.detail}`);
+          log(`unit ${name} arm ${arm}: ${f.reason}: ${publicDetail(unit.setup, f.detail)}`);
           if (!(e instanceof AdapterRefusal) || e.reason === "harness_error") {
             incidents.push(incident("harness_error", `unit ${name} arm ${arm}: ${f.detail}`, { data: { setup: unit.setup, unit: name, arm } }));
           }
@@ -761,7 +775,7 @@ export async function runUnit(unit, ctx) {
         } catch (e) {
           const f = e instanceof AdapterRefusal ? { reason: e.reason, detail: e.detail } : { reason: "harness_error", detail: e?.message ?? String(e) };
           measured.spawns = { unavailable: f };
-          log(`unit ${name} arm ${arm} spawn: ${f.reason}: ${f.detail}`);
+          log(`unit ${name} arm ${arm} spawn: ${f.reason}: ${publicDetail(unit.setup, f.detail)}`);
           incidents.push(incident("harness_error", `unit ${name} arm ${arm} spawn: ${f.detail}`, { data: { setup: unit.setup, unit: name, arm } }));
         }
         const post = ctx.neutrality.check(`after ${name} arm ${arm} spawn`);
@@ -774,7 +788,7 @@ export async function runUnit(unit, ctx) {
     }
   } catch (e) {
     failure = e instanceof AdapterRefusal ? { reason: e.reason, detail: e.detail } : { reason: "harness_error", detail: e?.stack ? String(e.message) : String(e) };
-    log(`unit ${name}: ${failure.reason}: ${failure.detail}`);
+    log(`unit ${name}: ${failure.reason}: ${publicDetail(unit.setup, failure.detail)}`);
     if (!(e instanceof AdapterRefusal) || e.reason === "harness_error") {
       incidents.push(incident("harness_error", `unit ${name}: ${failure.detail}`, { data: { setup: unit.setup, unit: name } }));
     }
@@ -981,8 +995,9 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
   const startPhaseWatch = async (phase, extra) => {
     const w = probe.startWatch(watchOpts(phase, extra));
     if (!(await w.ready())) {
-      const detail = `unit ${name} arm ${arm}: the ${phase} watch did not start (exit ${JSON.stringify(w.exit ?? null)}): ${String(w.stderr ?? "").slice(-300)}`;
-      log(detail);
+      const why = `(exit ${JSON.stringify(w.exit ?? null)}): ${String(w.stderr ?? "").slice(-300)}`;
+      const detail = `unit ${name} arm ${arm}: the ${phase} watch did not start ${why}`;
+      log(`unit ${name} arm ${arm}: the ${phase} watch did not start ${publicDetail(unit.setup, why)}`);
       out.incidents.push(incident("harness_error", detail, { data: { setup: unit.setup, unit: name, phase: `${arm}/${phase}` } }));
     }
     return w;

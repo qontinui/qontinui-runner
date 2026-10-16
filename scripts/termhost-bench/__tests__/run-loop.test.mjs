@@ -311,19 +311,51 @@ test("an arrangement the harness failed is a run-level incident, once per cause;
   assert.equal(validateResults(res.doc).valid, true);
 });
 
-test("a third party's arrange incident stays off the redacted copy (D7)", async (t) => {
+test("a third party's arrange incident stays off the redacted copy, and the public log carries it reading-free (D7, second review S2)", async (t) => {
+  const lines = [];
   const { res } = await fakeRun(t, {
     opts: { ns: [1], setups: ["runner", "tmux"] },
+    deps: { log: (l) => lines.push(l) },
     adapterHook: (a, setup) => {
       const arrange = a.arrange.bind(a);
       a.arrange = async (arm, actx) => {
         const r = await arrange(arm, actx);
-        return setup === "tmux" && arm === "tiled" ? { ...r, ok: false, failure: { reason: "harness_error", detail: "arrange call timed out" } } : r;
+        if (arm !== "tiled") return r;
+        return { ...r, ok: false, failure: { reason: "harness_error", detail: `${setup} arrange call timed out after 12034 ms` } };
       };
     },
   });
-  assert.equal(res.doc.incidents.filter((i) => /: arrange: /.test(i.detail) && i.data?.setup === "tmux").length, 1);
-  assert.equal(redactRunnerOnly(res.doc).incidents.filter((i) => /: arrange: /.test(i.detail)).length, 0);
+  const tmux = res.doc.incidents.filter((i) => /: arrange: /.test(i.detail) && i.data?.setup === "tmux");
+  assert.equal(tmux.length, 1);
+  assert.match(tmux[0].detail, /after 12034 ms$/, "the incident record keeps the verbatim text (it never leaves the VM)");
+  assert.equal(redactRunnerOnly(res.doc).incidents.filter((i) => /: arrange: /.test(i.detail) && i.data?.setup === "tmux").length, 0);
+  const logged = lines.filter((l) => /: arrange: /.test(l));
+  assert.ok(logged.some((l) => l.endsWith("arrange: tmux arrange call timed out after # ms")), JSON.stringify(logged));
+  assert.ok(logged.some((l) => l.endsWith("arrange: runner arrange call timed out after 12034 ms")), "the runner's own detail stays verbatim");
+  assert.ok(!logged.some((l) => /tmux.*12034/.test(l)), "no third-party reading in the public log");
+});
+
+test("one arrange incident per CAUSE: the same cause with other numbers is one, a different cause is a second (second review N2)", async (t) => {
+  const seen = new Map();
+  const run = (spawnDetail) =>
+    fakeRun(t, {
+      opts: { ns: [1], setups: ["runner"] },
+      adapterHook: (a) => {
+        const arrange = a.arrange.bind(a);
+        a.arrange = async (arm, actx) => {
+          const r = await arrange(arm, actx);
+          if (arm !== "tiled") return r;
+          const pass = (seen.get(spawnDetail) ?? 0) + 1;
+          seen.set(spawnDetail, pass);
+          return { ...r, ok: false, failure: { reason: "harness_error", detail: pass === 1 ? "arrange call timed out after 12034 ms" : spawnDetail } };
+        };
+      },
+    });
+  const same = (await run("arrange call timed out after 12999 ms")).res.doc.incidents.filter((i) => /: arrange: /.test(i.detail));
+  assert.equal(same.length, 1, JSON.stringify(same));
+  const other = (await run("the extension refused: no editor group")).res.doc.incidents.filter((i) => /: arrange: /.test(i.detail));
+  assert.equal(other.length, 2, JSON.stringify(other));
+  assert.ok(other.some((i) => /\(spawn pass\): arrange: the extension refused/.test(i.detail)));
 });
 
 test("the primary-state guard's baseline is in the results, and a guard watching nothing blocks a supervisor run (review S7)", async (t) => {

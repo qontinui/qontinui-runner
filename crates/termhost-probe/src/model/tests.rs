@@ -583,6 +583,111 @@ fn one_disagreeing_marker_is_recorded_but_does_not_void_latency() {
     );
 }
 
+/// A WGC + DDA run simulated from presentations, so the cross-check's frame
+/// interval is DERIVED from the frames the model saw, never injected.
+///
+/// The desktop presents every `present_every` refresh intervals. DDA captures
+/// every presentation and stamps it. WGC captures every `wgc_every`-th
+/// presentation, stamps it `wgc_stamp_ms` later, and shows only content that
+/// was visible `wgc_render_ms` before that presentation. A marker every 100 ms,
+/// at a phase that walks across the presentation interval.
+fn presented_run(
+    present_every: u64,
+    wgc_every: u64,
+    wgc_render_ms: u64,
+    wgc_stamp_ms: u64,
+) -> WatchSummary {
+    let mut c = cfg();
+    c.secondary = Some(SourceId::Dda);
+    let mut m = Model::new(c, 0);
+    let period = REFRESH * present_every;
+    let t0 = 1_000 * MS;
+    let emit: Vec<u64> = (0..200u64)
+        .map(|i| t0 + 500 * MS + i * 100 * MS + (i * 7_919_000) % period)
+        .collect();
+    let latest = |cut: u64| emit.iter().rposition(|&e| e <= cut);
+    let frame_ns = |source: SourceId, index: u64, t_ns: u64, seq: Option<usize>| FrameObs {
+        source,
+        index,
+        t_ns,
+        width: 800,
+        height: 600,
+        region: WINDOW,
+        markers: seq.map_or_else(Vec::new, |s| vec![obs(MarkerKind::Output, 0, s as u32)]),
+        rejected: 0,
+        missed: None,
+        scan_ns: 0,
+        lag_ns: Some(0),
+    };
+    for (i, &e) in emit.iter().enumerate() {
+        m.on_emitted(Emitted {
+            session: 0,
+            kind: MarkerKind::Output,
+            seq_full: i as u64,
+            t_emit_ns: e,
+            source: EmitSource::Generator,
+        });
+    }
+    let end = t0 + 21_000 * MS;
+    let mut k = 0u64;
+    loop {
+        let t = t0 + k * period;
+        if t > end {
+            break;
+        }
+        m.on_frame(frame_ns(SourceId::Dda, k, t, latest(t)));
+        if k % wgc_every == 0 {
+            let shown = t.checked_sub(wgc_render_ms * MS).and_then(latest);
+            m.on_frame(frame_ns(SourceId::Wgc, k, t + wgc_stamp_ms * MS, shown));
+        }
+        k += 1;
+    }
+    m.finish(end + 100 * MS).1
+}
+
+/// Second review M1: a hosted-VM-like shape (presenting every other refresh,
+/// WGC a whole frame later on ~30% of markers) agrees THROUGH the frame
+/// interval measured from the frames; judged in refresh intervals it would not.
+#[test]
+fn the_vm_shape_agrees_through_the_measured_frame_interval() {
+    let s = presented_run(2, 1, 10, 0);
+    let cc = &s.crosscheck;
+    assert_eq!(cc.verdict, "agree", "{}", cc.detail);
+    let two_r = 2.0 * REFRESH as f64 / 1e6;
+    assert!(
+        cc.frame_ms.is_some_and(|f| (f - two_r).abs() < 1e-6),
+        "{cc:?}"
+    );
+    assert!(cc.disagreed == 0 && cc.compared > 150, "{cc:?}");
+    // The shape is real: about 30% of markers WGC a whole presentation later,
+    // which bands one refresh wide would void.
+    let late = cc.max_abs_delta_ms.unwrap_or_default();
+    assert!((late - two_r).abs() < 1e-3, "{cc:?}");
+    assert_eq!(s.output_latency_ms.state, KpiState::Measured);
+}
+
+/// Second review M1: WGC dropping every other frame at 60 Hz while DDA keeps
+/// every refresh. Its own spacing doubles; that must not widen its bands.
+#[test]
+fn wgc_dropping_every_other_frame_at_60hz_disagrees() {
+    let s = presented_run(1, 2, 0, 5);
+    let cc = &s.crosscheck;
+    assert_eq!(cc.verdict, "disagree", "{}", cc.detail);
+    assert!(
+        cc.frame_ms
+            .is_some_and(|f| (f - REFRESH as f64 / 1e6).abs() < 1e-6),
+        "{cc:?}"
+    );
+    assert!(
+        cc.cadence_ratio.is_some_and(|r| (r - 2.0).abs() < 1e-6),
+        "{cc:?}"
+    );
+    assert_eq!(s.output_latency_ms.reason, Some("capture_disagreement"));
+    // The same host with WGC keeping every frame agrees.
+    let ok = presented_run(1, 1, 0, 5);
+    assert_eq!(ok.crosscheck.verdict, "agree", "{}", ok.crosscheck.detail);
+}
+
 fn agreeing_run(c: ModelConfig) -> WatchSummary {
     let mut m = Model::new(c, 0);
     for seq in 0..150u32 {

@@ -253,6 +253,24 @@ test("readingFreeDetail keeps a labelled exit code: a cause, not a reading (revi
   assert.equal(readingFreeDetail("status 0xC0000005 seen at 42 ms"), "status # seen at # ms", "an unlabelled hex status is masked");
 });
 
+test("readingFreeDetail's exit-code exception leaks no reading (second review S1)", () => {
+  const masked = [
+    ["exit code 56.0ms", "exit code #ms"],
+    ["exit 56ms", "exit #ms"],
+    ["exit 4123 ms of lag", "exit # ms of lag"],
+    ["exit status: -75.7", "exit status: #"],
+    ["exit: 12e3", "exit: #"],
+    ["the probe did not exit 5000 ms after its stop", "the probe did not exit # ms after its stop"],
+    ["exit 3%", "exit #%"],
+    ["exit 3 frames", "exit # frames"],
+    ["exit 1e5", "exit #"],
+    ["exit 12345678901", "exit #"],
+  ];
+  for (const [input, want] of masked) assert.equal(readingFreeDetail(input), want, input);
+  const kept = ["exit 3", "exit code 3221225477 (0xC0000005)", "exited with code -1", "exit code 0xC0000005", "(stopped, exit 3) without"];
+  for (const k of kept) assert.equal(readingFreeDetail(k), k, k);
+});
+
 test("readingFreeDetail cuts by code point, never inside a surrogate pair (review N3)", () => {
   const cut = readingFreeDetail("\u{1F600}".repeat(300));
   assert.equal(Array.from(cut).length, READING_FREE_DETAIL_MAX);

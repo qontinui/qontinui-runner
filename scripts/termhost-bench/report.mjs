@@ -191,12 +191,18 @@ export function checkAssertions(doc, a) {
 export const READING_FREE_DETAIL_MAX = 240;
 
 /**
- * A process exit code the detail labels as one (`exit 3`, `exit code 3221225477`,
- * `exit status: -1`), with the NTSTATUS that may follow it in parentheses
- * (`(0xC0000005)`). Kept: an exit code is the process's verdict on why it stopped
- * — a CAUSE (an access violation, a refusal) — not a measurement of the setup.
+ * A process exit code the detail labels as one, in exactly these forms:
+ * `exit N`, `exit code N`, `exited with code N`, where N is an i32/u32 code
+ * (at most 10 decimal digits, optionally signed) or `0x` with 1-8 hex digits,
+ * optionally followed by the NTSTATUS it reads as, `(0xC0000005)`. N must END
+ * there: not followed by another digit, a decimal or exponent part, or a unit
+ * (`ms`, `s`, `%`, `fps`, …), so `exit 5000 ms after` or `exit code 56.0ms` is a
+ * reading and is masked. Kept: an exit code is the process's verdict on why it
+ * stopped — a CAUSE (an access violation, a refusal) — not a measurement of the
+ * setup.
  */
-const EXIT_CODE = String.raw`\bexit(?: code| status)?[ :=]+[+-]?\p{Nd}+(?: \(0[xX][cC][0-9a-fA-F]{7}\))?`;
+const EXIT_UNIT = String.raw`(?:ms|us|µs|ns|s|sec|secs|min|h|fps|hz|frames?|px|mb|kb|gb|%)(?![\p{L}])`;
+const EXIT_CODE = String.raw`\b(?:exit|exit code|exited with code) (?:[+-]?\p{Nd}{1,10}|0[xX][0-9a-fA-F]{1,8})(?![\p{Nd}\p{L}]|[.,]\p{Nd}|\s*${EXIT_UNIT}|\s*%)(?: \(0[xX][cC][0-9a-fA-F]{7}\))?`;
 /**
  * A number: optionally signed (a sign only where no letter or digit precedes it,
  * so `win32-x64` keeps its hyphen), decimal in any script (`\p{Nd}`), with digit
@@ -204,7 +210,7 @@ const EXIT_CODE = String.raw`\bexit(?: code| status)?[ :=]+[+-]?\p{Nd}+(?: \(0[x
  * `Infinity` / `NaN`.
  */
 const NUMBER = String.raw`(?:(?<![\p{L}\p{N}])[+-])?(?:\bInfinity\b|\bNaN\b|0[xX][0-9a-fA-F]+|(?:\p{Nd}+(?:[.,]\p{Nd}+)*|\.\p{Nd}+)(?:[eE][+-]?\p{Nd}+)?)`;
-const MASK = new RegExp(`(${EXIT_CODE})|${NUMBER}`, "gu");
+const MASK = new RegExp(`(${EXIT_CODE})|${NUMBER}`, "giu");
 
 /**
  * A third-party KPI detail with no reading left in it (D7): every number — a
