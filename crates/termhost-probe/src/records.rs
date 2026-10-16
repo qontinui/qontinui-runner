@@ -367,6 +367,10 @@ pub struct IncidentRecord {
     pub stops_run: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// When it happened on the probe clock (the frames' clock), where known:
+    /// `at` is wall time, stamped when the engine got to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_ns: Option<Ns>,
 }
 
 impl IncidentRecord {
@@ -377,7 +381,14 @@ impl IncidentRecord {
             detail: detail.into(),
             stops_run,
             data: None,
+            t_ns: None,
         }
+    }
+
+    /// It happened at `t_ns` on the probe clock.
+    pub fn at_ns(mut self, t_ns: u64) -> Self {
+        self.t_ns = Some(Ns(t_ns));
+        self
     }
 
     /// The incident concerns this capture source (`data.source`).
@@ -800,6 +811,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&about).expect("JSON");
         assert!(v.get("source").is_none(), "{about}");
         assert_eq!(v["data"]["source"], "wgc");
+        // The probe-clock time rides beside the schema fields only when set.
+        assert!(v.get("t_ns").is_none(), "{about}");
+        let timed = to_line(&Record::Incident(
+            IncidentRecord::new("capture_lost", "y", false)
+                .about_source(SourceId::X11)
+                .at_ns(42),
+        ));
+        let v: serde_json::Value = serde_json::from_str(&timed).expect("JSON");
+        assert_eq!(v["t_ns"], "42");
     }
 
     #[test]

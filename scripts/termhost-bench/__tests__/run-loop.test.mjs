@@ -19,7 +19,7 @@ import { NeutralityGuard } from "../neutrality.mjs";
 import { InvalidResults, convertProbeIncident, redactRunnerOnly } from "../results.mjs";
 import { AdapterRefusal } from "../adapters/index.mjs";
 import { RunnerAdapter } from "../adapters/runner.mjs";
-import { RESTORE_CHECK_MIN_FRAMES, RunAbort, RunFailed, abortAwareSleep, measureOrder, planUnits, restoreCoverageGap, runBench } from "../run.mjs";
+import { RESTORE_CHECK_MIN_FRAMES, RunAbort, RunFailed, abortAwareSleep, measureOrder, outputMarkersEmitted, planUnits, restoreCoverageGap, runBench } from "../run.mjs";
 import { stallSegment } from "./helpers/bench-fixtures.mjs";
 import { paneStalls, stallCoverage } from "../kpis.mjs";
 import { validateResults } from "../validate.mjs";
@@ -915,8 +915,8 @@ test("SF1: at N = 12 the restored (focus) session must be among the judged, else
   assert.match(check(other.focus).notes[0], /0: \d+ kept frame\(s\) .* \(judged\), .*11: no kept frame \(not judged: no kept frame\)\)$/);
 });
 
-test("nit: the restore check's judging boundaries — frames 9/10, span >= 2000, end <= 2000, final still run < 2000 (review r13 nit, r14 MF2)", () => {
-  const ok = { frames: RESTORE_CHECK_MIN_FRAMES, seqs: 2, firstMs: 0, lastMs: 3000, finalSeq: 9, finalFromMs: 1001 };
+test("nit: the restore check's judging boundaries — frames 9/10, span >= 2000, end <= 2000, final still run < 2000 (review r13 nit, r14 MF2, r15 nit 7)", () => {
+  const ok = { frames: RESTORE_CHECK_MIN_FRAMES, seqs: 2, firstMs: 0, lastMs: 3000, finalSeq: 9, finalFromMs: 1001, finalHeldMs: 1999 };
   assert.equal(RESTORE_CHECK_MIN_FRAMES, 10);
   assert.equal(restoreCoverageGap(ok, 5000), null, "exactly 10 frames, end exactly 2000 ms before the watch's end, final run 1999 ms");
   assert.equal(restoreCoverageGap({ ...ok, frames: 9 }, 5000), "fewer than 10 kept frames");
@@ -924,13 +924,23 @@ test("nit: the restore check's judging boundaries — frames 9/10, span >= 2000,
   assert.equal(restoreCoverageGap({ ...ok, lastMs: 1999 }, 3999), "kept frames span under 2000 ms");
   assert.equal(restoreCoverageGap(ok, 5001), "last kept frame over 2000 ms before the watch's end");
   assert.equal(
-    restoreCoverageGap({ ...ok, finalFromMs: 1000 }, 5000, 12),
+    restoreCoverageGap({ ...ok, finalFromMs: 1000, finalHeldMs: 2000 }, 5000, 12),
     "marker did not advance in the final 2000 ms of its kept frames (seq 9 from +1000 ms; its generator wrote 12 marker(s) meanwhile)",
     "a final still run of exactly 2000 ms",
   );
-  assert.match(restoreCoverageGap({ ...ok, seqs: 1, finalFromMs: 0 }, 5000), /final 3000 ms .*no generator log, so how many markers it wrote is unknown\)$/);
-  assert.equal(restoreCoverageGap({ frames: 0, seqs: 0, firstMs: null, lastMs: null, finalSeq: null, finalFromMs: null }, 5000), "no kept frame");
+  // The held time is the run's time outside excluded spans, not its wall span.
+  assert.equal(restoreCoverageGap({ ...ok, finalFromMs: 0, finalHeldMs: 1999 }, 5000), null, "a 3000 ms span, 1999 ms of it seen");
+  assert.match(restoreCoverageGap({ ...ok, seqs: 1, finalFromMs: 0, finalHeldMs: 3000 }, 5000), /final 3000 ms .*no generator log, so how many markers it wrote is unknown\)$/);
+  assert.equal(restoreCoverageGap({ frames: 0, seqs: 0, firstMs: null, lastMs: null, finalSeq: null, finalFromMs: null, finalHeldMs: null }, 5000), "no kept frame");
 });
+
+test("nit: markers emitted in (a, b] — not at a, at b (review r15 nit 5)", () => {
+  const gen = { markers: [10n, 20n, 30n].map((t) => ({ kind: "output", tEmit: t })).concat([{ kind: "echo", tEmit: 25n }]) };
+  assert.equal(outputMarkersEmitted(gen, 10n, 30n), 2);
+  assert.equal(outputMarkersEmitted(gen, 9n, 30n), 3);
+  assert.equal(outputMarkersEmitted(undefined, 0n, 30n), null);
+});
+
 test("MF1: a 2.4 s whole-screen freeze at the soak's end is a pane_stalled incident, not a void (review r13 MF1)", async (t) => {
   const { res } = await fakeRun(t, {
     opts: { ns: [1], setups: ["tmux"] },
@@ -1033,7 +1043,8 @@ test("r14 D/E: in a 5 s restore watch a whole-screen freeze never voids, and a s
 });
 
 test("r14 SF3: a restored session not judged for a long final still run reports how many markers its generator really wrote (review r14 SF3)", async (t) => {
-  // Session 0 frozen from 2.0 s to the end of a 5 s watch, occluded 2.5-4.3 s: seen ~1.2 s, so no stall.
+  // Session 0 frozen from 2.0 s to the end of a 5 s watch, its marker hidden 2.5-3.6 s (over the
+  // 900 ms gap): seen ~1.9 s in two pieces, so no stall; its final still run spans ~3 s.
   const { focus } = await restoreRun(t, {
     restoreCheckMs: 5000,
     wrapProbe: editRestoreWatch((rs) => {
@@ -1041,9 +1052,12 @@ test("r14 SF3: a restored session not judged for a long final still run reports 
       const ms = (x) => start + BigInt(x) * 1_000_000n;
       let seq = null;
       return rs.map((r) => {
-        if (r.type === "interval" && BigInt(r.t_start_ns) >= ms(2500) && BigInt(r.t_start_ns) < ms(4300)) return { ...r, valid: false, exclusion_class: "occluded" };
         if (r.type !== "frame" || BigInt(r.t_ns) < ms(2000)) return r;
-        return { ...r, markers: r.markers.map((m) => (m.kind === "output" && m.session === 0 ? { ...m, seq: (seq ??= m.seq) } : m)) };
+        const hidden = BigInt(r.t_ns) >= ms(2500) && BigInt(r.t_ns) < ms(3600);
+        const markers = r.markers
+          .filter((m) => !(hidden && m.kind === "output" && m.session === 0))
+          .map((m) => (m.kind === "output" && m.session === 0 ? { ...m, seq: (seq ??= m.seq) } : m));
+        return { ...r, markers };
       });
     }),
   });
@@ -1053,4 +1067,58 @@ test("r14 SF3: a restored session not judged for a long final still run reports 
   const m = /not judged: marker did not advance in the final \d+ ms of its kept frames \(seq \d+ from \+\d+ ms; its generator wrote (\d+) marker\(s\) meanwhile\)/.exec(inc?.detail ?? "");
   assert.ok(m, inc?.detail);
   assert.ok(Number(m[1]) >= 20 && Number(m[1]) <= 35, m[1]);
+});
+
+test("r15 MF1: a primary capture loss after a restored session's last kept frame leaves it unjudged, and the check names the loss (review r15 MF1, r3.mjs)", async (t) => {
+  const withLoss = (kind) =>
+    editRestoreWatch((rs) => {
+      const start = BigInt(rs.find((r) => r.type === "start").t0_ns) + 5_000_000n;
+      const ms = (x) => start + BigInt(x) * 1_000_000n;
+      const source = rs.find((r) => r.type === "capture" && r.state === "started").source;
+      const kept = rs.filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= ms(3500));
+      if (!kind) return kept;
+      const detail = kind === "ended" ? `${source} capture ended: gone` : `${source} capture lost (re-establishing): read failed`;
+      return [...kept, { type: "incident", kind: "capture_lost", at: "2026-10-16T00:00:00.000Z", t_ns: String(ms(3550)), detail, stops_run: kind === "ended", data: { source } }];
+    });
+  // Without a loss: 1.5 s with no frame after +3.5 s of a 5 s watch is within the end term, and judged clean.
+  const none = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: withLoss(null) });
+  assert.equal(check(none.focus).data?.outcome, "clean", JSON.stringify(check(none.focus)));
+  assert.deepEqual(check(none.focus).data.losses, []);
+  for (const kind of ["lost", "ended"]) {
+    const { focus } = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: withLoss(kind) });
+    assert.equal(check(focus).state, "unknown", JSON.stringify(check(focus)));
+    assert.ok(
+      unknownIncident(focus, /0: \d+ kept frame\(s\) .*\(not judged: the primary capture was lost after its last kept frame \(.* capture (lost \(re-establishing\)|ended)[^)]*\)\); the primary capture \(\w+\) was lost at \+\d+ ms/),
+      `${kind}: ${JSON.stringify(focus.incidents)}`,
+    );
+  }
+});
+
+test("r15 MF1: the restore check lists the window's losses in a clean note too, and a mapped loss counts within the slack (review r15 MF1)", async (t) => {
+  const edit = (incs) =>
+    editRestoreWatch((rs) => {
+      const startRec = rs.find((r) => r.type === "start");
+      const start = BigInt(startRec.t0_ns) + 5_000_000n;
+      const ms = (x) => start + BigInt(x) * 1_000_000n;
+      const source = rs.find((r) => r.type === "capture" && r.state === "started").source;
+      const lastKept = incs.cut === undefined ? rs : rs.filter((r) => r.type !== "frame" || BigInt(r.t_ns) <= ms(incs.cut));
+      const at0 = "2026-10-16T00:00:00.000Z";
+      const out = lastKept.map((r) => (r.type === "start" ? { ...r, at: at0 } : r));
+      for (const x of incs.list) {
+        const rec = { type: "incident", kind: "capture_lost", at: at0, detail: `${source} capture lost (re-establishing): read failed`, stops_run: false, data: { source } };
+        if (x.exactMs !== undefined) rec.t_ns = String(x.exactMs === "before" ? BigInt(startRec.t0_ns) - 1n : ms(x.exactMs));
+        else rec.at = new Date(Date.parse(at0) + Number((ms(x.wallMs) - BigInt(startRec.t0_ns)) / 1_000_000n)).toISOString();
+        out.push(rec);
+      }
+      return out;
+    });
+  // A failed read at +1 s, frames after it, and one before the window: clean, and the note names only the first.
+  const early = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: edit({ list: [{ exactMs: 1000 }, { exactMs: "before" }] }) });
+  assert.equal(check(early.focus).data?.outcome, "clean", JSON.stringify(check(early.focus)));
+  assert.equal(check(early.focus).data.losses.length, 1);
+  assert.match(check(early.focus).notes[0], /; the primary capture \(\w+\) was lost at \+1000 ms \(.*\); re-established: later frames were read\)$/);
+  // Frames to +3.5 s, a loss placed by wall clock 0.5 s BEFORE the last kept frame: within the slack, so not judged.
+  const mapped = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: edit({ cut: 3500, list: [{ wallMs: 3000 }] }) });
+  assert.equal(check(mapped.focus).state, "unknown", JSON.stringify(check(mapped.focus)));
+  assert.ok(unknownIncident(mapped.focus, /not judged: the primary capture was lost after its last kept frame/), JSON.stringify(mapped.focus.incidents));
 });

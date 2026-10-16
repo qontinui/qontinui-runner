@@ -50,7 +50,8 @@ impl EngineSetup {
 
 enum CaptureMsg {
     Frame(FrameObs),
-    Status(SourceId, CaptureStatus),
+    /// A status, and when the source returned it on the probe clock.
+    Status(SourceId, CaptureStatus, u64),
 }
 
 fn capture_loop(
@@ -103,10 +104,10 @@ fn capture_loop(
         match status {
             CaptureStatus::Frame | CaptureStatus::Timeout => {}
             CaptureStatus::Lost(_) => {
-                let _ = tx.send(CaptureMsg::Status(id, status));
+                let _ = tx.send(CaptureMsg::Status(id, status, now_ns()));
             }
             CaptureStatus::Ended(_) => {
-                let _ = tx.send(CaptureMsg::Status(id, status));
+                let _ = tx.send(CaptureMsg::Status(id, status, now_ns()));
                 return;
             }
         }
@@ -191,7 +192,7 @@ impl Engine {
                     self.sink.emit(&r);
                 }
             }
-            CaptureMsg::Status(source, CaptureStatus::Lost(detail)) => {
+            CaptureMsg::Status(source, CaptureStatus::Lost(detail), t_ns) => {
                 self.sink.emit(&Record::Incident(
                     IncidentRecord::new(
                         "capture_lost",
@@ -201,21 +202,23 @@ impl Engine {
                         ),
                         false,
                     )
-                    .about_source(source),
+                    .about_source(source)
+                    .at_ns(t_ns),
                 ))
             }
-            CaptureMsg::Status(source, CaptureStatus::Ended(detail)) => {
+            CaptureMsg::Status(source, CaptureStatus::Ended(detail), t_ns) => {
                 self.sink.emit(&Record::Incident(
                     IncidentRecord::new(
                         "capture_lost",
                         format!("{} capture ended: {detail}", source.as_str()),
                         source == self.model.config().primary,
                     )
-                    .about_source(source),
+                    .about_source(source)
+                    .at_ns(t_ns),
                 ));
                 self.ended.insert(source, detail);
             }
-            CaptureMsg::Status(_, _) => {}
+            CaptureMsg::Status(_, _, _) => {}
         }
     }
 
@@ -433,5 +436,67 @@ mod tests {
                 .any(|l| l.contains("\"type\":\"frame\"") && l.contains("\"lag_ms\":null")),
             "a frame record must say its lag is unknown"
         );
+    }
+
+    /// One failed read, then the end of capture.
+    struct Losing {
+        calls: u32,
+    }
+
+    impl CaptureSource for Losing {
+        fn id(&self) -> SourceId {
+            SourceId::Synthetic
+        }
+        fn describe(&self) -> String {
+            "losing".into()
+        }
+        fn next_frame(
+            &mut self,
+            _timeout: Duration,
+            _f: &mut dyn FnMut(RawFrame<'_>),
+        ) -> CaptureStatus {
+            self.calls += 1;
+            std::thread::sleep(Duration::from_millis(5));
+            match self.calls {
+                1 => CaptureStatus::Lost("read failed".into()),
+                2 => CaptureStatus::Timeout,
+                _ => CaptureStatus::Ended("gone".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_capture_loss_carries_its_time_on_the_probe_clock() {
+        let mut setup = EngineSetup::new(ModelConfig::new(SourceId::Synthetic, None, 16_666_667));
+        setup.sources = vec![Box::new(Losing { calls: 0 })];
+        let (sink, lines) = Sink::memory();
+        let t0 = now_ns();
+        let mut engine = Engine::start(setup, sink, t0);
+        engine.pump_until(t0 + 200 * MS);
+        let _ = engine.finish(now_ns());
+        let t1 = now_ns();
+        let times: Vec<(String, u64)> = lines
+            .lock()
+            .expect("lines")
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "incident" && v["kind"] == "capture_lost")
+            .map(|v| {
+                let t = v["t_ns"]
+                    .as_str()
+                    .expect("t_ns")
+                    .parse::<u64>()
+                    .expect("u64");
+                (v["detail"].as_str().unwrap_or("").to_string(), t)
+            })
+            .collect();
+        assert_eq!(times.len(), 2, "{times:?}");
+        assert!(
+            times[0].0.contains("capture lost (re-establishing)"),
+            "{times:?}"
+        );
+        assert!(times[1].0.contains("capture ended"), "{times:?}");
+        assert!(times.iter().all(|&(_, t)| t > t0 && t < t1), "{times:?}");
+        assert!(times[0].1 < times[1].1, "{times:?}");
     }
 }

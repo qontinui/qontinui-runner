@@ -36,9 +36,12 @@ import { doctorNotes, gatherDoctorFacts, mapDoctor, toCapabilities, blockingMech
 import { environmentSpec } from "./envs/index.mjs";
 import {
   allUnknown,
+  CAPTURE_LOST_SLACK_MS,
   captureInfo,
+  captureLosses,
   clockGate,
   computeRowKpis,
+  describeLoss,
   describeStall,
   indexGenerators,
   indexProbeSegment,
@@ -70,16 +73,23 @@ export const RESTORE_CHECK_MIN_FRAMES = 10;
  * entry over a watch of `windowMs`, or null when it can: >= RESTORE_CHECK_MIN_FRAMES
  * kept frames, spanning >= STALL_MIN_MS, the last within STALL_MIN_MS of the
  * watch's end, and the marker observed ADVANCING within the final STALL_MIN_MS
- * of those frames (its final still run is shorter than that). `emitted` is how
+ * of those frames (its final still run, outside excluded spans, is shorter than
+ * that; a backwards step is not an advance). `emitted` is how
  * many output markers the session's generator wrote during that final run, or
  * null without a generator log; it is only reported.
  */
+/** Output markers a generator emitted in (a, b] on the probe clock; null without a generator log. */
+export function outputMarkersEmitted(gen, a, b) {
+  if (!gen) return null;
+  return (gen.markers ?? []).filter((m) => m.kind === "output" && typeof m.tEmit === "bigint" && m.tEmit > a && m.tEmit <= b).length;
+}
+
 export function restoreCoverageGap(c, windowMs, emitted = null) {
   if (!c || c.frames === 0) return "no kept frame";
   if (c.frames < RESTORE_CHECK_MIN_FRAMES) return `fewer than ${RESTORE_CHECK_MIN_FRAMES} kept frames`;
   if (c.lastMs - c.firstMs < STALL_MIN_MS) return `kept frames span under ${STALL_MIN_MS} ms`;
   if (windowMs - c.lastMs > STALL_MIN_MS) return `last kept frame over ${STALL_MIN_MS} ms before the watch's end`;
-  const held = c.lastMs - c.finalFromMs;
+  const held = c.finalHeldMs;
   if (held >= STALL_MIN_MS) {
     const wrote = emitted === null ? "no generator log, so how many markers it wrote is unknown" : `its generator wrote ${emitted} marker(s) meanwhile`;
     return `marker did not advance in the final ${Math.round(held)} ms of its kept frames (seq ${c.finalSeq} from +${Math.round(c.finalFromMs)} ms; ${wrote})`;
@@ -1180,14 +1190,24 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       const windowMs = nsToMs(win.t1 - win.t0);
       const emittedInFinal = (k) => {
         const c = cov.get(k);
-        const g = gens?.get?.(k);
-        if (!g || c?.finalFromMs === null || c?.finalFromMs === undefined) return null;
-        const a = win.t0 + BigInt(Math.round(c.finalFromMs * 1e6));
-        const b = win.t0 + BigInt(Math.round(c.lastMs * 1e6));
-        return (g.markers ?? []).filter((m) => m.kind === "output" && typeof m.tEmit === "bigint" && m.tEmit > a && m.tEmit <= b).length;
+        if (c?.finalFromMs === null || c?.finalFromMs === undefined) return null;
+        return outputMarkersEmitted(gens?.get?.(k), win.t0 + BigInt(Math.round(c.finalFromMs * 1e6)), win.t0 + BigInt(Math.round(c.lastMs * 1e6)));
+      };
+      // A primary capture loss after a session's last kept frame: the read that
+      // could have shown its repaint failed or never came, so it cannot be judged.
+      const losses = captureLosses(idx, primaryFrames(idx, primary, win)).filter((x) => x.t === null || (x.t >= win.t0 && x.t <= win.t1));
+      const lossText = losses.length > 0 ? `; ${losses.map((x) => describeLoss(x, win)).join("; ")}` : "";
+      const slackNs = BigInt(CAPTURE_LOST_SLACK_MS) * 1_000_000n;
+      const lossAfter = (k) => {
+        const c = cov.get(k);
+        if (!c || c.lastMs === null) return null;
+        const last = win.t0 + BigInt(Math.round(c.lastMs * 1e6));
+        return losses.find((x) => x.t === null || x.t > last - (x.exact ? 0n : slackNs)) ?? null;
       };
       const whyNot = (k) =>
-        restoreCoverageGap(cov.get(k), windowMs, emittedInFinal(k)) ?? (unresolved.has(k) ? "still at the watch's end on a short frameless tail" : null);
+        restoreCoverageGap(cov.get(k), windowMs, emittedInFinal(k)) ??
+        (lossAfter(k) ? `the primary capture was lost after its last kept frame (${lossAfter(k).detail})` : null) ??
+        (unresolved.has(k) ? "still at the watch's end on a short frameless tail" : null);
       const judged = expected.filter((k) => whyNot(k) === null);
       const seen = expected
         .map((k) => {
@@ -1208,24 +1228,33 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       if (wedged === 0 && judged.length < need) {
         return unknownCheck(
           `${judged.length} of the ${need} session(s) the restored layout should show could be judged ` +
-            `(>= ${RESTORE_CHECK_MIN_FRAMES} kept frames spanning >= ${STALL_MIN_MS} ms, reaching within ${STALL_MIN_MS} ms of the end of a ${Math.round(windowMs)} ms watch, advancing within their final ${STALL_MIN_MS} ms; ${seen})`,
+            `(>= ${RESTORE_CHECK_MIN_FRAMES} kept frames spanning >= ${STALL_MIN_MS} ms, reaching within ${STALL_MIN_MS} ms of the end of a ${Math.round(windowMs)} ms watch, advancing within their final ${STALL_MIN_MS} ms; ${seen}${lossText})`,
         );
       }
       if (wedged === 0 && !judged.includes(restoredSession)) {
         const why = expected.includes(restoredSession) ? whyNot(restoredSession) : "it is not one of the arm's sessions";
-        return unknownCheck(`the restored session ${restoredSession} could not be judged (${why}); ${seen}`);
+        return unknownCheck(`the restored session ${restoredSession} could not be judged (${why}); ${seen}${lossText}`);
       }
       const outcome = wedged > 0 ? "not repainting" : stalls.some((x) => x.recovered) ? "recovered from a hitch" : "clean";
       const total = primaryFrames(idx, primary, win).length;
       const unresolvedList = [...unresolved].sort((x, y) => x - y);
       const shownOutcome = unresolvedList.length > 0 && wedged === 0 ? `${outcome} (${unresolvedList.length} session(s) unresolved: ${unresolvedList.join(",")})` : outcome;
-      const note = `restore check: observed, ${shownOutcome} (${total} primary frame(s); ${seen})`;
+      const note = `restore check: observed, ${shownOutcome} (${total} primary frame(s); ${seen}${lossText})`;
       log(`unit ${name} arm ${arm}: ${note}`);
       return {
         comparable: false,
         source,
         state: "measured",
-        data: { outcome, frames: total, sessions: expected, judged, unresolved: unresolvedList, restored: restoredSession, stalls },
+        data: {
+          outcome,
+          frames: total,
+          sessions: expected,
+          judged,
+          unresolved: unresolvedList,
+          restored: restoredSession,
+          stalls,
+          losses: losses.map((x) => ({ atMs: x.t === null ? null : Math.round(nsToMs(x.t - win.t0)), ended: x.ended, cuts: x.cuts, detail: x.detail })),
+        },
         notes: [note],
       };
     } catch (e) {
