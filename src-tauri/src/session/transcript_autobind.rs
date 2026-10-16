@@ -275,7 +275,12 @@ pub fn apply_decision(
             config_dir: Some(identity.config_dir.clone()),
         },
     };
-    match tailer.bind_and_replay(&identity.claude_session_id, path, req, transcript_sync_permitted) {
+    match tailer.bind_and_replay(
+        &identity.claude_session_id,
+        path,
+        req,
+        transcript_sync_permitted,
+    ) {
         Ok(o) if o.already_bound => None,
         Ok(o) => {
             info!(
