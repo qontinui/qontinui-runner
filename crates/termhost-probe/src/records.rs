@@ -565,11 +565,25 @@ pub struct WatchSummary {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CrosscheckSummary {
     /// `agree`, `disagree` (latency KPIs become unknown(capture_disagreement)),
-    /// or `not_performed`.
+    /// or `not_performed`. Judged on the statistics below, never on one
+    /// marker (`model::analysis::crosscheck` states the rule).
     pub verdict: &'static str,
     pub compared: u64,
+    /// Markers whose gap lies inside the per-marker band.
     pub agreed: u64,
+    /// Markers whose gap lies outside the per-marker band (each has a
+    /// `crosscheck` record).
     pub disagreed: u64,
+    /// The primary's declared stage offset minus the secondary's (ms).
+    pub expected_offset_ms: f64,
+    /// The per-marker band on the primary-minus-secondary gap (ms).
+    pub marker_band_ms: Option<(f64, f64)>,
+    /// The band the median gap must lie in (ms).
+    pub median_band_ms: Option<(f64, f64)>,
+    /// The median primary-minus-secondary gap (ms).
+    pub median_gap_ms: Option<f64>,
+    /// `disagreed / compared`; the run disagrees above 5%.
+    pub outside_share: Option<f64>,
     /// The secondary source coalesced frames where it first saw the marker, so
     /// its time is only an upper bound.
     pub secondary_coalesced: u64,

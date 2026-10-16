@@ -908,8 +908,15 @@ impl Model {
             .unwrap_or_default();
         let (crosscheck, cc_records) = match (self.cfg.secondary, &refresh_unknown) {
             (Some(_), Some(detail)) => {
-                let (mut s, _) =
-                    analysis::crosscheck(&primary_list, |_| None, &[], |_| None, refresh_ns, false);
+                let (mut s, _) = analysis::crosscheck(
+                    &primary_list,
+                    |_| None,
+                    &[],
+                    |_| None,
+                    refresh_ns,
+                    0.0,
+                    false,
+                );
                 s.detail = format!("not performed: {detail}");
                 (s, Vec::new())
             }
@@ -921,12 +928,20 @@ impl Model {
                     &sec_list,
                     |m| self.first_seen(self.cfg.primary, m),
                     refresh_ns,
+                    crate::selftest::render_offset_ms(self.cfg.primary)
+                        - crate::selftest::render_offset_ms(sec),
                     true,
                 )
             }
-            (None, _) => {
-                analysis::crosscheck(&primary_list, |_| None, &[], |_| None, refresh_ns, false)
-            }
+            (None, _) => analysis::crosscheck(
+                &primary_list,
+                |_| None,
+                &[],
+                |_| None,
+                refresh_ns,
+                0.0,
+                false,
+            ),
         };
         out.extend(cc_records.into_iter().map(Record::Crosscheck));
         let disagreement = (crosscheck.verdict == "disagree").then(|| crosscheck.detail.clone());

@@ -126,21 +126,64 @@ pub fn loss(
     t
 }
 
-/// Compare two sources' first appearances. A marker both saw is AGREED when
-/// the times differ by at most one refresh interval and DISAGREED otherwise —
-/// except where the secondary coalesced frames at that marker, which makes its
-/// time an upper bound only (not compared). The two are never averaged (plan
-/// D2): any disagreement makes the run's latencies unknown(capture_disagreement).
+/// Per-marker band, in refresh intervals either side of the two sources'
+/// declared offset: a marker whose primary-minus-secondary gap lies outside it
+/// is counted as disagreeing (and gets a `crosscheck` record).
+pub const CROSSCHECK_MARKER_BAND_REFRESHES: f64 = 2.0;
+/// The run's median gap must lie within this many refresh intervals of the
+/// declared offset band; outside it the two sources are systematically apart.
+pub const CROSSCHECK_MEDIAN_BAND_REFRESHES: f64 = 1.0;
+/// The largest share of compared markers that may lie outside the per-marker
+/// band before the run disagrees.
+pub const CROSSCHECK_MAX_OUTSIDE_SHARE: f64 = 0.05;
+
+/// Compare two sources' first appearances (plan D2: two independent sources
+/// for one timestamp; a capture defect must be visible). The two are never
+/// averaged, and a disagreement makes the run's latencies
+/// unknown(capture_disagreement).
+///
+/// Each marker both saw cleanly gives a gap, primary minus secondary. The
+/// secondary's time is only an upper bound where it coalesced frames at that
+/// marker, so such a marker is not compared when the bound is the later time.
+///
+/// What the gaps are held to — the RULE, not any one marker:
+/// - the two timestamps stamp different stages: WGC's `SystemRelativeTime` is
+///   the compositor's render of the capture frame, DDA's `LastPresentTime` the
+///   desktop presentation, so WGC may be up to `expected_offset_ms` later by
+///   design (`selftest::WGC_RENDER_OFFSET_MS`). The declared band is
+///   `[0, expected_offset_ms]` (or `[expected_offset_ms, 0]` for a negative one);
+/// - each source sees a marker first in ITS next frame, so a single gap also
+///   carries up to one frame interval of sampling phase. On a GPU-less hosted
+///   VM the compositor presents every other refresh (CI run 38362046020: WGC
+///   frame spacing median 31.25 ms = 2 x 15.625 ms), so single gaps of one to
+///   two refresh intervals are a property of the machine, not a defect;
+/// - SYSTEMATIC disagreement (a time-base, unit or attribution bug): the median
+///   gap lies more than one refresh interval outside the declared band;
+/// - a source MISSING FRAMES (or a marker decoded from the wrong frame): more
+///   than 5% of compared markers lie more than two refresh intervals outside
+///   the declared band.
+///
+/// Until CI run 38362046020 the rule was "any one marker more than one refresh
+/// interval apart voids the run"; there 22-104 of 206-698 markers per watch
+/// (11-15%) were more than one refresh interval apart — 359 of those 361 with
+/// WGC later, and none of the 359 with a WGC frame between the two times — while
+/// the median gap was 6.5-8.9 ms and 0.4-1.3% lay outside the per-marker
+/// band.
+///
+/// `expected_offset_ms` is the primary's declared stage offset minus the
+/// secondary's.
 pub fn crosscheck(
     markers_primary: &[(Marker, FirstSeen)],
     secondary_seen: impl Fn(Marker) -> Option<FirstSeen>,
     secondary_markers: &[(Marker, FirstSeen)],
     primary_seen: impl Fn(Marker) -> Option<FirstSeen>,
     refresh_ns: u64,
+    expected_offset_ms: f64,
     secondary_configured: bool,
 ) -> (CrosscheckSummary, Vec<CrosscheckRecord>) {
     let mut s = CrosscheckSummary {
         verdict: "not_performed",
+        expected_offset_ms,
         ..Default::default()
     };
     let mut records = Vec::new();
@@ -149,6 +192,18 @@ pub fn crosscheck(
         return (s, records);
     }
     let refresh_ms = refresh_ns as f64 / 1e6;
+    let (lo, hi) = (expected_offset_ms.min(0.0), expected_offset_ms.max(0.0));
+    let marker_band = (
+        lo - CROSSCHECK_MARKER_BAND_REFRESHES * refresh_ms,
+        hi + CROSSCHECK_MARKER_BAND_REFRESHES * refresh_ms,
+    );
+    let median_band = (
+        lo - CROSSCHECK_MEDIAN_BAND_REFRESHES * refresh_ms,
+        hi + CROSSCHECK_MEDIAN_BAND_REFRESHES * refresh_ms,
+    );
+    s.marker_band_ms = Some(marker_band);
+    s.median_band_ms = Some(median_band);
+    let mut gaps: Vec<f64> = Vec::new();
     for &(m, p) in markers_primary {
         if m.kind == MarkerKind::Calibration {
             continue;
@@ -162,13 +217,15 @@ pub fn crosscheck(
             continue;
         }
         s.compared += 1;
+        // Records keep the secondary-minus-primary sign they always had.
         let delta = (q.t_ns as i128 - p.t_ns as i128) as f64 / 1e6;
+        let gap = -delta;
+        gaps.push(gap);
         s.max_abs_delta_ms = Some(
             s.max_abs_delta_ms
                 .map_or(delta.abs(), |m| m.max(delta.abs())),
         );
-        let agree = delta.abs() <= refresh_ms;
-        if agree {
+        if (marker_band.0..=marker_band.1).contains(&gap) {
             s.agreed += 1;
         } else {
             s.disagreed += 1;
@@ -188,20 +245,41 @@ pub fn crosscheck(
         .iter()
         .filter(|(m, _)| m.kind != MarkerKind::Calibration && primary_seen(*m).is_none())
         .count() as u64;
-    s.verdict = if s.disagreed > 0 {
+    if gaps.is_empty() {
+        s.detail = "the secondary source saw none of the primary's markers cleanly".into();
+        return (s, records);
+    }
+    gaps.sort_by(f64::total_cmp);
+    let median = gaps[crate::stats::nearest_rank(50, gaps.len()) - 1];
+    let outside_share = s.disagreed as f64 / s.compared as f64;
+    s.median_gap_ms = Some(median);
+    s.outside_share = Some(outside_share);
+    let systematic = !(median_band.0..=median_band.1).contains(&median);
+    let missed = outside_share > CROSSCHECK_MAX_OUTSIDE_SHARE;
+    s.verdict = if systematic || missed {
         "disagree"
-    } else if s.compared == 0 {
-        "not_performed"
     } else {
         "agree"
     };
-    s.detail = match s.verdict {
-        "disagree" => format!(
-            "{} of {} markers seen by both sources first appeared more than one refresh interval ({refresh_ms:.2} ms) apart",
-            s.disagreed, s.compared
-        ),
-        "not_performed" => "the secondary source saw none of the primary's markers cleanly".into(),
-        _ => format!("{} markers agreed within one refresh interval ({refresh_ms:.2} ms)", s.agreed),
+    let pct = 100.0 * outside_share;
+    let max_pct = 100.0 * CROSSCHECK_MAX_OUTSIDE_SHARE;
+    let median_text = format!(
+        "the median primary-minus-secondary gap over {} markers is {median:.2} ms (band [{:.2}, {:.2}] ms: the declared {expected_offset_ms:.1} ms stage offset +/- one refresh interval, {refresh_ms:.2} ms)",
+        s.compared, median_band.0, median_band.1
+    );
+    let tail_text = format!(
+        "{} of {} markers ({pct:.1}%) lie outside [{:.2}, {:.2}] ms (+/- two refresh intervals; at most {max_pct:.0}% may)",
+        s.disagreed, s.compared, marker_band.0, marker_band.1
+    );
+    s.detail = match (systematic, missed) {
+        (true, true) => format!("systematic offset and missed frames: {median_text}; {tail_text}"),
+        (true, false) => {
+            format!("systematic offset between the sources: {median_text}; {tail_text}")
+        }
+        (false, true) => {
+            format!("a source missed frames or misattributed markers: {tail_text}; {median_text}")
+        }
+        (false, false) => format!("agreed: {median_text}; {tail_text}"),
     };
     (s, records)
 }
@@ -283,14 +361,45 @@ mod tests {
         assert_eq!(t.lost, 1);
     }
 
+    const R64: u64 = 15_625_000;
+
+    /// Run `crosscheck` over output markers 0..n with the primary at
+    /// `100 * seq` ms and the secondary at `primary - gap(seq)` ms.
+    fn run_gaps(
+        n: u32,
+        offset_ms: f64,
+        gap: impl Fn(u32) -> i64,
+    ) -> (CrosscheckSummary, Vec<CrosscheckRecord>) {
+        let m = |seq| Marker::new(MarkerKind::Output, 1, seq);
+        let primary: Vec<(Marker, FirstSeen)> = (0..n)
+            .map(|i| (m(i), fs(1000 + 100 * u64::from(i))))
+            .collect();
+        let sec: HashMap<Marker, FirstSeen> = (0..n)
+            .map(|i| {
+                let t = (1000 + 100 * i64::from(i) - gap(i)) as u64;
+                (m(i), fs(t))
+            })
+            .collect();
+        let sec_list: Vec<(Marker, FirstSeen)> = sec.iter().map(|(k, v)| (*k, *v)).collect();
+        let primary_map: HashMap<Marker, FirstSeen> = primary.iter().copied().collect();
+        crosscheck(
+            &primary,
+            |k| sec.get(&k).copied(),
+            &sec_list,
+            |k| primary_map.get(&k).copied(),
+            R64,
+            offset_ms,
+            true,
+        )
+    }
+
     #[test]
-    fn crosscheck_agrees_within_one_refresh_and_never_averages() {
-        let refresh = 16_666_667;
+    fn crosscheck_never_averages_and_skips_a_coalesced_upper_bound() {
         let m = |seq| Marker::new(MarkerKind::Output, 1, seq);
         let primary = vec![(m(1), fs(100)), (m(2), fs(200)), (m(3), fs(300))];
         let mut sec = HashMap::new();
-        sec.insert(m(1), fs(110)); // agree (10 ms)
-        sec.insert(m(2), fs(240)); // disagree (40 ms)
+        sec.insert(m(1), fs(95)); // gap +5 ms: inside
+        sec.insert(m(2), fs(240)); // gap -40 ms: outside +/- two intervals
         sec.insert(
             m(3),
             FirstSeen {
@@ -306,22 +415,79 @@ mod tests {
             |k| sec.get(&k).copied(),
             &sec_list,
             |k| primary_map.get(&k).copied(),
-            refresh,
+            R64,
+            10.0,
             true,
         );
         assert_eq!(
             (s.compared, s.agreed, s.disagreed, s.secondary_coalesced),
             (2, 1, 1, 1)
         );
+        // Half the compared markers outside the band is far over 5%.
         assert_eq!(s.verdict, "disagree");
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].t_primary_ns, Ns(200 * MS));
         assert_eq!(recs[0].t_secondary_ns, Ns(240 * MS));
     }
 
+    /// CI run 38362046020's shape (windows-latest, 64 Hz, WARP): WGC later than
+    /// DDA by 0-31 ms, median ~8 ms, ~12% of markers more than one refresh
+    /// interval apart, ~1% more than two. The old any-marker rule voided this;
+    /// the statistic rule measures it.
+    #[test]
+    fn a_hosted_vm_spread_of_one_to_two_intervals_agrees() {
+        let (s, recs) = run_gaps(400, 10.0, |i| match i % 100 {
+            0 => 45,                        // 1%: beyond two intervals of the band
+            1..=12 => 16 + (i % 15) as i64, // 12%: one to two intervals
+            _ => (i % 12) as i64,           // the bulk: 0-11 ms
+        });
+        assert_eq!(s.verdict, "agree", "{}", s.detail);
+        assert_eq!(s.disagreed, 4);
+        assert_eq!(recs.len(), 4, "each marker outside the band is recorded");
+        assert!(s.median_gap_ms.is_some_and(|m| m < 15.0));
+    }
+
+    /// A time-base, unit or attribution bug moves every marker: the median
+    /// leaves its band even though no single marker leaves the wide one.
+    #[test]
+    fn a_systematic_offset_disagrees() {
+        // The secondary 20 ms LATER than the primary on every marker (gap -20):
+        // inside the per-marker band [-31.25, 41.25], outside the median band
+        // [-15.625, 25.625].
+        let (s, _) = run_gaps(200, 10.0, |_| -20);
+        assert_eq!(s.verdict, "disagree", "{}", s.detail);
+        assert_eq!(s.disagreed, 0);
+        assert!(s.detail.starts_with("systematic offset"), "{}", s.detail);
+        // ...and the primary 30 ms later than the declared offset allows.
+        let (s, _) = run_gaps(200, 10.0, |_| 30);
+        assert_eq!(s.verdict, "disagree", "{}", s.detail);
+        // With no declared offset the same 20 ms is systematic too.
+        let (s, _) = run_gaps(200, 0.0, |_| 20);
+        assert_eq!(s.verdict, "disagree", "{}", s.detail);
+    }
+
+    /// A source that misses frames sees some markers whole frames late: past
+    /// 5% of markers outside the band, the run disagrees even with a sound
+    /// median.
+    #[test]
+    fn a_source_missing_frames_disagrees() {
+        // Every tenth marker 50 ms late in the primary (10%).
+        let (s, _) = run_gaps(300, 10.0, |i| if i % 10 == 0 { 55 } else { 5 });
+        assert_eq!(s.verdict, "disagree", "{}", s.detail);
+        assert!(s.median_gap_ms.is_some_and(|m| (m - 5.0).abs() < 1e-9));
+        assert!(
+            s.detail.starts_with("a source missed frames"),
+            "{}",
+            s.detail
+        );
+        // At 5% exactly it still agrees; the bound is "more than".
+        let (s, _) = run_gaps(300, 10.0, |i| if i % 20 == 0 { 55 } else { 5 });
+        assert_eq!(s.verdict, "agree", "{}", s.detail);
+    }
+
     #[test]
     fn crosscheck_without_a_secondary_is_not_performed() {
-        let (s, _) = crosscheck(&[], |_| None, &[], |_| None, 16 * MS, false);
+        let (s, _) = crosscheck(&[], |_| None, &[], |_| None, 16 * MS, 0.0, false);
         assert_eq!(s.verdict, "not_performed");
     }
 
@@ -329,7 +495,8 @@ mod tests {
     fn a_marker_only_the_secondary_saw_is_primary_unseen() {
         let m = Marker::new(MarkerKind::Output, 2, 5);
         let sec = vec![(m, fs(50))];
-        let (s, _) = crosscheck(&[], |_| None, &sec, |_| None, 16 * MS, true);
+        let (s, _) = crosscheck(&[], |_| None, &sec, |_| None, 16 * MS, 0.0, true);
         assert_eq!(s.primary_unseen, 1);
+        assert_eq!(s.verdict, "not_performed");
     }
 }

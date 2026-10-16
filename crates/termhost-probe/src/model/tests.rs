@@ -522,8 +522,8 @@ fn late_real_input_amends_the_interval_and_the_hang_it_let_count() {
     assert_eq!(s.hang_episodes_excluded, 1);
 }
 
-#[test]
-fn a_capture_disagreement_makes_latency_unknown() {
+/// A WGC + DDA run whose DDA time for marker `seq` is `ms(seq)` after WGC's.
+fn crosschecked_run(dda_after_wgc_ms: impl Fn(u32) -> u64) -> (Vec<Record>, WatchSummary) {
     let mut c = cfg();
     c.secondary = Some(SourceId::Dda);
     let mut m = Model::new(c, 0);
@@ -536,21 +536,50 @@ fn a_capture_disagreement_makes_latency_unknown() {
             t + 10,
             vec![obs(MarkerKind::Output, 0, seq)],
         ));
-        // DDA agrees except for one marker it reports 60 ms later.
-        let late = if seq == 77 { 60 } else { 5 };
         m.on_frame(frame(
             SourceId::Dda,
             u64::from(seq),
-            t + 10 + late,
+            t + 10 + dda_after_wgc_ms(seq),
             vec![obs(MarkerKind::Output, 0, seq)],
         ));
     }
-    let (recs, s) = m.finish(15_100 * MS);
-    assert_eq!(s.crosscheck.verdict, "disagree");
-    assert_eq!(s.crosscheck.disagreed, 1);
+    m.finish(15_100 * MS)
+}
+
+#[test]
+fn a_capture_disagreement_makes_latency_unknown() {
+    // DDA 30 ms after WGC on every marker: a systematic offset (the median gap
+    // -30 ms lies outside [-1 refresh, declared WGC offset + 1 refresh]).
+    let (_, s) = crosschecked_run(|_| 30);
+    assert_eq!(s.crosscheck.verdict, "disagree", "{}", s.crosscheck.detail);
     assert_eq!(s.output_latency_ms.state, KpiState::Unknown);
     assert_eq!(s.output_latency_ms.reason, Some("capture_disagreement"));
-    assert!(recs.iter().any(|r| matches!(r, Record::Crosscheck(_))));
+    // A source that misses frames: every fifth marker 60 ms apart (20%).
+    let (recs2, s2) = crosschecked_run(|seq| if seq % 5 == 0 { 60 } else { 5 });
+    assert_eq!(
+        s2.crosscheck.verdict, "disagree",
+        "{}",
+        s2.crosscheck.detail
+    );
+    assert_eq!(s2.crosscheck.disagreed, 30);
+    assert_eq!(s2.output_latency_ms.reason, Some("capture_disagreement"));
+    assert!(recs2.iter().any(|r| matches!(r, Record::Crosscheck(_))));
+}
+
+#[test]
+fn one_disagreeing_marker_is_recorded_but_does_not_void_latency() {
+    // DDA agrees except for one marker it reports 60 ms later (CI run
+    // 38362046020: one marker no longer voids the run; the rule is a statistic).
+    let (recs, s) = crosschecked_run(|seq| if seq == 77 { 60 } else { 5 });
+    assert_eq!(s.crosscheck.verdict, "agree", "{}", s.crosscheck.detail);
+    assert_eq!(s.crosscheck.disagreed, 1);
+    assert_eq!(s.output_latency_ms.state, KpiState::Measured);
+    assert_eq!(
+        recs.iter()
+            .filter(|r| matches!(r, Record::Crosscheck(_)))
+            .count(),
+        1
+    );
 }
 
 fn agreeing_run(c: ModelConfig) -> WatchSummary {
