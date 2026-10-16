@@ -163,6 +163,11 @@ fn an_echo_no_frame_could_see_is_unobservable_not_lost() {
     let c = find(&o, "input_round_trip");
     assert_eq!(c.passed, Some(true), "{}", report(&o));
     assert!(c.detail.contains("4/5 echo markers seen, 1 unobservable"), "{}", c.detail);
+    // The fault swallows that one paint only: every other gate still passes.
+    for name in KEY_CHECKS {
+        assert_eq!(find(&o, name).passed, Some(true), "{name}:\n{}", report(&o));
+    }
+    assert_eq!(o.exit_code, 0, "{}\n{}", o.summary, report(&o));
 }
 
 #[test]
