@@ -62,6 +62,10 @@ const RESOLVE_ONLY: &str = "SUBJECT_ISOLATION_RESOLVE_ONLY";
 /// The subject's port: anything but the primary's.
 const SUBJECT_PORT: &str = "9881";
 const PLANTED_FILE: &str = "planted-by-a-missed-call-site.txt";
+/// Bounds on the children: a hung driver fails the test instead of hanging
+/// `cargo test` (the drive itself takes well under a second).
+const DRIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The child: one runner, driven through the real writers. Ignored, so a plain
 /// `cargo test` never runs it on its own; [`run_driver`] runs it with
@@ -287,24 +291,25 @@ fn drive_every_store(mode: &str) -> Vec<PathBuf> {
 /// Returns nothing to the report — it asserts in place.
 fn children_see_the_root(root: &Path) -> Vec<PathBuf> {
     let keys = ["QONTINUI_HOME", "QONTINUI_SESSION_NAMES_DIR"];
-    let output = if cfg!(windows) {
+    let child = if cfg!(windows) {
         // console-ok: a test-only child, never in a release build
-        Command::new("cmd")
-            .args([
-                "/C",
-                "echo %QONTINUI_HOME%& echo %QONTINUI_SESSION_NAMES_DIR%",
-            ])
-            .output()
+        let mut c = Command::new("cmd");
+        c.args([
+            "/C",
+            "echo %QONTINUI_HOME%& echo %QONTINUI_SESSION_NAMES_DIR%",
+        ]);
+        c
     } else {
         // console-ok: a test-only child, never in a release build
-        Command::new("sh")
-            .args([
-                "-c",
-                "printf '%s\\n%s\\n' \"$QONTINUI_HOME\" \"$QONTINUI_SESSION_NAMES_DIR\"",
-            ])
-            .output()
-    }
-    .expect("spawn a child of the subject");
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            "printf '%s\\n%s\\n' \"$QONTINUI_HOME\" \"$QONTINUI_SESSION_NAMES_DIR\"",
+        ]);
+        c
+    };
+    let output = qontinui_runner_lib::process_helpers::output_with_timeout(child, CHILD_TIMEOUT)
+        .expect("run a child of the subject");
     let text = String::from_utf8_lossy(&output.stdout);
     let seen: Vec<&str> = text.lines().map(str::trim).collect();
     assert_eq!(seen.len(), keys.len(), "the child printed {text:?}");
@@ -350,7 +355,8 @@ fn run_driver(fixture: &Path, mode: &str, extra: &[(&str, &str)]) -> Vec<PathBuf
     for (key, value) in extra {
         cmd.env(key, value);
     }
-    let out = cmd.output().expect("spawn the driver");
+    let out = qontinui_runner_lib::process_helpers::output_with_timeout(cmd, DRIVER_TIMEOUT)
+        .expect("run the driver");
     assert!(
         out.status.success(),
         "the {mode} driver failed ({}):\n--- stdout\n{}\n--- stderr\n{}",
