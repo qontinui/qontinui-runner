@@ -190,8 +190,8 @@ export function renderReport(input) {
     lines.push(
       `### Headline: N = ${HEADLINE.n} (median over runs, run spread in brackets)`,
       "",
-      `| setup | build | arm | runs | profile (calibrated) | pty_host_impl | ${cols.join(" | ")} | labels |`,
-      `|---|---|---|---|---|---|${cols.map(() => "---").join("|")}|---|`,
+      `| setup | build | arm | runs | profile (calibrated) | pty_host_impl | cross-check | ${cols.join(" | ")} | labels |`,
+      `|---|---|---|---|---|---|---|${cols.map(() => "---").join("|")}|---|`,
     );
     const groups = new Map();
     for (const r of atHeadlineN) {
@@ -203,11 +203,14 @@ export function renderReport(input) {
       const r0 = g[0];
       const cal = [...new Set(g.map((r) => `${r.scenario.profile} (${r.scenario.profile_calibrated})`))].join(", ");
       const pty = [...new Set(g.map((r) => absentText(r.setup.pty_host_impl)))].join(", ");
+      // The capture cross-check profile each row was judged under (D2): beside the
+      // reading, so a software-compositor row is never read as a strict one.
+      const cc = [...new Set(g.map((r) => r.scenario.crosscheck_profile))].join(", ");
       // Labels such as dom_renderer_fallback say a row describes a configuration
       // no operator runs (D6): it stays in the table, named, and out of any verdict.
       const labels = [...new Set(g.flatMap((r) => r.labels ?? []))].sort().join(", ") || "-";
       lines.push(
-        `| ${r0.setup.id}${r0.setup.variant !== "default" ? `/${r0.setup.variant}` : ""} | ${buildText(r0.setup)} | ${r0.scenario.arm} | ${g.length} | ${cal} | ${pty} | ${cols.map((id) => spreadCell(g, id)).join(" | ")} | ${labels} |`,
+        `| ${r0.setup.id}${r0.setup.variant !== "default" ? `/${r0.setup.variant}` : ""} | ${buildText(r0.setup)} | ${r0.scenario.arm} | ${g.length} | ${cal} | ${pty} | ${cc} | ${cols.map((id) => spreadCell(g, id)).join(" | ")} | ${labels} |`,
       );
     }
     lines.push("");

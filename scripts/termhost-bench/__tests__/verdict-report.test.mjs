@@ -585,6 +585,24 @@ test("the N = 15 headline table names each group's labels, e.g. VS Code's dom_re
   assert.ok(table.some((l) => /^\| vscode \| .+ \| dom_renderer_fallback, software_rendered \|$/.test(l)), table.join("\n"));
 });
 
+test("both report tables name the cross-check profile beside every row, as the row records it (D2)", () => {
+  const doc = headlineDoc();
+  doc.rows.find((r) => r.setup.id === "tmux-wsl" && r.scenario.arm === "tiled").scenario.crosscheck_profile = "software-compositor";
+  const md = renderReport(doc);
+  const every = md.split("### Every row (windows-desktop)")[1].split("\n\n")[1].split("\n");
+  assert.match(every[0], /\| pty_host_impl \| cross-check \|/);
+  const everyBody = every.slice(2);
+  assert.equal(everyBody.length, 8);
+  for (const l of everyBody) assert.match(l, /\| (system_conhost|bundled_openconsole|unix_pty) \| (strict|software-compositor) \|/, l);
+  assert.equal(everyBody.filter((l) => /\| software-compositor \|/.test(l)).length, 1, "the one relaxed row says so");
+  const head = md.split("### Headline: N = 15")[1].split("\n\n")[1].split("\n");
+  assert.match(head[0], /\| pty_host_impl \| cross-check \|/);
+  const headBody = head.slice(2);
+  assert.equal(headBody.length, 8);
+  for (const l of headBody) assert.match(l, /\| (system_conhost|bundled_openconsole|unix_pty) \| (strict|software-compositor) \|/, l);
+  assert.ok(headBody.some((l) => /^\| tmux-wsl \| [^|]+ \| tiled \| .*\| software-compositor \|/.test(l)), head.join("\n"));
+});
+
 test("the headline fixture is a valid results file (the line is never drawn from an invalid shape)", () => {
   const res = validateResults(headlineDoc());
   assert.equal(res.valid, true, JSON.stringify(res.errors.slice(0, 5)));
