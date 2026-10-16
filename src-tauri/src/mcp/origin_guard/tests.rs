@@ -1513,6 +1513,12 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/state-machine/permitted-triggers"),
     ("POST", "/stop-execution"),
     ("GET", "/terminal-pages"),
+    // Session Manager organization (groups, pins, tags, saved views): no
+    // secret, no caller-named path, no outbound request, no process — the
+    // store only rewrites its own JSON file (plan
+    // 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, Phase 2).
+    ("GET", "/terminal/session-org"),
+    ("POST", "/terminal/session-org"),
     ("POST", "/tests/execute-suite"),
     ("GET", "/ui-bridge/control/design/evaluate/contexts"),
     ("GET", "/ui-bridge/control/transition/{id}/can-execute"),

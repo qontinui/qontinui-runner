@@ -27,7 +27,8 @@
 //! ([`project_session_info`], [`project_prs`], [`prs_unavailable`]), so the
 //! projection unit-tests without a Tauri handle, a live disk or PG — the idiom
 //! [`crate::install_effects_producer::project_restore_health`] established. The
-//! Tauri command and the HTTP twin (`GET /control/sessions/info`) are both thin
+//! Tauri commands and the HTTP twin (`GET /control/sessions/info`, via
+//! `super::session_info_list`) are all thin
 //! shells over the same functions, so the rendered and raw read paths cannot
 //! drift (D5).
 
@@ -272,6 +273,16 @@ pub struct SessionLifecycleInfo {
     pub restore_status: String,
     /// `None` ⇒ never reported (unknown), not `false`.
     pub bypass_permissions: Option<bool>,
+    /// The WORK-axis finished marker (`/finish-session`), Unix millis; `None`
+    /// = not marked finished. Orthogonal to `state`: an `open` session can be
+    /// finished and a `closed` one usually is not. The Session Manager's
+    /// `Finished` activity and `is:finished` / `is:closable` read it from here
+    /// (plan
+    /// `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+    /// Phases 1 and 4).
+    pub finished_at: Option<i64>,
+    /// Free text recorded with [`Self::finished_at`].
+    pub finish_reason: Option<String>,
 }
 
 /// One PR this session authored (attributed by the `Session-Id:` git trailer).
@@ -974,6 +985,13 @@ pub struct SessionInfoEnvelope {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Wire `claudeSessionId`: set ONLY on a degraded row of a LISTING
+    /// ([`Self::unavailable_for`]), which has no `body` and so no
+    /// `identity.claudeSessionId` — without it the client cannot attach the
+    /// row's real `reason` to the session it belongs to. Absent everywhere
+    /// else (an available envelope carries the id in `identity`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
     #[serde(flatten)]
     pub body: Option<SessionInfoBody>,
 }
@@ -984,38 +1002,23 @@ impl SessionInfoEnvelope {
         Self {
             available: false,
             reason: Some(reason.to_string()),
+            claude_session_id: None,
             body: None,
         }
     }
-}
 
-/// Response body of `GET /control/sessions/info` — every OPEN session's
-/// projection.
-///
-/// Carries its own `status`/`reason` so a runner that cannot reach its
-/// lifecycle store says so, instead of returning `sessions: []` (which reads
-/// identically to "this runner has zero sessions" — the silent empty this whole
-/// plan exists to remove).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionsInfoResponse {
-    /// [`STATUS_OK`] | [`STATUS_UNAVAILABLE`].
-    pub status: String,
-    /// REQUIRED whenever `status != "ok"`.
-    pub reason: Option<String>,
-    pub sessions: Vec<SessionInfoEnvelope>,
-}
-
-impl SessionsInfoResponse {
-    /// Degraded listing — empty WITH a reason, never a bare empty.
-    pub fn unavailable(reason: &str) -> Self {
+    /// The degraded envelope for ONE row of a listing: the reason AND the
+    /// session it is about, so the client indexes it to its row.
+    pub fn unavailable_for(reason: &str, claude_session_id: &str) -> Self {
         Self {
-            status: STATUS_UNAVAILABLE.to_string(),
-            reason: Some(reason.to_string()),
-            sessions: Vec::new(),
+            claude_session_id: Some(claude_session_id.to_string()),
+            ..Self::unavailable(reason)
         }
     }
 }
+
+// The batched listing (`GET /control/sessions/info` and the `session_info_list`
+// Tauri twin) lives in `super::session_info_list`, over [`build_session_info`].
 
 /// Normalize a stored/live `name_source` into the wire vocabulary.
 ///
@@ -1172,6 +1175,7 @@ pub fn project_session_info(
     SessionInfoEnvelope {
         available: true,
         reason: None,
+        claude_session_id: None,
         body: Some(SessionInfoBody {
             identity: SessionIdentity {
                 claude_session_id: rec.claude_session_id.clone(),
@@ -1222,6 +1226,8 @@ pub fn project_session_info(
                 restore_tier: rec.restore_tier.clone(),
                 restore_pending_at: rec.restore_pending_at,
                 bypass_permissions: rec.bypass_permissions,
+                finished_at: rec.finished_at,
+                finish_reason: non_empty(rec.finish_reason.as_ref()),
             },
             prs,
             tenancy,
@@ -1284,6 +1290,45 @@ pub async fn build_session_info(
     project_session_info(rec, live.as_ref(), transcript_exists, prs, tenancy)
 }
 
+/// [`build_session_info`] for the batched listing: the live-registry row is
+/// already resolved by the caller (ONE registry walk for the whole listing),
+/// and the remaining blocking reads — the transcript probe and the tenancy
+/// read (`.mcp.json`) — run on the blocking pool via
+/// [`spawn_blocking_tracked`](qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked)
+/// instead of an async worker. A blocking task that panicked degrades THIS
+/// row to `session_read_failed`, never the listing.
+pub async fn build_session_info_owned(
+    rec: TerminalSessionRecord,
+    live: Option<LiveClaudeSession>,
+    probe: Arc<dyn crate::session::snapshot_history::TranscriptProbe>,
+) -> SessionInfoEnvelope {
+    let rec = Arc::new(rec);
+    let blocking_rec = Arc::clone(&rec);
+    let reads = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        let exists = probe.transcript_exists(
+            &blocking_rec.claude_session_id,
+            blocking_rec.working_dir.as_deref(),
+        );
+        (exists, read_session_tenancy(&blocking_rec))
+    })
+    .await;
+    let (transcript_exists, tenancy) = match reads {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "session_info: blocking reads for {} failed: {e}",
+                rec.claude_session_id
+            );
+            return SessionInfoEnvelope::unavailable_for(
+                "session_read_failed",
+                &rec.claude_session_id,
+            );
+        }
+    };
+    let prs = load_prs(&rec.claude_session_id).await;
+    project_session_info(&rec, live.as_ref(), transcript_exists, prs, tenancy)
+}
+
 /// `session_info_get` — the ONE read the session-info dropdown makes.
 ///
 /// Returns the whole D1 projection for `claude_session_id`: durable record ⨝
@@ -1326,6 +1371,22 @@ pub async fn session_info_get(
 
 #[cfg(test)]
 mod tests {
+    /// A degraded LISTING row names its session on the wire
+    /// (`claudeSessionId`) beside its reason, so the client can attach the
+    /// real reason to the row; the single-session degraded envelope does not.
+    #[test]
+    fn a_degraded_listing_row_carries_its_session_id_on_the_wire() {
+        let row = super::SessionInfoEnvelope::unavailable_for("session_read_failed", "abc-123");
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["available"], false);
+        assert_eq!(json["reason"], "session_read_failed");
+        assert_eq!(json["claudeSessionId"], "abc-123");
+        assert!(json.get("identity").is_none());
+
+        let bare = serde_json::to_value(super::SessionInfoEnvelope::unavailable("x")).unwrap();
+        assert!(bare.get("claudeSessionId").is_none());
+    }
+
     /// The defect this classification exists for: a bare shell must NOT be
     /// presented as a real session. Measured live 2026-08-18 — `POST /terminals`
     /// alone produced `confirmed:false, transcriptExists:false` with a
@@ -2200,13 +2261,6 @@ mod tests {
         assert!(!env.available);
         assert_eq!(env.reason.as_deref(), Some("session_not_found"));
         assert!(env.body.is_none());
-        let listing = SessionsInfoResponse::unavailable("lifecycle_store_unavailable");
-        assert_eq!(listing.status, STATUS_UNAVAILABLE);
-        assert_eq!(
-            listing.reason.as_deref(),
-            Some("lifecycle_store_unavailable")
-        );
-        assert!(listing.sessions.is_empty());
     }
 
     #[test]

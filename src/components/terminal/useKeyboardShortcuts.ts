@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout";
 import { stepShownTab, type LayoutRequestSource, type TerminalWorkMode } from "./terminalWorkMode";
 import type { UIAction } from "./useUIState";
@@ -14,6 +14,9 @@ import {
   matchesDigitChord,
 } from "@/lib/globalChords";
 import { isSurfaceVisible } from "@/lib/surfaceVisible";
+import { nextWithActivity } from "./sessionStatusModel";
+import { nextInGroup, nextNeedsYouJump, type GroupPlace } from "./sessionTriageChords";
+import type { UnifiedSession } from "./useSessionManager";
 
 /**
  * `Ctrl+Shift+L`'s target: the preset after `gridLayoutId`, wrapping. `null`
@@ -51,7 +54,8 @@ interface UseKeyboardShortcutsParams {
     setFocusedZone: (idx: number) => void;
     focusPrevZone: () => void;
     focusNextZone: () => void;
-    focusNextNeedsInput: (states: Record<string, SessionState>) => void;
+    /** Focus the next needs-input (else errored) zone; false = none to focus. */
+    focusNextNeedsInput: (states: Record<string, SessionState>) => boolean;
     toggleMaximize: (idx: number) => void;
     setMaximizedZone: (idx: number | null) => void;
     setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
@@ -102,12 +106,17 @@ interface UseKeyboardShortcutsParams {
     setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
   };
   sessionManager?: {
-    frozenCount: number;
+    noOutputCount: number;
     needsInputCount: number;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    sessions: Array<any>;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    resumeSession: (session: any) => void;
+    sessions: readonly UnifiedSession[];
+    /** The card-body click: focus the session's tab, else its transcript. */
+    openSession: (session: UnifiedSession) => void;
+    /** Every Live row, unfiltered — next-in-group walks the whole group. */
+    allSessions: readonly UnifiedSession[];
+    /** A row's group and its place in it; `null` = no group (or org unknown). */
+    groupPlaceOf: (session: UnifiedSession) => GroupPlace | null;
+    /** Reopen the newest recently-closed session that can be (Ctrl+Shift+Backspace). */
+    reopenLastClosed: () => Promise<{ state: string; detail: string } | null>;
   };
   /**
    * The terminal page's root element. Every chord below is inert while
@@ -152,6 +161,10 @@ export function useKeyboardShortcuts({
   sessionManager,
   surfaceRef,
 }: UseKeyboardShortcutsParams) {
+  // Ctrl+Shift+J's cycle position: the last session it opened.
+  const lastNoOutputJumpRef = useRef<string | null>(null);
+  // Ctrl+Shift+N's position in the Session Manager's `Needs you` rows.
+  const lastNeedsYouJumpRef = useRef<string | null>(null);
   useEffect(() => {
     // tmux mode's swap: the same assignment a session-manager click makes
     // (`planTabReveal` → zone 0 under the pinned `single` layout), so the
@@ -210,22 +223,80 @@ export function useKeyboardShortcuts({
       }
       if (isCtrlShiftChord(e, "n")) {
         e.preventDefault();
+        // No tab here needs input → the next Session Manager row reading
+        // `Needs you` (see `nextNeedsYouJump`); the tab walks below also fall
+        // through to it when they find nothing to focus.
+        const openNextNeedsYouRow = (): boolean => {
+          if (!sessionManager) return false;
+          const row = nextWithActivity(
+            sessionManager.sessions,
+            "needs-you",
+            lastNeedsYouJumpRef.current,
+          );
+          if (!row) return false;
+          lastNeedsYouJumpRef.current = row.sessionId;
+          sessionManager.openSession(row);
+          return true;
+        };
+        const jump = sessionManager
+          ? nextNeedsYouJump(
+              tabs.filter((t) => t.isAlive !== false).map((t) => sessionStates[t.id]),
+              sessionManager.sessions,
+              lastNeedsYouJumpRef.current,
+            )
+          : ({ kind: "tabs" } as const);
+        if (jump.kind === "row") {
+          openNextNeedsYouRow();
+          return;
+        }
         if (zoneLayout.workMode === "tmux") {
           // The off-screen tabs are in no zone, so the zone walk cannot reach
           // them: walk the tab list instead, needs-input first, then error —
           // the same fallback `focusNextNeedsInput` applies in grid mode.
-          swapTo(
+          const target =
             stepShownTab(
               tabs,
               zoneLayout.shownTabId,
               1,
               (id) => sessionStates[id] === "needs-input",
             ) ??
-              stepShownTab(tabs, zoneLayout.shownTabId, 1, (id) => sessionStates[id] === "error"),
-          );
+            stepShownTab(tabs, zoneLayout.shownTabId, 1, (id) => sessionStates[id] === "error");
+          if (target) swapTo(target);
+          else openNextNeedsYouRow();
           return;
         }
-        zoneLayout.focusNextNeedsInput(sessionStates);
+        if (!zoneLayout.focusNextNeedsInput(sessionStates)) openNextNeedsYouRow();
+        return;
+      }
+      // Ctrl+Shift+↓: the next session in the on-screen session's group.
+      if (isCtrlShiftChord(e, "ArrowDown")) {
+        e.preventDefault();
+        if (!sessionManager) return;
+        const currentTab = zoneLayout.workMode === "tmux" ? zoneLayout.shownTabId : activeId;
+        const current =
+          sessionManager.allSessions.find((s) => s.zoneTabId !== null && s.zoneTabId === currentTab) ??
+          null;
+        const next = nextInGroup(
+          sessionManager.allSessions,
+          current?.sessionId ?? null,
+          sessionManager.groupPlaceOf,
+        );
+        if (next) sessionManager.openSession(next);
+        return;
+      }
+      // Ctrl+Shift+Backspace: reopen the last closed session (Chrome's
+      // Ctrl+Shift+T, which here opens a new terminal).
+      if (isCtrlShiftChord(e, "Backspace")) {
+        e.preventDefault();
+        if (!sessionManager) return;
+        void sessionManager.reopenLastClosed().then((result) =>
+          addHistoryEvent(
+            "Reopen closed session",
+            result ? result.detail : "nothing recently closed can be reopened",
+            undefined,
+            result?.state === "done" ? "#9ece6a" : "#e0af68",
+          ),
+        );
         return;
       }
       if (isCtrlShiftChord(e, "f")) {
@@ -446,22 +517,24 @@ export function useKeyboardShortcuts({
         workflowGen.setShowSidebar((v) => !v);
         return;
       }
-      // Ctrl+Shift+J: Jump to next frozen session (resume first frozen)
+      // Ctrl+Shift+J: open the next session reading "No output (mid-tool)" —
+      // alive, silent, its last transcript record a pending tool step. It
+      // OPENS the session (focuses its tab) rather than resuming it: such a
+      // session is still running, and a resume would fork it.
       if (isCtrlShiftChord(e, "j")) {
         e.preventDefault();
         if (sessionManager) {
-          // Transcript rows only: a tab-sourced row is a live tab with
-          // nothing to resume (`sessionManagerLiveRows.ts`).
-          const frozen = sessionManager.sessions.find(
-            (s: { liveStatus: string; source: string }) =>
-              s.source === "transcript" && s.liveStatus === "frozen",
+          const next = nextWithActivity(
+            sessionManager.sessions,
+            "no-output-mid-tool",
+            lastNoOutputJumpRef.current,
           );
-          if (frozen) {
-            // Pass the full session object (includes _transcript) to resumeSession
-            sessionManager.resumeSession(frozen);
+          if (next) {
+            lastNoOutputJumpRef.current = next.sessionId;
+            sessionManager.openSession(next);
             addHistoryEvent(
-              "Resume frozen",
-              `Session ${frozen.sessionId?.slice(0, 8) ?? ""}`,
+              "Open silent session",
+              `Session ${next.sessionId.slice(0, 8)}`,
               undefined,
               "#f7768e",
             );

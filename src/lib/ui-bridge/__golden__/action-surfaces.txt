@@ -4,10 +4,10 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 178
-#   guarded: 23
-#   literal: 55
-#   registry: 43
+# total: 208
+#   guarded: 46
+#   literal: 61
+#   registry: 44
 #   delegated: 9
 #   builtin: 15
 #   fixture: 33
@@ -57,6 +57,19 @@ src/components/settings/Settings.tsx:169	literal	component	reset	schema=no	arity
 src/components/settings/Settings.tsx:191	guarded	component	switch-tab	schema=yes	arity=-	effect=write
 src/components/settings/Settings.tsx:223	literal	component	list-tabs	schema=no	arity=0	effect=read
 src/components/terminal/CommandBar.selection.test.ts:39	fixture	free	-	schema=no	arity=0	effect=-
+src/components/terminal/SessionGroupSuggestionsDialog.tsx:111	literal	component	list-suggestions	schema=no	arity=0	effect=read
+src/components/terminal/SessionGroupSuggestionsDialog.tsx:126	guarded	component	accept-suggestion	schema=yes	arity=-	effect=write
+src/components/terminal/SessionGroupSuggestionsDialog.tsx:138	guarded	component	dismiss-suggestion	schema=yes	arity=-	effect=write
+src/components/terminal/SessionGroupSuggestionsDialog.tsx:150	literal	component	accept-all	schema=no	arity=0	effect=write
+src/components/terminal/SessionQueryBar.tsx:130	literal	component	get-query	schema=no	arity=0	effect=read
+src/components/terminal/SessionQueryBar.tsx:148	guarded	component	set-query	schema=yes	arity=-	effect=read
+src/components/terminal/SessionQueryBar.tsx:158	literal	component	clear-query	schema=no	arity=0	effect=read
+src/components/terminal/SessionQueryBar.tsx:165	guarded	component	toggle-chip	schema=yes	arity=-	effect=read
+src/components/terminal/SessionQueryBar.tsx:176	guarded	component	save-view	schema=yes	arity=-	effect=write
+src/components/terminal/SessionQueryBar.tsx:190	guarded	component	delete-view	schema=yes	arity=-	effect=write
+src/components/terminal/SessionSearchPalette.tsx:186	guarded	component	search	schema=yes	arity=-	effect=read
+src/components/terminal/SessionSearchPalette.tsx:205	guarded	component	activate	schema=yes	arity=-	effect=write
+src/components/terminal/SessionSearchPalette.tsx:220	literal	component	close	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:227	literal	element	focus	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:249	literal	element	blur	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:269	guarded	element	sendKeys	schema=no	arity=-	effect=destructive
@@ -71,22 +84,22 @@ src/components/terminal/TerminalInstance.tsx:1860	guarded	element	writeToTermina
 src/components/terminal/TerminalInstance.tsx:1905	literal	element	paste	schema=no	arity=0	effect=destructive
 src/components/terminal/TerminalInstance.tsx:1942	guarded	element	pasteText	schema=no	arity=-	effect=destructive
 src/components/terminal/TerminalInstance.tsx:1989	guarded	element	getScrollback	schema=no	arity=-	effect=read
-src/components/terminal/TerminalPage.tsx:289	literal	component	create-terminal	schema=no	arity=0	effect=write
-src/components/terminal/TerminalPage.tsx:318	delegated	component	buildCreatePlainTerminalAction	schema=no	arity=-	effect=-
-src/components/terminal/TerminalPage.tsx:321	literal	component	list-terminals	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:340	literal	component	open-terminal-window	schema=no	arity=0	effect=write
-src/components/terminal/TerminalPage.tsx:350	literal	component	pop-out-active-terminal	schema=no	arity=0	effect=write
-src/components/terminal/TerminalPage.tsx:370	guarded	component	pop-out-page	schema=yes	arity=-	effect=write
-src/components/terminal/TerminalPage.tsx:389	guarded	component	move-terminal-to-window	schema=yes	arity=-	effect=write
-src/components/terminal/TerminalPage.tsx:423	guarded	component	maximize-zone	schema=yes	arity=-	effect=read
-src/components/terminal/TerminalPage.tsx:448	literal	component	restore-zone	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:461	guarded	component	toggle-maximize-zone	schema=yes	arity=-	effect=read
-src/components/terminal/TerminalPage.tsx:482	literal	component	get-zone-view-state	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:500	guarded	component	set-terminal-work-mode	schema=yes	arity=-	effect=write
-src/components/terminal/TerminalPage.tsx:530	literal	component	get-terminal-work-mode	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:543	literal	component	list-runner-windows	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:555	literal	component	close-empty-terminal-windows	schema=no	arity=0	effect=destructive
-src/components/terminal/TerminalPage.tsx:629	delegated	component	buildTerminalLaunchMenuActions	schema=no	arity=-	effect=-
+src/components/terminal/TerminalPage.tsx:294	literal	component	create-terminal	schema=no	arity=0	effect=write
+src/components/terminal/TerminalPage.tsx:323	delegated	component	buildCreatePlainTerminalAction	schema=no	arity=-	effect=-
+src/components/terminal/TerminalPage.tsx:326	literal	component	list-terminals	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:345	literal	component	open-terminal-window	schema=no	arity=0	effect=write
+src/components/terminal/TerminalPage.tsx:355	literal	component	pop-out-active-terminal	schema=no	arity=0	effect=write
+src/components/terminal/TerminalPage.tsx:375	guarded	component	pop-out-page	schema=yes	arity=-	effect=write
+src/components/terminal/TerminalPage.tsx:394	guarded	component	move-terminal-to-window	schema=yes	arity=-	effect=write
+src/components/terminal/TerminalPage.tsx:428	guarded	component	maximize-zone	schema=yes	arity=-	effect=read
+src/components/terminal/TerminalPage.tsx:453	literal	component	restore-zone	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:466	guarded	component	toggle-maximize-zone	schema=yes	arity=-	effect=read
+src/components/terminal/TerminalPage.tsx:487	literal	component	get-zone-view-state	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:505	guarded	component	set-terminal-work-mode	schema=yes	arity=-	effect=write
+src/components/terminal/TerminalPage.tsx:535	literal	component	get-terminal-work-mode	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:548	literal	component	list-runner-windows	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:560	literal	component	close-empty-terminal-windows	schema=no	arity=0	effect=destructive
+src/components/terminal/TerminalPage.tsx:634	delegated	component	buildTerminalLaunchMenuActions	schema=no	arity=-	effect=-
 src/components/terminal/ZoneLayoutPicker.tsx:98	guarded	component	select-layout	schema=yes	arity=-	effect=write
 src/components/terminal/ZoneLayoutPicker.tsx:135	literal	component	list-layouts	schema=no	arity=0	effect=read
 src/components/terminal/ZoneProfilePicker.tsx:239	guarded	component	load-profile	schema=yes	arity=-	effect=destructive
@@ -128,52 +141,69 @@ src/components/terminal/commands/uibridge.test.ts:404	fixture	free	test.ai-text	
 src/components/terminal/commands/usePromptLibraryCommands.test.ts:77	fixture	free	terminal.help	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.test.ts:105	fixture	free	terminal.doc-finder	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.ts:118	registry	free	-	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:690	registry	free	terminal.focus	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:764	registry	free	terminal.spawn	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:791	registry	free	terminal.spawn-ai	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:854	registry	free	terminal.spawn-with	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:882	registry	free	terminal.approve-all	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:924	registry	free	terminal.maximize	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:958	registry	free	terminal.close	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1018	registry	free	terminal.layout	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1099	registry	free	terminal.mode	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1132	registry	free	terminal.restart	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1175	registry	free	terminal.swap	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1227	registry	free	terminal.toggle-focus-mode	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1249	registry	free	terminal.toggle-auto-focus	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1272	registry	free	terminal.toggle-sound	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1290	registry	free	terminal.mute	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1311	registry	free	terminal.unmute	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1332	registry	free	terminal.toggle-auto-restart	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1355	registry	free	terminal.sort-zones	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1378	registry	free	terminal.export-all	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1402	registry	free	terminal.show-shortcuts	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1431	registry	free	terminal.toggle-sessions-sidebar	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1451	registry	free	terminal.resume	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1467	registry	free	terminal.toggle-findings	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1484	registry	free	terminal.toggle-file-ownership	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1506	registry	free	terminal.toggle-desktop-notify	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1527	registry	free	terminal.plan-refresh	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1559	registry	free	terminal.auto-approve	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1646	registry	free	terminal.select-by-state	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1683	registry	free	terminal.tag-toggle	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1725	registry	free	terminal.tag-clear	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1752	registry	free	terminal.generate-workflow	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1775	registry	free	terminal.save-workflow	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1796	registry	free	terminal.analyze	schema=yes	arity=1	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1836	registry	free	terminal.plan-implement	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1864	registry	free	terminal.plan-verify	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1885	registry	free	terminal.doc-finder	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1904	registry	free	terminal.prompt	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1922	registry	free	terminal.metrics	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:1958	registry	free	terminal.history	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:2002	registry	free	terminal.copy-names	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:2096	registry	free	terminal.elevated	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:691	registry	free	terminal.focus	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:765	registry	free	terminal.spawn	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:792	registry	free	terminal.spawn-ai	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:855	registry	free	terminal.spawn-with	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:883	registry	free	terminal.approve-all	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:925	registry	free	terminal.maximize	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:959	registry	free	terminal.close	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1019	registry	free	terminal.layout	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1100	registry	free	terminal.mode	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1133	registry	free	terminal.restart	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1176	registry	free	terminal.swap	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1228	registry	free	terminal.toggle-focus-mode	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1250	registry	free	terminal.toggle-auto-focus	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1273	registry	free	terminal.toggle-sound	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1291	registry	free	terminal.mute	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1312	registry	free	terminal.unmute	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1333	registry	free	terminal.toggle-auto-restart	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1356	registry	free	terminal.sort-zones	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1379	registry	free	terminal.export-all	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1403	registry	free	terminal.show-shortcuts	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1432	registry	free	terminal.toggle-sessions-sidebar	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1452	registry	free	terminal.resume	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1472	registry	free	terminal.sessions-find	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1495	registry	free	terminal.toggle-findings	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1512	registry	free	terminal.toggle-file-ownership	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1534	registry	free	terminal.toggle-desktop-notify	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1555	registry	free	terminal.plan-refresh	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1587	registry	free	terminal.auto-approve	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1674	registry	free	terminal.select-by-state	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1711	registry	free	terminal.tag-toggle	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1753	registry	free	terminal.tag-clear	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1780	registry	free	terminal.generate-workflow	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1803	registry	free	terminal.save-workflow	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1824	registry	free	terminal.analyze	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1864	registry	free	terminal.plan-implement	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1892	registry	free	terminal.plan-verify	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1913	registry	free	terminal.doc-finder	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1932	registry	free	terminal.prompt	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1950	registry	free	terminal.metrics	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:1986	registry	free	terminal.history	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:2030	registry	free	terminal.copy-names	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:2124	registry	free	terminal.elevated	schema=yes	arity=0	effect=-
 src/components/terminal/createPlainTerminalAction.ts:64	literal	free	-	schema=no	arity=0	effect=write
 src/components/terminal/terminalLaunchMenuActions.ts:120	guarded	free	create-plain	schema=yes	arity=-	effect=write
 src/components/terminal/terminalLaunchMenuActions.ts:137	guarded	free	create-ai-session	schema=yes	arity=-	effect=destructive
 src/components/terminal/terminalLaunchMenuActions.ts:172	guarded	free	create-best-account	schema=yes	arity=-	effect=destructive
 src/components/terminal/terminalLaunchMenuActions.ts:206	guarded	free	create-with-command	schema=yes	arity=-	effect=destructive
+src/components/terminal/useSessionOrgBridge.ts:128	literal	component	list-groups	schema=no	arity=0	effect=read
+src/components/terminal/useSessionOrgBridge.ts:149	guarded	component	create-group	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:166	guarded	component	rename-group	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:175	guarded	component	recolor-group	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:190	guarded	component	set-group-collapsed	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:201	guarded	component	move-group	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:213	guarded	component	ungroup-group	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:223	guarded	component	delete-group	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:233	guarded	component	add-to-group	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:242	guarded	component	remove-from-group	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:251	guarded	component	set-pinned	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:260	guarded	component	set-muted	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:269	guarded	component	snooze	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:281	guarded	component	move-to-page	schema=yes	arity=-	effect=write
+src/components/terminal/useSessionOrgBridge.ts:291	guarded	component	close	schema=yes	arity=-	effect=destructive
+src/components/terminal/useSessionOrgBridge.ts:304	guarded	component	close-group	schema=yes	arity=-	effect=destructive
 src/hooks/changeTrackingHandler.test.ts:52	builtin	element	click	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/usePageEvents.ts:1360	delegated	component	map	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/utils.ts:192	delegated	component	map	schema=no	arity=-	effect=-
