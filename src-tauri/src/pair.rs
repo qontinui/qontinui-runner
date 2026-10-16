@@ -317,9 +317,10 @@ pub fn ensure_device_initialized_at(path: &std::path::Path) {
 /// Path to the paired-user JSON written by `device pair` and read by
 /// `device init` to attach a `user_id` to the register payload. Lives
 /// alongside `auth_tokens.enc`: under `QONTINUI_SECURE_STORAGE_DIR` when
-/// that env var is set and non-empty, else the Tauri app's local data
-/// directory (`data_local_dir()/com.qontinui.runner/`) — so the CLI bin
-/// and the GUI runner read the same file.
+/// that env var is set and non-empty, else `<root>/secure` under an instance
+/// root, else the Tauri app's local data directory
+/// (`data_local_dir()/com.qontinui.runner/`) — so the CLI bin and the GUI
+/// runner read the same file (`instance_env::secure_storage_dir`).
 pub(crate) fn paired_user_path() -> Option<PathBuf> {
     crate::instance_env::secure_storage_dir().map(|d| d.join("paired_user.json"))
 }

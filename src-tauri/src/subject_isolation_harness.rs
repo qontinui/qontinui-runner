@@ -69,7 +69,11 @@ const PLANTED_FILE: &str = "planted-by-a-missed-call-site.txt";
 #[test]
 #[ignore = "the child process of the subject-isolation tests; run by them"]
 fn driver() {
-    let mode = std::env::var(MODE).expect("driver run without SUBJECT_ISOLATION_MODE");
+    let Ok(mode) = std::env::var(MODE) else {
+        // Reached by `cargo test -- --include-ignored`: nothing to drive.
+        eprintln!("subject_isolation_harness::driver: no {MODE}; not a child run, skipping");
+        return;
+    };
     let report = PathBuf::from(std::env::var(REPORT).expect("SUBJECT_ISOLATION_REPORT"));
     let machine_home = PathBuf::from(std::env::var(MACHINE_HOME).expect("MACHINE_HOME"));
 
@@ -123,6 +127,21 @@ fn driver() {
     let lines: Vec<String> = written.iter().map(|p| p.display().to_string()).collect();
     std::fs::write(&report, lines.join("\n")).expect("write the driver report");
 }
+
+/// The only parent variables a driver child inherits.
+const CHILD_ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "LANG",
+    "RUST_BACKTRACE",
+];
 
 /// Every location override a launcher or this test binary's sandbox may have
 /// exported — cleared so the child resolves its stores exactly as a fresh
@@ -308,12 +327,13 @@ fn run_driver(fixture: &Path, mode: &str, extra: &[(&str, &str)]) -> Vec<PathBuf
         "--nocapture",
         "--test-threads=1",
     ]);
-    // Nothing of the parent's runner configuration reaches the child: the
-    // driver resolves every location itself.
-    for (key, _) in std::env::vars_os() {
-        let key = key.to_string_lossy().into_owned();
-        if key.starts_with("QONTINUI_") || key.starts_with("COORD_") || key.starts_with("XDG_") {
-            cmd.env_remove(&key);
+    // Nothing of the parent's configuration reaches the child — only what a
+    // process needs to start and find its tools. A snapshot-and-strip would
+    // race any in-process test that sets a variable between the two.
+    cmd.env_clear();
+    for key in CHILD_ENV_PASSTHROUGH {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
         }
     }
     cmd.env(MODE, mode)

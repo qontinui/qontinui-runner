@@ -85,7 +85,8 @@ const FETCH_LIMIT: u32 = 500;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Filename of the on-disk override cache, under the runner's per-instance
-/// config dir (`dirs::config_dir()/com.qontinui.runner[/instance-<name>]`) —
+/// config dir (`<platform config dir>/com.qontinui.runner[/instance-<name>]`,
+/// via `instance_env::runner_config_base`) —
 /// the same convention `prompts.rs` and `backup.rs` already use for per-device
 /// state. Deliberately NOT a new path scheme.
 const CACHE_FILE: &str = "agent-commands-cache.json";
