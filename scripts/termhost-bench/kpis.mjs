@@ -495,12 +495,14 @@ export function generatorWindow(gens, win) {
       if (seg > gapNs) {
         // The gap minus the generator's own file I/O inside it (a slow log
         // write on a 9P run directory is not a pane that stopped draining).
-        // Where the window cuts the gap, only the I/O that cannot fit in the
-        // part outside the window is attributed inside it: the records do not
-        // say where in the gap the I/O fell, and spreading it evenly would hide
-        // real pane stall at a window edge.
+        // A record carries io_ns as it stood BEFORE its own log write, so the
+        // gap's I/O starts the gap: it occupies [a.t, a.t + io] (the record's
+        // write, then any I/O after it, with the pane write after that), and
+        // only its overlap with the window's part of the gap is subtracted.
+        // At either window edge that keeps a real pane stall from being hidden.
         const ioTotal = a.io !== null && a.io !== undefined && b.io !== null && b.io !== undefined ? Math.max(0, b.io - a.io) : 0;
-        const io = Math.max(0, ioTotal - (Number(seg) - Number(hi - lo)));
+        const ioEnd = Number(a.t) + Math.min(ioTotal, Number(seg));
+        const io = Math.max(0, Math.min(Number(hi), ioEnd) - Math.max(Number(lo), Number(a.t)));
         const gapPart = Math.max(0, Number(hi - lo) - io);
         blocked += gapPart;
         gapInWindow += BigInt(Math.round(gapPart));

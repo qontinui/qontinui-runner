@@ -762,3 +762,16 @@ test("producer_stall_pct at a window edge: only the I/O that cannot fit outside 
   const whole = generatorWindow(new Map([[0, { points: pts }]]), { t0: -2000n * MS, t1: 6000n * MS });
   assert.equal(whole.stall[0], (1500 / 8000) * 100);
 });
+
+test("producer_stall_pct at a window END: the gap's I/O starts the gap (a record's io_ns predates its own write), so the stall after it is kept (review repro t1edge.mjs)", () => {
+  // Window 0..5000 ms. Record a at 3500 ms; its own 9P log write takes 3500..4700 ms (inside the
+  // window), then the pane write blocks 4700..5000 and on past the window; b lands at 5500 ms.
+  const pts = [];
+  for (let t = -1000n * MS; t <= 3500n * MS; t += 500n * MS) pts.push({ t, blocked: 0, io: 0, written: 0, scheduled: 0 });
+  pts.push({ t: 5500n * MS, blocked: 0, io: 1200e6, written: 0, scheduled: 0 });
+  pts.push({ t: 6000n * MS, blocked: 0, io: 1200e6, written: 0, scheduled: 0 });
+  const r = generatorWindow(new Map([[0, { points: pts }]]), { t0: 0n, t1: 5000n * MS });
+  assert.equal(r.stall[0], 6, "300 ms of pane stall in a 5000 ms window — not 16 %");
+  assert.match(r.notes.join(" "), /session 0: 300 ms\): counted as blocked/);
+  assert.match(r.notes.join(" "), /own file I\/O inside record gaps was not counted as stall \(session 0: 1200 ms\)/);
+});
