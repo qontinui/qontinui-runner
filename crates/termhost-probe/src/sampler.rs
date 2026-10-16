@@ -97,6 +97,21 @@ fn is_generator(p: &ProcInfo, run_id: Option<&str>) -> bool {
         })
 }
 
+/// Whether the live process `p` is the generator a slot file names. A slot
+/// names its generator by PID, and a PID is not an identity: another process
+/// can hold it (a reused PID; or, for tmux-wsl, a Windows process holding the
+/// number of a generator that runs inside WSL, whose slot file carries a Linux
+/// PID). So the process must carry this run's generator flag; or, where its
+/// command line is unreadable, be a node process whose parent is the slot's
+/// session shell.
+fn slot_names(p: &ProcInfo, slot: &Slot, run_id: Option<&str>) -> bool {
+    if is_generator(p, run_id) {
+        return true;
+    }
+    let name = p.name.to_ascii_lowercase();
+    p.cmd.is_empty() && (name == "node" || name == "node.exe") && p.parent == Some(slot.ppid)
+}
+
 fn is_compositor(p: &ProcInfo, display: Option<&str>) -> bool {
     let name = p.name.to_ascii_lowercase();
     if name == "dwm.exe" || name == "dwm" {
@@ -224,11 +239,14 @@ pub fn assign_groups(
         }
     }
     for s in slots {
-        if table.contains_key(&s.pid) {
-            candidates.push(s.pid);
-            if shell_ok(s.ppid) {
-                candidates.push(s.ppid);
-            }
+        let Some(p) = table.get(&s.pid) else { continue };
+        if !slot_names(p, s, cfg.run_id.as_deref()) {
+            continue;
+        }
+        candidates.push(s.pid);
+        // The shell is the generator's own parent, never a PID the slot asserts.
+        if p.parent == Some(s.ppid) && shell_ok(s.ppid) {
+            candidates.push(s.ppid);
         }
     }
     for pid in candidates {
@@ -368,7 +386,12 @@ impl Sampler {
             .unwrap_or_default();
         for s in &slots {
             if let (Some(session), Some(p)) = (s.session, table.get(&s.pid)) {
-                self.gen_sessions.insert((s.pid, p.start_time), session);
+                // Only the generator the slot names carries its session: an
+                // unrelated process holding the PID never becomes "session k's
+                // generator" in an exit record.
+                if slot_names(p, s, self.cfg.run_id.as_deref()) {
+                    self.gen_sessions.insert((s.pid, p.start_time), session);
+                }
             }
         }
         let groups = assign_groups(table, &self.cfg, &slots, &mut self.workload_ids);
@@ -661,6 +684,112 @@ mod tests {
         );
         assert_eq!(parse_slot(slot, Some("run-8")), None, "another run's slot");
         assert_eq!(parse_slot("not json", None), None);
+    }
+
+    #[test]
+    fn a_slot_pid_held_by_another_process_is_not_workload() {
+        // tmux-wsl's slot files carry LINUX pids; on Windows those numbers can
+        // belong to anything — here the host's own OpenConsole.exe (101) and a
+        // stranger (500) with an unreadable command line under another parent.
+        let mut t = table();
+        t.insert(500, p(Some(9), "svchost.exe", &[]));
+        let cfg = SamplerConfig {
+            host_pids: vec![100],
+            run_id: Some("run-7".into()),
+            ..SamplerConfig::default()
+        };
+        let slots = [
+            Slot {
+                pid: 101,
+                ppid: 100,
+                session: Some(0),
+            },
+            Slot {
+                pid: 500,
+                ppid: 9,
+                session: Some(1),
+            },
+        ];
+        let g = assign_groups(&t, &cfg, &slots, &mut HashSet::new());
+        assert!(
+            g[GROUP_HOST].contains(&101),
+            "the host's own OpenConsole stays host: {g:?}"
+        );
+        assert!(!g[GROUP_WORKLOAD].contains(&101), "{g:?}");
+        assert!(!g[GROUP_WORKLOAD].contains(&500), "{g:?}");
+        assert!(!g[GROUP_WORKLOAD].contains(&9), "{g:?}");
+        // Another run's generator at the slot's PID is not this run's either.
+        let mut other = table();
+        if let Some(gen) = other.get_mut(&103) {
+            gen.cmd[5] = "run-8".into();
+        }
+        let slots = [Slot {
+            pid: 103,
+            ppid: 102,
+            session: Some(0),
+        }];
+        let g = assign_groups(&other, &cfg, &slots, &mut HashSet::new());
+        assert!(g[GROUP_WORKLOAD].is_empty(), "{g:?}");
+        // An unreadable command line is accepted only for node under the slot's shell.
+        let mut unread = table();
+        if let Some(gen) = unread.get_mut(&103) {
+            gen.cmd.clear();
+        }
+        let wrong_shell = [Slot {
+            pid: 103,
+            ppid: 101,
+            session: Some(0),
+        }];
+        let g = assign_groups(&unread, &cfg, &wrong_shell, &mut HashSet::new());
+        assert!(g[GROUP_WORKLOAD].is_empty(), "{g:?}");
+        // A slot naming the real generator but another "shell" (here the host's
+        // OpenConsole) never moves that process out of the host.
+        let g = assign_groups(&table(), &cfg, &wrong_shell, &mut HashSet::new());
+        assert_eq!(
+            g[GROUP_WORKLOAD],
+            vec![102, 103],
+            "the generator and its real parent"
+        );
+        assert!(g[GROUP_HOST].contains(&101), "{g:?}");
+    }
+
+    #[test]
+    fn an_unrelated_process_at_a_slot_pid_never_names_a_session_when_it_exits() {
+        let dir = std::env::temp_dir().join(format!(
+            "termhost-probe-slots-stranger-{}-{}",
+            std::process::id(),
+            crate::clock::now_ns()
+        ));
+        std::fs::create_dir_all(&dir).expect("run dir");
+        // A Linux pid from tmux-wsl's slot, held on this side by the host's OpenConsole.
+        std::fs::write(
+            dir.join("slot-0"),
+            r#"{"schema":"termhost-bench/slot/v1","slot":0,"run_id":"run-7","pid":101,"ppid":100}"#,
+        )
+        .expect("slot-0");
+        let mut s = Sampler::new(
+            SamplerConfig {
+                host_pids: vec![100],
+                run_id: Some("run-7".into()),
+                run_dir: Some(dir.clone()),
+                ..SamplerConfig::default()
+            },
+            Box::new(FakeReader {
+                cpu: HashMap::new(),
+                unreadable: None,
+                exited_mid_read: None,
+            }),
+        );
+        let t = table();
+        assert!(s.sample_table(&t, 0).exited.is_empty());
+        let mut after = t.clone();
+        after.remove(&101);
+        let gone = s.sample_table(&after, 500_000_000).exited;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            gone.iter().all(|e| e.session.is_none()),
+            "the OpenConsole's exit names no generator session: {gone:?}"
+        );
     }
 
     #[test]
