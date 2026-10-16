@@ -3,7 +3,11 @@
  * Replay the probe's capture cross-check (plan D2) over a probe watch file, so a
  * reviewer can re-derive every figure the rule was tuned on from a CI artifact.
  *
- *   node scripts/termhost-bench/tools/crosscheck-replay.mjs <probe-*.jsonl>... [--json]
+ *   node scripts/termhost-bench/tools/crosscheck-replay.mjs <probe-*.jsonl>... [--json] [--profile strict|software-compositor]
+ *
+ * The profile (plan D2: `strict`, or `software-compositor` for windows-hosted,
+ * which drops the DDA-coalescing fallback) is the one the watch's summary
+ * records it was told, `--profile` to judge it under the other, else `strict`.
  *
  * It reads the watch's `frame`, `first_seen` and `summary` records and reports,
  * per file:
@@ -147,10 +151,12 @@ export function replay(watch, o = {}) {
   const sFrames = watch.frames.get(secondary) ?? [];
   const sByIndex = new Map(sFrames.map((f) => [f.index, f]));
   const rule = { ...RULE, ...(o.rule ?? {}) };
+  const profile = o.profile ?? watch.summary?.crosscheck?.profile ?? "strict";
+  if (!["strict", "software-compositor"].includes(profile)) throw new Error(`unknown cross-check profile "${profile}"`);
   const pSp = spacingP50(pFrames);
   const sSp = spacingP50(sFrames);
   const sMissedShare = secondaryMissedShare(sFrames);
-  const sMissedTooMany = sMissedShare !== null && sMissedShare > rule.maxSecondaryMissedShare;
+  const sMissedTooMany = profile === "strict" && sMissedShare !== null && sMissedShare > rule.maxSecondaryMissedShare;
   const F = Math.min(Math.max(sSp !== null && !sMissedTooMany ? sSp : refreshMs, refreshMs), rule.frameMaxRefreshes * refreshMs);
   const offset = (RENDER_OFFSET_MS[primary] ?? 0) - (RENDER_OFFSET_MS[secondary] ?? 0);
   const lo = Math.min(offset, 0);
@@ -206,6 +212,7 @@ export function replay(watch, o = {}) {
   }
   const r3 = (x) => (x === null ? null : Math.round(x * 1000) / 1000);
   return {
+    profile,
     primary,
     secondary,
     refreshMs,
@@ -236,7 +243,9 @@ function main(argv) {
   const json = argv.includes("--json");
   const ri = argv.indexOf("--refresh-ms");
   const refreshMs = ri >= 0 ? Number(argv[ri + 1]) : undefined;
-  const files = argv.filter((a, i) => !a.startsWith("--") && !(ri >= 0 && i === ri + 1));
+  const pi = argv.indexOf("--profile");
+  const profile = pi >= 0 ? argv[pi + 1] : undefined;
+  const files = argv.filter((a, i) => !a.startsWith("--") && !(ri >= 0 && i === ri + 1) && !(pi >= 0 && i === pi + 1));
   if (files.length === 0) {
     process.stderr.write("usage: crosscheck-replay.mjs <probe-*.jsonl>... [--json] [--refresh-ms N]\n");
     return 2;
@@ -244,7 +253,7 @@ function main(argv) {
   for (const f of files) {
     let r;
     try {
-      r = replay(parseWatch(readFileSync(f, "utf8")), { refreshMs });
+      r = replay(parseWatch(readFileSync(f, "utf8")), { refreshMs, profile });
     } catch (e) {
       process.stderr.write(`${f}: ${e.message}\n`);
       return 2;
@@ -255,7 +264,7 @@ function main(argv) {
     }
     const name = f.split(/[\\/]/).pop();
     process.stdout.write(
-      `${name}: F ${r.frameMs} ms${r.frameFellBackToRefresh ? " (R: fallback)" : ""} (spacing p50 ${r.primary} ${r.spacingP50[r.primary]}, ${r.secondary} ${r.spacingP50[r.secondary]}; ${r.secondary} coalesced on ${r.secondaryMissedShare === null ? "-" : (100 * r.secondaryMissedShare).toFixed(1)}% of frames) ` +
+      `${name} [${r.profile}]: F ${r.frameMs} ms${r.frameFellBackToRefresh ? " (R: fallback)" : ""} (spacing p50 ${r.primary} ${r.spacingP50[r.primary]}, ${r.secondary} ${r.spacingP50[r.secondary]}; ${r.secondary} coalesced on ${r.secondaryMissedShare === null ? "-" : (100 * r.secondaryMissedShare).toFixed(1)}% of frames) ` +
         `median ${r.medianGapMs} ms in [${r.medianBandMs.join(", ")}] (margin ${r.medianMarginMs} ms) ` +
         `late > ${r.lateBoundMs}: ${r.late}/${r.compared} (${r.lateShare === null ? "-" : (100 * r.lateShare).toFixed(1)}%, margin ${r.lateMarginPoints} points) ` +
         `outside [${r.markerBandMs.join(", ")}]: ${r.outside}/${r.compared} (${r.outsideShare === null ? "-" : (100 * r.outsideShare).toFixed(1)}%) ` +

@@ -90,6 +90,7 @@ export function watchArgs(o) {
   if (o.compositor === false) args.push("--no-compositor");
   if (o.tag) args.push("--tag", o.tag);
   if (o.minValidIntervals !== undefined) args.push("--min-valid-intervals", String(o.minValidIntervals));
+  if (o.crosscheckProfile) args.push("--crosscheck-profile", o.crosscheckProfile);
   return args;
 }
 

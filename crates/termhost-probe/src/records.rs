@@ -572,6 +572,9 @@ pub struct CrosscheckSummary {
     /// or `not_performed`. Judged on the statistics below, never on one
     /// marker (`model::analysis::crosscheck` states the rule).
     pub verdict: &'static str,
+    /// The rule's profile, `strict` or `software-compositor`, as the watch was
+    /// told (`--crosscheck-profile`); never inferred from the data.
+    pub profile: &'static str,
     pub compared: u64,
     /// Markers whose gap lies inside the per-marker band.
     pub agreed: u64,

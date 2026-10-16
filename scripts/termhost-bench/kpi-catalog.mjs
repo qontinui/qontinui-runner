@@ -80,6 +80,15 @@ export const PTY_HOST_IMPLS = Object.freeze(["system_conhost", "bundled_opencons
 /** Where a profile's numbers come from (D3). */
 export const PROFILE_PROVENANCE = Object.freeze(["calibration", "assumption", "synthetic"]);
 
+/**
+ * The capture cross-check's profiles (plan D2, `model::analysis::CrosscheckProfile`):
+ * `strict` everywhere but `windows-hosted`, whose software compositor makes DDA
+ * coalesce presentations as a matter of course, so its profile drops the
+ * coalescing fallback (`software-compositor`). Chosen by the environment spec,
+ * passed to the probe, recorded on every row; never inferred from the data.
+ */
+export const CROSSCHECK_PROFILES = Object.freeze(["strict", "software-compositor"]);
+
 /** Capability doctor verdicts — the vocabulary of qontinui-claude-config `capability-doctor.sh`. */
 export const DOCTOR_STATES = Object.freeze([
   "OPERATIVE",

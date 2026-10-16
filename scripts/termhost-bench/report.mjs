@@ -68,14 +68,14 @@ export function renderReport(doc) {
       `app ${absentText(s.app_version)}; launch ${s.launch_mode}; pty host ${absentText(s.pty_host_impl)}; render ${absentText(s.render_backend)}; ` +
         `holder ${absentText(s.pty_holder)}; shell ${s.session_shell} (${absentText(s.shell_integration)})`,
       "",
-      `| N | arm | run | V (target/actual) | profile (calibrated) | ${REPORT_KPIS.join(" | ")} | labels |`,
-      `|---|---|---|---|---|${REPORT_KPIS.map(() => "---").join("|")}|---|`,
+      `| N | arm | run | V (target/actual) | profile (calibrated) | cross-check | ${REPORT_KPIS.join(" | ")} | labels |`,
+      `|---|---|---|---|---|---|${REPORT_KPIS.map(() => "---").join("|")}|---|`,
     );
     for (const r of rows.sort((a, b) => a.scenario.n - b.scenario.n || a.scenario.arm.localeCompare(b.scenario.arm) || a.scenario.run_index - b.scenario.run_index)) {
       const sc = r.scenario;
       lines.push(
         `| ${sc.n} | ${sc.arm} | ${sc.run_index + 1}/${sc.run_count} | ${sc.v_target}/${typeof sc.v_actual === "number" ? sc.v_actual : absentText(sc.v_actual)} | ` +
-          `${sc.profile} (${sc.profile_calibrated}) | ${REPORT_KPIS.map((id) => cell(r.kpis[id], id)).join(" | ")} | ${r.labels.join(", ") || "-"} |`,
+          `${sc.profile} (${sc.profile_calibrated}) | ${sc.crosscheck_profile} | ${REPORT_KPIS.map((id) => cell(r.kpis[id], id)).join(" | ")} | ${r.labels.join(", ") || "-"} |`,
       );
     }
     lines.push("");

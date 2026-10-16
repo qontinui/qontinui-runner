@@ -84,6 +84,7 @@
       "scenario": {
         "profile": "claude-tui",
         "profile_calibrated": false,
+        "crosscheck_profile": "strict",
         "profile_provenance": "assumption",
         "profile_digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
         "n": 5,
@@ -323,6 +324,7 @@
       "scenario": {
         "profile": "claude-tui",
         "profile_calibrated": false,
+        "crosscheck_profile": "strict",
         "profile_provenance": "assumption",
         "profile_digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
         "n": 5,

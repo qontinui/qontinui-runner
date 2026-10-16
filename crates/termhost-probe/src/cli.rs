@@ -106,6 +106,22 @@ impl From<FramesArg> for FramesMode {
     }
 }
 
+/// The capture cross-check's profile (`model::analysis::CrosscheckProfile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CrosscheckProfileArg {
+    Strict,
+    SoftwareCompositor,
+}
+
+impl From<CrosscheckProfileArg> for crate::model::analysis::CrosscheckProfile {
+    fn from(p: CrosscheckProfileArg) -> Self {
+        match p {
+            CrosscheckProfileArg::Strict => Self::Strict,
+            CrosscheckProfileArg::SoftwareCompositor => Self::SoftwareCompositor,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SourceArg {
     Wgc,
@@ -163,6 +179,11 @@ pub struct WatchArgs {
     /// Do not sample the compositor (dwm.exe / the X server).
     #[arg(long)]
     pub no_compositor: bool,
+    /// The capture cross-check's profile: `strict` (default; every real-GPU
+    /// host) or `software-compositor` (the hosted VM, plan D6). The harness
+    /// passes the one its environment declares.
+    #[arg(long, value_enum, default_value = "strict")]
+    pub crosscheck_profile: CrosscheckProfileArg,
 }
 
 #[derive(Debug, Args)]

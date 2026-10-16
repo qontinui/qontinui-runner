@@ -42,6 +42,7 @@ fn main() {
                 echo_stdout: a.stdout,
                 stdin_stop: a.stdin_stop,
                 compositor: !a.no_compositor,
+                crosscheck_profile: a.crosscheck_profile.into(),
                 args,
             };
             run_or_report("watch", watch::run(&mut host, &cfg))

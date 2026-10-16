@@ -119,9 +119,35 @@ test("a DDA coalescing presentations does not widen F: WGC dropping every third 
   assert.ok(r.frameFellBackToRefresh);
   assert.ok(near(r.frameMs, R_MS));
   assert.equal(r.verdict, "disagree", JSON.stringify(r));
-  // With that fallback switched off the same watch would agree: the hole it closes.
-  const open = replay(parseWatch(watchText({ ddaKeep: (k) => k % 2 === 0, wgcKeep: (k) => k % 3 !== 2 })), { rule: { maxSecondaryMissedShare: 1 } });
-  assert.equal(open.verdict, "agree", JSON.stringify(open));
+});
+
+test("the same coalescing-plus-drop timeline disagrees under strict and AGREES under software-compositor (the hole that profile accepts)", () => {
+  const text = watchText({ ddaKeep: (k) => k % 2 === 0, wgcKeep: (k) => k % 3 !== 2 });
+  const strict = replay(parseWatch(text), { profile: "strict" });
+  assert.equal(strict.verdict, "disagree", JSON.stringify(strict));
+  const soft = replay(parseWatch(text), { profile: "software-compositor" });
+  assert.equal(soft.profile, "software-compositor");
+  assert.ok(!soft.frameFellBackToRefresh);
+  assert.ok(near(soft.frameMs, 2 * R_MS));
+  assert.equal(soft.verdict, "agree", JSON.stringify(soft));
+});
+
+test("a hosted-VM-like timeline (DDA coalescing every other presentation, WGC 3 ms behind) agrees only under software-compositor", () => {
+  const text = watchText({ ddaKeep: (k) => k % 2 === 0, renderMs: 3 });
+  assert.equal(replay(parseWatch(text), { profile: "software-compositor" }).verdict, "agree");
+  const strict = replay(parseWatch(text), { profile: "strict" });
+  assert.equal(strict.verdict, "disagree", JSON.stringify(strict));
+  assert.ok(strict.why.includes("late"));
+});
+
+test("the profile defaults to the one the watch's summary records, and an unknown one is refused", () => {
+  const text = watchText({ ddaKeep: (k) => k % 2 === 0, wgcKeep: (k) => k % 3 !== 2 });
+  const w = parseWatch(text);
+  w.summary = { ...w.summary, crosscheck: { profile: "software-compositor" } };
+  assert.equal(replay(w).profile, "software-compositor");
+  assert.equal(replay(w).verdict, "agree");
+  assert.equal(replay(parseWatch(text)).profile, "strict", "no recorded profile: strict");
+  assert.throws(() => replay(parseWatch(text), { profile: "lenient" }), /unknown cross-check profile/);
 });
 
 test("helpers: a spacing p50 needs 20 deltas; the coalesced share counts frames with missed > 0", () => {

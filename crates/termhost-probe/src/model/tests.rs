@@ -602,6 +602,7 @@ struct Presented {
     dda_keep: fn(u64) -> bool,
     dda_max: u64,
     markers: u64,
+    profile: analysis::CrosscheckProfile,
 }
 
 const EVERY: fn(u64) -> bool = |_| true;
@@ -616,12 +617,14 @@ impl Presented {
             dda_keep: EVERY,
             dda_max: u64::MAX,
             markers: 200,
+            profile: analysis::CrosscheckProfile::Strict,
         }
     }
 
     fn run(self) -> WatchSummary {
         let mut c = cfg();
         c.secondary = Some(SourceId::Dda);
+        c.crosscheck_profile = self.profile;
         let mut m = Model::new(c, 0);
         let period = REFRESH * self.present_every;
         let t0 = 1_000 * MS;
@@ -890,6 +893,80 @@ fn a_secondary_missing_presentations_cannot_widen_the_bands() {
         cc.frame_basis
     );
     assert_eq!(cc.verdict, "disagree", "{}", cc.detail);
+}
+
+/// The coordinator's profile decision: the SAME timeline — DDA keeping every
+/// other presentation (coalescing on every frame) while WGC drops every third —
+/// disagrees under `strict` (F falls back to R, a third of markers late) and
+/// AGREES under `software-compositor` (F = DDA's own 2R spacing hides it). The
+/// hole the hosted VM's profile accepts, pinned.
+#[test]
+fn a_coalescing_secondary_plus_drops_is_judged_by_the_profile() {
+    let timeline = |profile| {
+        Presented {
+            dda_keep: |k| k % 2 == 0,
+            wgc_keep: |k| k % 3 != 2,
+            profile,
+            ..Presented::at_60hz()
+        }
+        .run()
+        .crosscheck
+    };
+    let strict = timeline(analysis::CrosscheckProfile::Strict);
+    assert_eq!(
+        (strict.profile, strict.verdict),
+        ("strict", "disagree"),
+        "{}",
+        strict.detail
+    );
+    assert!(ms_eq(strict.frame_ms, R_MS), "{strict:?}");
+    let soft = timeline(analysis::CrosscheckProfile::SoftwareCompositor);
+    assert_eq!(
+        (soft.profile, soft.verdict),
+        ("software-compositor", "agree"),
+        "{}",
+        soft.detail
+    );
+    assert!(ms_eq(soft.frame_ms, 2.0 * R_MS), "{soft:?}");
+    assert!(
+        soft.frame_basis.contains("profile software-compositor"),
+        "{}",
+        soft.frame_basis
+    );
+}
+
+/// A hosted-VM-like timeline (DDA coalescing every other presentation, WGC
+/// rendering 3 ms behind, so ~18% of the markers DDA saw first-hand reach WGC
+/// a presentation later): agrees under `software-compositor`, disagrees
+/// (late) under `strict`.
+#[test]
+fn a_vm_like_timeline_agrees_only_under_software_compositor() {
+    let timeline = |profile| {
+        Presented {
+            dda_keep: |k| k % 2 == 0,
+            wgc_render_ms: 3,
+            profile,
+            ..Presented::at_60hz()
+        }
+        .run()
+    };
+    let soft = timeline(analysis::CrosscheckProfile::SoftwareCompositor);
+    assert_eq!(
+        soft.crosscheck.verdict, "agree",
+        "{}",
+        soft.crosscheck.detail
+    );
+    assert_eq!(soft.output_latency_ms.state, KpiState::Measured);
+    let strict = timeline(analysis::CrosscheckProfile::Strict);
+    assert_eq!(
+        strict.crosscheck.verdict, "disagree",
+        "{}",
+        strict.crosscheck.detail
+    );
+    assert_eq!(
+        strict.output_latency_ms.reason,
+        Some("capture_disagreement")
+    );
 }
 
 fn agreeing_run(c: ModelConfig) -> WatchSummary {

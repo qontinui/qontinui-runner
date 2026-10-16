@@ -619,6 +619,7 @@
       "required": [
         "profile",
         "profile_calibrated",
+        "crosscheck_profile",
         "profile_provenance",
         "profile_digest",
         "n",
@@ -639,6 +640,12 @@
         },
         "profile_calibrated": {
           "type": "boolean"
+        },
+        "crosscheck_profile": {
+          "enum": [
+            "strict",
+            "software-compositor"
+          ]
         },
         "profile_provenance": {
           "enum": [

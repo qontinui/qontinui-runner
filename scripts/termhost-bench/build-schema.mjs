@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   ARMS,
+  CROSSCHECK_PROFILES,
   DOCTOR_STATES,
   ENVIRONMENTS,
   INCIDENT_KINDS,
@@ -293,6 +294,7 @@ export function buildResultSchema() {
         required: [
           "profile",
           "profile_calibrated",
+          "crosscheck_profile",
           "profile_provenance",
           "profile_digest",
           "n",
@@ -309,6 +311,7 @@ export function buildResultSchema() {
         properties: {
           profile: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
           profile_calibrated: { type: "boolean" },
+          crosscheck_profile: { enum: [...CROSSCHECK_PROFILES] },
           profile_provenance: { enum: [...PROFILE_PROVENANCE] },
           profile_digest: ref("sha256"),
           n: { type: "integer", minimum: 1 },

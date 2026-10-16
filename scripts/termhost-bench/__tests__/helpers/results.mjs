@@ -187,6 +187,7 @@ export function scenario(overrides = {}) {
   return {
     profile: "claude-tui",
     profile_calibrated: false,
+    crosscheck_profile: "strict",
     profile_provenance: "assumption",
     profile_digest: `sha256:${"12".repeat(32)}`,
     n: 15,

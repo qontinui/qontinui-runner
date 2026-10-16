@@ -165,6 +165,14 @@ test("an unaligned clock or a capture disagreement makes latency unknown, never 
   assertUnknown(cc.kpis.output_latency_ms, "capture_disagreement");
 });
 
+test("a probe that judged the cross-check under another profile than the environment declared is a harness error", () => {
+  const ok = computeRowKpis({ ...withSummary(focusFixture(), { crosscheck: { verdict: "agree", profile: "software-compositor" } }), crosscheckProfile: "software-compositor", environment: "windows-hosted" });
+  assert.notEqual(ok.kpis.output_latency_ms.reason, "harness_error");
+  const bad = computeRowKpis({ ...withSummary(focusFixture(), { crosscheck: { verdict: "agree", profile: "strict" } }), crosscheckProfile: "software-compositor", environment: "windows-hosted" });
+  assertUnknown(bad.kpis.output_latency_ms, "harness_error");
+  assert.match(bad.kpis.output_latency_ms.detail, /under the strict profile; the windows-hosted environment declares software-compositor/);
+});
+
 test("a measured latency whose cross-check was not performed says so in the row's notes (review N3)", () => {
   const cc = { verdict: "not_performed", compared: 2, agreed: 2, disagreed: 0, detail: "only 2 marker(s) seen cleanly by both sources; the median rule needs 3, so neither marker rule decides" };
   const { kpis } = computeRowKpis(withSummary(focusFixture(), { secondary: "dda", crosscheck: cc }));

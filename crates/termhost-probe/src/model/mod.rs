@@ -174,6 +174,8 @@ pub struct ModelConfig {
     /// probe was not keeping up (WGC's three-buffer pool is full after about
     /// three refresh intervals, and then drops frames).
     pub lag_bound_ns: u64,
+    /// The capture cross-check's profile, as the environment declared it.
+    pub crosscheck_profile: analysis::CrosscheckProfile,
 }
 
 impl ModelConfig {
@@ -194,6 +196,7 @@ impl ModelConfig {
             frames: FramesMode::All,
             monitor: MonitorPresence::Configured,
             lag_bound_ns: (3 * refresh_ns).max(50_000_000),
+            crosscheck_profile: analysis::CrosscheckProfile::Strict,
         }
     }
 }
@@ -924,6 +927,7 @@ impl Model {
                     |_| None,
                     refresh_ns,
                     analysis::Cadence::default(),
+                    self.cfg.crosscheck_profile,
                     0.0,
                     false,
                 );
@@ -939,6 +943,7 @@ impl Model {
                     |m| self.first_seen(self.cfg.primary, m),
                     refresh_ns,
                     cadence,
+                    self.cfg.crosscheck_profile,
                     crate::selftest::render_offset_ms(self.cfg.primary)
                         - crate::selftest::render_offset_ms(sec),
                     true,
@@ -951,6 +956,7 @@ impl Model {
                 |_| None,
                 refresh_ns,
                 analysis::Cadence::default(),
+                self.cfg.crosscheck_profile,
                 0.0,
                 false,
             ),

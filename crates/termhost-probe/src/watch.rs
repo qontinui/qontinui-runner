@@ -54,6 +54,9 @@ pub struct WatchConfig {
     pub echo_stdout: bool,
     pub stdin_stop: bool,
     pub compositor: bool,
+    /// The capture cross-check's profile (`--crosscheck-profile`), which the
+    /// environment declares; never inferred from the data.
+    pub crosscheck_profile: crate::model::analysis::CrosscheckProfile,
     pub args: Vec<String>,
 }
 
@@ -196,6 +199,7 @@ pub fn run(host: &mut dyn Host, cfg: &WatchConfig) -> Result<i32> {
     mc.capture_available = primary.is_some();
     mc.min_valid_intervals = cfg.min_valid_intervals;
     mc.frames = cfg.frames;
+    mc.crosscheck_profile = cfg.crosscheck_profile;
     mc.monitor = if monitor.is_ok() {
         MonitorPresence::Configured
     } else {

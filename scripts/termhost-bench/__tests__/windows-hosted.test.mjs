@@ -22,10 +22,11 @@ import { VERDICT_EXCLUDED_LABELS, compareBuilds } from "../compare.mjs";
 import { PROBE_MECHANISMS, blockingMechanisms, gatherDoctorFacts, mapDoctor } from "../doctor.mjs";
 import { ENVIRONMENT_SPECS, environmentSpec } from "../envs/index.mjs";
 import { SCREEN_QUERY, hostedRunnerVerdict, parseScreen, startWindowsHosted } from "../envs/windows-hosted.mjs";
-import { KPI_CATALOG, ROW_LABELS } from "../kpi-catalog.mjs";
+import { CROSSCHECK_PROFILES, KPI_CATALOG, ROW_LABELS } from "../kpi-catalog.mjs";
 import { machineBlock } from "../machine.mjs";
 import { NeutralityGuard } from "../neutrality.mjs";
-import { checkAssertions } from "../report.mjs";
+import { watchArgs } from "../probe.mjs";
+import { checkAssertions, renderReport } from "../report.mjs";
 import { adapterOptionsFor, fallbackSetup, noteLogLines, rowLabels, runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
 import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
@@ -133,6 +134,66 @@ test("a linux-xvfb run with VS Code labels every VS Code row dom_renderer_fallba
   assert.ok(vsc.length > 0 && tmux.length > 0);
   assert.ok(vsc.every((r) => r.labels.includes("dom_renderer_fallback")), "every VS Code row");
   assert.ok(tmux.every((r) => !r.labels.includes("dom_renderer_fallback")), "and no other setup's");
+});
+
+/** A fake run in `env` that records every watch's options; returns the doc and those options. */
+async function profiledRun(t, env, setups) {
+  const tmp = mkdtempSync(join(tmpdir(), "tb-profile-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  mkdirSync(join(tmp, "primary"), { recursive: true });
+  const settings = join(tmp, "primary", "settings.json");
+  writeFileSync(settings, "{}");
+  const clock = new VirtualClock();
+  let current = null;
+  const watches = [];
+  const probe = fakeProbe({ clock, current: () => current });
+  const startWatch = probe.startWatch.bind(probe);
+  probe.startWatch = (o) => {
+    watches.push(o);
+    return startWatch(o);
+  };
+  const res = await runBench(fakeRunOptions(join(tmp, "work"), { env, setups, ns: [1], smokeSetups: [], out: join(tmp, "results.json") }), {
+    log: () => {},
+    sleep: clock.sleep,
+    startEnvironment: async () => ({ env: {}, screen: { width: 1920, height: 1080, scalePct: 100 }, display: null, stop: async () => {} }),
+    probePath: "fake-probe",
+    createAdapter: async (setup, o) => (current = new FakeAdapter({ id: setup, clock, variant: o.variant })),
+    probe,
+    gatherDoctorFacts: async () => ({ ...healthyFacts(), "env.hosted_runner": { state: "OPERATIVE", reason: "fake" } }),
+    sampleBackgroundLoad: async () => ({ cpu_pct: 1, memory_used_mb: 100, sampled_ms: 1 }),
+    machineBlock: (o) => machineBlock({ ...o, gpu: { state: "unknown", reason: "not_instrumented", detail: "test" } }),
+    neutrality: new NeutralityGuard({ paths: [{ label: "settings.json", path: settings }] }),
+    reapGenerators: async () => ({ ended: [], survivors: [] }),
+    primaryPresent: async () => false,
+  });
+  return { doc: res.doc, watches };
+}
+
+test("the cross-check profile is the environment's: software-compositor on windows-hosted, strict elsewhere, and every spec declares one", () => {
+  assert.equal(environmentSpec("windows-hosted").crosscheckProfile, "software-compositor");
+  assert.equal(environmentSpec("windows-desktop").crosscheckProfile, "strict");
+  assert.equal(environmentSpec("linux-xvfb").crosscheckProfile, "strict");
+  for (const spec of Object.values(ENVIRONMENT_SPECS)) assert.ok(CROSSCHECK_PROFILES.includes(spec.crosscheckProfile), spec.id);
+});
+
+test("the profile flows from the environment spec to every watch's probe argv, into every row, and into the report", async (t) => {
+  for (const [env, setups, want] of [
+    ["windows-hosted", ["runner"], "software-compositor"],
+    ["linux-xvfb", ["runner"], "strict"],
+  ]) {
+    const { doc, watches } = await profiledRun(t, env, setups);
+    assert.ok(watches.length > 0, env);
+    for (const w of watches) {
+      const argv = watchArgs(w);
+      const i = argv.indexOf("--crosscheck-profile");
+      assert.ok(i > 0, `${env} ${w.label}: no --crosscheck-profile in ${argv.join(" ")}`);
+      assert.equal(argv[i + 1], want, `${env} ${w.label}`);
+    }
+    assert.ok(doc.rows.length > 0);
+    for (const r of doc.rows) assert.equal(r.scenario.crosscheck_profile, want, env);
+    assert.equal(validateResults(doc).valid, true, JSON.stringify(validateResults(doc).errors.slice(0, 3)));
+    assert.match(renderReport(doc), new RegExp(`\\| ${want} \\|`), "the report shows it beside the row's latency");
+  }
 });
 
 test("a VS Code unit that never described itself still records the launch mode it was planned with", () => {

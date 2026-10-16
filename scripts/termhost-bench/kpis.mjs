@@ -1182,6 +1182,8 @@ export function fromProbe(id, v, { what = `the probe's ${id}` } = {}) {
  *   spawns?: {records?: object[], list?: {session: number|null, tCmdNs: bigint}[],
  *     unavailable?: {reason: string, detail?: string}} | null,
  *   switchTimeoutMs?: number, spawnTimeoutMs?: number,
+ *   crosscheckProfile?: string,  the environment's cross-check profile; a probe
+ *     summary judged under another is a harness error
  * }} p
  * @returns {{kpis: Record<string, object>, vActual: number|null, notes: string[], sessionsSeen: number[]}}
  */
@@ -1218,6 +1220,14 @@ export function computeRowKpis(p) {
         cap.failed.length > 0
           ? `no primary capture source opened: ${cap.failed.map((f) => `${f.source}: ${f.detail}`).join("; ")}`
           : "no primary capture source opened",
+    };
+  } else if (p.crosscheckProfile && summary.crosscheck?.profile && summary.crosscheck.profile !== p.crosscheckProfile) {
+    // The probe judged the cross-check under another profile than the
+    // environment declared (a stale probe, or the argument lost on the way):
+    // its latency verdict answers a different question.
+    captureGate = {
+      reason: "harness_error",
+      detail: `the probe judged the capture cross-check under the ${summary.crosscheck.profile} profile; the ${p.environment} environment declares ${p.crosscheckProfile}`,
     };
   } else if (p.armFailure) {
     captureGate = p.armFailure;

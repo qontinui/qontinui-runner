@@ -174,6 +174,33 @@ pub const CROSSCHECK_MAX_LATE_SHARE: f64 = 0.10;
 /// that judge the primary; past this share F falls back to R.
 pub const CROSSCHECK_MAX_SECONDARY_MISSED_SHARE: f64 = 0.05;
 
+/// Which variant of the rule a watch is judged under. It is an ARGUMENT
+/// (`watch --crosscheck-profile`), chosen by the environment the run declares
+/// (`scripts/termhost-bench/envs`), never inferred from the data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CrosscheckProfile {
+    /// Every real-GPU host and `windows-desktop`: the full rule, including
+    /// F = R when the secondary coalesces presentations on more than 5% of
+    /// its frames.
+    #[default]
+    Strict,
+    /// `windows-hosted` only (plan D6: software rendering, no GPU): the same
+    /// rule WITHOUT that coalescing fallback, because the hosted VM's DDA
+    /// coalesces on 22-63% of its frames as a matter of course. Its numbers are
+    /// a same-VM regression signal and plumbing check (D6/D11), never compared
+    /// across environments.
+    SoftwareCompositor,
+}
+
+impl CrosscheckProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CrosscheckProfile::Strict => "strict",
+            CrosscheckProfile::SoftwareCompositor => "software-compositor",
+        }
+    }
+}
+
 /// The secondary's measured cadence: its frame-spacing p50 (ms, `None` below
 /// [`CROSSCHECK_FRAME_MIN_DELTAS`] deltas) and the share of its frames that
 /// coalesced presentations (`None` when it reports no count).
@@ -225,7 +252,14 @@ pub fn spacing_p50_ms(frames_ns: &[u64]) -> Option<f64> {
 /// (WGC fires only when the window changes). F is R — the narrowest band,
 /// which fails visibly — when DDA had fewer than 20 deltas, or when more than
 /// 5% of its frames report coalesced presentations: a DDA that misses
-/// presentations has a coarse spacing of its own making.
+/// presentations has a coarse spacing of its own making. That fallback applies
+/// under the `strict` profile only; under `software-compositor` (the hosted
+/// VM, see [`CrosscheckProfile`]) F is DDA's spacing whatever it coalesced, and
+/// a coalescing DDA plus WGC dropping every third presentation can then AGREE
+/// (`a_coalescing_secondary_plus_drops_is_judged_by_the_profile` in the model
+/// tests, and the replay tool's test of the same timeline). That is accepted
+/// there because those numbers are a same-VM regression signal, never a
+/// cross-environment comparison; `strict` keeps the full detection.
 ///
 /// The declared band: WGC's `SystemRelativeTime` stamps the compositor's
 /// render of the capture frame, DDA's `LastPresentTime` the desktop
@@ -261,9 +295,11 @@ pub fn spacing_p50_ms(frames_ns: &[u64]) -> Option<f64> {
 /// - at 144 Hz one presentation (6.9 ms) is inside the declared offset, so
 ///   neither a one-frame lag nor dropped presentations are caught at every
 ///   true offset;
-/// - a DDA missing presentations sets F = R, which on the GPU-less hosted VM
-///   (CI run 38362046020: 22-63% of DDA frames coalesced; WGC 5-9% late at
-///   F = 2 R, 10-15% at F = R) makes every watch disagree.
+/// - under `strict`, a DDA missing presentations sets F = R, which on the
+///   GPU-less hosted VM (CI run 38362046020: 22-63% of DDA frames coalesced;
+///   WGC 5-9% late at F = 2 R, 10-15% at F = R) makes every watch disagree —
+///   hence the `software-compositor` profile for that environment, under
+///   which all six watches agree.
 ///
 /// Every marker outside the per-marker band is a `crosscheck` record with
 /// verdict `outside_band`, whatever the run's verdict.
@@ -284,11 +320,13 @@ pub fn crosscheck(
     primary_seen: impl Fn(Marker) -> Option<FirstSeen>,
     refresh_ns: u64,
     cadence: Cadence,
+    profile: CrosscheckProfile,
     expected_offset_ms: f64,
     secondary_configured: bool,
 ) -> (CrosscheckSummary, Vec<CrosscheckRecord>) {
     let mut s = CrosscheckSummary {
         verdict: "not_performed",
+        profile: profile.as_str(),
         expected_offset_ms,
         secondary_spacing_ms: cadence.secondary_ms,
         secondary_missed_share: cadence.secondary_missed_share,
@@ -301,9 +339,10 @@ pub fn crosscheck(
     }
     let refresh_ms = refresh_ns as f64 / 1e6;
     let spacing = cadence.secondary_ms.filter(|f| f.is_finite() && *f > 0.0);
-    let too_many_missed = cadence
-        .secondary_missed_share
-        .is_some_and(|m| m > CROSSCHECK_MAX_SECONDARY_MISSED_SHARE);
+    let too_many_missed = profile == CrosscheckProfile::Strict
+        && cadence
+            .secondary_missed_share
+            .is_some_and(|m| m > CROSSCHECK_MAX_SECONDARY_MISSED_SHARE);
     let (frame_ms, basis) = match spacing {
         None => (refresh_ms, "the refresh interval: the secondary had fewer than 20 frame deltas".to_string()),
         Some(_) if too_many_missed => (
@@ -314,7 +353,16 @@ pub fn crosscheck(
                 100.0 * CROSSCHECK_MAX_SECONDARY_MISSED_SHARE
             ),
         ),
-        Some(sp) => (sp, format!("the secondary's frame-spacing p50 ({sp:.2} ms)")),
+        Some(sp) => (
+            sp,
+            match (profile, cadence.secondary_missed_share) {
+                (CrosscheckProfile::SoftwareCompositor, Some(m)) if m > CROSSCHECK_MAX_SECONDARY_MISSED_SHARE => format!(
+                    "the secondary's frame-spacing p50 ({sp:.2} ms), kept although {:.1}% of its frames coalesced presentations (profile software-compositor)",
+                    100.0 * m
+                ),
+                _ => format!("the secondary's frame-spacing p50 ({sp:.2} ms)"),
+            },
+        ),
     };
     let frame_ms = frame_ms.clamp(refresh_ms, CROSSCHECK_FRAME_MAX_REFRESHES * refresh_ms);
     s.frame_ms = Some(frame_ms);
@@ -566,6 +614,7 @@ mod tests {
                 secondary_ms: frame_ms,
                 secondary_missed_share: Some(0.0),
             },
+            CrosscheckProfile::Strict,
             offset_ms,
             true,
         )
@@ -636,6 +685,7 @@ mod tests {
             |k| primary_map.get(&k).copied(),
             R64,
             Cadence::default(),
+            CrosscheckProfile::Strict,
             10.0,
             true,
         );
@@ -821,6 +871,7 @@ mod tests {
             |_| None,
             16 * MS,
             Cadence::default(),
+            CrosscheckProfile::Strict,
             0.0,
             false,
         );
@@ -838,6 +889,7 @@ mod tests {
             |_| None,
             16 * MS,
             Cadence::default(),
+            CrosscheckProfile::Strict,
             0.0,
             true,
         );
@@ -898,6 +950,7 @@ mod tests {
                     secondary_ms: Some(31.25),
                     secondary_missed_share: Some(missed),
                 },
+                CrosscheckProfile::Strict,
                 10.0,
                 true,
             )
@@ -911,6 +964,25 @@ mod tests {
             "{}",
             s.frame_basis
         );
+        // Under software-compositor the coalescing fallback is off.
+        let soft = crosscheck(
+            &[],
+            |_| None,
+            &[],
+            |_| None,
+            R64,
+            Cadence {
+                secondary_ms: Some(31.25),
+                secondary_missed_share: Some(0.6),
+            },
+            CrosscheckProfile::SoftwareCompositor,
+            10.0,
+            true,
+        )
+        .0;
+        assert!(ms_eq(soft.frame_ms, 31.25));
+        assert_eq!(soft.profile, "software-compositor");
+        assert_eq!(cc(0.06).profile, "strict");
         // No count reported (a source that cannot tell): its spacing stands.
         let s = crosscheck(
             &[],
@@ -922,6 +994,7 @@ mod tests {
                 secondary_ms: Some(31.25),
                 secondary_missed_share: None,
             },
+            CrosscheckProfile::Strict,
             10.0,
             true,
         )

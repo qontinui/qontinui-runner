@@ -616,6 +616,7 @@ function scenarioFor(unit, arm, o, ctx, { vTarget, vActual }) {
   return {
     profile: ctx.profile.id,
     profile_calibrated: ctx.profile.calibrated,
+    crosscheck_profile: ctx.spec.crosscheckProfile,
     profile_provenance: ctx.profile.provenance.kind,
     profile_digest: ctx.profileDigest,
     n: unit.n,
@@ -861,6 +862,7 @@ export async function runUnit(unit, ctx) {
     }
     const computed = computeRowKpis({
       environment: o.env,
+      crosscheckProfile: ctx.spec.crosscheckProfile,
       setupId: unit.setup,
       n: unit.n,
       arm,
@@ -988,6 +990,8 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
     hostPids: adapter.processRoots(),
     runId: genRunId,
     frames: "all",
+    // The environment's cross-check profile, told to the probe (never inferred).
+    crosscheckProfile: ctx.spec.crosscheckProfile,
     ...extra,
   });
   const probeIncidents = (records, phase) =>
