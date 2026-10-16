@@ -279,28 +279,51 @@ test("one arm's failure is that arm's alone: the measured arm keeps its row (rev
   assert.ok(res.doc.incidents.some((i) => /arm tiled: tiled arrange timed out/.test(i.detail)));
 });
 
-test("an arrangement the harness failed is an incident; one the host could not realise is not (ci run 38362046020)", async (t) => {
+test("an arrangement the harness failed is a run-level incident, once per cause; one the host could not realise is not (ci run 38362046020)", async (t) => {
+  const arranged = new Map();
+  const lines = [];
   const { res } = await fakeRun(t, {
     opts: { ns: [1], setups: ["runner"] },
+    deps: { log: (l) => lines.push(l) },
     adapterHook: (a) => {
       const arrange = a.arrange.bind(a);
       a.arrange = async (arm, actx) => {
         const r = await arrange(arm, actx);
+        arranged.set(arm, (arranged.get(arm) ?? 0) + 1);
         if (arm === "tiled") return { ...r, ok: false, failure: { reason: "harness_error", detail: "the extension's arrange call timed out" } };
         return { ...r, ok: false, failure: { reason: "arm_not_realisable", detail: "no editor group" } };
       };
     },
   });
+  assert.equal(arranged.get("tiled"), 2, "the measure and the spawn pass each arranged the arm");
   const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
   const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
   assert.equal(tiled.kpis.output_latency_ms.reason, "harness_error");
-  assert.ok(
-    tiled.incidents.some((i) => i.kind === "harness_error" && i.detail.endsWith("arm tiled: arrange: the extension's arrange call timed out")),
-    JSON.stringify(tiled.incidents),
-  );
+  const top = res.doc.incidents.filter((i) => /: arrange: /.test(i.detail));
+  assert.equal(top.length, 1, `one root cause, one incident (review N5): ${JSON.stringify(top)}`);
+  assert.equal(top[0].kind, "harness_error");
+  assert.ok(top[0].detail.endsWith("arm tiled: arrange: the extension's arrange call timed out"), "the measure pass's, not the spawn pass's: " + top[0].detail);
+  assert.equal(top[0].data.setup, "runner", "redaction filters run-level incidents on data.setup");
+  assert.ok(lines.some((l) => l.endsWith("arm tiled: arrange: the extension's arrange call timed out")), "the cause reaches the log");
+  assert.ok(!res.doc.rows.flatMap((r) => r.incidents ?? []).some((i) => /: arrange: /.test(i.detail)), "not duplicated on the row");
   assert.equal(focus.kpis.output_latency_ms.reason, "arm_not_realisable");
-  assert.ok(!focus.incidents.some((i) => /arrange:/.test(i.detail)), "a host that cannot realise the arm is a reading, not a harness error");
+  assert.ok(!res.doc.incidents.some((i) => /arm focus.*arrange:/.test(i.detail)), "a host that cannot realise the arm is a reading, not a harness error");
   assert.equal(validateResults(res.doc).valid, true);
+});
+
+test("a third party's arrange incident stays off the redacted copy (D7)", async (t) => {
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner", "tmux"] },
+    adapterHook: (a, setup) => {
+      const arrange = a.arrange.bind(a);
+      a.arrange = async (arm, actx) => {
+        const r = await arrange(arm, actx);
+        return setup === "tmux" && arm === "tiled" ? { ...r, ok: false, failure: { reason: "harness_error", detail: "arrange call timed out" } } : r;
+      };
+    },
+  });
+  assert.equal(res.doc.incidents.filter((i) => /: arrange: /.test(i.detail) && i.data?.setup === "tmux").length, 1);
+  assert.equal(redactRunnerOnly(res.doc).incidents.filter((i) => /: arrange: /.test(i.detail)).length, 0);
 });
 
 test("the primary-state guard's baseline is in the results, and a guard watching nothing blocks a supervisor run (review S7)", async (t) => {

@@ -107,7 +107,7 @@ export const REASON_CODES = Object.freeze({
   degenerate_input: "the samples cannot define the statistic (e.g. every x equal for a slope)",
   capture_unavailable: "no operative capture source for this environment",
   capture_disagreement:
-    "WGC and DDA disagreed on marker first-appearance (D2): the median gap lay more than one refresh interval outside the declared WGC render offset, or more than 5% of markers lay more than two refresh intervals outside it",
+    "WGC and DDA disagreed on marker first-appearance (D2): the median gap lay more than a quarter frame interval outside the declared WGC render offset, or (from 20 markers) more than 5% of markers lay more than one frame interval outside it",
   refresh_rate_unknown:
     "the display refresh rate is unknown, so nothing measured in refresh intervals can be counted",
   clock_unaligned: "the generator and probe clocks could not be shown to share a timebase",

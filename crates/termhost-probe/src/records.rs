@@ -352,6 +352,10 @@ pub struct CrosscheckRecord {
     pub t_secondary_ns: Ns,
     pub delta_ms: f64,
     pub refresh_ms: f64,
+    /// The frame interval the bands were sized in (ms).
+    pub frame_ms: f64,
+    /// Always `outside_band`: this marker's gap lay outside the per-marker
+    /// band. Whether the RUN disagreed is the summary's verdict, not this.
     pub verdict: &'static str,
 }
 
@@ -572,18 +576,25 @@ pub struct CrosscheckSummary {
     /// Markers whose gap lies inside the per-marker band.
     pub agreed: u64,
     /// Markers whose gap lies outside the per-marker band (each has a
-    /// `crosscheck` record).
+    /// `crosscheck` record, verdict `outside_band`).
     pub disagreed: u64,
     /// The primary's declared stage offset minus the secondary's (ms).
     pub expected_offset_ms: f64,
+    /// The frame interval F both bands are sized in (ms): the primary's
+    /// measured frame-spacing p50 clamped to 1-2 refresh intervals.
+    pub frame_ms: Option<f64>,
     /// The per-marker band on the primary-minus-secondary gap (ms).
     pub marker_band_ms: Option<(f64, f64)>,
     /// The band the median gap must lie in (ms).
     pub median_band_ms: Option<(f64, f64)>,
     /// The median primary-minus-secondary gap (ms).
     pub median_gap_ms: Option<f64>,
-    /// `disagreed / compared`; the run disagrees above 5%.
+    /// `disagreed / compared`; the run disagrees above 5% when the tail rule
+    /// applies.
     pub outside_share: Option<f64>,
+    /// Whether the tail rule (the 5% share) decided: only from 20 compared
+    /// markers. Below that the verdict rests on the median alone.
+    pub tail_rule_applied: bool,
     /// The secondary source coalesced frames where it first saw the marker, so
     /// its time is only an upper bound.
     pub secondary_coalesced: u64,

@@ -901,6 +901,12 @@ impl Model {
         };
 
         // Cross-check before latencies: a disagreement makes them unknown.
+        // Its bands are sized in the primary's measured frame spacing (p50).
+        let frame_spacing_ms = (!deltas.is_empty()).then(|| {
+            let mut d = deltas.clone();
+            d.sort_by(f64::total_cmp);
+            d[stats::nearest_rank(50, d.len()) - 1]
+        });
         let primary_list = self
             .seen_order
             .get(&self.cfg.primary)
@@ -914,6 +920,7 @@ impl Model {
                     &[],
                     |_| None,
                     refresh_ns,
+                    None,
                     0.0,
                     false,
                 );
@@ -928,6 +935,7 @@ impl Model {
                     &sec_list,
                     |m| self.first_seen(self.cfg.primary, m),
                     refresh_ns,
+                    frame_spacing_ms,
                     crate::selftest::render_offset_ms(self.cfg.primary)
                         - crate::selftest::render_offset_ms(sec),
                     true,
@@ -939,6 +947,7 @@ impl Model {
                 &[],
                 |_| None,
                 refresh_ns,
+                None,
                 0.0,
                 false,
             ),

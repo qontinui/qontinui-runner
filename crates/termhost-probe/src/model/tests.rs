@@ -548,13 +548,14 @@ fn crosschecked_run(dda_after_wgc_ms: impl Fn(u32) -> u64) -> (Vec<Record>, Watc
 
 #[test]
 fn a_capture_disagreement_makes_latency_unknown() {
-    // DDA 30 ms after WGC on every marker: a systematic offset (the median gap
-    // -30 ms lies outside [-1 refresh, declared WGC offset + 1 refresh]).
+    // DDA 30 ms after WGC on every marker: a systematic offset. WGC frames
+    // 100 ms apart clamp the frame interval to two refreshes (33.3 ms), so the
+    // median gap -30 ms lies outside [-F/4, 10 ms + F/4] = [-8.3, 18.3] ms.
     let (_, s) = crosschecked_run(|_| 30);
     assert_eq!(s.crosscheck.verdict, "disagree", "{}", s.crosscheck.detail);
     assert_eq!(s.output_latency_ms.state, KpiState::Unknown);
     assert_eq!(s.output_latency_ms.reason, Some("capture_disagreement"));
-    // A source that misses frames: every fifth marker 60 ms apart (20%).
+    // A marker tail: every fifth marker 60 ms apart (20%), outside +/- one frame.
     let (recs2, s2) = crosschecked_run(|seq| if seq % 5 == 0 { 60 } else { 5 });
     assert_eq!(
         s2.crosscheck.verdict, "disagree",

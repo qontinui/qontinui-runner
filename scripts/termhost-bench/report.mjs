@@ -187,18 +187,38 @@ export function checkAssertions(doc, a) {
   return failures;
 }
 
-/** The longest third-party detail a gate line carries. */
+/** The longest third-party detail a gate line carries, in code points. */
 export const READING_FREE_DETAIL_MAX = 240;
 
 /**
+ * A process exit code the detail labels as one (`exit 3`, `exit code 3221225477`,
+ * `exit status: -1`), with the NTSTATUS that may follow it in parentheses
+ * (`(0xC0000005)`). Kept: an exit code is the process's verdict on why it stopped
+ * — a CAUSE (an access violation, a refusal) — not a measurement of the setup.
+ */
+const EXIT_CODE = String.raw`\bexit(?: code| status)?[ :=]+[+-]?\p{Nd}+(?: \(0[xX][cC][0-9a-fA-F]{7}\))?`;
+/**
+ * A number: optionally signed (a sign only where no letter or digit precedes it,
+ * so `win32-x64` keeps its hyphen), decimal in any script (`\p{Nd}`), with digit
+ * groups, a fraction or a leading `.`, and an exponent; or hex (`0x…`, whole); or
+ * `Infinity` / `NaN`.
+ */
+const NUMBER = String.raw`(?:(?<![\p{L}\p{N}])[+-])?(?:\bInfinity\b|\bNaN\b|0[xX][0-9a-fA-F]+|(?:\p{Nd}+(?:[.,]\p{Nd}+)*|\.\p{Nd}+)(?:[eE][+-]?\p{Nd}+)?)`;
+const MASK = new RegExp(`(${EXIT_CODE})|${NUMBER}`, "gu");
+
+/**
  * A third-party KPI detail with no reading left in it (D7): every number — a
- * latency, a lag, a count, a percentage, a pid — becomes `#`, and the text is cut
- * at {@link READING_FREE_DETAIL_MAX} characters. What remains is the sentence that
- * names the cause ("the probe fell behind its capture source (frame lag # ms ...").
+ * latency, a lag, a count, a percentage, a pid, a handle — becomes `#`, sign and
+ * all; hex, non-ASCII digits, exponents, `Infinity` and `NaN` included. A labelled
+ * process exit code is kept (see EXIT_CODE: a cause, not a reading). The text is
+ * cut at {@link READING_FREE_DETAIL_MAX} code points, never inside a surrogate
+ * pair. What remains is the sentence that names the cause ("the probe fell behind
+ * its capture source (frame lag # ms ...").
  */
 export function readingFreeDetail(detail) {
-  const masked = String(detail).replace(/\d+(?:\.\d+)?/g, "#");
-  return masked.length > READING_FREE_DETAIL_MAX ? `${masked.slice(0, READING_FREE_DETAIL_MAX - 1)}…` : masked;
+  const masked = String(detail).replace(MASK, (m, exit) => (exit !== undefined ? exit : "#"));
+  const cps = Array.from(masked);
+  return cps.length > READING_FREE_DETAIL_MAX ? `${cps.slice(0, READING_FREE_DETAIL_MAX - 1).join("")}…` : masked;
 }
 
 /** Validate, then return `{valid, errors}` plus the redacted copy (or null). */

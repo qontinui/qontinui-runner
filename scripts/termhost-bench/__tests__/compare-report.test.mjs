@@ -227,10 +227,38 @@ test("a gate failure carries the runner's detail text but a third party's only w
 });
 
 test("readingFreeDetail masks every number and bounds the length", () => {
-  assert.equal(readingFreeDetail("pid 4680 at 1.5 ms, 3% of 0x140198"), "pid # at # ms, #% of #x#");
+  assert.equal(readingFreeDetail("pid 4680 at 1.5 ms, 3% of 0x140198"), "pid # at # ms, #% of #");
   const long = readingFreeDetail("x".repeat(1000));
   assert.equal(long.length, READING_FREE_DETAIL_MAX);
   assert.ok(long.endsWith("…"));
+});
+
+test("readingFreeDetail: sign, hex, any script's digits, exponents, Infinity and NaN are numbers (review N3)", () => {
+  const cases = [
+    ["median -15.63 ms in [-3.91, +13.91]", "median # ms in [#, #]"],
+    ["handle 0xFFAA, hwnd 0x1a2b3c", "handle #, hwnd #"],
+    ["１２３ ms (fullwidth), ٣٤ ms (arabic-indic)", "# ms (fullwidth), # ms (arabic-indic)"],
+    ["1e-5 and 1.5E+3 and .5", "# and # and #"],
+    ["lag Infinity ms, ratio -Infinity, mean NaN", "lag # ms, ratio #, mean #"],
+    ["1,234,567 frames", "# frames"],
+    ["win32-x64 1.139.1", "win#-x# #"],
+  ];
+  for (const [input, want] of cases) assert.equal(readingFreeDetail(input), want, input);
+  for (const [, want] of cases) assert.doesNotMatch(want, /\p{Nd}/u);
+});
+
+test("readingFreeDetail keeps a labelled exit code: a cause, not a reading (review N3)", () => {
+  assert.equal(readingFreeDetail("Code.exe died: exit code 3221225477 (0xC0000005) after 12 s"), "Code.exe died: exit code 3221225477 (0xC0000005) after # s");
+  assert.equal(readingFreeDetail("the soak watch ended (stopped, exit 3) without"), "the soak watch ended (stopped, exit 3) without");
+  assert.equal(readingFreeDetail("status 0xC0000005 seen at 42 ms"), "status # seen at # ms", "an unlabelled hex status is masked");
+});
+
+test("readingFreeDetail cuts by code point, never inside a surrogate pair (review N3)", () => {
+  const cut = readingFreeDetail("\u{1F600}".repeat(300));
+  assert.equal(Array.from(cut).length, READING_FREE_DETAIL_MAX);
+  assert.doesNotMatch(cut, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  const short = "\u{1F600}".repeat(READING_FREE_DETAIL_MAX);
+  assert.equal(readingFreeDetail(short), short, "exactly the cap is not cut");
 });
 
 test("an unproven build is never one side of a comparison (D12, review round 2 M1)", () => {

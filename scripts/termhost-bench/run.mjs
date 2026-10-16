@@ -652,6 +652,20 @@ export async function runUnit(unit, ctx) {
   const incidents = [];
   const arms = new Map();
   const armErrors = new Map();
+  // An arrangement the harness failed, as a run-level incident (see runArm). The
+  // measure and spawn passes arrange each arm twice, so one root cause would be
+  // two incidents: the spawn pass's is dropped when its detail repeats the
+  // measure pass's.
+  const arrangeSeen = new Set();
+  const recordArrangeFailure = (arm, f, pass = "") => {
+    if (!f) return;
+    const key = `${arm}\u0000${f.detail}`;
+    if (arrangeSeen.has(key)) return;
+    arrangeSeen.add(key);
+    const detail = `unit ${name} arm ${arm}${pass}: arrange: ${f.detail}`;
+    log(detail);
+    incidents.push(incident("harness_error", detail, { data: { setup: unit.setup, unit: name, arm, phase: `${arm}/arrange` } }));
+  };
   let adapter = null;
   let failure = null;
   let admission = null;
@@ -707,7 +721,9 @@ export async function runUnit(unit, ctx) {
         // One arm's failure is that arm's alone: the arms that measured keep their
         // rows, and the failed one carries its own reason.
         try {
-          arms.set(arm, await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }, { only: "measure" }));
+          const measured = await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }, { only: "measure" });
+          arms.set(arm, measured);
+          recordArrangeFailure(arm, measured.arrangeFailure);
         } catch (e) {
           const f = e instanceof AdapterRefusal ? { reason: e.reason, detail: e.detail } : { reason: "harness_error", detail: e?.message ?? String(e) };
           armErrors.set(arm, f);
@@ -731,6 +747,7 @@ export async function runUnit(unit, ctx) {
         if (!measured || ctx.aborted?.()) continue;
         try {
           const sp = await runArm(unit, arm, { ...ctx, adapter, unitDir, genDir, genRunId, slotMap, name }, { only: "spawn" });
+          recordArrangeFailure(arm, sp.arrangeFailure, " (spawn pass)");
           // A spawn measures the NEW session's first marker, so an arrangement that
           // shows no earlier session does not void it; it is noted, not fatal.
           measured.spawns = sp.spawns ?? (sp.armFailure ? { unavailable: sp.armFailure } : null);
@@ -926,6 +943,7 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
   const out = {
     vTarget: arr.vTarget ?? defaultVTarget(unit, arm),
     armFailure: arr.ok ? null : arr.failure ?? { reason: "harness_error", detail: "arrange failed" },
+    arrangeFailure: null,
     paneSizes: arr.paneSizes ?? [],
     layout: arr.layout ?? null,
     arrangeNotes: arr.notes ?? [],
@@ -937,16 +955,12 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
     diagnostics: {},
   };
   // An arrangement the harness failed (not one the host could not realise) is the
-  // harness's error like any other: an incident, so the run's incident count and
-  // its results file say so. Before this, CI run 38362046020's `0 incidents`
-  // could not rule an arrange failure out as the cause of the VS Code tiled
-  // arm's unknown(harness_error).
-  if (out.armFailure?.reason === "harness_error") {
-    const pass = only === "spawn" ? " (spawn pass)" : "";
-    out.incidents.push(
-      incident("harness_error", `unit ${name} arm ${arm}${pass}: arrange: ${out.armFailure.detail}`, { data: { setup: unit.setup, unit: name, phase: `${arm}/arrange` } }),
-    );
-  }
+  // harness's error like any other. It is handed back as `arrangeFailure` for the
+  // caller to record as a RUN-level incident (data.setup set, so redaction keeps
+  // a third party's off the uploaded copy), like an arrangement that threw: a
+  // row-level incident is not counted in the run's `N incidents`, and CI run
+  // 38362046020's `0 incidents` could not rule this path out.
+  out.arrangeFailure = out.armFailure?.reason === "harness_error" ? out.armFailure : null;
   const act = await probe.activate({ runDir: join(unitDir, `activate-${arm}${only === "spawn" ? "-spawn" : ""}`), target: target() });
   if (!act.ok) out.arrangeNotes.push(`activation: ${act.detail}`);
   await sleep(o.warmupMs);
