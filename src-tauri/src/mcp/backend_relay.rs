@@ -10003,7 +10003,10 @@ mod egress_tests {
         use crate::egress::test_support::{fake_session_tenant, pin_for};
         use crate::egress::SessionScope;
         let tmp = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        // Non-verbatim: git cannot create a worktree under a `\\?\` path.
+        let base = std::path::PathBuf::from(strip_verbatim_prefix(
+            &std::fs::canonicalize(tmp.path()).unwrap().to_string_lossy(),
+        ));
         let root = base.join("repo");
         let wt = base.join("wt-b");
         let git = |dir: &std::path::Path, args: &[&str]| {
@@ -10157,7 +10160,10 @@ mod egress_tests {
         use crate::egress::test_support::{fake_session_tenant, pin_for};
         use crate::egress::SessionScope;
         let tmp = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        // Non-verbatim: git cannot create a worktree under a `\\?\` path.
+        let base = std::path::PathBuf::from(strip_verbatim_prefix(
+            &std::fs::canonicalize(tmp.path()).unwrap().to_string_lossy(),
+        ));
         let root = git_repo_with_worktrees(&base, &["src-b"]);
         let a = uuid::Uuid::from_u128(0x7e7a_0012);
         let b = uuid::Uuid::from_u128(0x7e7a_0013);
@@ -10187,6 +10193,7 @@ mod egress_tests {
 
     /// Re-review W4: the files routes forward the CANONICAL path the gate
     /// checked, so the handler cannot re-resolve a swapped symlink.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_files_routes_forward_the_canonical_path_the_gate_checked() {
         let _on = pin(Flow::CodeMirror, Level::On);
@@ -10194,7 +10201,6 @@ mod egress_tests {
         let base = std::fs::canonicalize(tmp.path()).unwrap();
         std::fs::create_dir_all(base.join("real")).unwrap();
         std::fs::write(base.join("real/f.txt"), "x").unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
         let server = RecordingServer::start("{}".to_string());
         let asked = base.join("link/f.txt");
