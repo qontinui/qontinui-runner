@@ -4824,6 +4824,14 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
     // `GET /sessions/create-requests` catch-up poll. Until then the target
     // took the relay's word that a create grant existed, so a relay defect
     // spawned PTYs here.
+    //
+    // A GRANTED create may declare no edit siblings (no grant names one). That
+    // refusal is decided HERE, before the gate consumes the grant, so a frame
+    // that carries them does not burn its grant for nothing.
+    if let Some(frame) = crate::mcp::remote_terminal::granted_create_edit_sibling_refusal(data) {
+        warn!("relay create: refused a granted create that declares edit siblings");
+        return Some(frame);
+    }
     let gate = |data: &Value| {
         crate::mcp::remote_terminal::admit_terminal_create(
             crate::mcp::remote_terminal::grants(),
@@ -4968,10 +4976,13 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         // scenario A). The mobile client sends none of the three, which is the
         // arm that still gets this device's default.
         let relay = match &admitted {
+            // A granted frame declaring edit siblings was refused before the
+            // gate (`granted_create_edit_sibling_refusal`), so none is read here.
             Some(create) => crate::mcp::remote_terminal::RelayCreate {
                 working_dir: Some(create.working_dir.clone()),
                 intent_repo: create.intent_repo.clone(),
                 agent_session_id: None,
+                edit_siblings: Vec::new(),
             },
             None => match crate::mcp::remote_terminal::resolve_relay_create(&relay_targets, data) {
                 Ok(relay) => relay,
@@ -5019,6 +5030,31 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             })
         };
 
+        // The allowlisted edit siblings are validated like every spawn
+        // surface's (name shape, a checkout on this device, an intent repo to
+        // apply to) before the allocate, so a typo is a typed refusal frame
+        // rather than a silent shared-checkout pane (vet V9).
+        let edit_siblings = match crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+            effective_intent_repo.as_deref(),
+            &relay.edit_siblings,
+        ) {
+            Ok(v) => v,
+            Err(refusal) => {
+                warn!("backend_relay terminal_create: refused edit siblings — {refusal}");
+                // Same keys as every other create refusal frame
+                // (`create_refusal_frame`), so a client parses them uniformly.
+                let remote = crate::mcp::remote_terminal::remote_echo(data);
+                return Some(serde_json::json!({
+                    "type": "error",
+                    "code": refusal.code(),
+                    "message": refusal.message,
+                    "request_id": data.get("request_id").cloned().unwrap_or(Value::Null),
+                    "grant_jti": remote["grant_jti"].clone(),
+                    "remote": remote,
+                }));
+            }
+        };
+
         let (working_dir, isolated_ctx) =
             crate::agent_worktree::isolated_edit::acquire_for_terminal(
                 effective_intent_repo.as_deref(),
@@ -5035,6 +5071,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 // issued — a capability no grant confers (plan
                 // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential).
                 None,
+                &edit_siblings,
             )
             .await;
 
@@ -7605,6 +7642,58 @@ mod remote_admission_tests {
             "terminal_create",
             &with_create_grant(json!({ "type": "terminal_create" }))
         ));
+    }
+
+    /// Plan 2026-10-10: a GRANTED create that declares edit siblings is refused
+    /// BEFORE the grant gate consumes its grant. `handle_terminal_create` needs
+    /// a live `ApiState`, so the ordering is pinned at the source level (the
+    /// same shape as the other wiring pins in this crate): the refusal must sit
+    /// between the drain gate and the grant gate.
+    #[test]
+    fn a_granted_edit_sibling_refusal_runs_before_the_grant_is_consumed() {
+        let src = include_str!("backend_relay.rs");
+        // Needles are assembled with `concat!` so none of them appears verbatim
+        // in this test's own text, and the search is bounded to the handler
+        // body (it ends at the first column-0 `}`), so a needle missing from
+        // the handler cannot be satisfied by a match further down the file.
+        let body_start = src
+            .find(concat!("async fn ", "handle_terminal_create("))
+            .expect("handler present");
+        let rest = src.get(body_start..).expect("in bounds");
+        let body_end = rest.find("\n}\n").expect("handler body closes");
+        let body = rest.get(..body_end).expect("in bounds");
+        assert!(
+            !body.contains(concat!("fn a_granted_edit_sibling", "_refusal_runs_before")),
+            "the bounded body must not reach this test"
+        );
+        let refusal = body
+            .find(concat!("granted_create_edit_sibling_refusal", "(data)"))
+            .expect("the refusal is wired into the handler");
+        let gate = body
+            .find(concat!("let admitted = match ", "gate(data)"))
+            .expect("the grant gate is in the handler");
+        let drain = body
+            .find(concat!("drain_gate_", "for_work("))
+            .expect("the drain gate is in the handler");
+        assert!(
+            drain < refusal && refusal < gate,
+            "the edit-sibling refusal must run after the drain gate and before the grant gate"
+        );
+
+        // …and the helper refuses exactly the granted frame that declares one.
+        let frame = with_create_grant(json!({
+            "type": "terminal_create",
+            "editSiblings": ["qontinui-schemas"],
+        }));
+        let refused = crate::mcp::remote_terminal::granted_create_edit_sibling_refusal(&frame)
+            .expect("refused");
+        assert_eq!(refused["code"], "remote_create_edit_sibling_not_allowed");
+        assert!(
+            crate::mcp::remote_terminal::granted_create_edit_sibling_refusal(&with_create_grant(
+                json!({ "type": "terminal_create" })
+            ))
+            .is_none()
+        );
     }
 
     /// …and buys nothing else on this device. A create grant is not an attach
