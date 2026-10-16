@@ -47,9 +47,10 @@ pub struct Faults {
     pub drop_keys: bool,
     /// The compositor never presents a frame.
     pub capture_dead: bool,
-    /// While an echo whose sequence is `1 mod n` is on screen, the compositor
-    /// presents nothing (a capture gap that swallows the whole echo, as a
-    /// loaded hosted runner's ~10 Hz capture did). 0 = off.
+    /// The paint of an echo whose sequence is `1 mod n` is never presented, so
+    /// no frame shows that echo until the next change replaces it (a capture
+    /// gap that swallows the whole echo, as a loaded hosted runner's ~10 Hz
+    /// capture did). 0 = off.
     pub swallow_echo_mod: u32,
     /// ONE frame (the fifth) reaches the probe this long after it was
     /// presented — a scheduler hiccup, not a probe that fell behind.
@@ -79,6 +80,8 @@ pub struct Desktop {
     generation: AtomicU64,
     /// When the canvas last changed (stored before `generation` moves).
     last_change_ns: AtomicU64,
+    /// A canvas generation the compositor must never present (0 = none).
+    swallowed_generation: AtomicU64,
     state: Mutex<State>,
     bus: Mutex<Option<Arc<InputBus>>>,
     geometry: TestGeometry,
@@ -95,6 +98,7 @@ impl Desktop {
             )),
             generation: AtomicU64::new(1),
             last_change_ns: AtomicU64::new(0),
+            swallowed_generation: AtomicU64::new(0),
             state: Mutex::new(State {
                 foreground: false,
                 occluded: false,
@@ -114,6 +118,13 @@ impl Desktop {
     }
 
     fn draw(&self, slot: PaintSlot, marker: Option<Marker>) {
+        self.draw_swallowed(slot, marker, false);
+    }
+
+    /// Draw; with `swallow`, the generation this paint produces is never
+    /// presented. Marked under the canvas lock before the generation moves,
+    /// so the compositor cannot present it in between.
+    fn draw_swallowed(&self, slot: PaintSlot, marker: Option<Marker>, swallow: bool) {
         let (x, y) = match slot {
             PaintSlot::Output => self.geometry.output_at,
             PaintSlot::Echo => self.geometry.echo_at,
@@ -124,6 +135,10 @@ impl Desktop {
             c.fill_rect(x as usize + i * 12, y as usize, 12, 24, *rgb);
         }
         self.last_change_ns.store(now_ns(), Ordering::SeqCst);
+        if swallow {
+            let next = self.generation.load(Ordering::SeqCst) + 1;
+            self.swallowed_generation.store(next, Ordering::SeqCst);
+        }
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -171,17 +186,9 @@ impl CaptureSource for FakeCapture {
         let deadline = now_ns() + timeout.as_nanos() as u64;
         loop {
             let generation = self.desk.generation.load(Ordering::SeqCst);
-            let n = self.desk.faults.swallow_echo_mod;
-            let swallowed = n > 0
-                && self
-                    .desk
-                    .state
-                    .lock()
-                    .expect("state")
-                    .echoes
-                    .last()
-                    .is_some_and(|e| e.seq % n == 1);
-            if generation != self.last && swallowed {
+            if generation != self.last
+                && generation == self.desk.swallowed_generation.load(Ordering::SeqCst)
+            {
                 // Consumed, never presented: no frame shows this echo.
                 self.last = generation;
             }
@@ -311,7 +318,9 @@ impl KeyInjector for FakeInjector {
             termhost_probe::selftest::SESSION,
             marker_seq(u64::from(seq)),
         );
-        self.desk.draw(PaintSlot::Echo, Some(m));
+        let n = self.desk.faults.swallow_echo_mod;
+        self.desk
+            .draw_swallowed(PaintSlot::Echo, Some(m), n > 0 && seq % n == 1);
         self.desk
             .state
             .lock()
