@@ -446,10 +446,11 @@ mod tests {
     /// (`get_envs` reports a removal as `None`), so a `GIT_DIR` inherited from
     /// the runner's launcher cannot point a CI step or a checkout at another
     /// repo. This is the runner half of what `build_step_command`'s test pinned
-    /// before the executor moved into ci-exec (qontinui-runner 0aca8ff42): ci-exec
-    /// builds its git, tool and container commands through this method, and
-    /// builds step commands through it from the qontinui-schemas change that
-    /// ports 238439693. A bare `Command::new` fails it.
+    /// before the executor moved into ci-exec (qontinui-runner 0aca8ff42).
+    /// ci-exec builds its git, tool and container commands through this method.
+    /// It does NOT yet build manifest STEP commands through it at the pinned
+    /// schemas commit: that is qontinui-schemas#242 (c98b5258), which reaches
+    /// the runner with the next schemas pin. A bare `Command::new` fails this.
     #[test]
     fn a_git_command_is_scrubbed_of_the_repo_local_env() {
         let cmd = RunnerProcess.command("git");
