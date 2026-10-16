@@ -41,10 +41,11 @@ import {
   captureLosses,
   clockGate,
   computeRowKpis,
-  describeLoss,
   describeStall,
   indexGenerators,
   indexProbeSegment,
+  LOSS_DETAIL_MAX,
+  lossGroups,
   injectAbortReason,
   nsToMs,
   paneStalls,
@@ -52,6 +53,7 @@ import {
   segmentWindow,
   stallCoverage,
   STALL_MIN_MS,
+  summarizeLosses,
 } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
 import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
@@ -1195,8 +1197,10 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       };
       // A primary capture loss after a session's last kept frame: the read that
       // could have shown its repaint failed or never came, so it cannot be judged.
-      const losses = captureLosses(idx, primaryFrames(idx, primary, win)).filter((x) => x.t === null || (x.t >= win.t0 && x.t <= win.t1));
-      const lossText = losses.length > 0 ? `; ${losses.map((x) => describeLoss(x, win)).join("; ")}` : "";
+      const pframes = primaryFrames(idx, primary, win);
+      const lastPrimaryT = pframes.length > 0 ? pframes.at(-1).t : null;
+      const losses = captureLosses(idx, pframes).filter((x) => x.t === null || (x.t >= win.t0 && x.t <= win.t1));
+      const lossText = losses.length > 0 ? `; ${summarizeLosses(losses, lastPrimaryT, win)}` : "";
       const slackNs = BigInt(CAPTURE_LOST_SLACK_MS) * 1_000_000n;
       const lossAfter = (k) => {
         const c = cov.get(k);
@@ -1206,7 +1210,7 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
       };
       const whyNot = (k) =>
         restoreCoverageGap(cov.get(k), windowMs, emittedInFinal(k)) ??
-        (lossAfter(k) ? `the primary capture was lost after its last kept frame (${lossAfter(k).detail})` : null) ??
+        (lossAfter(k) ? `the primary capture was lost after its last kept frame (${lossAfter(k).detail.slice(0, LOSS_DETAIL_MAX)})` : null) ??
         (unresolved.has(k) ? "still at the watch's end on a short frameless tail" : null);
       const judged = expected.filter((k) => whyNot(k) === null);
       const seen = expected
@@ -1253,7 +1257,7 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
           unresolved: unresolvedList,
           restored: restoredSession,
           stalls,
-          losses: losses.map((x) => ({ atMs: x.t === null ? null : Math.round(nsToMs(x.t - win.t0)), ended: x.ended, cuts: x.cuts, detail: x.detail })),
+          losses: { count: losses.length, groups: lossGroups(losses, lastPrimaryT, win) },
         },
         notes: [note],
       };

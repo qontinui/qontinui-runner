@@ -499,4 +499,31 @@ mod tests {
         assert!(times.iter().all(|&(_, t)| t > t0 && t < t1), "{times:?}");
         assert!(times[0].1 < times[1].1, "{times:?}");
     }
+
+    #[test]
+    fn a_capture_loss_is_timed_in_the_capture_thread_not_when_the_engine_handles_it() {
+        let mut setup = EngineSetup::new(ModelConfig::new(SourceId::Synthetic, None, 16_666_667));
+        setup.sources = vec![Box::new(Losing { calls: 0 })];
+        let (sink, lines) = Sink::memory();
+        let t0 = now_ns();
+        let mut engine = Engine::start(setup, sink, t0);
+        // The capture thread loses its first read ~5 ms in; nothing pumps the
+        // engine until 150 ms later.
+        std::thread::sleep(Duration::from_millis(150));
+        let pump_start = now_ns();
+        engine.pump_until(pump_start + 100 * MS);
+        let _ = engine.finish(now_ns());
+        let first = lines
+            .lock()
+            .expect("lines")
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "incident" && v["kind"] == "capture_lost")
+            .expect("a capture_lost incident");
+        let t: u64 = first["t_ns"].as_str().expect("t_ns").parse().expect("u64");
+        assert!(
+            t > t0 && t < pump_start,
+            "t_ns {t} not before the pump at {pump_start}"
+        );
+    }
 }

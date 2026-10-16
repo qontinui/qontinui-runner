@@ -1083,12 +1083,12 @@ test("r15 MF1: a primary capture loss after a restored session's last kept frame
   // Without a loss: 1.5 s with no frame after +3.5 s of a 5 s watch is within the end term, and judged clean.
   const none = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: withLoss(null) });
   assert.equal(check(none.focus).data?.outcome, "clean", JSON.stringify(check(none.focus)));
-  assert.deepEqual(check(none.focus).data.losses, []);
+  assert.deepEqual(check(none.focus).data.losses, { count: 0, groups: [] });
   for (const kind of ["lost", "ended"]) {
     const { focus } = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: withLoss(kind) });
     assert.equal(check(focus).state, "unknown", JSON.stringify(check(focus)));
     assert.ok(
-      unknownIncident(focus, /0: \d+ kept frame\(s\) .*\(not judged: the primary capture was lost after its last kept frame \(.* capture (lost \(re-establishing\)|ended)[^)]*\)\); the primary capture \(\w+\) was lost at \+\d+ ms/),
+      unknownIncident(focus, /0: \d+ kept frame\(s\) .*\(not judged: the primary capture was lost after its last kept frame \(.* capture (lost \(re-establishing\)|ended)[^)]*\)\); 1 primary capture loss\(es\) \(\w+; first \+\d+ ms, last \+\d+ ms\): 1 x /),
       `${kind}: ${JSON.stringify(focus.incidents)}`,
     );
   }
@@ -1107,6 +1107,7 @@ test("r15 MF1: the restore check lists the window's losses in a clean note too, 
       for (const x of incs.list) {
         const rec = { type: "incident", kind: "capture_lost", at: at0, detail: `${source} capture lost (re-establishing): read failed`, stops_run: false, data: { source } };
         if (x.exactMs !== undefined) rec.t_ns = String(x.exactMs === "before" ? BigInt(startRec.t0_ns) - 1n : ms(x.exactMs));
+        else if (x.unplaced) rec.at = "nope";
         else rec.at = new Date(Date.parse(at0) + Number((ms(x.wallMs) - BigInt(startRec.t0_ns)) / 1_000_000n)).toISOString();
         out.push(rec);
       }
@@ -1115,10 +1116,17 @@ test("r15 MF1: the restore check lists the window's losses in a clean note too, 
   // A failed read at +1 s, frames after it, and one before the window: clean, and the note names only the first.
   const early = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: edit({ list: [{ exactMs: 1000 }, { exactMs: "before" }] }) });
   assert.equal(check(early.focus).data?.outcome, "clean", JSON.stringify(check(early.focus)));
-  assert.equal(check(early.focus).data.losses.length, 1);
-  assert.match(check(early.focus).notes[0], /; the primary capture \(\w+\) was lost at \+1000 ms \(.*\); re-established: later frames were read\)$/);
+  assert.deepEqual(check(early.focus).data.losses, { count: 1, groups: [{ effect: "later", count: 1, firstMs: 1000, lastMs: 1000 }] });
+  assert.match(check(early.focus).notes[0], /; 1 primary capture loss\(es\) \(\w+; first \+1000 ms, last \+1000 ms\): 1 x re-established: later frames were read at \+1000 ms; frameless tail read \+\d+ ms\.\.\+5000 ms \(e\.g\. ".*"\)\)$/);
   // Frames to +3.5 s, a loss placed by wall clock 0.5 s BEFORE the last kept frame: within the slack, so not judged.
   const mapped = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: edit({ cut: 3500, list: [{ wallMs: 3000 }] }) });
   assert.equal(check(mapped.focus).state, "unknown", JSON.stringify(check(mapped.focus)));
   assert.ok(unknownIncident(mapped.focus, /not judged: the primary capture was lost after its last kept frame/), JSON.stringify(mapped.focus.incidents));
+  // The same 0.5 s before, on the probe clock: no slack, frames followed it, so judged.
+  const exact = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: edit({ cut: 3500, list: [{ exactMs: 3000 }] }) });
+  assert.equal(check(exact.focus).data?.outcome, "clean", JSON.stringify(check(exact.focus)));
+  // A loss that cannot be placed in time is kept by the window filter and leaves the session unjudged.
+  const unplaced = await restoreRun(t, { restoreCheckMs: 5000, wrapProbe: edit({ list: [{ wallMs: 1000, unplaced: true }] }) });
+  assert.equal(check(unplaced.focus).state, "unknown", JSON.stringify(check(unplaced.focus)));
+  assert.ok(unknownIncident(unplaced.focus, /not judged: the primary capture was lost after its last kept frame .*none placed in time/), JSON.stringify(unplaced.focus.incidents));
 });

@@ -26,7 +26,10 @@ import {
   STALL_TAIL_MIN_MS,
   STALL_VOIDED_KPIS,
   captureLosses,
-  describeLoss,
+  lossEffects,
+  lossGroups,
+  summarizeLosses,
+  LOSS_DETAIL_MAX,
   CAPTURE_LOST_SLACK_MS,
   describeStall,
   excludedSpans,
@@ -1266,7 +1269,7 @@ test("r14 B: a primary capture lost at 45 s is not a frozen screen: no void, and
   const r = computeRowKpis({ ...f, soak: { records } });
   assert.deepEqual(r.stalls, [], JSON.stringify(r.stalls));
   assert.equal(r.kpis.output_latency_ms.state, "measured");
-  assert.ok((r.kpis.output_latency_ms.notes ?? []).some((n) => /^the primary capture \(\w+\) was lost at \+\d+ ms \(x11 capture ended: gone\); capture ended: no frameless time after \+\d+ ms counts toward a pane stall$/.test(n)), JSON.stringify(r.kpis.output_latency_ms.notes));
+  assert.ok((r.kpis.output_latency_ms.notes ?? []).some((n) => /^1 primary capture loss\(es\) \(\w+; first \+(\d+) ms, last \+\1 ms\): 1 x capture ended: no frameless time after it counts at \+\1 ms; (no frameless tail|frameless tail read \+\d+ ms\.\.\+\1 ms) \(e\.g\. "x11 capture ended: gone"\)$/.test(n)), JSON.stringify(r.kpis.output_latency_ms.notes));
   // Without the incident the same row voids.
   const bare = computeRowKpis({ ...f, soak: { records: records.filter((x) => x.type !== "incident") } });
   assertUnknown(bare.kpis.output_latency_ms, "pane_stalled");
@@ -1350,33 +1353,6 @@ test("r15 S5: only an RFC 3339 `at` is placed; a local time or a number is not (
   assert.equal(placed("2026-10-16 00:00:20.500"), null);
 });
 
-test("r15 SF2: each loss's note says what it did (review r15 SF2, r2.mjs)", () => {
-  const frames = every(0, 20_000, 100).map((t) => fr(t, t / 100));
-  const all = frames.map((f) => ({ t: BigInt(f.t_ns) }));
-  const win = winTo(60_000);
-  // A failed read at 5 s, frames to 20 s, frozen to 60 s: the row voids, and the note says frames followed.
-  const seg = lostSeg(frames, [lostAt(5000, "x11", { kind: "lost", exact: true })]);
-  assert.deepEqual(paneStalls(seg, gens100(60_000), win, V0).map((x) => x.voids), [true]);
-  const say = (inc) => captureLosses(lostSeg(frames, [inc]), all).map((x) => describeLoss(x, win))[0];
-  assert.match(say(lostAt(5000, "x11", { kind: "lost", exact: true })), /^the primary capture \(x11\) was lost at \+5000 ms \(x11 capture lost \(re-establishing\): read failed\); re-established: later frames were read$/);
-  assert.match(say(lostAt(30_000, "x11", { kind: "lost", exact: true })), /; re-established: a frameless tail is counted from \+30000 ms$/);
-  assert.match(say(lostAt(30_000, "x11", { exact: true })), /; capture ended: no frameless time after \+30000 ms counts toward a pane stall$/);
-  assert.match(say({ ...lostAt(30_000, "x11", { kind: "lost" }), at: "nope" }), /at a time that could not be placed on the probe's clock .*; one failed read whose time is unknown; it changes nothing$/);
-  assert.match(say({ ...lostAt(30_000), at: "nope" }), /; every frameless tail ends at the run's last frame$/);
-});
-
-test("r15 nit 5: a loss outside the soak window is not noted on the row (review r15 nit 5)", () => {
-  const f0 = focusFixture();
-  const primary = captureInfo(indexProbeSegment(f0.soak.records)).primary;
-  const start = BigInt(f0.soak.records.find((r) => r.type === "start").t0_ns);
-  const inc = (t) => ({ type: "incident", kind: "capture_lost", at: "2026-10-16T00:00:00.000Z", t_ns: String(t), detail: `${primary} capture lost (re-establishing): x`, stops_run: false, data: { source: primary } });
-  const notesFor = (t) => computeRowKpis({ ...f0, soak: { records: [...f0.soak.records, inc(t)] } }).kpis.output_latency_ms.notes ?? [];
-  // The fixture's window starts 5 ms after the start record.
-  assert.ok(!notesFor(start).some((n) => /primary capture/.test(n)), "before the window");
-  assert.ok(notesFor(start + 5n * MS).some((n) => /primary capture .* lost at \+0 ms/.test(n)), "at its start");
-  assert.ok(notesFor(start + 10_000n * MS).some((n) => /lost at \+9995 ms/.test(n)));
-});
-
 test("r15 nit 6: a backwards seq step is not an advance in the final still run (review r15 nit 6)", () => {
   const back = [...every(0, 2900, 100).map((t) => fr(t, 50)), ...every(3100, 5000, 100).map((t) => fr(t, 49))];
   const c = stallCoverage(synthSeg(back), winTo(5000), [0]).get(0);
@@ -1386,12 +1362,6 @@ test("r15 nit 6: a backwards seq step is not an advance in the final still run (
   // The held time leaves out excluded spans.
   const c2 = stallCoverage(synthSeg(back, [ivx(1000, 2000, "occluded")]), winTo(5000), [0]).get(0);
   assert.equal(c2.finalHeldMs, 4000);
-});
-
-test("r15: an end is read from the engine's wording, not from stops_run (review r15 SF3)", () => {
-  const frames = every(0, 20_000, 100).map((t) => fr(t, t / 100));
-  const xs = captureLosses(lostSeg(frames, [{ ...lostAt(30_000), stops_run: false }, { ...lostAt(31_000, "x11", { kind: "lost" }), stops_run: true }]));
-  assert.deepEqual(xs.map((x) => [x.ended, x.cuts]), [[true, true], [false, false]]);
 });
 
 test("r15 S5: a Date.parse-able `at` that is not RFC 3339 is not placed (review r15)", () => {
@@ -1404,4 +1374,99 @@ test("r15 SF3: tail markers are counted from the restart, not from the run's las
   // 50 markers between the last frame and a failed read at 25 s, 15 after it.
   const gens = gensAt([...every(0, 20_000, 100), ...every(20_100, 25_000, 100), ...every(26_000, 54_000, 2000)]);
   assert.deepEqual(paneStalls(lostSeg(frames, [lostAt(25_000, "x11", { kind: "lost", exact: true })]), gens, winTo(60_000), V0), []);
+});
+
+// --- review r16 ---------------------------------------------------------------
+
+const f20 = every(0, 20_000, 100).map((t) => fr(t, t / 100));
+const last20 = at(20_000);
+const effectsOf = (incs, frames = f20) => {
+  const all = frames.map((f) => ({ t: BigInt(f.t_ns) }));
+  const xs = captureLosses(lostSeg(frames, incs), all);
+  return lossEffects(xs, all.at(-1).t, winTo(60_000));
+};
+const L = (ms, o = {}) => lostAt(ms, "x11", { kind: "lost", ...o });
+
+test("r16 S1 R1: only the failed read that set the tail's start says so; an earlier one is superseded (review r16 S1)", () => {
+  const e = effectsOf([L(25_000, { exact: true }), L(40_000, { exact: true })]);
+  assert.deepEqual(e.effects, ["superseded", "restart"]);
+  assert.equal(e.tailStart, at(40_000));
+  const line = summarizeLosses(captureLosses(lostSeg(f20, [L(25_000, { exact: true }), L(40_000, { exact: true })]), f20.map((f) => ({ t: BigInt(f.t_ns) }))), last20, winTo(60_000));
+  assert.match(line, /^2 primary capture loss\(es\) \(x11; first \+25000 ms, last \+40000 ms\): 1 x a retry, no later frame read: the tail is counted from it at \+40000 ms; 1 x a retry, no later frame read; superseded by a later failed read at \+25000 ms; frameless tail read \+40000 ms\.\.\+60000 ms /);
+});
+
+test("r16 S1 R2: a mapped failed read within the slack before the last frame reports the real tail start (review r16 S1)", () => {
+  const e = effectsOf([L(19_500)]);
+  assert.deepEqual([e.effects, e.tailStart], [["at_last_frame"], last20]);
+  const xs = captureLosses(lostSeg(f20, [L(19_500)]), f20.map((f) => ({ t: BigInt(f.t_ns) })));
+  assert.match(summarizeLosses(xs, last20, winTo(60_000)), /1 x a retry around the last frame, no later frame read: the tail is counted from the last frame at \+19500 ms; frameless tail read \+20000 ms\.\.\+60000 ms/);
+  assert.ok(!/re-established/.test(summarizeLosses(xs, last20, winTo(60_000))));
+});
+
+test("r16 S1: every effect a loss can have (review r16 S1)", () => {
+  assert.deepEqual(effectsOf([L(5000, { exact: true })]).effects, ["later"]);
+  assert.deepEqual(effectsOf([lostAt(30_000, "x11", { exact: true })]).effects, ["ended"]);
+  assert.deepEqual(effectsOf([lostAt(30_000, "x11", { exact: true }), lostAt(40_000, "x11", { exact: true })]).effects, ["ended", "cut_superseded"]);
+  assert.deepEqual(effectsOf([{ ...lostAt(30_000), at: "nope" }]).effects, ["unplaced_cut"]);
+  assert.deepEqual(effectsOf([{ ...L(30_000), at: "nope" }]).effects, ["unplaced_retry"]);
+  // R3: an end at 30 s, then a failed read placed after it: no effect, and the tail is 20-30 s.
+  const r3 = effectsOf([lostAt(30_000, "x11", { exact: true }), L(45_000, { exact: true })]);
+  assert.deepEqual([r3.effects, r3.tailStart, r3.tailEnd], [["ended", "after_end"], last20, at(30_000)]);
+  assert.deepEqual(paneStalls(lostSeg(f20, [lostAt(30_000, "x11", { exact: true }), L(45_000, { exact: true })]), gens100(60_000), winTo(60_000), V0).map((x) => x.framelessMs), [10_000]);
+});
+
+test("r16 S3: a failed read exactly at the window's end, or at an end's cut, leaves no tail (review r16 S3)", () => {
+  const run = (incs) => paneStalls(lostSeg(f20, incs), gens100(60_000), winTo(60_000), V0);
+  assert.deepEqual(run([L(60_000, { exact: true })]), [], "at win.t1: it may have consumed the repaint");
+  const e = effectsOf([L(59_999, { exact: true })]);
+  assert.deepEqual([e.tailStart, e.tailEnd], [at(59_999), at(60_000)]);
+  assert.deepEqual(run([lostAt(50_000, "x11", { exact: true }), L(50_000, { exact: true })]), [], "at the cut");
+  assert.deepEqual(effectsOf([L(60_000, { exact: true })]).effects, ["restart"]);
+});
+
+test("r16 S3: only a WGC primary cuts on a failed read with no later frame; X11 and other sources do not (review r16 S3)", () => {
+  const xs = (primary) => {
+    const frames = f20.map((f) => ({ ...f, source: primary }));
+    const seg = { ...lostSeg(frames, [lostAt(30_000, primary, { kind: "lost", exact: true })]), captures: [{ type: "capture", source: primary, state: "started" }], summary: { primary } };
+    return captureLosses(seg, frames.map((f) => ({ t: BigInt(f.t_ns) }))).map((x) => x.cuts);
+  };
+  assert.deepEqual(xs("wgc"), [true]);
+  assert.deepEqual(xs("x11"), [false]);
+  assert.deepEqual(xs("synthetic"), [false]);
+});
+
+test("r16 N3: an end is read from stops_run, which the engine sets exactly on the primary's end (review r16 N3)", () => {
+  const xs = captureLosses(lostSeg(f20, [{ ...lostAt(30_000), stops_run: false }, { ...L(31_000), stops_run: true }]));
+  assert.deepEqual(xs.map((x) => [x.ended, x.cuts]), [[false, false], [true, true]]);
+});
+
+test("r16 S2: losses are one bounded summary on the row, unplaced ones included, those outside the window not (review r16 S2, repro2)", () => {
+  // 800 failed reads, one every 50 ms after the last frame: one note, of bounded length.
+  const incs = every(20_050, 60_000, 50).map((t) => L(t, { exact: true }));
+  const all = f20.map((f) => ({ t: BigInt(f.t_ns) }));
+  const xs = captureLosses(lostSeg(f20, incs), all);
+  assert.equal(xs.length, 800);
+  const line = summarizeLosses(xs, last20, winTo(60_000));
+  assert.ok(line.length < 600, `${line.length}: ${line}`);
+  assert.match(line, /^800 primary capture loss\(es\) \(x11; first \+20050 ms, last \+60000 ms\): 1 x a retry, no later frame read: the tail is counted from it at \+60000 ms; 799 x a retry, no later frame read; superseded by a later failed read \+20050 ms\.\.\+59950 ms; no frameless tail /);
+  assert.deepEqual(lossGroups(xs, last20, winTo(60_000)).map((g) => [g.effect, g.count, g.firstMs, g.lastMs]), [["restart", 1, 60_000, 60_000], ["superseded", 799, 20_050, 59_950]]);
+  // A long detail is cut.
+  const long = captureLosses(lostSeg(f20, [{ ...L(30_000, { exact: true }), detail: `x11 capture lost (re-establishing): ${"x".repeat(500)}` }]), all);
+  assert.ok(summarizeLosses(long, last20, winTo(60_000)).length < LOSS_DETAIL_MAX + 400);
+  // On the row: one note; a loss before the window is left out, an unplaced one is kept.
+  const f0 = focusFixture();
+  const primary = captureInfo(indexProbeSegment(f0.soak.records)).primary;
+  const start = BigInt(f0.soak.records.find((r) => r.type === "start").t0_ns);
+  const inc = (t) => ({ type: "incident", kind: "capture_lost", at: "nope", ...(t === null ? {} : { t_ns: String(t) }), detail: `${primary} capture lost (re-establishing): x`, stops_run: false, data: { source: primary } });
+  const notesFor = (incs) => (computeRowKpis({ ...f0, soak: { records: [...f0.soak.records, ...incs] } }).kpis.output_latency_ms.notes ?? []).filter((n) => /primary capture loss/.test(n));
+  assert.deepEqual(notesFor([inc(start)]), [], "before the window");
+  assert.match(notesFor([inc(start + 5n * MS)])[0], /^1 primary capture loss\(es\) \(\w+; first \+0 ms, last \+0 ms\)/, "at its start");
+  assert.match(notesFor([inc(null)])[0], /^1 primary capture loss\(es\) \(\w+; none placed in time\): 1 x a retry whose time could not be placed: no effect/);
+  assert.equal(notesFor(every(1000, 30_000, 10).map((ms) => inc(start + 5n * MS + BigInt(ms) * MS))).length, 1);
+});
+
+test("r16 S1: a failed read exactly at the last frame does not restart the tail; it is a retry around the last frame (review r16 S1)", () => {
+  const e = effectsOf([L(20_000, { exact: true })]);
+  assert.deepEqual([e.effects, e.restartBy, e.tailStart], [["at_last_frame"], -1, last20]);
+  assert.deepEqual(effectsOf([L(20_001, { exact: true })]).effects, ["restart"]);
 });

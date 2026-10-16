@@ -611,7 +611,7 @@ const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})
 /**
  * The PRIMARY capture source's `capture_lost` incidents (`engine.rs`), each with
  * what it means for a frameless tail:
- * - "capture ended" (`CaptureStatus::Ended`; `stops_run` on the primary): the
+ * - "capture ended" (`CaptureStatus::Ended`; `stops_run` set on the primary): the
  *   source stopped for good, so no frame could follow; frameless time after it
  *   is not a frozen screen.
  * - "capture lost (re-establishing)" (`CaptureStatus::Lost`): ONE failed read.
@@ -620,7 +620,12 @@ const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})
  *   tail, since the failed read may have consumed a repaint. WGC is the exception:
  *   nothing in `windows/wgc.rs` re-creates its device or frame pool, and a lost
  *   device can go silent (no frame, no error, the window still alive), so a WGC
- *   loss with no primary frame after it is read like an end.
+ *   loss with no primary frame after it (or one that cannot be placed in time) is
+ *   read like an end. What it cannot see: a silent device that never returns
+ *   `Lost`, a resize `Recreate` failing on every frame (each a `Lost`, so tails
+ *   are cut), and frames composed before a loss but read after it (they count as
+ *   later frames).
+ * Not consulted: a Desktop Duplication ACCESS_LOST (DDA is never the primary).
  *
  * `t` is the incident's `t_ns` when the probe wrote one (`exact`), else its `at`
  * mapped as above (null when that cannot be done: no start record, an
@@ -648,9 +653,10 @@ export function captureLosses(seg, all = []) {
     const wall = typeof r.at === "string" && RFC3339.test(r.at) ? Date.parse(r.at) : NaN;
     const t = exactT ?? (t0 !== null && Number.isFinite(wall0) && Number.isFinite(wall) && wall >= wall0 ? t0 + BigInt(wall - wall0) * NS_PER_MS : null);
     const detail = String(r.detail ?? "");
-    // The engine words an end "<source> capture ended: ..." (`stops_run` is also set
-    // for the primary, but the wording is the one signal both kinds carry).
-    const ended = /capture ended/.test(detail);
+    // `stops_run`: the engine sets it on a capture_lost exactly when the PRIMARY
+    // source ended (`engine.rs`: `source == primary` on Ended, false on Lost), and
+    // only primary losses are read here.
+    const ended = r.stops_run === true;
     const later = t !== null && lastT !== null && lastT > t + (exactT !== null ? 0n : slackNs);
     const cuts = ended || (primary === "wgc" && !later);
     out.push({ t, exact: exactT !== null, ended, source: primary, cuts, later, detail });
@@ -658,25 +664,114 @@ export function captureLosses(seg, all = []) {
   return out;
 }
 
-/** What one primary capture loss did to the stall rule, for a note. */
-export function describeLoss(x, win) {
-  const when = x.t === null ? "at a time that could not be placed on the probe's clock" : `at +${Math.round(nsToMs(x.t - win.t0))} ms`;
-  let effect;
-  if (x.cuts) {
-    effect =
-      x.t === null
-        ? "every frameless tail ends at the run's last frame"
-        : x.ended
-          ? `capture ended: no frameless time after +${Math.round(nsToMs(x.t - win.t0))} ms counts toward a pane stall`
-          : `a WGC loss with no later frame (WGC does not re-create its device): no frameless time after +${Math.round(nsToMs(x.t - win.t0))} ms counts toward a pane stall`;
-  } else if (x.t === null) {
-    effect = "one failed read whose time is unknown; it changes nothing";
-  } else if (x.later) {
-    effect = "re-established: later frames were read";
-  } else {
-    effect = `re-established: a frameless tail is counted from +${Math.round(nsToMs(x.t - win.t0))} ms`;
+/**
+ * The frameless tail after a run's last frame `end`, read against the primary
+ * capture losses: it ends at the window's end or at the earliest loss that cuts
+ * (an unplaced one, or one placed before `end`, leaves no tail), and starts at
+ * `end` or at the latest failed read placed after it, up to and including the
+ * cut. A failed read exactly at the cut (or at the window's end) leaves no tail:
+ * it may have consumed the repaint. The slack is not applied here: a mapped
+ * failed read placed before `end` (as it may be, within the slack) leaves the
+ * start at `end`. `cutBy` / `restartBy` index the loss that set each bound
+ * (-1: none).
+ *
+ * @returns {{tailStart: bigint, tailEnd: bigint, cutBy: number, restartBy: number}}
+ */
+export function lossTail(losses, end, win) {
+  let tailEnd = win.t1;
+  let cutBy = -1;
+  losses.forEach((x, i) => {
+    if (!x.cuts) return;
+    const cutAt = x.t ?? end;
+    if (cutAt < tailEnd) {
+      tailEnd = cutAt;
+      cutBy = i;
+    }
+  });
+  let tailStart = end;
+  let restartBy = -1;
+  losses.forEach((x, i) => {
+    if (!x.cuts && x.t !== null && x.t > tailStart && x.t <= tailEnd) {
+      tailStart = x.t;
+      restartBy = i;
+    }
+  });
+  return { tailStart, tailEnd, cutBy, restartBy };
+}
+
+/** Effect codes of {@link lossEffects}, in the order a summary lists them. */
+export const LOSS_EFFECTS = Object.freeze({
+  ended: "capture ended: no frameless time after it counts",
+  wgc_silent: "a WGC loss with no later frame (WGC does not re-create its device): no frameless time after it counts",
+  unplaced_cut: "an end (or WGC loss) that could not be placed in time: no frameless tail at all",
+  cut_superseded: "an end after an earlier one: no effect",
+  restart: "a retry, no later frame read: the tail is counted from it",
+  at_last_frame: "a retry around the last frame, no later frame read: the tail is counted from the last frame",
+  superseded: "a retry, no later frame read; superseded by a later failed read",
+  after_end: "a retry placed after capture ended: no effect",
+  later: "re-established: later frames were read",
+  unplaced_retry: "a retry whose time could not be placed: no effect",
+});
+
+/**
+ * What each primary capture loss did to the frameless tail after `lastFrameT`
+ * (the window's last primary frame, the only frame a tail can follow), as an
+ * effect code of {@link LOSS_EFFECTS} per loss, with the tail's bounds.
+ */
+export function lossEffects(losses, lastFrameT, win) {
+  const end = lastFrameT ?? win.t0;
+  const tail = lossTail(losses, end, win);
+  const effects = losses.map((x, i) => {
+    if (x.cuts) {
+      if (i === tail.cutBy) return x.t === null ? "unplaced_cut" : x.ended ? "ended" : "wgc_silent";
+      return "cut_superseded";
+    }
+    if (x.t === null) return "unplaced_retry";
+    if (x.later) return "later";
+    if (x.t > tail.tailEnd) return "after_end";
+    if (i === tail.restartBy) return "restart";
+    return tail.restartBy >= 0 ? "superseded" : "at_last_frame";
+  });
+  return { effects, ...tail };
+}
+
+/** At most this many characters of one sample incident detail in a loss summary. */
+export const LOSS_DETAIL_MAX = 120;
+
+/**
+ * One bounded line for all primary capture losses in a window: the count, the
+ * first and last, and per effect its count and span, with the tail's bounds and
+ * one sample detail.
+ */
+export function summarizeLosses(losses, lastFrameT, win) {
+  if (losses.length === 0) return null;
+  const { effects, tailStart, tailEnd } = lossEffects(losses, lastFrameT, win);
+  const ms = (t) => `+${Math.round(nsToMs(t - win.t0))} ms`;
+  const placed = losses.filter((x) => x.t !== null).map((x) => x.t).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const span = placed.length > 0 ? `first ${ms(placed[0])}, last ${ms(placed.at(-1))}` : "none placed in time";
+  const groups = [];
+  for (const code of Object.keys(LOSS_EFFECTS)) {
+    const xs = losses.filter((_, i) => effects[i] === code);
+    if (xs.length === 0) continue;
+    const ts = xs.filter((x) => x.t !== null).map((x) => x.t).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const when = ts.length === 0 ? "" : ts.length === 1 ? ` at ${ms(ts[0])}` : ` ${ms(ts[0])}..${ms(ts.at(-1))}`;
+    groups.push(`${xs.length} x ${LOSS_EFFECTS[code]}${when}`);
   }
-  return `the primary capture (${x.source}) was lost ${when} (${x.detail}); ${effect}`;
+  const tailText = lastFrameT === null ? "" : tailEnd > tailStart ? `; frameless tail read ${ms(tailStart)}..${ms(tailEnd)}` : "; no frameless tail";
+  const detail = losses[0].detail.length > LOSS_DETAIL_MAX ? `${losses[0].detail.slice(0, LOSS_DETAIL_MAX)}...` : losses[0].detail;
+  return `${losses.length} primary capture loss(es) (${losses[0].source}; ${span}): ${groups.join("; ")}${tailText} (e.g. "${detail}")`;
+}
+
+/** The loss summary's groups as data: per effect, the count and first / last ms. */
+export function lossGroups(losses, lastFrameT, win) {
+  const { effects } = lossEffects(losses, lastFrameT, win);
+  return Object.keys(LOSS_EFFECTS)
+    .map((effect) => {
+      const ts = losses.filter((_, i) => effects[i] === effect).map((x) => x.t);
+      const placed = ts.filter((t) => t !== null).map((t) => Math.round(nsToMs(t - win.t0)));
+      return { effect, count: ts.length, firstMs: placed.length > 0 ? Math.min(...placed) : null, lastMs: placed.length > 0 ? Math.max(...placed) : null };
+    })
+    .filter((g) => g.count > 0);
 }
 
 /** Is `t` inside one of the half-open spans? */
@@ -879,21 +974,9 @@ export function paneStalls(seg, gens, win, visible) {
     let hitch = null;
     for (const run of runs) {
       const end = run.pieces.at(-1).t1;
-      // No later primary frame at all: the screen sent nothing more, nothing contradicts the still marker.
-      // The tail ends at the window's end or at a loss that ended capture (never before the
-      // run's last frame: no frame follows an end), and starts at the run's last frame or
-      // at the latest re-established loss after it.
-      let tailEnd = win.t1;
-      for (const x of losses) {
-        if (!x.cuts) continue;
-        // Unplaced, or placed before the run's last frame: no tail at all.
-        const cutAt = x.t ?? end;
-        if (cutAt < tailEnd) tailEnd = cutAt;
-      }
-      let tailStart = end;
-      for (const x of losses) {
-        if (!x.cuts && x.t !== null && x.t > tailStart && x.t < tailEnd) tailStart = x.t;
-      }
+      // No later primary frame at all: the screen sent nothing more, nothing contradicts the
+      // still marker. The tail's bounds against the capture losses: lossTail.
+      const { tailStart, tailEnd } = lossTail(losses, end, win);
       const frameless = end === lastFrameT ? unexcludedNs(spans, tailStart, tailEnd) : 0n;
       const seenNs = run.pieces.reduce((acc, p) => acc + (p.t1 - p.t0), 0n);
       const ms = Number(seenNs + frameless) / 1e6;
@@ -1161,13 +1244,14 @@ export function computeRowKpis(p) {
   // clock (and output_latency_ms already reads clock_unaligned otherwise).
   const stallRuleRan = !captureGate && !clockGate(p, "output_latency_ms");
   const stalls = stallRuleRan ? paneStalls(seg, p.gens, win, visible) : [];
-  // Each primary capture loss in the window, and what it did to the stall rule.
+  // The primary capture losses in the window (unplaced ones included), and what
+  // they did to the stall rule: one bounded summary.
   if (stallRuleRan) {
     const sf = stallFrames(seg, win);
-    for (const x of captureLosses(seg, sf?.all ?? [])) {
-      if (x.t !== null && (x.t < win.t0 || x.t > win.t1)) continue;
-      notes.push(`output_latency_ms: ${describeLoss(x, win)}`);
-    }
+    const all = sf?.all ?? [];
+    const losses = captureLosses(seg, all).filter((x) => x.t === null || (x.t >= win.t0 && x.t <= win.t1));
+    const line = summarizeLosses(losses, all.length > 0 ? all.at(-1).t : null, win);
+    if (line) notes.push(`output_latency_ms: ${line}`);
   }
   // A wedge (frozen to the end of the soak) leaves the per-marker KPIs measured
   // from the live part only: they become unknown(pane_stalled). A reason the KPI
