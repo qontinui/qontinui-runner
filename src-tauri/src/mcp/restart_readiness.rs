@@ -1351,6 +1351,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,

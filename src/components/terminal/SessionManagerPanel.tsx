@@ -29,13 +29,22 @@ interface SessionManagerPanelProps {
   sessionLockStates?: Map<string, LockState>;
   /**
    * Resume a past (historical) session by id. Wired in `TerminalPage` to the
-   * real terminal resume path (`shellIntegration.handleResumeSession`) — it
-   * creates a tab and queues `claude --resume <id>` with the session's config
-   * dir. Consumed only by the "Previous" view; undefined ⇒ Resume falls back to
+   * one resume path (`shellIntegration.resumeTarget` → `resumeInNewTab`): a new
+   * tab with a verified `--resume` under the session's resolved account.
+   * Consumed only by the "Previous" view; undefined ⇒ Resume falls back to
    * copying the command.
    */
   onResumePastSession?: (session: PastSession) => void;
+  /**
+   * Which view shows. Owned by `TerminalPage`, so the "Since restart" strip's
+   * Review can open "Previous" — and the choice survives the sidebar closing.
+   */
+  view: SessionPanelView;
+  onViewChange: (view: SessionPanelView) => void;
 }
+
+/** The panel's three views. */
+export type SessionPanelView = "live" | "previous" | "fleet";
 
 /** Human-readable status group labels. */
 const STATUS_GROUP_LABELS: Record<SessionLiveStatus, string> = {
@@ -109,8 +118,9 @@ export function SessionManagerPanel({
   sessionConflictCounts,
   sessionLockStates,
   onResumePastSession,
+  view,
+  onViewChange: setView,
 }: SessionManagerPanelProps) {
-  const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
     sessions,
     loading,
@@ -167,7 +177,8 @@ export function SessionManagerPanel({
         page. With these stamps a driver can switch the panel deterministically
         — `POST /ui-bridge/control/element/terminal.session-manager-view-previous/action
         {"action":"click"}` — which is the only way to reach the
-        `past-sessions-view` surface, since the panel always mounts on "live".
+        `past-sessions-view` surface by hand (the "Since restart" strip's Review
+        also opens it).
 
         This row sits ABOVE the `view === "previous" ? … : <>…</>` conditional
         so it renders in both views; see `SessionManagerPanel.test.ts` for the
@@ -221,130 +232,130 @@ export function SessionManagerPanel({
         <PastSessionsView onResumePastSession={onResumePastSession} />
       ) : (
         <>
-      <StewardControl />
-      <SessionManagerHeader
-        loading={loading}
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-        statusFilter={statusFilter}
-        onStatusFilterChange={setStatusFilter}
-        accountFilter={accountFilter}
-        onAccountFilterChange={setAccountFilter}
-        groupBy={groupBy}
-        onGroupByChange={setGroupBy}
-        sortBy={sortBy}
-        onSortByChange={setSortBy}
-        accountUsage={accountUsage}
-        accounts={allAccounts}
-        onRefresh={refresh}
-        frozenCount={frozenCount}
-        needsInputCount={needsInputCount}
-        activeCount={activeCount}
-        totalCount={sessions.length}
-      />
+          <StewardControl />
+          <SessionManagerHeader
+            loading={loading}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
+            statusFilter={statusFilter}
+            onStatusFilterChange={setStatusFilter}
+            accountFilter={accountFilter}
+            onAccountFilterChange={setAccountFilter}
+            groupBy={groupBy}
+            onGroupByChange={setGroupBy}
+            sortBy={sortBy}
+            onSortByChange={setSortBy}
+            accountUsage={accountUsage}
+            accounts={allAccounts}
+            onRefresh={refresh}
+            frozenCount={frozenCount}
+            needsInputCount={needsInputCount}
+            activeCount={activeCount}
+            totalCount={sessions.length}
+          />
 
-      {/* Bulk action bar */}
-      {selectionMode && (
-        <div className="flex items-center gap-2 px-3 py-1.5 bg-[#7aa2f7]/5 border-b border-[#2a2d3d]">
-          <span className="text-[10px] text-[#7aa2f7] font-medium">
-            {selectedIds.size} selected
-          </span>
-          <div className="flex-1" />
-          <button
-            onClick={bulkResume}
-            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-[#9ece6a]/15 text-[#9ece6a] hover:bg-[#9ece6a]/25 transition-colors"
-            title="Resume all selected sessions"
-          >
-            <TerminalSquare className="w-3 h-3" />
-            Resume {selectedIds.size}
-          </button>
-          <button
-            onClick={clearSelection}
-            className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
-            title="Clear selection"
-          >
-            <X className="w-3 h-3" />
-          </button>
-        </div>
-      )}
-
-      {/* Select all frozen shortcut */}
-      {!selectionMode && frozenCount > 1 && (
-        <div className="flex items-center px-3 py-1 border-b border-[#2a2d3d]">
-          <button
-            onClick={selectAllFrozen}
-            className="flex items-center gap-1 text-[10px] text-[#f7768e]/70 hover:text-[#f7768e] transition-colors"
-          >
-            <CheckSquare className="w-3 h-3" />
-            Select all {frozenCount} frozen sessions
-          </button>
-        </div>
-      )}
-
-      {/* Session list */}
-      <div className="flex-1 overflow-y-auto scrollbar-dark">
-        {loading && sessions.length === 0 ? (
-          <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
-            <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />
-            Loading sessions...
-          </div>
-        ) : sessions.length === 0 ? (
-          <div className="px-3 py-8 text-center text-[#565f89] text-xs">
-            {searchQuery || statusFilter !== "all" || accountFilter !== "all"
-              ? "No sessions match filters"
-              : "No sessions found"}
-          </div>
-        ) : (
-          groups.map(([groupKey, groupSessions]) => (
-            <div key={groupKey}>
-              {/* Group header */}
-              {groups.length > 1 && (
-                <div className="flex items-center gap-2 px-3 pt-3 pb-1">
-                  <div className="flex-1 h-px bg-[#2a2d3d]" />
-                  <span className="text-[10px] font-medium text-[#565f89] whitespace-nowrap">
-                    {groupKey}
-                    <span className="ml-1 text-[#414868]">({groupSessions.length})</span>
-                  </span>
-                  <div className="flex-1 h-px bg-[#2a2d3d]" />
-                </div>
-              )}
-
-              {/* Session cards */}
-              {groupSessions.map((session) => (
-                <SessionCard
-                  key={session.sessionId}
-                  session={session}
-                  isSelected={session.sessionId === selectedSessionId}
-                  isChecked={selectedIds.has(session.sessionId)}
-                  selectionMode={selectionMode}
-                  isPinned={pinnedIds.has(session.sessionId)}
-                  sessionLabel={sessionLabels[session.sessionId] ?? null}
-                  fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
-                  lockState={sessionLockStates?.get(session.sessionId)}
-                  onResume={resumeSession}
-                  onOpen={openSession}
-                  onViewTranscript={viewTranscript}
-                  onCopyId={copySessionId}
-                  onToggleSelect={toggleSelect}
-                  onTogglePin={togglePin}
-                  onSetLabel={setSessionLabel}
-                  onAfterPromote={refresh}
-                  onOpenWorktrees={setWorktreeFocus}
-                />
-              ))}
+          {/* Bulk action bar */}
+          {selectionMode && (
+            <div className="flex items-center gap-2 px-3 py-1.5 bg-[#7aa2f7]/5 border-b border-[#2a2d3d]">
+              <span className="text-[10px] text-[#7aa2f7] font-medium">
+                {selectedIds.size} selected
+              </span>
+              <div className="flex-1" />
+              <button
+                onClick={bulkResume}
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-[#9ece6a]/15 text-[#9ece6a] hover:bg-[#9ece6a]/25 transition-colors"
+                title="Resume all selected sessions"
+              >
+                <TerminalSquare className="w-3 h-3" />
+                Resume {selectedIds.size}
+              </button>
+              <button
+                onClick={clearSelection}
+                className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
+                title="Clear selection"
+              >
+                <X className="w-3 h-3" />
+              </button>
             </div>
-          ))
-        )}
-      </div>
+          )}
 
-      {/*
+          {/* Select all frozen shortcut */}
+          {!selectionMode && frozenCount > 1 && (
+            <div className="flex items-center px-3 py-1 border-b border-[#2a2d3d]">
+              <button
+                onClick={selectAllFrozen}
+                className="flex items-center gap-1 text-[10px] text-[#f7768e]/70 hover:text-[#f7768e] transition-colors"
+              >
+                <CheckSquare className="w-3 h-3" />
+                Select all {frozenCount} frozen sessions
+              </button>
+            </div>
+          )}
+
+          {/* Session list */}
+          <div className="flex-1 overflow-y-auto scrollbar-dark">
+            {loading && sessions.length === 0 ? (
+              <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
+                <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />
+                Loading sessions...
+              </div>
+            ) : sessions.length === 0 ? (
+              <div className="px-3 py-8 text-center text-[#565f89] text-xs">
+                {searchQuery || statusFilter !== "all" || accountFilter !== "all"
+                  ? "No sessions match filters"
+                  : "No sessions found"}
+              </div>
+            ) : (
+              groups.map(([groupKey, groupSessions]) => (
+                <div key={groupKey}>
+                  {/* Group header */}
+                  {groups.length > 1 && (
+                    <div className="flex items-center gap-2 px-3 pt-3 pb-1">
+                      <div className="flex-1 h-px bg-[#2a2d3d]" />
+                      <span className="text-[10px] font-medium text-[#565f89] whitespace-nowrap">
+                        {groupKey}
+                        <span className="ml-1 text-[#414868]">({groupSessions.length})</span>
+                      </span>
+                      <div className="flex-1 h-px bg-[#2a2d3d]" />
+                    </div>
+                  )}
+
+                  {/* Session cards */}
+                  {groupSessions.map((session) => (
+                    <SessionCard
+                      key={session.sessionId}
+                      session={session}
+                      isSelected={session.sessionId === selectedSessionId}
+                      isChecked={selectedIds.has(session.sessionId)}
+                      selectionMode={selectionMode}
+                      isPinned={pinnedIds.has(session.sessionId)}
+                      sessionLabel={sessionLabels[session.sessionId] ?? null}
+                      fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
+                      lockState={sessionLockStates?.get(session.sessionId)}
+                      onResume={resumeSession}
+                      onOpen={openSession}
+                      onViewTranscript={viewTranscript}
+                      onCopyId={copySessionId}
+                      onToggleSelect={toggleSelect}
+                      onTogglePin={togglePin}
+                      onSetLabel={setSessionLabel}
+                      onAfterPromote={refresh}
+                      onOpenWorktrees={setWorktreeFocus}
+                    />
+                  ))}
+                </div>
+              ))
+            )}
+          </div>
+
+          {/*
         Worktrees panel — sibling of the session list. The on-demand,
         human-consented cleanup trigger (plan
         `2026-07-19-worktree-cleanup-lifecycle-tracking` Phase 4). Collapsed
         by default so it costs nothing until asked for; `SessionCard`'s
         worktree affordance opens it focused on that session's worktree.
       */}
-      <WorktreesPanel defaultOpen={worktreeFocus !== null} highlightPath={worktreeFocus} />
+          <WorktreesPanel defaultOpen={worktreeFocus !== null} highlightPath={worktreeFocus} />
         </>
       )}
     </div>
