@@ -183,14 +183,23 @@ test("only the runner's rows leave the job: the artifact and the summary come fr
     else for (let i = at + 1; i < s.length && /^ {12}\S/.test(s[i]); i += 1) paths.push(s[i].trim());
   }
   assert.ok(paths.length >= uploads.length, `upload paths found: ${paths.length}`);
-  // Every upload path names the redacted file or a runner unit directory.
+  // Every upload path names the redacted file, a file the verdict step derives
+  // from it (Phase 6: the verdict and the proposed baseline), or a runner unit
+  // directory.
   for (const p of paths) {
-    assert.ok(/termhost-bench-linux-xvfb-runner\.json$/.test(p) || /\/units\/\*-runner-\*\//.test(p), `upload path ${p} could carry a third-party row`);
+    assert.ok(
+      /termhost-bench-linux-xvfb-(runner|verdict|baseline-proposed)\.json$/.test(p) || /\/units\/\*-runner-\*\//.test(p),
+      `upload path ${p} could carry a third-party row`,
+    );
   }
+  // ... and the verdict step reads only the redacted copy.
+  const verdictCalls = job.filter((l) => /compare\.mjs /.test(l) && !/^\s*#/.test(l));
+  assert.equal(verdictCalls.length, 1, "one compare.mjs invocation");
+  assert.match(verdictCalls[0], /compare\.mjs "\$redacted" --baseline /);
   assert.ok(!paths.some((p) => /results\.json$/.test(p)), "the full results file is never uploaded");
   // The summary renders the redacted copy only.
   const summary = job.filter((l) => /cli\.mjs (report|compare)/.test(l) && /GITHUB_STEP_SUMMARY/.test(l));
-  assert.ok(summary.length >= 2);
+  assert.ok(summary.length >= 1);
   for (const l of summary) assert.match(l, /"\$redacted"/, l.trim());
   // The full file is only ever reported with --format json (failures, not values).
   for (const inv of cliInvocations(job).filter((t) => /cli\.mjs report "\$results"/.test(t))) assert.match(inv, /--format json/);

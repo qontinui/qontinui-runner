@@ -122,18 +122,18 @@ test("two files pair the first's head (or single) rows with the second's baselin
   assert.equal(cmp.baseline_commit, BASE);
 });
 
-test("the comparison renders every side's spread or unknown, and draws no verdict", () => {
+test("the comparison renders every side's spread or unknown; with no verdict applied it draws none", () => {
   const doc = abDoc();
   doc.rows = doc.rows.map((r) => (r.setup.build?.role === "baseline" ? { ...r, kpis: { ...r.kpis, cpu_pct: unknownKpi("cpu_pct", "harness_error") } } : r));
   const md = renderComparison(compareBuilds(doc));
   assert.match(md, /^### runner: head a{12} vs baseline b{12} \(linux-xvfb\)$/m);
-  assert.match(md, /No verdict is drawn here/);
-  assert.match(md, /^\| output_latency_ms \| p95 \| 5 \| focus \| [\d.]+ ms \[[\d.]+–[\d.]+\] \| [\d.]+ ms \[[\d.]+–[\d.]+\] \| 3 measured \| 2 measured, 1 unknown\(capture_unavailable\) \|$/m);
-  assert.match(md, /^\| cpu_pct \| mean \| 5 \| focus \| .+ \| unknown \| 3 measured \| 3 unknown\(harness_error\) \|$/m);
+  assert.doesNotMatch(md, /^Verdict:/m, "compareBuilds alone judges nothing");
+  assert.match(md, /^\| output_latency_ms \| p95 \| 5 \| focus \| [\d.]+ ms \[[\d.]+–[\d.]+\] \| [\d.]+ ms \[[\d.]+–[\d.]+\] \| 3 measured \| 2 measured, 1 unknown\(capture_unavailable\) \| – \|$/m);
+  assert.match(md, /^\| cpu_pct \| mean \| 5 \| focus \| .+ \| unknown \| 3 measured \| 3 unknown\(harness_error\) \| – \|$/m);
   assert.match(md, /^\| hangs \| count \| 5 \| focus \| 1\.00 \[0\.00–2\.00\] \|/m);
   const tableRows = md.split(/\r?\n/).filter((l) => l.startsWith("| ") && !l.startsWith("| KPI "));
   assert.ok(tableRows.length > 0);
-  assert.ok(tableRows.every((l) => !/regression|improvement|verdict/i.test(l)), "no row carries a verdict (Phase 6)");
+  assert.ok(tableRows.every((l) => !/regression|improvement|no_change/i.test(l)), "no row carries a verdict until applyVerdict runs");
 });
 
 // ---------------------------------------------------------------------------
@@ -153,10 +153,9 @@ test("a cell is a measured number (stats-shape KPIs name their statistic) or the
 test("the report renders every row with its setup facts, every unknown with its reason, incidents and mechanisms", () => {
   const md = renderReport(linuxXvfbResults());
   assert.match(md, /^## termhost-bench 2026-10-11T13-00-00Z-xvfb — linux-xvfb$/m);
-  assert.match(md, /^### runner \(head 94d141a980a3\)$/m);
-  assert.match(md, /^### tmux$/m);
-  assert.match(md, /pty host unix_pty/);
-  assert.match(md, /\| 5 \| focus \| 1\/2 \| 1\/unknown\(sessions_not_rendered\) \|/, "an unknown V is rendered as an absence, not 0");
+  assert.match(md, /^- \*\*runner\*\* \(head 94d141a980a3\): app 0\.1\.0; launch subject_instance_root; pty host unix_pty;/m);
+  assert.match(md, /^- \*\*tmux\*\* \(-\): /m);
+  assert.match(md, /^\| runner \| head 94d141a980a3 \| 5 \| focus \| 1\/2 \| 1\/unknown\(sessions_not_rendered\) \| claude-tui \(false\) \| unix_pty \|/m, "an unknown V is rendered as an absence, not 0");
   assert.match(md, /unknown\(insufficient_samples\)/);
   assert.match(md, /`hangs` unknown\(occluded\) — the window lost the foreground for most of the soak/);
   assert.doesNotMatch(md, /unknown\(no_baseline_level\)`|`degradation_[a-z_]+` unknown\(no_baseline_level\)/, "expected absences are not listed as findings");

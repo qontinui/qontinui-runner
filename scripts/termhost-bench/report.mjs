@@ -1,22 +1,40 @@
 /**
- * termhost-bench `report`: a results file rendered as markdown (one table per
- * setup, variant and build role, every unknown with its reason, the profile's
- * calibration flag and the PTY host beside every row), the CI gate's assertions,
- * and the redacted copy public CI may upload (the runner's own rows only, D7).
+ * termhost-bench `report`: results rendered as markdown, the CI gate's
+ * assertions, and the redacted copy public CI may upload (the runner's own rows
+ * only, D7).
  *
- * Plan `2026-10-11-terminal-page-performance-kpis-across-setups`, Phase 3. Phase 6
- * grows this into the committed-report generator (one table per environment, the
- * headline line for `windows-desktop`); the rendering rules here are the ones it
- * keeps: a number only for a measured value, `unknown(<reason>)` otherwise.
+ * Plan `2026-10-11-terminal-page-performance-kpis-across-setups`, Phases 3 and 6.
+ * The report takes one results file or several, and renders ONE table per
+ * environment: it refuses files from two environments outright (D6), because a
+ * linux-xvfb number beside a Windows one implies a comparison its provenance
+ * cannot carry [policy: verification-and-evidence/unknown-must-not-render-as-a-default].
+ * In order:
+ *
+ *   - for `windows-desktop`, the headline line — exactly
+ *     `headline: windows-desktop n=15 setups=runner,vscode,windows-terminal,tmux-wsl arms=focus,tiled state=measured`
+ *     — emitted only when all four setups' headline KPIs read `measured` at
+ *     N = 15 in both arms (a KPI with no referent in an arm, `not_applicable_to_arm`,
+ *     is not a gap). The committed report's content anchor
+ *     (`rtp-windows-desktop-comparison-recorded`) reads that line; otherwise the
+ *     report says what is missing, in words that cannot match it;
+ *   - the headline table: N = 15, each setup and arm, every headline KPI and its
+ *     degradation as the median over runs with the run spread (no composite, D10);
+ *   - every row in one table, with `profile_calibrated` and `pty_host_impl` beside
+ *     each (the schema at this phase has no `crosscheck_profile` field);
+ *   - each setup's facts, every unknown with its reason, the runner's diagnostics
+ *     (labelled non-comparable), incidents and mechanisms not OPERATIVE.
+ *
+ * A number appears only for a measured value; anything else is `state(reason)`.
  */
 
-import { getKpi } from "./kpi-catalog.mjs";
+import { HEADLINE, KPI_CATALOG, SETUP_IDS, getKpi } from "./kpi-catalog.mjs";
 import { CAPTURE_KPIS, isCaptureHealthUnknown } from "./kpis.mjs";
 import { redactRunnerOnly } from "./results.mjs";
 import { validateResults } from "./validate.mjs";
-import { compareStatistic, valueOf } from "./compare.mjs";
+import { HEADLINE_KPIS, VERDICT_EXCLUDED_LABELS, comparableBuild, compareStatistic, spreadOf, statesOf, valueOf } from "./compare.mjs";
+import { summarizeDiagnostic } from "./diagnostics.mjs";
 
-/** The KPIs the per-row table shows (the operator's headline set, D10 — no composite). */
+/** The KPIs the per-row table shows (the operator's headline set plus frame cadence, D10 — no composite). */
 export const REPORT_KPIS = Object.freeze([
   "output_latency_ms",
   "input_latency_ms",
@@ -29,6 +47,15 @@ export const REPORT_KPIS = Object.freeze([
   "spawn_latency_ms",
 ]);
 
+/** The degradations the headline table shows beside the headline KPIs (compare.mjs `HEADLINE_KPIS`). */
+export const HEADLINE_DEGRADATIONS = Object.freeze(KPI_CATALOG.filter((k) => k.degradation_of).map((k) => k.id));
+
+/** The four setups the operator's question names (D6, windows-desktop). */
+export const HEADLINE_SETUPS = Object.freeze(["runner", "vscode", "windows-terminal", "tmux-wsl"]);
+
+/** The one line the committed windows-desktop report carries once the comparison is recorded. */
+export const HEADLINE_LINE = `headline: ${HEADLINE.environment} n=${HEADLINE.n} setups=${HEADLINE_SETUPS.join(",")} arms=${HEADLINE.arms.join(",")} state=measured`;
+
 /**
  * One KPI cell: a measured value's number (a stats-shape KPI's compared statistic,
  * named), else state(reason).
@@ -39,69 +66,207 @@ export function cell(kpiValue, id) {
   const kpi = getKpi(id);
   const v = valueOf(kpiValue, kpi);
   if (v === null) return "measured(?)";
-  const r = Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
-  return `${r}${kpi.shape === "value" ? "" : ` ${compareStatistic(kpi)}`}`;
+  return `${num(v)}${kpi.shape === "value" ? "" : ` ${compareStatistic(kpi)}`}`;
 }
+
+const num = (v) => (Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
 
 const absentText = (v) => (v && typeof v === "object" && "state" in v ? `${v.state}(${v.reason})` : String(v));
 
-/** The whole report as markdown. */
-export function renderReport(doc) {
-  const m = doc.machine;
-  const lines = [
-    `## termhost-bench ${doc.run.id} — ${m.environment}`,
-    "",
-    `Machine: ${m.name}, ${m.os.platform} ${m.os.release}, ${m.cpu.logical_cores} logical cores, ${m.ram_mb} MB RAM. ` +
-      `Started ${doc.run.started_at}, finished ${doc.run.finished_at}. Numbers compare only within one environment (D6).`,
-    "",
-  ];
-  const groups = new Map();
-  for (const r of doc.rows) {
-    const key = `${r.setup.id}|${r.setup.variant}|${r.setup.build?.role ?? "-"}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(r);
+/**
+ * The one environment a set of results documents shares.
+ *
+ * @throws when they name two, or none
+ */
+export function oneEnvironment(docs) {
+  const envs = [...new Set(docs.map((d) => d?.machine?.environment))];
+  if (envs.length !== 1 || !envs[0]) {
+    throw new Error(`refusing to put ${envs.map(String).join(" and ")} in one table: numbers compare only within one environment (D6)`);
   }
-  for (const rows of groups.values()) {
-    const s = rows[0].setup;
+  return envs[0];
+}
+
+/** A row's build, as the report names it. */
+const buildText = (s) => (s.build?.role ? `${s.build.role} ${s.build.state ? "unproven build" : (s.build.commit?.slice(0, 12) ?? "")}`.trim() : "-");
+
+/**
+ * Whether the headline comparison is established: for each of the four setups
+ * and both arms, at least one N = 15 row (default variant, not a baseline build,
+ * a proven build where the setup has one, not excluded from verdicts), and every
+ * headline KPI in every such row `measured` — or `not_applicable` because the KPI
+ * has no referent in that arm.
+ *
+ * @param {object[]} docs results documents of ONE environment
+ * @returns {{established: boolean, missing: string[]}}
+ */
+export function headlineStatus(docs) {
+  const env = oneEnvironment(docs);
+  if (env !== HEADLINE.environment) return { established: false, missing: [`the environment is ${env}, not ${HEADLINE.environment}`] };
+  const rows = docs.flatMap((d) => d.rows);
+  const missing = [];
+  for (const setup of HEADLINE_SETUPS) {
+    for (const arm of HEADLINE.arms) {
+      const at = rows.filter(
+        (r) =>
+          r.setup.id === setup &&
+          r.setup.variant === "default" &&
+          r.scenario.n === HEADLINE.n &&
+          r.scenario.arm === arm &&
+          r.setup.build?.role !== "baseline" &&
+          comparableBuild(r) &&
+          !(r.labels ?? []).some((l) => VERDICT_EXCLUDED_LABELS.includes(l)),
+      );
+      if (at.length === 0) {
+        missing.push(`${setup} ${arm}: no N = ${HEADLINE.n} row`);
+        continue;
+      }
+      for (const id of HEADLINE_KPIS) {
+        const bad = at.filter((r) => {
+          const v = r.kpis[id];
+          return !(v?.state === "measured" || (v?.state === "not_applicable" && v.reason === "not_applicable_to_arm"));
+        });
+        if (bad.length > 0) missing.push(`${setup} ${arm}: ${id} ${statesOf(bad.map((r) => r.kpis[id]))}`);
+      }
+    }
+  }
+  return { established: missing.length === 0, missing };
+}
+
+function spreadCell(rows, id) {
+  const kpi = getKpi(id);
+  const raw = rows.map((r) => r.kpis[id]);
+  const s = spreadOf(raw.map((v) => valueOf(v, kpi)).filter((v) => v !== null));
+  if (!s) return statesOf(raw);
+  const stat = kpi.shape === "value" ? "" : ` ${compareStatistic(kpi)}`;
+  return s.runs > 1 ? `${num(s.median)}${stat} [${num(s.min)}–${num(s.max)}] (${s.runs} runs)` : `${num(s.median)}${stat}`;
+}
+
+const setupOrder = (id) => {
+  const i = SETUP_IDS.indexOf(id);
+  return i < 0 ? SETUP_IDS.length : i;
+};
+const rowOrder = (a, b) =>
+  setupOrder(a.setup.id) - setupOrder(b.setup.id) ||
+  a.setup.variant.localeCompare(b.setup.variant) ||
+  String(a.setup.build?.role ?? "").localeCompare(String(b.setup.build?.role ?? "")) ||
+  a.scenario.n - b.scenario.n ||
+  a.scenario.arm.localeCompare(b.scenario.arm) ||
+  a.scenario.run_index - b.scenario.run_index;
+
+/**
+ * The report as markdown: one results document, or several from ONE environment.
+ *
+ * @param {object | object[]} input
+ */
+export function renderReport(input) {
+  const docs = Array.isArray(input) ? input : [input];
+  if (docs.length === 0) throw new Error("no results to report");
+  const env = oneEnvironment(docs);
+  const rows = docs.flatMap((d) => d.rows).sort(rowOrder);
+  const lines = [`## termhost-bench ${docs.map((d) => d.run.id).join(", ")} — ${env}`, ""];
+  for (const doc of docs) {
+    const m = doc.machine;
     lines.push(
-      `### ${s.id}${s.variant !== "default" ? `/${s.variant}` : ""}${s.build?.role ? ` (${s.build.role} ${s.build.state ? "unproven build" : (s.build.commit?.slice(0, 12) ?? "")})` : ""}`,
-      "",
-      `app ${absentText(s.app_version)}; launch ${s.launch_mode}; pty host ${absentText(s.pty_host_impl)}; render ${absentText(s.render_backend)}; ` +
-        `holder ${absentText(s.pty_holder)}; shell ${s.session_shell} (${absentText(s.shell_integration)})`,
-      "",
-      `| N | arm | run | V (target/actual) | profile (calibrated) | cross-check | ${REPORT_KPIS.join(" | ")} | labels |`,
-      `|---|---|---|---|---|---|${REPORT_KPIS.map(() => "---").join("|")}|---|`,
+      `Machine: ${m.name}, ${m.os.platform} ${m.os.release}, ${m.cpu.logical_cores} logical cores, ${m.ram_mb} MB RAM. ` +
+        `Run ${doc.run.id}: started ${doc.run.started_at}, finished ${doc.run.finished_at}. Numbers compare only within one environment (D6).`,
     );
-    for (const r of rows.sort((a, b) => a.scenario.n - b.scenario.n || a.scenario.arm.localeCompare(b.scenario.arm) || a.scenario.run_index - b.scenario.run_index)) {
-      const sc = r.scenario;
+  }
+  lines.push("");
+
+  // The headline line, and the headline table.
+  if (env === HEADLINE.environment) {
+    const st = headlineStatus(docs);
+    if (st.established) lines.push(HEADLINE_LINE, "");
+    else lines.push(`The headline comparison is NOT established (${st.missing.length} gap(s)):`, "", ...st.missing.map((m) => `- ${m}`), "");
+  }
+  const atHeadlineN = rows.filter((r) => r.scenario.n === HEADLINE.n);
+  if (atHeadlineN.length > 0) {
+    const cols = [...HEADLINE_KPIS, ...HEADLINE_DEGRADATIONS];
+    lines.push(
+      `### Headline: N = ${HEADLINE.n} (median over runs, run spread in brackets)`,
+      "",
+      `| setup | build | arm | runs | profile (calibrated) | pty_host_impl | ${cols.join(" | ")} |`,
+      `|---|---|---|---|---|---|${cols.map(() => "---").join("|")}|`,
+    );
+    const groups = new Map();
+    for (const r of atHeadlineN) {
+      const key = `${r.setup.id}|${r.setup.variant}|${buildText(r.setup)}|${r.scenario.arm}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    for (const g of groups.values()) {
+      const r0 = g[0];
+      const cal = [...new Set(g.map((r) => `${r.scenario.profile} (${r.scenario.profile_calibrated})`))].join(", ");
+      const pty = [...new Set(g.map((r) => absentText(r.setup.pty_host_impl)))].join(", ");
       lines.push(
-        `| ${sc.n} | ${sc.arm} | ${sc.run_index + 1}/${sc.run_count} | ${sc.v_target}/${typeof sc.v_actual === "number" ? sc.v_actual : absentText(sc.v_actual)} | ` +
-          `${sc.profile} (${sc.profile_calibrated}) | ${sc.crosscheck_profile} | ${REPORT_KPIS.map((id) => cell(r.kpis[id], id)).join(" | ")} | ${r.labels.join(", ") || "-"} |`,
+        `| ${r0.setup.id}${r0.setup.variant !== "default" ? `/${r0.setup.variant}` : ""} | ${buildText(r0.setup)} | ${r0.scenario.arm} | ${g.length} | ${cal} | ${pty} | ${cols.map((id) => spreadCell(g, id)).join(" | ")} |`,
       );
     }
     lines.push("");
   }
+
+  // Every row, one table for the environment.
+  lines.push(
+    `### Every row (${env})`,
+    "",
+    `| setup | build | N | arm | run | V (target/actual) | profile (calibrated) | pty_host_impl | cross-check | ${REPORT_KPIS.join(" | ")} | labels |`,
+    `|---|---|---|---|---|---|---|---|---|${REPORT_KPIS.map(() => "---").join("|")}|---|`,
+  );
+  for (const r of rows) {
+    const s = r.setup;
+    const sc = r.scenario;
+    lines.push(
+      `| ${s.id}${s.variant !== "default" ? `/${s.variant}` : ""} | ${buildText(s)} | ${sc.n} | ${sc.arm} | ${sc.run_index + 1}/${sc.run_count} | ${sc.v_target}/${typeof sc.v_actual === "number" ? sc.v_actual : absentText(sc.v_actual)} | ` +
+        `${sc.profile} (${sc.profile_calibrated}) | ${absentText(s.pty_host_impl)} | ${sc.crosscheck_profile} | ${REPORT_KPIS.map((id) => cell(r.kpis[id], id)).join(" | ")} | ${r.labels.join(", ") || "-"} |`,
+    );
+  }
+  lines.push("");
+
+  // Each setup's facts.
+  const facts = new Map();
+  for (const r of rows) {
+    const s = r.setup;
+    const key = `${s.id}|${s.variant}|${buildText(s)}`;
+    if (facts.has(key)) continue;
+    facts.set(
+      key,
+      `- **${s.id}${s.variant !== "default" ? `/${s.variant}` : ""}** (${buildText(s)}): app ${absentText(s.app_version)}; launch ${s.launch_mode}; pty host ${absentText(s.pty_host_impl)}; ` +
+        `render ${absentText(s.render_backend)}; holder ${absentText(s.pty_holder)}; shell ${s.session_shell} (${absentText(s.shell_integration)})`,
+    );
+  }
+  lines.push("### Setups", "", ...facts.values(), "");
+
+  const where = (r) => `${r.setup.id}/${r.setup.variant}${r.setup.build?.role ? ` (${r.setup.build.role})` : ""} N=${r.scenario.n} ${r.scenario.arm} run ${r.scenario.run_index}`;
   const unknowns = [];
-  for (const r of doc.rows) {
+  for (const r of rows) {
     for (const [id, v] of Object.entries(r.kpis)) {
       if (v.state === "unknown" && v.reason !== "no_baseline_level" && v.reason !== "too_few_levels") {
-        unknowns.push(`- ${r.setup.id}/${r.setup.variant} N=${r.scenario.n} ${r.scenario.arm} run ${r.scenario.run_index}: \`${id}\` unknown(${v.reason})${v.detail ? ` — ${v.detail}` : ""}`);
+        unknowns.push(`- ${where(r)}: \`${id}\` unknown(${v.reason})${v.detail ? ` — ${v.detail}` : ""}`);
       }
     }
   }
   if (unknowns.length > 0) lines.push("### Unknown values and why", "", ...unknowns.slice(0, 400), unknowns.length > 400 ? `- … ${unknowns.length - 400} more` : "", "");
-  // The run's own incidents, then each row's (the probe's, attributed to the arm
+
+  // The runner's own diagnostics: never compared, never in a verdict (D1).
+  const diags = rows
+    .filter((r) => r.setup.id === "runner" && r.diagnostics && Object.keys(r.diagnostics).length > 0)
+    .map((r) => [`- ${where(r)}:`, ...Object.keys(r.diagnostics).sort().map((k) => `  - \`${k}\`: ${summarizeDiagnostic(r.diagnostics[k])}`)].join("\n"));
+  if (diags.length > 0) lines.push("### Runner diagnostics (non-comparable)", "", "Runner internals with no counterpart in another host: context for a runner reading, never compared and never in a verdict (D1).", "", ...diags, "");
+
+  // The runs' own incidents, then each row's (the probe's, attributed to the arm
   // that recorded them).
-  const incidentLine = (i, where) => `- **${i.kind}**${where}${i.stops_run ? " (stopped the run)" : ""} at ${i.at}: ${i.detail}`;
+  const incidentLine = (i, w) => `- **${i.kind}**${w}${i.stops_run ? " (stopped the run)" : ""} at ${i.at}: ${i.detail}`;
   const incidents = [
-    ...doc.incidents.map((i) => incidentLine(i, "")),
-    ...doc.rows.flatMap((r) =>
-      (r.incidents ?? []).map((i) => incidentLine(i, ` (${r.setup.id}/${r.setup.variant} N=${r.scenario.n} ${r.scenario.arm} run ${r.scenario.run_index})`)),
-    ),
+    ...docs.flatMap((d) => d.incidents.map((i) => incidentLine(i, docs.length > 1 ? ` (run ${d.run.id})` : ""))),
+    ...rows.flatMap((r) => (r.incidents ?? []).map((i) => incidentLine(i, ` (${r.setup.id}/${r.setup.variant} N=${r.scenario.n} ${r.scenario.arm} run ${r.scenario.run_index})`))),
   ];
   if (incidents.length > 0) lines.push("### Incidents", "", ...incidents, "");
-  const caps = Object.entries(doc.capabilities).filter(([, c]) => c.state !== "OPERATIVE");
-  if (caps.length > 0) lines.push("### Mechanisms not OPERATIVE", "", ...caps.map(([id, c]) => `- \`${id}\` ${c.state}: ${c.reason}`), "");
+  const caps = docs.flatMap((d) =>
+    Object.entries(d.capabilities)
+      .filter(([, c]) => c.state !== "OPERATIVE")
+      .map(([id, c]) => `- \`${id}\` ${c.state}: ${c.reason}${docs.length > 1 ? ` (run ${d.run.id})` : ""}`),
+  );
+  if (caps.length > 0) lines.push("### Mechanisms not OPERATIVE", "", ...caps, "");
   return `${lines.join("\n")}\n`;
 }
 

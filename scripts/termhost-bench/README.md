@@ -170,16 +170,29 @@ Both timing formats (classic, advanced) and both typescript layouts (`--log-out`
 - **Phase 2 (`crates/termhost-probe`)** reproduces `marker-golden.json`: port `codec.pixel` (`marker-raster.mjs` is the reference), decode every `rows[]` row to exactly its `expected` list, decode every `valid` vector and reject every `invalid` one with its `reason`, in `codec.decode_order`. Markers sit at `codec.region` / `codec.echo_region` of each pane.
 - **Phase 3 (orchestrator)** imports `KPI_CATALOG` / `getKpi` / vocabularies (`kpi-catalog.mjs`), `validateResults` (`validate.mjs`, run before writing any results file), `measureKpi` / `unknownKpi` / `notApplicableKpi` / `degradationKpi` / `slope` (`stats.mjs`), `loadProfile` / `profileDigest` (`profile.mjs`) and `parseOverlays` (`marker.mjs`, display-free checks); it launches the generator with the D13 command line above (`--echo` included), maps `slot-<k>` files to host sessions, starts measuring once every `gen-<k>.jsonl` has its first `marker`, stops with `<run-dir>/stop`, and kills any generator still alive by its slot-file PID.
 
+## The regression verdict (`compare --baseline`, Phase 6)
+
+`node scripts/termhost-bench/compare.mjs <results.json> --baseline baselines/<env>.json [--verdict-json <f>] [--propose-baseline <f>]`
+(the same as `cli.mjs compare`) judges each **headline** KPI (catalog `headline_statistic`) at each N and arm of the same-VM A/B (D11):
+
+- **regression** iff the head build's median over runs is worse than the baseline build's by more than `max(relative × |baseline median|, absolute)` — the threshold the baseline file records for that KPI — **and** the run spreads `[min, max]` do not overlap; **improvement** symmetrically; **no_change** otherwise (`within_threshold` / `spreads_overlap`);
+- **unknown** when either side has no measured run, fewer measured runs than the file's `min_runs`, the KPI has no threshold, the file is for another environment or setup, or there is no usable baseline file at all (`no baseline`).
+
+The exit code is 1 on `regression` and 0 on everything else; the scheduled `run-linux-xvfb` job fails on that verdict only. A baseline file (`termhost-bench-baseline/v1`) holds `environment`, `setup: runner`, `variant`, `min_runs` (≥ 2), `thresholds` keyed by headline KPI, `recorded_from` and the baseline build's `readings` — runner rows only (D7). A test validates every committed one.
+
+`report` takes one results file or several from **one** environment and renders one table for it (two environments are refused, D6): for `windows-desktop` the headline line `headline: windows-desktop n=15 setups=runner,vscode,windows-terminal,tmux-wsl arms=focus,tiled state=measured`, only when all four setups' headline KPIs read `measured` at N = 15 in both arms; the N = 15 headline table; every row with `profile_calibrated` and `pty_host_impl`; every unknown with its reason; and the runner's diagnostics, labelled non-comparable.
+
 ## Post-land items (deferred, not missing)
 
-Two Phase 3 outputs can only come from a scheduled run of the landed
-`linux-xvfb` job, so they arrive after this code lands rather than with it:
+Two outputs can only come from a scheduled run of the landed `linux-xvfb` job,
+so they arrive after this code lands rather than with it:
 
-- `scripts/termhost-bench/baselines/linux-xvfb.json`, taken from the first
-  scheduled run's results file. It must hold no row labelled `unknown_build`:
-  a baseline from a build nobody proved is no baseline (D12), so drop those
-  rows (or take a later run) before committing it;
+- `scripts/termhost-bench/baselines/linux-xvfb.json`. The first scheduled run
+  uploads `termhost-bench-linux-xvfb-baseline-proposed.json` in its
+  `termhost-bench-linux-xvfb-runner` artifact: the baseline build's readings and
+  thresholds proposed by unit. Review the thresholds against the run's spreads,
+  then commit it under that name. `compare` refuses to propose one from a
+  baseline build nobody proved (D12);
 - the `linux-xvfb` report in `qontinui-dev-notes`, rendered from that same run.
 
-Until then there is no Linux baseline to compare against, and `compare` has
-nothing to read for that environment.
+Until then every verdict reads `unknown(no baseline)` and the job never fails on it.

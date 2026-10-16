@@ -9,12 +9,15 @@
  *            --n 1,5,15 --arms focus,tiled --runs 2 [--ab-baseline <sha>] ...
  *   node scripts/termhost-bench/cli.mjs report  <results.json> [--format md|json]
  *            [--redact-to <file>] [--require-measured k1,k2 --at-n 15] [--require-rows-n 1,5,15]
+ *   node scripts/termhost-bench/cli.mjs report  <a.json> <b.json> ...   (one environment's files, one report)
  *   node scripts/termhost-bench/cli.mjs compare <results.json> [<baseline-results.json>]
+ *            [--baseline baselines/<env>.json [--verdict-json <file>] [--propose-baseline <file>]]
  *
  * Exit: 0 success; 1 a failure (an invalid file, a failed assertion, a run that
- * left no row, a run that stopped on an incident); 2 usage; 3 the doctor says a run
- * cannot start here (`run` refuses before any unit; `doctor` reports a blocking
- * mechanism).
+ * left no row, a run that stopped on an incident, a `compare --baseline` verdict
+ * of regression — and of nothing else: an unknown verdict exits 0); 2 usage; 3 the
+ * doctor says a run cannot start here (`run` refuses before any unit; `doctor`
+ * reports a blocking mechanism).
  *
  * Node built-ins only; no package.json change (plan D8).
  */
@@ -24,13 +27,14 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { compareBuilds, renderComparison } from "./compare.mjs";
+import { applyVerdict, compareBuilds, proposeBaseline, readBaselineFile, renderComparison, unknownVerdict, verdictFails } from "./compare.mjs";
 import { blockingMechanisms, doctorNotes, doctorReport, gatherDoctorFacts, mapDoctor, renderDoctor } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
 import { ARMS, KPI_CATALOG, SETUP_IDS } from "./kpi-catalog.mjs";
 import { resolveProbeBinary } from "./probe.mjs";
 import { checkAssertions, prepareReport, renderReport } from "./report.mjs";
 import { InvalidResults } from "./results.mjs";
+import { validateResults } from "./validate.mjs";
 import { RUN_DEFAULTS, RunAbort, RunFailed, planUnits, runBench } from "./run.mjs";
 import { createAdapter } from "./adapters/index.mjs";
 import { supervisorAnswers } from "./adapters/runner.mjs";
@@ -44,12 +48,17 @@ export const HELP = `termhost-bench — terminal-host performance under N AI ses
 
   doctor   --env <linux-xvfb|windows-hosted|windows-desktop> [--setups runner,tmux] [--json]
   run      --env linux-xvfb --setups runner,tmux --n 1,5,15 --arms focus,tiled --runs 2
-  report   <results.json> [--format md|json] [--redact-to <file>]
+  report   <results.json> [more.json ...] [--format md|json] [--redact-to <file>]
+           (several files: one environment's, rendered as one report; the gate options take one)
            [--require-measured <kpi,...> --at-n <n,...>] [--require-rows-n <n,...>]
            [--require-measured-if-operative <mechanism>:<kpi,...>]
            [--setups ...] [--arms ...] [--roles head,single]
            [--ab-baseline <sha>]   (an A/B run: every runner row at --at-n must have a proven build)
   compare  <results.json> [<baseline.json>] [--setup runner] [--variant default] [--format md|json]
+           [--baseline <baselines/env.json>]  draw the regression verdict (exit 1 on regression only;
+                                              a missing baseline file is unknown("no baseline"), exit 0)
+           [--verdict-json <file>]            write the verdict as JSON
+           [--propose-baseline <file>]        write a baseline proposed from this run (runner rows only)
 
 run options:
   --profile <id|path>        load profile (default claude-tui)       --seed <n>       (default 1)
@@ -144,6 +153,9 @@ const FLAGS_WITH_VALUES = new Set([
   "wt-cache-dir",
   "wsl-distro",
   "require-measured-if-operative",
+  "baseline",
+  "verdict-json",
+  "propose-baseline",
 ]);
 const BOOLEAN_FLAGS = new Set(["json", "help", "accept-capture-health-unknown"]);
 
@@ -406,7 +418,8 @@ function readDoc(path) {
 }
 
 function cmdReport(positional, flags, io) {
-  if (positional.length !== 1) throw new UsageError("report takes one results file");
+  if (positional.length === 0) throw new UsageError("report takes one results file, or several from one environment");
+  if (positional.length > 1) return cmdReportMany(positional, flags, io);
   const doc = readDoc(positional[0]);
   const prep = prepareReport(doc);
   if (!prep.valid) {
@@ -443,13 +456,68 @@ function cmdReport(positional, flags, io) {
   return 0;
 }
 
+/**
+ * Several results files of ONE environment as one report (the committed report,
+ * D7). No gate options: those check one run's file.
+ */
+function cmdReportMany(positional, flags, io) {
+  for (const f of ["redact-to", "require-measured", "require-measured-if-operative", "at-n", "require-rows-n", "ab-baseline"]) {
+    if (flags[f] !== undefined) throw new UsageError(`--${f} checks one results file; pass one file`);
+  }
+  const docs = positional.map(readDoc);
+  for (const [i, doc] of docs.entries()) {
+    const res = validateResults(doc);
+    if (!res.valid) {
+      io.out(`INVALID: ${positional[i]} (${res.errors.length} errors)\n`);
+      for (const e of res.errors.slice(0, 50)) io.out(`  ${e.path || "/"} [${e.keyword}]\n`);
+      return 1;
+    }
+  }
+  try {
+    io.out(renderReport(docs));
+  } catch (e) {
+    throw new UsageError(e.message);
+  }
+  return 0;
+}
+
 function cmdCompare(positional, flags, io) {
   if (positional.length < 1 || positional.length > 2) throw new UsageError("compare takes one or two results files");
+  for (const f of ["verdict-json", "propose-baseline"]) {
+    if (flags[f] !== undefined && flags.baseline === undefined) throw new UsageError(`--${f} needs --baseline`);
+  }
   const head = readDoc(positional[0]);
   const base = positional[1] ? readDoc(positional[1]) : null;
-  const cmp = compareBuilds(head, base, { setup: flags.setup ?? "runner", variant: flags.variant ?? "default" });
-  io.out(flags.format === "json" ? `${JSON.stringify(cmp, null, 2)}\n` : renderComparison(cmp));
-  return 0;
+  const opts = { setup: flags.setup ?? "runner", variant: flags.variant ?? "default" };
+  if (flags.baseline === undefined) {
+    const cmp = compareBuilds(head, base, opts);
+    io.out(flags.format === "json" ? `${JSON.stringify(cmp, null, 2)}\n` : renderComparison(cmp));
+    return 0;
+  }
+  // Verdict mode: everything short of a judged regression is reported and exits 0.
+  const baselineState = readBaselineFile(resolve(flags.baseline));
+  let cmp = null;
+  let verdict;
+  try {
+    cmp = applyVerdict(compareBuilds(head, base, opts), baselineState);
+    verdict = cmp.verdict;
+  } catch (e) {
+    verdict = unknownVerdict("no comparison", e.message);
+  }
+  if (flags["verdict-json"]) writeFileSync(resolve(flags["verdict-json"]), `${JSON.stringify(verdict, null, 2)}\n`);
+  if (flags["propose-baseline"]) {
+    try {
+      if (!cmp) throw new Error("no comparison to propose from");
+      writeFileSync(resolve(flags["propose-baseline"]), `${JSON.stringify(proposeBaseline(cmp, { runId: head.run?.id ?? null }), null, 2)}\n`);
+      io.err(`termhost-bench: wrote a proposed baseline ${flags["propose-baseline"]} (review its thresholds before committing it)\n`);
+    } catch (e) {
+      io.err(`termhost-bench: no baseline proposed: ${e.message}\n`);
+    }
+  }
+  if (flags.format === "json") io.out(`${JSON.stringify(cmp ?? { verdict }, null, 2)}\n`);
+  else io.out(cmp ? renderComparison(cmp) : `Verdict: **unknown** — ${verdict.reason}: ${verdict.detail}. An unknown never fails the job.\n`);
+  io.err(`termhost-bench: verdict ${verdict.verdict} (${verdict.reason})\n`);
+  return verdictFails(verdict) ? 1 : 0;
 }
 
 /**

@@ -296,8 +296,18 @@ jobs:
   # artifact and the job summary are rendered from the redacted copy
   # (`report --redact-to`); the gate's failure lines give a third-party KPI's
   # state and reason code without its detail text; and the failure-only log
-  # upload takes runner unit directories only. No verdict is drawn yet: the
-  # regression rule arrives with Phase 6, in compare.mjs.
+  # upload takes runner unit directories only.
+  #
+  # Regression verdict (Phase 6, D11): `compare.mjs --baseline
+  # scripts/termhost-bench/baselines/linux-xvfb.json` judges each headline KPI
+  # of the head build against the baseline build measured in this same VM —
+  # regression iff the head's median over runs is worse by more than the
+  # threshold the baseline file records AND the run spreads do not overlap. The
+  # job fails on `regression` and on nothing else: an unknown (no baseline file
+  # yet, no baseline build in this run, an unknown or under-sampled side) is
+  # reported in the summary and never fails it. Until the first scheduled run's
+  # baseline is committed, every verdict reads unknown("no baseline"); that run
+  # uploads a proposed baseline (runner readings only, D7) to review and commit.
   #
   # No rust-cache: ci.yml saves its ~2.6 GB caches from main only, to keep the
   # repo under its 10 GB cap, and a weekly save from this job would compete with
@@ -634,12 +644,48 @@ jobs:
             --require-measured output_latency_ms,cpu_pct,memory_mb,producer_stall_pct --at-n "$GATE_N" \
             "${ab[@]}"
 
+      # Reads the runner-only copy, so nothing it prints or writes carries a
+      # third-party reading (D7). Fails on a `regression` verdict only; an
+      # unknown — including a compare that could not run — is a warning.
+      - name: Regression verdict (fails on regression only)
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/tb-out"
+          redacted="$out/termhost-bench-linux-xvfb-runner.json"
+          verdict="$out/termhost-bench-linux-xvfb-verdict.json"
+          if [ "$BASELINE" = none ] || [ ! -f "$redacted" ]; then
+            if [ "$BASELINE" = none ]; then why="no baseline build in this run"; else why="no runner-only results"; fi
+            echo "### Regression verdict: unknown — $why (never a failure)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          rc=0
+          node scripts/termhost-bench/compare.mjs "$redacted" --baseline scripts/termhost-bench/baselines/linux-xvfb.json --verdict-json "$verdict" --propose-baseline "$out/termhost-bench-linux-xvfb-baseline-proposed.json" > "$out/verdict.md" || rc=$?
+          cat "$out/verdict.md" >> "$GITHUB_STEP_SUMMARY"
+          v="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).verdict))' "$verdict" 2>/dev/null || echo unknown)"
+          echo "verdict: $v (compare exited $rc)"
+          if [ "$v" = regression ]; then
+            echo "::error::termhost-bench: the head build regressed against the baseline build $BASELINE (see the job summary)"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::compare exited $rc with verdict '$v': reported as unknown, never a failure"
+          fi
+          exit 0
+
       - name: Upload the runner's results (redacted)
         if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: termhost-bench-linux-xvfb-runner
-          path: ${{ runner.temp }}/tb-out/termhost-bench-linux-xvfb-runner.json
+          path: |
+            ${{ runner.temp }}/tb-out/termhost-bench-linux-xvfb-runner.json
+            ${{ runner.temp }}/tb-out/termhost-bench-linux-xvfb-verdict.json
+            ${{ runner.temp }}/tb-out/termhost-bench-linux-xvfb-baseline-proposed.json
           if-no-files-found: warn
           retention-days: 90
 
@@ -647,18 +693,13 @@ jobs:
         if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
         shell: bash
         working-directory: head/qontinui-runner
-        env:
-          BASELINE: ${{ steps.params.outputs.baseline }}
         run: |
           redacted="$RUNNER_TEMP/tb-out/termhost-bench-linux-xvfb-runner.json"
           if [ ! -f "$redacted" ]; then
             echo "No runner-only results to summarise (see the run and validate steps)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          if [ "$BASELINE" != none ]; then
-            node scripts/termhost-bench/cli.mjs compare "$redacted" >> "$GITHUB_STEP_SUMMARY" \
-              || echo "compare could not pair head and baseline rows (see the log)." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          # The head-against-baseline table, with its verdict, is the verdict step's.
           node scripts/termhost-bench/cli.mjs report "$redacted" >> "$GITHUB_STEP_SUMMARY"
 
       # Runner unit directories only (`u<k>-runner-...`): their stdout and

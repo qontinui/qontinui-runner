@@ -66,6 +66,7 @@ import { homedir } from "node:os";
 import path, { basename, dirname, join } from "node:path";
 
 import { HttpError, PRIMARY_RUNNER_PORT, RunnerClient, RunnerNotListed, SupervisorClient, httpJson, sleep, unwrap } from "../../lib/runner-clients.mjs";
+import { derivedRunnerDiagnostics } from "../diagnostics.mjs";
 import { ECHO_REGION, MARKER_KINDS, markerOverlay, markerSeq } from "../marker.mjs";
 import { platformDirs } from "../neutrality.mjs";
 import { listProcesses, startKeyCompare, terminatePid, terminateTree } from "../proc.mjs";
@@ -1422,6 +1423,9 @@ export class RunnerAdapter {
       state: "measured",
       data: summarizeGuardWarnings(this.guardWarnings),
     });
+    // Phase 6: the transport rates perf-harness used to own, and the renderer-memory
+    // breakdown (declared, since no build serves it over HTTP).
+    Object.assign(d, derivedRunnerDiagnostics(d, { platform: this.platform }));
     return d;
   }
 
