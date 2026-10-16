@@ -314,9 +314,13 @@ pub(crate) fn apply_subject_root_env(cmd: &mut std::process::Command, root: &std
 /// (which a projected `profiles.json` never does), a device JWT is read from
 /// `COORD_DEVICE_JWT`, and `QONTINUI_DISABLE_EMBEDDED_PG` /
 /// `QONTINUI_ALLOW_NO_DB` would leave the child with no database at all instead
-/// of its private cluster. Same list as the supervisor's
-/// `process::instance_root::HARNESS_STORE_ENV_KEYS`.
-pub(crate) const HARNESS_STORE_ENV_KEYS: [&str; 7] = [
+/// of its private cluster; `COORD_ADMIN_SECRET` is the operator's coord admin
+/// credential. GitHub tokens are deliberately kept: they are the user's own
+/// credentials for the repositories a subject's sessions work on. Mirrors the
+/// supervisor's `process::instance_root::HARNESS_STORE_ENV_KEYS` (added by the
+/// same plan phase).
+pub(crate) const HARNESS_STORE_ENV_KEYS: [&str; 8] = [
+    "COORD_ADMIN_SECRET",
     "RUNNER_DATABASE_URL",
     "DATABASE_URL",
     "REDIS_URL",
