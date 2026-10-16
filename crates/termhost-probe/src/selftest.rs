@@ -65,6 +65,11 @@ use crate::sampler::{Sampler, SamplerConfig, GROUP_HOST};
 use crate::stats;
 
 const MS: u64 = 1_000_000;
+
+/// `input_round_trip` excuses at most `keys / MAX_UNOBSERVABLE_DIV` echoes that
+/// no capture frame could have seen; more than that is a capture too sparse to
+/// judge the round trip, and fails.
+const MAX_UNOBSERVABLE_DIV: usize = 4;
 /// The session id the selftest's markers carry.
 pub const SESSION: u16 = 7;
 
@@ -1084,13 +1089,40 @@ impl Selftest<'_> {
             .recognised
             .load(std::sync::atomic::Ordering::Relaxed)
             - recognised_before;
+        // Every echo is painted into ONE slot, so echo i is on screen only
+        // until echo i+1 replaces it. A capture that lands no frame in that
+        // window could not have seen it: measured on windows-latest (run
+        // 38974786541), primary frames ~97 ms apart with one 234 ms gap
+        // swallowed a whole 100 ms echo. Such an echo is UNOBSERVABLE, not
+        // lost. It is excused only on positive evidence -- no primary frame
+        // stamped at least one refresh after its paint and before the next
+        // echo's paint -- and only for a bounded share of the keys.
+        let painted: Vec<u64> = win
+            .echoes()
+            .iter()
+            .skip(echo_base as usize)
+            .map(|e| e.t_painted_ns)
+            .collect();
+        let refresh = engine.model().config().refresh_ns;
         let mut echo_lat = Vec::new();
+        let mut unobservable = 0usize;
         if let Some(p) = primary {
             for (i, t) in t_injects.iter().enumerate() {
                 let m = Marker::new(MarkerKind::Echo, SESSION, marker_seq(echo_base + i as u64));
-                if let Some(fs) = engine.model().first_seen(p, m) {
-                    if fs.t_ns >= *t && fs.t_ns - t < 1000 * MS {
-                        echo_lat.push((fs.t_ns - t) as f64 / 1e6);
+                let seen = engine
+                    .model()
+                    .first_seen(p, m)
+                    .filter(|fs| fs.t_ns >= *t && fs.t_ns - t < 1000 * MS);
+                match seen {
+                    Some(fs) => echo_lat.push((fs.t_ns - t) as f64 / 1e6),
+                    None => {
+                        // An echo the window never painted is a real loss.
+                        if let Some(&at) = painted.get(i) {
+                            let until = painted.get(i + 1).copied().unwrap_or(at + 1000 * MS);
+                            if !engine.model().primary_frame_within(at + refresh, until) {
+                                unobservable += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1103,7 +1135,8 @@ impl Selftest<'_> {
                 ..
             }
         );
-        let all_echoed = echo_lat.len() == keys;
+        let all_echoed =
+            echo_lat.len() + unobservable == keys && unobservable * MAX_UNOBSERVABLE_DIV <= keys;
         let ok = completed && sent as usize == keys && all_echoed && recognised >= 2 * sent as u64;
         let mut lat = echo_lat.clone();
         let deps: Vec<&'static str> = match primary {
@@ -1115,13 +1148,15 @@ impl Selftest<'_> {
             &deps,
             Some(ok),
             format!(
-                "{sent}/{keys} keys injected with the foreground checked before each; {}/{keys} echo markers seen; the listener recognised {recognised} of the probe's {} key events as its own; outcome {outcome:?}",
+                "{sent}/{keys} keys injected with the foreground checked before each; {}/{keys} echo markers seen, {unobservable} unobservable (no capture frame landed while the echo was on screen; at most {} may be); the listener recognised {recognised} of the probe's {} key events as its own; outcome {outcome:?}",
                 echo_lat.len(),
+                keys / MAX_UNOBSERVABLE_DIV,
                 2 * sent
             ),
             json!({
                 "sent": sent,
                 "echoed": echo_lat.len(),
+                "unobservable": unobservable,
                 "recognised": recognised,
                 "input_latency_p50_ms": median(&mut lat),
                 "input_latency_max_ms": echo_lat.iter().copied().fold(0.0, f64::max),
