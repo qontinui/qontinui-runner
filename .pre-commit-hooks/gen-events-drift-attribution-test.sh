@@ -715,20 +715,20 @@ if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
     fi
 fi
 
-# Non-vacuity: a tree that adds the pty-holder crate as a dependency (and a
+# Non-vacuity: a tree that adds a not-yet-covered crate as a dependency (and a
 # transitive one behind it) is caught; target `path`s and an out-of-repo
 # sibling are not. The target paths point OUTSIDE every input on purpose —
 # under an input they would be "covered" and prove nothing about the section
 # filter that is supposed to skip them.
 premise_fixture 'fn f() {}'
-mkdir -p "$PREMISE_FIXTURE/crates/pty-holder"
+mkdir -p "$PREMISE_FIXTURE/crates/new-crate"
 cat > "$PREMISE_FIXTURE/src-tauri/Cargo.toml" <<'TOML'
 [package]
 name = "x"
 
 [dependencies]
 qontinui-spec-check = { path = "../crates/spec-check" }
-qontinui-pty-holder = { path = "../crates/pty-holder" }
+qontinui-new-crate = { path = "../crates/new-crate" }
 qontinui-types = { path = "../../qontinui-schemas/rust" }
 
 [lib]
@@ -738,7 +738,7 @@ path = "../tools/lib.rs"
 name = "export_schemas"
 path = "bin/export_schemas.rs"
 TOML
-cat > "$PREMISE_FIXTURE/crates/pty-holder/Cargo.toml" <<'TOML'
+cat > "$PREMISE_FIXTURE/crates/new-crate/Cargo.toml" <<'TOML'
 [target.'cfg(unix)'.dependencies]
 frame = { path = "../frame-proto" }
 TOML
@@ -750,19 +750,19 @@ members = ["src-tauri"]
 [patch.crates-io]
 foo = { path = "patched/foo" }
 TOML
-PTY_OUT="$(gen_events_uncovered_path_deps "$PREMISE_FIXTURE")"
-check "a new pty-holder path dependency, its own, and a [patch] path are reported uncovered" \
-    "crates/pty-holder (from src-tauri/Cargo.toml)"$'\n'"patched/foo (from Cargo.toml)"$'\n'"crates/frame-proto (from crates/pty-holder/Cargo.toml)" \
-    "$PTY_OUT"
+NEW_OUT="$(gen_events_uncovered_path_deps "$PREMISE_FIXTURE")"
+check "an uncovered crate path dependency, its own, and a [patch] path are reported uncovered" \
+    "crates/new-crate (from src-tauri/Cargo.toml)"$'\n'"patched/foo (from Cargo.toml)"$'\n'"crates/frame-proto (from crates/new-crate/Cargo.toml)" \
+    "$NEW_OUT"
 
 # The hook script itself, against fixtures: it must FAIL on an uncovered
 # dependency (double- or single-quoted), and must not pass a walk that read
 # nothing — a missing manifest is a failure, not an empty answer.
 PATH_DEPS_HOOK="$SCRIPT_DIR/gen-events-path-deps-check.sh"
 path_deps_hook_rc() { bash "$PATH_DEPS_HOOK" "$1" >/dev/null 2>&1; echo "$?"; }
-check "the path-deps hook fails on the uncovered pty-holder fixture" "1" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
+check "the path-deps hook fails on the uncovered-crate fixture" "1" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
 premise_fixture 'fn f() {}'
-printf "[dependencies]\nqontinui-pty-holder = { path = '../crates/pty-holder' }\n" > "$PREMISE_FIXTURE/src-tauri/Cargo.toml"
+printf "[dependencies]\nqontinui-new-crate = { path = '../crates/new-crate' }\n" > "$PREMISE_FIXTURE/src-tauri/Cargo.toml"
 check "  and on a single-quoted (TOML literal string) uncovered path" "1" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
 EMPTY_ROOT="$(mktemp -d -t gen-events-nomanifest-XXXXXX)"; FIXTURE_ROOTS+=("$EMPTY_ROOT")
 check "  and does not pass when src-tauri/Cargo.toml is missing" "2" "$(path_deps_hook_rc "$EMPTY_ROOT")"

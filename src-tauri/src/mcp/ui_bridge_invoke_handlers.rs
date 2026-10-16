@@ -296,7 +296,45 @@ async fn in_process_get_access_token_for_websocket(
     crate::commands::auth::get_access_token_for_websocket_impl()
         .await
         .map(Value::String)
-        .map_err(|e| in_process_command_failed(COMMAND, e.to_string()))
+        .map_err(|e| {
+            let e = e.to_string();
+            match websocket_error_status(&e) {
+                StatusCode::UNAUTHORIZED => in_process_device_token_expired(COMMAND, &e),
+                _ => in_process_command_failed(COMMAND, e),
+            }
+        })
+}
+
+/// The HTTP status a `get_access_token_for_websocket` error maps to: the same
+/// expiry refusal `get_coord_device_token` answers 401, else the door's 500.
+///
+/// The refusal reaches this door wrapped in `AppError::AuthError`, whose
+/// Display prefixes `"Authentication error: "`, so the typed prefix is matched
+/// right after that wrapper (or bare), not anywhere in the text.
+fn websocket_error_status(err: &str) -> StatusCode {
+    let inner = err.strip_prefix("Authentication error: ").unwrap_or(err);
+    if inner.starts_with(crate::commands::auth::DEVICE_TOKEN_EXPIRED) {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// 401 for a mint door whose credential has EXPIRED (`DEVICE_TOKEN_EXPIRED`,
+/// plan `2026-10-09-runner-credential-expires-when-coord-is-down-across-its-only-refresh-window`
+/// Phase 1). The caller's credential problem — sign in to the runner — not the
+/// runner failing to read its store, which is what 500 means on these doors.
+fn in_process_device_token_expired(
+    command: &str,
+    err: &str,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(api_error(format!(
+            "invoke proxy: in-process invoke of '{}' refused: {}",
+            command, err
+        ))),
+    )
 }
 
 /// 400 for args that do not match an in-process command's `args_schema`.
@@ -457,6 +495,8 @@ async fn in_process_dismiss_recent_crash(
 /// - `Ok(None)`      -> JSON `null`: definitively no token (for that tenant). NOT an error.
 /// - `Err(e)`        -> 500: the credential store was unreadable, so the answer
 ///   is UNKNOWN -- never collapsed into `null`;
+/// - expired         -> 401 `DEVICE_TOKEN_EXPIRED`: the runner's credential for
+///   what was asked has expired (sign in to the runner); typed text verbatim;
 /// - refused         -> 409 `get_coord_device_token:tenant_required` (name a
 ///   tenant) or 400 `get_coord_device_token:tenant_invalid`, typed text verbatim.
 async fn in_process_get_coord_device_token(
@@ -471,6 +511,7 @@ async fn in_process_get_coord_device_token(
         Ok(None) => Ok(Value::Null),
         Err(e) => Err(match coord_device_token_error_status(&e) {
             StatusCode::BAD_REQUEST => in_process_bad_args(COMMAND, &e),
+            StatusCode::UNAUTHORIZED => in_process_device_token_expired(COMMAND, &e),
             StatusCode::CONFLICT => (
                 StatusCode::CONFLICT,
                 Json(api_error(format!(
@@ -487,9 +528,12 @@ async fn in_process_get_coord_device_token(
 /// caller's to fix — 409 `tenant_required` (name a tenant), 400
 /// `tenant_invalid` (the tenant named is malformed) — while anything else is the
 /// runner failing to read its own store, a 500 the caller cannot fix by changing
-/// the request.
+/// the request. An expired credential is 401 `DEVICE_TOKEN_EXPIRED`: the
+/// credential's problem, not a broken route, so 500 keeps its single meaning.
 fn coord_device_token_error_status(err: &str) -> StatusCode {
-    if err.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_REQUIRED) {
+    if err.starts_with(crate::commands::auth::DEVICE_TOKEN_EXPIRED) {
+        StatusCode::UNAUTHORIZED
+    } else if err.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_REQUIRED) {
         StatusCode::CONFLICT
     } else if err.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_INVALID) {
         StatusCode::BAD_REQUEST
@@ -1370,9 +1414,25 @@ mod coord_device_token_arg_tests {
     #[test]
     fn device_token_errors_map_to_their_statuses() {
         use super::coord_device_token_error_status as status_for;
-        use crate::commands::auth::{DEVICE_TOKEN_TENANT_INVALID, DEVICE_TOKEN_TENANT_REQUIRED};
+        use crate::commands::auth::{
+            DEVICE_TOKEN_EXPIRED, DEVICE_TOKEN_TENANT_INVALID, DEVICE_TOKEN_TENANT_REQUIRED,
+        };
         use axum::http::StatusCode;
         for (err, want) in [
+            (
+                format!(
+                    "{DEVICE_TOKEN_EXPIRED}: the coord device token this runner holds in its \
+                     default slot expired at exp 1791331745; coordCredential \
+                     posture=unrefreshable, cta=re_pair"
+                ),
+                StatusCode::UNAUTHORIZED,
+            ),
+            // The prefix, not a mention: an unreadable-store error that merely
+            // QUOTES the token name stays a 500.
+            (
+                format!("Could not read the credential store ({DEVICE_TOKEN_EXPIRED} unknown)"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
             (
                 format!("{DEVICE_TOKEN_TENANT_REQUIRED}: holds 2 tenants"),
                 StatusCode::CONFLICT,
@@ -1387,6 +1447,60 @@ mod coord_device_token_arg_tests {
             ),
         ] {
             assert_eq!(status_for(&err), want, "{err}");
+        }
+    }
+
+    /// The expired refusal reaches the wire as 401 `success:false` with the
+    /// typed text verbatim — never the 500 that reads as "route broken".
+    #[test]
+    fn an_expired_device_token_is_a_401_carrying_the_typed_text() {
+        use axum::http::StatusCode;
+        let err = format!(
+            "{}: the coord device token this runner holds in its default slot expired",
+            crate::commands::auth::DEVICE_TOKEN_EXPIRED
+        );
+        let (status, axum::Json(body)) =
+            super::in_process_device_token_expired("get_coord_device_token", &err);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!body.success);
+        assert!(body.error.unwrap().contains(&err));
+    }
+
+    /// The websocket door's status, driven by the REAL refusal as the door
+    /// produces it — the guard's text wrapped in `AppError::AuthError` — so a
+    /// change to either the wrapper's Display or the prefix breaks this test
+    /// rather than silently demoting the door to 500.
+    #[test]
+    fn the_websocket_door_maps_the_real_expired_refusal_to_401() {
+        use axum::http::StatusCode;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let exp = chrono::Utc::now().timestamp() - 3_600;
+        let dead = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string())
+        );
+        let refusal = crate::commands::auth::refuse_expired_device_token(&dead, None, None)
+            .expect_err("a past-exp JWT is refused");
+        let wire = crate::error::AppError::AuthError(refusal).to_string();
+        assert_eq!(
+            super::websocket_error_status(&wire),
+            StatusCode::UNAUTHORIZED,
+            "{wire}"
+        );
+        // Every other door failure keeps its 500 — including one that merely
+        // MENTIONS the prefix mid-text.
+        for other in [
+            crate::error::AppError::AuthError("Not authenticated. Please log in first.".into())
+                .to_string(),
+            "store unreadable (DEVICE_TOKEN_EXPIRED unknown)".to_string(),
+            "Tier 0/1 runner".to_string(),
+        ] {
+            assert_eq!(
+                super::websocket_error_status(&other),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{other}"
+            );
         }
     }
 
