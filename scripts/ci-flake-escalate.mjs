@@ -114,7 +114,12 @@ import { parseArgs as nodeParseArgs } from "node:util";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { isRustTestJob, parseTestOutcomes, platformOfJobName } from "./ci-flake-analyze.mjs";
+import {
+  ghApiText,
+  isRustTestJob,
+  parseTestOutcomes,
+  platformOfJobName,
+} from "./ci-flake-analyze.mjs";
 
 const DEFAULT_COORD_URL = "https://coord.qontinui.io";
 const FLAKINESS_PATH = "/coord/test-flakiness";
@@ -694,7 +699,9 @@ export function fetchRunJobs(repo, runId, { attempt, gh = execGh } = {}) {
       return { name: j.name, conclusion: j.conclusion, logText: null };
     }
     try {
-      const logText = gh(["api", `repos/${repo}/actions/jobs/${j.id}/logs`], { repo });
+      const logText = ghApiText(`repos/${repo}/actions/jobs/${j.id}/logs`, (args) =>
+        gh(args, { repo }),
+      );
       return { name: j.name, conclusion: j.conclusion, logText };
     } catch (err) {
       error(

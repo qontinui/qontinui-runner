@@ -3064,12 +3064,60 @@ pub fn pair_with_auth_token_with_ids(
     tenant_id: uuid::Uuid,
     origin: &PairBaseOrigin,
 ) -> Result<PairCompleteResponse, String> {
+    pair_with_auth_token_with_ids_typed(base, oauth_token, device_id, user_id, tenant_id, origin)
+        .map_err(|e| e.to_string())
+}
+
+/// A failed `POST /api/v1/devices/pair-cli`, with the HTTP status kept as
+/// DATA rather than flattened into the message.
+///
+/// The device-JWT refresher needs to tell a verdict on the bearer (401/403 —
+/// only a sign-in can recover) from a transient fault (5xx, 404, 429,
+/// transport), and the only honest way to do that is a typed status: matching
+/// on the rendered message would break the first time its wording changed.
+/// `Display` renders exactly the string [`pair_with_auth_token_with_ids`]
+/// has always returned, so callers that only log it see no difference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairCliError {
+    /// The HTTP status pair-cli answered with, or `None` when no response
+    /// arrived (client build, transport) or a 2xx body failed to decode.
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl std::fmt::Display for PairCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PairCliError {}
+
+impl PairCliError {
+    fn without_status(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
+/// [`pair_with_auth_token_with_ids`] with the failure typed — see
+/// [`PairCliError`].
+pub fn pair_with_auth_token_with_ids_typed(
+    base: &str,
+    oauth_token: &str,
+    device_id: &str,
+    user_id: &str,
+    tenant_id: uuid::Uuid,
+    origin: &PairBaseOrigin,
+) -> Result<PairCompleteResponse, PairCliError> {
     let url = format!("{}/api/v1/devices/pair-cli", base);
     let body = pair_cli_request_body(device_id, tenant_id);
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("reqwest client build failed: {}", e))?;
+        .map_err(|e| PairCliError::without_status(format!("reqwest client build failed: {}", e)))?;
     // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/devices/pair-cli`,
     // authenticated by the operator's OAuth token. Not a coord route.
     let resp = client
@@ -3078,16 +3126,20 @@ pub fn pair_with_auth_token_with_ids(
         .header("X-Qontinui-User-Id", user_id)
         .json(&body)
         .send()
-        .map_err(|e| describe_send_error(&url, &e, origin))?;
+        .map_err(|e| PairCliError::without_status(describe_send_error(&url, &e, origin)))?;
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp
             .text()
             .unwrap_or_else(|_| "<unable to read response body>".to_string());
-        return Err(format!("POST {} -> HTTP {}: {}", url, status, body_text));
+        return Err(PairCliError {
+            status: Some(status.as_u16()),
+            message: format!("POST {} -> HTTP {}: {}", url, status, body_text),
+        });
     }
-    resp.json::<PairCompleteResponse>()
-        .map_err(|e| format!("decode pair-cli response failed: {}", e))
+    resp.json::<PairCompleteResponse>().map_err(|e| {
+        PairCliError::without_status(format!("decode pair-cli response failed: {}", e))
+    })
 }
 
 // ============================================================================

@@ -678,6 +678,59 @@ test("fetchRunJobs: a log that cannot be read is marked unreadable, and the arm 
   assert.deepEqual(r.escalations, []);
 });
 
+test("fetchRunJobs: gh's escape-sequence refusal is retried with --allow-escape-sequences and the coloured log parses", () => {
+  // Run 38263126224: a coloured Windows cargo log made `gh api` refuse, and the
+  // arm went DARK instead of filing the failing test.
+  const coloured = RED_WINDOWS_LOG.replace(
+    "evicts_oldest ... FAILED",
+    "evicts_oldest ... \u001b[31mFAILED\u001b[0m",
+  );
+  const { calls, gh } = recorder({
+    "api repos/o/r/actions/runs/5/jobs?per_page=100": JSON.stringify({
+      jobs: [{ id: 7, name: "test (windows-latest)", conclusion: "failure" }],
+    }),
+    "api repos/o/r/actions/jobs/7/logs": (args) => {
+      if (args.includes("--allow-escape-sequences")) return coloured;
+      const e = new Error("Command failed: gh api");
+      e.stderr =
+        "the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway";
+      throw e;
+    },
+  });
+  const jobs = fetchRunJobs("o/r", "5", { gh });
+  assert.equal(jobs[0].unreadable, undefined);
+  assert.equal(calls.length, 3, "list, refused read, one retry");
+  assert.deepEqual(calls[2].args, [
+    "api",
+    "repos/o/r/actions/jobs/7/logs",
+    "--allow-escape-sequences",
+  ]);
+  const r = selectMainRedEscalations(jobs);
+  assert.deepEqual(r.unreadable, []);
+  assert.deepEqual(r.escalations, [
+    {
+      testId: "qontinui_runner_lib::spill::tests::evicts_oldest",
+      mainRed: { shards: ["windows-latest"] },
+    },
+  ]);
+});
+
+test("fetchRunJobs: only the escape-sequence refusal is retried — any other read failure stays unreadable", () => {
+  const { calls, gh } = recorder({
+    "api repos/o/r/actions/runs/5/jobs?per_page=100": JSON.stringify({
+      jobs: [{ id: 1, name: "test (ubuntu-22.04)", conclusion: "failure" }],
+    }),
+    "api repos/o/r/actions/jobs/1/logs": () => {
+      const e = new Error("HTTP 410");
+      e.stderr = "gone (HTTP 410)";
+      throw e;
+    },
+  });
+  const jobs = fetchRunJobs("o/r", "5", { gh });
+  assert.equal(jobs[0].unreadable, true);
+  assert.equal(calls.length, 2, "no retry for an unrelated failure");
+});
+
 // ---------------------------------------------------------------------------
 // sliceGatingStep — only the gate's output is parsed, never the smoke step's
 // ---------------------------------------------------------------------------
