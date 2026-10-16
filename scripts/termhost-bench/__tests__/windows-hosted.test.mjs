@@ -331,6 +331,8 @@ test("the job runs on bench-scope's triggers, on windows-latest, inside GitHub's
   assert.ok(timeout <= 360, "GitHub-hosted jobs stop at 360 minutes");
   const bounded = [...text.matchAll(/^ {8}timeout-minutes: (\d+)$/gm)].reduce((a, m) => a + Number(m[1]), 0);
   assert.ok(bounded < timeout, `the step bounds (${bounded}) fit inside the job's (${timeout}), so an expiry names its step`);
+  // The checkout, toolchain and pnpm setup steps carry no bound of their own.
+  assert.ok(timeout - bounded >= 15, `the step bounds (${bounded}) leave at least 15 of the job's ${timeout} minutes for the unbounded steps`);
   assert.match(text, /if \[ "\$EVENT" = "pull_request" \]; then\n\s+n=1; arms=focus,tiled; runs=1; baseline=none/, "the PR smoke: N = 1, one run, head only");
   for (const s of steps(job).filter((x) => /baseline/i.test(x.name) && !/Resolve/.test(x.name))) {
     assert.match(s.text, /if: steps\.params\.outputs\.baseline != 'none'/, s.name);

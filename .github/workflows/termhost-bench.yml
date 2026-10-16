@@ -736,10 +736,11 @@ jobs:
   # a cold windows debug build at 54 min), about 95 min for the A/B's 12 units,
   # about 25 min for the VS Code smoke's 3 and about 15 min for the Windows
   # Terminal smoke's 2. The step bounds below sum to under the job's 360 minutes
-  # (GitHub's ceiling) with room for the unbounded checkout and setup steps; the
-  # A/B's bound went from 125 to 110 minutes (still above its estimate) to make
-  # room for the Windows Terminal smoke. Tighten them once there are runs to
-  # measure.
+  # (GitHub's ceiling) with at least 15 minutes left for the unbounded checkout
+  # and setup steps (windows-hosted.test.mjs holds that margin): the A/B's bound
+  # went from 125 to 105 minutes and the VS Code smoke's from 35 to 32, each still
+  # above its estimate, to make room for the Windows Terminal smoke. Tighten them
+  # once there are runs to measure.
   # ---------------------------------------------------------------------------
   run-windows-hosted:
     name: termhost-bench run (windows-hosted, windows-latest)
@@ -922,7 +923,7 @@ jobs:
         id: run
         shell: bash
         working-directory: head/qontinui-runner
-        timeout-minutes: 110
+        timeout-minutes: 105
         env:
           N: ${{ steps.params.outputs.n }}
           ARMS: ${{ steps.params.outputs.arms }}
@@ -1015,7 +1016,7 @@ jobs:
         if: ${{ !cancelled() && steps.probe.outcome == 'success' }}
         shell: bash
         working-directory: head/qontinui-runner
-        timeout-minutes: 35
+        timeout-minutes: 32
         env:
           N: ${{ steps.params.outputs.n }}
           ARMS: ${{ steps.params.outputs.arms }}
@@ -1090,8 +1091,8 @@ jobs:
             --require-measured-if-operative capture.wgc:output_latency_ms
 
       # Runner unit directories only (`u<k>-runner-...` under the A/B's work
-      # dir). The VS Code smoke's work dir is another directory, and no path here
-      # reaches it (D7).
+      # dir). The VS Code and Windows Terminal smokes' work dirs (tb-vscode,
+      # tb-wt) are other directories, and no path here reaches them (D7).
       - name: Upload runner unit logs (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
