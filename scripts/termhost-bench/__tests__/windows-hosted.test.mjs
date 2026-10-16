@@ -172,7 +172,7 @@ test("--require-measured-if-operative holds a KPI to measured only where the fil
   doc.capabilities["capture.wgc"] = { state: "OPERATIVE", reason: "fake" };
   const held = checkAssertions(doc, gate);
   assert.equal(held.length, 1);
-  assert.match(held[0], /vscode N = 15 tiled run 0: output_latency_ms is unknown\(capture_unavailable\)$/, "a third party's detail text never reaches the log (D7)");
+  assert.match(held[0], /vscode N = 15 tiled run 0: output_latency_ms is unknown\(capture_unavailable\) — hosted VM$/, "a third party's detail reaches the log only reading-free (D7)");
   doc.capabilities["capture.wgc"] = { state: "INOPERATIVE-ON-THIS-MACHINE", reason: "no capture on the image" };
   assert.deepEqual(checkAssertions(doc, gate), [], "capture inoperative: unknown with its reason is the honest reading");
   target.kpis.cpu_pct = { state: "unknown", unit: "% of one logical core", n: 0, reason: "harness_error", detail: "x" };

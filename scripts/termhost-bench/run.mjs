@@ -936,6 +936,17 @@ export async function runArm(unit, arm, ctx, { only } = {}) {
     spawns: null,
     diagnostics: {},
   };
+  // An arrangement the harness failed (not one the host could not realise) is the
+  // harness's error like any other: an incident, so the run's incident count and
+  // its results file say so. Before this, CI run 38362046020's `0 incidents`
+  // could not rule an arrange failure out as the cause of the VS Code tiled
+  // arm's unknown(harness_error).
+  if (out.armFailure?.reason === "harness_error") {
+    const pass = only === "spawn" ? " (spawn pass)" : "";
+    out.incidents.push(
+      incident("harness_error", `unit ${name} arm ${arm}${pass}: arrange: ${out.armFailure.detail}`, { data: { setup: unit.setup, unit: name, phase: `${arm}/arrange` } }),
+    );
+  }
   const act = await probe.activate({ runDir: join(unitDir, `activate-${arm}${only === "spawn" ? "-spawn" : ""}`), target: target() });
   if (!act.ok) out.arrangeNotes.push(`activation: ${act.detail}`);
   await sleep(o.warmupMs);

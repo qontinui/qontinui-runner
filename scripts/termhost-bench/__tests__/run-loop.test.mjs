@@ -279,6 +279,30 @@ test("one arm's failure is that arm's alone: the measured arm keeps its row (rev
   assert.ok(res.doc.incidents.some((i) => /arm tiled: tiled arrange timed out/.test(i.detail)));
 });
 
+test("an arrangement the harness failed is an incident; one the host could not realise is not (ci run 38362046020)", async (t) => {
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"] },
+    adapterHook: (a) => {
+      const arrange = a.arrange.bind(a);
+      a.arrange = async (arm, actx) => {
+        const r = await arrange(arm, actx);
+        if (arm === "tiled") return { ...r, ok: false, failure: { reason: "harness_error", detail: "the extension's arrange call timed out" } };
+        return { ...r, ok: false, failure: { reason: "arm_not_realisable", detail: "no editor group" } };
+      };
+    },
+  });
+  const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
+  const focus = res.doc.rows.find((r) => r.scenario.arm === "focus");
+  assert.equal(tiled.kpis.output_latency_ms.reason, "harness_error");
+  assert.ok(
+    tiled.incidents.some((i) => i.kind === "harness_error" && i.detail.endsWith("arm tiled: arrange: the extension's arrange call timed out")),
+    JSON.stringify(tiled.incidents),
+  );
+  assert.equal(focus.kpis.output_latency_ms.reason, "arm_not_realisable");
+  assert.ok(!focus.incidents.some((i) => /arrange:/.test(i.detail)), "a host that cannot realise the arm is a reading, not a harness error");
+  assert.equal(validateResults(res.doc).valid, true);
+});
+
 test("the primary-state guard's baseline is in the results, and a guard watching nothing blocks a supervisor run (review S7)", async (t) => {
   const watched = await fakeRun(t, {});
   assert.equal(watched.res.doc.capabilities["harness.neutrality"].state, "OPERATIVE");

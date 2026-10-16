@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 
 import { KPI_CATALOG, getKpi } from "../kpi-catalog.mjs";
 import { COMPARED_KPIS, comparableBuild, compareBuilds, compareStatistic, renderComparison, spreadOf, statesOf, valueOf } from "../compare.mjs";
-import { REPORT_KPIS, cell, checkAssertions, prepareReport, renderReport } from "../report.mjs";
+import { READING_FREE_DETAIL_MAX, REPORT_KPIS, cell, checkAssertions, prepareReport, readingFreeDetail, renderReport } from "../report.mjs";
 import { measureKpi, unknownKpi } from "../stats.mjs";
 import { validateResults } from "../validate.mjs";
 import { linuxXvfbResults, measuredKpis, row, spread } from "./helpers/results.mjs";
@@ -205,12 +205,32 @@ test("the gate names a missing row, an unmeasured KPI and a filtered-out role", 
   ]);
 });
 
-test("a gate failure carries the runner's detail text but only a third party's state and reason (D7)", () => {
+test("a gate failure carries the runner's detail text but a third party's only with every number masked (D7)", () => {
   const doc = linuxXvfbResults();
   const runner = checkAssertions(doc, { requireMeasured: ["hangs"], atN: [5], setups: ["runner"], arms: ["focus"] });
   assert.deepEqual(runner, ["runner (head) N = 5 focus run 0: hangs is unknown(occluded) — the window lost the foreground for most of the soak"]);
   const tmux = checkAssertions(doc, { requireMeasured: ["switch_latency_ms"], atN: [5], setups: ["tmux"], arms: ["focus"] });
-  assert.deepEqual(tmux, ["tmux N = 5 focus run 0: switch_latency_ms is unknown(harness_error)"]);
+  assert.equal(tmux.length, 1);
+  assert.match(tmux[0], /^tmux N = 5 focus run 0: switch_latency_ms is unknown\(harness_error\)/);
+  const r = doc.rows.find((x) => x.setup.id === "tmux" && x.scenario.n === 5 && x.scenario.arm === "focus");
+  r.kpis.switch_latency_ms = {
+    ...r.kpis.switch_latency_ms,
+    detail: "the probe fell behind its capture source (frame lag 56.0 ms judged as the p95, bound 50 ms, 32 frame(s) over it), so first appearances may be late",
+  };
+  const [line] = checkAssertions(doc, { requireMeasured: ["switch_latency_ms"], atN: [5], setups: ["tmux"], arms: ["focus"] });
+  assert.equal(
+    line,
+    "tmux N = 5 focus run 0: switch_latency_ms is unknown(harness_error) — the probe fell behind its capture source (frame lag # ms judged as the p#, bound # ms, # frame(s) over it), so first appearances may be late",
+    "the cause leaves the job; no reading does",
+  );
+  assert.doesNotMatch(line.split(" — ")[1], /\d/);
+});
+
+test("readingFreeDetail masks every number and bounds the length", () => {
+  assert.equal(readingFreeDetail("pid 4680 at 1.5 ms, 3% of 0x140198"), "pid # at # ms, #% of #x#");
+  const long = readingFreeDetail("x".repeat(1000));
+  assert.equal(long.length, READING_FREE_DETAIL_MAX);
+  assert.ok(long.endsWith("…"));
 });
 
 test("an unproven build is never one side of a comparison (D12, review round 2 M1)", () => {

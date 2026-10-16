@@ -108,8 +108,13 @@ export function renderReport(doc) {
  * The CI gate's assertions, checked on a valid document.
  *
  * A failure line names the KPI's state and reason code. Its free-text `detail` is
- * added for the runner's own rows only: public CI logs carry these lines, a detail
- * can quote a reading, and a third-party setup's readings never leave the job (D7).
+ * added verbatim for the runner's own rows only: public CI logs carry these lines,
+ * a detail can quote a reading, and a third-party setup's readings never leave the
+ * job (D7). A third party's line carries the detail with every number masked
+ * ({@link readingFreeDetail}): the CAUSE leaves the job, the reading does not. Without
+ * it, CI run 38362046020's `vscode N = 1 tiled run 0: output_latency_ms is
+ * unknown(harness_error)` named no cause at all — several unrelated failures
+ * share that reason code, and the results file stays in the VM by design.
  *
  * `requireMeasuredIfOperative` adds KPIs to the measured requirement only where
  * the file's own capabilities report a mechanism OPERATIVE — e.g. the capture KPIs
@@ -169,7 +174,7 @@ export function checkAssertions(doc, a) {
           for (const r of rows) {
             const v = r.kpis[id];
             if (v?.state !== "measured") {
-              const detail = setup === "runner" && v?.detail ? ` — ${v.detail}` : "";
+              const detail = !v?.detail ? "" : setup === "runner" ? ` — ${v.detail}` : ` — ${readingFreeDetail(v.detail)}`;
               failures.push(
                 `${setup}${r.setup.build?.role ? ` (${r.setup.build.role})` : ""} N = ${n} ${arm} run ${r.scenario.run_index}: ${id} is ${v?.state ?? "missing"}(${v?.reason ?? "?"})${detail}`,
               );
@@ -180,6 +185,20 @@ export function checkAssertions(doc, a) {
     }
   }
   return failures;
+}
+
+/** The longest third-party detail a gate line carries. */
+export const READING_FREE_DETAIL_MAX = 240;
+
+/**
+ * A third-party KPI detail with no reading left in it (D7): every number — a
+ * latency, a lag, a count, a percentage, a pid — becomes `#`, and the text is cut
+ * at {@link READING_FREE_DETAIL_MAX} characters. What remains is the sentence that
+ * names the cause ("the probe fell behind its capture source (frame lag # ms ...").
+ */
+export function readingFreeDetail(detail) {
+  const masked = String(detail).replace(/\d+(?:\.\d+)?/g, "#");
+  return masked.length > READING_FREE_DETAIL_MAX ? `${masked.slice(0, READING_FREE_DETAIL_MAX - 1)}…` : masked;
 }
 
 /** Validate, then return `{valid, errors}` plus the redacted copy (or null). */
