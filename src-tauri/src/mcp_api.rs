@@ -5757,6 +5757,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_session_obligations",
     "coord_session_worktrees",
     "coord_set_gate_audience",
+    // Plan 2026-10-04-coord-pr-hold-without-github-drafts D4: placing a hold
+    // only TIGHTENS (it can stop a merge, never cause one), so any principal
+    // that may open a PR may hold one. Release authority is enforced by coord
+    // server-side (holder or operator; a security_tier hold is operator-only).
+    // Without this entry no proxied session could place the hold that
+    // replaces GitHub drafts on private repos.
+    "coord_set_pr_hold",
     "coord_signature",
     "coord_slo_metrics",
     "coord_snooze_gate",
@@ -18377,6 +18384,40 @@ mod coord_mcp_body_gate_tests {
             assert!(
                 coord_mcp_withholding_is_deliberate(tool),
                 "{tool} must be a recorded exclusion, not drift"
+            );
+        }
+    }
+
+    /// Plan `2026-10-04-coord-pr-hold-without-github-drafts` D4: the hold tool
+    /// that replaces GitHub drafts is FORWARDED (holding only tightens), while
+    /// the draft toggle it retires stays a deliberate withholding. Moving either
+    /// name between the lists reds this test by name.
+    #[test]
+    fn pr_hold_is_forwarded_and_the_draft_toggle_stays_withheld() {
+        assert!(
+            coord_mcp_tool_is_allowed("coord_set_pr_hold"),
+            "coord_set_pr_hold must be callable through the proxy (plan D4)"
+        );
+        assert!(
+            !coord_mcp_withholding_is_deliberate("coord_set_pr_hold"),
+            "coord_set_pr_hold must not also read as a deliberate withholding"
+        );
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"coord_set_pr_hold","arguments":{}}
+            }))
+            .is_ok(),
+            "coord_set_pr_hold must pass the proxy gate"
+        );
+        for withheld in ["coord_set_pr_draft", "coord_create_pr"] {
+            assert!(
+                !coord_mcp_tool_is_allowed(withheld),
+                "{withheld} must stay withheld"
+            );
+            assert!(
+                coord_mcp_withholding_is_deliberate(withheld),
+                "{withheld} must stay a recorded deliberate exclusion"
             );
         }
     }
