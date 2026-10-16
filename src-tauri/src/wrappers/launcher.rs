@@ -165,6 +165,9 @@ mod tests {
 
     #[test]
     fn launcher_path_is_under_local_data() {
+        // `launcher_path` reads `QONTINUI_INSTANCE_ROOT`; a sibling test's
+        // subject launch must not race it.
+        let _lock = crate::test_env::env_lock();
         let p = launcher_path();
         let expected_parent = dirs::data_local_dir()
             .unwrap()

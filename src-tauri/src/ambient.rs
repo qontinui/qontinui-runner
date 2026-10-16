@@ -2200,11 +2200,34 @@ mod tests {
             let item = leaves.get(i + 3).and_then(leaf_ident)?;
             return item.ends_with("_dir").then(|| format!("dirs::{item}"));
         }
+        // `BaseDirectory::<X>` for a `PathResolver::resolve` — every variant
+        // but the read-only bundle and the OS temp dir is a machine dir.
+        if ident == "BaseDirectory"
+            && leaves.get(i + 1).is_some_and(|l| l.is_punct(':'))
+            && leaves.get(i + 2).is_some_and(|l| l.is_punct(':'))
+        {
+            let variant = leaves.get(i + 3).and_then(leaf_ident)?;
+            return (!matches!(variant, "Resource" | "Temp"))
+                .then(|| format!("BaseDirectory::{variant}"));
+        }
         let after_dot = i > 0 && leaves[i - 1].is_punct('.');
+        if !after_dot {
+            return None;
+        }
         let called = leaves
             .get(i + 1)
             .is_some_and(|l| l.is_open(Delimiter::Parenthesis));
-        if after_dot && called && (TAURI_APP_DIR_METHODS.contains(&ident) || ident == "machine_dir")
+        // `.path().<x>_dir()` — Tauri's `PathResolver` (`home_dir`,
+        // `data_dir`, `document_dir`, …), whatever its name.
+        let on_path_resolver = i >= 4
+            && leaves[i - 2].is_close(Delimiter::Parenthesis)
+            && leaves[i - 3].is_open(Delimiter::Parenthesis)
+            && leaves[i - 4].is_ident("path");
+        let resolver_dir = on_path_resolver
+            && ident.ends_with("_dir")
+            && !matches!(ident, "resource_dir" | "temp_dir");
+        if resolver_dir
+            || (called && (TAURI_APP_DIR_METHODS.contains(&ident) || ident == "machine_dir"))
         {
             return Some(format!(".{ident}()"));
         }
@@ -2241,13 +2264,6 @@ mod tests {
             "`paired_user_path_with`: the BARE-DEFAULT binding-store candidate, consulted only \
              without an instance root (`pair/subject_isolation.rs` replaces the candidate set \
              under one, D2)",
-        ),
-        (
-            "backup.rs",
-            5,
-            "TRANSITIONAL: the backup restore allow-list (two dirs) and its three path helpers; qontinui-runner \
-             #2176 re-resolves them through their owning modules — route or drop this entry \
-             when it lands",
         ),
         (
             "coord_doctor.rs",
@@ -2415,6 +2431,10 @@ mod tests {
                 let g = dirs::config_dir_fake_not;
                 let h = my::config_dir();
                 let i = machine_dir();
+                let j = app.path().home_dir();
+                let k = app.path().resolve("x", BaseDirectory::AppLocalData);
+                let l = app.path().resolve("x", BaseDirectory::Resource);
+                let m = app.path().temp_dir();
             }
         "#;
         let leaves = prod_tokens(src, "synthetic.rs").leaves;
@@ -2428,6 +2448,8 @@ mod tests {
                 "dirs::data_local_dir",
                 ".app_data_dir()",
                 ".machine_dir()",
+                ".home_dir()",
+                "BaseDirectory::AppLocalData",
             ]
         );
     }

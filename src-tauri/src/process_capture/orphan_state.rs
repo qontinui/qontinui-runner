@@ -44,8 +44,9 @@ impl OrphanState {
     }
 }
 
-/// Resolve the on-disk path; co-located with the existing
-/// `auth_tokens.enc` in `<data_local_dir>/com.qontinui.runner/`.
+/// Resolve the on-disk path: `<data_local_dir>/com.qontinui.runner/`
+/// (`instance_env::runner_data_local_base`) — beside `auth_tokens.enc` on a
+/// runner without `QONTINUI_SECURE_STORAGE_DIR`.
 pub fn state_path() -> Option<PathBuf> {
     let dir = qontinui_runner_lib::instance_env::runner_data_local_base()?;
     Some(dir.join("process_tree_state.json"))

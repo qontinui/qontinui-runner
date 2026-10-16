@@ -334,8 +334,10 @@ pub fn webview2_data_dir() -> Option<std::path::PathBuf> {
 /// EXCEPT a subject under an instance root, which gets its root's webview dir —
 /// `WEBVIEW2_USER_DATA_FOLDER`, which startup always exports inside the root,
 /// else `<root>/webview`. Applied through the same `data_directory` path as
-/// Windows (`webview_recovery`), so WebKitGTK's cookies / localStorage are the
-/// subject's own too (plan
+/// Windows (`webview_recovery`), so on Linux WebKitGTK's cookies /
+/// localStorage are the subject's own too. macOS's WKWebView ignores
+/// `data_directory`, so a subject there still shares the harness's web store
+/// (plan
 /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
 /// D1).
 #[cfg(not(target_os = "windows"))]

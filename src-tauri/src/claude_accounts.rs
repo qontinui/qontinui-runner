@@ -108,8 +108,13 @@ pub fn claude_accounts_file_path() -> Option<PathBuf> {
 /// Unscoped canonical `settings.json` (the PRIMARY runner's file) — the
 /// migration source. Must NOT honor `QONTINUI_CONFIG_DIR`: a secondary
 /// running the migration has to probe the primary's file, not its own
-/// instance-scoped copy.
+/// instance-scoped copy. A SUBJECT runner has no primary to read from: its
+/// own `settings.json` (under its root's config dir) is the migration source.
 fn unscoped_settings_path() -> Option<PathBuf> {
+    if qontinui_runner_lib::instance_env::instance_root().is_some() {
+        return qontinui_runner_lib::instance_env::runner_config_dir()
+            .map(|(d, _)| d.join("settings.json"));
+    }
     qontinui_runner_lib::instance_env::runner_config_base().map(|d| d.join("settings.json"))
 }
 
@@ -334,11 +339,12 @@ mod tests {
     }
 
     /// The canonical path must come straight from `dirs::config_dir()` —
-    /// `QONTINUI_CONFIG_DIR` plays no part. The resolver never reads env, so
-    /// this asserts equality with the dirs-derived path without mutating
-    /// process env (env-mutation would race other tests' `load_settings`).
+    /// `QONTINUI_CONFIG_DIR` plays no part. The resolver reads only
+    /// `QONTINUI_INSTANCE_ROOT` (through `instance_env::platform_dir`), so the
+    /// env lock keeps a sibling test's subject launch from racing it.
     #[test]
     fn canonical_path_ignores_qontinui_config_dir() {
+        let _lock = crate::test_env::env_lock();
         let expected = dirs::config_dir().map(|d| accounts_path_under(&d));
         assert_eq!(claude_accounts_file_path(), expected);
         if let Some(p) = claude_accounts_file_path() {

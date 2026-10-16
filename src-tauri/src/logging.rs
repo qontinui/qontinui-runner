@@ -682,9 +682,14 @@ fn find_dev_logs_ancestor(exe_path: &std::path::Path) -> Option<PathBuf> {
 ///
 /// Scoped per-runner for secondary instances so the `latest_crash.txt` file
 /// from one runner doesn't overwrite another's.
+///
+/// A SUBJECT runner (`QONTINUI_INSTANCE_ROOT`) never takes the
+/// workspace `.dev-logs` beside its executable — that directory belongs to the
+/// harness's checkout — and resolves through the instance-root seam instead.
 pub fn get_crash_dump_dir() -> PathBuf {
     let base = std::env::current_exe()
         .ok()
+        .filter(|_| crate::instance::instance_root().is_none())
         .and_then(|exe_path| find_dev_logs_ancestor(&exe_path))
         .unwrap_or_else(|| {
             // Fallback to local app data
