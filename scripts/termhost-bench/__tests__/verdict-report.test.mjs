@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   BASELINE_SCHEMA_ID,
+  GATE_SIMULATION,
   GATING_KPI,
   HEADLINE_KPIS,
   MIN_RUNS_FLOOR,
@@ -205,15 +206,30 @@ test("an under-sampled side never fires: fewer measured runs than the baseline's
   assert.equal(judge(gap).gate.head.spread.runs, 2);
 });
 
-test("an entry unknown on a build leaves the pool by name, never silently (and the gate still judges the rest)", () => {
-  const doc = abDoc([80, 82, 84], [50, 52, 54], { at: (n, arm) => (n === 5 && arm === "tiled" ? { head: [null, null, null] } : null) });
+test("a head that lost entries the baseline measured makes the gate unknown, never no_change (the wedge case)", () => {
+  // The head wedges every pane at N = 15; N = 1 and 5 are unchanged.
+  const doc = abDoc([50, 52, 54], [50, 52, 54], { at: (n) => (n === 15 ? { head: [null, null, null] } : null) });
   const cmp = judge(doc);
+  assert.equal(cmp.gate.verdict, "unknown");
+  assert.equal(cmp.gate.reason, "head_unknown_where_baseline_measured: N=15 focus, N=15 tiled; not pooled (2 of 6): N=15 focus (head unknown), N=15 tiled (head unknown)");
+  assert.equal(cmp.verdict.verdict, "unknown");
+  assert.equal(verdictFails(cmp.verdict), false, "an unknown gate never fails the job");
+  // Even when the rest regresses, a lost head entry leaves the verdict unknown, not regression.
+  const both = abDoc([80, 82, 84], [50, 52, 54], { at: (n, arm) => (n === 5 && arm === "tiled" ? { head: [null, null, null] } : null) });
+  assert.deepEqual([judge(both).gate.verdict, judge(both).gate.reason.split(";")[0]], ["unknown", "head_unknown_where_baseline_measured: N=5 tiled"]);
+});
+
+test("an entry unknown on both builds, or on the baseline only, leaves the pool by name and the gate judges the rest", () => {
+  const bothUnknown = abDoc([80, 82, 84], [50, 52, 54], { at: (n, arm) => (n === 5 && arm === "tiled" ? { head: [null, null, null], base: [null, null, null] } : null) });
+  const cmp = judge(bothUnknown);
   assert.equal(cmp.gate.verdict, "regression");
   assert.equal(cmp.gate.entries.length, 5);
-  assert.deepEqual(cmp.gate.excluded, [{ n: 5, arm: "tiled", why: "head unknown" }]);
-  assert.equal(cmp.gate.reason, "beyond_threshold_and_spreads_disjoint; not pooled (1 of 6): N=5 tiled (head unknown)");
-  assert.match(cmp.verdict.reason, /not pooled \(1 of 6\): N=5 tiled \(head unknown\)/, "the overall verdict carries it too");
+  assert.deepEqual(cmp.gate.excluded, [{ n: 5, arm: "tiled", why: "head unknown, baseline unknown" }]);
+  assert.equal(cmp.gate.reason, "beyond_threshold_and_spreads_disjoint; not pooled (1 of 6): N=5 tiled (head unknown, baseline unknown)");
+  assert.match(cmp.verdict.reason, /not pooled \(1 of 6\): N=5 tiled/, "the overall verdict carries it too");
   assert.match(renderComparison(cmp), /not pooled \(1 of 6\): N=5 tiled/);
+  const baseOnly = abDoc([80, 82, 84], [50, 52, 54], { at: (n, arm) => (n === 1 && arm === "focus" ? { base: [null, null, null] } : null) });
+  assert.deepEqual([judge(baseOnly).gate.verdict, judge(baseOnly).gate.excluded], ["regression", [{ n: 1, arm: "focus", why: "baseline unknown" }]]);
   assert.equal(judge(abDoc([80, 82, 84], [50, 52, 54])).gate.excluded, undefined, "nothing excluded, nothing said");
 });
 
@@ -450,9 +466,28 @@ test("the gate's false-red rate with nothing changed is <= 2 % at CV 0.2, launch
     assert.ok(linux.anyEntry > 0.1, `per-entry without the gate: ${pct(linux.anyEntry)}`);
     const win = redRate({ runs: 2, cv: 0.2, effect: 1, trials: 10000, seed: 2, shared });
     assert.ok(win.gate <= 0.02, `windows-hosted, shared ${shared}: gate red with no change ${pct(win.gate)}`);
+    const key = shared === 0 ? "independent" : "shared";
+    assert.equal(pct(linux.gate), pct(GATE_SIMULATION["linux-xvfb"].null[key] / 100), "GATE_SIMULATION quotes the measured figure");
+    assert.equal(pct(win.gate), pct(GATE_SIMULATION["windows-hosted"].null[key] / 100), "GATE_SIMULATION quotes the measured figure");
     lines.push(`shared ${shared}: linux-xvfb ${pct(linux.gate)} (any single entry ${pct(linux.anyEntry)}), windows-hosted ${pct(win.gate)}`);
   }
   t.diagnostic(`null, CV 0.2: ${lines.join("; ")}`);
+});
+
+test("GATE_SIMULATION matches the thresholds, and the README quotes its figures", () => {
+  for (const [env, sim] of Object.entries(GATE_SIMULATION)) {
+    assert.equal(sim.runs, SCHEDULED_RUNS[env], env);
+    assert.equal(sim.relative, PROPOSED_GATE_RELATIVE[sim.runs], env);
+  }
+  const readme = readFileSync(join(HERE, "..", "README.md"), "utf8");
+  const line = readme.split("\n").find((l) => l.startsWith("Seeded simulation"));
+  assert.ok(line, "the README's simulation paragraph");
+  for (const sim of Object.values(GATE_SIMULATION)) {
+    for (const v of [sim.null.independent, sim.null.shared, sim.power.independent, sim.power.shared]) assert.ok(line.includes(`${v.toFixed(2)} %`), `README quotes ${v.toFixed(2)} %`);
+    assert.ok(line.includes(`relative ${sim.relative}`) || line.includes(`, ${sim.relative})`), `README quotes threshold ${sim.relative}`);
+  }
+  const doc = readFileSync(join(HERE, "..", "compare.mjs"), "utf8");
+  assert.doesNotMatch(doc, /no change \d+(\.\d+)? % \(/, "compare.mjs prose carries no hand-copied figures");
 });
 
 test("the gate's power: a 30 % p95 regression across every N, at CV 0.2, independent and half-shared launch noise", (t) => {
@@ -467,6 +502,9 @@ test("the gate's power: a 30 % p95 regression across every N, at CV 0.2, indepen
     const win = redRate({ runs: 2, cv: 0.2, effect: 1.3, trials: 4000, seed: 5, shared });
     assert.ok(linux.gate >= bounds[shared].linux, `linux-xvfb, shared ${shared}: power ${pct(linux.gate)}`);
     assert.ok(win.gate >= bounds[shared].win, `windows-hosted, shared ${shared}: power ${pct(win.gate)}`);
+    const key = shared === 0 ? "independent" : "shared";
+    assert.equal(pct(linux.gate), pct(GATE_SIMULATION["linux-xvfb"].power[key] / 100), "GATE_SIMULATION quotes the measured figure");
+    assert.equal(pct(win.gate), pct(GATE_SIMULATION["windows-hosted"].power[key] / 100), "GATE_SIMULATION quotes the measured figure");
     lines.push(`shared ${shared}: linux-xvfb ${pct(linux.gate)}, windows-hosted ${pct(win.gate)}`);
   }
   const at15 = redRate({ runs: 3, cv: 0.15, effect: 1.3, trials: 4000, seed: 3, shared: 0.5 });
@@ -814,6 +852,13 @@ test("the verdict steps, executed: unknown passes, regression fails, and no verd
 
       const unknownSide = runStep("unknown-side", { baseline: BASE, results: abDoc([500, 510, 520].slice(0, runs), [null, null, null].slice(0, runs)), baselineFileContent: bfile });
       assert.equal(unknownSide.status, 0, `${env}: ${unknownSide.out}`);
+
+      // The wedge case: the head lost N = 15. The gate is unknown, and an unknown never fails the step
+      // (the job's assert step is what fails on an unmeasured output_latency_ms at the gate N).
+      const wedged = runStep("wedged", { baseline: BASE, results: abDoc([50, 52, 54].slice(0, runs), [50, 52, 54].slice(0, runs), { at: (n) => (n === 15 ? { head: [null, null, null].slice(0, runs) } : null) }), baselineFileContent: bfile });
+      assert.equal(wedged.status, 0, `${env}: ${wedged.out}`);
+      assert.equal(JSON.parse(readFileSync(join(wedged.dir, `termhost-bench-${env}-verdict.json`), "utf8")).verdict, "unknown");
+      assert.match(wedged.summary, /head_unknown_where_baseline_measured: N=15 focus, N=15 tiled/);
 
       const noResults = runStep("no-results", { baseline: BASE, results: null, baselineFileContent: bfile });
       assert.equal(noResults.status, 0, `${env}: ${noResults.out}`);

@@ -259,9 +259,9 @@ export const PROPOSED_THRESHOLDS = Object.freeze({
  * shared by the two arms of one (N, build, run) — they share a launch
  * (run.mjs measures both arms of a unit in one launch) — so the six entries are
  * three independent pairs, not six independent draws. Chosen so the job goes
- * red with no change <= 2 % at that 50 % sharing:
- *   runs 3, 0.16: no change 1.5 % (0.9 % independent); a 30 % regression 76 % (88 %);
- *   runs 2, 0.24: 1.4 % (0.4 %); 67 % (71 %).
+ * red with no change <= 2 % at that 50 % sharing; the measured figures are
+ * `GATE_SIMULATION`, which the seeded test reproduces exactly (so they cannot
+ * drift from it).
  * Noise shared more widely (one run's time slice across every N and both
  * builds) is not modelled: it cancels in the head/baseline ratio only when the
  * two builds are interleaved within it. The non-overlapping-spreads rule caps
@@ -269,6 +269,19 @@ export const PROPOSED_THRESHOLDS = Object.freeze({
  * before any threshold applies.
  */
 export const PROPOSED_GATE_RELATIVE = Object.freeze({ 2: 0.24, 3: 0.16 });
+
+/**
+ * What the seeded simulation in `__tests__/verdict-report.test.mjs` measures for
+ * the thresholds above, in percent of trials the job goes red: CV 0.2; `null` =
+ * nothing changed (10 000 trials), `power` = a 30 % p95 regression across every
+ * N and arm (4 000 trials); `independent` = no shared launch noise, `shared` =
+ * half the log-variance shared by a unit's two arms. The test asserts these
+ * exact figures and the README quotes them (a test holds that too).
+ */
+export const GATE_SIMULATION = Object.freeze({
+  "linux-xvfb": Object.freeze({ runs: 3, relative: 0.16, null: Object.freeze({ independent: 0.83, shared: 1.6 }), power: Object.freeze({ independent: 87.52, shared: 75.75 }) }),
+  "windows-hosted": Object.freeze({ runs: 2, relative: 0.24, null: Object.freeze({ independent: 0.4, shared: 1.22 }), power: Object.freeze({ independent: 71.8, shared: 67.4 }) }),
+});
 
 const isNum = (x) => typeof x === "number" && Number.isFinite(x);
 
@@ -403,7 +416,10 @@ export function judgeEntry(e, threshold, minRuns) {
  * `absolute` (ms) has no meaning for the dimensionless pooled ratio and applies
  * to the per-entry, informational verdicts alone. An entry measured on only one
  * build (or neither) cannot be pooled; the gate names every such entry in its
- * reason rather than letting it leave silently. A pooled regression must also REPRODUCE: at
+ * reason rather than letting it leave silently. An entry the BASELINE measured
+ * and the head did not makes the gate `unknown` (`head_unknown_where_baseline_measured`):
+ * a head that wedged at one N must not read as no_change on the rest. One
+ * unknown on both builds, or on the baseline only, just drops. A pooled regression must also REPRODUCE: at
  * least `MIN_GATE_ENTRIES` of the pooled entries must have the head's median
  * worse than the baseline's by more than the same relative threshold — one
  * entry moving the pool alone is reported as `no_change(not_reproduced)`. A
@@ -425,6 +441,16 @@ export function poolGate(entries, threshold, minRuns) {
     .map((e) => ({ n: e.n, arm: e.arm, why: [!e.head.spread && "head unknown", !e.baseline.spread && "baseline unknown"].filter(Boolean).join(", ") }));
   const notPooled = excluded.length > 0 ? `; not pooled (${excluded.length} of ${entries.length}): ${excluded.map((x) => `N=${x.n} ${x.arm} (${x.why})`).join(", ")}` : "";
   const out = (fields) => ({ entries: keys, ...(excluded.length > 0 ? { excluded } : {}), ...fields, reason: `${fields.reason}${notPooled}` });
+  // The head lost an entry the baseline measured (e.g. every N = 15 pane wedged):
+  // judging the rest would read a broken head as no_change, so the gate is
+  // unknown. An entry unknown on BOTH builds says nothing about the head; it just drops.
+  const headLost = excluded.filter((x) => x.why === "head unknown");
+  if (headLost.length > 0) {
+    return out({
+      verdict: "unknown",
+      reason: `head_unknown_where_baseline_measured: ${headLost.map((x) => `N=${x.n} ${x.arm}`).join(", ")}`,
+    });
+  }
   if (!threshold || !(threshold.relative > 0)) return out({ verdict: "unknown", reason: "no_threshold", detail: `the baseline file records no relative threshold for ${GATING_KPI}` });
   if (pooled.length < MIN_GATE_ENTRIES) {
     return out({ verdict: "unknown", reason: "too_few_gate_entries", detail: `${pooled.length} N/arm entr${pooled.length === 1 ? "y" : "ies"} measured on both builds; the gate pools at least ${MIN_GATE_ENTRIES}` });
