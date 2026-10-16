@@ -26,7 +26,7 @@ import { REQUIRED_FILES, WT_PIN, wtBuildFor } from "../adapters/windows-terminal
 import { blockingMechanisms, mapDoctor } from "../doctor.mjs";
 import { desktopVerdict, startWindowsDesktop } from "../envs/windows-desktop.mjs";
 import { CLOCK_OFFSET_ENV as GEN_OFFSET_ENV, clockOffsetFromEnv, createRealClock, runVirtual } from "../generator/ai-session.mjs";
-import { computeRowKpis, generatorWindow, indexGenerators } from "../kpis.mjs";
+import { computeRowKpis, gapIoInWindow, generatorWindow, indexGenerators } from "../kpis.mjs";
 import { loadProfile } from "../profile.mjs";
 import { generatorArgv } from "../rundir.mjs";
 import {
@@ -758,20 +758,69 @@ test("producer_stall_pct at a window edge: only the I/O that cannot fit outside 
   for (let t = 3000n * MS; t <= 6000n * MS; t += 500n * MS) pts.push({ t, blocked: 0, io: 1000e6, written: 0, scheduled: 0 });
   const r = generatorWindow(new Map([[0, { points: pts }]]), { t0: 1000n * MS, t1: 6000n * MS });
   assert.equal(r.stall[0], 30, "the 1500 ms pane block in a 5000 ms window — not 18 %, from spreading the I/O evenly");
+  // The same with a's own write placed (io_after_prev_ns): still 30 %.
+  const placed = pts.map((p) => (p.t === 2500n * MS ? { ...p, ioAfterPrev: 1000e6 } : p));
+  assert.equal(generatorWindow(new Map([[0, { points: placed }]]), { t0: 1000n * MS, t1: 6000n * MS }).stall[0], 30);
   // The I/O could all fall in the window: a gap wholly inside it still subtracts all of it.
   const whole = generatorWindow(new Map([[0, { points: pts }]]), { t0: -2000n * MS, t1: 6000n * MS });
   assert.equal(whole.stall[0], (1500 / 8000) * 100);
 });
 
-test("producer_stall_pct at a window END: the gap's I/O starts the gap (a record's io_ns predates its own write), so the stall after it is kept (review repro t1edge.mjs)", () => {
+test("producer_stall_pct at a window END: record a's own write is placed exactly (io_after_prev_ns), so the stall after it is kept (review repro t1edge.mjs)", () => {
   // Window 0..5000 ms. Record a at 3500 ms; its own 9P log write takes 3500..4700 ms (inside the
   // window), then the pane write blocks 4700..5000 and on past the window; b lands at 5500 ms.
-  const pts = [];
-  for (let t = -1000n * MS; t <= 3500n * MS; t += 500n * MS) pts.push({ t, blocked: 0, io: 0, written: 0, scheduled: 0 });
-  pts.push({ t: 5500n * MS, blocked: 0, io: 1200e6, written: 0, scheduled: 0 });
-  pts.push({ t: 6000n * MS, blocked: 0, io: 1200e6, written: 0, scheduled: 0 });
-  const r = generatorWindow(new Map([[0, { points: pts }]]), { t0: 0n, t1: 5000n * MS });
-  assert.equal(r.stall[0], 6, "300 ms of pane stall in a 5000 ms window — not 16 %");
+  const pts = (ioAfterPrev) => {
+    const out = [];
+    for (let t = -1000n * MS; t <= 3500n * MS; t += 500n * MS) out.push({ t, blocked: 0, io: 0, ioAfterPrev: 0, written: 0, scheduled: 0 });
+    out.push({ t: 5500n * MS, blocked: 0, io: 1200e6, ioAfterPrev, written: 0, scheduled: 0 });
+    out.push({ t: 6000n * MS, blocked: 0, io: 1200e6, ioAfterPrev: 1200e6, written: 0, scheduled: 0 });
+    return out;
+  };
+  const r = generatorWindow(new Map([[0, { points: pts(1200e6) }]]), { t0: 0n, t1: 5000n * MS });
+  assert.equal(r.stall[0], 6, "300 ms of pane stall in a 5000 ms window");
   assert.match(r.notes.join(" "), /session 0: 300 ms\): counted as blocked/);
   assert.match(r.notes.join(" "), /own file I\/O inside record gaps was not counted as stall \(session 0: 1200 ms\)/);
+  // An older generator (no io_after_prev_ns): the conservative rule, never below the truth.
+  const old = generatorWindow(new Map([[0, { points: pts(null) }]]), { t0: 0n, t1: 5000n * MS });
+  assert.equal(old.stall[0], 16, "only the 700 ms of I/O that cannot fit in the 500 ms outside the window is taken out");
+  assert.ok(old.stall[0] >= 6);
+  assert.match(old.notes.join(" "), /overstate the stall but never hides it/);
+});
+
+test("I/O on BOTH sides of a blocked pane write: the record's own write is placed, the marker log after the block is not, and the stall is never hidden (review repro p5-postwrite-io.mjs)", () => {
+  // a at 3500: its progress log 3500..4100 (600 ms); the pane write blocks 4100..5600; a marker
+  // log 5600..6200 (600 ms); b at 6200. Window 0..5000: true pane stall inside it = 900 ms = 18 %.
+  const pts = (ioAfterPrev) => {
+    const out = [];
+    for (let t = -1000n * MS; t <= 3500n * MS; t += 500n * MS) out.push({ t, blocked: 0, io: 0, ioAfterPrev: 0, written: 0, scheduled: 0 });
+    out.push({ t: 6200n * MS, blocked: 0, io: 1200e6, ioAfterPrev, written: 0, scheduled: 0 });
+    out.push({ t: 6700n * MS, blocked: 0, io: 1200e6, ioAfterPrev: 1200e6, written: 0, scheduled: 0 });
+    return out;
+  };
+  const win = { t0: 0n, t1: 5000n * MS };
+  const placed = generatorWindow(new Map([[0, { points: pts(600e6) }]]), win);
+  assert.equal(placed.stall[0], 18, "exactly the truth: a's 600 ms write placed, the 600 ms marker log kept outside");
+  const unplaced = generatorWindow(new Map([[0, { points: pts(null) }]]), win);
+  assert.ok(unplaced.stall[0] >= 18, `never below the truth (${unplaced.stall[0]})`);
+  assert.equal(unplaced.stall[0], 30, "all 1200 ms of unplaced I/O fits in the 1200 ms of the gap outside the window");
+  // gapIoInWindow directly: the own write's overlap plus the rest's unavoidable part.
+  const a = { t: 3500n * MS, io: 0 };
+  assert.equal(gapIoInWindow(a, { t: 6200n * MS, io: 1200e6, ioAfterPrev: 600e6 }, 3500n * MS, 5000n * MS), 600e6);
+  assert.equal(gapIoInWindow(a, { t: 6200n * MS, io: 1200e6, ioAfterPrev: null }, 3500n * MS, 5000n * MS), 0);
+  assert.equal(gapIoInWindow(a, { t: 6200n * MS, io: 1200e6, ioAfterPrev: 5000e6 }, 3500n * MS, 5000n * MS), 0, "an io_after_prev_ns outside [a.io, b.io] is ignored");
+  assert.equal(gapIoInWindow({ t: 0n, io: null }, { t: 2500n * MS, io: 9 }, 0n, 2500n * MS), 0, "no io_ns: nothing subtracted");
+});
+
+test("the generator writes io_after_prev_ns: the I/O total right after the previous record's own write", async () => {
+  const { profile } = loadProfile("claude-tui");
+  const r = await runVirtual({ profile, durationMs: 4000, logDelayNs: 50_000_000 });
+  const progress = r.records.filter((x) => x.type === "progress");
+  assert.ok(progress.length >= 3);
+  for (let i = 1; i < progress.length; i += 1) {
+    assert.equal(progress[i].io_after_prev_ns, progress[i - 1].io_ns + 50_000_000, `record ${i}: the previous record's io_ns plus its own 50 ms write`);
+    assert.ok(progress[i].io_after_prev_ns <= progress[i].io_ns);
+  }
+  assert.equal(r.exit.io_after_prev_ns, progress.at(-1).io_ns + 50_000_000);
+  const g = indexGenerators(new Map([[0, r.records]])).get(0);
+  assert.ok(g.points.filter((p) => p.kind === "progress").every((p) => Number.isFinite(p.ioAfterPrev)), "kpis carries it through");
 });

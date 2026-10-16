@@ -312,6 +312,7 @@ export function indexGenerators(bySlot) {
               blocked: r.blocked_ns,
               // The generator's own file I/O (absent from older generators).
               io: Number.isFinite(r.io_ns) ? r.io_ns : null,
+              ioAfterPrev: Number.isFinite(r.io_after_prev_ns) ? r.io_after_prev_ns : null,
               written: r.bytes_written ?? 0,
               scheduled: r.bytes_scheduled ?? 0,
               kind: r.type,
@@ -462,6 +463,44 @@ export const RECORD_GAP_MS = 2 * PROGRESS_INTERVAL_MS;
  * the KPIs unknown: dropping it would shrink the sample to the sessions that kept
  * running, which is the opposite of what happened.
  */
+/**
+ * The generator's own file I/O inside the window's part [lo, hi] of the record
+ * gap a -> b, in ns, placed only where the records place it:
+ *
+ *   - record a's OWN log write is known exactly: a carries io_ns from before it,
+ *     b carries io_after_prev_ns from after it, so it occupies
+ *     [a.t, a.t + (b.ioAfterPrev - a.io)] and its overlap with [lo, hi] counts;
+ *   - the rest of the gap's I/O (marker records written after a blocked pane
+ *     write, stop-file checks, resize records) has no known place, so only the
+ *     part that cannot fit in the gap outside the window counts inside it.
+ *
+ * Without io_after_prev_ns (an older generator) the whole gap's I/O takes the
+ * second rule. Either way unplaced I/O is attributed to the window as little as
+ * the records allow, so the stall a gap reports can overstate the pane's real
+ * stall but never hides it.
+ *
+ * @returns {number}
+ */
+export function gapIoInWindow(a, b, lo, hi) {
+  const num = (x) => x !== null && x !== undefined && Number.isFinite(x);
+  if (!num(a.io) || !num(b.io)) return 0;
+  const total = Math.max(0, b.io - a.io);
+  const at = Number(a.t);
+  const bt = Number(b.t);
+  const [l, h] = [Number(lo), Number(hi)];
+  const overlap = (x0, x1) => Math.max(0, Math.min(h, x1) - Math.max(l, x0));
+  // Record a's own write, when b says where it ended.
+  const own = num(b.ioAfterPrev) && b.ioAfterPrev >= a.io && b.ioAfterPrev <= b.io ? Math.min(b.ioAfterPrev - a.io, bt - at) : 0;
+  const ownIn = overlap(at, at + own);
+  // The rest, somewhere in [a.t + own, b.t]: only what cannot fit outside the window.
+  const restStart = at + own;
+  const rest = Math.max(0, total - own);
+  const restWindow = overlap(restStart, bt);
+  const restOutside = Math.max(0, bt - restStart - restWindow);
+  const restIn = Math.min(restWindow, Math.max(0, rest - restOutside));
+  return ownIn + restIn;
+}
+
 export function generatorWindow(gens, win) {
   const stall = [];
   const delivered = [];
@@ -495,14 +534,7 @@ export function generatorWindow(gens, win) {
       if (seg > gapNs) {
         // The gap minus the generator's own file I/O inside it (a slow log
         // write on a 9P run directory is not a pane that stopped draining).
-        // A record carries io_ns as it stood BEFORE its own log write, so the
-        // gap's I/O starts the gap: it occupies [a.t, a.t + io] (the record's
-        // write, then any I/O after it, with the pane write after that), and
-        // only its overlap with the window's part of the gap is subtracted.
-        // At either window edge that keeps a real pane stall from being hidden.
-        const ioTotal = a.io !== null && a.io !== undefined && b.io !== null && b.io !== undefined ? Math.max(0, b.io - a.io) : 0;
-        const ioEnd = Number(a.t) + Math.min(ioTotal, Number(seg));
-        const io = Math.max(0, Math.min(Number(hi), ioEnd) - Math.max(Number(lo), Number(a.t)));
+        const io = gapIoInWindow(a, b, lo, hi);
         const gapPart = Math.max(0, Number(hi - lo) - io);
         blocked += gapPart;
         gapInWindow += BigInt(Math.round(gapPart));
@@ -535,7 +567,9 @@ export function generatorWindow(gens, win) {
   if (ioExcluded.length > 0) {
     notes.push(
       `producer_stall_pct: the generator's own file I/O inside record gaps was not counted as stall ` +
-        `(${ioExcluded.map((x) => `session ${x.session}: ${Math.round(x.ms)} ms`).join(", ")})`,
+        `(${ioExcluded.map((x) => `session ${x.session}: ${Math.round(x.ms)} ms`).join(", ")}); I/O whose place in a gap ` +
+        "the records do not give is taken out of the window only where it cannot fit outside it, so the reading can overstate " +
+        "the stall but never hides it",
     );
   }
   if (clamped > 0) notes.push(`producer_stall_pct: ${clamped} session stall reading(s) above 100% were clamped (a write straddling a record)`);

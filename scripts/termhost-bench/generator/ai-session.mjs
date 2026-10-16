@@ -37,9 +37,11 @@
  *   echo      {seq, byte, t_read_ns, t_emit_ns, t_written_ns, bytes} (--echo);
  *             t_read_ns is the string "unknown" when the read time is not known
  *   progress  cumulative counters every 500 ms (window any interval by differencing),
- *             among them blocked_ns (time inside the pane write) and io_ns (time in
+ *             among them blocked_ns (time inside the pane write), io_ns (time in
  *             the generator's own file I/O: every log record, resize ones included,
- *             and every stop-file check)
+ *             and every stop-file check — as it stood BEFORE this record's own write)
+ *             and io_after_prev_ns (io_ns right AFTER the previous start/progress
+ *             record's own write: a record cannot carry its own, the next one does)
  *   resize    the pane size the host gave the session, as it changes
  *   exit      reason and final counters (blocked_ns, io_ns among them)
  *
@@ -459,6 +461,8 @@ class GeneratorRun {
     // One timer for the run: the caller passes its own (`opts.io`) when it logs
     // outside this object too (the resize watcher), so all of it is counted once.
     this.io = opts.io ?? createIoTimer(this.clock);
+    // The I/O total right after the last start/progress record's own write.
+    this.ioAfterPoint = 0n;
     this.log = this.io.wrap(opts.log);
     this.echo = opts.echo ?? false;
     this.shouldStop = this.io.wrap(opts.shouldStop ?? (() => null));
@@ -511,6 +515,7 @@ class GeneratorRun {
       t0_ns: String(this.t0),
       ...(opts.startExtra ?? {}),
     });
+    this.ioAfterPoint = this.io.ns();
   }
 
   /** One blocking write, timed on both sides; the time inside it is producer stall. */
@@ -586,9 +591,12 @@ class GeneratorRun {
       writes: st.writes,
       blocked_ns: Number(st.blockedNs),
       io_ns: Number(this.io.ns()),
+      io_after_prev_ns: Number(this.ioAfterPoint),
       echo_bytes: st.echoBytes,
       queued: this.queue.length,
     });
+    // A record cannot carry the I/O total after its own write; the next one does.
+    this.ioAfterPoint = this.io.ns();
   }
 
   pollStop(now) {
@@ -786,6 +794,7 @@ class GeneratorRun {
       writes: st.writes,
       blocked_ns: Number(st.blockedNs),
       io_ns: Number(this.io.ns()),
+      io_after_prev_ns: Number(this.ioAfterPoint),
       markers: st.markers,
       echoes: st.echoes,
       echo_bytes: st.echoBytes,
