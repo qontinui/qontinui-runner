@@ -344,7 +344,7 @@ test("a linked worktree resolves its primary checkout through git rev-parse --gi
   // Real git: a primary and a linked worktree.
   const git = spawnSync("git", ["--version"]);
   if (git.status !== 0) return;
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "tb-probe-wt-")));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), "tb-probe-wt-")));
   try {
     const primary = join(dir, "primary");
     const wt = join(dir, "wt");
@@ -356,13 +356,13 @@ test("a linked worktree resolves its primary checkout through git rev-parse --gi
     g(primary, "init", "-q");
     g(primary, "commit", "-q", "--allow-empty", "-m", "init");
     g(primary, "worktree", "add", "-q", "--detach", wt);
-    assert.equal(realpathSync(primaryCheckoutRoot(wt)), realpathSync(primary), "realpath'd both sides (Windows 8.3 names and case)");
+    assert.equal(realpathSync.native(primaryCheckoutRoot(wt)), realpathSync.native(primary), "native realpath on both sides: the JS realpathSync keeps a Windows 8.3 short name (RUNNER~1) that git expands");
     assert.equal(primaryCheckoutRoot(primary), null);
     const release = join(primary, "target-agent", "release", "termhost-probe");
     mkdirSync(dirname(release), { recursive: true });
     writeFileSync(release, "");
     const found = locateProbeBinary({ env: {}, platform: "linux", repoRoot: wt });
-    assert.equal(realpathSync(found.path), realpathSync(release));
+    assert.equal(realpathSync.native(found.path), realpathSync.native(release));
     assert.equal(found.source, "primary_shared");
   } finally {
     rmSync(dir, { recursive: true, force: true });

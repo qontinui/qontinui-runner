@@ -586,12 +586,15 @@ export async function main(argv, io = {}, deps = {}) {
   }
 }
 
-/** Whether `argv1` names this module, through any symlink (a symlinked path must not run nothing, silently). */
+/**
+ * Whether `argv1` names this module, through any symlink (a symlinked path must not run nothing, silently).
+ * The NATIVE realpath: the JS one keeps a Windows 8.3 short name (`RUNNER~1`) that the module URL spells long.
+ */
 export function isEntryPoint(argv1, moduleUrl = import.meta.url) {
   if (!argv1) return false;
   const real = (p) => {
     try {
-      return realpathSync(p);
+      return realpathSync.native(p);
     } catch {
       return resolve(p);
     }
