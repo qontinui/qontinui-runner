@@ -335,27 +335,39 @@ test("a third party's arrange incident stays off the redacted copy, and the publ
   assert.ok(!logged.some((l) => /tmux.*12034/.test(l)), "no third-party reading in the public log");
 });
 
-test("one arrange incident per CAUSE: the same cause with other numbers is one, a different cause is a second (second review N2)", async (t) => {
-  const seen = new Map();
-  const run = (spawnDetail) =>
-    fakeRun(t, {
-      opts: { ns: [1], setups: ["runner"] },
-      adapterHook: (a) => {
+test("one arrange incident per cause: a third party's keyed reading-free, the runner's verbatim, never truncated (second review N2, third review N3)", async (t) => {
+  const run = (setups, spawnDetail, measureDetail = "arrange call timed out after 12034 ms") => {
+    let pass = 0;
+    return fakeRun(t, {
+      opts: { ns: [1], setups },
+      adapterHook: (a, setup) => {
         const arrange = a.arrange.bind(a);
         a.arrange = async (arm, actx) => {
           const r = await arrange(arm, actx);
-          if (arm !== "tiled") return r;
-          const pass = (seen.get(spawnDetail) ?? 0) + 1;
-          seen.set(spawnDetail, pass);
-          return { ...r, ok: false, failure: { reason: "harness_error", detail: pass === 1 ? "arrange call timed out after 12034 ms" : spawnDetail } };
+          if (arm !== "tiled" || setup !== setups.at(-1)) return r;
+          pass += 1;
+          return { ...r, ok: false, failure: { reason: "harness_error", detail: pass === 1 ? measureDetail : spawnDetail } };
         };
       },
     });
-  const same = (await run("arrange call timed out after 12999 ms")).res.doc.incidents.filter((i) => /: arrange: /.test(i.detail));
-  assert.equal(same.length, 1, JSON.stringify(same));
-  const other = (await run("the extension refused: no editor group")).res.doc.incidents.filter((i) => /: arrange: /.test(i.detail));
-  assert.equal(other.length, 2, JSON.stringify(other));
-  assert.ok(other.some((i) => /\(spawn pass\): arrange: the extension refused/.test(i.detail)));
+  };
+  const arrangeIncidents = (res, setup) => res.doc.incidents.filter((i) => /: arrange: /.test(i.detail) && i.data?.setup === setup);
+  // A third party: the same cause with other numbers is one incident...
+  const tmuxSame = await run(["runner", "tmux"], "arrange call timed out after 12999 ms");
+  assert.equal(arrangeIncidents(tmuxSame.res, "tmux").length, 1);
+  // ...a different cause is a second.
+  const tmuxOther = await run(["runner", "tmux"], "the extension refused: no editor group");
+  assert.equal(arrangeIncidents(tmuxOther.res, "tmux").length, 2);
+  // The runner's details are keyed verbatim: other numbers are another incident.
+  const runnerNumbers = await run(["runner"], "arrange call timed out after 12999 ms");
+  assert.equal(arrangeIncidents(runnerNumbers.res, "runner").length, 2);
+  const runnerSame = await run(["runner"], "arrange call timed out after 12034 ms");
+  assert.equal(arrangeIncidents(runnerSame.res, "runner").length, 1);
+  // The key is never truncated: two causes that differ only past the gate's cut are two.
+  const long = "x".repeat(300);
+  const tmuxLong = await run(["runner", "tmux"], `${long} B`, `${long} A`);
+  assert.equal(arrangeIncidents(tmuxLong.res, "tmux").length, 2);
+  assert.ok(arrangeIncidents(tmuxOther.res, "tmux").some((i) => /\(spawn pass\): arrange: the extension refused/.test(i.detail)));
 });
 
 test("the primary-state guard's baseline is in the results, and a guard watching nothing blocks a supervisor run (review S7)", async (t) => {

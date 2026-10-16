@@ -580,17 +580,24 @@ pub struct CrosscheckSummary {
     pub disagreed: u64,
     /// The primary's declared stage offset minus the secondary's (ms).
     pub expected_offset_ms: f64,
-    /// The frame interval F both bands are sized in (ms): the secondary's
-    /// frame-spacing p50, clamped to 1-2 refresh intervals; one refresh
-    /// interval when either source's p50 is unknown.
+    /// The frame interval F the bands are sized in (ms): the secondary's
+    /// frame-spacing p50 clamped to 1-2 refresh intervals, or one refresh
+    /// interval (see `frame_basis`).
     pub frame_ms: Option<f64>,
-    /// The primary's frame-spacing p50 (ms); `null` below 20 deltas.
-    pub primary_spacing_ms: Option<f64>,
+    /// Where `frame_ms` came from, in words.
+    pub frame_basis: String,
     /// The secondary's frame-spacing p50 (ms); `null` below 20 deltas.
     pub secondary_spacing_ms: Option<f64>,
-    /// `primary_spacing_ms / secondary_spacing_ms`; above 1.5 or below 1/1.5
-    /// the run disagrees (one source kept a coarser cadence: missed frames).
-    pub cadence_ratio: Option<f64>,
+    /// The share of the secondary's frames that coalesced presentations
+    /// (`missed > 0`); above 5% `frame_ms` falls back to the refresh interval.
+    pub secondary_missed_share: Option<f64>,
+    /// The gap above which a marker is late: the declared offset's top plus
+    /// half a frame (ms).
+    pub late_bound_ms: Option<f64>,
+    /// Compared markers whose gap lies above `late_bound_ms`.
+    pub late: u64,
+    /// `late / compared`; above 10% (from 20 markers) the run disagrees.
+    pub late_share: Option<f64>,
     /// The per-marker band on the primary-minus-secondary gap (ms).
     pub marker_band_ms: Option<(f64, f64)>,
     /// The band the median gap must lie in (ms).
@@ -600,7 +607,7 @@ pub struct CrosscheckSummary {
     /// `disagreed / compared`; the run disagrees above 5% when the tail rule
     /// applies.
     pub outside_share: Option<f64>,
-    /// Whether the tail rule (the 5% share) decided: only from 20 compared
+    /// Whether the share rules (late and tail) decided: only from 20 compared
     /// markers. Below that the verdict rests on the median alone.
     pub tail_rule_applied: bool,
     /// The secondary source coalesced frames where it first saw the marker, so

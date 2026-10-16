@@ -178,6 +178,9 @@ export async function downloadVerified({ urls, dest, expected, fetch = globalThi
       const actual = hash.digest("hex");
       if (actual !== expected) throw new ArchiveIntegrityError({ url, expected, actual, bytes });
       renameSync(part, dest);
+      // Verbatim on purpose (not a reading, D7): the byte count and digest are
+      // facts of the PINNED public archive, the evidence the download matched
+      // its pin, and say nothing about how VS Code performs.
       log(`vscode: ${bytes} bytes, SHA-256 ${actual} verified`);
       return { path: dest, bytes, url, sha256: actual };
     } catch (e) {
@@ -214,6 +217,7 @@ export async function ensureArchive({ build, cacheDir, version = VSCODE_PIN.vers
     const reuse = verified && verified.path === dest && verified.size === st.size && verified.mtimeMs === st.mtimeMs;
     const actual = reuse ? verified.sha256 : await hash(dest);
     if (actual === build.sha256) return { path: dest, cached: true, sha256: actual };
+    // Verbatim on purpose: digests of the cached and pinned archive (harness facts).
     log(`vscode: cached ${dest} hashes to ${actual}, not the pinned ${build.sha256}: discarding it`);
     rmSync(dest, { force: true });
   }

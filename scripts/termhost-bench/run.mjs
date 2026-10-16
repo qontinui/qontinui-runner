@@ -60,7 +60,7 @@ import { NeutralityGuard, neutralityVerdict } from "./neutrality.mjs";
 import * as probeLib from "./probe.mjs";
 import { carriesFlag, listProcesses, terminatePid } from "./proc.mjs";
 import { loadProfile } from "./profile.mjs";
-import { readingFreeDetail } from "./report.mjs";
+import { maskReadings, readingFreeDetail } from "./report.mjs";
 import { buildDocument, convertProbeIncident, finalizeLadder, incident, redactRunnerOnly, unprovenBuild, writeResultsOrSetAside } from "./results.mjs";
 import { createRunDir, createUnitDir, generatorArgv, generatorRunId, makeRunId } from "./rundir.mjs";
 import { echoCount, readGeneratorLog, readGeneratorLogs, readSlots, slotForHostId, waitForGenerators, waitForNewSlot } from "./sessions.mjs";
@@ -670,9 +670,11 @@ export async function runUnit(unit, ctx) {
   const arrangeSeen = new Set();
   const recordArrangeFailure = (arm, f, pass = "") => {
     if (!f) return;
-    // Keyed on the reading-free text: two passes failing the same way with
-    // different numbers in the message (a timeout's elapsed ms) are one cause.
-    const key = `${arm}\u0000${readingFreeDetail(f.detail)}`;
+    // A third party's is keyed on its reading-free text (two passes failing the
+    // same way with different numbers — a timeout's elapsed ms — are one cause:
+    // its numbers never leave the VM, so they cannot tell causes apart for the
+    // log either); the runner's on its verbatim text. Never truncated.
+    const key = `${arm}\u0000${unit.setup === "runner" ? String(f.detail) : maskReadings(f.detail)}`;
     if (arrangeSeen.has(key)) return;
     arrangeSeen.add(key);
     const where = `unit ${name} arm ${arm}${pass}: arrange: `;

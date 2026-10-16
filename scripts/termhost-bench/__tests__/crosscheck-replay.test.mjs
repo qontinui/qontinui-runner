@@ -1,7 +1,9 @@
 /**
  * The cross-check replay tool (`tools/crosscheck-replay.mjs`) on synthetic probe
- * watch files: its port of `analysis.rs` `crosscheck` reaches the same verdicts
- * the Rust tests pin, and its CLI reads a file path.
+ * watch files: its port of `analysis.rs` `crosscheck` reaches the verdicts the
+ * Rust model tests pin on the same timelines (third review: presented
+ * timelines, F derived from DDA's frames), and its CLI reads a file path and
+ * refuses a watch that did not record every frame.
  *
  *   node --test scripts/termhost-bench/__tests__/crosscheck-replay.test.mjs
  */
@@ -14,94 +16,145 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseWatch, replay, spacingP50 } from "../tools/crosscheck-replay.mjs";
+import { RULE, framesMode, parseWatch, replay, secondaryMissedShare, spacingP50 } from "../tools/crosscheck-replay.mjs";
 
 const TOOL = fileURLToPath(new URL("../tools/crosscheck-replay.mjs", import.meta.url));
 const MS = 1_000_000n;
+const R_NS = 16_666_667n;
+const R_MS = 16.666667;
 
 /**
- * A watch file as the probe writes it: the desktop presents every `presentEvery`
- * refreshes (R = 16.667 ms); DDA captures each presentation; WGC every
- * `wgcEvery`-th, stamped `stampMs` later, showing content visible `renderMs`
- * before it. Markers every 100 ms at a walking phase.
+ * A watch file as the probe writes it. The desktop presents every
+ * `presentEvery` refreshes (R = 16.667 ms). DDA captures the presentations
+ * `ddaKeep` keeps and reports the ones it coalesced as `missed`; WGC captures
+ * the ones `wgcKeep` keeps, stamped `stampMs` later, showing content visible
+ * `renderMs` before. Markers every 101.3 ms, so their phase walks.
  */
-function watchText({ presentEvery = 1, wgcEvery = 1, renderMs = 0, stampMs = 5 } = {}) {
-  const R = 16_666_667n;
-  const period = R * BigInt(presentEvery);
+function watchText({ presentEvery = 1, wgcKeep = () => true, ddaKeep = () => true, renderMs = 0, stampMs = 5, frames = "all", start = true } = {}) {
+  const period = R_NS * BigInt(presentEvery);
   const t0 = 1_000n * MS;
-  const emit = Array.from({ length: 200 }, (_, i) => t0 + 500n * MS + BigInt(i) * 100n * MS + ((BigInt(i) * 7_919_000n) % period));
+  // 101.3 ms apart: not a multiple of any presentation interval, so the phase
+  // (and the presentation index modulo a drop pattern) walks across them all.
+  const emit = Array.from({ length: 200 }, (_, i) => t0 + 500n * MS + BigInt(i) * 101_300_000n);
   const latest = (cut) => {
     let s = -1;
     for (let i = 0; i < emit.length && emit[i] <= cut; i++) s = i;
     return s;
   };
   const lines = [];
-  const first = { wgc: new Map(), dda: new Map() };
-  const frame = (source, index, t, seq) => {
-    lines.push({ schema: "termhost-probe/v1", type: "frame", source, index, t_ns: String(t), missed: source === "dda" ? 0 : undefined, markers: seq < 0 ? [] : [{ kind: "output", session: 0, seq }] });
+  if (start) lines.push({ schema: "termhost-probe/v1", type: "start", subcommand: "watch", args: ["termhost-probe", "watch", "--run-dir", "x", "--frames", frames] });
+  const first = { wgc: new Set(), dda: new Set() };
+  const frame = (source, index, t, seq, missed) => {
+    lines.push({ schema: "termhost-probe/v1", type: "frame", source, index, t_ns: String(t), missed, markers: seq < 0 ? [] : [{ kind: "output", session: 0, seq }] });
     if (seq >= 0 && !first[source].has(seq)) {
-      first[source].set(seq, true);
+      first[source].add(seq);
       lines.push({ schema: "termhost-probe/v1", type: "first_seen", source, kind: "output", session: 0, seq, t_ns: String(t), frame: index });
     }
   };
+  let ddaMissed = 0;
   for (let k = 0n; t0 + k * period <= t0 + 21_000n * MS; k++) {
     const t = t0 + k * period;
-    frame("dda", Number(k), t, latest(t));
-    if (k % BigInt(wgcEvery) === 0n) frame("wgc", Number(k), t + BigInt(stampMs) * MS, latest(t - BigInt(renderMs) * MS));
+    if (ddaKeep(Number(k))) {
+      frame("dda", Number(k), t, latest(t), ddaMissed);
+      ddaMissed = 0;
+    } else {
+      ddaMissed++;
+    }
+    if (wgcKeep(Number(k))) frame("wgc", Number(k), t + BigInt(stampMs) * MS, latest(t - BigInt(renderMs) * MS), undefined);
   }
-  lines.push({ schema: "termhost-probe/v1", type: "summary", primary: "wgc", secondary: "dda", refresh_ms: 16.666667 });
+  lines.push({ schema: "termhost-probe/v1", type: "summary", primary: "wgc", secondary: "dda", refresh_ms: R_MS });
   return lines.map((l) => JSON.stringify(l)).join("\n");
 }
 
-test("a sound 60 Hz watch agrees, F from DDA's spacing", () => {
-  const r = replay(parseWatch(watchText()));
+const near = (a, b) => Math.abs(a - b) < 1e-3;
+const run = (o) => replay(parseWatch(watchText(o)));
+
+test("a sound 60 Hz watch agrees, F from DDA's spacing, nothing late", () => {
+  const r = run();
   assert.equal(r.verdict, "agree", JSON.stringify(r));
   assert.equal(r.compared, 200);
   assert.equal(r.medianGapMs, 5);
-  assert.ok(Math.abs(r.frameMs - 16.667) < 1e-3);
+  assert.equal(r.late, 0);
+  assert.ok(near(r.frameMs, R_MS));
+  assert.equal(r.secondaryMissedShare, 0);
 });
 
-test("WGC dropping every other frame disagrees on cadence; its own spacing does not widen F", () => {
-  const r = replay(parseWatch(watchText({ wgcEvery: 2 })));
+test("WGC dropping every third presentation is LATE (third review M1)", () => {
+  const r = run({ wgcKeep: (k) => k % 3 !== 2 });
   assert.equal(r.verdict, "disagree", JSON.stringify(r));
-  assert.ok(r.why.includes("cadence"));
-  assert.ok(Math.abs(r.cadenceRatio - 2) < 1e-3);
-  assert.ok(Math.abs(r.frameMs - 16.667) < 1e-3);
+  assert.deepEqual(r.why, ["late"]);
+  assert.ok(r.lateShare > 0.25, String(r.lateShare));
+  assert.ok(near(r.frameMs, R_MS));
 });
 
-test("the hosted-VM shape agrees through the measured frame interval, and the retired rule counts what it voided", () => {
-  const r = replay(parseWatch(watchText({ presentEvery: 2, renderMs: 10, stampMs: 0 })));
-  assert.equal(r.verdict, "agree", JSON.stringify(r));
-  assert.ok(Math.abs(r.frameMs - 33.333) < 1e-3);
-  assert.equal(r.outside, 0);
-  assert.ok(r.retired.overOneRefresh > 40, "about 30% of markers a whole presentation apart");
-  assert.equal(r.retired.primaryLater, r.retired.overOneRefresh);
-  // Here a WGC frame DID come at DDA's time, rendered before the marker arrived
-  // (the render delay), so none count as "no WGC frame between"; in CI run
-  // 38362046020 all 359 did (the VM's sampling phase).
-  assert.equal(r.retired.noPrimaryFrameBetween, 0);
-  // Judged in refresh intervals, the same watch would be voided by its tail.
-  const w = parseWatch(watchText({ presentEvery: 2, renderMs: 10, stampMs: 0 }));
-  w.frames.set("dda", w.frames.get("dda").slice(0, 5)); // no trusted spacing: F falls back to R
-  assert.equal(replay(w).verdict, "disagree");
+test("WGC dropping a pseudo-random 15% of presentations is late", () => {
+  const r = run({ wgcKeep: (k) => Number((BigInt(k) * 2_654_435_761n) >> 7n) % 100 >= 15 });
+  assert.equal(r.verdict, "disagree", JSON.stringify(r));
+  assert.ok(r.why.includes("late"));
+  assert.ok(r.lateShare > RULE.maxLateShare, String(r.lateShare));
 });
 
-test("a spacing p50 needs 20 deltas", () => {
-  const f = (n) => Array.from({ length: n }, (_, i) => ({ t: BigInt(i) * 16n * MS }));
+test("the late share at its boundary: presenting every other refresh, WGC 2 ms behind agrees, 5 ms behind is late", () => {
+  const two = run({ presentEvery: 2, renderMs: 2, stampMs: 0 });
+  assert.equal(two.verdict, "agree", JSON.stringify(two));
+  assert.ok(two.late > 0 && two.lateShare < RULE.maxLateShare);
+  assert.ok(near(two.frameMs, 2 * R_MS), "the measured F");
+  const five = run({ presentEvery: 2, renderMs: 5, stampMs: 0 });
+  assert.equal(five.verdict, "disagree", JSON.stringify(five));
+  assert.deepEqual(five.why, ["late"]);
+});
+
+test("the measured F decides: the same 2 ms tail judged at F = R would be voided", () => {
+  const w = parseWatch(watchText({ presentEvery: 2, renderMs: 2, stampMs: 0 }));
+  w.frames.set("dda", w.frames.get("dda").slice(0, 20)); // 19 deltas: F falls back to R
+  const r = replay(w);
+  assert.ok(r.frameFellBackToRefresh);
+  assert.equal(r.verdict, "disagree", JSON.stringify(r));
+});
+
+test("a DDA coalescing presentations does not widen F: WGC dropping every third is still late", () => {
+  const r = run({ ddaKeep: (k) => k % 2 === 0, wgcKeep: (k) => k % 3 !== 2 });
+  assert.ok(r.secondaryMissedShare > 0.9);
+  assert.ok(near(r.spacingP50.dda, 2 * R_MS), "DDA's own spacing is 2R");
+  assert.ok(r.frameFellBackToRefresh);
+  assert.ok(near(r.frameMs, R_MS));
+  assert.equal(r.verdict, "disagree", JSON.stringify(r));
+  // With that fallback switched off the same watch would agree: the hole it closes.
+  const open = replay(parseWatch(watchText({ ddaKeep: (k) => k % 2 === 0, wgcKeep: (k) => k % 3 !== 2 })), { rule: { maxSecondaryMissedShare: 1 } });
+  assert.equal(open.verdict, "agree", JSON.stringify(open));
+});
+
+test("helpers: a spacing p50 needs 20 deltas; the coalesced share counts frames with missed > 0", () => {
+  const f = (n) => Array.from({ length: n }, (_, i) => ({ t: BigInt(i) * 16n * MS, missed: i % 4 === 0 ? 1 : 0 }));
   assert.equal(spacingP50(f(20)), null);
   assert.equal(spacingP50(f(21)), 16);
+  assert.equal(secondaryMissedShare(f(8)), 2 / 8);
+  assert.equal(secondaryMissedShare([{ t: 0n, missed: null }]), null);
 });
 
-test("the CLI reads a probe watch file and prints one verdict line per file", (t) => {
+test("a watch not recorded with --frames all is refused, never sized (third review N2)", () => {
+  assert.equal(framesMode({ args: ["p", "watch", "--frames", "changes"] }), "changes");
+  assert.equal(framesMode({ args: ["p", "watch", "--frames=none"] }), "none");
+  assert.equal(framesMode({ args: ["p", "watch"] }), "all", "the probe's default");
+  assert.equal(framesMode(null), null);
+  assert.throws(() => run({ frames: "changes" }), /--frames changes/);
+  assert.throws(() => run({ start: false }), /no start record/);
+});
+
+test("the CLI reads a probe watch file, prints one verdict per file, and exits 2 on a refused one", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "tb-replay-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const file = join(dir, "probe-tiled-soak.jsonl");
-  writeFileSync(file, watchText({ wgcEvery: 2 }));
+  writeFileSync(file, watchText({ wgcKeep: (k) => k % 3 !== 2 }));
   const out = spawnSync(process.execPath, [TOOL, file, "--json"], { encoding: "utf8" });
   assert.equal(out.status, 0, out.stderr);
   const row = JSON.parse(out.stdout.trim());
   assert.equal(row.verdict, "disagree");
   assert.equal(row.file, file);
-  const usage = spawnSync(process.execPath, [TOOL], { encoding: "utf8" });
-  assert.equal(usage.status, 2);
+  const changes = join(dir, "probe-changes.jsonl");
+  writeFileSync(changes, watchText({ frames: "changes" }));
+  const refused = spawnSync(process.execPath, [TOOL, changes], { encoding: "utf8" });
+  assert.equal(refused.status, 2);
+  assert.match(refused.stderr, /--frames changes/);
+  assert.equal(spawnSync(process.execPath, [TOOL], { encoding: "utf8" }).status, 2);
 });

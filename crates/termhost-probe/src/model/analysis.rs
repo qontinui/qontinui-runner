@@ -141,45 +141,57 @@ pub const CROSSCHECK_MEDIAN_BAND_FRAMES: f64 = 0.25;
 /// The largest share of compared markers that may lie outside the per-marker
 /// band before the run disagrees.
 pub const CROSSCHECK_MAX_OUTSIDE_SHARE: f64 = 0.05;
-/// The fewest compared markers for which the tail rule decides. Below 20 one
-/// marker is already more than 5%, so the share would let a single marker
-/// void the run.
+/// The fewest compared markers for which the tail and late-share rules
+/// decide. Below 20 one marker is already more than 5%, so a share would let a
+/// single marker void the run.
 pub const CROSSCHECK_TAIL_MIN_COMPARED: u64 = 20;
 /// The fewest compared markers for which the median rule decides: from three
 /// the median is a middle marker, never an extreme one. Below it the
 /// cross-check is `not_performed`.
 pub const CROSSCHECK_MEDIAN_MIN_COMPARED: u64 = 3;
-/// F is never coarser than two refresh intervals, the slowest typical cadence
-/// measured (the GPU-less hosted VM: WGC spacings 35% one refresh, 47% two,
-/// DDA's p50 30.9-32.4 ms at R = 15.625 ms). A host that truly composes more slowly
-/// gets bands that are too tight, so it fails visibly
-/// (unknown(capture_disagreement)), never silently.
+/// F is never coarser than two refresh intervals. A host whose compositor
+/// truly presents more slowly gets bands that are too tight, so it fails
+/// visibly (unknown(capture_disagreement)), never silently.
 pub const CROSSCHECK_FRAME_MAX_REFRESHES: f64 = 2.0;
-/// The fewest frame-to-frame deltas a source's spacing p50 is trusted from.
-/// Below it one long gap could set the widest band; F falls back to R, the
-/// narrowest, which fails visibly.
+/// The fewest frame-to-frame deltas the secondary's spacing p50 is trusted
+/// from. Below it one long gap could set the widest band; F falls back to R,
+/// the narrowest, which fails visibly.
 pub const CROSSCHECK_FRAME_MIN_DELTAS: usize = 20;
-/// Neither source's spacing p50 may exceed this multiple of the other's.
-/// Beyond it one source kept a coarser cadence than the other saw: it missed
-/// frames (or, with the primary coarser, the desktop changed outside the
-/// window, which a benchmark run does not expect). This is also what stops a
-/// defective source from widening the bands that judge it.
-pub const CROSSCHECK_MAX_CADENCE_RATIO: f64 = 1.5;
+/// A marker is LATE when the primary's gap exceeds the declared band's top by
+/// more than this many frame intervals: the primary saw it in a later
+/// presentation than the secondary did.
+pub const CROSSCHECK_LATE_BAND_FRAMES: f64 = 0.5;
+/// The largest share of compared markers that may be late (from 20 markers).
+/// Chosen from simulations of 60 Hz timelines with DDA at every refresh
+/// (`tools/crosscheck-replay` tests): a sound capture is 0% late at every true
+/// offset; WGC dropping a random 15% of presentations is 14-19% late, every
+/// third 31-36%; a random 10% straddles it (9-15%).
+pub const CROSSCHECK_MAX_LATE_SHARE: f64 = 0.10;
+/// The largest share of the secondary's frames that may report coalesced
+/// presentations (`missed > 0`: DXGI `AccumulatedFrames > 1`) before its
+/// spacing stops being trusted as the compositor's cadence. A secondary that
+/// misses presentations widens its own spacing, which would widen the bands
+/// that judge the primary; past this share F falls back to R.
+pub const CROSSCHECK_MAX_SECONDARY_MISSED_SHARE: f64 = 0.05;
 
-/// Each source's measured frame-spacing p50 (ms), or `None` when it had fewer
-/// than [`CROSSCHECK_FRAME_MIN_DELTAS`] deltas.
+/// The secondary's measured cadence: its frame-spacing p50 (ms, `None` below
+/// [`CROSSCHECK_FRAME_MIN_DELTAS`] deltas) and the share of its frames that
+/// coalesced presentations (`None` when it reports no count).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cadence {
-    pub primary_ms: Option<f64>,
     pub secondary_ms: Option<f64>,
+    pub secondary_missed_share: Option<f64>,
 }
 
 impl Cadence {
-    /// From each source's frame times (ns, any order).
-    pub fn from_frames(primary_ns: &[u64], secondary_ns: &[u64]) -> Cadence {
+    /// From the secondary's frames: (time ns, coalesced presentations), any order.
+    pub fn from_secondary(frames: &[(u64, Option<u32>)]) -> Cadence {
+        let times: Vec<u64> = frames.iter().map(|f| f.0).collect();
+        let known: Vec<u32> = frames.iter().filter_map(|f| f.1).collect();
         Cadence {
-            primary_ms: spacing_p50_ms(primary_ns),
-            secondary_ms: spacing_p50_ms(secondary_ns),
+            secondary_ms: spacing_p50_ms(&times),
+            secondary_missed_share: (!known.is_empty())
+                .then(|| known.iter().filter(|&&m| m > 0).count() as f64 / known.len() as f64),
         }
     }
 }
@@ -206,46 +218,52 @@ pub fn spacing_p50_ms(frames_ns: &[u64]) -> Option<f64> {
 /// secondary's time is only an upper bound where it coalesced frames at that
 /// marker, so such a marker is not compared when the bound is the later time.
 ///
-/// Units. The bands are sized in FRAME intervals F, not refresh intervals R:
-/// F is the SECONDARY's (DDA's) measured frame-spacing p50, clamped to
-/// `[R, 2 R]`, and R when either source had fewer than 20 deltas. A source
-/// that misses frames widens its own spacing, so no source may widen the bands
-/// alone: the cadence rule below disagrees whenever either p50 exceeds 1.5
-/// times the other's, and F is only ever a spacing BOTH sources kept. Of the
-/// two, DDA's sets it because `LastPresentTime` is not quantized to the
-/// compositor tick: WGC's spacings are whole refresh intervals (CI run
-/// 38362046020, R = 15.625 ms: 35% one refresh, 47% two, the rest longer), so
-/// its p50 sits on a 1R/2R boundary and could flip between runs, while DDA's
-/// p50 (30.9-32.4 ms there) lies inside its distribution. On real hardware F
-/// is about R.
+/// Units. The bands are sized in FRAME intervals F, an estimate of the
+/// compositor's presentation cadence: the SECONDARY's (DDA's) frame-spacing
+/// p50, clamped to `[R, 2 R]`. DDA fires on any desktop presentation, so its
+/// spacing measures the compositor, not how often the measured window renders
+/// (WGC fires only when the window changes). F is R — the narrowest band,
+/// which fails visibly — when DDA had fewer than 20 deltas, or when more than
+/// 5% of its frames report coalesced presentations: a DDA that misses
+/// presentations has a coarse spacing of its own making.
 ///
 /// The declared band: WGC's `SystemRelativeTime` stamps the compositor's
 /// render of the capture frame, DDA's `LastPresentTime` the desktop
 /// presentation, so WGC may be up to `expected_offset_ms` later by design
-/// (`selftest::WGC_RENDER_OFFSET_MS`). The declared band is
-/// `[0, expected_offset_ms]` (or `[expected_offset_ms, 0]` for a negative one).
+/// (`selftest::WGC_RENDER_OFFSET_MS`). The declared band is `[lo, hi]` =
+/// `[0, expected_offset_ms]` (or `[expected_offset_ms, 0]`).
 ///
-/// What the rule catches — and what it does not:
-/// - a SYSTEMATIC offset: the median gap (of an even count, the LOWER of the
-///   two middle gaps) lies more than F/4 outside the declared band. That is a
-///   time-base or unit bug, or either source lagging by a whole frame on every
-///   marker — at every true offset inside the declared band only where 0.75 F
-///   exceeds that band's width (F > 13.3 ms for 10 ms: up to 75 Hz). At 144 Hz
-///   a one-frame lag is not caught at every true offset (it is at 7 ms);
-/// - a source missing frames by CADENCE: either source's spacing p50 more than
-///   1.5 times the other's (both from 20 deltas);
-/// - the PRIMARY missing frames by TAIL: from 20 compared markers
-///   ([`CROSSCHECK_TAIL_MIN_COMPARED`]), more than 5% of markers more than one
-///   frame outside the declared band (markers seen whole frames late, or read
-///   from the wrong frame). Below 20 markers the tail rule does not decide and
-///   the summary says so; a systematic defect moves every marker, so the median
-///   still shows it. A secondary that coalesced frames is not a miss here: its
-///   marker is skipped (above);
-/// - below three compared markers neither marker rule decides:
-///   `not_performed`;
-/// - it does NOT catch a primary that misses an occasional frame (its cadence
-///   intact and under 5% of markers late), nor a misattribution confined to so
-///   few markers.
+/// The run DISAGREES on any of:
+/// - (a) SYSTEMATIC: the median gap (of an even count, the LOWER of the two
+///   middle gaps) lies more than F/4 outside `[lo, hi]` — a time-base or unit
+///   bug, or either source a whole frame late on every marker;
+/// - (b) LATE: from 20 compared markers, more than 10% have a gap above
+///   `hi + F/2` — the primary seeing markers a whole presentation after the
+///   secondary did, on many markers (dropped or delayed frames);
+/// - (c) TAIL: from 20 compared markers, more than 5% lie more than one F
+///   outside `[lo, hi]` either way — markers seen several frames apart, or read
+///   from the wrong frame.
+///
+/// Below 20 markers only (a) decides, and the summary says the share rules
+/// were not applied; below three, nothing decides (`not_performed`). A
+/// secondary that coalesced frames at a marker is skipped (above), not counted
+/// as a miss.
+///
+/// Limits, measured on simulated 60 Hz timelines with DDA at every refresh
+/// (`scripts/termhost-bench/__tests__/crosscheck-replay.test.mjs`) and in the
+/// model's own tests:
+/// - a primary one presentation late on a marker is LATE only when its true
+///   offset exceeds `hi + F/2 - F` (1.7 ms at 60 Hz with hi = 10 ms): at a
+///   0 ms offset WGC dropping every third presentation (33% of markers late,
+///   latency p95 15.4 -> 30.7 ms) agrees;
+/// - drops are caught by share, not by count: a random 15% of presentations
+///   is caught, a random 10% only sometimes (9-15% late), less never;
+/// - at 144 Hz one presentation (6.9 ms) is inside the declared offset, so
+///   neither a one-frame lag nor dropped presentations are caught at every
+///   true offset;
+/// - a DDA missing presentations sets F = R, which on the GPU-less hosted VM
+///   (CI run 38362046020: 22-63% of DDA frames coalesced; WGC 5-9% late at
+///   F = 2 R, 10-15% at F = R) makes every watch disagree.
 ///
 /// Every marker outside the per-marker band is a `crosscheck` record with
 /// verdict `outside_band`, whatever the run's verdict.
@@ -253,9 +271,8 @@ pub fn spacing_p50_ms(frames_ns: &[u64]) -> Option<f64> {
 /// Until CI run 38362046020 the rule was "any one marker more than one refresh
 /// interval apart voids the run"; there 22-104 of 206-698 markers per watch
 /// (11-15%) were more than one refresh interval apart — 359 of those 361 with
-/// WGC later, and none of the 359 with a WGC frame between the two times —
-/// while the median gap was 6.5-8.9 ms. `scripts/termhost-bench/tools/
-/// crosscheck-replay.mjs` replays this rule over a probe watch file.
+/// WGC later. `scripts/termhost-bench/tools/crosscheck-replay.mjs` replays this
+/// rule over a probe watch file.
 ///
 /// `expected_offset_ms` is the primary's declared stage offset minus the
 /// secondary's.
@@ -273,8 +290,8 @@ pub fn crosscheck(
     let mut s = CrosscheckSummary {
         verdict: "not_performed",
         expected_offset_ms,
-        primary_spacing_ms: cadence.primary_ms,
         secondary_spacing_ms: cadence.secondary_ms,
+        secondary_missed_share: cadence.secondary_missed_share,
         ..Default::default()
     };
     let mut records = Vec::new();
@@ -283,19 +300,25 @@ pub fn crosscheck(
         return (s, records);
     }
     let refresh_ms = refresh_ns as f64 / 1e6;
-    let usable = |x: Option<f64>| x.filter(|f| f.is_finite() && *f > 0.0);
-    let (p_sp, s_sp) = (usable(cadence.primary_ms), usable(cadence.secondary_ms));
-    let frame_ms = match (p_sp, s_sp) {
-        (Some(_), Some(q)) => q,
-        _ => refresh_ms,
-    }
-    .clamp(refresh_ms, CROSSCHECK_FRAME_MAX_REFRESHES * refresh_ms);
-    let cadence_ratio = match (p_sp, s_sp) {
-        (Some(p), Some(q)) => Some(p / q),
-        _ => None,
+    let spacing = cadence.secondary_ms.filter(|f| f.is_finite() && *f > 0.0);
+    let too_many_missed = cadence
+        .secondary_missed_share
+        .is_some_and(|m| m > CROSSCHECK_MAX_SECONDARY_MISSED_SHARE);
+    let (frame_ms, basis) = match spacing {
+        None => (refresh_ms, "the refresh interval: the secondary had fewer than 20 frame deltas".to_string()),
+        Some(_) if too_many_missed => (
+            refresh_ms,
+            format!(
+                "the refresh interval: {:.1}% of the secondary's frames coalesced presentations (at most {:.0}% may)",
+                100.0 * cadence.secondary_missed_share.unwrap_or_default(),
+                100.0 * CROSSCHECK_MAX_SECONDARY_MISSED_SHARE
+            ),
+        ),
+        Some(sp) => (sp, format!("the secondary's frame-spacing p50 ({sp:.2} ms)")),
     };
+    let frame_ms = frame_ms.clamp(refresh_ms, CROSSCHECK_FRAME_MAX_REFRESHES * refresh_ms);
     s.frame_ms = Some(frame_ms);
-    s.cadence_ratio = cadence_ratio;
+    s.frame_basis = basis.clone();
     let (lo, hi) = (expected_offset_ms.min(0.0), expected_offset_ms.max(0.0));
     let marker_band = (
         lo - CROSSCHECK_MARKER_BAND_FRAMES * frame_ms,
@@ -305,8 +328,10 @@ pub fn crosscheck(
         lo - CROSSCHECK_MEDIAN_BAND_FRAMES * frame_ms,
         hi + CROSSCHECK_MEDIAN_BAND_FRAMES * frame_ms,
     );
+    let late_bound = hi + CROSSCHECK_LATE_BAND_FRAMES * frame_ms;
     s.marker_band_ms = Some(marker_band);
     s.median_band_ms = Some(median_band);
+    s.late_bound_ms = Some(late_bound);
     let mut gaps: Vec<f64> = Vec::new();
     for &(m, p) in markers_primary {
         if m.kind == MarkerKind::Calibration {
@@ -329,6 +354,9 @@ pub fn crosscheck(
             s.max_abs_delta_ms
                 .map_or(delta.abs(), |m| m.max(delta.abs())),
         );
+        if gap > late_bound {
+            s.late += 1;
+        }
         if (marker_band.0..=marker_band.1).contains(&gap) {
             s.agreed += 1;
         } else {
@@ -358,65 +386,66 @@ pub fn crosscheck(
     // Nearest rank: of an even count, the lower of the two middle gaps.
     let median = gaps[crate::stats::nearest_rank(50, gaps.len()) - 1];
     let outside_share = s.disagreed as f64 / s.compared as f64;
+    let late_share = s.late as f64 / s.compared as f64;
     s.median_gap_ms = Some(median);
     s.outside_share = Some(outside_share);
+    s.late_share = Some(late_share);
     s.tail_rule_applied = s.compared >= CROSSCHECK_TAIL_MIN_COMPARED;
     if s.compared < CROSSCHECK_MEDIAN_MIN_COMPARED {
         s.detail = format!(
-            "only {} marker(s) seen cleanly by both sources; the median rule needs {CROSSCHECK_MEDIAN_MIN_COMPARED}, so neither marker rule decides",
+            "only {} marker(s) seen cleanly by both sources; the median rule needs {CROSSCHECK_MEDIAN_MIN_COMPARED}, so no rule decides",
             s.compared
         );
         return (s, records);
     }
     let systematic = !(median_band.0..=median_band.1).contains(&median);
+    let late = s.tail_rule_applied && late_share > CROSSCHECK_MAX_LATE_SHARE;
     let tail = s.tail_rule_applied && outside_share > CROSSCHECK_MAX_OUTSIDE_SHARE;
-    let slow_cadence = cadence_ratio.is_some_and(|r| {
-        r > CROSSCHECK_MAX_CADENCE_RATIO || r * CROSSCHECK_MAX_CADENCE_RATIO < 1.0
-    });
-    s.verdict = if systematic || tail || slow_cadence {
+    s.verdict = if systematic || late || tail {
         "disagree"
     } else {
         "agree"
     };
-    let pct = 100.0 * outside_share;
-    let max_pct = 100.0 * CROSSCHECK_MAX_OUTSIDE_SHARE;
     let median_text = format!(
-        "the median primary-minus-secondary gap over {} markers is {median:.2} ms (band [{:.2}, {:.2}] ms: the declared {expected_offset_ms:.1} ms stage offset +/- a quarter frame, frame {frame_ms:.2} ms)",
+        "the median primary-minus-secondary gap over {} markers is {median:.2} ms (band [{:.2}, {:.2}] ms: the declared {expected_offset_ms:.1} ms stage offset +/- a quarter frame)",
         s.compared, median_band.0, median_band.1
     );
-    let tail_text = if s.tail_rule_applied {
+    let shares_text = if s.tail_rule_applied {
         format!(
-            "{} of {} markers ({pct:.1}%) lie outside [{:.2}, {:.2}] ms (+/- one frame; at most {max_pct:.0}% may)",
-            s.disagreed, s.compared, marker_band.0, marker_band.1
+            "{} of {} markers ({:.1}%) are late, above {late_bound:.2} ms (at most {:.0}% may); {} ({:.1}%) lie outside [{:.2}, {:.2}] ms (at most {:.0}% may)",
+            s.late,
+            s.compared,
+            100.0 * late_share,
+            100.0 * CROSSCHECK_MAX_LATE_SHARE,
+            s.disagreed,
+            100.0 * outside_share,
+            marker_band.0,
+            marker_band.1,
+            100.0 * CROSSCHECK_MAX_OUTSIDE_SHARE
         )
     } else {
         format!(
-            "{} of {} markers lie outside [{:.2}, {:.2}] ms (+/- one frame); the tail rule needs {CROSSCHECK_TAIL_MIN_COMPARED} markers and was not applied",
-            s.disagreed, s.compared, marker_band.0, marker_band.1
+            "{} late and {} outside [{:.2}, {:.2}] ms of {} markers; the share rules need {CROSSCHECK_TAIL_MIN_COMPARED} markers and were not applied",
+            s.late, s.disagreed, marker_band.0, marker_band.1, s.compared
         )
     };
-    let fmt_sp = |x: Option<f64>| x.map_or("unknown".to_string(), |v| format!("{v:.2} ms"));
-    let cadence_text = format!(
-        "frame spacing p50: primary {}, secondary {}",
-        fmt_sp(cadence.primary_ms),
-        fmt_sp(cadence.secondary_ms)
-    );
+    let frame_text = format!("frame {frame_ms:.2} ms from {basis}");
     let mut causes = Vec::new();
     if systematic {
         causes.push("a systematic offset between the sources");
     }
-    if slow_cadence {
-        causes.push("one source kept a coarser frame cadence than the other (more than 1.5 times its spacing p50): it missed frames, or the desktop changed outside the window");
+    if late {
+        causes.push("the primary saw markers a presentation late");
     }
     if tail {
-        causes.push("the primary missed frames or misattributed markers (the tail)");
+        causes.push("markers seen whole frames apart (the tail)");
     }
     let head = if causes.is_empty() {
         "agreed".to_string()
     } else {
         causes.join(" and ")
     };
-    s.detail = format!("{head}: {median_text}; {tail_text}; {cadence_text}");
+    s.detail = format!("{head}: {median_text}; {shares_text}; {frame_text}");
     (s, records)
 }
 
@@ -503,8 +532,8 @@ mod tests {
 
     /// Run `crosscheck` with one output marker per gap (primary minus
     /// secondary, ms): the primary at `1 s + 100 ms * i`, the secondary `gap`
-    /// earlier. `frame_ms` is both sources' measured frame spacing (a cadence
-    /// they agree on); `None` is a spacing neither source measured.
+    /// earlier. `frame_ms` is the secondary's measured frame spacing, with no
+    /// coalescing reported; `None` is a spacing it did not measure.
     fn run(
         gaps: &[f64],
         refresh_ns: u64,
@@ -534,8 +563,8 @@ mod tests {
             |k| primary_map.get(&k).copied(),
             refresh_ns,
             Cadence {
-                primary_ms: frame_ms,
                 secondary_ms: frame_ms,
+                secondary_missed_share: Some(0.0),
             },
             offset_ms,
             true,
@@ -725,7 +754,7 @@ mod tests {
         assert_eq!(s.verdict, "disagree", "{}", s.detail);
         assert_eq!(s.median_gap_ms, Some(5.0));
         assert!(
-            s.detail.starts_with("the primary missed frames"),
+            s.detail.starts_with("markers seen whole frames apart"),
             "{}",
             s.detail
         );
@@ -742,7 +771,7 @@ mod tests {
         assert_eq!(s19.verdict, "agree", "{}", s19.detail);
         assert!(!s19.tail_rule_applied);
         assert_eq!(s19.disagreed, 2, "still counted and recorded");
-        assert!(s19.detail.contains("was not applied"), "{}", s19.detail);
+        assert!(s19.detail.contains("not applied"), "{}", s19.detail);
         let (s20, _) = run(&with_two_out(20), R64, Some(15.625), 10.0);
         assert!(s20.tail_rule_applied);
         assert_eq!(s20.verdict, "disagree", "2 of 20 is 10%: {}", s20.detail);
@@ -816,68 +845,88 @@ mod tests {
         assert_eq!(s.verdict, "not_performed");
     }
 
-    /// The run with the two sources' spacing p50s given apart.
-    fn run_cadence(gaps: &[f64], p: Option<f64>, q: Option<f64>) -> CrosscheckSummary {
-        let m = |i: usize| Marker::new(MarkerKind::Output, 1, i as u32);
-        let at = |i: usize| 1_000 * MS + 100 * MS * i as u64;
-        let first = |t_ns: u64| FirstSeen {
-            t_ns,
-            frame: 0,
-            missed: None,
+    /// Third review: the late-share rule at its boundary. At 64 Hz with F = R a
+    /// marker is late above 10 + 7.81 = 17.81 ms; 20 ms is late but inside the
+    /// one-frame tail band (25.63), so only the late rule can decide.
+    #[test]
+    fn the_late_share_rule_at_its_boundary() {
+        let with_late = |late: usize| -> Vec<f64> {
+            (0..100)
+                .map(|i| if i < late { 20.0 } else { 5.0 })
+                .collect()
         };
-        let primary: Vec<(Marker, FirstSeen)> =
-            (0..gaps.len()).map(|i| (m(i), first(at(i)))).collect();
-        let sec: HashMap<Marker, FirstSeen> = gaps
-            .iter()
-            .enumerate()
-            .map(|(i, g)| (m(i), first((at(i) as f64 - g * 1e6).round() as u64)))
-            .collect();
-        let (s, _) = crosscheck(
-            &primary,
-            |k| sec.get(&k).copied(),
+        let (s10, _) = run(&with_late(10), R64, Some(15.625), 10.0);
+        assert_eq!((s10.late, s10.disagreed), (10, 0));
+        assert_eq!(s10.verdict, "agree", "10% may: {}", s10.detail);
+        let (s11, _) = run(&with_late(11), R64, Some(15.625), 10.0);
+        assert_eq!(s11.verdict, "disagree", "{}", s11.detail);
+        assert!(
+            s11.detail
+                .starts_with("the primary saw markers a presentation late"),
+            "{}",
+            s11.detail
+        );
+        assert!(ms_eq(s11.late_bound_ms, 17.8125));
+        // Below 20 markers the share rules do not decide.
+        let (s19, _) = run(
+            &(0..19)
+                .map(|i| if i < 5 { 20.0 } else { 5.0 })
+                .collect::<Vec<_>>(),
+            R64,
+            Some(15.625),
+            10.0,
+        );
+        assert_eq!(s19.verdict, "agree", "{}", s19.detail);
+    }
+
+    fn ms_eq(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|a| (a - b).abs() < 1e-9)
+    }
+
+    /// Third review: a secondary reporting coalesced presentations on more than
+    /// 5% of its frames does not set F; R does.
+    #[test]
+    fn a_secondary_that_coalesces_does_not_set_the_frame_interval() {
+        let cc = |missed: f64| {
+            crosscheck(
+                &[],
+                |_| None,
+                &[],
+                |_| None,
+                R64,
+                Cadence {
+                    secondary_ms: Some(31.25),
+                    secondary_missed_share: Some(missed),
+                },
+                10.0,
+                true,
+            )
+            .0
+        };
+        assert!(ms_eq(cc(0.05).frame_ms, 31.25), "5% may");
+        let s = cc(0.06);
+        assert!(ms_eq(s.frame_ms, 15.625));
+        assert!(
+            s.frame_basis.contains("coalesced presentations"),
+            "{}",
+            s.frame_basis
+        );
+        // No count reported (a source that cannot tell): its spacing stands.
+        let s = crosscheck(
             &[],
             |_| None,
-            R60,
+            &[],
+            |_| None,
+            R64,
             Cadence {
-                primary_ms: p,
-                secondary_ms: q,
+                secondary_ms: Some(31.25),
+                secondary_missed_share: None,
             },
             10.0,
             true,
-        );
-        s
-    }
-
-    /// Second review M1: F is the SECONDARY's spacing, and neither source may
-    /// widen it alone: either one more than 1.5 times coarser disagrees.
-    #[test]
-    fn the_cadence_rule_and_f_come_from_both_sources() {
-        let g = healthy_60(5.0);
-        // The primary dropping every other frame: its p50 doubles.
-        let s = run_cadence(&g, Some(2.0 * R60_MS), Some(R60_MS));
-        assert_eq!(s.verdict, "disagree", "{}", s.detail);
-        assert!(
-            s.detail
-                .starts_with("one source kept a coarser frame cadence"),
-            "{}",
-            s.detail
-        );
-        assert_eq!(
-            s.frame_ms,
-            Some(R60_MS),
-            "the primary's own coarse spacing does not widen F"
-        );
-        // The secondary dropping every other frame.
-        let s = run_cadence(&g, Some(R60_MS), Some(2.0 * R60_MS));
-        assert_eq!(s.verdict, "disagree", "{}", s.detail);
-        // Within 1.5 times: agree, F from the secondary.
-        let s = run_cadence(&g, Some(20.0), Some(24.0));
-        assert_eq!(s.verdict, "agree", "{}", s.detail);
-        assert_eq!(s.frame_ms, Some(24.0));
-        // Either spacing unknown: F is R and the cadence rule does not decide.
-        let s = run_cadence(&g, None, Some(2.0 * R60_MS));
-        assert_eq!(s.frame_ms, Some(R60_MS));
-        assert_eq!(s.cadence_ratio, None);
+        )
+        .0;
+        assert!(ms_eq(s.frame_ms, 31.25));
     }
 
     /// Second review S4: a spacing p50 needs 20 deltas; one long delta never
@@ -894,7 +943,21 @@ mod tests {
         let mut shuffled = every(21, 16);
         shuffled.reverse();
         assert_eq!(spacing_p50_ms(&shuffled), Some(16.0));
-        let c = Cadence::from_frames(&[0, 500 * MS], &every(41, 33));
-        assert_eq!((c.primary_ms, c.secondary_ms), (None, Some(33.0)));
+        let frames: Vec<(u64, Option<u32>)> = every(41, 33)
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| (t, Some(u32::from(i % 4 == 0))))
+            .collect();
+        let c = Cadence::from_secondary(&frames);
+        assert_eq!(c.secondary_ms, Some(33.0));
+        assert!(
+            c.secondary_missed_share
+                .is_some_and(|m| (m - 11.0 / 41.0).abs() < 1e-9),
+            "{c:?}"
+        );
+        assert_eq!(
+            Cadence::from_secondary(&[(0, None), (MS, None)]).secondary_missed_share,
+            None
+        );
     }
 }

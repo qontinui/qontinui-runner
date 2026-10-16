@@ -548,9 +548,9 @@ fn crosschecked_run(dda_after_wgc_ms: impl Fn(u32) -> u64) -> (Vec<Record>, Watc
 
 #[test]
 fn a_capture_disagreement_makes_latency_unknown() {
-    // DDA 30 ms after WGC on every marker: a systematic offset. WGC frames
-    // 100 ms apart clamp the frame interval to two refreshes (33.3 ms), so the
-    // median gap -30 ms lies outside [-F/4, 10 ms + F/4] = [-8.3, 18.3] ms.
+    // DDA 30 ms after WGC on every marker: a systematic offset. DDA's frames
+    // 100 ms apart (no coalescing reported) clamp F to two refreshes (33.3 ms),
+    // so the median gap -30 ms lies outside [-F/4, 10 ms + F/4] = [-8.3, 18.3].
     let (_, s) = crosschecked_run(|_| 30);
     assert_eq!(s.crosscheck.verdict, "disagree", "{}", s.crosscheck.detail);
     assert_eq!(s.output_latency_ms.state, KpiState::Unknown);
@@ -583,109 +583,313 @@ fn one_disagreeing_marker_is_recorded_but_does_not_void_latency() {
     );
 }
 
-/// A WGC + DDA run simulated from presentations, so the cross-check's frame
-/// interval is DERIVED from the frames the model saw, never injected.
+/// A presented timeline for the cross-check, so its frame interval is DERIVED
+/// from the frames the model saw, never injected.
 ///
 /// The desktop presents every `present_every` refresh intervals. DDA captures
-/// every presentation and stamps it. WGC captures every `wgc_every`-th
-/// presentation, stamps it `wgc_stamp_ms` later, and shows only content that
-/// was visible `wgc_render_ms` before that presentation. A marker every 100 ms,
-/// at a phase that walks across the presentation interval.
-fn presented_run(
+/// the presentations `dda_keep` keeps (at most `dda_max` frames), stamps each
+/// with its presentation time, and reports the presentations it coalesced as
+/// `missed`. WGC captures the presentations `wgc_keep` keeps, stamps each
+/// `wgc_stamp_ms` later, and shows only content visible `wgc_render_ms` before
+/// the presentation. Markers every 101.3 ms (`markers` of them), so their
+/// phase walks across the presentation interval.
+#[derive(Clone, Copy)]
+struct Presented {
     present_every: u64,
-    wgc_every: u64,
+    wgc_keep: fn(u64) -> bool,
     wgc_render_ms: u64,
     wgc_stamp_ms: u64,
-) -> WatchSummary {
-    let mut c = cfg();
-    c.secondary = Some(SourceId::Dda);
-    let mut m = Model::new(c, 0);
-    let period = REFRESH * present_every;
-    let t0 = 1_000 * MS;
-    let emit: Vec<u64> = (0..200u64)
-        .map(|i| t0 + 500 * MS + i * 100 * MS + (i * 7_919_000) % period)
-        .collect();
-    let latest = |cut: u64| emit.iter().rposition(|&e| e <= cut);
-    let frame_ns = |source: SourceId, index: u64, t_ns: u64, seq: Option<usize>| FrameObs {
-        source,
-        index,
-        t_ns,
-        width: 800,
-        height: 600,
-        region: WINDOW,
-        markers: seq.map_or_else(Vec::new, |s| vec![obs(MarkerKind::Output, 0, s as u32)]),
-        rejected: 0,
-        missed: None,
-        scan_ns: 0,
-        lag_ns: Some(0),
-    };
-    for (i, &e) in emit.iter().enumerate() {
-        m.on_emitted(Emitted {
-            session: 0,
-            kind: MarkerKind::Output,
-            seq_full: i as u64,
-            t_emit_ns: e,
-            source: EmitSource::Generator,
-        });
-    }
-    let end = t0 + 21_000 * MS;
-    let mut k = 0u64;
-    loop {
-        let t = t0 + k * period;
-        if t > end {
-            break;
-        }
-        m.on_frame(frame_ns(SourceId::Dda, k, t, latest(t)));
-        if k % wgc_every == 0 {
-            let shown = t.checked_sub(wgc_render_ms * MS).and_then(latest);
-            m.on_frame(frame_ns(SourceId::Wgc, k, t + wgc_stamp_ms * MS, shown));
-        }
-        k += 1;
-    }
-    m.finish(end + 100 * MS).1
+    dda_keep: fn(u64) -> bool,
+    dda_max: u64,
+    markers: u64,
 }
 
-/// Second review M1: a hosted-VM-like shape (presenting every other refresh,
-/// WGC a whole frame later on ~30% of markers) agrees THROUGH the frame
-/// interval measured from the frames; judged in refresh intervals it would not.
+const EVERY: fn(u64) -> bool = |_| true;
+
+impl Presented {
+    fn at_60hz() -> Presented {
+        Presented {
+            present_every: 1,
+            wgc_keep: EVERY,
+            wgc_render_ms: 0,
+            wgc_stamp_ms: 5,
+            dda_keep: EVERY,
+            dda_max: u64::MAX,
+            markers: 200,
+        }
+    }
+
+    fn run(self) -> WatchSummary {
+        let mut c = cfg();
+        c.secondary = Some(SourceId::Dda);
+        let mut m = Model::new(c, 0);
+        let period = REFRESH * self.present_every;
+        let t0 = 1_000 * MS;
+        // 101.3 ms apart: not a multiple of any presentation interval, so the
+        // phase (and the presentation index modulo a drop pattern) walks.
+        let emit: Vec<u64> = (0..self.markers)
+            .map(|i| t0 + 500 * MS + i * 101_300_000)
+            .collect();
+        let latest = |cut: u64| emit.iter().rposition(|&e| e <= cut);
+        let frame_ns = |source: SourceId,
+                        index: u64,
+                        t_ns: u64,
+                        seq: Option<usize>,
+                        missed: Option<u32>| FrameObs {
+            source,
+            index,
+            t_ns,
+            width: 800,
+            height: 600,
+            region: WINDOW,
+            markers: seq.map_or_else(Vec::new, |s| vec![obs(MarkerKind::Output, 0, s as u32)]),
+            rejected: 0,
+            missed,
+            scan_ns: 0,
+            lag_ns: Some(0),
+        };
+        for (i, &e) in emit.iter().enumerate() {
+            m.on_emitted(Emitted {
+                session: 0,
+                kind: MarkerKind::Output,
+                seq_full: i as u64,
+                t_emit_ns: e,
+                source: EmitSource::Generator,
+            });
+        }
+        let end = t0 + 1_000 * MS + self.markers * 100 * MS;
+        let (mut dda_frames, mut dda_missed) = (0u64, 0u32);
+        let mut k = 0u64;
+        loop {
+            let t = t0 + k * period;
+            if t > end {
+                break;
+            }
+            if (self.dda_keep)(k) && dda_frames < self.dda_max {
+                m.on_frame(frame_ns(SourceId::Dda, k, t, latest(t), Some(dda_missed)));
+                dda_frames += 1;
+                dda_missed = 0;
+            } else {
+                dda_missed += 1;
+            }
+            if (self.wgc_keep)(k) {
+                let shown = t.checked_sub(self.wgc_render_ms * MS).and_then(latest);
+                m.on_frame(frame_ns(
+                    SourceId::Wgc,
+                    k,
+                    t + self.wgc_stamp_ms * MS,
+                    shown,
+                    None,
+                ));
+            }
+            k += 1;
+        }
+        m.finish(end + 100 * MS).1
+    }
+}
+
+fn ms_eq(a: Option<f64>, b: f64) -> bool {
+    a.is_some_and(|a| (a - b).abs() < 1e-6)
+}
+const R_MS: f64 = REFRESH as f64 / 1e6;
+
+/// Rule (a), with F derived from the frames: presenting every other refresh,
+/// WGC stamped 15 ms after DDA on every marker. At the measured F = 2R the
+/// median (15 ms) is inside [-F/4, 10 + F/4] = [-8.3, 18.3]; at F = R it would
+/// not be (top 14.2), so the measured F is what makes this agree.
 #[test]
-fn the_vm_shape_agrees_through_the_measured_frame_interval() {
-    let s = presented_run(2, 1, 10, 0);
+fn rule_a_judges_the_median_in_the_measured_frame_interval() {
+    let p = Presented {
+        present_every: 2,
+        wgc_stamp_ms: 15,
+        ..Presented::at_60hz()
+    };
+    let s = p.run();
     let cc = &s.crosscheck;
+    assert!(ms_eq(cc.frame_ms, 2.0 * R_MS), "{cc:?}");
+    assert!(ms_eq(cc.median_gap_ms, 15.0), "{cc:?}");
     assert_eq!(cc.verdict, "agree", "{}", cc.detail);
-    let two_r = 2.0 * REFRESH as f64 / 1e6;
+    // The same offset at 60 Hz presentation (F = R) is systematic.
+    let s = Presented {
+        wgc_stamp_ms: 15,
+        ..Presented::at_60hz()
+    }
+    .run();
+    assert_eq!(s.crosscheck.verdict, "disagree", "{}", s.crosscheck.detail);
     assert!(
-        cc.frame_ms.is_some_and(|f| (f - two_r).abs() < 1e-6),
+        s.crosscheck.detail.starts_with("a systematic offset"),
+        "{}",
+        s.crosscheck.detail
+    );
+}
+
+/// Rule (c), with F derived: presenting every other refresh, WGC rendering
+/// 2 ms behind, so ~6% of markers land a whole presentation (33.3 ms) late.
+/// Under the measured F = 2R that is inside one frame (top 43.3) and under
+/// the 10% late share; judged at F = R it would be a 6% tail.
+#[test]
+fn rule_c_judges_the_tail_in_the_measured_frame_interval() {
+    let s = Presented {
+        present_every: 2,
+        wgc_render_ms: 2,
+        wgc_stamp_ms: 0,
+        ..Presented::at_60hz()
+    }
+    .run();
+    let cc = &s.crosscheck;
+    assert!(ms_eq(cc.frame_ms, 2.0 * R_MS), "{cc:?}");
+    assert_eq!(cc.verdict, "agree", "{}", cc.detail);
+    assert_eq!(cc.disagreed, 0);
+    assert!(
+        cc.late > 0 && cc.late_share.is_some_and(|l| l < 0.10),
         "{cc:?}"
     );
-    assert!(cc.disagreed == 0 && cc.compared > 150, "{cc:?}");
-    // The shape is real: about 30% of markers WGC a whole presentation later,
-    // which bands one refresh wide would void.
-    let late = cc.max_abs_delta_ms.unwrap_or_default();
-    assert!((late - two_r).abs() < 1e-3, "{cc:?}");
     assert_eq!(s.output_latency_ms.state, KpiState::Measured);
+    // The same tail where DDA's spacing cannot be trusted (F = R): voided.
+    let s = Presented {
+        present_every: 2,
+        wgc_render_ms: 2,
+        wgc_stamp_ms: 0,
+        dda_max: 20,
+        ..Presented::at_60hz()
+    }
+    .run();
+    assert!(ms_eq(s.crosscheck.frame_ms, R_MS), "{:?}", s.crosscheck);
 }
 
-/// Second review M1: WGC dropping every other frame at 60 Hz while DDA keeps
-/// every refresh. Its own spacing doubles; that must not widen its bands.
+/// Third review M1: at 60 Hz with DDA keeping every presentation, WGC
+/// dropping every third one (a third of markers a presentation late) is LATE.
 #[test]
-fn wgc_dropping_every_other_frame_at_60hz_disagrees() {
-    let s = presented_run(1, 2, 0, 5);
+fn wgc_dropping_every_third_presentation_is_late() {
+    let s = Presented {
+        wgc_keep: |k| k % 3 != 2,
+        ..Presented::at_60hz()
+    }
+    .run();
     let cc = &s.crosscheck;
+    assert!(ms_eq(cc.frame_ms, R_MS), "{cc:?}");
     assert_eq!(cc.verdict, "disagree", "{}", cc.detail);
     assert!(
-        cc.frame_ms
-            .is_some_and(|f| (f - REFRESH as f64 / 1e6).abs() < 1e-6),
-        "{cc:?}"
+        cc.detail
+            .contains("the primary saw markers a presentation late"),
+        "{}",
+        cc.detail
     );
-    assert!(
-        cc.cadence_ratio.is_some_and(|r| (r - 2.0).abs() < 1e-6),
-        "{cc:?}"
-    );
+    assert!(cc.late_share.is_some_and(|l| l > 0.25), "{cc:?}");
     assert_eq!(s.output_latency_ms.reason, Some("capture_disagreement"));
-    // The same host with WGC keeping every frame agrees.
-    let ok = presented_run(1, 1, 0, 5);
+    // ...and the same host keeping every presentation agrees.
+    let ok = Presented::at_60hz().run();
     assert_eq!(ok.crosscheck.verdict, "agree", "{}", ok.crosscheck.detail);
+    assert_eq!(ok.crosscheck.late, 0);
+}
+
+/// Third review M1: WGC dropping a pseudo-random 15% of presentations.
+#[test]
+fn wgc_dropping_a_random_15_percent_is_late() {
+    let s = Presented {
+        wgc_keep: |k| (k.wrapping_mul(2_654_435_761) >> 7) % 100 >= 15,
+        ..Presented::at_60hz()
+    }
+    .run();
+    let cc = &s.crosscheck;
+    assert_eq!(cc.verdict, "disagree", "{}", cc.detail);
+    assert!(cc.late_share.is_some_and(|l| l > 0.10), "{cc:?}");
+}
+
+/// The late-share threshold, end to end: presenting every other refresh with
+/// WGC rendering 2 ms behind is ~6% late (agree); 5 ms behind, ~15% (disagree).
+#[test]
+fn the_late_share_threshold_from_timelines() {
+    let run = |render| {
+        Presented {
+            present_every: 2,
+            wgc_render_ms: render,
+            wgc_stamp_ms: 0,
+            ..Presented::at_60hz()
+        }
+        .run()
+        .crosscheck
+    };
+    let (two, five) = (run(2), run(5));
+    assert_eq!(two.verdict, "agree", "{}", two.detail);
+    assert_eq!(five.verdict, "disagree", "{}", five.detail);
+    assert!(five.late_share.is_some_and(|l| l > 0.10), "{five:?}");
+    assert_eq!(five.disagreed, 0, "late, not a tail: the late rule decided");
+}
+
+/// The 20-delta fallback end to end: DDA with 20 frames (19 deltas) gives
+/// F = R, with 21 the measured spacing.
+#[test]
+fn a_secondary_with_too_few_frames_falls_back_to_the_refresh_interval() {
+    let run = |dda_max| {
+        Presented {
+            present_every: 2,
+            dda_max,
+            ..Presented::at_60hz()
+        }
+        .run()
+        .crosscheck
+    };
+    let few = run(20);
+    assert!(ms_eq(few.frame_ms, R_MS), "{few:?}");
+    assert!(
+        few.frame_basis.contains("fewer than 20"),
+        "{}",
+        few.frame_basis
+    );
+    let enough = run(21);
+    assert!(ms_eq(enough.frame_ms, 2.0 * R_MS), "{enough:?}");
+}
+
+/// The three-marker threshold: two markers decide nothing, three do.
+#[test]
+fn the_cross_check_needs_three_markers() {
+    let run = |markers| {
+        Presented {
+            wgc_stamp_ms: 40,
+            markers,
+            ..Presented::at_60hz()
+        }
+        .run()
+        .crosscheck
+    };
+    let two = run(2);
+    assert_eq!(
+        (two.compared, two.verdict),
+        (2, "not_performed"),
+        "{}",
+        two.detail
+    );
+    let three = run(3);
+    assert_eq!(
+        (three.compared, three.verdict),
+        (3, "disagree"),
+        "{}",
+        three.detail
+    );
+}
+
+/// Third review: a DDA that misses presentations must not widen F. DDA keeping
+/// every other presentation (missed = 1 on each frame) has a 2R spacing of its
+/// own making; F falls back to R, so WGC dropping every third is still late.
+#[test]
+fn a_secondary_missing_presentations_cannot_widen_the_bands() {
+    let s = Presented {
+        dda_keep: |k| k % 2 == 0,
+        wgc_keep: |k| k % 3 != 2,
+        ..Presented::at_60hz()
+    }
+    .run();
+    let cc = &s.crosscheck;
+    assert!(ms_eq(cc.secondary_spacing_ms, 2.0 * R_MS), "{cc:?}");
+    assert!(cc.secondary_missed_share.is_some_and(|m| m > 0.9), "{cc:?}");
+    assert!(ms_eq(cc.frame_ms, R_MS), "{cc:?}");
+    assert!(
+        cc.frame_basis.contains("coalesced presentations"),
+        "{}",
+        cc.frame_basis
+    );
+    assert_eq!(cc.verdict, "disagree", "{}", cc.detail);
 }
 
 fn agreeing_run(c: ModelConfig) -> WatchSummary {

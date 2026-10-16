@@ -635,6 +635,9 @@ export class VscodeAdapter {
     } catch (e) {
       this.notes.push(`process table unreadable after launch: ${e.message}`);
     }
+    // Verbatim in the public log on purpose (D7 covers readings, and this is not
+    // one): the pid is the process the HARNESS launched, which the job's later
+    // lines refer to, and says nothing about how VS Code performs.
     this.log(`vscode: pid ${this.pid} (${this.app.launchMode}) from ${this.app.exe}`);
     const control = await this.waitForControl(p.control);
     this.client = new HarnessClient({ port: control.port, nonce, fetch: this.controlFetch });

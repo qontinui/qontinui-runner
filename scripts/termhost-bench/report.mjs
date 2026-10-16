@@ -191,18 +191,20 @@ export function checkAssertions(doc, a) {
 export const READING_FREE_DETAIL_MAX = 240;
 
 /**
- * A process exit code the detail labels as one, in exactly these forms:
- * `exit N`, `exit code N`, `exited with code N`, where N is an i32/u32 code
- * (at most 10 decimal digits, optionally signed) or `0x` with 1-8 hex digits,
- * optionally followed by the NTSTATUS it reads as, `(0xC0000005)`. N must END
- * there: not followed by another digit, a decimal or exponent part, or a unit
- * (`ms`, `s`, `%`, `fps`, …), so `exit 5000 ms after` or `exit code 56.0ms` is a
- * reading and is masked. Kept: an exit code is the process's verdict on why it
- * stopped — a CAUSE (an access violation, a refusal) — not a measurement of the
- * setup.
+ * A process exit code the detail labels as one — an ALLOWLIST, so anything it
+ * does not name is masked. The forms: `exit N`, `exit code N`, `exited with
+ * code N`, where N is an ASCII-decimal u32 (at most 4294967295, no sign) or
+ * `0x` with 1-8 hex digits. N is kept only when what follows it is the end of
+ * the text, one of `; , : )`, a parenthesised hex status (`(0xC0000005)`), or
+ * whitespace and one of the words after / from / while / on / during / when.
+ * Anything else after N — a unit (`ms`, `seconds`, `MiB`, `lines`), a word, a
+ * decimal or exponent part, another digit — makes it a reading, masked. Kept:
+ * an exit code is the process's verdict on why it stopped, a CAUSE (an access
+ * violation, a refusal), not a measurement of the setup.
  */
-const EXIT_UNIT = String.raw`(?:ms|us|µs|ns|s|sec|secs|min|h|fps|hz|frames?|px|mb|kb|gb|%)(?![\p{L}])`;
-const EXIT_CODE = String.raw`\b(?:exit|exit code|exited with code) (?:[+-]?\p{Nd}{1,10}|0[xX][0-9a-fA-F]{1,8})(?![\p{Nd}\p{L}]|[.,]\p{Nd}|\s*${EXIT_UNIT}|\s*%)(?: \(0[xX][cC][0-9a-fA-F]{7}\))?`;
+const EXIT_FOLLOW = String.raw`(?=$|[;,:)]| \(0[xX][0-9a-fA-F]{1,8}\)|\s+(?:after|from|while|on|during|when)(?![\p{L}\p{N}]))`;
+const EXIT_CODE = String.raw`\b(?:exit|exit code|exited with code) (?<code>[0-9]{1,10}|0[xX][0-9a-fA-F]{1,8})${EXIT_FOLLOW}(?: \(0[xX][0-9a-fA-F]{1,8}\))?`;
+const U32_MAX = 4294967295;
 /**
  * A number: optionally signed (a sign only where no letter or digit precedes it,
  * so `win32-x64` keeps its hyphen), decimal in any script (`\p{Nd}`), with digit
@@ -211,6 +213,7 @@ const EXIT_CODE = String.raw`\b(?:exit|exit code|exited with code) (?:[+-]?\p{Nd
  */
 const NUMBER = String.raw`(?:(?<![\p{L}\p{N}])[+-])?(?:\bInfinity\b|\bNaN\b|0[xX][0-9a-fA-F]+|(?:\p{Nd}+(?:[.,]\p{Nd}+)*|\.\p{Nd}+)(?:[eE][+-]?\p{Nd}+)?)`;
 const MASK = new RegExp(`(${EXIT_CODE})|${NUMBER}`, "giu");
+const NUMBERS = new RegExp(NUMBER, "giu");
 
 /**
  * A third-party KPI detail with no reading left in it (D7): every number — a
@@ -222,9 +225,19 @@ const MASK = new RegExp(`(${EXIT_CODE})|${NUMBER}`, "giu");
  * its capture source (frame lag # ms ...").
  */
 export function readingFreeDetail(detail) {
-  const masked = String(detail).replace(MASK, (m, exit) => (exit !== undefined ? exit : "#"));
-  const cps = Array.from(masked);
-  return cps.length > READING_FREE_DETAIL_MAX ? `${cps.slice(0, READING_FREE_DETAIL_MAX - 1).join("")}…` : masked;
+  const cps = Array.from(maskReadings(detail));
+  return cps.length > READING_FREE_DETAIL_MAX ? `${cps.slice(0, READING_FREE_DETAIL_MAX - 1).join("")}…` : cps.join("");
+}
+
+/** {@link readingFreeDetail}'s masking without its length cut (e.g. for a dedupe key). */
+export function maskReadings(detail) {
+  return String(detail).replace(MASK, (m, exit, ...rest) => {
+    if (exit === undefined) return "#";
+    const code = rest.at(-1)?.code ?? "";
+    // A decimal code past u32 is not an exit code: mask it like any number.
+    if (/^[0-9]+$/.test(code) && Number(code) > U32_MAX) return exit.replace(NUMBERS, "#");
+    return exit;
+  });
 }
 
 /** Validate, then return `{valid, errors}` plus the redacted copy (or null). */

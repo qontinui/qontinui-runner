@@ -10,16 +10,23 @@
  * - each source's frame-spacing p50 and its spacing histogram in refresh
  *   intervals (how often the compositor presented);
  * - the CURRENT rule (`crates/termhost-probe/src/model/analysis.rs` `crosscheck`,
- *   ported below): F, the median gap and its band and margin, the per-marker
- *   band and the share outside it, the cadence ratio, the verdict;
+ *   ported below): F and where it came from (DDA's spacing p50, or R when DDA
+ *   had too few deltas or coalesced presentations on more than 5% of its
+ *   frames), the median gap and its band and margin, the late share and its
+ *   margin, the share outside the one-frame band, the verdict;
  * - the RETIRED rule ("any one marker more than one refresh interval apart"):
  *   how many markers it counted, how many of those had WGC later, and of those
  *   how many had no primary frame between the two times (sampling phase, not a
  *   defect).
  *
  * The port must follow the Rust rule; `__tests__/crosscheck-replay.test.mjs`
- * pins it on a synthetic watch. Node built-ins only. Input files are data: they
+ * pins it on synthetic watches. Node built-ins only. Input files are data: they
  * are parsed as JSON lines and nothing in them is executed.
+ *
+ * A watch must have been recorded with `--frames all` (the probe's default):
+ * with `changes` or `none` its frame records are not every frame, so every
+ * spacing — and so F — would be wrong. The tool refuses such a watch, and one
+ * with no start record to say which it was.
  */
 
 import { readFileSync } from "node:fs";
@@ -34,7 +41,9 @@ export const RULE = Object.freeze({
   medianMinCompared: 3,
   frameMaxRefreshes: 2.0,
   frameMinDeltas: 20,
-  maxCadenceRatio: 1.5,
+  lateBandFrames: 0.5,
+  maxLateShare: 0.1,
+  maxSecondaryMissedShare: 0.05,
 });
 
 /** `selftest::render_offset_ms`: the stage each source stamps, relative to DDA. */
@@ -48,6 +57,7 @@ export function parseWatch(text) {
   const frames = new Map();
   const first = new Map();
   let summary = null;
+  let start = null;
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     let r;
@@ -64,10 +74,27 @@ export function parseWatch(text) {
       first.get(r.source).set(`${r.kind}:${r.session}:${r.seq}`, { kind: r.kind, t: BigInt(r.t_ns), frame: r.frame, missed: r.missed ?? null });
     } else if (r?.type === "summary") {
       summary = r;
+    } else if (r?.type === "start" && start === null) {
+      start = r;
     }
   }
   for (const list of frames.values()) list.sort((a, b) => cmpBig(a.t, b.t));
-  return { frames, first, summary };
+  return { frames, first, summary, start };
+}
+
+/**
+ * Which `--frames` mode the watch was recorded in, from its start record's
+ * argv: `all` (also the probe's default when the flag is absent), `changes`,
+ * `none`, or null when there is no start record to read.
+ */
+export function framesMode(start) {
+  if (!start || !Array.isArray(start.args)) return null;
+  const args = start.args.map(String);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--frames") return args[i + 1] ?? null;
+    if (args[i].startsWith("--frames=")) return args[i].slice("--frames=".length);
+  }
+  return "all";
 }
 
 /** A source's frame-spacing p50 (ms), or null below `RULE.frameMinDeltas` deltas. */
@@ -77,6 +104,13 @@ export function spacingP50(frames) {
   if (d.length < RULE.frameMinDeltas) return null;
   d.sort((a, b) => a - b);
   return d[rank(50, d.length) - 1];
+}
+
+/** The share of a source's frames that coalesced presentations (`missed > 0`), or null. */
+export function secondaryMissedShare(frames) {
+  const known = frames.filter((f) => f.missed !== null && f.missed !== undefined);
+  if (known.length === 0) return null;
+  return known.filter((f) => f.missed > 0).length / known.length;
 }
 
 /** How a source's spacings fall in whole refresh intervals: {"1": n, "2": n, ...}. */
@@ -95,6 +129,16 @@ export function spacingHistogram(frames, refreshMs) {
  * @param {{refreshMs?: number, primary?: string, secondary?: string}} [o]
  */
 export function replay(watch, o = {}) {
+  if (!o.skipFramesCheck) {
+    const mode = framesMode(watch.start);
+    if (mode !== "all") {
+      throw new Error(
+        mode === null
+          ? "the watch has no start record, so whether it recorded every frame (--frames all) is unknown: refusing to size F from it"
+          : `the watch was recorded with --frames ${mode}, so its frame records are not every frame: refusing to size F from them`,
+      );
+    }
+  }
   const primary = o.primary ?? watch.summary?.primary ?? "wgc";
   const secondary = o.secondary ?? watch.summary?.secondary ?? "dda";
   const refreshMs = o.refreshMs ?? watch.summary?.refresh_ms;
@@ -102,15 +146,18 @@ export function replay(watch, o = {}) {
   const pFrames = watch.frames.get(primary) ?? [];
   const sFrames = watch.frames.get(secondary) ?? [];
   const sByIndex = new Map(sFrames.map((f) => [f.index, f]));
+  const rule = { ...RULE, ...(o.rule ?? {}) };
   const pSp = spacingP50(pFrames);
   const sSp = spacingP50(sFrames);
-  const F = Math.min(Math.max(pSp !== null && sSp !== null ? sSp : refreshMs, refreshMs), RULE.frameMaxRefreshes * refreshMs);
-  const cadenceRatio = pSp !== null && sSp !== null ? pSp / sSp : null;
+  const sMissedShare = secondaryMissedShare(sFrames);
+  const sMissedTooMany = sMissedShare !== null && sMissedShare > rule.maxSecondaryMissedShare;
+  const F = Math.min(Math.max(sSp !== null && !sMissedTooMany ? sSp : refreshMs, refreshMs), rule.frameMaxRefreshes * refreshMs);
   const offset = (RENDER_OFFSET_MS[primary] ?? 0) - (RENDER_OFFSET_MS[secondary] ?? 0);
   const lo = Math.min(offset, 0);
   const hi = Math.max(offset, 0);
-  const markerBand = [lo - RULE.markerBandFrames * F, hi + RULE.markerBandFrames * F];
-  const medianBand = [lo - RULE.medianBandFrames * F, hi + RULE.medianBandFrames * F];
+  const markerBand = [lo - rule.markerBandFrames * F, hi + rule.markerBandFrames * F];
+  const medianBand = [lo - rule.medianBandFrames * F, hi + rule.medianBandFrames * F];
+  const lateBound = hi + rule.lateBandFrames * F;
 
   const gaps = [];
   let coalesced = 0;
@@ -147,12 +194,14 @@ export function replay(watch, o = {}) {
   const median = n > 0 ? sorted[rank(50, n) - 1] : null;
   const outside = sorted.filter((g) => g < markerBand[0] || g > markerBand[1]).length;
   const share = n > 0 ? outside / n : null;
+  const late = sorted.filter((g) => g > lateBound).length;
+  const lateShare = n > 0 ? late / n : null;
   let verdict = "not_performed";
   const why = [];
-  if (n >= RULE.medianMinCompared) {
+  if (n >= rule.medianMinCompared) {
     if (median < medianBand[0] || median > medianBand[1]) why.push("systematic");
-    if (cadenceRatio !== null && (cadenceRatio > RULE.maxCadenceRatio || cadenceRatio * RULE.maxCadenceRatio < 1)) why.push("cadence");
-    if (n >= RULE.tailMinCompared && share > RULE.maxOutsideShare) why.push("tail");
+    if (n >= rule.tailMinCompared && lateShare > rule.maxLateShare) why.push("late");
+    if (n >= rule.tailMinCompared && share > rule.maxOutsideShare) why.push("tail");
     verdict = why.length ? "disagree" : "agree";
   }
   const r3 = (x) => (x === null ? null : Math.round(x * 1000) / 1000);
@@ -163,7 +212,8 @@ export function replay(watch, o = {}) {
     spacingP50: { [primary]: r3(pSp), [secondary]: r3(sSp) },
     spacingHistogram: { [primary]: spacingHistogram(pFrames, refreshMs), [secondary]: spacingHistogram(sFrames, refreshMs) },
     frameMs: r3(F),
-    cadenceRatio: r3(cadenceRatio),
+    secondaryMissedShare: r3(sMissedShare),
+    frameFellBackToRefresh: sSp === null || sMissedTooMany,
     compared: n,
     coalesced,
     medianGapMs: r3(median),
@@ -172,6 +222,10 @@ export function replay(watch, o = {}) {
     markerBandMs: markerBand.map(r3),
     outside,
     outsideShare: r3(share),
+    lateBoundMs: r3(lateBound),
+    late,
+    lateShare: r3(lateShare),
+    lateMarginPoints: lateShare === null ? null : r3(100 * (rule.maxLateShare - lateShare)),
     verdict,
     why,
     retired: { overOneRefresh: retiredOver, primaryLater: retiredPrimaryLater, noPrimaryFrameBetween: retiredNoPrimaryFrameBetween },
@@ -188,15 +242,22 @@ function main(argv) {
     return 2;
   }
   for (const f of files) {
-    const r = replay(parseWatch(readFileSync(f, "utf8")), { refreshMs });
+    let r;
+    try {
+      r = replay(parseWatch(readFileSync(f, "utf8")), { refreshMs });
+    } catch (e) {
+      process.stderr.write(`${f}: ${e.message}\n`);
+      return 2;
+    }
     if (json) {
       process.stdout.write(`${JSON.stringify({ file: f, ...r })}\n`);
       continue;
     }
     const name = f.split(/[\\/]/).pop();
     process.stdout.write(
-      `${name}: F ${r.frameMs} ms (spacing p50 ${r.primary} ${r.spacingP50[r.primary]}, ${r.secondary} ${r.spacingP50[r.secondary]}; ratio ${r.cadenceRatio}) ` +
+      `${name}: F ${r.frameMs} ms${r.frameFellBackToRefresh ? " (R: fallback)" : ""} (spacing p50 ${r.primary} ${r.spacingP50[r.primary]}, ${r.secondary} ${r.spacingP50[r.secondary]}; ${r.secondary} coalesced on ${r.secondaryMissedShare === null ? "-" : (100 * r.secondaryMissedShare).toFixed(1)}% of frames) ` +
         `median ${r.medianGapMs} ms in [${r.medianBandMs.join(", ")}] (margin ${r.medianMarginMs} ms) ` +
+        `late > ${r.lateBoundMs}: ${r.late}/${r.compared} (${r.lateShare === null ? "-" : (100 * r.lateShare).toFixed(1)}%, margin ${r.lateMarginPoints} points) ` +
         `outside [${r.markerBandMs.join(", ")}]: ${r.outside}/${r.compared} (${r.outsideShare === null ? "-" : (100 * r.outsideShare).toFixed(1)}%) ` +
         `=> ${r.verdict}${r.why.length ? ` (${r.why.join(", ")})` : ""}; retired rule: ${r.retired.overOneRefresh} over one refresh, ` +
         `${r.retired.primaryLater} with ${r.primary} later, ${r.retired.noPrimaryFrameBetween} of those with no ${r.primary} frame between\n` +

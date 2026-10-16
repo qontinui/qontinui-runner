@@ -228,8 +228,9 @@ pub struct Model {
     seen_order: BTreeMap<SourceId, Vec<(Marker, FirstSeen)>>,
     frame_counts: BTreeMap<SourceId, u64>,
     primary_frames: Vec<u64>,
-    /// The secondary source's frame times (ns), for its frame cadence.
-    secondary_frames: Vec<u64>,
+    /// The secondary source's frames (time ns, coalesced presentations), for
+    /// the compositor cadence the cross-check is sized in.
+    secondary_frames: Vec<(u64, Option<u32>)>,
     last_markers: HashMap<SourceId, Vec<Marker>>,
     /// Per source: each session's displayed output marker rectangle.
     displayed: HashMap<SourceId, BTreeMap<u16, Rect>>,
@@ -346,7 +347,7 @@ impl Model {
         }
         let v = shown.len() as u32;
         if Some(f.source) == self.cfg.secondary {
-            self.secondary_frames.push(f.t_ns);
+            self.secondary_frames.push((f.t_ns, f.missed));
         }
         if f.source == self.cfg.primary && self.cfg.capture_available {
             let at = self.primary_frames.partition_point(|&t| t <= f.t_ns);
@@ -907,8 +908,8 @@ impl Model {
         };
 
         // Cross-check before latencies: a disagreement makes them unknown.
-        // Its bands are sized in BOTH sources' measured frame cadence.
-        let cadence = analysis::Cadence::from_frames(&self.primary_frames, &self.secondary_frames);
+        // Its bands are sized in the compositor's cadence, from the secondary.
+        let cadence = analysis::Cadence::from_secondary(&self.secondary_frames);
         let primary_list = self
             .seen_order
             .get(&self.cfg.primary)

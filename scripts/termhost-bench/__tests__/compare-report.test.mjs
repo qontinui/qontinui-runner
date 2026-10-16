@@ -253,7 +253,7 @@ test("readingFreeDetail keeps a labelled exit code: a cause, not a reading (revi
   assert.equal(readingFreeDetail("status 0xC0000005 seen at 42 ms"), "status # seen at # ms", "an unlabelled hex status is masked");
 });
 
-test("readingFreeDetail's exit-code exception leaks no reading (second review S1)", () => {
+test("readingFreeDetail keeps an exit code only by allowlist (second review S1, third review S3)", () => {
   const masked = [
     ["exit code 56.0ms", "exit code #ms"],
     ["exit 56ms", "exit #ms"],
@@ -262,13 +262,53 @@ test("readingFreeDetail's exit-code exception leaks no reading (second review S1
     ["exit: 12e3", "exit: #"],
     ["the probe did not exit 5000 ms after its stop", "the probe did not exit # ms after its stop"],
     ["exit 3%", "exit #%"],
-    ["exit 3 frames", "exit # frames"],
     ["exit 1e5", "exit #"],
     ["exit 12345678901", "exit #"],
+    // the third review's probe (mask.mjs): units, words and shapes no denylist names
+    ["exit 4123 seconds of lag", "exit # seconds of lag"],
+    ["exit 56 msec", "exit # msec"],
+    ["exit 5000 milliseconds", "exit # milliseconds"],
+    ["exit 120 lines", "exit # lines"],
+    ["exit 300 rows", "exit # rows"],
+    ["exit 64 MiB", "exit # MiB"],
+    ["exit 12 kHz", "exit # kHz"],
+    ["exit 3 of 5 frames", "exit # of # frames"],
+    ["exit 75 percent", "exit # percent"],
+    ["exit 4123\tms", "exit #\tms"],
+    ["exit 12 / 60", "exit # / #"],
+    ["exit 9999999999 (0xC0000005)", "exit # (#)"],
+    ["exit 4294967296", "exit #"],
+    ["EXIT CODE 5000 MS", "EXIT CODE # MS"],
+    ["exit 4123 µs", "exit # µs"],
+    ["exit 56  ms", "exit #  ms"],
+    ["exit ٥٦ ms", "exit # ms"],
+    ["exit ٥٦", "exit #"],
+    ["exited with code 8000 then", "exited with code # then"],
+    ["exit 30 fps", "exit # fps"],
+    ["exit 16.7ms", "exit #ms"],
+    ["exit 250 ticks", "exit # ticks"],
+    ["exit 60 Hz", "exit # Hz"],
+    ["exit -75", "exit #"],
+    ["exit 2e3", "exit #"],
+    ["exited with code -1", "exited with code #"],
+    ["exit 3 at 4 ms", "exit # at # ms"],
   ];
   for (const [input, want] of masked) assert.equal(readingFreeDetail(input), want, input);
-  const kept = ["exit 3", "exit code 3221225477 (0xC0000005)", "exited with code -1", "exit code 0xC0000005", "(stopped, exit 3) without"];
+  const kept = [
+    "exit 3",
+    "exit code 3221225477 (0xC0000005)",
+    "exit 4294967295",
+    "exit 0x1F4",
+    "exit code 0xC0000005",
+    "(stopped, exit 3) without",
+    "exit 3; retry",
+    "exit 3: refused",
+    "exit 1234567890",
+    "exited with code 1 while starting",
+    "exit 3 after the stop",
+  ];
   for (const k of kept) assert.equal(readingFreeDetail(k), k, k);
+  assert.equal(readingFreeDetail("exit 3 (0xC0000005) after 12 ms"), "exit 3 (0xC0000005) after # ms");
 });
 
 test("readingFreeDetail cuts by code point, never inside a surrogate pair (review N3)", () => {
