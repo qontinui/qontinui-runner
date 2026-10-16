@@ -1552,11 +1552,16 @@ pub(crate) mod test_support {
     /// `Some(answer)` when a test faked the tenant of session key `key` (a
     /// terminal id or a task-run id) on this thread.
     pub(crate) fn faked_session_tenant(key: &str) -> Option<super::SessionScope> {
+        // Compared in ownership-key form, as the real lookup compares paths:
+        // on Windows `git worktree list` prints `C:/x/wt` for a fake keyed
+        // `C:\x\wt`, and the two name the same directory.
+        let norm = |k: &str| super::normalize_ownership_key(k, cfg!(windows));
+        let want = norm(key);
         SESSION_TENANTS.with(|m| {
             m.borrow()
                 .iter()
                 .rev()
-                .find(|(k, _)| k == key)
+                .find(|(k, _)| norm(k) == want)
                 .map(|(_, t)| *t)
         })
     }
