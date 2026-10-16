@@ -47,6 +47,10 @@ pub struct Faults {
     pub drop_keys: bool,
     /// The compositor never presents a frame.
     pub capture_dead: bool,
+    /// While an echo whose sequence is `1 mod n` is on screen, the compositor
+    /// presents nothing (a capture gap that swallows the whole echo, as a
+    /// loaded hosted runner's ~10 Hz capture did). 0 = off.
+    pub swallow_echo_mod: u32,
     /// ONE frame (the fifth) reaches the probe this long after it was
     /// presented — a scheduler hiccup, not a probe that fell behind.
     pub one_late_frame_ms: u64,
@@ -167,6 +171,20 @@ impl CaptureSource for FakeCapture {
         let deadline = now_ns() + timeout.as_nanos() as u64;
         loop {
             let generation = self.desk.generation.load(Ordering::SeqCst);
+            let n = self.desk.faults.swallow_echo_mod;
+            let swallowed = n > 0
+                && self
+                    .desk
+                    .state
+                    .lock()
+                    .expect("state")
+                    .echoes
+                    .last()
+                    .is_some_and(|e| e.seq % n == 1);
+            if generation != self.last && swallowed {
+                // Consumed, never presented: no frame shows this echo.
+                self.last = generation;
+            }
             if generation != self.last && !self.desk.faults.capture_dead {
                 let changed = self.desk.last_change_ns.load(Ordering::SeqCst);
                 let frozen_until = self.desk.state.lock().expect("state").frozen_until;
