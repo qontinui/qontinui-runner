@@ -4,6 +4,7 @@
 //! Subscriptions use WebSocket transport for real-time event streaming.
 
 pub mod mutation;
+pub mod output_page;
 pub mod query;
 pub mod schema;
 pub mod subscription;

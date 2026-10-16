@@ -878,6 +878,186 @@
       "id": "term-heartbeat-idle-status",
       "name": "Stuck-Session Heartbeat",
       "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The review panel is mounted over the zone.",
+          "enabled": true,
+          "id": "review-panel-open-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-panel"
+            },
+            "label": "Session review panel",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The review send bar's Send button is present.",
+          "enabled": true,
+          "id": "review-panel-open-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-send"
+            },
+            "label": "Review Send button",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Insert without sending is offered for a PTY target.",
+          "enabled": true,
+          "id": "review-panel-open-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-insert"
+            },
+            "label": "Review Insert button",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The review toggle is in the zone title bar.",
+          "enabled": true,
+          "id": "review-panel-open-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-toggle"
+            },
+            "label": "Review toggle",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A PTY zone whose tab is bound to a Claude session shows the review panel (`SessionReviewPanel`, terminal/SessionReviewPanel.tsx), toggled from the zone title bar by the `terminal.review-toggle` button beside the prompts toggle; the tab's unread badge (`terminal.review-badge`) sits next to it and reads `n unread`, `?` when the change list or the read state could not be read, and is absent when there are no hunks. The panel overlays the zone with the same top/right orientation contract as the prompts panel (the two are mutually exclusive per tab). Its body is the shared file-changes list (`FileChangesPanel`) for `GET /sessions/{claudeSessionId}/file-changes`, headed by the base it was diffed against (e.g. `vs HEAD — committed work not shown`); each hunk (`terminal.review-hunk.<key12>`) carries an unread dot that is the explicit, reversible read toggle (`terminal.review-hunk-read.<key12>`) and an add-note button (`terminal.review-add-note.<key12>`). A hunk scrolled past inside an expanded file diff is marked read automatically unless the operator explicitly marked it unread. Its footer is the review send bar (`terminal.review-send-bar`): attached notes as chips (`terminal.review-chip.<noteId>`, detach `terminal.review-chip-detach.<noteId>`), a free-text line, Preview exact text, Send (`terminal.review-send`) and Insert without sending (`terminal.review-insert`).",
+      "id": "review-panel-open",
+      "name": "Session Review Panel Open",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The inline note editor is open under a hunk.",
+          "enabled": true,
+          "id": "review-note-draft-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-note-draft"
+            },
+            "label": "Review note draft editor",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The note body input is present.",
+          "enabled": true,
+          "id": "review-note-draft-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-note-draft-input"
+            },
+            "label": "Review note body input",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Save is present.",
+          "enabled": true,
+          "id": "review-note-draft-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-note-save"
+            },
+            "label": "Review note Save",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The operator clicked a hunk's add-note button; an inline note editor (`terminal.review-note-draft`) opens under that hunk's header with a textarea (`terminal.review-note-draft-input`), Save (`terminal.review-note-save`, creates a pending note), Save & attach (`terminal.review-note-save-attach`, creates it and attaches it to the next send) and Cancel. A pending note is listed under Drafts with attach / discard (`terminal.review-note-attach.<noteId>`, `terminal.review-note-discard.<noteId>`); an attached note appears as a chip in the send bar, and detaching it returns it to Drafts. Every edge is re-validated server-side (`PATCH /sessions/{id}/review/notes/{noteId}`).",
+      "id": "review-note-draft",
+      "name": "Review Note Draft",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The exact-text preview is shown.",
+          "enabled": true,
+          "id": "review-send-preview-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-send-preview"
+            },
+            "label": "Review send preview",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The Preview exact text toggle is shown.",
+          "enabled": true,
+          "id": "review-send-preview-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.review-preview-toggle"
+            },
+            "label": "Review preview toggle",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "With at least one note attached, the operator toggled Preview exact text (`terminal.review-preview-toggle`); the send bar shows the exact composed prompt (`terminal.review-send-preview`) that Send would deliver — line 1 the `[review <8-hex>]` marker, then each note's path, hunk header, excerpt and comment (an orphaned note, whose hunk is no longer in the diff, is composed from its stored excerpt and labelled orphaned), then the free text. Send submits it to the PTY (notes become submitted, then confirmed when the marker is seen in the transcript, or UNKNOWN if the session ends first); Insert without sending types it with no Enter and leaves the notes attached — delivery is the operator's.",
+      "id": "review-send-preview",
+      "name": "Review Send Preview",
+      "source": "ai-generated"
     }
   ],
   "metadata": {
@@ -1168,6 +1348,60 @@
         "id": "term-heartbeat-idle-status",
         "isInitial": false,
         "name": "Stuck-Session Heartbeat",
+        "transitions": []
+      },
+      {
+        "description": "A PTY zone whose tab is bound to a Claude session shows the review panel (`SessionReviewPanel`, terminal/SessionReviewPanel.tsx), toggled from the zone title bar by the `terminal.review-toggle` button beside the prompts toggle; the tab's unread badge (`terminal.review-badge`) sits next to it and reads `n unread`, `?` when the change list or the read state could not be read, and is absent when there are no hunks. The panel overlays the zone with the same top/right orientation contract as the prompts panel (the two are mutually exclusive per tab). Its body is the shared file-changes list (`FileChangesPanel`) for `GET /sessions/{claudeSessionId}/file-changes`, headed by the base it was diffed against (e.g. `vs HEAD — committed work not shown`); each hunk (`terminal.review-hunk.<key12>`) carries an unread dot that is the explicit, reversible read toggle (`terminal.review-hunk-read.<key12>`) and an add-note button (`terminal.review-add-note.<key12>`). A hunk scrolled past inside an expanded file diff is marked read automatically unless the operator explicitly marked it unread. Its footer is the review send bar (`terminal.review-send-bar`): attached notes as chips (`terminal.review-chip.<noteId>`, detach `terminal.review-chip-detach.<noteId>`), a free-text line, Preview exact text, Send (`terminal.review-send`) and Insert without sending (`terminal.review-insert`).",
+        "elements": [
+          {
+            "id": "terminal.review-panel"
+          },
+          {
+            "id": "terminal.review-send"
+          },
+          {
+            "id": "terminal.review-insert"
+          },
+          {
+            "id": "terminal.review-toggle"
+          }
+        ],
+        "id": "review-panel-open",
+        "isInitial": false,
+        "name": "Session Review Panel Open",
+        "transitions": []
+      },
+      {
+        "description": "The operator clicked a hunk's add-note button; an inline note editor (`terminal.review-note-draft`) opens under that hunk's header with a textarea (`terminal.review-note-draft-input`), Save (`terminal.review-note-save`, creates a pending note), Save & attach (`terminal.review-note-save-attach`, creates it and attaches it to the next send) and Cancel. A pending note is listed under Drafts with attach / discard (`terminal.review-note-attach.<noteId>`, `terminal.review-note-discard.<noteId>`); an attached note appears as a chip in the send bar, and detaching it returns it to Drafts. Every edge is re-validated server-side (`PATCH /sessions/{id}/review/notes/{noteId}`).",
+        "elements": [
+          {
+            "id": "terminal.review-note-draft"
+          },
+          {
+            "id": "terminal.review-note-draft-input"
+          },
+          {
+            "id": "terminal.review-note-save"
+          }
+        ],
+        "id": "review-note-draft",
+        "isInitial": false,
+        "name": "Review Note Draft",
+        "transitions": []
+      },
+      {
+        "description": "With at least one note attached, the operator toggled Preview exact text (`terminal.review-preview-toggle`); the send bar shows the exact composed prompt (`terminal.review-send-preview`) that Send would deliver — line 1 the `[review <8-hex>]` marker, then each note's path, hunk header, excerpt and comment (an orphaned note, whose hunk is no longer in the diff, is composed from its stored excerpt and labelled orphaned), then the free text. Send submits it to the PTY (notes become submitted, then confirmed when the marker is seen in the transcript, or UNKNOWN if the session ends first); Insert without sending types it with no Enter and leaves the notes attached — delivery is the operator's.",
+        "elements": [
+          {
+            "id": "terminal.review-send-preview"
+          },
+          {
+            "id": "terminal.review-preview-toggle"
+          }
+        ],
+        "id": "review-send-preview",
+        "isInitial": false,
+        "name": "Review Send Preview",
         "transitions": []
       }
     ]

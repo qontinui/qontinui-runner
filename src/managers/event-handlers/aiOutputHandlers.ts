@@ -102,7 +102,6 @@ export const setupAiOutputHandlers: HandlerSetupFunction = (context) => {
       // FindingsTracker handles:
       // - [FINDING:category:severity] markers
       // - [VERIFICATION:PENDING/COMPLETED/FAILED] markers
-      // - [RUNNER:RESTART] markers
       //
       // Rust backend also parses findings and sends via TauriFindingsListener events.
       if (source === "claude" || source === "ai") {

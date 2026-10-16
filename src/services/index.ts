@@ -48,7 +48,6 @@ export type {
   VerificationPendingMarker,
   VerificationCompletedMarker,
   VerificationFailedMarker,
-  RunnerRestartMarker,
 } from "./VerificationService";
 
 // Findings Tracking Services (categorized findings system)

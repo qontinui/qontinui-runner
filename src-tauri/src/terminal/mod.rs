@@ -16,6 +16,7 @@ pub mod claude_resume_sniff;
 pub mod commit_report;
 pub mod context_watcher;
 pub mod coord_warn;
+pub mod daemon_pane_io;
 pub mod exit_notice;
 pub mod graceful_exit;
 pub mod grid;
@@ -24,6 +25,7 @@ pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_scan;
 pub mod pane_io;
+pub mod pane_output;
 pub mod phantom_turn;
 pub mod remote_pane_io;
 mod scan_gate;
@@ -31,6 +33,9 @@ pub mod scan_interval;
 pub mod session;
 pub mod transcript;
 pub mod transcript_watcher;
+#[cfg(test)]
+mod transport_cost;
+pub mod transport_stats;
 pub mod types;
 pub mod usage_limit;
 pub mod visibility;

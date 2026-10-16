@@ -201,6 +201,11 @@ pub(crate) struct ResourceSample {
     /// equivalent, and a fabricated 0.0 would read as "idle".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) load_1m: Option<f64>,
+    /// Whole-host CPU busy ratio in permille (0..=1000), measured between this
+    /// sample and the previous one on every OS. `None` on the first sample
+    /// after start (no delta exists yet) — never a fabricated 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_busy_permille: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mem_total_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -583,6 +588,7 @@ impl ResourceSample {
             lane_instance,
             cpu_cores: None,
             load_1m: None,
+            cpu_busy_permille: None,
             mem_total_bytes: None,
             mem_available_bytes: None,
             commit_total_bytes: None,
@@ -815,6 +821,87 @@ fn read_memory_status() -> Option<MemoryStatus> {
     }
 }
 
+/// Cumulative CPU time counters, in arbitrary but consistent units (100 ns
+/// ticks on Windows, USER_HZ jiffies on Linux). `busy` excludes idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CpuTimes {
+    pub(crate) idle: u64,
+    pub(crate) total: u64,
+}
+
+/// Busy permille between two cumulative readings, clamped to 0..=1000.
+/// `None` when no time elapsed or a counter went backwards (UNKNOWN, not 0).
+pub(crate) fn cpu_busy_permille_between(prev: CpuTimes, cur: CpuTimes) -> Option<i32> {
+    let total = cur.total.checked_sub(prev.total)?;
+    let idle = cur.idle.checked_sub(prev.idle)?;
+    if total == 0 {
+        return None;
+    }
+    let busy = total.saturating_sub(idle);
+    let permille = (u128::from(busy) * 1000 / u128::from(total)).min(1000);
+    Some(permille as i32)
+}
+
+/// Advance the previous-reading slot and return the delta since it. The first
+/// call (empty slot) stores the reading and returns `None`.
+pub(crate) fn advance_cpu_busy(slot: &mut Option<CpuTimes>, cur: CpuTimes) -> Option<i32> {
+    let prev = slot.replace(cur);
+    prev.and_then(|p| cpu_busy_permille_between(p, cur))
+}
+
+#[cfg(windows)]
+fn read_cpu_times() -> Option<CpuTimes> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetSystemTimes;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut idle, mut kernel, mut user) = (zero, zero, zero);
+    // SAFETY: three valid out-pointers to FILETIME structs.
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    if ok == 0 {
+        return None;
+    }
+    let ft = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    // Kernel time INCLUDES idle time on Windows.
+    Some(CpuTimes {
+        idle: ft(idle),
+        total: ft(kernel).checked_add(ft(user))?,
+    })
+}
+
+/// Parse the aggregate `cpu ` line of `/proc/stat`.
+#[cfg(any(not(windows), test))]
+pub(crate) fn parse_proc_stat_cpu(text: &str) -> Option<CpuTimes> {
+    let line = text.lines().find(|l| l.starts_with("cpu "))?;
+    let v: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .map(|x| x.parse().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if v.len() < 4 {
+        return None;
+    }
+    // user nice system idle iowait irq softirq steal (guest is already in user).
+    let idle = v[3].checked_add(v.get(4).copied().unwrap_or(0))?;
+    let total = v.iter().take(8).try_fold(0u64, |a, x| a.checked_add(*x))?;
+    Some(CpuTimes { idle, total })
+}
+
+#[cfg(not(windows))]
+fn read_cpu_times() -> Option<CpuTimes> {
+    parse_proc_stat_cpu(&std::fs::read_to_string("/proc/stat").ok()?)
+}
+
+/// Host CPU busy permille since the previous call; `None` on the first call.
+fn sample_cpu_busy_permille() -> Option<i32> {
+    static PREV: std::sync::Mutex<Option<CpuTimes>> = std::sync::Mutex::new(None);
+    let cur = read_cpu_times()?;
+    let mut slot = PREV.lock().unwrap_or_else(|e| e.into_inner());
+    advance_cpu_busy(&mut slot, cur)
+}
+
 /// Collect the `host` lane. Blocking (sysinfo refresh + a disk enumeration), so
 /// callers run it on a blocking pool.
 ///
@@ -872,6 +959,8 @@ fn collect_host_lane() -> ResourceSample {
     {
         s.load_1m = Some(sysinfo::System::load_average().one);
     }
+
+    s.cpu_busy_permille = sample_cpu_busy_permille();
 
     // Same volume probe the disk floor gates on, so the dashboard's disk figure
     // and the gate's are literally one reading.
@@ -1689,6 +1778,103 @@ fn warn_once(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_busy_delta_arithmetic() {
+        let a = CpuTimes {
+            idle: 100,
+            total: 200,
+        };
+        let b = CpuTimes {
+            idle: 150,
+            total: 300,
+        };
+        // 100 total, 50 idle -> 500 permille.
+        assert_eq!(cpu_busy_permille_between(a, b), Some(500));
+        assert_eq!(cpu_busy_permille_between(a, a), None);
+    }
+
+    #[test]
+    fn cpu_busy_first_tick_is_none_then_measured() {
+        let mut slot = None;
+        let a = CpuTimes {
+            idle: 0,
+            total: 100,
+        };
+        assert_eq!(advance_cpu_busy(&mut slot, a), None);
+        let b = CpuTimes {
+            idle: 0,
+            total: 200,
+        };
+        assert_eq!(advance_cpu_busy(&mut slot, b), Some(1000));
+    }
+
+    #[test]
+    fn cpu_busy_clamps_and_rejects_backwards() {
+        let a = CpuTimes {
+            idle: 0,
+            total: 100,
+        };
+        // idle moved backwards relative to total growth is rejected, not wrapped.
+        assert_eq!(
+            cpu_busy_permille_between(
+                CpuTimes {
+                    idle: 10,
+                    total: 100
+                },
+                CpuTimes {
+                    idle: 5,
+                    total: 200
+                }
+            ),
+            None
+        );
+        // idle grew more than total: busy saturates at 0.
+        assert_eq!(
+            cpu_busy_permille_between(
+                a,
+                CpuTimes {
+                    idle: 100,
+                    total: 150
+                }
+            ),
+            Some(0)
+        );
+        // counter reset
+        assert_eq!(
+            cpu_busy_permille_between(
+                CpuTimes {
+                    idle: 0,
+                    total: 500
+                },
+                a
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn proc_stat_parse() {
+        let t = parse_proc_stat_cpu("cpu  10 0 10 70 10 0 0 0 0 0\ncpu0 1 1 1 1\n").unwrap();
+        assert_eq!(
+            t,
+            CpuTimes {
+                idle: 80,
+                total: 100
+            }
+        );
+        assert!(parse_proc_stat_cpu("nothing").is_none());
+    }
+
+    #[test]
+    fn host_sample_serializes_cpu_busy_only_when_known() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        let j = serde_json::to_value(&s).unwrap();
+        assert!(j.get("cpu_busy_permille").is_none());
+        s.cpu_busy_permille = Some(420);
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["cpu_busy_permille"], 420);
+    }
 
     #[test]
     fn sample_cadence_is_floored_and_much_faster_than_the_budget() {

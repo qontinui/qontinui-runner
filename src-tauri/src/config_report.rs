@@ -262,11 +262,13 @@ pub struct LayerSpec {
     pub status: LayerStatus,
 }
 
-/// The fifteen layers that feed a runner session, in report order.
+/// The layers that feed a runner session, in report order.
 ///
 /// The count is the point: the plan's original draft claimed fifteen and
 /// enumerated thirteen. Rows 4 and 15 are the two that were missing, and layer
-/// 15 is the one that must never be printed.
+/// 15 is the one that must never be printed. Layers 16 (the outbound proxy rung)
+/// and 17 (the TLS trust census) were added by plan
+/// `2026-10-10-spec-front-end-phase-9-generic-boundary`.
 pub const LAYER_SPECS: &[LayerSpec] = &[
     LayerSpec {
         name: "settings_struct",
@@ -439,6 +441,37 @@ pub const LAYER_SPECS: &[LayerSpec] = &[
                     it is `Withheld` so it can never carry a value into the \
                     renderer",
         anchor: "secure_storage::SecureStorage",
+        side: LayerSide::Lib,
+        status: LayerStatus::Resolved,
+    },
+    LayerSpec {
+        name: "network_proxy",
+        title: "Outbound proxy rung (HTTP and WebSocket)",
+        describes: "whether outbound traffic goes through an HTTP proxy and which \
+                    rung decided it — the operator's own `HTTPS_PROXY` / \
+                    `HTTP_PROXY` / `ALL_PROXY`, the active profile's \
+                    `network.proxy_url` exported at startup, or none (on Windows \
+                    and macOS the OS system proxy may still apply) — plus the \
+                    `NO_PROXY` in force (always exported with loopback, as a \
+                    superset of the Windows bypass list unless the operator set \
+                    their own; an operator `*` is left alone), and \
+                    whether the WebSocket transports tunnel through it or go DIRECT \
+                    past a socks5/https proxy they cannot use. The proxy is shown \
+                    with any credential removed",
+        anchor: "outbound_net::apply_profile_environment_at_startup",
+        side: LayerSide::Lib,
+        status: LayerStatus::Resolved,
+    },
+    LayerSpec {
+        name: "tls_trust",
+        title: "TLS trust source per stack (corporate CA census)",
+        describes: "which trust source each of the runner's TLS stacks uses — the \
+                    OS store, a bundled root list, or UNKNOWN — for the HTTP \
+                    clients, the WebSocket transports, crash reporting, `git`, the \
+                    `claude` CLI and the Python bridge, each with how its verdict is \
+                    known (measured by a test, configured, or not established), so \
+                    a deployment can show its security team what it trusts",
+        anchor: "outbound_net::tls_trust::census",
         side: LayerSide::Lib,
         status: LayerStatus::Resolved,
     },
@@ -890,6 +923,8 @@ fn resolve_layer(
         "settings_json_second_reader" => resolve_settings_json_second_reader(now),
         "profiles_coord_base" => resolve_profiles_coord_base(now),
         "secure_storage_keyring" => resolve_secure_storage(now),
+        "network_proxy" => resolve_network_proxy(now),
+        "tls_trust" => resolve_tls_trust(now),
         // Bin-only layers arrive as data or not at all.
         "settings_struct" => inputs.settings_struct.clone().unwrap_or_else(|| {
             LayerReading::unknown(inputs.observer.missing_injection_reason(spec), now)
@@ -1026,6 +1061,74 @@ fn resolve_profiles_coord_base(now: DateTime<Utc>) -> LayerReading {
             now,
         ),
     }
+}
+
+/// Layer 16 — the outbound proxy rung, as `main` recorded it at startup.
+///
+/// Read from the record `outbound_net::apply_profile_environment_at_startup`
+/// left in this process, never recomputed: a process that never ran that step
+/// (the headless bin) reports UNKNOWN, because what ITS environment would
+/// choose says nothing about the running runner's. The proxy value is the
+/// redacted display form — it structurally carries no credential.
+fn resolve_network_proxy(now: DateTime<Utc>) -> LayerReading {
+    match crate::outbound_net::startup_outcome() {
+        Some(o) => LayerReading::known(
+            format!(
+                "proxy={} no_proxy={} websocket={}",
+                o.proxy.as_deref().unwrap_or("none"),
+                if o.no_proxy.is_empty() {
+                    "(unset)"
+                } else {
+                    o.no_proxy.as_str()
+                },
+                websocket_route_note(o.proxy.as_deref()),
+            ),
+            match &o.profile {
+                Some(p) => format!("{} (profile {p:?})", o.arm.as_str()),
+                None => o.arm.as_str().to_string(),
+            },
+            now,
+        ),
+        None => LayerReading::unknown(
+            "the proxy rung is recorded by the runner's own startup step \
+             (outbound_net::apply_profile_environment_at_startup); this process did not run it",
+            now,
+        ),
+    }
+}
+
+/// How the WebSocket transports treat the environment proxy: tunnelled
+/// through an `http://` proxy, or DIRECT past one they cannot use.
+fn websocket_route_note(proxy: Option<&str>) -> String {
+    match proxy.and_then(|p| p.split_once("://")) {
+        None => "direct-or-os-system-proxy".to_string(),
+        Some((scheme, _)) if crate::outbound_net::proxy_scheme_is_tunnellable(scheme) => {
+            "tunnelled".to_string()
+        }
+        Some((scheme, _)) => format!(
+            "DIRECT (a {scheme}:// proxy cannot carry a WebSocket; only http:// CONNECT can)"
+        ),
+    }
+}
+
+/// Layer 17 — the TLS trust census. Always readable: the table is static
+/// apart from what the startup step exported (a CA bundle, git's backend), and
+/// a process that never ran that step reports the rows that do not depend on
+/// it, with git's and the bundle's columns as for an unconfigured machine —
+/// which the source string says.
+fn resolve_tls_trust(now: DateTime<Utc>) -> LayerReading {
+    let outcome = crate::outbound_net::startup_outcome();
+    let rows = crate::outbound_net::tls_trust::census(outcome);
+    LayerReading::known(
+        crate::outbound_net::tls_trust::render_line(&rows),
+        if outcome.is_some() {
+            "outbound_net::tls_trust::census over the startup outcome"
+        } else {
+            "outbound_net::tls_trust::census — this process did not run the startup step, \
+             so no CA bundle or git backend export is reflected"
+        },
+        now,
+    )
 }
 
 /// Layer 15 — the credential store. Permanently withheld.
@@ -1167,12 +1270,12 @@ mod tests {
         }
     }
 
-    /// The inventory is fifteen layers with unique names, and the names are
-    /// asserted against LITERALS — comparing the table to itself would pin
+    /// The inventory is seventeen layers with unique names (fifteen until the
+    /// outbound proxy rung and the TLS trust census landed), and the names are asserted against LITERALS — comparing the table to itself would pin
     /// nothing, and the count is exactly the fact the plan's draft got wrong.
     #[test]
-    fn config_report_layer_table_is_fifteen_unique_named_layers() {
-        assert_eq!(LAYER_SPECS.len(), 15, "the inventory is fifteen layers");
+    fn config_report_layer_table_is_the_unique_named_inventory() {
+        assert_eq!(LAYER_SPECS.len(), 17, "the inventory is seventeen layers");
 
         let names: Vec<&str> = LAYER_SPECS.iter().map(|s| s.name).collect();
         assert_eq!(
@@ -1193,6 +1296,8 @@ mod tests {
                 "mcp_config_carrier",
                 "mcp_json",
                 "secure_storage_keyring",
+                "network_proxy",
+                "tls_trust",
             ]
         );
 
@@ -1236,7 +1341,7 @@ mod tests {
     /// resolved: the row carries a real reading of a real fact, which is the bar
     /// this column asserts.
     #[test]
-    fn config_report_resolved_layers_are_the_full_fifteen() {
+    fn config_report_resolved_layers_are_the_full_inventory() {
         let resolved: Vec<(&str, LayerSide)> = LAYER_SPECS
             .iter()
             .filter(|s| s.status == LayerStatus::Resolved)
@@ -1260,11 +1365,13 @@ mod tests {
                 ("mcp_config_carrier", LayerSide::ExternalBinary),
                 ("mcp_json", LayerSide::Bin),
                 ("secure_storage_keyring", LayerSide::Lib),
+                ("network_proxy", LayerSide::Lib),
+                ("tls_trust", LayerSide::Lib),
             ]
         );
         assert_eq!(
             resolved.len(),
-            15,
+            17,
             "after Phase 5 every layer in the inventory is resolved"
         );
     }
@@ -1352,7 +1459,11 @@ mod tests {
             .find("secure_storage_keyring")
             .expect("keyring row rendered");
         let keyring_row = &text[start..];
-        let row_body = keyring_row.split("\n---").next().unwrap_or(keyring_row);
+        // The row ends at its own capture stamp; later rows follow it.
+        let row_body = keyring_row
+            .split("captured_at:")
+            .next()
+            .unwrap_or(keyring_row);
         assert!(
             !row_body.contains("value:"),
             "a WITHHELD row must not render a value line:\n{row_body}"
@@ -1416,7 +1527,7 @@ absence of a reading, NOT a finding that the generations agree.
     #[test]
     fn config_report_headless_bin_reports_bin_layers_as_unknown() {
         let report = build_report(&headless_inputs());
-        assert_eq!(report.rows.len(), 15, "every layer gets a row, always");
+        assert_eq!(report.rows.len(), 17, "every layer gets a row, always");
         let row = report
             .row("api_endpoint_registry")
             .expect("the bin-only layer still gets a row");
@@ -1852,7 +1963,7 @@ absence of a reading, NOT a finding that the generations agree.
         let text = report.render();
         assert_eq!(
             text.matches("captured_at: ").count(),
-            15,
+            17,
             "one capture stamp per layer:\n{text}"
         );
     }
