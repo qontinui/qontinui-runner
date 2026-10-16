@@ -2817,7 +2817,7 @@ THE AUTONOMY DIAL. One of:
         let pk = workspace_trust::project_key(&primary).unwrap();
         workspace_trust::ensure_runner_minted_trust_in(&cfg, &pk);
         let before = std::fs::read(&cfg).unwrap();
-        let r = run_finish(&wt, &acct, AutonomyTier::DraftRequired);
+        let r = run_finish(&wt, &acct, AutonomyTier::HoldRequired);
         assert!(!r.conjuncts.parent_repo_trusted.is_satisfied());
         assert!(
             matches!(r.decision, TrustGateDecision::Withhold { .. }),
@@ -2834,7 +2834,7 @@ THE AUTONOMY DIAL. One of:
         let (_tmp, primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
         let pk = workspace_trust::project_key(&primary).unwrap();
         workspace_trust::ensure_trusted_in(&cfg, &pk);
-        let r = run_finish(&wt, &acct, AutonomyTier::DraftRequired);
+        let r = run_finish(&wt, &acct, AutonomyTier::HoldRequired);
         assert_eq!(r.decision.rule(), "derived-from-parent-repo-trust");
         assert!(r.primary_checkout_write_outcome.is_none());
         let wk = workspace_trust::project_key(&wt).unwrap();
@@ -2867,7 +2867,7 @@ THE AUTONOMY DIAL. One of:
             format!("gitdir: {}/.git/worktrees/{name}\n", victim.display()),
         )
         .unwrap();
-        let r = run_finish(&wt, &acct, AutonomyTier::DraftRequired);
+        let r = run_finish(&wt, &acct, AutonomyTier::HoldRequired);
         assert!(
             !r.conjuncts.parent_repo_trusted.is_satisfied(),
             "{:?}",
