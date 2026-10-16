@@ -74,13 +74,20 @@ describe("session manager Resume", () => {
         onResumedTab,
       }),
     );
+    // Resume reads navigator.platform to pick the shell syntax. Node 20 (CI)
+    // has no global navigator, so pin one rather than inherit the host's.
+    vi.stubGlobal("navigator", { platform: "Linux x86_64" } as Navigator);
     vi.useFakeTimers();
-    await shell.handleResumeSession({
-      session_id: "0123456789abcdef",
-      project_path: "/repo",
-      config_dir: "/home/u/.claude",
-    } as TranscriptSession);
-    vi.useRealTimers();
+    try {
+      await shell.handleResumeSession({
+        session_id: "0123456789abcdef",
+        project_path: "/repo",
+        config_dir: "/home/u/.claude",
+      } as TranscriptSession);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
     expect(onResumedTab.mock.calls).toEqual([["t-resumed"]]);
   });
 });
