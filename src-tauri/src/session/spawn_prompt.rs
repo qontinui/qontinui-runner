@@ -1532,6 +1532,8 @@ mod script_tests {
     const STOP_HOOK: &str = include_str!("../../resources/session-restore/claude_stop_hook.sh");
     const PRECOMPACT_HOOK: &str =
         include_str!("../../resources/session-restore/claude_precompact_hook.sh");
+    const BASH_GUARD_HOOK: &str =
+        include_str!("../../resources/session-restore/claude_bash_guard_hook.sh");
 
     /// Every rung of the cascade, exercised unconditionally. `jq` is rung ONE
     /// -- the rung most production boxes actually run -- so skipping it when the
@@ -1589,6 +1591,7 @@ mod script_tests {
     /// stderr — the channel a degrade must announce itself on.
     struct HookRun {
         curl_args: Vec<String>,
+        stdout: String,
         stderr: String,
     }
 
@@ -1674,6 +1677,7 @@ mod script_tests {
                 .lines()
                 .map(str::to_string)
                 .collect(),
+            stdout: String::from_utf8_lossy(&res.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&res.stderr).into_owned(),
         }
     }
@@ -1908,6 +1912,257 @@ mod script_tests {
         }
     }
 
+    // ── The PreToolUse `Bash` command-safety guard ──────────────────────────
+    //
+    // Plan `2026-10-03-runner-sessions-stop-on-builtin-command-safety-prompts`,
+    // Phase 2. Every case runs the REAL bundled script through `bash` on a PATH
+    // holding no interpreter at all (`&[]`), and the payloads are built by
+    // serde_json, so the script sees the same JSON-escaped command text Claude
+    // Code sends.
+
+    /// The command from the plan's "The problem", as observed on 2026-10-03.
+    const GUARD_OBSERVED: &str = "for p in a/b c/d; do f=$S/$d/$(echo $p | tr / _); \
+        if git show $ref:$p > $f 2>/dev/null; then :; else echo \"MISSING $ref $p\"; \
+        rm -f $f; fi; done";
+    /// Its rewrite from the same section — no cleanup `rm` at all.
+    const GUARD_REWRITE: &str = "for p in a/b c/d; do f=$S/$d/$(echo $p | tr / _); \
+        git cat-file -e \"$ref:$p\" 2>/dev/null && git show \"$ref:$p\" > \"$f\" \
+        || echo \"MISSING $ref $p\"; done";
+
+    /// A production-shaped `PreToolUse` payload for `tool_name` running `command`.
+    fn pre_tool_use_payload(tool_name: &str, command: &str, pretty: bool) -> String {
+        let v = serde_json::json!({
+            "session_id": SESSION_ID,
+            "transcript_path": "/t/x.jsonl",
+            "cwd": "/w",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_input": {"command": command, "description": "run it"},
+        });
+        if pretty {
+            serde_json::to_string_pretty(&v).unwrap()
+        } else {
+            v.to_string()
+        }
+    }
+
+    /// Run the guard on a raw stdin `payload`, with `extra` env on top of an
+    /// interpreter-free PATH. Returns its stdout.
+    fn run_bash_guard(payload: &str, extra: &[(&str, &str)]) -> String {
+        run_hook_argv(
+            BASH_GUARD_HOOK,
+            "claude_bash_guard_hook.sh",
+            payload,
+            extra,
+            &[],
+        )
+        .stdout
+    }
+
+    /// The deny envelope's reason, asserting the envelope's shape on the way.
+    fn guard_deny_reason(stdout: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("the guard printed something that is not JSON ({e}): {stdout}")
+        });
+        let out = &v["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "PreToolUse", "{stdout}");
+        assert_eq!(
+            out["permissionDecision"], "deny",
+            "the guard only ever DENIES, never allows: {stdout}"
+        );
+        out["permissionDecisionReason"]
+            .as_str()
+            .expect("a reason string")
+            .to_string()
+    }
+
+    #[test]
+    fn the_bash_guard_denies_the_observed_command_with_a_working_rewrite_reason() {
+        for pretty in [false, true] {
+            let out = run_bash_guard(&pre_tool_use_payload("Bash", GUARD_OBSERVED, pretty), &[]);
+            let reason = guard_deny_reason(&out);
+            assert!(
+                reason.contains("$f"),
+                "names the matched variable: {reason}"
+            );
+            assert!(
+                reason.contains("Dangerous rm operation on possibly-empty variable path"),
+                "quotes the built-in prompt it pre-empts: {reason}"
+            );
+            // The rewrite advice: drop the cleanup rm, or write to a literal /
+            // mktemp path, or refuse an empty value — spelled with the
+            // command's OWN variable, never a stand-in it does not have.
+            assert!(reason.contains("drop the rm"), "{reason}");
+            assert!(reason.contains("mktemp"), "{reason}");
+            assert!(reason.contains("rm -f \"${f:?}\""), "{reason}");
+            assert!(reason.contains("[ -n \"$f\" ] && rm -f \"$f\""), "{reason}");
+            assert!(
+                !reason.contains("NAME") && !reason.contains("@VAR@"),
+                "no placeholder survives when a variable name was matched: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bash_guard_is_silent_on_the_rewrite_and_on_its_pinned_non_matches() {
+        for command in [
+            GUARD_REWRITE,
+            "rm -f \"/literal/path\"",
+            "rm -rf build/",
+            "echo rm $x",
+            // Quoted variable: NOT matched — Phase 0 proved the built-in prompt
+            // for the unquoted form only, and the rule is narrow by design.
+            "rm -f \"$f\"",
+            // Heredoc prose, mid-line and at line start: a command carrying a
+            // heredoc is not judged at all.
+            "cat > notes.md <<'EOF'\nthe cleanup step runs rm $x later\nrm $x\nEOF",
+            "printf 'nothing to delete here'",
+            // A separator or an escaped newline INSIDE quotes is data, not a
+            // command start: quoted segments are blanked before matching.
+            "git commit -m \"fix; rm $x\"",
+            "printf 'a\\nrm $x'",
+            "printf 'a\nrm $x'",
+            // `${NAME:?}` aborts on an empty value — the guarded idiom the
+            // reason itself recommends — bare or quoted.
+            "rm -f ${x:?}",
+            "rm -f ${x:?x is unset}",
+            "rm -f \"${x:?}\"",
+            // ANSI-C / locale quoting: the blanked segment must not read as an
+            // identifier (`$'a'` blanks to `$%`).
+            "rm $'a'",
+            "rm $\"x\"",
+            // Keywords need a command-start position of their own, and a
+            // trailing space: neither is `do` / `then` here.
+            "echo dorm $x",
+            "echo to do rm $x",
+            "echo then rm $x",
+            // A JSON `\\n` preceded by a backslash is a literal backslash-n (or a
+            // line continuation), not a newline command start.
+            "printf a\\nrm $x",
+            "printf a\\\\nrm $x",
+        ] {
+            for pretty in [false, true] {
+                let out = run_bash_guard(&pre_tool_use_payload("Bash", command, pretty), &[]);
+                assert!(out.is_empty(), "{command:?} must draw no output: {out}");
+            }
+        }
+    }
+
+    /// The other side of the boundary, pinned: what DOES match.
+    #[test]
+    fn the_bash_guard_matches_rm_at_command_start_on_an_unquoted_expansion() {
+        for (command, names) in [
+            ("rm -f $f", Some("$f")),
+            ("rm -rf /tmp/${dir}", Some("$dir")),
+            ("cd /w && rm -rf $d/build", Some("$d")),
+            ("cd /w\nrm -rf $d", Some("$d")),
+            ("ls || rm $x", Some("$x")),
+            ("if true; then rm $x; fi", Some("$x")),
+            ("rm -f a.txt $(ls *.tmp)", None),
+            ("rm $((1 + 2))", None),
+            // `${x:-default}` still collapses when the default is empty-ish;
+            // only the `:?` form refuses an empty value.
+            ("rm -f ${x:-/tmp/y}", Some("$x")),
+            // A quoted segment BEFORE the real command start does not hide it.
+            ("echo \"it's; done\"; rm $x", Some("$x")),
+            // Multi-letter UNBRACED names are named WHOLE — the reason must
+            // never name a variable the command does not have (Phase 0).
+            ("rm -rf $DIR", Some("$DIR")),
+            ("rm $foo", Some("$foo")),
+            ("rm -rf /x/$HOME_DIR/y", Some("$HOME_DIR")),
+            ("rm ${DIR}", Some("$DIR")),
+            // Keywords at a real command start.
+            ("for a in b; do rm $item; done", Some("$item")),
+            ("if t; then :; else rm $other; fi", Some("$other")),
+            ("cd /w\ndo rm $q", Some("$q")),
+            // KNOWN FALSE POSITIVE, accepted per D2 (one rewrite turn): quotes
+            // NESTED inside a double-quoted `"$(...)"` are not tracked by the
+            // builtin-only blanking, so the inner `$f` reads as unquoted.
+            ("rm -f \"$(dirname \"$f\")\"/x", Some("$f")),
+        ] {
+            let reason = guard_deny_reason(&run_bash_guard(
+                &pre_tool_use_payload("Bash", command, false),
+                &[],
+            ));
+            // EXACT name, not `contains`: `$D` is a substring of `$DIR`.
+            let named = reason
+                .split_once("built from ")
+                .and_then(|(_, rest)| rest.split_once(", and"))
+                .map(|(name, _)| name)
+                .unwrap_or_else(|| panic!("{command:?}: no named variable in {reason}"));
+            match names {
+                Some(var) => {
+                    assert_eq!(named, var, "{command:?}: {reason}");
+                    let guarded = format!("rm -f \"${{{}:?}}\"", var.trim_start_matches('$'));
+                    assert!(reason.contains(&guarded), "{command:?}: {reason}");
+                }
+                None => assert_eq!(named, "a $(...) expansion", "{command:?}: {reason}"),
+            }
+        }
+    }
+
+    /// The rules see the COMMAND value only — never `description` or any other
+    /// field. Both reproductions from the review of a47330cd: a safe command
+    /// whose description mentions an unquoted `rm $x` drew a deny.
+    #[test]
+    fn the_bash_guard_never_judges_the_description() {
+        for (command, description) in [
+            ("rm -f \"$tmp\"", "Delete the temp file (rm $tmp)"),
+            ("echo hi", "note; rm $x"),
+            ("echo hi", "\"command\": \"rm -f $x\""),
+        ] {
+            for pretty in [false, true] {
+                let v = serde_json::json!({
+                    "session_id": SESSION_ID,
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    // `description` FIRST, so a whole-payload match would see it
+                    // before the command.
+                    "tool_input": {"description": description, "command": command},
+                });
+                let payload = if pretty {
+                    serde_json::to_string_pretty(&v).unwrap()
+                } else {
+                    v.to_string()
+                };
+                let out = run_bash_guard(&payload, &[]);
+                assert!(
+                    out.is_empty(),
+                    "{command:?} / {description:?} must draw no output: {out}"
+                );
+            }
+        }
+    }
+
+    /// Fail open: anything that is not a recognised Bash payload is exit 0 with
+    /// no output (`run_hook_argv` asserts the exit status).
+    #[test]
+    fn the_bash_guard_fails_open_on_empty_garbage_and_other_tools() {
+        for payload in [
+            String::new(),
+            "not json at all; rm -f $f".to_string(),
+            pre_tool_use_payload("Read", "rm -f $f", false),
+            pre_tool_use_payload("BashOutput", "rm -f $f", false),
+            pre_tool_use_payload("Monitor", "rm -f $f", false),
+        ] {
+            let out = run_bash_guard(&payload, &[]);
+            assert!(out.is_empty(), "{payload:?} must draw no output: {out}");
+        }
+    }
+
+    /// D3's zero-child-process property: with `PATH` EMPTIED there is no
+    /// `grep`, `jq`, `python3` or `cat` to reach for, and the deny still comes
+    /// out. A rule that shelled out would print nothing here.
+    #[test]
+    fn the_bash_guard_still_denies_with_path_emptied() {
+        let out = run_bash_guard(
+            &pre_tool_use_payload("Bash", GUARD_OBSERVED, false),
+            &[("PATH", "")],
+        );
+        let reason = guard_deny_reason(&out);
+        assert!(reason.contains("$f"), "{reason}");
+    }
+
     /// The static twin of the behavioural tests above: no bundled hook may
     /// reach for an interpreter without offering `python3` AND a rung that
     /// needs no interpreter at all. This is what catches a reintroduction in
@@ -1919,6 +2174,7 @@ mod script_tests {
             ("claude_session_hook.sh", SESSION_HOOK),
             ("claude_stop_hook.sh", STOP_HOOK),
             ("claude_precompact_hook.sh", PRECOMPACT_HOOK),
+            ("claude_bash_guard_hook.sh", BASH_GUARD_HOOK),
         ] {
             // Strip comments FIRST. Every literal below also appears in the
             // prose explaining the defect, so a grep over the raw file is
@@ -2278,6 +2534,7 @@ mod script_tests {
             ("claude_session_hook.sh", SESSION_HOOK),
             ("claude_precompact_hook.sh", PRECOMPACT_HOOK),
             ("claude_stop_hook.sh", STOP_HOOK),
+            ("claude_bash_guard_hook.sh", BASH_GUARD_HOOK),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let (bin, bash) = isolated_bin(
