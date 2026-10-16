@@ -163,9 +163,12 @@ pub const CROSSCHECK_FRAME_MIN_DELTAS: usize = 20;
 pub const CROSSCHECK_LATE_BAND_FRAMES: f64 = 0.5;
 /// The largest share of compared markers that may be late (from 20 markers).
 /// Chosen from simulations of 60 Hz timelines with DDA at every refresh
-/// (`tools/crosscheck-replay` tests): a sound capture is 0% late at every true
-/// offset; WGC dropping a random 15% of presentations is 14-19% late, every
-/// third 31-36%; a random 10% straddles it (9-15%).
+/// (five seeded runs per case through the replay tool's port of this rule,
+/// plus the second-round review's own simulation): a sound capture is 0% late
+/// at every true offset from 0 to 10 ms; WGC dropping a random 15% of
+/// presentations is 14-19% late; dropping every third is 31-39% late at true
+/// offsets of 5 and 10 ms (and 0% at 0 ms, where a late gap stays under the
+/// bound); a random 10% straddles it (9-15%).
 pub const CROSSCHECK_MAX_LATE_SHARE: f64 = 0.10;
 /// The largest share of the secondary's frames that may report coalesced
 /// presentations (`missed > 0`: DXGI `AccumulatedFrames > 1`) before its

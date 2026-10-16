@@ -309,6 +309,17 @@ test("readingFreeDetail keeps an exit code only by allowlist (second review S1, 
   ];
   for (const k of kept) assert.equal(readingFreeDetail(k), k, k);
   assert.equal(readingFreeDetail("exit 3 (0xC0000005) after 12 ms"), "exit 3 (0xC0000005) after # ms");
+  // Round 4 N3: the status group needs the same terminator after it.
+  for (const [input, want] of [
+    ["exit 5 (0x5)ms", "exit # (#)ms"],
+    ["exit 12 (0xC) 340 ms", "exit # (#) # ms"],
+    ["exit 7 (0x7) (0x8)", "exit # (#) (#)"],
+    ["exit 3 on-demand", "exit # on-demand"],
+    ["exit 3 afterward", "exit # afterward"],
+  ]) assert.equal(readingFreeDetail(input), want, input);
+  for (const k of ["exit 0x1F;", "exit 7 (0xC0000005);", "exited with code 4294967295)", "exit 3 when stopped"]) assert.equal(readingFreeDetail(k), k, k);
+  // The documented limit: a reading worded exactly like an exit code is kept.
+  assert.equal(readingFreeDetail("waited until exit 4500; gave up"), "waited until exit 4500; gave up");
 });
 
 test("readingFreeDetail cuts by code point, never inside a surrogate pair (review N3)", () => {

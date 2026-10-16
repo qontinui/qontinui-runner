@@ -194,16 +194,21 @@ export const READING_FREE_DETAIL_MAX = 240;
  * A process exit code the detail labels as one — an ALLOWLIST, so anything it
  * does not name is masked. The forms: `exit N`, `exit code N`, `exited with
  * code N`, where N is an ASCII-decimal u32 (at most 4294967295, no sign) or
- * `0x` with 1-8 hex digits. N is kept only when what follows it is the end of
- * the text, one of `; , : )`, a parenthesised hex status (`(0xC0000005)`), or
- * whitespace and one of the words after / from / while / on / during / when.
- * Anything else after N — a unit (`ms`, `seconds`, `MiB`, `lines`), a word, a
- * decimal or exponent part, another digit — makes it a reading, masked. Kept:
- * an exit code is the process's verdict on why it stopped, a CAUSE (an access
- * violation, a refusal), not a measurement of the setup.
+ * `0x` with 1-8 hex digits, optionally followed by a parenthesised hex status
+ * (`(0xC0000005)`). What follows N — or the status, when there is one — must be
+ * the end of the text, one of `; , : )`, or whitespace and one of the words
+ * after / from / while / on / during / when. Anything else — a unit (`ms`,
+ * `seconds`, `MiB`, `lines`), a word, a decimal or exponent part, another
+ * digit, a second status — makes it a reading, masked (`exit 5 (0x5)ms` is).
+ * Kept: an exit code is the process's verdict on why it stopped, a CAUSE (an
+ * access violation, a refusal), not a measurement of the setup.
+ *
+ * A known limit: the shape is matched, not the meaning, so a reading worded
+ * exactly like an exit code — "waited until exit 4500; gave up" — is kept.
+ * No producer in this harness words a reading that way; a new one must not.
  */
-const EXIT_FOLLOW = String.raw`(?=$|[;,:)]| \(0[xX][0-9a-fA-F]{1,8}\)|\s+(?:after|from|while|on|during|when)(?![\p{L}\p{N}]))`;
-const EXIT_CODE = String.raw`\b(?:exit|exit code|exited with code) (?<code>[0-9]{1,10}|0[xX][0-9a-fA-F]{1,8})${EXIT_FOLLOW}(?: \(0[xX][0-9a-fA-F]{1,8}\))?`;
+const EXIT_END = String.raw`(?=$|[;,:)]|\s+(?:after|from|while|on|during|when)(?![\p{L}\p{N}-]))`;
+const EXIT_CODE = String.raw`\b(?:exit|exit code|exited with code) (?<code>[0-9]{1,10}|0[xX][0-9a-fA-F]{1,8})(?: \(0[xX][0-9a-fA-F]{1,8}\))?${EXIT_END}`;
 const U32_MAX = 4294967295;
 /**
  * A number: optionally signed (a sign only where no letter or digit precedes it,

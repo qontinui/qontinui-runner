@@ -137,7 +137,7 @@ test("a linux-xvfb run with VS Code labels every VS Code row dom_renderer_fallba
 });
 
 /** A fake run in `env` that records every watch's options; returns the doc and those options. */
-async function profiledRun(t, env, setups) {
+async function profiledRun(t, env, setups, { stale = null } = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "tb-profile-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   mkdirSync(join(tmp, "primary"), { recursive: true });
@@ -150,7 +150,8 @@ async function profiledRun(t, env, setups) {
   const startWatch = probe.startWatch.bind(probe);
   probe.startWatch = (o) => {
     watches.push(o);
-    return startWatch(o);
+    // `stale`: a probe that judges under another profile than its argv says.
+    return startWatch(stale ? { ...o, crosscheckProfile: stale } : o);
   };
   const res = await runBench(fakeRunOptions(join(tmp, "work"), { env, setups, ns: [1], smokeSetups: [], out: join(tmp, "results.json") }), {
     log: () => {},
@@ -191,8 +192,24 @@ test("the profile flows from the environment spec to every watch's probe argv, i
     }
     assert.ok(doc.rows.length > 0);
     for (const r of doc.rows) assert.equal(r.scenario.crosscheck_profile, want, env);
+    // End to end through the gate: the fake probe echoes the profile its argv
+    // carried, so a watch told another profile than the row's would be voided.
+    for (const r of doc.rows) {
+      assert.doesNotMatch(r.kpis.output_latency_ms.detail ?? "", /judged the capture cross-check/, `${env}: ${JSON.stringify(r.kpis.output_latency_ms)}`);
+    }
+    assert.ok(doc.rows.some((r) => r.kpis.output_latency_ms.state === "measured"), `${env}: some row's output latency is measured`);
     assert.equal(validateResults(doc).valid, true, JSON.stringify(validateResults(doc).errors.slice(0, 3)));
     assert.match(renderReport(doc), new RegExp(`\\| ${want} \\|`), "the report shows it beside the row's latency");
+  }
+});
+
+test("a probe that judged under another profile than the environment declared voids the rows' latency, end to end (round 4 S1)", async (t) => {
+  const { doc } = await profiledRun(t, "windows-hosted", ["runner"], { stale: "strict" });
+  assert.ok(doc.rows.length > 0);
+  for (const r of doc.rows) {
+    assert.equal(r.kpis.output_latency_ms.state, "unknown", JSON.stringify(r.kpis.output_latency_ms));
+    assert.equal(r.kpis.output_latency_ms.reason, "harness_error");
+    assert.match(r.kpis.output_latency_ms.detail, /the soak watch judged the capture cross-check under the strict profile; the windows-hosted environment declares software-compositor/);
   }
 });
 

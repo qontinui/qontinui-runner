@@ -165,12 +165,66 @@ test("an unaligned clock or a capture disagreement makes latency unknown, never 
   assertUnknown(cc.kpis.output_latency_ms, "capture_disagreement");
 });
 
-test("a probe that judged the cross-check under another profile than the environment declared is a harness error", () => {
-  const ok = computeRowKpis({ ...withSummary(focusFixture(), { crosscheck: { verdict: "agree", profile: "software-compositor" } }), crosscheckProfile: "software-compositor", environment: "windows-hosted" });
-  assert.notEqual(ok.kpis.output_latency_ms.reason, "harness_error");
-  const bad = computeRowKpis({ ...withSummary(focusFixture(), { crosscheck: { verdict: "agree", profile: "strict" } }), crosscheckProfile: "software-compositor", environment: "windows-hosted" });
-  assertUnknown(bad.kpis.output_latency_ms, "harness_error");
-  assert.match(bad.kpis.output_latency_ms.detail, /under the strict profile; the windows-hosted environment declares software-compositor/);
+/** A row whose soak summary's cross-check block is `cc`, in an environment declaring `declared`. */
+const profiled = (cc, declared = "software-compositor") =>
+  computeRowKpis({ ...withSummary(focusFixture(), { secondary: "dda", crosscheck: cc }), crosscheckProfile: declared, environment: "windows-hosted" });
+
+test("a soak cross-check judged under the declared profile keeps its latency measured (round 4 N5)", () => {
+  const ok = profiled({ verdict: "agree", profile: "software-compositor" });
+  assert.equal(ok.kpis.output_latency_ms.state, "measured", JSON.stringify(ok.kpis.output_latency_ms));
+});
+
+test("a soak cross-check under another, an absent, an empty or a differently spelled profile makes output latency harness_error — and only the latency (round 4 S1, N4)", () => {
+  const good = profiled({ verdict: "agree", profile: "software-compositor" });
+  for (const [cc, said] of [
+    [{ verdict: "agree", profile: "strict" }, /under the strict profile; the windows-hosted environment declares software-compositor/],
+    [{ verdict: "agree" }, /under no recorded profile/],
+    [{ verdict: "agree", profile: "" }, /under no recorded profile/],
+    [{ verdict: "agree", profile: "Software-Compositor" }, /under the Software-Compositor profile/],
+  ]) {
+    const r = profiled(cc);
+    assertUnknown(r.kpis.output_latency_ms, "harness_error");
+    assert.match(r.kpis.output_latency_ms.detail, said, JSON.stringify(cc));
+    // N4: the other capture KPIs are the probe's own, untouched by the profile.
+    for (const id of ["frame_interval_ms", "jank_share", "hangs", "marker_loss", "marker_skipped"]) {
+      assert.deepEqual(r.kpis[id], good.kpis[id], `${id} under ${JSON.stringify(cc)}`);
+    }
+  }
+  // No declared profile (an older caller) or no cross-check block: no gate.
+  const undeclared = computeRowKpis(withSummary(focusFixture(), { crosscheck: { verdict: "agree" } }));
+  assert.equal(undeclared.kpis.output_latency_ms.state, "measured");
+});
+
+test("the input watch's cross-check is held to the declared profile too (round 4 S2)", () => {
+  const injectT0 = T0 + BigInt(SOAK_MS + 1000) * MS;
+  const keys = [];
+  const echoes = [];
+  const seen = [];
+  for (let i = 0; i < 120; i += 1) {
+    const tInject = injectT0 + BigInt(i * 100) * MS;
+    keys.push({ type: "inject", index: i, key: "a", t_inject_ns: String(tInject), t_check_ns: String(tInject), tagged: true });
+    echoes.push({ seq: i, byte: 97, tEmit: tInject + 2n * MS });
+    seen.push({ session: 0, seq: i, t: tInject + 30n * MS });
+  }
+  const gen = genLog({ session: 0, t0: T0 - 5000n * MS, durationMs: SOAK_MS + 30000, echoes });
+  const row = (inputProfile) => {
+    const records = watchSegment({ t0: injectT0 - 200n * MS, durationMs: 13000, sessions: [{ session: 0, gen, latencyMs: 20 }], echoSeen: seen, crosscheckProfile: inputProfile });
+    const soak = withSummary(focusFixture(), { crosscheck: { verdict: "agree", profile: "software-compositor" } });
+    return computeRowKpis({
+      ...soak,
+      environment: "windows-hosted",
+      crosscheckProfile: "software-compositor",
+      gens: indexGenerators(new Map([[0, gen]])),
+      input: { records, injects: keys, focusSession: 0, echoBase: 0 },
+    }).kpis;
+  };
+  assert.equal(row("software-compositor").input_latency_ms.state, "measured", JSON.stringify(row("software-compositor").input_latency_ms));
+  for (const wrong of ["strict", undefined]) {
+    const k = row(wrong);
+    assertUnknown(k.input_latency_ms, "harness_error");
+    assert.match(k.input_latency_ms.detail, /^the input watch judged the capture cross-check/);
+    assert.equal(k.output_latency_ms.state, "measured", "the soak's own profile was right");
+  }
 });
 
 test("a measured latency whose cross-check was not performed says so in the row's notes (review N3)", () => {

@@ -243,11 +243,20 @@ function main(argv) {
   const json = argv.includes("--json");
   const ri = argv.indexOf("--refresh-ms");
   const refreshMs = ri >= 0 ? Number(argv[ri + 1]) : undefined;
+  const usage = "usage: crosscheck-replay.mjs <probe-*.jsonl>... [--json] [--refresh-ms N] [--profile strict|software-compositor]\n";
   const pi = argv.indexOf("--profile");
   const profile = pi >= 0 ? argv[pi + 1] : undefined;
+  if (pi >= 0 && (profile === undefined || profile.startsWith("--"))) {
+    process.stderr.write(`--profile needs a value (strict or software-compositor)\n${usage}`);
+    return 2;
+  }
+  if (ri >= 0 && (argv[ri + 1] === undefined || argv[ri + 1].startsWith("--"))) {
+    process.stderr.write(`--refresh-ms needs a value\n${usage}`);
+    return 2;
+  }
   const files = argv.filter((a, i) => !a.startsWith("--") && !(ri >= 0 && i === ri + 1) && !(pi >= 0 && i === pi + 1));
   if (files.length === 0) {
-    process.stderr.write("usage: crosscheck-replay.mjs <probe-*.jsonl>... [--json] [--refresh-ms N]\n");
+    process.stderr.write(usage);
     return 2;
   }
   for (const f of files) {

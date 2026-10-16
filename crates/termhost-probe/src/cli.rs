@@ -472,4 +472,39 @@ mod tests {
         };
         assert!(s.validate().is_err());
     }
+
+    /// The cross-check profile parses, defaults to strict, and refuses an
+    /// unknown name (round 4 N1).
+    #[test]
+    fn watch_parses_the_crosscheck_profile_and_defaults_to_strict() {
+        let watch = |extra: &[&str]| {
+            let mut argv = vec!["termhost-probe", "watch", "--run-dir", "r", "--pid", "7"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let Cmd::Watch(w) = watch(&[]).expect("parses").cmd else {
+            panic!("watch")
+        };
+        assert_eq!(w.crosscheck_profile, CrosscheckProfileArg::Strict);
+        assert_eq!(
+            crate::model::analysis::CrosscheckProfile::from(w.crosscheck_profile),
+            crate::model::analysis::CrosscheckProfile::Strict
+        );
+        let Cmd::Watch(w) = watch(&["--crosscheck-profile", "software-compositor"])
+            .expect("parses")
+            .cmd
+        else {
+            panic!("watch")
+        };
+        assert_eq!(
+            w.crosscheck_profile,
+            CrosscheckProfileArg::SoftwareCompositor
+        );
+        assert_eq!(
+            crate::model::analysis::CrosscheckProfile::from(w.crosscheck_profile).as_str(),
+            "software-compositor"
+        );
+        assert!(watch(&["--crosscheck-profile", "lenient"]).is_err());
+        assert!(watch(&["--crosscheck-profile"]).is_err());
+    }
 }

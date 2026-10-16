@@ -89,7 +89,7 @@ export function genLog({
  *   sessions?: {session: number, gen: object[], latencyMs: number, rect?: object, hidden?: boolean}[],
  *   frameHz?: number, bands?: boolean, intervalClass?: (i: number) => string | null,
  *   hostPids?: number[], cpuPct?: number, memMb?: number, gpu?: string, hostExits?: object[],
- *   crosscheck?: string, captureFailed?: boolean, echoSeen?: {session: number, seq: number, t: bigint}[],
+ *   crosscheck?: string, crosscheckProfile?: string, captureFailed?: boolean, echoSeen?: {session: number, seq: number, t: bigint}[],
  *   behind?: boolean | null, hangs?: number, groupNote?: (group: string, k: number) => string | null,
  * }} o
  */
@@ -110,6 +110,7 @@ export function watchSegment({
   gpu = "unsupported: no PDH on Linux",
   hostExits = [],
   crosscheck = "not_performed",
+  crosscheckProfile,
   captureFailed = false,
   echoSeen = [],
   behind = false,
@@ -220,6 +221,7 @@ export function watchSegment({
       refreshAssumed,
       captureFailed,
       crosscheck,
+      crosscheckProfile,
       behind,
       hangs,
       groupAcc,
@@ -235,7 +237,7 @@ export function watchSegment({
  * `finish`, for the cases a fixture draws): the capture KPIs, V, the sessions
  * seen, interval counts, process groups and the probe's own health.
  */
-function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, refreshAssumed, captureFailed, crosscheck, behind, hangs, groupAcc, crashes }) {
+function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, refreshAssumed, captureFailed, crosscheck, crosscheckProfile, behind, hangs, groupAcc, crashes }) {
   const frames = recs.filter((r) => r.type === "frame" && r.source === primary);
   const deltas = [];
   for (let i = 1; i < frames.length; i += 1) deltas.push(Number(BigInt(frames[i].t_ns) - BigInt(frames[i - 1].t_ns)) / 1e6);
@@ -342,7 +344,9 @@ function probeSummary({ t0, t1, primary, recs, sessions, firstSeen, refreshMs, r
     input_latency_ms: unknownKpi("input_latency_ms", "not_instrumented", { n: 0, detail: "watch receives no injection times" }),
     marker_loss: gate("marker_loss", true, shareKpi("marker_loss", lost, counted)),
     marker_skipped: gate("marker_skipped", true, shareKpi("marker_skipped", 0, counted)),
-    crosscheck: { verdict: crosscheck, compared: 0, agreed: 0, disagreed: 0, detail: crosscheck === "disagree" ? "3 of 40 markers disagreed" : "n/a" },
+    // The probe echoes the profile it was told (`--crosscheck-profile`); a watch
+    // told none records none.
+    crosscheck: { verdict: crosscheck, ...(crosscheckProfile ? { profile: crosscheckProfile } : {}), compared: 0, agreed: 0, disagreed: 0, detail: crosscheck === "disagree" ? "3 of 40 markers disagreed" : "n/a" },
     negative_latencies: 0,
     crashes,
     processes: Object.fromEntries(Object.entries(groupAcc).map(([name, acc]) => [name, processSummary(acc)])),

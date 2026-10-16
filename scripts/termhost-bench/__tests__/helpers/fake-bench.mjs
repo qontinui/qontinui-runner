@@ -9,6 +9,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { watchArgs } from "../../probe.mjs";
 import { readSlots } from "../../sessions.mjs";
 import { MS, genLog, watchSegment } from "./bench-fixtures.mjs";
 
@@ -191,7 +192,11 @@ export function fakeProbe({ clock, current }) {
               latencyMs: 20,
               rect: { x: 10 + 300 * (k % 3), y: 40 + 300 * Math.floor(k / 3), w: 160, h: 16 },
             }));
-          return { records: watchSegment({ t0, durationMs: Math.max(1, Number((t1 - t0) / MS)), sessions }), exit: { code: 0 } };
+          // Like the real probe, the summary echoes the --crosscheck-profile its argv carried.
+          const argv = watchArgs(o);
+          const pi = argv.indexOf("--crosscheck-profile");
+          const crosscheckProfile = pi >= 0 ? argv[pi + 1] : undefined;
+          return { records: watchSegment({ t0, durationMs: Math.max(1, Number((t1 - t0) / MS)), sessions, crosscheckProfile }), exit: { code: 0 } };
         },
       };
     },

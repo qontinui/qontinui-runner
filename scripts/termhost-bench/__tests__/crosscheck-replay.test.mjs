@@ -182,5 +182,19 @@ test("the CLI reads a probe watch file, prints one verdict per file, and exits 2
   const refused = spawnSync(process.execPath, [TOOL, changes], { encoding: "utf8" });
   assert.equal(refused.status, 2);
   assert.match(refused.stderr, /--frames changes/);
-  assert.equal(spawnSync(process.execPath, [TOOL], { encoding: "utf8" }).status, 2);
+  const bare = spawnSync(process.execPath, [TOOL], { encoding: "utf8" });
+  assert.equal(bare.status, 2);
+  assert.match(bare.stderr, /\[--profile strict\|software-compositor\]/, "the usage line lists --profile");
+  // Round 4 N2: a bare --profile is an error, never a file name or a default.
+  for (const argv of [[file, "--profile"], [file, "--profile", "--json"]]) {
+    const r = spawnSync(process.execPath, [TOOL, ...argv], { encoding: "utf8" });
+    assert.equal(r.status, 2, argv.join(" "));
+    assert.match(r.stderr, /--profile needs a value/);
+  }
+  const unknown = spawnSync(process.execPath, [TOOL, file, "--profile", "lenient"], { encoding: "utf8" });
+  assert.equal(unknown.status, 2);
+  assert.match(unknown.stderr, /unknown cross-check profile/);
+  const soft = spawnSync(process.execPath, [TOOL, file, "--profile", "software-compositor", "--json"], { encoding: "utf8" });
+  assert.equal(soft.status, 0, soft.stderr);
+  assert.equal(JSON.parse(soft.stdout.trim()).profile, "software-compositor");
 });

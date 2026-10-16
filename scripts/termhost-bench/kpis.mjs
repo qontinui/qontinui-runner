@@ -209,6 +209,27 @@ export function captureInfo(seg) {
   return { opened, failed, primary, refreshHz, refreshSource, refreshKnown };
 }
 
+/**
+ * A watch whose cross-check was judged under another profile than the
+ * environment declared — or whose summary does not say which (an absent or
+ * empty `profile`: a probe that predates the argument, or one that lost it) —
+ * answers a different question: its latency KPIs are unknown(harness_error).
+ * Only when the environment declared a profile and the watch has a cross-check
+ * block to judge.
+ *
+ * @returns {{reason: string, detail: string} | null}
+ */
+export function crosscheckProfileGate(p, summary, phase) {
+  const cc = summary?.crosscheck;
+  if (!p?.crosscheckProfile || !cc || typeof cc !== "object") return null;
+  if (cc.profile === p.crosscheckProfile) return null;
+  const said = typeof cc.profile === "string" && cc.profile !== "" ? `under the ${cc.profile} profile` : "under no recorded profile";
+  return {
+    reason: "harness_error",
+    detail: `the ${phase} watch judged the capture cross-check ${said}; the ${p.environment} environment declares ${p.crosscheckProfile}`,
+  };
+}
+
 /** Below this many frames with a known lag the probe gives no `behind` verdict (`model::LAG_VERDICT_MIN_FRAMES`). */
 export const LAG_VERDICT_MIN_FRAMES = 10;
 
@@ -1221,14 +1242,6 @@ export function computeRowKpis(p) {
           ? `no primary capture source opened: ${cap.failed.map((f) => `${f.source}: ${f.detail}`).join("; ")}`
           : "no primary capture source opened",
     };
-  } else if (p.crosscheckProfile && summary.crosscheck?.profile && summary.crosscheck.profile !== p.crosscheckProfile) {
-    // The probe judged the cross-check under another profile than the
-    // environment declared (a stale probe, or the argument lost on the way):
-    // its latency verdict answers a different question.
-    captureGate = {
-      reason: "harness_error",
-      detail: `the probe judged the capture cross-check under the ${summary.crosscheck.profile} profile; the ${p.environment} environment declares ${p.crosscheckProfile}`,
-    };
   } else if (p.armFailure) {
     captureGate = p.armFailure;
   } else if (primaryFrameCount === 0 || va === null) {
@@ -1241,11 +1254,16 @@ export function computeRowKpis(p) {
   }
   const gated = (id) => captureGate && CAPTURE_KPIS.includes(id);
   const gateValue = (id) => unknownKpi(id, captureGate.reason, { detail: captureGate.detail });
+  // The cross-check's profile gates only the latency it judges (output here,
+  // input in inputLatencyKpi), never the rest of the capture KPIs.
+  const profileGate = captureGate ? null : crosscheckProfileGate(p, summary, "soak");
 
   // --- the probe's capture KPIs -------------------------------------------
   for (const id of PROBE_CAPTURE_KPIS) {
     if (gated(id)) {
       set(id, gateValue(id));
+    } else if (id === "output_latency_ms" && profileGate) {
+      set(id, unknownKpi(id, profileGate.reason, { detail: profileGate.detail }));
     } else if (id === "output_latency_ms" && clockGate(p, id)) {
       // A generator's emission (node hrtime) against a first appearance (probe).
       set(id, clockGate(p, id));
@@ -1582,6 +1600,8 @@ export function inputLatencyKpi(p, captureGate) {
   const seg = indexProbeSegment(inp.records ?? []);
   const cap = captureInfo(seg);
   if (!cap.primary) return unknownKpi(id, "capture_unavailable", { detail: "the input phase's watch opened no capture source" });
+  const profileGate = crosscheckProfileGate(p, seg.summary, "input");
+  if (profileGate) return unknownKpi(id, profileGate.reason, { detail: profileGate.detail });
   const health = probeHealthGate(seg);
   if (health) return unknownKpi(id, health.reason, { detail: health.detail });
   if (seg.summary?.crosscheck?.verdict === "disagree") {
