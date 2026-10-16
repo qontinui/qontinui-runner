@@ -156,6 +156,19 @@ fn hang_records(out: &[Record]) -> Vec<&crate::records::HangRecord> {
 }
 
 #[test]
+fn primary_frame_within_is_half_open_and_ignores_the_secondary() {
+    let mut m = Model::new(cfg(), 0);
+    m.on_frame(frame(SourceId::Wgc, 1, 100, vec![]));
+    m.on_frame(frame(SourceId::Dda, 1, 150, vec![]));
+    m.on_frame(frame(SourceId::Wgc, 2, 200, vec![]));
+    assert!(m.primary_frame_within(100 * MS, 101 * MS), "the start is inclusive");
+    assert!(!m.primary_frame_within(101 * MS, 200 * MS), "the end is exclusive, and a secondary frame does not count");
+    assert!(m.primary_frame_within(101 * MS, 200 * MS + 1));
+    assert!(!m.primary_frame_within(201 * MS, 1000 * MS), "nothing after the last frame");
+    assert!(!m.primary_frame_within(0, 100 * MS));
+}
+
+#[test]
 fn first_appearance_is_recorded_once_per_source() {
     let mut m = Model::new(cfg(), 0);
     let a = m.on_frame(frame(
