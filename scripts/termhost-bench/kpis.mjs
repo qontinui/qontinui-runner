@@ -706,6 +706,8 @@ export const LOSS_EFFECTS = Object.freeze({
   unplaced_cut: "an end (or WGC loss) that could not be placed in time: no frameless tail at all",
   cut_superseded: "an end after an earlier one: no effect",
   restart: "a retry, no later frame read: the tail is counted from it",
+  at_tail_end: "a failed read at the tail's end: no frameless tail",
+  no_tail: "a retry with no frameless tail to start (no primary frame in the window, or capture ended at or before the last frame): no effect",
   at_last_frame: "a retry around the last frame, no later frame read: the tail is counted from the last frame",
   superseded: "a retry, no later frame read; superseded by a later failed read",
   after_end: "a retry placed after capture ended: no effect",
@@ -729,7 +731,9 @@ export function lossEffects(losses, lastFrameT, win) {
     if (x.t === null) return "unplaced_retry";
     if (x.later) return "later";
     if (x.t > tail.tailEnd) return "after_end";
-    if (i === tail.restartBy) return "restart";
+    // No tail can follow: no primary frame, or an end at or before the last frame.
+    if (lastFrameT === null || tail.tailEnd <= end) return "no_tail";
+    if (i === tail.restartBy) return tail.tailStart === tail.tailEnd ? "at_tail_end" : "restart";
     return tail.restartBy >= 0 ? "superseded" : "at_last_frame";
   });
   return { effects, ...tail };

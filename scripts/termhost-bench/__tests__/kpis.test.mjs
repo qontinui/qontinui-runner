@@ -1421,7 +1421,7 @@ test("r16 S3: a failed read exactly at the window's end, or at an end's cut, lea
   const e = effectsOf([L(59_999, { exact: true })]);
   assert.deepEqual([e.tailStart, e.tailEnd], [at(59_999), at(60_000)]);
   assert.deepEqual(run([lostAt(50_000, "x11", { exact: true }), L(50_000, { exact: true })]), [], "at the cut");
-  assert.deepEqual(effectsOf([L(60_000, { exact: true })]).effects, ["restart"]);
+  assert.deepEqual(effectsOf([L(60_000, { exact: true })]).effects, ["at_tail_end"]);
 });
 
 test("r16 S3: only a WGC primary cuts on a failed read with no later frame; X11 and other sources do not (review r16 S3)", () => {
@@ -1448,8 +1448,8 @@ test("r16 S2: losses are one bounded summary on the row, unplaced ones included,
   assert.equal(xs.length, 800);
   const line = summarizeLosses(xs, last20, winTo(60_000));
   assert.ok(line.length < 600, `${line.length}: ${line}`);
-  assert.match(line, /^800 primary capture loss\(es\) \(x11; first \+20050 ms, last \+60000 ms\): 1 x a retry, no later frame read: the tail is counted from it at \+60000 ms; 799 x a retry, no later frame read; superseded by a later failed read \+20050 ms\.\.\+59950 ms; no frameless tail /);
-  assert.deepEqual(lossGroups(xs, last20, winTo(60_000)).map((g) => [g.effect, g.count, g.firstMs, g.lastMs]), [["restart", 1, 60_000, 60_000], ["superseded", 799, 20_050, 59_950]]);
+  assert.match(line, /^800 primary capture loss\(es\) \(x11; first \+20050 ms, last \+60000 ms\): 1 x a failed read at the tail's end: no frameless tail at \+60000 ms; 799 x a retry, no later frame read; superseded by a later failed read \+20050 ms\.\.\+59950 ms; no frameless tail /);
+  assert.deepEqual(lossGroups(xs, last20, winTo(60_000)).map((g) => [g.effect, g.count, g.firstMs, g.lastMs]), [["at_tail_end", 1, 60_000, 60_000], ["superseded", 799, 20_050, 59_950]]);
   // A long detail is cut.
   const long = captureLosses(lostSeg(f20, [{ ...L(30_000, { exact: true }), detail: `x11 capture lost (re-establishing): ${"x".repeat(500)}` }]), all);
   assert.ok(summarizeLosses(long, last20, winTo(60_000)).length < LOSS_DETAIL_MAX + 400);
@@ -1469,4 +1469,24 @@ test("r16 S1: a failed read exactly at the last frame does not restart the tail;
   const e = effectsOf([L(20_000, { exact: true })]);
   assert.deepEqual([e.effects, e.restartBy, e.tailStart], [["at_last_frame"], -1, last20]);
   assert.deepEqual(effectsOf([L(20_001, { exact: true })]).effects, ["restart"]);
+});
+
+test("r17: a retry where no tail can follow, or at the tail's end, says so (review r17)", () => {
+  const M = 1_000_000n;
+  const win = { t0: 0n, t1: 10_000n * M };
+  const R = (ms, o = {}) => ({ t: BigInt(ms) * M, exact: true, ended: false, source: "x11", cuts: false, later: false, detail: "d", ...o });
+  // A: no primary frame in the window.
+  assert.deepEqual(lossEffects([R(3000)], null, win).effects, ["no_tail"]);
+  assert.match(summarizeLosses([R(3000)], null, win), /1 x a retry with no frameless tail to start .*: no effect at \+3000 ms \(e\.g\./);
+  // B: an end at 4 s before the last frame at 5 s: the retry at 3 s has nothing to start.
+  assert.deepEqual(lossEffects([R(3000), R(4000, { ended: true, cuts: true })], 5000n * M, win).effects, ["no_tail", "ended"]);
+  // An unplaced WGC cut sets the tail's end at the last frame: not "at_last_frame".
+  assert.deepEqual(lossEffects([R(4900, { source: "wgc" }), R(0, { t: null, source: "wgc", cuts: true })], 5000n * M, win).effects, ["no_tail", "unplaced_cut"]);
+  // ... and with a tail, the same retry is at_last_frame.
+  assert.deepEqual(lossEffects([R(4900)], 5000n * M, win).effects, ["at_last_frame"]);
+  // C: a retry exactly at the window's end: it sets the start, and there is no tail.
+  const c = lossEffects([R(10_000)], 5000n * M, win);
+  assert.deepEqual([c.effects, c.tailStart === c.tailEnd], [["at_tail_end"], true]);
+  assert.match(summarizeLosses([R(10_000)], 5000n * M, win), /1 x a failed read at the tail's end: no frameless tail at \+10000 ms; no frameless tail/);
+  assert.deepEqual(lossEffects([R(9999)], 5000n * M, win).effects, ["restart"]);
 });
