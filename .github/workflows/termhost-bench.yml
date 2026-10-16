@@ -688,6 +688,12 @@ jobs:
             exit 2
           }
           echo "verdict: $v (compare exited $rc)"
+          # A head that lost readings the baseline measured (e.g. wedged at one N)
+          # leaves the gate unknown and the job green: say so where it is seen.
+          r="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).reason))' "$verdict" 2>/dev/null || true)"
+          if [ "$v" = unknown ] && [[ "$r" == head_unknown_where_baseline_measured* ]]; then
+            echo "::warning::termhost-bench: the head build lost readings the baseline build measured (${r%%;*}); the regression gate is unknown, not passed"
+          fi
           if [ "$v" = regression ]; then
             echo "::error::termhost-bench: the head build regressed against the baseline build $BASELINE (see the job summary)"
             exit 1
@@ -1088,6 +1094,12 @@ jobs:
             exit 2
           }
           echo "verdict: $v (compare exited $rc)"
+          # A head that lost readings the baseline measured (e.g. wedged at one N)
+          # leaves the gate unknown and the job green: say so where it is seen.
+          r="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).reason))' "$verdict" 2>/dev/null || true)"
+          if [ "$v" = unknown ] && [[ "$r" == head_unknown_where_baseline_measured* ]]; then
+            echo "::warning::termhost-bench: the head build lost readings the baseline build measured (${r%%;*}); the regression gate is unknown, not passed"
+          fi
           if [ "$v" = regression ]; then
             echo "::error::termhost-bench: the head build regressed against the baseline build $BASELINE (see the job summary)"
             exit 1

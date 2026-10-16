@@ -482,10 +482,15 @@ test("GATE_SIMULATION matches the thresholds, and the README quotes its figures"
   const readme = readFileSync(join(HERE, "..", "README.md"), "utf8");
   const line = readme.split("\n").find((l) => l.startsWith("Seeded simulation"));
   assert.ok(line, "the README's simulation paragraph");
-  for (const sim of Object.values(GATE_SIMULATION)) {
-    for (const v of [sim.null.independent, sim.null.shared, sim.power.independent, sim.power.shared]) assert.ok(line.includes(`${v.toFixed(2)} %`), `README quotes ${v.toFixed(2)} %`);
-    assert.ok(line.includes(`relative ${sim.relative}`) || line.includes(`, ${sim.relative})`), `README quotes threshold ${sim.relative}`);
-  }
+  // Each figure in its labelled position: a swap of two figures fails.
+  const L = GATE_SIMULATION["linux-xvfb"];
+  const W = GATE_SIMULATION["windows-hosted"];
+  const f = (v) => `${v.toFixed(2)} %`;
+  const expected =
+    `with nothing changed the gate goes red ${f(L.null.shared)} of the time on linux-xvfb (${L.runs} runs, relative ${L.relative}) ` +
+    `and ${f(W.null.shared)} on windows-hosted (${W.runs} runs, ${W.relative}), or ${f(L.null.independent)} / ${f(W.null.independent)} with no sharing; ` +
+    `a 30 % regression across every N goes red ${f(L.power.shared)} / ${f(W.power.shared)}, or ${f(L.power.independent)} / ${f(W.power.independent)} with no sharing.`;
+  assert.ok(line.includes(expected), `the README states, in place:\n${expected}`);
   const doc = readFileSync(join(HERE, "..", "compare.mjs"), "utf8");
   assert.doesNotMatch(doc, /no change \d+(\.\d+)? % \(/, "compare.mjs prose carries no hand-copied figures");
 });
@@ -859,6 +864,13 @@ test("the verdict steps, executed: unknown passes, regression fails, and no verd
       assert.equal(wedged.status, 0, `${env}: ${wedged.out}`);
       assert.equal(JSON.parse(readFileSync(join(wedged.dir, `termhost-bench-${env}-verdict.json`), "utf8")).verdict, "unknown");
       assert.match(wedged.summary, /head_unknown_where_baseline_measured: N=15 focus, N=15 tiled/);
+      assert.match(
+        wedged.out,
+        /^::warning::termhost-bench: the head build lost readings the baseline build measured \(head_unknown_where_baseline_measured: N=15 focus, N=15 tiled\); the regression gate is unknown, not passed$/m,
+        `${env}: the annotation`,
+      );
+      // An unknown for any other reason carries no such annotation.
+      assert.doesNotMatch(noFile.out, /::warning::termhost-bench: the head build lost/, env);
 
       const noResults = runStep("no-results", { baseline: BASE, results: null, baselineFileContent: bfile });
       assert.equal(noResults.status, 0, `${env}: ${noResults.out}`);
