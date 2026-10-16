@@ -89,6 +89,10 @@ report options:
   --require-measured-if-operative <mechanism>:<kpi,...>
                              these KPIs must read measured at --at-n only where the results'
                              capabilities report <mechanism> OPERATIVE (e.g. capture.wgc:output_latency_ms)
+  --accept-capture-health-unknown
+                             third-party smokes on windows-hosted only: a third-party row's capture KPI
+                             may read unknown for capture health (capture_disagreement, or the probe fell
+                             behind); every other unknown still fails, runner rows are never excused (D6)
 `;
 
 const LIST = (s) =>
@@ -141,7 +145,7 @@ const FLAGS_WITH_VALUES = new Set([
   "wsl-distro",
   "require-measured-if-operative",
 ]);
-const BOOLEAN_FLAGS = new Set(["json", "help"]);
+const BOOLEAN_FLAGS = new Set(["json", "help", "accept-capture-health-unknown"]);
 
 /** Every option the CLI accepts (a workflow that passes another one fails at parse time). */
 export const KNOWN_FLAGS = Object.freeze([...FLAGS_WITH_VALUES, ...BOOLEAN_FLAGS]);
@@ -429,6 +433,7 @@ function cmdReport(positional, flags, io) {
     arms: flags.arms ? LIST(flags.arms) : undefined,
     roles: flags.roles ? LIST(flags.roles) : undefined,
     abBaseline: Boolean(flags["ab-baseline"]),
+    acceptCaptureHealthUnknown: Boolean(flags["accept-capture-health-unknown"]),
   });
   io.out(flags.format === "json" ? `${JSON.stringify({ valid: true, failures }, null, 2)}\n` : renderReport(doc));
   if (failures.length > 0) {

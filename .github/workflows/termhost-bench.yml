@@ -719,6 +719,11 @@ jobs:
   #   - vscode: the same, asserted on a file that never leaves the VM.
   #   - windows-terminal: the same at its N, asserted on its own file that never
   #     leaves the VM.
+  #   Both third-party smokes pass --accept-capture-health-unknown: on this
+  #   software-composited VM their capture KPIs may read unknown for CAPTURE
+  #   health (WGC/DDA disagreement, or the probe fell behind) — a third-party
+  #   smoke here checks plumbing (D6). Any other unknown still fails, and the
+  #   plumbing KPIs must still be measured. The runner's gate does not pass it.
   #
   # What leaves the VM (D7): the runner's own rows, as in the Linux job — the
   # redacted copy, the job summary rendered from it, and runner unit logs on
@@ -1047,7 +1052,8 @@ jobs:
           node scripts/termhost-bench/cli.mjs report "$results" --format json \
             --setups vscode --arms "$ARMS" --require-rows-n "$N" \
             --require-measured cpu_pct,memory_mb,producer_stall_pct --at-n "$GATE_N" \
-            --require-measured-if-operative capture.wgc:output_latency_ms
+            --require-measured-if-operative capture.wgc:output_latency_ms \
+            --accept-capture-health-unknown
 
       # D7: an assert-only smoke, as VS Code's. Its results file, unit directories
       # (the private settings, the unpacked build) and archive cache stay in the
@@ -1088,7 +1094,8 @@ jobs:
           node scripts/termhost-bench/cli.mjs report "$results" --format json \
             --setups windows-terminal --arms "$ARMS" --require-rows-n "$WT_N" \
             --require-measured cpu_pct,memory_mb,producer_stall_pct --at-n "$WT_GATE_N" \
-            --require-measured-if-operative capture.wgc:output_latency_ms
+            --require-measured-if-operative capture.wgc:output_latency_ms \
+            --accept-capture-health-unknown
 
       # Runner unit directories only (`u<k>-runner-...` under the A/B's work
       # dir). The VS Code and Windows Terminal smokes' work dirs (tb-vscode,

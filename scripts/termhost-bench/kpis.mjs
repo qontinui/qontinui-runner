@@ -234,6 +234,30 @@ export function crosscheckProfileGate(p, summary, phase) {
   };
 }
 
+/**
+ * How every probe-fell-behind verdict begins: the harness's (`probeHealthGate`)
+ * and the probe's own (`crates/termhost-probe/src/model/mod.rs`, the KPIs it
+ * computes itself). A KPI value has no field for a cause beyond its reason code
+ * (the schema's kpiValue is closed), so this one prefix is the shared token;
+ * tests pin both producers to it.
+ */
+export const PROBE_BEHIND_DETAIL = "the probe fell behind";
+
+/**
+ * Is `kpi` unknown because the CAPTURE could not be trusted — WGC and DDA
+ * disagreed (capture_disagreement) or the probe fell behind its source
+ * (harness_error with the probe-behind verdict)? Capture health, not the host:
+ * on a software-rendered hosted VM a third-party smoke checks plumbing (D6), and
+ * this is what `--accept-capture-health-unknown` lets through. Any other unknown
+ * (pane_stalled, sessions_not_rendered, a launch failure, zone_unresolved, a
+ * different harness_error) is not capture health.
+ */
+export function isCaptureHealthUnknown(kpi) {
+  if (kpi?.state !== "unknown") return false;
+  if (kpi.reason === "capture_disagreement") return true;
+  return kpi.reason === "harness_error" && typeof kpi.detail === "string" && kpi.detail.startsWith(PROBE_BEHIND_DETAIL);
+}
+
 /** Below this many frames with a known lag the probe gives no `behind` verdict (`model::LAG_VERDICT_MIN_FRAMES`). */
 export const LAG_VERDICT_MIN_FRAMES = 10;
 
@@ -258,7 +282,7 @@ export function probeHealthGate(seg) {
   if (p.behind === true) {
     return {
       reason: "harness_error",
-      detail: `the probe fell behind its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged${p.lag_statistic ? ` as the ${p.lag_statistic}` : ""}, bound ${p.lag_bound_ms ?? "?"} ms${p.lag_bound_basis ? ` — ${p.lag_bound_basis}` : ""}${Number.isInteger(p.frames_over_bound) ? `, ${p.frames_over_bound} frame(s) over it` : ""}), so first appearances may be late`,
+      detail: `${PROBE_BEHIND_DETAIL} its capture source (frame lag ${p.lag_ms_judged ?? "?"} ms judged${p.lag_statistic ? ` as the ${p.lag_statistic}` : ""}, bound ${p.lag_bound_ms ?? "?"} ms${p.lag_bound_basis ? ` — ${p.lag_bound_basis}` : ""}${Number.isInteger(p.frames_over_bound) ? `, ${p.frames_over_bound} frame(s) over it` : ""}), so first appearances may be late`,
     };
   }
   if (p.behind !== false && Number(p.frames ?? 0) > 0) {

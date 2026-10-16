@@ -23,6 +23,7 @@ import { PROBE_MECHANISMS, blockingMechanisms, gatherDoctorFacts, mapDoctor } fr
 import { ENVIRONMENT_SPECS, environmentSpec } from "../envs/index.mjs";
 import { SCREEN_QUERY, hostedRunnerVerdict, parseScreen, startWindowsHosted } from "../envs/windows-hosted.mjs";
 import { CROSSCHECK_PROFILES, KPI_CATALOG, ROW_LABELS } from "../kpi-catalog.mjs";
+import { PROBE_BEHIND_DETAIL, isCaptureHealthUnknown, probeHealthGate } from "../kpis.mjs";
 import { machineBlock } from "../machine.mjs";
 import { NeutralityGuard } from "../neutrality.mjs";
 import { watchArgs } from "../probe.mjs";
@@ -256,6 +257,108 @@ test("--require-measured-if-operative holds a KPI to measured only where the fil
   assert.deepEqual(checkAssertions(doc, gate), [], "capture inoperative: unknown with its reason is the honest reading");
   target.kpis.cpu_pct = { state: "unknown", unit: "% of one logical core", n: 0, reason: "harness_error", detail: "x" };
   assert.equal(checkAssertions(doc, gate).length, 1, "an unconditional requirement still holds");
+});
+
+/**
+ * A windows-hosted file with WT-shaped rows (N = 1, both arms) and runner rows,
+ * capture.wgc OPERATIVE so output_latency_ms is held, as in the hosted job.
+ */
+function hostedSmokeDoc() {
+  const doc = structuredClone(windowsDesktopResults());
+  doc.machine.environment = "windows-hosted";
+  doc.capabilities["capture.wgc"] = { state: "OPERATIVE", reason: "fake" };
+  const tpl = doc.rows.find((r) => r.setup.id === "vscode" && r.scenario.n === 1);
+  const wt = ["focus", "tiled"].map((arm) => {
+    const r = structuredClone(tpl);
+    r.setup.id = "windows-terminal";
+    r.scenario.arm = arm;
+    // One N level for this setup: the per-session slope has too few (the validator checks it).
+    r.kpis.memory_mb_per_session = { state: "unknown", unit: r.kpis.memory_mb_per_session.unit, n: 1, reason: "too_few_levels" };
+    return r;
+  });
+  doc.rows.push(...wt);
+  return { doc, wt };
+}
+
+const SMOKE = (setup, extra = {}) => ({ atN: [1], setups: [setup], arms: ["focus", "tiled"], requireRowsN: [1], requireMeasured: ["cpu_pct", "memory_mb", "producer_stall_pct"], requireMeasuredIfOperative: [{ mechanism: "capture.wgc", kpis: ["output_latency_ms"] }], ...extra });
+const DISAGREE = { state: "unknown", unit: "ms", n: 0, reason: "capture_disagreement", detail: "the primary saw markers a presentation late in 31 of 120 markers" };
+const BEHIND = { state: "unknown", unit: "ms", n: 0, reason: "harness_error", detail: `${PROBE_BEHIND_DETAIL}: its p95 frame lag was 41.0 ms (9 of 400 frames over the 33.3 ms bound; software-compositor: …)` };
+
+test("--accept-capture-health-unknown: the WT smoke's two failures from CI (capture_disagreement on focus, probe-behind on tiled) pass; without the flag they fail", () => {
+  const { doc, wt } = hostedSmokeDoc();
+  wt[0].kpis.output_latency_ms = DISAGREE;
+  wt[1].kpis.output_latency_ms = BEHIND;
+  assert.equal(checkAssertions(doc, SMOKE("windows-terminal")).length, 2, "the strict gate: both rows fail, as CI did");
+  assert.deepEqual(checkAssertions(doc, SMOKE("windows-terminal", { acceptCaptureHealthUnknown: true })), []);
+  // The harness's own probe-health verdict (kpis.mjs probeHealthGate) is excused too.
+  const harness = probeHealthGate({ summary: { probe: { behind: true, lag_ms_judged: 41, lag_bound_ms: 33.3 } } });
+  wt[1].kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, ...harness };
+  assert.deepEqual(checkAssertions(doc, SMOKE("windows-terminal", { acceptCaptureHealthUnknown: true })), []);
+});
+
+test("--accept-capture-health-unknown excuses capture health only: pane_stalled, sessions_not_rendered, another harness_error, an unmeasured plumbing KPI, another environment all still fail", () => {
+  const flagged = SMOKE("windows-terminal", { acceptCaptureHealthUnknown: true });
+  const cases = [
+    ["pane_stalled", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "harness_error", detail: "session 0's pane stopped repainting (pane_stalled)" })],
+    ["sessions_not_rendered", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "sessions_not_rendered", detail: "x" })],
+    ["zone_unresolved", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "zone_unresolved", detail: "x" })],
+    ["a launch failure", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "harness_error", detail: "no window of Windows Terminal's class appeared within 60 s" })],
+    ["a probe that merely could not show it kept up", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "harness_error", detail: "the probe could not show it kept up with its capture source" })],
+    ["cpu_pct unmeasured (plumbing)", (r) => (r.kpis.cpu_pct = { ...DISAGREE, unit: "% of one logical core" })],
+    ["producer_stall_pct unmeasured (plumbing)", (r) => (r.kpis.producer_stall_pct = { ...BEHIND, unit: "%" })],
+  ];
+  for (const [what, mutate] of cases) {
+    const { doc, wt } = hostedSmokeDoc();
+    mutate(wt[0]);
+    assert.equal(checkAssertions(doc, flagged).length, 1, what);
+  }
+  // On a windows-desktop file the flag excuses nothing: there the capture IS the measurement.
+  const { doc, wt } = hostedSmokeDoc();
+  doc.machine.environment = "windows-desktop";
+  wt[0].kpis.output_latency_ms = DISAGREE;
+  assert.equal(checkAssertions(doc, flagged).length, 1, "windows-desktop");
+});
+
+test("the runner's gate never accepts a capture-health unknown, with the flag or without it, and the job passes the flag only on the two third-party smokes", () => {
+  const { doc } = hostedSmokeDoc();
+  const runner = doc.rows.find((r) => r.setup.id === "runner" && r.scenario.n === 1 && r.scenario.arm === "focus");
+  runner.kpis.output_latency_ms = DISAGREE;
+  const gate = { atN: [1], setups: ["runner"], arms: ["focus"], requireMeasured: ["cpu_pct"], requireMeasuredIfOperative: [{ mechanism: "capture.wgc", kpis: ["output_latency_ms"] }] };
+  assert.equal(checkAssertions(doc, gate).length, 1);
+  assert.equal(checkAssertions(doc, { ...gate, acceptCaptureHealthUnknown: true }).length, 1, "a runner row is never excused");
+  runner.kpis.output_latency_ms = BEHIND;
+  assert.equal(checkAssertions(doc, { ...gate, acceptCaptureHealthUnknown: true }).length, 1);
+  const gates = invocations(jobLines(yml(), "run-windows-hosted")).filter((x) => /--require-measured /.test(x));
+  const flagged = gates.filter((x) => /--accept-capture-health-unknown/.test(x));
+  assert.deepEqual(flagged.map((x) => /--setups ([a-z-]+)/.exec(x)[1]).sort(), ["vscode", "windows-terminal"]);
+  assert.ok(!gates.find((x) => /--setups runner/.test(x)).includes("--accept-capture-health-unknown"), "the runner gate is unchanged");
+  assert.ok(KNOWN_FLAGS.includes("accept-capture-health-unknown"));
+});
+
+test("the CLI: report --accept-capture-health-unknown lets the WT smoke's capture-health unknowns through, and without it the gate exits 1", async (t) => {
+  const { main } = await import("../cli.mjs");
+  const { doc, wt } = hostedSmokeDoc();
+  wt[0].kpis.output_latency_ms = DISAGREE;
+  wt[1].kpis.output_latency_ms = BEHIND;
+  assert.equal(validateResults(doc).valid, true, JSON.stringify(validateResults(doc).errors.slice(0, 3)));
+  const dir = mkdtempSync(join(tmpdir(), "tb-cap-health-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "results.json");
+  writeFileSync(file, JSON.stringify(doc));
+  const args = ["report", file, "--format", "json", "--setups", "windows-terminal", "--arms", "focus,tiled", "--require-rows-n", "1", "--require-measured", "cpu_pct,memory_mb,producer_stall_pct", "--at-n", "1", "--require-measured-if-operative", "capture.wgc:output_latency_ms"];
+  const io = { out: () => {}, err: () => {} };
+  assert.equal(await main(args, io), 1, "strict: the gate fails");
+  assert.equal(await main([...args, "--accept-capture-health-unknown"], io), 0, "with the flag: plumbing checked, capture health excused");
+});
+
+test("both producers of the probe-behind verdict begin with the one shared prefix (the harness's and the probe's Rust)", () => {
+  const harness = probeHealthGate({ summary: { probe: { behind: true } } });
+  assert.ok(harness.detail.startsWith(PROBE_BEHIND_DETAIL), harness.detail);
+  const rust = readFileSync(join(HERE, "..", "..", "..", "crates", "termhost-probe", "src", "model", "mod.rs"), "utf8");
+  assert.match(rust, new RegExp(`"${PROBE_BEHIND_DETAIL}: its \\{\\} frame lag`), "the probe's own verdict text starts with it too");
+  assert.equal(isCaptureHealthUnknown({ state: "measured", unit: "ms", n: 1, stats: {} }), false);
+  assert.equal(isCaptureHealthUnknown({ ...DISAGREE }), true);
+  assert.equal(isCaptureHealthUnknown({ ...BEHIND, reason: "sessions_not_rendered" }), false, "the prefix counts only on harness_error");
 });
 
 test("the CLI: the VS Code options and the conditional gate parse, and a malformed one is a usage error", async () => {

@@ -11,6 +11,7 @@
  */
 
 import { getKpi } from "./kpi-catalog.mjs";
+import { CAPTURE_KPIS, isCaptureHealthUnknown } from "./kpis.mjs";
 import { redactRunnerOnly } from "./results.mjs";
 import { validateResults } from "./validate.mjs";
 import { compareStatistic, valueOf } from "./compare.mjs";
@@ -122,6 +123,17 @@ export function renderReport(doc) {
  * not OPERATIVE those KPIs may read unknown (with the reason the validator
  * already requires); they are never missing.
  *
+ * `acceptCaptureHealthUnknown` (`--accept-capture-health-unknown`, the
+ * third-party smokes on windows-hosted only): on a windows-hosted file, a
+ * THIRD-PARTY row's capture-dependent KPI (catalog `needs: capture`) may read
+ * unknown for capture health — capture_disagreement, or the probe-fell-behind
+ * verdict (`kpis.mjs` isCaptureHealthUnknown). A software-composited hosted VM's
+ * capture says nothing about a third-party host, and its smoke there checks
+ * plumbing (D6). Every other unknown still fails (pane_stalled,
+ * sessions_not_rendered, a launch failure, …), the plumbing KPIs still have to
+ * be measured, and runner rows are never excused: the runner's own gate does
+ * not pass this flag, and it would not apply to them if it did.
+ *
  * `abBaseline`: the run measured a head and a baseline build (`--ab-baseline`).
  * Then every runner row at a gate N must carry a PROVEN build: a row labelled
  * `unknown_build` fails the gate, measured or not, because an A/B number from a
@@ -130,7 +142,7 @@ export function renderReport(doc) {
  * @param {object} doc
  * @param {{requireMeasured?: string[], atN?: number[], setups?: string[], arms?: string[],
  *   requireRowsN?: number[], roles?: string[], abBaseline?: boolean,
- *   requireMeasuredIfOperative?: {mechanism: string, kpis: string[]}[]}} a
+ *   requireMeasuredIfOperative?: {mechanism: string, kpis: string[]}[], acceptCaptureHealthUnknown?: boolean}} a
  * @returns {string[]} failures (empty = the gate holds)
  */
 export function checkAssertions(doc, a) {
@@ -173,6 +185,7 @@ export function checkAssertions(doc, a) {
         for (const id of required) {
           for (const r of rows) {
             const v = r.kpis[id];
+            if (captureHealthExcused(doc, a, setup, id, v)) continue;
             if (v?.state !== "measured") {
               const detail = !v?.detail ? "" : setup === "runner" ? ` — ${v.detail}` : ` — ${readingFreeDetail(v.detail)}`;
               failures.push(
@@ -185,6 +198,17 @@ export function checkAssertions(doc, a) {
     }
   }
   return failures;
+}
+
+/** Whether `--accept-capture-health-unknown` excuses this KPI value (see checkAssertions). */
+export function captureHealthExcused(doc, a, setup, id, v) {
+  return (
+    a.acceptCaptureHealthUnknown === true &&
+    setup !== "runner" &&
+    doc.machine?.environment === "windows-hosted" &&
+    CAPTURE_KPIS.includes(id) &&
+    isCaptureHealthUnknown(v)
+  );
 }
 
 /** The longest third-party detail a gate line carries, in code points. */
