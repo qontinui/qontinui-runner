@@ -183,7 +183,8 @@ test("only output_latency_ms p95 gates: another KPI's regression is computed, re
 test("an unknown side never fires, however bad the other looks; unknown runs are never folded in as numbers (mutation M1)", () => {
   const baseUnknown = judge(abDoc([500, 510, 520], [null, null, null]));
   assert.deepEqual([lat(baseUnknown).verdict.verdict, lat(baseUnknown).verdict.reason], ["unknown", "baseline_unknown"]);
-  assert.deepEqual([baseUnknown.gate.verdict, baseUnknown.gate.reason], ["unknown", "too_few_gate_entries"]);
+  assert.equal(baseUnknown.gate.verdict, "unknown");
+  assert.match(baseUnknown.gate.reason, /^too_few_gate_entries; not pooled \(6 of 6\): N=1 focus \(baseline unknown\), /);
   assert.equal(verdictFails(baseUnknown.verdict), false);
   const headUnknown = judge(abDoc([null, null, null], [50, 52, 54]));
   assert.deepEqual([lat(headUnknown).verdict.verdict, lat(headUnknown).verdict.reason], ["unknown", "head_unknown"]);
@@ -202,6 +203,18 @@ test("an under-sampled side never fires: fewer measured runs than the baseline's
   // A run missing at ANY pooled entry contributes no pooled value.
   const gap = abDoc([80, 82, 84], [50, 52, 54], { at: (n, arm) => (n === 1 && arm === "tiled" ? { head: [80, null, 84] } : null) });
   assert.equal(judge(gap).gate.head.spread.runs, 2);
+});
+
+test("an entry unknown on a build leaves the pool by name, never silently (and the gate still judges the rest)", () => {
+  const doc = abDoc([80, 82, 84], [50, 52, 54], { at: (n, arm) => (n === 5 && arm === "tiled" ? { head: [null, null, null] } : null) });
+  const cmp = judge(doc);
+  assert.equal(cmp.gate.verdict, "regression");
+  assert.equal(cmp.gate.entries.length, 5);
+  assert.deepEqual(cmp.gate.excluded, [{ n: 5, arm: "tiled", why: "head unknown" }]);
+  assert.equal(cmp.gate.reason, "beyond_threshold_and_spreads_disjoint; not pooled (1 of 6): N=5 tiled (head unknown)");
+  assert.match(cmp.verdict.reason, /not pooled \(1 of 6\): N=5 tiled \(head unknown\)/, "the overall verdict carries it too");
+  assert.match(renderComparison(cmp), /not pooled \(1 of 6\): N=5 tiled/);
+  assert.equal(judge(abDoc([80, 82, 84], [50, 52, 54])).gate.excluded, undefined, "nothing excluded, nothing said");
 });
 
 test("a headline KPI with no recorded threshold is unknown; a non-headline KPI is not judged at all", () => {
@@ -381,26 +394,43 @@ function lognormal(rand, cv) {
   return Math.exp(-(s * s) / 2 + s * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand()));
 }
 
+/** A standard normal draw (Box-Muller). */
+function normal(rand) {
+  let u = 0;
+  while (u === 0) u = rand();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
+}
+
 /**
  * The share of trials in which the scheduled job would go red: six gate entries
  * (N 1, 5, 15 x two arms), `runs` runs per build, every value a typical p95
- * (100-300 ms) times run-to-run noise of `cv`, the head `effect` times worse.
- * Drives the real poolGate (and, for contrast, any single entry's judgeEntry).
+ * (100-300 ms) times lognormal run-to-run noise of `cv`, the head `effect` times
+ * worse. `shared` is the share of the log-variance that is launch noise common
+ * to both arms of one (N, build, run): run.mjs measures a unit's two arms in one
+ * launch, so the six entries are not independent. Drives the real poolGate (and,
+ * for contrast, any single entry's judgeEntry).
  */
-function redRate({ runs, cv, effect, trials, seed, relative = PROPOSED_GATE_RELATIVE[runs] }) {
+function redRate({ runs, cv, effect, trials, seed, shared, relative = PROPOSED_GATE_RELATIVE[runs] }) {
   const rand = seeded(seed);
+  const sigma = Math.sqrt(Math.log(1 + cv * cv));
   let gateRed = 0;
   let anyEntryRed = 0;
   for (let t = 0; t < trials; t += 1) {
+    // One launch per (build, N, run), shared by its two arms.
+    const launch = {};
+    for (const build of ["head", "baseline"]) for (const n of LEVELS) launch[`${build}${n}`] = Array.from({ length: runs }, () => normal(rand));
     const entries = [];
     for (const n of LEVELS) {
       for (const arm of ARM_LIST) {
         const level = 100 + 200 * rand();
-        const side = (f) => {
-          const vals = Array.from({ length: runs }, () => level * f * lognormal(rand, cv));
+        const side = (build, f) => {
+          const vals = Array.from({ length: runs }, (_, i) => {
+            const z = Math.sqrt(shared) * launch[`${build}${n}`][i] + Math.sqrt(1 - shared) * normal(rand);
+            return level * f * Math.exp(-(sigma * sigma) / 2 + sigma * z);
+          });
           return { spread: spreadOf(vals), states: `${runs} measured`, values: vals.map((value, run) => ({ run, value })) };
         };
-        entries.push({ kpi: GATING_KPI, direction: "lower_is_better", n, arm, head: side(effect), baseline: side(1) });
+        entries.push({ kpi: GATING_KPI, direction: "lower_is_better", n, arm, head: side("head", effect), baseline: side("baseline", 1) });
       }
     }
     if (poolGate(entries, { relative }, runs).verdict === "regression") gateRed += 1;
@@ -409,26 +439,40 @@ function redRate({ runs, cv, effect, trials, seed, relative = PROPOSED_GATE_RELA
   return { gate: gateRed / trials, anyEntry: anyEntryRed / trials };
 }
 
-test("the gate's false-red rate with nothing changed is <= 2 % at CV 0.2 (runs 3 on linux-xvfb, 2 on windows-hosted)", (t) => {
-  const linux = redRate({ runs: 3, cv: 0.2, effect: 1, trials: 10000, seed: 1 });
-  assert.ok(linux.gate <= 0.02, `linux-xvfb gate red with no change: ${(linux.gate * 100).toFixed(2)} %`);
-  // What the review measured: any of the six entries alone, uncorrected, goes red far more often.
-  assert.ok(linux.anyEntry > 0.1, `per-entry without the gate: ${(linux.anyEntry * 100).toFixed(2)} %`);
-  const win = redRate({ runs: 2, cv: 0.2, effect: 1, trials: 10000, seed: 2 });
-  assert.ok(win.gate <= 0.02, `windows-hosted gate red with no change: ${(win.gate * 100).toFixed(2)} %`);
-  t.diagnostic(`null, CV 0.2: linux-xvfb gate ${(linux.gate * 100).toFixed(2)} % (any single entry ${(linux.anyEntry * 100).toFixed(2)} %), windows-hosted gate ${(win.gate * 100).toFixed(2)} %`);
+const pct = (x) => `${(x * 100).toFixed(2)} %`;
+
+test("the gate's false-red rate with nothing changed is <= 2 % at CV 0.2, launch noise independent or half shared, in both environments", (t) => {
+  const lines = [];
+  for (const shared of [0, 0.5]) {
+    const linux = redRate({ runs: 3, cv: 0.2, effect: 1, trials: 10000, seed: 1, shared });
+    assert.ok(linux.gate <= 0.02, `linux-xvfb, shared ${shared}: gate red with no change ${pct(linux.gate)}`);
+    // What the review measured: any of the six entries alone, uncorrected, goes red far more often.
+    assert.ok(linux.anyEntry > 0.1, `per-entry without the gate: ${pct(linux.anyEntry)}`);
+    const win = redRate({ runs: 2, cv: 0.2, effect: 1, trials: 10000, seed: 2, shared });
+    assert.ok(win.gate <= 0.02, `windows-hosted, shared ${shared}: gate red with no change ${pct(win.gate)}`);
+    lines.push(`shared ${shared}: linux-xvfb ${pct(linux.gate)} (any single entry ${pct(linux.anyEntry)}), windows-hosted ${pct(win.gate)}`);
+  }
+  t.diagnostic(`null, CV 0.2: ${lines.join("; ")}`);
 });
 
-test("the gate's power: a 30 % p95 regression across every N goes red >= 95 % at CV 0.15 and >= 85 % at CV 0.2", (t) => {
-  // CV 0.2 cannot reach 95 % under the plan's non-overlapping-spreads rule at
-  // 3 runs (the simulation's frontier peaks near 92 % at a 3.6 % false-red rate);
-  // the bound pinned here is the one the rule allows.
-  const at15 = redRate({ runs: 3, cv: 0.15, effect: 1.3, trials: 5000, seed: 3 });
-  assert.ok(at15.gate >= 0.95, `power at CV 0.15: ${(at15.gate * 100).toFixed(1)} %`);
-  const at20 = redRate({ runs: 3, cv: 0.2, effect: 1.3, trials: 5000, seed: 4 });
-  assert.ok(at20.gate >= 0.85, `power at CV 0.2: ${(at20.gate * 100).toFixed(1)} %`);
-  const win = redRate({ runs: 2, cv: 0.2, effect: 1.3, trials: 5000, seed: 5 });
-  t.diagnostic(`power, 30 %: linux-xvfb CV 0.15 ${(at15.gate * 100).toFixed(1)} %, CV 0.2 ${(at20.gate * 100).toFixed(1)} %; windows-hosted (2 runs) CV 0.2 ${(win.gate * 100).toFixed(1)} %`);
+test("the gate's power: a 30 % p95 regression across every N, at CV 0.2, independent and half-shared launch noise", (t) => {
+  // The non-overlapping-spreads rule caps the power (3 runs against 3 are
+  // disjoint 1 time in 20 under no change), and shared launch noise lowers it
+  // further; these bounds pin what the tuned thresholds support. The windows-hosted
+  // bound also catches a threshold that disarms its gate (e.g. 0.5).
+  const lines = [];
+  const bounds = { 0: { linux: 0.82, win: 0.65 }, 0.5: { linux: 0.7, win: 0.6 } };
+  for (const shared of [0, 0.5]) {
+    const linux = redRate({ runs: 3, cv: 0.2, effect: 1.3, trials: 4000, seed: 4, shared });
+    const win = redRate({ runs: 2, cv: 0.2, effect: 1.3, trials: 4000, seed: 5, shared });
+    assert.ok(linux.gate >= bounds[shared].linux, `linux-xvfb, shared ${shared}: power ${pct(linux.gate)}`);
+    assert.ok(win.gate >= bounds[shared].win, `windows-hosted, shared ${shared}: power ${pct(win.gate)}`);
+    lines.push(`shared ${shared}: linux-xvfb ${pct(linux.gate)}, windows-hosted ${pct(win.gate)}`);
+  }
+  const at15 = redRate({ runs: 3, cv: 0.15, effect: 1.3, trials: 4000, seed: 3, shared: 0.5 });
+  assert.ok(at15.gate >= 0.9, `linux-xvfb power at CV 0.15, shared 0.5: ${pct(at15.gate)}`);
+  lines.push(`linux-xvfb at CV 0.15, shared 0.5: ${pct(at15.gate)}`);
+  t.diagnostic(`power, 30 %, CV 0.2: ${lines.join("; ")}`);
 });
 
 // ---------------------------------------------------------------------------

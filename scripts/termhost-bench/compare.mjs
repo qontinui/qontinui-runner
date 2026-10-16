@@ -30,7 +30,9 @@
  * not-fire-a-detector]: the overall verdict is the gate's, and the scheduled job
  * fails only on its `regression`. Judging some 40 entries and failing on any one
  * would go red on most runs where nothing changed (the review's measurement); the
- * one pooled gate keeps that under 2 % (the seeded simulation in the tests).
+ * one pooled gate keeps that under 2 % (the seeded simulation in the tests, which
+ * assumes half the variance is launch noise shared by a unit's two arms; see
+ * `PROPOSED_GATE_RELATIVE`).
  *
  * "Control-normalised" (the plan's arming row) is not defined anywhere in the
  * plan, and the results carry no control reading (no unloaded control session,
@@ -251,14 +253,22 @@ export const PROPOSED_THRESHOLDS = Object.freeze({
 
 /**
  * The gate's relative threshold, by runs per build — chosen with the seeded
- * null/power simulation in `__tests__/verdict-report.test.mjs` (six pooled
- * entries, run-to-run CV 0.2, a 30 % regression across every N and arm):
- *   runs 3, 0.14: job red with no change 1.2 %, a 30 % regression red 90 %;
- *   runs 2, 0.20: 1.1 % and 83 %.
- * The non-overlapping-spreads rule caps the power: with 3 runs against 3 a null
- * comparison is disjoint 1 time in 20 before any threshold applies.
+ * null/power simulation in `__tests__/verdict-report.test.mjs`: six pooled
+ * entries, run-to-run CV 0.2, a 30 % regression across every N and arm, and the
+ * CORRELATION ASSUMPTION that half of each value's log-variance is launch noise
+ * shared by the two arms of one (N, build, run) — they share a launch
+ * (run.mjs measures both arms of a unit in one launch) — so the six entries are
+ * three independent pairs, not six independent draws. Chosen so the job goes
+ * red with no change <= 2 % at that 50 % sharing:
+ *   runs 3, 0.16: no change 1.5 % (0.9 % independent); a 30 % regression 76 % (88 %);
+ *   runs 2, 0.24: 1.4 % (0.4 %); 67 % (71 %).
+ * Noise shared more widely (one run's time slice across every N and both
+ * builds) is not modelled: it cancels in the head/baseline ratio only when the
+ * two builds are interleaved within it. The non-overlapping-spreads rule caps
+ * the power: with 3 runs against 3 a null comparison is disjoint 1 time in 20
+ * before any threshold applies.
  */
-export const PROPOSED_GATE_RELATIVE = Object.freeze({ 2: 0.2, 3: 0.14 });
+export const PROPOSED_GATE_RELATIVE = Object.freeze({ 2: 0.24, 3: 0.16 });
 
 const isNum = (x) => typeof x === "number" && Number.isFinite(x);
 
@@ -266,7 +276,8 @@ const isNum = (x) => typeof x === "number" && Number.isFinite(x);
  * Structural check of a baseline document, including the ways one could disarm
  * the gate: no threshold for the gating KPI, a relative threshold outside (0, 1]
  * (25 meant as 25 %), a `min_runs` above what the environment's scheduled job
- * takes, and a count KPI with no absolute floor.
+ * takes, and a count KPI with no absolute floor. A threshold's `absolute` applies
+ * to the per-entry, informational verdicts only: the pooled gate is relative.
  *
  * @param {{scheduledRuns?: Record<string, number>}} [o]
  * @returns {string[]} errors (empty = usable)
@@ -388,7 +399,11 @@ export function judgeEntry(e, threshold, minRuns) {
  * median is equivalent); what matters is that it is ONE per entry. Each run's
  * pooled value is the geometric mean of its normalised values over the entries; then the two sides' pooled run values are judged as
  * one entry: worse than the baseline's by more than the relative threshold AND
- * spreads that do not overlap. A pooled regression must also REPRODUCE: at
+ * spreads that do not overlap. The gate is relative only: a threshold's
+ * `absolute` (ms) has no meaning for the dimensionless pooled ratio and applies
+ * to the per-entry, informational verdicts alone. An entry measured on only one
+ * build (or neither) cannot be pooled; the gate names every such entry in its
+ * reason rather than letting it leave silently. A pooled regression must also REPRODUCE: at
  * least `MIN_GATE_ENTRIES` of the pooled entries must have the head's median
  * worse than the baseline's by more than the same relative threshold — one
  * entry moving the pool alone is reported as `no_change(not_reproduced)`. A
@@ -405,7 +420,11 @@ export function judgeEntry(e, threshold, minRuns) {
 export function poolGate(entries, threshold, minRuns) {
   const pooled = entries.filter((e) => e.head.spread && e.baseline.spread);
   const keys = pooled.map((e) => ({ n: e.n, arm: e.arm }));
-  const out = (fields) => ({ entries: keys, ...fields });
+  const excluded = entries
+    .filter((e) => !(e.head.spread && e.baseline.spread))
+    .map((e) => ({ n: e.n, arm: e.arm, why: [!e.head.spread && "head unknown", !e.baseline.spread && "baseline unknown"].filter(Boolean).join(", ") }));
+  const notPooled = excluded.length > 0 ? `; not pooled (${excluded.length} of ${entries.length}): ${excluded.map((x) => `N=${x.n} ${x.arm} (${x.why})`).join(", ")}` : "";
+  const out = (fields) => ({ entries: keys, ...(excluded.length > 0 ? { excluded } : {}), ...fields, reason: `${fields.reason}${notPooled}` });
   if (!threshold || !(threshold.relative > 0)) return out({ verdict: "unknown", reason: "no_threshold", detail: `the baseline file records no relative threshold for ${GATING_KPI}` });
   if (pooled.length < MIN_GATE_ENTRIES) {
     return out({ verdict: "unknown", reason: "too_few_gate_entries", detail: `${pooled.length} N/arm entr${pooled.length === 1 ? "y" : "ies"} measured on both builds; the gate pools at least ${MIN_GATE_ENTRIES}` });

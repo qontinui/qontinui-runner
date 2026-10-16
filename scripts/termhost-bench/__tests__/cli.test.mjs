@@ -337,3 +337,18 @@ test("doctor --json carries the probe doctor's notes and still exits 0 (Phase 2 
   assert.equal(code, 0, "a note never blocks");
   assert.deepEqual(JSON.parse(out.join("")).notes, [note]);
 });
+
+test("the linux-xvfb job's step bounds fit its timeout with >= 15 minutes for the unbounded steps (validate, verdict, uploads)", () => {
+  const text = jobText(readFileSync(WORKFLOW, "utf8"), "run-linux-xvfb").join("\n");
+  const timeout = Number(/^ {4}timeout-minutes: (\d+)$/m.exec(text)[1]);
+  assert.ok(timeout <= 360, "GitHub-hosted jobs stop at 360 minutes");
+  const bounds = [...text.matchAll(/^ {8}timeout-minutes: (\d+)$/gm)].map((m) => Number(m[1]));
+  const bounded = bounds.reduce((a, b) => a + b, 0);
+  assert.ok(bounded < timeout, `the step bounds (${bounded}) fit inside the job's (${timeout}), so an expiry names its step`);
+  // A slow benchmark must still leave time for the !cancelled() steps after it:
+  // validate, assert, the regression verdict and the uploads carry no bound.
+  assert.ok(timeout - bounded >= 15, `the step bounds (${bounded}) leave at least 15 of the job's ${timeout} minutes for the unbounded steps`);
+  // The run bound stays above its estimate (27 units at about 7.5 min = about 200).
+  const run = /- name: Run the benchmark\n(?: {8}.*\n)*? {8}timeout-minutes: (\d+)/.exec(text);
+  assert.ok(run && Number(run[1]) > 200, `the run step's bound (${run?.[1]}) is above its 200-minute estimate`);
+});

@@ -318,12 +318,18 @@ jobs:
   # them. Both builds compile cold, each in its own checkout's target/, so each
   # exe runs in place beside the resources its build copied next to it.
   #
-  # UNMEASURED at introduction: no run of this job exists yet. Estimate for the
-  # full ladder: about 75 min for the two cold builds plus about 200 min for 27
-  # units (3 runs x 3 N x {head, baseline, tmux}) of two arms each. 350 min sits
-  # under GitHub's 360-minute ceiling, and the run step's own 260-minute bound
-  # leaves the report and upload steps time to say what happened. Tighten both
-  # once there are runs to measure.
+  # UNMEASURED: no full-ladder run's timings exist yet. Estimate: about 75 min
+  # for the two cold builds (about 37 each) plus about 200 min for 27 units
+  # (3 runs x 3 N x {head, baseline, tmux}) of two arms each. The job takes
+  # GitHub's hosted maximum, 360 min, and its step bounds sum to 340 (deps 10,
+  # head build 45, probe 20, baseline build 45, run 220), leaving 20 for the
+  # unbounded steps — checkout, setup, doctor, then validate, the verdict and
+  # the uploads, which must still run after a slow benchmark (cli.test.mjs
+  # holds the >= 15 margin). The trade-off: each build bound is about 20 %
+  # above its estimate (it was 100 % at 75), and the run bound 10 % above its
+  # 200 (it was 260, which with the builds summed to 440 of 350 minutes, so a
+  # slow run would have taken the verdict down with it). Tighten once there
+  # are runs to measure.
   # ---------------------------------------------------------------------------
 
   # The run job's own trigger filter. The workflow's `pull_request` paths are the
@@ -375,7 +381,7 @@ jobs:
     needs: bench-scope
     if: needs.bench-scope.outputs.run == 'true'
     runs-on: ubuntu-22.04
-    timeout-minutes: 350
+    timeout-minutes: 360
     steps:
       # Full history, blobless: the baseline is resolved from origin/main, and
       # the runner adapter checks with `git merge-base --is-ancestor` that a
@@ -525,7 +531,7 @@ jobs:
 
       - name: Build the head runner
         working-directory: head/qontinui-runner
-        timeout-minutes: 75
+        timeout-minutes: 45
         run: |
           pnpm install --frozen-lockfile
           pnpm run tauri build --debug --no-bundle
@@ -547,7 +553,7 @@ jobs:
       - name: Build the baseline runner
         if: steps.params.outputs.baseline != 'none'
         working-directory: baseline/qontinui-runner
-        timeout-minutes: 75
+        timeout-minutes: 45
         run: |
           channel="$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)"
           if [ -n "$channel" ]; then rustup toolchain install "$channel" --profile minimal; fi
@@ -586,7 +592,7 @@ jobs:
         id: run
         shell: bash
         working-directory: head/qontinui-runner
-        timeout-minutes: 260
+        timeout-minutes: 220
         env:
           N: ${{ steps.params.outputs.n }}
           ARMS: ${{ steps.params.outputs.arms }}
