@@ -229,11 +229,6 @@ export function rowLabels({ softwareRendered, setup, smoke, paneSizes, geometry,
 }
 
 /**
- * The log lines for a row's KPI notes. A note can quote a reading; public CI
- * logs carry these lines, and a third party's readings never leave the job (D7),
- * so only the runner's notes are logged — every other setup's stay in the file.
- */
-/**
  * A free-text detail as the PUBLIC job log may carry it: the runner's verbatim, a
  * third party's with every reading masked (D7, {@link readingFreeDetail}). The
  * incident records keep the verbatim text; redaction drops a third party's from
@@ -243,6 +238,11 @@ export function publicDetail(setupId, detail) {
   return setupId === "runner" ? String(detail) : readingFreeDetail(detail);
 }
 
+/**
+ * The log lines for a row's KPI notes. A note can quote a reading; public CI
+ * logs carry these lines, and a third party's readings never leave the job (D7),
+ * so only the runner's notes are logged — every other setup's stay in the file.
+ */
 export function noteLogLines(setupId, where, notes) {
   return setupId === "runner" ? notes.map((n) => `${where}: ${n}`) : [];
 }

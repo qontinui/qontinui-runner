@@ -1254,15 +1254,19 @@ export function computeRowKpis(p) {
   }
   const gated = (id) => captureGate && CAPTURE_KPIS.includes(id);
   const gateValue = (id) => unknownKpi(id, captureGate.reason, { detail: captureGate.detail });
-  // The cross-check's profile gates only the latency it judges (output here,
-  // input in inputLatencyKpi), never the rest of the capture KPIs.
+  // The profile chooses both the cross-check (which judges latency) and the
+  // probe-lag bound (whose `behind` verdict gates every capture KPI the probe
+  // computes: frame interval, jank, hangs, loss, skips). A watch judged under
+  // another profile than the environment declared may have been held to the
+  // wrong lag bound, so all of PROBE_CAPTURE_KPIS are gated (input latency in
+  // inputLatencyKpi), not latency alone.
   const profileGate = captureGate ? null : crosscheckProfileGate(p, summary, "soak");
 
   // --- the probe's capture KPIs -------------------------------------------
   for (const id of PROBE_CAPTURE_KPIS) {
     if (gated(id)) {
       set(id, gateValue(id));
-    } else if (id === "output_latency_ms" && profileGate) {
+    } else if (profileGate) {
       set(id, unknownKpi(id, profileGate.reason, { detail: profileGate.detail }));
     } else if (id === "output_latency_ms" && clockGate(p, id)) {
       // A generator's emission (node hrtime) against a first appearance (probe).

@@ -43,6 +43,7 @@ import {
   injectAbortReason,
   parseJsonl,
   LAG_VERDICT_MIN_FRAMES,
+  PROBE_CAPTURE_KPIS,
   probeHealthGate,
   seqAtOrAfter,
 } from "../kpis.mjs";
@@ -174,7 +175,7 @@ test("a soak cross-check judged under the declared profile keeps its latency mea
   assert.equal(ok.kpis.output_latency_ms.state, "measured", JSON.stringify(ok.kpis.output_latency_ms));
 });
 
-test("a soak cross-check under another, an absent, an empty or a differently spelled profile makes output latency harness_error — and only the latency (round 4 S1, N4)", () => {
+test("a soak judged under another, an absent, an empty or a differently spelled profile makes every probe capture KPI harness_error (round 4 S1; the profile also chooses the lag bound)", () => {
   const good = profiled({ verdict: "agree", profile: "software-compositor" });
   for (const [cc, said] of [
     [{ verdict: "agree", profile: "strict" }, /under the strict profile; the windows-hosted environment declares software-compositor/],
@@ -185,14 +186,45 @@ test("a soak cross-check under another, an absent, an empty or a differently spe
     const r = profiled(cc);
     assertUnknown(r.kpis.output_latency_ms, "harness_error");
     assert.match(r.kpis.output_latency_ms.detail, said, JSON.stringify(cc));
-    // N4: the other capture KPIs are the probe's own, untouched by the profile.
+    // The profile also chose the probe-lag bound, whose verdict gates all of these.
     for (const id of ["frame_interval_ms", "jank_share", "hangs", "marker_loss", "marker_skipped"]) {
-      assert.deepEqual(r.kpis[id], good.kpis[id], `${id} under ${JSON.stringify(cc)}`);
+      assert.equal(good.kpis[id].state, "measured", `${id} under the declared profile`);
+      assertUnknown(r.kpis[id], "harness_error");
+      assert.match(r.kpis[id].detail, said, `${id} under ${JSON.stringify(cc)}`);
     }
   }
   // No declared profile (an older caller) or no cross-check block: no gate.
   const undeclared = computeRowKpis(withSummary(focusFixture(), { crosscheck: { verdict: "agree" } }));
   assert.equal(undeclared.kpis.output_latency_ms.state, "measured");
+});
+
+test("a strict environment fed a software-compositor summary with 80 ms of lag gates every probe capture KPI (head-confirmation review)", () => {
+  const fx = focusFixture();
+  const probe = fx.soak.records.find((r) => r.type === "summary").probe;
+  const lagged = {
+    ...probe,
+    behind: false,
+    lag_ms_judged: 80,
+    lag_statistic: "p95",
+    lag_bound_ms: 93.75,
+    lag_bound_basis: "software-compositor: 93.8 ms, the larger of the strict 50.0 ms and 3 frame intervals of 31.25 ms (WGC's frame pool)",
+  };
+  const r = computeRowKpis({
+    ...withSummary(fx, { secondary: "dda", crosscheck: { verdict: "agree", profile: "software-compositor" }, probe: lagged }),
+    environment: "windows-desktop",
+    crosscheckProfile: "strict",
+  });
+  for (const id of PROBE_CAPTURE_KPIS) {
+    assertUnknown(r.kpis[id], "harness_error");
+    assert.match(r.kpis[id].detail, /under the software-compositor profile; the windows-desktop environment declares strict/, id);
+  }
+  // The same summary in the environment that declared it: measured.
+  const ok = computeRowKpis({
+    ...withSummary(fx, { secondary: "dda", crosscheck: { verdict: "agree", profile: "software-compositor" }, probe: lagged }),
+    environment: "windows-hosted",
+    crosscheckProfile: "software-compositor",
+  });
+  for (const id of PROBE_CAPTURE_KPIS) assert.equal(ok.kpis[id].state, "measured", `${id}: ${JSON.stringify(ok.kpis[id])}`);
 });
 
 test("the input watch's cross-check is held to the declared profile too (round 4 S2)", () => {
