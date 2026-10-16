@@ -128,13 +128,16 @@ export function buildResultSchema() {
           probe: {
             description:
               "The termhost-probe binary that decoded this run's frames: it may be a shared build from another " +
-              "commit (source primary_shared), so it is identified by its file, not assumed to be harness_commit's.",
+              "commit (source primary_shared), so it is identified by its file, not assumed to be harness_commit's. " +
+              "path/source name where it was found; executed_path is the copy pinned in the run directory that " +
+              "the doctor and every probe call ran; size_bytes and sha256 are the copy's, mtime the original's.",
             type: "object",
-            required: ["path", "source", "size_bytes", "mtime", "sha256", "codec_version", "build"],
+            required: ["path", "source", "executed_path", "size_bytes", "mtime", "sha256", "codec_version", "build"],
             additionalProperties: false,
             properties: {
               path: orAbsent({ type: "string", minLength: 1 }),
               source: orAbsent({ enum: [...PROBE_SOURCES] }),
+              executed_path: orAbsent({ type: "string", minLength: 1 }),
               size_bytes: orAbsent({ type: "integer", minimum: 0 }),
               mtime: orAbsent(ref("dateTime")),
               sha256: orAbsent(ref("sha256")),

@@ -10,6 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,10 +24,10 @@ import { RESTORE_CHECK_MIN_FRAMES, RunAbort, RunFailed, abortAwareSleep, measure
 import { stallSegment } from "./helpers/bench-fixtures.mjs";
 import { paneStalls, stallCoverage } from "../kpis.mjs";
 import { validateResults } from "../validate.mjs";
-import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
+import { FakeAdapter, fakeProbe, fakeProbeBinary, fakeRunOptions, healthyFacts, VirtualClock } from "./helpers/fake-bench.mjs";
 
 /** A run on fakes; returns the result and every adapter call. */
-async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null, adapterHook = null, wrapProbe = null, wrapSleep = null } = {}) {
+async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = healthyFacts(), deps: overrides = {}, describe = null, adapterHook = null, wrapProbe = null, wrapSleep = null, driverPaths = null } = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "tb-run-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   mkdirSync(join(tmp, "primary"), { recursive: true });
@@ -39,7 +40,7 @@ async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = 
     log: () => {},
     sleep: wrapSleep ? wrapSleep(clock.sleep) : clock.sleep,
     startEnvironment: async () => ({ env: { DISPLAY: ":99" }, screen: { width: 1920, height: 1080, scalePct: 100 }, display: ":99", stop: async () => calls.push(["env.stop"]) }),
-    probePath: "fake-probe",
+    probePath: fakeProbeBinary(tmp),
     createAdapter: async (setup, o) => {
       current = new FakeAdapter({
         id: setup,
@@ -65,6 +66,15 @@ async function fakeRun(t, { opts = {}, refuseAt = {}, onArrange = null, facts = 
     reapGenerators: async () => ({ ended: [], survivors: [] }),
     primaryPresent: async () => false,
   };
+  if (driverPaths) {
+    // Build the fake through runBench's driver factory, recording the path it was given.
+    const fake = deps.probe;
+    deps.probe = undefined;
+    deps.probeDriver = (args) => {
+      driverPaths.push(args.probePath);
+      return fake;
+    };
+  }
   const res = await runBench(fakeRunOptions(join(tmp, "work"), { out: join(tmp, "results.json"), redactedOut: join(tmp, "redacted.json"), ...opts }), { ...deps, ...overrides });
   return { res, calls, tmp, probe: deps.probe };
 }
@@ -95,7 +105,8 @@ test("a run writes a schema-valid file: one row per unit and arm, every KPI pres
   assert.equal(res.doc.rows.length, 2 * 2 * 2, "2 setups x 2 levels x 2 arms");
   assert.equal(res.stopped, null);
   // Which probe binary decoded the frames (M1): the injected one, its codec version from the doctor, no invented build commit.
-  assert.equal(res.doc.run.probe.path, "fake-probe");
+  assert.match(res.doc.run.probe.path, /fake-probe$/);
+  assert.match(res.doc.run.probe.executed_path, /probe-bin[\\/]fake-probe$/, "the pinned copy in the run directory");
   assert.equal(res.doc.run.probe.source, "explicit");
   assert.equal(res.doc.run.probe.codec_version, 2);
   assert.equal(res.doc.run.probe.build.reason, "not_instrumented");
@@ -1276,4 +1287,56 @@ test("every setup is wired everywhere: an adapter, a fallback launch mode and an
     assert.ok(inSomeEnv.has(id), `${id} is in no environment's setups`);
   }
   assert.throws(() => fallbackLaunchMode("no-such-setup", {}), /no launch mode for setup "no-such-setup"/);
+});
+
+test("a probe rewritten mid-run changes neither what runs nor what is recorded: the doctor and the driver run the pinned copy (S1)", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-pin-run-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const original = fakeProbeBinary(join(dir, "primary", "target-agent", "release"), "termhost-probe", "build A");
+  const driverPaths = [];
+  const doctorPaths = [];
+  let rewrites = 0;
+  const { res } = await fakeRun(t, {
+    driverPaths,
+    onArrange: () => {
+      writeFileSync(original, `build B ${(rewrites += 1)}`);
+    },
+    deps: {
+      probePath: original,
+      probeSource: "primary_shared",
+      gatherDoctorFacts: async (a) => {
+        doctorPaths.push(a.probePath);
+        return { ...healthyFacts(), probePath: a.probePath, probeTried: a.probeTried, probeSource: a.probeSource };
+      },
+    },
+  });
+  assert.ok(rewrites > 0, "the original was rewritten during the run");
+  assert.equal(readFileSync(original, "utf8").startsWith("build B"), true);
+  const copy = res.doc.run.probe.executed_path;
+  assert.notEqual(copy, original);
+  assert.deepEqual(doctorPaths, [copy], "the doctor ran the copy");
+  assert.deepEqual(driverPaths, [copy], "every probe call goes through the copy");
+  assert.equal(readFileSync(copy, "utf8"), "build A", "the copy is what the doctor checked");
+  assert.equal(res.doc.run.probe.sha256, `sha256:${createHash("sha256").update("build A").digest("hex")}`);
+  assert.equal(res.doc.run.probe.path, original);
+  assert.equal(res.doc.run.probe.source, "primary_shared");
+});
+
+test("a probe found in the primary's shared target-agent runs DEGRADED, recorded as such (S2: the source reaches the doctor)", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-shared-run-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const shared = fakeProbeBinary(join(dir, "primary", "target-agent", "release"), "termhost-probe");
+  const { res } = await fakeRun(t, {
+    deps: {
+      probePath: undefined,
+      locateProbe: () => ({ path: shared, source: "primary_shared", tried: [shared] }),
+      gatherDoctorFacts: async (a) => ({ ...healthyFacts(), probePath: a.probePath, probeTried: a.probeTried, probeSource: a.probeSource }),
+    },
+  });
+  assert.equal(res.doc.capabilities["probe.binary"].state, "DEGRADED");
+  assert.match(res.doc.capabilities["probe.binary"].reason, /provenance unproven/);
+  assert.ok(res.doc.rows.length > 0, "the run proceeded");
+  assert.equal(res.doc.run.probe.source, "primary_shared");
+  assert.equal(res.doc.run.probe.path, shared);
+  assert.equal(validateResults(res.doc).valid, true);
 });

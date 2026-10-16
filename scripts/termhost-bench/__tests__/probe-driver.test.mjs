@@ -13,11 +13,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 
-import { WatchProcess, activate, codecMismatch, endChild, freshTag, goldenCodec, injectArgs, locateProbeBinary, primaryCheckoutRoot, probeCandidateList, probeCandidates, probeIdentity, raceTimeout, resolveProbeBinary, runProbe, setAside, takeRunFile, watchArgs } from "../probe.mjs";
+import { WatchProcess, activate, codecMismatch, endChild, freshTag, goldenCodec, injectArgs, locateProbeBinary, pinProbe, primaryCheckoutRoot, probeCandidateList, probeCandidates, probeIdentity, raceTimeout, resolveProbeBinary, runProbe, setAside, takeRunFile, watchArgs } from "../probe.mjs";
 import { blockingMechanisms, mapDoctor } from "../doctor.mjs";
 import { createHash } from "node:crypto";
 import { validateResults } from "../validate.mjs";
@@ -264,25 +264,34 @@ test("a probe from the primary checkout's shared target-agent is DEGRADED (prove
   assert.equal(drifted["probe.binary"].state, "INOPERATIVE-ON-THIS-MACHINE");
 });
 
-test("the run records which probe binary it used: path, source, size, mtime, sha256, codec version, and no invented build commit (M1)", () => {
-  const dir = mkdtempSync(join(tmpdir(), "tb-probe-id-"));
+test("the run pins its probe: a copy in the run directory, its sha256, the original's path and source; a later rewrite of the original changes neither (M1, S1)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-probe-pin-"));
   try {
-    const bin = join(dir, "termhost-probe");
-    writeFileSync(bin, "probe-bytes");
-    const id = probeIdentity({ path: bin, source: "primary_shared" }, { codecVersion: 2 });
-    assert.equal(id.path, bin);
-    assert.equal(id.source, "primary_shared");
-    assert.equal(id.size_bytes, 11);
+    const exe = process.platform === "win32" ? "termhost-probe.exe" : "termhost-probe";
+    const bin = join(dir, "shared", exe);
+    mkdirSync(dirname(bin), { recursive: true });
+    writeFileSync(bin, "probe-bytes", { mode: 0o755 });
+    const runDir = join(dir, "run");
+    const pinned = pinProbe(bin, runDir);
+    assert.equal(pinned.path, join(runDir, "probe-bin", exe), "the name (and a Windows .exe) is kept");
+    assert.equal(readFileSync(pinned.path, "utf8"), "probe-bytes");
+    if (process.platform !== "win32") assert.equal(statSync(pinned.path).mode & 0o111, 0o111, "the exec bit survives");
+    const want = `sha256:${createHash("sha256").update("probe-bytes").digest("hex")}`;
+    assert.equal(pinned.sha256, want);
+    assert.equal(pinned.size, 11);
+    // The shared build is rewritten after pinning: the copy and its record stand.
+    writeFileSync(bin, "another commit's probe");
+    assert.equal(readFileSync(pinned.path, "utf8"), "probe-bytes");
+    const id = probeIdentity({ path: bin, source: "primary_shared" }, { pinned, codecVersion: 2 });
+    assert.deepEqual([id.path, id.source, id.executed_path, id.sha256, id.size_bytes, id.codec_version], [bin, "primary_shared", pinned.path, want, 11, 2]);
     assert.match(id.mtime, /^\d{4}-\d{2}-\d{2}T/);
-    assert.equal(id.sha256, `sha256:${createHash("sha256").update("probe-bytes").digest("hex")}`);
-    assert.equal(id.codec_version, 2);
     assert.deepEqual([id.build.state, id.build.reason], ["unknown", "not_instrumented"]);
-    const gone = probeIdentity({ path: join(dir, "missing"), source: "checkout" });
-    assert.equal(gone.sha256.state, "unknown");
-    assert.equal(gone.codec_version.state, "unknown");
+    const unpinned = probeIdentity({ path: bin, source: "checkout" });
+    assert.deepEqual([unpinned.sha256.state, unpinned.executed_path.state, unpinned.codec_version.state], ["unknown", "unknown", "unknown"]);
     const none = probeIdentity({ path: null, source: null });
     assert.deepEqual([none.path.state, none.source.state], ["unknown", "unknown"]);
-    // The identity is valid where the schema puts it.
+    assert.throws(() => pinProbe(join(dir, "missing"), runDir), /ENOENT/);
+    // The identity is valid where the schema puts it, and required.
     const doc = linuxXvfbResults();
     doc.run.probe = id;
     assert.equal(validateResults(doc).valid, true, JSON.stringify(validateResults(doc).errors.slice(0, 3)));

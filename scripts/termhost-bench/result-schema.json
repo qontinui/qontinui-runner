@@ -142,11 +142,12 @@
           ]
         },
         "probe": {
-          "description": "The termhost-probe binary that decoded this run's frames: it may be a shared build from another commit (source primary_shared), so it is identified by its file, not assumed to be harness_commit's.",
+          "description": "The termhost-probe binary that decoded this run's frames: it may be a shared build from another commit (source primary_shared), so it is identified by its file, not assumed to be harness_commit's. path/source name where it was found; executed_path is the copy pinned in the run directory that the doctor and every probe call ran; size_bytes and sha256 are the copy's, mtime the original's.",
           "type": "object",
           "required": [
             "path",
             "source",
+            "executed_path",
             "size_bytes",
             "mtime",
             "sha256",
@@ -175,6 +176,17 @@
                     "checkout",
                     "primary_shared"
                   ]
+                },
+                {
+                  "$ref": "#/$defs/absent"
+                }
+              ]
+            },
+            "executed_path": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
                 },
                 {
                   "$ref": "#/$defs/absent"

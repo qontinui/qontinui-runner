@@ -133,6 +133,7 @@ export const RUN = {
   probe: {
     path: "/work/qontinui-runner/target/release/termhost-probe",
     source: "checkout",
+    executed_path: "/tmp/termhost-bench/2026-10-11T12-00-00Z-fixture/probe-bin/termhost-probe",
     size_bytes: 8123456,
     mtime: "2026-10-11T11:30:00Z",
     sha256: `sha256:${"9f".repeat(32)}`,

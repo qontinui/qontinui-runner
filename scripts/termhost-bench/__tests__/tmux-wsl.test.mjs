@@ -56,7 +56,7 @@ import { incident } from "../results.mjs";
 import { classify, cpuTicks, groupReading, parseArgs as samplerParseArgs, pssKb, readReadings, statReading } from "../wsl-sampler.mjs";
 import { MS, genLog, operativeCapabilities, watchSegment } from "./helpers/bench-fixtures.mjs";
 import { createFakeWt } from "./helpers/fake-wt.mjs";
-import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
+import { FakeAdapter, fakeProbe, fakeProbeBinary, fakeRunOptions, healthyFacts, VirtualClock } from "./helpers/fake-bench.mjs";
 
 const WIN_ENV = { SystemRoot: "C:\\Windows", PATH: "C:\\Windows\\System32", LOCALAPPDATA: "C:\\Users\\bench\\AppData\\Local" };
 const INOP = "INOPERATIVE-ON-THIS-MACHINE";
@@ -681,7 +681,7 @@ test("the run loop records an adapter's teardown incidents with its setup and un
     log: () => {},
     sleep: clock.sleep,
     startEnvironment: async () => ({ env: { DISPLAY: ":99" }, screen: { width: 1920, height: 1080, scalePct: 100 }, display: ":99", stop: async () => {} }),
-    probePath: "fake-probe",
+    probePath: fakeProbeBinary(tmp),
     createAdapter: async (setup, o) => (current = new WslFake({ id: setup, clock, variant: o.variant })),
     probe: fakeProbe({ clock, current: () => current }),
     gatherDoctorFacts: async () => healthyFacts(),

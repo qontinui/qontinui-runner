@@ -35,7 +35,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -137,35 +137,47 @@ export function resolveProbeBinary(o = {}) {
 }
 
 /**
- * Which probe binary a run used, for the results' `run.probe`: path, source,
- * size, mtime and sha256 of the file, and the codec version its doctor reported.
- * The probe reports no build commit (only its crate version, in start records),
- * so `build` is an honest unknown rather than the harness's commit.
+ * Pin the run's probe: copy the found binary into the run directory (keeping its
+ * name, so a Windows `.exe` stays one, and its mode, so the exec bit survives) and
+ * hash the COPY. The doctor and every later probe call run the copy, so a shared
+ * build rewritten mid-run (another worktree building into the primary's
+ * target-agent) changes neither what this run executes nor what it records.
+ *
+ * @param {string} src the found probe binary
+ * @param {string} runDir
+ * @returns {{path: string, size: number, sha256: string, source_mtime: string}}
+ */
+export function pinProbe(src, runDir) {
+  const st = statSync(src);
+  const dir = join(runDir, "probe-bin");
+  mkdirSync(dir, { recursive: true });
+  const dst = join(dir, basename(src));
+  copyFileSync(src, dst);
+  chmodSync(dst, st.mode & 0o7777);
+  const bytes = readFileSync(dst);
+  return { path: dst, size: bytes.length, sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, source_mtime: st.mtime.toISOString() };
+}
+
+/**
+ * Which probe binary a run used, for the results' `run.probe`: the ORIGINAL path
+ * and source, the pinned copy it executed (`executed_path`), the copy's size and
+ * sha256, the original's mtime when it was copied, and the codec version its
+ * doctor reported. The probe reports no build commit (only its crate version, in
+ * start records), so `build` is an honest unknown rather than the harness's commit.
  *
  * @param {{path: string | null, source: string | null}} found `locateProbeBinary` output
- * @param {{codecVersion?: number | null, read?: typeof readFileSync, stat?: typeof statSync}} [o]
+ * @param {{pinned?: ReturnType<typeof pinProbe> | null, codecVersion?: number | null}} [o]
  */
-export function probeIdentity(found, { codecVersion = null, read = readFileSync, stat = statSync } = {}) {
+export function probeIdentity(found, { pinned = null, codecVersion = null } = {}) {
   const absent = (detail) => ({ state: "unknown", reason: "harness_error", detail });
-  let size = absent("not read");
-  let mtime = absent("not read");
-  let sha256 = absent("not read");
-  if (found?.path) {
-    try {
-      const st = stat(found.path);
-      size = st.size;
-      mtime = st.mtime.toISOString();
-      sha256 = `sha256:${createHash("sha256").update(read(found.path)).digest("hex")}`;
-    } catch (e) {
-      size = mtime = sha256 = absent(`cannot read ${found.path}: ${e.message}`);
-    }
-  }
+  const notPinned = absent(found?.path ? "the probe was not pinned" : "no probe binary found");
   return {
     path: found?.path ?? absent("no probe binary found"),
     source: PROBE_SOURCES.includes(found?.source) ? found.source : absent("unknown source"),
-    size_bytes: size,
-    mtime,
-    sha256,
+    executed_path: pinned?.path ?? notPinned,
+    size_bytes: pinned?.size ?? notPinned,
+    mtime: pinned?.source_mtime ?? notPinned,
+    sha256: pinned?.sha256 ?? notPinned,
     codec_version: Number.isInteger(codecVersion) ? codecVersion : absent("the probe's doctor reported no codec"),
     build: { state: "unknown", reason: "not_instrumented", detail: "termhost-probe reports no build commit (only its crate version, in start records)" },
   };

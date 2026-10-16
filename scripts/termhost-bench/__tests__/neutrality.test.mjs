@@ -17,7 +17,7 @@ import { machineBlock } from "../machine.mjs";
 import { NeutralityGuard, diffSnapshots, digestFile, neutralityVerdict, platformDirs, primaryStatePaths, snapshot } from "../neutrality.mjs";
 import { runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
-import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
+import { FakeAdapter, fakeProbe, fakeProbeBinary, fakeRunOptions, healthyFacts, VirtualClock } from "./helpers/fake-bench.mjs";
 
 test("the primary's files live where the runner's own resolution puts them", () => {
   const win = primaryStatePaths({ platform: "win32", env: { APPDATA: "C:\\U\\AppData\\Roaming", LOCALAPPDATA: "C:\\U\\AppData\\Local" }, home: "C:\\U" });
@@ -96,7 +96,7 @@ test("D12 fixture: the primary's settings.json changing mid-run produces an inci
       log: () => {},
       sleep: clock.sleep,
       startEnvironment: async () => ({ env: { DISPLAY: ":99" }, screen: { width: 1920, height: 1080 }, display: ":99", stop: async () => {} }),
-      probePath: "fake-probe",
+      probePath: fakeProbeBinary(tmp),
       createAdapter: async (setup, o) => {
         current = new FakeAdapter({
           id: setup,

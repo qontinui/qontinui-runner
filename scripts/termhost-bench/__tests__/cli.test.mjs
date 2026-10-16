@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { KNOWN_FLAGS, UsageError, main, normaliseRunOptions, parseArgv } from "../cli.mjs";
@@ -351,4 +351,19 @@ test("the linux-xvfb job's step bounds fit its timeout with >= 15 minutes for th
   // The run bound stays above its estimate (27 units at about 7.5 min = about 200).
   const run = /- name: Run the benchmark\n(?: {8}.*\n)*? {8}timeout-minutes: (\d+)/.exec(text);
   assert.ok(run && Number(run[1]) > 200, `the run step's bound (${run?.[1]}) is above its 200-minute estimate`);
+});
+
+test("doctor with a --probe that does not exist says so, tries nothing else, and blocks (S1 wording through the CLI)", async () => {
+  const out = [];
+  const err = [];
+  const missing = resolvePath("/nonexistent-termhost-bench/termhost-probe");
+  const code = await main(["doctor", "--env", "linux-xvfb", "--setups", "tmux", "--probe", missing, "--json"], { out: (x) => out.push(x), err: (x) => err.push(x) }, {
+    gatherDoctorFacts: async (a) => ({ ...healthyFacts(), probePath: a.probePath, probeTried: a.probeTried, probeSource: a.probeSource, probeDoctor: null }),
+    startEnvironment: async () => ({ env: {}, display: ":99", stop: async () => {} }),
+  });
+  assert.equal(code, 3, err.join(""));
+  const report = JSON.parse(out.join(""));
+  const probe = report.mechanisms.find((m) => m.id === "probe.binary") ?? report.mechanisms["probe.binary"];
+  assert.equal(probe.state, "INOPERATIVE-ON-THIS-MACHINE");
+  assert.equal(probe.reason, `--probe names ${missing}, which does not exist; no other build is tried in its place`);
 });

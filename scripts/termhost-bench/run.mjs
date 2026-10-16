@@ -398,8 +398,20 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
   const environment = await (deps.startEnvironment ?? spec.start)({ log });
   let outPath = o.out ?? join(runDir, "results.json");
   try {
-    const probeFound = deps.probePath ? { path: deps.probePath, source: "explicit", tried: [deps.probePath] } : probeLib.locateProbeBinary({ explicit: o.probe });
-    const probePath = probeFound.path;
+    const probeFound = deps.probePath
+      ? { path: deps.probePath, source: deps.probeSource ?? "explicit", tried: [deps.probePath] }
+      : (deps.locateProbe ?? probeLib.locateProbeBinary)({ explicit: o.probe });
+    // Pin it before the doctor runs it: the doctor, every probe call and run.probe
+    // all describe this one copy, whatever happens to the original meanwhile.
+    let pinned = null;
+    if (probeFound.path) {
+      try {
+        pinned = (deps.pinProbe ?? probeLib.pinProbe)(probeFound.path, runDir);
+      } catch (e) {
+        throw new RunAbort(`cannot pin the probe binary ${probeFound.path} into the run directory: ${e.message}`);
+      }
+    }
+    const probePath = pinned?.path ?? null;
     const createAdapter = deps.createAdapter ?? defaultCreateAdapter;
     const adapterOptions = (unit) => adapterOptionsFor(unit, o, log);
 
@@ -427,7 +439,7 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
     if (blocking.length > 0) {
       throw new RunAbort(`the doctor reports a run cannot start here: ${blocking.map((b) => `${b.id} ${b.state} (${b.reason})`).join("; ")}`);
     }
-    const probe = deps.probe ?? realProbeDriver({ probePath, envVars: environment.env, log });
+    const probe = deps.probe ?? (deps.probeDriver ?? realProbeDriver)({ probePath, envVars: environment.env, log });
 
     const neutrality = deps.neutrality ?? new NeutralityGuard(o.primaryStatePaths ? { paths: o.primaryStatePaths } : {});
     const base = neutrality.baseline();
@@ -504,7 +516,7 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
           finished_at: now().toISOString(),
           harness_commit: harnessCommit(o.repoRoot),
           // Which probe binary decoded this run's frames (it may not be this checkout's build).
-          probe: (deps.probeIdentity ?? probeLib.probeIdentity)(probeFound, { codecVersion: facts.probeDoctor?.record?.codec?.version ?? null }),
+          probe: probeLib.probeIdentity(probeFound, { pinned, codecVersion: facts.probeDoctor?.record?.codec?.version ?? null }),
           node_version: process.version,
           command: o.command ?? ["node", "scripts/termhost-bench/cli.mjs", "run"],
         },

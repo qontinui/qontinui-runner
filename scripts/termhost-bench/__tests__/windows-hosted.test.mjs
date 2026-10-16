@@ -30,7 +30,7 @@ import { watchArgs } from "../probe.mjs";
 import { checkAssertions, renderReport } from "../report.mjs";
 import { adapterOptionsFor, fallbackSetup, noteLogLines, rowLabels, runBench } from "../run.mjs";
 import { validateResults } from "../validate.mjs";
-import { FakeAdapter, VirtualClock, fakeProbe, fakeRunOptions, healthyFacts } from "./helpers/fake-bench.mjs";
+import { FakeAdapter, fakeProbe, fakeProbeBinary, fakeRunOptions, healthyFacts, VirtualClock } from "./helpers/fake-bench.mjs";
 import { windowsDesktopResults } from "./helpers/results.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -120,7 +120,7 @@ test("a linux-xvfb run with VS Code labels every VS Code row dom_renderer_fallba
     log: () => {},
     sleep: clock.sleep,
     startEnvironment: async () => ({ env: { DISPLAY: ":99" }, screen: { width: 1920, height: 1080, scalePct: 100 }, display: ":99", stop: async () => {} }),
-    probePath: "fake-probe",
+    probePath: fakeProbeBinary(tmp),
     createAdapter: async (setup, o) => (current = new FakeAdapter({ id: setup, clock, variant: o.variant })),
     probe: fakeProbe({ clock, current: () => current }),
     gatherDoctorFacts: async () => healthyFacts(),
@@ -159,7 +159,7 @@ async function profiledRun(t, env, setups, { stale = null } = {}) {
     log: () => {},
     sleep: clock.sleep,
     startEnvironment: async () => ({ env: {}, screen: { width: 1920, height: 1080, scalePct: 100 }, display: null, stop: async () => {} }),
-    probePath: "fake-probe",
+    probePath: fakeProbeBinary(tmp),
     createAdapter: async (setup, o) => (current = new FakeAdapter({ id: setup, clock, variant: o.variant })),
     probe,
     gatherDoctorFacts: async () => ({ ...healthyFacts(), "env.hosted_runner": { state: "OPERATIVE", reason: "fake" } }),

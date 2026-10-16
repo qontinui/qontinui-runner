@@ -278,3 +278,11 @@ export function fakeRunOptions(workDir, over = {}) {
     ...over,
   };
 }
+
+/** A stand-in probe binary file in `dir` (runBench pins the probe it finds by copying it). */
+export function fakeProbeBinary(dir, name = "fake-probe", content = "fake probe bytes") {
+  mkdirSync(dir, { recursive: true });
+  const p = join(dir, name);
+  writeFileSync(p, content, { mode: 0o755 });
+  return p;
+}
