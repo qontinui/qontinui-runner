@@ -48,7 +48,7 @@ const v = (state, reason) => ({ state, reason });
  *   environment: string, envPlatform: string, envNotBuilt: string | null, platform: string,
  *   nodeVersion: string, xvfbPath?: string | null, windowManagerPath?: string | null,
  *   display?: {started: boolean, detail: string} | null,
- *   probePath: string | null, probeDoctor?: {record: object | null, error: string | null} | null,
+ *   probePath: string | null, probeTried?: string[] | null, probeDoctor?: {record: object | null, error: string | null} | null,
  *   setupMechanisms?: Record<string, {state: string, reason: string}>,
  * }} f
  * @returns {Record<string, {state: string, reason: string}>}
@@ -72,7 +72,12 @@ export function mapDoctor(f) {
       : v(DEGRADED, "no matchbox-window-manager: windows are neither maximised nor focused by policy; the harness activates the measured window itself");
   }
   if (!f.probePath) {
-    m["probe.binary"] = v(INOPERATIVE, "termhost-probe is not built (cargo build -p termhost-probe) and no --probe was given");
+    m["probe.binary"] = v(
+      INOPERATIVE,
+      `termhost-probe is not built (cargo build -p termhost-probe) and no --probe was given${
+        Array.isArray(f.probeTried) && f.probeTried.length > 0 ? `; tried ${f.probeTried.join(", ")}` : ""
+      }`,
+    );
   } else if (!f.probeDoctor?.record) {
     m["probe.binary"] = v(UNKNOWN, f.probeDoctor?.error ?? `termhost-probe at ${f.probePath} did not answer doctor`);
   } else {
@@ -188,7 +193,7 @@ export function renderDoctor(report) {
  * Gather the facts (impure): tools on PATH, the probe's doctor (run with the
  * environment's display), each adapter's check().
  *
- * @param {{environment: string, spec: object, probePath: string | null, adapters?: object[],
+ * @param {{environment: string, spec: object, probePath: string | null, probeTried?: string[] | null, adapters?: object[],
  *   envVars?: object | null, display?: {started: boolean, detail: string} | null,
  *   which?: (name: string) => string | null, doctorFn?: typeof probeDoctor}} o
  */
@@ -196,6 +201,7 @@ export async function gatherDoctorFacts({
   environment,
   spec,
   probePath,
+  probeTried = null,
   adapters = [],
   envVars = null,
   display = null,
@@ -210,6 +216,7 @@ export async function gatherDoctorFacts({
     platform: process.platform,
     nodeVersion: process.version,
     probePath,
+    probeTried,
     probeDoctor: null,
     display,
     setupMechanisms: {},

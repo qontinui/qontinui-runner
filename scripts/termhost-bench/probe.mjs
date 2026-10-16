@@ -36,7 +36,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseJsonl } from "./kpis.mjs";
@@ -44,24 +44,79 @@ import { parseJsonl } from "./kpis.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, "..", "..");
 
-/** The probe binary: `--probe`, then `$TERMHOST_PROBE`, then the workspace's target dirs. */
-export function resolveProbeBinary({
+/**
+ * The primary checkout of a linked worktree (the directory holding the shared
+ * `.git`), from `git rev-parse --git-common-dir`; null in the primary itself, in
+ * a bare repository, or when git cannot answer.
+ *
+ * @param {string} repoRoot
+ * @param {{gitCommonDir?: (dir: string) => string | null}} [o]
+ */
+export function primaryCheckoutRoot(repoRoot, { gitCommonDir = readGitCommonDir } = {}) {
+  const common = gitCommonDir(repoRoot);
+  if (!common) return null;
+  const abs = resolve(repoRoot, common);
+  if (basename(abs) !== ".git") return null;
+  const root = dirname(abs);
+  return root === resolve(repoRoot) ? null : root;
+}
+
+function readGitCommonDir(dir) {
+  // cwd, not `git -C`: the harness's PowerShell scan reads any `-C` as an abbreviated -Command.
+  const r = spawnSync("git", ["rev-parse", "--git-common-dir"], { cwd: dir, encoding: "utf8", timeout: 10000 });
+  return r.status === 0 && r.stdout.trim() !== "" ? r.stdout.trim() : null;
+}
+
+/**
+ * Every path the probe binary is looked for at, in order: `--probe`,
+ * `$TERMHOST_PROBE`, this checkout's `target/{debug,release}` and
+ * `target-agent/{debug,release}`, then — from a linked worktree — the primary
+ * checkout's `target-agent/{debug,release}`, where cargo-guard.sh builds a
+ * worktree's crates (its shared TARGET_DIR).
+ *
+ * @param {{explicit?: string | null, env?: object, platform?: string, repoRoot?: string,
+ *   primaryRoot?: string | null}} [o]
+ * @returns {string[]}
+ */
+export function probeCandidates({ explicit = null, env = process.env, platform = process.platform, repoRoot = REPO_ROOT, primaryRoot = null } = {}) {
+  const exe = platform === "win32" ? "termhost-probe.exe" : "termhost-probe";
+  const roots = [
+    [repoRoot, ["target", "debug"]],
+    [repoRoot, ["target", "release"]],
+    [repoRoot, ["target-agent", "debug"]],
+    [repoRoot, ["target-agent", "release"]],
+    ...(primaryRoot
+      ? [
+          [primaryRoot, ["target-agent", "debug"]],
+          [primaryRoot, ["target-agent", "release"]],
+        ]
+      : []),
+  ];
+  return [explicit, env.TERMHOST_PROBE || null, ...roots.map(([root, parts]) => join(root, ...parts, exe))].filter(Boolean);
+}
+
+/**
+ * The probe binary: the first of `probeCandidates` that exists, else null.
+ * `locateProbeBinary` also returns every path it tried (for the doctor).
+ */
+export function locateProbeBinary({
   explicit = null,
   env = process.env,
   platform = process.platform,
   repoRoot = REPO_ROOT,
+  primaryRoot,
+  gitCommonDir,
   exists = existsSync,
 } = {}) {
-  const exe = platform === "win32" ? "termhost-probe.exe" : "termhost-probe";
-  const candidates = [
-    explicit,
-    env.TERMHOST_PROBE || null,
-    join(repoRoot, "target", "debug", exe),
-    join(repoRoot, "target", "release", exe),
-    join(repoRoot, "target-agent", "debug", exe),
-  ].filter(Boolean);
-  for (const c of candidates) if (exists(c)) return resolve(c);
-  return null;
+  const primary = primaryRoot !== undefined ? primaryRoot : primaryCheckoutRoot(repoRoot, gitCommonDir ? { gitCommonDir } : {});
+  const tried = probeCandidates({ explicit, env, platform, repoRoot, primaryRoot: primary });
+  for (const c of tried) if (exists(c)) return { path: resolve(c), tried };
+  return { path: null, tried };
+}
+
+/** The probe binary path, or null (see `locateProbeBinary`). */
+export function resolveProbeBinary(o = {}) {
+  return locateProbeBinary(o).path;
 }
 
 /** `--hwnd` / `--pid` / `--title`, exactly one. */

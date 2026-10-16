@@ -1254,3 +1254,21 @@ test("r15 MF1: the restore check lists the window's losses in a clean note too, 
   assert.equal(check(unplaced.focus).state, "unknown", JSON.stringify(check(unplaced.focus)));
   assert.ok(unknownIncident(unplaced.focus, /not judged: the primary capture was lost after its last kept frame .*none placed in time/), JSON.stringify(unplaced.focus.incidents));
 });
+
+test("every setup is wired everywhere: an adapter, a fallback launch mode and an environment (a new setup cannot fall through to a guess)", async () => {
+  const { SETUP_IDS, LAUNCH_MODES } = await import("../kpi-catalog.mjs");
+  const { createAdapter } = await import("../adapters/index.mjs");
+  const { ENVIRONMENT_SPECS } = await import("../envs/index.mjs");
+  const { fallbackLaunchMode } = await import("../run.mjs");
+  const src = readFileSync(new URL("../adapters/index.mjs", import.meta.url), "utf8");
+  const body = src.slice(src.indexOf("export async function createAdapter"));
+  const cases = [...body.slice(0, body.indexOf("default:")).matchAll(/case "([^"]+)":/g)].map((m) => m[1]);
+  assert.deepEqual([...cases].sort(), [...SETUP_IDS].sort(), "createAdapter has a case for exactly the SETUP_IDS");
+  await assert.rejects(createAdapter("no-such-setup", {}), /unknown setup "no-such-setup"/);
+  const inSomeEnv = new Set(Object.values(ENVIRONMENT_SPECS).flatMap((e) => e.setups));
+  for (const id of SETUP_IDS) {
+    for (const o of [{}, { runnerMode: "supervisor", vscodeAppPath: "/x" }]) assert.ok(LAUNCH_MODES.includes(fallbackLaunchMode(id, o)), `${id}: ${fallbackLaunchMode(id, o)}`);
+    assert.ok(inSomeEnv.has(id), `${id} is in no environment's setups`);
+  }
+  assert.throws(() => fallbackLaunchMode("no-such-setup", {}), /no launch mode for setup "no-such-setup"/);
+});

@@ -12,11 +12,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 
-import { WatchProcess, activate, endChild, freshTag, injectArgs, raceTimeout, runProbe, setAside, takeRunFile, watchArgs } from "../probe.mjs";
+import { WatchProcess, activate, endChild, freshTag, injectArgs, locateProbeBinary, primaryCheckoutRoot, probeCandidates, raceTimeout, resolveProbeBinary, runProbe, setAside, takeRunFile, watchArgs } from "../probe.mjs";
+import { mapDoctor } from "../doctor.mjs";
 
 function dir(t) {
   const d = mkdtempSync(join(tmpdir(), "tb-probe-"));
@@ -175,4 +177,79 @@ test("a child that ignores SIGTERM is killed, never waited on forever (review N6
   const seg = await w.stop({ timeoutMs: 10 });
   assert.equal(seg.timedOut, true);
   assert.deepEqual(c3.signals, ["SIGTERM", "SIGKILL"]);
+});
+
+// ---------------------------------------------------------------------------
+// Finding the probe binary (KB runbook review): cargo-guard.sh builds a linked
+// worktree's crates into the PRIMARY checkout's shared target-agent/.
+// ---------------------------------------------------------------------------
+
+test("the probe is looked for at every candidate, in order, and the first that exists wins", () => {
+  const repo = join("/r", "wt");
+  const primary = join("/r", "primary");
+  const tried = probeCandidates({ explicit: "/x/probe", env: { TERMHOST_PROBE: "/e/probe" }, platform: "linux", repoRoot: repo, primaryRoot: primary });
+  assert.deepEqual(tried, [
+    "/x/probe",
+    "/e/probe",
+    join(repo, "target", "debug", "termhost-probe"),
+    join(repo, "target", "release", "termhost-probe"),
+    join(repo, "target-agent", "debug", "termhost-probe"),
+    join(repo, "target-agent", "release", "termhost-probe"),
+    join(primary, "target-agent", "debug", "termhost-probe"),
+    join(primary, "target-agent", "release", "termhost-probe"),
+  ]);
+  // Each candidate alone is found.
+  for (const c of tried) {
+    const got = locateProbeBinary({ explicit: "/x/probe", env: { TERMHOST_PROBE: "/e/probe" }, platform: "linux", repoRoot: repo, primaryRoot: primary, exists: (p) => p === c });
+    assert.equal(got.path, resolvePath(c), c);
+    assert.deepEqual(got.tried, tried);
+  }
+  // The primary's own target-agent/release, the cargo-guard release build, from a worktree.
+  const release = join(primary, "target-agent", "release", "termhost-probe");
+  assert.equal(resolveProbeBinary({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: primary, exists: (p) => p === release }), resolvePath(release));
+  // Not in the primary itself (no primary root), and .exe on Windows.
+  assert.equal(probeCandidates({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: null }).length, 4);
+  assert.ok(probeCandidates({ env: {}, platform: "win32", repoRoot: repo, primaryRoot: null }).every((p) => p.endsWith("termhost-probe.exe")));
+  const none = locateProbeBinary({ env: {}, platform: "linux", repoRoot: repo, primaryRoot: primary, exists: () => false });
+  assert.deepEqual([none.path, none.tried.length], [null, 6]);
+});
+
+test("a linked worktree resolves its primary checkout through git rev-parse --git-common-dir", () => {
+  // Pure: what git prints in each case.
+  assert.equal(primaryCheckoutRoot("/p/wt", { gitCommonDir: () => "/p/primary/.git" }), resolvePath("/p/primary"));
+  assert.equal(primaryCheckoutRoot("/p/primary", { gitCommonDir: () => ".git" }), null, "the primary itself");
+  assert.equal(primaryCheckoutRoot("/p/bare-wt", { gitCommonDir: () => "/p/repo.git" }), null, "a bare repository has no checkout");
+  assert.equal(primaryCheckoutRoot("/p/x", { gitCommonDir: () => null }), null, "git could not answer");
+  // Real git: a primary and a linked worktree.
+  const git = spawnSync("git", ["--version"]);
+  if (git.status !== 0) return;
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "tb-probe-wt-")));
+  try {
+    const primary = join(dir, "primary");
+    const wt = join(dir, "wt");
+    const g = (cwd, ...args) => {
+      const r = spawnSync("git", ["-C", cwd, "-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" });
+      assert.equal(r.status, 0, r.stderr);
+    };
+    mkdirSync(primary);
+    g(primary, "init", "-q");
+    g(primary, "commit", "-q", "--allow-empty", "-m", "init");
+    g(primary, "worktree", "add", "-q", "--detach", wt);
+    assert.equal(primaryCheckoutRoot(wt), primary);
+    assert.equal(primaryCheckoutRoot(primary), null);
+    const release = join(primary, "target-agent", "release", "termhost-probe");
+    mkdirSync(dirname(release), { recursive: true });
+    writeFileSync(release, "");
+    assert.equal(locateProbeBinary({ env: {}, platform: "linux", repoRoot: wt }).path, release);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the doctor's INOPERATIVE probe.binary names every path it tried", () => {
+  const tried = probeCandidates({ env: {}, platform: "linux", repoRoot: "/r/wt", primaryRoot: "/r/primary" });
+  const m = mapDoctor({ environment: "linux-xvfb", envPlatform: "linux", platform: "linux", nodeVersion: process.version, probePath: null, probeTried: tried, display: null, setupMechanisms: {}, drain: null });
+  assert.equal(m["probe.binary"].state, "INOPERATIVE-ON-THIS-MACHINE");
+  for (const p of tried) assert.ok(m["probe.binary"].reason.includes(p), p);
+  assert.match(m["probe.binary"].reason, /; tried /);
 });

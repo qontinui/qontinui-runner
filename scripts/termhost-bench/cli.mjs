@@ -31,7 +31,7 @@ import { applyVerdict, compareBuilds, proposeBaseline, readBaselineFile, renderC
 import { blockingMechanisms, doctorNotes, doctorReport, gatherDoctorFacts, mapDoctor, renderDoctor } from "./doctor.mjs";
 import { environmentSpec } from "./envs/index.mjs";
 import { ARMS, KPI_CATALOG, SETUP_IDS } from "./kpi-catalog.mjs";
-import { resolveProbeBinary } from "./probe.mjs";
+import { locateProbeBinary } from "./probe.mjs";
 import { HEADLINE_LINE, checkAssertions, headlineStatus, oneEnvironment, prepareReport, renderReport } from "./report.mjs";
 import { InvalidResults } from "./results.mjs";
 import { validateResults } from "./validate.mjs";
@@ -70,7 +70,9 @@ run options:
   --out <file>               results file (default <run-dir>/results.json)
   --redacted-out <file>      also write the runner-rows-only copy public CI may upload (D7)
   --smoke-setups <a,b>       label these setups' rows assert_only_smoke (public CI, D7)
-  --probe <path>             termhost-probe binary (default: $TERMHOST_PROBE, then target/*/)
+  --probe <path>             termhost-probe binary (default: $TERMHOST_PROBE, then target/{debug,release},
+                             target-agent/{debug,release}, and from a linked worktree the primary
+                             checkout's target-agent/{debug,release}, where cargo-guard.sh builds)
   --work-dir <dir>           parent of the run directory (default: the OS temp dir)
   --run-id <id>              explicit run id
 
@@ -351,7 +353,10 @@ async function cmdDoctor(flags, io, deps = {}) {
     const facts = await (deps.gatherDoctorFacts ?? gatherDoctorFacts)({
       environment: env,
       spec,
-      probePath: resolveProbeBinary({ explicit: flags.probe ? resolve(flags.probe) : null }),
+      ...(() => {
+        const probe = locateProbeBinary({ explicit: flags.probe ? resolve(flags.probe) : null });
+        return { probePath: probe.path, probeTried: probe.tried };
+      })(),
       adapters,
       envVars: environment?.env ?? null,
       display,

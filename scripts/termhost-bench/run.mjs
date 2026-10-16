@@ -279,11 +279,14 @@ export function abortAwareSleep(signal, inner = null) {
 }
 
 /** The launch mode a setup's unit was planned with, from the run's options. */
-function fallbackLaunchMode(setupId, o) {
+export function fallbackLaunchMode(setupId, o = {}) {
   if (setupId === "runner") return o.runnerMode === "supervisor" ? "supervisor_spawn_test" : "subject_instance_root";
   if (setupId === "vscode") return o.vscodeAppPath ? "installed_app_path" : "portable_pinned";
   if (setupId === "windows-terminal") return "portable_pinned";
-  return "private_server";
+  if (setupId === "tmux" || setupId === "tmux-wsl") return "private_server";
+  // A setup added to SETUP_IDS without a launch mode here is a programming error,
+  // not a row to label with a plausible guess.
+  throw new Error(`fallbackLaunchMode: no launch mode for setup ${JSON.stringify(setupId)}`);
 }
 
 /**
@@ -395,7 +398,8 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
   const environment = await (deps.startEnvironment ?? spec.start)({ log });
   let outPath = o.out ?? join(runDir, "results.json");
   try {
-    const probePath = deps.probePath ?? probeLib.resolveProbeBinary({ explicit: o.probe });
+    const probeFound = deps.probePath ? { path: deps.probePath, tried: [deps.probePath] } : probeLib.locateProbeBinary({ explicit: o.probe });
+    const probePath = probeFound.path;
     const createAdapter = deps.createAdapter ?? defaultCreateAdapter;
     const adapterOptions = (unit) => adapterOptionsFor(unit, o, log);
 
@@ -409,6 +413,7 @@ async function runBenchInner(opts, deps, { log, now, sleep, aborted, abort, live
       environment: o.env,
       spec,
       probePath,
+      probeTried: probeFound.tried,
       adapters: checkAdapters,
       envVars: environment.env,
       display: { started: true, detail: environment.display ?? "started" },
