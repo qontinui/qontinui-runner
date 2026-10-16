@@ -1383,16 +1383,23 @@ export function computeRowKpis(p) {
     if (line) notes.push(`output_latency_ms: ${line}`);
   }
   // A wedge (frozen to the end of the soak) leaves the per-marker KPIs measured
-  // from the live part only: they become unknown(pane_stalled). A reason the KPI
-  // already had is kept — only a bare sample shortfall, which the wedge explains,
-  // is replaced — and the wedge is noted on it instead.
+  // from the live part only: they become unknown(pane_stalled). It replaces a
+  // bare sample shortfall (which the wedge explains) and a CAPTURE-HEALTH unknown
+  // (capture_disagreement, or the probe fell behind): a marker that stayed still
+  // for seconds is seen from which frames carry it, which neither a timing-offset
+  // disagreement nor probe lag invalidates — and a capture-health reason is what
+  // a third-party smoke may excuse (--accept-capture-health-unknown), so keeping
+  // it would let a wedged pane through. The capture-health reading stays as a
+  // note. Any other reason the KPI already had (clock_unaligned, …) is kept, and
+  // the wedge is noted on it instead.
   const wedged = stalls.filter((x) => !x.recovered && x.voids);
   if (wedged.length > 0) {
     const what = wedged.map(describeStall).join("; ");
     notes.push(`output_latency_ms: pane stalled: ${what}`);
     for (const id of STALL_VOIDED_KPIS) {
       const cur = kpis[id];
-      if (cur.state === "measured" || cur.reason === "insufficient_samples") {
+      if (cur.state === "measured" || cur.reason === "insufficient_samples" || isCaptureHealthUnknown(cur)) {
+        if (isCaptureHealthUnknown(cur)) notes.push(`${id}: also unknown for capture health: ${cur.reason}${cur.detail ? ` — ${cur.detail}` : ""}`);
         set(id, unknownKpi(id, "pane_stalled", { n: cur.n ?? 0, detail: `pane stalled: ${what}` }));
       } else {
         notes.push(`${id}: pane stalled: ${what}`);

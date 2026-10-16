@@ -643,7 +643,7 @@ test("a stalled pane in a soak becomes a pane_stalled incident on its row and na
   assert.match(tiled.kpis.output_latency_ms.detail, /^pane stalled: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame \(a wedge on what was seen: the still marker alone meets the bar\)$/);
   assert.ok(
     tiled.incidents.some(
-      (i) => i.kind === "pane_stalled" && /arm tiled: soak: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame \(a wedge on what was seen: the still marker alone meets the bar\): the pane did not repaint after that; its marker KPIs are unknown\(pane_stalled\)$/.test(i.detail),
+      (i) => i.kind === "pane_stalled" && /arm tiled: soak: session 0 stayed at seq \d+ for \d+ ms .*, and did not advance in any later frame \(a wedge on what was seen: the still marker alone meets the bar\): the pane did not repaint after that; its marker KPIs read output_latency_ms unknown\(pane_stalled\), marker_loss unknown\(pane_stalled\), marker_skipped unknown\(pane_stalled\)$/.test(i.detail),
     ),
     JSON.stringify(tiled.incidents),
   );

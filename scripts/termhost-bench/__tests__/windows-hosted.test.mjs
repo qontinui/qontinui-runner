@@ -299,7 +299,7 @@ test("--accept-capture-health-unknown: the WT smoke's two failures from CI (capt
 test("--accept-capture-health-unknown excuses capture health only: pane_stalled, sessions_not_rendered, another harness_error, an unmeasured plumbing KPI, another environment all still fail", () => {
   const flagged = SMOKE("windows-terminal", { acceptCaptureHealthUnknown: true });
   const cases = [
-    ["pane_stalled", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "harness_error", detail: "session 0's pane stopped repainting (pane_stalled)" })],
+    ["pane_stalled", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "pane_stalled", detail: "pane stalled: session 0 stayed at seq 249 for 20067 ms" })],
     ["sessions_not_rendered", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "sessions_not_rendered", detail: "x" })],
     ["zone_unresolved", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "zone_unresolved", detail: "x" })],
     ["a launch failure", (r) => (r.kpis.output_latency_ms = { state: "unknown", unit: "ms", n: 0, reason: "harness_error", detail: "no window of Windows Terminal's class appeared within 60 s" })],

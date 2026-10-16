@@ -47,6 +47,7 @@ import {
   probeHealthGate,
   seqAtOrAfter,
 } from "../kpis.mjs";
+import { checkAssertions } from "../report.mjs";
 import { measureKpi } from "../stats.mjs";
 import { MS, genLog, operativeCapabilities, stallSegment, watchSegment } from "./helpers/bench-fixtures.mjs";
 
@@ -885,6 +886,46 @@ test("the stall rule does not run on an unaligned clock, and never overwrites an
   assertUnknown(w.kpis.marker_loss, "refresh_rate_unknown");
   assert.ok((w.kpis.marker_loss.notes ?? []).some((n) => /^pane stalled: session 0/.test(n)), JSON.stringify(w.kpis.marker_loss));
   assertUnknown(w.kpis.output_latency_ms, "pane_stalled");
+});
+
+/** The probe's own probe-behind verdict on its capture KPIs, as its summary carries it. */
+const probeBehind = (unit) => ({ state: "unknown", unit, n: 0, reason: "harness_error", detail: "the probe fell behind: its p95 frame lag was 120.0 ms (40 of 400 frames over the 93.8 ms bound; software-compositor), so markers may have appeared only in later frames" });
+const withProbeBehind = (records) =>
+  records.map((r) => (r.type === "summary" ? { ...r, probe: { ...r.probe, behind: true, lag_ms_judged: 120, lag_bound_ms: 93.75 }, output_latency_ms: probeBehind("ms"), marker_loss: probeBehind("%"), marker_skipped: probeBehind("%") } : r));
+
+/** A windows-hosted WT smoke document holding `kpis` for N = 1 focus, gated as the job gates it. */
+function smokeFails(kpis) {
+  const doc = {
+    machine: { environment: "windows-hosted" },
+    capabilities: { "capture.wgc": { state: "OPERATIVE", reason: "fake" } },
+    rows: [{ setup: { id: "windows-terminal" }, scenario: { n: 1, arm: "focus", run_index: 0 }, kpis }],
+  };
+  return checkAssertions(doc, { atN: [1], setups: ["windows-terminal"], arms: ["focus"], requireMeasuredIfOperative: [{ mechanism: "capture.wgc", kpis: ["output_latency_ms"] }], acceptCaptureHealthUnknown: true });
+}
+
+test("a voiding wedge overrides a capture-health unknown — probe behind, or capture_disagreement — so a wedged third-party pane FAILS the smoke even with --accept-capture-health-unknown (head confirmation of 8b3f54a98 M1)", () => {
+  for (const [label, f, patch, before] of [
+    ["probe behind", focusFixture(), withProbeBehind, "harness_error"],
+    ["capture_disagreement", focusFixture({ watch: { crosscheck: "disagree" } }), (x) => x, "capture_disagreement"],
+  ]) {
+    const healthOnly = computeRowKpis({ ...f, environment: "windows-hosted", soak: { records: patch(f.soak.records) } });
+    assertUnknown(healthOnly.kpis.output_latency_ms, before);
+    assert.deepEqual(smokeFails(healthOnly.kpis), [], `${label} alone: the flag excuses it (plumbing check, D6)`);
+    const w = computeRowKpis({ ...f, environment: "windows-hosted", soak: { records: patch(stallSegment(f.soak.records, { fromMs: SOAK_MS / 2 })) } });
+    assert.equal(w.stalls.filter((x) => x.voids).length, 1, `${label}: the wedge is seen from frame presence`);
+    for (const id of STALL_VOIDED_KPIS) {
+      if (w.kpis[id].state === "measured") continue;
+      if (healthOnly.kpis[id].state === "unknown" && healthOnly.kpis[id].reason === before) assertUnknown(w.kpis[id], "pane_stalled");
+    }
+    assertUnknown(w.kpis.output_latency_ms, "pane_stalled");
+    assert.ok(
+      (w.kpis.output_latency_ms.notes ?? []).some((n) => n.startsWith(`also unknown for capture health: ${before}`)),
+      `${label}: the capture-health reading is kept as a note: ${JSON.stringify(w.kpis.output_latency_ms.notes)}`,
+    );
+    const fails = smokeFails(w.kpis);
+    assert.equal(fails.length, 1, `${label}: a wedged pane fails the smoke even with the flag`);
+    assert.match(fails[0], /output_latency_ms is unknown\(pane_stalled\)/);
+  }
 });
 
 /** A probe segment for paneStalls alone: x11 primary, the given frames and intervals. */

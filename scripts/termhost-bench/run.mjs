@@ -53,6 +53,7 @@ import {
   segmentWindow,
   stallCoverage,
   STALL_MIN_MS,
+  STALL_VOIDED_KPIS,
   summarizeLosses,
 } from "./kpis.mjs";
 import { machineBlock, sampleBackgroundLoad } from "./machine.mjs";
@@ -887,11 +888,17 @@ export async function runUnit(unit, ctx) {
       wsl: wslSamples,
     });
     noteRefresh(ctx.refreshSeen, a.soak);
+    // What the marker KPIs actually carry, read from the row (a wedge does not
+    // replace every reason: clock_unaligned, for one, keeps precedence).
+    const markerKpis = STALL_VOIDED_KPIS.map((id) => {
+      const v = computed.kpis[id];
+      return `${id} ${v?.state === "measured" ? "measured" : `${v?.state ?? "missing"}(${v?.reason ?? "?"})`}`;
+    }).join(", ");
     for (const st of computed.stalls ?? []) {
       const verdict = st.recovered
         ? "a hitch the pane recovered from; its marker KPIs stay measured"
         : st.voids
-          ? "the pane did not repaint after that; its marker KPIs are unknown(pane_stalled)"
+          ? `the pane did not repaint after that; its marker KPIs read ${markerKpis}`
           : "still at the soak's end on too short a frameless tail to call a wedge; its marker KPIs stay measured";
       a.incidents.push(
         incident("pane_stalled", `unit ${name} arm ${arm}: soak: ${describeStall(st)}: ${verdict}`, {
