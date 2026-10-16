@@ -895,11 +895,14 @@ export async function runUnit(unit, ctx) {
       return `${id} ${v?.state === "measured" ? "measured" : `${v?.state ?? "missing"}(${v?.reason ?? "?"})`}`;
     }).join(", ");
     for (const st of computed.stalls ?? []) {
+      // Each verdict reads the marker KPIs off the row: a stall that voids nothing
+      // still leaves them as they were (a capture-health unknown, say), never
+      // "measured" by assumption.
       const verdict = st.recovered
-        ? "a hitch the pane recovered from; its marker KPIs stay measured"
+        ? `a hitch the pane recovered from (not voided); its marker KPIs read ${markerKpis}`
         : st.voids
           ? `the pane did not repaint after that; its marker KPIs read ${markerKpis}`
-          : "still at the soak's end on too short a frameless tail to call a wedge; its marker KPIs stay measured";
+          : `still at the soak's end on too short a frameless tail to call a wedge (not voided); its marker KPIs read ${markerKpis}`;
       a.incidents.push(
         incident("pane_stalled", `unit ${name} arm ${arm}: soak: ${describeStall(st)}: ${verdict}`, {
           data: { setup: unit.setup, unit: name, arm, session: st.session, recovered: st.recovered, voids: st.voids },

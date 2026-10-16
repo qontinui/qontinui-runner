@@ -869,8 +869,37 @@ test("a recovered hitch in a soak is a pane_stalled incident that says so, and v
   assert.equal(tiled.kpis.output_latency_ms.state, "measured", JSON.stringify(tiled.kpis.output_latency_ms));
   const inc = tiled.incidents.filter((i) => i.kind === "pane_stalled");
   assert.equal(inc.length, 1, JSON.stringify(tiled.incidents));
-  assert.match(inc[0].detail, /soak: session 0 stayed at seq \d+ for \d+ ms .*, then advanced again: a hitch the pane recovered from; its marker KPIs stay measured$/);
+  assert.match(inc[0].detail, /soak: session 0 stayed at seq \d+ for \d+ ms .*, then advanced again: a hitch the pane recovered from \(not voided\); its marker KPIs read output_latency_ms measured, marker_loss measured, marker_skipped measured$/);
   assert.equal(inc[0].data.recovered, true);
+  assert.equal(validateResults(res.doc).valid, true);
+});
+
+test("a recovered hitch on a capture-disagreement row: the incident reads the KPIs as the row carries them, never 'stay measured' (head confirmation of 802e8f3d4)", async (t) => {
+  const { res } = await fakeRun(t, {
+    opts: { ns: [1], setups: ["runner"] },
+    wrapProbe: (inner) => ({
+      ...inner,
+      startWatch(o) {
+        const w = inner.startWatch(o);
+        if (o.label !== "tiled-soak") return w;
+        return { ...w, stop: async () => {
+          const seg = await w.stop();
+          const records = freezeWindow(seg.records, 10_000, 12_500).map((r) =>
+            r.type === "summary"
+              ? { ...r, crosscheck: { ...(r.crosscheck ?? {}), verdict: "disagree", detail: "3 of 40 markers disagreed" }, output_latency_ms: { state: "unknown", unit: "ms", n: 40, reason: "capture_disagreement", detail: "3 of 40 markers disagreed" } }
+              : r,
+          );
+          return { ...seg, records };
+        } };
+      },
+    }),
+  });
+  const tiled = res.doc.rows.find((r) => r.scenario.arm === "tiled");
+  assert.equal(tiled.kpis.output_latency_ms.reason, "capture_disagreement", "a recovered hitch voids nothing: the capture-health reason stays");
+  const inc = tiled.incidents.filter((i) => i.kind === "pane_stalled");
+  assert.equal(inc.length, 1, JSON.stringify(tiled.incidents));
+  assert.match(inc[0].detail, /a hitch the pane recovered from \(not voided\); its marker KPIs read output_latency_ms unknown\(capture_disagreement\), /);
+  assert.doesNotMatch(inc[0].detail, /stay measured/);
   assert.equal(validateResults(res.doc).valid, true);
 });
 
@@ -1053,7 +1082,7 @@ test("MF1: a 2.4 s whole-screen freeze at the soak's end is a pane_stalled incid
   assert.equal(tiled.kpis.output_latency_ms.state, "measured", JSON.stringify(tiled.kpis.output_latency_ms));
   const inc = tiled.incidents.filter((i) => i.kind === "pane_stalled");
   assert.equal(inc.length, 1, JSON.stringify(tiled.incidents));
-  assert.match(inc[0].detail, /\(tail-dependent, not a wedge: .*\): still at the soak's end on too short a frameless tail to call a wedge; its marker KPIs stay measured$/);
+  assert.match(inc[0].detail, /\(tail-dependent, not a wedge: .*\): still at the soak's end on too short a frameless tail to call a wedge \(not voided\); its marker KPIs read output_latency_ms measured, marker_loss measured, marker_skipped measured$/);
   assert.deepEqual([inc[0].data.recovered, inc[0].data.voids], [false, false]);
 });
 
