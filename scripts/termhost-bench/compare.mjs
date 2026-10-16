@@ -5,8 +5,11 @@
  * headline KPIs, the regression verdict (plan Phase 6).
  *
  * Plan `2026-10-11-terminal-page-performance-kpis-across-setups`. Phase 3 built the
- * table; Phase 6 adds the verdict here (no second module). For each headline KPI
- * (every catalog row with a `headline_statistic`) at each N and arm:
+ * table; Phase 6 adds the verdict here (no second module). ONE verdict gates: the
+ * gate, output_latency_ms p95 pooled over every N and arm (the KPI the plan's
+ * Phase 6 arming row names; see `poolGate`). Every headline KPI (catalog
+ * `headline_statistic`) is also judged at each N and arm, informationally — rendered,
+ * `gating: false`, never failing a job. Each judgement is:
  *
  *   - **regression** iff the head build's median-of-runs is worse than the baseline
  *     build's by more than the threshold the baseline FILE records for that KPI
@@ -24,8 +27,16 @@
  * `termhost-bench-baseline/v1`) supplies the thresholds and the minimum run count,
  * and records the readings it was proposed from (runner rows only, D7). An unknown
  * never fires the detector [policy: verification-and-evidence/an-unknown-input-must-
- * not-fire-a-detector]: the overall verdict is `regression` only when a judged
- * entry is one, and the scheduled job fails only on that.
+ * not-fire-a-detector]: the overall verdict is the gate's, and the scheduled job
+ * fails only on its `regression`. Judging some 40 entries and failing on any one
+ * would go red on most runs where nothing changed (the review's measurement); the
+ * one pooled gate keeps that under 2 % (the seeded simulation in the tests).
+ *
+ * "Control-normalised" (the plan's arming row) is not defined anywhere in the
+ * plan, and the results carry no control reading (no unloaded control session,
+ * no control KPI). The only control in the design is the same-VM baseline build
+ * (D11), which every comparison here is already drawn against; normalising by
+ * any further control is deferred until the plan defines one.
  *
  * An unknown value is never folded into a median: a side with no measured run reads
  * `unknown`, with its reasons.
@@ -38,12 +49,11 @@
  * from different environments are refused (D6).
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ARMS, ENVIRONMENTS, KPI_CATALOG, getKpi } from "./kpi-catalog.mjs";
-import { percentile } from "./stats.mjs";
 
 /**
  * Row labels that keep a row out of every comparison, and so out of the verdict
@@ -78,14 +88,19 @@ export function valueOf(kpiValue, kpi) {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-/** median / min / max of a non-empty list (nearest-rank median: an observed value). */
+/**
+ * median / min / max of a non-empty list. The median is the midpoint of the two
+ * middle values for an even count (with two runs, their mean) — a statistic of
+ * the runs, not necessarily one of them.
+ */
 export function spreadOf(values) {
   if (values.length === 0) return null;
-  const m = percentile(values, 50);
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length / 2;
   return {
-    median: m.state === "measured" ? m.value : values[0],
-    min: Math.min(...values),
-    max: Math.max(...values),
+    median: sorted.length % 2 === 1 ? sorted[Math.floor(mid)] : (sorted[mid - 1] + sorted[mid]) / 2,
+    min: sorted[0],
+    max: sorted[sorted.length - 1],
     runs: values.length,
   };
 }
@@ -165,7 +180,9 @@ export function compareBuilds(head, baseline = null, { setup = "runner", variant
       const side = (rows) => {
         const raw = rows.map((r) => r.kpis[id]);
         const nums = raw.map((v) => valueOf(v, kpi)).filter((v) => v !== null);
-        return { spread: spreadOf(nums), states: statesOf(raw), total: rows.length };
+        // Per run, for the pooled gate: the run index and its value (null = not measured).
+        const values = rows.map((r) => ({ run: r.scenario.run_index, value: valueOf(r.kpis[id], kpi) }));
+        return { spread: spreadOf(nums), states: statesOf(raw), total: rows.length, values };
       };
       out.entries.push({
         kpi: id,
@@ -192,8 +209,25 @@ export const BASELINE_SCHEMA_ID = "termhost-bench-baseline/v1";
 /** The KPIs the verdict judges: the headline ones (catalog `headline_statistic`). */
 export const HEADLINE_KPIS = Object.freeze(KPI_CATALOG.filter((k) => k.headline_statistic).map((k) => k.id));
 
+/**
+ * The one KPI whose verdict GATES the scheduled job (the plan's Phase 6 arming
+ * row names output_latency_ms p95). Every other headline KPI's verdict is
+ * computed and rendered, and is informational: it never fails a job.
+ */
+export const GATING_KPI = "output_latency_ms";
+
 /** Fewer measured runs on a side than this and the side is under-sampled. */
 export const MIN_RUNS_FLOOR = 2;
+
+/**
+ * Runs per build each scheduled job takes (`runs` in termhost-bench.yml's
+ * parameters step; a test holds the two in step). A baseline's `min_runs` may not
+ * exceed its environment's, or its gate could never be judged.
+ */
+export const SCHEDULED_RUNS = Object.freeze({ "linux-xvfb": 3, "windows-hosted": 2 });
+
+/** The fewest pooled entries the gate is drawn from: one entry alone is not a reproduction. */
+export const MIN_GATE_ENTRIES = 2;
 
 /** Verdicts an entry can carry. */
 export const VERDICTS = Object.freeze(["regression", "improvement", "no_change", "unknown"]);
@@ -215,14 +249,29 @@ export const PROPOSED_THRESHOLDS = Object.freeze({
   count: Object.freeze({ relative: 0, absolute: 1 }),
 });
 
+/**
+ * The gate's relative threshold, by runs per build — chosen with the seeded
+ * null/power simulation in `__tests__/verdict-report.test.mjs` (six pooled
+ * entries, run-to-run CV 0.2, a 30 % regression across every N and arm):
+ *   runs 3, 0.14: job red with no change 1.2 %, a 30 % regression red 90 %;
+ *   runs 2, 0.20: 1.1 % and 83 %.
+ * The non-overlapping-spreads rule caps the power: with 3 runs against 3 a null
+ * comparison is disjoint 1 time in 20 before any threshold applies.
+ */
+export const PROPOSED_GATE_RELATIVE = Object.freeze({ 2: 0.2, 3: 0.14 });
+
 const isNum = (x) => typeof x === "number" && Number.isFinite(x);
 
 /**
- * Structural check of a baseline document.
+ * Structural check of a baseline document, including the ways one could disarm
+ * the gate: no threshold for the gating KPI, a relative threshold outside (0, 1]
+ * (25 meant as 25 %), a `min_runs` above what the environment's scheduled job
+ * takes, and a count KPI with no absolute floor.
  *
+ * @param {{scheduledRuns?: Record<string, number>}} [o]
  * @returns {string[]} errors (empty = usable)
  */
-export function validateBaseline(b) {
+export function validateBaseline(b, { scheduledRuns = SCHEDULED_RUNS } = {}) {
   const errors = [];
   if (!b || typeof b !== "object" || Array.isArray(b)) return ["the baseline is not a JSON object"];
   if (b.schema !== BASELINE_SCHEMA_ID) errors.push(`schema must be ${BASELINE_SCHEMA_ID}, got ${JSON.stringify(b.schema)}`);
@@ -230,9 +279,15 @@ export function validateBaseline(b) {
   if (b.setup !== "runner") errors.push("setup must be runner: a baseline holds the runner's own readings only (D7)");
   if (typeof b.variant !== "string" || b.variant.length === 0) errors.push("variant must be a non-empty string");
   if (!Number.isInteger(b.min_runs) || b.min_runs < MIN_RUNS_FLOOR) errors.push(`min_runs must be an integer >= ${MIN_RUNS_FLOOR} (one run has no spread)`);
+  const scheduled = scheduledRuns[b.environment];
+  if (Number.isInteger(b.min_runs) && Number.isInteger(scheduled) && b.min_runs > scheduled) {
+    errors.push(`min_runs ${b.min_runs} exceeds the ${scheduled} run(s) the scheduled ${b.environment} job takes: the gate could never be judged`);
+  }
   if (!b.thresholds || typeof b.thresholds !== "object" || Array.isArray(b.thresholds)) {
     errors.push("thresholds must be an object keyed by headline KPI id");
   } else {
+    if (!b.thresholds[GATING_KPI]) errors.push(`thresholds.${GATING_KPI}: required — it is the KPI that gates the job`);
+    else if (!(isNum(b.thresholds[GATING_KPI].relative) && b.thresholds[GATING_KPI].relative > 0)) errors.push(`thresholds.${GATING_KPI}.relative: required and > 0 (the gate is relative)`);
     for (const [id, t] of Object.entries(b.thresholds)) {
       if (!HEADLINE_KPIS.includes(id)) errors.push(`thresholds.${id}: not a headline KPI (${HEADLINE_KPIS.join(", ")})`);
       if (!t || typeof t !== "object") {
@@ -242,10 +297,12 @@ export function validateBaseline(b) {
       const extra = Object.keys(t).filter((k) => k !== "relative" && k !== "absolute");
       if (extra.length > 0) errors.push(`thresholds.${id}: unknown field(s) ${extra.join(", ")}`);
       if (t.relative === undefined && t.absolute === undefined) errors.push(`thresholds.${id}: needs relative and/or absolute`);
-      for (const k of ["relative", "absolute"]) {
-        if (t[k] !== undefined && !(isNum(t[k]) && t[k] >= 0)) errors.push(`thresholds.${id}.${k}: must be a number >= 0`);
+      if (t.relative !== undefined && !(isNum(t.relative) && t.relative >= 0 && t.relative <= 1)) errors.push(`thresholds.${id}.relative: must be a share in [0, 1] (0.25 is 25 %)`);
+      if (t.absolute !== undefined && !(isNum(t.absolute) && t.absolute >= 0)) errors.push(`thresholds.${id}.absolute: must be a number >= 0`);
+      if (HEADLINE_KPIS.includes(id) && getKpi(id).unit === "count" && !(isNum(t.absolute) && t.absolute > 0)) {
+        errors.push(`thresholds.${id}.absolute: a count KPI needs an absolute floor > 0 (its baseline median is usually 0, where a relative margin is 0)`);
       }
-      if (t.relative === 0 && (t.absolute ?? 0) === 0) errors.push(`thresholds.${id}: a zero threshold would call any worsening a regression`);
+      if ((t.relative ?? 0) === 0 && (t.absolute ?? 0) === 0) errors.push(`thresholds.${id}: a zero threshold would call any worsening a regression`);
     }
   }
   if (b.readings !== undefined) {
@@ -287,7 +344,7 @@ export function readBaselineFile(path, { readFile = readFileSync } = {}) {
   return { state: "present", baseline: doc };
 }
 
-/** The margin a KPI must worsen by before it can be a regression. */
+/** The margin a KPI must worsen by before it can be a regression: from the BASELINE median. */
 export function thresholdMargin(threshold, baselineMedian) {
   return Math.max((threshold.relative ?? 0) * Math.abs(baselineMedian), threshold.absolute ?? 0);
 }
@@ -320,18 +377,90 @@ export function judgeEntry(e, threshold, minRuns) {
   return { verdict: worse > 0 ? "regression" : "improvement", reason: "beyond_threshold_and_spreads_disjoint", detail };
 }
 
+/**
+ * The GATE: the gating KPI's statistic pooled over every N and arm the two
+ * builds share, so one judgement covers the whole ladder (no multiple
+ * comparisons) and a regression must show across it to move the pool.
+ *
+ * Each entry's values are divided by that entry's median over both builds' runs,
+ * so the pooled values read as ratios near 1. The normaliser scales both sides
+ * alike, so no verdict depends on its choice (a mutation to the baseline's own
+ * median is equivalent); what matters is that it is ONE per entry. Each run's
+ * pooled value is the geometric mean of its normalised values over the entries; then the two sides' pooled run values are judged as
+ * one entry: worse than the baseline's by more than the relative threshold AND
+ * spreads that do not overlap. A pooled regression must also REPRODUCE: at
+ * least `MIN_GATE_ENTRIES` of the pooled entries must have the head's median
+ * worse than the baseline's by more than the same relative threshold — one
+ * entry moving the pool alone is reported as `no_change(not_reproduced)`. A
+ * run that lacks a measured value at any pooled
+ * entry contributes no pooled value (it is not a number), so a side left with
+ * fewer than `minRuns` is under-sampled and the gate unknown.
+ *
+ * @param {object[]} entries `compareBuilds` entries of the gating KPI (with `values`)
+ * @param {{relative: number}} threshold
+ * @param {number} minRuns
+ * @returns {{verdict: string, reason: string, detail?: string, entries: {n: number, arm: string}[],
+ *   head?: object, baseline?: object}}
+ */
+export function poolGate(entries, threshold, minRuns) {
+  const pooled = entries.filter((e) => e.head.spread && e.baseline.spread);
+  const keys = pooled.map((e) => ({ n: e.n, arm: e.arm }));
+  const out = (fields) => ({ entries: keys, ...fields });
+  if (!threshold || !(threshold.relative > 0)) return out({ verdict: "unknown", reason: "no_threshold", detail: `the baseline file records no relative threshold for ${GATING_KPI}` });
+  if (pooled.length < MIN_GATE_ENTRIES) {
+    return out({ verdict: "unknown", reason: "too_few_gate_entries", detail: `${pooled.length} N/arm entr${pooled.length === 1 ? "y" : "ies"} measured on both builds; the gate pools at least ${MIN_GATE_ENTRIES}` });
+  }
+  const norms = pooled.map((e) => {
+    const all = [...e.head.values, ...e.baseline.values].map((v) => v.value).filter((v) => v !== null);
+    return spreadOf(all).median;
+  });
+  if (pooled.some((e, k) => !(norms[k] > 0) || [...e.head.values, ...e.baseline.values].some((v) => v.value !== null && !(v.value > 0)))) {
+    return out({ verdict: "unknown", reason: "non_positive_value", detail: "a geometric mean needs positive values" });
+  }
+  const side = (which) => {
+    const runs = [...new Set(pooled.flatMap((e) => e[which].values.map((v) => v.run)))].sort((a, b) => a - b);
+    const vals = [];
+    for (const run of runs) {
+      let logSum = 0;
+      let complete = true;
+      pooled.forEach((e, k) => {
+        const v = e[which].values.find((x) => x.run === run)?.value ?? null;
+        if (v === null) complete = false;
+        else logSum += Math.log(v / norms[k]);
+      });
+      if (complete) vals.push(Math.exp(logSum / pooled.length));
+    }
+    return { spread: spreadOf(vals), states: `${vals.length} of ${runs.length} run(s) measured at every pooled entry` };
+  };
+  const head = side("head");
+  const baseline = side("baseline");
+  const judged = judgeEntry({ kpi: GATING_KPI, direction: getKpi(GATING_KPI).direction, head, baseline }, { relative: threshold.relative }, minRuns);
+  const sign = getKpi(GATING_KPI).direction === "lower_is_better" ? 1 : -1;
+  const worseAt = pooled.filter((e) => sign * (e.head.spread.median - e.baseline.spread.median) > threshold.relative * Math.abs(e.baseline.spread.median));
+  if (judged.verdict === "regression" && worseAt.length < MIN_GATE_ENTRIES) {
+    return out({
+      verdict: "no_change",
+      reason: "not_reproduced",
+      detail: `the pool moved, but only ${worseAt.length} of ${pooled.length} entries are worse beyond the threshold (${worseAt.map((e) => `N=${e.n} ${e.arm}`).join(", ") || "none"}); ${judged.detail}`,
+      head,
+      baseline,
+    });
+  }
+  return out({ ...judged, reproduced_at: worseAt.map((e) => ({ n: e.n, arm: e.arm })), head, baseline });
+}
+
 /** The overall verdict when no comparison could be drawn at all. */
 export function unknownVerdict(reason, detail) {
-  return { verdict: "unknown", reason, ...(detail ? { detail } : {}), counts: Object.fromEntries(VERDICTS.map((v) => [v, 0])) };
+  return { verdict: "unknown", reason, ...(detail ? { detail } : {}), gating: null, counts: Object.fromEntries(VERDICTS.map((v) => [v, 0])) };
 }
 
 /**
- * Attach a verdict to every headline entry of a comparison, and the overall one.
- * Non-headline entries stay in the table, unjudged.
+ * Attach a verdict to every headline entry (each `gating: false`, informational)
+ * and the gate (`cmp.gate`, `gating: true`); the overall verdict IS the gate's.
  *
  * @param {object} cmp       `compareBuilds` output
  * @param {{state: string, baseline?: object, reason?: string}} baselineState `readBaselineFile` output
- * @returns {object} cmp, with `entries[].verdict` and `verdict`
+ * @returns {object} cmp, with `entries[].verdict`, `gate` and `verdict`
  */
 export function applyVerdict(cmp, baselineState) {
   let blocker = null;
@@ -345,23 +474,30 @@ export function applyVerdict(cmp, baselineState) {
   const counts = Object.fromEntries(VERDICTS.map((v) => [v, 0]));
   for (const e of cmp.entries) {
     if (!HEADLINE_KPIS.includes(e.kpi)) continue;
-    e.verdict = blocker
-      ? { verdict: "unknown", reason: blocker }
-      : judgeEntry(e, baselineState.baseline.thresholds[e.kpi], baselineState.baseline.min_runs);
+    e.verdict = {
+      ...(blocker ? { verdict: "unknown", reason: blocker } : judgeEntry(e, baselineState.baseline.thresholds[e.kpi], baselineState.baseline.min_runs)),
+      gating: false,
+    };
     counts[e.verdict.verdict] += 1;
   }
-  const judged = counts.regression + counts.improvement + counts.no_change;
-  let overall;
-  if (blocker) overall = { verdict: "unknown", reason: blocker };
-  else if (counts.regression > 0) overall = { verdict: "regression", reason: `${counts.regression} headline entr${counts.regression === 1 ? "y" : "ies"} regressed` };
-  else if (judged === 0) overall = { verdict: "unknown", reason: "no headline entry could be judged" };
-  else if (counts.improvement > 0) overall = { verdict: "improvement", reason: `${counts.improvement} improved, none regressed` };
-  else overall = { verdict: "no_change", reason: `${judged} judged, none regressed` };
-  cmp.verdict = { ...overall, counts, baseline: baselineState?.state === "present" ? { recorded_from: baselineState.baseline.recorded_from ?? null, min_runs: baselineState.baseline.min_runs } : null };
+  const gateEntries = cmp.entries.filter((e) => e.kpi === GATING_KPI);
+  const gate = blocker
+    ? { verdict: "unknown", reason: blocker, entries: gateEntries.map((e) => ({ n: e.n, arm: e.arm })) }
+    : poolGate(gateEntries, baselineState.baseline.thresholds[GATING_KPI], baselineState.baseline.min_runs);
+  cmp.gate = { kpi: GATING_KPI, statistic: compareStatistic(getKpi(GATING_KPI)), pooled: "geometric mean over N x arm, each entry normalised by its median over both builds", ...gate, gating: true };
+  const informational = counts.regression > 0 ? `; ${counts.regression} informational entr${counts.regression === 1 ? "y" : "ies"} regressed (never gating)` : "";
+  cmp.verdict = {
+    verdict: gate.verdict,
+    reason: `${gate.reason}${informational}`,
+    ...(gate.detail ? { detail: gate.detail } : {}),
+    gating: { kpi: GATING_KPI, statistic: cmp.gate.statistic, entries: gate.entries },
+    counts,
+    baseline: baselineState?.state === "present" ? { recorded_from: baselineState.baseline.recorded_from ?? null, min_runs: baselineState.baseline.min_runs } : null,
+  };
   return cmp;
 }
 
-/** Whether a verdict fails the scheduled job: `regression` and nothing else. */
+/** Whether a verdict fails the scheduled job: the gate's `regression` and nothing else. */
 export function verdictFails(verdict) {
   return verdict?.verdict === "regression";
 }
@@ -369,18 +505,20 @@ export function verdictFails(verdict) {
 /**
  * A baseline document proposed from one comparison: the BASELINE build's
  * readings (runner rows only — the comparison is runner-only by construction,
- * D7), the proposed thresholds by unit, and the run it came from. Refused when
- * the baseline side has no proven commit (D12: a baseline from a build nobody
- * proved is no baseline).
+ * D7), the proposed thresholds, `min_runs` = the environment's scheduled runs,
+ * and the run it came from. Refused when the baseline side has no proven commit
+ * (D12: a baseline from a build nobody proved is no baseline).
  */
-export function proposeBaseline(cmp, { runId = null, recordedAt = new Date().toISOString(), minRuns = MIN_RUNS_FLOOR } = {}) {
+export function proposeBaseline(cmp, { runId = null, recordedAt = new Date().toISOString(), minRuns } = {}) {
   if (cmp.setup !== "runner") throw new Error("a baseline holds the runner's own readings only (D7)");
   if (!cmp.baseline_commit) throw new Error("the baseline build has no proven commit; a baseline from a build nobody proved is no baseline (D12)");
+  const runs = minRuns ?? SCHEDULED_RUNS[cmp.environment] ?? MIN_RUNS_FLOOR;
   const thresholds = {};
   for (const id of HEADLINE_KPIS) {
     const t = PROPOSED_THRESHOLDS[getKpi(id).unit];
     if (t) thresholds[id] = { ...t };
   }
+  thresholds[GATING_KPI] = { ...thresholds[GATING_KPI], relative: PROPOSED_GATE_RELATIVE[runs] ?? PROPOSED_GATE_RELATIVE[3] };
   const readings = cmp.entries
     .filter((e) => HEADLINE_KPIS.includes(e.kpi) && e.baseline.spread)
     .map((e) => ({ kpi: e.kpi, statistic: e.statistic, unit: e.unit, n: e.n, arm: e.arm, ...e.baseline.spread }));
@@ -390,7 +528,7 @@ export function proposeBaseline(cmp, { runId = null, recordedAt = new Date().toI
     setup: cmp.setup,
     variant: cmp.variant,
     recorded_from: { run_id: runId, recorded_at: recordedAt, baseline_commit: cmp.baseline_commit, head_commit: cmp.head_commit },
-    min_runs: minRuns,
+    min_runs: runs,
     thresholds,
     readings,
   };
@@ -413,26 +551,45 @@ export function renderComparison(cmp) {
     "",
   ];
   if (v) {
+    const g = cmp.gate;
     lines.push(
-      `Verdict: **${v.verdict}** — ${v.reason}. (${VERDICTS.map((k) => `${v.counts[k]} ${k}`).join(", ")} over the headline entries.) Only \`regression\` fails the job; an unknown never does.`,
+      `Verdict: **${v.verdict}** — ${v.reason}. Only the gate (\`${g.kpi}\` ${g.statistic}, pooled over ${g.entries.length} N/arm entr${g.entries.length === 1 ? "y" : "ies"}) fails the job, and only on \`regression\`; every other verdict is informational, and an unknown never fails.`,
+      "",
+      `| gate | head (pooled, per run) | baseline (pooled, per run) | head runs | baseline runs | verdict |`,
+      `|---|---|---|---|---|---|`,
+      `| ${g.kpi} ${g.statistic}, ${g.pooled} | ${fmt(g.head?.spread, "ratio")} | ${fmt(g.baseline?.spread, "ratio")} | ${g.head?.states ?? "-"} | ${g.baseline?.states ?? "-"} | ${verdictCell(g)} |`,
       "",
     );
   }
   lines.push(
-    "Median over runs, run spread in brackets; a side with no measured run reads unknown. Headline KPIs carry a verdict (beyond the baseline file's threshold AND disjoint spreads); the rest are context.",
+    "Median over runs (the midpoint for an even count), run spread in brackets; a side with no measured run reads unknown. Headline KPIs carry a verdict (beyond the baseline file's threshold AND disjoint spreads); `gating` says whether it can fail the job.",
     "",
-    "| KPI | stat | N | arm | head | baseline | head runs | baseline runs | verdict |",
-    "|---|---|---|---|---|---|---|---|---|",
+    "| KPI | stat | N | arm | head | baseline | head runs | baseline runs | verdict | gating |",
+    "|---|---|---|---|---|---|---|---|---|---|",
   );
   for (const e of cmp.entries) {
+    const gating = !e.verdict ? "–" : e.kpi === GATING_KPI ? "no (pooled into the gate)" : "no (informational)";
     lines.push(
-      `| ${e.kpi} | ${e.statistic} | ${e.n} | ${e.arm} | ${fmt(e.head.spread, e.unit)} | ${fmt(e.baseline.spread, e.unit)} | ${e.head.states} | ${e.baseline.states} | ${verdictCell(e.verdict)} |`,
+      `| ${e.kpi} | ${e.statistic} | ${e.n} | ${e.arm} | ${fmt(e.head.spread, e.unit)} | ${fmt(e.baseline.spread, e.unit)} | ${e.head.states} | ${e.baseline.states} | ${verdictCell(e.verdict)} | ${gating} |`,
     );
   }
   return `${lines.join("\n")}\n`;
 }
 
-const invokedDirectly = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+/** Whether `argv1` names this module, through any symlink (a symlinked path must not run nothing, silently). */
+export function isEntryPoint(argv1, moduleUrl = import.meta.url) {
+  if (!argv1) return false;
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  return real(resolve(argv1)) === real(fileURLToPath(moduleUrl));
+}
+
+const invokedDirectly = isEntryPoint(process.argv[1]);
 if (invokedDirectly) {
   // Imported here, not at the top: cli.mjs imports this module, so it loads once
   // this one has finished evaluating (no top-level await: that would deadlock the cycle).

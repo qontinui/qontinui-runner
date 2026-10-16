@@ -173,25 +173,31 @@ Both timing formats (classic, advanced) and both typescript layouts (`--log-out`
 ## The regression verdict (`compare --baseline`, Phase 6)
 
 `node scripts/termhost-bench/compare.mjs <results.json> --baseline baselines/<env>.json [--verdict-json <f>] [--propose-baseline <f>]`
-(the same as `cli.mjs compare`) judges each **headline** KPI (catalog `headline_statistic`) at each N and arm of the same-VM A/B (D11):
+(the same as `cli.mjs compare`) draws two kinds of verdict from the same-VM A/B (D11):
 
-- **regression** iff the head build's median over runs is worse than the baseline build's by more than `max(relative × |baseline median|, absolute)` — the threshold the baseline file records for that KPI — **and** the run spreads `[min, max]` do not overlap; **improvement** symmetrically; **no_change** otherwise (`within_threshold` / `spreads_overlap`);
-- **unknown** when either side has no measured run, fewer measured runs than the file's `min_runs`, the KPI has no threshold, the file is for another environment or setup, or there is no usable baseline file at all (`no baseline`).
+- **The gate** — the only verdict that fails a job. `output_latency_ms` p95 (the KPI the plan's arming row names), pooled over every N and arm both builds measured: each entry normalised by its median over both builds, each run's pooled value the geometric mean over the entries. **regression** iff the head's pooled median is worse than the baseline's by more than the file's relative threshold, the pooled run spreads do not overlap, **and** it reproduces — at least two entries' medians are worse beyond the same threshold (else `no_change(not_reproduced)`).
+- **Informational** — every headline KPI (catalog `headline_statistic`) at each N and arm, judged alone: beyond `max(relative × |baseline median|, absolute)` and disjoint spreads. Rendered, and in the verdict JSON with `gating: false`; never failing a job.
 
-The exit code is 1 on `regression` and 0 on everything else; the scheduled `run-linux-xvfb` job fails on that verdict only. A baseline file (`termhost-bench-baseline/v1`) holds `environment`, `setup: runner`, `variant`, `min_runs` (≥ 2), `thresholds` keyed by headline KPI, `recorded_from` and the baseline build's `readings` — runner rows only (D7). A test validates every committed one.
+Either is **unknown** when a side has no measured run, fewer measured runs than the file's `min_runs`, the KPI has no threshold, the file is for another environment or setup, or there is no usable baseline file (`no baseline`). The exit code is 1 on the gate's `regression` and 0 otherwise; the scheduled jobs fail on that only, and fail the step (exit 2) when compare wrote no verdict at all. Medians are the midpoint for an even count of runs.
+
+Seeded simulation (`__tests__/verdict-report.test.mjs`, run-to-run CV 0.2): with nothing changed the gate goes red 1.2 % of the time on linux-xvfb (3 runs, relative 0.14) and 1.1 % on windows-hosted (2 runs, 0.20); a 30 % regression across every N goes red 90 % / 83 % (98 % at CV 0.15 on linux-xvfb). The non-overlapping-spreads rule caps the power: three runs against three are disjoint 1 time in 20 under no change before any threshold applies.
+
+A baseline file (`termhost-bench-baseline/v1`) holds `environment`, `setup: runner`, `variant`, `min_runs` (2 up to the environment's scheduled runs: 3 on linux-xvfb, 2 on windows-hosted), `thresholds` keyed by headline KPI — `output_latency_ms` required with `relative` in (0, 1], every `relative` a share in [0, 1], every count KPI with an `absolute` floor > 0 — plus `recorded_from` and the baseline build's `readings`, runner rows only (D7). A test validates every committed one.
 
 `report` takes one results file or several from **one** environment and renders one table for it (two environments are refused, D6): for `windows-desktop` the headline line `headline: windows-desktop n=15 setups=runner,vscode,windows-terminal,tmux-wsl arms=focus,tiled state=measured`, only when all four setups' headline KPIs read `measured` at N = 15 in both arms; the N = 15 headline table; every row with `profile_calibrated` and `pty_host_impl`; every unknown with its reason; and the runner's diagnostics, labelled non-comparable.
 
 ## Post-land items (deferred, not missing)
 
-Two outputs can only come from a scheduled run of the landed `linux-xvfb` job,
+Two outputs can only come from scheduled runs of the landed jobs,
 so they arrive after this code lands rather than with it:
 
-- `scripts/termhost-bench/baselines/linux-xvfb.json`. The first scheduled run
-  uploads `termhost-bench-linux-xvfb-baseline-proposed.json` in its
-  `termhost-bench-linux-xvfb-runner` artifact: the baseline build's readings and
-  thresholds proposed by unit. Review the thresholds against the run's spreads,
-  then commit it under that name. `compare` refuses to propose one from a
+- `scripts/termhost-bench/baselines/linux-xvfb.json` and
+  `baselines/windows-hosted.json`. Each environment's first scheduled run
+  uploads `termhost-bench-<env>-baseline-proposed.json` in its
+  `termhost-bench-<env>-runner` artifact: the baseline build's readings, the
+  thresholds proposed by unit and the gate's simulated threshold, and
+  `min_runs` = that job's scheduled runs. Review the thresholds against the
+  run's spreads, then commit it under that name. `compare` refuses to propose one from a
   baseline build nobody proved (D12);
 - the `linux-xvfb` report in `qontinui-dev-notes`, rendered from that same run.
 

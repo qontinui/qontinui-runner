@@ -94,7 +94,9 @@ const buildText = (s) => (s.build?.role ? `${s.build.role} ${s.build.state ? "un
  * and both arms, at least one N = 15 row (default variant, not a baseline build,
  * a proven build where the setup has one, not excluded from verdicts), and every
  * headline KPI in every such row `measured` — or `not_applicable` because the KPI
- * has no referent in that arm.
+ * has no referent in that arm. Every row behind the line must come from ONE
+ * machine (`machine.name`, the schema's only machine identity): four setups
+ * measured on two machines are not one comparison.
  *
  * @param {object[]} docs results documents of ONE environment
  * @returns {{established: boolean, missing: string[]}}
@@ -102,8 +104,9 @@ const buildText = (s) => (s.build?.role ? `${s.build.role} ${s.build.state ? "un
 export function headlineStatus(docs) {
   const env = oneEnvironment(docs);
   if (env !== HEADLINE.environment) return { established: false, missing: [`the environment is ${env}, not ${HEADLINE.environment}`] };
-  const rows = docs.flatMap((d) => d.rows);
+  const rows = docs.flatMap((d) => d.rows.map((r) => ({ ...r, machineName: d.machine?.name })));
   const missing = [];
+  const machines = new Set();
   for (const setup of HEADLINE_SETUPS) {
     for (const arm of HEADLINE.arms) {
       const at = rows.filter(
@@ -120,6 +123,7 @@ export function headlineStatus(docs) {
         missing.push(`${setup} ${arm}: no N = ${HEADLINE.n} row`);
         continue;
       }
+      for (const r of at) machines.add(r.machineName);
       for (const id of HEADLINE_KPIS) {
         const bad = at.filter((r) => {
           const v = r.kpis[id];
@@ -129,6 +133,7 @@ export function headlineStatus(docs) {
       }
     }
   }
+  if (machines.size > 1) missing.push(`the rows come from ${machines.size} machines (${[...machines].sort().join(", ")}): one comparison is one machine's`);
   return { established: missing.length === 0, missing };
 }
 
@@ -185,8 +190,8 @@ export function renderReport(input) {
     lines.push(
       `### Headline: N = ${HEADLINE.n} (median over runs, run spread in brackets)`,
       "",
-      `| setup | build | arm | runs | profile (calibrated) | pty_host_impl | ${cols.join(" | ")} |`,
-      `|---|---|---|---|---|---|${cols.map(() => "---").join("|")}|`,
+      `| setup | build | arm | runs | profile (calibrated) | pty_host_impl | ${cols.join(" | ")} | labels |`,
+      `|---|---|---|---|---|---|${cols.map(() => "---").join("|")}|---|`,
     );
     const groups = new Map();
     for (const r of atHeadlineN) {
@@ -198,8 +203,11 @@ export function renderReport(input) {
       const r0 = g[0];
       const cal = [...new Set(g.map((r) => `${r.scenario.profile} (${r.scenario.profile_calibrated})`))].join(", ");
       const pty = [...new Set(g.map((r) => absentText(r.setup.pty_host_impl)))].join(", ");
+      // Labels such as dom_renderer_fallback say a row describes a configuration
+      // no operator runs (D6): it stays in the table, named, and out of any verdict.
+      const labels = [...new Set(g.flatMap((r) => r.labels ?? []))].sort().join(", ") || "-";
       lines.push(
-        `| ${r0.setup.id}${r0.setup.variant !== "default" ? `/${r0.setup.variant}` : ""} | ${buildText(r0.setup)} | ${r0.scenario.arm} | ${g.length} | ${cal} | ${pty} | ${cols.map((id) => spreadCell(g, id)).join(" | ")} |`,
+        `| ${r0.setup.id}${r0.setup.variant !== "default" ? `/${r0.setup.variant}` : ""} | ${buildText(r0.setup)} | ${r0.scenario.arm} | ${g.length} | ${cal} | ${pty} | ${cols.map((id) => spreadCell(g, id)).join(" | ")} | ${labels} |`,
       );
     }
     lines.push("");

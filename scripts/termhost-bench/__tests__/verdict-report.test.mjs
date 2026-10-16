@@ -15,21 +15,29 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   BASELINE_SCHEMA_ID,
+  GATING_KPI,
   HEADLINE_KPIS,
+  MIN_RUNS_FLOOR,
   NO_BASELINE,
+  PROPOSED_GATE_RELATIVE,
+  PROPOSED_THRESHOLDS,
+  SCHEDULED_RUNS,
   applyVerdict,
   compareBuilds,
   judgeEntry,
+  poolGate,
   proposeBaseline,
   readBaselineFile,
   renderComparison,
+  spreadOf,
+  thresholdMargin,
   validateBaseline,
   verdictFails,
 } from "../compare.mjs";
@@ -38,40 +46,57 @@ import { derivedRunnerDiagnostics, summarizeDiagnostic, transportRates } from ".
 import { main } from "../cli.mjs";
 import { measureKpi, notApplicableKpi, unknownKpi } from "../stats.mjs";
 import { validateResults } from "../validate.mjs";
-import { linuxXvfbResults, measuredKpis, row, spread, windowsDesktopResults } from "./helpers/results.mjs";
+import { linuxXvfbResults, measuredKpis, row, windowsDesktopResults } from "./helpers/results.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BASELINES_DIR = join(HERE, "..", "baselines");
 const HEAD = "a".repeat(40);
 const BASE = "b".repeat(40);
-
-/** A runner row at N = 5 focus whose output_latency_ms p95 is `p95`, or unknown when null. */
-function runnerRow(role, commit, runIndex, p95) {
-  return row({
-    setupOverrides: { build: { commit, source: "artifact", role }, launch_mode: "subject_instance_root", pty_host_impl: "unix_pty", session_shell: "bash" },
-    scenarioOverrides: { n: 5, arm: "focus", v_target: 1, v_actual: 1, run_index: runIndex, run_count: 3 },
-    kpis: measuredKpis({
-      output_latency_ms: p95 === null ? unknownKpi("output_latency_ms", "capture_unavailable", { detail: "no frames" }) : latencyWithP95(p95),
-    }),
-  });
-}
+const LEVELS = [1, 5, 15];
+const ARM_LIST = ["focus", "tiled"];
 
 /** An output_latency_ms value whose p95 is exactly `p95` (600 identical samples). */
 function latencyWithP95(p95) {
   return measureKpi("output_latency_ms", Array.from({ length: 600 }, () => p95));
 }
 
-/** A same-VM A/B document: head and baseline output_latency_ms p95 per run. */
-function abDoc(headP95s, baseP95s) {
+/**
+ * A runner row of one build role at (n, arm), run `runIndex`: output_latency_ms
+ * p95 = `p95` (null = unknown), and any other KPI overrides.
+ */
+function runnerRow(role, commit, runIndex, n, arm, p95, extra = {}) {
+  return row({
+    setupOverrides: { build: { commit, source: "artifact", role }, launch_mode: "subject_instance_root", pty_host_impl: "unix_pty", session_shell: "bash" },
+    scenarioOverrides: { n, arm, v_target: 1, v_actual: 1, run_index: runIndex, run_count: 3 },
+    kpis: measuredKpis({
+      output_latency_ms: p95 === null ? unknownKpi("output_latency_ms", "capture_unavailable", { detail: "no frames" }) : latencyWithP95(p95),
+      ...extra,
+    }),
+  });
+}
+
+/**
+ * A same-VM A/B document over the whole ladder (N 1, 5, 15 x focus, tiled): each
+ * side's output_latency_ms p95 per run, scaled per level (`at(n, arm)` overrides a
+ * level), so the gate pools six entries.
+ */
+function abDoc(headP95s, baseP95s, { at = () => null, extra = () => ({}) } = {}) {
   const doc = linuxXvfbResults();
-  doc.rows = [
-    ...headP95s.map((v, i) => runnerRow("head", HEAD, i, v)),
-    ...baseP95s.map((v, i) => runnerRow("baseline", BASE, i, v)),
-  ];
+  doc.rows = [];
+  for (const n of LEVELS) {
+    for (const arm of ARM_LIST) {
+      const scale = 1 + n / 15;
+      const o = at(n, arm) ?? {};
+      const h = o.head ?? headP95s;
+      const b = o.base ?? baseP95s;
+      h.forEach((v, i) => doc.rows.push(runnerRow("head", HEAD, i, n, arm, v === null ? null : v * scale, extra("head", n, arm))));
+      b.forEach((v, i) => doc.rows.push(runnerRow("baseline", BASE, i, n, arm, v === null ? null : v * scale, extra("baseline", n, arm))));
+    }
+  }
   return doc;
 }
 
-/** A usable baseline file for linux-xvfb: output_latency_ms worsens beyond 20 % or 5 ms. */
+/** A usable baseline file for linux-xvfb: the gate's relative 0.14, min_runs 3. */
 function baselineFile(over = {}) {
   return {
     schema: BASELINE_SCHEMA_ID,
@@ -79,89 +104,132 @@ function baselineFile(over = {}) {
     setup: "runner",
     variant: "default",
     recorded_from: { run_id: "fixture", recorded_at: "2026-10-16T00:00:00Z", baseline_commit: BASE, head_commit: HEAD },
-    min_runs: 2,
-    thresholds: { output_latency_ms: { relative: 0.2, absolute: 5 } },
+    min_runs: 3,
+    thresholds: { output_latency_ms: { relative: 0.14, absolute: 5 }, cpu_pct: { relative: 0.25, absolute: 5 }, hangs: { relative: 0, absolute: 1 } },
     ...over,
   };
 }
 
 const present = (b = baselineFile()) => ({ state: "present", baseline: b });
-const lat = (cmp) => cmp.entries.find((e) => e.kpi === "output_latency_ms" && e.n === 5 && e.arm === "focus");
+const judge = (doc, b) => applyVerdict(compareBuilds(doc), present(b));
+const lat = (cmp, n = 5, arm = "focus") => cmp.entries.find((e) => e.kpi === "output_latency_ms" && e.n === n && e.arm === arm);
 
 // ---------------------------------------------------------------------------
-// compare: the verdict
+// compare: the gate and the informational verdicts
 // ---------------------------------------------------------------------------
 
-test("a synthetic regression fires: beyond the threshold and spreads disjoint (mutation M2)", () => {
-  const cmp = applyVerdict(compareBuilds(abDoc([80, 82, 84], [50, 52, 54])), present());
-  assert.equal(lat(cmp).verdict.verdict, "regression");
+test("a synthetic regression across the ladder fires the gate: beyond the threshold, spreads disjoint, reproduced (mutation M2)", () => {
+  const cmp = judge(abDoc([80, 82, 84], [50, 52, 54]));
+  assert.equal(cmp.gate.verdict, "regression");
+  assert.equal(cmp.gate.gating, true);
+  assert.equal(cmp.gate.entries.length, 6);
+  assert.equal(cmp.gate.reproduced_at.length, 6);
   assert.equal(cmp.verdict.verdict, "regression");
+  assert.deepEqual(cmp.verdict.gating.kpi, GATING_KPI);
   assert.equal(verdictFails(cmp.verdict), true);
-  assert.match(renderComparison(cmp), /^Verdict: \*\*regression\*\*/m);
-  assert.match(renderComparison(cmp), /^\| output_latency_ms \| p95 \| 5 \| focus \| .+ \| \*\*regression\*\* \|$/m);
+  assert.equal(lat(cmp).verdict.gating, false, "each entry is informational; the pool gates");
+  const md = renderComparison(cmp);
+  assert.match(md, /^Verdict: \*\*regression\*\*/m);
+  assert.match(md, /^\| output_latency_ms p95, geometric mean over N x arm, .+ \| \*\*regression\*\* \|$/m);
+  assert.match(md, /^\| output_latency_ms \| p95 \| 5 \| focus \| .+ \| \*\*regression\*\* \| no \(pooled into the gate\) \|$/m);
 });
 
 test("an improvement is the symmetric case, and never fails the job", () => {
-  const cmp = applyVerdict(compareBuilds(abDoc([30, 31, 32], [50, 52, 54])), present());
-  assert.equal(lat(cmp).verdict.verdict, "improvement");
-  assert.equal(cmp.verdict.verdict, "improvement");
+  const cmp = judge(abDoc([30, 31, 32], [50, 52, 54]));
+  assert.equal(cmp.gate.verdict, "improvement");
   assert.equal(verdictFails(cmp.verdict), false);
 });
 
-test("overlapping run spreads suppress a regression even beyond the threshold (mutation M3)", () => {
-  // Head median 80 is 54 % worse than 52, but one head run (53) falls inside the baseline spread [50, 54].
-  const cmp = applyVerdict(compareBuilds(abDoc([53, 80, 84], [50, 52, 54])), present());
+test("overlapping run spreads suppress the gate even beyond the threshold (mutation M3)", () => {
+  // Head median 80 vs 52 at every level, but one head run (53) inside the baseline spread.
+  const cmp = judge(abDoc([53, 80, 84], [50, 52, 54]));
+  assert.deepEqual([cmp.gate.verdict, cmp.gate.reason], ["no_change", "spreads_overlap"]);
   assert.deepEqual([lat(cmp).verdict.verdict, lat(cmp).verdict.reason], ["no_change", "spreads_overlap"]);
   assert.equal(verdictFails(cmp.verdict), false);
 });
 
 test("a worsening within the threshold is no_change, even with disjoint spreads", () => {
-  // 56 vs 52: worse by 4 ms, under max(20 % x 52, 5) = 10.4.
-  const cmp = applyVerdict(compareBuilds(abDoc([55, 56, 57], [50, 52, 54])), present());
-  assert.deepEqual([lat(cmp).verdict.verdict, lat(cmp).verdict.reason], ["no_change", "within_threshold"]);
+  // 56 vs 52: 7.7 %, under the gate's 14 %.
+  const cmp = judge(abDoc([55, 56, 57], [50, 52, 54]));
+  assert.deepEqual([cmp.gate.verdict, cmp.gate.reason], ["no_change", "within_threshold"]);
+});
+
+test("a regression at one entry alone does not gate: it must reproduce (the pool alone is not enough)", () => {
+  // N = 15 focus 4x worse, every other level unchanged: the pooled geometric mean moves (4^(1/6) = 1.26).
+  const doc = abDoc([50, 52, 54], [50, 52, 54], { at: (n, arm) => (n === 15 && arm === "focus" ? { head: [200, 208, 216] } : null) });
+  const cmp = judge(doc);
+  assert.deepEqual([cmp.gate.verdict, cmp.gate.reason], ["no_change", "not_reproduced"]);
+  assert.equal(lat(cmp, 15, "focus").verdict.verdict, "regression", "the entry itself still reads regression, informationally");
+  assert.equal(verdictFails(cmp.verdict), false);
+  // The same regression at two levels reproduces.
+  const two = abDoc([50, 52, 54], [50, 52, 54], { at: (n, arm) => (n >= 5 && arm === "focus" ? { head: [200, 208, 216] } : null) });
+  assert.equal(judge(two).gate.verdict, "regression");
+});
+
+test("only output_latency_ms p95 gates: another KPI's regression is computed, rendered and never fails the job", () => {
+  const cpu = (role) => ({ cpu_pct: measureKpi("cpu_pct", Array.from({ length: 120 }, () => (role === "head" ? 300 : 50))) });
+  const doc = abDoc([50, 52, 54], [50, 52, 54], { extra: (role) => cpu(role) });
+  // Give the cpu rows a run spread: vary by run index.
+  for (const r of doc.rows) r.kpis.cpu_pct = measureKpi("cpu_pct", Array.from({ length: 120 }, () => (r.setup.build.role === "head" ? 300 : 50) + r.scenario.run_index));
+  const cmp = judge(doc);
+  const c = cmp.entries.find((e) => e.kpi === "cpu_pct" && e.n === 15 && e.arm === "tiled");
+  assert.deepEqual([c.verdict.verdict, c.verdict.gating], ["regression", false]);
+  assert.notEqual(cmp.verdict.verdict, "regression");
+  assert.match(cmp.verdict.reason, /informational entries regressed \(never gating\)/);
+  assert.equal(verdictFails(cmp.verdict), false);
+  assert.match(renderComparison(cmp), /^\| cpu_pct \| mean \| 15 \| tiled \| .+ \| \*\*regression\*\* \| no \(informational\) \|$/m);
 });
 
 test("an unknown side never fires, however bad the other looks; unknown runs are never folded in as numbers (mutation M1)", () => {
-  const baseUnknown = applyVerdict(compareBuilds(abDoc([500, 510, 520], [null, null, null])), present());
+  const baseUnknown = judge(abDoc([500, 510, 520], [null, null, null]));
   assert.deepEqual([lat(baseUnknown).verdict.verdict, lat(baseUnknown).verdict.reason], ["unknown", "baseline_unknown"]);
-  assert.notEqual(baseUnknown.verdict.verdict, "regression");
+  assert.deepEqual([baseUnknown.gate.verdict, baseUnknown.gate.reason], ["unknown", "too_few_gate_entries"]);
   assert.equal(verdictFails(baseUnknown.verdict), false);
-  const headUnknown = applyVerdict(compareBuilds(abDoc([null, null, null], [50, 52, 54])), present());
+  const headUnknown = judge(abDoc([null, null, null], [50, 52, 54]));
   assert.deepEqual([lat(headUnknown).verdict.verdict, lat(headUnknown).verdict.reason], ["unknown", "head_unknown"]);
   assert.equal(verdictFails(headUnknown.verdict), false);
 });
 
 test("an under-sampled side never fires: fewer measured runs than the baseline's min_runs (mutation M4)", () => {
-  const cmp = applyVerdict(compareBuilds(abDoc([500, null, null], [50, 52, 54])), present());
+  const cmp = judge(abDoc([500, null, null], [50, 52, 54]));
+  assert.deepEqual([cmp.gate.verdict, cmp.gate.reason], ["unknown", "head_under_sampled"]);
   assert.deepEqual([lat(cmp).verdict.verdict, lat(cmp).verdict.reason], ["unknown", "head_under_sampled"]);
   assert.equal(verdictFails(cmp.verdict), false);
-  const base = applyVerdict(compareBuilds(abDoc([500, 510, 520], [50, null, null])), present());
-  assert.deepEqual([lat(base).verdict.verdict, lat(base).verdict.reason], ["unknown", "baseline_under_sampled"]);
-  const strict = applyVerdict(compareBuilds(abDoc([80, 82, 84], [50, 52, 54])), present(baselineFile({ min_runs: 4 })));
-  assert.equal(lat(strict).verdict.reason, "head_under_sampled", "min_runs comes from the baseline file");
+  const base = judge(abDoc([500, 510, 520], [50, null, null]));
+  assert.deepEqual([base.gate.verdict, base.gate.reason], ["unknown", "baseline_under_sampled"]);
+  // min_runs comes from the baseline file: 3 here, so two measured runs are too few.
+  assert.deepEqual([judge(abDoc([80, 82, null], [50, 52, 54])).gate.reason], ["head_under_sampled"]);
+  // A run missing at ANY pooled entry contributes no pooled value.
+  const gap = abDoc([80, 82, 84], [50, 52, 54], { at: (n, arm) => (n === 1 && arm === "tiled" ? { head: [80, null, 84] } : null) });
+  assert.equal(judge(gap).gate.head.spread.runs, 2);
 });
 
 test("a headline KPI with no recorded threshold is unknown; a non-headline KPI is not judged at all", () => {
-  const cmp = applyVerdict(compareBuilds(abDoc([80, 82, 84], [50, 52, 54])), present());
-  const cpu = cmp.entries.find((e) => e.kpi === "cpu_pct");
-  assert.deepEqual([cpu.verdict.verdict, cpu.verdict.reason], ["unknown", "no_threshold"]);
+  const cmp = judge(abDoc([80, 82, 84], [50, 52, 54]));
+  const mem = cmp.entries.find((e) => e.kpi === "memory_mb");
+  assert.deepEqual([mem.verdict.verdict, mem.verdict.reason], ["unknown", "no_threshold"]);
   for (const e of cmp.entries) assert.equal(e.verdict !== undefined, HEADLINE_KPIS.includes(e.kpi), e.kpi);
   assert.ok(!HEADLINE_KPIS.includes("frame_interval_ms"));
 });
 
-test("a higher-is-better KPI regresses downwards (direction from the catalog)", () => {
+test("a higher-is-better KPI regresses downwards; the margin is drawn from the BASELINE median (mutation N3a)", () => {
   const e = { kpi: "x", direction: "higher_is_better", head: { spread: { median: 0.5, min: 0.4, max: 0.6, runs: 3 } }, baseline: { spread: { median: 0.99, min: 0.98, max: 1, runs: 3 } } };
   assert.equal(judgeEntry(e, { relative: 0.1 }, 2).verdict, "regression");
   assert.equal(judgeEntry({ ...e, direction: "neutral" }, { relative: 0.1 }, 2).verdict, "unknown");
+  // 100 -> 130 with 25 %: 30 > 25 from the baseline median (a margin from the head's, 32.5, would say no_change).
+  assert.equal(thresholdMargin({ relative: 0.25 }, 100), 25);
+  const lower = { kpi: "y", direction: "lower_is_better", head: { spread: { median: 130, min: 128, max: 132, runs: 3 } }, baseline: { spread: { median: 100, min: 98, max: 102, runs: 3 } } };
+  assert.equal(judgeEntry(lower, { relative: 0.25 }, 3).verdict, "regression");
 });
 
-test("no baseline file: every headline verdict is unknown(no baseline), and nothing fails", () => {
+test("no baseline file: every verdict, the gate's included, is unknown(no baseline), and nothing fails", () => {
   const dir = mkdtempSync(join(tmpdir(), "tb-verdict-"));
   try {
     const missing = readBaselineFile(join(dir, "linux-xvfb.json"));
     assert.deepEqual(missing, { state: "absent", reason: NO_BASELINE });
     const cmp = applyVerdict(compareBuilds(abDoc([800, 820, 840], [50, 52, 54])), missing);
     assert.deepEqual([cmp.verdict.verdict, cmp.verdict.reason], ["unknown", "no baseline"]);
+    assert.deepEqual([cmp.gate.verdict, cmp.gate.reason], ["unknown", "no baseline"]);
     assert.ok(cmp.entries.filter((e) => e.verdict).every((e) => e.verdict.verdict === "unknown" && e.verdict.reason === "no baseline"));
     assert.equal(verdictFails(cmp.verdict), false);
   } finally {
@@ -169,7 +237,7 @@ test("no baseline file: every headline verdict is unknown(no baseline), and noth
   }
 });
 
-test("the CLI: a missing baseline file exits 0 with unknown; a regression exits 1; the verdict JSON says which (mutation M5)", async () => {
+test("the CLI: a missing baseline file exits 0 with unknown; a regression exits 1; the verdict JSON says which and what gates (mutation M5)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "tb-verdict-cli-"));
   try {
     const results = join(dir, "results.json");
@@ -180,23 +248,24 @@ test("the CLI: a missing baseline file exits 0 with unknown; a regression exits 
     const vj = join(dir, "verdict.json");
     const code = await main(["compare", results, "--baseline", join(dir, "absent.json"), "--verdict-json", vj], io);
     assert.equal(code, 0, err.join(""));
-    assert.deepEqual(JSON.parse(readFileSync(vj, "utf8")).verdict, "unknown");
+    assert.equal(JSON.parse(readFileSync(vj, "utf8")).verdict, "unknown");
     assert.equal(JSON.parse(readFileSync(vj, "utf8")).reason, "no baseline");
     assert.match(out.join(""), /^Verdict: \*\*unknown\*\* — no baseline/m);
 
     const bf = join(dir, "linux-xvfb.json");
     writeFileSync(bf, JSON.stringify(baselineFile()));
     assert.equal(await main(["compare", results, "--baseline", bf, "--verdict-json", vj], io), 1);
-    assert.equal(JSON.parse(readFileSync(vj, "utf8")).verdict, "regression");
+    const v = JSON.parse(readFileSync(vj, "utf8"));
+    assert.equal(v.verdict, "regression");
+    assert.equal(v.gating.kpi, "output_latency_ms");
+    assert.equal(v.gating.statistic, "p95");
+    assert.equal(v.gating.entries.length, 6);
 
-    // A run with no baseline build at all: unknown, exit 0.
     const headOnly = join(dir, "head-only.json");
-    const doc = abDoc([80, 82, 84], []);
-    writeFileSync(headOnly, JSON.stringify(doc));
+    writeFileSync(headOnly, JSON.stringify(abDoc([80, 82, 84], [])));
     assert.equal(await main(["compare", headOnly, "--baseline", bf, "--verdict-json", vj], io), 0);
     assert.equal(JSON.parse(readFileSync(vj, "utf8")).reason, "no comparison");
 
-    // A corrupt baseline file: unknown, exit 0 (the PR-time test below keeps a committed one valid).
     writeFileSync(bf, "{");
     assert.equal(await main(["compare", results, "--baseline", bf, "--verdict-json", vj], io), 0);
     assert.match(JSON.parse(readFileSync(vj, "utf8")).reason, /^baseline is not JSON/);
@@ -207,46 +276,159 @@ test("the CLI: a missing baseline file exits 0 with unknown; a regression exits 
   }
 });
 
+test("compare.mjs run through a symlink still runs (S1): it never does nothing silently", { skip: process.platform === "win32" && "symlinks need privileges on Windows" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-link-"));
+  try {
+    const link = join(dir, "compare-link.mjs");
+    symlinkSync(join(HERE, "..", "compare.mjs"), link);
+    const r = spawnSync(process.execPath, [link], { encoding: "utf8" });
+    assert.equal(r.status, 2, `stdout ${r.stdout} stderr ${r.stderr}`);
+    assert.match(r.stderr, /compare takes one or two results files/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a baseline for another environment or setup judges nothing", () => {
-  const cmp = applyVerdict(compareBuilds(abDoc([80, 82, 84], [50, 52, 54])), present(baselineFile({ environment: "windows-hosted" })));
+  const cmp = judge(abDoc([80, 82, 84], [50, 52, 54]), { ...baselineFile(), environment: "windows-hosted", min_runs: 2 });
   assert.equal(cmp.verdict.verdict, "unknown");
   assert.match(cmp.verdict.reason, /^baseline mismatch: the file is for windows-hosted/);
 });
 
-test("validateBaseline refuses what would make the gate lie", () => {
+test("validateBaseline refuses every baseline that would disarm the gate (the review's disarm.mjs, S5 and N2)", () => {
   assert.deepEqual(validateBaseline(baselineFile()), []);
   const errs = (over) => validateBaseline(baselineFile(over)).join("\n");
+  // disarm.mjs: an empty thresholds object, min_runs above the schedule, 25 meant as 25 %.
+  assert.match(errs({ min_runs: 2, thresholds: {} }), /thresholds\.output_latency_ms: required — it is the KPI that gates the job/);
+  assert.match(errs({ min_runs: 99 }), /min_runs 99 exceeds the 3 run\(s\) the scheduled linux-xvfb job takes/);
+  assert.match(errs({ min_runs: 3, environment: "windows-hosted" }), /exceeds the 2 run\(s\) the scheduled windows-hosted job takes/);
+  assert.match(errs({ thresholds: { output_latency_ms: { relative: 25 } } }), /relative: must be a share in \[0, 1\]/);
+  assert.match(errs({ thresholds: { output_latency_ms: { absolute: 5 } } }), /output_latency_ms\.relative: required and > 0/);
+  assert.match(errs({ thresholds: { output_latency_ms: { relative: 0, absolute: 5 } } }), /output_latency_ms\.relative: required and > 0/);
+  // N2: a count KPI's relative-only threshold has margin 0 at a 0 median.
+  assert.match(errs({ thresholds: { output_latency_ms: { relative: 0.14 }, hangs: { relative: 0.5 } } }), /hangs\.absolute: a count KPI needs an absolute floor/);
+  assert.equal(judgeEntry({ kpi: "hangs", direction: "lower_is_better", head: { spread: { median: 1, min: 1, max: 1, runs: 2 } }, baseline: { spread: { median: 0, min: 0, max: 0, runs: 2 } } }, { relative: 0.5 }, 2).verdict, "regression", "why N2 matters: this is what the validator now refuses");
+  // The rest.
   assert.match(errs({ setup: "tmux" }), /runner's own readings only/);
   assert.match(errs({ min_runs: 1 }), /min_runs/);
-  assert.match(errs({ thresholds: { frame_interval_ms: { relative: 0.2 } } }), /not a headline KPI/);
-  assert.match(errs({ thresholds: { output_latency_ms: {} } }), /needs relative and\/or absolute/);
-  assert.match(errs({ thresholds: { output_latency_ms: { relative: 0 } } }), /zero threshold/);
-  assert.match(errs({ thresholds: { output_latency_ms: { relative: -1 } } }), /must be a number >= 0/);
+  assert.match(errs({ thresholds: { output_latency_ms: { relative: 0.14 }, frame_interval_ms: { relative: 0.2 } } }), /not a headline KPI/);
+  assert.match(errs({ thresholds: { output_latency_ms: { relative: 0.14 }, cpu_pct: {} } }), /needs relative and\/or absolute/);
+  assert.match(errs({ thresholds: { output_latency_ms: { relative: 0.14 }, cpu_pct: { relative: 0 } } }), /zero threshold/);
   assert.match(errs({ schema: "x" }), /schema must be/);
+});
+
+test("the scheduled runs compare.mjs assumes are the workflow's own defaults", () => {
+  const yml = readFileSync(join(HERE, "..", "..", "..", ".github", "workflows", "termhost-bench.yml"), "utf8");
+  const defaults = [...yml.matchAll(/runs="\$\{IN_RUNS:-(\d+)\}"/g)].map((m) => Number(m[1]));
+  assert.deepEqual(defaults, [SCHEDULED_RUNS["linux-xvfb"], SCHEDULED_RUNS["windows-hosted"]], "linux-xvfb's job first, then windows-hosted's");
+  assert.match(yml, /^ {6}runs:\n {8}description: .+\n {8}type: string\n {8}default: ""$/m, "dispatch leaves runs to each job");
 });
 
 test("a proposed baseline holds the baseline build's runner readings, validates, and needs a proven baseline commit", () => {
   const cmp = compareBuilds(abDoc([80, 82, 84], [50, 52, 54]));
   const b = proposeBaseline(cmp, { runId: "ci-1-1", recordedAt: "2026-10-16T00:00:00Z" });
   assert.deepEqual(validateBaseline(b), []);
+  assert.equal(b.min_runs, 3, "linux-xvfb's scheduled runs");
+  assert.equal(b.thresholds.output_latency_ms.relative, PROPOSED_GATE_RELATIVE[3]);
   assert.equal(b.recorded_from.baseline_commit, BASE);
   assert.deepEqual(Object.keys(b.thresholds).sort(), [...HEADLINE_KPIS].sort());
-  const r = b.readings.find((x) => x.kpi === "output_latency_ms");
-  assert.deepEqual([r.median, r.min, r.max, r.runs], [52, 50, 54, 3]);
+  const r = b.readings.find((x) => x.kpi === "output_latency_ms" && x.n === 15);
+  assert.deepEqual([r.median, r.min, r.max, r.runs], [104, 100, 108, 3]);
   assert.ok(!JSON.stringify(b).includes("tmux"), "runner rows only (D7)");
   assert.throws(() => proposeBaseline({ ...cmp, baseline_commit: null }), /D12/);
-  // Judged against itself it is consistent: the proposal's own thresholds accept the same-VM regression.
   assert.equal(applyVerdict(compareBuilds(abDoc([80, 82, 84], [50, 52, 54])), present(b)).verdict.verdict, "regression");
+  const win = proposeBaseline({ ...cmp, environment: "windows-hosted" });
+  assert.deepEqual([win.min_runs, win.thresholds.output_latency_ms.relative], [2, PROPOSED_GATE_RELATIVE[2]]);
+  assert.deepEqual(validateBaseline(win), []);
 });
 
-test("every committed baseline file is valid (a corrupt one would silence the scheduled gate)", { skip: !existsSync(BASELINES_DIR) && "no committed baseline yet: deferred to the first scheduled linux-xvfb run" }, () => {
+test("every committed baseline file is valid and armed (a corrupt or disarmed one would silence the scheduled gate)", { skip: !existsSync(BASELINES_DIR) && "no committed baseline yet: deferred to the first scheduled run of each environment" }, () => {
   const files = readdirSync(BASELINES_DIR).filter((f) => f.endsWith(".json"));
   assert.ok(files.length > 0, "baselines/ exists but holds no baseline");
   for (const f of files) {
     const st = readBaselineFile(join(BASELINES_DIR, f));
     assert.equal(st.state, "present", `${f}: ${st.reason}`);
-    assert.equal(`${st.baseline.environment}.json`, f, "a baseline file is named for its environment");
+    const b = st.baseline;
+    assert.equal(`${b.environment}.json`, f, "a baseline file is named for its environment");
+    // The three disarm checks, stated here as well as in the validator.
+    assert.ok(b.thresholds[GATING_KPI], `${f}: no threshold for the gating KPI`);
+    assert.ok(b.thresholds[GATING_KPI].relative > 0 && b.thresholds[GATING_KPI].relative <= 1, `${f}: the gate's relative threshold is outside (0, 1]`);
+    assert.ok(b.min_runs >= MIN_RUNS_FLOOR && b.min_runs <= SCHEDULED_RUNS[b.environment], `${f}: min_runs ${b.min_runs} vs the ${SCHEDULED_RUNS[b.environment]} scheduled runs`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// the gate's false-red rate and power (the review's fp-sim.mjs, seeded)
+// ---------------------------------------------------------------------------
+
+/** mulberry32: a seeded uniform [0, 1) generator, so the bounds below are deterministic. */
+function seeded(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** A lognormal factor with mean 1 and coefficient of variation `cv`. */
+function lognormal(rand, cv) {
+  const s = Math.sqrt(Math.log(1 + cv * cv));
+  let u = 0;
+  while (u === 0) u = rand();
+  return Math.exp(-(s * s) / 2 + s * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand()));
+}
+
+/**
+ * The share of trials in which the scheduled job would go red: six gate entries
+ * (N 1, 5, 15 x two arms), `runs` runs per build, every value a typical p95
+ * (100-300 ms) times run-to-run noise of `cv`, the head `effect` times worse.
+ * Drives the real poolGate (and, for contrast, any single entry's judgeEntry).
+ */
+function redRate({ runs, cv, effect, trials, seed, relative = PROPOSED_GATE_RELATIVE[runs] }) {
+  const rand = seeded(seed);
+  let gateRed = 0;
+  let anyEntryRed = 0;
+  for (let t = 0; t < trials; t += 1) {
+    const entries = [];
+    for (const n of LEVELS) {
+      for (const arm of ARM_LIST) {
+        const level = 100 + 200 * rand();
+        const side = (f) => {
+          const vals = Array.from({ length: runs }, () => level * f * lognormal(rand, cv));
+          return { spread: spreadOf(vals), states: `${runs} measured`, values: vals.map((value, run) => ({ run, value })) };
+        };
+        entries.push({ kpi: GATING_KPI, direction: "lower_is_better", n, arm, head: side(effect), baseline: side(1) });
+      }
+    }
+    if (poolGate(entries, { relative }, runs).verdict === "regression") gateRed += 1;
+    if (entries.some((e) => judgeEntry(e, PROPOSED_THRESHOLDS.ms, runs).verdict === "regression")) anyEntryRed += 1;
+  }
+  return { gate: gateRed / trials, anyEntry: anyEntryRed / trials };
+}
+
+test("the gate's false-red rate with nothing changed is <= 2 % at CV 0.2 (runs 3 on linux-xvfb, 2 on windows-hosted)", (t) => {
+  const linux = redRate({ runs: 3, cv: 0.2, effect: 1, trials: 10000, seed: 1 });
+  assert.ok(linux.gate <= 0.02, `linux-xvfb gate red with no change: ${(linux.gate * 100).toFixed(2)} %`);
+  // What the review measured: any of the six entries alone, uncorrected, goes red far more often.
+  assert.ok(linux.anyEntry > 0.1, `per-entry without the gate: ${(linux.anyEntry * 100).toFixed(2)} %`);
+  const win = redRate({ runs: 2, cv: 0.2, effect: 1, trials: 10000, seed: 2 });
+  assert.ok(win.gate <= 0.02, `windows-hosted gate red with no change: ${(win.gate * 100).toFixed(2)} %`);
+  t.diagnostic(`null, CV 0.2: linux-xvfb gate ${(linux.gate * 100).toFixed(2)} % (any single entry ${(linux.anyEntry * 100).toFixed(2)} %), windows-hosted gate ${(win.gate * 100).toFixed(2)} %`);
+});
+
+test("the gate's power: a 30 % p95 regression across every N goes red >= 95 % at CV 0.15 and >= 85 % at CV 0.2", (t) => {
+  // CV 0.2 cannot reach 95 % under the plan's non-overlapping-spreads rule at
+  // 3 runs (the simulation's frontier peaks near 92 % at a 3.6 % false-red rate);
+  // the bound pinned here is the one the rule allows.
+  const at15 = redRate({ runs: 3, cv: 0.15, effect: 1.3, trials: 5000, seed: 3 });
+  assert.ok(at15.gate >= 0.95, `power at CV 0.15: ${(at15.gate * 100).toFixed(1)} %`);
+  const at20 = redRate({ runs: 3, cv: 0.2, effect: 1.3, trials: 5000, seed: 4 });
+  assert.ok(at20.gate >= 0.85, `power at CV 0.2: ${(at20.gate * 100).toFixed(1)} %`);
+  const win = redRate({ runs: 2, cv: 0.2, effect: 1.3, trials: 5000, seed: 5 });
+  t.diagnostic(`power, 30 %: linux-xvfb CV 0.15 ${(at15.gate * 100).toFixed(1)} %, CV 0.2 ${(at20.gate * 100).toFixed(1)} %; windows-hosted (2 runs) CV 0.2 ${(win.gate * 100).toFixed(1)} %`);
 });
 
 // ---------------------------------------------------------------------------
@@ -349,6 +531,60 @@ test("the headline line is withheld when any headline KPI is unknown, a setup or
   assert.equal(headlineStatus([linux]).established, false);
 });
 
+test("the headline line is withheld when its rows come from two machines (S3, the review's two-machines.mjs)", () => {
+  const doc = (machine, setups) => {
+    const d = headlineDoc();
+    d.machine.name = machine;
+    d.run.id = `run-${machine}`;
+    d.rows = d.rows.filter((r) => setups.includes(r.setup.id));
+    return d;
+  };
+  const docs = [doc("gpu-box-A", ["runner", "vscode"]), doc("laptop-B", ["windows-terminal", "tmux-wsl"])];
+  const st = headlineStatus(docs);
+  assert.equal(st.established, false);
+  assert.deepEqual(st.missing, ["the rows come from 2 machines (gpu-box-A, laptop-B): one comparison is one machine's"]);
+  assert.deepEqual(headlineLines(renderReport(docs)), []);
+  // The same split across two runs on ONE machine is one comparison.
+  const same = [doc("gpu-box-A", ["runner", "vscode"]), doc("gpu-box-A", ["windows-terminal", "tmux-wsl"])];
+  assert.deepEqual(headlineLines(renderReport(same)), [HEADLINE_LINE]);
+});
+
+test("a baseline build's rows never stand behind the headline (mutation N3b)", () => {
+  const doc = headlineDoc();
+  for (const r of doc.rows.filter((x) => x.setup.id === "runner")) r.setup.build = { ...r.setup.build, role: "baseline" };
+  const st = headlineStatus([doc]);
+  assert.equal(st.established, false);
+  assert.ok(st.missing.includes("runner focus: no N = 15 row") && st.missing.includes("runner tiled: no N = 15 row"), st.missing.join("; "));
+});
+
+test("report with several files honours --format json (N4)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-report-json-"));
+  try {
+    const a = headlineDoc();
+    const b = headlineDoc();
+    b.run.id = "second-run";
+    writeFileSync(join(dir, "a.json"), JSON.stringify(a));
+    writeFileSync(join(dir, "b.json"), JSON.stringify(b));
+    const out = [];
+    assert.equal(await main(["report", join(dir, "a.json"), join(dir, "b.json"), "--format", "json"], { out: (x) => out.push(x), err: () => {} }), 0);
+    const j = JSON.parse(out.join(""));
+    assert.deepEqual([j.valid, j.environment, j.runs], [true, "windows-desktop", [a.run.id, "second-run"]]);
+    assert.deepEqual([j.headline.established, j.headline.line, j.headline.missing], [true, HEADLINE_LINE, []]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the N = 15 headline table names each group's labels, e.g. VS Code's dom_renderer_fallback (N5)", () => {
+  const doc = linuxXvfbResults();
+  const vs = row({ setupId: "vscode", scenarioOverrides: { n: 15, arm: "tiled" }, labels: ["dom_renderer_fallback", "software_rendered"] });
+  doc.rows.push(vs);
+  const md = renderReport(doc);
+  const table = md.split("### Headline: N = 15")[1].split("\n\n")[1].split("\n");
+  assert.match(table[0], /\| labels \|$/);
+  assert.ok(table.some((l) => /^\| vscode \| .+ \| dom_renderer_fallback, software_rendered \|$/.test(l)), table.join("\n"));
+});
+
 test("the headline fixture is a valid results file (the line is never drawn from an invalid shape)", () => {
   const res = validateResults(headlineDoc());
   assert.equal(res.valid, true, JSON.stringify(res.errors.slice(0, 5)));
@@ -425,11 +661,14 @@ test("the report renders the runner's diagnostics, labelled non-comparable, and 
 const REPO = join(HERE, "..", "..", "..");
 const WORKFLOW = join(REPO, ".github", "workflows", "termhost-bench.yml");
 
-/** The verdict step's `run:` script, dedented. */
-function verdictStepScript() {
+/** A job's verdict step `run:` script, dedented. */
+function verdictStepScript(job) {
   const lines = readFileSync(WORKFLOW, "utf8").split(/\r?\n/);
-  const at = lines.findIndex((l) => l === "      - name: Regression verdict (fails on regression only)");
-  assert.ok(at > 0, "the run-linux-xvfb job has the verdict step");
+  const start = lines.findIndex((l) => l === `  ${job}:`);
+  assert.ok(start > 0, `the workflow has no job ${job}`);
+  const at = lines.findIndex((l, i) => i > start && l === "      - name: Regression verdict (fails on regression only)");
+  const next = lines.findIndex((l, i) => i > start && /^ {2}[A-Za-z0-9_-]+:\s*$/.test(l));
+  assert.ok(at > 0 && (next < 0 || at < next), `the ${job} job has the verdict step`);
   const run = lines.findIndex((l, i) => i > at && l === "        run: |");
   const body = [];
   for (let i = run + 1; i < lines.length && (lines[i] === "" || /^ {10}/.test(lines[i])); i += 1) body.push(lines[i].slice(10));
@@ -437,23 +676,25 @@ function verdictStepScript() {
   return body.join("\n");
 }
 
-test("the retention claim's anchor (rtp-terminal-regression-retention-instrument) matches the scheduled job", () => {
+const JOBS = { "linux-xvfb": "run-linux-xvfb", "windows-hosted": "run-windows-hosted" };
+
+test("the retention claim's anchor (rtp-terminal-regression-retention-instrument) matches each scheduled job's verdict step", () => {
   const yml = readFileSync(WORKFLOW, "utf8");
-  const hits = yml.split(/\r?\n/).filter((l) => /compare\.mjs.*--baseline/.test(l) && !/^\s*#/.test(l));
-  assert.equal(hits.length, 1, "exactly one executed line, not only a comment");
-  assert.match(hits[0], /node scripts\/termhost-bench\/compare\.mjs "\$redacted" --baseline scripts\/termhost-bench\/baselines\/linux-xvfb\.json /);
   const lines = yml.split(/\r?\n/);
-  const job = lines.findIndex((l) => l === "  run-linux-xvfb:");
-  const next = lines.findIndex((l, i) => i > job && /^ {2}[A-Za-z0-9_-]+:\s*$/.test(l));
-  const idx = lines.findIndex((l) => l === hits[0]);
-  assert.ok(idx > job && idx < next, "the line is in the run-linux-xvfb job (the one the schedule runs)");
+  const hits = lines.filter((l) => /compare\.mjs.*--baseline/.test(l) && !/^\s*#/.test(l));
+  assert.equal(hits.length, 2, "one executed line per scheduled job, not only a comment");
+  for (const [env, job] of Object.entries(JOBS)) {
+    const start = lines.findIndex((l) => l === `  ${job}:`);
+    const next = lines.findIndex((l, i) => i > start && /^ {2}[A-Za-z0-9_-]+:\s*$/.test(l));
+    const inJob = lines.slice(start, next < 0 ? undefined : next).filter((l) => hits.includes(l));
+    assert.equal(inJob.length, 1, job);
+    assert.match(inJob[0], new RegExp(`node scripts/termhost-bench/compare\\.mjs "\\$redacted" --baseline scripts/termhost-bench/baselines/${env}\\.json `));
+  }
 });
 
 const bash = spawnSync("bash", ["-c", "exit 0"]).status === 0;
 
-test("the verdict step, executed: unknown passes (no baseline file, no baseline build), regression fails (mutation M8)", { skip: !bash && "no bash on this machine" }, () => {
-  const script = verdictStepScript();
-  assert.match(script, /^set -uo pipefail$/m, "no -e: the step decides its own exit");
+test("the verdict steps, executed: unknown passes, regression fails, and no verdict file is an error (mutations M8, S1)", { skip: !bash && "no bash on this machine" }, () => {
   const root = mkdtempSync(join(tmpdir(), "tb-step-"));
   try {
     // The step runs in the head checkout; give it the scripts it calls and nothing else.
@@ -461,47 +702,67 @@ test("the verdict step, executed: unknown passes (no baseline file, no baseline 
     for (const p of ["scripts/termhost-bench", "scripts/lib", "scripts/tui-repaint-generator.mjs"]) {
       cpSync(join(REPO, p), join(repo, p), { recursive: true, filter: (src) => !src.includes("__tests__") && !src.endsWith(join("termhost-bench", "baselines")) });
     }
-    const runStep = (name, { baseline, results, baselineFileContent }) => {
-      const tmp = join(root, name);
-      mkdirSync(join(tmp, "tb-out"), { recursive: true });
-      const bdir = join(repo, "scripts", "termhost-bench", "baselines");
-      rmSync(bdir, { recursive: true, force: true });
-      if (baselineFileContent) {
-        mkdirSync(bdir, { recursive: true });
-        writeFileSync(join(bdir, "linux-xvfb.json"), JSON.stringify(baselineFileContent));
-      }
-      if (results) writeFileSync(join(tmp, "tb-out", "termhost-bench-linux-xvfb-runner.json"), JSON.stringify(results));
-      const summary = join(tmp, "summary.md");
-      const r = spawnSync("bash", ["-c", script], {
-        cwd: repo,
-        env: { ...process.env, RUNNER_TEMP: tmp, GITHUB_STEP_SUMMARY: summary, BASELINE: baseline },
-        encoding: "utf8",
-      });
-      return { status: r.status, out: `${r.stdout}${r.stderr}`, summary: existsSync(summary) ? readFileSync(summary, "utf8") : "", dir: join(tmp, "tb-out") };
-    };
-    const regressing = abDoc([80, 82, 84], [50, 52, 54]);
+    const compareJs = join(repo, "scripts", "termhost-bench", "compare.mjs");
+    const realCompare = readFileSync(compareJs, "utf8");
+    for (const [env, job] of Object.entries(JOBS)) {
+      const script = verdictStepScript(job);
+      assert.match(script, /^set -uo pipefail$/m, "no -e: the step decides its own exit");
+      const runStep = (name, { baseline, results, baselineFileContent, compareSource = realCompare }) => {
+        const tmp = join(root, `${env}-${name}`);
+        mkdirSync(join(tmp, "tb-out"), { recursive: true });
+        const bdir = join(repo, "scripts", "termhost-bench", "baselines");
+        rmSync(bdir, { recursive: true, force: true });
+        if (baselineFileContent) {
+          mkdirSync(bdir, { recursive: true });
+          writeFileSync(join(bdir, `${env}.json`), JSON.stringify(baselineFileContent));
+        }
+        writeFileSync(compareJs, compareSource);
+        if (results) {
+          const doc = structuredClone(results);
+          doc.machine.environment = env;
+          writeFileSync(join(tmp, "tb-out", `termhost-bench-${env}-runner.json`), JSON.stringify(doc));
+        }
+        const summary = join(tmp, "summary.md");
+        const r = spawnSync("bash", ["-c", script], {
+          cwd: repo,
+          env: { ...process.env, RUNNER_TEMP: tmp, GITHUB_STEP_SUMMARY: summary, BASELINE: baseline },
+          encoding: "utf8",
+        });
+        return { status: r.status, out: `${r.stdout}${r.stderr}`, summary: existsSync(summary) ? readFileSync(summary, "utf8") : "", dir: join(tmp, "tb-out") };
+      };
+      const runs = SCHEDULED_RUNS[env];
+      const regressing = abDoc([80, 82, 84].slice(0, runs), [50, 52, 54].slice(0, runs));
+      const bfile = { ...baselineFile(), environment: env, min_runs: runs, thresholds: { output_latency_ms: { relative: PROPOSED_GATE_RELATIVE[runs], absolute: 5 } } };
 
-    const noFile = runStep("no-file", { baseline: BASE, results: regressing });
-    assert.equal(noFile.status, 0, noFile.out);
-    assert.match(noFile.summary, /^Verdict: \*\*unknown\*\* — no baseline\./m);
-    assert.ok(existsSync(join(noFile.dir, "termhost-bench-linux-xvfb-baseline-proposed.json")), "the first run proposes a baseline");
-    assert.deepEqual(validateBaseline(JSON.parse(readFileSync(join(noFile.dir, "termhost-bench-linux-xvfb-baseline-proposed.json"), "utf8"))), []);
+      const noFile = runStep("no-file", { baseline: BASE, results: regressing });
+      assert.equal(noFile.status, 0, `${env}: ${noFile.out}`);
+      assert.match(noFile.summary, /^Verdict: \*\*unknown\*\* — no baseline\./m, env);
+      const proposed = join(noFile.dir, `termhost-bench-${env}-baseline-proposed.json`);
+      assert.ok(existsSync(proposed), `${env}: the first run proposes a baseline`);
+      assert.deepEqual(validateBaseline(JSON.parse(readFileSync(proposed, "utf8"))), [], env);
 
-    const noBuild = runStep("no-build", { baseline: "none", results: regressing, baselineFileContent: baselineFile() });
-    assert.equal(noBuild.status, 0, noBuild.out);
-    assert.match(noBuild.summary, /unknown — no baseline build in this run/);
+      const noBuild = runStep("no-build", { baseline: "none", results: regressing, baselineFileContent: bfile });
+      assert.equal(noBuild.status, 0, `${env}: ${noBuild.out}`);
+      assert.match(noBuild.summary, /unknown — no baseline build in this run/);
 
-    const fires = runStep("fires", { baseline: BASE, results: regressing, baselineFileContent: baselineFile() });
-    assert.equal(fires.status, 1, fires.out);
-    assert.match(fires.out, /::error::termhost-bench: the head build regressed/);
-    assert.equal(JSON.parse(readFileSync(join(fires.dir, "termhost-bench-linux-xvfb-verdict.json"), "utf8")).verdict, "regression");
+      const fires = runStep("fires", { baseline: BASE, results: regressing, baselineFileContent: bfile });
+      assert.equal(fires.status, 1, `${env}: ${fires.out}`);
+      assert.match(fires.out, /::error::termhost-bench: the head build regressed/);
+      assert.equal(JSON.parse(readFileSync(join(fires.dir, `termhost-bench-${env}-verdict.json`), "utf8")).verdict, "regression");
 
-    const unknownSide = runStep("unknown-side", { baseline: BASE, results: abDoc([500, 510, 520], [null, null, null]), baselineFileContent: baselineFile() });
-    assert.equal(unknownSide.status, 0, unknownSide.out);
+      const unknownSide = runStep("unknown-side", { baseline: BASE, results: abDoc([500, 510, 520].slice(0, runs), [null, null, null].slice(0, runs)), baselineFileContent: bfile });
+      assert.equal(unknownSide.status, 0, `${env}: ${unknownSide.out}`);
 
-    const noResults = runStep("no-results", { baseline: BASE, results: null, baselineFileContent: baselineFile() });
-    assert.equal(noResults.status, 0, noResults.out);
-    assert.match(noResults.summary, /unknown — no runner-only results/);
+      const noResults = runStep("no-results", { baseline: BASE, results: null, baselineFileContent: bfile });
+      assert.equal(noResults.status, 0, `${env}: ${noResults.out}`);
+      assert.match(noResults.summary, /unknown — no runner-only results/);
+
+      // S1: a compare that runs nothing and writes no verdict is an error, never "no regression".
+      const silent = runStep("silent", { baseline: BASE, results: regressing, baselineFileContent: bfile, compareSource: "// does nothing\n" });
+      assert.equal(silent.status, 2, `${env}: ${silent.out}`);
+      assert.match(silent.out, /::error::termhost-bench: compare wrote no verdict \(exit 0\): the regression detector did not run/);
+    }
+    writeFileSync(compareJs, realCompare);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -75,10 +75,11 @@ test("a value-shape KPI contributes its value whatever its statistic is called; 
   assert.equal(valueOf(undefined, getKpi("hangs")), null);
 });
 
-test("spreads are nearest-rank medians with the run range; states count every run", () => {
+test("spreads are medians (the midpoint for an even count) with the run range; states count every run", () => {
   assert.equal(spreadOf([]), null);
   assert.deepEqual(spreadOf([3, 1, 2]), { median: 2, min: 1, max: 3, runs: 3 });
-  assert.ok([1, 2, 3, 4].includes(spreadOf([4, 1, 3, 2]).median), "an observed value, never an average of two");
+  assert.equal(spreadOf([4, 1, 3, 2]).median, 2.5, "an even count's median is the midpoint of the middle two");
+  assert.deepEqual(spreadOf([10, 20]), { median: 15, min: 10, max: 20, runs: 2 }, "two runs: their mean, labelled as the median");
   assert.equal(statesOf([{ state: "measured" }, { state: "unknown", reason: "occluded" }, { state: "unknown", reason: "occluded" }, undefined]), "1 measured, 2 unknown(occluded), 1 missing(?)");
 });
 
@@ -128,8 +129,8 @@ test("the comparison renders every side's spread or unknown; with no verdict app
   const md = renderComparison(compareBuilds(doc));
   assert.match(md, /^### runner: head a{12} vs baseline b{12} \(linux-xvfb\)$/m);
   assert.doesNotMatch(md, /^Verdict:/m, "compareBuilds alone judges nothing");
-  assert.match(md, /^\| output_latency_ms \| p95 \| 5 \| focus \| [\d.]+ ms \[[\d.]+–[\d.]+\] \| [\d.]+ ms \[[\d.]+–[\d.]+\] \| 3 measured \| 2 measured, 1 unknown\(capture_unavailable\) \| – \|$/m);
-  assert.match(md, /^\| cpu_pct \| mean \| 5 \| focus \| .+ \| unknown \| 3 measured \| 3 unknown\(harness_error\) \| – \|$/m);
+  assert.match(md, /^\| output_latency_ms \| p95 \| 5 \| focus \| [\d.]+ ms \[[\d.]+–[\d.]+\] \| [\d.]+ ms \[[\d.]+–[\d.]+\] \| 3 measured \| 2 measured, 1 unknown\(capture_unavailable\) \| – \| – \|$/m);
+  assert.match(md, /^\| cpu_pct \| mean \| 5 \| focus \| .+ \| unknown \| 3 measured \| 3 unknown\(harness_error\) \| – \| – \|$/m);
   assert.match(md, /^\| hangs \| count \| 5 \| focus \| 1\.00 \[0\.00–2\.00\] \|/m);
   const tableRows = md.split(/\r?\n/).filter((l) => l.startsWith("| ") && !l.startsWith("| KPI "));
   assert.ok(tableRows.length > 0);

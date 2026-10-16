@@ -86,9 +86,9 @@ on:
         type: string
         default: "focus,tiled"
       runs:
-        description: "Runs per (N, setup, build)"
+        description: "Runs per (N, setup, build) (empty: the job's scheduled count — 3 on linux-xvfb, 2 on windows-hosted)"
         type: string
-        default: "2"
+        default: ""
       baseline_sha:
         description: "Baseline commit for the same-VM A/B (empty: the newest main commit at least 7 days old; none: head only)"
         type: string
@@ -303,9 +303,13 @@ jobs:
   # of the head build against the baseline build measured in this same VM —
   # regression iff the head's median over runs is worse by more than the
   # threshold the baseline file records AND the run spreads do not overlap. The
-  # job fails on `regression` and on nothing else: an unknown (no baseline file
-  # yet, no baseline build in this run, an unknown or under-sampled side) is
-  # reported in the summary and never fails it. Until the first scheduled run's
+  # job fails on the gate's `regression` and on nothing else: an unknown (no
+  # baseline file yet, no baseline build in this run, an unknown or
+  # under-sampled side) is reported in the summary and never fails it, while a
+  # compare that writes no verdict at all fails the step (the detector did not
+  # run). Only output_latency_ms p95 gates, pooled over every N and arm; the
+  # other headline KPIs' verdicts are informational. The schedule takes 3 runs
+  # per build, the gate's min_runs. Until the first scheduled run's
   # baseline is committed, every verdict reads unknown("no baseline"); that run
   # uploads a proposed baseline (runner readings only, D7) to review and commit.
   #
@@ -315,9 +319,9 @@ jobs:
   # exe runs in place beside the resources its build copied next to it.
   #
   # UNMEASURED at introduction: no run of this job exists yet. Estimate for the
-  # full ladder: about 75 min for the two cold builds plus about 135 min for 18
-  # units (2 runs x 3 N x {head, baseline, tmux}) of two arms each. 350 min sits
-  # under GitHub's 360-minute ceiling, and the run step's own 230-minute bound
+  # full ladder: about 75 min for the two cold builds plus about 200 min for 27
+  # units (3 runs x 3 N x {head, baseline, tmux}) of two arms each. 350 min sits
+  # under GitHub's 360-minute ceiling, and the run step's own 260-minute bound
   # leaves the report and upload steps time to say what happened. Tighten both
   # once there are runs to measure.
   # ---------------------------------------------------------------------------
@@ -406,7 +410,8 @@ jobs:
           if [ "$EVENT" = "pull_request" ]; then
             n=1; arms=focus,tiled; runs=1; baseline=none
           else
-            n="${IN_N:-1,5,15}"; arms="${IN_ARMS:-focus,tiled}"; runs="${IN_RUNS:-2}"; baseline="${IN_BASELINE:-}"
+            # 3 runs: the gate's min_runs (compare.mjs SCHEDULED_RUNS["linux-xvfb"]).
+            n="${IN_N:-1,5,15}"; arms="${IN_ARMS:-focus,tiled}"; runs="${IN_RUNS:-3}"; baseline="${IN_BASELINE:-}"
           fi
           [[ "$n" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "::error::n must be comma-separated positive integers, got '$n'"; exit 1; }
           [[ "$arms" =~ ^(focus|tiled)(,(focus|tiled))*$ ]] || { echo "::error::arms must be focus and/or tiled, got '$arms'"; exit 1; }
@@ -581,7 +586,7 @@ jobs:
         id: run
         shell: bash
         working-directory: head/qontinui-runner
-        timeout-minutes: 230
+        timeout-minutes: 260
         env:
           N: ${{ steps.params.outputs.n }}
           ARMS: ${{ steps.params.outputs.arms }}
@@ -666,7 +671,16 @@ jobs:
           rc=0
           node scripts/termhost-bench/compare.mjs "$redacted" --baseline scripts/termhost-bench/baselines/linux-xvfb.json --verdict-json "$verdict" --propose-baseline "$out/termhost-bench-linux-xvfb-baseline-proposed.json" > "$out/verdict.md" || rc=$?
           cat "$out/verdict.md" >> "$GITHUB_STEP_SUMMARY"
-          v="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).verdict))' "$verdict" 2>/dev/null || echo unknown)"
+          # No verdict file means the detector did not run: that is an error, not
+          # "no regression".
+          if [ ! -f "$verdict" ]; then
+            echo "::error::termhost-bench: compare wrote no verdict (exit $rc): the regression detector did not run"
+            exit 2
+          fi
+          v="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).verdict))' "$verdict")" || {
+            echo "::error::termhost-bench: the verdict file is unreadable: the regression detector's answer is lost"
+            exit 2
+          }
           echo "verdict: $v (compare exited $rc)"
           if [ "$v" = regression ]; then
             echo "::error::termhost-bench: the head build regressed against the baseline build $BASELINE (see the job summary)"
@@ -770,8 +784,16 @@ jobs:
   # redacted copy, the job summary rendered from it, and runner unit logs on
   # failure. The VS Code and Windows Terminal results, their unit directories
   # (profiles, logs) and their archive caches are never uploaded; their gate
-  # failures name a KPI's state and reason code without the detail text. No verdict is drawn yet: the regression
-  # rule arrives with Phase 6, in compare.mjs.
+  # failures name a KPI's state and reason code without the detail text.
+  #
+  # Regression verdict (Phase 6, D11): as in the Linux job, `compare.mjs
+  # --baseline scripts/termhost-bench/baselines/windows-hosted.json` on the
+  # runner-only copy; the job fails on the gate's `regression` only, and a
+  # compare that writes no verdict fails the step. The schedule takes 2 runs per
+  # build here (3 does not fit the 360 minutes), so the proposed baseline's
+  # min_runs is 2 and its gate threshold the one the simulation chose for 2 runs.
+  # The gate reads output_latency_ms, which needs capture: where capture.wgc is
+  # not OPERATIVE on the image, the gate reads unknown and never fails the job.
   #
   # No rust-cache, for the Linux job's reason: ci.yml saves its caches from main
   # only, and the two checkouts here would not hit them anyway (a cache's paths
@@ -825,6 +847,7 @@ jobs:
           if [ "$EVENT" = "pull_request" ]; then
             n=1; arms=focus,tiled; runs=1; baseline=none; wt_n=1
           else
+            # 2 runs: what the 360-minute budget holds (compare.mjs SCHEDULED_RUNS["windows-hosted"]).
             n="${IN_N:-1,5,15}"; arms="${IN_ARMS:-focus,tiled}"; runs="${IN_RUNS:-2}"; baseline="${IN_BASELINE:-}"; wt_n=1,5
           fi
           [[ "$n" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "::error::n must be comma-separated positive integers, got '$n'"; exit 1; }
@@ -1027,12 +1050,56 @@ jobs:
             --require-measured-if-operative capture.wgc:output_latency_ms \
             "${ab[@]}"
 
+      # Reads the runner-only copy (D7). Fails on the gate's `regression` only.
+      # No timeout-minutes: it takes seconds, and the step bounds above already
+      # use all but the 15 minutes windows-hosted.test.mjs holds for the
+      # unbounded steps.
+      - name: Regression verdict (fails on regression only)
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/tb-out"
+          redacted="$out/termhost-bench-windows-hosted-runner.json"
+          verdict="$out/termhost-bench-windows-hosted-verdict.json"
+          if [ "$BASELINE" = none ] || [ ! -f "$redacted" ]; then
+            if [ "$BASELINE" = none ]; then why="no baseline build in this run"; else why="no runner-only results"; fi
+            echo "### Regression verdict: unknown — $why (never a failure)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          rc=0
+          node scripts/termhost-bench/compare.mjs "$redacted" --baseline scripts/termhost-bench/baselines/windows-hosted.json --verdict-json "$verdict" --propose-baseline "$out/termhost-bench-windows-hosted-baseline-proposed.json" > "$out/verdict.md" || rc=$?
+          cat "$out/verdict.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f "$verdict" ]; then
+            echo "::error::termhost-bench: compare wrote no verdict (exit $rc): the regression detector did not run"
+            exit 2
+          fi
+          v="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).verdict))' "$verdict")" || {
+            echo "::error::termhost-bench: the verdict file is unreadable: the regression detector's answer is lost"
+            exit 2
+          }
+          echo "verdict: $v (compare exited $rc)"
+          if [ "$v" = regression ]; then
+            echo "::error::termhost-bench: the head build regressed against the baseline build $BASELINE (see the job summary)"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::compare exited $rc with verdict '$v': reported as unknown, never a failure"
+          fi
+          exit 0
+
       - name: Upload the runner's results (redacted)
         if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: termhost-bench-windows-hosted-runner
-          path: ${{ runner.temp }}/tb-out/termhost-bench-windows-hosted-runner.json
+          path: |
+            ${{ runner.temp }}/tb-out/termhost-bench-windows-hosted-runner.json
+            ${{ runner.temp }}/tb-out/termhost-bench-windows-hosted-verdict.json
+            ${{ runner.temp }}/tb-out/termhost-bench-windows-hosted-baseline-proposed.json
           if-no-files-found: warn
           retention-days: 90
 
@@ -1041,18 +1108,13 @@ jobs:
         shell: bash
         working-directory: head/qontinui-runner
         timeout-minutes: 5
-        env:
-          BASELINE: ${{ steps.params.outputs.baseline }}
         run: |
           redacted="$RUNNER_TEMP/tb-out/termhost-bench-windows-hosted-runner.json"
           if [ ! -f "$redacted" ]; then
             echo "No runner-only results to summarise (see the run and validate steps)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          if [ "$BASELINE" != none ]; then
-            node scripts/termhost-bench/cli.mjs compare "$redacted" >> "$GITHUB_STEP_SUMMARY" \
-              || echo "compare could not pair head and baseline rows (see the log)." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          # The head-against-baseline table, with its verdict, is the verdict step's.
           node scripts/termhost-bench/cli.mjs report "$redacted" >> "$GITHUB_STEP_SUMMARY"
 
       # D7: an assert-only smoke. Its results file, unit directories and archive

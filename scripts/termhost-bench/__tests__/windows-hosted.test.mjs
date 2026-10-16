@@ -504,11 +504,19 @@ test("only the runner's rows leave the VM: uploads and the summary come from the
     else for (let i = at + 1; i < s.lines.length && /^ {12}\S/.test(s.lines[i]); i += 1) paths.push(s.lines[i].trim());
   }
   for (const p of paths) {
-    assert.ok(/termhost-bench-windows-hosted-runner\.json$/.test(p) || /\/tb\/termhost-bench\/\*\/units\/\*-runner-\*\//.test(p), `upload path ${p} could carry a third-party row`);
+    // The redacted copy, the two files the verdict step derives from it (Phase 6), or a runner unit dir.
+    assert.ok(
+      /termhost-bench-windows-hosted-(runner|verdict|baseline-proposed)\.json$/.test(p) || /\/tb\/termhost-bench\/\*\/units\/\*-runner-\*\//.test(p),
+      `upload path ${p} could carry a third-party row`,
+    );
     assert.ok(!/tb-vscode|tb-wt|termhost-cache|results\.json$/.test(p), `upload path ${p} reaches a third-party smoke`);
   }
   const summary = job.filter((l) => /cli\.mjs (report|compare)/.test(l) && /GITHUB_STEP_SUMMARY/.test(l));
-  assert.ok(summary.length >= 2);
+  assert.ok(summary.length >= 1);
+  // The verdict step reads only the redacted copy.
+  const verdictCalls = job.filter((l) => /compare\.mjs /.test(l) && !/^\s*#/.test(l));
+  assert.equal(verdictCalls.length, 1, "one compare.mjs invocation");
+  assert.match(verdictCalls[0], /compare\.mjs "\$redacted" --baseline /);
   for (const l of summary) assert.match(l, /"\$redacted"/, l.trim());
   for (const inv of invocations(job).filter((x) => /cli\.mjs report "\$results"/.test(x))) assert.match(inv, /--format json/);
   for (const name of [/Assert the VS Code smoke/, /Assert the Windows Terminal smoke/, /Run the Windows Terminal smoke/]) {

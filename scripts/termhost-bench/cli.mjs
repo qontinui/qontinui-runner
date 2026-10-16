@@ -23,7 +23,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,7 +32,7 @@ import { blockingMechanisms, doctorNotes, doctorReport, gatherDoctorFacts, mapDo
 import { environmentSpec } from "./envs/index.mjs";
 import { ARMS, KPI_CATALOG, SETUP_IDS } from "./kpi-catalog.mjs";
 import { resolveProbeBinary } from "./probe.mjs";
-import { checkAssertions, prepareReport, renderReport } from "./report.mjs";
+import { HEADLINE_LINE, checkAssertions, headlineStatus, oneEnvironment, prepareReport, renderReport } from "./report.mjs";
 import { InvalidResults } from "./results.mjs";
 import { validateResults } from "./validate.mjs";
 import { RUN_DEFAULTS, RunAbort, RunFailed, planUnits, runBench } from "./run.mjs";
@@ -473,10 +473,28 @@ function cmdReportMany(positional, flags, io) {
       return 1;
     }
   }
+  let environment;
   try {
-    io.out(renderReport(docs));
+    environment = oneEnvironment(docs);
   } catch (e) {
     throw new UsageError(e.message);
+  }
+  if (flags.format === "json") {
+    const st = headlineStatus(docs);
+    io.out(
+      `${JSON.stringify(
+        {
+          valid: true,
+          environment,
+          runs: docs.map((d) => d.run.id),
+          headline: { ...st, line: st.established ? HEADLINE_LINE : null },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  } else {
+    io.out(renderReport(docs));
   }
   return 0;
 }
@@ -563,7 +581,20 @@ export async function main(argv, io = {}, deps = {}) {
   }
 }
 
-const invokedDirectly = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+/** Whether `argv1` names this module, through any symlink (a symlinked path must not run nothing, silently). */
+export function isEntryPoint(argv1, moduleUrl = import.meta.url) {
+  if (!argv1) return false;
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  return real(resolve(argv1)) === real(fileURLToPath(moduleUrl));
+}
+
+const invokedDirectly = isEntryPoint(process.argv[1]);
 if (invokedDirectly) {
   main(process.argv.slice(2)).then((code) => {
     process.exitCode = code;
