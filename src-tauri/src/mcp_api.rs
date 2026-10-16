@@ -5759,10 +5759,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_set_gate_audience",
     // Plan 2026-10-04-coord-pr-hold-without-github-drafts D4: placing a hold
     // only TIGHTENS (it can stop a merge, never cause one), so any principal
-    // that may open a PR may hold one. Release authority is enforced by coord
-    // server-side (holder or operator; a security_tier hold is operator-only).
-    // Without this entry no proxied session could place the hold that
-    // replaces GitHub drafts on private repos.
+    // that may open a PR may hold one. Forwarded for PLACING ONLY:
+    // `coord_mcp_request_gate_one` refuses `held != true`, because through
+    // this proxy every session shares the device JWT and a release can cause
+    // a merge (COORD_MCP_PR_HOLD_RELEASE_REFUSAL names the release doors).
     "coord_set_pr_hold",
     "coord_signature",
     "coord_slo_metrics",
@@ -5884,10 +5884,11 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 ///   guarantee, so this exclusion keeps the override in the operator family. Its
 ///   twin `coord_attest_escalate_override` is excluded as privilege escalation
 ///   (and is also `require_strategy_admin`).
-/// * `coord_set_pr_draft`: merge authority. A PR's draft state is the
-///   operator's release lever under the served `security-surface-implement-tier`
-///   setting `draft-required` ("the operator undrafts to release it to the
-///   train").
+/// * `coord_set_pr_draft`: merge authority. A PR's draft state was the
+///   operator's release lever before coord-owned holds replaced it (plan
+///   `2026-10-04-coord-pr-hold-without-github-drafts`, which renamed the served
+///   tier `draft-required` to `hold-required` and deletes this tool in its
+///   Phase 4). Undrafting can release a PR to the train, so it stays withheld.
 ///
 /// Two more are recorded here because coord grants them on the device floor and
 /// this list masks them on purpose. They were found while classifying the
@@ -7196,9 +7197,32 @@ fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBod
                 Some(tool.to_string()),
             );
         }
+        if tool == COORD_SET_PR_HOLD_TOOL
+            && req.pointer("/params/arguments/held") != Some(&serde_json::Value::Bool(true))
+        {
+            return reject(COORD_MCP_PR_HOLD_RELEASE_REFUSAL.to_string(), None);
+        }
     }
     Ok(())
 }
+
+/// The coord hold tool (plan `2026-10-04-coord-pr-hold-without-github-drafts`).
+const COORD_SET_PR_HOLD_TOOL: &str = "coord_set_pr_hold";
+
+/// Why this proxy forwards only PLACING a hold. Through `/coord-mcp` a call
+/// carries this box's paired-DEVICE JWT, so every session on the box (and a
+/// leaked session nonce) presents the same principal: a device-held hold
+/// placed by one session could be RELEASED by any other — and a release can
+/// cause a merge, which is the reasoning that withholds
+/// `coord_request_expedited_land`. Placing only tightens, so it is forwarded;
+/// anything but `held: true` (a release, or a missing `held`) is refused here.
+const COORD_MCP_PR_HOLD_RELEASE_REFUSAL: &str = "coord_set_pr_hold is forwarded by the \
+     /coord-mcp proxy only to PLACE a hold (`held: true`). A release (`held: false`, or \
+     no `held`) is refused here, because through this proxy every session on the box \
+     shares one device credential. Release a hold from the operator console \
+     (/admin/coord/prs), or through coord's HTTP door \
+     POST /coord/repos/:owner/:repo/pull-requests/:number/hold with the holder's own \
+     credential.";
 
 // ---------------------------------------------------------------------------
 // Semantic recall: fill in `coord_memory_search`'s query vector
@@ -11635,6 +11659,41 @@ async fn forward_validated_vcs_pr(
     coord_base: &str,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
 ) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // A held create is preceded by a capability read, and refused WITHOUT
+    // creating anything unless coord positively serves holds.
+    if req.hold.is_some() {
+        let refusal = match coord_serves_pr_hold(coord_base, bearer).await {
+            Ok(true) => None,
+            Ok(false) => Some((
+                "VCS_PR_PROXY_HOLD_UNSUPPORTED",
+                "coord does not serve PR holds (its tools/list has no coord_set_pr_hold), so \
+                 a held create would open an UNHELD PR. Nothing was created."
+                    .to_string(),
+            )),
+            Err(e) => Some((
+                "VCS_PR_PROXY_HOLD_CAPABILITY_UNKNOWN",
+                format!(
+                    "could not confirm coord serves PR holds ({e}), so the held create was \
+                     refused. Nothing was created."
+                ),
+            )),
+        };
+        if let Some((code, error)) = refusal {
+            warn!("vcs pr proxy: {code}: {error} (coord_base_source={coord_base_source})");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": error,
+                    "code": code,
+                    "coord_base_source": coord_base_source.as_str(),
+                })),
+            )
+                .into_response();
+        }
+    }
     let url = vcs_pr_upstream_url(coord_base, owner, name);
     let upstream_body = vcs_pr_upstream_body(req);
     // The source is threaded through now rather than discarded at the `_`: this
@@ -11655,18 +11714,55 @@ async fn forward_validated_vcs_pr(
 /// top-level `hold` object carrying non-empty `kind`, `reason` and `held_by`.
 /// A coord that predates holds ignores the request's `hold` and answers a
 /// plain 2xx — this is the check that catches it.
+///
+/// The predicate itself lives in the lib
+/// ([`qontinui_runner_lib::pr_hold_echo::hold_echo_confirmed`]) so the
+/// `qontinui-pr` CLI's re-check is the same function.
 fn vcs_pr_hold_echo_confirmed(body: &[u8]) -> bool {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    let Some(hold) = v.get("hold").and_then(|h| h.as_object()) else {
-        return false;
-    };
-    ["kind", "reason", "held_by"].iter().all(|k| {
-        hold.get(*k)
-            .and_then(|x| x.as_str())
-            .is_some_and(|x| !x.trim().is_empty())
-    })
+    serde_json::from_slice::<serde_json::Value>(body)
+        .is_ok_and(|v| qontinui_runner_lib::pr_hold_echo::hold_echo_confirmed(&v))
+}
+
+/// Whether coord serves PR holds, read BEFORE a held create: coord's own
+/// `tools/list` (same `/mcp` door and bearer the coord-mcp proxy uses) must
+/// list `coord_set_pr_hold`. `Ok(false)` = coord answered and does not serve
+/// holds; `Err` = the answer could not be read, which is UNKNOWN. Either way
+/// the caller creates NOTHING: a coord predating holds would ignore `hold`
+/// and open an UNHELD PR the train may land.
+async fn coord_serves_pr_hold(coord_base: &str, bearer: &str) -> Result<bool, String> {
+    static HOLD_PROBE_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = HOLD_PROBE_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("vcs pr hold probe reqwest client")
+    });
+    let url = format!("{}/mcp", coord_base.trim_end_matches('/'));
+    // coord-auth-exempt(forwarder): a read on the caller's own bearer, the
+    // same principal the create that follows it is forwarded under.
+    let resp = client
+        .post(&url)
+        .bearer_auth(bearer)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .map_err(|e| format!("{url}: {}", crate::util::error_chain::error_chain(&e)))?;
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("{url}: {}", crate::util::error_chain::error_chain(&e)))?;
+    if !status.is_success() {
+        return Err(format!("{url} answered {status}"));
+    }
+    qontinui_runner_lib::pr_hold_echo::tools_list_serves(
+        &bytes,
+        qontinui_runner_lib::pr_hold_echo::COORD_SET_PR_HOLD_TOOL,
+    )
+    .ok_or_else(|| format!("{url} answered {status} with no readable tools/list"))
 }
 
 /// Forward the PR-creation POST to coord and return coord's status + headers +
@@ -11789,9 +11885,9 @@ async fn forward_vcs_pr_post(
                 "success": false,
                 "error": format!(
                     "PR {shown} was created UNHELD: coord answered {status} but did not \
-                     confirm the requested hold (no `hold` echo with kind/reason/held_by — \
-                     this coord likely predates PR holds). The merge train may land it: \
-                     hold it with coord_set_pr_hold or close it now."
+                     confirm the requested hold (no `hold` echo with kind/reason/held_by). \
+                     The merge train may land it: close the PR now, or hold it with \
+                     coord_set_pr_hold (held:true), which this coord listed before the create."
                 ),
                 "code": "VCS_PR_PROXY_HOLD_UNCONFIRMED",
                 "pr_url": pr_url,
@@ -18402,13 +18498,34 @@ mod coord_mcp_body_gate_tests {
             !coord_mcp_withholding_is_deliberate("coord_set_pr_hold"),
             "coord_set_pr_hold must not also read as a deliberate withholding"
         );
+        // A release (or a call with no `held`) is refused at this door: the
+        // device JWT is shared by every session on the box.
+        for args in [
+            serde_json::json!({"repo":"o/r","pr_number":1,"held":false}),
+            serde_json::json!({"repo":"o/r","pr_number":1}),
+            serde_json::json!({"repo":"o/r","pr_number":1,"held":"true"}),
+        ] {
+            let err = gate(serde_json::json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{"name":"coord_set_pr_hold","arguments":args}
+            }))
+            .expect_err("a non-placing coord_set_pr_hold must be refused");
+            assert_eq!(err.0, serde_json::json!(7));
+            assert!(err.1.contains("only to PLACE a hold"), "{}", err.1);
+            assert!(
+                err.1.contains("/admin/coord/prs"),
+                "names a release door: {}",
+                err.1
+            );
+        }
         assert!(
             gate(serde_json::json!({
                 "jsonrpc":"2.0","id":1,"method":"tools/call",
-                "params":{"name":"coord_set_pr_hold","arguments":{}}
+                "params":{"name":"coord_set_pr_hold",
+                          "arguments":{"repo":"o/r","pr_number":1,"held":true,"reason":"r"}}
             }))
             .is_ok(),
-            "coord_set_pr_hold must pass the proxy gate"
+            "placing a hold (held:true) must forward"
         );
         for withheld in ["coord_set_pr_draft", "coord_create_pr"] {
             assert!(
@@ -22458,6 +22575,10 @@ mod vcs_pr_proxy_tests {
         let err = v["error"].as_str().unwrap();
         assert!(err.contains("https://github.com/old/coord/pull/8"), "{err}");
         assert!(err.contains("UNHELD"), "{err}");
+        assert!(
+            err.find("close the PR now") < err.find("coord_set_pr_hold"),
+            "closing comes first: {err}"
+        );
 
         // An UNHELD request needs no echo: the same old coord is a success.
         let resp = forward_vcs_pr_post(
@@ -22480,20 +22601,28 @@ mod vcs_pr_proxy_tests {
     async fn the_handler_hand_off_requires_the_echo_exactly_when_hold_is_sent() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app: Router = Router::new().route(
-            "/coord/repos/{owner}/{repo}/pull-requests",
-            post(|body: axum::body::Bytes| async move {
-                let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                (
-                    axum::http::StatusCode::CREATED,
-                    axum::Json(serde_json::json!({
-                        "number": 9,
-                        "url": "https://github.com/o/r/pull/9",
-                        "sent": sent,
-                    })),
-                )
-            }),
-        );
+        let app: Router = Router::new()
+            .route(
+                "/mcp",
+                post(|| async {
+                    axum::Json(serde_json::json!({"jsonrpc":"2.0","id":1,
+                        "result":{"tools":[{"name":"coord_set_pr_hold"}]}}))
+                }),
+            )
+            .route(
+                "/coord/repos/{owner}/{repo}/pull-requests",
+                post(|body: axum::body::Bytes| async move {
+                    let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    (
+                        axum::http::StatusCode::CREATED,
+                        axum::Json(serde_json::json!({
+                            "number": 9,
+                            "url": "https://github.com/o/r/pull/9",
+                            "sent": sent,
+                        })),
+                    )
+                }),
+            );
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
@@ -22519,6 +22648,94 @@ mod vcs_pr_proxy_tests {
         assert_eq!(resp.status(), 201, "an unheld request must not require it");
         let v = body_json(resp).await;
         assert!(v["sent"].get("hold").is_none());
+    }
+
+    /// A held create against a coord that does NOT serve holds (its tools/list
+    /// lacks `coord_set_pr_hold`), or whose tools/list cannot be read, is
+    /// refused BEFORE any create is forwarded — nothing is created, so there is
+    /// no UNHELD PR to clean up. An unheld create skips the probe entirely.
+    #[tokio::test]
+    async fn a_held_create_is_refused_before_creating_when_coord_does_not_serve_holds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        for (mcp_status, mcp_body, want_code) in [
+            (
+                200u16,
+                serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"coord_orient"}]}}),
+                "VCS_PR_PROXY_HOLD_UNSUPPORTED",
+            ),
+            (
+                500u16,
+                serde_json::json!({"error":"boom"}),
+                "VCS_PR_PROXY_HOLD_CAPABILITY_UNKNOWN",
+            ),
+            (
+                200u16,
+                serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"x"}}),
+                "VCS_PR_PROXY_HOLD_CAPABILITY_UNKNOWN",
+            ),
+        ] {
+            let creates = Arc::new(AtomicUsize::new(0));
+            let c = creates.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app: Router = Router::new()
+                .route(
+                    "/mcp",
+                    post(move || {
+                        let b = mcp_body.clone();
+                        async move {
+                            (
+                                axum::http::StatusCode::from_u16(mcp_status).unwrap(),
+                                axum::Json(b),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/coord/repos/{owner}/{repo}/pull-requests",
+                    post(move || {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        async {
+                            (
+                                axum::http::StatusCode::CREATED,
+                                axum::Json(serde_json::json!({"number": 1, "url": "u"})),
+                            )
+                        }
+                    }),
+                );
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            let base = format!("http://{addr}");
+            let held = serde_json::from_str::<VcsPullRequestBody>(
+                r#"{"repo":"o/r","head":"h","title":"t","hold":{"reason":"why"}}"#,
+            )
+            .unwrap();
+            let resp =
+                forward_validated_vcs_pr(&held, "o", "r", "jwt", &base, TEST_COORD_BASE_SOURCE)
+                    .await;
+            assert_eq!(resp.status(), 503, "{want_code}");
+            let v = body_json(resp).await;
+            assert_eq!(v["code"], want_code);
+            assert!(v["error"].as_str().unwrap().contains("Nothing was created"));
+            assert_eq!(
+                creates.load(Ordering::SeqCst),
+                0,
+                "no create may be forwarded"
+            );
+
+            // The same coord still serves an UNHELD create, with no probe gate.
+            let plain = serde_json::from_str::<VcsPullRequestBody>(
+                r#"{"repo":"o/r","head":"h","title":"t"}"#,
+            )
+            .unwrap();
+            let resp =
+                forward_validated_vcs_pr(&plain, "o", "r", "jwt", &base, TEST_COORD_BASE_SOURCE)
+                    .await;
+            assert_eq!(resp.status(), 201);
+            assert_eq!(creates.load(Ordering::SeqCst), 1);
+        }
     }
 
     /// The base-resolution arm the VCS forwarder now reports in its 502s. Any
