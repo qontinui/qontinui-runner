@@ -1006,8 +1006,9 @@ export function stallCoverage(seg, win, sessions) {
  * - that WEDGE, `recovered: false`, if any (a voiding one first, then the
  *   longest): when it `voids`, its marker KPIs are unknown(pane_stalled), since
  *   measured from the live part they would hide it; otherwise it is reported;
- * - the longest HITCH, `recovered: true`, if any: the KPIs stay measured (a hitch
- *   is exactly what they must show) and it is reported beside them.
+ * - the longest HITCH, `recovered: true`, if any: it does not void the KPIs (a
+ *   hitch is exactly what they must show; whatever state they hold, they keep)
+ *   and it is reported beside them.
  * Entries are in time order (session, then start). `lastShownMs` is when the
  * run's sequence was last seen, in ms from the window's start.
  *
@@ -1406,18 +1407,22 @@ export function computeRowKpis(p) {
       }
     }
   }
-  // A hitch the pane recovered from is what these KPIs exist to show: they stay
-  // measured, and the hitch is named beside them.
+  // What the marker KPIs hold now, for the notes of stalls that do not void
+  // them: not voided is not "measured" (a capture-health unknown, say, stays).
+  const markerStates = () =>
+    STALL_VOIDED_KPIS.map((id) => `${id} ${kpis[id].state === "measured" ? "measured" : `${kpis[id].state}(${kpis[id].reason})`}`).join(", ");
+  // A hitch the pane recovered from is what these KPIs exist to show: it does
+  // not void them, and the hitch is named beside them.
   const hitches = stalls.filter((x) => x.recovered);
   if (hitches.length > 0) {
-    notes.push(`output_latency_ms: pane hitch, recovered (the marker KPIs stay measured): ${hitches.map(describeStall).join("; ")}`);
+    notes.push(`output_latency_ms: pane hitch, recovered (not voided by the stall; the marker KPIs read ${markerStates()}): ${hitches.map(describeStall).join("; ")}`);
   }
   // A still marker that qualifies only with a short frameless tail at the
   // window's end: a slow host or a brief whole-screen stall looks the same, so
-  // it is reported, and the KPIs stay measured.
+  // it is reported and does not void the KPIs.
   const tailOnly = stalls.filter((x) => !x.recovered && !x.voids);
   if (tailOnly.length > 0) {
-    notes.push(`output_latency_ms: pane still at the window's end, tail-dependent (the marker KPIs stay measured): ${tailOnly.map(describeStall).join("; ")}`);
+    notes.push(`output_latency_ms: pane still at the window's end, tail-dependent (not voided by the stall; the marker KPIs read ${markerStates()}): ${tailOnly.map(describeStall).join("; ")}`);
   }
   if (kpis.output_latency_ms.state === "measured") {
     // Which displayed sessions contributed: a session whose output marker never

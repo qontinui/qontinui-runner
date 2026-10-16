@@ -173,7 +173,7 @@ export const INCIDENT_KINDS = Object.freeze({
   operator_input: "real operator input was detected and the input arm aborted (D9)",
   host_crashed: "a host process exited during the run",
   pane_stalled:
-    "a displayed session's output marker stayed still for >= 2 s while its generator kept writing, in a soak or the focus arm's restore check; `detail` says whether the pane recovered (a hitch: the marker KPIs stay measured), did not advance in any later frame (a wedge, which voids them), or was still at the end only through a frameless tail too short to call a wedge (they stay measured), and when it was last shown",
+    "a displayed session's output marker stayed still for >= 2 s while its generator kept writing, in a soak or the focus arm's restore check; `detail` says whether the pane recovered (a hitch: the marker KPIs are not voided by the stall), did not advance in any later frame (a wedge, which voids them), or was still at the end only through a frameless tail too short to call a wedge (not voided by the stall), what the marker KPIs read, and when it was last shown",
   harness_error: "an internal harness failure",
 });
 

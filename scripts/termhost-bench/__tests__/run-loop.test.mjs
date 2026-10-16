@@ -900,6 +900,10 @@ test("a recovered hitch on a capture-disagreement row: the incident reads the KP
   assert.equal(inc.length, 1, JSON.stringify(tiled.incidents));
   assert.match(inc[0].detail, /a hitch the pane recovered from \(not voided\); its marker KPIs read output_latency_ms unknown\(capture_disagreement\), /);
   assert.doesNotMatch(inc[0].detail, /stay measured/);
+  // The row's own note on the hitch says the same, with the KPI's actual state.
+  const notes = tiled.kpis.output_latency_ms.notes ?? [];
+  assert.ok(notes.some((n) => /^pane hitch, recovered \(not voided by the stall; the marker KPIs read output_latency_ms unknown\(capture_disagreement\), /.test(n)), JSON.stringify(notes));
+  for (const n of notes) assert.doesNotMatch(n, /stay measured/);
   assert.equal(validateResults(res.doc).valid, true);
 });
 

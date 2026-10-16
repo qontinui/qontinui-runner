@@ -1320,7 +1320,7 @@ test("MF1: a 2.4 s whole-screen freeze at the soak's end keeps the marker KPIs m
   for (const id of STALL_VOIDED_KPIS) assert.notEqual(r.kpis[id].reason, "pane_stalled", id);
   assert.equal(r.kpis.output_latency_ms.state, "measured");
   assert.ok(
-    (r.kpis.output_latency_ms.notes ?? []).some((n) => /^pane still at the window's end, tail-dependent \(the marker KPIs stay measured\): session 0 .*tail-dependent, not a wedge/.test(n)),
+    (r.kpis.output_latency_ms.notes ?? []).some((n) => /^pane still at the window's end, tail-dependent \(not voided by the stall; the marker KPIs read output_latency_ms measured, marker_loss measured, marker_skipped measured\): session 0 .*tail-dependent, not a wedge/.test(n)),
     JSON.stringify(r.kpis.output_latency_ms.notes),
   );
 });
