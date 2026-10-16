@@ -690,10 +690,19 @@ jobs:
   # $RUNNER_TEMP, outside every checkout), an isolated instance with a private
   # profile, driven by the harness extension.
   #
-  # Two `cli.mjs run` invocations, not one: the A/B wants two interleaved runs
-  # per N, the smoke one; and the third-party rows then live in a results file
-  # this job only ever asserts on. Phase 5 adds Windows Terminal (N = 1, 5) as one
-  # more invocation of the same shape.
+  # Separate `cli.mjs run` invocations, not one: the A/B wants two interleaved
+  # runs per N, a smoke one; and the third-party rows then live in results files
+  # this job only ever asserts on.
+  #
+  # Phase 5 adds Windows Terminal as one more assert-only smoke of the same shape
+  # (D7), at N = 1 and 5 in both arms (N = 1 on a pull request): the pinned
+  # portable build (the release ZIP from microsoft/terminal, SHA-256 verified,
+  # cached under $RUNNER_TEMP, a `.portable` file beside the binary so its
+  # settings stay in the run directory), its window driven through wt.exe and
+  # proven to run in a process the run started (D5). A hosted VM cannot install
+  # Windows Terminal from the Store, which is why the job downloads the ZIP. The
+  # tmux-wsl setup is not smoked here: a hosted runner has no WSL distro; it runs
+  # on windows-desktop only.
   #
   # Triggers: bench-scope's, unchanged — the smoke on a pull request that touches
   # the benchmark (N = 1, one run, head only), the full ladder on dispatch and on
@@ -708,12 +717,14 @@ jobs:
   #     and producer_stall_pct measured at the gate N; output_latency_ms too where
   #     capture.wgc is OPERATIVE.
   #   - vscode: the same, asserted on a file that never leaves the VM.
+  #   - windows-terminal: the same at its N, asserted on its own file that never
+  #     leaves the VM.
   #
   # What leaves the VM (D7): the runner's own rows, as in the Linux job — the
   # redacted copy, the job summary rendered from it, and runner unit logs on
-  # failure. The VS Code results, its unit directories (profile, logs) and its
-  # archive cache are never uploaded; its gate failures name a KPI's state and
-  # reason code without the detail text. No verdict is drawn yet: the regression
+  # failure. The VS Code and Windows Terminal results, their unit directories
+  # (profiles, logs) and their archive caches are never uploaded; their gate
+  # failures name a KPI's state and reason code without the detail text. No verdict is drawn yet: the regression
   # rule arrives with Phase 6, in compare.mjs.
   #
   # No rust-cache, for the Linux job's reason: ci.yml saves its caches from main
@@ -722,10 +733,13 @@ jobs:
   #
   # UNMEASURED at introduction: no run of this job exists yet. Estimate for the
   # full ladder: about 110 min for the two cold builds (published-parity measured
-  # a cold windows debug build at 54 min), about 95 min for the A/B's 12 units
-  # and about 25 min for the smoke's 3. The step bounds below sum to under the
-  # job's 360 minutes (GitHub's ceiling) with room for the unbounded checkout and
-  # setup steps. Tighten them once there are runs to measure.
+  # a cold windows debug build at 54 min), about 95 min for the A/B's 12 units,
+  # about 25 min for the VS Code smoke's 3 and about 15 min for the Windows
+  # Terminal smoke's 2. The step bounds below sum to under the job's 360 minutes
+  # (GitHub's ceiling) with room for the unbounded checkout and setup steps; the
+  # A/B's bound went from 125 to 110 minutes (still above its estimate) to make
+  # room for the Windows Terminal smoke. Tighten them once there are runs to
+  # measure.
   # ---------------------------------------------------------------------------
   run-windows-hosted:
     name: termhost-bench run (windows-hosted, windows-latest)
@@ -762,9 +776,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT" = "pull_request" ]; then
-            n=1; arms=focus,tiled; runs=1; baseline=none
+            n=1; arms=focus,tiled; runs=1; baseline=none; wt_n=1
           else
-            n="${IN_N:-1,5,15}"; arms="${IN_ARMS:-focus,tiled}"; runs="${IN_RUNS:-2}"; baseline="${IN_BASELINE:-}"
+            n="${IN_N:-1,5,15}"; arms="${IN_ARMS:-focus,tiled}"; runs="${IN_RUNS:-2}"; baseline="${IN_BASELINE:-}"; wt_n=1,5
           fi
           [[ "$n" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "::error::n must be comma-separated positive integers, got '$n'"; exit 1; }
           [[ "$arms" =~ ^(focus|tiled)(,(focus|tiled))*$ ]] || { echo "::error::arms must be focus and/or tiled, got '$arms'"; exit 1; }
@@ -777,14 +791,17 @@ jobs:
             baseline="$(git rev-parse --verify "${baseline}^{commit}")"
           fi
           if [[ ",$n," == *",15,"* ]]; then gate_n=15; else gate_n="$(tr ',' '\n' <<<"$n" | sort -n | tail -1)"; fi
+          wt_gate_n="$(tr ',' '\n' <<<"$wt_n" | sort -n | tail -1)"
           {
             echo "n=$n"
             echo "arms=$arms"
             echo "runs=$runs"
             echo "baseline=$baseline"
             echo "gate_n=$gate_n"
+            echo "wt_n=$wt_n"
+            echo "wt_gate_n=$wt_gate_n"
           } >> "$GITHUB_OUTPUT"
-          echo "N=$n arms=$arms runs=$runs baseline=$baseline gate at N=$gate_n"
+          echo "N=$n arms=$arms runs=$runs baseline=$baseline gate at N=$gate_n; Windows Terminal N=$wt_n gate at N=$wt_gate_n"
 
       - name: Check out the baseline
         if: steps.params.outputs.baseline != 'none'
@@ -886,12 +903,13 @@ jobs:
         timeout-minutes: 5
         run: |
           set -o pipefail
-          node scripts/termhost-bench/cli.mjs doctor --env windows-hosted --setups runner,vscode \
+          node scripts/termhost-bench/cli.mjs doctor --env windows-hosted --setups runner,vscode,windows-terminal \
             --runner-mode subject \
             --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner.exe" \
             --head-commit "$(git rev-parse HEAD)" \
             --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe" \
             --vscode-cache-dir "$RUNNER_TEMP/termhost-cache" \
+            --wt-cache-dir "$RUNNER_TEMP/termhost-cache-wt" \
             | tee "$RUNNER_TEMP/termhost-bench-doctor.txt"
           {
             echo "### termhost-bench doctor (windows-hosted)"
@@ -904,7 +922,7 @@ jobs:
         id: run
         shell: bash
         working-directory: head/qontinui-runner
-        timeout-minutes: 125
+        timeout-minutes: 110
         env:
           N: ${{ steps.params.outputs.n }}
           ARMS: ${{ steps.params.outputs.arms }}
@@ -1028,6 +1046,47 @@ jobs:
           node scripts/termhost-bench/cli.mjs report "$results" --format json \
             --setups vscode --arms "$ARMS" --require-rows-n "$N" \
             --require-measured cpu_pct,memory_mb,producer_stall_pct --at-n "$GATE_N" \
+            --require-measured-if-operative capture.wgc:output_latency_ms
+
+      # D7: an assert-only smoke, as VS Code's. Its results file, unit directories
+      # (the private settings, the unpacked build) and archive cache stay in the
+      # VM; nothing below uploads or summarises them.
+      - name: Run the Windows Terminal smoke
+        id: wt
+        if: ${{ !cancelled() && steps.probe.outcome == 'success' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 25
+        env:
+          WT_N: ${{ steps.params.outputs.wt_n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tb-wt-out"
+          node scripts/termhost-bench/cli.mjs run --env windows-hosted --setups windows-terminal \
+            --n "$WT_N" --arms "$ARMS" --runs 1 --smoke-setups windows-terminal \
+            --wt-cache-dir "$RUNNER_TEMP/termhost-cache-wt" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe" \
+            --work-dir "$RUNNER_TEMP/tb-wt" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-wt" \
+            --out "$RUNNER_TEMP/tb-wt-out/results.json"
+
+      - name: Assert the Windows Terminal smoke (asserted here, never uploaded)
+        if: ${{ !cancelled() && steps.wt.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 5
+        env:
+          WT_N: ${{ steps.params.outputs.wt_n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          WT_GATE_N: ${{ steps.params.outputs.wt_gate_n }}
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-wt-out/results.json"
+          [ -f "$results" ] || { echo "::error::the Windows Terminal smoke wrote no results file"; exit 1; }
+          node scripts/termhost-bench/validate.mjs "$results"
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --setups windows-terminal --arms "$ARMS" --require-rows-n "$WT_N" \
+            --require-measured cpu_pct,memory_mb,producer_stall_pct --at-n "$WT_GATE_N" \
             --require-measured-if-operative capture.wgc:output_latency_ms
 
       # Runner unit directories only (`u<k>-runner-...` under the A/B's work

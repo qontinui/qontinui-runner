@@ -342,7 +342,7 @@ test("every option the job passes to cli.mjs is one the CLI accepts", () => {
   const all = invocations(job);
   assert.ok(all.length >= 7, `found ${all.length} invocations: the extraction broke`);
   const used = new Set(all.flatMap(flagsOf));
-  for (const f of ["env", "setups", "runner-mode", "runner-exe", "head-commit", "ab-baseline", "baseline-exe", "probe", "out", "smoke-setups", "vscode-cache-dir", "require-measured", "require-measured-if-operative", "at-n", "require-rows-n", "redact-to", "format"]) {
+  for (const f of ["env", "setups", "runner-mode", "runner-exe", "head-commit", "ab-baseline", "baseline-exe", "probe", "out", "smoke-setups", "vscode-cache-dir", "wt-cache-dir", "require-measured", "require-measured-if-operative", "at-n", "require-rows-n", "redact-to", "format"]) {
     assert.ok(used.has(f), `the job passes --${f}`);
   }
   assert.deepEqual([...used].filter((f) => !KNOWN_FLAGS.includes(f)), [], "options the CLI would refuse");
@@ -367,13 +367,14 @@ test("the runner A/B and the VS Code smoke are separate runs: their own setups, 
   assert.match(vscodeStep.text, /if: \$\{\{ !cancelled\(\) && steps\.probe\.outcome == 'success' \}\}/, "it runs even when a runner step failed");
 });
 
-test("the gate: the process and producer KPIs always, output latency where capture.wgc is OPERATIVE — for the runner and for VS Code", () => {
+test("the gate: the process and producer KPIs always, output latency where capture.wgc is OPERATIVE — for the runner, VS Code and Windows Terminal", () => {
   const all = invocations(jobLines(yml(), "run-windows-hosted"));
   const gates = all.filter((x) => /--require-measured /.test(x));
-  assert.equal(gates.length, 2, "one gate per run");
-  for (const [setup, g] of [["runner", gates.find((x) => /--setups runner/.test(x))], ["vscode", gates.find((x) => /--setups vscode/.test(x))]]) {
+  assert.equal(gates.length, 3, "one gate per run");
+  for (const [setup, nVar, gateVar] of [["runner", "N", "GATE_N"], ["vscode", "N", "GATE_N"], ["windows-terminal", "WT_N", "WT_GATE_N"]]) {
+    const g = gates.find((x) => new RegExp(`--setups ${setup}\\b`).test(x));
     assert.ok(g, `${setup} has a gate`);
-    assert.match(g, new RegExp(`--setups ${setup} --arms "\\$ARMS" --require-rows-n "\\$N"`), "rows for every N and arm, never missing");
+    assert.match(g, new RegExp(`--setups ${setup} --arms "\\$ARMS" --require-rows-n "\\$${nVar}"`), "rows for every N and arm, never missing");
     const always = /--require-measured ([a-z_,]+)/.exec(g)[1].split(",");
     assert.deepEqual(always, ["cpu_pct", "memory_mb", "producer_stall_pct"]);
     const [mechanism, kpis] = /--require-measured-if-operative ([^\s]+)/.exec(g)[1].split(":");
@@ -381,7 +382,7 @@ test("the gate: the process and producer KPIs always, output latency where captu
     assert.ok(PROBE_MECHANISMS.includes(mechanism), "a mechanism the probe's doctor reports");
     assert.deepEqual(kpis.split(","), ["output_latency_ms"]);
     for (const id of [...always, ...kpis.split(",")]) assert.ok(KPI_CATALOG.some((k) => k.id === id), id);
-    assert.match(g, /--at-n "\$GATE_N"/);
+    assert.match(g, new RegExp(`--at-n "\\$${gateVar}"`));
     assert.match(g, /--format json/, "the full file is reported as failures, never rendered");
   }
 });
@@ -399,14 +400,17 @@ test("only the runner's rows leave the VM: uploads and the summary come from the
   }
   for (const p of paths) {
     assert.ok(/termhost-bench-windows-hosted-runner\.json$/.test(p) || /\/tb\/termhost-bench\/\*\/units\/\*-runner-\*\//.test(p), `upload path ${p} could carry a third-party row`);
-    assert.ok(!/tb-vscode|termhost-cache|results\.json$/.test(p), `upload path ${p} reaches the VS Code smoke`);
+    assert.ok(!/tb-vscode|tb-wt|termhost-cache|results\.json$/.test(p), `upload path ${p} reaches a third-party smoke`);
   }
   const summary = job.filter((l) => /cli\.mjs (report|compare)/.test(l) && /GITHUB_STEP_SUMMARY/.test(l));
   assert.ok(summary.length >= 2);
   for (const l of summary) assert.match(l, /"\$redacted"/, l.trim());
   for (const inv of invocations(job).filter((x) => /cli\.mjs report "\$results"/.test(x))) assert.match(inv, /--format json/);
-  const smokeAssert = steps(job).find((s) => /Assert the VS Code smoke/.test(s.name));
-  assert.doesNotMatch(smokeAssert.text, /GITHUB_STEP_SUMMARY|upload-artifact/);
+  for (const name of [/Assert the VS Code smoke/, /Assert the Windows Terminal smoke/, /Run the Windows Terminal smoke/]) {
+    const step = steps(job).find((s) => name.test(s.name));
+    assert.ok(step, String(name));
+    assert.doesNotMatch(step.text, /GITHUB_STEP_SUMMARY|upload-artifact/);
+  }
 });
 
 test("the display step is best effort, and the doctor reports the vscode facts with the same cache", () => {
@@ -414,7 +418,32 @@ test("the display step is best effort, and the doctor reports the vscode facts w
   const display = steps(job).find((s) => s.name === "Set the display resolution");
   assert.match(display.text, /continue-on-error: true/);
   assert.match(display.text, /shell: powershell/);
-  const doctor = invocations(job).find((x) => /cli\.mjs doctor --env windows-hosted --setups runner,vscode/.test(x));
+  const doctor = invocations(job).find((x) => /cli\.mjs doctor --env windows-hosted --setups runner,vscode,windows-terminal/.test(x));
   assert.ok(doctor);
   assert.match(doctor, /--vscode-cache-dir "\$RUNNER_TEMP\/termhost-cache"/);
+});
+
+test("Phase 5: the Windows Terminal smoke is its own assert-only run at N = 1 and 5 (1 on a pull request), both arms, its cache outside every checkout", () => {
+  const job = jobLines(yml(), "run-windows-hosted");
+  const text = job.join("\n");
+  assert.match(text, /n=1; arms=focus,tiled; runs=1; baseline=none; wt_n=1\n/, "a pull request smokes N = 1");
+  assert.match(text, /baseline="\$\{IN_BASELINE:-\}"; wt_n=1,5\n/, "dispatch and schedule smoke N = 1 and 5");
+  assert.match(text, /echo "wt_n=\$wt_n"/);
+  assert.match(text, /echo "wt_gate_n=\$wt_gate_n"/);
+  const all = invocations(job);
+  const wt = all.find((x) => /cli\.mjs run --env windows-hosted --setups windows-terminal\b/.test(x));
+  assert.ok(wt, "the smoke: windows-hosted, Windows Terminal alone");
+  assert.match(wt, /--n "\$WT_N" --arms "\$ARMS" --runs 1 --smoke-setups windows-terminal/);
+  assert.match(wt, /--wt-cache-dir "\$RUNNER_TEMP\/termhost-cache-wt"/, "the ZIP cache sits outside every checkout");
+  assert.match(wt, /--work-dir "\$RUNNER_TEMP\/tb-wt"/);
+  assert.match(wt, /--out "\$RUNNER_TEMP\/tb-wt-out\/results\.json"/);
+  const step = steps(job).find((s) => s.name === "Run the Windows Terminal smoke");
+  assert.match(step.text, /if: \$\{\{ !cancelled\(\) && steps\.probe\.outcome == 'success' \}\}/, "it runs even when a runner step failed");
+  assert.match(step.text, /WT_N: \$\{\{ steps\.params\.outputs\.wt_n \}\}/);
+  const assertStep = steps(job).find((s) => /Assert the Windows Terminal smoke/.test(s.name));
+  assert.match(assertStep.text, /if: \$\{\{ !cancelled\(\) && steps\.wt\.outcome != 'skipped' \}\}/);
+  assert.match(assertStep.text, /node scripts\/termhost-bench\/validate\.mjs "\$results"/, "schema-validated in the job");
+  assert.ok(!all.some((x) => /--setups[^\n]*tmux-wsl/.test(x)), "no tmux-wsl on a hosted runner: it has no WSL distro");
+  const doctor = all.find((x) => /cli\.mjs doctor/.test(x));
+  assert.match(doctor, /--wt-cache-dir "\$RUNNER_TEMP\/termhost-cache-wt"/, "the doctor hashes the same cache the smoke uses");
 });
