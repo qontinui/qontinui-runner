@@ -523,6 +523,7 @@ GET /task-runs/{id}/workflow-state get_workflow_state
 GET /tenant/active get_active_tenant
 GET /terminal-pages list_terminal_pages_handler
 GET /terminals list_terminals_handler
+GET /terminals/transport-stats get_transport_stats_handler
 GET /terminals/{id}/buffer get_buffer_handler
 GET /terminals/{id}/coord-session get_coord_session_handler
 GET /terminals/{id}/output get_buffer_handler
@@ -958,6 +959,7 @@ MERGE registry_routes::routes
 MERGE regression_api::routes
 MERGE relay::routes
 MERGE restate_api::routes
+MERGE resume_door::routes
 MERGE reviews::routes
 MERGE routes::router
 MERGE saved_api_requests::routes
@@ -1024,6 +1026,7 @@ POST /a11y/disconnect handle_disconnect
 POST /a11y/focus handle_focus
 POST /a11y/query handle_query
 POST /a11y/type_text handle_type_text
+POST /agent-worktrees/edit-sibling edit_sibling_handler
 POST /agent-worktrees/reclaim reclaim_handler
 POST /ai/generate-api-request generate_api_request_handler
 POST /ai/generate-context generate_context_handler
@@ -1096,6 +1099,7 @@ POST /contexts/{scope}/from-file create_context_from_file_handler
 POST /contexts/{scope}/{id}/duplicate duplicate_context_handler
 POST /control/session-open post_session_open
 POST /control/sessions/ledger/capture post_sessions_ledger_capture
+POST /control/sessions/resume post_sessions_resume
 POST /control/shim-beacon post_shim_beacon
 POST /coord-mcp coord_mcp_proxy_handler
 POST /coord-mcp/gates/register coord_register_gate_handler
@@ -1328,6 +1332,7 @@ POST /task-runs/{id}/resume resume_task_run_http
 POST /task-runs/{id}/stop stop_task_run
 POST /task-runs/{id}/unpause unpause_task_run
 POST /terminals create_terminal_handler
+POST /terminals/transport-stats reset_transport_stats_handler
 POST /terminals/{id}/move move_terminal_handler
 POST /terminals/{id}/resize resize_terminal_handler
 POST /terminals/{id}/submit-prompt submit_prompt_handler
