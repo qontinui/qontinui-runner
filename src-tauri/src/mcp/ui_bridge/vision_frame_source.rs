@@ -250,12 +250,12 @@ pub async fn resolve_frame_provider(
     // to `AdbScreencapSource` when it is serial-shaped AND adb currently lists it
     // as a connected device. A real serial still routes; `bogus-id` falls through
     // to the intended "unknown vision target" error.
-    let connected = adb_helper::is_connected_device(id).await;
+    let connected = adb_helper::connected_device_status(id).await;
     if should_route_to_adb(id, connected) {
         return Ok(Box::new(AdbScreencapSource { serial: id.clone() }));
     }
 
-    Err(format!("unknown vision target '{id}'"))
+    Err(unknown_target_message(id, connected))
 }
 
 /// Pure routing decision for step 3 of [`resolve_frame_provider`]: a target the
@@ -264,10 +264,29 @@ pub async fn resolve_frame_provider(
 ///
 /// Separated from the async resolver (which needs an `ApiState` + a live adb
 /// server) so the bogus-id-vs-real-serial distinction is unit-testable in
-/// isolation. `connected` is the result of [`adb_helper::is_connected_device`].
-fn should_route_to_adb(id: &str, connected: bool) -> bool {
+/// isolation. `connected` is the result of [`adb_helper::connected_device_status`].
+fn should_route_to_adb(id: &str, connected: Option<bool>) -> bool {
     let serial_shaped = id.starts_with("emulator-") || adb_helper::is_adb_serial(id);
-    serial_shaped && connected
+    // Only a device adb actually LISTS routes. `None` (adb could not be asked)
+    // does not: routing every serial-shaped label to an adb that cannot even
+    // be listed would turn a typo into a capture failure. The refusal says adb
+    // could not be asked ([`unknown_target_message`]) rather than "absent".
+    serial_shaped && connected == Some(true)
+}
+
+/// The unknown-target refusal for `id`. When adb could not be asked and the
+/// id is serial-shaped, it SAYS so: "not a registered target, and adb could
+/// not be asked" — never a flat claim that the device does not exist.
+fn unknown_target_message(id: &str, connected: Option<bool>) -> String {
+    let serial_shaped = id.starts_with("emulator-") || adb_helper::is_adb_serial(id);
+    if serial_shaped && connected.is_none() {
+        format!(
+            "unknown vision target '{id}': not a registered device or app, and adb could not be \
+             asked whether it is an attached device (is the adb server running?)"
+        )
+    } else {
+        format!("unknown vision target '{id}'")
+    }
 }
 
 #[cfg(test)]
@@ -388,7 +407,7 @@ mod tests {
             "precondition: bogus-id is serial-shaped, so syntax alone can't reject it"
         );
         assert!(
-            !should_route_to_adb("bogus-id", false),
+            !should_route_to_adb("bogus-id", Some(false)),
             "an unknown, not-connected id must not route to adb"
         );
     }
@@ -396,9 +415,9 @@ mod tests {
     #[test]
     fn real_serial_routes_to_adb_when_connected() {
         // A genuine USB serial that adb lists routes to AdbScreencapSource.
-        assert!(should_route_to_adb("R3CN30ABCDE", true));
+        assert!(should_route_to_adb("R3CN30ABCDE", Some(true)));
         // An emulator transport id that adb lists also routes.
-        assert!(should_route_to_adb("emulator-5554", true));
+        assert!(should_route_to_adb("emulator-5554", Some(true)));
     }
 
     #[test]
@@ -406,15 +425,49 @@ mod tests {
         // Even a perfectly serial-shaped id is rejected if adb doesn't list it —
         // e.g. a device that was unplugged. Better to report "unknown target"
         // than to hand a dead serial to the framebuffer puller.
-        assert!(!should_route_to_adb("R3CN30ABCDE", false));
-        assert!(!should_route_to_adb("emulator-5554", false));
+        assert!(!should_route_to_adb("R3CN30ABCDE", Some(false)));
+        assert!(!should_route_to_adb("emulator-5554", Some(false)));
+    }
+
+    #[test]
+    fn an_unreachable_adb_does_not_route_but_says_it_could_not_ask() {
+        // adb could not be asked: nothing routes to it ...
+        assert!(!should_route_to_adb("R3CN30ABCDE", None));
+        assert!(!should_route_to_adb("bogus-id", None));
+        // ... and the refusal says adb could not be asked, rather than
+        // claiming the device does not exist.
+        let msg = unknown_target_message("R3CN30ABCDE", None);
+        assert!(msg.contains("adb could not be"), "{msg}");
+        // adb answered and does not list it: the plain unknown target.
+        assert_eq!(
+            unknown_target_message("R3CN30ABCDE", Some(false)),
+            "unknown vision target 'R3CN30ABCDE'"
+        );
+        // Not serial-shaped: adb is irrelevant to the message.
+        assert_eq!(
+            unknown_target_message("has spaces", None),
+            "unknown vision target 'has spaces'"
+        );
     }
 
     #[test]
     fn non_serial_shaped_never_routes_even_if_claimed_connected() {
         // Defense in depth: a string that isn't serial-shaped never routes,
         // regardless of the presence flag.
-        assert!(!should_route_to_adb("has spaces", true));
-        assert!(!should_route_to_adb("app/with/slashes", true));
+        assert!(!should_route_to_adb("has spaces", Some(true)));
+        assert!(!should_route_to_adb("app/with/slashes", Some(true)));
+    }
+}
+
+#[cfg(test)]
+mod resolve_wiring_pins {
+    /// The resolver's refusal goes through `unknown_target_message`, so an
+    /// unreachable adb is SAID, never rendered as a flat "unknown target".
+    #[test]
+    fn the_resolver_refusal_names_whether_adb_could_be_asked() {
+        let src = include_str!("vision_frame_source.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production half");
+        assert!(production.contains("Err(unknown_target_message(id, connected))"));
+        assert!(production.contains("adb_helper::connected_device_status(id)"));
     }
 }

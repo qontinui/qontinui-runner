@@ -115,7 +115,10 @@ mod tests {
             // 435 -> 434: graphql `task_run_output` moved to char-boundary
             // `str::get` slicing in `graphql::output_page` (plan
             // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
-            baseline: 434,
+            // 434 -> 432: the vision/extract + vision/describe handlers were
+            // rewritten onto the Observation envelope (plan
+            // 2026-09-20-ui-bridge-observations-…, Phase 2) with no byte slice.
+            baseline: 432,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (

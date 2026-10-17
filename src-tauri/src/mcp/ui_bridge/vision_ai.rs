@@ -167,15 +167,26 @@ impl OcrClient {
         Self::new(endpoint, model)
     }
 
+    /// The model alias requests are routed to.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Send the image bytes (already encoded as PNG/JPEG/WebP — anything the
-    /// model accepts) and return the parsed + post-processed blocks plus
-    /// the aggregate text (one-per-line in scan-order, top-to-bottom).
+    /// model accepts) and return the parsed + post-processed blocks, the
+    /// aggregate text (one-per-line in scan-order, top-to-bottom), how many
+    /// blocks the model returned before post-processing, and how many each
+    /// post-processing step removed.
+    ///
+    /// The raw count and the drop counts are what let `vision/extract`
+    /// tell "the model saw no text" from "the model saw text and every block
+    /// fell under the confidence floor" — both used to arrive as `blocks: []`.
     pub async fn extract(
         &self,
         image_bytes: &[u8],
         image_mime: &str,
         min_confidence: f64,
-    ) -> Result<(Vec<OcrBlock>, String), AiError> {
+    ) -> Result<OcrExtraction, AiError> {
         let b64 = B64.encode(image_bytes);
         let url = format!(
             "{}/v1/chat/completions",
@@ -208,10 +219,45 @@ impl OcrClient {
             .ok_or_else(|| AiError::Parse("no choices[0].message.content".into()))?;
 
         let raw = parse_ocr_json(&content)?;
-        let blocks = post_process_blocks(raw, min_confidence);
-        let aggregate = aggregate_text(&blocks);
-        Ok((blocks, aggregate))
+        let raw_count = raw.len() as u64;
+        let (blocks, dropped) = post_process_blocks(raw, min_confidence);
+        let aggregate_text = aggregate_text(&blocks);
+        Ok(OcrExtraction {
+            raw_count,
+            blocks,
+            aggregate_text,
+            dropped,
+        })
     }
+}
+
+/// How many raw model blocks each post-processing step removed.
+///
+/// Every step is counted, so `raw = kept + belowConfidence + emptyText +
+/// deduplicated` always holds. A step that drops silently makes an empty
+/// block list unreadable: "nothing was there" and "everything was filtered"
+/// become one answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroppedBlocks {
+    /// Blocks whose confidence fell under the caller's `minConfidence`.
+    pub below_confidence: u64,
+    /// Blocks whose text was empty or whitespace-only.
+    pub empty_text: u64,
+    /// Blocks that repeated an earlier block's text at (almost) the same bbox.
+    pub deduplicated: u64,
+}
+
+/// Result of one OCR call, before it is judged into an observation.
+#[derive(Debug, Clone)]
+pub struct OcrExtraction {
+    /// Blocks the model returned, before any post-processing.
+    pub raw_count: u64,
+    /// Blocks that survived post-processing, in scan order.
+    pub blocks: Vec<OcrBlock>,
+    /// `blocks` texts joined by newline.
+    pub aggregate_text: String,
+    pub dropped: DroppedBlocks,
 }
 
 /// Parse the model's response. Handles bare JSON arrays and
@@ -242,24 +288,32 @@ fn strip_fence(s: &str) -> &str {
 /// 4. Dedup identical (text, ≈bbox) tuples — some engines emit one block
 ///    per line AND a duplicate spanning the same lines.
 /// 5. Sort top-to-bottom, left-to-right for stable scan order.
-fn post_process_blocks(raw: Vec<OcrRawBlock>, min_confidence: f64) -> Vec<OcrBlock> {
-    let mut out: Vec<OcrBlock> = raw
-        .into_iter()
-        .filter_map(|r| {
-            let collapsed = collapse_whitespace(&r.text);
-            if collapsed.is_empty() {
-                return None;
-            }
-            if r.confidence < min_confidence {
-                return None;
-            }
-            Some(OcrBlock {
-                bbox: r.bbox,
-                text: collapsed,
-                confidence: r.confidence,
-            })
-        })
-        .collect();
+///
+/// Returns the kept blocks and a count per drop reason. A block that is
+/// both empty and under the floor counts as `empty_text` (step 1 runs
+/// first): it carried no text to be unsure about.
+fn post_process_blocks(
+    raw: Vec<OcrRawBlock>,
+    min_confidence: f64,
+) -> (Vec<OcrBlock>, DroppedBlocks) {
+    let mut dropped = DroppedBlocks::default();
+    let mut out: Vec<OcrBlock> = Vec::with_capacity(raw.len());
+    for r in raw {
+        let collapsed = collapse_whitespace(&r.text);
+        if collapsed.is_empty() {
+            dropped.empty_text += 1;
+            continue;
+        }
+        if r.confidence < min_confidence {
+            dropped.below_confidence += 1;
+            continue;
+        }
+        out.push(OcrBlock {
+            bbox: r.bbox,
+            text: collapsed,
+            confidence: r.confidence,
+        });
+    }
 
     // Dedup: same text + bbox within 4 px on each side.
     out.sort_by(|a, b| {
@@ -274,11 +328,13 @@ fn post_process_blocks(raw: Vec<OcrRawBlock>, min_confidence: f64) -> Vec<OcrBlo
         let dup = deduped
             .iter()
             .any(|existing| existing.text == block.text && box_close(existing.bbox, block.bbox, 4));
-        if !dup {
+        if dup {
+            dropped.deduplicated += 1;
+        } else {
             deduped.push(block);
         }
     }
-    deduped
+    (deduped, dropped)
 }
 
 fn box_close(a: OcrBbox, b: OcrBbox, tol: u32) -> bool {
@@ -328,17 +384,30 @@ fn aggregate_text(blocks: &[OcrBlock]) -> String {
 // VLM describe client
 // ===========================================================================
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct VlmDescription {
     pub description: String,
     pub tokens: Option<VlmTokens>,
     /// Closed-schema machine twin of `description` (plan §8 Phase 4 /
-    /// goal #3 — prose-paired-with-structured). `None` when the model's
-    /// reply was prose-only or failed strict validation; the endpoint
-    /// still returns `description` in that case (graceful fallback) and a
-    /// `UB-VLM-STRUCTURED-PARSE-FAIL` diagnostic is logged.
-    pub structured: Option<VlmStructuredSummary>,
+    /// goal #3 — prose-paired-with-structured), with the two ways it can be
+    /// missing kept apart. They used to be one `None`: a prose-only reply
+    /// (the model gave no twin) and a twin that failed strict validation (the
+    /// model gave one and it was unusable) are different facts, and only the
+    /// second is a producer failure.
+    pub structured: StructuredTwin,
+}
+
+/// What the VLM reply carried in place of the structured twin.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StructuredTwin {
+    /// A twin that passed strict validation.
+    Parsed(VlmStructuredSummary),
+    /// No twin at all: the reply was prose (not JSON), or a JSON object with
+    /// a `description` and no `structured` key.
+    ProseOnly,
+    /// A twin was offered and failed strict validation — or the reply was
+    /// JSON of some other shape. The reason is the validator's message.
+    Invalid(String),
 }
 
 // ===========================================================================
@@ -472,15 +541,50 @@ struct VlmDualEnvelope {
 /// passes strict serde validation (closed enums + `deny_unknown_fields`).
 ///
 /// On ANY failure — not JSON, missing keys, prose-only, out-of-vocabulary
-/// enum, extra fields — returns `Err(reason)`. The caller (the describe
-/// handler / [`VlmClient::describe`]) then falls back to prose-only with
-/// `structured: None` and logs `UB-VLM-STRUCTURED-PARSE-FAIL`. This
-/// function never panics and never returns a partially-validated twin.
+/// enum, extra fields — returns `Err(reason)`; [`classify_vlm_reply`] decides
+/// which of those failures is "no twin offered" and which is "twin offered
+/// and unusable". This function never panics and never returns a
+/// partially-validated twin.
 fn parse_vlm_structured(content: &str) -> Result<(String, VlmStructuredSummary), String> {
     let stripped = strip_fence(content);
     let envelope: VlmDualEnvelope =
         serde_json::from_str(stripped).map_err(|e| format!("{e}: {}", trunc(stripped, 200)))?;
     Ok((envelope.description, envelope.structured))
+}
+
+/// Split a VLM reply into its caption and its [`StructuredTwin`], by fixed
+/// rules on the reply's shape:
+///
+/// 1. The strict envelope parses → `Parsed`, caption from `description`.
+/// 2. The reply is not JSON at all → `ProseOnly`, caption = the reply.
+/// 3. A JSON object with a string `description` and NO `structured` key →
+///    `ProseOnly`, caption = that string (the model captioned and offered no
+///    twin).
+/// 4. Anything else that is JSON (a `structured` key that fails strict
+///    validation, a non-object, an object without `description`) →
+///    `Invalid(reason)`, caption = the object's `description` string when it
+///    has one, else the raw reply.
+fn classify_vlm_reply(raw_content: &str) -> (String, StructuredTwin) {
+    let strict_err = match parse_vlm_structured(raw_content) {
+        Ok((desc, summary)) => {
+            return (desc.trim().to_string(), StructuredTwin::Parsed(summary));
+        }
+        Err(reason) => reason,
+    };
+    let raw_caption = raw_content.trim().to_string();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(strip_fence(raw_content)) else {
+        return (raw_caption, StructuredTwin::ProseOnly);
+    };
+    let description = value
+        .get("description")
+        .and_then(|d| d.as_str())
+        .map(|d| d.trim().to_string());
+    let has_structured = value.get("structured").is_some();
+    match (description, has_structured) {
+        (Some(desc), false) => (desc, StructuredTwin::ProseOnly),
+        (Some(desc), true) => (desc, StructuredTwin::Invalid(strict_err)),
+        (None, _) => (raw_caption, StructuredTwin::Invalid(strict_err)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -509,6 +613,11 @@ impl VlmClient {
             endpoint: endpoint.into(),
             model: model.into(),
         }
+    }
+
+    /// The model alias requests are routed to.
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     pub fn from_env() -> Self {
@@ -574,26 +683,18 @@ impl VlmClient {
             .get("usage")
             .and_then(|u| serde_json::from_value::<VlmTokens>(u.clone()).ok());
 
-        // Strict-parse the dual-audience envelope. On success the prose
-        // comes from `description` inside the JSON; on ANY failure we fall
-        // back to prose-only with the raw content as the caption and a
-        // logged `UB-VLM-STRUCTURED-PARSE-FAIL` diagnostic. The endpoint
-        // never errors on a structured-parse failure (plan §8 Phase 4 —
-        // "Never 500 on structured-parse failure").
-        let (description, structured) = match parse_vlm_structured(&raw_content) {
-            Ok((desc, summary)) => (desc.trim().to_string(), Some(summary)),
-            Err(reason) => {
-                // Canonical diagnostic code emitted as a literal string.
-                // The typed `qontinui_schemas::ui_bridge_diagnostics`
-                // enum is wired by Phase 5 — kept decoupled here on
-                // purpose (no schemas-crate dep in P4).
-                warn!(
-                    "UB-VLM-STRUCTURED-PARSE-FAIL: VLM reply not a valid \
-{{description, structured}} envelope, falling back to prose-only: {reason}"
-                );
-                (raw_content.trim().to_string(), None)
-            }
-        };
+        // Split the reply into caption + twin. The endpoint never errors on
+        // a structured-parse failure (plan §8 Phase 4 — "Never 500 on
+        // structured-parse failure"); an unusable twin is RETURNED as an
+        // `unknown{model_reply_unparseable}` inner observation by the
+        // describe handler rather than only logged.
+        let (description, structured) = classify_vlm_reply(&raw_content);
+        if let StructuredTwin::Invalid(reason) = &structured {
+            warn!(
+                "UB-VLM-STRUCTURED-PARSE-FAIL: VLM reply's structured twin failed \
+strict validation: {reason}"
+            );
+        }
         if description.is_empty() {
             warn!("VLM: empty description returned");
         }
@@ -680,9 +781,18 @@ mod tests {
                 confidence: 0.5,
             },
         ];
-        let out = post_process_blocks(raw, 0.7);
+        let (out, dropped) = post_process_blocks(raw, 0.7);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "Click me");
+        assert_eq!(
+            dropped,
+            DroppedBlocks {
+                below_confidence: 1,
+                empty_text: 1,
+                deduplicated: 0,
+            },
+            "every dropped block must be counted under the step that dropped it"
+        );
     }
 
     #[test]
@@ -709,8 +819,9 @@ mod tests {
                 confidence: 0.93,
             },
         ];
-        let out = post_process_blocks(raw, 0.0);
+        let (out, dropped) = post_process_blocks(raw, 0.0);
         assert_eq!(out.len(), 1);
+        assert_eq!(dropped.deduplicated, 1);
     }
 
     #[test]
@@ -737,8 +848,9 @@ mod tests {
                 confidence: 0.93,
             },
         ];
-        let out = post_process_blocks(raw, 0.0);
+        let (out, dropped) = post_process_blocks(raw, 0.0);
         assert_eq!(out.len(), 2);
+        assert_eq!(dropped, DroppedBlocks::default());
     }
 
     #[test]
@@ -931,5 +1043,33 @@ mod tests {
         assert_eq!(json["elements"][0]["bbox"]["w"], 3);
         // Omitted optionals are not serialized (skip_serializing_if).
         assert!(json["elements"][0].get("text").is_none());
+    }
+
+    /// The two ways the twin can be missing are different facts and must
+    /// classify apart: no twin offered (prose) versus a twin offered and
+    /// refused by strict validation. They used to be one `None`.
+    #[test]
+    fn classify_vlm_reply_keeps_prose_only_and_invalid_twin_apart() {
+        let (caption, twin) = classify_vlm_reply("A login form with two inputs.");
+        assert_eq!(caption, "A login form with two inputs.");
+        assert_eq!(twin, StructuredTwin::ProseOnly);
+
+        let (caption, twin) = classify_vlm_reply(r#"{"description":"only prose"}"#);
+        assert_eq!(caption, "only prose");
+        assert_eq!(twin, StructuredTwin::ProseOnly);
+
+        let (caption, twin) = classify_vlm_reply(
+            r#"{"description":"d","structured":{"layout":"sidebar","confidence":0.8}}"#,
+        );
+        assert_eq!(caption, "d");
+        assert!(
+            matches!(twin, StructuredTwin::Invalid(_)),
+            "an out-of-vocabulary twin is offered-and-unusable, not absent: {twin:?}"
+        );
+
+        let (_, twin) = classify_vlm_reply(
+            r#"{"description":"d","structured":{"layout":"grid","confidence":0.8}}"#,
+        );
+        assert!(matches!(twin, StructuredTwin::Parsed(_)));
     }
 }
