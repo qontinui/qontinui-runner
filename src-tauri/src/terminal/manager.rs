@@ -517,7 +517,78 @@ impl TerminalManager {
         io: Arc<dyn super::pane_io::PaneIo>,
         pinned_session_id: String,
     ) -> Result<TerminalInfo, String> {
-        let id = uuid::Uuid::new_v4().to_string();
+        self.insert_with_io(
+            uuid::Uuid::new_v4().to_string(),
+            title,
+            working_dir,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            io,
+            pinned_session_id,
+        )
+    }
+
+    /// Re-adopt a terminal whose PTY a holder kept alive across a runner
+    /// restart (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D14): attach a FRESH consumer to holder pane `terminal_id` — restore
+    /// envelope and size nudge included ([`DaemonPaneIo::attach_existing`]) —
+    /// and build the session around it under that same id (the pane id is the
+    /// local correlation key). The tab's title and working directory come from
+    /// the holder's restore metadata ([`DaemonPaneIo::session_identity`]): the
+    /// remote path passes `""` for a cwd it cannot know, a local holder can.
+    ///
+    /// `from_offset` is the first byte this runner already holds for the pane
+    /// (`None`: none — the ring's tail); `cols` × `rows` is the consumer's
+    /// fitted size. `pinned_session_id` is the harness session id the caller
+    /// resolved for the pane (the holder does not carry one).
+    ///
+    /// [`DaemonPaneIo::attach_existing`]: super::daemon_pane_io::DaemonPaneIo::attach_existing
+    /// [`DaemonPaneIo::session_identity`]: super::daemon_pane_io::DaemonPaneIo::session_identity
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_holder_pane(
+        &self,
+        terminal_id: &str,
+        from_offset: Option<u64>,
+        page_id: Option<String>,
+        cols: u16,
+        rows: u16,
+        app_handle: AppHandle,
+        pinned_session_id: String,
+    ) -> Result<TerminalInfo, String> {
+        let pane =
+            super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, cols, rows)?;
+        let (title, cwd) = pane.session_identity();
+        self.insert_with_io(
+            terminal_id.to_string(),
+            title,
+            cwd,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            Arc::new(pane),
+            pinned_session_id,
+        )
+    }
+
+    /// The registry half of [`Self::create_with_io`] and
+    /// [`Self::adopt_holder_pane`]: build the session around `io` under `id`,
+    /// insert it, emit `terminal-created`.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_with_io(
+        &self,
+        id: String,
+        title: String,
+        working_dir: String,
+        page_id: Option<String>,
+        cols: u16,
+        rows: u16,
+        app_handle: AppHandle,
+        io: Arc<dyn super::pane_io::PaneIo>,
+        pinned_session_id: String,
+    ) -> Result<TerminalInfo, String> {
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
 
         let emitter = app_handle.clone();
