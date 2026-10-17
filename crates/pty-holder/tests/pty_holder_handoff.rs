@@ -33,6 +33,7 @@ mod unix {
     use qontinui_pty_holder::proc_identity::{is_same_process, start_token};
     use qontinui_pty_holder::protocol::ExitReply;
     use qontinui_pty_holder::protocol::{parse_reply, to_payload, Reply, Request};
+    use qontinui_pty_holder::scrollback::read_scrollback;
     use qontinui_pty_holder::spec::{write_spec, ChildSpec};
 
     // The debug-built holder: the post-commit test faults some tests use
@@ -485,6 +486,59 @@ mod unix {
                 signal: None
             })
         );
+    }
+
+    /// Plan D7 across Phase 8: the durable tail outlives the swap. The
+    /// predecessor persists everything up to X and stops writing before the
+    /// commit; the successor rewrites the tail from its restored ring at the
+    /// same absolute offsets, so it holds both sides of the swap, once each.
+    #[test]
+    fn pty_holder_handoff_scrollback_tail_spans_the_swap() {
+        let mut pane = start("tail", echo_spec(7), None);
+        let dir = pane.dir.clone();
+        let mut live = attach(&dir, None);
+        let r = read_until(&mut live, 0, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"before-swap") > 0
+        });
+        let outcome = connect(&dir, &p1(), soon())
+            .expect("handshake")
+            .prepare_upgrade(upgrade_deadline())
+            .expect("prepare_upgrade answered");
+        let UpgradeOutcome::Upgraded { successor_pid, .. } = outcome else {
+            panic!("expected upgraded, got {outcome:?}");
+        };
+        pane.adopt_cleanup(successor_pid);
+        pane.holder_exits_within(Duration::from_secs(10))
+            .expect("the predecessor exits after the handoff");
+        drop(live);
+        send_input(&dir, b"two\n");
+        let mut again = attach(&dir, Some(r.next));
+        read_until(&mut again, r.next, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:two") > 0
+        });
+        // The successor's timer writes within SCROLLBACK_INTERVAL (5 s).
+        let end = Instant::now() + Duration::from_secs(20);
+        let tail = loop {
+            let t = read_scrollback(&dir, &p1()).expect("a whole, readable tail");
+            if t.as_ref().is_some_and(|t| count(&t.bytes, b"got:two") > 0) || Instant::now() >= end
+            {
+                break t.expect("a tail on disk");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        assert_eq!(tail.child_pid, pane.child_pid, "the same child's stream");
+        assert_eq!(tail.start_offset, 0, "a short stream's tail starts at 0");
+        assert_eq!(tail.discarded_bytes, 0);
+        for line in [&b"before-swap"[..], b"got:two"] {
+            assert_eq!(
+                count(&tail.bytes, line),
+                1,
+                "{:?} exactly once in the tail",
+                String::from_utf8_lossy(line)
+            );
+        }
+        drop(again);
+        send_input(&dir, b"quit\n");
     }
 
     /// D12a rule 3: an adopted pane's exit code is UNKNOWN — reported as

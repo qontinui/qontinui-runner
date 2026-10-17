@@ -155,7 +155,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -369,6 +369,9 @@ pub struct UpgradeCtx {
     /// and an upgrade is refused once it is.
     pub lock_fd: RawFd,
     pub log: PathBuf,
+    /// The pane's durable-tail writer (plan D7), suspended across the commit
+    /// (`crate::scrollback::suspend_for_handoff`).
+    pub scrollback: Arc<Mutex<crate::scrollback::ScrollbackWriter>>,
 }
 
 /// How a `prepare_upgrade` ended for the predecessor.
@@ -456,6 +459,7 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
             &ctx.pane_dir,
             &info.pane_id,
         ));
+        crate::scrollback::resume_after_handoff(&ctx.scrollback);
         pane.resume_reads();
         pane.unfreeze_input();
         UpgradeResult::Failed(why)
@@ -508,6 +512,8 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
     if let Err(e) = pane.drain_input_for_handoff(INPUT_CONN_DRAIN_BOUND) {
         return rollback(Some(&mut child), format!("input drain: {e}"));
     }
+    // The tail on disk is the successor's from the commit on (plan D7).
+    crate::scrollback::suspend_for_handoff(pane, &ctx.scrollback, &ctx.log);
     let held = pane.take_input_for_handoff();
     let child_exit = pane.lock_state().observed_exit;
     let sent = ours.set_write_timeout(Some(ACK_TIMEOUT)).and_then(|()| {
@@ -745,6 +751,7 @@ fn take_pane_back(
         Back::DeclaredLoss { .. } => "ERROR: ",
     };
     log_line(&ctx.log, &format!("upgrade: {level}{why}"));
+    crate::scrollback::resume_after_handoff(&ctx.scrollback);
     let record = LockRecord {
         holder_pid: info.holder_pid,
         child_pid: info.child_pid,
@@ -995,7 +1002,13 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
         log_line(&log, "adopt: test fault: exit-after-commit");
         return Err(10);
     }
-    // Committed: the pane is ours now.
+    // Committed: the pane is ours now. Its tail is written from the restored
+    // ring, at the same absolute offsets, once this holder runs.
+    let scrollback = Arc::new(Mutex::new(crate::scrollback::ScrollbackWriter::new(
+        &pane_dir,
+        &pane_id,
+        header.child_pid,
+    )));
     let info = HolderInfo {
         pane_id: pane_id.clone(),
         holder_pid: std::process::id(),
@@ -1005,6 +1018,7 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
             pane_dir: pane_dir.clone(),
             lock_fd: lock.as_raw_fd(),
             log: log.clone(),
+            scrollback: Arc::clone(&scrollback),
         }),
     };
     let record = LockRecord {
@@ -1094,7 +1108,9 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
             header.child_pid, header.handoff_offset, header.predecessor_pid, header.predecessor_build
         ),
     );
-    Ok(Holder::from_parts(info, pane, listener, log, lock, record))
+    Ok(Holder::from_parts(
+        info, pane, listener, log, scrollback, lock, record,
+    ))
 }
 
 struct Prepared {
