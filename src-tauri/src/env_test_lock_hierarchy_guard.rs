@@ -70,15 +70,22 @@
 //! * Two STANDALONE locks co-held with each other (neither touching the
 //!   hierarchy) are not checked against each other.
 //! * Wrappers are FREE fns matched tree-wide BY NAME. A non-hierarchy guard fn
-//!   that shares a wrapper's name is treated as the hierarchy too — an
-//!   over-report that fails loudly, never a silent pass; rename one of them.
+//!   that shares a wrapper's name is treated as the hierarchy too. Usually that
+//!   over-reports, but it can also MASK an inversion: an unrelated call of
+//!   that name made before a test locks a standalone static and then calls
+//!   `env_lock()` counts as taking the hierarchy first. Rename one of them.
 //!   `impl` methods are never wrappers: calls match by last path segment, so a
 //!   wrapper named `new` would make every `X::new(..)` the hierarchy. A
 //!   co-holder reaching a child only through a method wrapper is not seen.
-//! * Module-tree scoping starts at `main.rs`, `lib.rs` and `bin/*.rs`, and
-//!   does not follow a `#[path]` on an out-of-line `mod` nested inside an
-//!   inline `mod { … }` block. A file the tree does not reach is scanned as
-//!   non-test, as before.
+//!   Only an `impl` whose self type is a plain path is recognised as one; a
+//!   method of `impl T for &Foo`, `for [T]` or `for (A, B)` is treated as a
+//!   free fn and can become a wrapper.
+//! * Module-tree scoping starts at `main.rs`, `lib.rs` and `bin/*.rs`. It does
+//!   not follow a `#[path]` on an out-of-line `mod` nested inside an inline
+//!   `mod { … }` block, nor a `#[path]` on the inline block itself. A `mod x;`
+//!   is only found on a line ending in `;` with a space before `mod`, so
+//!   `#[cfg(test)]mod x;` or a trailing comment hides it. A file the tree does
+//!   not reach is scanned as non-test, as before.
 //!
 //! Registered in `main.rs` only, like `env_write_lock_guard`: it walks all of
 //! `src`, so a `lib.rs` twin would only double the work.
