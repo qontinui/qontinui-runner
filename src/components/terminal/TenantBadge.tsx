@@ -84,6 +84,14 @@ export function repoExpectedText(repo: TenancyRepoExpected | null | undefined): 
   return `${named}${where}${verdict}`;
 }
 
+/** Coord's own session row, as this runner registered it. Pure. */
+function coordRowText(tenancy: SessionTenancy): string {
+  const row = tenancy.coordRow;
+  if (!row) return "unknown (this runner does not report the coord-row leg)";
+  if (row.status === "registered") return `${row.tenantId ?? "?"} (as registered by this runner)`;
+  return `unknown (${row.reason ?? "no reason given"})`;
+}
+
 export interface TenantBadgeLabel {
   text: string;
   title: string;
@@ -101,10 +109,18 @@ export interface TenantBadgeLabel {
  *
  * Returns `null` whenever the badge must not render:
  *  - the device has <= 1 binding (`showSwitcher` false) — no clutter, and
- *  - the session has no recorded tenant AND nothing disagrees (a tab restored
- *    from a pre-F2 durable record). Showing the *device's* active tenant there
- *    would be a lie, because the restored session may well have been spawned
- *    under a different one.
+ *  - nothing names a tenant for this session: no spawn stamp, no
+ *    divergence, and no RESOLVED acting tenant in the runner's
+ *    `tenancy.display`. The device's *active* tenant is never shown in its
+ *    place — the session may have been spawned under a different one.
+ *
+ * A session whose spawn chose no tenant (the ordinary case on a multi-bound
+ * device, where the spawn picker defaults to "device default") used to be
+ * hidden here even though its credential resolved a tenant — the same blind
+ * spot that made the session-info Tenant row read `unknown` (plan
+ * `2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant`).
+ * It now shows that ACTING tenant, labelled as acting-via-credential rather
+ * than as a spawn stamp.
  *
  * Otherwise returns the short chip text (uuid stem) plus a `title` carrying
  * the full id, since tenant ids are uuids and the header has ~8 chars of room.
@@ -121,7 +137,9 @@ export function tenantBadgeLabel(
   if (!showSwitcher) return null;
   const stamped = tenantId?.trim() || tenancy?.row.tenantId?.trim() || null;
   const diverged = tenancy?.diverged === true;
-  if (!stamped && !diverged) return null;
+  const display = tenancy?.display ?? null;
+  const resolvedActing = display?.status === "resolved" ? display.tenantId : null;
+  if (!stamped && !diverged && !resolvedActing) return null;
 
   const fixed =
     `A session's tenant is fixed at spawn — switching the active tenant ` +
@@ -130,7 +148,13 @@ export function tenantBadgeLabel(
 
   if (diverged && tenancy) {
     const credential = tenancy.credential.tenantId;
-    const text = `${stamped ? stem(stamped) : "?"}≠${credential ? stem(credential) : "?"}`;
+    // Every leg the runner listed as conflicting, when it listed them — the
+    // stamp-vs-credential pair alone misses a coord row stamped elsewhere.
+    const conflictStems = [...new Set((display?.conflicts ?? []).map((c) => stem(c.tenantId)))];
+    const text =
+      conflictStems.length > 1
+        ? conflictStems.join("≠")
+        : `${stamped ? stem(stamped) : "?"}≠${credential ? stem(credential) : "?"}`;
     const lines = [
       `TENANT MISMATCH — this session does not act as one tenant.`,
       `Spawned for: ${
@@ -146,11 +170,34 @@ export function tenantBadgeLabel(
         credential ?? `unknown (${tenancy.credential.reason ?? "no reason given"})`
       }`,
       `Repo in the working directory belongs to: ${repoExpectedText(tenancy.repoExpected)}`,
+      `Coord session row: ${coordRowText(tenancy)}`,
     ];
     return { text, title: lines.join("\n"), diverged: true, credentialUnknown };
   }
 
-  // `stamped` is non-null here: the null case returned above unless diverged.
+  // No stamp, but the runner resolved the tenant the session ACTS as.
+  if (!stamped && resolvedActing && display) {
+    const how =
+      display.source === "credential"
+        ? "via its coord credential"
+        : display.source === "credential_default_slot"
+          ? "via its default-slot credential (the device default binding)"
+          : display.source === "data_plane_device"
+            ? "via the runner's data plane (the device default binding)"
+            : "via the runner's data plane";
+    const unconfirmed =
+      tenancy?.divergence === "unknown" ? ` Whether every leg agrees could not be compared.` : "";
+    return {
+      text: stem(resolvedActing),
+      title: `This session acts as tenant ${resolvedActing}${
+        display.tenantSlug ? ` (${display.tenantSlug})` : ""
+      } ${how}. Its spawn chose no tenant (device default).${unconfirmed} ${fixed}`,
+      diverged: false,
+      credentialUnknown: false,
+    };
+  }
+
+  // `stamped` is non-null here: every null case returned above.
   const acting = stamped as string;
   if (credentialUnknown && tenancy) {
     return {
