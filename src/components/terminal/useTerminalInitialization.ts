@@ -180,7 +180,8 @@ export function resumeGateEnv(gate: ResumeGateIdentity | undefined): Array<[stri
  * (`buildPickerAnswer`). Exported for unit tests.
  *
  * Autonomous resume (`--permission-mode bypassPermissions`, matching the
- * zone-profile + shell-integration resume builders): a boot-restored session
+ * shell-integration resume builder; the zone-profile resume calls this one):
+ * a boot-restored session
  * is unattended, so a bare `claude --resume` would stall forever on its first
  * permission prompt. Aligned with PR #547 — whichever lands second resolves
  * the textual conflict by keeping this union form.

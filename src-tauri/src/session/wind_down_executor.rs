@@ -2162,7 +2162,9 @@ mod tests {
                 adopted_from: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
-                gate_bound_boot_ms: None,
+                gate_bound_generation: None,
+                restored_in_generation: None,
+                gate_reported_generation: None,
             },
         );
         assert!(store.get("s1").unwrap().wind_down_outcome.is_none());

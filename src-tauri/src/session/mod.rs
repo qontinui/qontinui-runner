@@ -65,6 +65,7 @@ pub mod coord_sync;
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
+pub mod gate_host_watch; // The close observer's live-host check + pid-exit watcher: a skip-alive gate continuation is reported when its host exits, not `crashed` while it runs (plan 2026-10-07-a-resumed-gate-continuation-loses-its-reporter-on-…, D4)
 pub mod handoff;
 pub mod intent;
 pub mod local_store;
