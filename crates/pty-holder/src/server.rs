@@ -253,6 +253,11 @@ impl Holder {
         };
         let spec = crate::spec::consume_spec(pane_dir, pane_id).map_err(StartError::Spec)?;
         let pane = Pane::spawn(&spec).map_err(StartError::Child)?;
+        let scrollback = Arc::new(Mutex::new(crate::scrollback::ScrollbackWriter::new(
+            pane_dir,
+            pane_id,
+            pane.child_pid(),
+        )));
         let info = HolderInfo {
             pane_id: pane_id.clone(),
             holder_pid: std::process::id(),
@@ -263,6 +268,7 @@ impl Holder {
                 pane_dir: pane_dir.to_path_buf(),
                 lock_fd: lock.as_raw_fd(),
                 log: log_path(pane_dir, pane_id),
+                scrollback: Arc::clone(&scrollback),
             }),
         };
         let record = LockRecord {
@@ -297,14 +303,12 @@ impl Holder {
                 return Err(StartError::Io(e));
             }
         };
-        let scrollback =
-            crate::scrollback::ScrollbackWriter::new(pane_dir, pane_id, pane.child_pid());
         Ok(Holder {
             info: Arc::new(info),
             pane,
             listener,
             log: log_path(pane_dir, pane_id),
-            scrollback: Arc::new(Mutex::new(scrollback)),
+            scrollback,
             lock,
             record,
         })
@@ -323,20 +327,16 @@ impl Holder {
         pane: Arc<Pane>,
         listener: Listener,
         log: PathBuf,
+        scrollback: Arc<Mutex<crate::scrollback::ScrollbackWriter>>,
         lock: PaneLock,
         record: LockRecord,
     ) -> Holder {
-        // Its own durable-tail writer for the same child (plan D7); the log
-        // sits in the pane dir.
-        let pane_dir = log.parent().map(Path::to_path_buf).unwrap_or_default();
-        let scrollback =
-            crate::scrollback::ScrollbackWriter::new(&pane_dir, &info.pane_id, pane.child_pid());
         Holder {
             info: Arc::new(info),
             pane,
             listener,
             log,
-            scrollback: Arc::new(Mutex::new(scrollback)),
+            scrollback,
             lock,
             record,
         }

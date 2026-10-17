@@ -422,6 +422,10 @@ pub struct ScrollbackWriter {
     fsync_interval: Duration,
     /// Set by the final write; nothing touches the file after it.
     closed: bool,
+    /// Set while a holder upgrade hands the pane to a successor (plan
+    /// Phase 8): nothing is written, but the timer keeps running, so a
+    /// rollback can resume. See [`suspend_for_handoff`].
+    suspended: bool,
     /// The last write failed; the next success is logged as a recovery.
     failing: bool,
 }
@@ -446,6 +450,7 @@ impl ScrollbackWriter {
             rewrite_min_interval: REWRITE_MIN_INTERVAL,
             fsync_interval: FSYNC_INTERVAL,
             closed: false,
+            suspended: false,
             failing: false,
         }
     }
@@ -454,13 +459,37 @@ impl ScrollbackWriter {
         self.closed
     }
 
+    /// Stop writing for a holder upgrade's commit ([`suspend_for_handoff`]).
+    /// The handle is dropped, so a resumed writer never appends to a file a
+    /// successor may have replaced.
+    #[cfg(unix)]
+    fn mark_suspended(&mut self) {
+        self.file = None;
+        self.suspended = true;
+    }
+
+    /// Undo [`ScrollbackWriter::mark_suspended`]. A no-op on a writer that was
+    /// not suspended (a rollback before the commit point), so its appends go
+    /// on undisturbed. A resumed writer's next write is a whole-tail rewrite,
+    /// and it is due at once: the flood bound's clock is reset, so the tail
+    /// on disk does not stay frozen for up to [`REWRITE_MIN_INTERVAL`].
+    #[cfg(unix)]
+    fn resume(&mut self) {
+        if !self.suspended {
+            return;
+        }
+        self.suspended = false;
+        self.file = None;
+        self.last_rewrite = None;
+    }
+
     /// What to write for `ring` now, or `None`: closed, unchanged (the
     /// change mark), or a rewrite deferred by the flood bound. `force` (the
     /// final write) never defers. No I/O; it copies only the new bytes for an
     /// append, at most [`SCROLLBACK_CAP_BYTES`] for a rewrite — cheap under
     /// the pane lock.
     pub fn pending(&self, ring: &OutputRing, force: bool) -> Option<Pending> {
-        if self.closed {
+        if self.closed || self.suspended {
             return None;
         }
         let end = ring.end_offset();
@@ -647,6 +676,42 @@ pub fn persist_tick(pane: &Pane, writer: &Mutex<ScrollbackWriter>, log: &Path) -
     true
 }
 
+/// Plan Phase 8: before a holder upgrade COMMITS, persist everything the ring
+/// holds — its reads are quiesced, so that is the whole stream up to the
+/// handoff offset — and stop writing. From the commit on the file is the
+/// successor's, which rewrites it from its own (restored) ring; a tick of this
+/// holder's timer must not rename over it in the moments before this process
+/// exits. The timer keeps running and writes nothing until
+/// [`resume_after_handoff`] (a rollback, or taking the pane back). Under the
+/// writer mutex, so a tick in flight completes first; the I/O runs outside
+/// the pane lock, like a tick's.
+#[cfg(unix)]
+pub fn suspend_for_handoff(pane: &Pane, writer: &Mutex<ScrollbackWriter>, log: &Path) {
+    let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
+    let pending = {
+        let st = pane.lock_state();
+        w.pending(&st.ring, true)
+    };
+    let result = match pending {
+        Some(p) => w.apply(p),
+        None => Ok(()),
+    }
+    .and_then(|()| w.sync_if_due(true));
+    if let Err(e) = result {
+        crate::server::log_line(log, &format!("scrollback: pre-handoff write failed: {e}"));
+    }
+    w.mark_suspended();
+}
+
+/// Undo [`suspend_for_handoff`]: this holder serves the pane again. A no-op
+/// when nothing was suspended (every rollback calls it); otherwise the next
+/// write is an immediate whole-tail rewrite, so a file a dead successor
+/// touched is replaced, not appended to.
+#[cfg(unix)]
+pub fn resume_after_handoff(writer: &Mutex<ScrollbackWriter>) {
+    writer.lock().unwrap_or_else(|p| p.into_inner()).resume();
+}
+
 /// The holder's last write ([`ScrollbackWriter::finish`]), under the writer
 /// mutex: a timer tick in flight completes first, and every later one finds
 /// the writer closed. Called before the holder releases its pane lock.
@@ -739,6 +804,34 @@ mod tests {
         std::fs::metadata(scrollback_path(dir, &pane()))
             .unwrap()
             .len()
+    }
+
+    /// Plan Phase 8: a suspended writer writes nothing, however much the ring
+    /// gains; resumed, it rewrites at once (the flood bound does not defer
+    /// it); and a resume that follows no suspend leaves appends alone.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_handoff_scrollback_suspend_writes_nothing_until_resumed() {
+        let dir = tmpdir("suspend");
+        let mut ring = OutputRing::new(4096);
+        let mut w = writer(&dir);
+        ring.push(b"before ");
+        assert_eq!(tick(&mut w, &ring), Some("rewrite"));
+        // A resume with nothing suspended (a rollback before the commit
+        // point) keeps the open file: the next tick is still an append.
+        w.resume();
+        ring.push(b"more ");
+        assert_eq!(tick(&mut w, &ring), Some("append"));
+        w.mark_suspended();
+        ring.push(b"after the commit");
+        assert_eq!(tick(&mut w, &ring), None, "suspended: nothing written");
+        assert!(w.pending(&ring, true).is_none(), "not even a forced write");
+        assert_eq!(read(&dir).bytes, b"before more ");
+        // Resumed well inside REWRITE_MIN_INTERVAL of the first rewrite.
+        w.resume();
+        assert_eq!(tick(&mut w, &ring), Some("rewrite"));
+        assert_eq!(read(&dir).bytes, b"before more after the commit");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
