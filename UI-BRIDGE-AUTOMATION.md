@@ -123,8 +123,9 @@ curl -X POST http://localhost:9876/ui-bridge/invoke/test_web_integration_connect
     }
   }'
 
-# 4. Custom timeout (e.g. 10s).
-curl -X POST 'http://localhost:9876/ui-bridge/invoke/get_web_integration_status?timeoutMs=10000' \
+# 4. Custom timeout (e.g. 10s). `timeoutMs` bounds the FRONTEND round-trip only;
+#    in-process commands (e.g. get_web_integration_status) ignore it and use their own bound.
+curl -X POST 'http://127.0.0.1:9876/ui-bridge/invoke/get_scripted_output_settings?timeoutMs=10000' \
   -H 'Content-Type: application/json' \
   -d '{"args": {}}'
 ```
