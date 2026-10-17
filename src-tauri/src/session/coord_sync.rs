@@ -78,9 +78,10 @@
 //!
 //! ## Disconnect tolerance
 //!
-//! Every HTTP failure (network, 5xx, timeout) leaves the row unacked. The
-//! next tick re-reads `pending()` in seq order so the catch-up after a
-//! reconnect is automatic. The file is the queue.
+//! Every HTTP failure (network, 5xx, timeout) leaves the row unacked — except
+//! a `heartbeat`, which is dropped because the next one supersedes it (see
+//! below). The next tick re-reads `pending()` in seq order so the catch-up
+//! after a reconnect is automatic. The file is the queue.
 //!
 //! ## One session's failure is that session's problem
 //!
@@ -106,6 +107,26 @@
 //! and stop being retried. Only a row coord itself took counts as "taking" —
 //! a locally ACK-dropped row (spent best-effort budget, a 4xx) does not — so
 //! an outage can never quarantine anything.
+//!
+//! A `heartbeat` row never quarantines its session. Quarantine exists for a
+//! POISONED row — one coord refuses forever — and a heartbeat cannot be one:
+//! the next heartbeat supersedes it within an interval. So a heartbeat that
+//! fails in transport (network, timeout, any 5xx — a gateway 502/504 says
+//! nothing about the row) is ACK-dropped at the seam that still knows its kind
+//! (`push_chain`) and never becomes the session's blocking head, so it is never
+//! charged to `serving_failures`. Only a heartbeat failure with NO HTTP status
+//! (connect error, timeout) trips the batch abort and counts as outage
+//! evidence, so an unreachable coord stays bounded; a heartbeat answered with
+//! a 5xx does not, because coord's edge answered and other sessions may be
+//! served. And since a heartbeat is superseded by the next one, a pending
+//! heartbeat whose session's NEXT pending row is also a heartbeat is
+//! ACK-dropped before the chains are built — each run of consecutive
+//! heartbeats collapses to its newest — so the backlog an outage leaves costs
+//! one request per run, not one per missed interval. A heartbeat is never
+//! superseded across a non-heartbeat row, so one queued before a `state_change`
+//! still goes out even if that row then blocks. Before 2026-10-11 a run of
+//! gateway 502/504s quarantined 12 sessions on merytshost, diverting their
+//! heartbeats to the sidecar until coord's staleness watcher closed the rows.
 //!
 //! ## Conflict-on-acquire
 //!
@@ -784,6 +805,8 @@ pub(crate) struct SessionOutboxHealth {
     pub last_failure: Option<OutboxFailure>,
     pub retrying_sessions: u64,
     pub quarantined_sessions: u64,
+    /// [`HEARTBEATS_SUPERSEDED`] as of this snapshot.
+    pub heartbeats_superseded: u64,
 }
 
 fn session_outbox_health_cell() -> &'static Mutex<SessionOutboxHealth> {
@@ -837,6 +860,9 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         })),
         "retryingSessions": counted(h.retrying_sessions),
         "quarantinedSessions": counted(h.quarantined_sessions),
+        // Pending heartbeat rows dropped unsent because the session's next
+        // pending row was a newer heartbeat (process lifetime).
+        "heartbeatsSuperseded": counted(h.heartbeats_superseded),
         "observedAt": h.observed_at,
     })
 }
@@ -1015,6 +1041,12 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
     }
 }
 
+/// Pending heartbeat rows the drain ACK-dropped unsent because the session's
+/// NEXT pending row was a newer heartbeat (module header, "One session's
+/// failure is that session's problem"). Process-lifetime total, bumped only
+/// once the ACK has landed; `GET /health` `sessionOutbox.heartbeatsSuperseded`.
+pub(crate) static HEARTBEATS_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+
 /// Session LIFECYCLE kinds — the rows that define coord's session row itself:
 /// its creation (`started` → `POST /sessions`), its state (`state_change` →
 /// `PATCH`) and its end (`closed` → `PATCH {state:"closed"}`). A 429 on one of
@@ -1167,6 +1199,50 @@ async fn push_chain(
                         );
                     }
                     out.had_transport_error = true;
+                    continue;
+                }
+                // A heartbeat that failed in transport (network, timeout, or a
+                // 5xx — a gateway 502/504 says nothing about the row) is
+                // ACK-dropped, never retried: the next heartbeat supersedes it
+                // within one interval. Crucially it never sets `blocked_on`, so
+                // `drain_tick` cannot charge it to `serving_failures` and a
+                // gateway's bad hour can never quarantine the session (which
+                // would divert every later row — its heartbeats, its
+                // `state_change`, its `closed` — to the sidecar for the rest of
+                // the process). (A 4xx heartbeat is already ACK-dropped by the
+                // `PermanentFailure` arm, and a 409 is `Acked`.)
+                //
+                // Whether it counts as OUTAGE evidence depends on whether coord's
+                // edge answered at all. A failure with NO HTTP status (connect
+                // error, timeout, send error) is the outage signal: it sets
+                // `had_transport_error` and trips the abort when `trip_abort`
+                // holds, so a coord that is unreachable still costs at most
+                // MAX_CONCURRENT_PUSH_CHAINS requests a tick. A heartbeat that
+                // got an HTTP 5xx RESPONSE does neither — a heartbeat-only
+                // session never enters `state.retry`, so its `trip_abort` is
+                // always true, and letting a per-session 502 trip the abort
+                // would stop other sessions' chains and push the loop into the
+                // outage backoff while coord is serving them. Being dropped, a
+                // 5xx heartbeat is never retried, so it cannot amplify load.
+                if rec.event_kind == SessionEventKind::Heartbeat.as_str() {
+                    let unreachable = fail_status.is_none();
+                    tracing::warn!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        status = ?fail_status,
+                        unreachable,
+                        error = %snippet(&e),
+                        "coord_sync: heartbeat push failed — dropping it (the next \
+                         heartbeat supersedes it; never counts toward quarantine)"
+                    );
+                    out.succeeded.push((rec.session_id, rec.seq));
+                    out.cleared.push((rec.session_id, rec.seq));
+                    if unreachable {
+                        out.had_transport_error = true;
+                        if trip_abort {
+                            abort.store(true, Ordering::Relaxed);
+                        }
+                    }
                     continue;
                 }
                 tracing::warn!(
@@ -1350,6 +1426,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             h.oldest_unacked_at = None;
             h.retrying_sessions = 0;
             h.quarantined_sessions = quarantined;
+            h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
         });
         return TickResult::idle();
     }
@@ -1366,6 +1443,27 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .map(|r| ((r.session_id, r.seq), r.recorded_at))
         .collect();
 
+    // A heartbeat is superseded by the next one: a pending heartbeat whose
+    // session's NEXT pending row (by seq) is also a heartbeat is ACK-dropped by
+    // its exact (session, seq) key below, so each run of consecutive heartbeats
+    // collapses to its newest. Without this, the backlog an unreachable-coord
+    // outage leaves (one row per heartbeat interval per session) would all go
+    // out in one tick once coord answers again. Never across a non-heartbeat
+    // row: a heartbeat queued before a `state_change` still goes out even if
+    // that row then fails and blocks the chain. Dropping a heartbeat reorders
+    // nothing: the remaining rows keep their seq order.
+    let heartbeat_kind = SessionEventKind::Heartbeat.as_str();
+    let superseded_keys: HashSet<(Uuid, i64)> = pending
+        .windows(2)
+        .filter(|w| {
+            w[0].session_id == w[1].session_id
+                && w[0].event_kind == heartbeat_kind
+                && w[1].event_kind == heartbeat_kind
+        })
+        .map(|w| (w[0].session_id, w[0].seq))
+        .collect();
+    let mut superseded: Vec<(Uuid, i64)> = Vec::new();
+
     // Group into per-session chains. `pending()` returns records sorted by
     // (session_id, seq), so each chain is already in seq order.
     let mut chains: Vec<Vec<OutboxRecord>> = Vec::new();
@@ -1378,6 +1476,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             to_quarantine.push(rec);
             continue;
         }
+        if superseded_keys.contains(&(rec.session_id, rec.seq)) {
+            superseded.push((rec.session_id, rec.seq));
+            continue;
+        }
         match chains.last_mut() {
             Some(chain) if chain[0].session_id == rec.session_id => chain.push(rec),
             _ => chains.push(vec![rec]),
@@ -1386,6 +1488,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     // Quarantined sessions' rows land in the sidecar, then leave the outbox.
     let mut succeeded: Vec<(Uuid, i64)> = quarantine_rows(inner, state, to_quarantine);
+    // Counted only once the ACK lands (below), so a failed ACK — which leaves
+    // the rows pending for the next tick — is never counted twice.
+    let superseded_count = superseded.len() as u64;
+    succeeded.extend(superseded);
 
     // A session still inside its own backoff sits this tick out.
     chains.retain(|chain| {
@@ -1496,6 +1602,16 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                 for key in &succeeded {
                     state.in_sidecar.remove(key);
                 }
+                if superseded_count > 0 {
+                    let total = HEARTBEATS_SUPERSEDED
+                        .fetch_add(superseded_count, Ordering::Relaxed)
+                        + superseded_count;
+                    tracing::debug!(
+                        rows = superseded_count,
+                        total,
+                        "coord_sync: dropped heartbeat rows superseded by a newer pending heartbeat"
+                    );
+                }
             }
             Err(e) => tracing::warn!(error = %e, "coord_sync: ack write failed"),
         }
@@ -1520,6 +1636,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         h.oldest_unacked_at = remaining.iter().min().map(|at| **at);
         h.retrying_sessions = retrying;
         h.quarantined_sessions = quarantined;
+        h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
     });
 
     TickResult {
@@ -3665,6 +3782,13 @@ mod tests {
         /// The `Authorization` header each `POST /sessions` carried, in order
         /// (`None` = went out unauthenticated).
         post_auth: Vec<Option<String>>,
+        /// `PATCH /sessions/:id` for any of these session ids ALWAYS answers
+        /// 502 — an overloaded gateway in front of one session's rows.
+        poison_patch_ids: Vec<Uuid>,
+        /// `PATCH /sessions/:id` carrying a `state` field for any of these
+        /// session ids answers 502 — a failing `state_change` / `closed`
+        /// while that session's plain heartbeats still go through.
+        poison_state_patch_ids: Vec<Uuid>,
         /// When >0, the next N PATCHes return 500. Each attempt decrements it,
         /// so `budget - remaining` counts how many pushes were actually
         /// issued — which is how the bounded-parallel drain is asserted.
@@ -3807,6 +3931,21 @@ mod tests {
                             return (
                                 AxumStatus::INTERNAL_SERVER_ERROR,
                                 Json(json!({"error": "fake-down"})),
+                            )
+                                .into_response();
+                        }
+                        if g.poison_state_patch_ids.contains(&id) && body.get("state").is_some()
+                        {
+                            return (
+                                AxumStatus::BAD_GATEWAY,
+                                Json(json!({"error": "fake-502"})),
+                            )
+                                .into_response();
+                        }
+                        if g.poison_patch_ids.contains(&id) {
+                            return (
+                                AxumStatus::BAD_GATEWAY,
+                                Json(json!({"error": "fake-502"})),
                             )
                                 .into_response();
                         }
@@ -5149,7 +5288,12 @@ mod tests {
         let records: Vec<OutboxRecord> = (0..3)
             .map(|_| {
                 outbox
-                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .record(
+                        m,
+                        s,
+                        SessionEventKind::StateChange,
+                        json!({ "state": "active" }),
+                    )
                     .unwrap()
             })
             .collect();
@@ -5240,8 +5384,8 @@ mod tests {
                 crate::session::local_store::OutboxEvent::new(
                     m,
                     Uuid::new_v4(),
-                    SessionEventKind::Heartbeat,
-                    json!({}),
+                    SessionEventKind::StateChange,
+                    json!({ "state": "active" }),
                 )
             })
             .collect();
@@ -5280,8 +5424,8 @@ mod tests {
             .record(
                 Uuid::new_v4(),
                 Uuid::new_v4(),
-                SessionEventKind::Heartbeat,
-                json!({}),
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
             )
             .unwrap()];
         let abort = Arc::new(AtomicBool::new(false));
@@ -5300,6 +5444,607 @@ mod tests {
         assert!(
             !abort.load(Ordering::Relaxed),
             "a known-failing session's retry must not stall every other session"
+        );
+    }
+
+    /// A fake coord that accepts every TCP connection and closes it without
+    /// answering — a network-class failure with NO HTTP status. Returns the
+    /// base URL and the number of connections accepted (one per push).
+    async fn spawn_dropping_coord() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (format!("http://{addr}"), accepted)
+    }
+
+    /// Phase 2 of plan
+    /// `2026-10-11-a-live-runner-sessions-coord-row-once-reaped-stays-closed-under-its-own-heartbeats`:
+    /// a heartbeat answered with an HTTP 5xx is ACK-dropped and leaves its
+    /// session unblocked — and, since coord's edge answered, it is NOT outage
+    /// evidence: no abort, no `had_transport_error`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_5xx_is_dropped_without_tripping_the_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_5xx = 100;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let records: Vec<OutboxRecord> = (0..3)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+            })
+            .collect();
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcome = push_chain(
+            coord.inner.clone(),
+            records,
+            HashMap::new(),
+            abort.clone(),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.succeeded.len(),
+            3,
+            "every failed heartbeat is dropped"
+        );
+        assert!(
+            !outcome.acked_by_coord,
+            "a dropped row is not coord taking it"
+        );
+        assert!(
+            outcome.blocked_on.is_none(),
+            "a failing heartbeat must never become the session's blocking head"
+        );
+        assert!(
+            !outcome.had_transport_error,
+            "a 5xx answer is not an outage"
+        );
+        assert!(
+            !abort.load(Ordering::Relaxed),
+            "a 5xx heartbeat must not stop other sessions' chains"
+        );
+        assert_eq!(100 - rec.lock().await.next_patch_5xx, 3);
+    }
+
+    /// The outage half: a heartbeat that got NO HTTP answer (the connection
+    /// was dropped) is still dropped, but it trips the abort on a fresh
+    /// failure, so an unreachable coord stays bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_network_failure_is_dropped_and_trips_the_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, accepted) = spawn_dropping_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let records: Vec<OutboxRecord> = (0..3)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+            })
+            .collect();
+        let first = (records[0].session_id, records[0].seq);
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcome = push_chain(
+            coord.inner.clone(),
+            records,
+            HashMap::new(),
+            abort.clone(),
+            true,
+        )
+        .await;
+
+        assert!(outcome.had_transport_error);
+        assert!(!outcome.acked_by_coord);
+        assert!(outcome.blocked_on.is_none());
+        assert_eq!(
+            outcome.succeeded,
+            vec![first],
+            "the failed heartbeat is dropped"
+        );
+        assert!(
+            abort.load(Ordering::Relaxed),
+            "a fresh network-class heartbeat failure trips the abort flag"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the tripped abort stops the chain after one request"
+        );
+
+        // A known-failing session (trip_abort = false) drops its heartbeats
+        // without tripping anything.
+        let records: Vec<OutboxRecord> = (0..2)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+            })
+            .collect();
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcome = push_chain(
+            coord.inner.clone(),
+            records,
+            HashMap::new(),
+            abort.clone(),
+            false,
+        )
+        .await;
+        assert_eq!(outcome.succeeded.len(), 2);
+        assert!(outcome.blocked_on.is_none());
+        assert!(!abort.load(Ordering::Relaxed));
+    }
+
+    /// Drain-level outage bound for heartbeats: 40 pending heartbeat sessions
+    /// against an unreachable coord cost at most MAX_CONCURRENT_PUSH_CHAINS
+    /// requests in the tick, the tick reads as an outage, and nothing counts
+    /// as coord having taken a row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_only_outage_is_bounded_and_reads_as_an_outage() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, accepted) = spawn_dropping_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let events: Vec<crate::session::local_store::OutboxEvent> = (0..40)
+            .map(|_| {
+                crate::session::local_store::OutboxEvent::new(
+                    m,
+                    Uuid::new_v4(),
+                    SessionEventKind::Heartbeat,
+                    json!({}),
+                )
+            })
+            .collect();
+        outbox.record_batch(events).unwrap();
+
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+
+        let issued = accepted.load(Ordering::SeqCst);
+        assert!(issued >= 1);
+        assert!(
+            issued <= MAX_CONCURRENT_PUSH_CHAINS,
+            "an unreachable coord must not fan out: {issued} requests for 40 heartbeats"
+        );
+        assert!(tick.outage, "an unreachable coord is an outage");
+        assert!(state.last_ack.is_none(), "nothing was taken by coord");
+        assert_eq!(state.ack_ticks, 0);
+        assert!(state.quarantined.is_empty());
+        assert!(
+            state.retry.is_empty(),
+            "a heartbeat never blocks its session"
+        );
+    }
+
+    /// The incident shape: one session's heartbeat PATCH answers 502 while coord
+    /// serves everyone else. That 502 must not abort the other sessions'
+    /// chains: every healthy heartbeat goes out in the same tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_sessions_heartbeat_502_does_not_abort_other_sessions() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        // `pending()` sorts by (session_id, seq), so this id makes the failing
+        // session's chain run FIRST — its 502 lands while most healthy chains
+        // have not started, which is exactly where the old code's abort trip
+        // stopped them. A random id could sort last and pass on the old code.
+        let failing = Uuid::from_u128(1);
+        rec.lock().await.poison_patch_ids.push(failing);
+        // More healthy sessions than the concurrency bound, so some chains
+        // start only after the failing one has already answered.
+        let healthy: Vec<Uuid> = (0..3 * MAX_CONCURRENT_PUSH_CHAINS)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let mut events = vec![crate::session::local_store::OutboxEvent::new(
+            m,
+            failing,
+            SessionEventKind::Heartbeat,
+            json!({}),
+        )];
+        events.extend(healthy.iter().map(|sid| {
+            crate::session::local_store::OutboxEvent::new(
+                m,
+                *sid,
+                SessionEventKind::Heartbeat,
+                json!({}),
+            )
+        }));
+        outbox.record_batch(events).unwrap();
+
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+
+        assert!(tick.ran_any);
+        assert!(state.last_ack.is_some());
+        let g = rec.lock().await;
+        for sid in &healthy {
+            assert_eq!(
+                g.patches.iter().filter(|(id, _)| id == sid).count(),
+                1,
+                "every healthy session's heartbeat went out in the same tick"
+            );
+        }
+        drop(g);
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "the failed heartbeat is dropped and every healthy one is taken"
+        );
+        assert!(!state.retry.contains_key(&failing));
+        assert!(state.quarantined.is_empty());
+    }
+
+    /// A tick in which EVERY pending row is a heartbeat answered 5xx: coord's
+    /// edge answered, so it is not an outage, the rows are dropped, and nothing
+    /// counts as coord having taken a row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_all_heartbeat_5xx_tick_is_not_an_outage() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.fail_all = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        for _ in 0..3 {
+            outbox
+                .record(m, Uuid::new_v4(), SessionEventKind::Heartbeat, json!({}))
+                .unwrap();
+        }
+
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+
+        assert!(!tick.outage, "a 5xx answer is not an unreachable coord");
+        assert!(tick.ran_any);
+        assert!(outbox.pending().unwrap().is_empty(), "all three dropped");
+        assert!(state.last_ack.is_none(), "coord took nothing");
+        assert!(state.retry.is_empty());
+    }
+
+    /// The `(seq, kind)` of every pending row of `session`, in seq order.
+    fn pending_of(outbox: &OutboxWriter, session: Uuid) -> Vec<(i64, String)> {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == session)
+            .map(|r| (r.seq, r.event_kind))
+            .collect()
+    }
+
+    /// Supersession: a run of consecutive pending heartbeats collapses to its
+    /// NEWEST row. Proven on the outbox itself: with the session sitting out its
+    /// own backoff (so nothing is sent), the tick ACK-drops the older rows and
+    /// the one left pending is the highest seq. The next tick sends exactly it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_of_pending_heartbeats_collapses_to_its_newest() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        // The backlog an outage leaves: a run of heartbeats.
+        let seqs: Vec<i64> = (0..6)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+                    .seq
+            })
+            .collect();
+        let newest = *seqs.iter().max().unwrap();
+
+        let mut state = DrainState::default();
+        state.retry.insert(
+            s,
+            SessionRetry {
+                failures: 1,
+                serving_failures: 0,
+                next_attempt_at: Instant::now() + Duration::from_secs(3600),
+                failed_at_ack_tick: 0,
+            },
+        );
+        let superseded_before = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            pending_of(&outbox, s),
+            vec![(newest, "heartbeat".to_string())],
+            "only the NEWEST heartbeat of the run survives"
+        );
+        assert!(rec.lock().await.patches.is_empty(), "nothing was sent");
+        assert!(
+            HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed) - superseded_before >= 5,
+            "the five superseded rows are counted once their ACK landed"
+        );
+
+        state.retry.get_mut(&s).unwrap().next_attempt_at = Instant::now();
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            rec.lock()
+                .await
+                .patches
+                .iter()
+                .filter(|(id, _)| *id == s)
+                .count(),
+            1
+        );
+        assert!(outbox.pending().unwrap().is_empty());
+    }
+
+    /// A heartbeat is never superseded ACROSS a non-heartbeat row: in
+    /// hb, hb, state_change, hb, hb the heartbeat before the `state_change` is
+    /// still sent even though that `state_change` then fails and blocks the
+    /// chain — liveness is not lost exactly when the session is stuck. Only
+    /// each run collapses (to its newest), and the order is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_is_never_superseded_across_a_state_change() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        rec.lock().await.poison_state_patch_ids.push(t);
+        let hb = |outbox: &OutboxWriter| {
+            outbox
+                .record(m, t, SessionEventKind::Heartbeat, json!({}))
+                .unwrap()
+                .seq
+        };
+        hb(&outbox);
+        hb(&outbox);
+        let change = outbox
+            .record(
+                m,
+                t,
+                SessionEventKind::StateChange,
+                json!({ "state": "pending_resolution" }),
+            )
+            .unwrap()
+            .seq;
+        hb(&outbox);
+        let last = hb(&outbox);
+
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        {
+            let g = rec.lock().await;
+            let sent: Vec<&JsonValue> = g
+                .patches
+                .iter()
+                .filter(|(id, _)| *id == t)
+                .map(|(_, b)| b)
+                .collect();
+            assert_eq!(
+                sent,
+                vec![&json!({ "heartbeat": true })],
+                "the heartbeat before the failing state_change still reached coord"
+            );
+        }
+        assert_eq!(
+            pending_of(&outbox, t),
+            vec![
+                (change, "state_change".to_string()),
+                (last, "heartbeat".to_string()),
+            ],
+            "the blocked state_change heads the chain, the trailing run collapsed \
+             to its newest"
+        );
+
+        // The state_change recovers: it and the newest heartbeat go out, in order.
+        rec.lock().await.poison_state_patch_ids.clear();
+        state.retry.get_mut(&t).unwrap().next_attempt_at = Instant::now();
+        drain_tick(&coord.inner, &mut state).await;
+        let g = rec.lock().await;
+        let sent: Vec<&JsonValue> = g
+            .patches
+            .iter()
+            .filter(|(id, _)| *id == t)
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[1]["state"], "pending_resolution");
+        assert_eq!(sent[2], &json!({ "heartbeat": true }));
+        drop(g);
+        assert!(outbox.pending().unwrap().is_empty());
+    }
+
+    /// Drive `failing`'s rows of `kind` through a gateway 502 while coord keeps
+    /// taking another session's rows, for one more round than the quarantine
+    /// threshold. Returns the drain state afterwards.
+    async fn drive_502s_while_coord_serves_others(
+        coord: &CoordSync,
+        outbox: &OutboxWriter,
+        machine: Uuid,
+        failing: Uuid,
+        kind: SessionEventKind,
+        payload: JsonValue,
+    ) -> DrainState {
+        let mut state = DrainState::default();
+        let other = Uuid::new_v4();
+        record_started(outbox, machine, other);
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(state.last_ack.is_some(), "coord is serving");
+        for _ in 0..QUARANTINE_AFTER_SERVING_FAILURES + 2 {
+            outbox
+                .record(machine, failing, kind, payload.clone())
+                .unwrap();
+            outbox
+                .record(machine, other, SessionEventKind::Heartbeat, json!({}))
+                .unwrap();
+            if let Some(r) = state.retry.get_mut(&failing) {
+                r.next_attempt_at = Instant::now();
+            }
+            drain_tick(&coord.inner, &mut state).await;
+        }
+        state
+    }
+
+    /// Phase 2: a session whose heartbeat head answers 502 again and again
+    /// while coord ACKs another session's rows is NOT quarantined, and its
+    /// next `state_change` / `closed` still reach coord.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_502_storm_never_quarantines_its_session() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let failing = Uuid::new_v4();
+        rec.lock().await.poison_patch_ids.push(failing);
+
+        let mut state = drive_502s_while_coord_serves_others(
+            &coord,
+            &outbox,
+            machine,
+            failing,
+            SessionEventKind::Heartbeat,
+            json!({}),
+        )
+        .await;
+        assert!(
+            !state.quarantined.contains(&failing),
+            "failing heartbeats quarantined their session"
+        );
+        assert!(
+            !state.retry.contains_key(&failing),
+            "a failing heartbeat must not put its session on a serving-failure count"
+        );
+        assert!(
+            !outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .any(|r| r.session_id == failing),
+            "the failed heartbeats are dropped, not left to head-of-line-block"
+        );
+
+        // The gateway recovers: the session's lifecycle rows still reach coord.
+        rec.lock().await.poison_patch_ids.clear();
+        outbox
+            .record(
+                machine,
+                failing,
+                SessionEventKind::StateChange,
+                json!({ "state": "pending_resolution" }),
+            )
+            .unwrap();
+        outbox
+            .record(machine, failing, SessionEventKind::Closed, json!({}))
+            .unwrap();
+        drain_tick(&coord.inner, &mut state).await;
+        let g = rec.lock().await;
+        let bodies: Vec<&JsonValue> = g
+            .patches
+            .iter()
+            .filter(|(id, _)| *id == failing)
+            .map(|(_, b)| b)
+            .collect();
+        assert!(
+            bodies.iter().any(|b| b["state"] == "pending_resolution"),
+            "the state_change reached coord: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b["state"] == "closed"),
+            "the close reached coord: {bodies:?}"
+        );
+    }
+
+    /// Phase 2's other half: a NON-heartbeat head row under the same sequence
+    /// still quarantines — the poisoned-row guard is intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_heartbeat_head_under_a_502_storm_still_quarantines() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let failing = Uuid::new_v4();
+        rec.lock().await.poison_patch_ids.push(failing);
+
+        let state = drive_502s_while_coord_serves_others(
+            &coord,
+            &outbox,
+            machine,
+            failing,
+            SessionEventKind::StateChange,
+            json!({ "state": "active" }),
+        )
+        .await;
+        assert!(
+            state.quarantined.contains(&failing),
+            "a state_change head coord keeps refusing must still quarantine"
         );
     }
 
@@ -5362,11 +6107,19 @@ mod tests {
         // the stuck one's retry must not abort the healthy chain.
         let healthy = Uuid::new_v4();
         record_started(&outbox, machine, healthy);
-        for _ in 0..2 {
-            outbox
-                .record(machine, healthy, SessionEventKind::Heartbeat, json!({}))
-                .unwrap();
-        }
+        // A two-row tail. Not two heartbeats: the drain sends only the newest
+        // of a session's pending heartbeats.
+        outbox
+            .record(
+                machine,
+                healthy,
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
+            )
+            .unwrap();
+        outbox
+            .record(machine, healthy, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
         state.retry.get_mut(&stuck).unwrap().next_attempt_at = Instant::now();
         drain_tick(&coord.inner, &mut state).await;
 
@@ -5472,7 +6225,12 @@ mod tests {
         rec.lock().await.fail_all = true;
         let failing = Uuid::new_v4();
         outbox
-            .record(machine, failing, SessionEventKind::Heartbeat, json!({}))
+            .record(
+                machine,
+                failing,
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
+            )
             .unwrap();
         outbox
             .record(
@@ -5582,6 +6340,7 @@ mod tests {
             }),
             retrying_sessions: 1,
             quarantined_sessions: 0,
+            heartbeats_superseded: 2,
         });
         for key in [
             "pending",
@@ -5590,6 +6349,7 @@ mod tests {
             "lastFailure",
             "retryingSessions",
             "quarantinedSessions",
+            "heartbeatsSuperseded",
             "observedAt",
         ] {
             assert!(
@@ -6094,14 +6854,16 @@ mod tests {
             "a lone poisoned row must not back off the whole loop"
         );
 
-        // Whereas a FRESH failure with nothing taken is.
+        // Whereas a FRESH failure with nothing taken is. (A `state_change`, not
+        // a heartbeat: a heartbeat answered with an HTTP 5xx is dropped and is
+        // deliberately not outage evidence.)
         rec.lock().await.fail_all = true;
         outbox
             .record(
                 machine,
                 Uuid::new_v4(),
-                SessionEventKind::Heartbeat,
-                json!({}),
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
             )
             .unwrap();
         let tick = drain_tick(&coord.inner, &mut state).await;
