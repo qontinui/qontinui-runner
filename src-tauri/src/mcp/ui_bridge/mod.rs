@@ -913,7 +913,6 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/action-plan"),
             ("POST", "/ui-bridge/control/activate-tab/{}"),
             ("POST", "/ui-bridge/control/annotations"),
-            ("POST", "/ui-bridge/control/capture-element-images"),
             ("POST", "/ui-bridge/control/clear-storage"),
             ("POST", "/ui-bridge/control/design/evaluate"),
             ("POST", "/ui-bridge/control/design/evaluate/baseline"),
