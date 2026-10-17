@@ -5457,6 +5457,14 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// title declaration. Without that door, when the title recorded nothing, only the
 /// gate's registrant could move it, and no operator twin of the re-point exists.
 ///
+/// `coord_correct_gate` is IN for the same gate-verb family's reason (plan
+/// `2026-09-21-a-cleared-gate-is-uncorrectable-and-every-repair-mints-another-false-green-row`
+/// Phase 8). It corrects a CLEARED gate's recorded predicate or outcome. A
+/// correction is INSERT-only (it appends a correcting row, never edits history),
+/// applies to cleared gates only, and cannot release work: it clears nothing and
+/// approves nothing. Withheld, a cleared-gate error could only be repaired by
+/// registering another gate, which is the false-green row the plan exists to stop.
+///
 /// `coord_citations_reenrich` is IN because it is a SHIPPED REPAIR ROUTE, and a
 /// repair route an agent cannot reach is the defect it was built to close (plan
 /// `2026-09-10-citation-reenrich-is-unrunnable-and-plan-pr-is-unclassifiable`).
@@ -5612,6 +5620,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_claim_heartbeat",
     "coord_claim_release",
     "coord_conflict_check",
+    "coord_correct_gate",
     "coord_create_repo",
     "coord_declare_intent",
     // The direct supersession-declaration door (qontinui-coord, operator
@@ -17980,6 +17989,8 @@ mod coord_mcp_body_gate_tests {
             // The registrant-only re-point (coord#2056): the only way to carry a
             // superseded gate's continuation onto the replacement PR.
             "coord_repoint_gate",
+            // INSERT-only correction of a CLEARED gate; releases nothing.
+            "coord_correct_gate",
             // ...and the declaration that authorizes a NON-registrant re-point
             // of a superseded PR's system-registered gate.
             "coord_declare_supersession",
