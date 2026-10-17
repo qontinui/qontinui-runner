@@ -582,3 +582,53 @@ note = "A caveat string attached to the Canonical rung explaining it is the runn
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
 ]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/machine_capability.rs"
+symbol = "booted_at"
+disposition = "fallback_correct"
+note = "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
+reviewed = [
+    "cfg(windows)-only fn `booted_at` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/machine_capability.rs"
+symbol = "config_written_at"
+disposition = "fallback_correct"
+note = "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
+reviewed = [
+    "cfg(windows)-only fn `config_written_at` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/machine_capability.rs"
+symbol = "live"
+disposition = "fallback_correct"
+note = "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
+reviewed = [
+    "cfg(windows)-only fn `live` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/machine_capability.rs"
+symbol = "memory_management"
+disposition = "fallback_correct"
+note = "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
+reviewed = [
+    "cfg(windows)-only fn `memory_management` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/machine_capability.rs"
+symbol = "reading"
+disposition = "fallback_correct"
+note = "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
+reviewed = [
+    "cfg(windows)-only fn `reading` has no cfg(not(windows)) sibling in this file",
+]
