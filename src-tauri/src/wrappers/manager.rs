@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
@@ -107,40 +107,125 @@ impl OutputTail {
         out.join("\n")
     }
 
-    /// Drain `stream` line by line into the ring until it closes.
+    /// Drain `stream` into the ring until it closes. Reads BYTES, not lines:
+    /// a non-UTF-8 byte is decoded lossily instead of ending the drain (which
+    /// would close the pipe and hand the wrapper an EPIPE), and a line is never
+    /// buffered past `OUTPUT_LINE_MAX` bytes (the rest of a long line — a base64
+    /// dump — is read and discarded up to its newline).
     fn drain<R: AsyncRead + Unpin + Send + 'static>(&self, wrapper_id: &str, stream: R) {
         let tail = self.clone();
         let id = wrapper_id.to_string();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stream).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                debug!("wrapper[{}]: {}", id, line);
-                tail.push(&line);
+            let mut stream = stream;
+            let mut buf = [0u8; 4096];
+            let mut line: Vec<u8> = Vec::with_capacity(OUTPUT_LINE_MAX);
+            let mut overflow = false;
+            loop {
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    // A read error on a pipe is the end of it, never a reason
+                    // to stop reading earlier than that.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                for &b in buf.iter().take(n) {
+                    if b == b'\n' {
+                        let text = String::from_utf8_lossy(&line);
+                        debug!("wrapper[{}]: {}", id, text);
+                        tail.push(&text);
+                        if overflow {
+                            tail.push("[line cut]");
+                        }
+                        line.clear();
+                        overflow = false;
+                    } else if line.len() < OUTPUT_LINE_MAX {
+                        line.push(b);
+                    } else {
+                        overflow = true;
+                    }
+                }
+            }
+            if !line.is_empty() {
+                tail.push(&String::from_utf8_lossy(&line));
             }
         });
     }
 }
 
-/// Wrapper output is quoted in errors, so a URL's query string (a sign-in
-/// continuation, a token) is cut before it is kept.
+/// Header names whose whole line is dropped from quoted wrapper output.
+const SECRET_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+];
+/// A path or word segment at least this long, made only of token characters,
+/// is masked: it reads like a token, a session id or a conversation id.
+const TOKEN_SEGMENT_MIN: usize = 24;
+
+/// Wrapper output is quoted in errors, so it is reduced before it is kept:
+/// a header-like secret line (`Cookie:`, `Authorization: Bearer …`) is dropped
+/// whole, a word after `Bearer` is masked, a URL's query and fragment are cut,
+/// and any long token-like segment is masked.
 fn redact_query(line: &str) -> String {
+    let trimmed = line.trim_start().to_ascii_lowercase();
+    if SECRET_HEADERS.iter().any(|h| {
+        trimmed
+            .strip_prefix(h)
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    }) {
+        return "[header line omitted]".to_string();
+    }
     let mut out = String::with_capacity(line.len());
+    let mut mask_next = false;
     for (i, word) in line.split(' ').enumerate() {
         if i > 0 {
             out.push(' ');
         }
-        if word.contains("://") {
-            match word.split_once(['?', '#']) {
-                Some((head, _)) => {
-                    out.push_str(head);
-                    out.push_str("?…");
-                }
-                None => out.push_str(word),
-            }
-        } else {
+        if mask_next {
+            out.push('…');
+            mask_next = false;
+            continue;
+        }
+        if word.eq_ignore_ascii_case("bearer") {
             out.push_str(word);
+            mask_next = true;
+            continue;
+        }
+        let word = match word.split_once(['?', '#']) {
+            Some((head, _)) if word.contains("://") => format!("{head}?…"),
+            _ => word.to_string(),
+        };
+        out.push_str(&mask_token_segments(&word));
+    }
+    out
+}
+
+/// Mask every `/`-, `=`- or `:`-separated segment of `word` that looks like a
+/// token (long, and only `[A-Za-z0-9_-]`).
+fn mask_token_segments(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut segment = String::new();
+    let flush = |segment: &mut String, out: &mut String| {
+        let tokenish = segment.len() >= TOKEN_SEGMENT_MIN
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        out.push_str(if tokenish { "…" } else { segment.as_str() });
+        segment.clear();
+    };
+    for c in word.chars() {
+        if matches!(c, '/' | '=' | ':') {
+            flush(&mut segment, &mut out);
+            out.push(c);
+        } else {
+            segment.push(c);
         }
     }
+    flush(&mut segment, &mut out);
     out
 }
 
@@ -709,30 +794,57 @@ enum ExistingRecord {
 /// the map (so no lock is held while waiting). SIGTERM-equivalent first, then
 /// force-kill after `STOP_GRACE` if the child hasn't exited.
 async fn terminate_runtime(wrapper_id: &str, mut runtime: WrapperRuntime) {
-    // Kill the whole tree first (SIGKILL to the process group / close the
-    // kill-on-close job): a browser transport's Chromium processes are
-    // grandchildren that `child.start_kill()` below would never reach.
-    drop(runtime.tree.take());
+    let tree = runtime.tree.take();
     let mut child = match runtime.child.take() {
         Some(c) => c,
-        None => return,
+        None => {
+            drop(tree);
+            return;
+        }
     };
 
-    // tokio::process::Child has `start_kill` which on Windows uses
-    // TerminateProcess and on unix sends SIGKILL. There's no portable
-    // SIGTERM equivalent in tokio; on Windows the runner's other
-    // managers (ProcessCaptureManager) also use TerminateProcess, so
-    // we follow that precedent. If a wrapper needs graceful shutdown
-    // semantics it should declare its own /shutdown HTTP path which
-    // higher-level callers can invoke before `stop`.
-    if let Err(e) = child.start_kill() {
-        warn!(
-            "wrappers: start_kill('{}') failed: {} — proceeding to wait",
-            wrapper_id, e
-        );
+    // Playwright launches Chromium DETACHED on Unix (its own session and
+    // process group), so a SIGKILL to the wrapper's group never reaches it,
+    // and a SIGKILLed `node` cannot run the exit handlers that would have
+    // closed it. So, in order:
+    //   1. record every descendant now (once `node` dies they reparent to
+    //      init and can no longer be found by ancestry);
+    //   2. SIGTERM the group, so `runWrapperEntrypoint`'s handler closes the
+    //      transport and Playwright closes its browser;
+    //   3. wait STOP_GRACE;
+    //   4. SIGKILL the group (drop the guard) and every recorded descendant
+    //      still alive.
+    // On Windows the kill-on-close Job Object holds every descendant whatever
+    // its console or group, so dropping the guard is enough.
+    #[cfg(unix)]
+    let descendants = child.id().map(unix_descendants).unwrap_or_default();
+    #[cfg(unix)]
+    let graceful = match (
+        tree.is_some(),
+        child.id().and_then(|p| i32::try_from(p).ok()),
+    ) {
+        (true, Some(pgid)) if pgid > 1 => {
+            // SAFETY: plain signal delivery to a group this manager created
+            // (`process_group(0)` at spawn: pid == pgid).
+            unsafe { libc::killpg(pgid, libc::SIGTERM) };
+            true
+        }
+        _ => false,
+    };
+    #[cfg(not(unix))]
+    let graceful = false;
+
+    if !graceful {
+        // tokio's start_kill is TerminateProcess on Windows and SIGKILL on
+        // Unix; the tree guard below takes the rest of the tree.
+        if let Err(e) = child.start_kill() {
+            warn!(
+                "wrappers: start_kill('{}') failed: {} — proceeding to wait",
+                wrapper_id, e
+            );
+        }
     }
 
-    // Wait up to STOP_GRACE for the child to exit.
     match tokio::time::timeout(STOP_GRACE, child.wait()).await {
         Ok(Ok(status)) => {
             debug!("wrappers: '{}' exited with {}", wrapper_id, status);
@@ -745,6 +857,70 @@ async fn terminate_runtime(wrapper_id: &str, mut runtime: WrapperRuntime) {
             );
             let _ = child.kill().await;
         }
+    }
+    // Whatever is left of the group, and of the job on Windows.
+    drop(tree);
+    // The belt: a recorded descendant outside the group (a detached browser)
+    // that is still alive. The pids were read moments ago, so reuse of one by
+    // an unrelated process inside this window is possible but negligible.
+    #[cfg(unix)]
+    for pid in descendants {
+        // SAFETY: signal 0 probes existence; SIGKILL to a recorded descendant.
+        unsafe {
+            if libc::kill(pid, 0) == 0 {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Every descendant of `root` (children, grandchildren, …), read from
+/// `/proc`'s parent links. Linux only; elsewhere the group kill and the
+/// SIGTERM phase are the whole story.
+#[cfg(unix)]
+fn unix_descendants(root: u32) -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<i32>().ok())
+                else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                    continue;
+                };
+                // `pid (comm) state ppid …`: comm may hold spaces and parens,
+                // so read after the LAST ')'.
+                let ppid = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                    .and_then(|p| p.parse::<i32>().ok());
+                if let Some(ppid) = ppid {
+                    children.entry(ppid).or_default().push(pid);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut queue = vec![i32::try_from(root).unwrap_or(0)];
+        while let Some(p) = queue.pop() {
+            if let Some(kids) = children.get(&p) {
+                for &k in kids {
+                    out.push(k);
+                    queue.push(k);
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        Vec::new()
     }
 }
 
@@ -871,6 +1047,123 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!alive(grandchild), "grandchild {grandchild} survived stop");
+    }
+
+    /// Playwright launches Chromium DETACHED (its own session and group), so
+    /// a group kill misses it. Here the wrapper starts a `setsid`-style
+    /// detached grandchild and ignores SIGTERM's chance to clean up; the
+    /// recorded-descendant belt must still kill it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stop_kills_a_detached_grandchild_outside_the_group() {
+        if !node_available() {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("detached.pid");
+        let body = format!(
+            "const g = require('child_process').spawn('sleep', ['300'], {{ detached: true, stdio: 'ignore' }});\n\
+             g.unref();\n\
+             require('fs').writeFileSync({pid:?}, String(g.pid));\n\
+             require('http').createServer((q, r) => r.end('ok')).listen(Number(process.env.WRAPPER_PORT), '127.0.0.1');",
+            pid = pid_file.to_string_lossy()
+        );
+        fake_wrapper(tmp.path(), "headed", &body);
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        let manager = WrapperManager::new(registry);
+        manager.spawn("w").await.expect("the fake wrapper spawns");
+        let detached: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Precondition: it really is outside the wrapper's process group.
+        let group = |pid: u32| unsafe { libc::getpgid(pid as i32) };
+        let wrapper_pid = manager.status("w").await.pid.unwrap();
+        assert_ne!(group(detached), group(wrapper_pid));
+
+        manager.stop("w").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while alive(detached) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive(detached),
+            "detached grandchild {detached} survived stop"
+        );
+    }
+
+    /// Stop SIGTERMs the group first and waits, so a wrapper's own shutdown
+    /// handler (Playwright closing its browser) gets to run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_lets_the_wrapper_shut_down_gracefully() {
+        if !node_available() {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("graceful");
+        let body = format!(
+            "process.on('SIGTERM', () => {{ require('fs').writeFileSync({m:?}, 'closed'); process.exit(0); }});\n\
+             require('http').createServer((q, r) => r.end('ok')).listen(Number(process.env.WRAPPER_PORT), '127.0.0.1');",
+            m = marker.to_string_lossy()
+        );
+        fake_wrapper(tmp.path(), "headless", &body);
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        let manager = WrapperManager::new(registry);
+        manager.spawn("w").await.expect("the fake wrapper spawns");
+        manager.stop("w").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "closed");
+    }
+
+    #[tokio::test]
+    async fn the_drain_survives_bad_utf8_and_cuts_long_lines() {
+        let tail = OutputTail::default();
+        let mut data: Vec<u8> = b"first\n".to_vec();
+        data.extend_from_slice(&[0xff, 0xfe, b'b', b'a', b'd', b'\n']);
+        data.extend(std::iter::repeat_n(b'A', 100_000));
+        data.extend_from_slice(b"\nafter the long line\nno newline at end");
+        tail.drain("w", std::io::Cursor::new(data));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tail.render().contains("no newline at end") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let out = tail.render();
+        assert!(out.contains("first"), "{out}");
+        assert!(
+            out.contains("\u{fffd}\u{fffd}bad"),
+            "lossy, and it kept reading: {out}"
+        );
+        assert!(out.contains("[line cut]"), "{out}");
+        assert!(out.contains("after the long line"), "{out}");
+        assert!(out.contains("no newline at end"), "{out}");
+        assert!(out.len() <= OUTPUT_ERROR_MAX + OUTPUT_TAIL_LINES * 4);
+    }
+
+    #[test]
+    fn secret_headers_bearer_tokens_and_token_segments_are_dropped() {
+        assert_eq!(
+            redact_query("Cookie: sid=abc; other=1"),
+            "[header line omitted]"
+        );
+        assert_eq!(
+            redact_query("  authorization : Bearer eyJhbGciOi.secret"),
+            "[header line omitted]"
+        );
+        assert_eq!(
+            redact_query("sending Bearer eyJhbGciOiJIUzI1NiJ9 now"),
+            "sending Bearer … now"
+        );
+        assert_eq!(
+            redact_query("at https://gemini.google.com/app/8f3a2c1d9e0b7a6c5d4e3f2a1b0c"),
+            "at https://gemini.google.com/app/…"
+        );
+        assert_eq!(
+            redact_query("dist/index-node.js ready"),
+            "dist/index-node.js ready"
+        );
     }
 
     /// A wrapper that exits at once (a missing peer, no display) fails the
