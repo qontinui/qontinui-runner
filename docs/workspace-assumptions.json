@@ -215,15 +215,6 @@
     },
     {
       "class": "machine_path",
-      "file": "src/commands/setup_wizard.rs",
-      "symbol": "discover_claude_config_dirs",
-      "excerpt": "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
-    },
-    {
-      "class": "machine_path",
       "file": "src/mcp/test_fixtures.rs",
       "symbol": "const DEFAULT_TEST_CONFIG_DIR",
       "excerpt": "const DEFAULT_TEST_CONFIG_DIR: &str = \"C:\\\\claude\\\\.claude-test-fixture\";",
@@ -243,11 +234,11 @@
     {
       "class": "machine_path",
       "file": "src/session_archive/discovery.rs",
-      "symbol": "discover_account_homes_from_env",
-      "excerpt": "Some(PathBuf::from(\"C:\\\\claude\")),",
+      "symbol": "claude_root_for",
+      "excerpt": "Some(PathBuf::from(\"C:\\\\claude\"))",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
+      "note": "The Windows arm of the account-home scan root (the fleet's C:/claude layout); every other OS scans $HOME instead (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account Phase 1)."
     },
     {
       "class": "machine_path",

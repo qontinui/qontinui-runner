@@ -207,8 +207,9 @@ fn walk_probe() {}
 /// Checks (in order):
 /// 1. `CLAUDE_CONFIG_DIR` env var
 /// 2. User-configured dirs from settings (validated for `projects/` subfolder)
-/// 3. A hardcoded sweep of `C:\claude\.claude-*\` — EVERY multi-account Claude
-///    config dir on the box, not just this session's
+/// 3. A sweep of `<claude_root>/.claude-*` — `C:\claude` on Windows, `$HOME`
+///    elsewhere (`session_archive::discovery::claude_root_for`) — EVERY
+///    multi-account Claude config dir on the box, not just this session's
 /// 4. `~/.claude` fallback (standard location)
 ///
 /// Step 3 was missing from this list until 2026-08-10, which made the function

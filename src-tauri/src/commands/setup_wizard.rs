@@ -932,13 +932,26 @@ pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
         add(p, &label, "CLAUDE_CONFIG_DIR env var");
     }
 
-    // 2. Scan C:\claude\.claude-*\ (multi-account setups on Windows)
+    // 2. Scan <claude_root>/.claude-*/ (multi-account setups): `C:\claude` on
+    // Windows, the home dir elsewhere (`~/.claude-<x>` beside `~/.claude`).
+    // Same scan root as the session archive's account-home discovery
+    // (`claude_root_for`). The two still differ on purpose: the census also
+    // reads the configured roster and always keeps the default home, which
+    // the wizard skips when per-account homes exist (step 3).
+    let home = dirs::home_dir();
     let mut found_per_account = false;
-    let claude_root = std::path::Path::new("C:\\claude");
-    if claude_root.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(claude_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
+    if let Some(claude_root) = qontinui_runner_lib::session_archive::discovery::claude_root_for(
+        home.as_deref(),
+        cfg!(windows),
+    )
+    .filter(|root| root.is_dir())
+    {
+        if let Ok(entries) = std::fs::read_dir(&claude_root) {
+            // `read_dir` order is filesystem-defined; sort so the wizard lists
+            // homes in the same order every time (as the census does).
+            let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for path in paths {
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name.starts_with(".claude-") {
@@ -952,13 +965,12 @@ pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
         }
     }
 
-    // 3. %USERPROFILE%\.claude (standard location)
-    // Skip the default dir when per-account dirs exist — it always shares
-    // credentials with one of them and would show as a duplicate.
+    // 3. <home>/.claude (standard location; `%USERPROFILE%` on Windows,
+    // `$HOME` elsewhere). Skip the default dir when per-account dirs exist — it
+    // always shares credentials with one of them and would show as a duplicate.
     if !found_per_account {
-        if let Ok(home) = std::env::var("USERPROFILE") {
-            let home_claude = std::path::PathBuf::from(&home).join(".claude");
-            add(home_claude, ".claude", "home directory");
+        if let Some(home) = home {
+            add(home.join(".claude"), ".claude", "home directory");
         }
     }
 
