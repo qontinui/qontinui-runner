@@ -105,6 +105,7 @@ import { useTranscriptSessions } from "../useTranscriptSessions";
 import { useSessionManager } from "../useSessionManager";
 import { deriveSyntheticTabs } from "../syntheticTabs";
 import { planTabReveal } from "../tabReveal";
+import { rightPanelModeAfterRowSelect } from "../sessionManagerLiveRows";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
 import { TerminalOutputCoalescer, base64ToBytes } from "../terminalOutputTap";
 import { noteDecode, transportClockStart } from "../transportStats";
@@ -295,7 +296,14 @@ const PageSessionScope = memo(function PageSessionScope({
   // Live-tab set so the zone layout can exclude exited tombstones from the
   // hidden-but-LIVE "N more" count (and surface them separately).
   const liveTabIds = useMemo(() => new Set(tabs.filter((t) => t.isAlive).map((t) => t.id)), [tabs]);
-  const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds);
+  // Each tab's durable session key: tmux mode's grid snapshot re-finds a
+  // session's zone by it after a runner restart re-creates the session's tab.
+  const sessionKeyByTab = useMemo(() => {
+    const keys = new Map<string, string>();
+    for (const t of tabs) if (t.claudeSessionId) keys.set(t.id, t.claudeSessionId);
+    return keys;
+  }, [tabs]);
+  const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds, sessionKeyByTab);
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
   // (from ZoneMetadataProvider) so each page owns its own labels regardless of
@@ -702,6 +710,8 @@ const PageSessionScope = memo(function PageSessionScope({
     setRightPanelMode: (v) => rightPanelModeSetterRef.current(v as never),
     setSelectedTranscriptSessionId: (v) => selectedSessionSetterRef.current(v as never),
     pageId,
+    // A session the operator resumes is shown (tmux `new-window`; no-op in grid).
+    onResumedTab: zoneLayout.showSpawnedTab,
   });
 
   const getScrollback = useCallback(
@@ -747,7 +757,7 @@ const PageSessionScope = memo(function PageSessionScope({
       selectedSessionSetterRef.current(sessionId);
       rightPanelModeSetterRef.current("transcript" as never);
     },
-    onFocusSessionTab: (sessionId: string, tabId: string) => {
+    onFocusSessionTab: (sessionId: string, tabId: string, source: "transcript" | "tab") => {
       // Defensive: `zoneTabId` only ever names a tab this window owns, but a
       // stale or synthetic id must fall back to the transcript, not a no-op.
       const plan = tabs.some((t) => t.id === tabId)
@@ -760,6 +770,8 @@ const PageSessionScope = memo(function PageSessionScope({
           )
         : null;
       if (!plan) {
+        // A tab row has no transcript to fall back to — its id is a tab id.
+        if (source === "tab") return;
         selectedSessionSetterRef.current(sessionId);
         rightPanelModeSetterRef.current("transcript" as never);
         return;
@@ -776,7 +788,11 @@ const PageSessionScope = memo(function PageSessionScope({
       zoneLayout.requestReveal(tabId);
       // Keep the card highlighted as the current session.
       selectedSessionSetterRef.current(sessionId);
+      // A tab row's id names no transcript: an open transcript panel would
+      // keep painting the previous session's messages under it, so close it.
+      rightPanelModeSetterRef.current((mode) => rightPanelModeAfterRowSelect(source, mode));
     },
+    onCloseSessionTab: terminalManager.closeTerminal,
   });
 
   const workflowGen = useWorkflowGeneration({
@@ -785,6 +801,8 @@ const PageSessionScope = memo(function PageSessionScope({
     loadMessages,
     onNavigateToBuilder,
     onNavigateToActive,
+    pageId,
+    windowLabel: myWindowLabel,
   });
 
   const analysis = useAnalysis({
@@ -805,6 +823,7 @@ const PageSessionScope = memo(function PageSessionScope({
     pendingResumeRef: shellIntegration.pendingResumeRef,
     runGeneration: workflowGen.runGeneration,
     setRightPanelMode: workflowGen.setRightPanelMode,
+    showSpawnedTab: zoneLayout.showSpawnedTab,
   });
 
   // Session summary (AI Tier 2).
