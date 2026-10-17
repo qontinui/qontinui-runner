@@ -75,8 +75,8 @@ fn verify_holder(pane_dir: &Path, pane_id: &PaneId, holder_pid: u32) -> Result<(
                 }) =>
         {
             Err(format!(
-                "pid {holder_pid} is not the holder the lock record names (its start token \
-                 differs): the pid was reused"
+                "pid {holder_pid} is not the live holder the lock record names (its start \
+                 token differs or is gone): the holder has exited or the pid was reused"
             ))
         }
         Some(r) if r.holder_pid == holder_pid => Ok(()),
