@@ -681,8 +681,9 @@ jobs:
       # not_rendered (the inference confirmed) | unknown (a precondition failed).
       # Twice: BEFORE = origin/main's perf-harness (it imports ./perf-harness-lib.mjs
       # and ./lib/... relatively, so its copy sits in scripts/), and the HEAD one.
-      # Only the head run is asserted — `rendered`, and none of its terminals left
-      # behind; the before run is evidence, reported and never gated on.
+      # Only the head run is asserted — `rendered`, none of its terminals left
+      # behind, and its frontend probe measured; the before run is evidence,
+      # reported and never gated on.
       # UNMEASURED until its first CI run: two subject launches, a 45 s soak and
       # teardown each, estimated at about 4 minutes apiece; 30 minutes is a
       # generous first bound.
@@ -719,13 +720,13 @@ jobs:
           {
             echo "### Settle perf-harness's inactive-page inference (S = 10)"
             echo
-            echo "| perf-harness | verdict | sessions seen | generators | perf-harness exit | terminals left |"
-            echo "|---|---|---|---|---|---|"
+            echo "| perf-harness | verdict | sessions seen | generators | perf-harness exit | terminals left | frontend |"
+            echo "|---|---|---|---|---|---|---|"
             for which in before head; do
               if [ -f "$out/$which.json" ]; then
-                jq -r --arg w "$which" '"| \($w) | \(.verdict) | \(.sessionsSeen | map(tostring) | join(",")) | \(.generatorsStarted)/\(.sessions) | \(.perfHarnessExit.code // "?") | \(.terminalsLeftAfterHarness // "UNKNOWN") |"' "$out/$which.json"
+                jq -r --arg w "$which" '"| \($w) | \(.verdict) | \(.sessionsSeen | map(tostring) | join(",")) | \(.generatorsStarted)/\(.sessions) | \(.perfHarnessExit.code // "?") | \(.terminalsLeftAfterHarness // "UNKNOWN") | \((.perfHarnessRun.levels[0] // {}) as $l | (if $l.frontend then "frame p95 \($l.frontend.frameTimeMs.p95 // "?") ms" else "UNKNOWN: \(($l.frontendError // "no level") | .[0:120])" end)) |"' "$out/$which.json"
               else
-                echo "| $which | (no result file) | | | | |"
+                echo "| $which | (no result file) | | | | | |"
               fi
             done
             echo
@@ -745,6 +746,17 @@ jobs:
           fi
           if [ "$head_left" != 0 ]; then
             echo "::error::the head perf-harness left $head_left of its terminals behind (expected 0)"
+            rc=1
+          fi
+          # Plan 2026-10-14-perf-harness-frontend-probe-evaluates-strings-the-csp-refuses:
+          # the head harness's frontend probe (the bundled perf-probe component, no
+          # page/evaluate) must have MEASURED, not merely run. Printed to the log too,
+          # because the result files are uploaded only on failure.
+          head_frontend="$(jq -r '(.perfHarnessRun.levels[0] // {}) as $l | if $l.frontend then "measured" else "UNKNOWN: \($l.frontendError // "no level recorded")" end' "$head")"
+          echo "head perf-harness frontend: $head_frontend"
+          jq -c '.perfHarnessRun.levels[0].frontend // null' "$head"
+          if [ "$head_frontend" != measured ]; then
+            echo "::error::the head perf-harness measured no frontend: $head_frontend"
             rc=1
           fi
           exit "$rc"
