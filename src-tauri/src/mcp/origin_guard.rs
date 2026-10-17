@@ -284,7 +284,6 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",
     "GET /vga/capture",
-    "POST /gui-config/capture-elements",
     "/install-effects/registry-credentials/*",
     "/ui-bridge/test/coord-mcp/seed-agent-token",
     "/settings/self-healing/api-key",
