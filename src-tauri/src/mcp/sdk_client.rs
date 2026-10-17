@@ -9184,14 +9184,27 @@ mod connect_bearer_scope_tests {
             String::from_utf8_lossy(&head).into_owned()
         }
 
+        // Served with rustls, the stack the production reqwest client speaks,
+        // NOT native-tls: rcgen mints an ECDSA P-256 key, and native-tls's
+        // SChannel `Identity::from_pkcs8` imports the key into an RSA-only
+        // CryptoAPI container, so on Windows it fails with
+        // CRYPT_E_ASN1_BADTAG ("ASN1 bad tag value met"). rustls is pure Rust
+        // and takes the same DER on every platform. The provider is named
+        // because both of rustls's crypto features are on in this graph, which
+        // makes the process-default lookup ambiguous.
         let cert = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
-        let identity = native_tls::Identity::from_pkcs8(
-            cert.cert.pem().as_bytes(),
-            cert.signing_key.serialize_pem().as_bytes(),
-        )
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+        );
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], key)
         .unwrap();
-        let acceptor =
-            tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         let plaintext_auth: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
