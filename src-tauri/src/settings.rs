@@ -4258,7 +4258,9 @@ impl ConfigDirSource {
 pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
     resolve_config_dir_from(
         std::env::var("QONTINUI_CONFIG_DIR").ok(),
-        dirs::config_dir(),
+        qontinui_runner_lib::instance_env::platform_dir(
+            qontinui_runner_lib::instance_env::PlatformDir::Config,
+        ),
     )
 }
 
@@ -4271,16 +4273,14 @@ pub(crate) fn resolve_config_dir_from(
     env_config_dir: Option<String>,
     platform_config_dir: Option<PathBuf>,
 ) -> Result<(PathBuf, ConfigDirSource), String> {
-    env_config_dir
-        .filter(|s| !s.is_empty())
-        .map(|s| (PathBuf::from(s), ConfigDirSource::EnvConfigDir))
-        .or_else(|| {
-            platform_config_dir.map(|d| {
-                (
-                    d.join("com.qontinui.runner"),
-                    ConfigDirSource::PlatformConfigDir,
-                )
-            })
+    qontinui_runner_lib::instance_env::runner_config_dir_from(env_config_dir, platform_config_dir)
+        .map(|(dir, from_env)| {
+            let source = if from_env {
+                ConfigDirSource::EnvConfigDir
+            } else {
+                ConfigDirSource::PlatformConfigDir
+            };
+            (dir, source)
         })
         .ok_or_else(|| "Failed to get config directory".to_string())
 }
@@ -4980,8 +4980,9 @@ pub fn load_settings_full() -> LoadedSettings {
     // Tier env-var overlay. In-memory only; never persisted. Lets a parent
     // process (notably the supervisor spawning a temp runner) force the
     // booted runner onto a specific tier without writing to the shared
-    // settings.json — which is keyed off `dirs::config_dir()` and is the
-    // same file for primary + temp + named runners. Persisting tier=Local
+    // settings.json — which is keyed off the platform config dir and is the
+    // same file for primary + temp + named runners that carry no
+    // `QONTINUI_CONFIG_DIR`. Persisting tier=Local
     // for a temp runner would silently strip the primary runner's Tier 2
     // state, so the only safe override is this in-memory overlay.
     if let Ok(raw) = std::env::var("QONTINUI_RUNNER_TIER") {

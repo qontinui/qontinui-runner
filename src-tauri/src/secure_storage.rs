@@ -707,12 +707,8 @@ impl SecureStorage {
     ///
     /// The storage file will be created in the app's data directory.
     pub fn new() -> Result<Self> {
-        let data_dir = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-            .or_else(|| dirs::data_local_dir().map(|d| d.join(SERVICE_NAME)))
-            .context("Failed to get data directory")?;
+        let data_dir =
+            crate::instance_env::secure_storage_dir().context("Failed to get data directory")?;
 
         // Ensure directory exists
         fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
