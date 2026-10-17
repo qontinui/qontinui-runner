@@ -2,7 +2,8 @@
  * Frontend half of the terminal-output transport counters (plan
  * `2026-09-20-terminal-output-transport-is-unmeasured-encoded-broadcast`,
  * Phase 1). Exposed on `window.__qontinuiTransportStats`, read (and reset) by
- * `scripts/perf-harness.mjs` through the UI Bridge `page/evaluate` probe, and
+ * `scripts/perf-harness.mjs` through the `perf-probe` UI Bridge component
+ * (`src/lib/perfProbe.ts` — eval-free; the CSP refuses `page/evaluate`), and
  * paired there with the runner's `GET /terminals/transport-stats`.
  *
  * What each counter measures — and where it is fed from:
