@@ -905,7 +905,7 @@ CREATE TABLE agent.work_artifact_edges (
     CONSTRAINT ck_work_artifact_edges_followup_only_columns CHECK (((relation = 'spawned_followup'::text) OR ((resolution IS NULL) AND (resolution_pr IS NULL) AND (resolution_commit IS NULL) AND (resolution_note IS NULL) AND (resolved_by IS NULL) AND (resolved_at IS NULL) AND (size_class IS NULL) AND (size_class_source IS NULL) AND (unanchored_reason IS NULL) AND (resolution_history = '[]'::jsonb)))),
     CONSTRAINT ck_work_artifact_edges_open_carries_no_resolution CHECK (((resolution IS NOT NULL) OR ((resolution_pr IS NULL) AND (resolution_commit IS NULL) AND (resolution_note IS NULL) AND (resolved_by IS NULL) AND (resolved_at IS NULL)))),
     CONSTRAINT ck_work_artifact_edges_open_target CHECK (((relation = 'spawned_followup'::text) OR (to_id IS NOT NULL))),
-    CONSTRAINT ck_work_artifact_edges_relation CHECK ((relation = ANY (ARRAY['produced_report'::text, 'feeds'::text, 'authored_plan'::text, 'supersedes'::text, 'depends_on'::text, 'spawned_followup'::text, 'refutes'::text]))),
+    CONSTRAINT ck_work_artifact_edges_relation CHECK ((relation = ANY (ARRAY['produced_report'::text, 'feeds'::text, 'authored_plan'::text, 'supersedes'::text, 'depends_on'::text, 'spawned_followup'::text, 'refutes'::text, 'derives_from'::text, 'refines'::text, 'implements'::text, 'verifies'::text, 'traces_to'::text]))),
     CONSTRAINT ck_work_artifact_edges_resolution CHECK ((resolution = ANY (ARRAY['fixing'::text, 'fixed'::text, 'already_fixed'::text, 'dismissed'::text]))),
     CONSTRAINT ck_work_artifact_edges_resolution_commit_required CHECK (((resolution IS DISTINCT FROM 'already_fixed'::text) OR (resolution_commit IS NOT NULL))),
     CONSTRAINT ck_work_artifact_edges_resolution_commit_shape CHECK ((resolution_commit ~ '^[0-9a-f]{7,64}$'::text)),
@@ -919,6 +919,19 @@ CREATE TABLE agent.work_artifact_edges (
     CONSTRAINT ck_work_artifact_edges_size_class_source CHECK ((size_class_source = ANY (ARRAY['declared'::text, 'sweep'::text]))),
     CONSTRAINT ck_work_artifact_edges_unanchored_reason_nonblank CHECK (((unanchored_reason IS NULL) OR (btrim(unanchored_reason, ' 	
 v'::text) <> ''::text)))
+);
+
+
+--
+-- Name: work_artifact_spec_ref_counters; Type: TABLE; Schema: agent; Owner: -
+--
+
+CREATE TABLE agent.work_artifact_spec_ref_counters (
+    organization_scope uuid NOT NULL,
+    kind text NOT NULL,
+    last_number integer NOT NULL,
+    CONSTRAINT ck_spec_ref_counters_kind CHECK ((kind = ANY (ARRAY['request'::text, 'requirement'::text, 'interface_mapping'::text, 'story'::text, 'test_case'::text, 'doc_correction'::text]))),
+    CONSTRAINT ck_spec_ref_counters_positive CHECK ((last_number >= 1))
 );
 
 
@@ -969,12 +982,23 @@ CREATE TABLE agent.work_artifacts (
     difficulty_source text,
     difficulty_rubric_version integer,
     difficulty_signals jsonb,
+    spec_ref text,
     CONSTRAINT ck_work_artifacts_captured_by CHECK ((captured_by = ANY (ARRAY['runner_scan'::text, 'agent'::text, 'operator'::text]))),
     CONSTRAINT ck_work_artifacts_difficulty CHECK ((difficulty = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text]))),
     CONSTRAINT ck_work_artifacts_difficulty_conceptual CHECK ((difficulty_conceptual = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text]))),
     CONSTRAINT ck_work_artifacts_difficulty_implementation CHECK ((difficulty_implementation = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text]))),
     CONSTRAINT ck_work_artifacts_difficulty_source CHECK ((difficulty_source = ANY (ARRAY['declared'::text, 'computed'::text]))),
-    CONSTRAINT ck_work_artifacts_kind CHECK ((kind = ANY (ARRAY['investigation_prompt'::text, 'plan_authoring_prompt'::text, 'implementation_prompt'::text, 'investigation_report'::text, 'handoff'::text, 'plan'::text, 'diagnostic'::text])))
+    CONSTRAINT ck_work_artifacts_kind CHECK ((kind = ANY (ARRAY['investigation_prompt'::text, 'plan_authoring_prompt'::text, 'implementation_prompt'::text, 'investigation_report'::text, 'handoff'::text, 'plan'::text, 'diagnostic'::text, 'request'::text, 'requirement'::text, 'interface_mapping'::text, 'story'::text, 'test_case'::text, 'doc_correction'::text]))),
+    CONSTRAINT ck_work_artifacts_spec_ref CHECK (
+CASE kind
+    WHEN 'request'::text THEN ((spec_ref IS NOT NULL) AND (spec_ref ~ '^RQ-[0-9]{4,}$'::text))
+    WHEN 'requirement'::text THEN ((spec_ref IS NOT NULL) AND (spec_ref ~ '^REQ-[0-9]{4,}$'::text))
+    WHEN 'interface_mapping'::text THEN ((spec_ref IS NOT NULL) AND (spec_ref ~ '^IFM-[0-9]{4,}$'::text))
+    WHEN 'story'::text THEN ((spec_ref IS NOT NULL) AND (spec_ref ~ '^STY-[0-9]{4,}$'::text))
+    WHEN 'test_case'::text THEN ((spec_ref IS NOT NULL) AND (spec_ref ~ '^TC-[0-9]{4,}$'::text))
+    WHEN 'doc_correction'::text THEN ((spec_ref IS NOT NULL) AND (spec_ref ~ '^DOC-[0-9]{4,}$'::text))
+    ELSE (spec_ref IS NULL)
+END)
 );
 
 
@@ -4796,6 +4820,47 @@ CREATE TABLE coord.flag_registry (
     description text NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT flag_registry_sense_chk CHECK ((sense = ANY (ARRAY['enable'::text, 'disable'::text])))
+);
+
+
+--
+-- Name: fleet_placement_plans; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.fleet_placement_plans (
+    id bigint NOT NULL,
+    tenant_id uuid NOT NULL,
+    computed_at timestamp with time zone DEFAULT now() NOT NULL,
+    model_version integer NOT NULL,
+    mode text NOT NULL,
+    inputs_digest text NOT NULL,
+    inputs_coverage jsonb NOT NULL,
+    hosts jsonb NOT NULL,
+    repos jsonb NOT NULL,
+    advice jsonb DEFAULT '[]'::jsonb NOT NULL,
+    predicted_ttm_delta_secs double precision,
+    predicted_delta_basis text
+);
+
+
+--
+-- Name: COLUMN fleet_placement_plans.predicted_ttm_delta_secs; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.fleet_placement_plans.predicted_ttm_delta_secs IS 'Predicted change in mean time to merge for the tenant''s queued PRs, seconds, negative = faster. NULL = UNKNOWN (no repo had a known speed factor and a known candidate baseline), never zero.';
+
+
+--
+-- Name: fleet_placement_plans_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+ALTER TABLE coord.fleet_placement_plans ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME coord.fleet_placement_plans_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
 );
 
 
@@ -20237,6 +20302,14 @@ ALTER TABLE ONLY agent.memory_query_cache
 
 
 --
+-- Name: work_artifact_spec_ref_counters pk_work_artifact_spec_ref_counters; Type: CONSTRAINT; Schema: agent; Owner: -
+--
+
+ALTER TABLE ONLY agent.work_artifact_spec_ref_counters
+    ADD CONSTRAINT pk_work_artifact_spec_ref_counters PRIMARY KEY (organization_scope, kind);
+
+
+--
 -- Name: plan_difficulty_model_routes plan_difficulty_model_routes_pkey; Type: CONSTRAINT; Schema: agent; Owner: -
 --
 
@@ -21218,6 +21291,14 @@ ALTER TABLE ONLY coord.findings
 
 ALTER TABLE ONLY coord.flag_registry
     ADD CONSTRAINT flag_registry_pkey PRIMARY KEY (flag_name);
+
+
+--
+-- Name: fleet_placement_plans fleet_placement_plans_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.fleet_placement_plans
+    ADD CONSTRAINT fleet_placement_plans_pkey PRIMARY KEY (id);
 
 
 --
@@ -26085,6 +26166,13 @@ CREATE UNIQUE INDEX uq_work_artifacts_identity ON agent.work_artifacts USING btr
 
 
 --
+-- Name: uq_work_artifacts_spec_ref; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_work_artifacts_spec_ref ON agent.work_artifacts USING btree (COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid), spec_ref) WHERE (spec_ref IS NOT NULL);
+
+
+--
 -- Name: idx_proposal_events_app_id; Type: INDEX; Schema: atlas_managed; Owner: -
 --
 
@@ -29811,6 +29899,20 @@ CREATE INDEX ix_expedited_land_requests_reconcile ON coord.expedited_land_reques
 --
 
 CREATE INDEX ix_expedited_land_requests_repo_window ON coord.expedited_land_requests USING btree (tenant_id, repo, created_at) WHERE ((NOT shadow) AND (parent_request_id IS NULL));
+
+
+--
+-- Name: ix_fleet_placement_plans_computed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_fleet_placement_plans_computed ON coord.fleet_placement_plans USING btree (computed_at);
+
+
+--
+-- Name: ix_fleet_placement_plans_tenant_computed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_fleet_placement_plans_tenant_computed ON coord.fleet_placement_plans USING btree (tenant_id, computed_at DESC);
 
 
 --
