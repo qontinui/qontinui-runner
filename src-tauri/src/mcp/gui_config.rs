@@ -4,21 +4,15 @@
 //! (QontinuiConfig format) from caller-supplied element images, plus the
 //! window-focus and executor-start helpers.
 //!
-//! ## The element-capture routes are gone, and answer 410
+//! ## The element-capture routes were deleted
 //!
 //! `POST /gui-config/capture-elements` and `POST /gui-config/capture-multi-state`
-//! used to dispatch the Python commands `gui_config_capture_elements` /
-//! `gui_config_capture_multi_state`, which fetched element images from
+//! used to dispatch Python commands that fetched element images from
 //! `POST /ui-bridge/control/capture-element-images` — an html2canvas render in
 //! the frontend. That runner route was deleted by the vision-pipeline Phase 2
-//! (#119), so the pipeline already failed on every call. qontinui-runner#2242
-//! then deleted the frontend `capture_element_images` handler and html2canvas
-//! itself, and the Python commands were deleted after it.
-//!
-//! The two routes stay mounted only so a remaining external caller (the
-//! qontinui-mcp `capture_gui_elements` / `capture_multi_state_gui_config` tools)
-//! gets an explicit `410 Gone` naming the removal instead of a bare 404 or a
-//! Python "unknown command". They never reach the executor.
+//! (#119), and qontinui-runner#2242 deleted the frontend handler and
+//! html2canvas itself. Their only caller, qontinui-mcp's two capture tools, was
+//! deleted by qontinui-mcp#10, so the routes are gone too (404).
 
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Deserialize;
@@ -96,21 +90,6 @@ fn runner_window_has_foreground(_app_handle: &tauri::AppHandle) -> Result<bool, 
 // ============================================================================
 // Handlers
 // ============================================================================
-
-/// Why both element-capture routes answer 410 — see the module docs.
-const CAPTURE_REMOVED_MESSAGE: &str = "unsupported: GUI element capture was removed — the \
-     html2canvas DOM capture it depended on is gone (/ui-bridge/control/capture-element-images \
-     in #119, the frontend handler in qontinui-runner#2242). Supply element images to \
-     POST /gui-config/build yourself, or capture through /ui-bridge/vision/*.";
-
-/// POST /gui-config/capture-elements and POST /gui-config/capture-multi-state
-///
-/// Always `410 Gone` with [`CAPTURE_REMOVED_MESSAGE`]. No body is read and the
-/// Python executor is never contacted.
-pub async fn capture_removed() -> (StatusCode, Json<ApiResponse<()>>) {
-    warn!("GUI Config: element-capture route called after its removal (#2242)");
-    (StatusCode::GONE, Json(api_error(CAPTURE_REMOVED_MESSAGE)))
-}
 
 /// POST /gui-config/build
 ///
@@ -263,26 +242,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
 
     axum::Router::new()
-        .route("/gui-config/capture-elements", post(capture_removed))
         .route("/gui-config/build", post(build_gui_config))
-        .route("/gui-config/capture-multi-state", post(capture_removed))
         .route("/gui-config/focus-window", post(focus_window))
         .route("/gui-config/start-executor", post(start_executor))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Both removed capture routes answer 410 with a message naming the
-    /// removal, so a remaining caller learns why rather than seeing a 404.
-    #[tokio::test]
-    async fn capture_removed_answers_gone_and_names_the_removal() {
-        let (status, Json(body)) = capture_removed().await;
-        assert_eq!(status, StatusCode::GONE);
-        assert!(!body.success);
-        let error = body.error.expect("410 body carries an error message");
-        assert!(error.starts_with("unsupported:"), "{error}");
-        assert!(error.contains("#2242"), "{error}");
-    }
 }
