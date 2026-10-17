@@ -2641,3 +2641,57 @@ async fn an_http_apps_failure_answers_the_agent_with_its_code() {
         "{body}"
     );
 }
+
+/// The HTTP twin of the wrapper's structured failure. An HTTP-transport app
+/// that answers with the wrapper's object `error`, `{code, message,
+/// retryable}`, reaches the agent through the same door with that code, that
+/// message and that retry verdict, as the WebSocket arm reports a wrapper's
+/// failure frame. Before, the object read as "Unknown error from SDK app",
+/// with no code and retryability `null`.
+#[tokio::test]
+async fn an_http_apps_object_error_answers_the_agent_with_its_code_and_retry_verdict() {
+    let s = spawn_routed(None, BindingConfig::default(), relay_doors).await;
+    let app = Router::new().route(
+        "/dispatch",
+        post(|| async {
+            Json(json!({
+                "success": false,
+                "error": {
+                    "code": "APP_BUSY",
+                    "message": "The app is busy rendering; try again",
+                    "retryable": true,
+                },
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "http-app", "appName": "HTTP app", "appType": "web",
+                    "transport": "http",
+                    "baseUrl": format!("http://127.0.0.1:{app_port}") }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = tokio::time::timeout(PROMPT, s.app_dispatch("http-app"))
+        .await
+        .expect("the agent is answered when the app answers")
+        .unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(code(&body), Some("APP_BUSY"), "{body}");
+    assert_eq!(body["hint"]["failure_origin"], "app", "{body}");
+    assert_eq!(body["hint"]["retryable"], true, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("The app is busy rendering")),
+        "{body}"
+    );
+}
