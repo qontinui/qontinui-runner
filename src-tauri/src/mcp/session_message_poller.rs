@@ -2544,7 +2544,7 @@ mod tests {
         // must not come back, and every miss site must route through
         // `surface_blocked_delivery` — the one door that counts, logs and
         // surfaces.
-        let src = include_str!("session_message_poller.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("session_message_poller.rs"));
         let start = src
             .find("async fn deliver_once(")
             .expect("deliver_once is defined in this file");

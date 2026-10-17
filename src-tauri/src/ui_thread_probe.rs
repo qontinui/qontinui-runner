@@ -358,11 +358,7 @@ mod tests {
             concat!("Send", "Message"),
             concat!("WM_", "GETTEXT"),
         ];
-        let src = include_str!("ui_thread_probe.rs");
-        let production = src
-            .split_once("#[cfg(test)]")
-            .map(|(head, _)| head)
-            .expect("this module has a test block to split on");
+        let production = crate::source_pin::ProdSource::of(include_str!("ui_thread_probe.rs"));
         let code: String = production
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))

@@ -1861,33 +1861,6 @@ mod tests {
 
     // ---- the guard cannot be silently discarded ----
 
-    /// The production half of a source file, with its test module cut off.
-    ///
-    /// Same rule, and same reason, as `fleet.rs`'s writer pin: a pin must never
-    /// scan `#[cfg(test)]` code, or a negative assertion matches its OWN string
-    /// literals — which is exactly how the first version of this pin failed,
-    /// reporting two offenders that were both this test's search patterns.
-    fn prod_part(src: &str) -> &str {
-        src.split_once("\n#[cfg(test)]\nmod ")
-            .map_or(src, |(before, _)| before)
-    }
-
-    /// Strip whole-line comments, then all whitespace.
-    ///
-    /// Comments are dropped FIRST and deliberately: `BlockingSlot`'s own doc
-    /// names the forbidden spelling in prose (it has to — that is the thing a
-    /// reader must be warned about), and a pin that could not tell a warning
-    /// apart from a call site would fail on the very documentation that
-    /// explains it. Whitespace then goes so the pin matches regardless of how
-    /// `rustfmt` wrapped the line — same technique as `fleet.rs`'s writer pin.
-    fn squeezed_code(src: &str) -> String {
-        src.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .flat_map(|l| l.chars())
-            .filter(|c| !c.is_whitespace())
-            .collect()
-    }
-
     /// Every `.rs` file under `src/`, lib and bin trees alike.
     fn all_sources() -> Vec<(std::path::PathBuf, String)> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1931,7 +1904,19 @@ mod tests {
         let mut offenders = Vec::new();
         let mut bindings = 0usize;
         for (path, text) in all_sources() {
-            let code = squeezed_code(prod_part(&text));
+            // Production half only — a pin must never scan `#[cfg(test)]` code,
+            // or it matches its own needles (this pin's first version reported
+            // two offenders that were both its own search patterns). A file that
+            // IS a test module (`foo/tests.rs`) has no production half to cut to
+            // and is scanned whole, as it always was.
+            let code = crate::source_pin::ProdSource::try_of(&text)
+                .unwrap_or_else(|_| {
+                    crate::source_pin::ProdSource::whole(
+                        &text,
+                        "a whole-file test module has no production half to cut to",
+                    )
+                })
+                .squeezed();
             // A bare `…enter();` statement, and `let _ = …enter();`. The
             // fully-qualified paths end in the same suffix, so matching on the
             // suffix covers `qontinui_runner_lib::wedge_diagnostics::` too.
@@ -2011,44 +1996,25 @@ mod tests {
     /// `include_str!` rather than a directory walk: the compiler resolves it, so
     /// this pin cannot end up scanning the wrong tree and passing vacuously.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_public_spawn_wrapper_only_delegates() {
-        const SRC: &str = include_str!("wedge_diagnostics.rs");
         const SIGNATURE: &str = "pub fn spawn_blocking_tracked<F, R>(f: F)";
 
-        // Search the PRODUCTION half only, via the same `prod_part` helper the
-        // sibling pin uses. `SIGNATURE` also occurs in this test's own `const`
-        // above, so a raw `SRC.find` would match THAT the moment the real wrapper
-        // is renamed: the "could not find" panic below could then never fire, the
-        // slice would run to the end of the test module, and the delegation
-        // assertion would pass off this very failure message's text. Measured by
-        // the reviewer who caught it — a 22,879-char pseudo-body that reddened
-        // only by accident and reported a false cause.
-        let src = prod_part(SRC);
-
-        // The POSITIVE half first. A pin that only asserts an absence passes the
-        // day the function is renamed — the same vacuity the `bindings` floor
-        // above exists to prevent.
-        let start = src.find(SIGNATURE).unwrap_or_else(|| {
-            panic!(
-                "this pin could not find `{SIGNATURE}` in the production half of this \
-                 module. If the wrapper was renamed or its signature reformatted, \
-                 update this pin in the same change — otherwise it silently stops \
-                 guarding anything."
-            )
-        });
-        let body_start = start
-            + src[start..]
-                .find('{')
-                .expect("the wrapper must have a body");
-        let body_end = body_start
-            + src[body_start..]
-                .find("\n}\n")
-                .expect("the wrapper's body must be closed at column 0");
-        let raw_body = &src[body_start..body_end];
+        // The PRODUCTION half only, through `ProdSource`. `SIGNATURE` also occurs
+        // in this test's own `const` above, so a raw search of the whole file
+        // would match THAT the moment the real wrapper is renamed: the "could not
+        // find" failure could then never fire, the slice would run to the end of
+        // the test module, and the delegation assertion would pass off this very
+        // failure message's text. Measured by the reviewer who caught it — a
+        // 22,879-char pseudo-body that reddened only by accident and reported a
+        // false cause (occurrence 17).
+        //
+        // `body_of` is the POSITIVE half: it panics unless the signature occurs
+        // exactly once in production — a pin that only asserts an absence passes
+        // the day the function is renamed, the same vacuity the `bindings` floor
+        // above exists to prevent — and it bounds the RAW body on both sides
+        // (~780 bytes measured 2026-09-29, most of it the body's own comment).
+        let src = crate::source_pin::ProdSource::of(include_str!("wedge_diagnostics.rs"));
+        let raw_body = src.body_of(SIGNATURE, 100..3_000);
 
         // Comments are stripped BEFORE matching, for the same reason
         // `no_call_site_discards_a_blocking_slot` does it: this wrapper's own body
@@ -2057,7 +2023,7 @@ mod tests {
         // documentation that justifies it. (It did: the first version of this pin
         // reddened the clean tree, which is also why a pin must be proven to pass
         // before its mutation verdict means anything.)
-        let body = squeezed_code(raw_body);
+        let body = crate::source_pin::squeeze(raw_body);
 
         // BOTH bounds, because the two mis-parses are opposite and each one makes
         // this pin useless in its own way: a collapsed slice asserts nothing, and a

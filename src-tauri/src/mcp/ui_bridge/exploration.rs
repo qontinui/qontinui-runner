@@ -634,8 +634,8 @@ mod stop_uses_the_shared_classifier_tests {
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
-    fn stop_handler_body() -> &'static str {
-        let src = include_str!("exploration.rs");
+    fn stop_handler_body() -> String {
+        let src = crate::source_pin::ProdSource::of(include_str!("exploration.rs"));
         let start = src
             .find("pub async fn stop_ui_bridge_exploration")
             .expect("the stop handler is in this file");
@@ -643,7 +643,7 @@ mod stop_uses_the_shared_classifier_tests {
         let end = rest
             .find("\n/// Discover states from render logs")
             .expect("the stop handler is followed by discover_states_from_renders");
-        &rest[..end]
+        rest[..end].to_string()
     }
 
     #[test]

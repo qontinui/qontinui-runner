@@ -778,15 +778,18 @@ mod tests {
     /// Both write handlers gate the probe on the requester BEFORE persisting.
     #[test]
     fn both_task_write_handlers_gate_the_probe_before_persisting() {
-        let src = include_str!("scheduler.rs");
+        // The write needles omit the `pg` receiver: rustfmt wraps the update
+        // call as `pg\n        .update_scheduled_task(`, so `pg.update_…(`
+        // matched only this test's own literal while it scanned its own file.
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler.rs"));
         for (handler, write) in [
             (
                 "pub async fn create_scheduled_task(",
-                "pg.insert_scheduled_task(",
+                ".insert_scheduled_task(",
             ),
             (
                 "pub async fn update_scheduled_task(",
-                "pg.update_scheduled_task(",
+                ".update_scheduled_task(",
             ),
         ] {
             let (_, body) = src.split_once(handler).expect(handler);
@@ -807,7 +810,7 @@ mod tests {
     /// exemption was a read-then-write TOCTOU).
     #[test]
     fn the_update_is_a_conditional_write_on_the_modified_at_it_read() {
-        let src = include_str!("scheduler.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler.rs"));
         let (_, body) = src
             .split_once("pub async fn update_scheduled_task(")
             .expect("update handler");
@@ -830,7 +833,7 @@ mod tests {
     /// wake handler skips instead of waiting.
     #[test]
     fn reconcile_now_and_the_wake_handler_never_wait_behind_a_pass() {
-        let src = include_str!("scheduler.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler.rs"));
         let (_, body) = src
             .split_once("pub async fn reconcile_now(")
             .expect("reconcile_now");
@@ -873,7 +876,7 @@ mod tests {
     /// conditions only when the request carried them.
     #[test]
     fn the_task_api_reads_stored_rows_and_writes_conditions_only_when_sent() {
-        let src = include_str!("scheduler.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler.rs"));
         for handler in [
             "pub async fn list_scheduled_tasks(",
             "pub async fn get_scheduled_task(",
@@ -915,7 +918,7 @@ mod tests {
     /// deletable rather than a 500.
     #[test]
     fn delete_checks_existence_against_the_stored_row() {
-        let src = include_str!("scheduler.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler.rs"));
         let (_, body) = src
             .split_once("pub async fn delete_scheduled_task(")
             .expect("delete handler");

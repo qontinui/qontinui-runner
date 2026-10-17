@@ -1162,7 +1162,7 @@ mod tests {
     /// on its `modified_at`, and no executor write bumps `modified_at`.
     #[test]
     fn executor_writes_are_conditional_and_do_not_bump_modified_at() {
-        let src = include_str!("scheduler.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler.rs"));
         let (_, executor) = src
             .split_once("// Every write below is an EXECUTOR write")
             .expect("executor section");

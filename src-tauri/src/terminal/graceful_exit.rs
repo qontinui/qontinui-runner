@@ -1446,11 +1446,8 @@ mod tests {
     /// the production close is `TerminalManager::graceful_exit`'s.
     #[test]
     fn this_module_contains_no_kill_path() {
-        let source = include_str!("graceful_exit.rs");
+        let source = crate::source_pin::ProdSource::of(include_str!("graceful_exit.rs"));
         let production: String = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("module has a production section")
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()

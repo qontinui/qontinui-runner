@@ -3896,7 +3896,7 @@ mod tests {
     /// before acting on it (source-scan: the reconciler needs a database).
     #[test]
     fn the_reconciler_gates_catch_up_for_conditioned_tasks() {
-        let src = include_str!("scheduler_service.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler_service.rs"));
         let (_, body) = src
             .split_once("async fn reconcile_task(")
             .expect("reconcile_task exists");
@@ -4003,7 +4003,7 @@ mod tests {
     /// `execute_task_with_context` starts only through the atomic mark.
     #[test]
     fn execute_task_starts_only_through_the_atomic_mark() {
-        let src = include_str!("scheduler_service.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler_service.rs"));
         let (_, body) = src
             .split_once("async fn execute_task_with_context(")
             .expect("execute_task_with_context");
@@ -4018,7 +4018,7 @@ mod tests {
     /// snapshot-conditional clear lands; a lost race records nothing.
     #[test]
     fn a_condition_timeout_records_only_after_the_conditional_clear_lands() {
-        let src = include_str!("scheduler_service.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("scheduler_service.rs"));
         let (_, body) = src
             .split_once("async fn record_condition_timeout(")
             .expect("record_condition_timeout");

@@ -2434,15 +2434,7 @@ mod tests {
     /// reads process-global env that parallel test threads mutate.
     #[test]
     fn the_periodic_surveyor_is_instance_gated() {
-        const SRC: &str = include_str!("disk_survey.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("disk_survey.rs"));
         let spawn = prod
             .split_once("pub fn spawn_disk_surveyor() {")
             .map(|(_, after)| after)
