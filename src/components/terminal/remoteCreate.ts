@@ -231,7 +231,7 @@ export function describeRemoteCreateFailure(err: unknown): RemoteCreateRefusal {
       headline: "The target runner itself refuses remote creates",
       remedy: [
         "coord minted the grant, and the target's OWN dial still said no — the runner enforces its local setting.",
-        "Set `remote_create.accept_remote_create` to `same_user` or `tenant` in that runner's settings.json.",
+        "On that device, open Settings → Advanced → Remote session creation and choose `Same user` or `Whole tenant` (stored as `remote_create.accept_remote_create` in its settings.json).",
         "The two stores are mirrored, so a disagreement here usually means the mirror has not run since the change.",
       ],
     };
