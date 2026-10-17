@@ -32,6 +32,10 @@ serde_json = "1"
 # (`src-tauri/Cargo.toml`), so the runner's in-process `LocalPty` and the
 # holder drive one PTY implementation, not two.
 portable-pty = "0.8"
+# Phase 2b (plan D14): the attach restore payload's mode tracker. The same
+# version src-tauri's `Grid` parses with (`src-tauri/Cargo.toml`), so the holder
+# and the runner read one VT grammar.
+vte = "0.15"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
