@@ -15,16 +15,19 @@
 //! `WrapperManager` instead; the two managers can coexist behind their
 //! respective HTTP routes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
+
+use crate::process_helpers::ChildTreeGuard;
 
 use super::credentials::CredentialStore;
 use super::manifest::WrapperManifest;
@@ -41,14 +44,114 @@ const SPAWN_READY_POLL: Duration = Duration::from_millis(150);
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Max consecutive health failures before we mark the wrapper degraded.
 pub const HEALTH_MAX_RETRIES: u32 = 3;
+/// Readiness wait for a browser transport (`headless` / `headed`): `node`
+/// plus a Chromium launch. Measured 2026-10-17 on a Linux box under load
+/// average ~32: a headless transport reached `ready()` in 389-402 ms warm;
+/// a headed launch on a cold Windows desktop is slower and unmeasured, so the
+/// browser kinds get twice `api`'s budget rather than the same.
+const BROWSER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The readiness wait for a wrapper declaring `transport`.
+fn ready_timeout_for(transport: &str) -> Duration {
+    match transport {
+        "headless" | "headed" => BROWSER_SPAWN_READY_TIMEOUT,
+        _ => SPAWN_READY_TIMEOUT,
+    }
+}
+
+/// Lines of wrapper output kept for a spawn-failure error.
+const OUTPUT_TAIL_LINES: usize = 40;
+/// Longest single kept line, and the most the error quotes in total.
+const OUTPUT_LINE_MAX: usize = 400;
+const OUTPUT_ERROR_MAX: usize = 2000;
+
+/// A bounded ring of the wrapper's recent output lines.
+#[derive(Clone, Default)]
+struct OutputTail(Arc<std::sync::Mutex<VecDeque<String>>>);
+
+impl OutputTail {
+    fn push(&self, line: &str) {
+        let mut line = redact_query(line.trim_end());
+        if line.len() > OUTPUT_LINE_MAX {
+            let mut cut = OUTPUT_LINE_MAX;
+            while !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            line.truncate(cut);
+            line.push('…');
+        }
+        if let Ok(mut q) = self.0.lock() {
+            if q.len() == OUTPUT_TAIL_LINES {
+                q.pop_front();
+            }
+            q.push_back(line);
+        }
+    }
+
+    /// The newest lines, oldest first, capped at `OUTPUT_ERROR_MAX` bytes.
+    fn render(&self) -> String {
+        let q = match self.0.lock() {
+            Ok(q) => q.clone(),
+            Err(_) => return String::new(),
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut total = 0;
+        for line in q.iter().rev() {
+            total += line.len() + 1;
+            if total > OUTPUT_ERROR_MAX {
+                break;
+            }
+            out.push(line.clone());
+        }
+        out.reverse();
+        out.join("\n")
+    }
+
+    /// Drain `stream` line by line into the ring until it closes.
+    fn drain<R: AsyncRead + Unpin + Send + 'static>(&self, wrapper_id: &str, stream: R) {
+        let tail = self.clone();
+        let id = wrapper_id.to_string();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                debug!("wrapper[{}]: {}", id, line);
+                tail.push(&line);
+            }
+        });
+    }
+}
+
+/// Wrapper output is quoted in errors, so a URL's query string (a sign-in
+/// continuation, a token) is cut before it is kept.
+fn redact_query(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for (i, word) in line.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if word.contains("://") {
+            match word.split_once(['?', '#']) {
+                Some((head, _)) => {
+                    out.push_str(head);
+                    out.push_str("?…");
+                }
+                None => out.push_str(word),
+            }
+        } else {
+            out.push_str(word);
+        }
+    }
+    out
+}
+
 /// Transports a runner-spawned wrapper may declare.
 ///
 /// `@qontinui/ui-bridge-wrapper`'s `runWrapperEntrypoint` awaits
 /// `transport.ready()` and then binds the `/dispatch` + `/health` server on
 /// `WRAPPER_PORT` for EVERY transport kind, so `headless` and `headed`
 /// (Playwright Chromium driven from the wrapper process) bind the port exactly
-/// as `api` does — once the browser has launched, well inside
-/// `SPAWN_READY_TIMEOUT`. Phase 1 enabled `api` alone; `headless`/`headed` are
+/// as `api` does — once the browser has launched, inside
+/// `BROWSER_SPAWN_READY_TIMEOUT`. Phase 1 enabled `api` alone; `headless`/`headed` are
 /// enabled for the private web-account image wrappers (plan
 /// `2026-10-17-free-image-generation-local-gpu-and-private-ui-bridge-wrappers`).
 /// `injected` (needs a target page carrying the IIFE) and `live` (connects back
@@ -98,6 +201,14 @@ struct WrapperRuntime {
     port: u16,
     pid: Option<u32>,
     child: Option<Child>,
+    /// The wrapper's whole process tree: its own process group (Unix) or a
+    /// kill-on-close Job Object (Windows). A browser transport's Chromium
+    /// processes are GRANDCHILDREN of `node`; killing `node` alone would
+    /// orphan them. Dropping the guard kills the tree.
+    tree: Option<ChildTreeGuard>,
+    /// The last lines the wrapper wrote to stdout/stderr (drained so a chatty
+    /// wrapper can never block on a full pipe), kept for spawn-failure errors.
+    output: OutputTail,
     started_at: Instant,
     last_dispatch: Instant,
     consecutive_failures: u32,
@@ -175,6 +286,9 @@ impl WrapperManager {
         let env = build_env(wrapper_id, &wrapper.manifest);
 
         let mut cmd = crate::process_helpers::tokio_no_window("node");
+        // Own process group (Unix) before the exec, so the whole tree —
+        // node AND any browser it launches — dies together on stop.
+        ChildTreeGuard::arm_tokio(&mut cmd);
         cmd.current_dir(&install_path)
             .arg(&entry)
             .env("WRAPPER_PORT", port.to_string())
@@ -190,7 +304,7 @@ impl WrapperManager {
         // inherited env by default) but we *do not* override env_clear
         // because Node needs PATH/HOMEDRIVE/HOMEPATH on Windows.
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             format!(
                 "failed to spawn wrapper '{}' (node {}): {}",
                 wrapper_id,
@@ -199,12 +313,22 @@ impl WrapperManager {
             )
         })?;
         let pid = child.id();
+        let tree = ChildTreeGuard::attach_armed_tokio(&child);
+        let output = OutputTail::default();
+        if let Some(out) = child.stdout.take() {
+            output.drain(wrapper_id, out);
+        }
+        if let Some(err) = child.stderr.take() {
+            output.drain(wrapper_id, err);
+        }
 
         let mut runtime = WrapperRuntime {
             id: wrapper_id.to_string(),
             port,
             pid,
             child: Some(child),
+            tree: Some(tree),
+            output: output.clone(),
             started_at: Instant::now(),
             last_dispatch: Instant::now(),
             consecutive_failures: 0,
@@ -216,11 +340,24 @@ impl WrapperManager {
         // through the same terminate_runtime used by stop()/claim_or_retire
         // so it is waited on (and force-killed after STOP_GRACE) rather than
         // just signalled and dropped.
-        if let Err(e) = wait_for_port(port, SPAWN_READY_TIMEOUT).await {
+        let ready_timeout = ready_timeout_for(&wrapper.manifest.transport);
+        if let Err(e) = wait_for_port(port, ready_timeout, runtime.child.as_mut()).await {
             terminate_runtime(wrapper_id, runtime).await;
+            // Give the drain tasks a moment to take the last lines a dying
+            // process wrote before it closed its pipes.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let tail = output.render();
             return Err(format!(
-                "wrapper '{}' did not become ready on port {} within {:?}: {}",
-                wrapper_id, port, SPAWN_READY_TIMEOUT, e
+                "wrapper '{}' did not become ready on port {} within {:?}: {}{}",
+                wrapper_id,
+                port,
+                ready_timeout,
+                e,
+                if tail.is_empty() {
+                    " (it wrote no output)".to_string()
+                } else {
+                    format!("; its last output:\n{}", tail)
+                }
             ));
         }
 
@@ -497,12 +634,23 @@ fn pick_free_port() -> Result<u16, std::io::Error> {
     Ok(port)
 }
 
-/// Block until a TCP connect to `127.0.0.1:port` succeeds or the
-/// timeout elapses.
-async fn wait_for_port(port: u16, total: Duration) -> Result<(), String> {
+/// Block until a TCP connect to `127.0.0.1:port` succeeds, the timeout
+/// elapses, or — when `child` is given — the wrapper process exits first (a
+/// missing peer dependency or no display makes `node` exit at once; waiting
+/// out the whole timeout would only hide that).
+async fn wait_for_port(
+    port: u16,
+    total: Duration,
+    mut child: Option<&mut Child>,
+) -> Result<(), String> {
     let deadline = Instant::now() + total;
     let mut last_err = "no attempts".to_string();
     while Instant::now() < deadline {
+        if let Some(c) = child.as_deref_mut() {
+            if let Ok(Some(status)) = c.try_wait() {
+                return Err(format!("the wrapper process exited first ({status})"));
+            }
+        }
         match probe_port(port).await {
             Ok(()) => return Ok(()),
             Err(e) => last_err = e,
@@ -561,6 +709,10 @@ enum ExistingRecord {
 /// the map (so no lock is held while waiting). SIGTERM-equivalent first, then
 /// force-kill after `STOP_GRACE` if the child hasn't exited.
 async fn terminate_runtime(wrapper_id: &str, mut runtime: WrapperRuntime) {
+    // Kill the whole tree first (SIGKILL to the process group / close the
+    // kill-on-close job): a browser transport's Chromium processes are
+    // grandchildren that `child.start_kill()` below would never reach.
+    drop(runtime.tree.take());
     let mut child = match runtime.child.take() {
         Some(c) => c,
         None => return,
@@ -608,6 +760,154 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_transports_get_the_longer_readiness_wait() {
+        assert_eq!(ready_timeout_for("api"), SPAWN_READY_TIMEOUT);
+        assert_eq!(ready_timeout_for("headless"), BROWSER_SPAWN_READY_TIMEOUT);
+        assert_eq!(ready_timeout_for("headed"), BROWSER_SPAWN_READY_TIMEOUT);
+        assert!(BROWSER_SPAWN_READY_TIMEOUT > SPAWN_READY_TIMEOUT);
+    }
+
+    #[test]
+    fn output_tail_is_bounded_and_cuts_url_queries() {
+        let tail = OutputTail::default();
+        for i in 0..(OUTPUT_TAIL_LINES + 10) {
+            tail.push(&format!("line {i}"));
+        }
+        let rendered = tail.render();
+        assert!(
+            !rendered.contains("line 0\n"),
+            "the oldest lines are dropped"
+        );
+        assert!(rendered.ends_with(&format!("line {}", OUTPUT_TAIL_LINES + 9)));
+        assert_eq!(rendered.lines().count(), OUTPUT_TAIL_LINES);
+
+        let long = OutputTail::default();
+        for _ in 0..20 {
+            long.push(&"x".repeat(5000));
+        }
+        assert!(long.render().len() <= OUTPUT_ERROR_MAX + OUTPUT_TAIL_LINES * 4);
+
+        assert_eq!(
+            redact_query("went to https://accounts.example/signin?continue=SECRET now"),
+            "went to https://accounts.example/signin?… now"
+        );
+    }
+
+    /// Writes a fake wrapper into `root/w`: `--manifest-only` prints a
+    /// manifest declaring `transport`, and a normal run executes `body`.
+    #[cfg(unix)]
+    fn fake_wrapper(root: &Path, transport: &str, body: &str) {
+        let dir = root.join("w");
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"w","version":"0.0.0"}"#,
+        )
+        .unwrap();
+        let manifest = format!(
+            r#"{{"manifestVersion":1,"manifest":{{"id":"w","displayName":"w","transport":"{transport}"}},"actions":[]}}"#
+        );
+        std::fs::write(
+            dir.join("dist").join("index-node.js"),
+            format!(
+                "if (process.argv.includes('--manifest-only')) {{ console.log({manifest:?}); process.exit(0); }}\n{body}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn node_available() -> bool {
+        std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// A browser transport's Chromium is a GRANDCHILD of the wrapper's `node`.
+    /// `stop` must kill the whole tree, not only `node`: here the wrapper
+    /// starts a `sleep` grandchild (the stand-in for Chromium) and serves its
+    /// port, and after `stop` the grandchild must be gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_kills_the_wrappers_grandchildren() {
+        if !node_available() {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let body = format!(
+            "const g = require('child_process').spawn('sleep', ['300'], {{ stdio: 'ignore' }});\n\
+             require('fs').writeFileSync({pid:?}, String(g.pid));\n\
+             require('http').createServer((q, r) => r.end('ok')).listen(Number(process.env.WRAPPER_PORT), '127.0.0.1');",
+            pid = pid_file.to_string_lossy()
+        );
+        fake_wrapper(tmp.path(), "headless", &body);
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        let manager = WrapperManager::new(registry);
+
+        manager.spawn("w").await.expect("the fake wrapper spawns");
+        let grandchild: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(alive(grandchild), "precondition: the grandchild runs");
+
+        manager.stop("w").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(grandchild) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(grandchild), "grandchild {grandchild} survived stop");
+    }
+
+    /// A wrapper that exits at once (a missing peer, no display) fails the
+    /// spawn quickly, and the error carries the wrapper's own last words —
+    /// with any URL query cut — instead of a bare readiness timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dying_wrapper_fails_fast_with_its_output() {
+        if !node_available() {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        fake_wrapper(
+            tmp.path(),
+            "headed",
+            "console.error(\"Transport kind 'headed' needs the optional '@qontinui/ui-bridge-headless' peer; see https://docs.example/x?token=SECRET\"); process.exit(1);",
+        );
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        let manager = WrapperManager::new(registry);
+
+        let started = Instant::now();
+        let err = manager
+            .spawn("w")
+            .await
+            .expect_err("a dying wrapper must not spawn");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("exited first"), "{err}");
+        assert!(err.contains("ui-bridge-headless"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[test]
     fn browser_transports_are_spawnable_and_the_others_are_not() {
         for kind in ["api", "headless", "headed"] {
             assert!(transport_is_spawnable(kind), "{kind} must spawn");
@@ -632,6 +932,8 @@ mod tests {
                 port: 41234,
                 pid: Some(7),
                 child: None,
+                tree: None,
+                output: OutputTail::default(),
                 started_at: now,
                 last_dispatch: now,
                 consecutive_failures: HEALTH_MAX_RETRIES,
