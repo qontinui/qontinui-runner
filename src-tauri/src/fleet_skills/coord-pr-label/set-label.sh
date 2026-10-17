@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # coord-pr-label — set a coord:* label on a PR via gh + record in coord.pr_labels.
 #
-# Phase 2 D2.6 of the PR Merge Orchestrator
-# (qontinui-dev-notes/plans/2026-05-21-pr-merge-orchestrator-design.md).
+# Phase 2 D2.6 of the PR Merge Orchestrator (Qontinui's design plan
+# 2026-05-21-pr-merge-orchestrator-design, held in the maintainers' corpus).
 #
 # Validates the label against the `coord:*` namespace, adds the label over
 # the REST issues-labels route (`gh api -X POST repos/<o>/<r>/issues/<n>/labels`
@@ -114,9 +114,9 @@ case "$_coord_url_lc" in ws://*|wss://*) COORD_URL="" ;; esac
 COORD_URL="${COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
 
 # ----- validate against the coord:* namespace --------------------------------
-# Mirrors qontinui-coord/src/pr_merge/labels_routes.rs::validate_label.
-# Keeping the two in sync is a Phase 2 D2.6 requirement; the doc at
-# qontinui-dev-notes/docs/coord/pr-merge-labels.md is the spec.
+# Mirrors qontinui-coord/crates/coord/src/pr_merge/labels_routes.rs::validate_label.
+# Keeping the two in sync is a Phase 2 D2.6 requirement; coord's
+# validate_label is the spec, and this mirror follows it.
 #
 # Last reconciled against coord `origin/main` @ da36d08d (2026-08-22), which
 # closed four drifts this mirror had accumulated. Cite the REF, not a local
@@ -241,7 +241,7 @@ validate_label() {
   # unhelpful errors for one cause, and neither naming the fix.
   case "$rest" in
     priority|priority=*)
-      echo "error: coord:priority must be set on the PR itself (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'\`) — a skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github'" >&2
+      echo "error: coord:priority must be set on the PR itself (\`gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'\`), and any holder of repo write — agent or operator — may set it on its own authority. A skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github' (provenance, not authority). Read it back with \`gh api repos/<owner>/<repo>/issues/<n>/labels\`. The label moves the queue only while COORD_MERGE_PRIORITY=on is deployed: read priority_reason on the queued row (coord_query_train_health -> candidates_in_flight) — 'label' = honoured; label_expired / label_ignored_multi_repo / label_not_github / aged / red_main_fix = this label did not count; 'none' = lane off or label not yet mirrored" >&2
       return 1
       ;;
   esac
@@ -884,14 +884,29 @@ BEARER_SRC="$(ctc_stage_for_tenant "$READ_TENANT")"
 case "$BEARER_SRC" in
   rejected*) readback_unknown "no credential for tenant $READ_TENANT could be staged (${BEARER_SRC#rejected})" ;;
 esac
-: > "$TMPD/readback.json"
-RB_CODE="$(curl -sS -G -o "$(curl_path "$TMPD/readback.json")" -w '%{http_code}' \
-  --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
-  -H "@$(curl_path "$TMPD/bearer.hdr")" \
-  --data-urlencode "repo=$REPO" --data-urlencode "pr_number=$PR" \
-  "$COORD_URL/coord/agent-pr-labels" 2>/dev/null)" || RB_CODE="000"
+# rb_read -> RB_CODE; the read-back GET under the staged bearer.
+rb_read() {
+  : > "$TMPD/readback.json"
+  RB_CODE="$(curl -sS -G -o "$(curl_path "$TMPD/readback.json")" -w '%{http_code}' \
+    --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
+    -H "@$(curl_path "$TMPD/bearer.hdr")" \
+    --data-urlencode "repo=$REPO" --data-urlencode "pr_number=$PR" \
+    "$COORD_URL/coord/agent-pr-labels" 2>/dev/null)" || RB_CODE="000"
+  RB_CODE="${RB_CODE:-000}"
+}
+rb_read
+# Coord refused the local runner's token: forget it (the library then refuses
+# the runner rung for this tenant) and re-stage ONCE, which reaches the mint --
+# the same retry the library's own walkers make.
+if [ "$RB_CODE" = 401 ] && [[ "$BEARER_SRC" == runner* ]]; then
+  ctc_drop_runner_token "$READ_TENANT" "coord answered 401 to the local runner's token for tenant $READ_TENANT"
+  RB_SRC2="$(ctc_stage_for_tenant "$READ_TENANT")"
+  case "$RB_SRC2" in
+    rejected*) BEARER_SRC="runner(401)→$RB_SRC2" ;;
+    *) BEARER_SRC="runner(401)→$RB_SRC2"; rb_read ;;
+  esac
+fi
 rm -f "$TMPD/bearer.hdr"
-RB_CODE="${RB_CODE:-000}"
 RB_BODY="$(cat "$TMPD/readback.json" 2>/dev/null || true)"
 RB_SNIP="$(printf '%s' "$RB_BODY" | head -c 300)"
 
