@@ -123,7 +123,11 @@ everything in `src-tauri/.cargo/config.toml`:
 `RUSTFLAGS`, because plain `RUSTFLAGS` is split on whitespace with no quoting and
 the Windows value `-C link-args=/STACK:8388608 /Brepro` cannot survive that.
 **If you edit the `[target.*]` blocks in `.cargo/config.toml`, update both
-scripts.**
+scripts** — `build.rs` `tokio_console_rustflags_tests` fails `cargo test` when a
+script's branch differs from its target's `rustflags`. The Windows
+workspace-root `--remap-path-prefix` pair lives in each machine's
+`$CARGO_HOME/config.toml`, which `CARGO_ENCODED_RUSTFLAGS` also replaces, so the
+scripts do not carry it.
 
 ## How it is wired
 
