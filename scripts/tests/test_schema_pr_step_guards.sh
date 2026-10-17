@@ -289,8 +289,16 @@ cat > "$bin/gh" <<'STUB'
 #
 # And the red-PR carve-out: `pr view --json headRefOid` answers GH_STUB_HEAD_SHA,
 # and the `check-runs?check_name=schema-fresh` read (key `schema-fresh-runs`,
-# distinct from the ready script's unfiltered `check-runs` count) answers
-# GH_STUB_FRESH_RUN, pre-filtered to "<status> <conclusion>" or "none".
+# distinct from the ready script's unfiltered `check-runs` count, and matched
+# EXACTLY so `check_name=schema-fresh-verify` does not hit it) answers RAW
+# check-runs JSON, through which the step's OWN --jq filter is run with the real
+# `jq` binary — so the shipped newest-run selection (app filter, sort, last,
+# null -> "none") is what gets tested, never a pre-filtered stand-in. The JSON
+# is GH_STUB_FRESH_RUNS_JSON when set, else built from the convenience knob
+# GH_STUB_FRESH_RUN ("none" = no runs; "<status> <conclusion>" = one Actions
+# run, conclusion `none` meaning null). GH_STUB_FRESH_RAW, when set, is printed
+# verbatim INSTEAD of filtering: a gh that answered something the filter could
+# never produce.
 prev=""
 json=""
 method="GET"
@@ -307,7 +315,7 @@ if [ "${1:-}" = "api" ]; then
   case "$*" in
     *convertPullRequestToDraft*) key="graphql:convert" ;;
     *" graphql "*)   key="graphql" ;;
-    *"/check-runs?check_name=schema-fresh"*) key="schema-fresh-runs" ;;
+    *"/check-runs?check_name=schema-fresh&"*|*"/check-runs?check_name=schema-fresh") key="schema-fresh-runs" ;;
     *"/check-runs"*) key="check-runs" ;;
     *"/comments"*)   if [ "$method" = "POST" ]; then key="comment-post"; else key="comments-read"; fi ;;
     *"/pulls/"*)     if [ "$method" = "PATCH" ]; then key="pr-close"; else key="pr-body"; fi ;;
@@ -342,7 +350,27 @@ case "$key" in
   view:mergeable,mergeStateStatus) printf '%s\n' "${GH_STUB_MERGE:-MERGEABLE CLEAN}" ;;
   view:id)       echo "PR_kwDOtest77" ;;
   view:headRefOid) printf '%s\n' "${GH_STUB_HEAD_SHA:-a47f223e3a47f223e3a47f223e3a47f223e3a47f}" ;;
-  schema-fresh-runs) printf '%s\n' "${GH_STUB_FRESH_RUN:-none}" ;;
+  schema-fresh-runs)
+    if [ -n "${GH_STUB_FRESH_RAW:-}" ]; then
+      printf '%s\n' "$GH_STUB_FRESH_RAW"
+      exit 0
+    fi
+    jq_filter=""; prev=""
+    for a in "$@"; do [ "$prev" = "--jq" ] && jq_filter="$a"; prev="$a"; done
+    [ -n "$jq_filter" ] || { echo "gh stub: schema-fresh read without --jq" >&2; exit 96; }
+    runs_json="${GH_STUB_FRESH_RUNS_JSON:-}"
+    if [ -z "$runs_json" ]; then
+      case "${GH_STUB_FRESH_RUN:-none}" in
+        none) runs_json='{"total_count":0,"check_runs":[]}' ;;
+        *)
+          read -r st co <<< "$GH_STUB_FRESH_RUN"
+          runs_json="$(jq -cn --arg st "$st" --arg co "$co" \
+            '{total_count:1, check_runs:[{id:100, name:"schema-fresh", status:$st, conclusion:(if $co == "none" then null else $co end), started_at:"2026-10-17T04:00:00Z", app:{slug:"github-actions"}}]}')"
+          ;;
+      esac
+    fi
+    printf '%s\n' "$runs_json" | jq -r "$jq_filter"
+    ;;
   graphql:convert) printf '%s\n' "${GH_STUB_CONVERT_ISDRAFT:-true}" ;;
   comment)
     body_file=""; prev=""
@@ -428,12 +456,14 @@ GH_STUB_CONVERT_ISDRAFT=true
 GH_STUB_PR_BODY=""
 GH_STUB_HEAD_SHA="a47f223e3a47f223e3a47f223e3a47f223e3a47f"
 GH_STUB_FRESH_RUN="none"
+GH_STUB_FRESH_RUNS_JSON=""
+GH_STUB_FRESH_RAW=""
 GH_STUB_COMMENTS="$work/comments.txt"
 : > "$GH_STUB_COMMENTS"
 export GH_STUB_EMPTY_URL GH_STUB_FAIL_FIRST_CREATE GIT_STUB_STAGED PAT_TOKEN_STUB
 export GH_STUB_READY_LINE GH_STUB_CHECKS GH_STUB_GRAPHQL_ISDRAFT
 export GH_STUB_ISDRAFT GH_STUB_PR_BODY GH_STUB_COMMENTS GH_STUB_MERGE GH_STUB_CONVERT_ISDRAFT
-export GH_STUB_HEAD_SHA GH_STUB_FRESH_RUN
+export GH_STUB_HEAD_SHA GH_STUB_FRESH_RUN GH_STUB_FRESH_RUNS_JSON GH_STUB_FRESH_RAW
 
 # run_step <fail-keys> <list-open>
 # Echoes the exit code; leaves stdout+stderr in $work/out.txt, the gh call log in
@@ -463,6 +493,8 @@ run_step() {
     GH_STUB_PR_BODY="${GH_STUB_PR_BODY:-}" \
     GH_STUB_HEAD_SHA="${GH_STUB_HEAD_SHA:-}" \
     GH_STUB_FRESH_RUN="${GH_STUB_FRESH_RUN:-none}" \
+    GH_STUB_FRESH_RUNS_JSON="${GH_STUB_FRESH_RUNS_JSON:-}" \
+    GH_STUB_FRESH_RAW="${GH_STUB_FRESH_RAW:-}" \
     GH_STUB_COMMENTS="$GH_STUB_COMMENTS" \
     GH_TOKEN="stub-token" \
     PAT_TOKEN="${PAT_TOKEN_STUB:-}" \
@@ -707,16 +739,55 @@ assert "schema-fresh read refused: exit code" 1 "$rc"
 assert "schema-fresh read refused: reporter names the op" 1 "$(grep -c "'read schema-fresh check runs of #77' operation failed" "$work/out.txt" || true)"
 assert "schema-fresh read refused: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
 assert "schema-fresh read refused: never comments blind" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
-for garbled in "" "completed" "completed failure extra" "in_progress success" '{"message":"Not Found"}'; do
-  GH_STUB_FRESH_RUN="$garbled"
-  # The run_step default turns an empty knob into "none"; model an empty
-  # answer with a stub-side sentinel instead.
-  [ -n "$garbled" ] || GH_STUB_FRESH_RUN=" "
+# Raw answers the shipped filter could never produce, printed verbatim by the
+# stub (an empty knob means "unset", so the empty answer is a lone space).
+for garbled in " " "completed" "completed failure extra" "in_progress success" '{"message":"Not Found"}'; do
+  GH_STUB_FRESH_RAW="$garbled"
   rc="$(run_step "" "77")"
   assert "schema-fresh garbled [$garbled]: exit code" 1 "$rc"
   assert "schema-fresh garbled [$garbled]: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
   assert "schema-fresh garbled [$garbled]: refuses by name" 1 "$(grep -c "schema-fresh state on a47f223e3a47f223e3a47f223e3a47f223e3a47f" "$work/out.txt" || true)"
 done
+GH_STUB_FRESH_RAW=""
+# The shipped newest-run selection, over multi-run JSON. run_json <id> <app>
+# <status> <conclusion|null> <started_at|null> — one check-run object.
+run_json() {
+  jq -cn --argjson id "$1" --arg app "$2" --arg st "$3" --arg co "$4" --arg sa "$5" \
+    '{id:$id, name:"schema-fresh", status:$st, conclusion:(if $co == "null" then null else $co end), started_at:(if $sa == "null" then null else $sa end), app:{slug:$app}}'
+}
+runs_of() { printf '{"total_count":%s,"check_runs":[%s]}' "$#" "$(IFS=,; echo "$*")"; }
+fresh_case() {
+  # fresh_case <label> <want: rebuild|comment> <runs JSON>
+  GH_STUB_FRESH_RUNS_JSON="$3"
+  GH_STUB_PR_BODY="<!-- schema-pg-sql-refresh-dump:0000000000000000 -->"
+  : > "$GH_STUB_COMMENTS"
+  rc="$(run_step "" "77")"
+  GH_STUB_FRESH_RUNS_JSON=""
+  GH_STUB_PR_BODY=""
+  assert "$1: exit code" 0 "$rc"
+  if [ "$2" = "rebuild" ]; then
+    assert "$1: force-pushed" 1 "$(grep -c 'push --force' "$work/git.log" || true)"
+    assert "$1: converted to draft" 1 "$(grep -c '^graphql:convert$' "$work/gh.log" || true)"
+  else
+    assert "$1: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+    assert "$1: comment path" 1 "$(grep -c '^comment$' "$work/gh.log" || true)"
+  fi
+}
+fresh_case "older failure + newer success" comment \
+  "$(runs_of "$(run_json 100 github-actions completed failure 2026-10-15T04:00:00Z)" "$(run_json 101 github-actions completed success 2026-10-16T04:00:00Z)")"
+fresh_case "older success + newer failure" rebuild \
+  "$(runs_of "$(run_json 100 github-actions completed success 2026-10-15T04:00:00Z)" "$(run_json 101 github-actions completed failure 2026-10-16T04:00:00Z)")"
+# Listed newest-first, as the API may: the selection must not lean on order.
+fresh_case "newer success listed first" comment \
+  "$(runs_of "$(run_json 101 github-actions completed success 2026-10-16T04:00:00Z)" "$(run_json 100 github-actions completed failure 2026-10-15T04:00:00Z)")"
+fresh_case "non-Actions app red, Actions run green" comment \
+  "$(runs_of "$(run_json 100 github-actions completed success 2026-10-15T04:00:00Z)" "$(run_json 101 some-other-app completed failure 2026-10-16T04:00:00Z)")"
+fresh_case "empty check_runs" comment '{"total_count":0,"check_runs":[]}'
+# Defensive: a newer re-run reporting a null started_at (not observed on GitHub,
+# but not excluded either) is still the newest by id, so the stale failure under
+# it must not trigger a rebuild while it is pending.
+fresh_case "older failure + newer queued re-run (started_at null)" comment \
+  "$(runs_of "$(run_json 100 github-actions completed failure 2026-10-15T04:00:00Z)" "$(run_json 101 github-actions queued null null)")"
 GH_STUB_FRESH_RUN="completed failure"
 rc="$(run_step "view:headRefOid" "77")"
 assert "head sha refused: exit code" 1 "$rc"
@@ -1161,6 +1232,22 @@ if [ -z "${SCHEMA_STEP_MUTANT:-}" ]; then
   mutate red-carve-out-ignores-marker \
     '$0 == "                  if grep -qF \"$drift_marker\" \"$pr_body_file\"; then" { $0 = "                  if false; then" } { print }' \
     "ready+red+current dump: never pushed"
+  # Pick the OLDEST run instead of the newest: a re-run gone green is ignored.
+  mutate newest-run-last-to-first \
+    '{ sub(/\| last \|/, "| first |") } { print }' \
+    "older failure + newer success: never pushed"
+  # Drop the app filter: another app's red would rebuild a green PR.
+  mutate app-filter-dropped \
+    '{ sub(/ \| select\(\.app\.slug == "github-actions"\)/, "") } { print }' \
+    "non-Actions app red, Actions run green: never pushed"
+  # Sort on started_at: a re-run with a null started_at would rank oldest.
+  mutate newest-by-started-at \
+    '{ sub(/sort_by\(\.id\)/, "sort_by(.started_at // \"\", .id)") } { print }' \
+    "older failure + newer queued re-run (started_at null): never pushed"
+  # Read the verify job instead of the required shim.
+  mutate check-name-verify \
+    '{ sub(/check_name=schema-fresh&/, "check_name=schema-fresh-verify\\&") } { print }' \
+    "ready+red+stale dump: force-pushed"
   # Back to the default success(): an upstream failure skips the sweep.
   mutate sweep-success-only \
     "BEGIN { want = \"      - name: $SWEEP_STEP\" }

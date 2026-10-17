@@ -590,8 +590,15 @@ jobs:
                 # `none` when the head carries no such run. `check_name` is an
                 # exact match, so `schema-fresh-verify` is not in the set; one
                 # page of 100 is far beyond the reruns one head ever gets.
+                # "Newest" is the highest `id`, NOT `started_at`: check-run ids
+                # only ever increase and a re-run always gets a new one, so the
+                # order needs no timestamp. Should a run ever report a null or
+                # skewed `started_at` (not observed; queued Actions runs measured
+                # 2026-10-17 all carried one), a timestamp sort could rank a
+                # pending re-run below the stale failure it replaces and rebuild
+                # under it.
                 if ! fresh_run="$(gh api "repos/$REPO/commits/$head_sha/check-runs?check_name=schema-fresh&filter=all&per_page=100" \
-                    --jq '[.check_runs[] | select(.app.slug == "github-actions")] | sort_by(.started_at // "", .id) | last | if . == null then "none" else "\(.status) \(.conclusion // "none")" end')"; then
+                    --jq '[.check_runs[] | select(.app.slug == "github-actions")] | sort_by(.id) | last | if . == null then "none" else "\(.status) \(.conclusion // "none")" end')"; then
                   pr_op_failed "read schema-fresh check runs of #$existing_num"; exit 1
                 fi
                 if ! [[ "$fresh_run" =~ ^(none|(queued|in_progress|waiting|requested|pending)\ none|completed\ [a-z_]+)$ ]]; then
