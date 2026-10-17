@@ -339,20 +339,22 @@ impl AgenticExecutor {
                             );
                             // Emit realtime cost update event
                             {
-                                let cost_usd = if let (Some(input), Some(output)) =
+                                // No token counts: the cost is UNKNOWN (`None`),
+                                // never a fabricated $0 fed to the budget tracker.
+                                let cost_usd: Option<f64> = if let (Some(input), Some(output)) =
                                     (resp.input_tokens, resp.output_tokens)
                                 {
                                     let cache_create = resp.cache_creation_tokens.unwrap_or(0);
                                     let cache_read = resp.cache_read_tokens.unwrap_or(0);
-                                    crate::ai_pricing::calculate_cost_usd_with_cache(
+                                    Some(crate::ai_pricing::calculate_cost_usd_with_cache(
                                         input,
                                         output,
                                         cache_create,
                                         cache_read,
                                         step_model.as_deref().unwrap_or("claude-sonnet-4-20250514"),
-                                    )
+                                    ))
                                 } else {
-                                    0.0
+                                    None
                                 };
 
                                 let cumulative = self
@@ -371,13 +373,24 @@ impl AgenticExecutor {
                                     resp.output_tokens.unwrap_or(0),
                                     resp.cache_creation_tokens.unwrap_or(0),
                                     resp.cache_read_tokens.unwrap_or(0),
-                                    cost_usd,
+                                    // Display value only; never recorded against the budget.
+                                    cost_usd.unwrap_or(0.0),
                                     cumulative,
                                 );
 
+                                if cost_usd.is_none() {
+                                    warn!(
+                                        "agentic response-mode iteration {}: no token counts — \
+                                         cost UNKNOWN, not recorded in the budget tracker",
+                                        iteration
+                                    );
+                                }
+
                                 // Record cost in budget tracker and check safety limits
                                 let trackers = self.cost_trackers.lock().unwrap().clone();
-                                if let Some(ref trackers) = trackers {
+                                if let (Some(cost_usd), Some(trackers)) =
+                                    (cost_usd, trackers.as_ref())
+                                {
                                     let total_tokens = resp.input_tokens.unwrap_or(0)
                                         + resp.output_tokens.unwrap_or(0);
                                     let budget_result =
