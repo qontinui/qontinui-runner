@@ -3,8 +3,8 @@
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
 //! Phase 2. One [`Pane`] per holder (D13). Three threads keep it:
 //!
-//! - **reader** — reads the PTY master into the [`OutputRing`] for the whole
-//!   life of the pane, ALWAYS. Nothing a client does pauses it: flow control
+//! - **reader** — reads the PTY master into the [`OutputRing`] — and through
+//!   the [`ModeTracker`] (Phase 2b) — for the whole life of the pane, ALWAYS. Nothing a client does pauses it: flow control
 //!   gates what a connection is SENT, never what the holder reads (the
 //!   runner's one invariant, "gate emission, never pause reads"). A child
 //!   therefore never blocks on a full PTY buffer because a client is slow or
@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
+use crate::modes::ModeTracker;
 use crate::protocol::ExitReply;
 use crate::ring::OutputRing;
 use crate::spec::ChildSpec;
@@ -71,6 +72,11 @@ const INPUT_QUEUE_POLL: Duration = Duration::from_millis(10);
 #[derive(Debug)]
 pub struct PaneState {
     pub ring: OutputRing,
+    /// Every byte the ring was ever given, parsed for terminal modes (plan
+    /// D14). Fed under this lock with the ring, so its state is the state at
+    /// the ring's `end_offset` and its preamble log reaches back to the ring's
+    /// `start_offset`.
+    pub modes: ModeTracker,
     /// The PTY master read hit EOF (or an error, which ends it the same way).
     pub eof: bool,
     /// The child has exited (it may not be reaped yet). Unix: set under this
@@ -88,6 +94,9 @@ pub struct PaneState {
 /// The pane a holder owns.
 pub struct Pane {
     child_pid: u32,
+    /// The directory the child was started in (the spec's), for restore
+    /// metadata when the program never reports one with `OSC 7`.
+    spawn_cwd: Option<std::ffi::OsString>,
     state: Mutex<PaneState>,
     changed: Condvar,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -186,8 +195,10 @@ impl Pane {
 
         let pane = Arc::new(Pane {
             child_pid,
+            spawn_cwd: spec.cwd.clone(),
             state: Mutex::new(PaneState {
                 ring: OutputRing::new(spec.ring_capacity()),
+                modes: ModeTracker::new(),
                 eof: false,
                 child_gone: false,
                 exit: None,
@@ -224,6 +235,11 @@ impl Pane {
         self.child_pid
     }
 
+    /// The directory the child was started in.
+    pub fn spawn_cwd(&self) -> Option<&std::ffi::OsString> {
+        self.spawn_cwd.as_ref()
+    }
+
     /// The shared state. Never hold this across I/O on a client connection.
     pub fn lock_state(&self) -> MutexGuard<'_, PaneState> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
@@ -257,6 +273,9 @@ impl Pane {
                 Ok(n) => {
                     let mut st = self.lock_state();
                     st.ring.push(&buf[..n]);
+                    st.modes.feed(&buf[..n]);
+                    let ring_start = st.ring.start_offset();
+                    st.modes.forget_before(ring_start);
                     drop(st);
                     self.changed.notify_all();
                 }
