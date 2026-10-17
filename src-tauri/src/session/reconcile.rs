@@ -402,6 +402,7 @@ fn bind_record(
         gate_consuming_device_id: None,
         gate_bound_generation: None,
         restored_in_generation: None,
+        gate_reported_generation: None,
     }
 }
 
@@ -1622,6 +1623,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_generation: None,
             restored_in_generation: None,
+            gate_reported_generation: None,
         }
     }
 
@@ -2045,6 +2047,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_generation: None,
             restored_in_generation: None,
+            gate_reported_generation: None,
         };
         store.record_open(phantom);
 
@@ -2219,6 +2222,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_generation: None,
             restored_in_generation: None,
+            gate_reported_generation: None,
         });
 
         let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
@@ -2313,6 +2317,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_generation: None,
             restored_in_generation: None,
+            gate_reported_generation: None,
         });
 
         let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
