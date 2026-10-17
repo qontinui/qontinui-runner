@@ -2530,7 +2530,10 @@ async fn health(
         // network / timeout. `retryingSessions` are on their own backoff;
         // `quarantinedSessions` had their rows moved to the
         // `<outbox>.quarantine.jsonl` sidecar after failing while coord served
-        // everything else. A stalled drain used to be invisible from here.
+        // everything else. `usageTotalsDropped4xx` counts usage_totals rows
+        // that got a non-429 4xx since process start (ACKed in the usage arm,
+        // so never in `lastFailure`; a 404 is counted but re-sent). A stalled
+        // drain used to be invisible from here.
         "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
