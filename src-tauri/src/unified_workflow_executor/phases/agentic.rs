@@ -388,15 +388,18 @@ impl AgenticExecutor {
 
                                 // Record cost in budget tracker and check safety limits
                                 let trackers = self.cost_trackers.lock().unwrap().clone();
-                                if let (Some(cost_usd), Some(trackers)) =
-                                    (cost_usd, trackers.as_ref())
-                                {
+                                if let Some(trackers) = trackers.as_ref() {
                                     let total_tokens = resp.input_tokens.unwrap_or(0)
                                         + resp.output_tokens.unwrap_or(0);
-                                    let budget_result =
-                                        trackers.budget.record("agentic", total_tokens, cost_usd);
+                                    // An UNKNOWN cost is not recorded (no fabricated $0).
+                                    if let Some(cost_usd) = cost_usd {
+                                        let budget_result = trackers.budget.record(
+                                            "agentic",
+                                            total_tokens,
+                                            cost_usd,
+                                        );
 
-                                    match budget_result {
+                                        match budget_result {
                                         crate::cost_management::budget::BudgetResult::Warning { remaining_fraction, message } => {
                                             warn!("Budget warning ({}% remaining): {}", (remaining_fraction * 100.0) as u32, message);
                                             self.broadcaster.budget_warning(
@@ -414,10 +417,15 @@ impl AgenticExecutor {
                                         }
                                         crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                                     }
+                                    }
 
-                                    // Check circuit breaker
-                                    let cb_result =
-                                        trackers.circuit_breaker.check_single_call(cost_usd);
+                                    // Check circuit breaker. With an UNKNOWN cost, 0.0
+                                    // only consults the tripped flag (0 can neither trip
+                                    // nor warn), so a breaker tripped elsewhere still
+                                    // stops the run.
+                                    let cb_result = trackers
+                                        .circuit_breaker
+                                        .check_single_call(cost_usd.unwrap_or(0.0));
                                     if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cb_result {
                                         tracing::error!("Cost circuit breaker tripped: {}", reason);
                                         return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
@@ -434,8 +442,11 @@ impl AgenticExecutor {
                                         return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
                                     }
 
-                                    // Anomaly detection
-                                    if let Ok(mut detector) = trackers.anomaly_detector.lock() {
+                                    // Anomaly detection: only over known costs, so an
+                                    // unknown one does not drag the baseline down.
+                                    if let (Some(cost_usd), Ok(mut detector)) =
+                                        (cost_usd, trackers.anomaly_detector.lock())
+                                    {
                                         if let Some(anomaly) = detector.check(cost_usd) {
                                             warn!(
                                                 "Cost anomaly detected: ${:.4} (z-score: {:.2})",
@@ -1467,45 +1478,53 @@ impl AgenticExecutor {
 
                 // Record cost in budget tracker and check safety limits
                 let trackers = self.cost_trackers.lock().unwrap().clone();
-                if let (Some(cost_usd), Some(trackers)) = (cost_usd, trackers.as_ref()) {
+                if let Some(trackers) = trackers.as_ref() {
                     let total_tokens =
                         session_input_tokens.unwrap_or(0) + session_output_tokens.unwrap_or(0);
-                    let budget_result = trackers.budget.record("agentic", total_tokens, cost_usd);
+                    // An UNKNOWN cost is not recorded (no fabricated $0).
+                    if let Some(cost_usd) = cost_usd {
+                        let budget_result =
+                            trackers.budget.record("agentic", total_tokens, cost_usd);
 
-                    match budget_result {
-                        crate::cost_management::budget::BudgetResult::Warning {
-                            remaining_fraction,
-                            message,
-                        } => {
-                            warn!(
-                                "Budget warning ({}% remaining): {}",
-                                (remaining_fraction * 100.0) as u32,
-                                message
-                            );
-                            self.broadcaster.budget_warning(
-                                &config.execution_id,
+                        match budget_result {
+                            crate::cost_management::budget::BudgetResult::Warning {
                                 remaining_fraction,
-                                trackers.budget.snapshot().total_cost_usd,
-                                trackers.budget.snapshot().max_cost_usd,
-                                &message,
-                            );
+                                message,
+                            } => {
+                                warn!(
+                                    "Budget warning ({}% remaining): {}",
+                                    (remaining_fraction * 100.0) as u32,
+                                    message
+                                );
+                                self.broadcaster.budget_warning(
+                                    &config.execution_id,
+                                    remaining_fraction,
+                                    trackers.budget.snapshot().total_cost_usd,
+                                    trackers.budget.snapshot().max_cost_usd,
+                                    &message,
+                                );
+                            }
+                            crate::cost_management::budget::BudgetResult::Exceeded {
+                                ref phase,
+                                overage_usd,
+                            } => {
+                                let reason = format!(
+                                    "Budget exceeded in phase {}: ${:.4} over limit",
+                                    phase, overage_usd
+                                );
+                                tracing::error!("{}", reason);
+                                return (AgenticOutcome::BudgetExceeded { reason }, Vec::new());
+                            }
+                            crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                         }
-                        crate::cost_management::budget::BudgetResult::Exceeded {
-                            ref phase,
-                            overage_usd,
-                        } => {
-                            let reason = format!(
-                                "Budget exceeded in phase {}: ${:.4} over limit",
-                                phase, overage_usd
-                            );
-                            tracing::error!("{}", reason);
-                            return (AgenticOutcome::BudgetExceeded { reason }, Vec::new());
-                        }
-                        crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                     }
 
-                    // Check circuit breaker
-                    let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
+                    // Check circuit breaker. With an UNKNOWN cost, 0.0 only consults
+                    // the tripped flag (0 can neither trip nor warn), so a breaker
+                    // tripped elsewhere still stops the run.
+                    let cb_result = trackers
+                        .circuit_breaker
+                        .check_single_call(cost_usd.unwrap_or(0.0));
                     if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(
                         reason,
                     ) = &cb_result
@@ -1519,8 +1538,11 @@ impl AgenticExecutor {
                         );
                     }
 
-                    // Anomaly detection
-                    if let Ok(mut detector) = trackers.anomaly_detector.lock() {
+                    // Anomaly detection: only over known costs, so an unknown one
+                    // does not drag the baseline down.
+                    if let (Some(cost_usd), Ok(mut detector)) =
+                        (cost_usd, trackers.anomaly_detector.lock())
+                    {
                         if let Some(anomaly) = detector.check(cost_usd) {
                             warn!(
                                 "Cost anomaly detected: ${:.4} (z-score: {:.2})",
