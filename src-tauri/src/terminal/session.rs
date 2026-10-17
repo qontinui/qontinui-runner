@@ -1637,7 +1637,18 @@ impl TerminalSession {
             "terminal session",
             resource_override,
             Some(&app_handle),
-        )?;
+        )
+        .inspect_err(|_| {
+            // `admit_spawn` logs the reading and the floor; this line names
+            // WHICH spawn was refused. Every surface reaches this seam as a
+            // "terminal session", and only the title (`resume-unit-…`,
+            // `claim:pr:…`, a looping agent's tab) tells them apart in the log.
+            warn!(
+                terminal_id = %id,
+                title = %title,
+                "resource_guard: refused terminal session spawn"
+            );
+        })?;
 
         // The pane's backend: in-process `LocalPty`, or — behind
         // `terminal.pty_holder`, default OFF — an out-of-process PTY holder

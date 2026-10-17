@@ -905,6 +905,67 @@ struct ClaimHeartbeat {
 /// Max consecutive crash-restarts before we give up on a subprocess.
 const MAX_RESTARTS: u32 = 3;
 
+/// How often a coord launch held by the resource guard re-probes for headroom.
+const RESOURCE_REFUSAL_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a coord launch's (re)spawn may be held by the resource guard before
+/// the run stops waiting (see [`RefusalOutcome`] for what happens then).
+///
+/// While held, the run keeps its worktrees, heartbeat, daemons and its
+/// `admit_launch` slot — which counts toward the shared unattended cap, so a
+/// held launch also defers later launches and gate continuations. That is the
+/// intended back-pressure, and the bound is what stops it being permanent.
+///
+/// The hold exists because nothing ahead of the seam reads the commit lane for
+/// a launch today: `admit_launch` consults the thread lane only (qontinui-runner
+/// #1981 adds the memory lane there, deferring before anything is materialized).
+/// Until then this hold is the launch path's only memory gate; after, it is the
+/// backstop for a reading that moved between that check and the spawn.
+const RESOURCE_REFUSAL_MAX_HOLD: Duration = Duration::from_secs(600);
+
+/// What the launch restart loop does with a resource-guard refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalOutcome {
+    /// Sleep [`RESOURCE_REFUSAL_RETRY_INTERVAL`] and try the same (re)spawn
+    /// again, without spending a restart.
+    Hold,
+    /// The hold expired and no child ever ran: hand the launch back to coord
+    /// with a `deferred_load:` reason so it is offered again rather than latched
+    /// failed. The materialized worktrees stay on disk, exactly as they do on
+    /// the terminal path — nothing in this run removes them either way.
+    Reoffer,
+    /// The hold expired on a RESTART: a child already ran (and may have left
+    /// work in the worktree), so this ends the way an exhausted restart budget
+    /// does — a terminal `spawn-failed` carrying the refusal.
+    GiveUp,
+}
+
+/// Pure decision for [`RefusalOutcome`], so the policy is pinned by a test.
+fn resource_refusal_outcome(held: Duration, child_ever_started: bool) -> RefusalOutcome {
+    if held < RESOURCE_REFUSAL_MAX_HOLD {
+        RefusalOutcome::Hold
+    } else if child_ever_started {
+        RefusalOutcome::GiveUp
+    } else {
+        RefusalOutcome::Reoffer
+    }
+}
+
+/// The `deferred_load:` reason for a launch re-offered after a refusal hold, in
+/// the `deferred_load:<class>:<detail>` no-whitespace shape coord matches.
+///
+/// `class` is the refusing lane's [`ResourceGuardRefusal::pressure_class`], so
+/// coord sees the same `commit_pressure` / `thread_pressure` class whether the
+/// pre-check or the seam caught the condition.
+///
+/// [`ResourceGuardRefusal::pressure_class`]: crate::resource_guard::ResourceGuardRefusal::pressure_class
+fn resource_refusal_reoffer_reason(class: &str, held: Duration) -> String {
+    format!(
+        "{DEFERRED_LOAD_REASON_PREFIX}{class}:critical_held_{}s",
+        held.as_secs()
+    )
+}
+
 /// Heartbeat cadence for the claim.
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
@@ -8799,6 +8860,16 @@ async fn run_agent_subprocess(
     // every arm that had a child; a trust-gate refusal never started one, and
     // saying `exited` there would tell coord a process ran and stopped.
     let mut final_phase = SpawnPhase::Exited;
+    // How long the CURRENT (re)spawn has been held by the resource guard. Reset
+    // whenever a child actually starts; never counted against `MAX_RESTARTS`.
+    let mut refusal_held = Duration::ZERO;
+    // Whether any child has started in this run. A refusal hold that ends (by
+    // its bound or by a stop) before one did reports phase `blocked`: nothing
+    // ran, and `exited` would tell coord a process ran and stopped.
+    let mut child_ever_started = false;
+    // Set when a refusal hold expires before any child ran (see
+    // [`RefusalOutcome::Reoffer`]).
+    let mut reoffer_reason: Option<String> = None;
 
     // Select the most-available account once before the (re)spawn loop. On a
     // mid-run rate-limit the inference path rotates via
@@ -8831,6 +8902,8 @@ async fn run_agent_subprocess(
         .await
         {
             Ok((mut child, preconditions)) => {
+                refusal_held = Duration::ZERO;
+                child_ever_started = true;
                 let pid = child.id().map(|p| p as i64);
                 // Exempt this headless child from the session-tracking health
                 // check for its lifetime — WS agent spawns legitimately have
@@ -8911,7 +8984,67 @@ async fn run_agent_subprocess(
                     }
                 }
             }
+            Err(e) if crate::resource_guard::is_resource_guard_refusal(&e) => {
+                // Out of headroom (the headless seam's critical floor). Not a
+                // dead spawn and not a restart: hold, re-probe, and start the
+                // (re)spawn once the box has room again. Restarting into the
+                // refusal two seconds later — what this arm replaces — would
+                // spend `MAX_RESTARTS` in ~14 s on a condition that lasts
+                // minutes, and a respawn of a child that just crashed under the
+                // same pressure is exactly the spawn that should wait.
+                match resource_refusal_outcome(refusal_held, child_ever_started) {
+                    RefusalOutcome::Hold => {}
+                    RefusalOutcome::Reoffer => {
+                        warn!(
+                            agent_id = %payload.agent_id,
+                            held_secs = refusal_held.as_secs(),
+                            "agent_runtime: coord launch never got headroom and nothing was \
+                             started; handing it back to coord for re-offer: {e}"
+                        );
+                        let class = e
+                            .downcast_ref::<crate::resource_guard::ResourceGuardRefusal>()
+                            .map_or("resource_guard", |r| r.pressure_class());
+                        reoffer_reason = Some(resource_refusal_reoffer_reason(class, refusal_held));
+                        break;
+                    }
+                    RefusalOutcome::GiveUp => {
+                        warn!(
+                            agent_id = %payload.agent_id,
+                            restarts,
+                            held_secs = refusal_held.as_secs(),
+                            "agent_runtime: coord launch restart never got headroom; giving \
+                             up: {e}"
+                        );
+                        final_reason = Some(match final_reason.take() {
+                            Some(prev) => format!("{prev}; restart refused: {e}"),
+                            None => format!("restart refused: {e}"),
+                        });
+                        break;
+                    }
+                }
+                warn!(
+                    agent_id = %payload.agent_id,
+                    restarts,
+                    held_secs = refusal_held.as_secs(),
+                    "agent_runtime: coord launch (re)spawn HELD by the resource guard; \
+                     re-probing in {}s: {e}",
+                    RESOURCE_REFUSAL_RETRY_INTERVAL.as_secs()
+                );
+                tokio::select! {
+                    _ = stop.cancelled() => {
+                        if !child_ever_started {
+                            final_phase = SpawnPhase::Blocked;
+                        }
+                    }
+                    _ = tokio::time::sleep(RESOURCE_REFUSAL_RETRY_INTERVAL) => {}
+                }
+                refusal_held += RESOURCE_REFUSAL_RETRY_INTERVAL;
+                // No restart spent. The loop head handles a stop that arrived
+                // during the wait.
+                continue;
+            }
             Err(e) => {
+                refusal_held = Duration::ZERO;
                 warn!(
                     "agent_runtime: spawn_claude_child failed agent_id={} attempt={}: {e:#}",
                     payload.agent_id, restarts
@@ -8940,6 +9073,11 @@ async fn run_agent_subprocess(
     }
 
     hb_task.abort();
+
+    if let Some(reason) = reoffer_reason {
+        report_launch_deferral(payload.agent_id, &reason).await;
+        return Ok(());
+    }
 
     if final_exit_code == Some(0) {
         // Clean exit was already reported via spawn-complete; nothing
@@ -9548,6 +9686,13 @@ pub(crate) async fn spawn_claude_child(
     // signal delivery.
     own_process_group: bool,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
+    // Spawn-time resource gate — the headless twin of the one at
+    // `TerminalSession::spawn`, and FIRST, so a refusal leaves nothing behind.
+    // Every caller is unattended, so there is no override. A refusal comes back
+    // as the typed `ResourceGuardRefusal` (`is_resource_guard_refusal`), which
+    // a caller that can wait treats as retryable rather than as a dead spawn.
+    crate::resource_guard::admit_headless_spawn("headless agent session")?;
+
     // Resolved to an absolute path through the same PATH walk the PTY seams
     // use, so a failure names the real file. Falls back to the bare name when
     // nothing resolves; the spawn below retries either way (plan
@@ -10151,6 +10296,11 @@ async fn classify_spawn_error(agent_id: uuid::Uuid, e: &anyhow::Error) -> (Strin
             report_spawn_blocked(agent_id, blocked).await;
             (blocked.refusal.clone(), SpawnPhase::Blocked)
         }
+        // A resource-guard refusal also never started a child, so its phase
+        // is `blocked`. The reason text is unchanged — coord classifies it.
+        None if crate::resource_guard::is_resource_guard_refusal(e) => {
+            (format!("spawn failure: {e}"), SpawnPhase::Blocked)
+        }
         None => (format!("spawn failure: {e}"), SpawnPhase::Exited),
     }
 }
@@ -10327,6 +10477,68 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── resource-guard refusals in the coord-launch restart loop ──
+
+    /// A refusal holds (no restart spent) right up to the bound; at the bound
+    /// it re-offers when no child ever ran, and gives up when one did.
+    #[test]
+    fn a_resource_refusal_holds_then_reoffers_or_gives_up() {
+        let tick = RESOURCE_REFUSAL_RETRY_INTERVAL;
+        let max = RESOURCE_REFUSAL_MAX_HOLD;
+        for started in [false, true] {
+            assert_eq!(
+                resource_refusal_outcome(Duration::ZERO, started),
+                RefusalOutcome::Hold
+            );
+            assert_eq!(
+                resource_refusal_outcome(max - tick, started),
+                RefusalOutcome::Hold
+            );
+        }
+        assert_eq!(
+            resource_refusal_outcome(max, false),
+            RefusalOutcome::Reoffer
+        );
+        assert_eq!(resource_refusal_outcome(max, true), RefusalOutcome::GiveUp);
+        // The interval divides the bound, so a hold ends after a whole number
+        // of probes rather than one short sleep past it.
+        assert_eq!(max.as_secs() % tick.as_secs(), 0);
+    }
+
+    /// The re-offer reason is the one the loop posts, and keeps coord's
+    /// `deferred_load:<class>:<detail>` grammar — no whitespace — or coord's
+    /// prefix match reads it as a terminal failure.
+    #[test]
+    fn a_resource_refusal_reoffer_reason_is_a_deferred_load_reason() {
+        let reason = resource_refusal_reoffer_reason("commit_pressure", RESOURCE_REFUSAL_MAX_HOLD);
+        assert_eq!(reason, "deferred_load:commit_pressure:critical_held_600s");
+        assert!(reason.starts_with(DEFERRED_LOAD_REASON_PREFIX));
+        assert!(!reason.chars().any(char::is_whitespace));
+    }
+
+    /// A resource-guard refusal from the headless seam is classified `blocked`
+    /// (no child ever existed) with its reason text unchanged; an ordinary
+    /// spawn error stays `exited`. Neither posts anything (only a trust-gate
+    /// `SpawnBlocked` does).
+    #[tokio::test]
+    async fn a_resource_refusal_classifies_as_blocked_with_the_text_unchanged() {
+        let refusal = anyhow::anyhow!(
+            "resource_guard:critical:free_commit_bytes: Not starting a new headless agent session"
+        );
+        let (reason, phase) = classify_spawn_error(uuid::Uuid::nil(), &refusal).await;
+        assert!(matches!(phase, SpawnPhase::Blocked));
+        assert_eq!(
+            reason,
+            "spawn failure: resource_guard:critical:free_commit_bytes: Not starting a new \
+             headless agent session"
+        );
+
+        let other = anyhow::anyhow!("No such file or directory");
+        let (reason, phase) = classify_spawn_error(uuid::Uuid::nil(), &other).await;
+        assert!(matches!(phase, SpawnPhase::Exited));
+        assert_eq!(reason, "spawn failure: No such file or directory");
+    }
 
     // ── presentation boot readiness (plan 2026-09-17-a-gate-continuation-
     //    delivered-before-the-runner-finishes-booting-…, Phase 1) ──
