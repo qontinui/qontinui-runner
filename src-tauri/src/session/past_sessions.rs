@@ -188,29 +188,26 @@ pub(crate) fn account_from_config_dir(config_dir: Option<&str>) -> PastSessionAc
     PastSessionAccount { label, wrapper }
 }
 
-/// Locate the on-disk transcript for a session, if any. Prefers the recorded
-/// `config_dir`; falls back to scanning every known Claude config dir (a
-/// session's account may have been re-encoded / moved). Requires a
-/// `working_dir` to build the encoded project path.
+/// Locate the on-disk transcript for a session, if any.
+///
+/// Fast path: the exact encoded path under the RECORDED `config_dir` (the
+/// account the session runs on). Otherwise the newest `<session_id>.jsonl`
+/// under any Claude config dir on this machine — newest, not first-found, since
+/// a migrated session leaves a frozen copy at the same encoded path in its old
+/// account. That sweep needs no `working_dir`, so a session without one is
+/// still found.
 pub(crate) fn resolve_transcript_path(
     config_dir: Option<&str>,
     working_dir: Option<&str>,
     session_id: &str,
 ) -> Option<PathBuf> {
-    let wd = working_dir?;
-    if let Some(cd) = config_dir {
+    if let (Some(cd), Some(wd)) = (config_dir, working_dir) {
         let p = transcript::session_transcript_path(Path::new(cd), wd, session_id);
         if p.exists() {
             return Some(p);
         }
     }
-    for dir in transcript::find_claude_config_dirs() {
-        let p = transcript::session_transcript_path(&dir, wd, session_id);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    transcript::find_transcript_by_session_id(config_dir.map(Path::new), session_id)
 }
 
 /// Format a unix-millis timestamp into a short human date for the `"Session
