@@ -51,7 +51,14 @@
 #      self_heal=true, so "green because healed" is distinguishable from
 #      "green because fresh" without parsing prose.
 #
-# Properties 4 and 5 carry MUTATION PROOFS: the last section re-runs this whole
+#   6. A READY PR is never force-pushed EXCEPT in the two shapes that can
+#      never land: it CONFLICTS with main, or its own required `schema-fresh`
+#      concluded `failure` on its head while its body names an older dump than
+#      this run's (plan 2026-10-17-schema-refresh-pr-ready-but-red-is-never-rebuilt;
+#      #2199 sat ready-and-red for three nights, commented on, never rebuilt).
+#      An unreadable check state is a red; any other state is the comment path.
+#
+# Properties 4, 5 and 6 carry MUTATION PROOFS: the last section re-runs this whole
 # file against deliberately broken copies of the workflow and asserts each is
 # caught by the case that guards it (the child sets SCHEMA_STEP_MUTANT=1, which
 # skips that section). The `if:` evaluator below is strict — any expression
@@ -217,15 +224,19 @@ gh_calls="$( { grep -oE "(^|[^'\"])gh pr " "$code_only" || true; } | wc -l | tr 
 # ::warning:: + fall back to GITHUB_TOKEN).
 guard_re='^[[:space:]]*if (! )?([a-z_]+=)?"?\$?\(?(GH_TOKEN="\$PAT_TOKEN" )?gh pr '
 guarded="$(grep -cE "$guard_re" "$code_only" || true)"
-assert "gh calls in executable code" 9 "$gh_calls"
-assert "guarded gh calls (all but the bare open lookup)" 8 "$guarded"
+assert "gh calls in executable code" 10 "$gh_calls"
+assert "guarded gh calls (all but the bare open lookup)" 9 "$guarded"
 # The REST reads/writes (`gh api`) the ready-PR guard makes are every one of
 # them inside an `if !`: an unread comment list must never read as "not yet
-# commented".
+# commented", and an unread schema-fresh check list must never read as "not
+# red" (or as red).
 gh_api_calls="$( { grep -oE "(^|[^'\"])gh api " "$code_only" || true; } | wc -l | tr -d ' ')"
 gh_api_guarded="$(grep -cE '^[[:space:]]*if ! ([a-z_]+="\$\()?gh api ' "$code_only" || true)"
-assert "gh api calls in executable code" 3 "$gh_api_calls"
-assert "every gh api call is guarded" 3 "$gh_api_guarded"
+assert "gh api calls in executable code" 4 "$gh_api_calls"
+assert "every gh api call is guarded" 4 "$gh_api_guarded"
+# The PR body is read exactly ONCE: the red carve-out and the comment dedup
+# must decide on the same body, not two reads that could straddle an edit.
+assert "the PR body is read once" 1 "$(grep -c 'gh api "repos/\$REPO/pulls/\$existing_num"' "$code_only" || true)"
 # The one bare call must be the open lookup and nothing else. Without this,
 # swapping which call is bare (guarding `list`, un-guarding `edit`) keeps both
 # counts and passes vacuously.
@@ -275,6 +286,11 @@ cat > "$bin/gh" <<'STUB'
 # `api repos/<r>/pulls/<n>` (key `pr-body`) answers GH_STUB_PR_BODY; `pr
 # comment` APPENDS its --body-file to GH_STUB_COMMENTS, which `comments-read`
 # returns — so dedup across runs is exercised against real accumulated state.
+#
+# And the red-PR carve-out: `pr view --json headRefOid` answers GH_STUB_HEAD_SHA,
+# and the `check-runs?check_name=schema-fresh` read (key `schema-fresh-runs`,
+# distinct from the ready script's unfiltered `check-runs` count) answers
+# GH_STUB_FRESH_RUN, pre-filtered to "<status> <conclusion>" or "none".
 prev=""
 json=""
 method="GET"
@@ -291,6 +307,7 @@ if [ "${1:-}" = "api" ]; then
   case "$*" in
     *convertPullRequestToDraft*) key="graphql:convert" ;;
     *" graphql "*)   key="graphql" ;;
+    *"/check-runs?check_name=schema-fresh"*) key="schema-fresh-runs" ;;
     *"/check-runs"*) key="check-runs" ;;
     *"/comments"*)   if [ "$method" = "POST" ]; then key="comment-post"; else key="comments-read"; fi ;;
     *"/pulls/"*)     if [ "$method" = "PATCH" ]; then key="pr-close"; else key="pr-body"; fi ;;
@@ -324,6 +341,8 @@ case "$key" in
   view:isDraft)  printf '%s\n' "${GH_STUB_ISDRAFT:-true}" ;;
   view:mergeable,mergeStateStatus) printf '%s\n' "${GH_STUB_MERGE:-MERGEABLE CLEAN}" ;;
   view:id)       echo "PR_kwDOtest77" ;;
+  view:headRefOid) printf '%s\n' "${GH_STUB_HEAD_SHA:-a47f223e3a47f223e3a47f223e3a47f223e3a47f}" ;;
+  schema-fresh-runs) printf '%s\n' "${GH_STUB_FRESH_RUN:-none}" ;;
   graphql:convert) printf '%s\n' "${GH_STUB_CONVERT_ISDRAFT:-true}" ;;
   comment)
     body_file=""; prev=""
@@ -407,11 +426,14 @@ GH_STUB_ISDRAFT=true
 GH_STUB_MERGE="MERGEABLE CLEAN"
 GH_STUB_CONVERT_ISDRAFT=true
 GH_STUB_PR_BODY=""
+GH_STUB_HEAD_SHA="a47f223e3a47f223e3a47f223e3a47f223e3a47f"
+GH_STUB_FRESH_RUN="none"
 GH_STUB_COMMENTS="$work/comments.txt"
 : > "$GH_STUB_COMMENTS"
 export GH_STUB_EMPTY_URL GH_STUB_FAIL_FIRST_CREATE GIT_STUB_STAGED PAT_TOKEN_STUB
 export GH_STUB_READY_LINE GH_STUB_CHECKS GH_STUB_GRAPHQL_ISDRAFT
 export GH_STUB_ISDRAFT GH_STUB_PR_BODY GH_STUB_COMMENTS GH_STUB_MERGE GH_STUB_CONVERT_ISDRAFT
+export GH_STUB_HEAD_SHA GH_STUB_FRESH_RUN
 
 # run_step <fail-keys> <list-open>
 # Echoes the exit code; leaves stdout+stderr in $work/out.txt, the gh call log in
@@ -439,6 +461,8 @@ run_step() {
     GH_STUB_MERGE="${GH_STUB_MERGE:-MERGEABLE CLEAN}" \
     GH_STUB_CONVERT_ISDRAFT="${GH_STUB_CONVERT_ISDRAFT:-true}" \
     GH_STUB_PR_BODY="${GH_STUB_PR_BODY:-}" \
+    GH_STUB_HEAD_SHA="${GH_STUB_HEAD_SHA:-}" \
+    GH_STUB_FRESH_RUN="${GH_STUB_FRESH_RUN:-none}" \
     GH_STUB_COMMENTS="$GH_STUB_COMMENTS" \
     GH_TOKEN="stub-token" \
     PAT_TOKEN="${PAT_TOKEN_STUB:-}" \
@@ -602,6 +626,7 @@ for shape in "CONFLICTING DIRTY" "CONFLICTING UNKNOWN" "MERGEABLE DIRTY"; do
   assert "ready+conflicting ($shape): force-pushed" 1 "$(grep -c 'push --force' "$work/git.log" || true)"
   assert "ready+conflicting ($shape): no drift comment" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
   assert "ready+conflicting ($shape): re-readied" 1 "$(grep -c '^readied #4242$' "$work/out.txt" || true)"
+  assert "ready+conflicting ($shape): schema-fresh not read" 0 "$(grep -c '^schema-fresh-runs$' "$work/gh.log" || true)"
 done
 GH_STUB_MERGE="CONFLICTING DIRTY"
 GH_STUB_CONVERT_ISDRAFT=false
@@ -624,6 +649,88 @@ GH_STUB_MERGE="MERGEABLE CLEAN"
 : > "$GH_STUB_COMMENTS"
 rc="$(run_step "" "77")"
 assert "ready+mergeable: comment only" "1 0 0" "$(grep -c '^comment$' "$work/gh.log" || true) $(grep -c 'push' "$work/git.log" || true) $(grep -c '^graphql:convert$' "$work/gh.log" || true)"
+# A ready PR whose own required schema-fresh went RED while its body names an
+# OLDER dump can never land either (the #2199 livelock): converted back to a
+# draft from the mutation's own isDraft, rebuilt, force-pushed, re-readied.
+GH_STUB_MERGE="MERGEABLE CLEAN"
+GH_STUB_FRESH_RUN="completed failure"
+GH_STUB_PR_BODY="<!-- schema-pg-sql-refresh-dump:0000000000000000 -->"
+: > "$GH_STUB_COMMENTS"
+rc="$(run_step "" "77")"
+assert "ready+red+stale dump: exit code" 0 "$rc"
+assert "ready+red+stale dump: schema-fresh read once" 1 "$(grep -c '^schema-fresh-runs$' "$work/gh.log" || true)"
+assert "ready+red+stale dump: body read once" 1 "$(grep -c '^pr-body$' "$work/gh.log" || true)"
+assert "ready+red+stale dump: converted to draft" 1 "$(grep -c '^graphql:convert$' "$work/gh.log" || true)"
+assert "ready+red+stale dump: rebuilt from the trigger sha" 1 "$(grep -c 'checkout -B chore/schema-pg-sql-refresh 0000000000000000000000000000000000000000' "$work/git.log" || true)"
+assert "ready+red+stale dump: force-pushed" 1 "$(grep -c 'push --force' "$work/git.log" || true)"
+assert "ready+red+stale dump: PR body rewritten" 1 "$(grep -c '^edit$' "$work/gh.log" || true)"
+assert "ready+red+stale dump: no drift comment" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
+assert "ready+red+stale dump: re-readied" 1 "$(grep -c '^readied #4242$' "$work/out.txt" || true)"
+assert "ready+red+stale dump: warns it is rebuilding a red PR" 1 "$(grep -c 'required schema-fresh is RED' "$work/out.txt" || true)"
+# An EMPTY body (a hand-edited PR) carries no marker either: still stale.
+GH_STUB_PR_BODY=""
+rc="$(run_step "" "77")"
+assert "ready+red+empty body: force-pushed" "0 1" "$rc $(grep -c 'push --force' "$work/git.log" || true)"
+# The convert must still be asserted from its own answer on this path.
+GH_STUB_CONVERT_ISDRAFT=false
+rc="$(run_step "" "77")"
+GH_STUB_CONVERT_ISDRAFT=true
+assert "red convert returns isDraft=false: exit code" 1 "$rc"
+assert "red convert returns isDraft=false: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+# Red, but the body ALREADY carries this run's dump: the dump is current, so
+# the red is something else and a rebuild would push the same bytes. Comment
+# path (deduped against that body: nothing to announce), never a push.
+GH_STUB_PR_BODY="$(bash -c "awk '!/^-- Dumped by pg_dump version/' '$runner_temp/schema.fresh.sql' | sha256sum | cut -c1-16" | sed 's/^/<!-- schema-pg-sql-refresh-dump:/; s/$/ -->/')"
+: > "$GH_STUB_COMMENTS"
+rc="$(run_step "" "77")"
+GH_STUB_PR_BODY=""
+assert "ready+red+current dump: exit code" 0 "$rc"
+assert "ready+red+current dump: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+assert "ready+red+current dump: not converted" 0 "$(grep -c '^graphql:convert$' "$work/gh.log" || true)"
+assert "ready+red+current dump: says why it did not rebuild" 1 "$(grep -c 'already carries this run.s dump' "$work/out.txt" || true)"
+assert "ready+red+current dump: deduped, no comment" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
+# Anything but completed+failure keeps the comment path: in flight, green,
+# another conclusion, or no schema-fresh run at all.
+for fr in "queued none" "in_progress none" "completed success" "completed cancelled" "completed timed_out" "none"; do
+  GH_STUB_FRESH_RUN="$fr"
+  : > "$GH_STUB_COMMENTS"
+  rc="$(run_step "" "77")"
+  assert "ready+schema-fresh $fr: exit code" 0 "$rc"
+  assert "ready+schema-fresh $fr: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+  assert "ready+schema-fresh $fr: not converted" 0 "$(grep -c '^graphql:convert$' "$work/gh.log" || true)"
+  assert "ready+schema-fresh $fr: comment path" 1 "$(grep -c '^comment$' "$work/gh.log" || true)"
+done
+# An unreadable or garbled check state is a red, never a guess either way.
+GH_STUB_FRESH_RUN="completed failure"
+rc="$(run_step "schema-fresh-runs" "77")"
+assert "schema-fresh read refused: exit code" 1 "$rc"
+assert "schema-fresh read refused: reporter names the op" 1 "$(grep -c "'read schema-fresh check runs of #77' operation failed" "$work/out.txt" || true)"
+assert "schema-fresh read refused: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+assert "schema-fresh read refused: never comments blind" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
+for garbled in "" "completed" "completed failure extra" "in_progress success" '{"message":"Not Found"}'; do
+  GH_STUB_FRESH_RUN="$garbled"
+  # The run_step default turns an empty knob into "none"; model an empty
+  # answer with a stub-side sentinel instead.
+  [ -n "$garbled" ] || GH_STUB_FRESH_RUN=" "
+  rc="$(run_step "" "77")"
+  assert "schema-fresh garbled [$garbled]: exit code" 1 "$rc"
+  assert "schema-fresh garbled [$garbled]: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+  assert "schema-fresh garbled [$garbled]: refuses by name" 1 "$(grep -c "schema-fresh state on a47f223e3a47f223e3a47f223e3a47f223e3a47f" "$work/out.txt" || true)"
+done
+GH_STUB_FRESH_RUN="completed failure"
+rc="$(run_step "view:headRefOid" "77")"
+assert "head sha refused: exit code" 1 "$rc"
+assert "head sha refused: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+GH_STUB_HEAD_SHA="not-a-sha"
+rc="$(run_step "" "77")"
+GH_STUB_HEAD_SHA="a47f223e3a47f223e3a47f223e3a47f223e3a47f"
+assert "head sha garbled: exit code" 1 "$rc"
+assert "head sha garbled: check runs never read" 0 "$(grep -c '^schema-fresh-runs$' "$work/gh.log" || true)"
+rc="$(run_step "pr-body" "77")"
+assert "body unreadable: exit code" 1 "$rc"
+assert "body unreadable: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+GH_STUB_FRESH_RUN="none"
+: > "$GH_STUB_COMMENTS"
 rc="$(run_step "view:mergeable,mergeStateStatus" "77")"
 assert "mergeability unreadable: exit code" 1 "$rc"
 assert "mergeability unreadable: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
@@ -1040,6 +1147,20 @@ if [ -z "${SCHEMA_STEP_MUTANT:-}" ]; then
   mutate conflict-check-removed \
     '$0 == "              if [ \"$mergeable\" = \"CONFLICTING\" ] || [ \"${merge_status:-}\" = \"DIRTY\" ]; then" { $0 = "              if false; then" } { print }' \
     "ready+conflicting (CONFLICTING DIRTY): force-pushed"
+  # Remove the red carve-out: a ready PR whose schema-fresh is red against a
+  # stale dump is commented on forever (the #2199 livelock).
+  mutate red-carve-out-removed \
+    '$0 == "                if [ \"$fresh_run\" = \"completed failure\" ]; then" { $0 = "                if false; then" } { print }' \
+    "ready+red+stale dump: force-pushed"
+  # Widen it to any completed run: a GREEN ready PR would be force-pushed.
+  mutate red-carve-out-any-completed \
+    '$0 == "                if [ \"$fresh_run\" = \"completed failure\" ]; then" { $0 = "                if [[ \"$fresh_run\" == completed* ]]; then" } { print }' \
+    "ready+schema-fresh completed success: never pushed"
+  # Drop the current-dump check: a red PR already carrying this dump would be
+  # rebuilt into the same bytes, under a possibly-live proposal.
+  mutate red-carve-out-ignores-marker \
+    '$0 == "                  if grep -qF \"$drift_marker\" \"$pr_body_file\"; then" { $0 = "                  if false; then" } { print }' \
+    "ready+red+current dump: never pushed"
   # Back to the default success(): an upstream failure skips the sweep.
   mutate sweep-success-only \
     "BEGIN { want = \"      - name: $SWEEP_STEP\" }
