@@ -104,6 +104,12 @@ pub fn scrollback_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.scrollback", pane.as_str()))
 }
 
+/// `<pane-dir>/<pane-id>.scrollback.tmp` — where a tail rewrite is written
+/// before it is renamed over [`scrollback_path`].
+pub fn scrollback_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.scrollback.tmp", pane.as_str()))
+}
+
 /// `<pane-dir>/<pane-id>.report` — the holder's ready/error report file.
 pub fn report_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.report", pane.as_str()))

@@ -371,6 +371,12 @@ impl Holder {
             }
         }
         pane.wait_for_delivery();
+        // Every byte the child wrote is in the ring now: persist the final tail
+        // BEFORE the reap, which can take a while (a scope's reap passes) and
+        // is a window in which this holder could itself be killed. It closes
+        // the writer under its mutex, and the lock is still held, so no later
+        // timer tick can touch a successor holder's files.
+        crate::scrollback::persist_final(&pane, &scrollback, &log);
         // Plan D8: on a KILL this holder is the reaper of its own child tree.
         // Still under the lock, so a boot sweep cannot take this pane for dead
         // while its remainder is being ended.
@@ -382,9 +388,6 @@ impl Holder {
         if !reap.killed.is_empty() || !reap.notes.is_empty() {
             log_line(&log, &format!("pane ended; its tree: {}", reap.summary()));
         }
-        // Closes the writer under its mutex BEFORE the lock is released, so no
-        // later timer tick can touch a successor holder's files.
-        crate::scrollback::persist_final(&pane, &scrollback, &log);
         drop(lock);
         exit
     }

@@ -104,7 +104,11 @@
 //! says so once in the holder log.
 //!
 //! The file is never removed by the holder: outliving the holder is its whole
-//! purpose. Reaping it belongs with the lock file's, in the boot sweep.
+//! purpose. The boot sweep (`crate::sweep`) keeps it when it reaps a dead
+//! pane — a restorer reads it before respawning — and removes it, like a dead
+//! pane's log, once its pane has had no lock file for
+//! [`crate::sweep::DEAD_LOG_RETENTION`]. A dead pane's `.tmp` is removed with
+//! the pane.
 //!
 //! ## Reading
 //!
@@ -112,9 +116,9 @@
 //! [`MAX_SCROLLBACK_FILE_BYTES`] is refused before it is read), checked (the
 //! same no-symlink / regular-file / our-uid open as the lock), validated, and
 //! returns at most [`SCROLLBACK_CAP_BYTES`]. It is for the runner to restore a
-//! pane whose holder is gone; Phase 4 ships it with no production caller —
-//! the runner-side consumers are the boot sweep (Phase 3) and resume after
-//! holder death (Phase 6).
+//! pane whose holder is gone. It has no production caller yet: the boot sweep
+//! (Phase 3) leaves the tail in place without reading it, and the consumer is
+//! resume after holder death (Phase 6).
 //!
 //! ## Layout (integers big-endian)
 //!
@@ -133,7 +137,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::pane::{scrollback_path, PaneId};
+use crate::pane::{scrollback_path, scrollback_tmp_path, PaneId};
 use crate::pty::Pane;
 use crate::ring::OutputRing;
 
@@ -429,12 +433,9 @@ fn closed_error() -> io::Error {
 
 impl ScrollbackWriter {
     pub fn new(pane_dir: &Path, pane: &PaneId, child_pid: u32) -> Self {
-        let path = scrollback_path(pane_dir, pane);
-        let mut tmp = path.clone().into_os_string();
-        tmp.push(".tmp");
         ScrollbackWriter {
-            path,
-            tmp: PathBuf::from(tmp),
+            path: scrollback_path(pane_dir, pane),
+            tmp: scrollback_tmp_path(pane_dir, pane),
             child_pid,
             file: None,
             file_len: 0,
