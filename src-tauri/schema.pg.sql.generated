@@ -1947,6 +1947,81 @@ COMMENT ON COLUMN coord.canonical_repos.ci_node_required_capabilities IS 'JSON a
 
 
 --
+-- Name: capacity_advice_log; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.capacity_advice_log (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    emitted_at timestamp with time zone DEFAULT now() NOT NULL,
+    kind text NOT NULL,
+    target text NOT NULL,
+    computer_id uuid,
+    window_secs integer,
+    bottleneck jsonb,
+    evidence jsonb,
+    expected_effect jsonb,
+    confidence text NOT NULL,
+    actor text NOT NULL,
+    acted_on_at timestamp with time zone,
+    acted_by text,
+    realised_effect jsonb,
+    realised_at timestamp with time zone,
+    CONSTRAINT ck_capacity_advice_log_actor CHECK ((actor = ANY (ARRAY['agent'::text, 'operator'::text]))),
+    CONSTRAINT ck_capacity_advice_log_confidence CHECK ((confidence = ANY (ARRAY['high'::text, 'medium'::text, 'low'::text, 'unknown'::text])))
+);
+
+
+--
+-- Name: TABLE capacity_advice_log; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.capacity_advice_log IS 'Append-only record of every capacity recommendation coord''s capacity_advice() emitted (plan 2026-10-01-fleet-capacity-page-finds-the-bottleneck-and-the-idle-hardware), whether it was acted on, and the realised effect measured afterwards, so a wrong prediction is falsifiable. Only the four outcome columns (acted_on_at, acted_by, realised_effect, realised_at) are ever UPDATEd, each set once; nothing else is rewritten. Retained 90 days by coord on emitted_at. Written by coord only.';
+
+
+--
+-- Name: COLUMN capacity_advice_log.kind; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.capacity_advice_log.kind IS 'Advice kind (add_ci_runner_service, restore_runner, acquire_host, use_idle_hardware, move_workload, hosted_ceiling, measure_first, …). Deliberately NOT CHECKed: coord owns the vocabulary and it grows; a CHECK would make each new kind a lockstep migration and a failed log write.';
+
+
+--
+-- Name: COLUMN capacity_advice_log.computer_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.capacity_advice_log.computer_id IS 'The coord.computers row the advice targets, when it targets one. NO FOREIGN KEY YET: coord.computers is created by web#1598 and the FK is added by a later revision once it lands. Until then a reader must tolerate an id that resolves to nothing. NULL = the advice does not target a single computer.';
+
+
+--
+-- Name: COLUMN capacity_advice_log.expected_effect; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.capacity_advice_log.expected_effect IS 'Predicted effect WITH its arithmetic (e.g. queue p90 minutes saved per day, lands per day), shaped per advice kind by coord''s Advice type. Compared field-for-field with realised_effect. NULL = no effect could be sized (never a predicted zero).';
+
+
+--
+-- Name: COLUMN capacity_advice_log.confidence; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.capacity_advice_log.confidence IS 'high | medium | low | unknown, derived from sample coverage and model fit. unknown is a VALUE, not an absence: an advice whose deciding input is UNKNOWN is recorded with it, never dropped.';
+
+
+--
+-- Name: COLUMN capacity_advice_log.acted_on_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.capacity_advice_log.acted_on_at IS 'When the advice was acted on (by acted_by). NULL = not acted on yet — NOT "rejected"; this table records no rejection state. Set once.';
+
+
+--
+-- Name: COLUMN capacity_advice_log.realised_effect; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.capacity_advice_log.realised_effect IS 'Measured effect of an acted-on advice (Phase 6), in the shape of expected_effect, stamped at realised_at. NULL = not yet measured, never a realised zero. Set once.';
+
+
+--
 -- Name: ci_baselines; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -3891,6 +3966,8 @@ CREATE TABLE coord.device_resource_samples (
     wind_down_sessions jsonb,
     blocking_lanes jsonb,
     cpu_temp_c real,
+    workloads jsonb,
+    gpu jsonb,
     CONSTRAINT ck_device_resource_samples_lane CHECK ((lane = ANY (ARRAY['host'::text, 'wsl'::text, 'container'::text]))),
     CONSTRAINT ck_device_resource_samples_lane_instance_nonempty CHECK (((lane_instance IS NULL) OR (lane_instance <> ''::text)))
 );
@@ -4104,6 +4181,20 @@ COMMENT ON COLUMN coord.device_resource_samples.blocking_lanes IS 'Per-spawning-
 --
 
 COMMENT ON COLUMN coord.device_resource_samples.cpu_temp_c IS 'CPU package temperature in degrees Celsius at sample time (plan 2026-10-13-cpu-temperature-in-fleet-resource-telemetry). Package sensor (x86_pkg_temp, or the hottest coretemp input); divided to Celsius once at the collector, so the wire is always Celsius. NULL = NOT MEASURED (Windows or WSL host in v1, a host with no sensor, a failed read, or a publisher build that predates this field) and must NEVER be read as 0 or as "cool"; 0 is a legal real measurement and stays distinct from NULL. REPORTING ONLY: must not feed lane_pressure, lane_saturation or headroom.';
+
+
+--
+-- Name: COLUMN device_resource_samples.workloads; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.workloads IS 'Workload class census on this lane at sample time (plan 2026-10-01-fleet-capacity-page-finds-the-bottleneck-and-the-idle-hardware, Decision 2): a JSON array, one entry per class present, each {class, cpu_pct, rss_bytes, gpu_mem_bytes, proc_count}. The class vocabulary is CLOSED and versioned: claude_session, gh_actions_job, gh_actions_runner_idle, cargo_build, qontinui_runner, supervisor, docker, wsl_vm, gpu_inference, browser, other — other carries its share so unexplained load stays visible. Bounded to at most 16 entries app-side (runner census + coord ingest), NOT by a CHECK: a CHECK violation would fail the whole best-effort INSERT and discard every other metric on the row. argv, cwd and env NEVER leave the host — only the class is emitted; an entry carrying a process name, PID or command line is a publisher bug. NULL = NOT MEASURED / UNKNOWN (older runner, failed probe, or census switched off by workload_census_enabled = false or QONTINUI_WORKLOAD_CENSUS=0) and must NEVER be read as "nothing is running"; [] = measured, no classified process. A gpu_mem_bytes of NULL inside an entry is unmeasured, never 0.';
+
+
+--
+-- Name: COLUMN device_resource_samples.gpu; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.gpu IS 'Dynamic per-GPU axes at sample time (plan 2026-10-01-fleet-capacity-page-finds-the-bottleneck-and-the-idle-hardware, Decision 3): a JSON array, one entry per GPU, each {index, util_pct, mem_used_bytes, power_w, temp_c}, from nvidia-smi --query-gpu. The STATIC inventory (vendor, model, VRAM, driver) lives in coord.computers.gpus (web#1598, pending) and is not duplicated here. Written on the HOST lane only (one writer): a wsl lane row carries NULL, so a fleet VRAM sum never double-counts. Bounded to at most 16 entries app-side, NOT by a CHECK (same reason as workloads). NULL = NOT MEASURED / UNKNOWN (non-host lane, no NVIDIA tooling = not_supported, older runner, failed probe, census off) and must NEVER be read as an idle GPU; [] = nvidia-smi answered with zero GPUs. A NULL axis inside an entry is unmeasured, never 0.';
 
 
 --
@@ -4726,6 +4817,7 @@ CREATE TABLE coord.fleet_runtime_policy (
     min_free_bytes_sessions_wsl bigint,
     min_free_bytes_sessions_critical_host bigint,
     min_free_bytes_sessions_critical_wsl bigint,
+    workload_census_enabled boolean,
     CONSTRAINT fleet_runtime_policy_scope_band_chk CHECK ((scope_band = ANY (ARRAY['system'::text, 'tenant'::text, 'repo'::text])))
 );
 
@@ -4808,6 +4900,13 @@ COMMENT ON COLUMN coord.fleet_runtime_policy.min_free_bytes_sessions_critical_ws
 
 
 --
+-- Name: COLUMN fleet_runtime_policy.workload_census_enabled; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.fleet_runtime_policy.workload_census_enabled IS 'Tenant off-switch for the workload class census and GPU axes on coord.device_resource_samples (workloads, gpu; revision fcap_01), on the fleet_resources domain. NULL = no override, the census RUNS (it ships enabled); true = explicitly on; false = switched off, and runners then publish workloads = NULL and gpu = NULL (UNKNOWN), never []. The per-machine switch is QONTINUI_WORKLOAD_CENSUS=0 on the runner. Not the privacy control: argv, cwd and env never leave the host whatever this says.';
+
+
+--
 -- Name: fleet_runtime_policy_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
 --
 
@@ -4849,7 +4948,8 @@ CREATE TABLE coord.fleet_runtime_policy_versions (
     min_free_bytes_sessions_host bigint,
     min_free_bytes_sessions_wsl bigint,
     min_free_bytes_sessions_critical_host bigint,
-    min_free_bytes_sessions_critical_wsl bigint
+    min_free_bytes_sessions_critical_wsl bigint,
+    workload_census_enabled boolean
 );
 
 
@@ -4942,6 +5042,13 @@ COMMENT ON COLUMN coord.fleet_runtime_policy_versions.min_free_bytes_sessions_cr
 --
 
 COMMENT ON COLUMN coord.fleet_runtime_policy_versions.min_free_bytes_sessions_critical_wsl IS 'Snapshot of coord.fleet_runtime_policy.min_free_bytes_sessions_critical_wsl — see that column for its meaning and for why NULL is not zero. Snapshot rows written BEFORE revision sess_guard_01 carry NULL here: the column did not exist, so no override could have been in force, and NULL is the honest record of that history rather than a gap to be backfilled. Immutable: never UPDATE or DELETE a row here.';
+
+
+--
+-- Name: COLUMN fleet_runtime_policy_versions.workload_census_enabled; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.fleet_runtime_policy_versions.workload_census_enabled IS 'Snapshot of coord.fleet_runtime_policy.workload_census_enabled — see that column for its meaning and for why NULL is ON, not off. Snapshot rows written BEFORE revision fcap_01 carry NULL here: the column did not exist, so no off-switch could have been in force, and NULL is the honest record of that history rather than a gap to be backfilled. Immutable: never UPDATE or DELETE a row here.';
 
 
 --
@@ -9088,6 +9195,21 @@ CREATE TABLE coord.tenant_github_accounts (
     account_type text NOT NULL,
     installation_id bigint NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: tenant_github_hosts; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.tenant_github_hosts (
+    tenant_id uuid NOT NULL,
+    api_base text NOT NULL,
+    web_base text NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by text,
+    CONSTRAINT tenant_github_hosts_api_base_shape CHECK (((api_base ~ '^https://[^/?#@\s]+(/[^?#\s]*)?$'::text) AND (api_base !~ '/$'::text))),
+    CONSTRAINT tenant_github_hosts_web_base_shape CHECK ((web_base ~ '^https://[^/?#@\s]+$'::text))
 );
 
 
@@ -20555,6 +20677,14 @@ ALTER TABLE ONLY coord.canonical_repos
 
 
 --
+-- Name: capacity_advice_log capacity_advice_log_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.capacity_advice_log
+    ADD CONSTRAINT capacity_advice_log_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: ci_baselines ci_baselines_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -22336,6 +22466,14 @@ ALTER TABLE ONLY coord.tenant_github_accounts
 
 ALTER TABLE ONLY coord.tenant_github_accounts
     ADD CONSTRAINT tenant_github_accounts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_github_hosts tenant_github_hosts_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.tenant_github_hosts
+    ADD CONSTRAINT tenant_github_hosts_pkey PRIMARY KEY (tenant_id);
 
 
 --
@@ -29406,6 +29544,13 @@ CREATE INDEX idx_wush_unit_status_time ON coord.work_unit_status_history USING b
 --
 
 CREATE INDEX ix_agent_action_reports_tenant_created ON coord.agent_action_reports USING btree (tenant_id, created_at DESC);
+
+
+--
+-- Name: ix_capacity_advice_log_tenant_emitted_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_capacity_advice_log_tenant_emitted_at ON coord.capacity_advice_log USING btree (tenant_id, emitted_at DESC);
 
 
 --
@@ -38086,6 +38231,14 @@ ALTER TABLE ONLY coord.tenant_devices
 
 ALTER TABLE ONLY coord.tenant_github_accounts
     ADD CONSTRAINT tenant_github_accounts_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_github_hosts tenant_github_hosts_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.tenant_github_hosts
+    ADD CONSTRAINT tenant_github_hosts_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
 
 
 --
