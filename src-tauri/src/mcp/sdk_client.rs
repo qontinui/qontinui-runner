@@ -9160,14 +9160,15 @@ mod connect_bearer_scope_tests {
     /// One port that answers TLS and plaintext alike, so an `https` to `http`
     /// redirect keeps the host AND the effective port. Over TLS it answers
     /// every request with a 302 to the same path over `http` on the same
-    /// host and port. In plaintext it records the `Authorization` it was sent
-    /// and answers as a UI Bridge app. The first byte of a TLS connection is
-    /// a handshake record (0x16), which is how a connection is told apart.
+    /// host and port. In plaintext it answers as a UI Bridge app. Both sides
+    /// record the `Authorization` each request carried, returned as
+    /// `(port, over TLS, over plaintext)`. The first byte of a TLS connection
+    /// is a handshake record (0x16), which is how a connection is told apart.
     async fn spawn_downgrading_origin(
         host: &'static str,
     ) -> (
         u16,
-        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Option<String>>>>,
         Arc<std::sync::Mutex<Vec<Option<String>>>>,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9182,6 +9183,14 @@ mod connect_bearer_scope_tests {
                 }
             }
             String::from_utf8_lossy(&head).into_owned()
+        }
+
+        fn authorization(head: &str) -> Option<String> {
+            head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_string())
+            })
         }
 
         // Served with rustls, the stack the production reqwest client speaks,
@@ -9208,14 +9217,14 @@ mod connect_bearer_scope_tests {
         let plaintext_auth: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let redirects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tls_auth: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
         let seen = plaintext_auth.clone();
-        let redirected = redirects.clone();
+        let seen_tls = tls_auth.clone();
         tokio::spawn(async move {
             while let Ok((mut tcp, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
                 let seen = seen.clone();
-                let redirected = redirected.clone();
+                let seen_tls = seen_tls.clone();
                 tokio::spawn(async move {
                     let mut first = [0u8; 1];
                     if tcp.peek(&mut first).await.unwrap_or(0) == 0 {
@@ -9226,22 +9235,17 @@ mod connect_bearer_scope_tests {
                             return;
                         };
                         let head = read_head(&mut tls).await;
+                        seen_tls.lock().unwrap().push(authorization(&head));
                         let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
                         let reply = format!(
                             "HTTP/1.1 302 Found\r\nLocation: http://{host}:{port}{path}\r\n\
                              Content-Length: 0\r\nConnection: close\r\n\r\n"
                         );
-                        redirected.fetch_add(1, Ordering::SeqCst);
                         let _ = tls.write_all(reply.as_bytes()).await;
                         let _ = tls.shutdown().await;
                     } else {
                         let head = read_head(&mut tcp).await;
-                        let auth = head.lines().find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("authorization")
-                                .then(|| value.trim().to_string())
-                        });
-                        seen.lock().unwrap().push(auth);
+                        seen.lock().unwrap().push(authorization(&head));
                         let body = r#"{"uiBridge":{"appId":"fixture","appName":"Fixture","appType":"web"}}"#;
                         let reply = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
@@ -9254,7 +9258,7 @@ mod connect_bearer_scope_tests {
                 });
             }
         });
-        (port, redirects, plaintext_auth)
+        (port, tls_auth, plaintext_auth)
     }
 
     /// An admitted `https` Qontinui origin that redirects to `http` on the
@@ -9265,7 +9269,7 @@ mod connect_bearer_scope_tests {
     #[tokio::test]
     async fn an_https_origin_redirecting_to_http_never_gets_the_bearer_in_plaintext() {
         const HOST: &str = "qontinui-web.test";
-        let (port, redirects, plaintext_auth) = spawn_downgrading_origin(HOST).await;
+        let (port, tls_auth, plaintext_auth) = spawn_downgrading_origin(HOST).await;
         let url = format!("https://{HOST}:{port}");
         let admitted = vec![origin(&url)];
         let (target, choice) = choose_connect_bearer(
@@ -9291,9 +9295,13 @@ mod connect_bearer_scope_tests {
         let _ =
             connect_sdk_app_with(&manager, &url, ConnectHints::default(), choice, builder).await;
 
-        assert!(
-            redirects.load(Ordering::SeqCst) > 0,
-            "the handshake never reached the https origin, so no redirect was offered"
+        // The bearer DID go out on the admitted https hop. Without this the
+        // test would also pass if the bearer were never attached at all.
+        assert_eq!(
+            tls_auth.lock().unwrap().first().cloned(),
+            Some(Some("Bearer test-operator-token".to_string())),
+            "the first https request must carry the operator bearer (None outer: \
+             the handshake never reached the https origin)"
         );
         let leaked: Vec<_> = plaintext_auth
             .lock()
