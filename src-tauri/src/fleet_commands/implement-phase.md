@@ -320,9 +320,11 @@ trigger is NOT a gate; skip those and just report the blocker.
   a session monitoring for "an observable signal and a short expected wait
   (≲2h: deploy, CI, merge train)"; inside that window finish the phase rather
   than gating it — that window is a reason NOT to gate, never a reason to gate
-  without a dispatcher). If you rely on the spawn, delivery is a live defect —
-  continuations are being dispatched but never consumed, and coord's 24h pending
-  window drops them permanently — so treat it as best-effort and read the gate's
+  without a dispatcher). If you rely on the spawn, delivery is best-effort. The
+  2026-07-23 defect (continuations dispatched but never consumed) is no longer the
+  standing state, but nothing guarantees delivery (`_gate-registration`
+  → "Continuation policy" holds the dated measurement), and one never claimed
+  inside coord's 7-day pending window is dropped permanently. So treat it as best-effort and read the gate's
   `continuation_consumed_outcome` (a **null** outcome means never claimed, which
   is worse than a recorded `spawn_failed`).
   **When you attach one, populate `hint` — it is the spawned agent's ONLY

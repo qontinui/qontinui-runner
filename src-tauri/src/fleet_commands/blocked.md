@@ -245,9 +245,11 @@ continuation — but Step 5's plan-anchored HTTP fallback **403s**
 exception is registerable only over MCP `coord_register_gate` or the
 operator/acting `POST $COORD_HTTP_URL/coord/gates/register` route (Step 5 item 3).
 
-**Know the delivery risk before relying on the spawn.** Continuations are
-currently being **dispatched but never consumed**, and coord's 7-day pending window
-drops them permanently — treat the spawn as best-effort, and read the gate's
+**Know the delivery risk before relying on the spawn.** Delivery is best-effort.
+The 2026-07-23 defect (continuations **dispatched but never consumed**) is no
+longer the standing state, but nothing guarantees delivery
+(`_gate-registration` → "Continuation policy" holds the dated measurement), and
+one never claimed inside coord's 7-day pending window is dropped permanently. So treat the spawn as best-effort, and read the gate's
 `continuation_consumed_outcome` rather than assuming a `consumed` continuation
 ran (a **null** outcome means never claimed, which is worse than a recorded
 `spawn_failed`). Attach it anyway: a best-effort dispatcher strictly beats none.

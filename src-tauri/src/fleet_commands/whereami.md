@@ -1341,3 +1341,22 @@ the terminal is not in it, or the runner predates the block.
 Then one sentence naming anything that came back UNKNOWN and why it is not a
 "no". Do not merge the blocks, and do not let a reachability result rewrite an
 identity line — that conflation is the whole reason this command exists.
+
+**A product term on this card you do not recognise (tenant, device, UNKNOWN, …)
+is defined by the glossary door, not by this file:** the local runner's `GET
+http://127.0.0.1:9876/glossary` (the glossary this runner build compiled in), or
+coord `GET https://coord.qontinui.io/coord/glossary` (anonymous) / the MCP tool
+`coord_glossary`. One term: `?term=<id>` (MCP argument `term`), where the id is
+the snake_case one — `tenant`, `unknown`. An unknown id is a refusal with `code:
+"glossary_term_unknown"` and `known_version` (HTTP `404`; a tool error carrying
+the same body over MCP), distinct from an empty glossary (the whole-glossary
+read is never empty). A `404` WITHOUT that code — coord's `error:
+"no_such_route"`, the runner's `code: "NOT_FOUND"` "No route for GET /glossary"
+— or an unknown-tool / `-32601` answer, means the build you reached has no
+glossary door; confirm it against that build's id (runner `GET
+http://127.0.0.1:9876/health` `buildId`; coord `GET
+https://coord.qontinui.io/health` `build_sha`) rather than assuming, and do not
+read it as "the term is unknown". Over the runner's `/coord-mcp` proxy a
+`-32601` speaks for the RUNNER build's tool allowlist, not coord's: read
+`http://127.0.0.1:9876/health` `buildDrift`. This command's own "Rung 1/2" steps
+are its cascade steps, not the glossary's `rung`.
