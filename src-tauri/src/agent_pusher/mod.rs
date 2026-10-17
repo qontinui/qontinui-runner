@@ -221,7 +221,18 @@ pub struct BackoffState {
     pub consecutive_failures: u32,
     /// Unix seconds before which the target is skipped on a tick.
     pub next_attempt_epoch_secs: u64,
+    /// What this target's LAST tick did: `pushed`, `up_to_date`, `transient`,
+    /// `timed_out`, `failed`, or [`SKIPPED_EGRESS_OFF`]. `None` before the
+    /// first attempt. Not part of the backoff ladder — a success resets the
+    /// ladder and the tick writes the status after it.
+    pub last_status: Option<&'static str>,
 }
+
+/// The per-target status a tick records when the tenant's
+/// `egress_code_mirror` switch refused the push (plan
+/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7). While it
+/// reads this, the work-loss protection the pusher gives is OFF.
+pub const SKIPPED_EGRESS_OFF: &str = "skipped: egress_off";
 
 impl BackoffState {
     /// True while the target is inside its backoff window.
@@ -471,7 +482,20 @@ pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
             );
             continue;
         }
-        match push_one(state, target, &token_clone.token, timeout).await {
+        let outcome = push_one(state, target, &token_clone.token, timeout).await;
+        let status = match &outcome {
+            Ok(o) => o.status(),
+            Err(_) => "failed",
+        };
+        match outcome {
+            Ok(PushOutcome::SkippedEgressOff) => {
+                // Not a failure: the ladder is untouched, so the push resumes
+                // on the first tick after the switch flips back on.
+                debug!(
+                    "agent_pusher: agent_id={} repo={} branch={} {SKIPPED_EGRESS_OFF} —                      the tenant turned the code mirror off",
+                    state.agent_id, target.repo, target.branch
+                );
+            }
             Ok(PushOutcome::Pushed) => {
                 b.record_success();
                 info!(
@@ -539,6 +563,7 @@ pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
                 );
             }
         }
+        b.last_status = Some(status);
     }
     Ok(())
 }
@@ -558,6 +583,17 @@ async fn push_one(
     token: &str,
     push_timeout: Duration,
 ) -> Result<PushOutcome> {
+    // The tenant's `egress_code_mirror` switch, read on EVERY tick so a flip
+    // takes effect within one cadence. Checked before the git child exists:
+    // with the switch off no process is spawned and no connection is made.
+    // Asked in the tenant the agent token names (its `tenant_id` claim) — the
+    // tenant coord files the pushed branch under — else the default scope.
+    if !crate::egress::permit_or_count_for(
+        crate::egress::Flow::CodeMirror,
+        crate::auth::jwt_tenant_claim(token),
+    ) {
+        return Ok(PushOutcome::SkippedEgressOff);
+    }
     let origin_url = build_origin_url(&state.coord_http_base, &target.repo)?;
     // Coordination Phase 5 / Row 4: push the local branch
     // (`refs/heads/<branch>` — a normal checked-out branch in the
@@ -806,9 +842,23 @@ enum PushOutcome {
     /// (`kill_on_drop`). Carries elapsed time; counts as a failure for
     /// backoff purposes and is always logged at `warn!`.
     TimedOut(Duration),
+    /// The tenant's `egress_code_mirror` switch is off: nothing was spawned
+    /// and nothing left the machine. Not a failure.
+    SkippedEgressOff,
 }
 
 impl PushOutcome {
+    /// The per-target status word ([`BackoffState::last_status`]).
+    fn status(&self) -> &'static str {
+        match self {
+            PushOutcome::Pushed => "pushed",
+            PushOutcome::UpToDate => "up_to_date",
+            PushOutcome::Transient(_) => "transient",
+            PushOutcome::TimedOut(_) => "timed_out",
+            PushOutcome::SkippedEgressOff => SKIPPED_EGRESS_OFF,
+        }
+    }
+
     /// True for outcomes that count as a failure toward the per-target
     /// backoff ladder (successes and up-to-date no-ops reset it).
     /// `tick_once` matches the variants directly for per-arm log
@@ -1263,5 +1313,96 @@ mod tests {
             "cancelling must stop the pusher task; a detached task here is the \
              leak that put 1,353 orphaned daemons on one box"
         );
+    }
+}
+
+/// The registered flow test for the code mirror (`crate::egress::FLOW_TESTS`):
+/// [`push_one`] against a counting loopback "coord git door", with the switch
+/// pinned each way.
+#[cfg(test)]
+pub(crate) mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::{pin, ConnCounter};
+    use crate::egress::{Flow, Level};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+            ])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run git")
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    async fn push_once(level: Level) -> (usize, Option<&'static str>) {
+        let dir = tempfile::tempdir().unwrap();
+        git(
+            dir.path(),
+            &["init", "--quiet", "--initial-branch=agent-branch"],
+        );
+        std::fs::write(dir.path().join("f.txt"), "synthetic").unwrap();
+        git(dir.path(), &["add", "f.txt"]);
+        git(dir.path(), &["commit", "--quiet", "-m", "synthetic"]);
+
+        let counter = ConnCounter::start();
+        let state = Arc::new(PusherState {
+            agent_id: uuid::Uuid::nil(),
+            coord_http_base: counter.http_base(),
+            origin_repo_alias: "example/widget".into(),
+            targets: vec![],
+            token: Arc::new(tokio::sync::RwLock::new(TokenSlot {
+                token: "synthetic".into(),
+                jti: uuid::Uuid::nil(),
+                exp: chrono::Utc::now().timestamp() + 3600,
+                ..Default::default()
+            })),
+            backoff: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let target = PushTarget {
+            repo: "example/widget".into(),
+            branch: "agent-branch".into(),
+            worktree_path: dir.path().to_path_buf(),
+            push_ref: "refs/agent/synthetic".into(),
+        };
+        let _pin = pin(Flow::CodeMirror, level);
+        let status = match push_one(&state, &target, "synthetic", Duration::from_secs(20)).await {
+            Ok(o) => Some(o.status()),
+            Err(_) => None,
+        };
+        (counter.wait_for(1, Duration::from_millis(300)), status)
+    }
+
+    #[tokio::test]
+    pub(crate) async fn code_mirror_pinned_off_makes_zero_connections() {
+        let (connects, status) = push_once(Level::Off).await;
+        assert_eq!(
+            connects, 0,
+            "no push may reach coord's git door with the switch off"
+        );
+        assert_eq!(status, Some(SKIPPED_EGRESS_OFF));
+    }
+
+    #[tokio::test]
+    pub(crate) async fn code_mirror_pinned_on_makes_a_connection() {
+        let (connects, status) = push_once(Level::On).await;
+        assert!(connects >= 1, "with the switch on git pushes to the door");
+        assert_ne!(status, Some(SKIPPED_EGRESS_OFF));
     }
 }
