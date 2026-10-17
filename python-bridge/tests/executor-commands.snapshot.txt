@@ -45,8 +45,6 @@ get_ui_bridge_exploration_status -> _handle_get_ui_bridge_exploration_status (pa
 get_uitars_extraction_results -> _handle_get_uitars_extraction_results (noargs)
 get_uitars_extraction_status -> _handle_get_uitars_extraction_status (noargs)
 gui_config_build -> _handle_gui_config_build (params)
-gui_config_capture_elements -> _handle_gui_config_capture_elements (params)
-gui_config_capture_multi_state -> _handle_gui_config_capture_multi_state (params)
 list_browser_targets -> _handle_list_browser_targets (params)
 load -> _cmd_load (params)
 load_state_machine -> _handle_load_state_machine (params)
