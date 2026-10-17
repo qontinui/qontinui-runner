@@ -474,6 +474,17 @@ pub fn primary_boot_unix_millis() -> Option<i64> {
     PRIMARY_BOOT_UNIX_MILLIS.get().copied()
 }
 
+/// This process generation's boot instant, initializing it to `now()` if
+/// startup has not set it (first writer wins, so every caller agrees on one
+/// value). The gate-continuation generation stamp and the close observer's
+/// prior-generation test (plan
+/// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…`) key
+/// on THIS instant — the same one the PID-reuse guard uses — rather than a
+/// second clock. In production startup sets it before any spawn can run.
+pub fn primary_boot_unix_millis_or_init() -> i64 {
+    set_primary_boot_unix_millis(chrono::Utc::now().timestamp_millis())
+}
+
 /// Latest completed report — `/health` reads this; the periodic task is the
 /// sole writer. `None` until the first pass completes.
 static LATEST: OnceLock<Mutex<Option<TrackingHealthReport>>> = OnceLock::new();
@@ -1028,6 +1039,9 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 

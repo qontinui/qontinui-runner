@@ -3436,6 +3436,7 @@ impl TerminalSession {
                 page_id.to_string(),
                 0,
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                None,
             );
             info!(
                 terminal_id = %terminal_id,
