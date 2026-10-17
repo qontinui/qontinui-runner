@@ -1378,6 +1378,7 @@ pub fn terminal_session_record_open(
         gate_consuming_device_id: None,
         gate_bound_generation: None,
         restored_in_generation: None,
+        gate_reported_generation: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -2791,6 +2792,7 @@ async fn poll_and_record_session<F>(
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_generation,
                 restored_in_generation: None,
+                gate_reported_generation: None,
             };
             store.record_open(record);
             info!(
@@ -2890,6 +2892,7 @@ pub(crate) fn record_pinned_session_open(
         gate_consuming_device_id,
         gate_bound_generation,
         restored_in_generation: None,
+        gate_reported_generation: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -3158,6 +3161,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_generation: None,
             restored_in_generation: None,
+            gate_reported_generation: None,
         }
     }
 
@@ -3637,6 +3641,97 @@ mod tests {
         check("spawn record");
         record(None); // the session-open hook's write
         check("after the gate-less hook re-record");
+    }
+
+    /// Plan `2026-10-07-a-resumed-gate-continuation-…` Phase 3 test (k): an
+    /// operator's VERIFIED "Retry resume" of a prior-generation gate record
+    /// whose boot-restore resume FAILED is adopted into this generation exactly
+    /// once, through the verified branch's re-assert
+    /// ([`terminal_session_record_open`]: `record_open` of the gate-less
+    /// payload the frontend sends, then [`adopt_restored_continuation`]).
+    ///
+    /// The command takes a `tauri::State`, which this crate cannot build in a
+    /// unit test (tauri's `test` feature is off), so the test drives the
+    /// command's two store calls in its order with the payload shape it builds.
+    #[test]
+    fn verified_retry_of_a_failed_restore_is_adopted_exactly_once() {
+        use crate::session::session_lifecycle_store::{TerminalSessionRecord, RESTORE_TIER_FAILED};
+        let _g = crate::agent_runtime::CONTINUATION_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let gate = uuid::Uuid::now_v7();
+        let device = uuid::Uuid::now_v7();
+        let csid = "6b2d4f1a-3c5e-4a7b-9d8c-1e2f3a4b5c6d";
+        let tab = "term-retry-k";
+        let prior: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": csid,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": tab,
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+            "origin": "authoritative",
+            "gateId": gate.to_string(),
+            "gateConsumingDeviceId": device.to_string(),
+            "gateBoundGeneration": "gen-before-the-crash",
+        }))
+        .unwrap();
+        store.record_open(prior);
+        // This boot's restore marks the record, types the resume, and the
+        // handshake never verifies: the record stays `failed`, unadopted.
+        store.mark_restore_pending(csid);
+        let failed = store.get(csid).unwrap();
+        assert_eq!(failed.restore_tier.as_deref(), Some(RESTORE_TIER_FAILED));
+        assert_eq!(
+            crate::agent_runtime::registered_continuation_gate(tab),
+            None,
+            "a failed resume is not a live continuation"
+        );
+
+        // The frontend's verified-branch payload (`buildSessionOpenArgs`, no
+        // origin, no provider), shaped as `terminal_session_record_open` builds
+        // its record: no gate fields, no generation, no tier.
+        let retry_reassert = || {
+            let incoming: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+                "claudeSessionId": csid,
+                "pageId": "default",
+                "zoneIndex": 0,
+                "terminalId": tab,
+                "openedAt": 0,
+                "lastSeenAt": 0,
+                "state": "open",
+                "provider": crate::session::session_lifecycle_store::DEFAULT_PROVIDER,
+            }))
+            .unwrap();
+            store.record_open(incoming);
+            adopt_restored_continuation(&store, csid)
+        };
+
+        assert_eq!(
+            retry_reassert(),
+            Some((tab.to_string(), gate, Some(device))),
+            "the verified retry adopts the failed-tier continuation"
+        );
+        assert_eq!(
+            crate::agent_runtime::registered_continuation_gate(tab),
+            Some((Some(gate), Some(device)))
+        );
+        let generation = crate::session::tracking_health::process_generation();
+        let after = store.get(csid).unwrap();
+        assert_eq!(after.gate_bound_generation.as_deref(), Some(generation));
+        assert_eq!(after.gate_id, Some(gate.to_string()), "gate kept (sticky)");
+
+        // A second verified retry (or the session-open hook's re-record) finds
+        // it already this generation's: nothing is adopted twice.
+        assert_eq!(retry_reassert(), None, "adopted exactly once");
+        assert_eq!(
+            store.get(csid).unwrap().gate_bound_generation.as_deref(),
+            Some(generation)
+        );
+        crate::agent_runtime::deregister_continuation_for_test(tab);
     }
 
     /// Regression for the 2026-06-12 mis-bind incident: two transcripts in

@@ -80,7 +80,8 @@ import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
-import { buildResumeCmd, decideColdResume } from "../useTerminalInitialization";
+import { decideColdResume } from "../useTerminalInitialization";
+import { buildProfileResumeCmd, fetchRecordsByClaudeSessionId } from "../resumeRecordLookup";
 import {
   buildSessionOpenArgs,
   describeRecordOpenOutcome,
@@ -381,7 +382,14 @@ const PageSessionScope = memo(function PageSessionScope({
       // layout/tabs are untouched, and the operator can still resume any of
       // them by hand (single-id operator-clicked resume paths stay ungated
       // by design: the click is the intent).
-      const liveIds = await fetchLiveClaudeSessionIds();
+      //
+      // The same batch reads the durable records once (plan 2026-10-07 D2):
+      // `ZoneSessionInfo` carries no gate identity, so a gate continuation's
+      // `QONTINUI_GATE_*` env comes from its record, as the drain's does.
+      const [liveIds, records] = await Promise.all([
+        fetchLiveClaudeSessionIds(),
+        fetchRecordsByClaudeSessionId(),
+      ]);
       for (const { s, tabId } of toResume) {
         const decision = decideColdResume(liveIds, s.claudeSessionId);
         if (decision !== "respawn") {
@@ -450,11 +458,15 @@ const PageSessionScope = memo(function PageSessionScope({
           .catch((err) => console.warn(`[TerminalSession] profile resume record failed:`, err));
         // Rendered by the backend: the config dir (a model gateway replaces
         // the recorded subscription dir) and the permission posture are its
-        // decisions, never this file's.
+        // decisions, never this file's. The record's gate identity rides the
+        // typed resume (plan 2026-10-07 D2).
         let resumeCmd: string;
         try {
-          // "summary": no threshold env, exactly as this path always typed it.
-          resumeCmd = await buildResumeCmd(s.claudeSessionId, s.claudeConfigDir, "summary");
+          resumeCmd = await buildProfileResumeCmd(
+            s.claudeSessionId,
+            s.claudeConfigDir,
+            records.get(s.claudeSessionId),
+          );
         } catch (err) {
           console.warn(`[TerminalSession] profile resume not rendered:`, err);
           continue;
