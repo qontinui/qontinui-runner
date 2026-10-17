@@ -3523,6 +3523,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_claude_session_list_live,
             commands::terminal::terminal_session_list_history,
             commands::terminal::terminal_session_list_open,
+            commands::terminal::terminal_holder_sweep_settled,
+            commands::terminal::terminal_holder_sweep_status,
             commands::terminal::terminal_session_mark_restore_pending,
             commands::terminal::terminal_session_record_close,
             commands::terminal::terminal_session_set_finished,
@@ -4449,6 +4451,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Detached for the process lifetime (like the liveness poll
                 // below); best-effort at startup then every 30s.
                 session_pr_reconciler::start(lifecycle_store.clone());
+                let holder_sweep_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
@@ -4469,6 +4472,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         terminal::vt_sanitize::VtSanitizeHook::new(),
                     ));
                 }
+
+                // PTY-holder boot sweep (plan 2026-09-12-out-of-process-pty-
+                // owner-for-terminal-hosted-sessions, Phase 3): adopt every
+                // pane a holder kept alive across the last runner exit, and
+                // reap the dead — AFTER the sanitizer hook (an adopted pane's
+                // replay is untrusted output too). It runs on its own thread
+                // and never blocks setup; the webview's restore awaits its
+                // "settled" signal (`terminal_holder_sweep_settled`) before
+                // reading `terminal_list`. One `stat` when no pane directory
+                // exists.
+                terminal::holder_boot_sweep::run(
+                    &term_for_session,
+                    app.handle(),
+                    Some(holder_sweep_store),
+                );
 
                 // (The usage-limit watcher and the fleet auto-response matcher
                 // are both grid-scan pollers spawned once at startup alongside
@@ -4860,6 +4878,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     },
                                 },
                             };
+                            // A PTY holder is alive for this record's terminal
+                            // and its adoption is still pending or retrying
+                            // (plan 2026-09-12 Phase 3): held like a withheld
+                            // restore — never closed `no-terminal` meanwhile.
+                            let adoption_pending =
+                                terminal::holder_boot_sweep::adoption_pending(&rec.terminal_id);
                             let action = hold_for_withheld_boot_restore(
                                 classify(
                                     live_is_alive,
@@ -4871,8 +4895,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     confirmed,
                                     worker_plane,
                                 ),
-                                held,
+                                held || adoption_pending,
                             );
+                            if adoption_pending && action == PollAction::Skip {
+                                consecutive_no_match.remove(&rec.claude_session_id);
+                            }
                             if held && action == PollAction::Skip {
                                 held_for_restore += 1;
                                 // A held record is waiting, not missing: any

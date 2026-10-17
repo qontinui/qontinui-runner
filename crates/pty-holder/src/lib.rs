@@ -42,7 +42,14 @@
 //!   per-connection output pump.
 //! - [`client`] — connect + handshake, `probe`, `census`, `attach`.
 //! - [`spawn`] — the RUNNER side of a holder's birth: cgroup escape, Windows
-//!   job breakaway, the ready line, verified-pid teardown, reaping.
+//!   job breakaway and its WMI fallback, the ready line, verified-pid
+//!   teardown, reaping.
+//! - [`proc_identity`] — a process's start token, so a recorded pid can be
+//!   told from a recycled one (Phase 3).
+//! - [`reap`] — a pane's process tree is reaped by its own holder at pane end,
+//!   and a dead holder's proven remainder by the boot sweep (Phase 3, D8).
+//! - [`sweep`] — the boot sweep: the per-pane lock directory IS the orphan
+//!   ledger; live panes are handed to the caller to adopt (Phase 3).
 
 pub mod client;
 pub mod frame;
@@ -50,14 +57,17 @@ pub mod lock;
 pub mod metadata;
 pub mod modes;
 pub mod pane;
+pub mod proc_identity;
 pub mod protocol;
 pub mod pty;
+pub mod reap;
 pub mod ring;
 pub mod scrollback;
 pub mod server;
 pub mod spawn;
 pub mod spec;
 pub mod startup;
+pub mod sweep;
 pub mod terminate;
 pub mod transport;
 

@@ -66,6 +66,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     # The holder-owned KILL_ON_JOB_CLOSE job that holds a pane's child tree.
     "Win32_System_JobObjects",
+    # Phase 3: the boot sweep's walk of a dead holder's surviving child tree
+    # (CreateToolhelp32Snapshot / Process32FirstW / Process32NextW).
+    "Win32_System_Diagnostics_ToolHelp",
+    # Phase 3 (review round 2): GetTickCount64, the boot time a token-less
+    # orphan-ledger entry expires against.
+    "Win32_System_SystemInformation",
 ] }
 
 # The same tiered policy as src-tauri/Cargo.toml [lints] (plan

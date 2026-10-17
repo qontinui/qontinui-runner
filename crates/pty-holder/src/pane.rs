@@ -20,6 +20,9 @@
 //! - `<pane-id>.scrollback` — the pane's durable output tail, 0600, replaced
 //!   atomically via `<pane-id>.scrollback.tmp` (`crate::scrollback`, plan D7).
 //!   Like the lock file it outlives the holder; that is its purpose.
+//! - `<pane-id>.report` — the holder's one-line ready/error report, written
+//!   (atomically, 0600) only when it was started with `--report`: the Windows
+//!   WMI spawn route gives the holder no stdout pipe to print it on (Phase 3).
 //!
 //! On Windows the endpoint is a named pipe, whose namespace is global rather
 //! than a directory, so [`pipe_name`] folds the pane directory into the name.
@@ -99,6 +102,29 @@ pub fn spec_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// (`crate::scrollback`).
 pub fn scrollback_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.scrollback", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.scrollback.tmp` — where a tail rewrite is written
+/// before it is renamed over [`scrollback_path`].
+pub fn scrollback_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.scrollback.tmp", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.report` — the holder's ready/error report file.
+pub fn report_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.report", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.report-tmp` — where a report is written before it is
+/// renamed over [`report_path`].
+pub fn report_tmp_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.report-tmp", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.orphan` — the orphan ledger's entry for a dead
+/// holder whose leftovers could not be attributed (`crate::sweep`).
+pub fn orphan_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.orphan", pane.as_str()))
 }
 
 /// `<pane-dir>/<pane-id>.log` — the holder's diagnostic log.
@@ -344,6 +370,7 @@ mod tests {
         assert_eq!(spec_path(dir, &p), dir.join("p1.spec"));
         assert_eq!(log_path(dir, &p), dir.join("p1.log"));
         assert_eq!(scrollback_path(dir, &p), dir.join("p1.scrollback"));
+        assert_eq!(report_path(dir, &p), dir.join("p1.report"));
 
         let name = pipe_name(dir, &p);
         assert!(name.starts_with(r"\\.\pipe\qontinui-pty-holder-"), "{name}");

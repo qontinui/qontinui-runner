@@ -2,7 +2,7 @@
 //!
 //! Follows the same HashMap-based manager pattern as `claude_session::SessionManager`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
@@ -37,6 +37,52 @@ pub struct TerminalManager {
     /// the terminal had a coord row is not stranded local-only. Unattached →
     /// binding just sets the id.
     coord_bind_observer: OnceLock<CoordBindObserver>,
+    /// Terminal ids being BUILT right now — by [`Self::create`] (whose holder
+    /// pane exists before its session is inserted) or by
+    /// [`Self::adopt_holder_pane`]. Claimed under the sessions lock together
+    /// with the "not already open" check ([`Self::claim_in_flight`]), so no
+    /// build can insert over another (orphaning a session, unlisted but
+    /// running), and the boot sweep skips them.
+    in_flight: Mutex<HashSet<String>>,
+}
+
+/// Why [`TerminalManager::adopt_holder_pane`] adopted nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptError {
+    /// The terminal id is already open or being built: another path owns it.
+    Claimed(String),
+    /// The attach to the holder failed — definitively or not
+    /// ([`super::daemon_pane_io::AttachError::definitive`]).
+    Attach(super::daemon_pane_io::AttachError),
+    /// The session could not be built around the attached pane, which was
+    /// detached again (the holder keeps its child).
+    Session(String),
+}
+
+impl std::fmt::Display for AdoptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdoptError::Claimed(m) => write!(f, "{m}"),
+            AdoptError::Attach(e) => write!(f, "{e}"),
+            AdoptError::Session(m) => write!(f, "session: {m}"),
+        }
+    }
+}
+
+/// A [`TerminalManager::claim_in_flight`] claim, released on drop.
+struct InFlightClaim<'a> {
+    manager: &'a TerminalManager,
+    id: String,
+}
+
+impl Drop for InFlightClaim<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
 }
 
 /// See [`TerminalManager::coord_bind_observer`].
@@ -195,6 +241,7 @@ impl TerminalManager {
             remote_identities: Mutex::new(HashMap::new()),
             remote_panes: Mutex::new(HashMap::new()),
             coord_bind_observer: OnceLock::new(),
+            in_flight: Mutex::new(HashSet::new()),
         }
     }
 
@@ -318,6 +365,9 @@ impl TerminalManager {
         spawn_tenant: Option<uuid::Uuid>,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
+        // Claimed until the session is inserted (the claim drops at return):
+        // the boot sweep never probes or adopts this pane meanwhile.
+        let _building = self.claim_in_flight(&id)?;
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
         let working_dir = working_dir
             .filter(|d| !d.is_empty())
@@ -540,9 +590,10 @@ impl TerminalManager {
     /// remote path passes `""` for a cwd it cannot know, a local holder can.
     ///
     /// `from_offset` is the first byte this runner already holds for the pane
-    /// (`None`: none — the ring's tail); `cols` × `rows` is the consumer's
-    /// fitted size. `pinned_session_id` is the harness session id the caller
-    /// resolved for the pane (the holder does not carry one).
+    /// (`None`: none — the ring's tail); `size` is the consumer's fitted size,
+    /// or `None` to keep the PTY's own (the boot sweep adopts before any
+    /// webview has fit a tab). `pinned_session_id` is the harness session id
+    /// the caller resolved for the pane (the holder does not carry one).
     ///
     /// [`DaemonPaneIo::attach_existing`]: super::daemon_pane_io::DaemonPaneIo::attach_existing
     /// [`DaemonPaneIo::session_identity`]: super::daemon_pane_io::DaemonPaneIo::session_identity
@@ -552,14 +603,23 @@ impl TerminalManager {
         terminal_id: &str,
         from_offset: Option<u64>,
         page_id: Option<String>,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         app_handle: AppHandle,
         pinned_session_id: String,
-    ) -> Result<TerminalInfo, String> {
-        let pane =
-            super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, cols, rows)?;
+    ) -> Result<TerminalInfo, AdoptError> {
+        // Insert-if-absent: never over an open terminal, and never over one
+        // being built (inserting under a live id would orphan that session —
+        // still running, no longer listed).
+        let _building = self
+            .claim_in_flight(terminal_id)
+            .map_err(AdoptError::Claimed)?;
+        let pane = Arc::new(
+            super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, size)
+                .map_err(AdoptError::Attach)?,
+        );
         let (title, cwd) = pane.session_identity();
+        let (cols, rows) = pane.dims();
+        let io: Arc<dyn super::pane_io::PaneIo> = pane.clone();
         self.insert_with_io(
             terminal_id.to_string(),
             title,
@@ -568,9 +628,52 @@ impl TerminalManager {
             cols,
             rows,
             app_handle,
-            Arc::new(pane),
+            io,
             pinned_session_id,
         )
+        .map_err(|e| {
+            // The session could not be built around the attached pane. DETACH
+            // it, so that dropping it does not kill the live session: the
+            // holder keeps the child for a retry.
+            let _ = super::pane_io::PaneIo::release(
+                pane.as_ref(),
+                super::daemon_pane_io::DETACH_FRAME_BUDGET,
+            );
+            AdoptError::Session(e)
+        })
+    }
+
+    /// Claim `id` as being built: refused when it is already open or already
+    /// claimed. The check and the claim are one step under the sessions lock.
+    /// The claim is released when the returned guard drops.
+    fn claim_in_flight(&self, id: &str) -> Result<InFlightClaim<'_>, String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if sessions.contains_key(id) || !in_flight.insert(id.to_string()) {
+            return Err(format!(
+                "terminal {id} is already open or being built; not building it again"
+            ));
+        }
+        Ok(InFlightClaim {
+            manager: self,
+            id: id.to_string(),
+        })
+    }
+
+    /// Ids open now AND ids being built: what the boot sweep must not probe.
+    pub fn open_or_in_flight_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.list().into_iter().map(|t| t.id).collect();
+        ids.extend(
+            self.in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .cloned(),
+        );
+        ids
     }
 
     /// The registry half of [`Self::create_with_io`] and

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { autonomousResumeDetector, subscribeCoordDrainState } from "@/hooks/useCoordDrainState";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
 import type { TerminalRefsMap } from "./writeWhenReady";
@@ -19,7 +20,8 @@ import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
 import { noteRecordedZone, recordedZoneLedgerFor, type SessionOpenArgs } from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
-import { loadKnownPageIds } from "./useTerminalPages";
+import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
+import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
 
@@ -45,6 +47,244 @@ export async function fetchOpenRecords(
   opts?: { knownPageIds?: readonly string[]; adoptOrphans?: boolean },
 ): Promise<TerminalSessionRecord[]> {
   return (await fetchRestoreSet(pageId, opts)).records;
+}
+
+/**
+ * Wait for the runner's PTY-holder boot sweep to settle — every pane a holder
+ * kept alive across the last runner exit adopted back as a live terminal (or,
+ * if it could not be adopted, ended so its session is resumed normally) and
+ * every dead holder's leftovers reaped — before the restore reads
+ * `terminal_list` (plan
+ * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 3).
+ * Otherwise a surviving session would look dead and be cold-resumed beside
+ * its still-running `claude`. The backend bounds the wait itself. Returns
+ * whether the sweep SETTLED: `false` only when the wait ran out — the restore
+ * then proceeds, and the records it refuses as "live" meanwhile are
+ * re-decided once the sweep settles ({@link recheckRefusedAfterSweep}). An
+ * error (an older runner without the command, so no sweep) counts as settled.
+ * Exported for tests.
+ */
+export async function waitForHolderSweep(): Promise<boolean> {
+  try {
+    const resp = await invoke<CommandResponse>("terminal_holder_sweep_settled");
+    const settled = (resp?.data as { settled?: boolean } | undefined)?.settled;
+    if (settled === false) {
+      console.warn(
+        "[TerminalPage] the PTY-holder boot sweep did not settle in time; restoring anyway, " +
+          "and re-deciding the sessions it refuses as live once it settles",
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[TerminalPage] terminal_holder_sweep_settled unavailable: ${err}`);
+    return true;
+  }
+}
+
+/** The boot sweep as the restore sees it before it starts. */
+export interface HolderSweepStatus {
+  settled: boolean;
+  /**
+   * Terminal ids of live holder panes still being adopted. `null` when the
+   * census did not come in within the runner's wait — the restore then waits
+   * for the whole sweep instead.
+   */
+  held: ReadonlySet<string> | null;
+}
+
+/**
+ * The PTY-holder boot sweep's status as soon as its CENSUS is in — a few
+ * seconds at most, not the whole sweep (review round 4, M1): which panes are
+ * HELD (live, still being adopted). The restore restores every other record
+ * at once, and waits only for the held ones. An error (an older runner
+ * without the command, so no sweep) is "settled, nothing held". Exported for
+ * tests.
+ */
+export async function fetchHolderSweepStatus(): Promise<HolderSweepStatus> {
+  try {
+    const resp = await invoke<CommandResponse>("terminal_holder_sweep_status");
+    const data = resp?.data as { settled?: boolean; held?: string[] | null } | undefined;
+    return {
+      settled: data?.settled !== false,
+      held: Array.isArray(data?.held) ? new Set(data.held) : null,
+    };
+  } catch (err) {
+    console.warn(`[TerminalPage] terminal_holder_sweep_status unavailable: ${err}`);
+    return { settled: true, held: new Set() };
+  }
+}
+
+/**
+ * Split the restore's records by the sweep's census: those whose terminal a
+ * holder pane is still being adopted into are HELD BACK (they come back as an
+ * adopted tab, or through the re-run after the sweep settles); every other
+ * record is restored NOW. A settled sweep holds nothing back. Pure; exported
+ * for tests.
+ */
+export function splitRestoreByHold<T extends { terminalId: string }>(
+  records: readonly T[],
+  status: HolderSweepStatus,
+): { now: T[]; heldBack: T[] } {
+  if (status.settled || status.held === null || status.held.size === 0) {
+    return { now: [...records], heldBack: [] };
+  }
+  const held = status.held;
+  return {
+    now: records.filter((r) => !held.has(r.terminalId)),
+    heldBack: records.filter((r) => held.has(r.terminalId)),
+  };
+}
+
+/** How many more times {@link recheckRefusedAfterSweep} waits for the sweep. */
+export const HOLDER_SWEEP_RECHECK_ATTEMPTS = 3;
+
+/**
+ * The restore ran before the PTY-holder boot sweep settled, and refused to
+ * cold-resume `refused` because a live `claude` hosted each of them. Some of
+ * those processes may have been a DEAD holder's leftovers that the sweep then
+ * reaped, or a holder it ended after a failed adoption — sessions that would
+ * otherwise come back with no tab and no resume. Wait for the sweep (a few
+ * more bounded waits), then return exactly those refused session ids that are
+ * no longer hosted by a live process: the ones the restore must now resume.
+ * A sweep that never settles, or a live registry that cannot be read, returns
+ * none (fail closed: a missing tab is recoverable, a forked session is not).
+ * Exported for tests.
+ */
+export async function recheckRefusedAfterSweep(
+  refused: readonly string[],
+  liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+  heldBack: readonly string[] = [],
+): Promise<string[]> {
+  if (refused.length === 0 && heldBack.length === 0) return [];
+  let settled = false;
+  for (let i = 0; i < HOLDER_SWEEP_RECHECK_ATTEMPTS && !settled; i++) {
+    settled = await waitForHolderSweep();
+  }
+  // Held-back records are always restored after the wait — the re-run
+  // reconnects the ones that were adopted, and applies the same live-process
+  // check to the rest. Refused ones only once the sweep SETTLED.
+  if (!settled) return [...heldBack];
+  const live = refused.length > 0 ? await liveIds() : null;
+  return [...heldBack, ...refused.filter((id) => decideColdResume(live, id) === "respawn")];
+}
+
+/** The runner's event for a session handed back to the restore (Rust: `HOLDER_SESSION_RELEASED_EVENT`). */
+export const HOLDER_SESSION_RELEASED_EVENT = "pty-holder-session-released";
+
+/** Its payload. */
+export interface HolderSessionReleased {
+  sessionId: string;
+  terminalId: string;
+  pageId: string | null;
+}
+
+/**
+ * A holder whose adoption the runner was still retrying DIED (review round 6,
+ * T1). The restore had refused its session's resume while that holder's
+ * `claude` was alive, and nothing else would re-decide it: re-decide it now
+ * — the same recheck a late sweep settle runs — and `schedule` a re-run of
+ * the restore for its page when it is resumable. Returns whether one was
+ * scheduled. Exported for tests.
+ */
+export async function onHolderSessionReleased(
+  payload: HolderSessionReleased,
+  schedule: (pageId: string, sessionIds: string[]) => void,
+  liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+): Promise<boolean> {
+  const resumable = await recheckRefusedAfterSweep([payload.sessionId], liveIds);
+  if (resumable.length === 0) return false;
+  schedule(payload.pageId ?? "default", resumable);
+  return true;
+}
+
+/**
+ * Whether THIS window owns the restore of `pageId` and so handles a released
+ * session on it (review round 7, N4). Every window — the main one and each
+ * pop-out — mounts its own `TerminalPage`, so its own restore hook, and the
+ * runner broadcasts the event to all of them. A page-pinned pop-out owns its
+ * one page; the main window owns every page not detached into a pop-out —
+ * the same split `useTerminalPages` uses to decide which window restores a
+ * page. Exported for tests.
+ */
+export function ownsReleasedPage(
+  pageId: string,
+  pinnedPageId: string | null,
+  bindings: PageBindings,
+): boolean {
+  if (pinnedPageId !== null) return pageId === pinnedPageId;
+  return !bindings[pageId];
+}
+
+/**
+ * Serializes the targeted re-runs of each page's restore (review round 7,
+ * U1). A late sweep settle and a released holder can both ask for a re-run of
+ * the same page, for the same session, while a run is still in flight; two
+ * runs racing would each cold-resume it. Ids scheduled while a run of the
+ * page is in flight are only merged, and the run's end triggers ONE re-run
+ * for all of them (none when that run restored nothing — its full retry
+ * covers every id). A page this window has not begun restoring is not re-run
+ * at all: its first full restore, whenever it runs, covers every id — and a
+ * window that does not own the page never restores it. Exported for tests.
+ */
+export class RestoreRerunQueue {
+  private readonly inFlight = new Set<string>();
+  private readonly restored = new Set<string>();
+  private readonly pending = new Map<string, Set<string>>();
+
+  /** Merge `sessionIds` for `pageId`; true when the caller must trigger a re-run now. */
+  schedule(pageId: string, sessionIds: readonly string[]): boolean {
+    const known = this.restored.has(pageId) || this.inFlight.has(pageId);
+    if (!known || sessionIds.length === 0) return false;
+    const merged = this.pending.get(pageId) ?? new Set<string>();
+    for (const id of sessionIds) merged.add(id);
+    this.pending.set(pageId, merged);
+    return !this.inFlight.has(pageId);
+  }
+
+  /**
+   * A run of `pageId` starts. Returns the ids it alone must restore, or
+   * `undefined` for a full restore.
+   */
+  begin(pageId: string): ReadonlySet<string> | undefined {
+    this.inFlight.add(pageId);
+    const only = this.pending.get(pageId);
+    this.pending.delete(pageId);
+    return only;
+  }
+
+  /**
+   * The run of `pageId` ended; `restored` is false when it restored nothing
+   * (aborted or deferred — the full retry covers every id). True when ids
+   * were scheduled meanwhile: the caller triggers one re-run.
+   */
+  finish(pageId: string, restored: boolean): boolean {
+    this.inFlight.delete(pageId);
+    if (restored) this.restored.add(pageId);
+    else this.pending.delete(pageId);
+    return (this.pending.get(pageId)?.size ?? 0) > 0;
+  }
+}
+
+/**
+ * Session-level "cold resume in progress" claims (review round 7, U1): two
+ * runs in flight at once — of different pages — never both create a tab for
+ * one session. A run claims a session before `createTerminal` and releases
+ * its claims when it ends; by the next run, the tab it created is in the live
+ * tabs, which a re-run checks. Exported for tests.
+ */
+export class ColdResumeGuard {
+  private readonly claimed = new Set<string>();
+
+  tryClaim(sessionId: string): boolean {
+    if (this.claimed.has(sessionId)) return false;
+    this.claimed.add(sessionId);
+    return true;
+  }
+
+  release(sessionId: string): void {
+    this.claimed.delete(sessionId);
+  }
 }
 
 /** The restore set for a page, or the coord device drain's deferral of it. */
@@ -939,6 +1179,49 @@ export function useTerminalInitialization({
     liveTabsRef.current = tabs;
   }, [tabs]);
   const [drainResumeEpoch, setDrainResumeEpoch] = useState(0);
+  // Sessions a restore refused as "live" BEFORE the PTY-holder boot sweep
+  // settled, which the sweep's settle then showed to be resumable (see
+  // `recheckRefusedAfterSweep`), per page, and the page runs in flight. A
+  // re-run triggered for them (the same epoch bump as a drain re-run)
+  // restores exactly these records — one run per page at a time.
+  const rerunQueue = useRef(new RestoreRerunQueue());
+  // Sessions a run is creating a tab for right now.
+  const coldResumeGuard = useRef(new ColdResumeGuard());
+  const triggerRerun = useCallback((forPage: string) => {
+    drainDeferredPages.current.add(forPage);
+    didInitPages.current.delete(forPage);
+    setDrainResumeEpoch((n) => n + 1);
+  }, []);
+  // Re-run the restore of `forPage` (merging, like a drain re-run) for
+  // exactly `sessionIds` — after a late sweep settle, or a session a dead
+  // holder handed back. The active page re-runs now (or when its run in
+  // flight ends); another page when it is next activated.
+  const scheduleRecheckRerun = useCallback(
+    (forPage: string, sessionIds: string[]) => {
+      if (rerunQueue.current.schedule(forPage, sessionIds)) triggerRerun(forPage);
+    },
+    [triggerRerun],
+  );
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<HolderSessionReleased>(HOLDER_SESSION_RELEASED_EVENT, (event) => {
+      // Broadcast to every window: only the one that restores the page acts.
+      const releasedPage = event.payload.pageId ?? "default";
+      if (!ownsReleasedPage(releasedPage, readPinnedPageId(), getPageBindings())) return;
+      console.warn(
+        `[TerminalPage] a PTY holder died before adoption; re-deciding session ${event.payload.sessionId}`,
+      );
+      void onHolderSessionReleased(event.payload, scheduleRecheckRerun);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [scheduleRecheckRerun]);
   useEffect(
     () =>
       subscribeCoordDrainState(
@@ -964,6 +1247,17 @@ export function useTerminalInitialization({
     // same finally / drain timer.
     const isDrainRerun = drainDeferredPages.current.delete(initPageId);
     if (isDrainRerun) restoreCompletePages.current.delete(initPageId);
+    // A re-run for the holder sweep's late settle restores only these. Ids
+    // scheduled while this run is in flight wait for its end.
+    const recheckOnly = rerunQueue.current.begin(initPageId);
+    // Sessions this run claimed for a cold resume; released when it ends.
+    const coldClaims: string[] = [];
+    // The drain withheld the restore set: this run restored nothing.
+    let restoreDeferred = false;
+    // Sessions THIS run refuses as live while the sweep is unsettled, and
+    // sessions it holds back because their pane is still being adopted.
+    const refusedWhileSweeping: string[] = [];
+    const heldBackWhileSweeping: string[] = [];
 
     // Per-page restore queue (Phase 3): local to this page's init run so a
     // second page initializing before this one's drain timer fires can't see
@@ -1004,6 +1298,16 @@ export function useTerminalInitialization({
         //    generation per pass. Abort instead: leave the page as-is and let
         //    the next activation retry. (Same null-awareness as the plan-tab
         //    cold-start check in step 4 below.)
+        // Holder panes that survived the last runner exit are adopted by the
+        // runner's boot sweep. Learn its census first (seconds, not the whole
+        // sweep): every record whose pane is NOT held is restored now; the
+        // held ones wait for the sweep (review round 4, M1). Without a census
+        // — or on a re-run for its late settle — fall back to the full wait.
+        const sweepStatus = recheckOnly
+          ? { settled: await waitForHolderSweep(), held: new Set<string>() }
+          : await fetchHolderSweepStatus();
+        const holderSweepSettled =
+          sweepStatus.held === null ? await waitForHolderSweep() : sweepStatus.settled;
         const reconnectDecision = decideReconnectOutcome(await reconnectToExistingSessions());
         if (reconnectDecision.kind === "abort-restore") {
           restoreAborted = true;
@@ -1043,6 +1347,7 @@ export function useTerminalInitialization({
           // once-per-page guard and the orphan-adoption claim are released so
           // the restore re-runs — merging, not re-laying out — when
           // `drainResumeEpoch` moves.
+          restoreDeferred = true;
           drainDeferredPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
@@ -1121,7 +1426,19 @@ export function useTerminalInitialization({
         //    are claimed from records FIRST so the creation-order auto-fill in
         //    `useZoneLayout` can never steal a zone a record owns (it only fills
         //    zones still empty after this loop runs).
+        const { heldBack } = splitRestoreByHold(openRecords, {
+          settled: holderSweepSettled,
+          held: sweepStatus.held,
+        });
+        const heldBackIds = new Set(heldBack.map((r) => r.terminalId));
+        for (const r of heldBack) heldBackWhileSweeping.push(r.claudeSessionId);
         for (const [recIndex, rec] of openRecords.entries()) {
+          // A re-run for the holder sweep's late settle restores ONLY the
+          // sessions that settle showed resumable.
+          if (recheckOnly && !recheckOnly.has(rec.claudeSessionId)) continue;
+          // Its holder pane is still being adopted: it comes back as that
+          // tab, or through the re-run once the sweep settles.
+          if (heldBackIds.has(rec.terminalId)) continue;
           // A Conductor worker (Phase 2b): no PTY exists or should exist for
           // it. Adopt the record as a `sessionBacked` tab and let
           // `reconcileAssignments` place it — every worker record is written
@@ -1167,6 +1484,9 @@ export function useTerminalInitialization({
           // the transcript.
           if (restoreAction === "auto-resume") {
             const resumeDecision = decideColdResume(await getLiveSessionIds(), rec.claudeSessionId);
+            if (resumeDecision === "skip-alive" && !holderSweepSettled) {
+              refusedWhileSweeping.push(rec.claudeSessionId);
+            }
             if (resumeDecision !== "respawn") {
               console.warn(
                 `[TerminalPage] skipping cold respawn for session ${rec.claudeSessionId}: ` +
@@ -1195,6 +1515,9 @@ export function useTerminalInitialization({
           // The source names this restore in the resource-guard dialog. `queued`
           // counts the records still ahead, this one included — an upper bound,
           // since reconnected and live records ahead will be skipped.
+          // Another run in flight is already creating this session's tab.
+          if (!coldResumeGuard.current.tryClaim(rec.claudeSessionId)) continue;
+          coldClaims.push(rec.claudeSessionId);
           const tabId = await createTerminal(rec.title, rec.workingDir, undefined, {
             label: "session restore",
             queued: openRecords.length - recIndex,
@@ -1499,11 +1822,36 @@ export function useTerminalInitialization({
         // fewer tabs than expected" (recoverable, and the console carries the
         // cause) instead of a permanently blank window.
         setInitialized(true);
+        // The PTY-holder boot sweep had not settled, and this run refused
+        // some sessions as live or held some back for an adoption in flight:
+        // once it settles, re-run the restore (merging, like a drain re-run)
+        // for the held-back ones and the refused ones no longer hosted live.
+        if (refusedWhileSweeping.length > 0 || heldBackWhileSweeping.length > 0) {
+          void recheckRefusedAfterSweep(
+            refusedWhileSweeping,
+            fetchLiveClaudeSessionIds,
+            heldBackWhileSweeping,
+          ).then((resumable) => {
+            if (resumable.length === 0) return;
+            console.warn(
+              `[TerminalPage] the holder sweep settled late; resuming ${resumable.length} ` +
+                `session(s) it had kept from a cold resume`,
+            );
+            scheduleRecheckRerun(initPageId, resumable);
+          });
+        }
+        for (const id of coldClaims) coldResumeGuard.current.release(id);
+        // Re-runs scheduled while this run was in flight: one, now.
+        if (rerunQueue.current.finish(initPageId, !restoreAborted && !restoreDeferred)) {
+          triggerRerun(initPageId);
+        }
       }
     })();
   }, [
     pageId,
     drainResumeEpoch,
+    scheduleRecheckRerun,
+    triggerRerun,
     reconnectToExistingSessions,
     createTerminal,
     adoptWorkerTab,

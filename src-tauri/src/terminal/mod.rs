@@ -20,6 +20,7 @@ pub mod daemon_pane_io;
 pub mod exit_notice;
 pub mod graceful_exit;
 pub mod grid;
+pub mod holder_boot_sweep;
 pub mod interceptor;
 pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)

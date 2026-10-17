@@ -17,6 +17,15 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   fetchOpenRecords,
   fetchRestoreSet,
+  waitForHolderSweep,
+  recheckRefusedAfterSweep,
+  HOLDER_SWEEP_RECHECK_ATTEMPTS,
+  fetchHolderSweepStatus,
+  splitRestoreByHold,
+  onHolderSessionReleased,
+  ownsReleasedPage,
+  RestoreRerunQueue,
+  ColdResumeGuard,
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
@@ -839,5 +848,265 @@ describe("reportTreeReset — drain deferral", () => {
       "terminal_report_tree_reset",
       expect.objectContaining({ mountNumber: 2, openRecordCount: undefined }),
     );
+  });
+});
+
+describe("waitForHolderSweep — PTY-holder boot sweep before the restore", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("asks the runner to wait for the sweep to settle", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { settled: true } });
+    await expect(waitForHolderSweep()).resolves.toBe(true);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_holder_sweep_settled");
+  });
+
+  it("reports a sweep that did not settle in time", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { settled: false } });
+    await expect(waitForHolderSweep()).resolves.toBe(false);
+  });
+
+  it("counts a runner with no such command as settled (no sweep there)", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("command terminal_holder_sweep_settled not found"));
+    await expect(waitForHolderSweep()).resolves.toBe(true);
+  });
+});
+
+describe("recheckRefusedAfterSweep — sessions refused as live before the sweep settled", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  const unsettled = { success: true, message: null, data: { settled: false } };
+  const settled = { success: true, message: null, data: { settled: true } };
+
+  it("once the sweep settles, returns exactly the refused ids no longer hosted live", async () => {
+    mockInvoke.mockResolvedValueOnce(unsettled).mockResolvedValueOnce(settled);
+    const live = vi.fn().mockResolvedValue(new Set(["still-alive", "never-refused"]));
+    await expect(
+      recheckRefusedAfterSweep(["reaped-by-sweep", "still-alive"], live),
+    ).resolves.toEqual(["reaped-by-sweep"]);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+    expect(live).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes nothing when the sweep never settles", async () => {
+    mockInvoke.mockResolvedValue(unsettled);
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(recheckRefusedAfterSweep(["a"], live)).resolves.toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledTimes(HOLDER_SWEEP_RECHECK_ATTEMPTS);
+    expect(live).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the live registry cannot be read", async () => {
+    mockInvoke.mockResolvedValue(settled);
+    const live = vi.fn().mockResolvedValue(null);
+    await expect(recheckRefusedAfterSweep(["a"], live)).resolves.toEqual([]);
+  });
+
+  it("does nothing for nothing refused", async () => {
+    await expect(recheckRefusedAfterSweep([])).resolves.toEqual([]);
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("the holder sweep's census — restore what is not held, now", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  const rec = (terminalId: string) => ({ terminalId, claudeSessionId: `s-${terminalId}` });
+
+  it("restores a non-held record without waiting while a held one is still adopting", async () => {
+    // The census is in: t2's pane is still being adopted, the sweep is unsettled.
+    mockInvoke.mockImplementation(
+      (cmd: unknown) =>
+        cmd === "terminal_holder_sweep_status"
+          ? Promise.resolve({
+              success: true,
+              message: null,
+              data: { settled: false, held: ["t2"] },
+            })
+          : new Promise(() => {}), // a settle-wait would never resolve
+    );
+    const status = await fetchHolderSweepStatus();
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_holder_sweep_status");
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_holder_sweep_settled");
+    const { now, heldBack } = splitRestoreByHold([rec("t1"), rec("t2")], status);
+    expect(now.map((r) => r.terminalId)).toEqual(["t1"]);
+    expect(heldBack.map((r) => r.terminalId)).toEqual(["t2"]);
+  });
+
+  it("holds nothing back once the sweep settled, or with no census", () => {
+    const records = [rec("t1"), rec("t2")];
+    expect(splitRestoreByHold(records, { settled: true, held: new Set(["t2"]) }).heldBack).toEqual(
+      [],
+    );
+    expect(splitRestoreByHold(records, { settled: false, held: null }).now).toHaveLength(2);
+  });
+
+  it("reads a runner without the command as settled with nothing held", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("unknown command"));
+    const status = await fetchHolderSweepStatus();
+    expect(status.settled).toBe(true);
+    expect(status.held?.size).toBe(0);
+  });
+
+  it("reads a census that did not come in as held: null", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { settled: false, held: null },
+    });
+    await expect(fetchHolderSweepStatus()).resolves.toEqual({ settled: false, held: null });
+  });
+
+  it("re-runs the held-back sessions after the sweep, settled or not", async () => {
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: false } });
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(recheckRefusedAfterSweep([], live, ["s-t2"])).resolves.toEqual(["s-t2"]);
+    expect(live).not.toHaveBeenCalled();
+  });
+});
+
+describe("onHolderSessionReleased — a deferred holder died before adoption", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: true } });
+  });
+
+  const payload = { sessionId: "sess-1", terminalId: "t-pane", pageId: "page-2" };
+
+  it("re-runs the restore of its page for that session when no live process hosts it", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await expect(onHolderSessionReleased(payload, schedule, live)).resolves.toBe(true);
+    expect(schedule).toHaveBeenCalledWith("page-2", ["sess-1"]);
+  });
+
+  it("leaves a session a live process still hosts alone", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set(["sess-1"]));
+    await expect(onHolderSessionReleased(payload, schedule, live)).resolves.toBe(false);
+    expect(schedule).not.toHaveBeenCalled();
+  });
+
+  it("re-runs the default page when the record named none", async () => {
+    const schedule = vi.fn();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    await onHolderSessionReleased({ ...payload, pageId: null }, schedule, live);
+    expect(schedule).toHaveBeenCalledWith("default", ["sess-1"]);
+  });
+});
+
+describe("restore re-runs — one run per page, one cold resume per session (review round 7, U1)", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { settled: true } });
+  });
+
+  /**
+   * The hook's wiring, minus React: `schedule` is `scheduleRecheckRerun`,
+   * `run` is the init effect — `begin` at its start, a guarded cold resume per
+   * record, `finish` (and a trigger) in its `finally`.
+   */
+  function harness() {
+    const queue = new RestoreRerunQueue();
+    const guard = new ColdResumeGuard();
+    const createTerminal = vi.fn();
+    const triggered: string[] = [];
+    const schedule = (pageId: string, ids: string[]) => {
+      if (queue.schedule(pageId, ids)) triggered.push(pageId);
+    };
+    const runBody = (pageId: string, records: readonly string[]) => {
+      const only = queue.begin(pageId);
+      const claims: string[] = [];
+      for (const id of only ? [...only] : records) {
+        if (!guard.tryClaim(id)) continue;
+        claims.push(id);
+        createTerminal(id);
+      }
+      return () => {
+        for (const id of claims) guard.release(id);
+        if (queue.finish(pageId, true)) triggered.push(pageId);
+      };
+    };
+    return { queue, guard, createTerminal, triggered, schedule, runBody };
+  }
+
+  it("two schedules for one session while a run is in flight produce exactly one cold resume", async () => {
+    const h = harness();
+    const live = vi.fn().mockResolvedValue(new Set<string>());
+    // The page's first restore is in flight; it refused sess-1 as live.
+    const endFirst = h.runBody("page-2", []);
+    // A late sweep settle and a released holder both ask for sess-1.
+    const released = { sessionId: "sess-1", terminalId: "t-pane", pageId: "page-2" };
+    await onHolderSessionReleased(released, h.schedule, live);
+    await onHolderSessionReleased(released, h.schedule, live);
+    expect(h.triggered).toEqual([]);
+    endFirst();
+    // ONE re-run, for the merged ids.
+    expect(h.triggered).toEqual(["page-2"]);
+    h.runBody("page-2", ["sess-1", "sess-other"])();
+    expect(h.createTerminal).toHaveBeenCalledTimes(1);
+    expect(h.createTerminal).toHaveBeenCalledWith("sess-1");
+    expect(h.triggered).toEqual(["page-2"]);
+  });
+
+  it("a schedule with no run in flight triggers at once", () => {
+    const h = harness();
+    h.runBody("page-2", [])();
+    h.schedule("page-2", ["sess-1"]);
+    expect(h.triggered).toEqual(["page-2"]);
+    expect(h.queue.begin("page-2")).toEqual(new Set(["sess-1"]));
+  });
+
+  it("a page this window never began restoring is not re-run: its full restore covers it", () => {
+    const h = harness();
+    h.schedule("page-9", ["sess-1"]);
+    expect(h.triggered).toEqual([]);
+    expect(h.queue.begin("page-9")).toBeUndefined();
+  });
+
+  it("a run that restored nothing drops what was scheduled meanwhile: its full retry covers it", () => {
+    const queue = new RestoreRerunQueue();
+    queue.begin("page-2");
+    expect(queue.schedule("page-2", ["sess-1"])).toBe(false);
+    expect(queue.finish("page-2", false)).toBe(false);
+    expect(queue.begin("page-2")).toBeUndefined();
+  });
+
+  it("the session guard keeps two concurrent runs from both creating a tab", () => {
+    const guard = new ColdResumeGuard();
+    expect(guard.tryClaim("sess-1")).toBe(true);
+    expect(guard.tryClaim("sess-1")).toBe(false);
+    guard.release("sess-1");
+    expect(guard.tryClaim("sess-1")).toBe(true);
+  });
+});
+
+describe("ownsReleasedPage — one window handles a released session (review round 7, N4)", () => {
+  const bindings = { "page-pop": "term-1" };
+
+  it("the main window owns every page not detached into a pop-out", () => {
+    expect(ownsReleasedPage("page-2", null, bindings)).toBe(true);
+    expect(ownsReleasedPage("default", null, bindings)).toBe(true);
+    expect(ownsReleasedPage("page-pop", null, bindings)).toBe(false);
+  });
+
+  it("a pinned pop-out owns its one page only", () => {
+    expect(ownsReleasedPage("page-pop", "page-pop", bindings)).toBe(true);
+    expect(ownsReleasedPage("page-2", "page-pop", bindings)).toBe(false);
+  });
+
+  it("exactly one window owns each page", () => {
+    for (const page of ["page-2", "page-pop", "default"]) {
+      const owners = [null, "page-pop"].filter((pinned) =>
+        ownsReleasedPage(page, pinned, bindings),
+      );
+      expect(owners).toHaveLength(1);
+    }
   });
 });

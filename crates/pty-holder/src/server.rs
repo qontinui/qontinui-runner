@@ -3,8 +3,10 @@
 //! Start-up order is plan D3, per pane (D13), with Phase 2's child in it:
 //!
 //! 1. Make sure the pane directory exists and (Unix) is ours and 0700.
-//! 2. Take `<pane-id>.lock`, non-blocking. Held → another holder is alive for
-//!    this pane → exit, touching nothing (not even the spec).
+//! 2. Take `<pane-id>.lock`, non-blocking. Held by a live holder → exit,
+//!    touching nothing (not even the spec). Held while its record names no
+//!    live holder → a transient hold, waited out briefly first
+//!    (`crate::lock::PaneLock::try_acquire_unless_live`, finding 9bbe1079).
 //! 3. Consume `<pane-id>.spec` (`crate::spec`): read it, unlink it.
 //! 4. Open the PTY and spawn the child on it (`crate::pty`).
 //! 5. Write the [`LockRecord`] (holder pid, CHILD pid, versions, start time).
@@ -32,7 +34,7 @@
 //! - `KIND_OUTPUT` frames, at most [`MAX_OUTPUT_CHUNK`] bytes each;
 //! - once the child's exit is settled and everything before it is sent, one
 //!   `exit` frame — then it marks the exit delivered, which lets the holder
-//!   exit (`crate::pty::Pane::wait_for_end`).
+//!   exit (`crate::pty::Pane::wait_for_delivery`).
 //!
 //! ## The restore envelope (protocol version 3, plan D14)
 //!
@@ -121,7 +123,8 @@ pub const MAX_LOG_BYTES: u64 = 256 * 1024;
 pub enum StartError {
     /// Another live process holds this pane's lock.
     LockHeld {
-        record: Option<LockRecord>,
+        /// Boxed: a record is large next to every other variant.
+        record: Option<Box<LockRecord>>,
     },
     /// The pane directory is unusable (not absolute, not ours, cannot be made
     /// private).
@@ -180,6 +183,8 @@ pub struct Holder {
     scrollback: Arc<Mutex<crate::scrollback::ScrollbackWriter>>,
     // Held for the holder's lifetime; dropping it releases the pane.
     lock: PaneLock,
+    /// What `lock` holds, kept to rewrite it when the pane ends normally.
+    record: LockRecord,
 }
 
 fn now_unix_ms() -> u64 {
@@ -218,11 +223,13 @@ impl Holder {
             _ => StartError::Io(e),
         })?;
         let lock_file = lock_path(pane_dir, pane_id);
-        let mut lock = match PaneLock::try_acquire(&lock_file)? {
+        // A hold by no live holder (a fork-before-exec, a prober) is waited
+        // out briefly; a live holder is never retried against (`crate::lock`).
+        let mut lock = match PaneLock::try_acquire_unless_live(&lock_file)? {
             TryLock::Acquired(l) => l,
             TryLock::Held => {
                 return Err(StartError::LockHeld {
-                    record: crate::lock::read_record(&lock_file),
+                    record: crate::lock::read_record(&lock_file).map(Box::new),
                 })
             }
         };
@@ -234,14 +241,19 @@ impl Holder {
             child_pid: Some(pane.child_pid()),
             started_at_unix_ms: now_unix_ms(),
         };
+        let record = LockRecord {
+            holder_pid: info.holder_pid,
+            child_pid: info.child_pid,
+            versions: PROTOCOL_VERSIONS.to_vec(),
+            started_at_unix_ms: info.started_at_unix_ms,
+            holder_build: holder_build(),
+            child_start: pane.child_start().map(str::to_string),
+            holder_start: crate::proc_identity::start_token(info.holder_pid),
+            scope_unit: own_scope_unit(),
+            ended: None,
+        };
         let bound = (|| -> io::Result<Listener> {
-            lock.write_record(&LockRecord {
-                holder_pid: info.holder_pid,
-                child_pid: info.child_pid,
-                versions: PROTOCOL_VERSIONS.to_vec(),
-                started_at_unix_ms: info.started_at_unix_ms,
-                holder_build: holder_build(),
-            })?;
+            lock.write_record(&record)?;
             #[cfg(unix)]
             {
                 let sock = crate::pane::socket_path(pane_dir, pane_id);
@@ -270,6 +282,7 @@ impl Holder {
             log: log_path(pane_dir, pane_id),
             scrollback: Arc::new(Mutex::new(scrollback)),
             lock,
+            record,
         })
     }
 
@@ -294,7 +307,7 @@ impl Holder {
         }
     }
 
-    /// Serve until the holder may exit (`crate::pty::Pane::wait_for_end`) and
+    /// Serve until the holder may exit (`crate::pty::Pane::wait_for_delivery`) and
     /// return the child's exit. The accept loop runs on its own thread and
     /// never ends the holder; the lock is held until this returns. The durable
     /// tail is persisted on its timer throughout, and once more — the child's
@@ -306,7 +319,8 @@ impl Holder {
             listener,
             log,
             scrollback,
-            lock,
+            mut lock,
+            mut record,
         } = self;
         if let Err(e) = crate::scrollback::spawn_persister(
             Arc::clone(&pane),
@@ -327,12 +341,70 @@ impl Holder {
             // counted (its lock is held), until the child exits.
             eprintln!("pty-holder: accept thread: {e}");
         }
-        let exit = pane.wait_for_end();
-        // Closes the writer under its mutex BEFORE the lock is released, so no
-        // later timer tick can touch a successor holder's files.
+        let exit = pane.wait_for_exit();
+        // A NORMAL end (the child exited on its own) must never cost the
+        // child's leftovers — not now, and not at a later boot sweep (plan D8
+        // as decided 2026-10-14). So, still under the lock: the record says
+        // the pane ENDED BY EXIT (a sweep then cleans its files and signals
+        // nothing), and on Windows the job stops killing on close.
+        let mut end_errors: Vec<String> = Vec::new();
+        if pane.ended_by_kill() != Some(true) {
+            record.ended = Some(crate::lock::ENDED_BY_EXIT.to_string());
+            if let Err(e) = lock.write_record(&record) {
+                // Review round 3, R4: a record that still reads `ended: None`
+                // would let the next sweep reap the leftovers. An EMPTY one
+                // makes it signal nothing (no record, nothing provable).
+                let cleared = lock.clear_record();
+                end_errors.push(format!(
+                    "ERROR: could not mark the record ended-by-exit ({e}); cleared it instead: \
+                     {cleared:?}"
+                ));
+            }
+            if let Err(e) = pane.release_leftovers_on_normal_exit() {
+                end_errors.push(format!(
+                    "ERROR: could not disarm the job's kill-on-close ({e}): the child's \
+                     leftovers will end when this holder exits"
+                ));
+            }
+            for e in &end_errors {
+                log_line(&log, e);
+            }
+        }
+        pane.wait_for_delivery();
+        // Every byte the child wrote is in the ring now: persist the final tail
+        // BEFORE the reap, which can take a while (a scope's reap passes) and
+        // is a window in which this holder could itself be killed. It closes
+        // the writer under its mutex, and the lock is still held, so no later
+        // timer tick can touch a successor holder's files.
         crate::scrollback::persist_final(&pane, &scrollback, &log);
+        // Plan D8: on a KILL this holder is the reaper of its own child tree.
+        // Still under the lock, so a boot sweep cannot take this pane for dead
+        // while its remainder is being ended.
+        let mut reap = pane.reap_tree();
+        // The pane-end report carries what failed above, too.
+        for e in end_errors {
+            reap.note(e);
+        }
+        if !reap.killed.is_empty() || !reap.notes.is_empty() {
+            log_line(&log, &format!("pane ended; its tree: {}", reap.summary()));
+        }
         drop(lock);
         exit
+    }
+}
+
+/// The transient scope unit this holder runs in, when the spawner put it in
+/// one (`crate::spawn`'s scope route). Recorded in the lock so a boot sweep can
+/// stop what a dead holder left in it.
+fn own_scope_unit() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let cgroup = crate::reap::own_holder_scope_cgroup()?;
+        cgroup.rsplit('/').next().map(str::to_string)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
