@@ -56,6 +56,16 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     "hit your usage limit",
     "out of extra usage",
     "session limit reached",
+    // CLI 2.1.x phrasing: "You've hit your weekly limit · resets Oct 17, 10pm".
+    // None of the "... limit reached" forms above match it (2026-10-16: two
+    // hotmail sessions stranded on it with a healthy migration target idle).
+    // The leading "You've" is omitted - apostrophe style varies.
+    "hit your weekly limit",
+    "hit your 5-hour limit",
+    "hit your session limit",
+    "hit your opus limit",
+    "hit your sonnet limit",
+    "hit your limit",
     // Generic catch-alls LAST (specific patterns above win the label). The
     // CLI's phrasing shifts across releases ("Opus weekly limit reached",
     // "limit reached ∙ resets 3am", "You're out of usage until…") — a missed
@@ -240,6 +250,21 @@ mod tests {
         assert_eq!(
             window_indicates_usage_limit("Weekly limit reached — resets Thursday"),
             Some("weekly limit reached")
+        );
+    }
+
+    #[test]
+    fn hit_your_limit_phrasing_matches() {
+        // Verbatim from a stranded session transcript, 2026-10-16.
+        assert_eq!(
+            window_indicates_usage_limit(
+                "You've hit your weekly limit \u{b7} resets Oct 17, 10pm (Europe/Berlin)"
+            ),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("You\u{2019}ve hit your 5-hour limit \u{b7} resets 3am"),
+            Some("hit your 5-hour limit")
         );
     }
 
