@@ -125,11 +125,11 @@ struct WireResponse {
     /// coord cut the INPUT id list (more ids than its per-request cap). Wire
     /// name `input_truncated` since plan
     /// `2026-09-12-fleet-principal-session-routes-disagree-about-being-capped`
-    /// Phase 3; the legacy `truncated` is accepted as an alias so this build
-    /// reads a coord from either side of the rename. It says nothing about a
-    /// capped RESULT page — that is what `truncated` meant on the sibling
-    /// routes, and why coord renamed it.
-    #[serde(default, alias = "truncated")]
+    /// Phase 3 (qontinui-coord#2553). The transitional `truncated` alias is
+    /// gone now that the rename is deployed — the plan's third step. It says
+    /// nothing about a capped RESULT page — that is what `truncated` meant on
+    /// the sibling routes, and why coord renamed it.
+    #[serde(default)]
     input_truncated: bool,
     /// `false` means the join could not be expressed on that database at all —
     /// so every `statuses` entry it did or did not return is meaningless.
@@ -682,7 +682,7 @@ mod tests {
 
         let absent = body(serde_json::json!({
             "statuses": {"x": {"session_status": "finished", "since": "2026-09-13T10:00:00Z"}},
-            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": false
         }));
         assert!(finished_at_from_body(&absent).is_empty());
@@ -694,7 +694,7 @@ mod tests {
         // map entry is exactly how the caller is told to keep blocking.
         let (m, _) = map_from_body(&body(serde_json::json!({
             "statuses": {"a": {"session_status": null}},
-            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         })));
         assert!(m.is_empty());
@@ -704,7 +704,7 @@ mod tests {
     fn unrecognised_status_is_carried_verbatim_and_is_not_finished() {
         let (m, _) = map_from_body(&body(serde_json::json!({
             "statuses": {"a": {"session_status": "vacationing"}},
-            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         })));
         let got = m.get("a").expect("entry");
@@ -723,7 +723,7 @@ mod tests {
     fn bridge_column_absent_discards_the_whole_body() {
         let (m, note) = map_from_body(&body(serde_json::json!({
             "statuses": {"a": {"session_status": "finished"}},
-            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "unknown": [], "invalid": [], "accepted": 1, "input_truncated": false,
             "sessionBridgeColumnPresent": false
         })));
         assert!(
@@ -738,7 +738,7 @@ mod tests {
         let (m, note) = map_from_body(&body(serde_json::json!({
             "statuses": {},
             "unknown": ["a", "b"], "invalid": ["not-a-uuid"],
-            "accepted": 2, "truncated": true,
+            "accepted": 2, "input_truncated": true,
             "sessionBridgeColumnPresent": true
         })));
         assert!(m.is_empty());
@@ -747,27 +747,36 @@ mod tests {
         assert!(note.contains("truncated the INPUT id list"));
     }
 
-    /// Phase 3 of plan `2026-09-12-fleet-principal-session-routes-…` renames
-    /// the wire field `truncated` → `input_truncated`. This build must read
-    /// BOTH, because it may meet a coord from either side of that rename.
+    /// Phase 3 of plan `2026-09-12-fleet-principal-session-routes-…` renamed
+    /// the wire field `truncated` → `input_truncated`, and this build reads
+    /// ONLY the new name. A bare `truncated` is not read as the input cap: on
+    /// the sibling routes that word meant "more rows exist", which is the
+    /// confusion the rename removed.
     #[test]
-    fn input_truncated_is_read_under_both_the_new_and_the_legacy_name() {
-        for key in ["input_truncated", "truncated"] {
-            let mut v = serde_json::json!({
+    fn input_truncated_is_read_and_the_legacy_name_is_not() {
+        let base = || {
+            serde_json::json!({
                 "statuses": {}, "unknown": [], "invalid": [], "accepted": 500,
                 "sessionBridgeColumnPresent": true
-            });
-            v[key] = serde_json::json!(true);
-            let b = body(v);
-            assert!(b.input_truncated, "`{key}: true` must be read");
-            let (_, note) = map_from_body(&b);
-            assert!(
-                note.contains("truncated the INPUT id list"),
-                "{key}: {note}"
-            );
-        }
-        // Absent under either name -> false, and no note.
-        let b = body(serde_json::json!({"statuses": {}, "sessionBridgeColumnPresent": true}));
+            })
+        };
+        let mut v = base();
+        v["input_truncated"] = serde_json::json!(true);
+        let b = body(v);
+        assert!(b.input_truncated);
+        assert!(map_from_body(&b).1.contains("truncated the INPUT id list"));
+
+        let mut v = base();
+        v["truncated"] = serde_json::json!(true);
+        let b = body(v);
+        assert!(
+            !b.input_truncated,
+            "the legacy `truncated` must not be read"
+        );
+        assert!(map_from_body(&b).1.is_empty());
+
+        // Absent -> false, and no note.
+        let b = body(base());
         assert!(!b.input_truncated);
         assert!(map_from_body(&b).1.is_empty());
     }
