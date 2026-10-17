@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::app_dispatch::DispatchError;
+use super::app_dispatch::{ws_result_envelope, DispatchError, Dispatched};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
@@ -330,7 +330,10 @@ async fn try_ws_dispatch(
         .dispatch(&app_id, action, Method::GET, "/", payload)
         .await
     {
-        Ok(value) => Ok(Some(value)),
+        // RAW, deliberately: every caller of this probe either synthesizes a
+        // derived answer from the bare result or wraps it with
+        // `ws_result_envelope` itself.
+        Ok(value) => Ok(Some(value.into_raw())),
         Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::NotConnected(_)))
         | Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::Disconnected)) => {
             Err(format!(
@@ -348,6 +351,12 @@ async fn try_ws_dispatch(
 /// responsiveness cache for HTTP-transport apps. Errors are flattened to
 /// `String` for backward compatibility — handler call sites have not
 /// changed and still pattern-match on a `Result<Value, String>`.
+///
+/// The `Ok` value is ALWAYS the `{success, data}` API envelope, whichever
+/// transport answered ([`Dispatched::into_envelope`]): the HTTP arm's body
+/// already is one, and a WS-transport app's bare result is wrapped. Before
+/// that normalization every `/ui-bridge/sdk/*` proxy forwarded a WS app's
+/// answer with no `success` key, which a strict client reads as a failure.
 pub async fn dispatch_app_request(
     state: &Arc<ApiState>,
     action: &str,
@@ -400,6 +409,7 @@ async fn dispatch_app_request_typed(
             payload,
         )
         .await
+        .map(Dispatched::into_envelope)
 }
 
 /// Send an HTTP request to the connected SDK app.
@@ -469,6 +479,7 @@ pub async fn dispatch_app_request_by_id(
         .app_dispatcher
         .dispatch(app_id, action, http_method, http_path, payload)
         .await
+        .map(Dispatched::into_envelope)
         .map_err(dispatch_err_to_string)
 }
 
@@ -2174,7 +2185,7 @@ async fn handle_ai_assert(
 async fn handle_clipboard_read(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     match try_ws_dispatch(&state, "getClipboard", serde_json::json!({})).await {
-        Ok(Some(data)) => return Json(data),
+        Ok(Some(data)) => return Json(ws_result_envelope(data)),
         Ok(None) => {}
         Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2207,7 +2218,7 @@ async fn handle_clipboard_write(
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     match try_ws_dispatch(&state, "setClipboard", body.clone()).await {
-        Ok(Some(data)) => return Json(data),
+        Ok(Some(data)) => return Json(ws_result_envelope(data)),
         Ok(None) => {}
         Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
     }

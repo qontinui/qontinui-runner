@@ -1,8 +1,9 @@
-//! Page-health analysis, annotations CRUD, and runner-window capture helpers.
+//! Page-health forward, annotations CRUD, and runner-window capture helpers.
 //!
 //! Family scope (post Phase 2 vision-pipeline rewrite):
-//!   - `/control/page-health` — DOM-derived health summary (no pixels in
-//!     response). Kept here because its helpers
+//!   - `/control/page-health` — forwards to the app's SDK page-health producer
+//!     (`sdk/page-health`) and parses its observation strictly; the runner
+//!     keeps no analyzer of its own. Kept here because the module's helpers
 //!     (`capture_runner_window`, `capture_runner_window_base64`,
 //!     `lookup_element_normalized_rect`) are also reused by the new
 //!     `vision_routes` module and `errors::ui_bridge_readiness_handler`.
@@ -30,6 +31,9 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
+};
+use qontinui_vision_core::{
+    Observation, ObservationCoverage, PageHealthValue, Producer, Provenance, UnknownCode,
 };
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
@@ -499,7 +503,7 @@ fn extract_normalized_rect_from_element(
 }
 
 // ============================================================================
-// Page Health Analysis
+// Page Health
 // ============================================================================
 
 /// The `discover` options every page-wide sweep in this module MUST send.
@@ -560,429 +564,172 @@ pub struct PageHealthRequest {
     pub options: Option<serde_json::Value>,
 }
 
-/// Analyse the current page by running discover internally and returning a
-/// structured `PageHealthReport` with spatial coverage, layout regions,
-/// element diversity, text signal scanning, interactive readiness, visual
-/// anomalies and an ASCII heatmap.
+/// The webview IPC request type `/control/page-health` forwards to. The
+/// runner frontend answers it with the SDK's own page-health producer
+/// (`src/hooks/ui-bridge-events/pageHealth.ts`), named after the SDK's in-app
+/// `pageHealth` command it mirrors.
+pub const PAGE_HEALTH_REQUEST_TYPE: &str = "pageHealth";
+
+/// Producer id of an answer the RUNNER synthesised because the forward did not
+/// yield the app's own observation (no app, an app without the command, a
+/// timeout, a reply that is not the canonical envelope). A measured answer is
+/// never under this id: it is the app's observation verbatim, producer
+/// `sdk/page-health`.
+pub const PAGE_HEALTH_FORWARD_PRODUCER_ID: &str = "runner/page-health-forward";
+
+/// Transport errors from [`ui_bridge_request_sync`] that mean no app answered
+/// at all — the webview bridge is not there to ask, rather than asked and
+/// failing. Matched on the transport's own messages (`circuit_breaker.rs`,
+/// `request.rs`), which are the only carrier of that distinction.
+const APP_UNREACHABLE_MARKERS: [&str; 4] = [
+    // circuit_breaker.rs `check`: the bridge has been failing; not asked.
+    "circuit breaker open",
+    // request.rs readiness wait: the frontend never answered a ping (the
+    // structured `frontend_not_ready` body, or its serialization fallback).
+    "frontend_not_ready",
+    "did not become ready",
+    // request.rs: the request could not be emitted to the webview.
+    "Failed to emit UI Bridge request",
+];
+
+/// The transport's timeout wording (`request.rs`, IPC wait).
+const TRANSPORT_TIMEOUT_MARKER: &str = "request timed out after";
+
+/// The frontend's answer to a request type its dispatcher has no case for
+/// (`useUIBridgeEventHandler.ts`): a build whose webview predates the
+/// `pageHealth` case.
+const UNKNOWN_REQUEST_TYPE_PREFIX: &str = "Unknown request type";
+
+/// The frontend's answer when its UI Bridge is not mounted.
+const BRIDGE_NOT_AVAILABLE: &str = "UI Bridge is not available";
+
+/// Judge the `pageHealth` forward's reply into the route's answer, by fixed
+/// rules. Every arm is an observation (HTTP 200), never a 500 and never a
+/// verdict about a page nobody looked at:
+///
+/// | forward result | answer |
+/// |---|---|
+/// | transport: no app to ask ([`APP_UNREACHABLE_MARKERS`]) | `unknown{app_unreachable}` |
+/// | transport: timed out | `unknown{producer_failed}`, detail names the timeout |
+/// | transport: any other error | `unknown{producer_failed}` |
+/// | `success:false`, `Unknown request type …` | `unknown{capability_unavailable_in_build}` |
+/// | `success:false`, bridge not available | `unknown{app_unreachable}` |
+/// | `success:false`, anything else | `unknown{producer_failed}` |
+/// | reply is not a canonical `Observation<PageHealthValue>` | `unknown{producer_failed}` |
+/// | reply parses | the app's observation, verbatim (producer `sdk/page-health`) |
+///
+/// Strict parse: the reply goes through the canon's own deserializer
+/// (`qontinui_vision_core::Observation`), which refuses a `measured` without a
+/// value, an `unknown` without a code, an `absent` over partial coverage, and
+/// any report that is not a `PageHealthValue`. A reply the runner cannot
+/// trust is reported as the producer failing — not passed through, and not
+/// re-analysed here.
+pub(crate) fn page_health_forward_observation(
+    reply: Result<serde_json::Value, String>,
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> Observation<PageHealthValue> {
+    let unknown = |code: UnknownCode, detail: String| {
+        let mut source = serde_json::Map::new();
+        source.insert("transport".into(), serde_json::json!("runner-ipc"));
+        source.insert(
+            "request".into(),
+            serde_json::json!(PAGE_HEALTH_REQUEST_TYPE),
+        );
+        Observation::unknown(
+            code,
+            detail,
+            Provenance::new(
+                Producer::new(PAGE_HEALTH_FORWARD_PRODUCER_ID, env!("CARGO_PKG_VERSION")),
+                evaluated_at,
+                ObservationCoverage::default(),
+            )
+            .with_source(source),
+        )
+    };
+
+    let data = match reply {
+        Ok(d) => d,
+        Err(e) if APP_UNREACHABLE_MARKERS.iter().any(|m| e.contains(m)) => {
+            return unknown(
+                UnknownCode::AppUnreachable,
+                format!("no app answered the pageHealth request: {e}"),
+            );
+        }
+        Err(e) if e.contains(TRANSPORT_TIMEOUT_MARKER) => {
+            return unknown(
+                UnknownCode::ProducerFailed,
+                format!("timeout: the app did not answer the pageHealth request in time: {e}"),
+            );
+        }
+        Err(e) => {
+            return unknown(
+                UnknownCode::ProducerFailed,
+                format!("the pageHealth request failed: {e}"),
+            );
+        }
+    };
+
+    if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        let error = data
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("the app refused the pageHealth request without an error message");
+        let code = if error.starts_with(UNKNOWN_REQUEST_TYPE_PREFIX) {
+            UnknownCode::CapabilityUnavailableInBuild
+        } else if error.contains(BRIDGE_NOT_AVAILABLE) {
+            UnknownCode::AppUnreachable
+        } else {
+            UnknownCode::ProducerFailed
+        };
+        let detail = if code == UnknownCode::CapabilityUnavailableInBuild {
+            format!(
+                "the connected app does not serve the pageHealth request (a webview build \
+                 that predates it): {error}"
+            )
+        } else {
+            format!("the app refused the pageHealth request: {error}")
+        };
+        return unknown(code, detail);
+    }
+
+    match serde_json::from_value::<Observation<PageHealthValue>>(data) {
+        Ok(observation) => observation,
+        Err(e) => unknown(
+            UnknownCode::ProducerFailed,
+            format!(
+                "the app's pageHealth reply is not a canonical Observation<PageHealthValue>: {e}"
+            ),
+        ),
+    }
+}
+
+/// Assess the current page with the SDK's page-health producer, run in the
+/// app: forward [`PAGE_HEALTH_REQUEST_TYPE`] to the webview and answer its
+/// [`Observation<PageHealthValue>`] (producer `sdk/page-health`).
+///
+/// The runner keeps no analyzer of its own. Its Rust port of the SDK's
+/// heuristics took no runner-only input, so it was deleted in favour of the
+/// one implementation (plan
+/// `2026-09-20-ui-bridge-observations-distinguish-cannot-see-from-not-present-and-carry-provenance`).
+///
+/// Always HTTP 200: a forward that does not yield the app's observation is a
+/// typed `unknown` (see [`page_health_forward_observation`]), not a 500.
 pub async fn ui_bridge_page_health_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<PageHealthRequest>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Page health analysis");
-
-    // --- Step 1: run discover to get all elements -------------------------
+) -> Json<ApiResponse<Observation<PageHealthValue>>> {
+    info!("UI Bridge API: Page health (forwarded to the app's SDK producer)");
     let _body = body.map(|b| b.0).unwrap_or_default();
 
-    let discover_data =
-        match ui_bridge_request_sync(&state, "discover", discover_all_elements_payload()).await {
-            Ok(d) => d,
-            Err(e) => {
-                error!("UI Bridge API: page-health discover failed: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
-            }
-        };
-
-    // Elements live under "elements" key returned by discover.
-    let elements = discover_data
-        .get("elements")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let element_count = elements.len();
-
-    // Visible elements: state.visible == true and state.normalizedRect present.
-    let visible: Vec<&serde_json::Value> = elements
-        .iter()
-        .filter(|el| {
-            let state = el.get("state");
-            let is_visible = state
-                .and_then(|s| s.get("visible"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let has_rect = state.and_then(|s| s.get("normalizedRect")).is_some();
-            is_visible && has_rect
-        })
-        .collect();
-    let visible_count = visible.len();
-
-    let mut findings: Vec<serde_json::Value> = Vec::new();
-
-    // --- Step 2: Spatial coverage (20x20 grid) ----------------------------
-    const GRID: usize = 20;
-    let mut grid = [[false; GRID]; GRID];
-
-    for el in &visible {
-        if let Some(rect) = el.get("state").and_then(|s| s.get("normalizedRect")) {
-            let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let w = rect.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let h = rect.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-            let col_start = (x * GRID as f64).floor().max(0.0) as usize;
-            let col_end = ((x + w) * GRID as f64).ceil().min(GRID as f64) as usize;
-            let row_start = (y * GRID as f64).floor().max(0.0) as usize;
-            let row_end = ((y + h) * GRID as f64).ceil().min(GRID as f64) as usize;
-
-            for row in grid.iter_mut().take(row_end.min(GRID)).skip(row_start) {
-                for cell in row.iter_mut().take(col_end.min(GRID)).skip(col_start) {
-                    *cell = true;
-                }
-            }
-        }
+    let reply =
+        ui_bridge_request_sync(&state, PAGE_HEALTH_REQUEST_TYPE, serde_json::json!({})).await;
+    if let Err(e) = &reply {
+        error!("UI Bridge API: page-health forward failed: {}", e);
     }
-
-    let total_cells = (GRID * GRID) as f64;
-    let filled_cells = grid.iter().flatten().filter(|&&v| v).count() as f64;
-    let coverage_pct = (filled_cells / total_cells * 100.0).round();
-
-    // Left half = columns 0..10, right half = columns 10..20
-    let left_filled = grid
-        .iter()
-        .flat_map(|row| row[..GRID / 2].iter())
-        .filter(|&&v| v)
-        .count() as f64;
-    let right_filled = grid
-        .iter()
-        .flat_map(|row| row[GRID / 2..].iter())
-        .filter(|&&v| v)
-        .count() as f64;
-    let half_cells = (GRID * GRID / 2) as f64;
-    let left_half_pct = (left_filled / half_cells * 100.0).round();
-    let right_half_pct = (right_filled / half_cells * 100.0).round();
-
-    let spatial_severity = if coverage_pct < 15.0 {
-        "CRITICAL"
-    } else if coverage_pct < 30.0 {
-        "WARNING"
-    } else {
-        "OK"
-    };
-
-    // Sidebar-only: right < 5% and left > 20%
-    let spatial_severity = if right_half_pct < 5.0 && left_half_pct > 20.0 {
-        "CRITICAL"
-    } else {
-        spatial_severity
-    };
-
-    findings.push(serde_json::json!({
-        "check": "spatial_coverage",
-        "severity": spatial_severity,
-        "detail": format!(
-            "Elements cover {}% of viewport. Left={}%, Right={}%",
-            coverage_pct, left_half_pct, right_half_pct
-        ),
-        "data": {
-            "coverage_pct": coverage_pct,
-            "left_half_pct": left_half_pct,
-            "right_half_pct": right_half_pct
-        }
-    }));
-
-    // --- Step 3: Layout regions -------------------------------------------
-    let mut sidebar_count: usize = 0;
-    let mut header_count: usize = 0;
-    let mut content_count: usize = 0;
-
-    for el in &visible {
-        if let Some(rect) = el.get("state").and_then(|s| s.get("normalizedRect")) {
-            let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let w = rect.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let h = rect.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-            let cx = x + w / 2.0;
-            let cy = y + h / 2.0;
-
-            if cx < 0.2 {
-                sidebar_count += 1;
-            } else if cy < 0.08 {
-                header_count += 1;
-            } else {
-                content_count += 1;
-            }
-        }
-    }
-
-    let layout_severity = if content_count == 0 {
-        "CRITICAL"
-    } else if content_count < 3 {
-        "WARNING"
-    } else {
-        "OK"
-    };
-
-    findings.push(serde_json::json!({
-        "check": "layout_regions",
-        "severity": layout_severity,
-        "detail": format!(
-            "sidebar={}, header={}, content={}",
-            sidebar_count, header_count, content_count
-        ),
-        "data": {
-            "sidebar": sidebar_count,
-            "header": header_count,
-            "content": content_count
-        }
-    }));
-
-    // --- Step 4: Element diversity ----------------------------------------
-    let nav_types: &[&str] = &["button", "heading", "badge", "status-message"];
-    let mut type_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for el in &elements {
-        let t = el.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-        *type_counts.entry(t.to_string()).or_insert(0) += 1;
-    }
-
-    let all_nav = element_count > 5 && type_counts.keys().all(|k| nav_types.contains(&k.as_str()));
-
-    let diversity_severity = if all_nav { "WARNING" } else { "OK" };
-
-    findings.push(serde_json::json!({
-        "check": "element_diversity",
-        "severity": diversity_severity,
-        "detail": format!(
-            "{} type(s) across {} elements{}",
-            type_counts.len(),
-            element_count,
-            if all_nav { " (navigation-only)" } else { "" }
-        ),
-        "data": {
-            "types": type_counts
-        }
-    }));
-
-    // --- Step 5: Text signal scanning -------------------------------------
-    let skip_types: &[&str] = &["button", "link", "tab", "menuitem"];
-
-    let error_phrases: &[&str] = &[
-        "error occurred",
-        "failed to",
-        "exception",
-        "crash",
-        "unavailable",
-        "something went wrong",
-        "could not",
-    ];
-    let loading_phrases: &[&str] = &[
-        "loading",
-        "starting",
-        "connecting",
-        "please wait",
-        "initializing",
-        "fetching",
-    ];
-    let empty_phrases: &[&str] = &[
-        "no data",
-        "no results",
-        "nothing here",
-        "empty",
-        "no items",
-        "get started",
-    ];
-    let css_signals: &[&str] = &["spin", "pulse", "skeleton", "loading", "shimmer"];
-
-    let mut detected_errors: Vec<String> = Vec::new();
-    let mut detected_loading: Vec<String> = Vec::new();
-    let mut detected_empty: Vec<String> = Vec::new();
-    let mut detected_css: Vec<String> = Vec::new();
-
-    for el in &elements {
-        let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let text = el
-            .get("state")
-            .and_then(|s| s.get("textContent"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        // "classes" is a top-level array of strings
-        let classes_arr = el.get("classes").and_then(|v| v.as_array());
-        let classes_str: String = classes_arr
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-
-        // Check CSS class signals on all elements
-        let classes_lower = classes_str.to_lowercase();
-        for sig in css_signals {
-            if classes_lower.contains(sig) {
-                detected_css.push(format!("class contains '{}' on {}", sig, el_type));
-                break;
-            }
-        }
-
-        // Skip navigation types for text scanning
-        if skip_types.contains(&el_type) {
-            continue;
-        }
-
-        let text_lower = text.to_lowercase();
-        for phrase in error_phrases {
-            if text_lower.contains(phrase) {
-                detected_errors.push(text.chars().take(120).collect());
-                break;
-            }
-        }
-        for phrase in loading_phrases {
-            if text_lower.contains(phrase) {
-                detected_loading.push(text.chars().take(120).collect());
-                break;
-            }
-        }
-        for phrase in empty_phrases {
-            if text_lower.contains(phrase) {
-                detected_empty.push(text.chars().take(120).collect());
-                break;
-            }
-        }
-    }
-
-    let text_severity = if !detected_errors.is_empty() {
-        "CRITICAL"
-    } else if !detected_loading.is_empty() || !detected_css.is_empty() || !detected_empty.is_empty()
-    {
-        "WARNING"
-    } else {
-        "OK"
-    };
-
-    findings.push(serde_json::json!({
-        "check": "text_signals",
-        "severity": text_severity,
-        "detail": format!(
-            "errors={}, loading={}, empty={}, css_signals={}",
-            detected_errors.len(),
-            detected_loading.len(),
-            detected_empty.len(),
-            detected_css.len()
-        ),
-        "data": {
-            "errors": detected_errors,
-            "loading": detected_loading,
-            "empty": detected_empty,
-            "css_signals": detected_css
-        }
-    }));
-
-    // --- Step 6: Interactive readiness ------------------------------------
-    let mut interactive_total: usize = 0;
-    let mut interactive_disabled: usize = 0;
-
-    for el in &elements {
-        let cat = el.get("category").and_then(|v| v.as_str()).unwrap_or("");
-        if cat == "interactive" {
-            interactive_total += 1;
-            let enabled = el
-                .get("state")
-                .and_then(|s| s.get("enabled"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            if !enabled {
-                interactive_disabled += 1;
-            }
-        }
-    }
-
-    let interactive_severity = if interactive_total > 0
-        && (interactive_disabled as f64 / interactive_total as f64) > 0.5
-    {
-        "WARNING"
-    } else {
-        "OK"
-    };
-
-    findings.push(serde_json::json!({
-        "check": "interactive_readiness",
-        "severity": interactive_severity,
-        "detail": format!(
-            "{} interactive elements, {} disabled",
-            interactive_total, interactive_disabled
-        ),
-        "data": {
-            "total": interactive_total,
-            "disabled": interactive_disabled
-        }
-    }));
-
-    // --- Step 7: Visual anomalies -----------------------------------------
-    let mut zero_size: usize = 0;
-    let mut outside_viewport: usize = 0;
-
-    for el in &visible {
-        if let Some(rect) = el.get("state").and_then(|s| s.get("normalizedRect")) {
-            let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let w = rect.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let h = rect.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-            if w == 0.0 || h == 0.0 {
-                zero_size += 1;
-            }
-            if x + w < 0.0 || y + h < 0.0 || x > 1.0 || y > 1.0 {
-                outside_viewport += 1;
-            }
-        }
-    }
-
-    let anomaly_severity = if zero_size > 0 || outside_viewport > 0 {
-        "WARNING"
-    } else {
-        "OK"
-    };
-
-    findings.push(serde_json::json!({
-        "check": "visual_anomalies",
-        "severity": anomaly_severity,
-        "detail": format!(
-            "zero_size={}, outside_viewport={}",
-            zero_size, outside_viewport
-        ),
-        "data": {
-            "zero_size": zero_size,
-            "outside_viewport": outside_viewport
-        }
-    }));
-
-    // --- Step 8: ASCII heatmap --------------------------------------------
-    let heatmap: Vec<String> = grid
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|&filled| if filled { '#' } else { '.' })
-                .collect()
-        })
-        .collect();
-
-    // --- Step 9: Determine worst severity ---------------------------------
-    let severity_rank = |s: &str| -> u8 {
-        match s {
-            "CRITICAL" => 3,
-            "WARNING" => 2,
-            "OK" => 1,
-            _ => 0,
-        }
-    };
-
-    let worst = findings
-        .iter()
-        .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
-        .max_by_key(|s| severity_rank(s))
-        .unwrap_or("OK");
-
-    let report = serde_json::json!({
-        "summary": worst,
-        "findings": findings,
-        "heatmap": heatmap,
-        "element_count": element_count,
-        "visible_count": visible_count
-    });
-
-    Ok(Json(ApiResponse::success(report)))
+    Json(ApiResponse::success(page_health_forward_observation(
+        reply,
+        chrono::Utc::now(),
+    )))
 }
 
 // ============================================================================
@@ -1425,7 +1172,7 @@ pub(crate) fn build_visibility_report(
 /// motivating bug lives in the runner's own webview cannot be dismissed as
 /// meaningless there.
 ///
-/// Shaped like `ui_bridge_page_health_handler`: one `discover` IPC for the FULL
+/// One `discover` IPC for the FULL
 /// element set (`includeHidden: true` AND `interactiveOnly: false`), then pure
 /// analysis in Rust. Alongside it, concurrently, one `get_modal_context` IPC
 /// for the webview's modal stack, which is what lets `includeExpected` be
@@ -2258,5 +2005,317 @@ mod sweep_discover_tests {
     fn states_both_filters(text: &str) -> bool {
         let dense: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         dense.contains("\"includeHidden\":true") && dense.contains("\"interactiveOnly\":false")
+    }
+}
+
+#[cfg(test)]
+mod page_health_forward_tests {
+    //! `/control/page-health` forwards to the app's SDK producer and parses
+    //! the reply strictly (plan
+    //! 2026-09-20-ui-bridge-observations-distinguish-cannot-see-from-not-present-and-carry-provenance).
+    //! The runner's own analyzer is gone; every arm below is an answer the
+    //! runner gives about the FORWARD, never a verdict about the page.
+
+    use super::*;
+
+    fn at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-13T12:00:00Z")
+            .expect("fixed time")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// The route's HTTP body for a forward result, as JSON.
+    fn route_body(reply: Result<serde_json::Value, String>) -> serde_json::Value {
+        serde_json::to_value(ApiResponse::success(page_health_forward_observation(
+            reply,
+            at(),
+        )))
+        .expect("serialize")
+    }
+
+    /// A runner-synthesised `unknown{code}`: a success envelope (HTTP 200), no
+    /// value, no verdict text, and the runner's forward producer — never the
+    /// SDK's, since the SDK said nothing.
+    fn assert_runner_unknown(body: &serde_json::Value, code: &str) {
+        assert_eq!(body["success"], true, "an unknown is an answer: {body}");
+        let data = &body["data"];
+        assert_eq!(data["status"], "unknown", "{body}");
+        assert_eq!(data["unknown"]["code"], code, "{body}");
+        assert!(data.get("value").is_none(), "an unknown carries no report");
+        assert_eq!(
+            data["provenance"]["producer"]["id"],
+            PAGE_HEALTH_FORWARD_PRODUCER_ID
+        );
+        assert!(
+            data["provenance"]["observedAt"].is_null(),
+            "the runner sampled nothing"
+        );
+        assert_eq!(data["provenance"]["source"]["request"], "pageHealth");
+        // `unknown.detail` may quote a parse error naming the severities, so
+        // scan everything else.
+        let mut rest = data.clone();
+        rest["unknown"]["detail"] = serde_json::Value::Null;
+        let text = rest.to_string();
+        assert!(
+            !text.contains("CRITICAL") && !text.contains("WARNING") && !text.contains("summary"),
+            "no verdict over a page nobody looked at: {text}"
+        );
+    }
+
+    #[test]
+    fn no_app_to_ask_is_app_unreachable() {
+        for transport_error in [
+            "UI Bridge temporarily unavailable (circuit breaker open)".to_string(),
+            serde_json::json!({ "error": "frontend_not_ready", "diagnostics": {} }).to_string(),
+            "UI Bridge: Frontend did not become ready within 10s (diagnostics serialization failed)"
+                .to_string(),
+            "Failed to emit UI Bridge request: no webview".to_string(),
+        ] {
+            let body = route_body(Err(transport_error.clone()));
+            assert_runner_unknown(&body, "app_unreachable");
+            assert!(
+                body["data"]["unknown"]["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(&transport_error)),
+                "the transport's own words ride along: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frontend_without_its_bridge_is_app_unreachable() {
+        let body = route_body(Ok(serde_json::json!({
+            "requestId": "r1",
+            "type": "pageHealth",
+            "success": false,
+            "error": "UI Bridge is not available",
+            "timestamp": 1,
+        })));
+        assert_runner_unknown(&body, "app_unreachable");
+    }
+
+    /// A webview build that predates the `pageHealth` case answers the
+    /// dispatcher's catch-all. That is the capability being absent from the
+    /// running build — not the page failing and not the producer erroring.
+    #[test]
+    fn an_app_without_the_page_health_request_is_capability_unavailable_in_build() {
+        let body = route_body(Ok(serde_json::json!({
+            "requestId": "r1",
+            "type": "pageHealth",
+            "success": false,
+            "error": "Unknown request type: pageHealth",
+            "timestamp": 1,
+        })));
+        assert_runner_unknown(&body, "capability_unavailable_in_build");
+        assert!(body["data"]["unknown"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("Unknown request type: pageHealth")));
+    }
+
+    #[test]
+    fn any_other_refusal_is_producer_failed() {
+        let body = route_body(Ok(serde_json::json!({
+            "success": false,
+            "error": "Failed to handle pageHealth",
+        })));
+        assert_runner_unknown(&body, "producer_failed");
+    }
+
+    #[test]
+    fn a_transport_timeout_is_producer_failed_naming_the_timeout() {
+        let body = route_body(Err(
+            "UI Bridge request timed out after 30000ms. Is the frontend running?".to_string(),
+        ));
+        assert_runner_unknown(&body, "producer_failed");
+        assert!(body["data"]["unknown"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("timeout") && d.contains("timed out after 30000ms")));
+    }
+
+    #[test]
+    fn any_other_transport_error_is_producer_failed() {
+        let body = route_body(Err(
+            "UI Bridge concurrency limit reached (timeout acquiring permit)".to_string(),
+        ));
+        assert_runner_unknown(&body, "producer_failed");
+    }
+
+    /// The strict parse. Each of these is a reply the canon refuses, so the
+    /// runner reports the producer failing rather than forwarding it — and
+    /// in particular never re-renders a bare report (the deleted twin's
+    /// pre-envelope shape) as if it were a measurement.
+    #[test]
+    fn a_reply_that_is_not_a_canonical_observation_is_producer_failed() {
+        let provenance = serde_json::json!({
+            "producer": { "id": "sdk/page-health", "version": "0.31.0" },
+            "observedAt": null,
+            "evaluatedAt": "2026-10-13T12:00:00Z",
+            "coverage": { "considered": 1, "measured": 1, "unmeasured": [] },
+            "confidence": null,
+            "cache": null,
+            "source": null,
+        });
+        for (why, reply) in [
+            (
+                "a bare report, no envelope",
+                serde_json::json!({
+                    "summary": "CRITICAL", "findings": [], "heatmap": [],
+                    "element_count": 0, "visible_count": 0
+                }),
+            ),
+            (
+                "measured without a value",
+                serde_json::json!({ "status": "measured", "provenance": provenance }),
+            ),
+            (
+                "a value that is not a PageHealthValue",
+                serde_json::json!({
+                    "status": "measured",
+                    "value": { "summary": "FINE" },
+                    "provenance": provenance,
+                }),
+            ),
+            (
+                "unknown with a code outside the closed vocabulary",
+                serde_json::json!({
+                    "status": "unknown",
+                    "unknown": { "code": "page_is_fine", "detail": "x" },
+                    "provenance": provenance,
+                }),
+            ),
+            ("null", serde_json::Value::Null),
+        ] {
+            let body = route_body(Ok(reply));
+            assert_runner_unknown(&body, "producer_failed");
+            assert!(
+                body["data"]["unknown"]["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("not a canonical Observation")),
+                "{why}: {body}"
+            );
+        }
+    }
+
+    /// The SDK's recorded page-health output (qontinui-schemas
+    /// `rust/tests/fixtures/ui_bridge_sdk/page_health/`, read through the
+    /// sibling checkout the crate path-depends on) passes the forward's parse
+    /// and comes back as the SDK's own observation — same status, same value,
+    /// producer `sdk/page-health` — not re-judged and not re-attributed.
+    #[test]
+    fn recorded_sdk_page_health_fixtures_round_trip_through_the_forward() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../qontinui-schemas/rust/tests/fixtures/ui_bridge_sdk/page_health");
+        let mut fixtures: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the SDK page-health fixtures must be readable at {} \
+                     (qontinui-schemas sibling): {e}",
+                    dir.display()
+                )
+            })
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "json")
+                    && !p.to_string_lossy().ends_with(".provenance.json")
+            })
+            .collect();
+        fixtures.sort();
+        assert!(
+            fixtures.len() >= 3,
+            "expected the measured, laid-out and empty-registry captures; found {fixtures:?}"
+        );
+        let mut statuses = std::collections::BTreeSet::new();
+        for path in &fixtures {
+            let raw: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).expect("read fixture"))
+                    .expect("fixture is JSON");
+            let expected: Observation<PageHealthValue> = serde_json::from_value(raw.clone())
+                .unwrap_or_else(|e| panic!("{} is not canonical: {e}", path.display()));
+            let forwarded = page_health_forward_observation(Ok(raw.clone()), at());
+            assert_eq!(forwarded, expected, "{}", path.display());
+            assert_eq!(
+                forwarded.provenance().producer.id,
+                "sdk/page-health",
+                "{}: a forwarded answer keeps the SDK's provenance",
+                path.display()
+            );
+            let wire = serde_json::to_value(&forwarded).expect("serialize");
+            assert_eq!(wire["status"], raw["status"], "{}", path.display());
+            assert_eq!(wire.get("value"), raw.get("value"), "{}", path.display());
+            assert_eq!(
+                wire.get("unknown"),
+                raw.get("unknown"),
+                "{}",
+                path.display()
+            );
+            statuses.insert(raw["status"].as_str().unwrap_or_default().to_string());
+        }
+        assert!(
+            statuses.contains("measured") && statuses.contains("unknown"),
+            "the fixtures must exercise both a measured and an unknown answer: {statuses:?}"
+        );
+    }
+
+    /// The classifier keys on the transport's own wording. Pin that each
+    /// marker still occurs in the source that produces it, so a reworded
+    /// transport message breaks here instead of silently degrading its arm to
+    /// a generic `producer_failed`.
+    #[test]
+    fn every_classifier_marker_is_still_produced_by_the_transport() {
+        let transport = [
+            include_str!("request.rs"),
+            include_str!("circuit_breaker.rs"),
+        ]
+        .concat();
+        for marker in APP_UNREACHABLE_MARKERS {
+            assert!(
+                transport.contains(marker),
+                "`{marker}` no longer occurs in request.rs / circuit_breaker.rs"
+            );
+        }
+        // The timeout marker also occurs in prose and test strings, so pin
+        // the format string only the real IPC timeout message carries.
+        let timeout_format = format!("{TRANSPORT_TIMEOUT_MARKER} {{}}ms");
+        assert!(
+            transport.contains(&timeout_format),
+            "the IPC timeout message (`{timeout_format}`) is gone from request.rs"
+        );
+    }
+
+    /// The handler sends the request type the webview cases (next test), and
+    /// judges the reply through the forward — not some other path.
+    #[test]
+    fn the_handler_forwards_page_health_and_judges_the_reply() {
+        let source = include_str!("screenshots.rs");
+        let start = source
+            .find("pub async fn ui_bridge_page_health_handler(")
+            .expect("handler present");
+        let body = source
+            .get(start..)
+            .and_then(|rest| rest.find("\n}\n").and_then(|end| rest.get(..end)))
+            .expect("handler end");
+        let dense: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            dense.contains("ui_bridge_request_sync(&state,PAGE_HEALTH_REQUEST_TYPE,"),
+            "the handler must send PAGE_HEALTH_REQUEST_TYPE over ui_bridge_request_sync"
+        );
+        assert!(
+            dense.contains("page_health_forward_observation(reply,"),
+            "the handler must judge the reply through page_health_forward_observation"
+        );
+    }
+
+    /// The request type the route sends is one the runner's webview
+    /// dispatches. Without the case the forward answers
+    /// `capability_unavailable_in_build` on every call — the route would be
+    /// silently dead on the runner's own UI.
+    #[test]
+    fn the_webview_dispatches_the_request_type_the_route_sends() {
+        let discovery =
+            include_str!("../../../../src/hooks/ui-bridge-events/useDiscoveryEvents.ts");
+        assert!(
+            discovery.contains(&format!("case \"{PAGE_HEALTH_REQUEST_TYPE}\":")),
+            "useDiscoveryEvents.ts must `case \"{PAGE_HEALTH_REQUEST_TYPE}\"`"
+        );
     }
 }

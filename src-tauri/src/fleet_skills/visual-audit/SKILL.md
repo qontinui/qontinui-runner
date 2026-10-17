@@ -11,8 +11,8 @@ that turn declarative visual questions into structured answers:
 
 | Endpoint | What it does |
 |---|---|
-| `POST /ui-bridge/vision/analyze` | Run one of the five analyzers (layout/typography/color/dynamic/elements). Returns `verdict` (READ THIS FIRST — see below), `analyzer` (echoed back), `findings: [{kind, severity, analyzer?, region?, detail, elements?, confidence}]`, and the provenance set: `coverage?`, `frame?`, `frameError?`, `evaluatedAt`, `snapshotAttribution`. |
-| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **No assertion reads the frame** — one is captured, and its provenance reported, but no verdict here consults it. Returns `results: [{passed, outcome, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus `allPassed` and the same provenance set. |
+| `POST /ui-bridge/vision/analyze` | Run one of the five analyzers (layout/typography/color/dynamic/elements). Returns `verdict` (READ THIS FIRST — see below), `analyzer` (echoed back), `findings: [{kind, severity, analyzer?, region?, detail, elements?, confidence}]`, and the provenance set: `provenance` (envelope shape: `producer`, `observedAt`, `evaluatedAt`, `coverage`, `confidence`, `cache`, `source`), `coverage?`, `frame` (an Observation — read `frame.status`), `evaluatedAt`, `snapshotAttribution`. |
+| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **No assertion reads the frame** — one is captured, and its provenance reported, but no verdict here consults it. Returns `results: [{passed, outcome, code?, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus the call's own three-way `outcome` and `outcomeCounts: {passed, failed, unknown}`, and the same provenance set. |
 | `POST /ui-bridge/vision/baseline` | Capture a baseline image + register the snapshot's element bboxes under `name`. |
 | `GET  /ui-bridge/vision/baselines` | List registered baselines. |
 
@@ -88,11 +88,30 @@ below.
 | `verdict.state` | Means | Green? |
 |---|---|---|
 | `"checked"` | Preconditions met. An empty finding list here genuinely means clean. | yes |
-| `"degraded"` | Ran, but a named dimension was unmeasurable — e.g. no stacking order, so occlusion is UNKNOWN. Findings are real but incomplete. Carries a `reason`. | yes |
-| `"blocked"` | Preconditions **not** met. The input was too impoverished to check anything, so the finding list answers nothing. Carries a `reason`. | **no** |
+| `"degraded"` | Ran, but a named dimension was unmeasurable — e.g. no stacking order, so occlusion is UNKNOWN. Findings are real but incomplete. Carries a typed `code` and a `reason`. | yes |
+| `"blocked"` | Preconditions **not** met. The input was too impoverished to check anything, so the finding list answers nothing. Carries a typed `code` and a `reason`. | **no** — and not red either: report it as UNKNOWN |
 
 The verdict is an internally-tagged object, so read `verdict.state` (and
-`verdict.reason` on the two non-`checked` states), not a bare string.
+`verdict.code` — branch on this — plus `verdict.reason`, the human prose, on
+the two non-`checked` states), not a bare string. A `blocked` verdict is
+**never** reported as a clean page and **never** as a broken one: it is a
+refusal to answer. The one next action per `code`:
+
+| `verdict.code` / `unknown.code` | Next action |
+|---|---|
+| `input_missing` | The snapshot (or frame) lacked what this check needs — re-project with the script above and read its `--stats` line; for a pixel analyzer, check `frame.status` |
+| `needs_multi_frame_input` | The question needs two frames (`animation_settled`, `dynamic`) — use `vision/diff` over two captures |
+| `producer_failed` | The producer OR its capture failed — `frame.unknown.detail` names the capture ("frame capture failed: …"); confirm the window / device |
+| `below_confidence_floor` | OCR text fell under the floor — re-extract with a lower `minConfidence` |
+| `model_reply_unparseable` | A model reply could not be parsed — retry the producing call with `"force": true` |
+| `app_unreachable` | The bridge / app behind the target could not be reached — re-list the targets and confirm the app is up |
+| `capability_unavailable_in_build` | The answering build does not serve this route (an SDK bridge with no runner) — call the runner's `:9876` route |
+| `producer_not_run` | The producer did not run — nothing registered yet; wait for the page to hydrate, then re-run |
+| `stale_input` | The input is known to be stale — re-capture the snapshot / frame, then re-run |
+
+These are the nine members of the closed `UnknownCode` set
+(`qontinui-schemas/rust-vision-core/src/observation.rs`). A code outside it is a
+contract break: report it verbatim as UNKNOWN and do not infer a page state.
 
 A snapshot whose elements carry no geometry makes `layout` answer `Blocked`
 rather than returning `[]`. That is the whole point: a `layout` result that
@@ -127,8 +146,13 @@ projected 118/118 elements: 118 with geometry, 96 with stacking order, ...
 `analyze` and `assert` capture a frame **best-effort**. Layout, typography and
 elements are pure geometry over the snapshot, and no assertion in the DSL
 reads the frame at all, so a runner reporting `frontendState: "window_missing"`
-still answers every geometric question. A failed capture comes back as
-`frameError` in the response — check for it rather than assuming the pixels
+still answers every geometric question. The capture is reported as ONE
+observation, `frame`: `frame.status: "measured"` carries the frame's
+provenance in `frame.value`; `frame.status: "unknown"` says there were no
+pixels, with `frame.unknown.code: "producer_failed"` (a capture was attempted
+and failed — window gone, device capture error) and the error in
+`frame.unknown.detail`. An unknown `target` never gets this far: it is a
+malformed request, answered HTTP 404. Read `frame.status` rather than assuming the pixels
 agreed. Only `color` and `dynamic` degrade, and they say so with a `skipped`
 finding.
 
@@ -163,14 +187,15 @@ device, not the runner:
 # with geometry, and every element marked interactable by `inferActions`.
 SNAP=$(curl -sS "http://<device-ip>:8087/ui-bridge/control/discover" | jq '.data')
 
-# -sS, not -fsS: an unknown `target` 500s with `unknown vision target '<id>'`
-# in the RESPONSE BODY, which the paragraph below tells you to read. `-f`
-# discards the body and prints only curl's own exit-22 line, which cannot
-# distinguish a typo'd id from an offline device.
+# -sS, not -fsS: read the RESPONSE BODY. An unknown `target` is a 404 whose
+# body says `unknown vision target '<id>'`; `-f` would discard that and print
+# only curl's exit-22 line, which cannot tell a typo'd id from an offline device.
 curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"layout", snapshot:$s, target:"<device-id>"}')" \
-  | jq '.data.findings[]'
+  | jq '. as $r | $r.data | if (.verdict | type) != "object" then {verdict: "UNRECOGNISED (no verdict object)", raw: $r}
+               elif .verdict.state == "blocked" then {verdict: "UNKNOWN (blocked)", code: .verdict.code, reason: .verdict.reason}
+               else {verdict: .verdict.state, frame: .frame.status, frameCode: .frame.unknown.code, findings} end'  # envelope-ok: branches on .data.verdict.state first; a reply with no verdict renders UNRECOGNISED, never a default
 
 # assert + baseline take `target` the same way
 curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
@@ -179,9 +204,15 @@ curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
 ```
 
 `target` resolves against a registered physical device → registered app → adb
-serial, in that order; an unknown id 500s with `unknown vision target '<id>'`,
-and a target serving no screenshot fails loudly rather than silently capturing
-the runner desktop. Omit `target` for the default runner-desktop behavior.
+serial, in that order; an unknown id is a malformed request — HTTP 404 with
+`unknown vision target '<id>'`, on every vision route (a target that WAS valid
+but has gone away — adb device unplugged, an app whose registration heartbeat
+expired — answers the same 404, so re-list the targets before assuming a
+typo) — and a target whose
+capture fails (serves no screenshot, unreachable) comes back as
+`frame.status: "unknown"` / `producer_failed` rather than a silent capture of
+the runner desktop — `frame.provenance.source.target` names
+the surface a measured frame came from. Omit `target` for the default runner-desktop behavior.
 
 ## The Five Analyzers
 
@@ -254,7 +285,7 @@ bounding-box model cannot derive.
 # you are auditing is itself qontinui-web (see the applicability note below).
 # -f so the 404 below is a non-zero exit rather than a 0 with an error body,
 # -S so it still says why under -s. A 404 that exits 0 reads as a pass.
-curl -fsS -X POST http://localhost:3001/api/ui-bridge/control/visibility \
+curl -fsS -X POST http://127.0.0.1:3001/api/ui-bridge/control/visibility \
   -H 'Content-Type: application/json' -d '{"minRatio":0.02}'
 ```
 
@@ -356,15 +387,36 @@ Response:
       "assertion": { "type": "aligned_horizontally", "elements": [...] },
       "confidence": null }
   ],
-  "allPassed": false,
+  "outcome": "failed",
+  "outcomeCounts": { "passed": 2, "failed": 1, "unknown": 0 },
+  "provenance": {
+    "producer": { "id": "vision-core/assertions", "version": "0.1.2" },
+    "observedAt": null,
+    "evaluatedAt": "2026-09-07T04:31:22.418973512Z",
+    "coverage": { "considered": 3, "measured": 3, "unmeasured": [] },
+    "confidence": null, "cache": null,
+    "source": { "state": "unattributed" }
+  },
   "coverage": { "elements": 214, "withGeometry": 214, "withStacking": 0,
                 "withText": 118, "interactable": 63 },
   "evaluatedAt": "2026-09-07T04:31:22.418973512Z",
   "snapshotAttribution": { "state": "unattributed" },
-  "frame": { "width": 2560, "height": 1440, "capturedAt": "2026-09-07T04:31:22.401884073Z",
-             "scaleFactor": 1.0, "kind": "window", "captureBackend": "MonitorCrop" }
+  "frame": {
+    "status": "measured",
+    "value": { "width": 2560, "height": 1440, "capturedAt": "2026-09-07T04:31:22.401884073Z",
+               "scaleFactor": 1.0, "kind": "window", "captureBackend": "MonitorCrop" },
+    "provenance": { "producer": { "id": "runner/vision-frame", "version": "<runner version>" },
+                    "observedAt": "2026-09-07T04:31:22.401884073Z", "...": "..." }
+  }
 }
 ```
+
+**Read `outcome` for the call, with fixed precedence `failed` > `unknown` >
+`passed`** — and `outcomeCounts` for the tally. `outcome: "unknown"` means
+nothing failed but at least one assertion could not be evaluated (or the list
+was empty): report it as UNVERIFIED, never as a pass and never as a failure.
+Each unknown result carries a typed `code` beside its `detail`; `provenance.coverage.unmeasured`
+groups them by code.
 
 **Those `"confidence": null`s are not noise — read them as a statement.**
 `confidence` carries `#[serde(default)]` and **no** `skip_serializing_if`, so it
@@ -378,7 +430,7 @@ missing data.
 
 **`assert` carries `coverage` too, and you must read it here for the same
 reason you read it on `analyze`.** Every assertion in the DSL evaluates from
-the snapshot, so `allPassed: true` over a snapshot with `withGeometry: 0` is a
+the snapshot, so `outcome: "passed"` over a snapshot with `withGeometry: 0` is a
 vacuous pass: `no_clipping` skips every element that carries no `bbox` and then
 returns a **genuine** `passed` over the emptiness it was left holding.
 
@@ -394,7 +446,7 @@ what makes them readable:
 
 | you see | it means |
 |---|---|
-| no `coverage` key, `snapshotAttribution.state: "absent"` | you sent no snapshot. Most assertions come back `outcome: "unknown"`, detail *"no ElementSnapshot supplied, so this assertion was never evaluated"* — so `allPassed` is `false`, not a vacuous `true`. Not quite all: `contains_text` against a `region` target with `ocr_blocks` supplied needs no snapshot and still returns a real pass/fail |
+| no `coverage` key, `snapshotAttribution.state: "absent"` | you sent no snapshot. Most assertions come back `outcome: "unknown"`, detail *"no ElementSnapshot supplied, so this assertion was never evaluated"* — so the call's `outcome` is `unknown`, not a vacuous `passed`. Not quite all: `contains_text` against a `region` target with `ocr_blocks` supplied needs no snapshot and still returns a real pass/fail |
 | `coverage` present, `snapshotAttribution.state: "unattributed"` | you sent a snapshot that carries no producer-minted id. Normal today; no producer mints one yet |
 | `snapshotAttribution.state: "attributed"` | `snapshotAttribution.snapshotId` identifies the exact capture this verdict is about |
 
@@ -402,7 +454,7 @@ Note the presence rule differs between the two routes. On `assert`, `coverage`
 is present exactly when you supplied a snapshot. On `analyze` it can be absent
 even when you did, because the analyzer decides (`dynamic` never sets it).
 
-`frame.capturedAt` dates the FRAME and only the frame. It does not date your
+`frame.value.capturedAt` (= `frame.provenance.observedAt`) dates the FRAME and only the frame. It does not date your
 snapshot, so it does not tell you whether the input you posted was stale —
 nothing in either response does yet. `evaluatedAt` dates the answer.
 
@@ -442,33 +494,48 @@ curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
       --stats > /tmp/snapshot.json
 SNAP=$(cat /tmp/snapshot.json)
 
+# Read `verdict.state` FIRST: `blocked` is UNKNOWN (never clean, never broken),
+# and its findings list answers nothing. Info findings are dropped for brevity.
+# -sS, not -fsS, below: a non-2xx body must reach jq and print, not vanish.
+AN_JQ='. as $r | $r.data | if (.verdict | type) != "object" then {verdict: "UNRECOGNISED (no verdict object)", raw: $r}
+    elif .verdict.state == "blocked"
+    then {verdict: "UNKNOWN (blocked)", code: .verdict.code, reason: .verdict.reason}
+    else {verdict: .verdict.state, code: .verdict.code, frame: .frame.status, frameCode: .frame.unknown.code,
+          findings: [.findings[]? | select(.severity != "info")]} end'  # envelope-ok: branches on .data.verdict.state first; a reply with no verdict renders UNRECOGNISED, never a default
+
 # 1. Layout analyzer — catches the overlap bugs the plan was designed for
-curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"layout",snapshot:$s}')" \
-  | jq '.data.findings[] | select(.severity != "info")'
+  | jq "$AN_JQ"
 
 # 2. Elements analyzer — sub-24×24 targets + empty-snapshot smells
-curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"elements",snapshot:$s}')" \
-  | jq '.data.findings[]'
+  | jq "$AN_JQ"
 
 # 3. Contrast — only meaningful when snapshot supplies fg_color + bg_color
-curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"color",snapshot:$s}')" \
-  | jq '.data.findings[]'
+  | jq "$AN_JQ"
 
 # 4. A default assertion bundle for every interactive page
-curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{
         snapshot: $s,
         assertions: [
           { "type": "no_clipping" }
         ]
-      }')" | jq '.data.allPassed'
+      }')" | jq '. as $r | $r.data
+        | if .outcome == null then {outcome: "UNRECOGNISED (no outcome)", raw: $r}
+          elif .outcome == "unknown" then {outcome: "UNKNOWN (unverified)", outcomeCounts,
+               codes: [.results[]? | select(.outcome == "unknown") | .code] | unique,
+               frame: .frame.status, frameCode: .frame.unknown.code}
+          else {outcome, outcomeCounts, frame: .frame.status, frameCode: .frame.unknown.code} end'  # envelope-ok: branches on .data.outcome first; a reply with no outcome renders UNRECOGNISED, never a pass
+# `outcome: "unknown"` is UNVERIFIED — never a pass, never a failure.
 ```
 
 The terminal-tab overlap bug that triggered the whole Phase 6 design
