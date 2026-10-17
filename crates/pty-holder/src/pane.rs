@@ -16,7 +16,10 @@
 //!   (`crate::spec`);
 //! - `<pane-id>.log` — the holder's own, size-capped diagnostic log. A holder
 //!   has no stderr once it is detached, so this is where it says why an
-//!   endpoint failed without ending the pane.
+//!   endpoint failed without ending the pane;
+//! - `<pane-id>.scrollback` — the pane's durable output tail, 0600, replaced
+//!   atomically via `<pane-id>.scrollback.tmp` (`crate::scrollback`, plan D7).
+//!   Like the lock file it outlives the holder; that is its purpose.
 //!
 //! On Windows the endpoint is a named pipe, whose namespace is global rather
 //! than a directory, so [`pipe_name`] folds the pane directory into the name.
@@ -90,6 +93,12 @@ pub fn socket_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// `<pane-dir>/<pane-id>.spec` — the child spec (`crate::spec`).
 pub fn spec_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.spec", pane.as_str()))
+}
+
+/// `<pane-dir>/<pane-id>.scrollback` — the durable output tail
+/// (`crate::scrollback`).
+pub fn scrollback_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    pane_dir.join(format!("{}.scrollback", pane.as_str()))
 }
 
 /// `<pane-dir>/<pane-id>.log` — the holder's diagnostic log.
@@ -334,6 +343,7 @@ mod tests {
         assert_eq!(socket_path(dir, &p), dir.join("p1.sock"));
         assert_eq!(spec_path(dir, &p), dir.join("p1.spec"));
         assert_eq!(log_path(dir, &p), dir.join("p1.log"));
+        assert_eq!(scrollback_path(dir, &p), dir.join("p1.scrollback"));
 
         let name = pipe_name(dir, &p);
         assert!(name.starts_with(r"\\.\pipe\qontinui-pty-holder-"), "{name}");

@@ -26,6 +26,17 @@
 //! locked lets a second holder lock a fresh inode under the same name while a
 //! third still holds the old one — two "exclusive" holders. Reaping dead lock
 //! files is a later phase's boot sweep, done under the lock.
+//!
+//! **The fork-to-exec window.** The lock fd is `O_CLOEXEC`, but between a
+//! `fork` and the child's `exec` the child holds a copy of the open file
+//! description — and with it the `flock`. So when a process that briefly
+//! holds a pane lock (a runner probe's acquire-and-drop) spawns any child
+//! concurrently, the lock can read `Held` for that window after the drop,
+//! with NO live holder. Under load the window is observable
+//! (`pty_holder_lock_is_exclusive_and_released_on_drop` waits it out). The
+//! spawn path should therefore retry `LockHeld` when the lock record names
+//! no live holder, rather than report the pane taken — owed by Phase 3, which
+//! owns the spawn and lock paths.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -139,7 +150,8 @@ pub fn read_record(path: &Path) -> Option<LockRecord> {
 /// Largest lock record [`read_record`] will read.
 pub const MAX_RECORD_LEN: u64 = 64 * 1024;
 
-/// Open a lock file refusing anything but a regular file this user owns.
+/// Open a lock file refusing anything but a regular file this user owns. Also
+/// the open `crate::scrollback` reads a persisted tail through.
 ///
 /// Unix: `O_NOFOLLOW` (a symlink at the lock path fails the open with
 /// `ELOOP` instead of locking or truncating whatever it points at) and
@@ -147,7 +159,7 @@ pub const MAX_RECORD_LEN: u64 = 64 * 1024;
 /// `fstat` of the OPENED fd — not a racy `stat` of the path — must say
 /// regular file and our euid. Windows: regular-file check only; the directory
 /// is the per-user app-data tree.
-fn open_checked(opts: &mut OpenOptions, path: &Path) -> io::Result<File> {
+pub(crate) fn open_checked(opts: &mut OpenOptions, path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -297,10 +309,24 @@ mod tests {
         assert_eq!(read_record(&path), Some(rec));
 
         drop(first);
-        assert!(matches!(
-            PaneLock::try_acquire_existing(&path).unwrap(),
-            TryLock::Acquired(_)
-        ));
+        // Released on drop — but a sibling test that spawns a process while
+        // `first` was open (terminate.rs spawns `sleep`) gives the child a
+        // reference to this open file description until its exec closes the
+        // CLOEXEC fd, and under load that window is long enough to observe.
+        // So: acquirable within a bound, not necessarily on the first try.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match PaneLock::try_acquire_existing(&path).unwrap() {
+                TryLock::Acquired(_) => break,
+                TryLock::Held => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "lock still held 5 s after drop"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
