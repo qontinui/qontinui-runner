@@ -1234,6 +1234,8 @@ impl ProbeDoors for RunnerDoors {
         super::fleet_sessions::fleet_sessions_list(super::fleet_sessions::FleetSessionsArgs {
             device_id: Some(device_id.to_string()),
             state: None,
+            // The probe sweeps every live session regardless of its work axis.
+            session_status: None,
             include_closed: false,
             limit: Some(FLEET_PAGE_LIMIT),
             cursor,

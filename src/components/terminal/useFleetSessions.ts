@@ -161,6 +161,12 @@ export interface FleetSessionsQuery {
   deviceId?: string;
   state?: string;
   includeClosed?: boolean;
+  /**
+   * Work-axis filter (`?session_status=`). An older coord IGNORES it and serves
+   * an unfiltered page — a consumer that acts on the result must re-check each
+   * row's `sessionStatus` (see `isFinishedSessionStatus`).
+   */
+  sessionStatus?: string;
   /** Page size for each page of the walk, NOT a reachability control. */
   limit?: number;
 }
@@ -484,6 +490,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   const deviceId = opts?.deviceId ?? null;
   const state = opts?.state ?? null;
   const includeClosed = opts?.includeClosed ?? false;
+  const sessionStatus = opts?.sessionStatus ?? null;
   const limit = opts?.limit ?? FLEET_DEFAULT_LIMIT;
   /**
    * The walk's scope, as one comparable string, named EXPLICITLY in the restart
@@ -502,7 +509,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
    * is still named beside it — the two move together, so the effect needs no
    * lint suppression and no claim that one replaces the other.
    */
-  const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });
+  const scopeKey = fleetScopeKey({ deviceId, state, includeClosed, sessionStatus });
 
   /**
    * The page size as of the CALL, not as of the render that built the callback.
@@ -546,7 +553,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
         // is the honest failure — including 401/403, which means "this runner is
         // not paired", NOT "the fleet is empty".
         const result = await invoke<FleetSessionsResponse>("fleet_sessions_list", {
-          args: { deviceId, state, includeClosed, limit, cursor },
+          args: { deviceId, state, sessionStatus, includeClosed, limit, cursor },
         });
         if (generationRef.current !== generation) return;
 
@@ -572,6 +579,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
           deviceId,
           state,
           includeClosed,
+          sessionStatus,
           limit: typeof result.limit === "number" && result.limit > 0 ? result.limit : limit,
         });
         if (stalled) {
@@ -618,7 +626,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
         }
       }
     },
-    [deviceId, state, includeClosed],
+    [deviceId, state, includeClosed, sessionStatus],
   );
 
   // Runs on mount, whenever the SCOPE changes (a new device/state/include-closed
