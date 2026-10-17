@@ -16,6 +16,8 @@ export interface OpenRecordTab {
   id: string;
   title?: string;
   workingDir?: string;
+  /** The served CLI profile id the tab launched, when known. */
+  sessionProvider?: string;
 }
 
 /**
@@ -59,7 +61,11 @@ export type SessionOpenArgs = {
   title?: string;
   terminalId: string;
   origin?: SessionOrigin;
-  /** Which provider owns the session. Defaults to `"claude"` backend-side. */
+  /**
+   * Which provider owns the session — a served CLI profile id. Omitted, the
+   * backend keeps the provider it already holds for this id, else records
+   * Claude (`record_open_provider` in `commands/terminal.rs`).
+   */
   provider?: string;
 };
 
@@ -219,9 +225,12 @@ export function buildSessionOpenArgs(params: {
   configDir: string | undefined;
   pageId: string;
   origin?: SessionOrigin;
+  /** The launch provider; defaults to the tab's `sessionProvider`. */
+  provider?: string;
 }): SessionOpenArgs {
   const { assignments, tabs, tabId, claudeSessionId, configDir, pageId, origin } = params;
   const tab = tabs.find((t) => t.id === tabId);
+  const provider = params.provider ?? tab?.sessionProvider;
   return {
     claudeSessionId,
     configDir,
@@ -231,6 +240,7 @@ export function buildSessionOpenArgs(params: {
     title: tab?.title,
     terminalId: tabId,
     ...(origin ? { origin } : {}),
+    ...(provider ? { provider } : {}),
   };
 }
 

@@ -413,6 +413,13 @@ describe("Conductor worker tabs", () => {
     });
   });
 
+  it("workerTabFromRecord carries the record's provider onto the tab", () => {
+    expect(workerTabFromRecord(workerRecord({ provider: "claude" }))?.sessionProvider).toBe(
+      "claude",
+    );
+    expect(workerTabFromRecord(workerRecord())?.sessionProvider).toBeUndefined();
+  });
+
   it("workerTabFromRecord returns null for a non-worker record and defaults a blank title", () => {
     expect(workerTabFromRecord(workerRecord({ taskRunId: undefined }))).toBeNull();
     const tab = workerTabFromRecord(workerRecord({ title: "  ", openedAt: 0 }), 77);

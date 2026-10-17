@@ -12,7 +12,7 @@ import {
   type ResumeOutcome,
   type TypeAndVerifyOptions,
 } from "./resumeVerification";
-import { providerDescriptorFor } from "./providerAdapter";
+import { loadCliProfiles, providerDescriptorFor, shellEnvAssignment } from "./providerAdapter";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
@@ -68,6 +68,10 @@ export async function fetchRestoreSet(
   pageId: string,
   opts?: { knownPageIds?: readonly string[]; adoptOrphans?: boolean },
 ): Promise<RestoreSet> {
+  // Every record below is classified against the served CLI profiles, so the
+  // cache must be primed first. A failed load leaves it unprimed and every
+  // record restores terminal-only (loadCliProfiles says why).
+  await loadCliProfiles();
   let resp: CommandResponse | null;
   try {
     // `purpose: "restore"` marks THIS as the boot restore's own read: only it
@@ -162,23 +166,22 @@ export function recordBelongsToRestore(
  * permission prompt. Aligned with PR #547 — whichever lands second resolves
  * the textual conflict by keeping this union form.
  *
- * Phase 4 (provider-agnostic resume): the program + resume-flag SHAPE is
- * sourced from the provider descriptor's `resumeCommand` (so a future Gemini
- * record resumes via `gemini --resume <id>`, not a hardcoded `claude`); the
- * Claude-specific autonomous flag (`--permission-mode bypassPermissions`) and
- * the resume-summary env thresholds are applied ONLY when the resolved program
- * is Claude — they are CLI-specific and harmless to omit for other providers.
+ * Provider-agnostic resume: the program + resume-flag SHAPE comes from the
+ * provider's served profile (`providerDescriptorFor(provider).resumeCommand`);
+ * the Claude-specific autonomous flag (`--permission-mode bypassPermissions`)
+ * and the resume-summary env thresholds are applied ONLY when the resolved
+ * program is Claude. Returns `null` when the runner serves no profile for
+ * `provider` or the profile declares no resume by id — there is nothing honest
+ * to type, and another CLI's resume is never substituted.
  */
 export function buildResumeCmd(
   sessionId: string,
   configDir: string | undefined,
-  policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
-  provider?: string,
-): string {
-  // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
-  // ["gemini","--resume",id]. The descriptor owns the program + flags so the
-  // boot restore is not Claude-hardcoded.
-  const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
+  policy: ResumeSummaryPolicy,
+  provider: string | undefined,
+): string | null {
+  const argv = providerDescriptorFor(provider)?.resumeCommand(sessionId) ?? null;
+  if (argv === null || argv.length === 0) return null;
   const program = argv[0];
   const isClaude = program === "claude";
   const base = isClaude
@@ -193,9 +196,7 @@ export function buildResumeCmd(
   if (env.length === 0) return `${base}\r`;
   const isWindows =
     typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
-  return isWindows
-    ? `${env.map(([k, v]) => `$env:${k}="${v}"; `).join("")}${base}\r`
-    : `${env.map(([k, v]) => `${k}="${v}" `).join("")}${base}\r`;
+  return `${env.map(([k, v]) => shellEnvAssignment(k, v, isWindows)).join("")}${base}\r`;
 }
 
 /**
@@ -203,7 +204,8 @@ export function buildResumeCmd(
  * handshake actually appeared (Phase 3, issue #548): on first failure the
  * same command is retyped once; on persistent failure the tab is parked in an
  * explicit `resumeFailed` state (operator-clickable retry via
- * `ResumeFailedBanner`) and the durable restore-pending marker is left SET so
+ * `SessionFailureBanner`, which renders it as a `resume_failed` session
+ * failure) and the durable restore-pending marker is left SET so
  * the backend liveness poll keeps protecting the `open` record. Only a
  * verified handshake clears the marker and the reconnecting affordance.
  *
@@ -233,7 +235,11 @@ export async function runVerifiedResume(params: {
    * retry without zone context, tests).
    */
   recordOpen?: SessionOpenArgs;
-  verifyOptions?: TypeAndVerifyOptions;
+  /**
+   * Overrides for the verification loop. The handshake markers default to the
+   * provider's served profile, so a caller need not name them.
+   */
+  verifyOptions?: Partial<TypeAndVerifyOptions>;
 }): Promise<ResumeOutcome> {
   const {
     terminalRefs,
@@ -246,12 +252,24 @@ export async function runVerifiedResume(params: {
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
+  // The operator retry can run before anything else primed the profile cache.
+  await loadCliProfiles();
+  const descriptor = providerDescriptorFor(provider);
   const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
-  // Per-adapter handshake patterns (Phase 4): the verification loop matches the
-  // resume success/failure against the descriptor's patterns instead of the
-  // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
-  // banners. Claude's descriptor mirrors the live `resumeVerification.ts` sets.
-  const handshakePatterns = providerDescriptorFor(provider).handshakePatterns();
+  if (descriptor === null || resumeCmd === null) {
+    // No served profile (or no by-id resume) for this provider: typing any
+    // resume would be a guess at another CLI's syntax. Park the tab in the
+    // explicit failed state and keep the restore-pending marker, exactly as a
+    // failed verification does.
+    console.warn(
+      `[TerminalPage] no resumable CLI profile for provider ${JSON.stringify(provider ?? null)} — ` +
+        `session ${claudeSessionId} in ${tabId} is not resumed`,
+    );
+    updateTab(tabId, { isReconnecting: false, resumeFailed: true });
+    return "failed";
+  }
+  // The provider's own resume markers, from its served profile.
+  const handshakePatterns = descriptor.handshakePatterns();
   const outcome = await typeResumeAndVerify(terminalRefs, tabId, resumeCmd, {
     // Fallback picker answerer (#548 item 3): under the default "full" policy
     // the env thresholds in `buildResumeCmd` already suppress the picker;
@@ -718,8 +736,10 @@ export function classifyRestoreAction(
     // by id (`restoreTier() === "full"`). A `terminal-only`-tier provider can
     // re-open the terminal but not the chat, so a CONFIRMED row of that provider
     // restores terminal-only (honest "fresh conversation"), never a resume typed
-    // against an id the provider can't resume by `--resume`.
-    return providerDescriptorFor(rec.provider).restoreTier() === "full"
+    // against an id the provider can't resume by `--resume`. A provider with no
+    // served profile (unknown, or profiles not loaded) is UNKNOWN, and unknown
+    // restores terminal-only — it is never resumed as some other CLI.
+    return providerDescriptorFor(rec.provider)?.restoreTier() === "full"
       ? "auto-resume"
       : "terminal-only";
   }
@@ -783,6 +803,7 @@ interface UseTerminalInitializationParams {
     updates: Partial<{
       claudeSessionId?: string;
       claudeConfigDir?: string;
+      sessionProvider?: string;
       isReconnecting?: boolean;
       resumeFailed?: boolean;
       restoreTerminalOnly?: boolean;
@@ -1127,7 +1148,7 @@ export function useTerminalInitialization({
           // `reconcileAssignments` place it — every worker record is written
           // with `zone_index: 0`, so binding its recorded zone would stack
           // all of them onto one zone. Its state, transcript and steering
-          // come from the SessionManager through `WorkerSessionCell`.
+          // come from the SessionManager through `StructuredSessionCell`.
           if (isWorkerRecord(rec)) {
             adoptWorkerTab(rec);
             continue;
@@ -1147,6 +1168,7 @@ export function useTerminalInitialization({
             updateTab(tabId, {
               claudeSessionId: rec.claudeSessionId,
               claudeConfigDir: safeConfigDir,
+              sessionProvider: rec.provider,
             });
             rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
             continue;
@@ -1220,6 +1242,7 @@ export function useTerminalInitialization({
           updateTab(tabId, {
             claudeSessionId: rec.claudeSessionId,
             claudeConfigDir: safeConfigDir,
+            sessionProvider: rec.provider,
             // Show a "resuming" affordance until the resume lands; cleared in
             // the drain loop after the resume command is written. Phase 4:
             // CONFIRMED authoritative rows of a FULL-tier provider auto-resume
@@ -1305,8 +1328,8 @@ export function useTerminalInitialization({
               isClaudeSession: restoreAction === "auto-resume",
               claudeSessionId: rec.claudeSessionId,
               claudeConfigDir: safeConfigDir,
-              // Provider drives the adapter-supplied resume command + handshake
-              // patterns (Phase 4) — defaults to "claude" on pre-provider rows.
+              // Provider selects the served profile's resume command + handshake
+              // patterns; a provider with no profile is never resumed.
               provider: rec.provider,
               // Deferred re-assert payload: applied by `runVerifiedResume`
               // on VERIFIED handshake only. No `origin` — the backend

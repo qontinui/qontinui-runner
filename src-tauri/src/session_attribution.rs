@@ -296,7 +296,9 @@ fn resolve_transcript_path(
     }
     // Fallback: scan all known config dirs (same posture as
     // `transcript_read_session` when no config_dir is supplied / matches).
-    for dir in transcript::find_claude_config_dirs() {
+    for dir in
+        transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE)
+    {
         let p = transcript::session_transcript_path(&dir, working_dir, session_id);
         if p.exists() {
             return Some(p);

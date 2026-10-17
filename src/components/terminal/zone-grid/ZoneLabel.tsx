@@ -10,6 +10,7 @@ import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { TabTitle, useDisplayTitle } from "../displayTitle";
+import { providerLabel } from "../providerAdapter";
 
 /**
  * UI Bridge registration spec for a zone header (boot-restore remediation
@@ -155,6 +156,17 @@ export function ZoneLabel({
         style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
       />
       <span className="text-[10px] text-[#a9b1d6] truncate font-medium">{displayTitle}</span>
+
+      {/* Which AI CLI the tab launched (Phase 6). Absent for a plain shell and
+          for a tab whose provider is not yet known. */}
+      {tab.sessionProvider && (
+        <span
+          className="shrink-0 text-[8px] text-[#7aa2f7] bg-[#7aa2f7]/10 px-1 py-0 rounded"
+          data-session-provider={tab.sessionProvider}
+        >
+          {providerLabel(tab.sessionProvider)}
+        </span>
+      )}
 
       {/* Honesty label (Phase 5): interactive PTY shells are non-durable — a
           runner restart ends them. Mirrors the compact-card marker so the

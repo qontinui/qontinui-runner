@@ -6106,9 +6106,9 @@ pub(crate) fn build_continuation_claude_command(
     // and it keeps this builder pure so the argv-shape regressions below assert
     // against a fixed vector instead of whatever is on the machine's disk.
     hook_settings_args: Vec<String>,
-    launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
+    launch_cfg: &crate::session::launch_spec::LaunchConfig,
 ) -> Vec<String> {
-    use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
+    use crate::session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
 
     // `extra_required` is the caller-authoritative, verbatim tail — never
     // reordered or deduped by the seam. It carries, IN ORDER:
@@ -6261,7 +6261,7 @@ async fn run_continuation_terminal(
     let spawn_name = payload
         .session_name
         .as_deref()
-        .and_then(crate::claude_session::launch_spec::sanitize_session_name);
+        .and_then(crate::session::launch_spec::sanitize_session_name);
     let title = spawn_name.clone().unwrap_or_else(|| {
         payload
             .anchor_key
@@ -6315,9 +6315,8 @@ async fn run_continuation_terminal(
     // carries the runner-context briefing and that briefing's memory clause is
     // gated on the per-session provisioning OUTCOME (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
-    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
 
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
@@ -6809,7 +6808,9 @@ fn continuation_transcript_paths(
     selected_config_dir
         .map(std::path::PathBuf::from)
         .into_iter()
-        .chain(crate::terminal::transcript::find_claude_config_dirs())
+        .chain(crate::terminal::transcript::find_transcript_config_dirs(
+            &qontinui_runner_lib::cli_profile::claude::PROFILE,
+        ))
         .map(|dir| {
             crate::terminal::transcript::session_transcript_path(&dir, workdir, pinned_session_id)
         })
@@ -7375,9 +7376,10 @@ async fn run_condition_check_terminal(
     // Title from a short run-id prefix: "Condition check <8 chars>".
     let run_id_short: String = payload.run_id.chars().take(8).collect();
     // `check-<condition name>` when coord supplies one, else the run-id label.
-    let spawn_name = payload.condition_name.as_deref().and_then(|n| {
-        crate::claude_session::launch_spec::sanitize_session_name(&format!("check-{n}"))
-    });
+    let spawn_name = payload
+        .condition_name
+        .as_deref()
+        .and_then(|n| crate::session::launch_spec::sanitize_session_name(&format!("check-{n}")));
     let title = spawn_name
         .clone()
         .unwrap_or_else(|| format!("Condition check {run_id_short}"));
@@ -7417,9 +7419,8 @@ async fn run_condition_check_terminal(
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
-    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
         // UNKNOWN, and honestly so: this function does NO coord-mcp
         // provisioning of its own — it relies entirely on the downstream PTY
@@ -11254,7 +11255,7 @@ mod tests {
                 "-p do \"it\"".to_string(),
                 None,
                 Vec::new(),
-                &crate::claude_session::launch_spec::LaunchConfig::default(),
+                &crate::session::launch_spec::LaunchConfig::default(),
             )
         };
         let without = build(None);
@@ -11281,7 +11282,7 @@ mod tests {
             "do the thing".to_string(),
             None,
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.join("|"),
@@ -11308,7 +11309,7 @@ mod tests {
             "run /implement-plan plans/x.md".to_string(),
             None,
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.last().map(String::as_str),
@@ -11338,7 +11339,7 @@ mod tests {
             "-prompt with dash".to_string(),
             None,
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.join("|"),
@@ -11363,7 +11364,7 @@ mod tests {
                 "You are inside the Qontinui Runner.".to_string(),
             )),
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         // The prompt stays the trailing positional behind `--`.
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
@@ -11419,7 +11420,7 @@ mod tests {
                 briefing,
             )),
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         let flag = cmd
             .iter()
@@ -11459,7 +11460,7 @@ mod tests {
                 "--settings".to_string(),
                 "C:/hooks/claude_hook_settings.json".to_string(),
             ],
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
         assert_eq!(cmd.get(cmd.len() - 2).map(String::as_str), Some("--"));
@@ -11491,7 +11492,7 @@ mod tests {
             "do the thing".to_string(),
             None,
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.join("|"),
@@ -11516,7 +11517,7 @@ mod tests {
                 "briefing".to_string(),
             )),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.join("|"),
@@ -11547,7 +11548,7 @@ mod tests {
             "do the thing".to_string(),
             Some(carrier),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.join("|"),
@@ -11582,7 +11583,7 @@ mod tests {
                 "do the thing".to_string(),
                 Some(carrier.clone()),
                 vec![],
-                &crate::claude_session::launch_spec::LaunchConfig {
+                &crate::session::launch_spec::LaunchConfig {
                     default_template: template.map(str::to_string),
                     account_command: None,
                 },
@@ -11627,7 +11628,7 @@ mod tests {
                 "do the thing".to_string(),
                 carrier.clone(),
                 vec!["--settings".to_string(), "/h/s.json".to_string()],
-                &crate::claude_session::launch_spec::LaunchConfig::default(),
+                &crate::session::launch_spec::LaunchConfig::default(),
             );
             let flags: Vec<usize> = cmd
                 .iter()
@@ -12848,7 +12849,7 @@ mod tests {
                 compose_continuation_system_prompt("RUNNER CONTEXT".to_string(), Some(&brief)),
             )),
             Vec::new(),
-            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            &crate::session::launch_spec::LaunchConfig::default(),
         );
         let flag = cmd
             .iter()

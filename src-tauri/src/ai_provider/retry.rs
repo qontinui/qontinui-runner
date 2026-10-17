@@ -1,5 +1,7 @@
 use super::circuit_breaker;
 use super::types::AiResponse;
+use crate::session::failure::{category_for, kind_of_error_text, policy_for};
+use qontinui_types::cli_session::{FailureCategory, FailureKind, RecoveryPolicy};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -9,29 +11,37 @@ pub(super) const MAX_AI_RETRIES: u32 = 3;
 /// Base backoff delay in milliseconds (doubles each retry: 2s, 4s, 8s).
 pub(super) const BASE_BACKOFF_MS: u64 = 2000;
 
-/// Maximum number of rate-limit wait cycles before giving up entirely.
+/// Maximum number of account-capacity wait cycles before giving up entirely.
 /// Each cycle waits for the earliest account cooldown to expire, so this
-/// caps total wait time at roughly MAX_RATE_LIMIT_WAITS * cooldown_duration.
-const MAX_RATE_LIMIT_WAITS: u32 = 6;
+/// caps total wait time at roughly MAX_ACCOUNT_WAITS * cooldown_duration.
+const MAX_ACCOUNT_WAITS: u32 = 6;
 
-/// Check if an error is specifically a rate-limit / token-exhaustion error.
+/// The session-failure kind an error text names — a thin call into the one
+/// classifier (`session::failure`, plan
+/// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`
+/// Phase 7). This module no longer keeps a failure vocabulary of its own.
+fn failure_kind(error_msg: &str) -> Option<FailureKind> {
+    kind_of_error_text(error_msg)
+}
+
+/// Whether the recovery table answers `migrate_account` for this error — an
+/// exhausted quota or spend budget, which another account's capacity fixes
+/// (the Claude CLI's "You've hit your monthly spend limit" included, so a
+/// mid-request hit rotates instead of failing the call).
 ///
-/// This is a subset of retryable errors — used to trigger account rotation
-/// before retrying, so the next attempt uses a different account.
-pub fn is_rate_limit_error(error_msg: &str) -> bool {
-    let lower = error_msg.to_lowercase();
-    lower.contains("(429)")
-        || lower.contains("rate limit")
-        || lower.contains("too many requests")
-        || lower.contains("overloaded")
-        || lower.contains("token limit")
-        || lower.contains("usage limit")
-        // The Claude CLI prints "You've hit your monthly spend limit ..." on a
-        // capacity-exhausted account. Treat it as a rate-limit so a mid-request
-        // hit rotates to another account instead of failing the call. (The
-        // weekly-usage snapshot already de-prefers such accounts at selection
-        // time; this covers an account that tips over mid-flight.)
-        || lower.contains("spend limit")
+/// A rate limit or an overload is NOT in this set: its policy is a backoff on
+/// the same account. Until Phase 7 `"overloaded"` sat in the old
+/// `is_rate_limit_error` set and rotated accounts on a provider overload — a
+/// fault no account switch fixes.
+fn migrates_account(kind: Option<FailureKind>) -> bool {
+    kind.is_some_and(|k| policy_for(k, false) == RecoveryPolicy::MigrateAccount)
+}
+
+/// Whether the error is an account-capacity signal (a rate, quota or budget
+/// limit) rather than a provider fault. Capacity signals are kept out of the
+/// circuit breaker, which measures provider health.
+fn is_capacity_signal(kind: Option<FailureKind>) -> bool {
+    kind.is_some_and(|k| category_for(k) == FailureCategory::Limit)
 }
 
 /// Determine whether an AI error response represents a transient/retryable failure.
@@ -49,13 +59,14 @@ pub fn is_rate_limit_error(error_msg: &str) -> bool {
 /// - Missing API key configuration
 /// - Client construction failures
 pub(super) fn is_retryable_error(error_msg: &str) -> bool {
-    // Every rate-limit / capacity-exhaustion error is retryable — it triggers
-    // account rotation upstream (the rotation branch is gated behind this
-    // function returning true). Keeping this as the first check makes
-    // `is_rate_limit_error` a true subset, so signals it matches but the
-    // explicit list below omits (e.g. "token limit", "usage limit", "spend
-    // limit") still reach the rotation path.
-    if is_rate_limit_error(error_msg) {
+    // Every capacity limit and every overload is retryable. The account-move
+    // kinds must be, because the rotation branch is gated behind this function
+    // returning true; keeping this first makes that set a true subset, so
+    // phrasings the explicit list below omits ("token limit", "usage limit",
+    // "spend limit") still reach it. An overload is retried too — on the same
+    // account, by the plain backoff.
+    let kind = failure_kind(error_msg);
+    if is_capacity_signal(kind) || kind == Some(FailureKind::Overloaded) {
         return true;
     }
 
@@ -175,7 +186,7 @@ where
     }
 
     let mut attempt: u32 = 0;
-    let mut rate_limit_waits: u32 = 0;
+    let mut account_waits: u32 = 0;
 
     loop {
         let response = operation();
@@ -200,25 +211,28 @@ where
             return response;
         }
 
-        let is_rate_limit = is_rate_limit_error(error_msg);
+        let kind = failure_kind(error_msg);
 
-        // Record retryable failure to circuit breaker — but NOT rate-limit errors,
-        // which are capacity signals handled by account rotation, not provider failures.
-        if !is_rate_limit {
+        // Record retryable failure to circuit breaker — but NOT capacity
+        // signals (rate, quota, budget limits), which say nothing about the
+        // provider's health. An overload does.
+        if !is_capacity_signal(kind) {
             if let Some(key) = provider_key {
                 circuit_breaker::record_provider_failure(key, error_msg);
             }
         }
 
-        // For rate-limit errors: try rotating to another account
-        if is_rate_limit {
-            rate_limit_waits += 1;
+        // The `migrate_account` kinds: try rotating to another account. A rate
+        // limit or an overload falls through to the plain backoff below, on
+        // the same account.
+        if migrates_account(kind) {
+            account_waits += 1;
 
-            // Safety cap: don't spin forever if all accounts are persistently rate-limited
-            if rate_limit_waits > MAX_RATE_LIMIT_WAITS {
+            // Safety cap: don't spin forever if every account is persistently exhausted
+            if account_waits > MAX_ACCOUNT_WAITS {
                 error!(
-                    "{}: exceeded max rate-limit waits ({}) across all accounts, giving up: {}",
-                    operation_name, MAX_RATE_LIMIT_WAITS, error_msg
+                    "{}: exceeded max account waits ({}) across all accounts, giving up: {}",
+                    operation_name, MAX_ACCOUNT_WAITS, error_msg
                 );
                 return response;
             }
@@ -231,8 +245,8 @@ where
                     .and_then(|n| n.to_str())
                     .unwrap_or(&new_account);
                 info!(
-                    "{}: rate-limit detected (cycle {}/{}), switched to account '{}' for retry",
-                    operation_name, rate_limit_waits, MAX_RATE_LIMIT_WAITS, label
+                    "{}: account capacity exhausted ({:?}, cycle {}/{}), switched to account '{}' for retry",
+                    operation_name, kind, account_waits, MAX_ACCOUNT_WAITS, label
                 );
                 // Reset attempt counter — new account gets fresh retries
                 attempt = 0;
@@ -252,9 +266,9 @@ where
                 let resume_str = resume_time.format("%H:%M:%S").to_string();
 
                 warn!(
-                    "{}: all accounts rate-limited (cycle {}/{}). \
+                    "{}: all accounts exhausted (cycle {}/{}). \
                      Waiting {}s — will retry at {} with next available account.",
-                    operation_name, rate_limit_waits, MAX_RATE_LIMIT_WAITS, wait_secs, resume_str,
+                    operation_name, account_waits, MAX_ACCOUNT_WAITS, wait_secs, resume_str,
                 );
 
                 std::thread::sleep(wait_duration);
@@ -278,11 +292,12 @@ where
             }
         }
 
-        // Non-rate-limit retryable errors: standard exponential backoff
+        // Every other retryable error — a rate limit and an overload included —
+        // gets the standard exponential backoff on the same account.
         if attempt >= MAX_AI_RETRIES {
             error!(
-                "{} failed after {} retries and {} rate-limit waits: {}",
-                operation_name, attempt, rate_limit_waits, error_msg
+                "{} failed after {} retries and {} account waits: {}",
+                operation_name, attempt, account_waits, error_msg
             );
             return response;
         }
@@ -366,14 +381,15 @@ where
 
     if let Some(fb) = fallback {
         if is_retryable_error(error_msg) {
-            // Rotate account on rate-limit before trying fallback
-            if is_rate_limit_error(error_msg) {
-                if super::config::rotate_account_on_rate_limit() {
-                    warn!(
-                        "{}: rate-limit on primary, rotated account before fallback",
-                        operation_name
-                    );
-                }
+            // Rotate account before trying the fallback when the failure is
+            // the account's capacity (never on a rate limit or an overload).
+            if migrates_account(failure_kind(error_msg))
+                && super::config::rotate_account_on_rate_limit()
+            {
+                warn!(
+                    "{}: account capacity exhausted on primary, rotated account before fallback",
+                    operation_name
+                );
             }
             warn!(
                 "{}: primary failed with retryable error, trying fallback model",
@@ -411,13 +427,56 @@ mod tests {
     }
 
     #[test]
-    fn test_spend_limit_is_rate_limit() {
-        // The Claude CLI's monthly-spend-limit message must count as a
-        // rate-limit so a mid-request hit triggers account rotation.
+    fn test_spend_limit_migrates_the_account() {
+        // The Claude CLI's monthly-spend-limit message must reach the account
+        // rotation so a mid-request hit moves to another account.
         let msg = "Claude CLI failed (exit 1): stdout: You've hit your monthly \
                    spend limit . raise it at claude.ai/settings/usage";
-        assert!(is_rate_limit_error(msg));
+        assert_eq!(failure_kind(msg), Some(FailureKind::BudgetExhausted));
+        assert!(migrates_account(failure_kind(msg)));
         assert!(is_retryable_error(msg));
+    }
+
+    /// The Phase 7 regression: `"overloaded"` used to sit in the rate-limit
+    /// set, so a provider overload rotated accounts. It is its own kind now,
+    /// still retried (on the same account), never rotated, and — unlike a
+    /// capacity limit — counted against the provider's circuit breaker.
+    #[test]
+    fn test_overloaded_retries_but_never_rotates() {
+        for msg in [
+            "Claude API error (529): overloaded",
+            "The API is currently overloaded",
+        ] {
+            let kind = failure_kind(msg);
+            assert_eq!(kind, Some(FailureKind::Overloaded), "{msg}");
+            assert!(is_retryable_error(msg), "{msg}");
+            assert!(!migrates_account(kind), "{msg}");
+            assert!(!is_capacity_signal(kind), "{msg}");
+        }
+    }
+
+    /// A rate limit is retried with backoff on the same account; only quota
+    /// and budget exhaustion rotate.
+    #[test]
+    fn test_only_account_capacity_rotates() {
+        for msg in [
+            "Claude API error (429): rate limit exceeded",
+            "Too Many Requests",
+        ] {
+            let kind = failure_kind(msg);
+            assert_eq!(kind, Some(FailureKind::RateLimited), "{msg}");
+            assert!(!migrates_account(kind), "{msg}");
+            assert!(is_capacity_signal(kind), "{msg}");
+        }
+        for msg in [
+            "Claude AI usage limit reached|1790727000",
+            "token limit exceeded",
+        ] {
+            let kind = failure_kind(msg);
+            assert_eq!(kind, Some(FailureKind::QuotaExhausted), "{msg}");
+            assert!(migrates_account(kind), "{msg}");
+            assert!(is_retryable_error(msg), "{msg}");
+        }
     }
 
     #[test]

@@ -12,7 +12,6 @@ pub mod account_migration;
 pub mod agent_status_sideband;
 pub mod auto_response;
 pub mod auto_response_fleet;
-pub mod claude_resume_sniff;
 pub mod commit_report;
 pub mod context_watcher;
 pub mod coord_warn;
@@ -36,6 +35,7 @@ pub mod transcript_watcher;
 #[cfg(test)]
 mod transport_cost;
 pub mod transport_stats;
+pub mod typed_resume_sniff;
 pub mod types;
 pub mod usage_limit;
 pub mod visibility;

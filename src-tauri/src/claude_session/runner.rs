@@ -504,8 +504,8 @@ fn run_claude_session_inline(
     // everywhere else. The operator's global template + per-account command
     // layer in here; with no operator config the composed tail is
     // byte-identical to the historical argv.
-    let spec = crate::claude_session::launch_spec::LaunchSpec {
-        permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+    let spec = crate::session::launch_spec::LaunchSpec {
+        permission: crate::session::launch_spec::PermissionMode::BypassPermissions,
         session_id: session_id_pin,
         resume_id: resume_id_pin,
         model: model_override.map(|m| m.to_string()),
@@ -516,10 +516,10 @@ fn run_claude_session_inline(
         let ai = crate::settings::get_ai_settings();
         let (config_dir, _config_dir_source) =
             crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
-        crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref())
+        crate::session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref())
     };
     let (program, cli_args) =
-        crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
+        crate::session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
     // DERIVE the workspace-trust pre-accept for `working_dir` before the child
     // starts. Untrusted here does not prompt (non-interactive child) -- it
@@ -2517,6 +2517,8 @@ pub fn run_claude_session_interactive(
         tool_policy,
         None, // cli_session_ctx — non-chat spawn; CLI generates its own id
         None, // agent_log_emitter — non-interactive path, no coord agent_logs
+        // Autonomous / chat spawn: never prompts (plan 2026-09-20 Phase 9).
+        crate::session::launch_spec::PermissionMode::BypassPermissions,
     )?;
 
     // Register with Doctor health monitoring

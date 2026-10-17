@@ -31,6 +31,12 @@ import {
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
+import served from "../../../src-tauri/tests/fixtures/cli_screens/served_profiles.json";
+import { setCliProfiles, type ServedCliProfile } from "./providerAdapter";
+
+// The runner's served CLI profiles, primed as the restore path primes them
+// (`loadCliProfiles` finds the cache full and makes no IPC call).
+setCliProfiles(served as ServedCliProfile[]);
 
 const rec = (overrides: Partial<TerminalSessionRecord>): TerminalSessionRecord => ({
   claudeSessionId: "sid",
@@ -40,6 +46,8 @@ const rec = (overrides: Partial<TerminalSessionRecord>): TerminalSessionRecord =
   openedAt: 1,
   lastSeenAt: 1,
   state: "open",
+  // The backend always serializes a provider (serde default "claude").
+  provider: "claude",
   ...overrides,
 });
 
@@ -407,6 +415,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       verifyOptions: {
         settleMs: 1,
@@ -433,6 +442,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       verifyOptions: {
         settleMs: 1,
@@ -475,6 +485,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       recordOpen: RECORD_OPEN,
       verifyOptions: {
@@ -495,6 +506,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       recordOpen: RECORD_OPEN,
       verifyOptions: {
@@ -514,6 +526,30 @@ describe("runVerifiedResume", () => {
     );
   });
 
+  it("a provider with no served profile is never resumed: nothing typed, tab parked failed", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      provider: "gemini",
+      updateTab,
+      recordOpen: RECORD_OPEN,
+      verifyOptions: { settleMs: 1, timeoutMs: 5, intervalMs: 1, readTail: async () => "" },
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([]);
+    expect(updateTab).toHaveBeenCalledWith("tab-1", { isReconnecting: false, resumeFailed: true });
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_session_record_open", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "terminal_session_clear_restore_pending",
+      expect.anything(),
+    );
+    warn.mockRestore();
+  });
+
   it("bogus session id (failure frames inside Claude UI) → failed, marker kept, no re-assert (item 4)", async () => {
     const BOGUS =
       "╭──────────────╮\n│ No conversation found with session ID: sess-1 │\n╰──────────────╯\n  ? for shortcuts";
@@ -523,6 +559,7 @@ describe("runVerifiedResume", () => {
       terminalRefs: refsWithHandle(writes),
       tabId: "tab-1",
       claudeSessionId: "sess-1",
+      provider: "claude",
       updateTab,
       recordOpen: RECORD_OPEN,
       verifyOptions: {
@@ -558,6 +595,7 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
         claudeSessionId: "sess-1",
         origin: "authoritative",
         confirmedAt: 1_700_000_000_000,
+        provider: "claude",
       }),
     ).toBe("auto-resume");
   });
@@ -605,28 +643,28 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
 // must leave it answerable under the opt-in summary policy.
 describe("buildResumeCmd (resume-size picker policy)", () => {
   it("default 'full' policy raises both resume thresholds so the picker never shows", () => {
-    const cmd = buildResumeCmd("sess-1", undefined, "full");
-    expect(cmd).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD="999999999"');
-    expect(cmd).toContain('CLAUDE_CODE_RESUME_THRESHOLD_MINUTES="999999999"');
+    const cmd = buildResumeCmd("sess-1", undefined, "full", "claude");
+    expect(cmd).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD='999999999'");
+    expect(cmd).toContain("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES='999999999'");
     expect(cmd).toContain("--resume sess-1\r");
   });
 
   it("'summary' policy leaves the thresholds alone (picker shows; the loop answers it)", () => {
-    const cmd = buildResumeCmd("sess-1", undefined, "summary");
+    const cmd = buildResumeCmd("sess-1", undefined, "summary", "claude");
     expect(cmd).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
     expect(cmd).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
   });
 
   it("keeps the CLAUDE_CONFIG_DIR prefix alongside the threshold vars", () => {
-    const cmd = buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full");
-    expect(cmd).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-hotmail"');
+    const cmd = buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full", "claude");
+    expect(cmd).toContain("CLAUDE_CONFIG_DIR='C:/claude/.claude-hotmail'");
     expect(cmd).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
     expect(cmd).toContain("--resume sess-1\r");
   });
 
   it("resumes autonomously — bypassPermissions so an unattended restore never stalls on a permission prompt (#547 union)", () => {
     for (const policy of ["full", "summary"] as const) {
-      expect(buildResumeCmd("abc-123", undefined, policy)).toContain(
+      expect(buildResumeCmd("abc-123", undefined, policy, "claude")).toContain(
         "claude --permission-mode bypassPermissions --resume abc-123",
       );
     }
@@ -638,15 +676,20 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
   // the threshold vars via the 'summary' policy so the config-dir branch alone
   // is asserted.
   it("emits the CLAUDE_CONFIG_DIR prefix iff an account dir is bound (config-dir branch, no thresholds)", () => {
-    const bound = buildResumeCmd("sess-1", "C:/claude/.claude-qontinui", "summary");
-    expect(bound).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-qontinui"');
+    const bound = buildResumeCmd("sess-1", "C:/claude/.claude-qontinui", "summary", "claude");
+    expect(bound).toContain("CLAUDE_CONFIG_DIR='C:/claude/.claude-qontinui'");
     expect(bound).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
     expect(bound).toContain("--resume sess-1\r");
 
     // No account bound ⇒ no prefix at all (bare command).
-    const unbound = buildResumeCmd("sess-1", undefined, "summary");
+    const unbound = buildResumeCmd("sess-1", undefined, "summary", "claude");
     expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
     expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  });
+
+  it("a provider with no served profile has no resume command — never Claude's", () => {
+    expect(buildResumeCmd("sess-1", undefined, "full", "gemini")).toBeNull();
+    expect(buildResumeCmd("sess-1", undefined, "full", undefined)).toBeNull();
   });
 });
 

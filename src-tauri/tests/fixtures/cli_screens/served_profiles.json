@@ -1,0 +1,201 @@
+[
+  {
+    "accountIsolation": {
+      "kind": "env_var",
+      "name": "CLAUDE_CONFIG_DIR"
+    },
+    "auth": [],
+    "autoApprove": {
+      "argv": [
+        "--permission-mode",
+        "bypassPermissions"
+      ],
+      "detect": [
+        "--dangerously-skip-permissions",
+        "--permission-mode bypassPermissions",
+        "--permission-mode=bypassPermissions"
+      ],
+      "kind": "flags"
+    },
+    "displayName": "Claude Code",
+    "gracefulExit": {
+      "kind": "typed_command",
+      "text": "/exit"
+    },
+    "handshake": {
+      "failure": [],
+      "failureRegex": [
+        "No conversation found",
+        "No conversations? (?:found|to resume)",
+        "Select a (?:session|conversation) to resume"
+      ],
+      "success": [],
+      "successRegex": [
+        "\\? for shortcuts",
+        "esc to interrupt",
+        "bypass permissions",
+        "Welcome (?:back )?to Claude",
+        "Claude Code v\\d",
+        "[╭╰]─{3,}",
+        "(?:^|\\n)[ \\t]*─{3,}[ \\t]*\\r?\\n[ \\t]*❯[^\\n]*\\n[ \\t]*─{3,}"
+      ],
+      "titleRegex": [
+        "^[✳✢✶✻✽·*]\\s*Claude Code$"
+      ]
+    },
+    "id": "claude",
+    "identity": {
+      "flag": "--session-id",
+      "kind": "pinned"
+    },
+    "install": {},
+    "notes": [
+      "verified_version covers the stream-json capabilities, probed on Linux against 2.1.285 (Phase 2). The handshake markers were last documented against the 2.1.175 resume-size picker; the v2 logo, rule-prompt-rule frame and window-title markers against 2.1.286's first paint of a resumed session (Linux, 51/53 live panes verified). Windows and macOS are unverified.",
+      "typed_permission: control_request{subtype:can_use_tool} arrives only without a bypass mode and with `--permission-prompt-tool stdio` (permission_prompt_args), the flag the reference SDK passes. It is HIDDEN in 2.1.285's --help, which lists `--permission-prompts host|none` instead; the runner relies on `--permission-prompt-tool stdio` because that is the spelling the Phase 2 probe verified against 2.1.285 on Linux (fixtures can_use_tool_sdk_allow_with_session_state_events, can_use_tool_sdk_deny, can_use_tool_runner_shape_ignored). `--permission-prompts host` was not probed. permission_prompt_args also passes `--permission-mode default` — the documented default mode, i.e. the probe's own flagless mode stated explicitly — so an account settings.json permissions.defaultMode (e.g. bypassPermissions) cannot pre-empt the prompts; that flag was not separately probed. An account's own permissions.allow rules still let matching tools run without a request. The CLI accepts only the SDK's nested control_response ({subtype:success, request_id, response:{behavior:allow, updatedInput} | {behavior:deny, message}}); a deny reaches the model as an error tool_result and is not an errored turn. Any other shape is silently ignored and the turn hangs.",
+      "turn_boundary_event: system/session_state_changed (idle|running|requires_action) is emitted only when the child env sets CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1. Without it the event never arrives, so a spawn that does not set it must treat the capability as Unknown.",
+      "rate_limit_event: arrives once per turn by default. Only status `allowed` was observed; the spelling of a limited status is unknown.",
+      "pty_args: with TMUX set, the default `--teammate-mode auto` splits the caller's tmux window. `--teammate-mode in-process` keeps teammates in the session; it is a HIDDEN flag (not in --help), verified on 2.1.285 on Linux, and a CLI that drops it refuses the launch with an unknown-option error. The runner's PTY seam also strips TMUX/TMUX_PANE from every PTY child, so an unrecognised flag is the only thing lost if this entry is removed. Not applicable on Windows (no tmux)."
+    ],
+    "permissionPromptArgs": [
+      "--permission-mode",
+      "default",
+      "--permission-prompt-tool",
+      "stdio"
+    ],
+    "programs": [
+      "claude"
+    ],
+    "ptyArgs": [
+      "--teammate-mode",
+      "in-process"
+    ],
+    "rateLimitEvent": "supported",
+    "restoreTier": "full",
+    "resume": {
+      "kind": "by_id_argv",
+      "template": [
+        "claude",
+        "--resume",
+        "{id}"
+      ]
+    },
+    "resumeFlagAliases": [
+      "-r"
+    ],
+    "sessionChoiceArgs": [
+      "--continue",
+      "-c",
+      "resume"
+    ],
+    "structuredLane": {
+      "kind": "claude_stream_json"
+    },
+    "transcript": {
+      "kind": "jsonl_under_config_dir",
+      "subdir": "projects"
+    },
+    "trustDialog": {
+      "kind": "unknown"
+    },
+    "turnBoundaryEvent": "supported",
+    "typedPermission": "supported",
+    "usageLimitPhrases": [
+      "usage limit reached",
+      "5-hour limit reached",
+      "weekly limit reached",
+      "hit your usage limit",
+      "out of extra usage",
+      "session limit reached",
+      "limit reached",
+      "out of usage"
+    ],
+    "verifiedVersion": "2.1.285"
+  },
+  {
+    "accountIsolation": {
+      "kind": "env_var",
+      "name": "CODEX_HOME"
+    },
+    "auth": [
+      {
+        "args": [
+          "login"
+        ],
+        "kind": "cli_login"
+      }
+    ],
+    "autoApprove": {
+      "argv": [
+        "--dangerously-bypass-approvals-and-sandbox"
+      ],
+      "detect": [
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--ask-for-approval never",
+        "--ask-for-approval=never",
+        "-a never"
+      ],
+      "kind": "flags"
+    },
+    "displayName": "Codex CLI",
+    "gracefulExit": {
+      "kind": "unknown"
+    },
+    "handshake": {
+      "failure": [],
+      "failureRegex": [],
+      "success": [],
+      "successRegex": []
+    },
+    "id": "codex",
+    "identity": {
+      "capture": "codex_session_file",
+      "kind": "read_back"
+    },
+    "install": {
+      "linux": "npm i -g @openai/codex",
+      "macos": "npm i -g @openai/codex",
+      "windows": "npm i -g @openai/codex"
+    },
+    "notes": [
+      "verified_version: `--help` and `resume --help` were read from codex-cli 0.159.1 on Linux. That CLI was NOT authenticated, so nothing that needs a live session was observed.",
+      "Resume continuity is UNKNOWN: `codex resume <id>` exists, but whether it restores the conversation has not been observed. restore_tier stays terminal_only until an authenticated probe shows it does.",
+      "identity: read back from `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl` (line 1 `session_meta`, id in `payload`), matched by cwd and written after the launch. Ids are UUIDv7; never assume UUIDv4.",
+      "transcript: the glob is relative to the home directory. With CODEX_HOME set, that directory replaces `.codex`.",
+      "handshake: empty on purpose. #651's markers were derived against 0.142.2 and were never checked against an authenticated CLI.",
+      "graceful_exit, usage_limit_phrases, trust_dialog and the three event capabilities are unknown: none were observable without authentication.",
+      "structured_lane: the CLI offers `codex app-server` (experimental in 0.159.1). The runner implements NO Codex structured lane, so a launch surface must never offer one; every Codex session is PTY-hosted.",
+      "Platforms: Linux help text only. macOS is the same code path but unverified on hardware. Windows is UNKNOWN; the identity shim's `.cmd` wrapper is untested there."
+    ],
+    "programs": [
+      "codex"
+    ],
+    "rateLimitEvent": "unknown",
+    "restoreTier": "terminal_only",
+    "resume": {
+      "kind": "by_id_argv",
+      "template": [
+        "codex",
+        "resume",
+        "{id}"
+      ]
+    },
+    "sessionChoiceArgs": [
+      "resume",
+      "fork"
+    ],
+    "structuredLane": {
+      "kind": "codex_app_server"
+    },
+    "transcript": {
+      "glob": ".codex/sessions/**/rollout-*.jsonl",
+      "kind": "session_file_glob"
+    },
+    "trustDialog": {
+      "kind": "unknown"
+    },
+    "turnBoundaryEvent": "unknown",
+    "typedPermission": "unknown",
+    "usageLimitPhrases": [],
+    "verifiedVersion": "0.159.1"
+  }
+]

@@ -410,7 +410,9 @@ impl SessionDirectory {
     pub fn discover() -> Self {
         let mut me = Self::default();
         me.load_names(&session_names_dir());
-        for root in crate::terminal::transcript::find_claude_config_dirs() {
+        for root in crate::terminal::transcript::find_transcript_config_dirs(
+            &qontinui_runner_lib::cli_profile::claude::PROFILE,
+        ) {
             if me.load_transcripts(&root) {
                 me.roots_scanned += 1;
             }

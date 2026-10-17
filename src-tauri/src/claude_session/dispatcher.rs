@@ -3,8 +3,25 @@
 //! Parses NDJSON lines from Claude CLI's stdout and routes them to the appropriate
 //! handlers: text extraction, finding parsing, progress parsing, control request
 //! handling, and state transitions.
+//!
+//! **What a frame MEANS is decided without Tauri** ([`observe_frame`] over a
+//! per-session [`FrameLedger`]); [`dispatch_line`] only applies the
+//! [`FrameOutcome`] — emits, persistence, the next queued message. Plan
+//! `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`
+//! Phase 8 moved the meaning there so every recorded CLI fixture is a test:
+//!
+//! - a frame type the decoder does not list is counted and named once per
+//!   session at `info!` (type and byte length only — a frame can carry the
+//!   account's email and organisation), instead of vanishing at `debug!`;
+//! - a `rate_limit_event` whose status is not `allowed`, and a `result` that
+//!   is not a success (`is_error: true` under `subtype: success` included),
+//!   become a `Confirmed` [`FailureSignal::StructuredEvent`] for the one
+//!   classifier and recovery table (`session::failure`, `failure_recovery`);
+//! - `system:session_state_changed` `idle` drives `Processing → Ready` when
+//!   the CLI sends it (it arrives AFTER `result`); a CLI that never sends it
+//!   gets the `result`-driven transition, as before.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -13,15 +30,374 @@ use tauri::{Emitter, Manager};
 use tracing::{debug, info, trace, warn};
 
 use crate::claude_protocol::codec::decode_message;
-use crate::claude_protocol::types::OutgoingControlResponse;
+use crate::claude_protocol::types::{ClaudeOutputMessage, CliSessionState, SystemSubtype};
 use crate::commands::ai_session::emit_session_state;
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
+use crate::session::failure::FailureSignal;
+use crate::session::failure_recovery::{self, Evidence, Lane};
 use crate::str_utils::truncate_str;
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
+use super::permission::PermissionBroker;
 use super::state::{SessionState, SessionStateTracker};
 use super::writer::StdinWriter;
+
+// ============================================================================
+// Frame meaning (pure — no Tauri)
+// ============================================================================
+
+/// What the dispatcher remembers across ONE session's stdout frames. Owned by
+/// the session's stdout reader thread; one per CLI process.
+#[derive(Debug)]
+pub struct FrameLedger {
+    /// The session id the failure store keys this session under — the same
+    /// key the lane's exit path reports with, which is what lets an errored
+    /// turn and the non-zero exit that follows it be one failure.
+    session_key: String,
+    /// Frames the decoder does not understand, per type (`system:<subtype>`
+    /// for an unknown system subtype). The first of each type is logged.
+    unrecognized: BTreeMap<String, u64>,
+    /// The typed error code an errored turn's synthetic assistant frame
+    /// carried; consumed by that turn's `result`.
+    pending_error_code: Option<String>,
+    /// The CLI's own last-reported turn state, when it reports one.
+    cli_state: Option<CliSessionState>,
+    /// The CLI has sent at least one `session_state_changed`: from then on
+    /// `idle`, not `result`, ends the turn.
+    state_events_seen: bool,
+}
+
+impl FrameLedger {
+    pub fn new(session_key: impl Into<String>) -> Self {
+        Self {
+            session_key: session_key.into(),
+            unrecognized: BTreeMap::new(),
+            pending_error_code: None,
+            cli_state: None,
+            state_events_seen: false,
+        }
+    }
+
+    /// The failure-store key.
+    pub fn session_key(&self) -> &str {
+        &self.session_key
+    }
+
+    /// The CLI's last-reported turn state (`requires_action` is Phase 9's
+    /// "waiting on a permission decision" signal). `None` when the CLI does
+    /// not send state events.
+    pub fn cli_state(&self) -> Option<&CliSessionState> {
+        self.cli_state.as_ref()
+    }
+
+    /// Unrecognised frames seen so far, per type.
+    pub fn unrecognized_counts(&self) -> &BTreeMap<String, u64> {
+        &self.unrecognized
+    }
+
+    /// Count one unrecognised frame; `true` when it is the first of its type.
+    fn count_unrecognized(&mut self, frame_type: String, bytes: usize) -> bool {
+        let count = self.unrecognized.entry(frame_type.clone()).or_insert(0);
+        *count += 1;
+        let first = *count == 1;
+        if first {
+            // Type and size only: a frame's body can carry account data.
+            info!(
+                session = %self.session_key,
+                frame_type = %frame_type,
+                bytes,
+                "stream-json frame type this runner does not interpret (logged once per type per session; further ones are counted)"
+            );
+        }
+        first
+    }
+}
+
+impl Drop for FrameLedger {
+    fn drop(&mut self) {
+        if !self.unrecognized.is_empty() {
+            info!(
+                session = %self.session_key,
+                counts = ?self.unrecognized,
+                "stream-json frames this runner did not interpret, per type, over the session"
+            );
+        }
+    }
+}
+
+/// What one decoded frame asks [`dispatch_line`] to do.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FrameOutcome {
+    /// A state transition [`observe_frame`] performed on the tracker; the
+    /// caller emits it.
+    pub transitioned_to: Option<SessionState>,
+    /// The frame states that the turn failed (or the account is limited).
+    pub failure: Option<FailureSignal>,
+    /// The frame is a successful turn's `result` — evidence that clears the
+    /// session's active failures.
+    pub turn_succeeded: bool,
+    /// The frame is a `result`: persist the turn's output.
+    pub turn_ended: bool,
+    /// The session may be Ready for the next queued user message.
+    pub ready_for_next: bool,
+    /// The first frame of a type the decoder does not interpret, this session.
+    pub first_unrecognized: Option<String>,
+}
+
+/// Decide what `msg` means for this session, and perform the state transition
+/// it implies on `tracker`. `bytes` is the raw line's length (logged for
+/// unrecognised frames instead of the frame itself).
+pub fn observe_frame(
+    ledger: &mut FrameLedger,
+    msg: &ClaudeOutputMessage,
+    bytes: usize,
+    tracker: &SessionStateTracker,
+) -> FrameOutcome {
+    let mut out = FrameOutcome::default();
+    match msg {
+        ClaudeOutputMessage::Other(frame) => {
+            if ledger.count_unrecognized(frame.frame_type.clone(), bytes) {
+                out.first_unrecognized = Some(frame.frame_type.clone());
+            }
+        }
+        ClaudeOutputMessage::System(sys) => match &sys.subtype {
+            Some(SystemSubtype::SessionStateChanged) => {
+                ledger.state_events_seen = true;
+                let state = sys.state.clone();
+                match &state {
+                    Some(CliSessionState::Idle) => {
+                        out.transitioned_to =
+                            turn_end_transition(tracker, "session_state_changed:idle");
+                        out.ready_for_next = true;
+                    }
+                    Some(CliSessionState::RequiresAction) => {
+                        info!(
+                            session = %ledger.session_key,
+                            "CLI reports requires_action (waiting on a decision)"
+                        );
+                    }
+                    Some(CliSessionState::Running) => {}
+                    Some(CliSessionState::Unknown(s)) => {
+                        let key = format!("system:session_state_changed:{s}");
+                        if ledger.count_unrecognized(key.clone(), bytes) {
+                            out.first_unrecognized = Some(key);
+                        }
+                    }
+                    None => debug!("session_state_changed without a state"),
+                }
+                if state.is_some() {
+                    ledger.cli_state = state;
+                }
+            }
+            Some(SystemSubtype::Unknown(sub)) => {
+                let key = format!("system:{sub}");
+                if ledger.count_unrecognized(key.clone(), bytes) {
+                    out.first_unrecognized = Some(key);
+                }
+            }
+            Some(SystemSubtype::Init | SystemSubtype::ThinkingTokens) | None => {}
+        },
+        ClaudeOutputMessage::ControlResponse(_) => {
+            debug!("Received control response from CLI");
+            // The init handshake's answer: Initializing -> Ready.
+            if tracker.get() == SessionState::Initializing {
+                match tracker.transition(SessionState::Ready) {
+                    Ok(_) => {
+                        info!("Session initialized, transitioning to Ready");
+                        out.transitioned_to = Some(SessionState::Ready);
+                    }
+                    Err(e) => warn!("Failed to transition to Ready: {}", e),
+                }
+            }
+        }
+        ClaudeOutputMessage::Assistant(a) => {
+            if let Some(code) = a.error.as_deref().filter(|c| !c.trim().is_empty()) {
+                ledger.pending_error_code = Some(code.to_string());
+            }
+        }
+        ClaudeOutputMessage::RateLimitEvent(ev) => {
+            let info = ev.rate_limit_info.as_ref();
+            match info.and_then(|i| i.status.as_ref().map(|s| (i, s))) {
+                // The per-turn status report; not a failure.
+                Some((_, status)) if status.is_allowed() => {}
+                Some((info, status)) => {
+                    warn!(
+                        session = %ledger.session_key,
+                        status = status.as_str(),
+                        rate_limit_type = info.rate_limit_type.as_deref().unwrap_or("?"),
+                        "rate_limit_event reports a non-allowed status"
+                    );
+                    out.failure = Some(FailureSignal::StructuredEvent {
+                        error_code: None,
+                        api_status: None,
+                        rate_limit_status: Some(status.as_str().to_string()),
+                        message: None,
+                        reset_at: info.resets_at.and_then(epoch_to_rfc3339),
+                    });
+                }
+                // No status is no statement — not a failure, not an all-clear.
+                None => debug!("rate_limit_event without a status"),
+            }
+        }
+        ClaudeOutputMessage::Result(result) => {
+            out.turn_ended = true;
+            let error_code = ledger.pending_error_code.take();
+            let success = result.is_success();
+            info!("Received result message (success={})", success);
+            if success {
+                out.turn_succeeded = true;
+            } else if let Some(why) = unsuccessful_but_not_failed(result, tracker.get()) {
+                // The turn stopped short for a reason the session asked for:
+                // nothing failed, and no recovery policy fits a healthy
+                // session. Not a success either — no failure is cleared.
+                info!(session = %ledger.session_key, why, "unsuccessful result is not a failure");
+            } else {
+                out.failure = Some(FailureSignal::StructuredEvent {
+                    error_code,
+                    api_status: result.api_error_status,
+                    rate_limit_status: None,
+                    message: result.error_text(),
+                    reset_at: None,
+                });
+            }
+            // Fallback for a CLI that does not report its own state: the
+            // result ends the turn. When it does, `idle` (after this frame)
+            // ends it instead.
+            if !ledger.state_events_seen {
+                out.transitioned_to = turn_end_transition(tracker, "result");
+                out.ready_for_next = true;
+            }
+        }
+        ClaudeOutputMessage::User(_)
+        | ClaudeOutputMessage::ContentBlockStart(_)
+        | ClaudeOutputMessage::ContentBlockDelta(_)
+        | ClaudeOutputMessage::ContentBlockStop(_)
+        | ClaudeOutputMessage::ControlRequest(_) => {}
+    }
+    out
+}
+
+/// Why an unsuccessful `result` is NOT a session failure, or `None` when it
+/// is one. Two turn ends are asked for rather than suffered:
+///
+/// - the runner interrupted the turn (`state` is `Interrupting`: it sent the
+///   interrupt and is waiting for exactly this result), and
+/// - the turn hit the session's own turn limit (`subtype:
+///   "error_max_turns"`), a bound the launch set.
+///
+/// Recording either would show a broken session and pick a recovery for a
+/// session that is fine — as `unknown`, since neither names a provider error.
+pub fn unsuccessful_but_not_failed(
+    result: &crate::claude_protocol::types::ResultMessage,
+    state: SessionState,
+) -> Option<&'static str> {
+    if state == SessionState::Interrupting {
+        return Some("the runner interrupted the turn");
+    }
+    if result.subtype.as_deref() == Some("error_max_turns") {
+        return Some("the turn reached the session's max-turns limit");
+    }
+    None
+}
+
+/// End-of-turn transition: Processing/Interrupting -> Ready. `None` when the
+/// session was in neither state.
+fn turn_end_transition(tracker: &SessionStateTracker, cause: &str) -> Option<SessionState> {
+    let current = tracker.get();
+    if current != SessionState::Processing && current != SessionState::Interrupting {
+        info!(
+            "Turn end ({}) received but state is {} (not Processing/Interrupting), no transition",
+            cause, current
+        );
+        return None;
+    }
+    match tracker.transition(SessionState::Ready) {
+        Ok(_) => {
+            info!("Transitioned to Ready after {} (was: {})", cause, current);
+            Some(SessionState::Ready)
+        }
+        Err(e) => {
+            warn!("Failed to transition to Ready after {}: {}", cause, e);
+            None
+        }
+    }
+}
+
+/// What the stdout reader may log at `info!` about one raw CLI line.
+///
+/// Control frames and `system` frames are logged as their type and byte length
+/// ONLY: the `initialize` control_response carries the account's email and
+/// organisation, a `can_use_tool` request carries the tool's full input, and
+/// `system:init` lists the cwd, tools and MCP servers. Every other line keeps
+/// the short preview the reader has always logged.
+pub fn stdout_log_preview(line: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        #[serde(rename = "type")]
+        frame_type: Option<String>,
+        subtype: Option<String>,
+    }
+    match serde_json::from_str::<Head>(line) {
+        Ok(Head {
+            frame_type: Some(t),
+            subtype,
+        }) if t.starts_with("control_") || t == "system" => match subtype {
+            Some(sub) => format!("<{t}:{sub} frame, {} bytes>", line.len()),
+            None => format!("<{t} frame, {} bytes>", line.len()),
+        },
+        // A line that merely names a control frame without parsing is held
+        // back too, rather than trusted to be harmless.
+        Err(_) if line.contains("\"control_") => {
+            format!("<unparsed control frame, {} bytes>", line.len())
+        }
+        _ => truncate_str(line, 150).to_string(),
+    }
+}
+
+/// Epoch seconds -> RFC 3339, the failure record's `reset_at` form.
+fn epoch_to_rfc3339(secs: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(secs, 0).map(|t| t.to_rfc3339())
+}
+
+/// Hand a typed failure frame to the one failure store: classified, recorded
+/// as the session's active failure and announced. Recovery is NOT executed
+/// here — the CLI process is still running, and every structured-lane recovery
+/// restarts it. It runs when the child exits: the lane's exit path reports to
+/// `failure_recovery::report`, which folds that exit into this failure rather
+/// than recording a second one.
+fn report_structured_failure(
+    app_handle: &tauri::AppHandle,
+    session_ctx: Option<&AiSessionContext>,
+    session_key: &str,
+    signal: &FailureSignal,
+) {
+    let provider = qontinui_runner_lib::cli_profile::claude::ID;
+    let Some(failure) =
+        failure_recovery::record_only(session_key, Lane::Structured, provider, signal)
+    else {
+        return;
+    };
+    warn!(
+        session = %session_key,
+        kind = ?failure.kind,
+        policy = ?failure.recovery_policy,
+        "stream-json turn reported a typed failure"
+    );
+    if let Some(ctx) = session_ctx {
+        let text = match &failure.details {
+            Some(d) => format!("{}. {}", failure.title, d),
+            None => failure.title.clone(),
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            emit_ai_output(app_handle, &text, "status", None, Some(ctx));
+        }));
+    }
+}
+
+// ============================================================================
+// Dispatch (applies a FrameOutcome)
+// ============================================================================
 
 /// Emit a session state event if we have enough context.
 fn emit_state_if_possible(
@@ -60,8 +436,11 @@ pub struct DispatcherResult {
 /// - Text extraction and event emission
 /// - Finding parsing
 /// - Progress parsing
-/// - Control request auto-approval
-/// - State transitions on Result messages
+/// - Control requests, answered by subtype through the session's
+///   [`PermissionBroker`] (allowed in a bypass mode, parked for the operator
+///   in `Prompt` mode, refused with an `error` for any other subtype)
+/// - Applying [`observe_frame`]'s outcome: state transitions, typed
+///   failures, the next queued message
 ///
 /// Returns the extracted text (if any).
 #[allow(clippy::too_many_arguments)]
@@ -91,8 +470,14 @@ pub fn dispatch_line(
     // a git worktree). Scopes file-registry entries so two sessions editing
     // the same path in different worktrees do not flag each other as conflicts.
     worktree_id: Option<&str>,
+    // This session's frame bookkeeping (unrecognised-type counts, the CLI's
+    // reported state, the pending error code of an errored turn).
+    ledger: &mut FrameLedger,
+    // This session's control-request answerer (plan Phase 9).
+    permissions: &Arc<PermissionBroker>,
 ) -> Option<String> {
-    // Decode the NDJSON line
+    // Decode the NDJSON line. An unlisted frame type is NOT an error (it
+    // decodes as `Other`); only a malformed line lands here.
     let msg = match decode_message(line) {
         Ok(m) => m,
         Err(e) => {
@@ -100,6 +485,17 @@ pub fn dispatch_line(
             return None;
         }
     };
+
+    let outcome = observe_frame(ledger, &msg, line.len(), state_tracker);
+    if let Some(state) = outcome.transitioned_to {
+        emit_state_if_possible(app_handle, session_ctx, state);
+    }
+    if let Some(ref signal) = outcome.failure {
+        report_structured_failure(app_handle, session_ctx, ledger.session_key(), signal);
+    }
+    if outcome.turn_succeeded {
+        failure_recovery::clear_on_evidence(ledger.session_key(), Evidence::TurnSucceeded);
+    }
 
     // Emit tool activity from assistant messages with tool_use blocks.
     // This is the primary path for tool activity in bypassPermissions mode,
@@ -139,10 +535,13 @@ pub fn dispatch_line(
         );
     }
 
-    // Handle control requests from CLI (auto-approve tool use in bypass mode)
+    // Handle control requests from the CLI — by subtype (plan Phase 9).
     if let Some(ctrl_req) = msg.as_control_request() {
-        // Emit tool activity event so the frontend can show what the AI is doing
-        if ctrl_req.request.subtype == "can_use_tool" {
+        // Emit tool activity event so the frontend can show what the AI is
+        // doing — in a bypass mode only, where the request IS the call. A
+        // prompted request has not run and may never run; its permission card
+        // says what it wants instead.
+        if ctrl_req.request.subtype == "can_use_tool" && !permissions.mode().prompts() {
             if let Some(tool_name) = ctrl_req
                 .request
                 .data
@@ -155,48 +554,20 @@ pub fn dispatch_line(
                 }));
             }
         }
-        handle_control_request(ctrl_req, stdin_writer);
+        permissions.handle_control_request(ctrl_req);
         return None;
     }
 
-    // Handle control responses (to our init/interrupt requests)
+    // Control responses (to our init/interrupt requests) carry no output;
+    // the init transition was applied by `observe_frame`.
     if msg.as_control_response().is_some() {
-        debug!("Received control response from CLI");
-        // If we're initializing, transition to Ready
-        if state_tracker.get() == SessionState::Initializing {
-            match state_tracker.transition(SessionState::Ready) {
-                Ok(_) => {
-                    info!("Session initialized, transitioning to Ready");
-                    emit_state_if_possible(app_handle, session_ctx, SessionState::Ready);
-                }
-                Err(e) => warn!("Failed to transition to Ready: {}", e),
-            }
-        }
         return None;
     }
 
-    // Handle result messages (turn completion)
-    if msg.is_result() {
-        let success = msg.is_success_result();
-        info!("Received result message (success={})", success);
-
-        // Transition state: Processing/Interrupting -> Ready
-        let current = state_tracker.get();
-        if current == SessionState::Processing || current == SessionState::Interrupting {
-            match state_tracker.transition(SessionState::Ready) {
-                Ok(_) => {
-                    info!("Transitioned to Ready after result (was: {})", current);
-                    emit_state_if_possible(app_handle, session_ctx, SessionState::Ready);
-                }
-                Err(e) => warn!("Failed to transition to Ready after result: {}", e),
-            }
-        } else {
-            info!(
-                "Result received but state is {} (not Processing/Interrupting), no transition",
-                current
-            );
-        }
-
+    // Handle result messages (turn completion). The state transition — or,
+    // when the CLI reports its own state, the wait for `idle` — was decided
+    // by `observe_frame`.
+    if outcome.turn_ended {
         // Persist the AI response delta to DB for chat session resilience.
         // This captures everything the AI said since the last persist point.
         if let Some(ref tx) = turn_persist_tx {
@@ -217,6 +588,26 @@ pub fn dispatch_line(
         }
 
         // Check for pending user messages and send the next one
+        if outcome.ready_for_next {
+            send_next_pending_message(
+                state_tracker,
+                stdin_writer,
+                pending_messages,
+                user_has_interacted,
+                app_handle,
+                session_ctx,
+            );
+        }
+
+        // Skip text extraction for result messages — the text was already
+        // emitted via streaming content_block_delta events. Extracting text
+        // from the result would duplicate the entire response.
+        return None;
+    }
+
+    // `session_state_changed: idle` ended the turn: the next queued message
+    // may go now.
+    if outcome.ready_for_next {
         send_next_pending_message(
             state_tracker,
             stdin_writer,
@@ -225,10 +616,6 @@ pub fn dispatch_line(
             app_handle,
             session_ctx,
         );
-
-        // Skip text extraction for result messages — the text was already
-        // emitted via streaming content_block_delta events. Extracting text
-        // from the result would duplicate the entire response.
         return None;
     }
 
@@ -272,31 +659,6 @@ pub fn dispatch_line(
     }
 
     Some(text)
-}
-
-/// Handle a control request from the CLI.
-/// In bypass permissions mode, we auto-approve everything.
-fn handle_control_request(
-    ctrl_req: &crate::claude_protocol::types::CliControlRequest,
-    stdin_writer: &Arc<StdinWriter>,
-) {
-    let subtype = &ctrl_req.request.subtype;
-    debug!("CLI control request: subtype={}", subtype);
-
-    if let Some(ref request_id) = ctrl_req.request_id {
-        // Auto-approve tool use requests (we run in bypassPermissions mode)
-        let response = OutgoingControlResponse::allow_tool(request_id);
-        if let Err(e) = stdin_writer.write_message(&response) {
-            warn!("Failed to send control response: {}", e);
-        } else {
-            trace!("Auto-approved control request: {}", subtype);
-        }
-    } else {
-        warn!(
-            "CLI control request without request_id, cannot respond: {}",
-            subtype
-        );
-    }
 }
 
 /// Format a human-readable description of a tool activity.
@@ -803,6 +1165,775 @@ pub fn flush_line_buffer(
     if let Some(parser) = progress_parser {
         if let Some(parsed_progress) = parser.parse_line(line_buffer) {
             let _ = progress_tx.send(parsed_progress);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Every recorded Claude 2.1.285 stream-json fixture (plan Phase 2,
+    //! `tests/fixtures/cli_protocol/claude/2.1.285/`) replayed through the
+    //! dispatcher's frame logic in the order the CLI wrote it, with the
+    //! runner's own side of the turn simulated: the init handshake answer puts
+    //! the session in Ready, then the runner sends its user message and moves
+    //! to Processing. The same fixtures drive `mock_claude_cli --replay` in the
+    //! `cli_probes` integration test.
+
+    use super::*;
+    use crate::claude_protocol::types::RateLimitStatus;
+    use crate::session::failure::classify;
+    use crate::session::failure_recovery::{RecoveryTarget, StructuredRestart};
+    use qontinui_types::cli_session::{FailureConfidence, FailureEvidenceSource, FailureKind};
+
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cli_protocol/claude/2.1.285")
+    }
+
+    fn scenario(stem: &str) -> serde_json::Value {
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture_dir().join("manifest.json")).expect("manifest"),
+        )
+        .expect("manifest json");
+        manifest["scenarios"][stem].clone()
+    }
+
+    fn profile() -> &'static qontinui_types::cli_session::CliProfile {
+        qontinui_runner_lib::cli_profile::profile_for(qontinui_runner_lib::cli_profile::claude::ID)
+            .expect("claude profile")
+    }
+
+    /// One replayed fixture: each frame's type and outcome, and where the
+    /// session ended up.
+    struct Replay {
+        frames: Vec<(String, FrameOutcome)>,
+        ledger: FrameLedger,
+        tracker: SessionStateTracker,
+    }
+
+    impl Replay {
+        fn failures(&self) -> Vec<&FailureSignal> {
+            self.frames
+                .iter()
+                .filter_map(|(_, o)| o.failure.as_ref())
+                .collect()
+        }
+
+        /// The frame type at which the session went Processing -> Ready.
+        fn turn_ended_ready_at(&self) -> Vec<String> {
+            self.frames
+                .iter()
+                .skip(1) // the init handshake's own Ready
+                .filter(|(_, o)| o.transitioned_to == Some(SessionState::Ready))
+                .map(|(t, _)| t.clone())
+                .collect()
+        }
+
+        fn count(&self, frame_type: &str) -> usize {
+            self.frames.iter().filter(|(t, _)| t == frame_type).count()
+        }
+    }
+
+    fn replay(stem: &str) -> Replay {
+        let text = std::fs::read_to_string(fixture_dir().join(format!("{stem}.ndjson")))
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        let mut ledger = FrameLedger::new(format!("dispatcher-test-{stem}"));
+        let mut frames = Vec::new();
+        for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+            // Not dropped: every recorded frame decodes.
+            let msg = decode_message(line).unwrap_or_else(|e| panic!("{stem} line {i}: {e}"));
+            let outcome = observe_frame(&mut ledger, &msg, line.len(), &tracker);
+            frames.push((frame_label(&msg), outcome));
+            if i == 0 {
+                assert_eq!(
+                    tracker.get(),
+                    SessionState::Ready,
+                    "{stem}: the first frame is the init handshake answer"
+                );
+                // The runner sends its user message.
+                tracker.transition(SessionState::Processing).unwrap();
+            }
+        }
+        Replay {
+            frames,
+            ledger,
+            tracker,
+        }
+    }
+
+    fn frame_label(msg: &ClaudeOutputMessage) -> String {
+        match msg {
+            ClaudeOutputMessage::System(s) => match (&s.subtype, &s.state) {
+                (Some(sub), Some(state)) => format!("system:{}:{}", sub.as_str(), state.as_str()),
+                (Some(sub), None) => format!("system:{}", sub.as_str()),
+                (None, _) => "system".to_string(),
+            },
+            other => other.frame_type().to_string(),
+        }
+    }
+
+    /// `plain_turn`: the per-turn `rate_limit_event` is decoded (not dropped)
+    /// and, reporting `allowed`, is no failure; with no state events the
+    /// `result` ends the turn; the turn succeeded.
+    #[test]
+    fn fixture_plain_turn() {
+        let r = replay("plain_turn");
+        assert_eq!(r.count("rate_limit_event"), 1, "decoded, not dropped");
+        assert!(r.failures().is_empty());
+        assert_eq!(r.turn_ended_ready_at(), vec!["result".to_string()]);
+        assert_eq!(r.tracker.get(), SessionState::Ready);
+        let result = &r.frames.iter().find(|(t, _)| t == "result").unwrap().1;
+        assert!(result.turn_succeeded && result.turn_ended && result.ready_for_next);
+        assert!(r.ledger.unrecognized_counts().is_empty());
+        assert_eq!(
+            r.ledger.cli_state(),
+            None,
+            "no state events without the env var"
+        );
+        assert_eq!(scenario("plain_turn")["exit_code"], 0);
+    }
+
+    /// `errored_turn_invalid_model`: `subtype: success` + `is_error: true` is
+    /// reported FAILED — one Confirmed structured failure carrying the
+    /// synthetic assistant frame's `model_not_found` and the 404 — and the
+    /// non-zero exit that follows (exit 1, stderr recorded) is the same
+    /// failure, not a second one.
+    #[test]
+    fn fixture_errored_turn_is_reported_failed_and_its_exit_is_one_failure() {
+        let r = replay("errored_turn_invalid_model");
+        let result = &r.frames.iter().find(|(t, _)| t == "result").unwrap().1;
+        assert!(
+            !result.turn_succeeded,
+            "subtype success + is_error true is not a success"
+        );
+        let failures = r.failures();
+        assert_eq!(failures.len(), 1);
+        let FailureSignal::StructuredEvent {
+            error_code,
+            api_status,
+            rate_limit_status,
+            message,
+            ..
+        } = failures[0]
+        else {
+            panic!("expected a structured event, got {:?}", failures[0]);
+        };
+        assert_eq!(error_code.as_deref(), Some("model_not_found"));
+        assert_eq!(*api_status, Some(404));
+        assert_eq!(*rate_limit_status, None);
+        assert!(message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("issue with the selected model"));
+        let classified = classify(failures[0], profile()).unwrap();
+        assert_eq!(classified.kind, FailureKind::BadRequest);
+        assert_eq!(
+            classified.evidence.source,
+            FailureEvidenceSource::StructuredEvent
+        );
+        assert_eq!(classified.evidence.confidence, FailureConfidence::Confirmed);
+        // The session still leaves Processing on the fallback path.
+        assert_eq!(r.turn_ended_ready_at(), vec!["result".to_string()]);
+
+        // Frame, then exit: one failure through the real store.
+        struct NoRestart;
+        impl StructuredRestart for NoRestart {
+            fn still_wanted(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn restart(&self, _rotate: bool) -> Result<(), String> {
+                panic!("a bad request is never restarted");
+            }
+        }
+        let sc = scenario("errored_turn_invalid_model");
+        let exit_code = sc["exit_code"].as_i64().map(|c| c as i32);
+        assert_eq!(exit_code, Some(1));
+        let key = r.ledger.session_key().to_string();
+        let provider = qontinui_runner_lib::cli_profile::claude::ID;
+        let recorded =
+            failure_recovery::record_only(&key, Lane::Structured, provider, failures[0]).unwrap();
+        let target = || RecoveryTarget::Structured {
+            session_id: key.clone(),
+            restart: Arc::new(NoRestart),
+        };
+        let stderr = sc["stderr"].as_str().unwrap().to_string();
+        let on_stderr =
+            failure_recovery::report(target(), provider, None, FailureSignal::Stderr(stderr));
+        let on_exit = failure_recovery::report(
+            target(),
+            provider,
+            None,
+            FailureSignal::Exit { code: exit_code },
+        );
+        assert_eq!(on_stderr.unwrap().id, recorded.id);
+        assert_eq!(on_exit.unwrap().id, recorded.id);
+        let active = failure_recovery::active(&key);
+        assert_eq!(active.len(), 1, "one failure, not two: {active:?}");
+        assert_eq!(active[0].kind, FailureKind::BadRequest);
+        assert!(failure_recovery::dismiss(&key, &recorded.id));
+    }
+
+    /// `can_use_tool_sdk_allow_with_session_state_events`: with
+    /// `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` the CLI's own `idle` — which
+    /// arrives AFTER `result` — ends the turn; `result` no longer does.
+    /// `requires_action` is recorded; `thinking_tokens` is tolerated.
+    #[test]
+    fn fixture_session_state_idle_drives_ready() {
+        let sc = scenario("can_use_tool_sdk_allow_with_session_state_events");
+        assert_eq!(
+            sc["extra_env"][crate::claude_protocol::SESSION_STATE_EVENTS_ENV],
+            "1",
+            "the env var the structured lane now sets"
+        );
+        let r = replay("can_use_tool_sdk_allow_with_session_state_events");
+        assert_eq!(
+            r.turn_ended_ready_at(),
+            vec!["system:session_state_changed:idle".to_string()]
+        );
+        let result = &r.frames.iter().find(|(t, _)| t == "result").unwrap().1;
+        assert_eq!(result.transitioned_to, None, "result waits for idle");
+        assert!(!result.ready_for_next);
+        assert!(result.turn_succeeded);
+        assert_eq!(r.tracker.get(), SessionState::Ready);
+        assert_eq!(r.ledger.cli_state(), Some(&CliSessionState::Idle));
+        assert_eq!(r.count("system:session_state_changed:requires_action"), 1);
+        assert!(r.count("system:thinking_tokens") >= 1);
+        assert!(
+            r.ledger.unrecognized_counts().is_empty(),
+            "{:?}",
+            r.ledger.unrecognized_counts()
+        );
+        assert_eq!(r.count("rate_limit_event"), 1);
+        assert!(r.failures().is_empty());
+
+        // `requires_action` is the state the ledger holds while the
+        // permission request is open.
+        let text = std::fs::read_to_string(
+            fixture_dir().join("can_use_tool_sdk_allow_with_session_state_events.ndjson"),
+        )
+        .unwrap();
+        let tracker = SessionStateTracker::new();
+        let mut ledger = FrameLedger::new("dispatcher-test-requires-action");
+        for line in text.lines() {
+            let msg = decode_message(line).unwrap();
+            observe_frame(&mut ledger, &msg, line.len(), &tracker);
+            if msg.as_control_request().is_some() {
+                assert_eq!(ledger.cli_state(), Some(&CliSessionState::RequiresAction));
+            }
+        }
+    }
+
+    /// `can_use_tool_sdk_deny`: a denied tool is not an errored turn.
+    #[test]
+    fn fixture_sdk_deny_is_not_a_failure() {
+        let r = replay("can_use_tool_sdk_deny");
+        assert!(r.failures().is_empty());
+        assert_eq!(r.count("rate_limit_event"), 1);
+        assert_eq!(r.turn_ended_ready_at(), vec!["result".to_string()]);
+        assert!(r
+            .frames
+            .iter()
+            .any(|(t, o)| t == "result" && o.turn_succeeded));
+        assert_eq!(scenario("can_use_tool_sdk_deny")["exit_code"], 0);
+    }
+
+    /// `can_use_tool_runner_shape_ignored`: the CLI ignored the runner's
+    /// `{"allowed": true}` and never ended the turn, so the session stays
+    /// Processing — no fabricated Ready, no fabricated failure. (The hang is
+    /// Phase 9's responder to fix.)
+    #[test]
+    fn fixture_runner_shape_ignored_never_ends_the_turn() {
+        let r = replay("can_use_tool_runner_shape_ignored");
+        assert_eq!(r.tracker.get(), SessionState::Processing);
+        assert!(r.turn_ended_ready_at().is_empty());
+        assert!(r.failures().is_empty());
+        assert_eq!(r.count("rate_limit_event"), 1, "decoded, not dropped");
+        assert_eq!(r.count("control_request"), 1);
+        assert_eq!(
+            scenario("can_use_tool_runner_shape_ignored")["killed_by_probe_watchdog"],
+            true
+        );
+    }
+
+    fn observe_one(
+        ledger: &mut FrameLedger,
+        tracker: &SessionStateTracker,
+        line: &str,
+    ) -> FrameOutcome {
+        observe_frame(ledger, &decode_message(line).unwrap(), line.len(), tracker)
+    }
+
+    /// A non-allowed rate-limit status is a Confirmed structured failure;
+    /// `rejected` (the unified subscription window is spent) is a quota, an
+    /// unseen status is `unknown` — never success.
+    #[test]
+    fn non_allowed_rate_limit_event_is_a_failure() {
+        let tracker = SessionStateTracker::new();
+        let mut ledger = FrameLedger::new("dispatcher-test-rate-limit");
+        let rejected = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1790727000,"rateLimitType":"five_hour"}}"#,
+        );
+        let signal = rejected.failure.expect("rejected is a failure");
+        let FailureSignal::StructuredEvent {
+            rate_limit_status,
+            reset_at,
+            ..
+        } = &signal
+        else {
+            panic!("structured event expected");
+        };
+        assert_eq!(
+            rate_limit_status.as_deref(),
+            Some(RateLimitStatus::Rejected.as_str())
+        );
+        assert_eq!(reset_at.as_deref(), Some("2026-09-30T00:10:00+00:00"));
+        let f = classify(&signal, profile()).unwrap();
+        assert_eq!(f.kind, FailureKind::QuotaExhausted);
+        assert_eq!(f.evidence.confidence, FailureConfidence::Confirmed);
+
+        let unseen = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"some_future_status"}}"#,
+        );
+        let f = classify(
+            &unseen.failure.expect("an unseen status is not allowed"),
+            profile(),
+        )
+        .unwrap();
+        assert_eq!(f.kind, FailureKind::Unknown);
+
+        for line in [
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning"}}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
+            r#"{"type":"rate_limit_event"}"#,
+        ] {
+            assert_eq!(
+                observe_one(&mut ledger, &tracker, line).failure,
+                None,
+                "{line}"
+            );
+        }
+    }
+
+    /// Unknown frame types and system subtypes are counted per type and
+    /// reported as "first" exactly once per session.
+    #[test]
+    fn unrecognized_frames_are_counted_and_named_once() {
+        let tracker = SessionStateTracker::new();
+        let mut ledger = FrameLedger::new("dispatcher-test-unrecognized");
+        let first = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"stream_event","event":{}}"#,
+        );
+        assert_eq!(first.first_unrecognized.as_deref(), Some("stream_event"));
+        for _ in 0..2 {
+            let again = observe_one(&mut ledger, &tracker, r#"{"type":"stream_event"}"#);
+            assert_eq!(again.first_unrecognized, None);
+        }
+        let sys = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"system","subtype":"hook_started"}"#,
+        );
+        assert_eq!(
+            sys.first_unrecognized.as_deref(),
+            Some("system:hook_started")
+        );
+        // Known subtypes are not counted.
+        observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"system","subtype":"thinking_tokens"}"#,
+        );
+        assert_eq!(
+            ledger
+                .unrecognized_counts()
+                .iter()
+                .map(|(k, v)| (k.as_str(), *v))
+                .collect::<Vec<_>>(),
+            vec![("stream_event", 3), ("system:hook_started", 1)]
+        );
+    }
+
+    /// An errored result whose error code came from the preceding assistant
+    /// frame consumes it; the next turn does not inherit it.
+    #[test]
+    fn pending_error_code_belongs_to_one_turn() {
+        let tracker = SessionStateTracker::new();
+        let mut ledger = FrameLedger::new("dispatcher-test-pending-code");
+        observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"assistant","error":"rate_limit","is_api_error_message":true,"message":{"content":[]}}"#,
+        );
+        let errored = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429}"#,
+        );
+        let f = classify(&errored.failure.unwrap(), profile()).unwrap();
+        assert_eq!(f.kind, FailureKind::RateLimited);
+        let next = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"result","subtype":"error_during_execution","errors":["boom"]}"#,
+        );
+        let FailureSignal::StructuredEvent {
+            error_code,
+            message,
+            ..
+        } = next.failure.unwrap()
+        else {
+            panic!("structured event expected");
+        };
+        assert_eq!(error_code, None);
+        assert_eq!(message.as_deref(), Some("boom"));
+    }
+
+    /// The `result` fallback still ends an interrupted turn; `idle` while the
+    /// session is already Ready transitions nothing.
+    #[test]
+    fn fallback_and_idempotent_turn_end() {
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        tracker.transition(SessionState::Ready).unwrap();
+        tracker.transition(SessionState::Processing).unwrap();
+        tracker.transition(SessionState::Interrupting).unwrap();
+        let mut ledger = FrameLedger::new("dispatcher-test-fallback");
+        let r = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"result","subtype":"success"}"#,
+        );
+        assert_eq!(r.transitioned_to, Some(SessionState::Ready));
+        assert!(r.turn_succeeded);
+        let idle = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+        );
+        assert_eq!(idle.transitioned_to, None);
+        assert!(idle.ready_for_next, "a queued message may still go on idle");
+    }
+
+    /// An interrupted turn and a turn that hit the session's own max-turns
+    /// limit end unsuccessfully but are NOT failures — never recorded (as
+    /// `unknown`), never recovered. A real errored turn still is one.
+    #[test]
+    fn interrupt_and_max_turns_results_are_not_failures() {
+        let mut ledger = FrameLedger::new("dispatcher-test-not-failures");
+        let interrupting = SessionStateTracker::new();
+        interrupting.transition(SessionState::Initializing).unwrap();
+        interrupting.transition(SessionState::Ready).unwrap();
+        interrupting.transition(SessionState::Processing).unwrap();
+        interrupting.transition(SessionState::Interrupting).unwrap();
+        let r = observe_one(
+            &mut ledger,
+            &interrupting,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#,
+        );
+        assert_eq!(r.failure, None, "the runner asked for this turn end");
+        assert!(!r.turn_succeeded);
+        assert!(r.turn_ended);
+
+        let processing = SessionStateTracker::new();
+        processing.transition(SessionState::Initializing).unwrap();
+        processing.transition(SessionState::Ready).unwrap();
+        processing.transition(SessionState::Processing).unwrap();
+        let r = observe_one(
+            &mut ledger,
+            &processing,
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#,
+        );
+        assert_eq!(r.failure, None, "the launch's own turn limit");
+        assert!(!r.turn_succeeded);
+
+        processing.transition(SessionState::Processing).unwrap();
+        let r = observe_one(
+            &mut ledger,
+            &processing,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["boom"]}"#,
+        );
+        assert!(
+            r.failure.is_some(),
+            "a real errored turn is still a failure"
+        );
+    }
+
+    /// M1, from the wire: one turn's `rate_limit_event` reports `rejected`
+    /// (the account's window is spent), then its `result` errors with HTTP
+    /// 429. Both are recorded; the child's exit executes the QUOTA's
+    /// `migrate_account` — not the later-stored rate limit's backoff on the
+    /// dead account.
+    #[test]
+    fn rejected_window_then_429_result_migrates_the_account() {
+        struct Rotations(std::sync::Mutex<Vec<bool>>);
+        impl StructuredRestart for Rotations {
+            fn still_wanted(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn restart(&self, rotate: bool) -> Result<(), String> {
+                self.0.lock().unwrap().push(rotate);
+                Err("not in a test".into())
+            }
+        }
+        let key = "dispatcher-test-rejected-then-429";
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        tracker.transition(SessionState::Ready).unwrap();
+        tracker.transition(SessionState::Processing).unwrap();
+        let mut ledger = FrameLedger::new(key);
+        let provider = qontinui_runner_lib::cli_profile::claude::ID;
+        for line in [
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1790727000,"rateLimitType":"five_hour"}}"#,
+            r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"terminal_reason":"api_error","result":"API Error: 429 rate limited"}"#,
+        ] {
+            let signal = observe_one(&mut ledger, &tracker, line)
+                .failure
+                .expect("each frame states a failure");
+            failure_recovery::record_only(key, Lane::Structured, provider, &signal).unwrap();
+        }
+        let kinds: Vec<_> = failure_recovery::active(key)
+            .iter()
+            .map(|f| f.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![FailureKind::QuotaExhausted, FailureKind::RateLimited]
+        );
+
+        let restart = Arc::new(Rotations(std::sync::Mutex::new(Vec::new())));
+        let decided = failure_recovery::report(
+            RecoveryTarget::Structured {
+                session_id: key.to_string(),
+                restart: restart.clone(),
+            },
+            provider,
+            None,
+            FailureSignal::Exit { code: Some(1) },
+        )
+        .unwrap();
+        assert_eq!(decided.kind, FailureKind::QuotaExhausted);
+        assert_eq!(*restart.0.lock().unwrap(), vec![true], "migrate_account");
+        for f in failure_recovery::active(key) {
+            failure_recovery::dismiss(key, &f.id);
+        }
+    }
+
+    // ── Phase 9: control requests answered by subtype ─────────────────────
+
+    use crate::claude_session::permission::test_support::broker;
+    use crate::claude_session::permission::{
+        ControlHandling, PermissionDecision, PermissionOutcome,
+    };
+    use crate::session::launch_spec::PermissionMode;
+
+    /// What the probe actually sent the CLI, line by line.
+    fn fixture_stdin(stem: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(fixture_dir().join(format!("{stem}.stdin.ndjson")))
+            .unwrap_or_else(|e| panic!("{stem}: {e}"))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Replay `stem` through the frame logic and a broker in `mode`, the way
+    /// `dispatch_line` does, stopping at the first control request. Returns
+    /// the broker's handling, the request id and the CLI's state at that
+    /// moment.
+    fn replay_to_control_request(
+        stem: &str,
+        b: &Arc<crate::claude_session::permission::PermissionBroker>,
+    ) -> (ControlHandling, String, Option<CliSessionState>) {
+        let text = std::fs::read_to_string(fixture_dir().join(format!("{stem}.ndjson"))).unwrap();
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        let mut ledger = FrameLedger::new(format!("dispatcher-test-{stem}"));
+        for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+            let msg = decode_message(line).unwrap();
+            observe_frame(&mut ledger, &msg, line.len(), &tracker);
+            if i == 0 {
+                tracker.transition(SessionState::Processing).unwrap();
+            }
+            if let Some(req) = msg.as_control_request() {
+                let handled = b.handle_control_request(req);
+                return (
+                    handled,
+                    req.request_id.clone().unwrap(),
+                    ledger.cli_state().cloned(),
+                );
+            }
+        }
+        panic!("{stem}: no control request");
+    }
+
+    fn sent(
+        out: &crate::claude_session::permission::test_support::RecordingResponder,
+    ) -> Vec<serde_json::Value> {
+        out.lines()
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// `can_use_tool_sdk_allow_with_session_state_events` in `Prompt` mode: the
+    /// request is parked (the CLI said `requires_action` just before it), and
+    /// the operator's allow is EXACTLY the reply the CLI accepted — same
+    /// request id, `updatedInput` echoing the request's input.
+    #[test]
+    fn fixture_prompt_allow_is_the_reply_the_cli_accepted() {
+        let stem = "can_use_tool_sdk_allow_with_session_state_events";
+        let (b, out, sink) = broker(PermissionMode::Prompt, std::time::Duration::from_secs(60));
+        let (handled, request_id, state) = replay_to_control_request(stem, &b);
+        assert_eq!(handled, ControlHandling::Parked);
+        assert_eq!(state, Some(CliSessionState::RequiresAction));
+        assert!(out.lines().is_empty());
+        assert_eq!(sink.requested.lock().unwrap()[0].tool_name, "Write");
+        b.respond(
+            &request_id,
+            PermissionDecision::Allow {
+                updated_input: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(sent(&out), vec![fixture_stdin(stem)[2].clone()]);
+        assert_eq!(scenario(stem)["write_target_created"], true);
+    }
+
+    /// `can_use_tool_sdk_deny`: the operator's deny is exactly the deny the CLI
+    /// accepted (and turned into an error tool_result, not an errored turn).
+    #[test]
+    fn fixture_prompt_deny_is_the_reply_the_cli_accepted() {
+        let stem = "can_use_tool_sdk_deny";
+        let (b, out, sink) = broker(PermissionMode::Prompt, std::time::Duration::from_secs(60));
+        let (handled, request_id, _) = replay_to_control_request(stem, &b);
+        assert_eq!(handled, ControlHandling::Parked);
+        let resolved = b
+            .respond(
+                &request_id,
+                PermissionDecision::Deny {
+                    message: Some("denied by cli probe".to_string()),
+                    interrupt: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(resolved.outcome, PermissionOutcome::Denied);
+        assert_eq!(sent(&out), vec![fixture_stdin(stem)[2].clone()]);
+        assert_eq!(sink.resolved.lock().unwrap().len(), 1);
+    }
+
+    /// `can_use_tool_runner_shape_ignored`: the request that hung the CLI under
+    /// the old `{"allowed": true}` is answered, in a bypass mode, with the SDK
+    /// allow — never the ignored shape again.
+    #[test]
+    fn fixture_bypass_answers_the_request_that_used_to_hang() {
+        let stem = "can_use_tool_runner_shape_ignored";
+        let (b, out, _) = broker(
+            PermissionMode::BypassPermissions,
+            std::time::Duration::from_secs(60),
+        );
+        let (handled, request_id, _) = replay_to_control_request(stem, &b);
+        assert_eq!(handled, ControlHandling::Allowed);
+        let replies = sent(&out);
+        assert_eq!(replies.len(), 1);
+        let ignored = &fixture_stdin(stem)[2];
+        assert_eq!(ignored["response"], serde_json::json!({"allowed": true}));
+        assert_ne!(&replies[0], ignored);
+        assert_eq!(replies[0]["type"], "control_response");
+        assert_eq!(replies[0]["response"]["subtype"], "success");
+        assert_eq!(replies[0]["response"]["request_id"], request_id.as_str());
+        assert_eq!(replies[0]["response"]["response"]["behavior"], "allow");
+        assert!(
+            replies[0].get("request_id").is_none(),
+            "request_id rides inside response"
+        );
+        // The echoed input is the request's own.
+        let accepted = &fixture_stdin("can_use_tool_sdk_allow_with_session_state_events")[2];
+        assert_eq!(
+            replies[0]["response"]["response"]["updatedInput"],
+            accepted["response"]["response"]["updatedInput"]
+        );
+    }
+
+    /// An unanswered fixture request is denied at the bound (fail closed).
+    #[test]
+    fn fixture_prompt_request_times_out_to_a_deny() {
+        let stem = "can_use_tool_sdk_deny";
+        let (b, out, sink) = broker(PermissionMode::Prompt, std::time::Duration::from_millis(50));
+        let (_, request_id, _) = replay_to_control_request(stem, &b);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while out.lines().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let replies = sent(&out);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["response"]["request_id"], request_id.as_str());
+        assert_eq!(replies[0]["response"]["response"]["behavior"], "deny");
+        assert_eq!(
+            sink.resolved.lock().unwrap()[0].outcome,
+            PermissionOutcome::TimedOut
+        );
+    }
+
+    /// Any other subtype is refused with an `error`, in either posture.
+    #[test]
+    fn unknown_control_subtype_is_an_error_response() {
+        for mode in [PermissionMode::BypassPermissions, PermissionMode::Prompt] {
+            let (b, out, _) = broker(mode, std::time::Duration::from_secs(60));
+            let msg = decode_message(
+                r#"{"type":"control_request","request_id":"q1","request":{"subtype":"mcp_message","server_name":"x","message":{}}}"#,
+            )
+            .unwrap();
+            b.handle_control_request(msg.as_control_request().unwrap());
+            assert_eq!(
+                sent(&out),
+                vec![serde_json::json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "error",
+                        "request_id": "q1",
+                        "error": "unsupported control request subtype: mcp_message",
+                    }
+                })]
+            );
+        }
+    }
+
+    /// The stdout reader never logs a control or system frame's body: the
+    /// `initialize` response carries the account's email and organisation.
+    #[test]
+    fn stdout_log_preview_holds_back_control_and_system_frames() {
+        let init = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{"account":{"email":"someone@example.com","organization":"Org"}}}}"#;
+        let p = stdout_log_preview(init);
+        assert!(!p.contains("example.com") && !p.contains("Org"), "{p}");
+        assert_eq!(p, format!("<control_response frame, {} bytes>", init.len()));
+        let req = r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"content":"secret"}}}"#;
+        assert!(!stdout_log_preview(req).contains("secret"));
+        let sys = r#"{"type":"system","subtype":"init","cwd":"/home/x"}"#;
+        assert_eq!(
+            stdout_log_preview(sys),
+            format!("<system:init frame, {} bytes>", sys.len())
+        );
+        let broken = r#"{"type":"control_response","response":{"account":"#;
+        assert!(stdout_log_preview(broken).starts_with("<unparsed control frame"));
+        // Every other line keeps its short preview.
+        let text =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        assert_eq!(stdout_log_preview(text), text);
+        for line in std::fs::read_to_string(fixture_dir().join("plain_turn.ndjson"))
+            .unwrap()
+            .lines()
+        {
+            if line.starts_with(r#"{"type":"control_"#) || line.starts_with(r#"{"type":"system""#) {
+                assert!(stdout_log_preview(line).starts_with('<'), "{line}");
+            }
         }
     }
 }

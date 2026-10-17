@@ -49,6 +49,30 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Replace the session registered under `task_run_id` with `session`,
+    /// atomically, only when `expected` approves the one registered now.
+    /// `Err` (nothing changed) when no session is registered or `expected`
+    /// refuses it — the caller's view of what it is replacing is stale.
+    pub fn replace_if(
+        &self,
+        task_run_id: &str,
+        session: Arc<ClaudeSession>,
+        expected: impl FnOnce(&ClaudeSession) -> bool,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("SessionManager lock poisoned: {}", e))?;
+        replace_entry_if(
+            &mut guard,
+            task_run_id,
+            session,
+            |cur: &Arc<ClaudeSession>| expected(cur),
+        )?;
+        info!("SessionManager: replaced session for {}", task_run_id);
+        Ok(())
+    }
+
     /// Get a session by task_run_id.
     pub fn get(&self, task_run_id: &str) -> Option<Arc<ClaudeSession>> {
         self.sessions
@@ -365,9 +389,62 @@ impl std::fmt::Debug for SessionManager {
     }
 }
 
+/// The compare-and-swap at the heart of [`SessionManager::replace_if`]:
+/// replace `map[key]` with `value` only when an entry exists and `expected`
+/// approves it. `Err` (map untouched) otherwise.
+fn replace_entry_if<T>(
+    map: &mut HashMap<String, T>,
+    key: &str,
+    value: T,
+    expected: impl FnOnce(&T) -> bool,
+) -> Result<(), String> {
+    match map.get(key) {
+        None => Err(format!("no session registered for {key} — it was closed")),
+        Some(current) if !expected(current) => Err(format!(
+            "the session registered for {key} is no longer the one being replaced"
+        )),
+        Some(_) => {
+            map.insert(key.to_string(), value);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `replace_if` refuses when the registered instance is no longer the one
+    /// the restart set out to replace (the operator closed it and something
+    /// re-registered, or a peer restart won), and leaves the map untouched.
+    #[test]
+    fn replace_entry_if_refuses_when_the_registered_instance_changed() {
+        use super::super::state::SessionStateTracker;
+        let dead = SessionStateTracker::new();
+        let other = SessionStateTracker::new();
+        let fresh = SessionStateTracker::new();
+        let mut map = HashMap::new();
+        map.insert("s".to_string(), other.clone());
+        let r = replace_entry_if(&mut map, "s", fresh.clone(), |cur| cur.same_instance(&dead));
+        assert!(r.is_err());
+        assert!(
+            map["s"].same_instance(&other),
+            "a refused CAS must not swap"
+        );
+
+        // Closed: nothing registered.
+        let mut empty: HashMap<String, SessionStateTracker> = HashMap::new();
+        assert!(replace_entry_if(&mut empty, "s", fresh.clone(), |_| true).is_err());
+        assert!(
+            empty.is_empty(),
+            "a refused CAS must not resurrect a closed session"
+        );
+
+        // Still the dead instance: swapped.
+        map.insert("s".to_string(), dead.clone());
+        replace_entry_if(&mut map, "s", fresh.clone(), |cur| cur.same_instance(&dead)).unwrap();
+        assert!(map["s"].same_instance(&fresh));
+    }
 
     #[test]
     fn worktree_path_matches_on_exact_string_without_touching_fs() {

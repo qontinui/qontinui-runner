@@ -1,0 +1,8 @@
+╭───────────────────────────────────────────────────╮
+│ Select a session to resume                        │
+│                                                   │
+│ ❯ 1. fix the flaky zone-grid tests      (2h ago)  │
+│   2. refactor the restore drain         (1d ago)  │
+│   3. plan the CLI profile manifest      (3d ago)  │
+╰───────────────────────────────────────────────────╯
+  ↑/↓ to select · Enter to resume · Esc to exit

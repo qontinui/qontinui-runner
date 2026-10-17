@@ -388,6 +388,15 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/cli_profile/mod.rs",
+      "symbol": "program_stem",
+      "excerpt": "for suffix in [\".exe\", \".cmd\", \".bat\", \".ps1\"] {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Strips a Windows launcher suffix (.exe/.cmd/.bat/.ps1) off a program name so `claude.cmd` and `claude` match the same CLI profile. On every other OS the names carry no suffix, the loop matches nothing and the bare basename is returned; no Windows tool is invoked."
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/commands/saved_projects.rs",
       "symbol": "is_drive_rooted",
       "excerpt": "cfg(windows)-only fn `is_drive_rooted` has no cfg(not(windows)) sibling in this file",
@@ -649,6 +658,15 @@
       "excerpt": "cfg(windows)-only fn `exe_shadow_needed` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/install_effects_producer/intercept/shim_materializer.rs",
+      "symbol": "identity_cmd_template",
+      "excerpt": "cfg(windows)-only fn `identity_cmd_template` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows `.cmd` flavour of the identity shim, called only from the cfg(windows) block of write_identity_shims_for. Every OS gets the extensionless bash shim from identity_bash_template, so a non-Windows sibling would have nothing to render."
     },
     {
       "class": "os_bound_tooling",
@@ -927,14 +945,6 @@
       "file": "src/step_executor/legacy_steps.rs",
       "symbol": "StepExecutor::execute_shell_command_step",
       "excerpt": "let mut c = crate::process_helpers::tokio_no_window(\"powershell\");",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "os_bound_tooling",
-      "file": "src/terminal/claude_resume_sniff.rs",
-      "symbol": "is_claude_program",
-      "excerpt": "matches!(base, \"claude\" | \"claude.exe\" | \"claude.cmd\" | \"claude.ps1\")",
       "count": 1,
       "disposition": "unreviewed"
     },
