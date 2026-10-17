@@ -699,11 +699,14 @@ impl Selftest<'_> {
         // failed a correct probe by chance: windows-latest measured medians of
         // D + 11.5, 13.5 and 12.6 ms in one run and D + 16.3 ms (0.66 ms over
         // 15.62) in the next (runs 38974786541, 38979153092), with single
-        // markers up to D + 25.7 ms. A probe that mis-times by more than that
-        // still fails (the fake's 40 ms lag), and the clock and WGC/DDA gates
-        // catch smaller offsets. When the display reports no rate it is the
-        // assumed 60 Hz interval, and the check says so: a selftest
-        // tolerance, not a KPI. WGC's absolute check is reported but
+        // markers up to D + 25.7 ms. A probe that mis-times by more than two
+        // intervals still fails (the fake's 40 ms lag). The cost, stated: a
+        // lag SHARED by every capture source and smaller than about one
+        // interval above the pipeline's own is no longer caught by any gate
+        // (the WGC/DDA gates are relative, so a shared lag cancels, and
+        // clock_aligned measures the clock, not the capture path). When the
+        // display reports no rate it is the assumed 60 Hz interval, and the
+        // check says so: a selftest tolerance, not a KPI. WGC's absolute check is reported but
         // not gated (see WGC_RENDER_OFFSET_MS); `wgc_relative_checks` gates
         // WGC against DDA or across delays instead.
         let refresh_ms = refresh.ns as f64 / 1e6;
@@ -786,6 +789,7 @@ impl Selftest<'_> {
                     "min_ms": (observed > 0).then_some(min),
                     "max_ms": (observed > 0).then_some(max),
                     "refresh_ms": refresh_ms,
+                    "bound_ms": bound_ms,
                     "refresh_assumed": refresh.assumed,
                     "painter_late_max_ms": lateness.iter().copied().fold(0.0, f64::max),
                     "paint_errors": paint_errors,
