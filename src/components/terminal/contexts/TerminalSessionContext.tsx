@@ -81,6 +81,7 @@ import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
+import { buildProfileResumeCmd, fetchRecordsByClaudeSessionId } from "../resumeRecordLookup";
 import {
   buildSessionOpenArgs,
   describeRecordOpenOutcome,
@@ -341,17 +342,6 @@ const PageSessionScope = memo(function PageSessionScope({
     const sessions = pendingProfileSessionsRef.current;
     if (!sessions || sessions.length === 0) return;
 
-    const isWindows = navigator.platform.startsWith("Win");
-    const buildResumeCmd = (sessionId: string, configDir: string | undefined) => {
-      // Autonomous resume (matches clg/clh/clp) so a re-attached session
-      // doesn't stall on a permission prompt.
-      const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
-      if (!configDir) return `${base}\r`;
-      return isWindows
-        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
-        : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
-    };
-
     // Process only sessions whose zone now has an assignment; leave the
     // rest in the ref for the next assignments tick. The partition (and the
     // ref update) stays SYNCHRONOUS so a re-fire of this effect while the
@@ -383,7 +373,14 @@ const PageSessionScope = memo(function PageSessionScope({
       // layout/tabs are untouched, and the operator can still resume any of
       // them by hand (single-id operator-clicked resume paths stay ungated
       // by design: the click is the intent).
-      const liveIds = await fetchLiveClaudeSessionIds();
+      //
+      // The same batch reads the durable records once (plan 2026-10-07 D2):
+      // `ZoneSessionInfo` carries no gate identity, so a gate continuation's
+      // `QONTINUI_GATE_*` env comes from its record, as the drain's does.
+      const [liveIds, records] = await Promise.all([
+        fetchLiveClaudeSessionIds(),
+        fetchRecordsByClaudeSessionId(),
+      ]);
       for (const { s, tabId } of toResume) {
         const decision = decideColdResume(liveIds, s.claudeSessionId);
         if (decision !== "respawn") {
@@ -453,7 +450,11 @@ const PageSessionScope = memo(function PageSessionScope({
         writeWhenReady(
           terminalRefs.current,
           tabId,
-          buildResumeCmd(s.claudeSessionId, s.claudeConfigDir),
+          buildProfileResumeCmd(
+            s.claudeSessionId,
+            s.claudeConfigDir,
+            records.get(s.claudeSessionId),
+          ),
           {
             onTimeout: (id) =>
               console.warn(
