@@ -120,6 +120,8 @@ const CODE_FORBIDDEN: &str = "FORBIDDEN";
 const CODE_CONFLICT: &str = "CONFLICT";
 const CODE_REQUEST_TIMEOUT: &str = "REQUEST_TIMEOUT";
 const CODE_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
+// A removed route that stays mounted only to say so (`gui_config.rs`).
+const CODE_GONE: &str = "GONE";
 
 // ─── Envelope helpers ─────────────────────────────────────────────────────────
 
@@ -527,6 +529,7 @@ pub(crate) fn code_for_status(status: StatusCode) -> &'static str {
         StatusCode::CONFLICT => CODE_CONFLICT,
         StatusCode::REQUEST_TIMEOUT => CODE_REQUEST_TIMEOUT,
         StatusCode::TOO_MANY_REQUESTS => CODE_TOO_MANY_REQUESTS,
+        StatusCode::GONE => CODE_GONE,
         StatusCode::INTERNAL_SERVER_ERROR => CODE_INTERNAL_ERROR,
         StatusCode::NOT_IMPLEMENTED => CODE_NOT_IMPLEMENTED,
         StatusCode::BAD_GATEWAY => CODE_BAD_GATEWAY,
@@ -2046,9 +2049,8 @@ mod json_error_code_reconciliation_tests {
             code_for_status(StatusCode::INSUFFICIENT_STORAGE),
             "INTERNAL_ERROR"
         );
-        // Still the catch-all for a 4xx nothing names. GONE has no site in
-        // `mcp/` and no reason to be classified.
-        assert_eq!(code_for_status(StatusCode::GONE), "BAD_REQUEST");
+        // Still the catch-all for a 4xx nothing names.
+        assert_eq!(code_for_status(StatusCode::IM_A_TEAPOT), "BAD_REQUEST");
     }
 
     /// The 4xx statuses the JSON pass newly reaches must name themselves rather
@@ -2073,6 +2075,9 @@ mod json_error_code_reconciliation_tests {
             code_for_status(StatusCode::TOO_MANY_REQUESTS),
             "TOO_MANY_REQUESTS"
         );
+        // The removed `/gui-config/capture-*` routes answer 410; a caller must
+        // read "gone", not "fix your request".
+        assert_eq!(code_for_status(StatusCode::GONE), "GONE");
     }
 
     /// The 404 code is derived in ONE place, and this asserts the value that
