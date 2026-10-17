@@ -307,6 +307,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /bridges/{id}/workflow",
     "POST /vcs/pull-requests",
     "POST /agent-worktrees/reclaim",
+    // Rewrites `<agent_root>/.cargo/config.toml` and writes the edit-siblings
+    // marker under a CALLER-NAMED path (plan
+    // 2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits,
+    // vet V4).
+    "POST /agent-worktrees/edit-sibling",
     "POST /ui/recover",
     "DELETE /security/audit/cleanup",
     "POST /ui-bridge/relay/dispatch",
