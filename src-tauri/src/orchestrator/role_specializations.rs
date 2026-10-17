@@ -185,7 +185,7 @@ pub fn executor_role() -> AgentRole {
             // AWAS automation
             "awas_discover".to_string(),
             "awas_execute".to_string(),
-            // GUI config build (the capture tools answer 410 since #2242)
+            // GUI config build (the capture tools were deleted: #2242, qontinui-mcp#10)
             "build_gui_config".to_string(),
             // Sub-agent orchestration
             "spawn_sub_agent".to_string(),

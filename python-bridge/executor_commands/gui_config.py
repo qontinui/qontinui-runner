@@ -9,9 +9,9 @@ name to its handler method.
 The element-capture commands (``gui_config_capture_elements``,
 ``gui_config_capture_multi_state``) and their UI Bridge HTTP helpers were
 deleted: they POSTed ``/ui-bridge/control/capture-element-images``, whose
-html2canvas frontend handler qontinui-runner#2242 removed. The runner now
-answers ``/gui-config/capture-elements`` and ``/gui-config/capture-multi-state``
-with 410 Gone itself and never dispatches them here.
+html2canvas frontend handler qontinui-runner#2242 removed. The runner routes
+``/gui-config/capture-elements`` and ``/gui-config/capture-multi-state`` that
+dispatched them were deleted too, once qontinui-mcp#10 removed their only caller.
 """
 
 from typing import Any, ClassVar
