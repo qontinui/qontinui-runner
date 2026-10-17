@@ -221,7 +221,10 @@ impl Pane {
             }
         };
         let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE_FRAMES);
-        // Before the waiter thread exists: the child cannot have been reaped.
+        // Before the waiter thread exists: on Linux the child cannot have been
+        // reaped yet. On Windows the question is whether it has EXITED: a child
+        // that died within microseconds of spawn records no token, so its
+        // descendants are left alone by a later reap rather than signalled.
         let child_start = crate::proc_identity::start_token(child_pid);
 
         let pane = Arc::new(Pane {

@@ -161,8 +161,12 @@ pub use imp::{list_pids, stat};
 mod imp {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+
+    /// `GetExitCodeProcess`'s answer for a process that has not exited
+    /// (`STILL_ACTIVE`, 259).
+    const STILL_ACTIVE: u32 = 259;
 
     /// The creation time of the process behind `handle`, as one 64-bit
     /// FILETIME value.
@@ -193,8 +197,23 @@ mod imp {
         }
         // SAFETY: `h` was just opened with PROCESS_QUERY_LIMITED_INFORMATION.
         let created = unsafe { creation_time(h) };
+        // A Windows process object outlives the process while ANY handle to it
+        // is open, anywhere (our own `Child`, conhost, a scanner), and stays
+        // readable. Without this check an exited process kept its token, so
+        // `is_same_process` called it alive. A process that genuinely exits
+        // with code 259 is indistinguishable and reads as alive. That is safe
+        // for every caller: liveness waits stay bounded, and `verify_holder`'s
+        // terminate still needs the same creation time, so it can only reach
+        // the same (already-exited) process object, where it is a no-op.
+        let mut code: u32 = 0;
+        // SAFETY: `h` carries PROCESS_QUERY_LIMITED_INFORMATION, which
+        // GetExitCodeProcess requires; `code` is a valid local.
+        let running = unsafe { GetExitCodeProcess(h, &mut code) } != 0 && code == STILL_ACTIVE;
         // SAFETY: closing the handle OpenProcess returned, exactly once.
         unsafe { CloseHandle(h) };
+        if !running {
+            return None;
+        }
         created.map(|c| format!("windows:{c}"))
     }
 }
