@@ -23,6 +23,9 @@ import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
 import { DURABLE_TOOLTIP } from "./sessionDurability";
 import { describeThrown } from "@/lib/utils";
+import { isNeedsInputState } from "./agentTruth";
+import { useAgentMetrics } from "./agentMetrics";
+import { AgentMetricsStrip } from "./AgentMetricsStrip";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -84,6 +87,7 @@ const STATUS_DOT: Record<SessionLiveStatus, { color: string; pulse: boolean; lab
   completed: { color: "#565f89", pulse: false, label: "Completed" },
   error: { color: "#f7768e", pulse: false, label: "Error" },
   dormant: { color: "#414868", pulse: false, label: "Dormant" },
+  unknown: { color: "#414868", pulse: false, label: "State unknown" },
 };
 
 const ACCOUNT_BADGE_COLORS: Record<string, { bg: string; text: string }> = {
@@ -243,6 +247,9 @@ function SessionCardInner({
       : baseStatusInfo;
   const accountBadge = ACCOUNT_BADGE_COLORS[session.accountLabel];
   const durationLabel = formatDuration(session.durationMs);
+  // Context / cost / 5h headroom are per runner TERMINAL, so only a session
+  // open in a tab here can have them; the strip renders only for those.
+  const agentMetrics = useAgentMetrics(session.zoneTabId);
 
   // Context menu
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -268,7 +275,7 @@ function SessionCardInner({
   // be promoted from this UI (the backend would just 404).
   const canPromote =
     session.liveStatus === "active-in-zone" ||
-    session.liveStatus === "needs-input" ||
+    isNeedsInputState(session.liveStatus) ||
     session.liveStatus === "frozen";
 
   // Hide the button entirely once the promotion has succeeded — the parent
@@ -351,7 +358,7 @@ function SessionCardInner({
   // the explicit, correct behavior.
   const canCommit =
     session.liveStatus === "active-in-zone" ||
-    session.liveStatus === "needs-input" ||
+    isNeedsInputState(session.liveStatus) ||
     session.liveStatus === "frozen";
 
   const handleCommit = useCallback(
@@ -450,7 +457,7 @@ function SessionCardInner({
             ? "border-l-[#7aa2f7] bg-[#7aa2f7]/5"
             : session.liveStatus === "frozen"
               ? "border-l-[#f7768e]/50 hover:bg-[#1a1b26]"
-              : session.liveStatus === "needs-input"
+              : isNeedsInputState(session.liveStatus)
                 ? "border-l-[#e0af68]/50 hover:bg-[#1a1b26]"
                 : session.liveStatus === "active-in-zone"
                   ? "border-l-[#9ece6a]/50 hover:bg-[#1a1b26]"
@@ -558,6 +565,9 @@ function SessionCardInner({
           <span>&middot;</span>
           <span className="truncate">{session.projectLabel}</span>
         </div>
+
+        {/* Row 2b: context / cost / 5h headroom, with source + age (Phase 7) */}
+        {session.zoneTabId && <AgentMetricsStrip metrics={agentMetrics} className="mt-0.5 ml-3.5" />}
 
         {/* Row 3: Work summary hint (only for frozen/needs-input/active) */}
         {session.workSummaryHint &&

@@ -1,0 +1,71 @@
+{
+  "channel": "hook",
+  "cli_version": "2.1.285",
+  "event": "PermissionRequest",
+  "variants": [
+    {
+      "cwd": "string",
+      "hook_event_name": "string",
+      "permission_mode": "string",
+      "prompt_id": "string",
+      "scratchpad_dir": "string",
+      "session_id": "string",
+      "tool_input": {},
+      "tool_name": "string",
+      "transcript_path": "string"
+    },
+    {
+      "cwd": "string",
+      "hook_event_name": "string",
+      "permission_mode": "string",
+      "prompt_id": "string",
+      "scratchpad_dir": "string",
+      "session_id": "string",
+      "tool_input": {
+        "questions": [
+          {
+            "header": "string",
+            "multiSelect": "boolean",
+            "options": [
+              {
+                "description": "string",
+                "label": "string"
+              }
+            ],
+            "question": "string"
+          }
+        ]
+      },
+      "tool_name": "string",
+      "transcript_path": "string"
+    },
+    {
+      "cwd": "string",
+      "hook_event_name": "string",
+      "permission_mode": "string",
+      "permission_suggestions": [
+        {
+          "destination": "string",
+          "directories": [
+            "string"
+          ],
+          "type": "string"
+        },
+        {
+          "destination": "string",
+          "mode": "string",
+          "type": "string"
+        }
+      ],
+      "prompt_id": "string",
+      "scratchpad_dir": "string",
+      "session_id": "string",
+      "tool_input": {
+        "command": "string",
+        "description": "string"
+      },
+      "tool_name": "string",
+      "transcript_path": "string"
+    }
+  ]
+}

@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 
 import { sessionInfoElementId } from "./useSessionInfo";
+import { stateSourceText, type Verdict } from "./agentTruth";
 
 const SOURCE = readFileSync(
   fileURLToPath(new URL("./SessionInfoDropdown.tsx", import.meta.url)),
@@ -110,5 +111,51 @@ describe("SessionInfoDropdown addressability", () => {
   it("keeps the `data-no-register` opt-out wired in App.tsx", () => {
     // The opt-out above is inert unless the provider still excludes it.
     expect(APP_SOURCE).toContain('excludeSelectors={["[data-no-register]"]}');
+  });
+});
+
+/**
+ * Phase 4 of plan `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`:
+ * the panel says how the tab's state chip is KNOWN — "hooks", or "inferred
+ * from screen (hooks not firing: <reason>)" from the runner's hook-delivery
+ * verdict — and renders it independently of the session-info read.
+ */
+describe("SessionInfoDropdown state source (Phase 4)", () => {
+  const base: Verdict = {
+    state: { name: "working" },
+    source: "hook",
+    sinceMs: 0,
+    confidence: "authoritative",
+    disagreement: null,
+  };
+
+  it("reads 'hooks' for an event-reported state", () => {
+    expect(stateSourceText({ verdict: base, hookDelivery: { status: "installed" } })).toBe("hooks");
+  });
+
+  it("reads 'inferred from screen (hooks not firing: <reason>)' otherwise", () => {
+    const text = stateSourceText({
+      verdict: { ...base, source: "regex", confidence: "inferred" },
+      hookDelivery: { status: "absent", detail: "observed_silent" },
+    });
+    expect(text).toBe("inferred from screen (hooks not firing: hooks absent: observed_silent)");
+    expect(
+      stateSourceText({
+        verdict: { ...base, source: "regex", confidence: "inferred" },
+        hookDelivery: { status: "version_mismatch", detail: "2.1.290" },
+      }),
+    ).toBe("inferred from screen (hooks not firing: CLI version not probed: 2.1.290)");
+  });
+
+  it("is unknown — not a guess — when the runner reported nothing", () => {
+    expect(stateSourceText(undefined)).toBeNull();
+  });
+
+  it("renders the row, addressable, before (and independent of) the session-info body", () => {
+    expect(SOURCE).toContain("<StateSourceRow agentTruth={agentTruth} zoneIndex={zoneIndex} />");
+    expect(SOURCE).toContain('data-session-info-field="state-source"');
+    expect(SOURCE).toContain('data-testid={sessionInfoElementId("state-source", zoneIndex)}');
+    expect(SOURCE.indexOf("<StateSourceRow")).toBeLessThan(SOURCE.indexOf("<SessionInfoPanelBody"));
+    expect(sessionInfoElementId("state-source", 2)).toBe("terminal-session-info-state-source-2");
   });
 });

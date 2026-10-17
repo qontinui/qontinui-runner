@@ -1,6 +1,7 @@
 import type { SessionState } from "../useZoneLayout";
 
 export const STATE_BORDER_COLORS: Record<SessionState, string> = {
+  unknown: "#2a2d3d",
   idle: "#2a2d3d",
   working: "#7aa2f7",
   "needs-input": "#e0af68",
@@ -9,6 +10,7 @@ export const STATE_BORDER_COLORS: Record<SessionState, string> = {
 };
 
 export const STATE_COLORS: Record<SessionState, string> = {
+  unknown: "#414868",
   idle: "#565f89",
   working: "#7aa2f7",
   "needs-input": "#e0af68",
@@ -17,6 +19,7 @@ export const STATE_COLORS: Record<SessionState, string> = {
 };
 
 export const STATE_GLOW: Record<SessionState, string> = {
+  unknown: "none",
   idle: "none",
   working: "0 0 4px rgba(122, 162, 247, 0.3)",
   "needs-input": "0 0 8px rgba(224, 175, 104, 0.4)",
@@ -25,6 +28,7 @@ export const STATE_GLOW: Record<SessionState, string> = {
 };
 
 export const STATE_LABELS: Record<SessionState, string> = {
+  unknown: "Unknown",
   idle: "Idle",
   working: "Working",
   "needs-input": "Needs Input",
@@ -33,6 +37,7 @@ export const STATE_LABELS: Record<SessionState, string> = {
 };
 
 export const STATE_BG_COLORS: Record<SessionState, string> = {
+  unknown: "bg-[#414868]/10",
   idle: "bg-[#565f89]/10",
   working: "bg-[#7aa2f7]/10",
   "needs-input": "bg-[#e0af68]/15",

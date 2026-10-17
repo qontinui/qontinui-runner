@@ -22,7 +22,11 @@ import { useCallback, useMemo, useState } from "react";
 import { CheckCheck, X, Send, MousePointerClick, HelpCircle } from "lucide-react";
 
 import { deliverApprovals } from "./approveAll";
-import type { SessionState } from "./useZoneLayout";
+import {
+  isAuthoritativePermissionAsk,
+  isNeedsInputState,
+  partitionPermissionAsks,
+} from "./agentTruth";
 import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 
 /** Above this many waiting sessions, Approve-all requires a confirm click. */
@@ -46,6 +50,11 @@ function summarize(verb: string, delivered: number, targeted: number): string {
   return verb ? `${verb} ${body}` : body;
 }
 
+/** The skip suffix every batch writer appends: inferred panes are never typed into. */
+function skippedSuffix(skipped: number): string {
+  return skipped > 0 ? `, skipped ${skipped} inferred` : "";
+}
+
 function expandTemplate(
   template: string,
   vars: { zone: number; n: number; title: string; tag: string },
@@ -59,7 +68,7 @@ function expandTemplate(
 
 export function BatchActions() {
   const session = useTerminalSession();
-  const { tabs, zoneLayout, terminalRefs, sessionStates } = session;
+  const { tabs, zoneLayout, terminalRefs, sessionStates, agentVerdicts } = session;
   const assignments = zoneLayout.assignments;
   const { labelsAndTags, incrementMetric, addHistoryEvent } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
@@ -82,12 +91,22 @@ export function BatchActions() {
     return tabs;
   }, [tabs, hasSelection, selectedZones, assignments]);
 
-  const needsInputTabs = targetTabs.filter((t) => sessionStates[t.id] === "needs-input");
+  // What the strip SHOWS as waiting (any needs-input chip, inferred or not)…
+  const needsInputTabs = targetTabs.filter((t) => isNeedsInputState(sessionStates[t.id]));
+  // …versus what the batch writers may TYPE into: only panes a hook reports as
+  // asking for permission (`isAuthoritativePermissionAsk`). Inferred panes are
+  // skipped and counted in every result line.
+  const { actionable: actionableTabs, skippedInferred } = partitionPermissionAsks(
+    targetTabs,
+    sessionStates,
+    agentVerdicts,
+  );
+  const skipped = skippedInferred.length;
 
   // Total waiting regardless of selection — decides whether the per-zone
   // Select affordance is worth showing (pointless with a single waiter).
   const totalWaiting = useMemo(
-    () => tabs.filter((t) => sessionStates[t.id] === "needs-input").length,
+    () => tabs.filter((t) => isNeedsInputState(sessionStates[t.id])).length,
     [tabs, sessionStates],
   );
 
@@ -143,7 +162,7 @@ export function BatchActions() {
   const onSelectAllWaiting = useCallback(() => {
     const waiting = new Set<number>();
     for (const [zoneStr, tabId] of Object.entries(assignments)) {
-      if ((sessionStates[tabId] as SessionState) === "needs-input") {
+      if (isNeedsInputState(sessionStates[tabId])) {
         waiting.add(Number(zoneStr));
       }
     }
@@ -154,33 +173,33 @@ export function BatchActions() {
 
   const runApprove = useCallback(async () => {
     let count = 0;
-    for (const tab of needsInputTabs) {
+    for (const tab of actionableTabs) {
       count += await deliver(tab.id, "y\r");
     }
-    onMetrics("approve", count, needsInputTabs.length);
-    flashAction(summarize("Approved", count, needsInputTabs.length));
-  }, [needsInputTabs, deliver, onMetrics, flashAction]);
+    onMetrics("approve", count, actionableTabs.length);
+    flashAction(summarize("Approved", count, actionableTabs.length) + skippedSuffix(skipped));
+  }, [actionableTabs, skipped, deliver, onMetrics, flashAction]);
 
   const handleApproveAll = useCallback(() => {
     // Large batch → arm a one-shot confirm instead of firing blind.
-    if (needsInputTabs.length >= APPROVE_CONFIRM_THRESHOLD && !confirmApprove) {
+    if (actionableTabs.length >= APPROVE_CONFIRM_THRESHOLD && !confirmApprove) {
       setConfirmApprove(true);
       setTimeout(() => setConfirmApprove(false), CONFIRM_TIMEOUT_MS);
       return;
     }
     setConfirmApprove(false);
     void runApprove();
-  }, [needsInputTabs.length, confirmApprove, runApprove]);
+  }, [actionableTabs.length, confirmApprove, runApprove]);
 
   const handleRejectAll = useCallback(async () => {
     setConfirmApprove(false);
     let count = 0;
-    for (const tab of needsInputTabs) {
+    for (const tab of actionableTabs) {
       count += await deliver(tab.id, "n\r");
     }
-    onMetrics("reject", count, needsInputTabs.length);
-    flashAction(summarize("Rejected", count, needsInputTabs.length));
-  }, [needsInputTabs, deliver, onMetrics, flashAction]);
+    onMetrics("reject", count, actionableTabs.length);
+    flashAction(summarize("Rejected", count, actionableTabs.length) + skippedSuffix(skipped));
+  }, [actionableTabs, skipped, deliver, onMetrics, flashAction]);
 
   const hasTemplateVars = /\{(zone|n|title|tag)\}/.test(broadcastInput);
 
@@ -188,14 +207,17 @@ export function BatchActions() {
     if (!broadcastInput.trim()) return;
     let count = 0;
     let targeted = 0;
+    let skippedHere = 0;
 
     if (assignments && hasTemplateVars) {
       // Template mode: expand per-zone with contextual variables.
       let n = 0;
       for (const [zoneStr, tabId] of Object.entries(assignments)) {
-        const state = sessionStates[tabId] ?? "idle";
-        if (state !== "needs-input") continue;
         if (hasSelection && selectedZones && !selectedZones.has(Number(zoneStr))) continue;
+        if (!isAuthoritativePermissionAsk(agentVerdicts[tabId]?.verdict)) {
+          if (isNeedsInputState(sessionStates[tabId])) skippedHere++;
+          continue;
+        }
         n++;
         targeted++;
         const zoneIdx = Number(zoneStr);
@@ -217,19 +239,22 @@ export function BatchActions() {
       }
     } else {
       // Plain text mode: send identical text to all targets.
-      targeted = needsInputTabs.length;
-      for (const tab of needsInputTabs) {
+      targeted = actionableTabs.length;
+      skippedHere = skipped;
+      for (const tab of actionableTabs) {
         count += await deliver(tab.id, broadcastInput + "\r");
       }
     }
 
     onMetrics("broadcast", count, targeted);
-    flashAction(summarize("Sent to", count, targeted));
+    flashAction(summarize("Sent to", count, targeted) + skippedSuffix(skippedHere));
     setBroadcastInput("");
     setShowBroadcast(false);
   }, [
     broadcastInput,
-    needsInputTabs,
+    actionableTabs,
+    skipped,
+    agentVerdicts,
     deliver,
     onMetrics,
     flashAction,
@@ -276,11 +301,11 @@ export function BatchActions() {
             title={
               hasSelection
                 ? "Approve the selected zones (sends y)"
-                : "Approve every waiting session (sends y) — Ctrl+Shift+Enter"
+                : "Approve every session a hook reports as asking for permission (sends y); screen-inferred panes are skipped — Ctrl+Shift+Enter"
             }
           >
             <CheckCheck className="w-2.5 h-2.5" />
-            {confirmApprove ? `Approve ${needsInputTabs.length}?` : "Approve all"}
+            {confirmApprove ? `Approve ${actionableTabs.length}?` : "Approve all"}
           </button>
 
           <button
@@ -342,9 +367,9 @@ export function BatchActions() {
               if (e.key === "Escape") setShowBroadcast(false);
               e.stopPropagation();
             }}
-            placeholder={`Send to ${needsInputTabs.length} waiting session${
-              needsInputTabs.length !== 1 ? "s" : ""
-            }…`}
+            placeholder={`Send to ${actionableTabs.length} waiting session${
+              actionableTabs.length !== 1 ? "s" : ""
+            }${skipped > 0 ? ` (${skipped} inferred skipped)` : ""}…`}
             className="bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1 text-xs text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] w-64"
           />
           <button

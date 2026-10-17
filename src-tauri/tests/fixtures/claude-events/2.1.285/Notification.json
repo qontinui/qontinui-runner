@@ -1,0 +1,17 @@
+{
+  "channel": "hook",
+  "cli_version": "2.1.285",
+  "event": "Notification",
+  "variants": [
+    {
+      "cwd": "string",
+      "hook_event_name": "string",
+      "message": "string",
+      "notification_type": "string",
+      "prompt_id": "string",
+      "scratchpad_dir": "string",
+      "session_id": "string",
+      "transcript_path": "string"
+    }
+  ]
+}

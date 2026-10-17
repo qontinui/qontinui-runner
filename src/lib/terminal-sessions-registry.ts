@@ -20,6 +20,7 @@
 
 /** Mirrors `SessionState` from `./components/terminal/useZoneLayout.ts`. */
 export type TerminalSessionState =
+  | "unknown"
   | "idle"
   | "working"
   | "needs-input"

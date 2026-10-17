@@ -289,7 +289,7 @@ export type SessionInfoField =
  * `"panel"` for the two container elements and `"prs-empty-state"` for the
  * line that says WHY the PR list is empty. Pure — unit-tested. */
 export function sessionInfoElementId(
-  field: SessionInfoField | "trigger" | "panel" | "prs-empty-state",
+  field: SessionInfoField | "trigger" | "panel" | "prs-empty-state" | "state-source",
   zoneIndex: number,
 ): string {
   return `terminal-session-info-${field}-${zoneIndex}`;

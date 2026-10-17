@@ -33,6 +33,8 @@ import { describe, it, expect } from "vitest";
 import { sessionInfoElementId } from "../useSessionInfo";
 
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+/** Whitespace-collapsed, so a mount call prettier wraps across lines still matches. */
+const flat = (src: string) => src.replace(/\s+/g, " ");
 
 const COMPACT = read("./CompactZoneCard.tsx");
 const ZONE_LABEL = read("./ZoneLabel.tsx");
@@ -45,16 +47,21 @@ const MOUNT = "<SessionInfoDropdown claudeSessionId={tab.claudeSessionId}";
 describe("SessionInfoDropdown mount sites", () => {
   it("mounts in the compact zone card", () => {
     expect(COMPACT).toContain('import { SessionInfoDropdown } from "../SessionInfoDropdown";');
-    expect(COMPACT).toContain(`${MOUNT} zoneIndex={zoneIndex} />`);
+    expect(flat(COMPACT)).toContain(`${MOUNT} zoneIndex={zoneIndex} agentTruth={agentTruth} />`);
   });
 
   it("still mounts in the full zone header", () => {
-    expect(ZONE_LABEL).toContain(`${MOUNT} zoneIndex={zoneIndex} />`);
+    expect(flat(ZONE_LABEL)).toContain(`${MOUNT} zoneIndex={zoneIndex} agentTruth={agentTruth} />`);
   });
 
   it("still mounts in the single/maximized header and the solo strip", () => {
-    expect(ZONE_GRID).toContain(`${MOUNT} zoneIndex={singleViewZone} />`);
-    expect(ZONE_GRID).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
+    // Every mount site hands the dropdown the tab's runner verdict, so the
+    // "State source" row (plan 2026-09-20-terminal-session-state-comes-from-
+    // events-not-screen-scraping, Phase 4) renders wherever the trigger does.
+    expect(flat(ZONE_GRID)).toContain(
+      `${MOUNT} zoneIndex={singleViewZone} agentTruth={agentVerdicts[tab.id]} />`,
+    );
+    expect(flat(ZONE_GRID)).toContain(`${MOUNT} zoneIndex={zoneIdx} agentTruth={agentTruth} />`);
   });
 
   it("does NOT mount inside the off-grid hidden parking slot", () => {
