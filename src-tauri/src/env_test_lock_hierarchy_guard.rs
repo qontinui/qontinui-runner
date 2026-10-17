@@ -537,8 +537,9 @@ fn scan_source_in(src: &str, file_in_test: bool) -> syn::Result<Vec<FnFacts>> {
 }
 
 /// Fold `.` / `..` lexically, so `a/../b.rs` and `b.rs` are one key. `None`
-/// when a `..` climbs out of the source root (`#[path = "../build.rs"]` from
-/// a crate root): that file is outside the walk, never a same-named one inside.
+/// when a `..` climbs out of the source root (a path attribute naming
+/// `../build.rs` from a crate root; not written as a literal attribute,
+/// because scripts/check_untimed_subprocess.py would follow it): that file is outside the walk, never a same-named one inside.
 fn normalize(p: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for c in p.components() {
