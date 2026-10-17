@@ -1,6 +1,6 @@
 ---
 name: visual-audit
-description: Run a declarative visual audit on a UI Bridge-connected page. Combines five vision-core analyzers (layout, typography, color, dynamic, elements) with the 12-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag). Returns structured findings + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint.
+description: Run a declarative visual audit on a UI Bridge-connected page. Combines five vision-core analyzers (layout, typography, color, dynamic, elements) with the 12-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag). Returns structured findings + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
 user-invocable: true
 ---
 
@@ -473,6 +473,148 @@ curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
 
 The terminal-tab overlap bug that triggered the whole Phase 6 design
 becomes a one-line `no_overlap` invocation that reports it.
+
+## The image arm — candidate assets operated in situ
+
+Everything above audits the page as it IS. The image arm audits a page as it
+WOULD BE with a candidate image in one of its slots — a generated hero, a
+re-rendered logo — without rebuilding or redeploying anything. It is the arm a
+candidate judge calls (plan `2026-10-13-image-generation-and-visual-judgment`,
+Phase 18; judging itself arrives with that plan's Phase 20). It answers with
+VALUES and frames, never a verdict on the candidate.
+
+**It operates the page; it does not inspect a still.** A UX finding about an
+image is about what a user experiences, so the arm drives the states that
+experience lives in (served policy `ux-priorities`
+`ux-analysis-is-performed-not-inspected` — read it via `/policy`): every
+breakpoint, both colour schemes, hover, a slow network, and the
+loading-to-loaded timeline. Then it **restores the page and proves it did.**
+
+### The instrument: the SDK's media override, through `ui-bridge-inject`
+
+`POST /control/media/override` (SDK action `mediaOverride`) swaps one slot's
+image in place — an `<img>`'s `src`/`srcset`, **every** `<source srcset>` of
+its `<picture>` (or per type with `sources`, the AVIF/WebP-plus-fallback
+shape), or an element's CSS `background-image`. It answers only after the
+browser **decoded** the candidate and `currentSrc` names it; an override it
+cannot confirm is rolled back and fails (`DECODE_FAILED`, `DECODE_TIMEOUT`,
+`CURRENT_SRC_MISMATCH`). `mediaOverrideRestore` puts every attribute back and
+**verifies** it reads back; `mediaOverrideList` returning `active: []` is the
+proof the page ended restored. A TTL (`ttlMs`, default 120 s) restores the page
+by itself if the caller dies.
+
+**Which surfaces serve it — it is a DEV CONTROL:**
+
+| Surface | `mediaOverride` |
+|---|---|
+| `ui-bridge-inject` (the injected runtime, a browser the CLI launched) | **served** — the path this arm uses |
+| an embedded SDK whose app passes `features.devControls` on a dev build | served |
+| any production deployment, a published runner's own webview | `capability_unavailable_in_build` (typed refusal) |
+
+A refusal is UNKNOWN for the candidate, never a pass. Target a slot by
+`slotId` (its `data-ui-bridge-image-slot` value) or by a registered
+`elementId`. A candidate URL must be reachable FROM THE PAGE — serve local
+files over loopback, e.g. `python3 -m http.server 8090 --bind 127.0.0.1`.
+
+Resolve the CLI the way `/verify-web` does (`scripts/verify-page-verdict.sh`,
+`resolve_inject_cli`): the monorepo build
+`$ROOT/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs`, else
+`node_modules/@qontinui/ui-bridge-wrapper/dist/inject-cli.cjs`, run with
+`node` — never through the `.bin` symlink, through which it silently does
+nothing. **Check it is new enough first:** a build without `--throttle` in its
+`--help` predates this arm, and a page whose runtime predates the override
+answers every `mediaOverride` with an unknown-action failure — both UNKNOWN.
+
+```bash
+INJECT="$ROOT/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs"
+node "$INJECT" --help | grep -q -- '--throttle' \
+  || { echo "inject-cli predates the image arm -- rebuild it"; exit 1; }
+```
+
+### 1. The capture matrix, crossed with candidates
+
+One `--capture-matrix` run per candidate: every breakpoint × colour scheme ×
+DPR (the theme toggle IS the colour-scheme axis; resizing IS the viewport
+axis), each cell a fresh browser context running the same plan — swap, hover,
+capture, read the slot's media facts, restore, prove it.
+
+```bash
+PAGE=http://127.0.0.1:3001/        # the page that owns the slot
+CAND=http://127.0.0.1:8090/hero-candidate-2.avif
+OUT="$WORK/matrix-candidate-2"     # must be empty or absent
+cat > "$WORK/plan.ndjson" <<EOF
+{"action":"mediaOverride","payload":{"slotId":"hero","src":"$CAND","ttlMs":300000}}
+{"action":"getControlSnapshot","payload":{}}
+{"action":"find","payload":{"mediaOnly":true,"includeHidden":true}}
+{"action":"executeElementAction","payload":{"id":"hero-cta","request":{"action":"hover"}}}
+{"action":"getControlSnapshot","payload":{}}
+{"action":"mediaOverrideRestore","payload":{}}
+{"action":"mediaOverrideList","payload":{}}
+EOF
+node "$INJECT" --url "$PAGE" --capture-matrix "$OUT" --exec-stdin --quiet \
+  --viewport 390x844,1280x800 --color-scheme light,dark --dpr 1,2 \
+  < "$WORK/plan.ndjson"
+```
+
+Each cell writes `frame-<n>.png` + `snapshot-<n>.json` for every
+`getControlSnapshot` (in lockstep, stamped with the DPR and colour scheme the
+page itself reported), and `results.ndjson` with one line per action. Read, per
+cell:
+
+- the `mediaOverride` line: `ready.currentSrc` is the candidate and
+  `ready.naturalWidth`/`naturalHeight` are what decoded — a candidate smaller
+  than its slot at that DPR shows here before any judge looks;
+- the `find` line: each media row's `mediaMetadata` envelope — `objectFit`,
+  `effectiveResolution` (natural ÷ rendered × DPR), `dimsReserved`,
+  `isLcpCandidate`, `clsSources`, and `encodedBodySize` keyed on `currentSrc`;
+  a dimension it could not measure sits in `coverage.unmeasured` with its code,
+  never as `0`;
+- the last two lines: `restored[].verified: true` for every override and
+  `mediaOverrideList` → `active: []`. **A cell whose list is not empty did not
+  end restored — report it, do not average it away.** A `drift` entry names an
+  attribute the app rewrote after the swap; it was left as the app set it.
+
+Hover targets are page-specific — take the id from the cell's own snapshot
+(the slot's link or card ancestor), never from this example.
+
+### 2. A slow network, and the loading-to-loaded timeline
+
+`--throttle` (`slow-3g`, `fast-3g`, or `latency=<ms>,down=<kbps>,up=<kbps>`)
+applies Chromium network emulation once the page is ready; `--no-cache` stops a
+warm cache from painting a "slow" load instantly. What Chromium accepted is
+stamped as `network` on every timeline result and matrix cell.
+
+`captureTimeline` records frames on a timer. Two shapes answer two questions:
+
+```bash
+# (a) The candidate ARRIVING in its slot over a slow network: the override runs
+#     concurrently with the frames, and still confirms decode before it answers.
+node "$INJECT" --url "$PAGE" --throttle slow-3g --no-cache --quiet \
+  --exec "captureTimeline {\"dir\":\"$WORK/arrival\",\"frames\":12,\"intervalMs\":250,\"during\":{\"action\":\"mediaOverride\",\"payload\":{\"slotId\":\"hero\",\"src\":\"$CAND\"}}}" \
+  --exec 'mediaOverrideRestore {}' --exec 'mediaOverrideList {}'
+
+# (b) The slot's own loading-to-loaded timeline: reload under the throttle,
+#     frame 1 at the navigation commit, then read LCP/CLS from the media facts.
+node "$INJECT" --url "$PAGE" --throttle slow-3g --no-cache --quiet \
+  --exec "captureTimeline {\"dir\":\"$WORK/load\",\"frames\":16,\"intervalMs\":250,\"reload\":true}" \
+  --exec 'find {"mediaOnly":true,"includeHidden":true}'
+```
+
+(a)'s `during.answeredAtMs` is when the candidate was confirmed on screen and
+its frames show what stood in the slot until then (an empty box, the old image,
+a layout jump). (b) needs no override — a reload replaces the document, which
+drops any override — and answers whether the slot reserves its box (`clsSources`
+naming the slot is a measured layout shift) and whether it is the LCP element.
+Frames are raw pixels: `data-bridge-redact` does not mask a screenshot.
+
+### 3. What the arm hands on
+
+Per candidate: the matrix manifest (`$OUT/matrix.json`), the arrival and load
+timelines, and the restore proof. Phase 20's judges compare candidates from
+these artifacts; nothing in this arm ranks them. When any precondition fails —
+the CLI too old, the page's runtime refusing the override, a cell not
+`captured`, a list not empty — the candidate's in-situ state is **UNKNOWN**,
+and the report says which precondition failed.
 
 ## When NOT to use
 
