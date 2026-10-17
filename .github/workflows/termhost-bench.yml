@@ -1,0 +1,1114 @@
+name: termhost-bench probe
+
+# Phase 2 of plan `2026-10-11-terminal-page-performance-kpis-across-setups`.
+#
+# Builds and tests `crates/termhost-probe` — the outside-in measurement
+# instrument the terminal-performance KPIs are read with — and runs its
+# `selftest` against a REAL display server on both hosted platforms: Xvfb on
+# ubuntu-22.04, and the interactive desktop of windows-latest. The selftest
+# opens its own window and proves the instrument end to end there: markers
+# painted behind known delays are reported within one refresh interval, a
+# key-echo round trip completes, an UNTAGGED injection is classified as real
+# input and aborts the run, an occluded window turns its intervals unknown,
+# and node's clock reads the probe's timebase.
+#
+# Hosted runners only: the selftest steals focus and injects keystrokes, so it
+# must never run on a machine someone is using.
+#
+# Each job runs `doctor --json` first and writes it to the job summary, so an
+# INOPERATIVE mechanism is recorded with its reason rather than silently
+# skipped, and the selftest appends its own summary there (every check, gated
+# or not, and the mechanisms). The selftest gates a check when every
+# mechanism it depends on is OPERATIVE or DEGRADED — or UNKNOWN in the one
+# case a probe regression produces: a capture source that OPENED in an
+# operative interactive session and then delivered no frame, which turns the
+# job red instead of un-gating the checks that would catch the regression.
+# Any other UNKNOWN (a capture source that never opened, a GPU counter query
+# that errored) is the environment's to decide and is recorded, not gated.
+# Every mechanism named by `--require` must be OPERATIVE:
+#   - ubuntu: capture.x11, input.safe and clock.aligned are REQUIRED. Xvfb is a
+#     fully controlled X server, so an inoperative X11 path there is a defect in
+#     the instrument, never an environment limit — and without the requirement
+#     an inoperative mechanism would only un-gate its checks.
+#   - windows: clock.aligned is required (node ships on the image); the capture
+#     and input mechanisms are gated unless the doctor finds them INOPERATIVE,
+#     and recorded with their reasons where it does — what a hosted Windows
+#     session allows (Desktop Duplication in particular) is the image's to
+#     decide, not this repo's. `--require` flags for it follow once a run has
+#     shown what the image supports.
+#
+# Phase 3 adds the benchmark itself, the `run-linux-xvfb` job, and Phase 4 its
+# Windows leg, the `run-windows-hosted` job, each with its own header; they are
+# what the `schedule` trigger and the `workflow_dispatch` inputs are for.
+#
+# This file lives under `.github/workflows/`, so the PR that adds or edits it
+# needs `ci:gate-change=declared` (see ci-integrity.yml).
+
+# Paths: the probe, the contract it decodes, this file — and everything that
+# can change how the probe builds without touching it: the workspace manifest
+# and lock (a `windows` 0.61.x or x11rb bump), the toolchain pin, and the
+# sibling checkout action. Nothing else compiles the probe (ci.yml builds
+# src-tauri). The `push` to main runs the same paths so the cache saved
+# there (`save-if` below) exists for pull requests to restore. The shared
+# runner clients are a path of the benchmark's alone; the benchmark narrows
+# these triggers further for itself (`bench-scope`, below).
+on:
+  pull_request:
+    paths:
+      - "crates/termhost-probe/**"
+      - "scripts/termhost-bench/**"
+      - "scripts/lib/runner-clients.mjs"
+      - ".github/workflows/termhost-bench.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/actions/checkout-sibling/**"
+  push:
+    branches: [main]
+    paths:
+      - "crates/termhost-probe/**"
+      - "scripts/termhost-bench/**"
+      - ".github/workflows/termhost-bench.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/actions/checkout-sibling/**"
+  workflow_dispatch:
+    # Read by `run-linux-xvfb` and `run-windows-hosted`. Each is validated before
+    # use, and every one reaches a shell through `env:`, never spliced into a script.
+    inputs:
+      n:
+        description: "N ladder: comma-separated session counts"
+        type: string
+        default: "1,5,15"
+      arms:
+        description: "Arms: focus and/or tiled"
+        type: string
+        default: "focus,tiled"
+      runs:
+        description: "Runs per (N, setup, build)"
+        type: string
+        default: "2"
+      baseline_sha:
+        description: "Baseline commit for the same-VM A/B (empty: the newest main commit at least 7 days old; none: head only)"
+        type: string
+        default: ""
+  # Weekly, Monday 03:17 UTC: the same-VM A/B of main against main a week earlier.
+  schedule:
+    - cron: "17 3 * * 1"
+
+# `pull-requests: read` is required by ./.github/actions/checkout-sibling, which
+# reads the PR's coord dep-edge labels; nothing here writes.
+permissions:
+  contents: read
+  pull-requests: read
+
+# Copied verbatim from ci.yml — see its header for why the group is keyed this
+# way (first-attempt PR runs supersede per PR; every other run is its own group).
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: termhost-probe (ubuntu-22.04, Xvfb)
+    runs-on: ubuntu-22.04
+    # UNMEASURED at introduction: no run of this job exists yet. One small crate
+    # (cold build a few minutes) plus a selftest of about a minute; 30 minutes
+    # is a generous first bound. Tighten it once there are runs to measure.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
+      # load the workspace; same action as ci.yml's `holder-crates` job.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # x11rb speaks the X protocol in pure Rust, so the X server is the only
+      # system package the probe needs.
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Test termhost-probe
+        run: cargo test -p termhost-probe
+
+      - name: Clippy termhost-probe
+        run: cargo clippy -p termhost-probe --all-targets -- -D warnings
+
+      - name: Build termhost-probe
+        run: cargo build -p termhost-probe
+
+      - name: Doctor (Xvfb)
+        shell: bash
+        run: |
+          xvfb-run -a -s "-screen 0 1280x1024x24" target/debug/termhost-probe doctor
+          xvfb-run -a -s "-screen 0 1280x1024x24" target/debug/termhost-probe doctor --json > doctor.jsonl
+          {
+            echo "### termhost-probe doctor (ubuntu-22.04, Xvfb)"
+            echo '```json'
+            cat doctor.jsonl
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Selftest (Xvfb)
+        shell: bash
+        run: >-
+          xvfb-run -a -s "-screen 0 1280x1024x24"
+          target/debug/termhost-probe selftest --json
+          --require capture.x11 --require input.safe --require clock.aligned
+          --run-dir selftest-run --summary-md "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload selftest records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-probe-selftest-linux
+          path: |
+            doctor.jsonl
+            selftest-run/
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows:
+    name: termhost-probe (windows-latest)
+    runs-on: windows-latest
+    # UNMEASURED at introduction, as above; a cold Windows build is slower.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test termhost-probe
+        run: cargo test -p termhost-probe
+
+      - name: Clippy termhost-probe
+        run: cargo clippy -p termhost-probe --all-targets -- -D warnings
+
+      - name: Build termhost-probe
+        run: cargo build -p termhost-probe
+
+      - name: Doctor
+        shell: bash
+        run: |
+          target/debug/termhost-probe.exe doctor
+          target/debug/termhost-probe.exe doctor --json > doctor.jsonl
+          {
+            echo "### termhost-probe doctor (windows-latest)"
+            echo '```json'
+            cat doctor.jsonl
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Tests that move the foreground (ignored by default, because they must
+      # never run on a desktop someone is using): D9 for the doctor's probe.
+      # Exactly one test must run and pass: a filter that matched nothing
+      # would otherwise be green with 0 tests.
+      - name: Desktop tests (foreground-moving)
+        shell: bash
+        run: |
+          cargo test -p termhost-probe --lib -- --ignored --exact \
+            platform::windows::testwin::tests::desktop_the_doctors_probe_never_takes_the_foreground \
+            --nocapture 2>&1 | tee desktop-tests.log
+          grep -q "test result: ok. 1 passed" desktop-tests.log
+
+      - name: Selftest
+        shell: bash
+        run: >-
+          target/debug/termhost-probe.exe selftest --json
+          --require clock.aligned
+          --run-dir selftest-run --summary-md "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload selftest records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-probe-selftest-windows
+          path: |
+            doctor.jsonl
+            selftest-run/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Phase 3: the benchmark on linux-xvfb.
+  #
+  # Builds the runner the way ci.yml's `test` job does (`pnpm run tauri build
+  # --debug --no-bundle`), builds it again at the baseline commit, and runs
+  # `scripts/termhost-bench/cli.mjs run --env linux-xvfb --setups runner,tmux`:
+  # the head and baseline builds interleaved in this one VM (plan D11, so
+  # hosted-VM noise cancels against the same binary class), and tmux as an
+  # assert-only adapter smoke (D7). Each runner is a supervisor-free subject
+  # instance under its own QONTINUI_INSTANCE_ROOT inside the run directory
+  # (D12); the harness's Xvfb display is private to the run.
+  #
+  # Triggers (decided by `bench-scope`):
+  #   - pull_request that touches the benchmark itself: a smoke run. N = 1, one
+  #     run, head only.
+  #   - workflow_dispatch: the inputs above (default: the full ladder).
+  #   - schedule: the full ladder against the newest main commit at least seven
+  #     days old.
+  #   - never on push: that trigger exists to save the probe jobs' cache.
+  #
+  # Gate (the plan's Phase 3 gate and arming): the full results file is
+  # schema-valid; runner and tmux rows exist for every N of the ladder in every
+  # arm; and every one of them reads `measured` for output_latency_ms, cpu_pct,
+  # memory_mb and producer_stall_pct at N = 15 (at the ladder's top N when a
+  # dispatch leaves 15 out; at N = 1 for the smoke). Head and baseline rows are
+  # both held to it: an A/B against a baseline that cannot be measured compares
+  # nothing.
+  #
+  # What leaves the VM (D7): the runner's own rows only. The full results file,
+  # with tmux's rows, is validated and asserted here and never uploaded. The
+  # artifact and the job summary are rendered from the redacted copy
+  # (`report --redact-to`); the gate's failure lines give a third-party KPI's
+  # state and reason code without its detail text; and the failure-only log
+  # upload takes runner unit directories only. No verdict is drawn yet: the
+  # regression rule arrives with Phase 6, in compare.mjs.
+  #
+  # No rust-cache: ci.yml saves its ~2.6 GB caches from main only, to keep the
+  # repo under its 10 GB cap, and a weekly save from this job would compete with
+  # them. Both builds compile cold, each in its own checkout's target/, so each
+  # exe runs in place beside the resources its build copied next to it.
+  #
+  # UNMEASURED at introduction: no run of this job exists yet. Estimate for the
+  # full ladder: about 75 min for the two cold builds plus about 135 min for 18
+  # units (2 runs x 3 N x {head, baseline, tmux}) of two arms each. 350 min sits
+  # under GitHub's 360-minute ceiling, and the run step's own 230-minute bound
+  # leaves the report and upload steps time to say what happened. Tighten both
+  # once there are runs to measure.
+  # ---------------------------------------------------------------------------
+
+  # The run job's own trigger filter. The workflow's `pull_request` paths are the
+  # probe jobs' (they include the workspace manifest, lock, toolchain pin and
+  # sibling action, so a dependency bump rebuilds the probe), and `push` to main
+  # exists to save the probe jobs' cache. Neither is a reason to spend an hour
+  # building and booting the runner: the plan's smoke runs on a pull request
+  # that touches the benchmark (scripts/termhost-bench/**,
+  # crates/termhost-probe/**, plus the shared runner clients and this file).
+  # Schedule and dispatch always run it; push never does.
+  bench-scope:
+    name: termhost-bench run scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+
+      - name: Decide whether the benchmark runs
+        id: scope
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            schedule|workflow_dispatch) run=true ;;
+            pull_request)
+              # The checkout is GitHub's merge commit; its first parent is the
+              # base tip, so this diff is exactly what the PR changes.
+              changed="$(git diff --name-only HEAD^1 HEAD)"
+              if grep -qE '^(scripts/termhost-bench/|crates/termhost-probe/|scripts/lib/runner-clients\.mjs$|\.github/workflows/termhost-bench\.yml$)' <<<"$changed"; then
+                run=true
+              else
+                run=false
+              fi
+              ;;
+            *) run=false ;;
+          esac
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT: the benchmark runs: $run"
+
+  run-linux-xvfb:
+    name: termhost-bench run (linux-xvfb, ubuntu-22.04)
+    needs: bench-scope
+    if: needs.bench-scope.outputs.run == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      # Full history, blobless: the baseline is resolved from origin/main, and
+      # the runner adapter checks with `git merge-base --is-ancestor` that a
+      # build contains the D12 fix commits before it launches it.
+      - name: Check out the head
+        uses: actions/checkout@v5
+        with:
+          path: head/qontinui-runner
+          fetch-depth: 0
+          filter: blob:none
+
+      # The runner is checked out under a `path:`, so each sibling goes beside
+      # it (`../../qontinui-schemas/rust` from src-tauri), not at the action's
+      # default `$GITHUB_WORKSPACE/../<name>`.
+      - name: Check out sibling qontinui-schemas (head)
+        uses: ./head/qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/head/qontinui-schemas
+
+      - name: Resolve the run's parameters
+        id: params
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_N: ${{ inputs.n }}
+          IN_ARMS: ${{ inputs.arms }}
+          IN_RUNS: ${{ inputs.runs }}
+          IN_BASELINE: ${{ inputs.baseline_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            n=1; arms=focus,tiled; runs=1; baseline=none
+          else
+            n="${IN_N:-1,5,15}"; arms="${IN_ARMS:-focus,tiled}"; runs="${IN_RUNS:-2}"; baseline="${IN_BASELINE:-}"
+          fi
+          [[ "$n" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "::error::n must be comma-separated positive integers, got '$n'"; exit 1; }
+          [[ "$arms" =~ ^(focus|tiled)(,(focus|tiled))*$ ]] || { echo "::error::arms must be focus and/or tiled, got '$arms'"; exit 1; }
+          [[ "$runs" =~ ^[1-9][0-9]*$ ]] || { echo "::error::runs must be a positive integer, got '$runs'"; exit 1; }
+          if [ -z "$baseline" ]; then
+            # This week's main against last week's: the newest first-parent
+            # main commit at least seven days old.
+            baseline="$(git rev-list -1 --first-parent --before='7 days ago' origin/main)"
+            [ -n "$baseline" ] || { echo "::error::no main commit seven days old to use as the baseline"; exit 1; }
+          elif [ "$baseline" != none ]; then
+            [[ "$baseline" =~ ^[0-9a-fA-F]{7,40}$ ]] || { echo "::error::baseline_sha must be a commit sha or 'none', got '$baseline'"; exit 1; }
+            baseline="$(git rev-parse --verify "${baseline}^{commit}")"
+          fi
+          if [[ ",$n," == *",15,"* ]]; then gate_n=15; else gate_n="$(tr ',' '\n' <<<"$n" | sort -n | tail -1)"; fi
+          {
+            echo "n=$n"
+            echo "arms=$arms"
+            echo "runs=$runs"
+            echo "baseline=$baseline"
+            echo "gate_n=$gate_n"
+          } >> "$GITHUB_OUTPUT"
+          echo "N=$n arms=$arms runs=$runs baseline=$baseline gate at N=$gate_n"
+
+      - name: Check out the baseline
+        if: steps.params.outputs.baseline != 'none'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.params.outputs.baseline }}
+          path: baseline/qontinui-runner
+          persist-credentials: false
+
+      # The baseline compiles against the schemas commit ITS pin manifest
+      # records. These events carry no pull request, so no dep-edge declaration
+      # can apply and the action resolves straight to that pin.
+      - name: Check out sibling qontinui-schemas (baseline)
+        if: steps.params.outputs.baseline != 'none'
+        uses: ./head/qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/baseline/qontinui-schemas
+          pin-file: baseline/qontinui-runner/.github/sibling-pins.conf
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      # Node 22, not ci.yml's 20: the harness's backend echo-latency diagnostic
+      # uses the global WebSocket, which Node ships unflagged from 22.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: head/qontinui-runner/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      # ci.yml's Ubuntu build packages (and its 10-minute bound against an apt
+      # hang), plus what the benchmark runs: tmux and xterm (the tmux setup),
+      # Xvfb and a window manager (the environment), a session bus, a monospace
+      # font for xterm, and Mesa's software GL for WebKitGTK.
+      - name: Install build and benchmark dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core \
+            tmux \
+            xterm \
+            xvfb \
+            matchbox-window-manager \
+            dbus \
+            fonts-dejavu-core \
+            libgl1-mesa-dri
+
+      # Same reclaim as ci.yml (see its rationale): two cold debug targets plus
+      # the swapfile do not fit in the image's ~14 GB free.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swapfile (guard against link-time OOM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
+      - name: Build the head runner
+        working-directory: head/qontinui-runner
+        timeout-minutes: 75
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run tauri build --debug --no-bundle
+          test -x target/debug/qontinui-runner
+
+      # RELEASE, unlike the probe jobs' debug build: the benchmark scans every
+      # 1920x1080 X11 frame, and the debug scanner took 113 ms per frame (p50,
+      # p95 167 ms) in CI run 38345475088 — over twice the frame budget, so the
+      # probe fell behind (192 of 473 frames over its lag bound) and every
+      # capture KPI read harness_error.
+      - name: Build termhost-probe (release)
+        working-directory: head/qontinui-runner
+        timeout-minutes: 20
+        run: cargo build --release -p termhost-probe
+
+      # The baseline commit's rust-toolchain.toml may pin a channel other than
+      # the head's. Install it explicitly rather than rely on rustup's implicit
+      # install, whose default has changed between rustup releases.
+      - name: Build the baseline runner
+        if: steps.params.outputs.baseline != 'none'
+        working-directory: baseline/qontinui-runner
+        timeout-minutes: 75
+        run: |
+          channel="$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)"
+          if [ -n "$channel" ]; then rustup toolchain install "$channel" --profile minimal; fi
+          pnpm install --frozen-lockfile
+          pnpm run tauri build --debug --no-bundle
+          test -x target/debug/qontinui-runner
+
+      - name: Doctor
+        shell: bash
+        working-directory: head/qontinui-runner
+        # `doctor` exits 3 when it blocks a run. That is exactly when the summary
+        # matters, so the exit code is held until the summary is written.
+        run: |
+          set -o pipefail
+          rc=0
+          node scripts/termhost-bench/cli.mjs doctor --env linux-xvfb --setups runner,tmux \
+            --runner-mode subject \
+            --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner" \
+            --head-commit "$(git rev-parse HEAD)" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe" \
+            | tee "$RUNNER_TEMP/termhost-bench-doctor.txt" || rc=$?
+          {
+            echo "### termhost-bench doctor (linux-xvfb)"
+            echo '```'
+            cat "$RUNNER_TEMP/termhost-bench-doctor.txt"
+            echo '```'
+            if [ "$rc" -ne 0 ]; then echo "doctor exited $rc"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      # A session bus (dbus-run-session), because a desktop session has one and
+      # GTK and WebKitGTK reach for it. WEBKIT_DISABLE_DMABUF_RENDERER, because a
+      # hosted VM has no DRM device for WebKitGTK's DMA-BUF renderer (the rows
+      # are labelled software_rendered either way).
+      - name: Run the benchmark
+        id: run
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 230
+        env:
+          N: ${{ steps.params.outputs.n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          RUNS: ${{ steps.params.outputs.runs }}
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tb-out"
+          args=(run --env linux-xvfb --setups runner,tmux --runner-mode subject
+            --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner"
+            --head-commit "$(git rev-parse HEAD)"
+            --n "$N" --arms "$ARMS" --runs "$RUNS"
+            --smoke-setups tmux
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe"
+            --work-dir "$RUNNER_TEMP/tb" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            --out "$RUNNER_TEMP/tb-out/results.json"
+            --runner-env WEBKIT_DISABLE_DMABUF_RENDERER=1)
+          if [ "$BASELINE" != none ]; then
+            args+=(--ab-baseline "$BASELINE"
+              --baseline-exe "$GITHUB_WORKSPACE/baseline/qontinui-runner/target/debug/qontinui-runner")
+          fi
+          launcher=()
+          if command -v dbus-run-session >/dev/null; then
+            launcher=(dbus-run-session --)
+          else
+            echo "::warning::dbus-run-session not found: running without a session bus"
+          fi
+          "${launcher[@]}" node scripts/termhost-bench/cli.mjs "${args[@]}"
+
+      - name: Validate the results and write the runner-only copy
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-out/results.json"
+          [ -f "$results" ] || { echo "::error::the run wrote no results file"; exit 1; }
+          node scripts/termhost-bench/validate.mjs "$results"
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --redact-to "$RUNNER_TEMP/tb-out/termhost-bench-linux-xvfb-runner.json"
+
+      - name: Assert the gate
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          N: ${{ steps.params.outputs.n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          GATE_N: ${{ steps.params.outputs.gate_n }}
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-out/results.json"
+          [ -f "$results" ] || { echo "::error::the run wrote no results file"; exit 1; }
+          # An A/B run gates on both builds being PROVEN at the gate N (D12).
+          ab=()
+          if [ "$BASELINE" != none ]; then ab=(--ab-baseline "$BASELINE"); fi
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --setups runner,tmux --arms "$ARMS" --require-rows-n "$N" \
+            --require-measured output_latency_ms,cpu_pct,memory_mb,producer_stall_pct --at-n "$GATE_N" \
+            "${ab[@]}"
+
+      - name: Upload the runner's results (redacted)
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-bench-linux-xvfb-runner
+          path: ${{ runner.temp }}/tb-out/termhost-bench-linux-xvfb-runner.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Job summary (the runner's rows only)
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          redacted="$RUNNER_TEMP/tb-out/termhost-bench-linux-xvfb-runner.json"
+          if [ ! -f "$redacted" ]; then
+            echo "No runner-only results to summarise (see the run and validate steps)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$BASELINE" != none ]; then
+            node scripts/termhost-bench/cli.mjs compare "$redacted" >> "$GITHUB_STEP_SUMMARY" \
+              || echo "compare could not pair head and baseline rows (see the log)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          node scripts/termhost-bench/cli.mjs report "$redacted" >> "$GITHUB_STEP_SUMMARY"
+
+      # Runner unit directories only (`u<k>-runner-...`): their stdout and
+      # stderr, the runner's own log files, and those units' probe and generator
+      # records. tmux's unit directories never leave the VM (D7).
+      - name: Upload runner unit logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-bench-linux-xvfb-runner-logs
+          path: |
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-stdout.log
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-stderr.log
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-root/**/*.log*
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/gen/*.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Phase 4: the benchmark on windows-hosted, and the VS Code adapter smoke.
+  #
+  # The runner's same-VM A/B on GitHub's hosted windows-latest (plan D6 and D11):
+  # the head build and the baseline commit's build, each compiled cold in its own
+  # checkout as ci.yml's windows leg compiles it (`pnpm run tauri build --debug
+  # --no-bundle`, behind the same 32 GB pagefile), measured interleaved in this
+  # one VM at N = 1, 5, 15 as supervisor-free subject instances under their own
+  # QONTINUI_INSTANCE_ROOT (D12). Then VS Code as an assert-only adapter smoke
+  # (D7): the pinned portable build (SHA-256 verified, cached under
+  # $RUNNER_TEMP, outside every checkout), an isolated instance with a private
+  # profile, driven by the harness extension.
+  #
+  # Separate `cli.mjs run` invocations, not one: the A/B wants two interleaved
+  # runs per N, a smoke one; and the third-party rows then live in results files
+  # this job only ever asserts on.
+  #
+  # Phase 5 adds Windows Terminal as one more assert-only smoke of the same shape
+  # (D7), at N = 1 and 5 in both arms (N = 1 on a pull request): the pinned
+  # portable build (the release ZIP from microsoft/terminal, SHA-256 verified,
+  # cached under $RUNNER_TEMP, a `.portable` file beside the binary so its
+  # settings stay in the run directory), its window driven through wt.exe and
+  # proven to run in a process the run started (D5). A hosted VM cannot install
+  # Windows Terminal from the Store, which is why the job downloads the ZIP. The
+  # tmux-wsl setup is not smoked here: a hosted runner has no WSL distro; it runs
+  # on windows-desktop only.
+  #
+  # Triggers: bench-scope's, unchanged — the smoke on a pull request that touches
+  # the benchmark (N = 1, one run, head only), the full ladder on dispatch and on
+  # the weekly schedule against the newest main commit at least seven days old.
+  #
+  # Gate. Hosted Windows capture is the image's to decide (Phase 2 records it,
+  # gated only where the probe's doctor finds it operative), so a KPI that needs
+  # capture is held to `measured` only where the results' own capabilities report
+  # capture.wgc OPERATIVE; elsewhere it reads unknown with that reason, never
+  # missing. The process and producer KPIs need no capture and are always held:
+  #   - runner (head and baseline): rows for every N and arm; cpu_pct, memory_mb
+  #     and producer_stall_pct measured at the gate N; output_latency_ms too where
+  #     capture.wgc is OPERATIVE.
+  #   - vscode: the same, asserted on a file that never leaves the VM.
+  #   - windows-terminal: the same at its N, asserted on its own file that never
+  #     leaves the VM.
+  #   Both third-party smokes pass --accept-capture-health-unknown: on this
+  #   software-composited VM their capture KPIs may read unknown for CAPTURE
+  #   health (WGC/DDA disagreement, or the probe fell behind) — a third-party
+  #   smoke here checks plumbing (D6). Any other unknown still fails, and the
+  #   plumbing KPIs must still be measured. The runner's gate does not pass it.
+  #
+  # What leaves the VM (D7): the runner's own rows, as in the Linux job — the
+  # redacted copy, the job summary rendered from it, and runner unit logs on
+  # failure. The VS Code and Windows Terminal results, their unit directories
+  # (profiles, logs) and their archive caches are never uploaded; their gate
+  # failures name a KPI's state and reason code without the detail text. No verdict is drawn yet: the regression
+  # rule arrives with Phase 6, in compare.mjs.
+  #
+  # No rust-cache, for the Linux job's reason: ci.yml saves its caches from main
+  # only, and the two checkouts here would not hit them anyway (a cache's paths
+  # are part of its identity).
+  #
+  # UNMEASURED at introduction: no run of this job exists yet. Estimate for the
+  # full ladder: about 110 min for the two cold builds (published-parity measured
+  # a cold windows debug build at 54 min), about 95 min for the A/B's 12 units,
+  # about 25 min for the VS Code smoke's 3 and about 15 min for the Windows
+  # Terminal smoke's 2. The step bounds below sum to under the job's 360 minutes
+  # (GitHub's ceiling) with at least 15 minutes left for the unbounded checkout
+  # and setup steps (windows-hosted.test.mjs holds that margin): the A/B's bound
+  # went from 125 to 105 minutes and the VS Code smoke's from 35 to 32, each still
+  # above its estimate, to make room for the Windows Terminal smoke. Tighten them
+  # once there are runs to measure.
+  # ---------------------------------------------------------------------------
+  run-windows-hosted:
+    name: termhost-bench run (windows-hosted, windows-latest)
+    needs: bench-scope
+    if: needs.bench-scope.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      # Full history, blobless: the baseline is resolved from origin/main, and
+      # the runner adapter checks with `git merge-base --is-ancestor` that a
+      # build contains the D12 fix commits before it launches it.
+      - name: Check out the head
+        uses: actions/checkout@v5
+        with:
+          path: head/qontinui-runner
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Check out sibling qontinui-schemas (head)
+        uses: ./head/qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/head/qontinui-schemas
+
+      - name: Resolve the run's parameters
+        id: params
+        shell: bash
+        working-directory: head/qontinui-runner
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_N: ${{ inputs.n }}
+          IN_ARMS: ${{ inputs.arms }}
+          IN_RUNS: ${{ inputs.runs }}
+          IN_BASELINE: ${{ inputs.baseline_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            n=1; arms=focus,tiled; runs=1; baseline=none; wt_n=1
+          else
+            n="${IN_N:-1,5,15}"; arms="${IN_ARMS:-focus,tiled}"; runs="${IN_RUNS:-2}"; baseline="${IN_BASELINE:-}"; wt_n=1,5
+          fi
+          [[ "$n" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "::error::n must be comma-separated positive integers, got '$n'"; exit 1; }
+          [[ "$arms" =~ ^(focus|tiled)(,(focus|tiled))*$ ]] || { echo "::error::arms must be focus and/or tiled, got '$arms'"; exit 1; }
+          [[ "$runs" =~ ^[1-9][0-9]*$ ]] || { echo "::error::runs must be a positive integer, got '$runs'"; exit 1; }
+          if [ -z "$baseline" ]; then
+            baseline="$(git rev-list -1 --first-parent --before='7 days ago' origin/main)"
+            [ -n "$baseline" ] || { echo "::error::no main commit seven days old to use as the baseline"; exit 1; }
+          elif [ "$baseline" != none ]; then
+            [[ "$baseline" =~ ^[0-9a-fA-F]{7,40}$ ]] || { echo "::error::baseline_sha must be a commit sha or 'none', got '$baseline'"; exit 1; }
+            baseline="$(git rev-parse --verify "${baseline}^{commit}")"
+          fi
+          if [[ ",$n," == *",15,"* ]]; then gate_n=15; else gate_n="$(tr ',' '\n' <<<"$n" | sort -n | tail -1)"; fi
+          wt_gate_n="$(tr ',' '\n' <<<"$wt_n" | sort -n | tail -1)"
+          {
+            echo "n=$n"
+            echo "arms=$arms"
+            echo "runs=$runs"
+            echo "baseline=$baseline"
+            echo "gate_n=$gate_n"
+            echo "wt_n=$wt_n"
+            echo "wt_gate_n=$wt_gate_n"
+          } >> "$GITHUB_OUTPUT"
+          echo "N=$n arms=$arms runs=$runs baseline=$baseline gate at N=$gate_n; Windows Terminal N=$wt_n gate at N=$wt_gate_n"
+
+      - name: Check out the baseline
+        if: steps.params.outputs.baseline != 'none'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.params.outputs.baseline }}
+          path: baseline/qontinui-runner
+          persist-credentials: false
+
+      - name: Check out sibling qontinui-schemas (baseline)
+        if: steps.params.outputs.baseline != 'none'
+        uses: ./head/qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/baseline/qontinui-schemas
+          pin-file: baseline/qontinui-runner/.github/sibling-pins.conf
+
+      # Same guard, same size, as ci.yml's windows leg and published-parity: two
+      # cold debug builds of the runner on 16 GB of RAM.
+      - name: Configure pagefile (Windows — guard against link-time OOM)
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 32GB
+          maximum-size: 32GB
+          disk-root: "D:"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      # Node 22, as in the Linux job: the backend echo-latency diagnostic uses the
+      # global WebSocket, and the VS Code adapter streams its download with fetch.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: head/qontinui-runner/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      # First, so the VS Code smoke (which needs only the probe) still runs when
+      # a runner build fails. RELEASE, as in run-linux-xvfb: the benchmark scans
+      # every full-screen frame, and a debug scanner fell behind its capture source
+      # there (CI run 38345475088). The probe jobs above keep their debug build.
+      - name: Build termhost-probe (release)
+        id: probe
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 20
+        run: |
+          cargo build --release -p termhost-probe
+          test -f target/release/termhost-probe.exe
+
+      - name: Build the head runner
+        id: build_head
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 65
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run tauri build --debug --no-bundle
+          test -f target/debug/qontinui-runner.exe
+
+      # The baseline commit's rust-toolchain.toml may pin another channel; install
+      # it explicitly, as the Linux job does.
+      - name: Build the baseline runner
+        id: build_baseline
+        if: steps.params.outputs.baseline != 'none'
+        shell: bash
+        working-directory: baseline/qontinui-runner
+        timeout-minutes: 65
+        run: |
+          channel="$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)"
+          if [ -n "$channel" ]; then rustup toolchain install "$channel" --profile minimal; fi
+          pnpm install --frozen-lockfile
+          pnpm run tauri build --debug --no-bundle
+          test -f target/debug/qontinui-runner.exe
+
+      # A hosted image boots its desktop at 1024x768, where a 3 x 3 grid of panes
+      # is narrower than the load profile. Best effort: the environment measures
+      # whatever resolution results and every results file records it.
+      - name: Set the display resolution
+        if: ${{ !cancelled() && steps.probe.outcome == 'success' }}
+        continue-on-error: true
+        shell: powershell
+        timeout-minutes: 3
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Get-CimInstance Win32_VideoController | Select-Object Name, CurrentHorizontalResolution, CurrentVerticalResolution | Format-Table -AutoSize
+
+      - name: Doctor
+        if: ${{ !cancelled() && steps.probe.outcome == 'success' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          node scripts/termhost-bench/cli.mjs doctor --env windows-hosted --setups runner,vscode,windows-terminal \
+            --runner-mode subject \
+            --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner.exe" \
+            --head-commit "$(git rev-parse HEAD)" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe" \
+            --vscode-cache-dir "$RUNNER_TEMP/termhost-cache" \
+            --wt-cache-dir "$RUNNER_TEMP/termhost-cache-wt" \
+            | tee "$RUNNER_TEMP/termhost-bench-doctor.txt"
+          {
+            echo "### termhost-bench doctor (windows-hosted)"
+            echo '```'
+            cat "$RUNNER_TEMP/termhost-bench-doctor.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the runner A/B
+        id: run
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 105
+        env:
+          N: ${{ steps.params.outputs.n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          RUNS: ${{ steps.params.outputs.runs }}
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tb-out"
+          args=(run --env windows-hosted --setups runner --runner-mode subject
+            --runner-exe "$GITHUB_WORKSPACE/head/qontinui-runner/target/debug/qontinui-runner.exe"
+            --head-commit "$(git rev-parse HEAD)"
+            --n "$N" --arms "$ARMS" --runs "$RUNS"
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe"
+            --work-dir "$RUNNER_TEMP/tb" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            --out "$RUNNER_TEMP/tb-out/results.json")
+          if [ "$BASELINE" != none ]; then
+            args+=(--ab-baseline "$BASELINE"
+              --baseline-exe "$GITHUB_WORKSPACE/baseline/qontinui-runner/target/debug/qontinui-runner.exe")
+          fi
+          node scripts/termhost-bench/cli.mjs "${args[@]}"
+
+      - name: Validate the runner results and write the runner-only copy
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-out/results.json"
+          [ -f "$results" ] || { echo "::error::the run wrote no results file"; exit 1; }
+          node scripts/termhost-bench/validate.mjs "$results"
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --redact-to "$RUNNER_TEMP/tb-out/termhost-bench-windows-hosted-runner.json"
+
+      - name: Assert the runner gate
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 5
+        env:
+          N: ${{ steps.params.outputs.n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          GATE_N: ${{ steps.params.outputs.gate_n }}
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-out/results.json"
+          [ -f "$results" ] || { echo "::error::the run wrote no results file"; exit 1; }
+          # An A/B run gates on both builds being PROVEN at the gate N (D12).
+          ab=()
+          if [ "$BASELINE" != none ]; then ab=(--ab-baseline "$BASELINE"); fi
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --setups runner --arms "$ARMS" --require-rows-n "$N" \
+            --require-measured cpu_pct,memory_mb,producer_stall_pct --at-n "$GATE_N" \
+            --require-measured-if-operative capture.wgc:output_latency_ms \
+            "${ab[@]}"
+
+      - name: Upload the runner's results (redacted)
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-bench-windows-hosted-runner
+          path: ${{ runner.temp }}/tb-out/termhost-bench-windows-hosted-runner.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Job summary (the runner's rows only)
+        if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 5
+        env:
+          BASELINE: ${{ steps.params.outputs.baseline }}
+        run: |
+          redacted="$RUNNER_TEMP/tb-out/termhost-bench-windows-hosted-runner.json"
+          if [ ! -f "$redacted" ]; then
+            echo "No runner-only results to summarise (see the run and validate steps)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$BASELINE" != none ]; then
+            node scripts/termhost-bench/cli.mjs compare "$redacted" >> "$GITHUB_STEP_SUMMARY" \
+              || echo "compare could not pair head and baseline rows (see the log)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          node scripts/termhost-bench/cli.mjs report "$redacted" >> "$GITHUB_STEP_SUMMARY"
+
+      # D7: an assert-only smoke. Its results file, unit directories and archive
+      # cache stay in the VM; nothing below uploads or summarises them.
+      - name: Run the VS Code smoke
+        id: vscode
+        if: ${{ !cancelled() && steps.probe.outcome == 'success' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 32
+        env:
+          N: ${{ steps.params.outputs.n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tb-vscode-out"
+          node scripts/termhost-bench/cli.mjs run --env windows-hosted --setups vscode \
+            --n "$N" --arms "$ARMS" --runs 1 --smoke-setups vscode \
+            --vscode-cache-dir "$RUNNER_TEMP/termhost-cache" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe" \
+            --work-dir "$RUNNER_TEMP/tb-vscode" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-vsc" \
+            --out "$RUNNER_TEMP/tb-vscode-out/results.json"
+
+      - name: Assert the VS Code smoke (asserted here, never uploaded)
+        if: ${{ !cancelled() && steps.vscode.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 5
+        env:
+          N: ${{ steps.params.outputs.n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          GATE_N: ${{ steps.params.outputs.gate_n }}
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-vscode-out/results.json"
+          [ -f "$results" ] || { echo "::error::the VS Code smoke wrote no results file"; exit 1; }
+          node scripts/termhost-bench/validate.mjs "$results"
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --setups vscode --arms "$ARMS" --require-rows-n "$N" \
+            --require-measured cpu_pct,memory_mb,producer_stall_pct --at-n "$GATE_N" \
+            --require-measured-if-operative capture.wgc:output_latency_ms \
+            --accept-capture-health-unknown
+
+      # D7: an assert-only smoke, as VS Code's. Its results file, unit directories
+      # (the private settings, the unpacked build) and archive cache stay in the
+      # VM; nothing below uploads or summarises them.
+      - name: Run the Windows Terminal smoke
+        id: wt
+        if: ${{ !cancelled() && steps.probe.outcome == 'success' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 25
+        env:
+          WT_N: ${{ steps.params.outputs.wt_n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tb-wt-out"
+          node scripts/termhost-bench/cli.mjs run --env windows-hosted --setups windows-terminal \
+            --n "$WT_N" --arms "$ARMS" --runs 1 --smoke-setups windows-terminal \
+            --wt-cache-dir "$RUNNER_TEMP/termhost-cache-wt" \
+            --probe "$GITHUB_WORKSPACE/head/qontinui-runner/target/release/termhost-probe.exe" \
+            --work-dir "$RUNNER_TEMP/tb-wt" --run-id "ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-wt" \
+            --out "$RUNNER_TEMP/tb-wt-out/results.json"
+
+      - name: Assert the Windows Terminal smoke (asserted here, never uploaded)
+        if: ${{ !cancelled() && steps.wt.outcome != 'skipped' }}
+        shell: bash
+        working-directory: head/qontinui-runner
+        timeout-minutes: 5
+        env:
+          WT_N: ${{ steps.params.outputs.wt_n }}
+          ARMS: ${{ steps.params.outputs.arms }}
+          WT_GATE_N: ${{ steps.params.outputs.wt_gate_n }}
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/tb-wt-out/results.json"
+          [ -f "$results" ] || { echo "::error::the Windows Terminal smoke wrote no results file"; exit 1; }
+          node scripts/termhost-bench/validate.mjs "$results"
+          node scripts/termhost-bench/cli.mjs report "$results" --format json \
+            --setups windows-terminal --arms "$ARMS" --require-rows-n "$WT_N" \
+            --require-measured cpu_pct,memory_mb,producer_stall_pct --at-n "$WT_GATE_N" \
+            --require-measured-if-operative capture.wgc:output_latency_ms \
+            --accept-capture-health-unknown
+
+      # Runner unit directories only (`u<k>-runner-...` under the A/B's work
+      # dir). The VS Code and Windows Terminal smokes' work dirs (tb-vscode,
+      # tb-wt) are other directories, and no path here reaches them (D7).
+      - name: Upload runner unit logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-bench-windows-hosted-runner-logs
+          path: |
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-stdout.log
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-stderr.log
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/runner-root/**/*.log*
+            ${{ runner.temp }}/tb/termhost-bench/*/units/*-runner-*/gen/*.jsonl
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,26 @@
+{
+  "name": "termhost-bench-harness",
+  "displayName": "termhost-bench harness",
+  "description": "Drives an isolated VS Code's integrated terminals for termhost-bench (qontinui-runner scripts/termhost-bench). Inert unless launched by the harness.",
+  "version": "1.0.0",
+  "publisher": "qontinui",
+  "private": true,
+  "type": "commonjs",
+  "main": "./extension.js",
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": true
+  },
+  "contributes": {}
+}
