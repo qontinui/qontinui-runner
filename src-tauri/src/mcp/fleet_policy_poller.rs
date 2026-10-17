@@ -841,6 +841,28 @@ pub(crate) fn fleet_account_selection_mode() -> Option<AccountSelectionMode> {
     account_selection_cache().read().ok().and_then(|g| *g)
 }
 
+/// Whether coord has ANSWERED the account-selection domain at least once in
+/// this process (a 2xx row / no-row answer, or an auth/absent reset). Until
+/// then the cache's `None` means "not yet asked", not "the fleet has no
+/// opinion", so a REPORT of the selection's source (the env capture) must say
+/// `unknown` rather than `local`. Never reset. Decision sites ignore it — they
+/// fail safe to the local mode either way.
+static ACCOUNT_SELECTION_ANSWERED: AtomicBool = AtomicBool::new(false);
+
+/// See [`ACCOUNT_SELECTION_ANSWERED`]. Lock-free, safe on any path.
+pub(crate) fn account_selection_answered() -> bool {
+    ACCOUNT_SELECTION_ANSWERED.load(Ordering::Acquire)
+}
+
+/// Whether `outcome` is an answer from coord about the account-selection
+/// domain. PURE. A skip while unpaired and a kept transient failure are not.
+fn is_account_selection_answer(outcome: &PollOutcome) -> bool {
+    matches!(
+        outcome,
+        PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow | PollOutcome::ResetOff(_)
+    )
+}
+
 /// Overwrite the cached fleet account-selection mode. Internal — only the poll
 /// loop calls this (and the test guard below).
 fn set_account_selection_mode(mode: Option<AccountSelectionMode>) {
@@ -2674,6 +2696,9 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         if let Some(next_mode) = next_account_selection(&account_selection_outcome) {
             set_account_selection_mode(next_mode);
         }
+        if is_account_selection_answer(&account_selection_outcome) {
+            ACCOUNT_SELECTION_ANSWERED.store(true, Ordering::Release);
+        }
         // The same outcome-shaped key as plan capture: a varying error message
         // must not reopen the edge every tick.
         let account_selection_key = plan_capture_log_key(&account_selection_outcome);
@@ -3065,6 +3090,22 @@ pub mod commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an answer from coord marks the account-selection domain answered;
+    /// an unpaired skip or a transient failure leaves the env capture's source
+    /// `unknown`.
+    #[test]
+    fn account_selection_answer_classification() {
+        assert!(is_account_selection_answer(&PollOutcome::Updated(
+            "manual".into()
+        )));
+        assert!(is_account_selection_answer(&PollOutcome::UpdatedNoRow));
+        assert!(is_account_selection_answer(&PollOutcome::ResetOff(401)));
+        assert!(!is_account_selection_answer(&PollOutcome::SkippedNoJwt));
+        assert!(!is_account_selection_answer(&PollOutcome::Kept(
+            "timeout".into()
+        )));
+    }
 
     #[test]
     fn default_mode_constant_is_off() {
