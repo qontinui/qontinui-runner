@@ -41,6 +41,25 @@ const SPAWN_READY_POLL: Duration = Duration::from_millis(150);
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Max consecutive health failures before we mark the wrapper degraded.
 pub const HEALTH_MAX_RETRIES: u32 = 3;
+/// Transports a runner-spawned wrapper may declare.
+///
+/// `@qontinui/ui-bridge-wrapper`'s `runWrapperEntrypoint` awaits
+/// `transport.ready()` and then binds the `/dispatch` + `/health` server on
+/// `WRAPPER_PORT` for EVERY transport kind, so `headless` and `headed`
+/// (Playwright Chromium driven from the wrapper process) bind the port exactly
+/// as `api` does — once the browser has launched, well inside
+/// `SPAWN_READY_TIMEOUT`. Phase 1 enabled `api` alone; `headless`/`headed` are
+/// enabled for the private web-account image wrappers (plan
+/// `2026-10-17-free-image-generation-local-gpu-and-private-ui-bridge-wrappers`).
+/// `injected` (needs a target page carrying the IIFE) and `live` (connects back
+/// to this runner's WebSocket) stay refused until a consumer needs them.
+pub const SPAWNABLE_TRANSPORTS: &[&str] = &["api", "headless", "headed"];
+
+/// Whether [`WrapperManager::spawn`] will start a wrapper declaring `transport`.
+pub fn transport_is_spawnable(transport: &str) -> bool {
+    SPAWNABLE_TRANSPORTS.contains(&transport)
+}
+
 /// Idle reaper threshold (plan §1.3): no dispatch in this window → stop.
 pub const IDLE_REAP_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Reaper sweep cadence.
@@ -125,13 +144,12 @@ impl WrapperManager {
             .await
             .ok_or_else(|| format!("wrapper '{}' is not installed", wrapper_id))?;
 
-        // Phase 1 only enables `api`. Surface early so callers don't get
-        // a confusing readiness timeout against a transport that never
-        // binds a port.
-        if wrapper.manifest.transport != "api" {
+        // Refuse early a transport whose wrapper never binds `WRAPPER_PORT`,
+        // so callers don't get a confusing readiness timeout.
+        if !transport_is_spawnable(&wrapper.manifest.transport) {
             return Err(format!(
-                "wrapper '{}' declares transport '{}', but only 'api' is enabled in this runner",
-                wrapper_id, wrapper.manifest.transport
+                "wrapper '{}' declares transport '{}', but only {:?} are enabled in this runner",
+                wrapper_id, wrapper.manifest.transport, SPAWNABLE_TRANSPORTS
             ));
         }
 
@@ -588,6 +606,16 @@ pub fn install_path_for(root: &Path, id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_transports_are_spawnable_and_the_others_are_not() {
+        for kind in ["api", "headless", "headed"] {
+            assert!(transport_is_spawnable(kind), "{kind} must spawn");
+        }
+        for kind in ["injected", "live", "", "API", "headed "] {
+            assert!(!transport_is_spawnable(kind), "{kind:?} must be refused");
+        }
+    }
 
     /// Insert a runtime record in `state` with no child process — the
     /// shape a wrapper has after the health loop flips it (the process is
