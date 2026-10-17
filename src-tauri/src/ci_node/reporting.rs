@@ -31,6 +31,25 @@
 //! progress response (`lost` after a lease expiry, `cancelled` after a
 //! sweep) means coord no longer wants this build — the flusher cancels the
 //! dispatch's token so the executor stops burning the machine.
+//!
+//! # Keeping coord's lease alive (plan `2026-09-27-ci-node-shadow-dispatch-never-passes-checkout-race-lost-leases-unfiltered-selection` Phase 3)
+//!
+//! Coord's dispatch lease is 15 minutes and ONLY a progress POST renews it.
+//! Two gaps let it lapse under a healthy runner:
+//!
+//! - **A silent build step.** The flusher used to POST only when a line was
+//!   pending, so a step that printed nothing for 15 minutes (the final
+//!   `Compiling qontinui-runner` of a cold `cargo test`, a quiet test binary)
+//!   lost its lease mid-build; the next line then read back `lost` and
+//!   cancelled a build that was working.
+//!   The flusher now sends an empty keepalive batch every
+//!   [`BUILD_KEEPALIVE_INTERVAL`] while the build is open. A hung step stays
+//!   bounded by its manifest `timeout_secs`, and a dead runner stops sending,
+//!   so the lease still catches both.
+//! - **A deferred dispatch.** A dispatch held in the admission queue made no
+//!   coord contact at all until admitted. [`post_queued_heartbeat`] renews its
+//!   lease with `phase: "queued"`, which coord honours WITHOUT promoting it to
+//!   `running` or stamping `started_at`.
 
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -44,6 +63,10 @@ use tracing::{debug, warn};
 pub(crate) const FLUSH_MAX_LINES: usize = 50;
 /// …or when this much time has passed since the last flush.
 pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+/// With no lines pending, POST an EMPTY batch this often so coord's 15-minute
+/// dispatch lease survives a step that prints nothing (see the module doc).
+/// Fifteen renewals per lease: one lost POST, or ten, still cannot let it lapse.
+pub(crate) const BUILD_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 /// Bound on lines buffered while coord is unreachable (drop-oldest).
 const RETRY_QUEUE_CAP_LINES: usize = 5_000;
 /// Log-tail ring budget (~32 KB, per the contract).
@@ -54,6 +77,13 @@ const RESULT_RETRY_SECS: &[u64] = &[2, 4, 8, 16, 32];
 /// Decide whether a pending batch should flush. Pure, unit-tested.
 pub(crate) fn should_flush(pending_lines: usize, elapsed_since_last: Duration) -> bool {
     pending_lines > 0 && (pending_lines >= FLUSH_MAX_LINES || elapsed_since_last >= FLUSH_INTERVAL)
+}
+
+/// Decide whether an idle flusher should send a lease keepalive. Pure,
+/// unit-tested. Only when NOTHING is pending: a pending batch renews the lease
+/// on its own, and a keepalive racing it would just be a second POST.
+pub(crate) fn should_keepalive(pending_lines: usize, since_last_post: Duration) -> bool {
+    pending_lines == 0 && since_last_post >= BUILD_KEEPALIVE_INTERVAL
 }
 
 /// Coord's terminal dispatch-ledger states (mirrors `ci_dispatch::is_terminal`
@@ -223,7 +253,7 @@ impl LinePusher {
 async fn flusher_loop(
     coord_base: String,
     dispatch_id: String,
-    mut rx: mpsc::UnboundedReceiver<String>,
+    rx: mpsc::UnboundedReceiver<String>,
     cancel: CancellationToken,
 ) {
     let url = format!(
@@ -235,69 +265,120 @@ async fn flusher_loop(
         .timeout(Duration::from_secs(10))
         .build()
         .ok();
+    let poster = HttpBatchPoster {
+        client,
+        url,
+        dispatch_id: dispatch_id.clone(),
+        cancel,
+    };
+    drive_flusher(&poster, &dispatch_id, rx).await;
+}
 
-    /// One authenticated batch POST. `true` = coord accepted the batch
-    /// (drop it from the queue) — including the terminal-state case, where
-    /// coord accepted nothing but never will (re-sending is pointless), so
-    /// the token is cancelled and the lines are surrendered.
-    async fn post_batch(
-        client: &Option<reqwest::Client>,
-        url: &str,
-        batch: &[String],
-        seq: u64,
-        dispatch_id: &str,
-        cancel: &CancellationToken,
-    ) -> bool {
-        let Some(client) = client else { return false };
-        let Some(bearer) = device_bearer().await else {
-            debug!("ci_node: no device JWT for progress POST (dispatch {dispatch_id})");
-            return false;
-        };
-        let body = ProgressBody {
-            lines: batch,
-            progress_seq: seq,
-        };
-        // coord-auth-exempt(device-jwt-required): resolves the device JWT through
-        // `coord_mcp::read_usable_device_jwt` + `await_device_jwt_remint`, which can
-        // AWAIT a re-mint. The synchronous helper cannot, so routing this through it
-        // would drop progress lines during a token rotation.
-        match client
-            .post(url)
-            .bearer_auth(bearer)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(text) = resp.text().await {
-                    if let Some(state) = parse_response_state(&text) {
-                        if is_terminal_dispatch_state(&state) && !cancel.is_cancelled() {
-                            warn!(
-                                "ci_node: coord reports dispatch {dispatch_id} already terminal \
-                                 ({state}) — cancelling the local build"
-                            );
-                            cancel.cancel();
-                        }
+/// Where the flusher sends a batch. A trait so [`drive_flusher`] — the batching
+/// and keepalive schedule — can be driven under a paused clock against a fake,
+/// with no coord and no device credential. `true` = coord accepted the batch.
+trait BatchPoster {
+    async fn post(&self, batch: &[String], seq: u64) -> bool;
+}
+
+/// The production poster: an authenticated POST to the progress route.
+struct HttpBatchPoster {
+    client: Option<reqwest::Client>,
+    url: String,
+    dispatch_id: String,
+    cancel: CancellationToken,
+}
+
+impl BatchPoster for HttpBatchPoster {
+    async fn post(&self, batch: &[String], seq: u64) -> bool {
+        post_batch(
+            &self.client,
+            &self.url,
+            batch,
+            seq,
+            &self.dispatch_id,
+            &self.cancel,
+        )
+        .await
+    }
+}
+
+/// One authenticated batch POST. `true` = coord accepted the batch
+/// (drop it from the queue) — including the terminal-state case, where
+/// coord accepted nothing but never will (re-sending is pointless), so
+/// the token is cancelled and the lines are surrendered.
+async fn post_batch(
+    client: &Option<reqwest::Client>,
+    url: &str,
+    batch: &[String],
+    seq: u64,
+    dispatch_id: &str,
+    cancel: &CancellationToken,
+) -> bool {
+    let Some(client) = client else { return false };
+    let Some(bearer) = device_bearer().await else {
+        debug!("ci_node: no device JWT for progress POST (dispatch {dispatch_id})");
+        return false;
+    };
+    let body = ProgressBody {
+        lines: batch,
+        progress_seq: seq,
+    };
+    // coord-auth-exempt(device-jwt-required): resolves the device JWT through
+    // `coord_mcp::read_usable_device_jwt` + `await_device_jwt_remint`, which can
+    // AWAIT a re-mint. The synchronous helper cannot, so routing this through it
+    // would drop progress lines during a token rotation.
+    match client
+        .post(url)
+        .bearer_auth(bearer)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(text) = resp.text().await {
+                if let Some(state) = parse_response_state(&text) {
+                    if is_terminal_dispatch_state(&state) && !cancel.is_cancelled() {
+                        warn!(
+                            "ci_node: coord reports dispatch {dispatch_id} already terminal \
+                             ({state}) — cancelling the local build"
+                        );
+                        cancel.cancel();
                     }
                 }
-                true
             }
-            Ok(resp) => {
-                debug!(
-                    "ci_node: progress POST for dispatch {dispatch_id} returned {}",
-                    resp.status()
-                );
-                false
-            }
-            Err(e) => {
-                debug!("ci_node: progress POST for dispatch {dispatch_id} failed: {e}");
-                false
-            }
+            true
+        }
+        Ok(resp) => {
+            debug!(
+                "ci_node: progress POST for dispatch {dispatch_id} returned {}",
+                resp.status()
+            );
+            false
+        }
+        Err(e) => {
+            debug!("ci_node: progress POST for dispatch {dispatch_id} failed: {e}");
+            false
         }
     }
+}
+
+/// The flusher's schedule: accumulate lines, POST a batch every
+/// [`FLUSH_INTERVAL`] or [`FLUSH_MAX_LINES`], send an empty keepalive batch
+/// after [`BUILD_KEEPALIVE_INTERVAL`] of silence while the stream is open, and
+/// drain on close.
+async fn drive_flusher<P: BatchPoster>(
+    poster: &P,
+    dispatch_id: &str,
+    mut rx: mpsc::UnboundedReceiver<String>,
+) {
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut seq: u64 = 0;
     let mut last_flush = tokio::time::Instant::now();
+    // When a progress POST was last ATTEMPTED — the keepalive clock.
+    // `last_flush` cannot serve: the idle timer arm below advances it every
+    // FLUSH_INTERVAL precisely so it never reads as "long since a flush".
+    let mut last_post = tokio::time::Instant::now();
     let mut open = true;
 
     while open || !pending.is_empty() {
@@ -322,13 +403,22 @@ async fn flusher_loop(
             }
         }
         let closing = !open;
-        if should_flush(pending.len(), last_flush.elapsed()) || (closing && !pending.is_empty()) {
+        // An open stream with nothing to say still renews the lease; a closing
+        // one is about to send its result, which settles the row outright.
+        let keepalive = open && should_keepalive(pending.len(), last_post.elapsed());
+        if should_flush(pending.len(), last_flush.elapsed())
+            || (closing && !pending.is_empty())
+            || keepalive
+        {
             // Up to 500 lines per POST — bigger than the 50-line trigger so
-            // a backlog built up during a coord blip drains quickly.
+            // a backlog built up during a coord blip drains quickly. EMPTY on
+            // a keepalive, which coord takes as a lease renewal and nothing
+            // else.
             let batch: Vec<String> = pending.iter().take(500).cloned().collect();
             seq += 1;
-            let ok = post_batch(&client, &url, &batch, seq, &dispatch_id, &cancel).await;
+            let ok = poster.post(&batch, seq).await;
             last_flush = tokio::time::Instant::now();
+            last_post = last_flush;
             if ok {
                 for _ in 0..batch.len() {
                     pending.pop_front();
@@ -344,7 +434,7 @@ async fn flusher_loop(
                     // The retry re-sends the same seq (duplicates tolerated;
                     // seq is informational on coord's side).
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    if post_batch(&client, &url, &batch, seq, &dispatch_id, &cancel).await {
+                    if poster.post(&batch, seq).await {
                         for _ in 0..batch.len() {
                             pending.pop_front();
                         }
@@ -587,6 +677,95 @@ pub(crate) fn test_results_note(body: Option<&str>, sent_artifact: bool) -> Opti
     None
 }
 
+/// The body of a queue heartbeat: no lines, `phase: "queued"`. Coord's progress
+/// route renews the lease for this phase and writes nothing else, and it
+/// REFUSES a queued POST that carries lines, so `lines` is always empty.
+#[derive(Serialize)]
+struct QueuedHeartbeatBody {
+    lines: [&'static str; 0],
+    phase: &'static str,
+}
+
+/// The wire token coord's `ProgressPhase` reads for a queued dispatch.
+pub(crate) const QUEUED_PHASE: &str = "queued";
+
+fn queued_heartbeat_body() -> QueuedHeartbeatBody {
+    QueuedHeartbeatBody {
+        lines: [],
+        phase: QUEUED_PHASE,
+    }
+}
+
+/// What one queue heartbeat learned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QueueHeartbeat {
+    /// Coord renewed the lease; keep the dispatch queued.
+    Renewed,
+    /// Coord already holds a terminal state (`lost`, `cancelled` …): it no
+    /// longer wants this dispatch, so the caller drops it from the queue and
+    /// reports nothing (the ledger row is settled).
+    Terminal(String),
+    /// Coord refused the renewal (409 `queued_renewal_refused`): the row is no
+    /// longer a not-yet-started dispatch, or it is past coord's queued-age
+    /// ceiling. Retrying cannot change either, so the caller releases it.
+    Refused,
+    /// The POST did not land (no credential, transport error, other non-2xx).
+    /// The dispatch stays queued and the next heartbeat tries again.
+    Failed(String),
+}
+
+/// Classify a heartbeat response. Pure over `(status, body)`, unit-tested.
+pub(crate) fn classify_queue_heartbeat(status: u16, body: &str) -> QueueHeartbeat {
+    if status == 409 {
+        return QueueHeartbeat::Refused;
+    }
+    if !(200..300).contains(&status) {
+        return QueueHeartbeat::Failed(format!("status {status}"));
+    }
+    match parse_response_state(body) {
+        Some(state) if is_terminal_dispatch_state(&state) => QueueHeartbeat::Terminal(state),
+        _ => QueueHeartbeat::Renewed,
+    }
+}
+
+/// Renew coord's lease on a dispatch this runner holds in its admission queue.
+/// One attempt, 10 s bound: the admission queue-keeper calls this on a timer
+/// far shorter than the lease, so a miss is retried by the next tick rather
+/// than here.
+pub(crate) async fn post_queued_heartbeat(coord_base: &str, dispatch_id: &str) -> QueueHeartbeat {
+    let url = format!(
+        "{}/coord/ci/dispatches/{}/progress",
+        coord_base.trim_end_matches('/'),
+        dispatch_id
+    );
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    else {
+        return QueueHeartbeat::Failed("reqwest client build failed".to_string());
+    };
+    let Some(bearer) = device_bearer().await else {
+        return QueueHeartbeat::Failed("no device JWT".to_string());
+    };
+    // coord-auth-exempt(device-jwt-required): the same remint-awaiting resolver as
+    // the progress flusher and `post_result`; coord authorises the renewal against
+    // the dispatch's assignee, so it must never go anonymous.
+    match client
+        .post(&url)
+        .bearer_auth(bearer)
+        .json(&queued_heartbeat_body())
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            classify_queue_heartbeat(status, &body)
+        }
+        Err(e) => QueueHeartbeat::Failed(format!("transport: {e}")),
+    }
+}
+
 /// Fire-and-forget a `cancelled` result with a reason and no steps — the
 /// admission-rejection path (hard reject / disk floor / cancelled-while-
 /// queued).
@@ -656,6 +835,110 @@ mod tests {
             "batch full → flush"
         );
         assert!(should_flush(1, FLUSH_INTERVAL), "interval elapsed → flush");
+    }
+
+    /// A fake progress route: records `(when, batch length)` per POST.
+    struct RecordingPoster {
+        posts: Mutex<Vec<(tokio::time::Instant, usize)>>,
+    }
+
+    impl BatchPoster for RecordingPoster {
+        async fn post(&self, batch: &[String], _seq: u64) -> bool {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((tokio::time::Instant::now(), batch.len()));
+            true
+        }
+    }
+
+    /// REGRESSION (plan 2026-09-27 Phase 3), driven end to end under a paused
+    /// clock: an open stream with NO lines still reaches coord — one EMPTY batch
+    /// per [`BUILD_KEEPALIVE_INTERVAL`] — so a silent step keeps its lease.
+    /// Before the keepalive, the flusher posted only pending lines and this saw
+    /// zero POSTs.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_open_stream_sends_an_empty_keepalive_every_interval() {
+        let poster = std::sync::Arc::new(RecordingPoster {
+            posts: Mutex::new(Vec::new()),
+        });
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let started = tokio::time::Instant::now();
+        let task = {
+            let poster = poster.clone();
+            tokio::spawn(async move { drive_flusher(&*poster, "d-keepalive", rx).await })
+        };
+
+        tokio::time::sleep(BUILD_KEEPALIVE_INTERVAL - Duration::from_secs(5)).await;
+        assert!(
+            poster.posts.lock().unwrap().is_empty(),
+            "nothing is sent before the keepalive interval"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        {
+            let posts = poster.posts.lock().unwrap();
+            assert_eq!(
+                posts.len(),
+                1,
+                "exactly one keepalive by one interval: {posts:?}"
+            );
+            assert_eq!(posts[0].1, 0, "the keepalive is an EMPTY batch");
+            assert!(posts[0].0 - started >= BUILD_KEEPALIVE_INTERVAL);
+        }
+        tokio::time::sleep(BUILD_KEEPALIVE_INTERVAL).await;
+        assert_eq!(
+            poster.posts.lock().unwrap().len(),
+            2,
+            "and one per interval after"
+        );
+
+        drop(tx);
+        task.await.expect("flusher exits when the stream closes");
+    }
+
+    /// REGRESSION (plan 2026-09-27 Phase 3): a build step that printed nothing
+    /// for 15 minutes lost coord's lease mid-build, because the flusher only
+    /// POSTed pending lines. An idle flusher must renew within one lease.
+    #[test]
+    fn an_idle_flusher_renews_the_lease_well_inside_one_lease() {
+        assert!(!should_keepalive(0, Duration::from_secs(59)));
+        assert!(should_keepalive(0, BUILD_KEEPALIVE_INTERVAL));
+        assert!(
+            !should_keepalive(3, Duration::from_secs(600)),
+            "pending lines renew the lease themselves"
+        );
+    }
+
+    #[test]
+    fn queued_heartbeat_wire_shape_matches_coord_progress_phase() {
+        let v = serde_json::to_value(queued_heartbeat_body()).unwrap();
+        assert_eq!(v, serde_json::json!({"lines": [], "phase": "queued"}));
+    }
+
+    #[test]
+    fn queued_heartbeat_classification() {
+        assert_eq!(
+            classify_queue_heartbeat(200, r#"{"state":"dispatched"}"#),
+            QueueHeartbeat::Renewed
+        );
+        for terminal in ["lost", "cancelled", "failed", "succeeded"] {
+            assert_eq!(
+                classify_queue_heartbeat(200, &format!(r#"{{"state":"{terminal}"}}"#)),
+                QueueHeartbeat::Terminal(terminal.to_string())
+            );
+        }
+        assert_eq!(
+            classify_queue_heartbeat(409, r#"{"error":"queued_renewal_refused"}"#),
+            QueueHeartbeat::Refused
+        );
+        assert!(matches!(
+            classify_queue_heartbeat(400, r#"{"error":"invalid_phase"}"#),
+            QueueHeartbeat::Failed(_)
+        ));
+        assert!(matches!(
+            classify_queue_heartbeat(503, ""),
+            QueueHeartbeat::Failed(_)
+        ));
     }
 
     #[test]
