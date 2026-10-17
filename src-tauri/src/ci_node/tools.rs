@@ -1406,7 +1406,10 @@ fn extract_tree(
                 let mut entry = zip
                     .by_index(i)
                     .map_err(|e| format!("read zip entry {i} from {url}: {e}"))?;
-                let raw = entry.name().to_string();
+                let raw = entry
+                    .name()
+                    .map_err(|e| format!("read zip entry {i} name from {url}: {e}"))?
+                    .to_string();
                 let Some(rel) =
                     safe_tree_path(&raw, root_dir).map_err(|e| format!("{url}: {e}"))?
                 else {
