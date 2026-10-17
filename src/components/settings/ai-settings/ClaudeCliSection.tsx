@@ -470,8 +470,9 @@ export function ClaudeCliSection({
                   accountUsages.length > 0 &&
                   accountUsages
                     .filter((a) => !a.error)
-                    .sort(compareForAccountSelectionMode(settings.claude_cli.account_selection_mode))[0]
-                    ?.config_dir === dir;
+                    .sort(
+                      compareForAccountSelectionMode(settings.claude_cli.account_selection_mode),
+                    )[0]?.config_dir === dir;
 
                 return (
                   <div
@@ -788,6 +789,37 @@ export function ClaudeCliSection({
             </div>
           )}
 
+          {/* The pin is rendered for EVERY machine, not only multi-account ones:
+              a fleet-wide mode (manual in particular) reaches a zero- or
+              one-account machine too, and pinning is how it opts out. */}
+          <div className="space-y-2 pt-2">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.claude_cli.account_selection_pinned ?? false}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    claude_cli: {
+                      ...prev.claude_cli,
+                      account_selection_pinned: e.target.checked,
+                    },
+                  }))
+                }
+                className="mt-0.5 accent-primary"
+              />
+              <span>
+                <span className="text-xs font-medium block">
+                  Pin this machine&apos;s selection mode (ignore fleet policy)
+                </span>
+                <span className="text-[10px] text-muted-foreground block">
+                  When unpinned, a fleet-wide account selection mode set by the operator overrides
+                  the mode chosen here. Applies to every runner on this machine.
+                </span>
+              </span>
+            </label>
+          </div>
+
           {claudeConfigDirs.length > 1 && (
             <div className="space-y-2 pt-2">
               <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
@@ -809,9 +841,7 @@ export function ClaudeCliSection({
                   className="mt-0.5 accent-primary"
                 />
                 <span>
-                  <span className="text-xs font-medium block">
-                    Auto-migrate exhausted sessions
-                  </span>
+                  <span className="text-xs font-medium block">Auto-migrate exhausted sessions</span>
                   <span className="text-[10px] text-muted-foreground block">
                     When a session hits its usage limit, respawn it — same conversation and model —
                     on the account picked by the same use-it-or-lose-it rule.
