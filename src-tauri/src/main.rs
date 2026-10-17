@@ -123,6 +123,10 @@ mod dom_capture;
 mod drain;
 #[cfg(test)]
 mod runner_spawn_sites;
+// Shared by the source-scanning guards. The lib owns it; re-bound here so the
+// bin's guards say `crate::source_lex::…` (`crate_roots_ratchet`).
+#[cfg(test)]
+pub(crate) use qontinui_runner_lib::source_lex;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
 // path in this binary - including mcp_api.rs's /health reporting - keeps

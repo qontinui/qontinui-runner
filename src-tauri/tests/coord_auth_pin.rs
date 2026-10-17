@@ -86,6 +86,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// The shared `is_test_only_file` predicate (plan
+// `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b): one
+// definition, compiled into this gate by path rather than copied into it.
+#[path = "../src/source_lex.rs"]
+mod source_lex;
+
 /// Substrings that make a file "coord-touching" and therefore in scope.
 ///
 /// Deliberately broad — see the module doc on over-collection. A file that
@@ -269,6 +275,11 @@ const CFG_TEST_BRACE_WINDOW: usize = 1;
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 fn cfg_test_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
+    // A file opening `#![cfg(test)]` (an extracted test module) is one test
+    // range end to end: it carries no in-file `#[cfg(test)]` to open one.
+    if source_lex::is_test_only_file(&lines.join("\n")) {
+        return vec![(0, lines.len().saturating_sub(1))];
+    }
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -310,6 +321,30 @@ fn cfg_test_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// An extracted test module's coord write sits inside a test range; the same
+/// write in a production file does not (the control).
+#[test]
+fn an_extracted_test_only_file_is_one_test_range() {
+    let body = "fn t() {\n    let r = client.post(&coord_url).json(&b).send();\n}\n";
+    let extracted = format!("#![cfg(test)]\n\nuse super::*;\n\n{body}");
+    let lines: Vec<&str> = extracted.lines().collect();
+    let post = lines
+        .iter()
+        .position(|l| l.contains(".post("))
+        .expect("fixture has a write");
+    assert!(
+        cfg_test_ranges(&lines)
+            .iter()
+            .any(|(a, b)| post >= *a && post <= *b),
+        "a `#![cfg(test)]` file's coord write was read as production"
+    );
+    let lines: Vec<&str> = body.lines().collect();
+    assert!(
+        cfg_test_ranges(&lines).is_empty(),
+        "control: a production file has no test range"
+    );
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
