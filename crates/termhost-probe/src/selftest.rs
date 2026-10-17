@@ -18,8 +18,8 @@
 //! 3. the process sampler on the probe's own process;
 //! 4. each operative capture source sees a calibration marker;
 //! 5. output latency: markers painted at scheduled times behind an artificial
-//!    delay D (0, 50, 200 ms) must be reported as D within one refresh
-//!    interval — gated for DDA and X11. WGC stamps a later stage (the
+//!    delay D (0, 50, 200 ms) must be reported as D within two refresh
+//!    intervals — gated for DDA and X11. WGC stamps a later stage (the
 //!    compositor's render of the capture frame), measured on one machine
 //!    class only, so its absolute check is reported but not gated; WGC is
 //!    gated instead against DDA (`wgc_render_offset.d*`: median minus DDA's
@@ -693,16 +693,25 @@ impl Selftest<'_> {
         seq: &mut u64,
         all: &mut Vec<Marker>,
     ) -> Vec<(SourceId, u64, f64)> {
-        // The tolerance is one refresh interval. When the display reports no
-        // rate it is the assumed 60 Hz interval, and the check says so: a
-        // selftest tolerance, not a KPI. WGC's absolute check is reported but
+        // The tolerance is TWO refresh intervals: a paint is composed at the
+        // next vsync and presented up to one vsync after that, so a correctly
+        // timed marker lands anywhere in (D, D + 2 intervals]. One interval
+        // failed a correct probe by chance: windows-latest measured medians of
+        // D + 11.5, 13.5 and 12.6 ms in one run and D + 16.3 ms (0.66 ms over
+        // 15.62) in the next (runs 38974786541, 38979153092), with single
+        // markers up to D + 25.7 ms. A probe that mis-times by more than that
+        // still fails (the fake's 40 ms lag), and the clock and WGC/DDA gates
+        // catch smaller offsets. When the display reports no rate it is the
+        // assumed 60 Hz interval, and the check says so: a selftest
+        // tolerance, not a KPI. WGC's absolute check is reported but
         // not gated (see WGC_RENDER_OFFSET_MS); `wgc_relative_checks` gates
         // WGC against DDA or across delays instead.
         let refresh_ms = refresh.ns as f64 / 1e6;
+        let bound_ms = 2.0 * refresh_ms;
         let tolerance = if refresh.assumed {
-            format!("{refresh_ms:.2} ms, ASSUMED: the display reports no refresh rate")
+            format!("{bound_ms:.2} ms (two intervals), ASSUMED: the display reports no refresh rate")
         } else {
-            format!("one refresh interval, {refresh_ms:.2} ms")
+            format!("two refresh intervals, {bound_ms:.2} ms")
         };
         let mut medians = Vec::new();
         let period = self.cfg.marker_period_ms * MS;
@@ -760,7 +769,7 @@ impl Selftest<'_> {
                 }
                 let ok = observed == k
                     && paint_errors == 0
-                    && med.is_some_and(|m| (m - d_ms).abs() <= refresh_ms)
+                    && med.is_some_and(|m| (m - d_ms).abs() <= bound_ms)
                     && min >= d_ms - 1.0;
                 let name = format!("output_latency.{}.d{d}", kind.as_str());
                 let detail = format!(
