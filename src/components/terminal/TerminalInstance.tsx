@@ -73,7 +73,11 @@ import {
   type TerminalOutputPayload,
 } from "./terminalEventDemux";
 import { declarePaneTier } from "./terminalVisibilityTiers";
-import { PaneVisibilityService, routeOutputChunk } from "./paneVisibilityService";
+import {
+  PaneVisibilityService,
+  mountBootstrapPlan,
+  routeOutputChunk,
+} from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
 import { describeThrown } from "@/lib/utils";
 
@@ -1518,10 +1522,14 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // ~10x5 from a 0x0 box and the subsequent terminal_resize
         // SIGWINCHes Claude into a 10x5 redraw — the Rust grid is then
         // destructively resized and stays at 10x5 forever.
+        const hasLayout = () => {
+          const cc = containerRef.current;
+          return !!cc && cc.clientWidth > 0 && cc.clientHeight > 0;
+        };
         const waitForLayout = async (): Promise<boolean> => {
           const c = containerRef.current;
           if (!c) return false;
-          if (c.clientWidth > 0 && c.clientHeight > 0) return true;
+          if (hasLayout()) return true;
           return new Promise<boolean>((resolve) => {
             const ro = new ResizeObserver(() => {
               if (disposed) {
@@ -1529,17 +1537,19 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                 resolve(false);
                 return;
               }
-              const cc = containerRef.current;
-              if (cc && cc.clientWidth > 0 && cc.clientHeight > 0) {
+              if (hasLayout()) {
                 ro.disconnect();
                 resolve(true);
               }
             });
             ro.observe(c);
-            // Safety timeout — give up after 1s and try anyway.
+            // Safety timeout — stop waiting after 1s and report what the box
+            // measures then. A pane mounted hidden (`display: none`) still has
+            // none, and claiming otherwise resized its PTY to the backend's
+            // default size; it re-fits when it is revealed.
             setTimeout(() => {
               ro.disconnect();
-              resolve(true);
+              resolve(hasLayout());
             }, 1000);
           });
         };
@@ -1549,9 +1559,19 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         if (disposed) return;
         const laidOut = await waitForLayout();
         if (disposed) return;
+        // A pane mounted hidden skips both halves: it has no box to fit, and
+        // a grid paint over its (stream-stale) buffer would splice history
+        // once the reveal resync replays the dropped window. See
+        // `mountBootstrapPlan`.
+        const bootstrapPlan = mountBootstrapPlan({
+          hasLayout: laidOut,
+          visible: visibleRef.current,
+          behind: paneService.behind,
+        });
+        let painted = false;
 
         try {
-          if (laidOut) {
+          if (bootstrapPlan.resize) {
             backend.fit();
             // Sanity check: refuse to ship a tiny resize that would wipe
             // the grid. Claude's TUI requires a non-trivial viewport;
@@ -1571,12 +1591,29 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             }
           }
           if (disposed) return;
-          const result = await invoke<{ success: boolean; data: GridSnapshot | null }>(
-            "terminal_get_grid",
-            { terminalId },
-          );
-          if (result.success && result.data && !disposed) {
-            bootstrapPaint(result.data, isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap");
+          if (bootstrapPlan.paint) {
+            const result = await invoke<{ success: boolean; data: GridSnapshot | null }>(
+              "terminal_get_grid",
+              { terminalId },
+            );
+            // Re-checked after the fetch: a pane hidden while it was in flight
+            // has started dropping chunks, so the paint is no longer safe.
+            if (
+              result.success &&
+              result.data &&
+              !disposed &&
+              mountBootstrapPlan({
+                hasLayout: laidOut,
+                visible: visibleRef.current,
+                behind: paneService.behind,
+              }).paint
+            ) {
+              bootstrapPaint(
+                result.data,
+                isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap",
+              );
+              painted = true;
+            }
           }
         } catch (err) {
           console.warn(`[Terminal ${terminalId}] grid bootstrap failed:`, err);
@@ -1590,6 +1627,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // the listener wasn't attached, but the structure stays uniform.
         if (isReconnecting && !outputUnsub) {
           outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
+          // Without the paint, nothing covers what the terminal emitted
+          // between the ring snapshot and this registration. Mark the pane
+          // behind so its (next) active tier replays it from the ring.
+          if (!painted) paneService.noteMissedOutput();
         }
         if (disposed) return;
 
@@ -2046,7 +2087,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
      * classification: `classifyTabs` marks every tab of a preset layout
      * "assigned" (all mounted) and never consults viewport proximity, so a
      * flow-mode-only tier would leave preset layouts — maximized single view,
-     * compact zone cards, `HiddenTerminal`'s off-grid parking — paying full
+     * compact zone cards, the parked cells of unzoned / off-screen tabs — paying full
      * cost for panes nobody can see.
      *
      * The WebGL LRU is told too: a hidden pane is the first candidate to be
