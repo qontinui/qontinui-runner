@@ -185,11 +185,11 @@ expect_reject "$ONE_OVER" "51 characters"
 expect_reject "$ONE_OVER" 'coord:upstream-of=qontinui-supervisor#1234'
 
 # ----- known-BAD: over the ceiling --------------------------------------------
-# The case that first hit, 2026-08-19 (claude-config#296 -> dev-notes#167).
+# The case that first hit, 2026-08-19 (claude-config#296 -> the plans repo#167).
 expect_reject "coord:downstream-of=qontinui/qontinui-claude-config#296" \
   'coord:downstream-of=qontinui-claude-config#296'
-expect_reject "coord:downstream-of=qontinui/qontinui-dev-notes#1234" \
-  'coord:downstream-of=qontinui-dev-notes#1234'
+expect_reject "coord:downstream-of=qontinui/example-plans-repo#1234" \
+  'coord:downstream-of=example-plans-repo#1234'
 # The mis-signpost warning is the point of the guard, so assert it is present.
 expect_reject "coord:downstream-of=qontinui/qontinui-claude-config#296" \
   "not found"
@@ -201,9 +201,9 @@ expect_reject "coord:requires-tag=ts-v0.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 
 # A FOREIGN owner is not ours to drop: coord canonicalizes a bare name to the
 # TENANT's owner, so the "short form" would silently retarget the edge at a
 # different repo. Suggest nothing.
-expect_absent "coord:downstream-of=some-other-org/qontinui-dev-notes#1234" \
+expect_absent "coord:downstream-of=some-other-org/example-plans-repo#1234" \
   "drop the owner"
-expect_reject "coord:downstream-of=some-other-org/qontinui-dev-notes#1234" \
+expect_reject "coord:downstream-of=some-other-org/example-plans-repo#1234" \
   "shorten the value"
 # An owner with an EMPTY repo part would shorten to `coord:upstream-of=#<n>`,
 # which validate_label rejects ("missing repo"). Suggest nothing.
@@ -254,7 +254,7 @@ expect_accept "coord:requires-tag=ts-v*"
 # and a CLOSED-enum one get the caveat without it (pointing at a repo-wide
 # mutation for a label somebody creates once is advice nobody needs -- the same
 # over-broad-signposting the post-gh arm narrows its match to avoid).
-DYN_LABEL="coord:downstream-of=qontinui-dev-notes#167"
+DYN_LABEL="coord:downstream-of=example-plans-repo#167"
 expect_dry_contains "$DYN_LABEL" "NOT checked"
 expect_dry_contains "$DYN_LABEL" "gh label create \"$DYN_LABEL\" --repo $REPO"
 # ...and it must never assert an absence it has no evidence for. A dry run sent
