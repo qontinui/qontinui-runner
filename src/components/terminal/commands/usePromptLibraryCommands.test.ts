@@ -1,19 +1,27 @@
+// @vitest-environment jsdom
 /**
  * Tests for the dynamic per-prompt slash registration
  * (`registerPromptActions`) — the pure core of
- * `usePromptLibraryCommands`, following the node-environment precedent
- * (no JSX/hook rendering; the React glue is a one-line effect).
+ * `usePromptLibraryCommands`. The pure cases need no DOM; the last block
+ * mounts the REAL hook (React 19 `createRoot` + `act`, the
+ * `useSessionReview.test.ts` pattern), which is why the file runs in jsdom.
  */
 
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PromptTemplate } from "../promptLibraryApi";
 import { __resetForTest, getAll, getById, getBySlash, register } from "./registry";
 import type { CommandResult } from "./types";
 import {
+  FANOUT_COMMAND_ID,
+  registerFanoutAction,
   registerPromptActions,
+  usePromptLibraryCommands,
   type PromptLibraryCommandsContext,
 } from "./usePromptLibraryCommands";
+import type { EffectReport } from "./verdict";
 
 function prompt(overrides: Partial<PromptTemplate> & { name: string }): PromptTemplate {
   return {
@@ -31,12 +39,17 @@ function prompt(overrides: Partial<PromptTemplate> & { name: string }): PromptTe
 function makeCtx(overrides: Partial<PromptLibraryCommandsContext> = {}) {
   const calls = {
     opened: [] as Array<string | undefined>,
+    fanoutOpened: 0,
     spawned: [] as string[],
     inserted: [] as string[],
   };
   const ctx: PromptLibraryCommandsContext = {
     prompts: [],
     openPromptModal: (slug) => calls.opened.push(slug),
+    openFanoutModal: () => {
+      calls.fanoutOpened += 1;
+      return { changed: calls.fanoutOpened === 1 };
+    },
     spawnWithText: (text) => {
       calls.spawned.push(text);
     },
@@ -180,5 +193,81 @@ describe("registerPromptActions", () => {
 
     await getBySlash("/loop")!.handler({}, { source: "test" });
     expect(calls.spawned).toEqual(["fresh body"]);
+  });
+});
+
+describe("registerFanoutAction", () => {
+  it("registers /fanout (and /fan-out), which opens the modal in fan-out mode", async () => {
+    const { ctx, calls } = makeCtx();
+    const dispose = registerFanoutAction(() => ctx);
+
+    expect(getBySlash("/fanout")?.id).toBe(FANOUT_COMMAND_ID);
+    expect(getBySlash("/fan-out")?.id).toBe(FANOUT_COMMAND_ID);
+
+    const first = await getBySlash("/fanout")!.handler({}, { source: "test" });
+    expect(first.ok).toBe(true);
+    expect((first.value as EffectReport).affected).toBe(1);
+    expect(calls.fanoutOpened).toBe(1);
+    // Neither the single-session form nor a spawn was touched.
+    expect(calls.opened).toEqual([]);
+    expect(calls.spawned).toEqual([]);
+
+    // Already open in fan-out mode → reported as no change, not as success-with-effect.
+    const second = await getBySlash("/fanout")!.handler({}, { source: "test" });
+    expect((second.value as EffectReport).affected).toBe(0);
+
+    dispose();
+    expect(getById(FANOUT_COMMAND_ID)).toBeUndefined();
+  });
+
+  it("a prompt template named `fanout` meets the collision rule, not the built-in", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { ctx } = makeCtx();
+    registerFanoutAction(() => ctx);
+    const prompts = [prompt({ name: "fanout" })];
+    registerPromptActions(prompts, () => ctx);
+    expect(getBySlash("/fanout")?.id).toBe(FANOUT_COMMAND_ID);
+    expect(getById("prompt.fanout")).toBeUndefined();
+  });
+});
+
+describe("usePromptLibraryCommands (the hook the Terminal page mounts)", () => {
+  it("registers the built-in fan-out command ahead of the library, and disposes it on unmount", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // A library that carries a template literally named `fanout`, beside an ordinary one.
+    // Only registration is observed here, so no command handler is invoked.
+    const ctx = {
+      prompts: [prompt({ name: "fanout" }), prompt({ name: "ship-notes" })],
+      openPromptModal: () => {},
+      spawnWithText: () => {},
+      insertIntoFocused: () => true,
+    } as PromptLibraryCommandsContext;
+
+    const host = document.createElement("div");
+    const root = createRoot(host);
+    await act(async () => {
+      root.render(
+        createElement(function Page() {
+          usePromptLibraryCommands(ctx);
+          return null;
+        }),
+      );
+    });
+
+    const builtIn = getBySlash("/fanout");
+    expect(builtIn?.id).toBe("terminal.fanout");
+    expect(builtIn?.label).toBe("Fan out a prompt");
+    expect(getBySlash("/fan-out")?.id).toBe("terminal.fanout");
+    // The same-named template met the collision rule instead of shadowing it…
+    expect(getById("prompt.fanout")).toBeUndefined();
+    // …while the rest of the library registered as before.
+    expect(getBySlash("/ship-notes")?.id).toBe("prompt.ship-notes");
+
+    await act(async () => {
+      root.unmount();
+    });
+    expect(getBySlash("/fanout")).toBeUndefined();
+    expect(getBySlash("/ship-notes")).toBeUndefined();
   });
 });

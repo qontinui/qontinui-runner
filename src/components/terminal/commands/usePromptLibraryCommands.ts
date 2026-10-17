@@ -19,6 +19,13 @@
  * Registrations are disposed via the disposer `register()` returns —
  * both on library refresh (the effect re-runs when the prompt list
  * changes; React runs cleanup first) and on unmount.
+ *
+ * `/fanout` (plan
+ * `2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out`
+ * Phase 7) is registered here too — it opens the same modal in fan-out mode.
+ * It is registered BEFORE the per-prompt slugs, in its own effect that does
+ * not re-run on a library refresh, so a prompt template named `fanout` meets
+ * the collision rule above instead of shadowing the built-in.
  */
 
 import { useEffect, useRef } from "react";
@@ -44,6 +51,11 @@ export interface PromptLibraryCommandsContext {
    * behind it is its own way of throwing evidence away.
    */
   openPromptModal: (focusSlug?: string) => { changed: boolean } | void;
+  /**
+   * Open the same modal in fan-out mode (`/fanout`). `changed` is false when
+   * it was already open in that mode.
+   */
+  openFanoutModal: (focusSlug?: string) => { changed: boolean } | void;
   /** Spawn a fresh AI session with the text auto-typed. */
   spawnWithText: (text: string) => void | Promise<void>;
   /** Prefill text (NO trailing `\r`) into the focused session.
@@ -154,14 +166,50 @@ export function registerPromptActions(
   };
 }
 
+/** Stable id of the `/fanout` command. */
+export const FANOUT_COMMAND_ID = "terminal.fanout";
+
+/**
+ * Register the `/fanout` command. Pure of React, like
+ * {@link registerPromptActions}; returns its disposer.
+ */
+export function registerFanoutAction(getCtx: () => PromptLibraryCommandsContext): () => void {
+  const action: CommandAction = {
+    id: FANOUT_COMMAND_ID,
+    slash: "/fanout",
+    aliases: ["/fan-out"],
+    label: "Fan out a prompt",
+    description:
+      "Open the prompt library in fan-out mode: one prompt template × a matrix of values " +
+      "(e.g. platform:iOS,Android) → a preview of every member, then N sessions launched " +
+      "a few at a time by the runner's scheduler.",
+    paramSchema: {},
+    patterns: [/^fan[- ]?out$/i],
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const opened = getCtx().openFanoutModal();
+      return ok(stateEffect("opened", "the fan-out form", opened?.changed === true));
+    },
+  };
+  return register(action);
+}
+
 export function usePromptLibraryCommands(ctx: PromptLibraryCommandsContext): void {
   // Latest-context ref (the `useCommandAction` pattern): handlers close
   // over the ref so registrations survive re-renders without re-running
   // the effect, which is keyed on the prompt list only.
   const ctxRef = useRef(ctx);
-  ctxRef.current = ctx;
+  // Synced in an effect, not during render (`react-hooks/refs`). Handlers
+  // only read it on invocation, which is always after the commit that ran
+  // this effect.
+  useEffect(() => {
+    ctxRef.current = ctx;
+  }, [ctx]);
 
   const { prompts } = ctx;
+
+  // `/fanout` — declared before the per-prompt effect so it registers first
+  // (effects run in declaration order) and is not re-registered on refresh.
+  useEffect(() => registerFanoutAction(() => ctxRef.current), []);
 
   useEffect(() => {
     // React runs this cleanup before re-running the effect, so a library
