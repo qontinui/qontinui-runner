@@ -1,0 +1,223 @@
+# Workflow lint: zizmor (security audits) + actionlint (syntax/semantics) over
+# every workflow in qontinui-runner; zizmor also audits the composite actions
+# under .github/actions.
+#
+# Plan: 2026-10-04-adopt-self-hosted-ci-scout-improvements, Phase 1
+# (adopts Follow-up A of 2026-09-18-actions-script-injection-in-the-clorinde-
+# autocommit-push §6).
+#
+# TRIGGERS
+#   - pull_request: every PR, with NO `paths:` filter. This IS the
+#     required-check shim: the job is cheap (two static binaries over this
+#     repo's workflow files), so rather than a path-filtered workflow plus an always-green
+#     shim, it simply always runs -- a path filter is exactly what turns a
+#     required check into a ghost that never reports (see candidate-ci.yml's
+#     "NO `paths:` FILTER" note).
+#   - push to coord's candidate refs, so the merge train sees it.
+#   - workflow_dispatch, so a run can be recorded on demand.
+#   There is deliberately NO `push: main` trigger: coord reads a failing push
+#   run on main as main-red and holds the train.
+#
+# ADVISORY until >= 5 observed runs with zero unexplained reds (plan Phase
+# 1.5), then promote to a required check. Advisory is STEP-level
+# `continue-on-error: true`, never job-level: a job-level continue-on-error
+# lets the RUN conclude success but still publishes the job's CHECK RUN with
+# conclusion=failure, and coord's candidate classifier reads check runs, so it
+# would see red and hold the train. Evidence: qontinui-runner run 33284989396
+# concluded success while its continue-on-error job's check run 99186538561
+# reads conclusion=failure (`gh api repos/qontinui/qontinui-runner/check-runs/
+# 99186538561 --jq .conclusion`, verified 2026-10-04).
+#
+# Every step is advisory that way, each with its own timeout-minutes:
+# checkout, the arch guard, the tool install (download / sha256 / extract /
+# hang -- curl is bounded and retried), zizmor, actionlint, and the final
+# summary step. What CANNOT be made advisory, and so can still red the check:
+# the runner-side "Set up job" phase (runner assignment, fetching the pinned
+# checkout action), losing the runner mid-job (host crash, runner process
+# killed), cancellation, and the job-level timeout-minutes backstop -- which
+# is set above the sum of the step timeouts so it should never fire first.
+#
+# VISIBILITY while the check stays green: each finding is emitted as a
+# `::warning`/`::error` workflow-command annotation (shown on the run and the
+# PR diff), the failing step is marked failed in the job log, and the run's
+# step summary gets exactly one line per tool:
+#   - zizmor: PASS | FINDINGS(n) | ERROR (...)
+#   - actionlint: PASS | FINDINGS(n) | ERROR (...)
+# so Phase 1.5's ">= 5 observed runs, zero unexplained reds" is countable from
+# the run summaries. The final always() step is the SOLE writer of those
+# lines: every other step only sets step outputs (`verdict=` / `reason=`), so
+# a step killed at any point yields exactly one ERROR (...) line per tool, never
+# zero and never two.
+#
+# Both tools are pinned exactly and their release tarballs checked against a
+# sha256 recorded here: a float would let a new audit turn this red on an
+# unchanged workflow tree (plan D2).
+name: Workflow lint
+
+on:
+  pull_request:
+  push:
+    branches:
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-lint:
+    name: workflow-lint
+    # merytshost-public, the only runner registered to this repo (2026-10-04).
+    runs-on: [self-hosted, public-pool]  # never GitHub-hosted: hosted CI is off
+    # Backstop only. Step timeouts sum to 16 min (checkout 2 + arch 1 +
+    # install 7 + zizmor 3 + actionlint 2 + summary 1); this sits above that so
+    # a slow step is killed by its own advisory timeout, not by this one.
+    timeout-minutes: 20
+    env:
+      ZIZMOR_VERSION: 1.30.1
+      ZIZMOR_SHA256: e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        id: checkout
+        continue-on-error: true  # advisory; see header
+        timeout-minutes: 2
+        with:
+          persist-credentials: false
+      - name: Check host architecture (release tarballs below are x86_64)
+        id: arch
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true  # advisory; see header
+        timeout-minutes: 1
+        run: |
+          arch="$(uname -m)"
+          if [[ "$arch" != "x86_64" ]]; then
+            msg="host arch is ${arch}, but the pinned zizmor/actionlint downloads are x86_64-only; lint skipped (pin a matching tarball + sha256 to support this host)"
+            echo "::warning::workflow-lint: ${msg}"
+            echo "reason=${msg}" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+      - name: Install zizmor and actionlint (pinned, sha256-verified)
+        id: install
+        if: steps.arch.outcome == 'success'
+        continue-on-error: true  # advisory; see header
+        # Worst case per download: 3 attempts x 60 s + 2 x 3 s retry delay.
+        timeout-minutes: 7
+        run: |
+          set -Eeuo pipefail  # -E: the ERR trap must also fire inside fetch()
+          trap 'echo "::warning::workflow-lint: tool install failed (download, sha256 or extract); lint skipped"; echo "reason=install failed" >> "$GITHUB_OUTPUT"' ERR
+          bin="${RUNNER_TEMP}/workflow-lint-bin"
+          mkdir -p "$bin"
+          cd "$bin"
+          fetch() {
+            curl --fail --silent --show-error --location \
+              --connect-timeout 20 --max-time 60 --retry 2 --retry-delay 3 \
+              -o "$1" "$2"
+          }
+          fetch zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  zizmor.tar.gz" | sha256sum -c -
+          tar xzf zizmor.tar.gz zizmor
+          fetch actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          rm -f zizmor.tar.gz actionlint.tar.gz
+          echo "$bin" >> "$GITHUB_PATH"
+      - name: zizmor
+        id: zizmor
+        if: steps.install.outcome == 'success'
+        continue-on-error: true  # advisory; see header
+        timeout-minutes: 3
+        env:
+          # Online audits (impostor-commit, known-vulnerable-actions) read
+          # public action repos; the job token is read-only.
+          GH_TOKEN: ${{ github.token }}
+        # `--format github` emits each finding as a workflow-command annotation.
+        # Files are passed explicitly (not the directory) so each annotation's
+        # `file=` is the repo-relative path and attaches to the PR diff.
+        # Exit codes (zizmor 1.30.1 docs/usage.md): 0 clean; 11-14 findings
+        # (by max severity); 1/2/3 are tool errors, and anything else (101
+        # panic, 137 SIGKILL, 143 SIGTERM, ...) is an error too, never FINDINGS.
+        run: |
+          mapfile -t files < <( { find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \); find .github/actions -type f \( -name 'action.yml' -o -name 'action.yaml' \); } | sort)
+          set +e
+          out="$(zizmor --no-progress --format github --config .github/zizmor.yml "${files[@]}")"
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          n="$(printf '%s\n' "$out" | grep -c '^::' || true)"
+          if [[ $rc -eq 0 ]]; then verdict="PASS"
+          elif [[ $rc -ge 11 && $rc -le 14 ]]; then verdict="FINDINGS(${n})"
+          else verdict="ERROR (exit ${rc})"; fi
+          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"  # summary line: final step
+          exit "$rc"
+      - name: actionlint
+        id: actionlint
+        if: steps.install.outcome == 'success'
+        continue-on-error: true  # advisory; see header
+        timeout-minutes: 2
+        # `-shellcheck=` / `-pyflakes=` disable the external-linter integrations:
+        # CI must not depend on whatever shellcheck/pyflakes each self-hosted
+        # host happens to have installed (plan D2: exact pins, no floats).
+        # Re-enable with a pinned, sha256-checked install when that is wanted.
+        # Findings come out as JSON and are turned into `::warning` annotations
+        # with workflow-command escaping (% CR LF in the message; also : , in
+        # properties), so a message can never break or forge a command.
+        # Exit codes: 0 clean, 1 findings, else a tool/config error.
+        run: |
+          set +e
+          json="$(actionlint -shellcheck= -pyflakes= -format '{{json .}}')"
+          rc=$?
+          set -e
+          out="$(printf '%s' "$json" | python3 -c '
+          import json, sys
+          raw = sys.stdin.read().strip()
+          errs = json.loads(raw) if raw else []
+          def data(v):
+              return str(v).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          def prop(v):
+              return data(v).replace(":", "%3A").replace(",", "%2C")
+          for e in errs or []:
+              print("::warning file=%s,line=%s,col=%s,title=%s::%s" % (
+                  prop(e.get("filepath", "")), prop(e.get("line", "")),
+                  prop(e.get("column", "")), prop("actionlint " + str(e.get("kind", ""))),
+                  data(e.get("message", ""))))
+          ')" || { echo "::warning::workflow-lint: could not parse actionlint JSON output"; out=""; rc=99; }
+          printf '%s\n' "$out"
+          n="$(printf '%s\n' "$out" | grep -c '^::warning' || true)"
+          if [[ $rc -eq 0 ]]; then verdict="PASS"
+          elif [[ $rc -eq 1 ]]; then verdict="FINDINGS(${n})"
+          else verdict="ERROR (exit ${rc})"; fi
+          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"  # summary line: final step
+          exit "$rc"
+      # SOLE writer of the step-summary lines: exactly one per tool. A tool
+      # with no verdict (an earlier step failed or was killed) gets ERROR (...),
+      # using the failing step's own `reason=` when it managed to set one.
+      - name: Record verdicts
+        if: always()
+        continue-on-error: true  # advisory; see header
+        timeout-minutes: 1
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          ARCH_OUTCOME: ${{ steps.arch.outcome }}
+          ARCH_REASON: ${{ steps.arch.outputs.reason }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          INSTALL_REASON: ${{ steps.install.outputs.reason }}
+          ZIZMOR_VERDICT: ${{ steps.zizmor.outputs.verdict }}
+          ACTIONLINT_VERDICT: ${{ steps.actionlint.outputs.verdict }}
+        run: |
+          if [[ "$CHECKOUT_OUTCOME" != "success" ]]; then
+            z="ERROR (checkout failed)"; a="$z"
+          elif [[ "$ARCH_OUTCOME" != "success" ]]; then
+            z="ERROR (${ARCH_REASON:-arch check ${ARCH_OUTCOME}: killed or crashed})"; a="$z"
+          elif [[ "$INSTALL_OUTCOME" != "success" ]]; then
+            z="ERROR (${INSTALL_REASON:-install ${INSTALL_OUTCOME}: timeout or crash})"; a="$z"
+          else
+            z="${ZIZMOR_VERDICT:-ERROR (no verdict: step timed out or crashed)}"
+            a="${ACTIONLINT_VERDICT:-ERROR (no verdict: step timed out or crashed)}"
+          fi
+          printf '%s\n' "- zizmor: ${z}" "- actionlint: ${a}" >> "$GITHUB_STEP_SUMMARY"
