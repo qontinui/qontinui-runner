@@ -102,7 +102,8 @@ fn must_fail(faults: Faults, gate: &str) {
 
 #[test]
 fn fails_when_capture_lags_the_paint() {
-    // Every frame stamped 40 ms late: more than one 16.7 ms refresh interval.
+    // Every frame stamped 40 ms late: more than the two-refresh-interval
+    // (33.3 ms) output_latency bound.
     // DDA's absolute check catches it (WGC's absolute check is reported, not
     // gated, and a lag shared by both sources leaves their offset alone).
     let mut host = FakeHost::new(Faults {
