@@ -1399,15 +1399,17 @@ impl AgenticExecutor {
             {
                 // The CLI's reported cost is its list-price figure (a
                 // list-price equivalent, not the user's bill); the cache-aware
-                // price table is the fallback when it is absent.
-                let cost_usd = match (
+                // price table is the fallback when it is absent. With neither
+                // a reported cost nor token counts the cost is UNKNOWN: `None`,
+                // never a fabricated $0 fed to the budget tracker.
+                let cost_usd: Option<f64> = match (
                     session_reported_cost_usd,
                     session_input_tokens,
                     session_output_tokens,
                 ) {
-                    (Some(reported), _, _) => reported,
+                    (Some(reported), _, _) => Some(reported),
                     (None, Some(input), Some(output)) => {
-                        crate::ai_pricing::calculate_cost_usd_with_cache(
+                        Some(crate::ai_pricing::calculate_cost_usd_with_cache(
                             input,
                             output,
                             session_cache_creation.unwrap_or(0),
@@ -1415,9 +1417,9 @@ impl AgenticExecutor {
                             session_model
                                 .as_deref()
                                 .unwrap_or("claude-sonnet-4-20250514"),
-                        )
+                        ))
                     }
-                    _ => 0.0,
+                    _ => None,
                 };
 
                 let cumulative = self
@@ -1436,13 +1438,23 @@ impl AgenticExecutor {
                     session_output_tokens.unwrap_or(0),
                     session_cache_creation.unwrap_or(0),
                     session_cache_read.unwrap_or(0),
-                    cost_usd,
+                    // The realtime event's shape has no "unknown"; 0 here is a
+                    // display value only, never recorded against the budget.
+                    cost_usd.unwrap_or(0.0),
                     cumulative,
                 );
 
+                if cost_usd.is_none() {
+                    warn!(
+                        "agentic iteration {}: no reported cost and no token counts — \
+                         cost UNKNOWN, not recorded in the budget tracker",
+                        iteration
+                    );
+                }
+
                 // Record cost in budget tracker and check safety limits
                 let trackers = self.cost_trackers.lock().unwrap().clone();
-                if let Some(ref trackers) = trackers {
+                if let (Some(cost_usd), Some(trackers)) = (cost_usd, trackers.as_ref()) {
                     let total_tokens =
                         session_input_tokens.unwrap_or(0) + session_output_tokens.unwrap_or(0);
                     let budget_result = trackers.budget.record("agentic", total_tokens, cost_usd);
