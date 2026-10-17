@@ -26,7 +26,7 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
@@ -67,9 +67,40 @@ impl OutputTx {
     }
 }
 
-/// How long a producer facing a FULL bounded channel waits before retrying,
-/// with the lock released.
-const FULL_CHANNEL_POLL: Duration = Duration::from_millis(2);
+/// The longest a producer facing a FULL bounded channel sleeps before
+/// retrying, with the lock released. A backstop only: the reader taking a chunk
+/// and `close_output` both WAKE it (see [`Room`]), so in practice it retries
+/// the moment there is room — not on a poll (pty_holder review follow-up L5:
+/// the 2 ms poll this replaces spun ~500 wakeups/s per stalled pane).
+const FULL_CHANNEL_BACKSTOP: Duration = Duration::from_secs(1);
+
+/// "There may be room now": a generation counter bumped by every chunk the
+/// reader takes and by `close_output`, with a condvar a full-channel producer
+/// parks on. The producer reads the generation BEFORE its `try_send`, so a
+/// take that lands between a `Full` and the park still wakes it.
+#[derive(Default)]
+struct Room {
+    generation: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl Room {
+    fn generation(&self) -> u64 {
+        *self.generation.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn bump(&self) {
+        let mut g = self.generation.lock().unwrap_or_else(|p| p.into_inner());
+        *g = g.wrapping_add(1);
+        self.cv.notify_all();
+    }
+
+    /// Park until the generation moves past `seen`, or `backstop` elapses.
+    fn wait_past(&self, seen: u64, backstop: Duration) {
+        let g = self.generation.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = self.cv.wait_timeout_while(g, backstop, |g| *g == seen);
+    }
+}
 
 /// See the module docs.
 pub struct PaneOutput {
@@ -89,6 +120,8 @@ pub struct PaneOutput {
     loss_marker: LossMarker,
     /// `Some(n)` for a bounded channel (see [`Self::new_bounded`]).
     capacity: Option<usize>,
+    /// Wakes a producer waiting on a full bounded channel.
+    room: Arc<Room>,
 }
 
 impl PaneOutput {
@@ -115,6 +148,7 @@ impl PaneOutput {
             offset: AtomicU64::new(next),
             loss_marker,
             capacity: None,
+            room: Arc::default(),
         }
     }
 
@@ -140,6 +174,7 @@ impl PaneOutput {
             offset: AtomicU64::new(start_offset),
             loss_marker,
             capacity: Some(capacity),
+            room: Arc::default(),
         }
     }
 
@@ -156,11 +191,14 @@ impl PaneOutput {
     /// RemotePaneIo's ordering guarantee ("nothing after exit"), kept with a
     /// bounded channel. A full bounded channel is retried with the lock
     /// RELEASED, so `close_output` never waits behind a slow reader; once it
-    /// has run, the retry finds the slot empty and drops the chunk.
+    /// has run, the retry finds the slot empty and drops the chunk. Between
+    /// retries the producer parks until the reader takes a chunk or the
+    /// channel closes ([`Room`]).
     fn deliver(&self, chunk: Vec<u8>, advance: bool) -> bool {
         let len = chunk.len() as u64;
         let mut chunk = chunk;
         loop {
+            let seen = self.room.generation();
             {
                 let Ok(guard) = self.output_tx.lock() else {
                     return false;
@@ -179,7 +217,7 @@ impl PaneOutput {
                     Err(NotSent::Full(back)) => chunk = back,
                 }
             }
-            std::thread::sleep(FULL_CHANNEL_POLL);
+            self.room.wait_past(seen, FULL_CHANNEL_BACKSTOP);
         }
     }
 
@@ -204,6 +242,8 @@ impl PaneOutput {
             rx,
             pending: Vec::new(),
             pos: 0,
+            room: self.room.clone(),
+            _wake_on_drop: WakeOnDrop(self.room.clone()),
         }))
     }
 
@@ -323,6 +363,9 @@ impl PaneOutput {
         if let Ok(mut tx) = self.output_tx.lock() {
             drop(tx.take());
         }
+        // A producer parked on a full channel retries now, finds the slot
+        // empty and returns "not delivered".
+        self.room.bump();
     }
 
     /// Block until the exit is settled.
@@ -366,6 +409,23 @@ struct ChannelReader {
     rx: mpsc::Receiver<Vec<u8>>,
     pending: Vec<u8>,
     pos: usize,
+    /// Bumped on every chunk taken, so a producer waiting on a full bounded
+    /// channel retries at once.
+    room: Arc<Room>,
+    /// Bumps `room` once more when the reader is dropped. Declared AFTER `rx`
+    /// so it runs after the receiver is gone: the woken producer's retry then
+    /// sees the channel closed, not full, and returns at once instead of
+    /// sleeping out the backstop.
+    _wake_on_drop: WakeOnDrop,
+}
+
+/// See [`ChannelReader::_wake_on_drop`].
+struct WakeOnDrop(Arc<Room>);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.0.bump();
+    }
 }
 
 impl Read for ChannelReader {
@@ -378,6 +438,7 @@ impl Read for ChannelReader {
                 Ok(chunk) => {
                     self.pending = chunk;
                     self.pos = 0;
+                    self.room.bump();
                 }
                 // Every sender dropped: the pane exited or was released.
                 Err(mpsc::RecvError) => return Ok(0),
@@ -483,6 +544,65 @@ mod tests {
         }
         producer.join().unwrap();
         assert_eq!(out.offset(), 100);
+    }
+
+    /// Review follow-up L5: a producer waiting on a full channel is WOKEN by
+    /// the reader taking a chunk — it does not sit out the backstop.
+    #[test]
+    fn pty_holder_full_channel_producer_is_woken_by_the_reader() {
+        let out = std::sync::Arc::new(PaneOutput::new_bounded("k", 0, marker, 1));
+        assert!(out.push_output(b"a"));
+        let producer = {
+            let out = out.clone();
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                let delivered = out.push_output(b"b");
+                (delivered, t.elapsed())
+            })
+        };
+        // Long enough for the producer to be parked, well past several of the
+        // old 2 ms polls; far short of a backstop multiple.
+        std::thread::sleep(Duration::from_millis(50));
+        let mut r = out.take_reader().unwrap();
+        let mut one = [0u8; 1];
+        let woke = Instant::now();
+        r.read_exact(&mut one).unwrap();
+        let (delivered, _) = producer.join().unwrap();
+        assert!(delivered);
+        assert!(
+            woke.elapsed() < FULL_CHANNEL_BACKSTOP,
+            "the producer waited out the backstop instead of being woken: {:?}",
+            woke.elapsed()
+        );
+        out.settle(Ok(0));
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"b");
+    }
+
+    /// A producer waiting on a full channel whose READER is dropped returns
+    /// "not delivered" at once rather than after the backstop.
+    #[test]
+    fn pty_holder_dropped_reader_releases_a_waiting_producer() {
+        let out = std::sync::Arc::new(PaneOutput::new_bounded("k", 0, marker, 1));
+        assert!(out.push_output(b"a"));
+        let reader = out.take_reader().unwrap();
+        let producer = {
+            let out = out.clone();
+            std::thread::spawn(move || out.push_output(b"b"))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let dropped = Instant::now();
+        drop(reader);
+        assert!(
+            !producer.join().unwrap(),
+            "nothing can deliver to a dropped reader"
+        );
+        assert!(
+            dropped.elapsed() < FULL_CHANNEL_BACKSTOP,
+            "the producer slept out the backstop: {:?}",
+            dropped.elapsed()
+        );
     }
 
     /// `wait_for` is bounded and sees a later settle; first settle wins.
