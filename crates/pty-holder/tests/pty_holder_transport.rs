@@ -575,10 +575,24 @@ fn pty_holder_census_healthy_and_dead() {
         )),
         Probe::Dead { .. }
     ));
-    let rows = census(&dir, Duration::from_secs(3), &[]).unwrap();
+    // Polled, not taken once: a census probe acquires and drops each free
+    // lock, and a child another test in this binary forks meanwhile shares
+    // that open file description — and the lock — until its exec. Within that
+    // window the dead pane reads Unknown (held, no answer), never Healthy.
+    let end = Instant::now() + Duration::from_secs(5);
+    let rows = loop {
+        let rows = census(&dir, Duration::from_secs(3), &[]).unwrap();
+        let settled = rows
+            .first()
+            .is_some_and(|r| matches!(r.probe, Probe::Dead { .. }));
+        if settled || Instant::now() >= end {
+            break rows;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(rows.len(), 2, "{rows:#?}");
     assert_eq!(rows[0].pane_id, "gone");
-    assert!(matches!(rows[0].probe, Probe::Dead { .. }));
+    assert!(matches!(rows[0].probe, Probe::Dead { .. }), "{rows:#?}");
     assert_eq!(rows[1].pane_id, "live");
     assert!(matches!(rows[1].probe, Probe::Healthy { .. }));
     drop(healthy);
