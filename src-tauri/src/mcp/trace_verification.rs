@@ -37,7 +37,7 @@ pub fn extract_trace_data(
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = file.name().to_string();
+        let name = file.name().map_err(|e| e.to_string())?.to_string();
 
         // Extract action log for timeline
         if name.contains("actions") && name.ends_with(".json") {
