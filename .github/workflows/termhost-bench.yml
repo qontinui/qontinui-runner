@@ -724,7 +724,7 @@ jobs:
             echo "|---|---|---|---|---|---|---|"
             for which in before head; do
               if [ -f "$out/$which.json" ]; then
-                jq -r --arg w "$which" '"| \($w) | \(.verdict) | \(.sessionsSeen | map(tostring) | join(",")) | \(.generatorsStarted)/\(.sessions) | \(.perfHarnessExit.code // "?") | \(.terminalsLeftAfterHarness // "UNKNOWN") | \((.perfHarnessRun.levels[0] // {}) as $l | (if $l.frontend then "frame p95 \($l.frontend.frameTimeMs.p95 // "?") ms" else "UNKNOWN: \(($l.frontendError // "no level") | .[0:120])" end)) |"' "$out/$which.json"
+                jq -r --arg w "$which" '"| \($w) | \(.verdict) | \(.sessionsSeen | map(tostring) | join(",")) | \(.generatorsStarted)/\(.sessions) | \(.perfHarnessExit.code // "?") | \(.terminalsLeftAfterHarness // "UNKNOWN") | \(.perfHarnessRun.levels[0] as $l | (if $l == null then "UNKNOWN: no level" elif ($l.frontend.frameCount // 0) > 0 then "frame p95 \($l.frontend.frameTimeMs.p95 // "?") ms over \($l.frontend.frameCount) frames" elif $l.frontend then "UNKNOWN: probe answered, 0 frames" else "UNKNOWN: \(($l.frontendError // "no frontend sample or error") | .[0:120])" end)) |"' "$out/$which.json"
               else
                 echo "| $which | (no result file) | | | | | |"
               fi
@@ -750,9 +750,9 @@ jobs:
           fi
           # Plan 2026-10-14-perf-harness-frontend-probe-evaluates-strings-the-csp-refuses:
           # the head harness's frontend probe (the bundled perf-probe component, no
-          # page/evaluate) must have MEASURED, not merely run. Printed to the log too,
+          # page/evaluate) must have MEASURED -- at least one frame -- not merely run. Printed to the log too,
           # because the result files are uploaded only on failure.
-          head_frontend="$(jq -r '(.perfHarnessRun.levels[0] // {}) as $l | if $l.frontend then "measured" else "UNKNOWN: \($l.frontendError // "no level recorded")" end' "$head")"
+          head_frontend="$(jq -r '.perfHarnessRun.levels[0] as $l | if $l == null then "UNKNOWN: no level recorded" elif ($l.frontend.frameCount // 0) > 0 then "measured" elif $l.frontend then "UNKNOWN: the probe answered but recorded 0 frames" else "UNKNOWN: \($l.frontendError // "the level carries neither a frontend sample nor an error")" end' "$head")"
           echo "head perf-harness frontend: $head_frontend"
           jq -c '.perfHarnessRun.levels[0].frontend // null' "$head"
           if [ "$head_frontend" != measured ]; then
