@@ -27,7 +27,9 @@
 //! flight writes its spec before its holder creates the lock, so a young one
 //! is left alone), and a dead pane's diagnostic log once it is older than
 //! [`DEAD_LOG_RETENTION`] — a log outlives its pane on purpose, since it is
-//! the only account of why a holder died.
+//! the only account of why a holder died. A dead pane's durable output tail
+//! (`.scrollback`) is kept exactly as long, for a restorer; a stray
+//! `.scrollback.tmp` goes after [`STRAY_MIN_AGE`].
 //!
 //! **This is not a Windows stub** (the dinotty defect D8 names). Every step
 //! above runs on Windows: the lock is `LockFileEx`, the record carries the
@@ -46,8 +48,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::client::{census, Probe};
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{
-    check_private_dir, lock_path, orphan_path, report_path, report_tmp_path, socket_path,
-    spec_path, PaneId,
+    check_private_dir, lock_path, orphan_path, report_path, report_tmp_path, scrollback_tmp_path,
+    socket_path, spec_path, PaneId,
 };
 use crate::protocol::HelloAck;
 use crate::reap::{reap_orphans_of_dead_holder, ReapReport};
@@ -528,6 +530,9 @@ fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> S
         spec_path(pane_dir, pane),
         report_path(pane_dir, pane),
         report_tmp_path(pane_dir, pane),
+        // A rewrite in flight when the holder died: garbage. The tail itself
+        // stays for a restorer (`crate::scrollback`).
+        scrollback_tmp_path(pane_dir, pane),
     ];
     if cfg!(unix) {
         files.push(socket_path(pane_dir, pane));
@@ -567,12 +572,16 @@ fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> S
     }
 }
 
-/// The per-pane file kinds the stray pass may remove, and the age each must
-/// reach first.
-fn stray_age(extension: &str) -> Option<Duration> {
+/// The per-pane file kinds the stray pass may remove: the pane id a file name
+/// belongs to, and the age the file must reach first.
+fn stray_kind(file_name: &str) -> Option<(&str, Duration)> {
+    if let Some(pane) = file_name.strip_suffix(".scrollback.tmp") {
+        return Some((pane, STRAY_MIN_AGE));
+    }
+    let (pane, extension) = file_name.rsplit_once('.')?;
     match extension {
-        "sock" | "spec" | "report" | "report-tmp" => Some(STRAY_MIN_AGE),
-        "log" => Some(DEAD_LOG_RETENTION),
+        "sock" | "spec" | "report" | "report-tmp" => Some((pane, STRAY_MIN_AGE)),
+        "log" | "scrollback" => Some((pane, DEAD_LOG_RETENTION)),
         _ => None,
     }
 }
@@ -586,13 +595,14 @@ fn remove_strays(pane_dir: &Path, now: SystemTime, skip: &[PaneId], report: &mut
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let (Some(stem), Some(ext)) = (
-            path.file_stem().and_then(|s| s.to_str()),
-            path.extension().and_then(|s| s.to_str()),
-        ) else {
+        let Some((stem, min_age)) = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(stray_kind)
+        else {
             continue;
         };
-        let (Some(min_age), Ok(pane)) = (stray_age(ext), PaneId::new(stem)) else {
+        let Ok(pane) = PaneId::new(stem) else {
             continue;
         };
         if skip.contains(&pane) || lock_path(pane_dir, &pane).exists() {
@@ -692,8 +702,13 @@ mod tests {
         let pane = PaneId::new("gone").unwrap();
         std::fs::write(lock_path(&d, &pane), b"").unwrap();
         std::fs::write(spec_path(&d, &pane), b"{}").unwrap();
+        let tail = crate::pane::scrollback_path(&d, &pane);
+        std::fs::write(&tail, b"tail").unwrap();
+        std::fs::write(scrollback_tmp_path(&d, &pane), b"torn").unwrap();
         let report = boot_sweep(&d, Duration::from_secs(5), &[], |_, _| {}).unwrap();
         assert_eq!(report.entries.len(), 1, "{report:?}");
+        assert!(tail.exists(), "a dead pane's tail is kept for a restorer");
+        assert!(!scrollback_tmp_path(&d, &pane).exists());
         match &report.entries[0].outcome {
             SweepOutcome::Reaped {
                 record: None,
@@ -743,6 +758,9 @@ mod tests {
         let recent_log = d.join("d.log");
         let ancient_log = d.join("e.log");
         let foreign = d.join("notes.txt");
+        let recent_tail = d.join("f.scrollback");
+        let ancient_tail = d.join("g.scrollback");
+        let old_tmp = d.join("h.scrollback.tmp");
         for p in [
             &old_spec,
             &young_spec,
@@ -750,6 +768,9 @@ mod tests {
             &recent_log,
             &ancient_log,
             &foreign,
+            &recent_tail,
+            &ancient_tail,
+            &old_tmp,
         ] {
             std::fs::write(p, b"x").unwrap();
         }
@@ -758,12 +779,19 @@ mod tests {
         age(&recent_log, STRAY_MIN_AGE * 2);
         age(&ancient_log, DEAD_LOG_RETENTION * 2);
         age(&foreign, DEAD_LOG_RETENTION * 2);
+        age(&recent_tail, STRAY_MIN_AGE * 2);
+        age(&ancient_tail, DEAD_LOG_RETENTION * 2);
+        age(&old_tmp, STRAY_MIN_AGE * 2);
         let skip = [PaneId::new("c").unwrap()];
         let report = boot_sweep(&d, Duration::from_secs(5), &skip, |_, _| {}).unwrap();
         let mut removed = report.strays_removed.clone();
         removed.sort();
-        assert_eq!(removed, vec![old_spec, ancient_log], "{report:?}");
-        for kept in [young_spec, skipped_spec, recent_log, foreign] {
+        assert_eq!(
+            removed,
+            vec![old_spec, ancient_log, ancient_tail, old_tmp],
+            "{report:?}"
+        );
+        for kept in [young_spec, skipped_spec, recent_log, foreign, recent_tail] {
             assert!(kept.exists(), "{} was removed", kept.display());
         }
         let _ = std::fs::remove_dir_all(&d);
