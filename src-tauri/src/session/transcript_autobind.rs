@@ -28,11 +28,15 @@
 //!    a minted row.
 //!
 //! Consent: transcript sync's gate (the user's toggle AND the tenant's
-//! `egress_transcript_sync` switch, [`crate::egress::transcript_sync_gate_for`])
-//! is checked here before any coord traffic — in the default scope, then again
-//! in the minting tenant's scope once a mint names it — and again inside
-//! `bind_and_replay`; the tenant's `transcript_sync_enabled` is enforced
-//! downstream by the emitter exactly as for a sniffed pane. Attempts are throttled per session ([`AttemptLedger`])
+//! `egress_transcript_sync` switch) is checked twice here. First in the device
+//! default scope, inline, before any coord traffic. Then, AFTER the coord round
+//! trip (`resolve_coord_row`, the mint gate) has settled a decision, in that
+//! decision's scope ([`bind_scope`]): a mint in the minting tenant's scope, an
+//! adoption — whose tenant is not known here — under the strictest verdict
+//! across every bound tenant ([`crate::egress::SessionScope::Unresolved`]).
+//! `bind_and_replay` then refuses on that verdict; the tenant's
+//! `transcript_sync_enabled` is enforced downstream by the emitter exactly as
+//! for a sniffed pane. Attempts are throttled per session ([`AttemptLedger`])
 //! so a coord outage costs one bounded probe per window, not one per append.
 
 use std::collections::HashMap;
@@ -375,6 +379,18 @@ pub fn spawn_ensure_bound(tailer: &Arc<SessionTranscriptTailer>, path: &Path) {
     });
 }
 
+/// The scope a settled [`Decision`] is judged in before binding. A mint names
+/// the tenant that will own the row. An adoption's row belongs to a tenant this
+/// code does not know, so it is UNRESOLVED and takes the strictest bound
+/// tenant's verdict — the default scope would let tenant A's open switch replay
+/// a transcript into tenant B's row while B has sync off. PURE.
+fn bind_scope(decision: &Decision) -> crate::egress::SessionScope {
+    match decision {
+        Decision::Mint(t) => crate::egress::SessionScope::Tenant(*t),
+        _ => crate::egress::SessionScope::Unresolved,
+    }
+}
+
 async fn bind_one(
     tailer: &Arc<SessionTranscriptTailer>,
     identity: TranscriptIdentity,
@@ -383,13 +399,7 @@ async fn bind_one(
     let resolution =
         crate::mcp::session_work_status::resolve_coord_row(&identity.claude_session_id).await;
     let decision = settle(tailer, &identity, &resolution).await;
-    // A mint names the tenant that will own the row: re-ask the gate in THAT
-    // tenant's scope, so one tenant's open switch cannot carry another's
-    // transcript. An adoption has no tenant on hand; the default scope applies.
-    let permitted = match &decision {
-        Decision::Mint(t) => crate::egress::transcript_sync_gate_for(Some(*t)).is_open(),
-        _ => crate::egress::transcript_sync_permitted(),
-    };
+    let permitted = crate::egress::transcript_sync_gate_session(bind_scope(&decision)).is_open();
     let (t, p) = (tailer.clone(), path.to_path_buf());
     let joined = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         apply_decision(&t, &identity, &p, &decision, permitted).inspect(|k| t.note_autobind(*k))
@@ -403,6 +413,33 @@ async fn bind_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review fix: an adoption is judged under the strictest bound tenant, a
+    /// mint in its own tenant's scope.
+    #[test]
+    fn bind_scope_is_unresolved_for_an_adoption_and_the_tenant_for_a_mint() {
+        use crate::egress::SessionScope;
+        let t = Uuid::from_u128(0x7e7a_00a1);
+        assert_eq!(bind_scope(&Decision::Adopt(t)), SessionScope::Unresolved);
+        assert_eq!(bind_scope(&Decision::Mint(t)), SessionScope::Tenant(t));
+    }
+
+    /// Device bound to A (the default, sync on) and B (sync off): adopting a
+    /// row must not pass on A's switch, while a mint in A still does.
+    #[test]
+    fn an_adoption_is_refused_when_any_bound_tenant_has_transcript_sync_off() {
+        use crate::egress::test_support::{fake_bound_tenants, pin, pin_for};
+        use crate::egress::{permit_session, Flow, Level};
+        let a = Uuid::from_u128(0x7e7a_00a2);
+        let b = Uuid::from_u128(0x7e7a_00a3);
+        let _on = pin(Flow::TranscriptSync, Level::On);
+        let _b_off = pin_for(Flow::TranscriptSync, b, Level::Off);
+        let _bound = fake_bound_tenants(vec![a, b]);
+        let adopt = bind_scope(&Decision::Adopt(Uuid::from_u128(0x7e7a_00a4)));
+        assert!(!permit_session(Flow::TranscriptSync, adopt).allowed);
+        assert!(permit_session(Flow::TranscriptSync, bind_scope(&Decision::Mint(a))).allowed);
+        assert!(!permit_session(Flow::TranscriptSync, bind_scope(&Decision::Mint(b))).allowed);
+    }
     use crate::claude_session::coord_register::AiCoordRegistrar;
     use crate::session::local_store::OutboxWriter;
     use crate::session::transcript_emitter::TranscriptEmitter;
