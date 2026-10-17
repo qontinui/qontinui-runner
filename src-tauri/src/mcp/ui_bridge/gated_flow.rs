@@ -97,9 +97,7 @@ pub async fn ui_bridge_session_handler(
         .get_oauth_refresh_token()
         .map(|t| !t.trim().is_empty())
         .unwrap_or(false);
-    // A valid (unexpired) coord device-JWT sits in the access_token slot when
-    // `device_jwt_needs_refresh()` reports `Ok(false)`.
-    let has_device_jwt = matches!(auth_manager.device_jwt_needs_refresh(), Ok(false));
+    let has_device_jwt = has_live_device_jwt(&auth_manager);
 
     let bearer_kind: Option<&str> = if has_cognito_session {
         Some("access")
@@ -409,9 +407,42 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// A valid (UNEXPIRED) coord device JWT sits in the access_token slot. Keyed on
+/// actual expiry ([`crate::auth::AuthManager::device_jwt_is_live`]), not on the
+/// refresher's TTL/2 refresh threshold: a JWT inside its refresh window still
+/// authenticates, and during a coord outage that window lasts two hours.
+fn has_live_device_jwt(auth_manager: &crate::auth::AuthManager) -> bool {
+    matches!(auth_manager.device_jwt_is_live(), Ok(true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_jwt_inside_its_refresh_window_still_counts() {
+        use base64::Engine as _;
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let jwt = |exp: i64| {
+            format!(
+                "{}.{}.sig",
+                enc(br#"{"alg":"none"}"#),
+                enc(format!(r#"{{"exp":{exp}}}"#).as_bytes())
+            )
+        };
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_gated_flow_jwt");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("gated.enc");
+        let _ = std::fs::remove_file(&path);
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        let auth = crate::auth::AuthManager::with_storage_no_keychain(storage);
+        let now = chrono::Utc::now().timestamp();
+        assert!(!has_live_device_jwt(&auth), "absent");
+        auth.store_tokens(&jwt(now + 100 * 60), "").unwrap();
+        assert!(has_live_device_jwt(&auth), "inside the refresh window");
+        auth.store_tokens(&jwt(now - 120), "").unwrap();
+        assert!(!has_live_device_jwt(&auth), "expired");
+    }
 
     use crate::test_env::env_lock;
 
