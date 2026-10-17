@@ -385,6 +385,10 @@ mod tests {
 
     #[test]
     fn test_backup_paths() {
+        // Hold the env lock: a live sibling `IsolatedAmbient` points
+        // `USERPROFILE` at an empty temp dir, and on Windows the platform
+        // config dir then fails to resolve, which is not what this asserts.
+        let _env = crate::test_env::env_lock();
         // Just verify paths can be retrieved
         assert!(get_settings_path().is_some());
         assert!(get_prompts_path().is_some());

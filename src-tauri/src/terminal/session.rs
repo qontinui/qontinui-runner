@@ -5118,6 +5118,13 @@ pub(crate) mod tests {
     /// `Environment` read).
     #[test]
     fn pty_finalize_child_env_scrubs_credential_values() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = CommandBuilder::new("dummy");
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
             cmd.env(name, "hunter2");
@@ -5162,6 +5169,13 @@ pub(crate) mod tests {
     /// running the same tail `spawn` runs.
     #[test]
     fn pty_finalize_child_env_scrub_beats_a_caller_supplied_credential() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = CommandBuilder::new("dummy");
         // As if `extra_env` had carried both a legitimate pin and a credential.
         cmd.env("CLAUDE_CONFIG_DIR", "/caller/pinned");
