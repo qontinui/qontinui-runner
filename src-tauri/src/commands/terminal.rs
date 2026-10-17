@@ -1625,6 +1625,47 @@ pub(crate) fn close_outcome_response(outcome: &CloseOutcome) -> CommandResponse 
     }
 }
 
+/// The PTY-holder boot sweep's status as soon as its census is in (at most
+/// `holder_boot_sweep::CENSUS_WAIT`): `data.settled`, and `data.held` — the
+/// terminal ids of live panes still being adopted (`null` when the census did
+/// not come in within the wait). The webview's restore restores every record
+/// NOT held at once, and waits for the sweep only for the held ones (plan
+/// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 3,
+/// review round 4, M1).
+#[tauri::command]
+pub async fn terminal_holder_sweep_status() -> Result<CommandResponse, String> {
+    use crate::terminal::holder_boot_sweep::{sweep_status, CENSUS_WAIT};
+    let status = spawn_blocking_tracked(|| sweep_status(CENSUS_WAIT))
+        .await
+        .map_err(|e| String::from(AppError::ProcessError(format!("Join error: {}", e))))?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: serde_json::to_value(status).ok(),
+    })
+}
+
+/// Wait (at most `holder_boot_sweep::RESTORE_WAIT`) for the PTY-holder boot
+/// sweep to settle — every surviving holder pane adopted into a terminal (or,
+/// failing that, ended), and every dead holder's leftovers reaped — and
+/// say whether it did (`data.settled`). The webview's restore calls this
+/// BEFORE it reads `terminal_list`, so a session a holder kept alive is
+/// reconnected, never cold-resumed a second time (plan
+/// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 3).
+/// Setup itself never waits on the sweep.
+#[tauri::command]
+pub async fn terminal_holder_sweep_settled() -> Result<CommandResponse, String> {
+    use crate::terminal::holder_boot_sweep::{wait_settled, RESTORE_WAIT};
+    let settled = spawn_blocking_tracked(|| wait_settled(RESTORE_WAIT))
+        .await
+        .map_err(|e| String::from(AppError::ProcessError(format!("Join error: {}", e))))?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "settled": settled })),
+    })
+}
+
 /// The `purpose` value the boot restore passes to [`terminal_session_list_open`].
 pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 

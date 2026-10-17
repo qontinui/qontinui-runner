@@ -32,16 +32,27 @@ const GUARDED: &[(&str, &str)] = &[
     // Phase 2 data path: the PTY owner, its ring, the spec, the spawner.
     ("pty.rs", include_str!("pty.rs")),
     ("ring.rs", include_str!("ring.rs")),
+    // Phase 4: the ring's durable tail.
+    ("scrollback.rs", include_str!("scrollback.rs")),
     ("spec.rs", include_str!("spec.rs")),
     ("startup.rs", include_str!("startup.rs")),
     ("spawn.rs", include_str!("spawn.rs")),
     // Review round 2: out-of-band termination of a verified holder.
     ("terminate.rs", include_str!("terminate.rs")),
+    // Phase 2b: the mode tracker parses every output byte.
+    ("modes.rs", include_str!("modes.rs")),
+    // Phase 3: process identity, tree reaping, the boot sweep.
+    ("proc_identity.rs", include_str!("proc_identity.rs")),
+    ("reap.rs", include_str!("reap.rs")),
+    ("sweep.rs", include_str!("sweep.rs")),
 ];
 
 /// Files deliberately outside the guard: this file (it must spell the banned
-/// tokens) and `lib.rs` (module declarations and docs only).
-const EXEMPT: &[&str] = &["source_guard.rs", "lib.rs"];
+/// tokens), `lib.rs` (module declarations and docs only), and `metadata.rs` —
+/// the one place a short metadata value (an attach reply's cwd and title, Phase
+/// 2b) becomes a JSON string. It never sees stream bytes, and it is strict:
+/// non-UTF-8 is `None`, never lossy.
+const EXEMPT: &[&str] = &["source_guard.rs", "lib.rs", "metadata.rs"];
 
 /// Remove `//` and (nested) `/* */` comments, keeping string and char
 /// literals intact so a `"//"` inside a string is not mistaken for a comment.

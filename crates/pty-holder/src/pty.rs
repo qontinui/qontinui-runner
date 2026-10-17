@@ -3,8 +3,8 @@
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
 //! Phase 2. One [`Pane`] per holder (D13). Three threads keep it:
 //!
-//! - **reader** — reads the PTY master into the [`OutputRing`] for the whole
-//!   life of the pane, ALWAYS. Nothing a client does pauses it: flow control
+//! - **reader** — reads the PTY master into the [`OutputRing`] — and through
+//!   the [`ModeTracker`] (Phase 2b) — for the whole life of the pane, ALWAYS. Nothing a client does pauses it: flow control
 //!   gates what a connection is SENT, never what the holder reads (the
 //!   runner's one invariant, "gate emission, never pause reads"). A child
 //!   therefore never blocks on a full PTY buffer because a client is slow or
@@ -27,7 +27,7 @@
 //!   DISCARDS what is queued, which unblocks everything behind it.
 //! - the per-connection **pumps** in `server` read the ring; they live there.
 //!
-//! **When the holder exits** ([`Pane::wait_for_end`], called by `main`): never
+//! **When the holder exits** ([`Pane::wait_for_delivery`], called by `main`): never
 //! because a client went away (D13: "it never exits because the runner went
 //! away"). Only once the child has exited AND either (a) an `exit` frame was
 //! delivered to some attached client, or (b) [`crate::spec::ChildSpec::exit_linger`]
@@ -39,12 +39,14 @@
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
+use crate::modes::ModeTracker;
 use crate::protocol::ExitReply;
 use crate::ring::OutputRing;
 use crate::spec::ChildSpec;
@@ -71,6 +73,11 @@ const INPUT_QUEUE_POLL: Duration = Duration::from_millis(10);
 #[derive(Debug)]
 pub struct PaneState {
     pub ring: OutputRing,
+    /// Every byte the ring was ever given, parsed for terminal modes (plan
+    /// D14). Fed under this lock with the ring, so its state is the state at
+    /// the ring's `end_offset` and its preamble log reaches back to the ring's
+    /// `start_offset`.
+    pub modes: ModeTracker,
     /// The PTY master read hit EOF (or an error, which ends it the same way).
     pub eof: bool,
     /// The child has exited (it may not be reaped yet). Unix: set under this
@@ -81,6 +88,11 @@ pub struct PaneState {
     pub exit: Option<ExitReply>,
     /// An `exit` frame reached a client.
     pub exit_delivered: bool,
+    /// How the child ended, fixed at the moment its exit is observed:
+    /// `Some(true)` when a kill had REACHED the live child first
+    /// ([`Pane::kill_now`]), `Some(false)` when it exited on its own. Set once,
+    /// by the waiter; read by [`Pane::ended_by_kill`].
+    pub ended_by_kill: Option<bool>,
     /// Current PTY size, (cols, rows).
     pub size: (u16, u16),
 }
@@ -88,6 +100,9 @@ pub struct PaneState {
 /// The pane a holder owns.
 pub struct Pane {
     child_pid: u32,
+    /// The directory the child was started in (the spec's), for restore
+    /// metadata when the program never reports one with `OSC 7`.
+    spawn_cwd: Option<std::ffi::OsString>,
     state: Mutex<PaneState>,
     changed: Condvar,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -108,6 +123,29 @@ pub struct Pane {
     #[cfg(windows)]
     job: Option<win_job::Job>,
     exit_linger: Duration,
+    /// The child's start token (`crate::proc_identity`), taken in
+    /// [`Pane::spawn`] BEFORE the waiter can reap it — so it is the child's,
+    /// never a recycled pid's.
+    child_start: Option<String>,
+    /// Unix: what the waiter's session reap did (`crate::reap`, the kill
+    /// path), kept for [`Pane::reap_tree`] to report.
+    #[cfg(unix)]
+    session_reap: Mutex<Option<crate::reap::ReapReport>>,
+    /// A kill was sent while the child HAD NOT EXITED AT THE MOMENT OF THE
+    /// CHECK: set under the state lock, only while `child_gone` is false and
+    /// a non-reaping `waitid(WNOHANG|WNOWAIT)` (Unix) / a zero-timeout wait
+    /// (Windows) sees no exit, right before the signal / the job termination.
+    /// A `kill` that arrives after the child has exited sets nothing.
+    ///
+    /// **Inherent gap** (review round 3, R6): a child that exits on its own in
+    /// the instant between that check and the signal (or `TerminateJobObject`)
+    /// is recorded as killed, and its leftovers are reaped. No OS offers an
+    /// atomic "signal only if not yet exited"; the window is the few
+    /// instructions between two syscalls. Only a reached kill makes the pane's end a
+    /// KILL, the one end that reaps the child's leftovers (plan D8 as decided
+    /// 2026-10-14): a normal exit leaves `nohup` / `disown` jobs and
+    /// deliberately detached programs alone, as an in-process PTY always did.
+    kill_reached: AtomicBool,
 }
 
 impl std::fmt::Debug for Pane {
@@ -183,15 +221,23 @@ impl Pane {
             }
         };
         let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE_FRAMES);
+        // Before the waiter thread exists: on Linux the child cannot have been
+        // reaped yet. On Windows the question is whether it has EXITED: a child
+        // that died within microseconds of spawn records no token, so its
+        // descendants are left alone by a later reap rather than signalled.
+        let child_start = crate::proc_identity::start_token(child_pid);
 
         let pane = Arc::new(Pane {
             child_pid,
+            spawn_cwd: spec.cwd.clone(),
             state: Mutex::new(PaneState {
                 ring: OutputRing::new(spec.ring_capacity()),
+                modes: ModeTracker::new(),
                 eof: false,
                 child_gone: false,
                 exit: None,
                 exit_delivered: false,
+                ended_by_kill: None,
                 size: (spec.cols, spec.rows),
             }),
             changed: Condvar::new(),
@@ -203,6 +249,10 @@ impl Pane {
             #[cfg(windows)]
             job,
             exit_linger: spec.exit_linger(),
+            child_start,
+            #[cfg(unix)]
+            session_reap: Mutex::new(None),
+            kill_reached: AtomicBool::new(false),
         });
 
         let p = Arc::clone(&pane);
@@ -222,6 +272,16 @@ impl Pane {
 
     pub fn child_pid(&self) -> u32 {
         self.child_pid
+    }
+
+    /// The child's start token, taken before it could be reaped.
+    pub fn child_start(&self) -> Option<&str> {
+        self.child_start.as_deref()
+    }
+
+    /// The directory the child was started in.
+    pub fn spawn_cwd(&self) -> Option<&std::ffi::OsString> {
+        self.spawn_cwd.as_ref()
     }
 
     /// The shared state. Never hold this across I/O on a client connection.
@@ -257,6 +317,9 @@ impl Pane {
                 Ok(n) => {
                     let mut st = self.lock_state();
                     st.ring.push(&buf[..n]);
+                    st.modes.feed(&buf[..n]);
+                    let ring_start = st.ring.start_offset();
+                    st.modes.forget_before(ring_start);
                     drop(st);
                     self.changed.notify_all();
                 }
@@ -274,6 +337,8 @@ impl Pane {
         let deadline = Instant::now() + EXIT_DRAIN_GRACE;
         let mut st = self.lock_state();
         st.child_gone = true;
+        let killed = self.kill_reached.load(Ordering::SeqCst);
+        st.ended_by_kill.get_or_insert(killed);
         while !st.eof {
             let now = Instant::now();
             if now >= deadline {
@@ -291,7 +356,7 @@ impl Pane {
         let pid = self.child_pid as libc::pid_t;
         // Phase 1: wait for the exit WITHOUT reaping, so the pid stays ours
         // (a zombie) while `kill` may still be looking at it.
-        loop {
+        let exited = loop {
             // SAFETY: siginfo_t is plain data; zeroed is a valid initial value.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             // SAFETY: waitid on our own child pid with a valid out-pointer.
@@ -304,19 +369,46 @@ impl Pane {
                 )
             };
             if rc == 0 {
-                break;
+                break Ok(());
             }
-            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                break;
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                break Err(e);
             }
-        }
-        // Phase 2: under the lock, mark it gone and reap it — `kill` checks
-        // `child_gone` under the same lock, so it can never signal the pid
-        // after this point.
-        let mut status: libc::c_int = 0;
-        let reaped = {
+        };
+        // Phase 2: under the lock, mark it gone and fix HOW it ended — `kill`
+        // checks `child_gone` under the same lock, so from here on it can
+        // neither signal the pid nor turn this exit into a kill.
+        let killed = {
             let mut st = self.lock_state();
             st.child_gone = true;
+            let killed = self.kill_reached.load(Ordering::SeqCst);
+            st.ended_by_kill = Some(killed);
+            killed
+        };
+        // Plan D8, kill path only: the child was killed and is a zombie now —
+        // `exited` says waitid saw it so — so its pid (= its session id) is
+        // pinned: end what it left in its session BEFORE the reap below
+        // releases that id. A child that exited on its own leaves its session
+        // as an in-process PTY did. A waitid failure leaves the session
+        // unswept, and the report says so.
+        let session_reap = match (&exited, killed) {
+            (_, false) => None,
+            (Ok(()), true) => Some(crate::reap::reap_session_of_exited_child(self.child_pid)),
+            (Err(e), true) => {
+                let mut r = crate::reap::ReapReport::default();
+                r.note(format!(
+                    "waitid failed ({e}): the killed child is not provably a zombie, so its \
+                     session was NOT swept"
+                ));
+                Some(r)
+            }
+        };
+        *self.session_reap.lock().unwrap_or_else(|p| p.into_inner()) = session_reap;
+        // Phase 3: reap it.
+        let mut status: libc::c_int = 0;
+        let reaped = {
+            let _st = self.lock_state();
             loop {
                 // SAFETY: reaping our own child pid; `status` is a valid out-pointer.
                 let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -500,6 +592,27 @@ impl Pane {
             return false;
         }
         let pid = self.child_pid as libc::pid_t;
+        // The child may have exited on its own an instant ago, before the
+        // waiter marked it gone: then this kill reaches nothing, and must not
+        // turn its normal exit into a kill (review round 2, N2). A zombie is
+        // seen without reaping it (`WNOWAIT`), so the waiter's reap is intact.
+        // SAFETY: siginfo_t is plain data; zeroed (si_pid 0) means "no
+        // state change yet" for WNOHANG.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: a non-blocking, non-reaping waitid on our own child.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        // SAFETY: reading the pid field waitid filled (or left zeroed).
+        if rc == 0 && unsafe { info.si_pid() } != 0 {
+            return false;
+        }
+        self.kill_reached.store(true, Ordering::SeqCst);
         // SAFETY: plain signals to our own, still-unreaped child and its
         // process group (pgid == pid: portable-pty `setsid()`s the child).
         unsafe {
@@ -531,8 +644,14 @@ impl Pane {
         }
         #[cfg(windows)]
         {
-            if self.lock_state().child_gone {
-                return;
+            {
+                let _st = self.lock_state();
+                // Gone, or exited an instant ago and not yet settled: this
+                // kill reaches nothing (review round 2, N2).
+                if _st.child_gone || win_job::has_exited(self.child_pid) {
+                    return;
+                }
+                self.kill_reached.store(true, Ordering::SeqCst);
             }
             // The whole tree when the child is in our job; the child alone
             // otherwise.
@@ -545,22 +664,94 @@ impl Pane {
         }
     }
 
+    /// What the holder reaped of its child's tree, reported once the pane is
+    /// over (plan D8; the decision of 2026-10-14 on WHEN it reaps):
+    ///
+    /// - **The pane was killed** ([`Pane::kill_now`] — a tab closed, or the
+    ///   runner gave up on the pane). Unix: the child's session was swept by
+    ///   the waiter while the child was an unreaped zombie (`crate::reap`), and
+    ///   here, on the scope route, everything else in the holder's own scope.
+    ///   Windows: `kill_now` already terminated the holder-owned job.
+    /// - **The child exited on its own.** Nothing is reaped here: what it left
+    ///   running (`nohup` / `disown` jobs, a tmux server, an agent) keeps
+    ///   running, as with an in-process PTY on Linux. Windows: the holder
+    ///   disarms its job's `KILL_ON_JOB_CLOSE` first
+    ///   ([`Pane::release_leftovers_on_normal_exit`]), so they survive the
+    ///   holder's exit too.
+    pub fn reap_tree(&self) -> crate::reap::ReapReport {
+        let mut report = crate::reap::ReapReport::default();
+        if self.ended_by_kill() != Some(true) {
+            report.note("the child exited on its own: its leftovers are not reaped");
+            return report;
+        }
+        #[cfg(unix)]
+        {
+            if let Some(session) = self
+                .session_reap
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                report.absorb(session);
+            }
+            report.absorb(crate::reap::reap_own_scope());
+        }
+        #[cfg(windows)]
+        report.note(if self.job.is_some() {
+            "killed: the job holding the child's tree was terminated"
+        } else {
+            "killed: the child was never in a job, so only the child was terminated"
+        });
+        report
+    }
+
+    /// How the child ended (`Some(true)`: a kill reached it), once its exit is
+    /// settled; `None` before.
+    pub fn ended_by_kill(&self) -> Option<bool> {
+        self.lock_state().ended_by_kill
+    }
+
+    /// A NORMAL end (the child exited on its own): let what it left running
+    /// outlive this holder. Windows: clear the job's `KILL_ON_JOB_CLOSE`, which
+    /// would otherwise end every process still in it the moment the holder —
+    /// the job's last handle — exits. **This differs from the old in-process
+    /// PTY on Windows**, whose leftovers sat in the runner's own
+    /// `KILL_ON_JOB_CLOSE` job and died when the RUNNER exited: here they live
+    /// on, as on Linux, because the holder exits with its pane, far earlier
+    /// than a runner, and killing them then would end a `nohup`-style program
+    /// the moment its tab's command finished. A crash of the holder before
+    /// this point, or a kill, keeps the flag armed (crash safety). Unix:
+    /// nothing to do — no reap follows a normal exit.
+    pub fn release_leftovers_on_normal_exit(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            return job.disarm_kill_on_close().map_err(|e| e.to_string());
+        }
+        Ok(())
+    }
+
     /// Record that an `exit` frame reached a client.
     pub fn mark_exit_delivered(&self) {
         self.lock_state().exit_delivered = true;
         self.changed.notify_all();
     }
 
-    /// Block until the holder may exit (see the module docs) and return the
-    /// child's exit.
-    pub fn wait_for_end(&self) -> ExitReply {
+    /// Block until the child's exit is settled and return it.
+    pub fn wait_for_exit(&self) -> ExitReply {
         let mut st = self.lock_state();
-        let exit = loop {
+        loop {
             if let Some(e) = st.exit {
-                break e;
+                return e;
             }
             st = self.wait_changed(st, Duration::from_secs(60));
-        };
+        }
+    }
+
+    /// After [`Pane::wait_for_exit`]: block until the holder may exit — the
+    /// exit was delivered, or nobody collected it within the linger (see the
+    /// module docs).
+    pub fn wait_for_delivery(&self) {
+        let mut st = self.lock_state();
         let deadline = Instant::now() + self.exit_linger;
         while !st.exit_delivered {
             let now = Instant::now();
@@ -569,7 +760,6 @@ impl Pane {
             }
             st = self.wait_changed(st, deadline - now);
         }
-        exit
     }
 }
 
@@ -597,6 +787,25 @@ mod win_job {
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
+
+    /// Whether process `pid` — the pane's child, whose handle the waiter's
+    /// `portable_pty` child still holds, so the pid cannot have been reused —
+    /// has exited. Unreadable counts as NOT exited: the kill proceeds, as it
+    /// did before this check existed.
+    pub fn has_exited(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::{WaitForSingleObject, PROCESS_SYNCHRONIZE};
+        // SAFETY: no pointers; a non-null handle is closed below.
+        let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if h.is_null() {
+            return false;
+        }
+        // SAFETY: a valid handle with SYNCHRONIZE; a zero timeout only polls.
+        let running = unsafe { WaitForSingleObject(h, 0) } == WAIT_TIMEOUT;
+        // SAFETY: closing the handle opened above, once.
+        unsafe { CloseHandle(h) };
+        !running
+    }
 
     /// An owned job handle. `KILL_ON_JOB_CLOSE`: when the holder exits (its
     /// last handle closes) whatever is still in the job ends too — the same
@@ -645,6 +854,26 @@ mod win_job {
                 }
                 Ok(job)
             }
+        }
+
+        /// Clear `KILL_ON_JOB_CLOSE`: the job's processes then outlive its
+        /// last handle (`Pane::release_leftovers_on_normal_exit`).
+        pub fn disarm_kill_on_close(&self) -> io::Result<()> {
+            // SAFETY: an owned, valid job handle; `info` is plain data that
+            // outlives the call.
+            unsafe {
+                let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                if SetInformationJobObject(
+                    self.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
         }
 
         /// End every process in the job.
