@@ -1933,6 +1933,7 @@ fn record_from_seed(
         gate_consuming_device_id: None,
         gate_bound_generation: None,
         restored_in_generation: None,
+        gate_reported_generation: None,
     })
 }
 

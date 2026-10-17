@@ -66,6 +66,7 @@ import { callRegistry, textArg, useTerminalCommands } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
+import { buildRetryResumeArgs, fetchRecordsByClaudeSessionId } from "./resumeRecordLookup";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
@@ -1063,12 +1064,18 @@ function TerminalPageInner({
   // handshake the OPEN record is re-asserted under this live terminal id
   // (item 3 — the restore no longer re-asserts before verification, so the
   // verified branch owns it).
+  //
+  // The tab carries no gate identity, so the durable record is read first
+  // (plan 2026-10-07 D2): a gate continuation retried by hand must still be
+  // able to report its own work outcome, exactly as the drain's resume can.
+  // The verified re-assert then adopts it through `terminal_session_record_open`.
   const handleRetryResume = useCallback(
     (tabId: string) => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (!tab) return;
       // The typed dir for the command, the never-typed record dir for the
       // verified re-assert (no origin — the backend preserves the row's).
+      // Built at click time, from the assignments the operator is looking at.
       const retry = retryResumeArgs({
         tab,
         assignments: assignmentsRef.current,
@@ -1077,12 +1084,18 @@ function TerminalPageInner({
       });
       if (!retry) return;
       updateTab(tabId, { resumeFailed: false, isReconnecting: true });
-      void runVerifiedResume({
-        terminalRefs: terminalRefs.current,
-        tabId,
-        ...retry,
-        updateTab,
-      });
+      void (async () => {
+        const records = await fetchRecordsByClaudeSessionId();
+        await runVerifiedResume({
+          terminalRefs: terminalRefs.current,
+          updateTab,
+          ...buildRetryResumeArgs({
+            tabId,
+            ...retry,
+            record: records.get(retry.claudeSessionId),
+          }),
+        });
+      })();
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [updateTab, pageId],
