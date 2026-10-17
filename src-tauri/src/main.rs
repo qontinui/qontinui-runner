@@ -4298,18 +4298,60 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     );
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    let tailer_for_finish = app
+                        .try_state::<std::sync::Arc<
+                            session::session_transcript_tailer::SessionTranscriptTailer,
+                        >>()
+                        .map(|t| t.inner().clone());
                     lifecycle_store.attach_finish_observer(move |rec| {
                         use session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
-                        match reg.upgrade() {
+                        let verdict = match reg.upgrade() {
                             Some(r) => r.forward_finish_change(rec),
                             None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+                        };
+                        // Unfinished-resume phase 2: a mark for a session no
+                        // runner plane has a coord row for used to stay
+                        // local-only forever. Bind it through phase 1's binder
+                        // now (detached); registration then delivers the owed
+                        // finish itself — no second write path.
+                        if rec.finished_at.is_some()
+                            && matches!(
+                                verdict,
+                                FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
+                            )
+                        {
+                            if let Some(t) = tailer_for_finish.clone() {
+                                // Un-throttled and retrying, on its own detached
+                                // task: the finish is owed NOW, and the schedule
+                                // must outlive any tail that ends meanwhile.
+                                // `spawn_owed_finish_bind` needs a tokio context.
+                                let rec = rec.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    session::transcript_autobind::spawn_owed_finish_bind(&t, &rec);
+                                });
+                            }
                         }
+                        verdict
                     });
                     let store = std::sync::Arc::downgrade(&lifecycle_store);
                     coord_sync_facade.attach_finished_ack_observer(move |csid, finished_at| {
                         if let Some(s) = store.upgrade() {
                             s.mark_finish_synced(csid, finished_at);
                         }
+                    });
+                }
+                // Unfinished-resume phase 2 — bind every lifecycle-store session
+                // through Phase 1's binder at boot so a finished mark always
+                // finds an R4 entry. Detached: never delays setup.
+                if let Some(t) = app
+                    .try_state::<std::sync::Arc<
+                        session::session_transcript_tailer::SessionTranscriptTailer,
+                    >>()
+                    .map(|t| t.inner().clone())
+                {
+                    let store = lifecycle_store.clone();
+                    tauri::async_runtime::spawn(async move {
+                        session::transcript_autobind::bind_lifecycle_sessions(&t, &store).await;
                     });
                 }
                 // Append-only session-snapshot HISTORY (session-restore
