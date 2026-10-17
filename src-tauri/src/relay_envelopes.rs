@@ -96,9 +96,15 @@ pub enum RunnerRelayMessage {
         data: Value,
     },
 
-    /// AI session lifecycle state from the `session-state` broadcast channel.
-    /// `data` carries the original `AppEvent` payload (state transitions for
-    /// the mobile chat UI).
+    /// AI session lifecycle state from the `session-state` broadcast channel,
+    /// pushed live on every transition by
+    /// `commands::ai_session::emit_session_state_ex`. `data` is that
+    /// `SessionStateEvent` verbatim — camelCase `taskRunId`, `sessionId`,
+    /// `state`, plus `resumed` only when true.
+    ///
+    /// Distinct from the REPLY to an inbound `chat_session_state` request
+    /// (`backend_relay::handle_chat_session_state`), which shares the
+    /// `"type"` tag but carries flat snake_case fields and no `data` key.
     ChatSessionState {
         #[serde(default)]
         data: Value,
@@ -305,6 +311,21 @@ mod tests {
                 "type": "terminal_exit",
                 "terminal_id": "t-2",
                 "exit_code": 0
+            })
+        );
+    }
+
+    #[test]
+    fn relay_chat_session_state_nests_the_event_under_data() {
+        let typed = RunnerRelayMessage::ChatSessionState {
+            data: json!({ "taskRunId": "run-1", "sessionId": "s-1", "state": "idle" }),
+        };
+        let v = serde_json::to_value(&typed).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "chat_session_state",
+                "data": { "taskRunId": "run-1", "sessionId": "s-1", "state": "idle" }
             })
         );
     }
