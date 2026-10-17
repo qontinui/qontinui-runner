@@ -625,7 +625,7 @@ impl TenancyRepoExpected {
 
     /// The tenant this leg EXPECTS, for the comparison: the caller-named one
     /// when there is one, else the repo's single owner.
-    fn expected_tenant(&self) -> Option<&str> {
+    pub(crate) fn expected_tenant(&self) -> Option<&str> {
         self.caller_named_tenant_id
             .as_deref()
             .or(if self.status == TENANCY_RESOLVED {
@@ -662,6 +662,90 @@ impl TenancyRepoExpected {
     }
 }
 
+/// [`TenancyCoordRow::status`]: this runner process registered the session's
+/// coord row and recorded the tenant it was created under.
+pub const COORD_ROW_REGISTERED: &str = "registered";
+/// [`TenancyCoordRow::status`] of a projection made without the leg — never
+/// served (the same convention as [`REPO_EXPECTED_NOT_READ`]).
+pub const COORD_ROW_NOT_READ: &str = "not_read";
+/// [`TenancyCoordRow::reason`]: the registrar's in-process index has no entry
+/// for this session — a runner restart empties it, and a session the runner
+/// never sniffed is not in it.
+pub const COORD_ROW_NOT_REGISTERED: &str = "not_registered_by_this_process";
+
+/// The fifth leg: the tenant coord's OWN session row was created under (plan
+/// `2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant`
+/// Phase 4). Coord routes messages, the census and `resolve_session` by this
+/// row, not by the credential — so a row stamped X under a credential acting as
+/// Y is a divergence the operator must see.
+///
+/// Read from what the runner itself WROTE at registration
+/// (`AiCoordRegistrar::recorded_tenant`) — synchronously, with no network call
+/// on the session-info poll path. There is deliberately no `observed` arm: the
+/// optional cached coord read the plan allowed would put network I/O beside the
+/// poll path, and is not built.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenancyCoordRow {
+    /// [`COORD_ROW_REGISTERED`] | [`TENANCY_UNKNOWN`] (with `reason`) |
+    /// [`COORD_ROW_NOT_READ`] (never served).
+    pub status: String,
+    pub tenant_id: Option<String>,
+    /// `"registrar"` when registered; `None` otherwise.
+    pub source: Option<String>,
+    /// Why the leg is unknown: [`COORD_ROW_NOT_REGISTERED`],
+    /// `registered_without_tenant` (registered, but no tenant resolved, so the
+    /// create body named none and coord stamped its own default), or
+    /// `registrar_unavailable`.
+    pub reason: Option<String>,
+}
+
+/// What the registrar knows about a session's coord row — the input of
+/// [`TenancyCoordRow::from_read`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordRowRead {
+    Registered(uuid::Uuid),
+    Unknown(&'static str),
+}
+
+impl TenancyCoordRow {
+    fn not_read() -> Self {
+        Self {
+            status: COORD_ROW_NOT_READ.to_string(),
+            tenant_id: None,
+            source: None,
+            reason: None,
+        }
+    }
+
+    /// The row's tenant when it is known.
+    pub(crate) fn registered_tenant(&self) -> Option<&str> {
+        if self.status == COORD_ROW_REGISTERED {
+            self.tenant_id.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Project the registrar read. Pure.
+    pub(crate) fn from_read(read: CoordRowRead) -> Self {
+        match read {
+            CoordRowRead::Registered(t) => Self {
+                status: COORD_ROW_REGISTERED.to_string(),
+                tenant_id: Some(t.to_string()),
+                source: Some("registrar".to_string()),
+                reason: None,
+            },
+            CoordRowRead::Unknown(reason) => Self {
+                status: TENANCY_UNKNOWN.to_string(),
+                tenant_id: None,
+                source: None,
+                reason: Some(reason.to_string()),
+            },
+        }
+    }
+}
+
 /// Which tenant each half of this session acts as, and whether they disagree
 /// (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`
 /// P0).
@@ -681,6 +765,9 @@ pub struct SessionTenancy {
     /// The fourth leg — see [`TenancyRepoExpected`]. Folded into both
     /// [`Self::diverged`] and [`Self::divergence`].
     pub repo_expected: TenancyRepoExpected,
+    /// The fifth leg — see [`TenancyCoordRow`]. Folded into both
+    /// [`Self::diverged`] and [`Self::divergence`].
+    pub coord_row: TenancyCoordRow,
     /// True iff the tenants that ARE known name more than one tenant. An
     /// unknown value never manufactures a divergence, and never hides one.
     /// `false` is NOT agreement — read [`Self::divergence`] for that.
@@ -693,6 +780,13 @@ pub struct SessionTenancy {
     /// default was not recorded, or a session whose credential is unknown, is
     /// `unknown` — the boolean alone used to render both as "not diverged".
     pub divergence: String,
+    /// The ONE derived answer to "which tenant is this session?" that every
+    /// surface renders — see
+    /// [`super::session_tenant_display::TenantDisplay`]. Attached last, by
+    /// [`Self::with_display`], over the fully-folded legs; absent from a
+    /// projection that never attached it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<super::session_tenant_display::TenantDisplay>,
 }
 
 /// The tenancy report's `reason` for a session the proxy would refuse: the
@@ -859,8 +953,10 @@ pub(crate) fn project_tenancy(
         data_plane,
         credential,
         repo_expected: TenancyRepoExpected::empty(REPO_EXPECTED_NOT_READ),
+        coord_row: TenancyCoordRow::not_read(),
         diverged: false,
         divergence: String::new(),
+        display: None,
     };
     tenancy.fold_divergence();
     tenancy
@@ -871,6 +967,29 @@ impl SessionTenancy {
     pub(crate) fn with_repo_expected(mut self, leg: TenancyRepoExpected) -> Self {
         self.repo_expected = leg;
         self.fold_divergence();
+        self.display = None;
+        self
+    }
+
+    /// Attach the fifth leg (coord's own row tenant) and re-derive the
+    /// comparison with it.
+    pub(crate) fn with_coord_row(mut self, leg: TenancyCoordRow) -> Self {
+        self.coord_row = leg;
+        self.fold_divergence();
+        self.display = None;
+        self
+    }
+
+    /// Attach the display projection over the legs as they now stand. Call it
+    /// LAST: attaching a leg afterwards clears it rather than leave it stale.
+    pub(crate) fn with_display(
+        mut self,
+        bound: crate::auth::BindingSetRead,
+        slug_for: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        self.display = Some(super::session_tenant_display::project_tenant_display(
+            &self, bound, slug_for,
+        ));
         self
     }
 
@@ -904,6 +1023,12 @@ impl SessionTenancy {
                 .expected_tenant()
                 .map(str::to_ascii_lowercase),
         );
+        // Coord's own row: the tenant coord routes this session by.
+        known.extend(
+            self.coord_row
+                .registered_tenant()
+                .map(str::to_ascii_lowercase),
+        );
         known.sort();
         known.dedup();
         let diverged = known.len() > 1
@@ -918,6 +1043,9 @@ impl SessionTenancy {
             && !self
                 .repo_expected
                 .blocks_agreement(self.credential.tenant_id.as_deref())
+            // An unknown coord row is not agreement: coord may route this
+            // session by a tenant nothing here can see.
+            && self.coord_row.status != TENANCY_UNKNOWN
         {
             DIVERGENCE_AGREE
         } else {
@@ -954,6 +1082,12 @@ pub(crate) fn read_session_tenancy(rec: &TerminalSessionRecord) -> SessionTenanc
         &rec.terminal_id,
         non_empty(rec.working_dir.as_ref()).as_deref(),
     );
+    // The slug comes only from a coord answer this session's nonce already
+    // received, and only for the tenant that answer names.
+    let latest_answer = match &repo_expected {
+        crate::coord_mcp::RepoExpectationRead::Known { latest, .. } => latest.clone(),
+        crate::coord_mcp::RepoExpectationRead::Unknown(_) => None,
+    };
     project_tenancy(
         rec.tenant_id.as_deref(),
         data_plane,
@@ -966,6 +1100,43 @@ pub(crate) fn read_session_tenancy(rec: &TerminalSessionRecord) -> SessionTenanc
         crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
     )
     .with_repo_expected(TenancyRepoExpected::from_read(&repo_expected))
+    .with_coord_row(TenancyCoordRow::from_read(read_coord_row(
+        &rec.claude_session_id,
+    )))
+    .with_display(crate::auth::binding_set_probe(), |tenant| {
+        super::session_tenant_display::slug_from_answer(latest_answer.as_ref(), tenant)
+    })
+}
+
+/// What this runner process recorded about `claude_session_id`'s coord row:
+/// the tenant `AiCoordRegistrar` created it under. In-process and synchronous
+/// — no network I/O on the session-info poll path. The registrar's index key is
+/// the Claude session id on both planes (see `AiCoordRegistrar::session_id_for`).
+fn read_coord_row(claude_session_id: &str) -> CoordRowRead {
+    use tauri::Manager;
+    let Some(registrar) = crate::tauri_app_handle::current().and_then(|app| {
+        app.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            .map(|s| s.inner().clone())
+    }) else {
+        return CoordRowRead::Unknown("registrar_unavailable");
+    };
+    let key = claude_session_id.trim();
+    coord_row_from_registrar(
+        registrar.session_id_for(key).is_some(),
+        registrar.recorded_tenant(key),
+    )
+}
+
+/// The pure half of [`read_coord_row`].
+pub(crate) fn coord_row_from_registrar(
+    registered: bool,
+    tenant: Option<uuid::Uuid>,
+) -> CoordRowRead {
+    match (registered, tenant) {
+        (_, Some(t)) => CoordRowRead::Registered(t),
+        (true, None) => CoordRowRead::Unknown("registered_without_tenant"),
+        (false, None) => CoordRowRead::Unknown(COORD_ROW_NOT_REGISTERED),
+    }
 }
 
 /// The projected body — every field group of D1. Flattened into
