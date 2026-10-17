@@ -182,11 +182,21 @@ impl LoopController {
             .map(|s| s.inner().clone());
         let execution_id = config.execution_id.clone();
         if let Some(reg) = registrar.as_deref() {
-            reg.register_session(
-                &execution_id,
-                &format!("unified workflow: {}", config.workflow_name),
-                None,
-            );
+            let purpose = format!("unified workflow: {}", config.workflow_name);
+            // With a project path the run's tenant is resolved from it (plan
+            // `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5); a
+            // later worktree of the same repo has the same owner. Without
+            // one there is no directory to ask, so the cwd-blind resolver
+            // answers as before.
+            match config.project_path.as_deref() {
+                Some(dir) => {
+                    reg.register_session_in(&execution_id, &purpose, None, dir)
+                        .await;
+                }
+                None => {
+                    reg.register_session(&execution_id, &purpose, None);
+                }
+            }
         }
 
         let result = self

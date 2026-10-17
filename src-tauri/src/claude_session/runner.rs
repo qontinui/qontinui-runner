@@ -553,32 +553,42 @@ fn run_claude_session_inline(
     // federation context (`tenant_id` + `device_id` + `account_name` +
     // `session_id`), then run each registered bridge's pull + watcher.
     // All steps short-circuit silently on missing identity / no global
-    // bridge — federation is best-effort and never blocks the spawn.
+    // bridge — federation is best-effort and never FAILS the spawn; it can
+    // DELAY it, by at most the tenant's repo read (`CWD_TENANT_BUDGET`, taken
+    // only after the instant skips) plus the pull below.
     let federation_ctx_opt = {
         let ai_settings = crate::settings::get_ai_settings();
+        // Phase 8b (B2): thread the session's RECORDED tenant so the
+        // federated pool agrees with the coord record + JWT slot: the
+        // tenant `AiCoordRegistrar` stamped them with (registration resolves
+        // it from the spawn directory where the caller knows it), looked up
+        // by this spawn's own id, then by the owning task run's id (a
+        // workflow phase session's id is suffixed; the run is what
+        // registered). Neither registered yet, or no tenant recorded: the
+        // proxy's own authority order for this spawn directory (workspace,
+        // then repo, then the machine). The closure runs LAST inside
+        // `build_federation_ctx`, after its instant skips; its repo read is
+        // bounded by `CWD_TENANT_BUDGET`. A refusal leaves the session
+        // UNFEDERATED (logged) rather than federating the default tenant.
         match crate::claude_session::federation::build_federation_ctx(
             session_id,
             working_dir,
             &ai_settings.claude_cli,
-            // Phase 8b (B2): thread the session's RECORDED tenant so the
-            // federated pool agrees with the coord record + JWT slot: the
-            // tenant `AiCoordRegistrar` stamped them with, looked up by this
-            // spawn's own id, then by the owning task run's id (a workflow
-            // phase session's id is suffixed; the run is what registered).
-            // Neither registered yet, or no tenant recorded: the registrar's
-            // own resolver. `None` on an unresolvable or unpaired machine.
-            crate::claude_session::coord_register::federation_session_tenant(
-                tauri::Manager::try_state::<
-                    std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
-                >(app_handle)
-                .as_deref()
-                .map(|r| &**r),
-                &crate::claude_session::coord_register::federation_session_keys(
-                    session_id,
-                    task_run_id,
-                    session_ctx.as_ref(),
-                ),
-            ),
+            || {
+                crate::claude_session::coord_register::federation_session_tenant(
+                    tauri::Manager::try_state::<
+                        std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+                    >(app_handle)
+                    .as_deref()
+                    .map(|r| &**r),
+                    &crate::claude_session::coord_register::federation_session_keys(
+                        session_id,
+                        task_run_id,
+                        session_ctx.as_ref(),
+                    ),
+                    || run_async_inline(crate::session::resolve_new_session_tenant_at(working_dir)),
+                )
+            },
         ) {
             Ok(ctx) => Some(ctx),
             Err(reason) => {

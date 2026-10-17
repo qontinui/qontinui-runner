@@ -537,7 +537,17 @@ pub async fn create_ai_session(
     // stdout reader + waiter threads need at spawn time. The R6 idempotency
     // guard means this is the single Started write; the later (post-spawn)
     // success re-register is a no-op.
-    let coord_session_id = ai_coord_registrar.register_session(&task_run_id, &name, None);
+    //
+    // The session spawns in the runner's cwd, so that is the directory its
+    // tenant is resolved from (plan `2026-09-20-a-sessions-tenant-follows-its-
+    // repo…` Phase 5): a chat in tenant B's repo is recorded — and so
+    // federated (B2) — under B, not under the machine pin.
+    let working_dir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let coord_session_id = ai_coord_registrar
+        .register_session_in(&task_run_id, &name, None, &working_dir)
+        .await;
 
     // Phase 1b/1c — build the interactive-agent log emitter when the
     // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON (the default) and the
@@ -560,10 +570,6 @@ pub async fn create_ai_session(
     let trid = task_run_id.clone();
     let name_for_ctx = name.clone();
     let spawn_task = spawn_blocking_tracked(move || {
-        let working_dir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
         // Create an AiSessionContext so output events include the taskRunId.
         // Without this, emit_ai_output would emit events with taskRunId=null
         // and the frontend would be unable to filter them.
@@ -1992,9 +1998,17 @@ pub async fn resume_ai_sessions(
         // idempotency guard makes the later post-spawn register a no-op), so
         // the minted coord session id can seed the Phase-1b agent_logs emitter
         // the spawn's stdout/waiter threads consume. `None` registrar → no id.
-        let coord_session_id = ai_coord_registrar
-            .as_ref()
-            .and_then(|reg| reg.register_session(&task_run_id, &task_name, None));
+        //
+        // Its tenant is resolved from the directory it respawns in (plan
+        // `2026-09-20-a-sessions-tenant-follows-its-repo…` Phase 5), so the
+        // record and its federation follow that directory's repo.
+        let coord_session_id = match ai_coord_registrar.as_ref() {
+            Some(reg) => {
+                reg.register_session_in(&task_run_id, &task_name, None, &working_dir_for_spawn)
+                    .await
+            }
+            None => None,
+        };
         // Phase 1b/1c emitter — `None` (default) unless the
         // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON and the id resolved.
         let agent_log_emitter = coord_session_id

@@ -6858,7 +6858,7 @@ pub(crate) fn repo_unsettled_refusal(
 /// Does this device hold credentials for more than one tenant? An UNREADABLE
 /// store answers `true`: the conservative arm for a guard whose failure mode is
 /// a cross-tenant answer, and the refusal it produces is retryable.
-fn device_is_multi_bound() -> bool {
+pub(crate) fn device_is_multi_bound() -> bool {
     crate::auth::HeldDeviceTenants::read(&crate::auth::AuthManager::new())
         .set()
         .map(|held| held.len() > 1)
@@ -8927,7 +8927,7 @@ mod session_tenant_resolution_tests {
 /// the existing unverified-payload decoder ([`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]);
 /// signature verification is coord's job, and the value is used only to pick a
 /// local credential slot, never as an authorization decision.
-fn device_jwt_claim_tenant() -> Option<Uuid> {
+pub(crate) fn device_jwt_claim_tenant() -> Option<Uuid> {
     // The RAW slot, deliberately — NOT `device_bearer_for(None)`, which since
     // Phase 1a returns `None` for an expired or opaque token. Expiry
     // invalidates a token as a CREDENTIAL; it does not invalidate the
