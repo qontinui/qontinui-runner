@@ -98,10 +98,10 @@ fn runner_window_has_foreground(_app_handle: &tauri::AppHandle) -> Result<bool, 
 // ============================================================================
 
 /// Why both element-capture routes answer 410 — see the module docs.
-const CAPTURE_REMOVED_MESSAGE: &str = "unsupported: GUI element capture was removed in \
-     qontinui-runner#2242 (the html2canvas DOM capture behind \
-     /ui-bridge/control/capture-element-images is gone). Supply element images \
-     to POST /gui-config/build yourself, or capture through /ui-bridge/vision/*.";
+const CAPTURE_REMOVED_MESSAGE: &str = "unsupported: GUI element capture was removed — the \
+     html2canvas DOM capture it depended on is gone (/ui-bridge/control/capture-element-images \
+     in #119, the frontend handler in qontinui-runner#2242). Supply element images to \
+     POST /gui-config/build yourself, or capture through /ui-bridge/vision/*.";
 
 /// POST /gui-config/capture-elements and POST /gui-config/capture-multi-state
 ///
