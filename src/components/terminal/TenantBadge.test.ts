@@ -140,7 +140,7 @@ describe("the fourth tenancy leg (plan 2026-09-20 Phase 2)", () => {
     expect(repoExpectedText(null)).toContain("unknown");
     expect(repoExpectedText(repoLeg({ status: "no_repo" }))).toContain("no repo");
     expect(repoExpectedText(repoLeg({ status: "repo_unregistered", repo: "acme/x" }))).toContain(
-      "acme/x has no owning tenant",
+      "acme/x is owned by no tenant this device is paired to",
     );
     expect(
       repoExpectedText(repoLeg({ status: "several", repo: "acme/s", tenantIds: [A, B] })),
