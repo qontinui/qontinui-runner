@@ -2014,22 +2014,35 @@ mod tests {
     const TEST_ONLY_FILES: &[(&str, &str)] =
         &[("mcp/relay_binding/tests.rs", "mcp/relay_binding.rs")];
 
+    /// `src` from byte `from`. Every offset the scanner passes is the start of
+    /// an ASCII match or just past one, so it is a char boundary; the `get`
+    /// keeps the scan clear of the repo's `clippy::string_slice` gate.
+    fn tail(src: &str, from: usize) -> &str {
+        src.get(from..)
+            .expect("scanner offsets are char boundaries")
+    }
+
+    /// `src` up to byte `to` (see [`tail`]).
+    fn head(src: &str, to: usize) -> &str {
+        src.get(..to).expect("scanner offsets are char boundaries")
+    }
+
     /// Byte ranges of `#[cfg(test)] mod <name> { … }` blocks in `src`.
     fn cfg_test_ranges(src: &str) -> Vec<(usize, usize)> {
         let mut ranges = Vec::new();
         let mut from = 0;
-        while let Some(off) = src[from..].find("#[cfg(test)]") {
+        while let Some(off) = tail(src, from).find("#[cfg(test)]") {
             let attr = from + off;
             let after = attr + "#[cfg(test)]".len();
             from = after;
-            let rest = src[after..].trim_start();
+            let rest = tail(src, after).trim_start();
             if !(rest.starts_with("mod ")
                 || rest.starts_with("pub mod ")
                 || rest.starts_with("pub(crate) mod "))
             {
                 continue;
             }
-            let Some(brace_rel) = src[after..].find(['{', ';']) else {
+            let Some(brace_rel) = tail(src, after).find(['{', ';']) else {
                 continue;
             };
             let brace = after + brace_rel;
@@ -2038,7 +2051,7 @@ mod tests {
             }
             let mut depth = 0usize;
             let mut end = src.len();
-            for (i, c) in src[brace..].char_indices() {
+            for (i, c) in tail(src, brace).char_indices() {
                 match c {
                     '{' => depth += 1,
                     '}' => {
@@ -2125,26 +2138,29 @@ mod tests {
         let mut lines = Vec::new();
         for pat in DIRECT_WS_CONNECTS {
             let mut from = 0;
-            while let Some(off) = src[from..].find(pat) {
+            while let Some(off) = tail(src, from).find(pat) {
                 let at = from + off;
-                from = at + 1;
+                from = at + pat.len();
                 // `connect_async(` must not match inside `…_connect_async(`
                 // of a longer identifier, nor re-count a longer pattern.
-                if src[..at]
+                if head(src, at)
                     .chars()
                     .next_back()
                     .is_some_and(|c| c.is_alphanumeric() || c == '_')
                 {
                     continue;
                 }
-                let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
-                if src[line_start..at].trim_start().starts_with("//") {
+                let line_start = head(src, at).rfind('\n').map_or(0, |i| i + 1);
+                if tail(head(src, at), line_start)
+                    .trim_start()
+                    .starts_with("//")
+                {
                     continue;
                 }
                 if exempt.iter().any(|(s, e)| at > *s && at < *e) {
                     continue;
                 }
-                lines.push(src[..at].matches('\n').count() + 1);
+                lines.push(head(src, at).matches('\n').count() + 1);
             }
         }
         lines.sort_unstable();
