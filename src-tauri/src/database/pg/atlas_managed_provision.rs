@@ -453,7 +453,7 @@ pub(crate) async fn create_missing_in(
 /// transaction under the move's advisory lock and is re-checked under it, so
 /// one that cannot be added — rows in the child with no parent, a lock it
 /// cannot get in time — is logged at WARN and leaves the others alone. `Err`
-/// only when the catalog cannot be read at all.
+/// only when the catalog cannot be read at all or the dump cannot be parsed.
 pub(crate) async fn add_missing_foreign_keys_in(
     client: &mut Client,
     dump: &str,
