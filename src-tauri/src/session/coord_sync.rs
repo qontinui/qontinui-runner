@@ -792,6 +792,11 @@ pub(crate) struct SessionOutboxHealth {
     pub last_failure: Option<OutboxFailure>,
     pub retrying_sessions: u64,
     pub quarantined_sessions: u64,
+    /// `usage_totals` rows ACK-dropped on a 4xx since this process started
+    /// ([`USAGE_TOTALS_DROPPED_4XX`]). Such a drop is ACKed inside the usage
+    /// arm, so it never reaches `last_failure`; without this field it would be
+    /// visible only in the log.
+    pub usage_totals_dropped_4xx: u64,
 }
 
 fn session_outbox_health_cell() -> &'static Mutex<SessionOutboxHealth> {
@@ -825,6 +830,10 @@ pub(crate) fn session_outbox_health_json() -> JsonValue {
         .lock()
         .map(|h| h.clone())
         .unwrap_or_default();
+    let snapshot = SessionOutboxHealth {
+        usage_totals_dropped_4xx: USAGE_TOTALS_DROPPED_4XX.load(Ordering::Relaxed),
+        ..snapshot
+    };
     render_session_outbox_health(&snapshot)
 }
 
@@ -845,6 +854,8 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         })),
         "retryingSessions": counted(h.retrying_sessions),
         "quarantinedSessions": counted(h.quarantined_sessions),
+        // A process counter, not a drain observation: 0 is a real zero.
+        "usageTotalsDropped4xx": h.usage_totals_dropped_4xx,
         "observedAt": h.observed_at,
     })
 }
@@ -5920,6 +5931,7 @@ mod tests {
             }),
             retrying_sessions: 1,
             quarantined_sessions: 0,
+            usage_totals_dropped_4xx: 2,
         });
         for key in [
             "pending",
@@ -5928,6 +5940,7 @@ mod tests {
             "lastFailure",
             "retryingSessions",
             "quarantinedSessions",
+            "usageTotalsDropped4xx",
             "observedAt",
         ] {
             assert!(
@@ -5936,6 +5949,8 @@ mod tests {
             );
         }
         assert_eq!(observed["pending"], 3);
+        assert_eq!(observed["usageTotalsDropped4xx"], 2);
+        assert_eq!(unobserved["usageTotalsDropped4xx"], 0);
         assert_eq!(observed["lastFailure"]["kind"], "server_error");
         assert_eq!(observed["lastFailure"]["status"], 503);
         assert!(observed["lastFailure"]["at"].is_string());
