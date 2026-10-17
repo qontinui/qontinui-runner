@@ -1,0 +1,127 @@
+[package]
+name = "termhost-probe"
+version = "0.1.0"
+description = "termhost-bench's outside-in instrument: screen-capture marker decoding, window-state and process sampling, D9-safe key injection, and a selftest that proves each"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Plan 2026-10-11-terminal-page-performance-kpis-across-setups, Phase 2. A
+# standalone measurement binary that reads composited frames and OS process
+# accounting from OUTSIDE every terminal host (D1), so the runner, VS Code,
+# Windows Terminal and tmux are measured by one instrument. Nothing in the
+# runner links it.
+#
+# Every dependency below is already resolved in the workspace `Cargo.lock` at
+# the version the runner uses (the plan's "Crates already in the lock" row);
+# this crate adds features, never new versions. In particular `windows` is the
+# 0.61 line the runner already resolves (0.61.3) — NOT the 0.58 line
+# src-tauri's own `windows` dependency uses.
+
+[lib]
+name = "termhost_probe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "termhost-probe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Process enumeration (parent links, argv for the generator exclusion, start
+# times for PID-reuse detection). CPU time and memory are read with the OS
+# calls directly, because sysinfo exposes neither Windows private bytes nor
+# Linux PSS — the two numbers the KPI catalog names for `memory_mb`.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    # TypedEventHandler (FrameArrived), TimeSpan (SystemRelativeTime).
+    "Foundation",
+    # SizeInt32.
+    "Graphics",
+    # Windows.Graphics.Capture: the per-window primary source (D2).
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    # IDirect3DDevice / IDirect3DSurface for the WGC frame pool.
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    # D3D_DRIVER_TYPE / D3D_FEATURE_LEVEL for D3D11CreateDevice.
+    "Win32_Graphics_Direct3D",
+    # The device, staging textures and Map for both capture sources.
+    "Win32_Graphics_Direct3D11",
+    # DXGI Desktop Duplication: the missed-frame cross-check (D2).
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetCompositionTimingInfo.
+    "Win32_Graphics_Dwm",
+    # The selftest/doctor window's painting, monitors and display settings.
+    "Win32_Graphics_Gdi",
+    # RoInitialize for the WinRT capture objects.
+    "Win32_System_WinRT",
+    # CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess.
+    "Win32_System_WinRT_Direct3D11",
+    # IGraphicsCaptureItemInterop::CreateForWindow (per-HWND capture).
+    "Win32_System_WinRT_Graphics",
+    "Win32_System_WinRT_Graphics_Capture",
+    # QueryPerformanceCounter (the probe clock) and PDH (`\GPU Engine(*)\...`).
+    "Win32_System_Performance",
+    # GetProcessMemoryInfo (PrivateUsage, WorkingSetSize).
+    "Win32_System_ProcessStatus",
+    # OpenProcess, GetProcessTimes.
+    "Win32_System_Threading",
+    # IsProcessInJob / JOBOBJECT_BASIC_UI_RESTRICTIONS: names a job object's UI
+    # limits when desktop duplication is refused.
+    "Win32_System_JobObjects",
+    # OpenInputDesktop / GetUserObjectInformationW: is the session interactive
+    # and unlocked (D9)?
+    "Win32_System_StationsAndDesktops",
+    # ProcessIdToSessionId, WTSGetActiveConsoleSessionId.
+    "Win32_System_RemoteDesktop",
+    # SetConsoleCtrlHandler: Ctrl+C ends `watch` with its summary written.
+    "Win32_System_Console",
+    # GetModuleHandleW for window classes.
+    "Win32_System_LibraryLoader",
+    # Raw Input: the non-blocking real-input monitor (D9) — no low-level hook.
+    "Win32_UI_Input",
+    # SendInput with a per-run dwExtraInfo tag.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # Windows, messages, z-order walk, IsHungAppWindow, GetLayeredWindowAttributes.
+    "Win32_UI_WindowsAndMessaging",
+    # Per-monitor DPI awareness, so window rectangles are physical pixels that
+    # agree with DXGI desktop coordinates.
+    "Win32_UI_HiDpi",
+    # Named by signatures this crate calls (SECURITY_ATTRIBUTES parameters).
+    "Win32_Security",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# X11 damage + shm capture (D2), XTest injection and XInput2 raw events (the
+# Linux real-input monitor), RandR for the refresh rate. Pure-Rust connection;
+# no libxcb, no X11 headers.
+x11rb = { version = "0.13", features = ["damage", "shm", "xtest", "xinput", "randr"] }
+# CLOCK_MONOTONIC, sysconf(_SC_CLK_TCK), poll(2) on the X socket.
+libc = "0.2"
+# Maps the MIT-SHM segment the X server writes captured pixels into.
+memmap2 = "0.9"
+
+# The same tiered policy as src-tauri/Cargo.toml [lints] and crates/pty-holder
+# (plan 2026-07-05-lint-tiers-and-diff-scoped-gates): correctness/suspicious
+# DENY, `string_slice` DENY, style/perf warn. The workspace defines no
+# [workspace.lints], so the table is repeated here rather than inherited.
+[lints.rust]
+unfulfilled_lint_expectations = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = 1 }
+suspicious = { level = "deny", priority = 1 }
+string_slice = { level = "deny", priority = 2 }
+disallowed_methods = { level = "deny", priority = 2 }
+perf = { level = "warn", priority = 1 }
+complexity = { level = "warn", priority = 0 }
+style = { level = "warn", priority = 0 }
+pedantic = { level = "allow", priority = 0 }
+nursery = { level = "allow", priority = 0 }
