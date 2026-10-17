@@ -221,6 +221,7 @@ function TerminalPageInner({
     zoneCount: zoneLayout.layout.zones.length,
     setMaximizedZone: zoneLayout.setMaximizedZone,
     layoutId: zoneLayout.layoutId,
+    pageId,
   });
   useEffect(() => {
     zoneMaximizeRef.current = {
@@ -228,12 +229,14 @@ function TerminalPageInner({
       zoneCount: zoneLayout.layout.zones.length,
       setMaximizedZone: zoneLayout.setMaximizedZone,
       layoutId: zoneLayout.layoutId,
+      pageId,
     };
   }, [
     zoneLayout.maximizedZone,
     zoneLayout.layout.zones.length,
     zoneLayout.setMaximizedZone,
     zoneLayout.layoutId,
+    pageId,
   ]);
 
   // Register page-level UI Bridge actions so AI agents can discover
@@ -435,13 +438,17 @@ function TerminalPageInner({
         id: "get-zone-view-state",
         label: "Get Zone View State",
         description:
-          "Return { maximizedZone, zoneCount, layoutId } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot.",
-        // `read` — a query.
+          "Return { maximizedZone, zoneCount, layoutId, pageId } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot. `pageId` is the terminal page this view shows: a terminal created with that `page_id` mounts here, one on any other page is unwatched.",
+        // `read` — a query. `pageId` is what `scripts/perf-harness.mjs` creates its
+        // terminals on: a page-evaluate read of the persisted key is refused by the
+        // webview CSP (`script-src 'self'`, no 'unsafe-eval'), so this action is the
+        // eval-free door to it.
         effect: "read",
         handler: () => ({
           maximizedZone: zoneMaximizeRef.current.maximizedZone,
           zoneCount: zoneMaximizeRef.current.zoneCount,
           layoutId: zoneMaximizeRef.current.layoutId,
+          pageId: zoneMaximizeRef.current.pageId,
         }),
       },
       {
