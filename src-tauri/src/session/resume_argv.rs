@@ -617,8 +617,19 @@ mod tests {
         tokens.iter().map(|t| t.to_string()).collect()
     }
 
+    /// The Unix rules, whatever OS runs the test: these fixtures spell Unix
+    /// paths, which are not absolute on Windows (no drive). The Windows rules
+    /// have their own test (`replay_args_on(.., true)`).
+    fn unix_replay_args(
+        launch_argv: &[String],
+        session_id: &str,
+        launch_cwd: Option<&str>,
+    ) -> Result<Vec<String>, ReplayRefusal> {
+        replay_args_on(launch_argv, session_id, launch_cwd, false)
+    }
+
     fn replay(tokens: &[&str]) -> Result<Vec<String>, ReplayRefusal> {
-        replay_args(&argv(tokens), SID, CWD)
+        unix_replay_args(&argv(tokens), SID, CWD)
     }
 
     #[test]
@@ -740,13 +751,13 @@ mod tests {
         );
         for cwd in [None, Some("relative/cwd")] {
             assert_eq!(
-                replay_args(&argv(&["--add-dir", "lib"]), SID, cwd),
+                unix_replay_args(&argv(&["--add-dir", "lib"]), SID, cwd),
                 Err(ReplayRefusal::RelativePath { index: 1 })
             );
         }
         // An absolute one needs no launch directory.
         assert_eq!(
-            replay_args(&argv(&["--add-dir", "/abs"]), SID, None).unwrap(),
+            unix_replay_args(&argv(&["--add-dir", "/abs"]), SID, None).unwrap(),
             argv(&["--add-dir", "/abs"])
         );
     }
@@ -835,7 +846,7 @@ mod tests {
     fn resume_argv_a_missing_or_unsafe_session_id_refuses() {
         for bad in ["", "abc def", "a;b", "$(id)", "x\n"] {
             assert_eq!(
-                replay_args(&[], bad, CWD),
+                unix_replay_args(&[], bad, CWD),
                 Err(ReplayRefusal::InvalidSessionId),
                 "{bad:?}"
             );
@@ -861,7 +872,10 @@ mod tests {
         assert_eq!(replay(&["-p", "hello"]), Err(ReplayRefusal::PrintMode));
         assert_eq!(replay(&["--print"]), Err(ReplayRefusal::PrintMode));
         let many: Vec<String> = (0..=MAX_ARGV_TOKENS).map(|_| "--verbose".into()).collect();
-        assert_eq!(replay_args(&many, SID, CWD), Err(ReplayRefusal::TooLong));
+        assert_eq!(
+            unix_replay_args(&many, SID, CWD),
+            Err(ReplayRefusal::TooLong)
+        );
     }
 
     #[test]

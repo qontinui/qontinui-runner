@@ -3090,11 +3090,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
+        // An absolute launch directory on the OS running the test: the
+        // relative `--add-dir` resolves against it (a Unix path is not
+        // absolute on Windows, which has no drive in it).
+        let cwd = if cfg!(windows) {
+            "C:/op/proj"
+        } else {
+            "/home/op/proj"
+        };
         let body = serde_json::json!({
             "terminal_id": "term-9",
             "session_id": "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0",
             "source": "startup",
-            "cwd": "/home/op/proj",
+            "cwd": cwd,
             "argv": [
                 "PROMPT-TEXT summarize the repo",
                 "--model",
@@ -3115,9 +3123,13 @@ mod tests {
         assert_eq!(
             rec.resume_flags,
             Some(ResumeFlags::Replay {
-                flags: ["--model", "opus", "--add-dir", "/home/op/proj/lib"]
-                    .map(String::from)
-                    .to_vec()
+                flags: [
+                    "--model".to_string(),
+                    "opus".to_string(),
+                    "--add-dir".to_string(),
+                    format!("{cwd}/lib"),
+                ]
+                .to_vec()
             })
         );
         drop(store);

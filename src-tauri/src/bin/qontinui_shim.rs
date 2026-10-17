@@ -1632,19 +1632,26 @@ mod tests {
     fn exec_real_child_env_sets_and_removes_child_variables() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("env.txt");
+        // The removed variable is one this process always has (HOME), so the
+        // test never writes the process environment, which every parallel
+        // env-reading test shares. Not PATH: a shell started without one
+        // substitutes a default. `printf` is a builtin and `/bin/sh` is named
+        // absolutely, so the child needs neither.
+        assert!(
+            std::env::var_os("HOME").is_some(),
+            "the test needs HOME set"
+        );
         let script = format!(
-            "printf '%s|%s' \"${{{LAUNCH_ARGV_ENV}-unset}}\" \"${{QS_TEST_REMOVED-unset}}\" > '{}'",
+            "printf '%s|%s' \"${{{LAUNCH_ARGV_ENV}-unset}}\" \"${{HOME-unset}}\" > '{}'",
             out.display()
         );
-        std::env::set_var("QS_TEST_REMOVED", "present");
         let code = exec_real_child_env(
             &Some(PathBuf::from("/bin/sh")),
             "sh",
             &["-c".to_string(), script.clone()],
-            &["QS_TEST_REMOVED"],
+            &["HOME"],
             &[(LAUNCH_ARGV_ENV, "[\"--verbose\"]")],
         );
-        std::env::remove_var("QS_TEST_REMOVED");
         assert_eq!(code, Some(0));
         assert_eq!(
             std::fs::read_to_string(&out).unwrap(),
