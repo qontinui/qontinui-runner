@@ -7,6 +7,7 @@
 import { Shield, ShieldAlert } from "lucide-react";
 import { Badge } from "../ui/Badge";
 import type { ActiveBudgetStatus } from "./types";
+import { LIST_PRICE_EQUIVALENT } from "./costProvenance";
 
 interface CircuitBreakerStatusProps {
   budget: ActiveBudgetStatus | null;
@@ -45,7 +46,9 @@ export function CircuitBreakerStatus({ budget }: CircuitBreakerStatusProps) {
           <div className="mt-3 text-xs text-muted-foreground space-y-1">
             <p>Anomaly samples: {budget.anomaly_detector_sample_count}</p>
             {budget.anomaly_detector_mean > 0 && (
-              <p>Mean cost: ${budget.anomaly_detector_mean.toFixed(4)}</p>
+              <p>
+                Mean cost: ${budget.anomaly_detector_mean.toFixed(4)} ({LIST_PRICE_EQUIVALENT})
+              </p>
             )}
           </div>
         </>

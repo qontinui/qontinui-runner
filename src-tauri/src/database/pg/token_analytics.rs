@@ -3,6 +3,27 @@
 use super::PgDb;
 use crate::database::token_analytics::*;
 
+/// One phase's row of [`PgDb::get_phase_cost_with_cache`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseCacheCostRow {
+    pub phase: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// `SUM(cost_microusd)` over rows that carry the precise figure.
+    pub precise_microusd: i64,
+    /// `SUM(cost_cents)` over rows that do not (`cost_microusd IS NULL`) —
+    /// written before the precision column existed, or by a cents-only writer.
+    pub legacy_cents: i64,
+    /// Rows whose cost the provider reported (`cost_source = 'reported'`).
+    pub reported_rows: i64,
+    /// Rows whose cost was estimated from a price table (`'estimated'`).
+    pub estimated_rows: i64,
+    /// Rows with no recorded provenance (`cost_source IS NULL`).
+    pub unknown_rows: i64,
+}
+
 impl PgDb {
     /// Get daily cost breakdown for the last N days.
     pub async fn get_daily_cost(&self, days: u32) -> Result<Vec<DailyCostRow>, String> {
@@ -216,7 +237,13 @@ impl PgDb {
 
     /// Get per-phase cost breakdown with cache metrics for the cost dashboard.
     ///
-    /// Returns (phase, input_tokens, output_tokens, cache_creation, cache_read, cost_cents).
+    /// Cost comes back at the precision each row carries: the sum of
+    /// `cost_microusd` where the writer recorded it, and separately the sum of
+    /// whole `cost_cents` for rows that have no precise figure (everything
+    /// written before the precision column existed). The dashboard combines
+    /// them in micro-USD (`commands::cost_dashboard::phase_cost_microusd`).
+    /// Summing whole cents alone would turn a reported $0.0042 call into $0.00. The three row counts say where those
+    /// figures came from (`cost_source`), so the dashboard can label them.
     #[expect(
         clippy::disallowed_methods,
         reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
@@ -224,7 +251,7 @@ impl PgDb {
     pub async fn get_phase_cost_with_cache(
         &self,
         days: u32,
-    ) -> Result<Vec<(String, i64, i64, i64, i64, i64)>, String> {
+    ) -> Result<Vec<PhaseCacheCostRow>, String> {
         let conn = self
             .pool
             .get()
@@ -239,11 +266,16 @@ impl PgDb {
                     COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
                     COALESCE(SUM(cache_creation_tokens), 0)::bigint as cache_creation,
                     COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read,
-                    COALESCE(SUM(cost_cents), 0)::bigint as cost_cents
+                    COALESCE(SUM(cost_microusd), 0)::bigint as precise_microusd,
+                    COALESCE(SUM(cost_cents) FILTER (WHERE cost_microusd IS NULL), 0)::bigint
+                        as legacy_cents,
+                    COUNT(*) FILTER (WHERE cost_source = 'reported')::bigint as reported_rows,
+                    COUNT(*) FILTER (WHERE cost_source = 'estimated')::bigint as estimated_rows,
+                    COUNT(*) FILTER (WHERE cost_source IS NULL)::bigint as unknown_rows
                 FROM phase_token_usage
                 WHERE created_at > $1::text::timestamptz
                 GROUP BY phase
-                ORDER BY cost_cents DESC"#,
+                ORDER BY phase"#,
                 &[&since],
             )
             .await
@@ -251,15 +283,17 @@ impl PgDb {
 
         Ok(rows
             .iter()
-            .map(|r| {
-                (
-                    r.get::<_, String>(0),
-                    r.get::<_, i64>(1),
-                    r.get::<_, i64>(2),
-                    r.get::<_, i64>(3),
-                    r.get::<_, i64>(4),
-                    r.get::<_, i64>(5),
-                )
+            .map(|r| PhaseCacheCostRow {
+                phase: r.get::<_, String>(0),
+                input_tokens: r.get::<_, i64>(1),
+                output_tokens: r.get::<_, i64>(2),
+                cache_creation_tokens: r.get::<_, i64>(3),
+                cache_read_tokens: r.get::<_, i64>(4),
+                precise_microusd: r.get::<_, i64>(5),
+                legacy_cents: r.get::<_, i64>(6),
+                reported_rows: r.get::<_, i64>(7),
+                estimated_rows: r.get::<_, i64>(8),
+                unknown_rows: r.get::<_, i64>(9),
             })
             .collect())
     }
