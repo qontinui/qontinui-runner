@@ -9,10 +9,11 @@ interface UseFindingsActionsParams {
   tabs: Array<{ id: string; workingDir?: string }>;
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
-  pendingResumeRef: React.MutableRefObject<{ tabId: string; resumeCmd: string } | null>;
   runGeneration: (description: string, inlineContext: string) => Promise<void>;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
+    React.SetStateAction<
+      "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null
+    >
   >;
 }
 
@@ -21,7 +22,6 @@ export function useFindingsActions({
   tabs,
   terminalRefs,
   createTerminal,
-  pendingResumeRef,
   runGeneration,
   setRightPanelMode,
 }: UseFindingsActionsParams): {
@@ -55,22 +55,14 @@ export function useFindingsActions({
       const filePart = finding.codeContext?.file
         ? ` File: ${finding.codeContext.file}${finding.codeContext.line ? ":" + finding.codeContext.line : ""}.`
         : "";
-      const resumeCmd = `claude "Fix this issue: ${title}.${filePart} Details: ${desc}"`;
+      const fixCmd = `claude "Fix this issue: ${title}.${filePart} Details: ${desc}"`;
 
-      pendingResumeRef.current = { tabId, resumeCmd };
+      // Give the new shell a moment to draw its prompt before typing.
       setTimeout(() => {
-        const pending = pendingResumeRef.current;
-        if (!pending || pending.tabId !== tabId) return;
-        pendingResumeRef.current = null;
-        void writeToPaneOrReport(
-          terminalRefs.current,
-          tabId,
-          `${pending.resumeCmd}\r`,
-          "finding fix resume",
-        );
+        void writeToPaneOrReport(terminalRefs.current, tabId, `${fixCmd}\r`, "finding fix");
       }, 1500);
     },
-    [activeId, tabs, createTerminal, terminalRefs, pendingResumeRef, setRightPanelMode],
+    [activeId, tabs, createTerminal, terminalRefs, setRightPanelMode],
   );
 
   const handleGenerateFromFindings = useCallback(
