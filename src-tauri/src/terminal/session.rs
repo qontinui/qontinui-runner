@@ -469,9 +469,12 @@ fn digest_is_owed(tier: VisibilityTier, unwatched_interval: Option<Duration>) ->
 const SYNC_FLUSH_BYTE_CAP: usize = 256 * 1024;
 /// Time cap for a held sync frame: flush once the block has been open this
 /// long, so a slow producer mid-frame can't stall output past ~one frame.
-const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(50);
+pub(super) const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Synchronized-output (DEC 2026) frame coalescer for the reader thread.
+///
+/// `pub(super)` (with [`SYNC_FLUSH_TIME_CAP`]) so `daemon_pane_io`'s Phase 2b
+/// test can drive a restored holder stream through this exact pipeline.
 ///
 /// Full-screen TUIs (Claude Code) bracket each whole-frame redraw in
 /// `?2026h … ?2026l`. Emitting per-PTY-read would split a frame across
@@ -489,14 +492,14 @@ const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_milli
 /// receives `(payload, offset)` to broadcast as one event; `offset` is the
 /// absolute stream offset of the payload's first byte (a correct replay
 /// boundary — the first held byte's offset for a coalesced frame).
-struct SyncFrameCoalescer {
+pub(super) struct SyncFrameCoalescer {
     pending: Vec<u8>,
     pending_offset: u64,
     started_at: Option<std::time::Instant>,
 }
 
 impl SyncFrameCoalescer {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             pending: Vec::new(),
             pending_offset: 0,
@@ -507,7 +510,13 @@ impl SyncFrameCoalescer {
     /// Feed one read's processed `data` (stamped at `offset`) plus the live
     /// `in_sync` parser state observed right after advancing it into the grid.
     /// Emits zero or one coalesced event via `emit`.
-    fn feed<F: FnMut(&[u8], u64)>(&mut self, data: &[u8], offset: u64, in_sync: bool, mut emit: F) {
+    pub(super) fn feed<F: FnMut(&[u8], u64)>(
+        &mut self,
+        data: &[u8],
+        offset: u64,
+        in_sync: bool,
+        mut emit: F,
+    ) {
         if in_sync {
             // Mid-frame: hold this chunk. Stamp the held frame's offset on the
             // FIRST held byte (a correct replay boundary).
@@ -539,7 +548,7 @@ impl SyncFrameCoalescer {
     /// Flush a held frame if it has been open at least [`SYNC_FLUSH_TIME_CAP`].
     /// Called before each (blocking) read so a slow producer mid-frame still
     /// flushes within ~one frame rather than waiting for the next byte.
-    fn flush_if_timed_out<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
+    pub(super) fn flush_if_timed_out<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
         if let Some(started) = self.started_at {
             if started.elapsed() >= SYNC_FLUSH_TIME_CAP && !self.pending.is_empty() {
                 emit(&self.pending, self.pending_offset);
