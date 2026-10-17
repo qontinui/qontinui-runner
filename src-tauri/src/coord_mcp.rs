@@ -1326,7 +1326,10 @@ pub(crate) fn runner_credential_refusal_code(
         P::Live | P::Expiring => None,
         P::Expired => Some("runner_credential_expired"),
         P::Absent => Some("runner_credential_absent"),
-        P::Unrefreshable => Some("runner_credential_unrefreshable"),
+        // `Revoked` keeps the `unrefreshable` refusal code: its posture token
+        // is `unrefreshable` too (with `cause: device_credential_revoked`), so
+        // no reader of this contract meets a token it does not know.
+        P::Unrefreshable | P::Revoked => Some("runner_credential_unrefreshable"),
         P::Dark(_) => Some("runner_credential_dark"),
     };
     // This match re-derives "which postures can answer" in parallel with
@@ -1353,7 +1356,7 @@ pub(crate) fn runner_credential_breadcrumb_verdict(
         P::Live | P::Expiring => None,
         P::Expired => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
         P::Absent => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_ABSENT),
-        P::Unrefreshable => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_UNREFRESHABLE),
+        P::Unrefreshable | P::Revoked => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_UNREFRESHABLE),
         P::Dark(_) => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_DARK),
     }
 }
@@ -1403,6 +1406,12 @@ pub(crate) fn runner_credential_remedy(
             "The runner's coord credential expired and automatic refresh FAILED — no further \
              automatic rung exists. Your nonce is fine and a new session will not help. \
              Re-pair this runner (operator action); meanwhile use a credential-free door."
+        }
+        P::Revoked => {
+            "Coord REVOKED this runner's device credential (device_credential_revoked), and the \
+             runner has stopped retrying. Your nonce is fine and a new session will not help. \
+             An operator must Authenticate this runner on /runners; meanwhile use a \
+             credential-free door."
         }
         P::Dark(crate::mcp::device_jwt_refresher::DarkCause::UpstreamRejected) => {
             "Coord is REJECTING this runner's credential even though it has not expired \
@@ -1517,13 +1526,52 @@ pub(crate) enum RunnerCredentialHeal {
     /// CONTRADICTS the stale posture and the session must be forwarded.
     LocalReadOnly,
     /// `dark` — a credential that is locally usable and that coord refuses.
-    /// A local usability read is definitionally unable to contradict this
-    /// (looking alive is what `dark` MEANS), so there is nothing to ask and
-    /// the refusal is immediate. It is still bounded: an operator re-pair
-    /// makes the refresher persist a new credential, which spends the
-    /// rejection streak ([`reset_upstream_rejections_for`]) and the next pass
-    /// publishes an answering posture.
+    ///
+    /// A plain local usability read cannot contradict this (looking alive is
+    /// what `dark` MEANS), and neither can [`Self::Remint`]: its wait polls
+    /// `slot_jwt_is_usable`, which the refused token passes, so it would
+    /// return that same dead token at once and forward it. So this heal is
+    /// REPLACEMENT-aware: kick the refresher — whose pass force-refreshes a
+    /// slot coord keeps rejecting (plan
+    /// `2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap`
+    /// G1) — and wait the bounded [`DEVICE_JWT_REMINT_WAIT`] for a usable
+    /// token that DIFFERS from `presented`
+    /// ([`await_device_jwt_replacing_for`]). Forward with it; otherwise refuse
+    /// `runner_credential_dark` exactly as before.
+    RemintReplacing {
+        /// Fingerprint of the bearer this request would have presented — the
+        /// token coord is refusing. `None` when the request selected none, in
+        /// which case any usable token is a replacement.
+        presented: Option<CredentialFingerprint>,
+    },
+    /// `dark(no_default_binding)` — a usable credential is held, but
+    /// `paired_user.json` names no default binding pointing at it. No refresh
+    /// cures that (the slot is fine; the binding file is not), so kicking the
+    /// refresher and waiting [`DEVICE_JWT_REMINT_WAIT`] would only delay the
+    /// same refusal by five seconds on every call. Refuse at once. It is
+    /// still bounded: the self-heal or an operator re-pair rebuilds the
+    /// binding, and the next pass publishes an answering posture.
     None,
+}
+
+/// A SHA-256 of a bearer, so a heal can say "not THIS token" without carrying
+/// the token itself: [`RunnerCredentialHeal`] is logged with `?heal`, and a
+/// raw JWT there would put a live credential in the runner log. `Debug`
+/// prints a short prefix only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CredentialFingerprint([u8; 32]);
+
+impl CredentialFingerprint {
+    pub(crate) fn of(token: &str) -> Self {
+        use sha2::Digest;
+        Self(sha2::Sha256::digest(token.trim().as_bytes()).into())
+    }
+}
+
+impl std::fmt::Debug for CredentialFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sha256:{}", hex::encode(&self.0[..6]))
+    }
 }
 
 /// DD4's decision, as a pure function over the session's OWN slot: should this
@@ -1565,10 +1613,14 @@ pub(crate) enum RunnerCredentialHeal {
 ///   Same bound as the retry arm and `note_coord_upstream_verdict`'s.
 /// * **A posture about ANOTHER slot forwards.**
 /// * **An UNATTRIBUTABLE posture forwards** (it names no slot at all).
+///
+/// `presented` is the bearer the handler selected for this request — the one a
+/// `dark` heal must find a REPLACEMENT for ([`RunnerCredentialHeal::RemintReplacing`]).
 pub(crate) fn runner_credential_local_refusal(
     principal: &ProxyPrincipal,
     session_tenant: Option<Uuid>,
     posture: Option<&crate::mcp::device_jwt_refresher::CoordCredentialStatus>,
+    presented: Option<&str>,
 ) -> Option<(&'static str, serde_json::Value, RunnerCredentialHeal)> {
     if !matches!(principal, ProxyPrincipal::Device) {
         return None;
@@ -1581,7 +1633,7 @@ pub(crate) fn runner_credential_local_refusal(
     Some((
         code,
         runner_credential_refusal_body(code, status),
-        runner_credential_heal(status.posture),
+        runner_credential_heal(status.posture, presented),
     ))
 }
 
@@ -1622,8 +1674,12 @@ pub(crate) fn posture_describes_session_slot(
 
 /// Which recovery the handler owes a refusable posture before it may refuse.
 /// Exhaustive so a new posture must decide rather than default into `None`.
+///
+/// `presented` is the bearer the request selected; only the `dark` heal reads
+/// it, and only as a fingerprint.
 pub(crate) fn runner_credential_heal(
     posture: crate::mcp::device_jwt_refresher::CoordCredentialPosture,
+    presented: Option<&str>,
 ) -> RunnerCredentialHeal {
     use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
     match posture {
@@ -1631,8 +1687,22 @@ pub(crate) fn runner_credential_heal(
         // is the conservative answer rather than a panic.
         P::Live | P::Expiring => RunnerCredentialHeal::LocalReadOnly,
         P::Expired | P::Absent => RunnerCredentialHeal::Remint,
-        P::Unrefreshable => RunnerCredentialHeal::LocalReadOnly,
-        P::Dark(_) => RunnerCredentialHeal::None,
+        // `Revoked` with it: the refresher has stopped asking coord, so a kick
+        // is noise — but an operator's Authenticate lands a usable credential
+        // that a local read contradicts the stale posture with.
+        P::Unrefreshable | P::Revoked => RunnerCredentialHeal::LocalReadOnly,
+        // Only the cause a refresh can cure gets the replacement-aware wait.
+        P::Dark(crate::mcp::device_jwt_refresher::DarkCause::NoDefaultBinding) => {
+            RunnerCredentialHeal::None
+        }
+        P::Dark(crate::mcp::device_jwt_refresher::DarkCause::UpstreamRejected) => {
+            RunnerCredentialHeal::RemintReplacing {
+                presented: presented
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(CredentialFingerprint::of),
+            }
+        }
     }
 }
 
@@ -9505,6 +9575,60 @@ pub(crate) async fn await_device_jwt_remint_for(tenant: Option<Uuid>) -> Option<
     crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
     await_remint_with(
         move || read_usable_device_jwt_for(tenant),
+        DEVICE_JWT_REMINT_WAIT,
+        DEVICE_JWT_REMINT_POLL,
+    )
+    .await
+}
+
+/// Is `candidate` a usable REPLACEMENT for the token whose fingerprint is
+/// `presented`? Non-empty and different. Pure, so the one rule that keeps the
+/// `dark` heal from forwarding the refused token is pinned on its own.
+pub(crate) fn is_replacement_for(
+    candidate: &str,
+    presented: Option<CredentialFingerprint>,
+) -> bool {
+    let t = candidate.trim();
+    !t.is_empty() && presented.is_none_or(|p| CredentialFingerprint::of(t) != p)
+}
+
+/// [`await_remint_with`] for the `dark` heal: the same bound and poll, but a
+/// token only counts once it is a replacement ([`is_replacement_for`]). Given
+/// the presented token back for the whole window — the refresher could not
+/// replace it — this returns `None` and the caller refuses.
+pub(crate) async fn await_replacement_with<F, Fut>(
+    mut read_usable: F,
+    presented: Option<CredentialFingerprint>,
+    total: std::time::Duration,
+    interval: std::time::Duration,
+) -> Option<String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    await_remint_with(
+        move || {
+            let read = read_usable();
+            async move { read.await.filter(|t| is_replacement_for(t, presented)) }
+        },
+        total,
+        interval,
+    )
+    .await
+}
+
+/// The `dark` heal ([`RunnerCredentialHeal::RemintReplacing`]): kick the
+/// refresher — its pass force-refreshes a slot coord keeps rejecting — then
+/// wait the bounded [`DEVICE_JWT_REMINT_WAIT`] for a usable credential for
+/// `tenant` that is NOT the presented one.
+pub(crate) async fn await_device_jwt_replacing_for(
+    tenant: Option<Uuid>,
+    presented: Option<CredentialFingerprint>,
+) -> Option<String> {
+    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    await_replacement_with(
+        move || read_usable_device_jwt_for(tenant),
+        presented,
         DEVICE_JWT_REMINT_WAIT,
         DEVICE_JWT_REMINT_POLL,
     )
@@ -25070,6 +25194,7 @@ mod runner_credential_tests {
                 &ProxyPrincipal::Device,
                 Some(posture_tenant()),
                 Some(&status),
+                None,
             )
             .unwrap_or_else(|| panic!("{p:?} must be refused locally"));
             assert_eq!(code, runner_credential_refusal_code(p).unwrap());
@@ -25090,6 +25215,7 @@ mod runner_credential_tests {
                     &ProxyPrincipal::Device,
                     Some(posture_tenant()),
                     Some(&status),
+                    None,
                 )
                 .is_none(),
                 "{p:?} can answer — refusing it would turn a routine rotation into an outage"
@@ -25111,7 +25237,7 @@ mod runner_credential_tests {
             "the cell starts UNKNOWN"
         );
         assert!(
-            runner_credential_local_refusal(&ProxyPrincipal::Device, None, None).is_none(),
+            runner_credential_local_refusal(&ProxyPrincipal::Device, None, None, None).is_none(),
             "UNKNOWN must forward, exactly as before this phase"
         );
     }
@@ -25128,7 +25254,7 @@ mod runner_credential_tests {
             agent_id: uuid::Uuid::from_bytes([7; 16]),
         };
         assert!(
-            runner_credential_local_refusal(&agent, Some(posture_tenant()), Some(&status))
+            runner_credential_local_refusal(&agent, Some(posture_tenant()), Some(&status), None)
                 .is_none(),
             "an agent session must not be refused on a credential it never presents"
         );
@@ -25138,6 +25264,7 @@ mod runner_credential_tests {
             &ProxyPrincipal::Device,
             Some(posture_tenant()),
             Some(&status),
+            None,
         )
         .is_some());
         djr::reset_coord_credential_posture_for_test();
@@ -25154,6 +25281,7 @@ mod runner_credential_tests {
             &ProxyPrincipal::Device,
             Some(posture_tenant()),
             Some(&status),
+            None,
         )
         .unwrap();
 
@@ -25200,6 +25328,7 @@ mod runner_credential_tests {
             &ProxyPrincipal::Device,
             Some(posture_tenant()),
             Some(&status),
+            None,
         )
         .unwrap();
         assert!(
@@ -25215,6 +25344,7 @@ mod runner_credential_tests {
             &ProxyPrincipal::Device,
             Some(posture_tenant()),
             Some(&status),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -25229,6 +25359,7 @@ mod runner_credential_tests {
             &ProxyPrincipal::Device,
             Some(posture_tenant()),
             Some(&status),
+            None,
         )
         .unwrap();
         assert!(still.get("credential_free_doors").is_some());
@@ -25513,8 +25644,13 @@ mod runner_credential_tests {
         for p in dark_postures() {
             let status = publish_for(p, Some(a));
             assert!(
-                runner_credential_local_refusal(&ProxyPrincipal::Device, Some(b), Some(&status))
-                    .is_none(),
+                runner_credential_local_refusal(
+                    &ProxyPrincipal::Device,
+                    Some(b),
+                    Some(&status),
+                    None
+                )
+                .is_none(),
                 "{p:?} on slot A must not refuse a session pinned to B"
             );
             // ...and the SAME status still refuses A's own sessions, so the
@@ -25524,6 +25660,7 @@ mod runner_credential_tests {
                     &ProxyPrincipal::Device,
                     Some(uuid::Uuid::parse_str(a).unwrap()),
                     Some(&status),
+                    None,
                 )
                 .is_some(),
                 "{p:?} must still refuse the slot it is ABOUT"
@@ -25541,9 +25678,13 @@ mod runner_credential_tests {
         let _serialised = djr::posture_test_lock();
         djr::reset_coord_credential_posture_for_test();
         let status = publish_for(P::Unrefreshable, Some(FIXTURE_TENANT));
-        assert!(
-            runner_credential_local_refusal(&ProxyPrincipal::Device, None, Some(&status)).is_none()
-        );
+        assert!(runner_credential_local_refusal(
+            &ProxyPrincipal::Device,
+            None,
+            Some(&status),
+            None
+        )
+        .is_none());
         djr::reset_coord_credential_posture_for_test();
     }
 
@@ -25563,14 +25704,19 @@ mod runner_credential_tests {
             posture_describes_session_slot(&status, None),
             "legacy slot ↔ unpinned session is a real match"
         );
-        assert!(
-            runner_credential_local_refusal(&ProxyPrincipal::Device, None, Some(&status)).is_some()
-        );
+        assert!(runner_credential_local_refusal(
+            &ProxyPrincipal::Device,
+            None,
+            Some(&status),
+            None
+        )
+        .is_some());
         // And it is still NOT about a pinned session's slot.
         assert!(runner_credential_local_refusal(
             &ProxyPrincipal::Device,
             Some(posture_tenant()),
-            Some(&status)
+            Some(&status),
+            None
         )
         .is_none());
         djr::reset_coord_credential_posture_for_test();
@@ -25595,7 +25741,8 @@ mod runner_credential_tests {
             Some(posture_tenant())
         ));
         assert!(
-            runner_credential_local_refusal(&ProxyPrincipal::Device, None, Some(&status)).is_none(),
+            runner_credential_local_refusal(&ProxyPrincipal::Device, None, Some(&status), None)
+                .is_none(),
             "UNKNOWN-which-slot must forward, not refuse everyone"
         );
         djr::reset_coord_credential_posture_for_test();
@@ -25612,27 +25759,110 @@ mod runner_credential_tests {
         // wait the bounded re-mint window, which is also what preserves the
         // retryable 503 the pre-Phase-3 handler answered here.
         assert_eq!(
-            runner_credential_heal(P::Expired),
+            runner_credential_heal(P::Expired, None),
             RunnerCredentialHeal::Remint
         );
         assert_eq!(
-            runner_credential_heal(P::Absent),
+            runner_credential_heal(P::Absent, None),
             RunnerCredentialHeal::Remint
         );
         // The automatic rung already RAN and refused, so kicking it again is
         // noise — but an operator re-pair lands a usable JWT immediately while
         // the posture stays stale, and a local read contradicts it for free.
         assert_eq!(
-            runner_credential_heal(P::Unrefreshable),
+            runner_credential_heal(P::Unrefreshable, None),
             RunnerCredentialHeal::LocalReadOnly
         );
-        // `dark` MEANS locally-usable-and-refused-by-coord, so a local
-        // usability read is definitionally unable to contradict it. Nothing to
-        // ask; refuse now.
+        // `revoked` is terminal like `unrefreshable`: the refresher has
+        // stopped asking coord, so only an operator's new credential — which a
+        // local read sees at once — can contradict it.
         assert_eq!(
-            runner_credential_heal(P::Dark(DarkCause::UpstreamRejected)),
+            runner_credential_heal(P::Revoked, Some("revoked.jwt")),
+            RunnerCredentialHeal::LocalReadOnly
+        );
+        // `dark` MEANS locally-usable-and-refused-by-coord, so neither a local
+        // read nor a plain `Remint` wait can contradict it: both would hand
+        // back the refused token. The heal is REPLACEMENT-aware and carries
+        // which token it must replace — as a fingerprint, never the token.
+        assert_eq!(
+            runner_credential_heal(P::Dark(DarkCause::UpstreamRejected), Some("refused.jwt")),
+            RunnerCredentialHeal::RemintReplacing {
+                presented: Some(CredentialFingerprint::of("refused.jwt"))
+            }
+        );
+        // ...but only for the cause a refresh can cure. `no_default_binding`
+        // holds a usable slot and lacks a binding file — no refresh changes
+        // that, so the wait would only delay the same refusal by five seconds
+        // per call. Refuse at once.
+        assert_eq!(
+            runner_credential_heal(P::Dark(DarkCause::NoDefaultBinding), Some("held.jwt")),
             RunnerCredentialHeal::None
         );
+        // The fingerprint never prints the token (`?heal` is logged).
+        let shown = format!(
+            "{:?}",
+            runner_credential_heal(P::Dark(DarkCause::UpstreamRejected), Some("refused.jwt"))
+        );
+        assert!(!shown.contains("refused.jwt"), "{shown}");
+    }
+
+    /// Plan `2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap`
+    /// Verification Phase 4 item 6: the `dark` heal forwards ONLY with a token
+    /// that differs from the one presented. Given the presented token back for
+    /// the whole bound — the refresher could not replace it — or nothing at
+    /// all, it yields `None` and the handler refuses `runner_credential_dark`.
+    #[tokio::test]
+    async fn the_dark_heal_forwards_only_a_replacement_token() {
+        let presented = Some(CredentialFingerprint::of("refused.jwt"));
+        let total = std::time::Duration::from_millis(60);
+        let tick = std::time::Duration::from_millis(5);
+
+        // Only the refused token ever comes back: refuse.
+        let same = await_replacement_with(
+            || async { Some("refused.jwt".to_string()) },
+            presented,
+            total,
+            tick,
+        )
+        .await;
+        assert_eq!(same, None, "the refused token must never be forwarded");
+
+        // Nothing within the bound: refuse.
+        let nothing =
+            await_replacement_with(|| async { None::<String> }, presented, total, tick).await;
+        assert_eq!(nothing, None);
+
+        // The refresher replaces it mid-window: forward with the NEW token.
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let r = reads.clone();
+        let replaced = await_replacement_with(
+            move || {
+                let n = r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    Some(
+                        if n < 2 {
+                            "refused.jwt"
+                        } else {
+                            "replacement.jwt"
+                        }
+                        .to_string(),
+                    )
+                }
+            },
+            presented,
+            std::time::Duration::from_secs(2),
+            tick,
+        )
+        .await;
+        assert_eq!(replaced.as_deref(), Some("replacement.jwt"));
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+
+        // The pure rule underneath, both directions.
+        assert!(!is_replacement_for("refused.jwt", presented));
+        assert!(!is_replacement_for("  refused.jwt  ", presented));
+        assert!(!is_replacement_for("", presented));
+        assert!(is_replacement_for("replacement.jwt", presented));
+        assert!(is_replacement_for("anything.jwt", None));
     }
 
     /// The handler must ATTEMPT that recovery and must forward when it
@@ -25667,11 +25897,33 @@ mod runner_credential_tests {
             tenant < gate,
             "the refusal is per SLOT, so the session's tenant must be resolved first"
         );
-        // The heal itself, and the forward-on-heal.
+        // The heal itself, and the forward-on-heal. All three recoveries,
+        // and the `dark` one through the replacement-aware wait — reusing the
+        // plain re-mint wait there would forward the refused token.
         assert!(
-            body.contains("RunnerCredentialHeal::Remint")
-                && body.contains("RunnerCredentialHeal::LocalReadOnly"),
-            "both recoveries must be attempted by the handler"
+            body.contains("RunnerCredentialHeal::Remint ")
+                && body.contains("RunnerCredentialHeal::LocalReadOnly")
+                && body.contains("RunnerCredentialHeal::RemintReplacing { presented }"),
+            "every recovery must be attempted by the handler"
+        );
+        // `dark(no_default_binding)` refuses at once: no refresh cures it, so
+        // a wait would only delay the same refusal.
+        assert!(
+            body.contains("RunnerCredentialHeal::None => None"),
+            "the no-cure arm must refuse without waiting"
+        );
+        assert!(
+            body.contains("await_device_jwt_replacing_for(device_tenant, presented)"),
+            "the dark heal must wait for a REPLACEMENT of the presented token"
+        );
+        let gate_args = body
+            .get(gate..)
+            .and_then(|rest| rest.split_once(") {"))
+            .map(|(args, _)| args)
+            .expect("the gate call's argument list");
+        assert!(
+            gate_args.contains("bearer.as_deref()"),
+            "the gate must be handed the bearer this request presents: {gate_args}"
         );
         assert!(
             body.contains("bearer = Some(fresh)"),
@@ -26130,8 +26382,13 @@ mod spawn_tenant_credential_tests {
         let b_tenant = session_tenant_or_refuse(Some(&read_proxy_nonce(&b_path).unwrap())).unwrap();
         assert_eq!(b_tenant, Some(tenant_b()));
         assert!(
-            runner_credential_local_refusal(&ProxyPrincipal::Device, b_tenant, Some(&expired_a))
-                .is_none(),
+            runner_credential_local_refusal(
+                &ProxyPrincipal::Device,
+                b_tenant,
+                Some(&expired_a),
+                None
+            )
+            .is_none(),
             "a Pinned(B) session must forward past A's dead slot"
         );
 
@@ -26153,8 +26410,13 @@ mod spawn_tenant_credential_tests {
             .block_on(establish_session_expectation(&a_nonce));
         let a_tenant = session_tenant_or_refuse(Some(&a_nonce)).unwrap();
         assert!(
-            runner_credential_local_refusal(&ProxyPrincipal::Device, a_tenant, Some(&expired_a))
-                .is_some(),
+            runner_credential_local_refusal(
+                &ProxyPrincipal::Device,
+                a_tenant,
+                Some(&expired_a),
+                None
+            )
+            .is_some(),
             "the machine-pinned session presents A's slot and is still refused"
         );
     }

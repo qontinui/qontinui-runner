@@ -7981,6 +7981,7 @@ async fn coord_mcp_proxy_handler(
         &principal,
         device_tenant,
         crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
+        bearer.as_deref(),
     ) {
         // THE INVARIANT: a session whose own credential would have worked is
         // never refused. The posture says this slot cannot answer; ask the
@@ -7992,6 +7993,13 @@ async fn coord_mcp_proxy_handler(
             crate::coord_mcp::RunnerCredentialHeal::LocalReadOnly => {
                 crate::coord_mcp::read_usable_device_jwt_for(device_tenant).await
             }
+            // `dark`: forward only with a token that REPLACES the one coord is
+            // refusing — never the refused token itself, which is what a plain
+            // `Remint` wait would hand back (it is locally usable).
+            crate::coord_mcp::RunnerCredentialHeal::RemintReplacing { presented } => {
+                crate::coord_mcp::await_device_jwt_replacing_for(device_tenant, presented).await
+            }
+            // `dark(no_default_binding)`: nothing a refresh does can cure it.
             crate::coord_mcp::RunnerCredentialHeal::None => None,
         };
         match healed {

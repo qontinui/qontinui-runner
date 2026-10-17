@@ -597,6 +597,40 @@ describe("credentialDarkFromPostureSnapshot", () => {
     expect(p.ctaLabel).toBe("Sign in to re-pair");
   });
 
+  // Plan 2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap
+  // Phase 4 (G1 step 4): a revoked device renders as `unrefreshable` + cause
+  // `device_credential_revoked`, cta `operator_authenticate`. The banner has no
+  // in-app action for that CTA, so it must show the cause with NO button
+  // rather than offering a sign-in that cannot cure a revocation.
+  it("a revoked runner names the operator cure and offers no in-app action", () => {
+    const signal = credentialDarkFromPostureSnapshot({
+      posture: "unrefreshable",
+      cause: "device_credential_revoked",
+      canAnswer: false,
+      reason: "coord revoked this device's credential",
+      cta: "operator_authenticate",
+      since: 1_757_649_240,
+      tenantId: null,
+      pinnedTenant: false,
+    });
+    expect(signal?.dark).toBe(true);
+    expect(signal?.cause).toBe("device_credential_revoked");
+    expect(signal?.cta).toBeNull();
+    const p = credentialDarkPresentation(signal!, stubTime);
+    expect(p.title).toContain("/runners");
+    expect(p.title).not.toBe(
+      credentialDarkPresentation({ ...signal!, cause: "unrefreshable" }, stubTime).title,
+    );
+    expect(p.ctaAction).toBeNull();
+    expect(p.ctaLabel).toBeNull();
+    // It outranks every other dark cause: nothing the runner can try cures it.
+    const bySource = applyCredentialDarkSignal(
+      applyCredentialDarkSignal({}, signal!),
+      { ...darkExpired, source: "cognito", cause: "cognito_hard", cta: "sign_in" },
+    );
+    expect(effectiveCredentialDark(bySource)?.cause).toBe("device_credential_revoked");
+  });
+
   it("reads the deprecated `state` spelling from an older runner build", () => {
     const signal = credentialDarkFromPostureSnapshot({
       state: "unrefreshable",
