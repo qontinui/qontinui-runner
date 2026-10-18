@@ -57,6 +57,7 @@ import {
   useState,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useMemo,
   createRef,
@@ -1029,8 +1030,11 @@ export function TerminalSessionProvider({
 
   const activeValue = values[activePageId] ?? null;
 
+  // Layout effect, not a passive one: it runs before any bridge action can be
+  // dispatched against the committed tree, so a lookup never sees the values
+  // from one commit earlier.
   const valuesRef = useRef(values);
-  useEffect(() => {
+  useLayoutEffect(() => {
     valuesRef.current = values;
   }, [values]);
   const getPageSession = useCallback<PageSessionGetter>(
