@@ -1698,15 +1698,18 @@ mod tests {
         assert!(ring[OUTPUT_TAIL_LINES - 1]
             .ends_with(&format!("detail=exit_status={}", OUTPUT_TAIL_LINES + 9)));
         // …and the rendering is the newest of them that fit OUTPUT_ERROR_MAX
-        // bytes (these 69-byte diagnostics do not all fit), oldest first.
+        // bytes, oldest first: a contiguous SUFFIX of the ring. Each line is
+        // 67 bytes (68 with the separator), so 29 fit in 2000: exit_status
+        // 21..=49, i.e. ring[11..].
         let rendered = tail.render();
         assert!(rendered.len() <= OUTPUT_ERROR_MAX, "{}", rendered.len());
-        assert!(rendered.ends_with(&format!("detail=exit_status={}", OUTPUT_TAIL_LINES + 9)));
-        assert!(
-            !rendered.contains("detail=exit_status=9\n"),
-            "the oldest lines are dropped"
-        );
-        assert!(rendered.lines().count() < OUTPUT_TAIL_LINES);
+        assert_eq!(rendered, ring[11..].join("\n"));
+        assert!(rendered
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("detail=exit_status=21"));
+        assert!(!rendered.contains("detail=exit_status=20\n"));
 
         let long = OutputTail::default();
         for _ in 0..20 {
