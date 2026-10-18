@@ -8,6 +8,7 @@ import {
   type FleetErrorCode,
 } from "./fleetDiscovery";
 import type { RemoteSessionEndOutcome, RemoteSessionEndResult } from "./remoteTabs";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * "End on remote" and "Close all finished" — the pure half of plan
@@ -271,14 +272,13 @@ export function endInvokeFailure(
   deviceId: string,
   sessionId: string,
 ): RemoteSessionEndResult {
-  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
   return {
     outcome: "unknown",
     deviceId,
     sessionId,
     terminalId: null,
     via: null,
-    reason: raw.trim() || "the end request failed with no reason given",
+    reason: describeThrown(err, "the end request failed with no reason given"),
     grantSource: "none",
   };
 }
