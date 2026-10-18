@@ -23,7 +23,8 @@ these skills, byte for byte:
 | Helper | Used by | Needs |
 |---|---|---|
 | `_scripts/qontinui-http.py` | `/analyze-automation` | Python 3 and the `qontinui-mcp` package (`qontinui_mcp.client`, which brings `httpx`), installed from a source checkout: it is not on PyPI |
-| `_scripts/lib/envelope.py` | `/workflow-runs` | Python 3.9+, stdlib only |
+| `_scripts/lib/envelope.py` | `/workflow-runs`, `_scripts/close-finished-sessions.py` | Python 3.9+, stdlib only |
+| `_scripts/close-finished-sessions.py` | `/close-finished-sessions` | Python 3.9+, stdlib only, and `_scripts/lib/envelope.py` beside it. Closing needs a `/proc` process table (Linux) |
 | `_scripts/mobile-feedback.py` | `/mobile-dev`, `/mobile-verify` | Python 3 and Android `adb` |
 
 ## How a command finds a helper
