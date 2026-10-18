@@ -64,6 +64,9 @@ regexes = [
   # header {"alg":"HS256"}, payload {"sub":"1"}, signature the literal "sig".
   # It sits in earlier commits of qontinui-runner#2268, which the PR-range scan
   # reads; the current test builds it from pieces so no new literal is added.
-  # Exact literal, not a path exemption, for the reasons the entries above give.
-  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxIn0\.sig''',
+  # Exact literal, not a path exemption, for the reasons the entries above give,
+  # and ANCHORED (^…$): the allowlist regex is matched against the finding's
+  # secret, so an unanchored entry would also excuse any longer token that
+  # merely contains this one (a real JWT whose signature began with "sig").
+  '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxIn0\.sig$''',
 ]
