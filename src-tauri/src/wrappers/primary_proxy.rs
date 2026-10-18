@@ -432,9 +432,12 @@ pub async fn dispatch(
     timeout: Duration,
 ) -> Result<DispatchResponse, ProxyError> {
     let url = format!("{}/wrappers/{}/dispatch", base_url(), id);
-    // Add a 30s cushion so network round-trip overhead doesn't preempt
-    // the primary's per-call timeout.
-    let net_timeout = timeout.saturating_add(Duration::from_secs(30));
+    // The primary may spend up to PRE_DISPATCH_CEILING before its own
+    // per-call timeout starts (the exclusive turn, the spawn lock, the spawn),
+    // so the cushion covers that plus 30 s of network round-trip.
+    let net_timeout = timeout
+        .saturating_add(super::manager::PRE_DISPATCH_CEILING)
+        .saturating_add(Duration::from_secs(30));
     let dispatch_client = reqwest::Client::builder()
         .timeout(net_timeout)
         .pool_max_idle_per_host(4)

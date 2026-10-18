@@ -51,6 +51,34 @@ pub const HEALTH_MAX_RETRIES: u32 = 3;
 /// browser kinds get twice `api`'s budget rather than the same.
 const BROWSER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Why a bounded spawn did not produce a port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnError {
+    /// Another spawn of this wrapper held its lock past the caller's wait:
+    /// nothing was started.
+    Busy,
+    /// The spawn ran and failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::Busy => write!(f, "another spawn of this wrapper is in progress"),
+            SpawnError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+/// The most a dispatch can spend BEFORE the wrapper receives it, by
+/// construction: the bounded waits for an exclusive turn and the spawn lock
+/// (dispatch.rs `PRE_DISPATCH_WAIT`, 30 s together), retiring a Degraded
+/// record (`terminate_runtime`: two `STOP_GRACE` waits), a browser wrapper's
+/// readiness wait, and terminating a spawn that never became ready (two more
+/// `STOP_GRACE` waits). A caller sizing its read timeout adds its dispatch
+/// timeout to this.
+pub const PRE_DISPATCH_CEILING: Duration = Duration::from_secs(30 + 10 + 30 + 10);
+
 /// The readiness wait for a wrapper declaring `transport`.
 fn ready_timeout_for(transport: &str) -> Duration {
     match transport {
@@ -155,30 +183,31 @@ impl OutputTail {
 
 /// Header names whose whole line is dropped from quoted wrapper output.
 /// A secret header named ANYWHERE in a line — `Cookie: …`, `"cookie": "…"`,
-/// Node's `{ cookie: '…' }`, `- Authorization: …` — drops the whole line.
+/// Node's `{ cookie: '…' }`, `- Authorization: …` — keeps its name and loses
+/// its VALUE (to the closing quote or brace, else to the end of the line), so
+/// the rest of the line stays readable.
 static SECRET_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r#"(?i)(?:^|[^a-z0-9_-])(?:proxy-authorization|authorization|set-cookie|cookie|x-api-key|api-key)["'\s]*[:=]"#,
+        r#"(?i)(^|[^a-z0-9_-])((?:proxy-authorization|authorization|set-cookie|cookie|x-api-key|api-key)["'\s]*[:=]\s*)(["']?)[^"'\n}]*"#,
     )
     .expect("static regex")
 });
 /// `Bearer` and the credential after it, however many spaces separate them.
 static BEARER: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(bearer)\s+\S+").expect("static regex"));
-/// A path or word segment at least this long, made only of token characters
-/// (`[A-Za-z0-9._-]`, so JWTs and `g.a000…` cookies included), is masked: it
-/// reads like a token, a session id or a conversation id.
+/// A segment at least this long, made only of token characters
+/// (`[A-Za-z0-9._-]`, so JWTs and `g.a000…` cookies included) and holding both
+/// a letter and a digit, is masked: it reads like a token, a session id or a
+/// conversation id. A dotted hostname has no digit as a rule and survives.
 const TOKEN_SEGMENT_MIN: usize = 24;
 
 /// Wrapper output is quoted in errors and logs, so it is reduced before it is
-/// kept: a line naming a secret header is dropped whole, the credential after
-/// `Bearer` is masked, a URL's query and fragment are cut, and any long
-/// token-like segment is masked.
+/// kept: a secret header's value is masked, the credential after `Bearer` is
+/// masked, a URL's query and fragment are cut, and any long token-like segment
+/// is masked — inside quotes, JSON and object literals too.
 fn redact_query(line: &str) -> String {
-    if SECRET_HEADER.is_match(line) {
-        return "[header line omitted]".to_string();
-    }
-    let line = BEARER.replace_all(line, "$1 …");
+    let line = SECRET_HEADER.replace_all(line, "${1}${2}${3}…");
+    let line = BEARER.replace_all(&line, "$1 …");
     let mut out = String::with_capacity(line.len());
     for (i, word) in line.split(' ').enumerate() {
         if i > 0 {
@@ -193,8 +222,9 @@ fn redact_query(line: &str) -> String {
     out
 }
 
-/// Mask every `/`-, `=`- or `:`-separated segment of `word` that looks like a
-/// token (long, and only `[A-Za-z0-9._-]`).
+/// Mask every segment of `word` that looks like a token. Segments are split
+/// on path, assignment and quoting punctuation (`/ = : " ' ` , ; { } ( ) [ ]`),
+/// so a quoted or JSON value is a segment of its own.
 fn mask_token_segments(word: &str) -> String {
     let mut out = String::with_capacity(word.len());
     let mut segment = String::new();
@@ -202,12 +232,17 @@ fn mask_token_segments(word: &str) -> String {
         let tokenish = segment.len() >= TOKEN_SEGMENT_MIN
             && segment
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && segment.chars().any(|c| c.is_ascii_digit())
+            && segment.chars().any(|c| c.is_ascii_alphabetic());
         out.push_str(if tokenish { "…" } else { segment.as_str() });
         segment.clear();
     };
     for c in word.chars() {
-        if matches!(c, '/' | '=' | ':') {
+        if matches!(
+            c,
+            '/' | '=' | ':' | '"' | '\'' | '`' | ',' | ';' | '{' | '}' | '(' | ')' | '[' | ']'
+        ) {
             flush(&mut segment, &mut out);
             out.push(c);
         } else {
@@ -311,11 +346,35 @@ impl WrapperManager {
     /// Lazy-spawn a wrapper subprocess. Idempotent: if the wrapper is
     /// already `Running`, returns the existing port without re-spawning.
     pub async fn spawn(&self, wrapper_id: &str) -> Result<u16, String> {
-        // Per-wrapper lock so two concurrent dispatches don't race on
-        // spawn.
-        let lock = self.spawn_lock_for(wrapper_id).await;
-        let _guard = lock.lock().await;
+        self.spawn_within(wrapper_id, None)
+            .await
+            .map_err(|e| e.to_string())
+    }
 
+    /// [`Self::spawn`] whose wait for the per-wrapper spawn lock is bounded by
+    /// `lock_wait`: past it the answer is [`SpawnError::Busy`] — nothing was
+    /// started. Once the lock is held every remaining step is bounded by a
+    /// constant (see [`PRE_DISPATCH_CEILING`]).
+    pub async fn spawn_within(
+        &self,
+        wrapper_id: &str,
+        lock_wait: Option<Duration>,
+    ) -> Result<u16, SpawnError> {
+        // Per-wrapper lock so two concurrent dispatches don't race on spawn.
+        let lock = self.spawn_lock_for(wrapper_id).await;
+        let _guard = match lock_wait {
+            Some(wait) => tokio::time::timeout(wait, lock.lock_owned())
+                .await
+                .map_err(|_| SpawnError::Busy)?,
+            None => lock.lock_owned().await,
+        };
+        self.spawn_locked(wrapper_id)
+            .await
+            .map_err(SpawnError::Failed)
+    }
+
+    /// The spawn itself; the caller holds this wrapper's spawn lock.
+    async fn spawn_locked(&self, wrapper_id: &str) -> Result<u16, String> {
         // Fast path: already routable. `port_for` is the one Rust definition
         // of "routable" (Running only); the frontend mirrors it as
         // `isWrapperRoutable` in `src/lib/wrappers/status.ts`.
@@ -657,7 +716,7 @@ impl WrapperManager {
         }
     }
 
-    async fn spawn_lock_for(&self, wrapper_id: &str) -> Arc<Mutex<()>> {
+    pub(crate) async fn spawn_lock_for(&self, wrapper_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.spawn_locks.lock().await;
         locks
             .entry(wrapper_id.to_string())
@@ -721,8 +780,8 @@ async fn wait_for_port(
     let mut last_err = "no attempts".to_string();
     while Instant::now() < deadline {
         if let Some(c) = child.as_deref_mut() {
-            if let Ok(Some(status)) = c.try_wait() {
-                return Err(format!("the wrapper process exited first ({status})"));
+            if exited_without_reaping(c) {
+                return Err("the wrapper process exited first".to_string());
             }
         }
         match probe_port(port).await {
@@ -732,6 +791,33 @@ async fn wait_for_port(
         tokio::time::sleep(SPAWN_READY_POLL).await;
     }
     Err(last_err)
+}
+
+/// Whether `child` has exited — WITHOUT reaping it on Unix (`WNOWAIT`), so
+/// its zombie keeps the process-group id reserved for `terminate_runtime`'s
+/// group kill. Elsewhere `try_wait` (a Windows job needs no pgid).
+fn exited_without_reaping(child: &mut Child) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(pid) = child.id() else {
+            return true; // already reaped
+        };
+        // SAFETY: waitid with WNOHANG|WNOWAIT only inspects our own child.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let rc = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            rc == 0 && info.si_pid() != 0
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(child.try_wait(), Ok(Some(_)))
+    }
 }
 
 async fn probe_port(port: u16) -> Result<(), String> {
@@ -836,7 +922,12 @@ async fn terminate_runtime(wrapper_id: &str, mut runtime: WrapperRuntime) {
                     wrapper_id, e
                 );
             }
-            drop(tree);
+            match (tree, leader) {
+                // The leader is already reaped: its pgid may belong to an
+                // unrelated group by now, so the guard must not signal it.
+                (Some(t), None) => t.disarm(),
+                (t, _) => drop(t),
+            }
         }
         reap(wrapper_id, &mut child).await;
         for d in descendants {
@@ -927,14 +1018,7 @@ impl Descendant {
 #[cfg(unix)]
 fn proc_start_time(pid: i32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // `pid (comm) state …`: comm may hold spaces and parens, so count fields
-    // after the LAST ')'. Field 3 (state) is the first after it; 22 is 20th.
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+    parse_stat(&stat).map(|(_, start)| start)
 }
 
 /// Every descendant of `root` (children, grandchildren, …), read from
@@ -944,7 +1028,10 @@ fn proc_start_time(pid: i32) -> Option<u64> {
 fn unix_descendants(root: i32) -> Vec<Descendant> {
     #[cfg(target_os = "linux")]
     {
-        let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+        // ONE read of each stat file gives both the parent link and the
+        // start time, so the snapshot cannot pair a pid with a successor's
+        // start time.
+        let mut children: HashMap<i32, Vec<Descendant>> = HashMap::new();
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.flatten() {
                 let Some(pid) = entry
@@ -957,12 +1044,11 @@ fn unix_descendants(root: i32) -> Vec<Descendant> {
                 let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
                     continue;
                 };
-                let ppid = stat
-                    .rsplit_once(')')
-                    .and_then(|(_, rest)| rest.split_whitespace().nth(1))
-                    .and_then(|p| p.parse::<i32>().ok());
-                if let Some(ppid) = ppid {
-                    children.entry(ppid).or_default().push(pid);
+                if let Some((ppid, start_time)) = parse_stat(&stat) {
+                    children.entry(ppid).or_default().push(Descendant {
+                        pid,
+                        start_time: Some(start_time),
+                    });
                 }
             }
         }
@@ -971,11 +1057,8 @@ fn unix_descendants(root: i32) -> Vec<Descendant> {
         while let Some(p) = queue.pop() {
             if let Some(kids) = children.get(&p) {
                 for &k in kids {
-                    out.push(Descendant {
-                        pid: k,
-                        start_time: proc_start_time(k),
-                    });
-                    queue.push(k);
+                    out.push(k);
+                    queue.push(k.pid);
                 }
             }
         }
@@ -986,6 +1069,18 @@ fn unix_descendants(root: i32) -> Vec<Descendant> {
         let _ = root;
         Vec::new()
     }
+}
+
+/// `(ppid, starttime)` from one `/proc/<pid>/stat` body: fields 4 and 22.
+/// `comm` may hold spaces and parens, so fields are counted after the LAST
+/// ')' — field 3 (state) is the first there, so 4 is index 1 and 22 index 19.
+#[cfg(unix)]
+fn parse_stat(stat: &str) -> Option<(i32, u64)> {
+    let rest = stat.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace();
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let start = fields.nth(17)?.parse().ok()?;
+    Some((ppid, start))
 }
 
 /// Provided so the bare `Path` import is exercised; future install code
@@ -1208,6 +1303,32 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_descendant_whose_start_time_matches_is_killed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        Descendant {
+            pid,
+            start_time: proc_start_time(pid),
+        }
+        .kill_if_same();
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_fields_are_read_after_the_last_paren() {
+        // comm "a) b (c" holds spaces and parens; ppid is 42, starttime 777.
+        let stat = "123 (a) b (c) S 42 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 777 0 0";
+        assert_eq!(parse_stat(stat), Some((42, 777)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn a_descendant_is_killed_only_while_its_start_time_matches() {
         let me = std::process::id() as i32;
         let now = proc_start_time(me).expect("own start time readable");
@@ -1228,17 +1349,39 @@ mod tests {
 
     #[test]
     fn secret_headers_bearer_tokens_and_token_segments_are_dropped() {
-        assert_eq!(
-            redact_query("Cookie: sid=abc; other=1"),
-            "[header line omitted]"
-        );
-        assert_eq!(
-            redact_query("  authorization : Bearer eyJhbGciOi.secret"),
-            "[header line omitted]"
-        );
+        // A secret header keeps its name and loses its value, wherever it sits.
+        for (line, want) in [
+            ("Cookie: sid=abc; other=1", "Cookie: …"),
+            (
+                "  authorization : Bearer eyJhbGciOi.secret",
+                "  authorization : …",
+            ),
+            (
+                r#"  "cookie": "SID=abc", "n": 1"#,
+                r#"  "cookie": "…", "n": 1"#,
+            ),
+            ("{ cookie: 'SID=abc' }", "{ cookie: '…' }"),
+            ("- Authorization: Bearer x", "- Authorization: …"),
+            (
+                "headers: { 'x-api-key': 'k' }",
+                "headers: { 'x-api-key': '…' }",
+            ),
+            // A line that merely mentions the header keeps the rest of itself.
+            (
+                "request failed (no Authorization: header sent)",
+                "request failed (no Authorization: …",
+            ),
+        ] {
+            assert_eq!(redact_query(line), want, "{line}");
+        }
         assert_eq!(
             redact_query("sending Bearer eyJhbGciOiJIUzI1NiJ9 now"),
             "sending Bearer … now"
+        );
+        // Bearer followed by several spaces still masks the credential.
+        assert_eq!(
+            redact_query("sent Bearer   abc.def.ghi ok"),
+            "sent Bearer … ok"
         );
         assert_eq!(
             redact_query("at https://gemini.google.com/app/8f3a2c1d9e0b7a6c5d4e3f2a1b0c"),
@@ -1248,21 +1391,7 @@ mod tests {
             redact_query("dist/index-node.js ready"),
             "dist/index-node.js ready"
         );
-        // Header names anywhere in the line, not only at its start.
-        for line in [
-            r#"  "cookie": "SID=abc""#,
-            "{ cookie: 'SID=abc' }",
-            "- Authorization: Bearer x",
-            "headers: { 'x-api-key': 'k' }",
-        ] {
-            assert_eq!(redact_query(line), "[header line omitted]", "{line}");
-        }
-        // Bearer followed by several spaces still masks the credential.
-        assert_eq!(
-            redact_query("sent Bearer   abc.def.ghi ok"),
-            "sent Bearer … ok"
-        );
-        // A JWT-shaped or dotted cookie value is a token segment.
+        // JWT-shaped and dotted cookie values, bare, quoted and in JSON.
         assert_eq!(
             redact_query("token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig done"),
             "token=… done"
@@ -1270,6 +1399,19 @@ mod tests {
         assert_eq!(
             redact_query("value g.a000abcdefghijklmnopqrstuvwxyz"),
             "value …"
+        );
+        assert_eq!(
+            redact_query(r#"{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}"#),
+            r#"{"token":"…"}"#
+        );
+        assert_eq!(
+            redact_query("{ value: 'g.a000abcdefghijklmnopqrstuvwxyz1' }"),
+            "{ value: '…' }"
+        );
+        // A long dotted hostname is not a token.
+        assert_eq!(
+            redact_query("GET https://generativelanguage.googleapis.com/v1"),
+            "GET https://generativelanguage.googleapis.com/v1"
         );
     }
 
