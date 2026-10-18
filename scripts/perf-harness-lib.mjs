@@ -238,6 +238,19 @@ export function parseSpanCloseLine(line) {
 }
 
 /**
+ * `terminal_spawn.*` spans the harness's own spawn path never opens. perf-harness
+ * creates terminals over `POST /terminals` (`mcp/terminals.rs`), which calls the
+ * terminal manager directly; these two spans are opened only by the Tauri
+ * `terminal_create` command (`commands/terminal.rs`). On that path they are
+ * NOT APPLICABLE — never "0 ms", and never fabricated by the dry-run fake.
+ * `perf-harness.test.mjs` re-derives the list from the Rust source.
+ */
+export const HTTP_PATH_UNOPENED_SPANS = Object.freeze({
+  "terminal_spawn.manager_create": "opened only by the Tauri terminal_create command; POST /terminals never enters it",
+  "terminal_spawn.coord_register": "opened only by the Tauri terminal_create command; POST /terminals never enters it",
+});
+
+/**
  * Extract every `terminal_spawn.*` span close from a slab of log text.
  *
  * @param {string} text
@@ -537,6 +550,16 @@ export function renderSingleRun(run) {
     out.push("#### Spawn-segment breakdown (`terminal_spawn.*` spans)");
     out.push("");
     out.push(renderMarkdownTable(["S", "segment", "n", "p50 ms", "p95 ms", "max ms"], spanRows));
+    const notApplicable = Object.keys(
+      Object.assign({}, ...(run.levels ?? []).map((l) => l.spawnSpansNotApplicable ?? {})),
+    );
+    if (notApplicable.length) {
+      out.push("");
+      out.push(
+        `Not applicable on the \`POST /terminals\` path (opened only by the Tauri ` +
+          `\`terminal_create\` command): ${notApplicable.map((s) => `\`${s}\``).join(", ")}.`,
+      );
+    }
   } else {
     out.push(
       "#### Spawn-segment breakdown: **no `terminal_spawn.*` spans found in the runner log**",

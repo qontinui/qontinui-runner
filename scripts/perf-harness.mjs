@@ -46,13 +46,16 @@ import {
   unwrapTransportStats,
   normalizeFrontendTransport,
   foldTransport,
+  HTTP_PATH_UNOPENED_SPANS,
 } from "./perf-harness-lib.mjs";
+// The supervisor and temp-runner HTTP clients are shared with termhost-bench
+// (plan 2026-10-11-terminal-page-performance-kpis-across-setups, Phase 3). The
+// shared `RunnerClient` refuses the primary's port (PRIMARY_RUNNER_PORT) at
+// construction, exactly as the private copy this file used to carry did.
+import { PRIMARY_RUNNER_PORT, RunnerClient, SupervisorClient, sleep } from "./lib/runner-clients.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..");
-
-/** The primary runner's port. The harness refuses to drive it, ever. */
-const PRIMARY_RUNNER_PORT = 9876;
 
 /** Geometry every harness terminal is created at (and the presets repaint). */
 const TERMINAL_COLS = 120;
@@ -108,8 +111,10 @@ RUNNER SELECTION
   --git-ref REF          Build and run REF (implies --rebuild).
   --worktree PATH        Build and run a worktree checkout (implies --rebuild).
   --use-lkg              Pin the spawn to the supervisor's last-known-good exe.
-  --keep-runner          Leave the temp runner running at the end (default is to
-                         POST /runners/<id>/stop).
+  --keep-runner          Leave the temp runner — and the terminals this run
+                         created — running at the end (default: DELETE each
+                         harness terminal, then POST /runners/<id>/stop; with
+                         --runner-url only the terminals are closed).
 
 LOAD SHAPE
   --sessions 10,20,40    Cumulative session levels to measure (default
@@ -117,6 +122,11 @@ LOAD SHAPE
                          runner up to S terminals and times only the new ones,
                          so create latency is measured against a growing
                          population — the O(N) hypothesis this plan tests.
+                         Terminals are created on the page the Terminal tab is
+                         showing (terminal-page.get-zone-view-state over the UI
+                         Bridge; "default" without it), so they mount and render: a
+                         terminal on any other page is unwatched and gets no
+                         webview output.
   --generator CMD        Noisy generator run in every terminal. Default is a
                          PowerShell 20 Hz timestamp loop.
   --generator-preset P   Run scripts/tui-repaint-generator.mjs under node in every
@@ -272,8 +282,6 @@ export function parseSessionLevels(text) {
 // Small utilities
 // ---------------------------------------------------------------------------
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 /**
  * Read the tail of a file from `offset`, tolerating rotation (a file smaller
  * than the recorded offset is treated as a fresh file and read whole).
@@ -322,49 +330,6 @@ function fileSize(path) {
   } catch {
     return 0;
   }
-}
-
-/**
- * JSON HTTP call with a timeout and a readable failure.
- *
- * @param {string} url
- * @param {{method?:string, body?:unknown, timeoutMs?:number}} [options]
- * @returns {Promise<unknown>}
- */
-async function httpJson(url, options = {}) {
-  const { method = "GET", body, timeoutMs = 30000 } = options;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method,
-      signal: controller.signal,
-      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const text = await res.text();
-    let parsed;
-    try {
-      parsed = text ? JSON.parse(text) : null;
-    } catch {
-      throw new Error(`${method} ${url} -> ${res.status}, non-JSON body: ${text.slice(0, 400)}`);
-    }
-    if (!res.ok) {
-      throw new Error(`${method} ${url} -> ${res.status} ${JSON.stringify(parsed).slice(0, 600)}`);
-    }
-    return parsed;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Unwrap the runner's `{success, data}` envelope. */
-function unwrap(payload) {
-  if (payload && typeof payload === "object" && "data" in payload && "success" in payload) {
-    if (payload.success === false) throw new Error(`runner API error: ${JSON.stringify(payload)}`);
-    return payload.data;
-  }
-  return payload;
 }
 
 // ---------------------------------------------------------------------------
@@ -550,163 +515,54 @@ const PROBE_STOP = `(() => {
 })()`;
 
 // ---------------------------------------------------------------------------
-// Live clients
+// Which terminal page the harness creates its terminals on
 // ---------------------------------------------------------------------------
 
-/** Supervisor client — spawn-test and stop only. Never touches the primary. */
-class SupervisorClient {
-  constructor(baseUrl, log) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
-    this.log = log;
-  }
+/**
+ * The page the frontend falls back to when none is persisted, and the page a
+ * `POST /terminals` with no `page_id` lands on (`terminal/manager.rs`).
+ */
+export const DEFAULT_TERMINAL_PAGE = "default";
 
-  async health() {
-    return httpJson(`${this.baseUrl}/health`, { timeoutMs: 20000 });
-  }
+/** The Terminal page's UI Bridge component, and its eval-free view-state read. */
+export const TERMINAL_PAGE_COMPONENT = "terminal-page";
+export const VIEW_STATE_ACTION = "get-zone-view-state";
 
-  /**
-   * `POST /runners/spawn-test`. Temp runners land on 9877+; the primary is
-   * untouched by construction — this endpoint cannot address it.
-   *
-   * @param {object} body
-   * @param {number} timeoutMs
-   */
-  async spawnTest(body, timeoutMs) {
-    this.log(`supervisor: POST /runners/spawn-test ${JSON.stringify(body)}`);
-    return httpJson(`${this.baseUrl}/runners/spawn-test`, {
-      method: "POST",
-      body,
-      timeoutMs,
-    });
+/**
+ * Resolve the page to create terminals on: the one the Terminal tab is showing,
+ * as its own `get-zone-view-state` action reports it (`pageId`).
+ *
+ * Terminals on any OTHER page are `unwatched` and get no webview output by
+ * default. The original `page_id: "perf-harness"` only rendered when the
+ * frontend happened to switch to that page — which it does on a fresh runner,
+ * where `default` is empty and hidden, but not once the active page holds a
+ * terminal (an operator's box): there it measured an idle page.
+ *
+ * Not a page-evaluate read of the persisted key: the webview's CSP
+ * (`script-src 'self'`, no `'unsafe-eval'`) refuses every evaluated string.
+ * Without the UI Bridge (`--skip-frontend`), or from a build whose action
+ * predates `pageId`, it is `default` — where a page-less create lands — and the
+ * source says why.
+ *
+ * @returns {Promise<{pageId: string, source: string}>}
+ */
+export async function resolveTerminalPage(runner, { skipFrontend = false } = {}) {
+  if (skipFrontend) {
+    return { pageId: DEFAULT_TERMINAL_PAGE, source: "fallback: --skip-frontend (the UI Bridge is not used)" };
   }
-
-  /**
-   * @param {string} id temp-runner id returned by spawn-test
-   */
-  async stopRunner(id) {
-    this.log(`supervisor: POST /runners/${id}/stop`);
-    return httpJson(`${this.baseUrl}/runners/${encodeURIComponent(id)}/stop`, {
-      method: "POST",
-      body: {},
-      timeoutMs: 60000,
-    });
-  }
-}
-
-/** Temp-runner client: terminals API, log-sink resolution and the UI Bridge. */
-class RunnerClient {
-  constructor(baseUrl, log) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
-    const port = Number.parseInt(new URL(this.baseUrl).port || "0", 10);
-    if (port === PRIMARY_RUNNER_PORT) {
-      throw new Error(
-        `refusing to drive port ${PRIMARY_RUNNER_PORT}: that is the primary runner. ` +
-          `Spawn a temp runner via the supervisor (the harness does this by default).`,
-      );
+  try {
+    const raw = await runner.componentAction(TERMINAL_PAGE_COMPONENT, VIEW_STATE_ACTION, {}, 20000);
+    // The control door answers `{success, result}` around the handler's return.
+    const v = raw && typeof raw === "object" && "result" in raw ? raw.result : raw;
+    if (raw && raw.success === false) {
+      return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} failed (${raw.error ?? "no error"})` };
     }
-    this.log = log;
-  }
-
-  async health() {
-    return httpJson(`${this.baseUrl}/health`, { timeoutMs: 20000 });
-  }
-
-  /** Wait for `/health` to answer, polling until `timeoutMs` elapses. */
-  async waitHealthy(timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    let lastError = null;
-    while (Date.now() < deadline) {
-      try {
-        const h = await this.health();
-        if (h) return h;
-      } catch (e) {
-        lastError = e;
-      }
-      await sleep(1000);
+    if (v && typeof v.pageId === "string" && v.pageId.trim()) {
+      return { pageId: v.pageId, source: `frontend active page (${TERMINAL_PAGE_COMPONENT}.${VIEW_STATE_ACTION})` };
     }
-    throw new Error(`runner ${this.baseUrl} never became healthy: ${lastError?.message ?? "?"}`);
-  }
-
-  async logSink() {
-    return unwrap(await httpJson(`${this.baseUrl}/log-sources/runner-log-sink`, { timeoutMs: 20000 }));
-  }
-
-  async listTerminals() {
-    const data = unwrap(await httpJson(`${this.baseUrl}/terminals`, { timeoutMs: 30000 }));
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data?.terminals)) return data.terminals;
-    if (Array.isArray(data?.sessions)) return data.sessions;
-    return [];
-  }
-
-  /** @returns {Promise<{info:object, wallMs:number}>} */
-  async createTerminal(body, timeoutMs) {
-    const t0 = performance.now();
-    const data = unwrap(
-      await httpJson(`${this.baseUrl}/terminals`, { method: "POST", body, timeoutMs }),
-    );
-    return { info: data, wallMs: performance.now() - t0 };
-  }
-
-  async writeTerminal(id, text) {
-    return httpJson(`${this.baseUrl}/terminals/${encodeURIComponent(id)}/write`, {
-      method: "POST",
-      body: { data: Buffer.from(text, "utf8").toString("base64") },
-      timeoutMs: 20000,
-    });
-  }
-
-  async closeTerminal(id) {
-    return httpJson(`${this.baseUrl}/terminals/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-      timeoutMs: 30000,
-    });
-  }
-
-  /** UI Bridge page evaluation — the ONLY frontend measurement channel here. */
-  async evaluate(expression, timeoutMs = 30000) {
-    const payload = await httpJson(`${this.baseUrl}/ui-bridge/control/page/evaluate`, {
-      method: "POST",
-      body: { expression, unwrap: true, timeoutMs: Math.max(1000, timeoutMs - 2000) },
-      timeoutMs,
-    });
-    const data = unwrap(payload);
-    // `evaluate` answers `{type, value}` when it can classify the result.
-    if (data && typeof data === "object" && "value" in data && "type" in data) return data.value;
-    return data;
-  }
-
-  /** Zero the runner's transport counters. */
-  async resetTransportStats() {
-    return httpJson(`${this.baseUrl}/terminals/transport-stats`, {
-      method: "POST",
-      body: {},
-      timeoutMs: 20000,
-    });
-  }
-
-  /** Raw `GET /terminals/transport-stats` body (envelope or bare). */
-  async transportStats() {
-    return httpJson(`${this.baseUrl}/terminals/transport-stats`, { timeoutMs: 20000 });
-  }
-
-  /** The runner grid's `alt_screen` flag for one terminal. */
-  async gridAltScreen(id) {
-    const data = unwrap(
-      await httpJson(
-        `${this.baseUrl}/ui-bridge/sdk/terminal/sessions/${encodeURIComponent(id)}/grid`,
-        { timeoutMs: 20000 },
-      ),
-    );
-    return typeof data?.alt_screen === "boolean" ? data.alt_screen : null;
-  }
-
-  async activateTab(tabId) {
-    return httpJson(`${this.baseUrl}/ui-bridge/control/tab/activate`, {
-      method: "POST",
-      body: { tabId },
-      timeoutMs: 20000,
-    });
+    return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} reported no pageId (a build that predates it)` };
+  } catch (e) {
+    return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} failed (${e.message})` };
   }
 }
 
@@ -793,9 +649,9 @@ class FakeRunner {
       ["terminal_spawn.shim_materialize", wallMs * 0.15],
       ["terminal_spawn.record_open", wallMs * 0.22],
       ["terminal_spawn.identity_seam", wallMs * 0.5],
-      ["terminal_spawn.manager_create", wallMs * 0.85],
-      ["terminal_spawn.coord_register", wallMs * 0.06],
     ];
+    // Only spans the `POST /terminals` path opens: the fake reproduces the real
+    // path's log, so it must not invent `HTTP_PATH_UNOPENED_SPANS`.
     for (const [span, ms] of segments) {
       const busy = (ms * 0.8).toFixed(3);
       const idle = (ms * 0.2).toFixed(3);
@@ -822,6 +678,13 @@ class FakeRunner {
 
   async activateTab() {
     return { success: true };
+  }
+
+  async componentAction(componentId, actionId) {
+    if (componentId === TERMINAL_PAGE_COMPONENT && actionId === VIEW_STATE_ACTION) {
+      return { success: true, result: { maximizedZone: null, zoneCount: 1, layoutId: "single", pageId: DEFAULT_TERMINAL_PAGE } };
+    }
+    throw new Error(`dry-run: no component action ${componentId}.${actionId}`);
   }
 
   async resetTransportStats() {
@@ -937,7 +800,7 @@ class FakeRunner {
  *
  * @returns {Promise<object>} one `levels[]` entry
  */
-async function measureLevel({ runner, target, existing, config, logSinkPath, isDry, log }) {
+async function measureLevel({ runner, target, existing, created: allCreated, pageId, config, logSinkPath, isDry, log }) {
   const toCreate = Math.max(0, target - existing.length);
   log(`S=${target}: creating ${toCreate} terminal(s) (population before: ${existing.length})`);
 
@@ -953,13 +816,14 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
           title: `perf-harness S${target} #${existing.length + i + 1}`,
           cols: TERMINAL_COLS,
           rows: TERMINAL_ROWS,
-          page_id: "perf-harness",
+          page_id: pageId,
         },
         config.createTimeoutMs,
       );
       wallTimes.push(wallMs);
       created.push(info);
       existing.push(info);
+      allCreated.push(info);
     } catch (e) {
       failures.push(String(e?.message ?? e));
       log(`S=${target}: create #${i + 1} FAILED: ${e?.message ?? e}`);
@@ -1067,6 +931,7 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
     chunks,
     transport,
     spawnSpans,
+    spawnSpansNotApplicable: { ...HTTP_PATH_UNOPENED_SPANS },
     spawnSpanSampleCount: spanRecords.length,
     logBytesScanned: logText.length,
   };
@@ -1148,7 +1013,7 @@ async function totalBytes(runner) {
  * @param {object} config
  * @param {(msg:string)=>void} log
  */
-export async function runHarness(config, log) {
+export async function runHarness(config, log, deps = {}) {
   const isDry = Boolean(config.dryRun);
   const notes = [];
   const startedAt = new Date().toISOString();
@@ -1156,6 +1021,10 @@ export async function runHarness(config, log) {
   let supervisor = null;
   let runner = null;
   let spawned = null;
+  // Test seam: `deps.fetch` reaches the shared clients' fetch injection.
+  const clientOpts = deps.fetch ? { fetch: deps.fetch } : {};
+  /** Every terminal this run created — and so must close. */
+  const created = [];
 
   if (isDry) {
     runner = new FakeRunner(log);
@@ -1165,11 +1034,11 @@ export async function runHarness(config, log) {
     );
     log("dry-run: using the in-process FakeRunner (no supervisor, no HTTP)");
   } else if (config.runnerUrl) {
-    runner = new RunnerClient(config.runnerUrl, log);
+    runner = new RunnerClient(config.runnerUrl, log, clientOpts);
     notes.push(`Attached to an existing runner at ${config.runnerUrl} (not spawned by the harness).`);
     log(`attaching to existing runner ${config.runnerUrl}`);
   } else {
-    supervisor = new SupervisorClient(config.supervisor, log);
+    supervisor = new SupervisorClient(config.supervisor, log, clientOpts);
     const health = await supervisor.health().catch((e) => {
       throw new Error(
         `supervisor at ${config.supervisor} is unreachable (${e.message}). ` +
@@ -1205,7 +1074,7 @@ export async function runHarness(config, log) {
     if (spawned?.lkg_stale_warning?.stale) {
       notes.push(`supervisor LKG staleness: ${spawned.lkg_stale_warning.message}`);
     }
-    runner = new RunnerClient(apiUrl, log);
+    runner = new RunnerClient(apiUrl, log, clientOpts);
   }
 
   const run = {
@@ -1282,6 +1151,9 @@ export async function runHarness(config, log) {
       }
     }
 
+    run.terminalPage = await resolveTerminalPage(runner, { skipFrontend: config.skipFrontend });
+    log(`terminals go on page "${run.terminalPage.pageId}" (${run.terminalPage.source})`);
+
     const existing = await runner.listTerminals().catch(() => []);
     if (existing.length) {
       log(`runner already has ${existing.length} terminal(s); levels are cumulative on top`);
@@ -1293,6 +1165,8 @@ export async function runHarness(config, log) {
         runner,
         target,
         existing,
+        created,
+        pageId: run.terminalPage.pageId,
         config,
         logSinkPath,
         isDry,
@@ -1333,6 +1207,15 @@ export async function runHarness(config, log) {
         /* probe teardown is best effort; a dead webview is not a run failure */
       }
     }
+    // Close what this run created — on an attached runner (`--runner-url`) too,
+    // where nothing else would. Pre-existing terminals are never touched.
+    run.cleanup = await closeCreated(runner, created, { keep: Boolean(config.keepRunner), log });
+    if (run.cleanup.failed.length) {
+      run.notes.push(
+        `${run.cleanup.failed.length} of ${created.length} harness terminal(s) could not be closed: ` +
+          run.cleanup.failed.map((f) => `${f.id} (${f.error})`).join("; "),
+      );
+    }
     if (spawned?.id && !config.keepRunner) {
       try {
         await supervisor.stopRunner(spawned.id);
@@ -1348,6 +1231,33 @@ export async function runHarness(config, log) {
 
   run.finishedAt = new Date().toISOString();
   return run;
+}
+
+/**
+ * `DELETE /terminals/{id}` every terminal the run created. With `keep`
+ * (`--keep-runner`, which leaves the runner up for inspection) they are left
+ * running and listed. A failed close is recorded, never thrown: teardown must
+ * still reach the runner stop.
+ *
+ * @returns {Promise<{created: number, closed: string[], kept: string[], failed: {id: string, error: string}[]}>}
+ */
+export async function closeCreated(runner, created, { keep = false, log = () => {} } = {}) {
+  const out = { created: created.length, closed: [], kept: [], failed: [] };
+  if (keep) {
+    out.kept = created.map((t) => t.id);
+  } else {
+    // In parallel: on a wedged runner each DELETE waits out its own timeout,
+    // and serially that would hold the temp-runner stop for minutes.
+    const results = await Promise.allSettled(created.map((t) => runner.closeTerminal(t.id)));
+    results.forEach((r, i) => {
+      const id = created[i].id;
+      if (r.status === "fulfilled") out.closed.push(id);
+      else out.failed.push({ id, error: String(r.reason?.message ?? r.reason) });
+    });
+  }
+  if (out.kept.length) log(`left ${out.kept.length} harness terminal(s) running (--keep-runner)`);
+  else if (created.length) log(`closed ${out.closed.length} of ${created.length} harness terminal(s)`);
+  return out;
 }
 
 const fmt = (v) => (Number.isFinite(v) ? v.toFixed(1) : "?");
