@@ -55,6 +55,11 @@ pub const PRE_DISPATCH_WAIT: Duration = Duration::from_secs(30);
 /// the caller should come back soon — the action or the spawn is in use, the
 /// wrapper is not broken.
 pub const BUSY_CODE: &str = "wrapper_busy";
+/// The typed code a failed spawn carries (HTTP 503): the RUNNER could not
+/// start the wrapper, so nothing reached it. The only 503 a dispatch answers
+/// with — a wrapper's own 5xx becomes 502 (`wrapper_failure`) — so a caller
+/// may park on this code without risking a prompt the wrapper already sent.
+pub const SPAWN_FAILED_CODE: &str = "wrapper_spawn_failed";
 
 /// Take `mtx`, or `None` once `wait` has passed.
 async fn acquire_bounded(
@@ -110,6 +115,8 @@ pub(crate) fn wrapper_error_body(
         .and_then(|v| v.as_f64())
         .filter(|r| r.is_finite() && (0.0..=3600.0).contains(r))
     {
+        // `-0.0` passes the range check and would print as `-0`.
+        let r = if r == 0.0 { 0.0 } else { r };
         fields.push(format!("retry_after_s={r}"));
     }
     if let Some(t) = parsed.get("typed").and_then(|v| v.as_bool()) {
@@ -133,17 +140,36 @@ pub(crate) fn wrapper_error_body(
 
 /// The HTTP answer for a dispatch that never reached the wrapper. Busy is a
 /// 429 carrying the typed `code` `wrapper_busy` (nothing started, come back
-/// soon); a failed spawn is a 503 (the wrapper could not be started).
+/// soon); a failed spawn is a 503 carrying `wrapper_spawn_failed` (the
+/// wrapper could not be started).
 pub(crate) fn refusal_response(refusal: PreDispatchRefusal) -> (StatusCode, Json<ApiResponse<()>>) {
     match refusal {
         PreDispatchRefusal::Busy(msg) => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ApiResponse::error_with_code(msg, BUSY_CODE)),
         ),
-        PreDispatchRefusal::SpawnFailed(msg) => {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(api_error(msg)))
-        }
+        PreDispatchRefusal::SpawnFailed(msg) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error_with_code(msg, SPAWN_FAILED_CODE)),
+        ),
     }
+}
+
+/// The HTTP answer for a wrapper's own non-2xx. A 4xx passes through (the
+/// wrapper refused the call); every other status — a 5xx above all — is 502.
+/// A wrapper's 503 must NOT reach the caller as a 503: that status, with its
+/// typed code, is the runner's "nothing was started" verdict, and a wrapper
+/// that could answer it would get a prompt it already sent retried.
+pub(crate) fn wrapper_failure(
+    wrapper_id: &str,
+    status: u16,
+    parsed: &serde_json::Value,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let mapped = StatusCode::from_u16(status)
+        .ok()
+        .filter(|s| s.is_client_error())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    (mapped, Json(wrapper_error_body(wrapper_id, status, parsed)))
 }
 
 /// Everything before the wrapper receives the call, under ONE deadline: the
@@ -411,13 +437,7 @@ pub(crate) async fn dispatch_local(
     ctx.manager.note_dispatch(&wrapper_id).await;
 
     if !status.is_success() {
-        return Err((
-            // Translate the wrapper's HTTP status straightforwardly so
-            // upstream callers can distinguish "wrapper said 4xx" from
-            // "infra failure".
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(wrapper_error_body(&wrapper_id, status.as_u16(), &parsed)),
-        ));
+        return Err(wrapper_failure(&wrapper_id, status.as_u16(), &parsed));
     }
 
     // Two acceptable response shapes from the wrapper:
@@ -561,15 +581,47 @@ mod tests {
 
     /// The dispatch handler's answer for each refusal: busy is HTTP 429 with
     /// the typed code (a 503 here would park a caller for an hour on a merely
-    /// busy action), a failed spawn is 503 with no busy code.
+    /// busy action), a failed spawn is 503 with its own typed code.
     #[test]
-    fn a_busy_refusal_is_a_typed_429_and_a_failed_spawn_a_503() {
+    fn a_busy_refusal_is_a_typed_429_and_a_failed_spawn_a_typed_503() {
         let (status, body) = refusal_response(PreDispatchRefusal::Busy("b".into()));
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body.0.code.as_deref(), Some(BUSY_CODE));
         let (status, body) = refusal_response(PreDispatchRefusal::SpawnFailed("f".into()));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.0.code, None);
+        assert_eq!(body.0.code.as_deref(), Some(SPAWN_FAILED_CODE));
+    }
+
+    /// A wrapper cannot answer the runner's "nothing was started" verdicts:
+    /// its 503 (and every other 5xx) is 502 with no envelope code, its 429 is
+    /// a 429 with no busy code, and only a 4xx keeps its status.
+    #[test]
+    fn a_wrappers_own_5xx_is_502_and_never_carries_a_runner_code() {
+        let body = serde_json::json!({ "code": SPAWN_FAILED_CODE, "error": "x" });
+        for status in [500u16, 502, 503, 504, 599] {
+            let (s, b) = wrapper_failure("w", status, &body);
+            assert_eq!(s, StatusCode::BAD_GATEWAY, "{status}");
+            assert_eq!(b.0.code, None, "{status}");
+        }
+        let (s, b) = wrapper_failure("w", 429, &serde_json::json!({ "code": BUSY_CODE }));
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(b.0.code, None);
+        let (s, _) = wrapper_failure("w", 404, &body);
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = wrapper_failure("w", 302, &body);
+        assert_eq!(s, StatusCode::BAD_GATEWAY);
+    }
+
+    /// `-0` is a number in range; it is reported as `0`, never `-0`.
+    #[test]
+    fn a_negative_zero_retry_after_is_reported_as_zero() {
+        let b = wrapper_error_body("w", 429, &serde_json::json!({ "retry_after_s": -0.0 }));
+        let msg = b.error.unwrap();
+        assert!(
+            msg.contains("retry_after_s=0 ") || msg.contains("retry_after_s=0;"),
+            "{msg}"
+        );
+        assert!(!msg.contains("-0"), "{msg}");
     }
 
     /// An exclusive action held by another call: the dispatch path refuses

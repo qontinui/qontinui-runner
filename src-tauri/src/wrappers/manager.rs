@@ -95,26 +95,35 @@ const OUTPUT_TAIL_LINES: usize = 40;
 const OUTPUT_LINE_MAX: usize = 400;
 const OUTPUT_ERROR_MAX: usize = 2000;
 
-/// A bounded ring of the wrapper's recent output lines, and how many
-/// diagnostics it has kept (capped at `MAX_DIAG_LINES`).
+/// A bounded ring of the wrapper's recent output lines.
 #[derive(Clone, Default)]
-struct OutputTail(
-    Arc<std::sync::Mutex<VecDeque<String>>>,
-    Arc<std::sync::atomic::AtomicUsize>,
-);
+struct OutputTail(Arc<std::sync::Mutex<VecDeque<String>>>);
+
+/// What may be kept of a line the WRAPPER printed on one stream: what
+/// `classify_line` allows, except that past `MAX_DIAG_LINES` diagnostics on
+/// that stream (`diags` counts them) a diagnostic is omitted like any other
+/// line. The ONE classification of the line — the debug log and the ring both
+/// take this, so neither bypasses the cap.
+fn classify_capped(line: &str, diags: &mut usize) -> String {
+    let kept = classify_line(line);
+    if kept.starts_with("[wrapper] ") {
+        *diags += 1;
+        if *diags > MAX_DIAG_LINES {
+            return omitted(line.trim());
+        }
+    }
+    kept
+}
 
 impl OutputTail {
-    /// Keep what `classify_line` allows of a line the WRAPPER printed.
-    fn push(&self, line: &str) {
-        let mut kept = classify_line(line);
-        if kept.starts_with("[wrapper] ")
-            && self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_DIAG_LINES
-        {
-            kept = omitted(line.trim());
-        }
+    /// Keep what `classify_capped` allows of a line the WRAPPER printed on the
+    /// stream whose diagnostic count is `diags`; returns what was kept.
+    fn push(&self, line: &str, diags: &mut usize) -> String {
+        let kept = classify_capped(line, diags);
         if !kept.is_empty() {
-            self.push_own(kept);
+            self.push_own(kept.clone());
         }
+        kept
     }
 
     /// Keep a marker the RUNNER wrote itself (already safe, never classified).
@@ -167,6 +176,9 @@ impl OutputTail {
             let mut buf = [0u8; 4096];
             let mut line: Vec<u8> = Vec::with_capacity(OUTPUT_LINE_MAX);
             let mut overflow = false;
+            // The diagnostic cap is per STREAM: stdout and stderr each get
+            // their own drain, and so their own count.
+            let mut diags = 0usize;
             loop {
                 let n = match stream.read(&mut buf).await {
                     Ok(0) => break,
@@ -179,8 +191,8 @@ impl OutputTail {
                 for &b in buf.iter().take(n) {
                     if b == b'\n' {
                         let text = String::from_utf8_lossy(&line);
-                        debug!("wrapper[{}]: {}", id, classify_line(&text));
-                        tail.push(&text);
+                        let kept = tail.push(&text, &mut diags);
+                        debug!("wrapper[{}]: {}", id, kept);
                         if overflow {
                             tail.push_own("[line cut]".to_string());
                         }
@@ -194,7 +206,8 @@ impl OutputTail {
                 }
             }
             if !line.is_empty() {
-                tail.push(&String::from_utf8_lossy(&line));
+                let kept = tail.push(&String::from_utf8_lossy(&line), &mut diags);
+                debug!("wrapper[{}]: {}", id, kept);
             }
         });
     }
@@ -206,10 +219,16 @@ impl OutputTail {
 /// shapes (`detail_allowed`). These lists mirror the wrappers' own constants
 /// (qontinui-private-wrappers `web-image-core` `DIAG_EVENTS` / `DIAG_CODES`);
 /// a value the runner does not know is not kept, whatever the wrapper sends.
+///
+/// A kept diagnostic is an ADVISORY, UNAUTHENTICATED hint: any process the
+/// wrapper runs (or anything that reaches its stdout) can print one, so it is
+/// evidence for a human reading a log or an error tail, never an input the
+/// runner or a caller branches on. Closing the vocabulary bounds what such a
+/// line can CARRY, not who wrote it.
 static WRAPPER_DIAG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(
-        r"^\[wrapper\] event=([a-z_]{1,32}) code=([a-z_]{1,32})(?: detail=(\S{1,48}))?$",
-    )
+    regex::Regex::new(&format!(
+        r"^\[wrapper\] event=([a-z_]{{1,32}}) code=([a-z_]{{1,32}})(?: detail=(\S{{1,{DETAIL_MAX}}}))?$"
+    ))
     .expect("static regex")
 });
 pub(crate) const DIAG_EVENTS: &[&str] = &[
@@ -244,6 +263,11 @@ pub(crate) const DIAG_CODES: &[&str] = &[
     "timeout_error",
     "unknown",
 ];
+/// The longest `detail` a diagnostic may carry — and so the longest code any
+/// detail shape (`net::ERR_…`, `ERR_…`) may be. The wrappers' `netErrorCode`
+/// and `diagLine` cap at the same length; the pins on both sides hold them
+/// together.
+pub(crate) const DETAIL_MAX: usize = 48;
 /// The site ids a `spawn` diagnostic may name as its detail.
 const DIAG_SITES: &[&str] = &["gemini-web", "chatgpt-web"];
 /// POSIX errno names worth keeping (a closed list: an all-caps word is not
@@ -268,11 +292,28 @@ const ERRNOS: &[&str] = &[
     "ENOENT",
     "ENOMEM",
     "ENOSPC",
+    "ENOTFOUND",
     "ENOTDIR",
     "ENOTEMPTY",
     "EPERM",
     "EPIPE",
     "ETIMEDOUT",
+];
+/// npm's own error codes worth keeping (closed, like `ERRNOS`).
+const NPM_CODES: &[&str] = &["E401", "E403", "E404", "ETARGET", "ERESOLVE", "EINTEGRITY"];
+/// The error class names kept by name; any other `…Error` is reported as
+/// plain `Error`, so a class name cannot carry an identifier out.
+const ERROR_CLASSES: &[&str] = &[
+    "Error",
+    "AbortError",
+    "AggregateError",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TimeoutError",
+    "TypeError",
+    "URIError",
 ];
 /// At most this many diagnostics are kept per output stream; past it they are
 /// omitted like any other line, so a wrapper cannot flood logs with them.
@@ -306,24 +347,30 @@ fn wrapper_diag(t: &str) -> Option<String> {
 /// errno from a closed list, `MODULE_NOT_FOUND`, an exit status, Playwright's
 /// missing-browser message and the wrapper runtime's missing-peer message,
 /// both reduced to codes.
-static NET_ERR: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"net::ERR_[A-Z_]{1,40}").expect("static regex"));
+// A code is matched WHOLE or not at all: `\b` after the body means a token
+// longer than the bound is not cut to a prefix of itself. Bodies allow digits
+// (`net::ERR_HTTP2_PROTOCOL_ERROR`, `ERR_PNPM_FETCH_401`); `net::ERR_` plus 39
+// is `DETAIL_MAX`.
+static NET_ERR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"net::ERR_[A-Z0-9_]{1,39}\b").expect("static regex")
+});
 static NET_ERR_EXACT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"^net::ERR_[A-Z_]{1,40}$").expect("static regex")
+    regex::Regex::new(r"^net::ERR_[A-Z0-9_]{1,39}$").expect("static regex")
 });
 static NODE_ERR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?:^|[^:A-Za-z0-9_])(ERR_[A-Z_]{1,40})\b").expect("static regex")
+    regex::Regex::new(r"(?:^|[^:A-Za-z0-9_])(ERR_[A-Z0-9_]{1,40})\b").expect("static regex")
 });
 static NODE_ERR_EXACT: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"^ERR_[A-Z_]{1,40}$").expect("static regex"));
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^ERR_[A-Z0-9_]{1,40}$").expect("static regex"));
 static EXIT_DETAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"^exit_status=-?\d{1,4}$").expect("static regex")
 });
 static ERROR_CLASS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"\b((?:[A-Z][A-Za-z]{0,40})?Error)\b").expect("static regex")
 });
-static WORD: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"\b[A-Z_]{3,20}\b").expect("static regex"));
+static WORD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\b[A-Z][A-Z0-9_]{2,20}\b").expect("static regex")
+});
 static EXIT_STATUS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"(?i)\bexit(?:ed with)? (?:code|status) (-?\d{1,4})\b")
         .expect("static regex")
@@ -370,7 +417,15 @@ pub(crate) fn extract_codes(t: &str) -> Vec<String> {
         push("wrapper:missing_peer".to_string());
     }
     for m in ERROR_CLASS.captures_iter(t) {
-        push(m[1].to_string());
+        let class = &m[1];
+        push(
+            if ERROR_CLASSES.contains(&class) {
+                class
+            } else {
+                "Error"
+            }
+            .to_string(),
+        );
     }
     for m in NET_ERR.find_iter(t) {
         push(m.as_str().to_string());
@@ -380,7 +435,7 @@ pub(crate) fn extract_codes(t: &str) -> Vec<String> {
     }
     for m in WORD.find_iter(t) {
         let w = m.as_str();
-        if ERRNOS.contains(&w) || w == "MODULE_NOT_FOUND" {
+        if ERRNOS.contains(&w) || NPM_CODES.contains(&w) || w == "MODULE_NOT_FOUND" {
             push(w.to_string());
         }
     }
@@ -413,15 +468,22 @@ fn classify_line(line: &str) -> String {
     }
 }
 
+/// Lines `classify_text` keeps: the LAST ones, where a failing tool prints
+/// its verdict.
+const CLASSIFY_TEXT_LINES: usize = 20;
+
 /// `classify_line` over every line of a block of text (a manifest probe's or
-/// a package manager's output), joined; bounded to the first 20 lines.
+/// a package manager's output), joined; bounded to its last
+/// `CLASSIFY_TEXT_LINES` non-empty lines.
 pub(crate) fn classify_text(text: &str) -> String {
-    let lines: Vec<String> = text
+    let mut lines: Vec<String> = text
         .lines()
         .map(classify_line)
         .filter(|l| !l.is_empty())
-        .take(20)
         .collect();
+    if lines.len() > CLASSIFY_TEXT_LINES {
+        lines.drain(..lines.len() - CLASSIFY_TEXT_LINES);
+    }
     if lines.is_empty() {
         "no output".to_string()
     } else {
@@ -1283,17 +1345,179 @@ pub fn install_path_for(root: &Path, id: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The cap is per STREAM (one counter per drain), and what passes it is
+    /// what the debug log gets too: the drain logs `push`'s return.
     #[test]
     fn diagnostics_are_capped_per_stream() {
         let tail = OutputTail::default();
+        let (mut stdout, mut stderr) = (0usize, 0usize);
         for _ in 0..(MAX_DIAG_LINES + 5) {
-            tail.push("[wrapper] event=spawn code=ok");
+            tail.push("[wrapper] event=spawn code=ok", &mut stdout);
         }
         let out = tail.render();
         assert!(
             out.lines().last().unwrap().starts_with("omitted(len="),
             "{out}"
         );
+        // stdout's exhausted budget is not stderr's.
+        assert_eq!(
+            tail.push("[wrapper] event=spawn code=ok", &mut stderr),
+            "[wrapper] event=spawn code=ok"
+        );
+        // What the drain logs is the capped classification.
+        assert!(tail
+            .push("[wrapper] event=spawn code=ok", &mut stdout)
+            .starts_with("omitted(len="));
+    }
+
+    #[tokio::test]
+    async fn the_drain_caps_each_stream_on_its_own() {
+        let tail = OutputTail::default();
+        let flood = "[wrapper] event=spawn code=ok\n".repeat(MAX_DIAG_LINES + 1);
+        tail.drain("w", std::io::Cursor::new(flood.into_bytes()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tail.render().contains("omitted(len=") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tail.drain(
+            "w",
+            std::io::Cursor::new(b"[wrapper] event=latch code=ok\n".to_vec()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tail.render().contains("event=latch") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            tail.render().ends_with("[wrapper] event=latch code=ok"),
+            "{}",
+            tail.render()
+        );
+    }
+
+    /// REGRESSION PIN, not a behaviour test: the closed vocabulary, literally.
+    /// qontinui-private-wrappers `web-image-core` pins the SAME lists in its
+    /// `generate.test.ts`; a value added on one side and not the other fails
+    /// one of the two pins. Change both together.
+    #[test]
+    fn the_diagnostic_vocabulary_is_the_pinned_list() {
+        assert_eq!(
+            DIAG_EVENTS,
+            &[
+                "spawn",
+                "spawn_failed",
+                "page_load_failed",
+                "composer_missing",
+                "latch",
+                "latch_failed",
+                "budget_cut",
+                "handler_error",
+            ]
+        );
+        assert_eq!(
+            DIAG_CODES,
+            &[
+                "ok",
+                "missing_peer",
+                "fatal",
+                "net_error",
+                "error",
+                "ui_changed",
+                "login_wall",
+                "captcha",
+                "bot_challenge",
+                "rate_limited",
+                "state_unreadable",
+                "after_typing",
+                "before_typing",
+                "composer_wait",
+                "type_error",
+                "range_error",
+                "reference_error",
+                "syntax_error",
+                "timeout_error",
+                "unknown",
+            ]
+        );
+        assert_eq!(DETAIL_MAX, 48);
+    }
+
+    /// The longest code any detail shape allows fits the detail exactly, and
+    /// one character more is neither kept as a detail nor extracted as a
+    /// (truncated) code.
+    #[test]
+    fn the_longest_net_error_fits_the_detail_and_one_more_does_not() {
+        let longest = format!("net::ERR_{}", "A".repeat(DETAIL_MAX - "net::ERR_".len()));
+        assert_eq!(longest.len(), DETAIL_MAX);
+        let line = format!("[wrapper] event=page_load_failed code=net_error detail={longest}");
+        assert_eq!(classify_line(&line), line);
+        assert_eq!(
+            extract_codes(&format!("at {longest} x")),
+            vec![longest.clone()]
+        );
+        let over = format!("{longest}B");
+        let line = format!("[wrapper] event=page_load_failed code=net_error detail={over}");
+        assert!(classify_line(&line).starts_with("omitted(len="));
+        assert!(extract_codes(&format!("at {over} x")).is_empty());
+    }
+
+    #[test]
+    fn codes_with_digits_and_npm_codes_are_extracted_whole() {
+        assert_eq!(
+            extract_codes("page.goto: net::ERR_HTTP2_PROTOCOL_ERROR at https://x"),
+            vec!["net::ERR_HTTP2_PROTOCOL_ERROR"]
+        );
+        assert_eq!(
+            extract_codes(" ERR_PNPM_FETCH_401  GET https://registry/x: Unauthorized"),
+            vec!["ERR_PNPM_FETCH_401"]
+        );
+        // A longer lowercase-tailed token is not cut to a code-shaped prefix.
+        assert!(extract_codes("net::ERR_FOOsecret").is_empty());
+        assert!(extract_codes("x ERR_FOOsecret").is_empty());
+        for code in [
+            "E401",
+            "E404",
+            "ETARGET",
+            "ERESOLVE",
+            "EINTEGRITY",
+            "ENOTFOUND",
+            "EAI_AGAIN",
+        ] {
+            assert_eq!(
+                extract_codes(&format!("npm error code {code}")),
+                vec![code.to_string()],
+                "{code}"
+            );
+        }
+        // A digit-bearing all-caps word is still not trusted by its shape.
+        assert!(extract_codes("token E4SECRET9").is_empty());
+    }
+
+    /// An unknown error class is reported as plain `Error`: the class name is
+    /// not a channel for an identifier.
+    #[test]
+    fn error_classes_are_a_closed_list() {
+        assert_eq!(
+            extract_codes("TypeError: x is undefined"),
+            vec!["TypeError"]
+        );
+        assert_eq!(extract_codes("TimeoutError: waited"), vec!["TimeoutError"]);
+        assert_eq!(extract_codes("SecretTokenError: boom"), vec!["Error"]);
+    }
+
+    /// The LAST lines are kept: a package manager prints its verdict at the end.
+    #[test]
+    fn classify_text_keeps_the_last_lines() {
+        let mut text = String::new();
+        for i in 0..(CLASSIFY_TEXT_LINES + 10) {
+            text.push_str(&format!("step exited with code {i}\n"));
+        }
+        let out = classify_text(&text);
+        assert_eq!(out.matches("exit_status=").count(), CLASSIFY_TEXT_LINES);
+        assert!(
+            out.contains(&format!("exit_status={}", CLASSIFY_TEXT_LINES + 9)),
+            "{out}"
+        );
+        assert!(!out.contains("exit_status=0 "), "{out}");
     }
 
     /// `omitted` is keyed: equal text gives an equal tag in this process
@@ -1349,9 +1573,10 @@ mod tests {
     fn output_tail_is_bounded() {
         let tail = OutputTail::default();
         for i in 0..(OUTPUT_TAIL_LINES + 10) {
-            tail.push(&format!(
-                "[wrapper] event=budget_cut code=before_typing detail=exit_status={i}"
-            ));
+            tail.push(
+                &format!("[wrapper] event=budget_cut code=before_typing detail=exit_status={i}"),
+                &mut 0,
+            );
         }
         let rendered = tail.render();
         assert!(
@@ -1363,7 +1588,7 @@ mod tests {
 
         let long = OutputTail::default();
         for _ in 0..20 {
-            long.push(&"x".repeat(5000));
+            long.push(&"x".repeat(5000), &mut 0);
         }
         assert!(long.render().len() <= OUTPUT_ERROR_MAX + OUTPUT_TAIL_LINES * 4);
     }

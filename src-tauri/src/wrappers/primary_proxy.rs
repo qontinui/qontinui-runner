@@ -134,38 +134,7 @@ async fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, ProxyErr
         .send()
         .await
         .map_err(|e| ProxyError::other(format!("Failed to reach primary runner: {}", e)))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        // Try to parse the error envelope for a useful message; fall back
-        // to the status text on parse failure.
-        let body_text = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| status.canonical_reason().unwrap_or("error").to_string());
-        let envelope = serde_json::from_str::<ApiResponse<serde_json::Value>>(&body_text).ok();
-        let code = envelope.as_ref().and_then(|env| env.code.clone());
-        // An unparseable primary body is not forwarded raw: only its typed
-        // envelope fields are, and otherwise a digest of it.
-        let message = envelope
-            .and_then(|env| env.error)
-            .unwrap_or_else(|| super::manager::omitted(&body_text));
-        return Err(ProxyError::from_status(status, message, code));
-    }
-
-    let api: ApiResponse<T> = resp
-        .json()
-        .await
-        .map_err(|e| ProxyError::other(format!("Failed to parse primary response: {}", e)))?;
-
-    if api.success {
-        api.data
-            .ok_or_else(|| ProxyError::other("primary response missing `data` field".to_string()))
-    } else {
-        Err(ProxyError::other(
-            api.error.unwrap_or_else(|| "Unknown error".to_string()),
-        ))
-    }
+    parse_response::<T>(resp).await
 }
 
 /// Proxy: `GET /wrappers`
@@ -214,18 +183,8 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
 ) -> Result<T, ProxyError> {
     let status = resp.status();
     if !status.is_success() {
-        let body_text = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| status.canonical_reason().unwrap_or("error").to_string());
-        let envelope = serde_json::from_str::<ApiResponse<serde_json::Value>>(&body_text).ok();
-        let code = envelope.as_ref().and_then(|env| env.code.clone());
-        // An unparseable primary body is not forwarded raw: only its typed
-        // envelope fields are, and otherwise a digest of it.
-        let message = envelope
-            .and_then(|env| env.error)
-            .unwrap_or_else(|| super::manager::omitted(&body_text));
-        return Err(ProxyError::from_status(status, message, code));
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(failure_from_body(status, &body_text));
     }
 
     let api: ApiResponse<T> = resp
@@ -241,6 +200,23 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
             api.error.unwrap_or_else(|| "Unknown error".to_string()),
         ))
     }
+}
+
+/// The error for a primary's non-2xx answer. Only the envelope's typed
+/// fields pass through — its `error` (the primary's own message) and `code`;
+/// a body that is not the envelope is never forwarded, and the message is
+/// then the STATUS's reason text, which comes from the status code alone.
+fn failure_from_body(status: StatusCode, body_text: &str) -> ProxyError {
+    let envelope = serde_json::from_str::<ApiResponse<serde_json::Value>>(body_text).ok();
+    let code = envelope.as_ref().and_then(|env| env.code.clone());
+    let message = envelope.and_then(|env| env.error).unwrap_or_else(|| {
+        format!(
+            "primary runner returned {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("error")
+        )
+    });
+    ProxyError::from_status(status, message, code)
 }
 
 /// Helper: send a POST with an optional JSON body and parse the
@@ -555,5 +531,43 @@ mod tests {
             None,
         ));
         assert_eq!(s, StatusCode::BAD_GATEWAY);
+    }
+
+    /// A non-envelope body from the primary (a proxy's HTML page, a crash
+    /// dump) is never forwarded: the message is the status's reason text.
+    /// Through `parse_response`, the ONE error path both GET and the write
+    /// verbs take.
+    #[tokio::test]
+    async fn an_unparsed_primary_body_is_never_forwarded() {
+        let secret = concat!("SID=", "s3cr3tCookieValue");
+        let resp: reqwest::Response = axum::http::Response::builder()
+            .status(502)
+            .body(format!("<html>upstream said {secret}</html>"))
+            .unwrap()
+            .into();
+        let err = parse_response::<serde_json::Value>(resp).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!msg.contains("html"), "{msg}");
+        assert_eq!(msg, "primary runner returned 502 Bad Gateway");
+
+        // The envelope's typed fields DO pass.
+        let resp: reqwest::Response = axum::http::Response::builder()
+            .status(503)
+            .body(r#"{"success":false,"error":"failed to spawn wrapper 'w'","code":"wrapper_spawn_failed"}"#)
+            .unwrap()
+            .into();
+        match parse_response::<serde_json::Value>(resp).await.unwrap_err() {
+            ProxyError::Other {
+                status,
+                message,
+                code,
+            } => {
+                assert_eq!(status, Some(StatusCode::SERVICE_UNAVAILABLE));
+                assert_eq!(message, "failed to spawn wrapper 'w'");
+                assert_eq!(code.as_deref(), Some("wrapper_spawn_failed"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
