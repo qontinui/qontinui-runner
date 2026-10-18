@@ -192,6 +192,24 @@ export interface TerminalSessionContextValue extends TerminalManagerReturn, Stat
 
 export const TerminalSessionContext = createContext<TerminalSessionContextValue | null>(null);
 
+/**
+ * Read ANY page's session value by id, not only the active page's — `null` for
+ * a page with no mounted scope. Every page keeps an always-mounted scope (see
+ * {@link TerminalSessionProvider}), so a page the operator is not looking at
+ * still has a live `zoneLayout` and `tabs`; this is how `/layout --page` sets
+ * that page's grid without switching the operator's view to it.
+ *
+ * The getter is stable and reads a ref, so consumers do not re-render whenever
+ * some other page's state moves.
+ */
+export type PageSessionGetter = (pageId: string) => TerminalSessionContextValue | null;
+
+const PageSessionGetterContext = createContext<PageSessionGetter>(() => null);
+
+export function usePageSessionGetter(): PageSessionGetter {
+  return useContext(PageSessionGetterContext);
+}
+
 interface PageSessionScopeProps {
   pageId: string;
   /**
@@ -1011,8 +1029,17 @@ export function TerminalSessionProvider({
 
   const activeValue = values[activePageId] ?? null;
 
+  const valuesRef = useRef(values);
+  useEffect(() => {
+    valuesRef.current = values;
+  }, [values]);
+  const getPageSession = useCallback<PageSessionGetter>(
+    (pageId) => valuesRef.current[pageId] ?? null,
+    [],
+  );
+
   return (
-    <>
+    <PageSessionGetterContext.Provider value={getPageSession}>
       {scopedPages.map((p) => (
         <PageSessionScope
           key={p.id}
@@ -1041,7 +1068,7 @@ export function TerminalSessionProvider({
           </div>
         </div>
       )}
-    </>
+    </PageSessionGetterContext.Provider>
   );
 }
 
