@@ -20,6 +20,9 @@ vi.mock("./terminalHotStore", () => ({
   getTerminalHotStore: () => ({ getLastOutputLines: () => [] }),
 }));
 vi.mock("./approveAll", () => ({ writeToPaneOrReport: vi.fn(() => Promise.resolve()) }));
+// handleResumeSession reads `navigator.platform`. Node 21+ provides a global
+// `navigator`, Node 20 (the CI runtime) does not, so pin one here.
+vi.stubGlobal("navigator", { platform: "Linux x86_64" } as Navigator);
 
 import { createShownTerminal } from "./terminalWorkModeControl";
 import { useFindingsActions } from "./useFindingsActions";
