@@ -7,8 +7,9 @@
 //! Phase 1 added the read-side: list, detail, status, credentials.
 //! Phase 2 adds the write-side: install / update / uninstall / start /
 //! stop / dispatch / set_credential / delete_credential. It also moves
-//! the `ProxyError → HTTP` mapping into [`into_http`] so both
-//! `routes.rs` and `dispatch.rs` reuse a single helper.
+//! the `ProxyError → HTTP` mapping into [`into_http`], which `routes.rs`
+//! uses; `dispatch.rs` uses [`into_http_for_dispatch`], which narrows a
+//! passed-through 503 to a typed one.
 //!
 //! The proxy gate is `is_secondary()` (re-exported from
 //! `process_capture::primary_proxy` as the single source of truth) — a
@@ -473,8 +474,9 @@ pub async fn dispatch(
 // ---------------------------------------------------------------------------
 
 /// Convert a [`ProxyError`] into the standard error envelope. Lives here
-/// (rather than in `routes.rs`) so both `routes.rs` and `dispatch.rs` can
-/// reuse it without introducing a cross-module visibility hop.
+/// (rather than in `routes.rs`) so `routes.rs` and `dispatch.rs` share it
+/// without a cross-module visibility hop: `routes.rs` calls it directly, and
+/// `dispatch.rs` reaches it through [`into_http_for_dispatch`].
 ///
 /// - `NotFound` → 404 (preserves "missing wrapper" semantics).
 /// - `Unreachable` (the request never reached the primary) → 503 with the
@@ -486,8 +488,10 @@ pub async fn dispatch(
 ///   the secondary's caller sees the same status the primary returned.
 ///   A primary-side `400 BAD_REQUEST` for a malformed `InstallRequest`
 ///   stays a 400 instead of becoming a confusing 502.
-/// - Upstream HTTP 503 → passed through with its code (if any). On the
-///   dispatch route, [`into_http_for_dispatch`] narrows this to a TYPED 503.
+/// - Upstream HTTP 503 → passed through with its code (if any). The
+///   dispatch route does not use this function directly: it uses
+///   [`into_http_for_dispatch`], which passes on only a TYPED 503 and turns
+///   an untyped one into 502.
 /// - Any other upstream 5xx → 502 BAD_GATEWAY (the secondary failed to get
 ///   a useful response from the primary).
 pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
@@ -564,8 +568,10 @@ mod tests {
 
     /// Through a secondary runner the primary's typed verdicts survive: a
     /// 503 with a "nothing started" code stays a 503 with it, a typed 429
-    /// busy stays a 429 with its code. An UNTYPED 503 is not known to mean
-    /// "nothing started" and becomes 502, like every other 5xx.
+    /// busy stays a 429 with its code. On the DISPATCH route
+    /// (`into_http_for_dispatch`) an UNTYPED 503 is not known to mean
+    /// "nothing started" and becomes 502, like every other 5xx; `into_http`,
+    /// which the other routes use, keeps the 503.
     #[test]
     fn the_primarys_typed_503_and_429_pass_through() {
         for code in super::super::dispatch::NOTHING_STARTED_CODES {
