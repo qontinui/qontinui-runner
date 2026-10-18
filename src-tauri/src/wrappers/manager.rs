@@ -132,7 +132,7 @@ impl OutputTail {
                 for &b in buf.iter().take(n) {
                     if b == b'\n' {
                         let text = String::from_utf8_lossy(&line);
-                        debug!("wrapper[{}]: {}", id, text);
+                        debug!("wrapper[{}]: {}", id, redact_query(&text));
                         tail.push(&text);
                         if overflow {
                             tail.push("[line cut]");
@@ -154,46 +154,35 @@ impl OutputTail {
 }
 
 /// Header names whose whole line is dropped from quoted wrapper output.
-const SECRET_HEADERS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-    "x-api-key",
-    "api-key",
-];
-/// A path or word segment at least this long, made only of token characters,
-/// is masked: it reads like a token, a session id or a conversation id.
+/// A secret header named ANYWHERE in a line — `Cookie: …`, `"cookie": "…"`,
+/// Node's `{ cookie: '…' }`, `- Authorization: …` — drops the whole line.
+static SECRET_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(?:^|[^a-z0-9_-])(?:proxy-authorization|authorization|set-cookie|cookie|x-api-key|api-key)["'\s]*[:=]"#,
+    )
+    .expect("static regex")
+});
+/// `Bearer` and the credential after it, however many spaces separate them.
+static BEARER: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(bearer)\s+\S+").expect("static regex"));
+/// A path or word segment at least this long, made only of token characters
+/// (`[A-Za-z0-9._-]`, so JWTs and `g.a000…` cookies included), is masked: it
+/// reads like a token, a session id or a conversation id.
 const TOKEN_SEGMENT_MIN: usize = 24;
 
-/// Wrapper output is quoted in errors, so it is reduced before it is kept:
-/// a header-like secret line (`Cookie:`, `Authorization: Bearer …`) is dropped
-/// whole, a word after `Bearer` is masked, a URL's query and fragment are cut,
-/// and any long token-like segment is masked.
+/// Wrapper output is quoted in errors and logs, so it is reduced before it is
+/// kept: a line naming a secret header is dropped whole, the credential after
+/// `Bearer` is masked, a URL's query and fragment are cut, and any long
+/// token-like segment is masked.
 fn redact_query(line: &str) -> String {
-    let trimmed = line.trim_start().to_ascii_lowercase();
-    if SECRET_HEADERS.iter().any(|h| {
-        trimmed
-            .strip_prefix(h)
-            .is_some_and(|rest| rest.trim_start().starts_with(':'))
-    }) {
+    if SECRET_HEADER.is_match(line) {
         return "[header line omitted]".to_string();
     }
+    let line = BEARER.replace_all(line, "$1 …");
     let mut out = String::with_capacity(line.len());
-    let mut mask_next = false;
     for (i, word) in line.split(' ').enumerate() {
         if i > 0 {
             out.push(' ');
-        }
-        if mask_next {
-            out.push('…');
-            mask_next = false;
-            continue;
-        }
-        if word.eq_ignore_ascii_case("bearer") {
-            out.push_str(word);
-            mask_next = true;
-            continue;
         }
         let word = match word.split_once(['?', '#']) {
             Some((head, _)) if word.contains("://") => format!("{head}?…"),
@@ -205,7 +194,7 @@ fn redact_query(line: &str) -> String {
 }
 
 /// Mask every `/`-, `=`- or `:`-separated segment of `word` that looks like a
-/// token (long, and only `[A-Za-z0-9_-]`).
+/// token (long, and only `[A-Za-z0-9._-]`).
 fn mask_token_segments(word: &str) -> String {
     let mut out = String::with_capacity(word.len());
     let mut segment = String::new();
@@ -213,7 +202,7 @@ fn mask_token_segments(word: &str) -> String {
         let tokenish = segment.len() >= TOKEN_SEGMENT_MIN
             && segment
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
         out.push_str(if tokenish { "…" } else { segment.as_str() });
         segment.clear();
     };
@@ -807,78 +796,152 @@ async fn terminate_runtime(wrapper_id: &str, mut runtime: WrapperRuntime) {
     // process group), so a SIGKILL to the wrapper's group never reaches it,
     // and a SIGKILLed `node` cannot run the exit handlers that would have
     // closed it. So, in order:
-    //   1. record every descendant now (once `node` dies they reparent to
-    //      init and can no longer be found by ancestry);
+    //   1. snapshot every descendant now, each with its kernel start time
+    //      (once `node` dies they reparent to init and can no longer be found
+    //      by ancestry; the start time later proves a pid was not reused);
     //   2. SIGTERM the group, so `runWrapperEntrypoint`'s handler closes the
     //      transport and Playwright closes its browser;
-    //   3. wait STOP_GRACE;
-    //   4. SIGKILL the group (drop the guard) and every recorded descendant
-    //      still alive.
+    //   3. wait up to STOP_GRACE for the leader to exit WITHOUT reaping it, so
+    //      its zombie keeps the pgid reserved;
+    //   4. SIGKILL the group while that is still true, then reap the leader;
+    //   5. SIGKILL every snapshotted descendant whose start time still matches.
     // On Windows the kill-on-close Job Object holds every descendant whatever
     // its console or group, so dropping the guard is enough.
     #[cfg(unix)]
-    let descendants = child.id().map(unix_descendants).unwrap_or_default();
-    #[cfg(unix)]
-    let graceful = match (
-        tree.is_some(),
-        child.id().and_then(|p| i32::try_from(p).ok()),
-    ) {
-        (true, Some(pgid)) if pgid > 1 => {
-            // SAFETY: plain signal delivery to a group this manager created
-            // (`process_group(0)` at spawn: pid == pgid).
+    {
+        let leader = child
+            .id()
+            .and_then(|p| i32::try_from(p).ok())
+            .filter(|p| *p > 1);
+        let descendants = leader.map(unix_descendants).unwrap_or_default();
+        if let (true, Some(pgid)) = (tree.is_some(), leader) {
+            // SAFETY: signal delivery to a group this manager created
+            // (`process_group(0)` at spawn: pid == pgid); the leader has not
+            // been reaped, so the pgid cannot have been reused.
             unsafe { libc::killpg(pgid, libc::SIGTERM) };
-            true
+            let exited = wait_exit_without_reaping(pgid, STOP_GRACE).await;
+            if !exited {
+                warn!(
+                    "wrappers: '{}' did not exit within {:?}, killing",
+                    wrapper_id, STOP_GRACE
+                );
+            }
+            // The leader is alive or a zombie: either way its pgid is still
+            // reserved, so this group kill reaches only this wrapper's group.
+            drop(tree);
+        } else {
+            if let Err(e) = child.start_kill() {
+                warn!(
+                    "wrappers: start_kill('{}') failed: {} — proceeding to wait",
+                    wrapper_id, e
+                );
+            }
+            drop(tree);
         }
-        _ => false,
-    };
+        reap(wrapper_id, &mut child).await;
+        for d in descendants {
+            d.kill_if_same();
+        }
+    }
     #[cfg(not(unix))]
-    let graceful = false;
-
-    if !graceful {
-        // tokio's start_kill is TerminateProcess on Windows and SIGKILL on
-        // Unix; the tree guard below takes the rest of the tree.
+    {
+        // tokio's start_kill is TerminateProcess here; dropping the guard
+        // closes the kill-on-close job and takes every descendant with it.
         if let Err(e) = child.start_kill() {
             warn!(
                 "wrappers: start_kill('{}') failed: {} — proceeding to wait",
                 wrapper_id, e
             );
         }
+        drop(tree);
+        reap(wrapper_id, &mut child).await;
     }
+}
 
+/// Reap the wrapper's `node`, force-killing it if it is still running after
+/// STOP_GRACE.
+async fn reap(wrapper_id: &str, child: &mut Child) {
     match tokio::time::timeout(STOP_GRACE, child.wait()).await {
-        Ok(Ok(status)) => {
-            debug!("wrappers: '{}' exited with {}", wrapper_id, status);
-        }
+        Ok(Ok(status)) => debug!("wrappers: '{}' exited with {}", wrapper_id, status),
         Ok(Err(e)) => warn!("wrappers: wait('{}') failed: {}", wrapper_id, e),
         Err(_) => {
-            warn!(
-                "wrappers: '{}' did not exit within {:?}, killing",
-                wrapper_id, STOP_GRACE
-            );
             let _ = child.kill().await;
-        }
-    }
-    // Whatever is left of the group, and of the job on Windows.
-    drop(tree);
-    // The belt: a recorded descendant outside the group (a detached browser)
-    // that is still alive. The pids were read moments ago, so reuse of one by
-    // an unrelated process inside this window is possible but negligible.
-    #[cfg(unix)]
-    for pid in descendants {
-        // SAFETY: signal 0 probes existence; SIGKILL to a recorded descendant.
-        unsafe {
-            if libc::kill(pid, 0) == 0 {
-                libc::kill(pid, libc::SIGKILL);
-            }
         }
     }
 }
 
-/// Every descendant of `root` (children, grandchildren, …), read from
-/// `/proc`'s parent links. Linux only; elsewhere the group kill and the
-/// SIGTERM phase are the whole story.
+/// Wait up to `grace` for `pid` to exit, WITHOUT reaping it (`WNOWAIT`), so a
+/// zombie keeps its pid — and so its process-group id — reserved. True when
+/// it exited.
 #[cfg(unix)]
-fn unix_descendants(root: u32) -> Vec<i32> {
+async fn wait_exit_without_reaping(pid: i32, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        // SAFETY: waitid with WNOHANG|WNOWAIT only inspects our own child.
+        let exited = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let rc = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            rc == 0 && info.si_pid() != 0
+        };
+        if exited {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A descendant snapshotted with its kernel start time (`/proc/<pid>/stat`
+/// field 22), so a later kill can prove the pid still names the same process.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Descendant {
+    pid: i32,
+    start_time: Option<u64>,
+}
+
+#[cfg(unix)]
+impl Descendant {
+    /// SIGKILL it only if its pid still names the SAME process: the start time
+    /// read now equals the snapshot's. A pid whose start time cannot be read
+    /// (gone, or no `/proc`) is left alone.
+    fn kill_if_same(self) {
+        let Some(then) = self.start_time else {
+            return;
+        };
+        if proc_start_time(self.pid) == Some(then) {
+            // SAFETY: SIGKILL to a pid proven to be the snapshotted process.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// `/proc/<pid>/stat` field 22 (starttime, in clock ticks since boot).
+#[cfg(unix)]
+fn proc_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state …`: comm may hold spaces and parens, so count fields
+    // after the LAST ')'. Field 3 (state) is the first after it; 22 is 20th.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// Every descendant of `root` (children, grandchildren, …), read from
+/// `/proc`'s parent links, each with its start time. Linux only; elsewhere the
+/// group kill and the SIGTERM phase are the whole story.
+#[cfg(unix)]
+fn unix_descendants(root: i32) -> Vec<Descendant> {
     #[cfg(target_os = "linux")]
     {
         let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
@@ -894,8 +957,6 @@ fn unix_descendants(root: u32) -> Vec<i32> {
                 let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
                     continue;
                 };
-                // `pid (comm) state ppid …`: comm may hold spaces and parens,
-                // so read after the LAST ')'.
                 let ppid = stat
                     .rsplit_once(')')
                     .and_then(|(_, rest)| rest.split_whitespace().nth(1))
@@ -906,11 +967,14 @@ fn unix_descendants(root: u32) -> Vec<i32> {
             }
         }
         let mut out = Vec::new();
-        let mut queue = vec![i32::try_from(root).unwrap_or(0)];
+        let mut queue = vec![root];
         while let Some(p) = queue.pop() {
             if let Some(kids) = children.get(&p) {
                 for &k in kids {
-                    out.push(k);
+                    out.push(Descendant {
+                        pid: k,
+                        start_time: proc_start_time(k),
+                    });
                     queue.push(k);
                 }
             }
@@ -1142,6 +1206,26 @@ mod tests {
         assert!(out.len() <= OUTPUT_ERROR_MAX + OUTPUT_TAIL_LINES * 4);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descendant_is_killed_only_while_its_start_time_matches() {
+        let me = std::process::id() as i32;
+        let now = proc_start_time(me).expect("own start time readable");
+        // A snapshot whose start time does not match is never signalled (this
+        // test process would die if it were).
+        Descendant {
+            pid: me,
+            start_time: Some(now + 1),
+        }
+        .kill_if_same();
+        Descendant {
+            pid: me,
+            start_time: None,
+        }
+        .kill_if_same();
+        assert_eq!(proc_start_time(me), Some(now));
+    }
+
     #[test]
     fn secret_headers_bearer_tokens_and_token_segments_are_dropped() {
         assert_eq!(
@@ -1163,6 +1247,29 @@ mod tests {
         assert_eq!(
             redact_query("dist/index-node.js ready"),
             "dist/index-node.js ready"
+        );
+        // Header names anywhere in the line, not only at its start.
+        for line in [
+            r#"  "cookie": "SID=abc""#,
+            "{ cookie: 'SID=abc' }",
+            "- Authorization: Bearer x",
+            "headers: { 'x-api-key': 'k' }",
+        ] {
+            assert_eq!(redact_query(line), "[header line omitted]", "{line}");
+        }
+        // Bearer followed by several spaces still masks the credential.
+        assert_eq!(
+            redact_query("sent Bearer   abc.def.ghi ok"),
+            "sent Bearer … ok"
+        );
+        // A JWT-shaped or dotted cookie value is a token segment.
+        assert_eq!(
+            redact_query("token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig done"),
+            "token=… done"
+        );
+        assert_eq!(
+            redact_query("value g.a000abcdefghijklmnopqrstuvwxyz"),
+            "value …"
         );
     }
 
