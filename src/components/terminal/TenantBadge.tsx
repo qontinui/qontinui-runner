@@ -36,7 +36,12 @@ import { Building2 } from "lucide-react";
 
 import { useTenant } from "@/contexts/TenantContext";
 
-import { useSessionInfo, type SessionTenancy, type TenancyRepoExpected } from "./useSessionInfo";
+import {
+  coordRowSourceText,
+  useSessionInfo,
+  type SessionTenancy,
+  type TenancyRepoExpected,
+} from "./useSessionInfo";
 
 /** The chip's discriminating stem: uuids share a long tail. */
 function stem(tenantId: string): string {
@@ -84,11 +89,14 @@ export function repoExpectedText(repo: TenancyRepoExpected | null | undefined): 
   return `${named}${where}${verdict}`;
 }
 
-/** Coord's own session row, as this runner registered it. Pure. */
+/** Coord's own session row, as this runner registered it or as coord's
+ * resume-probe answer named it. Pure. */
 function coordRowText(tenancy: SessionTenancy): string {
   const row = tenancy.coordRow;
   if (!row) return "unknown (this runner does not report the coord-row leg)";
-  if (row.status === "registered") return `${row.tenantId ?? "?"} (as registered by this runner)`;
+  if (row.status === "registered") {
+    return `${row.tenantId ?? "?"} (${coordRowSourceText(row.source)})`;
+  }
   if (row.status === "not_applicable") {
     return "terminal-hosted — its tenant is what the runner writes under (above)";
   }
