@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::app_dispatch::DispatchError;
+use super::app_dispatch::{ws_result_envelope, DispatchError, Dispatched};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
@@ -330,7 +330,10 @@ async fn try_ws_dispatch(
         .dispatch(&app_id, action, Method::GET, "/", payload)
         .await
     {
-        Ok(value) => Ok(Some(value)),
+        // RAW, deliberately: every caller of this probe either synthesizes a
+        // derived answer from the bare result or wraps it with
+        // `ws_result_envelope` itself.
+        Ok(value) => Ok(Some(value.into_raw())),
         Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::NotConnected(_)))
         | Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::Disconnected)) => {
             Err(format!(
@@ -348,6 +351,12 @@ async fn try_ws_dispatch(
 /// responsiveness cache for HTTP-transport apps. Errors are flattened to
 /// `String` for backward compatibility — handler call sites have not
 /// changed and still pattern-match on a `Result<Value, String>`.
+///
+/// The `Ok` value is ALWAYS the `{success, data}` API envelope, whichever
+/// transport answered ([`Dispatched::into_envelope`]): the HTTP arm's body
+/// already is one, and a WS-transport app's bare result is wrapped. Before
+/// that normalization every `/ui-bridge/sdk/*` proxy forwarded a WS app's
+/// answer with no `success` key, which a strict client reads as a failure.
 pub async fn dispatch_app_request(
     state: &Arc<ApiState>,
     action: &str,
@@ -372,6 +381,51 @@ async fn dispatch_app_request_typed(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, DispatchError> {
+    dispatch_app_request_tagged(state, action, ws_payload, http_method, http_path, http_body)
+        .await
+        .map(Dispatched::into_envelope)
+}
+
+/// [`dispatch_app_request_typed`] for an ACTION: the WS arm's bare result is
+/// read with the strict action reader ([`Dispatched::into_action_envelope`]),
+/// so an outcome-less result is an indeterminate FAILURE, never the
+/// `success: true` a read's envelope defaults to.
+async fn dispatch_app_request_action_typed(
+    state: &Arc<ApiState>,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
+    dispatch_app_request_tagged(state, action, ws_payload, http_method, http_path, http_body)
+        .await
+        .map(Dispatched::into_action_envelope)
+}
+
+/// [`dispatch_app_request_action_typed`] with the error flattened to `String`.
+async fn dispatch_app_request_action(
+    state: &Arc<ApiState>,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    dispatch_app_request_action_typed(state, action, ws_payload, http_method, http_path, http_body)
+        .await
+        .map_err(dispatch_err_to_string)
+}
+
+/// The dispatch with its transport TAG kept, for the two normalizations above.
+async fn dispatch_app_request_tagged(
+    state: &Arc<ApiState>,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<Dispatched, DispatchError> {
     // The legacy split fed `ws_payload` to the WS arm and `http_body` to
     // the HTTP arm. Most call sites pass identical bodies; when they
     // differ, prefer `http_body` for the HTTP path to mirror legacy
@@ -469,6 +523,7 @@ pub async fn dispatch_app_request_by_id(
         .app_dispatcher
         .dispatch(app_id, action, http_method, http_path, payload)
         .await
+        .map(Dispatched::into_envelope)
         .map_err(dispatch_err_to_string)
 }
 
@@ -1496,7 +1551,7 @@ async fn handle_element_action(
     // or the runner's own webview when the IPC fallback below runs instead.
     let active_app = active_app_identity(&state).await;
     let mut acted_via_ipc = false;
-    let result = match dispatch_app_request_typed(
+    let result = match dispatch_app_request_action_typed(
         &state,
         "executeElementAction",
         ws_payload,
@@ -2174,7 +2229,7 @@ async fn handle_ai_assert(
 async fn handle_clipboard_read(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     match try_ws_dispatch(&state, "getClipboard", serde_json::json!({})).await {
-        Ok(Some(data)) => return Json(data),
+        Ok(Some(data)) => return Json(ws_result_envelope(data)),
         Ok(None) => {}
         Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2207,7 +2262,7 @@ async fn handle_clipboard_write(
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     match try_ws_dispatch(&state, "setClipboard", body.clone()).await {
-        Ok(Some(data)) => return Json(data),
+        Ok(Some(data)) => return Json(ws_result_envelope(data)),
         Ok(None) => {}
         Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -5010,7 +5065,7 @@ async fn handle_execute_batch_action(
         .unwrap_or_default();
     let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    let response = match dispatch_app_request(
+    let response = match dispatch_app_request_action(
         &state,
         "executeBatchAction",
         serde_json::json!({ "request": body.clone() }),
@@ -5047,7 +5102,7 @@ async fn handle_control_batch(
     let steps = control_batch_action_steps(&body);
     let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    let response = match dispatch_app_request(
+    let response = match dispatch_app_request_action(
         &state,
         "controlBatch",
         body.clone(),
@@ -8264,7 +8319,8 @@ mod tests {
                 .next()
                 .unwrap_or_default();
             assert!(
-                body.contains("dispatch_app_request_typed("),
+                body.contains("dispatch_app_request_typed(")
+                    || body.contains("dispatch_app_request_action_typed("),
                 "{handler} must keep the typed DispatchError"
             );
             assert!(
@@ -8333,6 +8389,8 @@ mod tests {
                 "dispatch_active(",
                 "sdk_request(",
                 "try_ws_dispatch(",
+                "dispatch_app_request_action_typed(",
+                "dispatch_app_request_action(",
             ]
             .iter()
             .any(|d| chunk.contains(d));
@@ -8491,7 +8549,7 @@ mod element_action_result_tests {
     //! `2026-09-10-two-runner-call-sites-still-report-success-for-an-action-that-did-not-happen`:
     //! both arms of `handle_element_action` read `success` through the strict
     //! shared reader, so a body with NO `success` key is a failure.
-    use super::{ipc_element_action_result, ws_element_action_result};
+    use super::{ipc_element_action_result, ws_element_action_result, Dispatched};
     use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
     use serde_json::json;
 
@@ -8514,6 +8572,87 @@ mod element_action_result_tests {
         let (body, ok, _) = ws_element_action_result(serde_json::Value::Null);
         assert!(!ok);
         assert_eq!(body["success"], json!(false));
+    }
+
+    /// The element-action handler reads its dispatch through
+    /// `Dispatched::into_action_envelope` (`dispatch_app_request_action_typed`).
+    /// Through the READ envelope a `null` or outcome-less WS result became
+    /// `{success: true, data: …}` BEFORE this strict reader saw it, so the
+    /// action read as done. Pin the handler's actual composition.
+    #[test]
+    fn ws_arm_outcome_less_result_through_the_dispatch_envelope_is_failure() {
+        for bare in [serde_json::Value::Null, json!({ "elementId": "x" })] {
+            let enveloped = Dispatched::Websocket(bare.clone()).into_action_envelope();
+            let (body, ok, err) = ws_element_action_result(enveloped);
+            assert!(!ok, "{bare} must not read as success");
+            assert_eq!(body["success"], json!(false), "{bare}");
+            assert_eq!(err.as_deref(), Some(INDETERMINATE_ACTION_ERROR), "{bare}");
+        }
+        let (_, ok, _) = ws_element_action_result(
+            Dispatched::Websocket(json!({ "success": true })).into_action_envelope(),
+        );
+        assert!(ok, "an explicit success is kept");
+    }
+
+    /// The ACTION handlers dispatch through the strict action envelope: a
+    /// handler moved back to a READ dispatch would let an outcome-less WS
+    /// result read as success again.
+    #[test]
+    fn action_handlers_dispatch_through_the_strict_action_envelope() {
+        let src = include_str!("sdk_client.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production half");
+        for handler in [
+            "handle_element_action",
+            "handle_execute_batch_action",
+            "handle_control_batch",
+        ] {
+            let wrapped = format!("\nasync fn {handler}_dispatch(");
+            let needle = if production.contains(wrapped.as_str()) {
+                wrapped
+            } else {
+                format!("\nasync fn {handler}(")
+            };
+            let body = production
+                .split(needle.as_str())
+                .nth(1)
+                .unwrap_or_else(|| panic!("{handler} not found"))
+                .split("\nasync fn ")
+                .next()
+                .unwrap_or_default();
+            assert!(
+                body.contains("dispatch_app_request_action_typed(")
+                    || body.contains("dispatch_app_request_action("),
+                "{handler} must dispatch through the strict action envelope"
+            );
+            for read in ["dispatch_app_request_typed(", "dispatch_app_request("] {
+                assert!(
+                    !body.contains(read),
+                    "{handler} still dispatches via {read}"
+                );
+            }
+        }
+        // Every WS ACTION name is dispatched through an `_action` variant.
+        for action in ["executeElementAction", "executeBatchAction", "controlBatch"] {
+            let quoted = format!("\"{action}\",");
+            let mut seen = 0;
+            for (i, _) in production.match_indices(quoted.as_str()) {
+                let mut start = i.saturating_sub(120);
+                while !production.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let before = &production[start..i];
+                let Some(at) = before.rfind("dispatch_app_request") else {
+                    continue; // a mention that is not a dispatch argument
+                };
+                seen += 1;
+                let call = &before[at..];
+                assert!(
+                    call.contains("_action"),
+                    "{action} is dispatched through a READ envelope: {call}"
+                );
+            }
+            assert!(seen >= 1, "{action}: no dispatch call found");
+        }
     }
 
     #[test]
