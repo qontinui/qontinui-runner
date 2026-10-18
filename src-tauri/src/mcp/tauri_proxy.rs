@@ -294,24 +294,13 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .inner()
                 .clone();
 
-            // L2 (shared-checkout coordination gap fix) — derive
-            // `intent_repo` from `working_dir` when the caller didn't
-            // declare one (no-op until `QONTINUI_AGENT_WORKTREE_MODE` is on).
-            let effective_intent_repo: Option<String> = a.intent_repo.clone().or_else(|| {
-                a.working_dir.as_deref().and_then(|wd| {
-                    let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
-                        std::path::Path::new(wd),
-                    );
-                    if let Some(ref repo) = derived {
-                        tracing::debug!(
-                            working_dir = %wd,
-                            derived_intent_repo = %repo,
-                            "tauri_proxy terminal_create: derived intent_repo from working_dir"
-                        );
-                    }
-                    derived
-                })
-            });
+            // L2 (shared-checkout coordination gap fix) — the shared
+            // derivation `terminal_create` uses.
+            let effective_intent_repo: Option<String> =
+                crate::commands::terminal::effective_intent_repo(
+                    a.intent_repo.clone(),
+                    a.working_dir.as_deref(),
+                );
 
             // Judged before the allocate, against the EFFECTIVE intent repo, so
             // a typo is a typed 400 rather than a silent shared-checkout pane.
