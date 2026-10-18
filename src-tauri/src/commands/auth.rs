@@ -932,10 +932,15 @@ pub struct SetRunnerTierResult {
 /// TierStep and the AccountSettings sign-in completion handler.
 ///
 /// On a **secondary** runner (any supervisor-launched temp/named instance) the
-/// tier is applied IN MEMORY ONLY and `persisted: false` is reported. Writing
-/// would target the primary's shared `settings.json` and silently demote a
-/// Tier-2 primary to whatever tier the temp runner picked — see the FOOTGUN
-/// GUARD in `settings::load_settings_full`. Applying in memory is what lets a
+/// tier is applied IN MEMORY ONLY and `persisted: false` is reported. Such a
+/// runner normally has its own config dir through `QONTINUI_CONFIG_DIR` (the
+/// supervisor sets one per instance), so its `settings.json` is its own. The
+/// guard (`instance::shares_primary_settings`) still refuses every named
+/// secondary: one launched without that override, or one that inherited
+/// another runner's, resolves that other runner's file, and on the primary's
+/// a persisted tier would silently demote a Tier-2 primary to whatever tier
+/// the temp runner picked. See the FOOTGUN GUARD in
+/// `settings::load_settings_full`. Applying in memory is what lets a
 /// temp runner exercise the same `isTier2` transition a primary does; without
 /// it every wizard test on a temp runner validated a path that changed neither
 /// disk nor memory.
@@ -973,7 +978,7 @@ pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String
             settings::set_in_memory_tier(parsed);
             warn!(
                 "set_runner_tier: secondary runner — applied in memory only (tier={:?}), \
-                 skipping save_settings so the primary's shared settings.json is not clobbered",
+                 skipping save_settings so a settings.json that may be the primary's is not clobbered",
                 parsed
             );
             Ok(SetRunnerTierResult {
@@ -1086,7 +1091,7 @@ pub async fn promote_runner_tier_to_account() -> Result<SetRunnerTierResult, Str
                 reason: None,
             }),
             Ok((TierWrite::SkippedSecondary, _)) => {
-                // A secondary must never write the shared settings.json (it
+                // A secondary must never write the primary's settings.json (it
                 // would demote the primary), but THIS process still needs the
                 // tier to bring its relay online — so apply the in-memory-only
                 // overlay, which is never persisted. Guarded on there being no

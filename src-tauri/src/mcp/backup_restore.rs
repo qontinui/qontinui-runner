@@ -113,7 +113,11 @@ pub async fn get_backup_info_handler(
 
 /// Restore user data from a backup
 ///
-/// Accepts base64-encoded ZIP data and restores all files to their original locations.
+/// Accepts base64-encoded ZIP data and restores each file to where THIS runner
+/// keeps it (its own `QONTINUI_CONFIG_DIR` for `settings.json`), not to the path
+/// it was backed up from. On a secondary runner the machine-global
+/// `claude-accounts.json` is skipped and reported in `skipped`; a skip is not
+/// a failure, so it neither lands in `errors` nor turns `success` false.
 pub async fn restore_backup_handler(
     State(_state): State<Arc<ApiState>>,
     Json(request): Json<RestoreRequest>,

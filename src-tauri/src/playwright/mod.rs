@@ -45,6 +45,10 @@ pub use script_storage::{
     save_script_library, search_scripts, update_script, PlaywrightLibrary, PlaywrightScript,
 };
 
+// The test library's path resolver, for `backup` — which must locate exactly
+// the file this module reads and writes.
+pub(crate) use script_storage::resolve_tests_path;
+
 // Re-export execution functions from executor module
 pub use executor::{run_script, run_script_inline};
 

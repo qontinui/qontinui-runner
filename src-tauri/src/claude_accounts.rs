@@ -119,8 +119,12 @@ pub fn claude_accounts_file_path() -> Option<PathBuf> {
 /// migration source. Must NOT honor `QONTINUI_CONFIG_DIR`: a secondary
 /// running the migration has to probe the primary's file, not its own
 /// instance-scoped copy.
+///
+/// Resolved through [`crate::settings::resolve_primary_settings_path`] — the
+/// platform arm of the one settings-path resolver — rather than a join of its
+/// own, so this cannot drift from where the primary actually keeps the file.
 fn unscoped_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
+    crate::settings::resolve_primary_settings_path().ok()
 }
 
 /// Load the roster from `path`. Fail-open: missing or corrupt file → `None`

@@ -135,23 +135,36 @@ fn default_version() -> String {
 // File Operations
 // ============================================================================
 
-/// Get the prompts file path in the app data directory.
+/// The prompts file path in the app data directory, **creating nothing**.
 ///
 /// Scoped per-runner for secondary instances so themed/test runners don't
 /// share a prompt library with the primary.
-fn get_prompts_path() -> Result<PathBuf, String> {
+///
+/// The ONE definition of where the prompt library lives: [`get_prompts_path`]
+/// (which also ensures the directory exists, for the writer) and
+/// `backup::get_backup_files` (which must read and restore exactly this file,
+/// and must create nothing to locate it) both go through it.
+pub(crate) fn resolve_prompts_path() -> Result<PathBuf, String> {
     let base = dirs::config_dir()
         .ok_or("Failed to get config directory")?
         .join("com.qontinui.runner");
-    let app_data_dir = crate::instance::scope_path(&base);
+    Ok(crate::instance::scope_path(&base).join(PROMPTS_FILE))
+}
+
+/// [`resolve_prompts_path`] plus the `create_dir_all` of its directory — for
+/// the library's own load/save.
+fn get_prompts_path() -> Result<PathBuf, String> {
+    let path = resolve_prompts_path()?;
 
     // Create directory if it doesn't exist
-    if !app_data_dir.exists() {
-        fs::create_dir_all(&app_data_dir)
-            .map_err(|e| format!("Failed to create app data directory: {}", e))?;
+    if let Some(app_data_dir) = path.parent() {
+        if !app_data_dir.exists() {
+            fs::create_dir_all(app_data_dir)
+                .map_err(|e| format!("Failed to create app data directory: {}", e))?;
+        }
     }
 
-    Ok(app_data_dir.join(PROMPTS_FILE))
+    Ok(path)
 }
 
 /// Load the prompt library from disk
