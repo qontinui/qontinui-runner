@@ -33,7 +33,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use super::manager::WrapperManager;
+use super::manager::{SpawnError, WrapperManager};
 use super::primary_proxy::{self, into_http as proxy_error_to_http};
 use super::registry::WrapperRegistry;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -46,8 +46,15 @@ pub const DEFAULT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_DISPATCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// HTTP header used to override the default dispatch timeout.
 pub const TIMEOUT_HEADER: &str = "X-Wrapper-Dispatch-Timeout";
-/// The longest a dispatch waits for an exclusive action's turn.
-pub const EXCLUSIVE_WAIT: Duration = Duration::from_secs(30);
+/// The longest a dispatch WAITS before it starts — for an exclusive action's
+/// turn and for the wrapper's spawn lock together, one deadline for both. The
+/// whole pre-dispatch time, waits and the spawn itself, is bounded by
+/// [`super::manager::PRE_DISPATCH_CEILING`].
+pub const PRE_DISPATCH_WAIT: Duration = Duration::from_secs(30);
+/// The typed code a busy refusal carries (HTTP 429): nothing was started, and
+/// the caller should come back soon — the action or the spawn is in use, the
+/// wrapper is not broken.
+pub const BUSY_CODE: &str = "wrapper_busy";
 
 /// Take `mtx`, or `None` once `wait` has passed.
 async fn acquire_bounded(
@@ -55,6 +62,53 @@ async fn acquire_bounded(
     wait: Duration,
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     tokio::time::timeout(wait, mtx.lock_owned()).await.ok()
+}
+
+/// Why a dispatch did not reach the wrapper.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PreDispatchRefusal {
+    /// The exclusive turn or the spawn lock was not free inside the wait.
+    Busy(String),
+    /// The spawn ran and failed.
+    SpawnFailed(String),
+}
+
+/// Everything before the wrapper receives the call, under ONE deadline: the
+/// exclusive turn (when the action is exclusive), then the spawn lock and the
+/// spawn. Returns the held turn guard and the wrapper's port.
+pub(crate) async fn turn_and_spawn(
+    ctx: &DispatchContext,
+    wrapper_id: &str,
+    action: &str,
+    exclusive: bool,
+    wait: Duration,
+) -> Result<(Option<tokio::sync::OwnedMutexGuard<()>>, u16), PreDispatchRefusal> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let guard = if exclusive {
+        let mtx = ctx.exclusivity.lock_for(wrapper_id, action).await;
+        match acquire_bounded(mtx, left()).await {
+            Some(g) => Some(g),
+            None => {
+                return Err(PreDispatchRefusal::Busy(format!(
+                    "{BUSY_CODE}: wrapper '{wrapper_id}' action '{action}' is in use by another \
+                     call; nothing was started"
+                )))
+            }
+        }
+    } else {
+        None
+    };
+    match ctx.manager.spawn_within(wrapper_id, Some(left())).await {
+        Ok(port) => Ok((guard, port)),
+        Err(SpawnError::Busy) => Err(PreDispatchRefusal::Busy(format!(
+            "{BUSY_CODE}: wrapper '{wrapper_id}' is being started by another call; nothing \
+             was started"
+        ))),
+        Err(SpawnError::Failed(e)) => Err(PreDispatchRefusal::SpawnFailed(format!(
+            "failed to spawn wrapper '{wrapper_id}': {e}"
+        ))),
+    }
 }
 
 /// Body for `POST /wrappers/:id/dispatch`.
@@ -212,45 +266,20 @@ pub async fn dispatch_handler(
     let timeout = resolve_timeout(&headers);
     let exclusive = action_is_exclusive(&ctx.registry, &wrapper_id, &req.action).await;
 
-    // Acquire the exclusivity guard *before* spawning so a slow spawn
-    // can't starve other parallel dispatches — well, parallel ones don't
-    // hit this branch, so the order is moot for them; for exclusive
-    // ones we want serialization across the spawn too, so this is fine.
-    // The wait for an exclusive action's turn is BOUNDED: an unbounded queue
-    // lets a caller's own read timeout fire while its request is still
-    // waiting here, and the request would then run (and act) after that
-    // caller gave up. A wait past EXCLUSIVE_WAIT answers 503 — "nothing was
-    // started", which is true — so the caller can come back.
-    let _exclusive_guard = if exclusive {
-        let mtx = ctx.exclusivity.lock_for(&wrapper_id, &req.action).await;
-        match acquire_bounded(mtx, EXCLUSIVE_WAIT).await {
-            Some(guard) => Some(guard),
-            None => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(api_error(format!(
-                        "wrapper '{}' action '{}' is busy: another call held it past {}s",
-                        wrapper_id,
-                        req.action,
-                        EXCLUSIVE_WAIT.as_secs()
-                    ))),
-                ));
+    // The exclusive turn, the spawn lock and the spawn all run under one
+    // bounded deadline (`turn_and_spawn`). A busy refusal is HTTP 429 with the
+    // typed `wrapper_busy` code — nothing was started, so the caller retries
+    // soon — never the 503 a broken wrapper gets.
+    let (_exclusive_guard, port) =
+        match turn_and_spawn(&ctx, &wrapper_id, &req.action, exclusive, PRE_DISPATCH_WAIT).await {
+            Ok(ok) => ok,
+            Err(PreDispatchRefusal::Busy(msg)) => {
+                return Err((StatusCode::TOO_MANY_REQUESTS, Json(api_error(msg))))
             }
-        }
-    } else {
-        None
-    };
-
-    // Lazy-spawn (no-op if already running).
-    let port = ctx.manager.spawn(&wrapper_id).await.map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error(format!(
-                "failed to spawn wrapper '{}': {}",
-                wrapper_id, e
-            ))),
-        )
-    })?;
+            Err(PreDispatchRefusal::SpawnFailed(msg)) => {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, Json(api_error(msg))))
+            }
+        };
 
     let url = format!("http://127.0.0.1:{}/dispatch", port);
     let body = serde_json::json!({
@@ -326,17 +355,46 @@ pub async fn dispatch_handler(
 mod tests {
     use super::*;
 
+    async fn context() -> (Arc<DispatchContext>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        let manager = WrapperManager::new(registry.clone());
+        (DispatchContext::new(registry, manager), tmp)
+    }
+
+    /// An exclusive action held by another call: the dispatch path refuses
+    /// as BUSY within the wait, before any spawn — not a spawn failure.
     #[tokio::test]
-    async fn an_exclusive_wait_is_bounded() {
-        let mtx = Arc::new(Mutex::new(()));
-        let held = mtx.clone().lock_owned().await;
-        assert!(acquire_bounded(mtx.clone(), Duration::from_millis(50))
-            .await
-            .is_none());
+    async fn a_held_exclusive_turn_is_a_busy_refusal() {
+        let (ctx, _tmp) = context().await;
+        let held = ctx.exclusivity.lock_for("w", "a").await.lock_owned().await;
+        let started = std::time::Instant::now();
+        let got = turn_and_spawn(&ctx, "w", "a", true, Duration::from_millis(80)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        match got {
+            Err(PreDispatchRefusal::Busy(msg)) => assert!(msg.starts_with(BUSY_CODE), "{msg}"),
+            other => panic!("expected busy, got {other:?}"),
+        }
         drop(held);
-        assert!(acquire_bounded(mtx, Duration::from_millis(50))
-            .await
-            .is_some());
+    }
+
+    /// A spawn in progress (its lock held) is busy too, inside the SAME
+    /// deadline: the spawn-lock wait is no longer unbounded.
+    #[tokio::test]
+    async fn a_held_spawn_lock_is_a_busy_refusal() {
+        let (ctx, _tmp) = context().await;
+        let held = ctx.manager.spawn_lock_for("w").await.lock_owned().await;
+        let started = std::time::Instant::now();
+        let got = turn_and_spawn(&ctx, "w", "a", false, Duration::from_millis(80)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(got, Err(PreDispatchRefusal::Busy(_))), "{got:?}");
+        drop(held);
+        // Free: the spawn runs and fails (no such wrapper): a different refusal.
+        let got = turn_and_spawn(&ctx, "w", "a", false, Duration::from_millis(80)).await;
+        assert!(
+            matches!(got, Err(PreDispatchRefusal::SpawnFailed(_))),
+            "{got:?}"
+        );
     }
 
     #[test]
