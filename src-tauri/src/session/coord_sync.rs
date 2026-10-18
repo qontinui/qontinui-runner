@@ -556,7 +556,8 @@ impl CoordSync {
     /// `UpdateSessionRequest`, so **no coord-side change is required**.
     ///
     /// Maps the response to a coarse [`ResumeProbe`]:
-    /// - 2xx → [`ResumeProbe::Found`] (row exists, now re-activated)
+    /// - 2xx → [`ResumeProbe::Found`] (row exists, now re-activated), carrying
+    ///   the `tenant_id` of coord's answer — see below
     /// - 404 / 410 → [`ResumeProbe::NotFound`] (GC'd or never existed)
     /// - 401 / 403 → [`ResumeProbe::Refused`] (coord answered and refused the
     ///   credential — not an outage; the caller still resumes, but must not
@@ -565,11 +566,14 @@ impl CoordSync {
     ///   [`ResumeProbe::Unreachable`] (treat as transient; caller resumes
     ///   optimistically and the drain loop retries).
     ///
-    /// Even [`ResumeProbe::Found`] proves only that a row with this id
-    /// exists: coord's non-close `PATCH /sessions/:id` matches by id alone
+    /// Coord's non-close `PATCH /sessions/:id` matches by id alone
     /// (`update_session_with_close_outcome` scopes only a close or a
-    /// harness-id bind to the caller's device + tenant), so a 2xx confirms
-    /// nothing about the tenant the row was created under.
+    /// harness-id bind to the caller's device + tenant), so the 2xx STATUS says
+    /// nothing about the row's tenant. Its BODY does: coord answers with the
+    /// updated row (`serde_json::to_value(SessionRow)`), whose `tenant_id` no
+    /// PATCH ever sets — the tenant the row was created under. That is parsed
+    /// into `Found(Some(t))`; a missing or unparseable field (or body) is
+    /// `Found(None)` and never fails the resume.
     ///
     /// Called by [`SessionRegistry::resume_external`].
     ///
@@ -602,7 +606,16 @@ impl CoordSync {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    ResumeProbe::Found
+                    let body = resp.text().await.unwrap_or_default();
+                    let tenant = resume_answer_tenant(&body);
+                    if tenant.is_none() {
+                        tracing::debug!(
+                            session = %session_id,
+                            "coord_sync: resume probe 2xx carried no parseable tenant_id — \
+                             the row's tenant stays unobserved"
+                        );
+                    }
+                    ResumeProbe::Found(tenant)
                 } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
                     ResumeProbe::NotFound
                 } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -876,13 +889,23 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
 // Resume probe outcome (R2)
 // ---------------------------------------------------------------------------
 
+/// The `tenant_id` of coord's 2xx answer to the resume probe (the updated
+/// `SessionRow`). `None` for an empty / non-JSON body, an absent field, or a
+/// value that is not a UUID — never an error. Pure.
+fn resume_answer_tenant(body: &str) -> Option<Uuid> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    Uuid::parse_str(v.get("tenant_id")?.as_str()?.trim()).ok()
+}
+
 /// Coarse outcome of [`CoordSync::probe_resume`], driving
 /// [`super::SessionRegistry::resume_external`]'s PATCH-vs-fresh-POST
 /// decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeProbe {
-    /// The coord row exists and was re-activated by the probe PATCH.
-    Found,
+    /// The coord row exists and was re-activated by the probe PATCH. Carries
+    /// the `tenant_id` coord's answer (the row) named — `None` when the body
+    /// carried no parseable one.
+    Found(Option<Uuid>),
     /// Coord returned 404/410 — the row was GC'd or never existed. The
     /// caller registers a fresh session.
     NotFound,
@@ -3818,7 +3841,7 @@ mod tests {
             "the body must set coord's WORK axis to finished: {body}"
         );
     }
-    use crate::session::{Intent, SessionKind, SessionRegistry, SessionTransports};
+    use crate::session::{Intent, RowTenant, SessionKind, SessionRegistry, SessionTransports};
     use axum::{
         extract::{Path as AxumPath, Query as AxumQuery, State as AxumState},
         http::StatusCode as AxumStatus,
@@ -3959,6 +3982,10 @@ mod tests {
         /// When set (and `patch_returns_404` is not), every PATCH answers
         /// this status instead of 200 — drives the resume-probe refusal arm.
         patch_status: Option<u16>,
+        /// The `tenant_id` field of a 2xx PATCH answer: `None` omits it (the
+        /// field-absent arm), `Some(v)` sends `v` verbatim (a non-UUID string
+        /// drives the unparseable arm).
+        patch_tenant: Option<serde_json::Value>,
         /// When set, `POST /sessions/:id/events` answers this status instead
         /// of 201 (still recording the body) — drives the mirror-drop arms
         /// (404 unknown session id, 405 no ingest route).
@@ -4130,7 +4157,11 @@ mod tests {
                             )
                                 .into_response();
                         }
-                        (AxumStatus::OK, Json(json!({"id": id}))).into_response()
+                        let mut answer = json!({"id": id});
+                        if let Some(t) = g.patch_tenant.clone() {
+                            answer["tenant_id"] = t;
+                        }
+                        (AxumStatus::OK, Json(answer)).into_response()
                     },
                 )
                 .delete(
@@ -7330,7 +7361,8 @@ mod tests {
         // `None` = the default binding, which is what an unpaired test box
         // holds; the tenant argument is the caller's to supply now.
         let probe = coord.probe_resume(id, None).await;
-        assert_eq!(probe, ResumeProbe::Found);
+        // The fake answers `{"id": …}` with no tenant_id: Found, unobserved.
+        assert_eq!(probe, ResumeProbe::Found(None));
         let g = rec.lock().await;
         assert_eq!(g.patches.len(), 1, "probe issues exactly one PATCH");
         let (patched_id, body) = &g.patches[0];
@@ -7404,15 +7436,89 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resumed, persisted, "a refusal does not change resumption");
-            assert_eq!(registry.tenant_observed_of(persisted), Some(false));
+            assert_eq!(
+                registry.row_tenant_of(persisted),
+                Some(RowTenant::Unobserved)
+            );
         }
     }
 
-    /// Only a FRESH registration observes its row's tenant: a resume — even a
-    /// 2xx `Found`, since coord's PATCH is not tenant-scoped — and an
-    /// optimistic one do not; the 404 fallback's fresh row does.
+    /// `probe_resume` reads the row's `tenant_id` from coord's 2xx answer, and
+    /// tolerates its absence or an unparseable value (Found, no tenant).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resume_external_marks_the_tenant_observed_only_for_a_fresh_row() {
+    async fn probe_resume_parses_the_row_tenant_from_the_2xx_answer() {
+        let _amb = crate::test_env::isolated_ambient();
+        let row_tenant = Uuid::new_v4();
+        let cases = [
+            (Some(json!(row_tenant.to_string())), Some(row_tenant)),
+            (None, None),
+            (Some(json!("not-a-uuid")), None),
+            (Some(json!(42)), None),
+            (Some(serde_json::Value::Null), None),
+        ];
+        for (field, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (base, rec) = spawn_fake_coord().await;
+            rec.lock().await.patch_tenant = field.clone();
+            let coord = CoordSync::new_for_test(
+                build_outbox(dir.path()),
+                base,
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            assert_eq!(
+                coord.probe_resume(Uuid::new_v4(), None).await,
+                ResumeProbe::Found(expected),
+                "tenant_id field {field:?}"
+            );
+        }
+        assert_eq!(resume_answer_tenant(""), None);
+        assert_eq!(resume_answer_tenant("<html>"), None);
+        assert_eq!(
+            resume_answer_tenant(&format!(r#"{{"tenant_id":" {row_tenant} "}}"#)),
+            Some(row_tenant)
+        );
+    }
+
+    /// A resumed record's row tenant is coord's answer, and the stamp is NOT
+    /// re-written from it: a row created under A resumed while B resolves keeps
+    /// the stamp B (the data plane's credential) and records Observed(A).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_records_the_row_tenant_coord_answered() {
+        let _amb = crate::test_env::isolated_ambient();
+        let created_under = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_tenant = Some(json!(created_under.to_string()));
+        let coord = CoordSync::new_for_test(
+            build_outbox(dir.path()),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord);
+        let persisted = Uuid::new_v4();
+        let resumed = registry
+            .resume_external(persisted, make_test_intent())
+            .await
+            .unwrap();
+        assert_eq!(resumed, persisted);
+        assert_eq!(
+            registry.row_tenant_of(persisted),
+            Some(RowTenant::Observed(created_under))
+        );
+        // The stamp is the current resolution, untouched by the row's tenant.
+        assert_ne!(
+            registry.tenant_scope_of(persisted),
+            crate::auth::TenantScope::Owned(created_under)
+        );
+    }
+
+    /// A FRESH registration AUTHORS its row's tenant; a resume whose 2xx answer
+    /// names no tenant, and an optimistic one, leave it unobserved; the 404
+    /// fallback's fresh row is authored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_marks_the_row_tenant_authored_only_for_a_fresh_row() {
         let _amb = crate::test_env::isolated_ambient();
         // Found.
         let dir = tempfile::tempdir().unwrap();
@@ -7429,10 +7535,13 @@ mod tests {
             .resume_external(persisted, make_test_intent())
             .await
             .unwrap();
-        assert_eq!(registry.tenant_observed_of(persisted), Some(false));
-        // A fresh register on the same registry: observed.
+        assert_eq!(
+            registry.row_tenant_of(persisted),
+            Some(RowTenant::Unobserved)
+        );
+        // A fresh register on the same registry: authored.
         let fresh = registry.register_external(make_test_intent()).unwrap();
-        assert_eq!(registry.tenant_observed_of(fresh), Some(true));
+        assert_eq!(registry.row_tenant_of(fresh), Some(RowTenant::Authored));
         // 404 fallback: the NEW row is fresh, so observed.
         rec.lock().await.patch_returns_404 = true;
         let gone = Uuid::new_v4();
@@ -7441,8 +7550,11 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(replacement, gone);
-        assert_eq!(registry.tenant_observed_of(replacement), Some(true));
-        assert_eq!(registry.tenant_observed_of(gone), None);
+        assert_eq!(
+            registry.row_tenant_of(replacement),
+            Some(RowTenant::Authored)
+        );
+        assert_eq!(registry.row_tenant_of(gone), None);
         // Unreachable: optimistic, unobserved.
         let dir2 = tempfile::tempdir().unwrap();
         let down = CoordSync::new_for_test(
@@ -7457,7 +7569,10 @@ mod tests {
             .resume_external(optimistic, make_test_intent())
             .await
             .unwrap();
-        assert_eq!(registry2.tenant_observed_of(optimistic), Some(false));
+        assert_eq!(
+            registry2.row_tenant_of(optimistic),
+            Some(RowTenant::Unobserved)
+        );
     }
 
     /// `resume_external` on an existing row REUSES the persisted id (no new

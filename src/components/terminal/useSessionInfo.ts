@@ -228,17 +228,21 @@ export interface TenantDisplay {
 }
 
 /** The fifth leg: the tenant coord's own session row was created under, as
- * this runner process registered it. */
+ * this runner process registered it or as coord's resume-probe answer named
+ * it. */
 export interface TenancyCoordRow {
-  /** `registered` | `unknown` (with `reason`) | `not_applicable` (the
-   * session's coord row IS the hosting terminal's own `SessionRegistry` row,
-   * decided by coord id — whether reached through the pinned terminal or a
-   * registrar entry auto-bind adopted — and the `dataPlane` leg named the
-   * tenant the row was OBSERVED to be created under (a fresh registration,
-   * not a post-restart resume): never a warning, never blocks agreement). */
+  /** `registered` (the row's tenant is known — see `source`) | `unknown`
+   * (with `reason`) | `not_applicable` (the session's coord row IS the hosting
+   * terminal's own `SessionRegistry` row, decided by coord id — whether reached
+   * through the pinned terminal or a registrar entry auto-bind adopted — and
+   * the `dataPlane` leg names the row's own tenant: the one this runner
+   * authored the row's create body with, or the one coord's answer to a
+   * resume probe named: never a warning, never blocks agreement). */
   status: string;
   tenantId: string | null;
-  /** `registrar` when registered. */
+  /** When registered: `registrar` (this runner minted the row) |
+   * `resume_probe` (the hosting terminal's resumed row, whose tenant coord's
+   * resume-probe answer named and the `dataPlane` leg does not show). */
   source: string | null;
   /** unknown: `not_registered_by_this_process` | `registered_without_tenant` |
    * `adopted_row_tenant_not_observed` | `terminal_row_not_wired` |
@@ -777,6 +781,13 @@ function boundSuffix(d: TenantDisplay): string {
   return d.actingInBoundSet === false ? ` · not among ${n} bound` : ` · 1 of ${n} bound`;
 }
 
+/** How a `registered` coord row's tenant became known, in words. Pure. */
+export function coordRowSourceText(source: string | null): string {
+  return source === "resume_probe"
+    ? "as coord answered this runner's resume probe"
+    : "as registered by this runner";
+}
+
 /** The Tenant row's hover text: the full acting id, the full bound set, every
  * conflict and coord's own row. */
 function tenantRowTitle(d: TenantDisplay, coordRow: TenancyCoordRow | null): string {
@@ -805,7 +816,7 @@ function tenantRowTitle(d: TenantDisplay, coordRow: TenancyCoordRow | null): str
     !coordRow
       ? "Coord session row: unknown — runner predates the leg"
       : coordRow.status === "registered"
-        ? `Coord session row: ${coordRow.tenantId ?? "?"} (as registered by this runner)`
+        ? `Coord session row: ${coordRow.tenantId ?? "?"} (${coordRowSourceText(coordRow.source)})`
         : coordRow.status === "not_applicable"
           ? "Coord session row: terminal-hosted — its tenant is the data-plane leg above"
           : `Coord session row: unknown — ${coordRow.reason ?? "no reason given"}`,

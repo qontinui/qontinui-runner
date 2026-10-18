@@ -1439,6 +1439,8 @@ describe("tenancy.display Rust-fixture contract", () => {
       "regression_2026_10_17",
       "adopted_terminal_row",
       "resumed_unconfirmed_terminal_row",
+      "resumed_observed_same_terminal_row",
+      "resumed_observed_other_terminal_row",
       "adopted_non_terminal_row",
       "coord_row_mismatch",
       "unknown_no_nonce",
@@ -1480,6 +1482,31 @@ describe("tenancy.display Rust-fixture contract", () => {
     expect(tenantRow(t).display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
     expect(tenantRow(t).title ?? "").toContain(
       "Coord session row: unknown — terminal_row_resume_unconfirmed",
+    );
+  });
+
+  it("keeps agreement when the resume probe's answer names the acting tenant", () => {
+    const t = byName.resumed_observed_same_terminal_row;
+    expect(t?.coordRow?.status).toBe("not_applicable");
+    expect(t?.coordRow?.reason).toBe("terminal_plane_row_is_the_data_plane_leg");
+    expect(t?.divergence).toBe("agree");
+    expect(tenantRow(t).display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
+  });
+
+  it("shows the mismatch when the resume probe's answer names another tenant", () => {
+    const t = byName.resumed_observed_other_terminal_row;
+    expect(t?.coordRow?.status).toBe("registered");
+    expect(t?.coordRow?.tenantId).toBe(PIZZERIA);
+    expect(t?.coordRow?.source).toBe("resume_probe");
+    expect(t?.diverged).toBe(true);
+    expect(t?.divergence).toBe("diverged");
+    expect(tenantRow(t).display).toBe(
+      "MISMATCH c231d9da (credential, data_plane) ≠ 33333333 (coord_row)",
+    );
+    const title = tenantRow(t).title ?? "";
+    expect(title).toContain(`Conflict — coord_row: ${PIZZERIA}`);
+    expect(title).toContain(
+      `Coord session row: ${PIZZERIA} (as coord answered this runner's resume probe)`,
     );
   });
 
