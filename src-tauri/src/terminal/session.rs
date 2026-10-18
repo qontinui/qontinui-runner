@@ -2313,7 +2313,7 @@ impl TerminalSession {
                 }
                 debug!(terminal_id = %reader_id, "Reader thread exiting");
             })
-            .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
+            .map_err(|e| abandon_pane(io.as_ref(), &id, format!("Failed to spawn reader thread: {e}")))?;
 
         // R1 — shared slots the waiter thread reads on PTY exit so it can
         // close the coord session mirror immediately (vs. leaving it for
@@ -2442,7 +2442,7 @@ impl TerminalSession {
                     );
                 }
             })
-            .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
+            .map_err(|e| abandon_pane(io.as_ref(), &id, format!("Failed to spawn waiter thread: {e}")))?;
 
         Ok(Self {
             id,
@@ -4877,6 +4877,27 @@ impl TerminalSession {
     }
 }
 
+/// `spawn_with_io` failed after the pane was built (pty_holder review
+/// follow-up L2). When the WAITER thread fails to spawn, the already-running
+/// reader thread holds the pane — through the `WireFlow` and its reader — and
+/// blocks until the pane's output ends, so the pane is never dropped and no
+/// `Drop` ever runs: the child would outlive a spawn that reported failure,
+/// with no session to close it. When the READER thread fails to spawn the pane
+/// is dropped on return, but a `LocalPty` has no kill on drop. Either way, end
+/// it here — kill, then release, which ends the reader's stream so a running
+/// reader thread exits — and return `reason` as the spawn's error. (A holder
+/// pane's own `Drop` then sees it released and does not kill again.)
+fn abandon_pane(io: &dyn PaneIo, id: &TerminalId, reason: String) -> String {
+    warn!(terminal_id = %id, pid = ?io.pid(), "{reason} — ending the pane rather than orphaning it");
+    if let Err(e) = io.kill(TASKKILL_TIMEOUT) {
+        warn!(terminal_id = %id, error = %e, "abandoned pane: kill failed");
+    }
+    if let Err(e) = io.release(lock_acquire_budget(None)) {
+        warn!(terminal_id = %id, error = %e, "abandoned pane: release reported an error");
+    }
+    reason
+}
+
 /// Called by the waiter once the child has exited: clears `is_alive` and
 /// reports whether a runner-initiated close (`close_inner` /
 /// `close_kill_only`, which clear it with SeqCst BEFORE they kill the child)
@@ -5573,6 +5594,55 @@ pub(crate) mod tests {
         fn release(&self, _budget: Duration) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    /// A pane that records the order of `kill` and `release`.
+    #[derive(Default)]
+    struct TeardownRecordingPaneIo(Mutex<Vec<&'static str>>);
+
+    impl crate::terminal::pane_io::PaneIo for TeardownRecordingPaneIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(0)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push("kill");
+            Ok(())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push("release");
+            Ok(())
+        }
+    }
+
+    /// pty_holder review follow-up L2: a spawn that fails after its reader
+    /// thread started ends the pane — kill, then release (which ends the
+    /// reader's stream) — and returns the failure as the spawn's error, rather
+    /// than leaving the child running behind a pane nothing will ever drop.
+    #[test]
+    fn abandoned_pane_is_killed_then_released() {
+        let io = TeardownRecordingPaneIo::default();
+        let id: TerminalId = "t-abandon".into();
+        let err = abandon_pane(&io, &id, "Failed to spawn waiter thread: boom".into());
+        assert_eq!(err, "Failed to spawn waiter thread: boom");
+        assert_eq!(*io.0.lock().unwrap(), vec!["kill", "release"]);
     }
 
     /// A writer that records what was typed and, like a TUI input line, echoes
