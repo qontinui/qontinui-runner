@@ -1691,13 +1691,22 @@ mod tests {
                 &mut 0,
             );
         }
+        // The RING holds exactly the newest OUTPUT_TAIL_LINES lines…
+        let ring: Vec<String> = tail.0.lock().unwrap().iter().cloned().collect();
+        assert_eq!(ring.len(), OUTPUT_TAIL_LINES);
+        assert!(ring[0].ends_with("detail=exit_status=10"), "{}", ring[0]);
+        assert!(ring[OUTPUT_TAIL_LINES - 1]
+            .ends_with(&format!("detail=exit_status={}", OUTPUT_TAIL_LINES + 9)));
+        // …and the rendering is the newest of them that fit OUTPUT_ERROR_MAX
+        // bytes (these 69-byte diagnostics do not all fit), oldest first.
         let rendered = tail.render();
+        assert!(rendered.len() <= OUTPUT_ERROR_MAX, "{}", rendered.len());
+        assert!(rendered.ends_with(&format!("detail=exit_status={}", OUTPUT_TAIL_LINES + 9)));
         assert!(
-            !rendered.contains("detail=exit_status=0\n"),
+            !rendered.contains("detail=exit_status=9\n"),
             "the oldest lines are dropped"
         );
-        assert!(rendered.ends_with(&format!("detail=exit_status={}", OUTPUT_TAIL_LINES + 9)));
-        assert_eq!(rendered.lines().count(), OUTPUT_TAIL_LINES);
+        assert!(rendered.lines().count() < OUTPUT_TAIL_LINES);
 
         let long = OutputTail::default();
         for _ in 0..20 {
