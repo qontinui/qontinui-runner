@@ -240,13 +240,21 @@ fn unresolved_reason(t: &SessionTenancy) -> Option<String> {
         .or_else(|| t.data_plane.reason.clone())
 }
 
+/// The reason a credential leg that is UNKNOWN but names no reason of its own
+/// carries, so a data-plane-sourced display never loses the credential context.
+pub const CREDENTIAL_UNKNOWN_NO_REASON: &str = "credential_unknown_no_reason";
+
 /// The credential's reason when the credential leg is UNKNOWN — the context a
 /// data-plane-sourced display carries so it never reads as if the credential
-/// agreed.
+/// agreed. An unknown credential with no reason still answers
+/// [`CREDENTIAL_UNKNOWN_NO_REASON`], never `None`.
 fn credential_unknown_reason(t: &SessionTenancy) -> Option<String> {
-    (t.credential.status == TENANCY_UNKNOWN)
-        .then(|| t.credential.reason.clone())
-        .flatten()
+    (t.credential.status == TENANCY_UNKNOWN).then(|| {
+        t.credential
+            .reason
+            .clone()
+            .unwrap_or_else(|| CREDENTIAL_UNKNOWN_NO_REASON.to_string())
+    })
 }
 
 /// Every leg that names a tenant, in a fixed order. The spawn-time device
@@ -289,11 +297,13 @@ fn conflicting_legs(t: &SessionTenancy) -> Vec<TenantConflict> {
 mod tests {
     use super::*;
     use crate::auth::{BindingTenantRead, TenantScope};
-    use crate::claude_session::coord_register::RecordedCoordRow;
+    use crate::claude_session::coord_register::{RecordedCoordRow, RecordedRowOrigin};
     use crate::commands::session_info::{
         coord_row_from_registrar, project_tenancy, CoordRowRead, SpawnDefaultRead, TenancyCoordRow,
         TenancyRepoExpected, COORD_ROW_ADOPTED, COORD_ROW_NOT_APPLICABLE, COORD_ROW_NOT_REGISTERED,
-        COORD_ROW_TERMINAL_PLANE, DIVERGENCE_AGREE, DIVERGENCE_DIVERGED, TENANCY_UNKNOWN,
+        COORD_ROW_OTHER_TERMINAL, COORD_ROW_REGISTRAR_POISONED, COORD_ROW_TERMINAL_PLANE,
+        COORD_ROW_TERMINAL_ROW_NOT_WIRED, COORD_ROW_TERMINAL_ROW_TENANT_UNRESOLVED,
+        DIVERGENCE_AGREE, DIVERGENCE_DIVERGED, TENANCY_UNKNOWN,
     };
     use crate::coord_mcp::CredentialTenantRead;
     use uuid::Uuid;
@@ -339,10 +349,38 @@ mod tests {
         )
     }
 
-    /// The coord-row leg of a terminal-hosted session: the registrar has no
-    /// entry and the hosting terminal is pinned to the session id.
+    /// The hosting terminal's own coord row (`SessionRegistry`'s).
+    const TERMINAL_ROW: Uuid = Uuid::from_u128(0x7e7e_0000_0000_4000_8000_000000000001);
+    /// A coord row that is NOT the hosting terminal's.
+    const OTHER_ROW: Uuid = Uuid::from_u128(0x7e7e_0000_0000_4000_8000_000000000002);
+
+    fn row(coord_session_id: Uuid, origin: RecordedRowOrigin) -> Option<RecordedCoordRow> {
+        Some(RecordedCoordRow {
+            coord_session_id,
+            origin,
+        })
+    }
+
+    /// The coord-row leg of a terminal-hosted session with no registrar entry:
+    /// the pinned terminal names its own row, and the data plane read it.
     fn terminal_plane_row() -> TenancyCoordRow {
-        TenancyCoordRow::from_read(coord_row_from_registrar(None, true))
+        TenancyCoordRow::from_read(coord_row_from_registrar(
+            row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
+            Some(TERMINAL_ROW),
+            true,
+            true,
+        ))
+    }
+
+    /// The same session after transcript auto-bind ADOPTED the terminal's own
+    /// row into the registrar.
+    fn adopted_terminal_row() -> TenancyCoordRow {
+        TenancyCoordRow::from_read(coord_row_from_registrar(
+            row(TERMINAL_ROW, RecordedRowOrigin::Adopted),
+            Some(TERMINAL_ROW),
+            true,
+            true,
+        ))
     }
 
     /// The 2026-10-17 session: no spawn stamp, a per-tenant credential and an
@@ -782,10 +820,16 @@ mod tests {
 
     #[test]
     fn a_terminal_plane_session_is_not_applicable_and_keeps_agreement() {
-        // The 2026-10-17 population: terminal-hosted sessions register through
-        // SessionRegistry, never through the registrar, so the registrar has no
-        // entry. That must not flip divergence from agree to unknown.
-        let read = coord_row_from_registrar(None, true);
+        // The 2026-10-17 population: a terminal-hosted session whose coord row
+        // is the hosting terminal's own (SessionRegistry's). With no registrar
+        // entry the pinned terminal names that row; it must not flip
+        // divergence from agree to unknown.
+        let read = coord_row_from_registrar(
+            row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
+            Some(TERMINAL_ROW),
+            true,
+            true,
+        );
         assert_eq!(read, CoordRowRead::NotApplicable(COORD_ROW_TERMINAL_PLANE));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
         assert_eq!(t.coord_row.status, COORD_ROW_NOT_APPLICABLE);
@@ -802,8 +846,89 @@ mod tests {
     }
 
     #[test]
-    fn a_registrar_plane_session_this_process_did_not_register_makes_divergence_unknown() {
-        let read = coord_row_from_registrar(None, false);
+    fn an_adopted_terminal_row_is_decided_by_coord_id_and_keeps_agreement() {
+        // B1: transcript auto-bind ADOPTS the terminal's own SessionRegistry
+        // row into the registrar for every tailed transcript. That entry is
+        // `adopted`, but it is the hosting terminal's row by coord id, so the
+        // leg is not applicable — it must not read
+        // unknown(adopted_row_tenant_not_observed).
+        let t = regression_tenancy().with_coord_row(adopted_terminal_row());
+        assert_eq!(t.coord_row.status, COORD_ROW_NOT_APPLICABLE);
+        assert_eq!(
+            t.coord_row.reason.as_deref(),
+            Some(COORD_ROW_TERMINAL_PLANE)
+        );
+        assert_eq!(t.divergence, DIVERGENCE_AGREE);
+        let d = project_tenant_display(&t, four_bindings(), no_slug);
+        assert_eq!(d.status, "resolved");
+    }
+
+    #[test]
+    fn a_clear_successor_resolving_to_the_terminal_row_is_not_applicable() {
+        // W2: a `/clear` successor's id is not the pin, but its adoption chain
+        // resolves to the pinned terminal's row — the same coord id the hosting
+        // terminal carries. Not a registrar-plane miss.
+        let read = coord_row_from_registrar(
+            row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
+            Some(TERMINAL_ROW),
+            true,
+            true,
+        );
+        assert_eq!(read, CoordRowRead::NotApplicable(COORD_ROW_TERMINAL_PLANE));
+        // Its own later mint (a registrar row of its own) answers for itself.
+        assert_eq!(
+            coord_row_from_registrar(
+                row(
+                    OTHER_ROW,
+                    RecordedRowOrigin::Minted {
+                        tenant: Some(u(QONTINUI))
+                    }
+                ),
+                Some(TERMINAL_ROW),
+                true,
+                true,
+            ),
+            CoordRowRead::Registered(u(QONTINUI))
+        );
+    }
+
+    #[test]
+    fn the_terminal_row_stands_aside_only_when_wired_and_its_tenant_resolved() {
+        // W1: no coord id on the terminal — nothing read the row.
+        let not_wired = coord_row_from_registrar(None, None, true, false);
+        assert_eq!(
+            not_wired,
+            CoordRowRead::Unknown(COORD_ROW_TERMINAL_ROW_NOT_WIRED)
+        );
+        // The terminal's row, but the data plane named no tenant for it.
+        for origin in [
+            RecordedRowOrigin::TerminalPinned,
+            RecordedRowOrigin::Adopted,
+        ] {
+            assert_eq!(
+                coord_row_from_registrar(
+                    row(TERMINAL_ROW, origin),
+                    Some(TERMINAL_ROW),
+                    true,
+                    false
+                ),
+                CoordRowRead::Unknown(COORD_ROW_TERMINAL_ROW_TENANT_UNRESOLVED)
+            );
+        }
+        // Either way `agree` cannot pass while coord's row is unobserved.
+        for read in [
+            not_wired,
+            CoordRowRead::Unknown(COORD_ROW_TERMINAL_ROW_TENANT_UNRESOLVED),
+        ] {
+            let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
+            assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
+            assert_eq!(t.divergence, "unknown");
+        }
+    }
+
+    #[test]
+    fn a_session_this_process_resolves_no_row_for_makes_divergence_unknown() {
+        let read = coord_row_from_registrar(None, Some(TERMINAL_ROW), false, true);
         assert_eq!(read, CoordRowRead::Unknown(COORD_ROW_NOT_REGISTERED));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
         assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
@@ -819,46 +944,52 @@ mod tests {
     }
 
     #[test]
-    fn the_registrar_read_maps_each_arm() {
-        let minted = |tenant| {
-            Some(RecordedCoordRow {
-                tenant,
-                adopted: false,
-            })
-        };
-        for terminal_plane in [false, true] {
-            // A registrar entry answers on either plane.
-            assert_eq!(
-                coord_row_from_registrar(minted(Some(u(QONTINUI))), terminal_plane),
-                CoordRowRead::Registered(u(QONTINUI))
-            );
-            assert_eq!(
-                coord_row_from_registrar(minted(None), terminal_plane),
-                CoordRowRead::Unknown("registered_without_tenant")
-            );
-            assert_eq!(
-                coord_row_from_registrar(
-                    Some(RecordedCoordRow {
-                        tenant: Some(u(QONTINUI)),
-                        adopted: true
-                    }),
-                    terminal_plane
-                ),
-                CoordRowRead::Unknown(COORD_ROW_ADOPTED)
-            );
+    fn the_registrar_read_maps_each_arm_of_a_row_that_is_not_the_terminals() {
+        let minted = |tenant| RecordedRowOrigin::Minted { tenant };
+        for terminal_row in [None, Some(TERMINAL_ROW)] {
+            for pinned_here in [false, true] {
+                let read = |origin| {
+                    coord_row_from_registrar(
+                        row(OTHER_ROW, origin),
+                        terminal_row,
+                        pinned_here,
+                        true,
+                    )
+                };
+                assert_eq!(
+                    read(minted(Some(u(QONTINUI)))),
+                    CoordRowRead::Registered(u(QONTINUI))
+                );
+                assert_eq!(
+                    read(minted(None)),
+                    CoordRowRead::Unknown("registered_without_tenant")
+                );
+                assert_eq!(
+                    read(RecordedRowOrigin::Adopted),
+                    CoordRowRead::Unknown(COORD_ROW_ADOPTED)
+                );
+                assert_eq!(
+                    read(RecordedRowOrigin::StatePoisoned),
+                    CoordRowRead::Unknown(COORD_ROW_REGISTRAR_POISONED)
+                );
+                assert_eq!(
+                    read(RecordedRowOrigin::TerminalPinned),
+                    CoordRowRead::Unknown(COORD_ROW_OTHER_TERMINAL)
+                );
+            }
         }
     }
 
     #[test]
-    fn an_adopted_row_reports_its_tenant_as_not_observed_and_blocks_agreement() {
+    fn an_adopted_row_that_is_not_the_terminals_reports_its_tenant_as_not_observed() {
         // The registrar holds the CALLER's tenant for an adopted row, not the
-        // tenant coord created it under: it is a registrar-plane unknown.
+        // tenant coord created it under: unless it is the hosting terminal's
+        // own row, it is unknown.
         let read = coord_row_from_registrar(
-            Some(RecordedCoordRow {
-                tenant: Some(u(QONTINUI)),
-                adopted: true,
-            }),
+            row(OTHER_ROW, RecordedRowOrigin::Adopted),
+            Some(TERMINAL_ROW),
             false,
+            true,
         );
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
         assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
@@ -868,6 +999,41 @@ mod tests {
             Some("adopted_row_tenant_not_observed")
         );
         assert_eq!(t.divergence, "unknown");
+    }
+
+    #[test]
+    fn a_poisoned_registrar_state_is_unknown_not_adopted() {
+        let read = coord_row_from_registrar(
+            row(OTHER_ROW, RecordedRowOrigin::StatePoisoned),
+            Some(TERMINAL_ROW),
+            false,
+            true,
+        );
+        assert_eq!(read, CoordRowRead::Unknown(COORD_ROW_REGISTRAR_POISONED));
+        let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
+        assert_eq!(
+            t.coord_row.reason.as_deref(),
+            Some("registrar_state_poisoned")
+        );
+        assert_eq!(t.divergence, "unknown");
+    }
+
+    #[test]
+    fn an_unknown_credential_without_a_reason_still_names_one() {
+        // S1: a data-plane-sourced display beside an unknown credential that
+        // gave no reason must not drop the credential context.
+        let mut t = tenancy(
+            None,
+            Some(TenantScope::Owned(u(QONTINUI))),
+            CredentialTenantRead::NotLive,
+            BindingTenantRead::Unknown,
+        );
+        assert_eq!(t.credential.status, TENANCY_UNKNOWN);
+        t.credential.reason = None;
+        assert_eq!(
+            credential_unknown_reason(&t).as_deref(),
+            Some(CREDENTIAL_UNKNOWN_NO_REASON)
+        );
     }
 
     #[test]
@@ -900,7 +1066,7 @@ mod tests {
         let qontinui_answer = answer(QONTINUI, "qontinui");
         vec![
             (
-                // The real shape: a terminal-hosted session, whose coord row is
+                // A terminal-hosted session, whose coord row is
                 // SessionRegistry's, so the coord-row leg is not applicable.
                 "regression_2026_10_17",
                 regression_tenancy()
@@ -908,6 +1074,30 @@ mod tests {
                     .with_display(four_bindings(), |t| {
                         slug_from_answer(Some(&qontinui_answer), t)
                     }),
+            ),
+            (
+                // The same session once transcript auto-bind ADOPTED the
+                // terminal's own row into the registrar: still the terminal's
+                // row by coord id, so still not applicable and still `agree`.
+                "adopted_terminal_row",
+                regression_tenancy()
+                    .with_coord_row(adopted_terminal_row())
+                    .with_display(four_bindings(), |t| {
+                        slug_from_answer(Some(&qontinui_answer), t)
+                    }),
+            ),
+            (
+                // An adopted row that is NOT the hosting terminal's: its
+                // create-time tenant was never observed, so `unknown`.
+                "adopted_non_terminal_row",
+                regression_tenancy()
+                    .with_coord_row(TenancyCoordRow::from_read(coord_row_from_registrar(
+                        row(OTHER_ROW, RecordedRowOrigin::Adopted),
+                        Some(TERMINAL_ROW),
+                        false,
+                        true,
+                    )))
+                    .with_display(four_bindings(), no_slug),
             ),
             (
                 "coord_row_mismatch",
