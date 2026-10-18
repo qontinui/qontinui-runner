@@ -486,10 +486,10 @@ pub async fn dispatch(
 ///   the secondary's caller sees the same status the primary returned.
 ///   A primary-side `400 BAD_REQUEST` for a malformed `InstallRequest`
 ///   stays a 400 instead of becoming a confusing 502.
-/// - Upstream HTTP 503 carrying a typed "nothing started" code → passed
-///   through with its code.
-/// - Any other upstream 5xx, an untyped 503 included → 502 BAD_GATEWAY (the
-///   secondary failed to get a useful response from the primary).
+/// - Upstream HTTP 503 → passed through with its code (if any). On the
+///   dispatch route, [`into_http_for_dispatch`] narrows this to a TYPED 503.
+/// - Any other upstream 5xx → 502 BAD_GATEWAY (the secondary failed to get
+///   a useful response from the primary).
 pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
     match e {
         ProxyError::NotFound(msg) => (StatusCode::NOT_FOUND, AxumJson(api_error(msg))),
@@ -521,17 +521,10 @@ pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
         } => {
             // 4xx upstream is the caller's fault — pass it through so the
             // status describes the underlying problem. A 503 passes through
-            // ONLY when it carries one of the primary's typed "nothing
-            // started" codes (`dispatch::NOTHING_STARTED_CODES`), which a
-            // caller parks on. An untyped 503 (an older primary, or anything
-            // else answering on that port) is not known to mean "nothing
-            // started", so like every other 5xx it becomes 502.
-            let typed_nothing_started = code
-                .as_deref()
-                .is_some_and(|c| super::dispatch::NOTHING_STARTED_CODES.contains(&c));
-            let mapped = if s.is_client_error()
-                || (s == StatusCode::SERVICE_UNAVAILABLE && typed_nothing_started)
-            {
+            // too (list, start, install: the primary's "unavailable"); the
+            // dispatch route narrows that (`into_http_for_dispatch`). Reserve
+            // 502 for the other 5xx.
+            let mapped = if s.is_client_error() || s == StatusCode::SERVICE_UNAVAILABLE {
                 s
             } else {
                 StatusCode::BAD_GATEWAY
@@ -542,6 +535,26 @@ pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
             };
             (mapped, AxumJson(body))
         }
+    }
+}
+
+/// [`into_http`] for the DISPATCH route: a 503 is passed on only when it
+/// carries one of the typed "nothing started" codes
+/// (`dispatch::NOTHING_STARTED_CODES`), which a caller parks on. An untyped
+/// 503 (an older primary, or anything else answering on that port) is not
+/// known to mean "nothing started" — the prompt may have been sent — so it
+/// becomes 502, like every other 5xx.
+pub fn into_http_for_dispatch(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
+    let (status, body) = into_http(e);
+    let typed = body
+        .0
+        .code
+        .as_deref()
+        .is_some_and(|c| super::dispatch::NOTHING_STARTED_CODES.contains(&c));
+    if status == StatusCode::SERVICE_UNAVAILABLE && !typed {
+        (StatusCode::BAD_GATEWAY, body)
+    } else {
+        (status, body)
     }
 }
 
@@ -556,7 +569,7 @@ mod tests {
     #[test]
     fn the_primarys_typed_503_and_429_pass_through() {
         for code in super::super::dispatch::NOTHING_STARTED_CODES {
-            let (s, body) = into_http(ProxyError::from_status(
+            let (s, body) = into_http_for_dispatch(ProxyError::from_status(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "x".into(),
                 Some(code.to_string()),
@@ -565,13 +578,20 @@ mod tests {
             assert_eq!(body.0.code.as_deref(), Some(*code));
         }
         for code in [None, Some("wrapper_busy".to_string())] {
-            let (s, body) = into_http(ProxyError::from_status(
+            let (s, body) = into_http_for_dispatch(ProxyError::from_status(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "failed to spawn".into(),
                 code.clone(),
             ));
             assert_eq!(s, StatusCode::BAD_GATEWAY, "{code:?}");
             assert_eq!(body.0.code, code);
+            // Other routes (list, start, install) keep the primary's 503.
+            let (s, _) = into_http(ProxyError::from_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable".into(),
+                code.clone(),
+            ));
+            assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{code:?}");
         }
         let (s, body) = into_http(ProxyError::from_status(
             StatusCode::TOO_MANY_REQUESTS,
