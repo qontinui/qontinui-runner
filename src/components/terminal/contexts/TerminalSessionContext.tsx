@@ -1037,9 +1037,9 @@ export function TerminalSessionProvider({
 
   const activeValue = values[activePageId] ?? null;
 
-  // Layout effect, not a passive one: it runs before any bridge action can be
-  // dispatched against the committed tree, so a lookup never sees the values
-  // from one commit earlier.
+  // Layout effect, not a passive one, so the ref matches what the provider last
+  // committed. A scope publishes its value from a passive effect, so a lookup
+  // can still trail that scope by one render; callers read the result back.
   const valuesRef = useRef(values);
   useLayoutEffect(() => {
     valuesRef.current = values;
