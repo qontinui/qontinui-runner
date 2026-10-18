@@ -129,6 +129,24 @@ pub fn clipboard_write_text(text: String) -> Result<(), String> {
         .map_err(|e| format!("Clipboard write failed: {}", e))
 }
 
+/// Read text from the local OS clipboard.
+///
+/// Paste counterpart of [`clipboard_write_text`]. `navigator.clipboard.readText`
+/// is rejected by WebKitGTK (the Linux webview) and needs focus/permission on
+/// WebView2, so terminal paste silently did nothing there. An empty or
+/// non-text clipboard is `Ok("")`, not an error, so callers can tell "nothing
+/// to paste" from "the read failed".
+#[tauri::command]
+pub fn clipboard_read_text() -> Result<String, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
+    match clipboard.get_text() {
+        Ok(text) => Ok(text),
+        Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+        Err(e) => Err(format!("Clipboard read failed: {}", e)),
+    }
+}
+
 /// Response from POST /api/v1/files/upload
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SharedFileResponse {
@@ -243,6 +261,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             share_to_mobile,
             share_file_to_mobile,
             clipboard_write_text,
+            clipboard_read_text,
         ])
         .build()
 }
