@@ -58,4 +58,12 @@ regexes = [
   # them), so the fixture cannot be respelled here without forking the bundle.
   # Exact literal, as above: any other token value in that tree stays scanned.
   '''eyJhbGciOiJub25lIn0\.eyJleHAiOjk5OTk5OTk5OTl9\.c2ln''',
+  # Synthetic JWT fixture in src-tauri/src/wrappers/manager.rs's own unit tests
+  # (inside `#[cfg(test)]`): the wrapper-output redaction/allowlist tests need a
+  # JWT-shaped string to prove it never reaches a log. It is not a credential:
+  # header {"alg":"HS256"}, payload {"sub":"1"}, signature the literal "sig".
+  # It sits in earlier commits of qontinui-runner#2268, which the PR-range scan
+  # reads; the current test builds it from pieces so no new literal is added.
+  # Exact literal, not a path exemption, for the reasons the entries above give.
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxIn0\.sig''',
 ]
