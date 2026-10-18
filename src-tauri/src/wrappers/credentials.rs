@@ -140,7 +140,10 @@ impl CredentialStore {
 
     /// Remove a credential. No-op if it doesn't exist. Accepts a name in the
     /// legacy charset too (`legacy_name_ok`), so a value an earlier build
-    /// stored is never orphaned in the keyring.
+    /// stored is never orphaned in the keyring. Such a legacy-named value is
+    /// listed as `<rejected, len=N>` with `hasValue: false`, so a DELETE
+    /// removes it only when the caller already knows the exact name;
+    /// otherwise it is removed on uninstall (`clear_for_wrapper`).
     pub fn delete(wrapper_id: &str, name: &str) -> Result<(), CredentialError> {
         validate_name_for_removal(name)?;
         if !qontinui_runner_lib::instance_env::os_keychain_allowed() {

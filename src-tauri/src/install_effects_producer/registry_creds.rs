@@ -15,7 +15,9 @@
 //!   as the wrapper store, but a single flat registry namespace rather than one
 //!   per wrapper.
 //! - Account names are validated `[A-Z0-9_]+` (the unix env-var charset) — the
-//!   exact same rule as `wrappers::credentials::validate_name`. The supported
+//!   same rule as the wrappers store's LEGACY, removal-only rule
+//!   (`wrappers::credentials::legacy_name_ok`); that store validates storing
+//!   and reading with the stricter manifest rule. The supported
 //!   names are the registry-auth env vars the package managers read:
 //!   `NPM_TOKEN`, `CARGO_REGISTRIES_<NAME>_TOKEN`, `PIP_INDEX_URL`,
 //!   `PIP_EXTRA_INDEX_URL`, `UV_INDEX_URL` — all of which match `[A-Z0-9_]+`.
