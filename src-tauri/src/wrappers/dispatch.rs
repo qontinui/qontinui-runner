@@ -46,6 +46,16 @@ pub const DEFAULT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_DISPATCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// HTTP header used to override the default dispatch timeout.
 pub const TIMEOUT_HEADER: &str = "X-Wrapper-Dispatch-Timeout";
+/// The longest a dispatch waits for an exclusive action's turn.
+pub const EXCLUSIVE_WAIT: Duration = Duration::from_secs(30);
+
+/// Take `mtx`, or `None` once `wait` has passed.
+async fn acquire_bounded(
+    mtx: Arc<Mutex<()>>,
+    wait: Duration,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    tokio::time::timeout(wait, mtx.lock_owned()).await.ok()
+}
 
 /// Body for `POST /wrappers/:id/dispatch`.
 #[derive(Debug, Deserialize)]
@@ -206,9 +216,27 @@ pub async fn dispatch_handler(
     // can't starve other parallel dispatches — well, parallel ones don't
     // hit this branch, so the order is moot for them; for exclusive
     // ones we want serialization across the spawn too, so this is fine.
+    // The wait for an exclusive action's turn is BOUNDED: an unbounded queue
+    // lets a caller's own read timeout fire while its request is still
+    // waiting here, and the request would then run (and act) after that
+    // caller gave up. A wait past EXCLUSIVE_WAIT answers 503 — "nothing was
+    // started", which is true — so the caller can come back.
     let _exclusive_guard = if exclusive {
         let mtx = ctx.exclusivity.lock_for(&wrapper_id, &req.action).await;
-        Some(mtx.lock_owned().await)
+        match acquire_bounded(mtx, EXCLUSIVE_WAIT).await {
+            Some(guard) => Some(guard),
+            None => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(api_error(format!(
+                        "wrapper '{}' action '{}' is busy: another call held it past {}s",
+                        wrapper_id,
+                        req.action,
+                        EXCLUSIVE_WAIT.as_secs()
+                    ))),
+                ));
+            }
+        }
     } else {
         None
     };
@@ -297,6 +325,19 @@ pub async fn dispatch_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_exclusive_wait_is_bounded() {
+        let mtx = Arc::new(Mutex::new(()));
+        let held = mtx.clone().lock_owned().await;
+        assert!(acquire_bounded(mtx.clone(), Duration::from_millis(50))
+            .await
+            .is_none());
+        drop(held);
+        assert!(acquire_bounded(mtx, Duration::from_millis(50))
+            .await
+            .is_some());
+    }
 
     #[test]
     fn timeout_header_clamps_to_max() {
