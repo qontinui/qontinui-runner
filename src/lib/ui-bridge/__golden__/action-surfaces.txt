@@ -85,9 +85,9 @@ src/components/terminal/TerminalPage.tsx:434	literal	component	get-zone-view-sta
 src/components/terminal/TerminalPage.tsx:447	literal	component	list-runner-windows	schema=no	arity=0	effect=read
 src/components/terminal/TerminalPage.tsx:459	literal	component	close-empty-terminal-windows	schema=no	arity=0	effect=destructive
 src/components/terminal/TerminalPage.tsx:533	delegated	component	buildTerminalLaunchMenuActions	schema=no	arity=-	effect=-
-src/components/terminal/ZoneLayoutPicker.tsx:113	guarded	component	select-layout	schema=yes	arity=-	effect=write
-src/components/terminal/ZoneLayoutPicker.tsx:166	guarded	component	get-page-layout	schema=yes	arity=-	effect=read
-src/components/terminal/ZoneLayoutPicker.tsx:189	literal	component	list-layouts	schema=no	arity=0	effect=read
+src/components/terminal/ZoneLayoutPicker.tsx:115	guarded	component	select-layout	schema=yes	arity=-	effect=write
+src/components/terminal/ZoneLayoutPicker.tsx:168	guarded	component	get-page-layout	schema=yes	arity=-	effect=read
+src/components/terminal/ZoneLayoutPicker.tsx:190	literal	component	list-layouts	schema=no	arity=0	effect=read
 src/components/terminal/ZoneProfilePicker.tsx:239	guarded	component	load-profile	schema=yes	arity=-	effect=destructive
 src/components/terminal/ZoneProfilePicker.tsx:264	guarded	component	save-profile	schema=yes	arity=-	effect=destructive
 src/components/terminal/ZoneProfilePicker.tsx:326	guarded	component	delete-profile	schema=yes	arity=-	effect=destructive
