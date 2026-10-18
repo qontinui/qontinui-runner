@@ -3806,6 +3806,19 @@ pub fn enrol_machine_key_after_pairing(
     web_base: &str,
     resp: &PairCompleteResponse,
 ) -> Result<bool, MachineKeyEnrolError> {
+    let storage = crate::secure_storage::SecureStorage::new()
+        .map_err(|e| MachineKeyEnrolError::Persist(e.to_string()))?;
+    enrol_machine_key_after_pairing_into(&storage, web_base, resp)
+}
+
+/// [`enrol_machine_key_after_pairing`] over an explicit store, so the
+/// "a pairing leaves a machine key behind" contract is testable against a
+/// temp `.enc` with no process-global path.
+pub(crate) fn enrol_machine_key_after_pairing_into(
+    storage: &crate::secure_storage::SecureStorage,
+    web_base: &str,
+    resp: &PairCompleteResponse,
+) -> Result<bool, MachineKeyEnrolError> {
     if resp
         .device_machine_key
         .as_deref()
@@ -3824,8 +3837,6 @@ pub fn enrol_machine_key_after_pairing(
         &resp.token,
         MachineKeyMintRoute::SelfMint,
     )?;
-    let storage = crate::secure_storage::SecureStorage::new()
-        .map_err(|e| MachineKeyEnrolError::Persist(e.to_string()))?;
     storage
         .store_device_machine_key_with_expiry(&mint.device_machine_key, mint.expires_at_unix())
         .map_err(|e| MachineKeyEnrolError::Persist(e.to_string()))?;
@@ -8887,5 +8898,162 @@ mod vanished_paired_user_heal_tests {
             usable_slot_claim_tenants_with(&mgr),
             Some((tb(), vec![ta(), tb()]))
         );
+    }
+}
+
+/// Plan `2026-10-17-runner-credential-for-every-account-tenant` Phase 6: every
+/// pairing leaves a device machine key behind. The shared post-pairing core
+/// (`commands::web_integration::complete_pairing_after_redeem`) calls
+/// [`enrol_machine_key_after_pairing`]; these drive its store-explicit body
+/// against a mock of web's self-mint route.
+#[cfg(test)]
+mod machine_key_after_pairing_tests {
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const PAIRED_JWT: &str = "hdr.payload-of-the-just-minted-device-jwt.sig";
+
+    #[derive(Clone)]
+    struct Mock {
+        status: StatusCode,
+        body: String,
+        /// One entry per hit: (device_id path segment, bearer presented).
+        hits: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    }
+
+    async fn self_mint(
+        State(m): State<Mock>,
+        Path(device_id): Path<String>,
+        h: HeaderMap,
+    ) -> (StatusCode, String) {
+        let bearer = h
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_start_matches("Bearer ").to_string());
+        m.hits.lock().unwrap().push((device_id, bearer));
+        (m.status, m.body.clone())
+    }
+
+    fn spawn(status: StatusCode, body: String) -> (String, Mock) {
+        let mock = Mock {
+            status,
+            body,
+            hits: Arc::new(Mutex::new(Vec::new())),
+        };
+        let served = mock.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let app: Router = Router::new()
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/self-mint",
+                        post(self_mint),
+                    )
+                    .with_state(served);
+                let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener");
+                let _ = axum::serve(listener, app).await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), mock)
+    }
+
+    fn store(dir: &tempfile::TempDir) -> crate::secure_storage::SecureStorage {
+        crate::secure_storage::SecureStorage::with_path(dir.path().join("tokens.enc"))
+            .expect("storage")
+    }
+
+    fn paired(dmk: Option<&str>) -> PairCompleteResponse {
+        PairCompleteResponse {
+            token: PAIRED_JWT.to_string(),
+            user_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+            device_id: Some(DID.to_string()),
+            jti: None,
+            exp: None,
+            tenant_id: Some("cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string()),
+            device_machine_key: dmk.map(str::to_string),
+        }
+    }
+
+    /// The contract: a pairing whose response carried no key ends with a key
+    /// STORED, minted by presenting the just-paired device JWT.
+    #[test]
+    fn after_a_pairing_a_machine_key_is_stored() {
+        let body = serde_json::json!({
+            "device_id": DID,
+            "device_machine_key": "dmk_minted_after_pairing",
+            "prefix": "dmk_minted_af",
+            "expires_at": "2099-01-01T00:00:00Z",
+        })
+        .to_string();
+        let (base, mock) = spawn(StatusCode::CREATED, body);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = store(&dir);
+        assert_eq!(storage.get_device_machine_key().unwrap(), None);
+
+        let enrolled = enrol_machine_key_after_pairing_into(&storage, &base, &paired(None))
+            .expect("enrolment succeeds");
+
+        assert!(enrolled, "a keyless pairing must enrol");
+        assert_eq!(
+            storage.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_minted_after_pairing"),
+            "the minted key must be in the store once the pairing completes"
+        );
+        assert!(
+            storage.get_device_machine_key_expires_at().is_some(),
+            "the key's expiry is stored with it"
+        );
+        assert_eq!(
+            *mock.hits.lock().unwrap(),
+            vec![(DID.to_string(), Some(PAIRED_JWT.to_string()))],
+            "exactly one self-mint, for this device, with the just-paired JWT as bearer"
+        );
+    }
+
+    /// A pairing response that already carried a key (pair-cli) needs no
+    /// second mint: a mint ROTATES the key, so minting again would kill the
+    /// one `persist_pairing` just stored.
+    #[test]
+    fn a_pairing_that_delivered_a_key_mints_nothing() {
+        let (base, mock) = spawn(StatusCode::CREATED, "{}".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = store(&dir);
+
+        let enrolled =
+            enrol_machine_key_after_pairing_into(&storage, &base, &paired(Some("dmk_from_pair")))
+                .expect("no-op");
+
+        assert!(!enrolled);
+        assert!(mock.hits.lock().unwrap().is_empty(), "no self-mint call");
+        assert_eq!(storage.get_device_machine_key().unwrap(), None);
+    }
+
+    /// A refused mint stores nothing and says so — the refresher retries.
+    #[test]
+    fn a_refused_mint_stores_no_key() {
+        let (base, mock) = spawn(StatusCode::FORBIDDEN, r#"{"error":"nope"}"#.to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = store(&dir);
+
+        let got = enrol_machine_key_after_pairing_into(&storage, &base, &paired(None));
+
+        assert!(got.is_err(), "a 403 is not an enrolment: {got:?}");
+        assert_eq!(mock.hits.lock().unwrap().len(), 1);
+        assert_eq!(storage.get_device_machine_key().unwrap(), None);
     }
 }

@@ -5407,23 +5407,30 @@ async fn enrol_device_machine_key_if_needed(
 ///
 /// ## Re-derivation
 ///
-/// [`try_device_machine_key_exchange`] is the one credential path that needs
-/// neither a live device JWT nor a Cognito session, which is exactly the
-/// situation a dead slot is in. It is called with `expected_tenant =
-/// Some(*tenant)`, so — per plan
+/// The device-machine-key exchange ([`fetch_device_machine_key_exchange`]) is
+/// the one credential path that needs neither a live device JWT nor a Cognito
+/// session, which is exactly the situation a dead slot is in. Coord alone
+/// decides which tenant it mints for (the device's HOME), so its result is
+/// persisted by [`persist_exchanged_jwt_by_claim`], routed by the JWT's own
+/// claim (plan `2026-10-17-runner-credential-for-every-account-tenant` D10):
+/// the legacy default slot ONLY when the claim is `local_default`, otherwise
+/// the claim's own per-tenant slot through the claim-checked write. So a
+/// foreign credential never lands in `tenant`'s slot nor in the default slot —
+/// the cross-tenant substitution `select_device_bearer` refuses by design
+/// (plan
 /// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
-/// D2 — it refuses to persist ANYTHING, including the legacy default slot,
-/// when the re-minted JWT's own `tenant_id` claim names a different tenant:
-/// coord alone decides which tenant a device-machine-key exchange mints for,
-/// so a mismatch here means `coord.devices.tenant_id` is not (or no longer)
-/// `tenant`, and seeding either slot with that credential would be the exact
-/// cross-tenant substitution `select_device_bearer` refuses by design. A
-/// `None` return (mismatch, or any other failure) leaves this slot cleared.
+/// D2) — while a home credential that IS the claim's is kept, in the home's
+/// slot, for the slot keeper's later steps. Only a claim equal to `tenant`
+/// counts as `rederived`; any other outcome leaves this slot cleared.
+///
+/// `local_default` is the device's local default binding
+/// ([`local_default_binding`]); `None` never writes the legacy slot.
 async fn clear_and_rederive_tenant_slot(
     auth_manager: &crate::auth::AuthManager,
     tenant: &uuid::Uuid,
     web_base: &str,
     device_id: &str,
+    local_default: Option<uuid::Uuid>,
     cause: SlotClearCause,
     evidence: &str,
 ) -> TenantSlotOutcome {
@@ -5466,11 +5473,12 @@ async fn clear_and_rederive_tenant_slot(
             rederived: false,
         };
     }
-    // expected_tenant = Some(*tenant): a mismatched mint is already refused
-    // (both slots) inside try_device_machine_key_exchange, so a `Some` here
-    // is guaranteed to be tenant's own credential — see the doc comment above.
-    let Some(jwt) =
-        try_device_machine_key_exchange(auth_manager, web_base, device_id, Some(*tenant)).await
+    // The exchange mints whatever tenant COORD holds as this device's home, so
+    // its result is routed by its own claim (D10 of plan
+    // `2026-10-17-runner-credential-for-every-account-tenant`): the legacy slot
+    // only when that claim is the local default, otherwise the claim's own
+    // slot. Only a claim equal to `tenant` re-derives THIS slot.
+    let Some(jwt) = fetch_device_machine_key_exchange(auth_manager, web_base, device_id).await
     else {
         return TenantSlotOutcome::Cleared {
             cause,
@@ -5478,30 +5486,60 @@ async fn clear_and_rederive_tenant_slot(
         };
     };
     let jwt_len = jwt.len();
-    match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &jwt)).await
+    let jwt_for_store = jwt.clone();
+    let landing = match store_write_off_runtime(auth_manager, move |m| {
+        persist_exchanged_jwt_by_claim(m, &jwt_for_store, local_default)
+    })
+    .await
     {
-        Ok(()) => {
-            info!(
-                "device_jwt_refresher: tenant {tenant} device-JWT slot RE-DERIVED via \
-                 device-machine-key exchange (len={jwt_len})"
-            );
-            // M1 — see [`reset_upstream_rejections_for`]. This is the arm that
-            // LATCHED: re-derive succeeds, rung 1 says `live`, and the next
-            // pass's rung 5 read the dead credential's streak back.
-            reset_upstream_rejections_for(Some(*tenant));
-            TenantSlotOutcome::Cleared {
-                cause,
-                rederived: true,
-            }
-        }
+        Ok(landing) => landing,
         Err(e) => {
-            warn!("device_jwt_refresher: tenant {tenant} re-derived slot persist failed: {e}");
-            TenantSlotOutcome::Cleared {
+            warn!("device_jwt_refresher: tenant {tenant} re-derived credential not persisted: {e}");
+            return TenantSlotOutcome::Cleared {
                 cause,
                 rederived: false,
-            }
+            };
         }
+    };
+    // M1 — see [`reset_upstream_rejections_for`]. Spend the evidence filed
+    // under every key the write landed in. This is the arm that LATCHED:
+    // re-derive succeeds, rung 1 says `live`, and the next pass's rung 5 read
+    // the dead credential's streak back.
+    match landing {
+        ExchangeLanding::DefaultSlot(_) => retire_rejection_streaks_after_legacy_mint(&jwt),
+        ExchangeLanding::TenantSlot(claim) => reset_upstream_rejections_for(Some(claim)),
     }
+    if landing.tenant() != *tenant {
+        DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "device_jwt_refresher: tenant {tenant} slot stays cleared — the device-machine-key \
+             exchange minted for tenant {} (coord's home for this device), which was written \
+             to {landing:?}, never to tenant {tenant}'s slot",
+            landing.tenant()
+        );
+        return TenantSlotOutcome::Cleared {
+            cause,
+            rederived: false,
+        };
+    }
+    info!(
+        "device_jwt_refresher: tenant {tenant} device-JWT slot RE-DERIVED via \
+         device-machine-key exchange into {landing:?} (len={jwt_len})"
+    );
+    TenantSlotOutcome::Cleared {
+        cause,
+        rederived: true,
+    }
+}
+
+/// This runner's local DEFAULT binding, read on the blocking pool. `None` when
+/// unbound or unreadable — callers that would write the legacy slot on its
+/// strength treat both as "not the default".
+async fn local_default_binding() -> Option<uuid::Uuid> {
+    spawn_blocking_tracked(crate::auth::default_binding_tenant)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Multi-tenant slot pass: walk every per-tenant device-JWT slot and
@@ -5655,6 +5693,7 @@ pub(crate) async fn refresh_tenant_slots(
                     &tenant,
                     web_base,
                     device_id,
+                    local_default_binding().await,
                     SlotClearCause::DecodedExpiry,
                     &evidence,
                 )
@@ -5707,6 +5746,7 @@ pub(crate) async fn refresh_tenant_slots(
                     &tenant,
                     web_base,
                     device_id,
+                    local_default_binding().await,
                     SlotClearCause::CoordRejection,
                     &evidence,
                 )
@@ -5895,6 +5935,56 @@ pub(crate) async fn try_device_machine_key_exchange(
     device_id: &str,
     expected_tenant: Option<uuid::Uuid>,
 ) -> Option<String> {
+    let token = fetch_device_machine_key_exchange(auth_manager, web_base, device_id).await?;
+    // Persist into the access_token slot (refresh-token slot stays empty — the
+    // device-JWT lifecycle is coord-owned). Guarded by `expected_tenant`: see
+    // the doc comment above for why a mismatch here is exactly the incident
+    // this exchange path was found to bypass.
+    let token_for_store = token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+    })
+    .await
+    {
+        Ok(()) => {
+            // M1: the old credential's rejections are spent evidence — for the
+            // default bucket and for the tenant slot the mirror just wrote.
+            retire_rejection_streaks_after_legacy_mint(&token);
+            info!(
+                "device_jwt_refresher: device JWT re-minted via device-machine-key \
+                 exchange (len={})",
+                token.len()
+            );
+            Some(token)
+        }
+        Err(e) => {
+            if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
+                DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "device_jwt_refresher: dmk exchange re-minted for tenant {:?}, not the \
+                     requested {} — refusing to persist (existing JWT preserved)",
+                    mismatch.returned, mismatch.expected
+                );
+            } else {
+                warn!("device_jwt_refresher: persist dmk-exchanged JWT failed: {e}");
+            }
+            None
+        }
+    }
+}
+
+/// The network half of [`try_device_machine_key_exchange`]: POST the exchange
+/// and return the minted JWT, persisting NOTHING. Every `None` arm of the
+/// wrapper's doc except the tenant mismatch is decided here. Split out so a
+/// caller that must route the result by its claim
+/// ([`clear_and_rederive_tenant_slot`] → [`persist_exchanged_jwt_by_claim`])
+/// does not inherit the wrapper's unconditional legacy-slot write.
+async fn fetch_device_machine_key_exchange(
+    auth_manager: &crate::auth::AuthManager,
+    web_base: &str,
+    device_id: &str,
+) -> Option<String> {
     // No dmk_ stored → this recovery path is unavailable for this device.
     let dmk = match auth_manager.get_device_machine_key() {
         Ok(Some(k)) if !k.trim().is_empty() => k,
@@ -5953,41 +6043,61 @@ pub(crate) async fn try_device_machine_key_exchange(
         warn!("device_jwt_refresher: dmk exchange returned an empty token");
         return None;
     }
-    // Persist into the access_token slot (refresh-token slot stays empty — the
-    // device-JWT lifecycle is coord-owned). Guarded by `expected_tenant`: see
-    // the doc comment above for why a mismatch here is exactly the incident
-    // this exchange path was found to bypass.
-    let token_for_store = body.token.clone();
-    match store_write_off_runtime(auth_manager, move |m| {
-        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
-    })
-    .await
-    {
-        Ok(()) => {
-            // M1: the old credential's rejections are spent evidence — for the
-            // default bucket and for the tenant slot the mirror just wrote.
-            retire_rejection_streaks_after_legacy_mint(&body.token);
-            info!(
-                "device_jwt_refresher: device JWT re-minted via device-machine-key \
-                 exchange (len={})",
-                body.token.len()
-            );
-            Some(body.token)
+    Some(body.token)
+}
+
+/// Which slot a device-machine-key exchange result was written to — decided by
+/// the minted JWT's OWN `tenant_id` claim, never by the slot that asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExchangeLanding {
+    /// The claim is this runner's local DEFAULT binding: the legacy
+    /// `access_token` slot (whose write mirrors into `device_jwt:<claim>`).
+    DefaultSlot(uuid::Uuid),
+    /// Any other tenant: that tenant's own `device_jwt:<claim>` slot only,
+    /// through the claim-checked write. The legacy slot is untouched.
+    TenantSlot(uuid::Uuid),
+}
+
+impl ExchangeLanding {
+    pub(crate) fn tenant(self) -> uuid::Uuid {
+        match self {
+            Self::DefaultSlot(t) | Self::TenantSlot(t) => t,
         }
-        Err(e) => {
-            if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
-                DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!(
-                    "device_jwt_refresher: dmk exchange re-minted for tenant {:?}, not the \
-                     requested {} — refusing to persist (existing JWT preserved)",
-                    mismatch.returned, mismatch.expected
-                );
-            } else {
-                warn!("device_jwt_refresher: persist dmk-exchanged JWT failed: {e}");
-            }
-            None
-        }
+    }
+}
+
+/// Persist a device-machine-key exchange result into the slot its claim names
+/// (plan `2026-10-17-runner-credential-for-every-account-tenant` D10).
+///
+/// The exchange authenticates by machine key alone, so coord — not the caller
+/// — decides the tenant: it mints the device's HOME tenant. The legacy slot is
+/// the DEFAULT binding's, so it is written only when the claim IS
+/// `local_default`; any other claim goes to that tenant's own slot through
+/// [`crate::auth::AuthManager::store_tenant_device_jwt_expecting`]. Before
+/// this, [`clear_and_rederive_tenant_slot`] persisted through the legacy write
+/// whatever the claim, so a runner whose home is not its local default ended
+/// up with the home's JWT in the default slot.
+///
+/// `local_default == None` (unbound, or the binding file is unreadable) never
+/// writes the legacy slot — an UNKNOWN default is not a licence to overwrite
+/// it. A JWT with no decodable claim cannot be routed and is refused.
+pub(crate) fn persist_exchanged_jwt_by_claim(
+    m: &crate::auth::AuthManager,
+    jwt: &str,
+    local_default: Option<uuid::Uuid>,
+) -> anyhow::Result<ExchangeLanding> {
+    let Some(claim) = crate::auth::jwt_tenant_claim(jwt) else {
+        anyhow::bail!(
+            "device-machine-key exchange minted a JWT with no tenant_id claim — no slot to \
+             route it to"
+        );
+    };
+    if local_default == Some(claim) {
+        m.store_tokens_expecting(jwt, "", Some(claim))?;
+        Ok(ExchangeLanding::DefaultSlot(claim))
+    } else {
+        m.store_tenant_device_jwt_expecting(&claim, jwt)?;
+        Ok(ExchangeLanding::TenantSlot(claim))
     }
 }
 
@@ -11809,6 +11919,21 @@ mod tenant_slot_refresh_tests {
                 retired > persisted,
                 "{item}: the retirement must come AFTER persist_pairing succeeds"
             );
+            // Plan 2026-10-17-runner-credential-for-every-account-tenant Phase 6:
+            // the shared redeem core is ALSO where a pairing leaves a machine key
+            // behind, so both redeem doors (and Phase 7's pair-all) enrol one.
+            // Sign-in's pair-cli response already carries a key.
+            if item.contains("complete_pairing_after_redeem") {
+                let enrolled = body
+                    .find("enrol_machine_key_after_redeem(")
+                    .unwrap_or_else(|| {
+                        panic!("{item} must enrol a device machine key after persisting")
+                    });
+                assert!(
+                    enrolled > persisted,
+                    "{item}: machine-key enrolment must come AFTER persist_pairing succeeds"
+                );
+            }
         }
     }
 
@@ -14178,6 +14303,246 @@ mod device_machine_key_exchange_tests {
             None,
             "the foreign tenant's slot must not be seeded either"
         );
+    }
+
+    // --- D10 (plan 2026-10-17-runner-credential-for-every-account-tenant
+    // Phase 6): `clear_and_rederive_tenant_slot` routes the exchange result by
+    // its own claim. ---
+
+    const HOME: &str = "11111111-1111-4111-8111-1111111111a1";
+    const LOCAL_DEFAULT: &str = "22222222-2222-4222-8222-2222222222a2";
+    const OTHER: &str = "33333333-3333-4333-8333-3333333333a3";
+
+    fn t(s: &str) -> uuid::Uuid {
+        uuid::Uuid::parse_str(s).unwrap()
+    }
+
+    async fn rederive(
+        mgr: &crate::auth::AuthManager,
+        slot: uuid::Uuid,
+        base: &str,
+        local_default: Option<uuid::Uuid>,
+    ) -> TenantSlotOutcome {
+        clear_and_rederive_tenant_slot(
+            mgr,
+            &slot,
+            base,
+            DID,
+            local_default,
+            SlotClearCause::DecodedExpiry,
+            "test: decoded exp in the past",
+        )
+        .await
+    }
+
+    /// The latent bug: the home is NOT the local default. The re-minted home
+    /// JWT lands in the home's slot ONLY — the default slot keeps the default
+    /// tenant's credential.
+    #[tokio::test]
+    async fn an_exchange_for_a_home_that_is_not_the_local_default_lands_only_in_its_slot() {
+        let _serialised = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let default_jwt = synth_jwt_with_tenant(&t(LOCAL_DEFAULT), now + 3600);
+        let mgr = setup("d10_home_not_default", Some("dmk_ok"), Some(&default_jwt));
+        mgr.store_tenant_device_jwt(&t(HOME), &synth_jwt_with_tenant(&t(HOME), now - 60))
+            .unwrap();
+        let minted = synth_jwt_with_tenant(&t(HOME), now + 4 * 3600);
+        let (base, cap, _shutdown) = spawn_mock(
+            StatusCode::OK,
+            serde_json::json!({ "token": minted }).to_string(),
+        );
+
+        let o = rederive(&mgr, t(HOME), &base, Some(t(LOCAL_DEFAULT))).await;
+
+        assert_eq!(
+            o,
+            TenantSlotOutcome::Cleared {
+                cause: SlotClearCause::DecodedExpiry,
+                rederived: true
+            }
+        );
+        assert_eq!(*cap.hits.lock().unwrap(), 1);
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(HOME)).unwrap().as_deref(),
+            Some(minted.as_str()),
+            "the home's slot holds the re-minted home JWT"
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            default_jwt,
+            "the DEFAULT slot must keep the default tenant's JWT, never the home's"
+        );
+        assert_eq!(mgr.get_tenant_device_jwt(&t(LOCAL_DEFAULT)).unwrap(), None);
+    }
+
+    /// When the claim IS the local default, the legacy slot is the right home
+    /// for it — written there, and mirrored into the tenant's own slot.
+    #[tokio::test]
+    async fn an_exchange_for_the_local_default_writes_the_default_slot_and_its_mirror() {
+        let _serialised = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let dead = synth_jwt_with_tenant(&t(LOCAL_DEFAULT), now - 60);
+        let mgr = setup("d10_home_is_default", Some("dmk_ok"), Some(&dead));
+        mgr.store_tenant_device_jwt(&t(LOCAL_DEFAULT), &dead)
+            .unwrap();
+        let minted = synth_jwt_with_tenant(&t(LOCAL_DEFAULT), now + 4 * 3600);
+        let (base, _cap, _shutdown) = spawn_mock(
+            StatusCode::OK,
+            serde_json::json!({ "token": minted }).to_string(),
+        );
+
+        let o = rederive(&mgr, t(LOCAL_DEFAULT), &base, Some(t(LOCAL_DEFAULT))).await;
+
+        assert!(
+            matches!(
+                o,
+                TenantSlotOutcome::Cleared {
+                    rederived: true,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), minted);
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(LOCAL_DEFAULT))
+                .unwrap()
+                .as_deref(),
+            Some(minted.as_str())
+        );
+    }
+
+    /// An UNKNOWN/unbound local default never licenses a legacy write, even
+    /// for the slot's own tenant.
+    #[tokio::test]
+    async fn an_unknown_local_default_never_writes_the_default_slot() {
+        let _serialised = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let legacy = synth_jwt_with_tenant(&t(OTHER), now + 3600);
+        let mgr = setup("d10_unknown_default", Some("dmk_ok"), Some(&legacy));
+        let minted = synth_jwt_with_tenant(&t(HOME), now + 4 * 3600);
+        let (base, _cap, _shutdown) = spawn_mock(
+            StatusCode::OK,
+            serde_json::json!({ "token": minted }).to_string(),
+        );
+
+        let o = rederive(&mgr, t(HOME), &base, None).await;
+
+        assert!(
+            matches!(
+                o,
+                TenantSlotOutcome::Cleared {
+                    rederived: true,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(HOME)).unwrap().as_deref(),
+            Some(minted.as_str())
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            legacy,
+            "legacy slot untouched"
+        );
+    }
+
+    /// Clearing tenant B's slot, the exchange mints the HOME: B's slot stays
+    /// cleared (not re-derived — coord does not mint B by machine key), the
+    /// home's credential goes to the home's slot, and the default slot is
+    /// untouched.
+    #[tokio::test]
+    async fn an_exchange_for_another_tenant_never_fills_the_cleared_slot() {
+        let _serialised = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let default_jwt = synth_jwt_with_tenant(&t(LOCAL_DEFAULT), now + 3600);
+        let mgr = setup("d10_other_tenant", Some("dmk_ok"), Some(&default_jwt));
+        mgr.store_tenant_device_jwt(&t(OTHER), &synth_jwt_with_tenant(&t(OTHER), now - 60))
+            .unwrap();
+        let minted = synth_jwt_with_tenant(&t(HOME), now + 4 * 3600);
+        let (base, _cap, _shutdown) = spawn_mock(
+            StatusCode::OK,
+            serde_json::json!({ "token": minted }).to_string(),
+        );
+        let mismatches_before = device_jwt_refresh_tenant_mismatch_total();
+
+        let o = rederive(&mgr, t(OTHER), &base, Some(t(LOCAL_DEFAULT))).await;
+
+        assert_eq!(
+            o,
+            TenantSlotOutcome::Cleared {
+                cause: SlotClearCause::DecodedExpiry,
+                rederived: false
+            }
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(OTHER)).unwrap(),
+            None,
+            "B stays cleared"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(HOME)).unwrap().as_deref(),
+            Some(minted.as_str()),
+            "the home credential is kept, in the home's own slot"
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), default_jwt);
+        assert!(device_jwt_refresh_tenant_mismatch_total() > mismatches_before);
+    }
+
+    /// A minted JWT that names no tenant cannot be routed: nothing persisted.
+    #[tokio::test]
+    async fn a_claimless_exchange_result_is_persisted_nowhere() {
+        let _serialised = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let default_jwt = synth_jwt_with_tenant(&t(LOCAL_DEFAULT), now + 3600);
+        let mgr = setup("d10_claimless", Some("dmk_ok"), Some(&default_jwt));
+        let minted = synth_jwt(now + 4 * 3600);
+        let (base, _cap, _shutdown) = spawn_mock(
+            StatusCode::OK,
+            serde_json::json!({ "token": minted }).to_string(),
+        );
+
+        let o = rederive(&mgr, t(HOME), &base, Some(t(LOCAL_DEFAULT))).await;
+
+        assert!(
+            matches!(
+                o,
+                TenantSlotOutcome::Cleared {
+                    rederived: false,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(mgr.get_tenant_device_jwt(&t(HOME)).unwrap(), None);
+        assert_eq!(mgr.get_access_token().unwrap(), default_jwt);
+    }
+
+    /// No exchange answer (non-2xx) re-derives nothing and writes nothing.
+    #[tokio::test]
+    async fn a_refused_exchange_leaves_every_slot_as_it_was() {
+        let _serialised = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let default_jwt = synth_jwt_with_tenant(&t(LOCAL_DEFAULT), now + 3600);
+        let mgr = setup("d10_refused", Some("dmk_ok"), Some(&default_jwt));
+        let (base, _cap, _shutdown) = spawn_mock(StatusCode::FORBIDDEN, "{}".to_string());
+
+        let o = rederive(&mgr, t(HOME), &base, Some(t(LOCAL_DEFAULT))).await;
+
+        assert!(
+            matches!(
+                o,
+                TenantSlotOutcome::Cleared {
+                    rederived: false,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(mgr.get_tenant_device_jwt(&t(HOME)).unwrap(), None);
+        assert_eq!(mgr.get_access_token().unwrap(), default_jwt);
     }
 }
 

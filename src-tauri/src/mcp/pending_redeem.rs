@@ -1341,6 +1341,10 @@ mod tests {
         let core = item_body(&web, "pub(crate) async fn complete_pairing_after_redeem(");
         assert!(core.contains("persist_pairing("), "the core persists");
         assert!(
+            core.contains("enrol_machine_key_after_redeem("),
+            "the core enrols the device machine key, so the background door enrols too"
+        );
+        assert!(
             !core.contains(MARKER_CLEAR),
             "the shared core must not end a local logout — that is the interactive door's"
         );
@@ -1352,6 +1356,14 @@ mod tests {
         assert!(
             !interactive.contains("persist_pairing("),
             "the interactive door must not persist around the shared core"
+        );
+        assert!(
+            !interactive.contains("enrol_machine_key_after"),
+            "the interactive door must not enrol around the shared core (one path)"
+        );
+        assert!(
+            !live.contains("enrol_machine_key_after"),
+            "the background door must not enrol around the shared core (one path)"
         );
         assert!(
             interactive.contains(MARKER_CLEAR),

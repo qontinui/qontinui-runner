@@ -862,29 +862,6 @@ pub async fn redeem_pair_code(
     complete_pairing_after_redeem(&resp, tenant_id, &web_base, "redeem_pair_code", || Ok(()))
         .await?;
 
-    // Plan 2026-09-24-runner-coord-credential-stranded-after-outage Phase 3:
-    // the redeem response carries no device machine key, so enrol one now with
-    // the just-minted device JWT. Without it this device has no unattended way
-    // back if its JWT expires during an outage. Best-effort — the pairing
-    // already succeeded, and the refresher retries enrolment on its cadence.
-    {
-        let enrol_base = web_base.clone();
-        let enrol_resp = resp.clone();
-        match spawn_blocking_tracked(move || {
-            qontinui_runner_lib::pair::enrol_machine_key_after_pairing(&enrol_base, &enrol_resp)
-        })
-        .await
-        {
-            Ok(Ok(true)) => info!("redeem_pair_code: device machine key enrolled"),
-            Ok(Ok(false)) => {}
-            Ok(Err(e)) => warn!(
-                "redeem_pair_code: device machine key enrolment did not complete ({e}); \
-                 the refresher retries it"
-            ),
-            Err(e) => warn!("redeem_pair_code: machine-key enrolment task failed: {e}"),
-        }
-    }
-
     // Redeeming a pair code IS an explicit interactive credential acquisition —
     // the operator typed a code that a signed-in web session minted — so it ends
     // any interactive logout, exactly like a Cognito sign-in does.
@@ -933,9 +910,9 @@ pub async fn redeem_pair_code(
 /// effects AFTER the core (the interactive door's sign-out-marker clear) stay
 /// with the door.
 ///
-/// `web_base` is the base the door redeemed against. Unused today; it is the
-/// argument the post-persist slot below hands qontinui-runner#1770's
-/// `enrol_machine_key_after_pairing`, so the core never re-resolves the base.
+/// `web_base` is the base the door redeemed against. The post-persist
+/// machine-key enrolment (`enrol_machine_key_after_pairing`) is handed it, so
+/// the core never re-resolves the base.
 pub(crate) async fn complete_pairing_after_redeem(
     resp: &qontinui_runner_lib::pair::PairCompleteResponse,
     tenant_id: uuid::Uuid,
@@ -953,9 +930,15 @@ pub(crate) async fn complete_pairing_after_redeem(
     .map_err(|e| format!("persist pairing task panicked: {e}"))?
     .map_err(|e| format!("persist pairing: {e}"))?;
 
-    // Post-persist credential steps (e.g. device-machine-key enrolment, which
-    // takes `web_base`) belong HERE, so both doors run them.
-    let _ = web_base;
+    // Plan 2026-09-24-runner-coord-credential-stranded-after-outage Phase 3:
+    // the redeem response carries no device machine key, so enrol one now with
+    // the just-minted device JWT. Without it this device has no unattended way
+    // back if its JWT expires during an outage. It lives HERE, in the core both
+    // redeem doors share, so a device re-paired from qontinui-web's Devices tab
+    // (the background pending-redeem door) enrols too (coord finding
+    // `7fd83b4a`). Best-effort — the pairing already succeeded, and the
+    // refresher retries enrolment on its cadence.
+    enrol_machine_key_after_redeem(resp, web_base, caller).await;
 
     // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
     // tenant is the default), so every rejection coord recorded against the OLD
@@ -1001,6 +984,32 @@ pub(crate) async fn complete_pairing_after_redeem(
     crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
     info!("{caller}: kicked relay + device-JWT refresher to pick up the fresh pairing");
     Ok(())
+}
+
+/// The machine-key step of [`complete_pairing_after_redeem`]: enrol a device
+/// machine key with the device JWT the redeem just minted. Never fails the
+/// pairing — every outcome is logged and the refresher retries a miss on its
+/// own cadence. `caller` prefixes the log lines.
+async fn enrol_machine_key_after_redeem(
+    resp: &qontinui_runner_lib::pair::PairCompleteResponse,
+    web_base: &str,
+    caller: &str,
+) {
+    let enrol_base = web_base.to_string();
+    let enrol_resp = resp.clone();
+    match spawn_blocking_tracked(move || {
+        qontinui_runner_lib::pair::enrol_machine_key_after_pairing(&enrol_base, &enrol_resp)
+    })
+    .await
+    {
+        Ok(Ok(true)) => info!("{caller}: device machine key enrolled"),
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => warn!(
+            "{caller}: device machine key enrolment did not complete ({e}); \
+             the refresher retries it"
+        ),
+        Err(e) => warn!("{caller}: machine-key enrolment task failed: {e}"),
+    }
 }
 
 /// Promote this runner to Tier `qontinui_account` after a pairing credential

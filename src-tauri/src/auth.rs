@@ -1469,6 +1469,35 @@ impl AuthManager {
             .context("Failed to store per-tenant device JWT in secure storage")
     }
 
+    /// [`Self::store_tenant_device_jwt`], refusing to write `tenant_id`'s slot
+    /// unless the JWT's own `tenant_id` claim (decoded, unverified —
+    /// [`jwt_tenant_claim`]) names exactly that tenant.
+    ///
+    /// Stricter than [`Self::store_tokens_expecting`] on purpose: a JWT with NO
+    /// decodable claim is refused too (`returned: None`), because a per-tenant
+    /// slot is keyed by the very claim this checks — a token that cannot say
+    /// whose it is has no evidence it belongs in this slot, and
+    /// `select_device_bearer` would then present it as `tenant_id`'s
+    /// credential. On refusal nothing is written and the error downcasts to
+    /// [`TenantMismatch`].
+    ///
+    /// Plan `2026-10-17-runner-credential-for-every-account-tenant` Phase 6:
+    /// the claim-checked write every refresher path that fills a per-tenant
+    /// slot from a mint it did not choose the tenant of (the device-machine-key
+    /// exchange, the slot keeper's seed door) goes through.
+    #[track_caller]
+    pub fn store_tenant_device_jwt_expecting(&self, tenant_id: &Uuid, jwt: &str) -> Result<()> {
+        let returned = jwt_tenant_claim(jwt);
+        if returned != Some(*tenant_id) {
+            return Err(TenantMismatch {
+                expected: *tenant_id,
+                returned,
+            }
+            .into());
+        }
+        self.store_tenant_device_jwt(tenant_id, jwt.trim())
+    }
+
     /// Explicit-acquisition variant of [`Self::store_tenant_device_jwt`]:
     /// overwrites a present-but-unreadable file store from blank rather than
     /// refusing. The FIRST write of the explicit pairing path
@@ -5701,6 +5730,85 @@ mod bearer_selection_tests {
         mgr.store_tokens_expecting(&jwt, "", None).unwrap();
 
         assert_eq!(mgr.get_access_token().unwrap(), jwt);
+    }
+
+    /// Plan `2026-10-17-runner-credential-for-every-account-tenant` Phase 6:
+    /// the claim-checked per-tenant write stores a JWT whose claim IS the
+    /// slot's tenant — in that slot only, never the legacy slot.
+    #[test]
+    fn store_tenant_device_jwt_expecting_stores_a_matching_claim_in_that_slot_only() {
+        let mgr = create_test_auth_manager("tenant_expecting_match");
+        let t = Uuid::parse_str("11111111-2222-4333-8444-5555555555c1").unwrap();
+        let jwt = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 60);
+
+        mgr.store_tenant_device_jwt_expecting(&t, &jwt).unwrap();
+
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t).unwrap().as_deref(),
+            Some(jwt.as_str())
+        );
+        assert!(
+            mgr.get_access_token().is_err() || mgr.get_access_token().unwrap().is_empty(),
+            "the per-tenant write never touches the legacy slot"
+        );
+        // Repetition: a second matching write overwrites in place.
+        let jwt2 = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 120);
+        mgr.store_tenant_device_jwt_expecting(&t, &jwt2).unwrap();
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t).unwrap().as_deref(),
+            Some(jwt2.as_str())
+        );
+    }
+
+    /// A cross-tenant JWT is refused by the claim-checked write: typed error,
+    /// neither the requested slot nor the claim's own slot is written, and a
+    /// slot that already held a credential keeps it.
+    #[test]
+    fn store_tenant_device_jwt_expecting_refuses_a_cross_tenant_jwt() {
+        let mgr = create_test_auth_manager("tenant_expecting_cross");
+        let slot = Uuid::parse_str("11111111-2222-4333-8444-5555555555c2").unwrap();
+        let other = Uuid::parse_str("22222222-3333-4444-5555-6666666666c2").unwrap();
+        let held = jwt_with_tenant(&slot, chrono::Utc::now().timestamp() + 60);
+        mgr.store_tenant_device_jwt(&slot, &held).unwrap();
+        let foreign = jwt_with_tenant(&other, chrono::Utc::now().timestamp() + 3600);
+
+        let err = mgr
+            .store_tenant_device_jwt_expecting(&slot, &foreign)
+            .expect_err("a JWT for another tenant must be refused");
+        let mismatch = err
+            .downcast_ref::<TenantMismatch>()
+            .expect("error must downcast to TenantMismatch");
+        assert_eq!(mismatch.expected, slot);
+        assert_eq!(mismatch.returned, Some(other));
+
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&slot).unwrap().as_deref(),
+            Some(held.as_str()),
+            "the slot keeps what it held"
+        );
+        assert_eq!(mgr.get_tenant_device_jwt(&other).unwrap(), None);
+    }
+
+    /// Unlike `store_tokens_expecting`, a JWT with NO claim (or an opaque
+    /// value) is refused: it cannot say whose it is, and a per-tenant slot is
+    /// keyed by exactly that.
+    #[test]
+    fn store_tenant_device_jwt_expecting_refuses_a_claimless_token() {
+        let mgr = create_test_auth_manager("tenant_expecting_claimless");
+        let slot = Uuid::parse_str("11111111-2222-4333-8444-5555555555c3").unwrap();
+        for token in [
+            live_jwt("no-claim"),
+            "qontinui_runner_opaque".to_string(),
+            String::new(),
+        ] {
+            let err = mgr
+                .store_tenant_device_jwt_expecting(&slot, &token)
+                .expect_err("a claimless token must be refused");
+            let mismatch = err.downcast_ref::<TenantMismatch>().expect("typed");
+            assert_eq!(mismatch.expected, slot);
+            assert_eq!(mismatch.returned, None);
+        }
+        assert_eq!(mgr.get_tenant_device_jwt(&slot).unwrap(), None);
     }
 
     /// [`slot_jwt_is_usable`] itself, over the three unusable shapes and the
