@@ -624,7 +624,12 @@ describe("mountBootstrapPlan — a pane mounted hidden neither resizes nor paint
       /const bootstrapPlan = mountBootstrapPlan\(\{\s*hasLayout: laidOut,\s*visible: visibleRef\.current,\s*behind: paneService\.behind,\s*\}\);/,
     );
     expect(source).toContain("if (bootstrapPlan.resize) {");
-    expect(source).toContain("if (bootstrapPlan.paint) {");
+    // A mount fetches only a paint it may apply; a reconnect always fetches
+    // (its snapshot resets flow control) and re-checks the plan before painting.
+    expect(source).toContain("isReconnecting || bootstrapPlan.paint");
+    expect(source).toMatch(
+      /const mayPaintNow = mountBootstrapPlan\(\{\s*hasLayout: laidOut,\s*visible: visibleRef\.current,\s*behind: paneService\.behind,\s*\}\)\.paint;\s*const painted =\s*mayPaintNow &&\s*bootstrapPaint\(/,
+    );
     // The layout wait reports the box it measured rather than assuming one.
     expect(source).toContain("resolve(hasLayout());");
     expect(source).not.toMatch(/setTimeout\(\(\) => \{\s*ro\.disconnect\(\);\s*resolve\(true\);/);

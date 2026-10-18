@@ -1270,7 +1270,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         //   3. After waiting for the container to have non-zero dims, fit
         //      + terminal_resize + brief 50ms wait for SIGWINCH, then fetch
         //      the GridSnapshot for the one-shot mount-gap bootstrap paint
-        //      (alt-screen-guarded via bootstrapPaint).
+        //      (alt-screen-guarded via bootstrapPaint). Both halves are gated
+        //      on `mountBootstrapPlan`: a pane with no box does not resize,
+        //      and a hidden or behind one does not paint.
         // Replay the Rust-side scrollback ring BEFORE any live/pending bytes
         // land. TerminalInstance remounts whenever the zone layout reshapes
         // (maximize / single-view toggle, layout switch, hidden↔assigned
@@ -1442,17 +1444,25 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             // dropping chunks, so the paint is no longer safe. An unpainted
             // reconnect is replayed by `lateAttachSettled` below.
             const offset = result.data.stream_offset;
-            const painted = bootstrapPaint(
-              result.data,
-              isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap",
-              (!isReconnecting || offset !== undefined) &&
-                mountBootstrapPlan({
-                  hasLayout: laidOut,
-                  visible: visibleRef.current,
-                  behind: paneService.behind,
-                }).paint,
-            );
+            const mayPaintNow = mountBootstrapPlan({
+              hasLayout: laidOut,
+              visible: visibleRef.current,
+              behind: paneService.behind,
+            }).paint;
+            const painted =
+              mayPaintNow &&
+              bootstrapPaint(
+                result.data,
+                isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap",
+                !isReconnecting || offset !== undefined,
+              );
+            // The title still flows up from a snapshot the pane did not paint.
+            if (!mayPaintNow) reportTitleFromSnapshot(result.data.title);
             lateAttachPaint = { painted, offset };
+          } else if (result === undefined) {
+            // A mount that fetched no snapshot: take the title from the cheap
+            // text snapshot now rather than at the first title-poll tick.
+            pollTitle();
           }
         } catch (err) {
           console.warn(`[Terminal ${terminalId}] grid bootstrap failed:`, err);
