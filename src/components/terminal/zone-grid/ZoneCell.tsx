@@ -754,6 +754,14 @@ function ZoneCellInner({
                   />
                 ) : undefined
               }
+              actionsSlot={
+                <ZoneHoverActions
+                  zoneIdx={zoneIdx}
+                  labelZone={cosmeticZone}
+                  onExportZone={onExportZone}
+                  inline
+                />
+              }
             />
           )}
           {/* D1: the single-zone layout renders no `ZoneLabel`, so before this

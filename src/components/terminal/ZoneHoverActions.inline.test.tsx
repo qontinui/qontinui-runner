@@ -40,8 +40,9 @@ vi.mock("./useTerminalWindowActions", () => ({
 
 import { ZoneHoverActions } from "./ZoneHoverActions";
 
+// A grid zone labels itself (`labelZone` is the zone its cosmetics resolve to).
 const render = (props: { zoneIdx: number; inline?: boolean }) =>
-  renderToStaticMarkup(<ZoneHoverActions {...props} />);
+  renderToStaticMarkup(<ZoneHoverActions labelZone={props.zoneIdx} {...props} />);
 
 describe("ZoneHoverActions", () => {
   it("default mode is the hover-revealed overlay", () => {

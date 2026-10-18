@@ -34,6 +34,9 @@ interface MaximizedHeaderProps {
   promptsVisible: boolean;
   /** The review toggle, when the session offers the review panel. */
   reviewSlot?: ReactNode;
+  /** The zone action cluster (restore, restart, label, export, send-to-window,
+   *  close), rendered inline at the end of the header. */
+  actionsSlot?: ReactNode;
 }
 
 const NAV_BUTTON =
@@ -46,6 +49,7 @@ export function MaximizedHeader({
   onTogglePrompts,
   promptsVisible,
   reviewSlot,
+  actionsSlot,
 }: MaximizedHeaderProps) {
   const { prevZone, nextZone, onGoToZone, onDeleteAndForward } = nav;
   return (
@@ -122,6 +126,7 @@ export function MaximizedHeader({
         </button>
       </div>
       <span className="text-[9px] text-[#565f89]">Esc or double-click to restore</span>
+      {actionsSlot}
     </div>
   );
 }
