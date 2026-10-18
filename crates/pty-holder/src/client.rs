@@ -31,14 +31,14 @@
 //!
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::frame::{
-    parse_output, parse_synthetic, read_frame, write_frame, Frame, SyntheticPart, KIND_CONTROL,
-    KIND_DATA, KIND_OUTPUT, KIND_SYNTHETIC,
+    encode_frame, parse_output, parse_synthetic, read_frame, write_frame, Frame, SyntheticPart,
+    KIND_CONTROL, KIND_DATA, KIND_OUTPUT, KIND_SYNTHETIC,
 };
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{check_private_dir, lock_path, PaneId};
@@ -209,7 +209,30 @@ pub fn connect_with_versions(
     deadline: Instant,
     versions: &[u32],
 ) -> Result<Client, ConnectError> {
-    let mut conn = transport::connect(pane_dir, pane, deadline)?;
+    let mut conn = open_verified(pane_dir, pane, deadline)?;
+    let hello = Request::Hello {
+        versions: versions.to_vec(),
+    };
+    send(&mut conn, &hello, deadline)?;
+    match recv(&mut conn, deadline)? {
+        Reply::HelloAck(ack) => Ok(Client {
+            conn,
+            ack,
+            poisoned: None,
+        }),
+        Reply::NoCommonVersion { holder_versions } => {
+            Err(ConnectError::Incompatible { holder_versions })
+        }
+        other => Err(ConnectError::Protocol(format!(
+            "expected hello_ack, got {other:?}"
+        ))),
+    }
+}
+
+/// Connect to a pane's endpoint and prove who serves it (Unix: the peer uid;
+/// Windows: the pipe server is the pid the lock record names). No handshake.
+fn open_verified(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> Result<Conn, ConnectError> {
+    let conn = transport::connect(pane_dir, pane, deadline)?;
     #[cfg(unix)]
     {
         // The pane dir is 0700, so nobody else can bind there; checked anyway,
@@ -241,23 +264,136 @@ pub fn connect_with_versions(
             }
         }
     }
-    let hello = Request::Hello {
-        versions: versions.to_vec(),
-    };
-    send(&mut conn, &hello, deadline)?;
-    match recv(&mut conn, deadline)? {
-        Reply::HelloAck(ack) => Ok(Client {
-            conn,
-            ack,
-            poisoned: None,
-        }),
-        Reply::NoCommonVersion { holder_versions } => {
-            Err(ConnectError::Incompatible { holder_versions })
+    Ok(conn)
+}
+
+/// What [`upgrade_pane`] asked, and what came of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneUpgrade {
+    /// The holder that was asked: its `hello_ack` pid, or — for a holder that
+    /// answered `no_common_version` — `None`.
+    pub asked_holder_pid: Option<u32>,
+    pub outcome: UpgradeOutcome,
+}
+
+/// Why [`upgrade_pane`] produced no outcome.
+#[derive(Debug)]
+pub enum PaneUpgradeError {
+    /// `prepare_upgrade` was never sent (connect or handshake failed):
+    /// nothing happened to the pane.
+    NotSent(ConnectError),
+    /// `prepare_upgrade` was sent and no answer arrived by the deadline, or
+    /// the connection failed while waiting. The upgrade may have committed,
+    /// rolled back, or still be running — UNKNOWN; probe the pane to learn
+    /// which holder serves it.
+    Unanswered(ConnectError),
+}
+
+impl std::fmt::Display for PaneUpgradeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaneUpgradeError::NotSent(e) => write!(f, "prepare_upgrade not sent: {e}"),
+            PaneUpgradeError::Unanswered(e) => {
+                write!(
+                    f,
+                    "prepare_upgrade sent but not answered (outcome unknown): {e}"
+                )
+            }
         }
-        other => Err(ConnectError::Protocol(format!(
-            "expected hello_ack, got {other:?}"
-        ))),
     }
+}
+
+/// `prepare_upgrade` on one pane, WHATEVER protocol version its holder
+/// speaks: the verb is in the frozen envelope (plan D15), so a holder that
+/// answers `no_common_version` is still asked on the same connection — the
+/// case an upgrade exists for. `handshake_deadline` bounds the connect and
+/// `hello`; `upgrade_deadline` the exchange itself (see
+/// [`Client::prepare_upgrade`] — give it at least 45 s).
+///
+/// A holder built before the verb existed rejects it as an unknown verb;
+/// that is reported as [`UpgradeOutcome::Unsupported`], not as a failure. Any
+/// other rejection is a definite answer that nothing was done:
+/// [`UpgradeOutcome::Rejected`].
+///
+/// **Incompatible holders: a weaker identity check (TOCTOU, accepted).**
+/// `no_common_version` carries no pid, so for `expected_holder_pid: None` this
+/// proves only that the pane is STILL served by some incompatible holder, not
+/// the same one the caller probed. One incompatible holder replaced by another
+/// in between goes undetected; the request still reaches only whichever holder
+/// serves this pane, which is then upgraded as the caller intended. Closing it
+/// needs the pid in `no_common_version` — a frozen-envelope change left to a
+/// later protocol revision.
+///
+/// `expected_holder_pid` is what the caller's own check saw: `Some(pid)` — the
+/// handshake must be answered by that holder — or `None` — it must be answered
+/// `no_common_version`. Anything else means the pane changed hands since the
+/// check (another upgrade landed, say), and `prepare_upgrade` is NOT sent.
+pub fn upgrade_pane(
+    pane_dir: &Path,
+    pane: &PaneId,
+    expected_holder_pid: Option<u32>,
+    handshake_deadline: Instant,
+    upgrade_deadline: Instant,
+) -> Result<PaneUpgrade, PaneUpgradeError> {
+    let mut conn =
+        open_verified(pane_dir, pane, handshake_deadline).map_err(PaneUpgradeError::NotSent)?;
+    let hello = Request::Hello {
+        versions: PROTOCOL_VERSIONS.to_vec(),
+    };
+    send(&mut conn, &hello, handshake_deadline).map_err(|e| PaneUpgradeError::NotSent(e.into()))?;
+    let asked_holder_pid =
+        match recv(&mut conn, handshake_deadline).map_err(PaneUpgradeError::NotSent)? {
+            Reply::HelloAck(ack) => Some(ack.holder_pid),
+            Reply::NoCommonVersion { .. } => None,
+            other => {
+                return Err(PaneUpgradeError::NotSent(ConnectError::Protocol(format!(
+                    "expected hello_ack, got {other:?}"
+                ))))
+            }
+        };
+    if asked_holder_pid != expected_holder_pid {
+        let seen = |p: Option<u32>| match p {
+            Some(pid) => format!("holder pid {pid}"),
+            None => "a holder with no common protocol version".to_string(),
+        };
+        return Err(PaneUpgradeError::NotSent(ConnectError::Protocol(format!(
+            "the pane's holder changed since it was checked: expected {}, found {}",
+            seen(expected_holder_pid),
+            seen(asked_holder_pid)
+        ))));
+    }
+    // A failed write may have delivered part of the request — or all of it.
+    send(&mut conn, &Request::PrepareUpgrade, upgrade_deadline)
+        .map_err(|e| PaneUpgradeError::Unanswered(e.into()))?;
+    let outcome = match recv(&mut conn, upgrade_deadline).map_err(PaneUpgradeError::Unanswered)? {
+        Reply::Upgraded {
+            successor_pid,
+            handoff_offset,
+        } => UpgradeOutcome::Upgraded {
+            successor_pid,
+            handoff_offset,
+        },
+        Reply::UpgradeFailed { reason } => UpgradeOutcome::Failed(reason),
+        Reply::Unsupported { reason, .. } => UpgradeOutcome::Unsupported(reason),
+        Reply::Rejected {
+            reason: RejectReason::UnknownVerb,
+            detail,
+        } => UpgradeOutcome::Unsupported(format!(
+            "this holder build predates in-place upgrade ({detail})"
+        )),
+        Reply::Rejected { reason, detail } => UpgradeOutcome::Rejected(format!(
+            "the holder rejected prepare_upgrade ({reason:?}: {detail}) and did not act on it"
+        )),
+        other => {
+            return Err(PaneUpgradeError::Unanswered(ConnectError::Protocol(
+                format!("expected upgraded / upgrade_failed / unsupported, got {other:?}"),
+            )))
+        }
+    };
+    Ok(PaneUpgrade {
+        asked_holder_pid,
+        outcome,
+    })
 }
 
 fn send(conn: &mut Conn, req: &Request, deadline: Instant) -> io::Result<()> {
@@ -420,7 +556,7 @@ impl Client {
         from_offset: Option<u64>,
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
-        self.attach_with(from_offset, false, deadline)
+        self.attach_with(from_offset, false, None, deadline)
     }
 
     /// [`Client::attach`] for a consumer with NO mode state of its own — a
@@ -437,13 +573,32 @@ impl Client {
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
         let restore = self.ack.version >= RESTORE_VERSION;
-        self.attach_with(from_offset, restore, deadline)
+        self.attach_with(from_offset, restore, None, deadline)
+    }
+
+    /// A RESUME at `from_offset` of a stream this consumer counted on
+    /// `stream_epoch` (the `attached.stream_epoch` of the connection whose
+    /// frames it last read) — [`Client::attach`], or
+    /// [`Client::attach_restoring`] with `restoring`, plus that identity
+    /// (plan Phase 8, H1): a holder that took its pane back after a declared
+    /// loss then knows whether `from_offset` is on its own stream, and resumes
+    /// its own consumer without a loss report.
+    pub fn attach_continuing(
+        self,
+        from_offset: u64,
+        stream_epoch: u64,
+        restoring: bool,
+        deadline: Instant,
+    ) -> Result<AttachedStream, ConnectError> {
+        let restore = restoring && self.ack.version >= RESTORE_VERSION;
+        self.attach_with(Some(from_offset), restore, Some(stream_epoch), deadline)
     }
 
     fn attach_with(
         mut self,
         from_offset: Option<u64>,
         restore: bool,
+        stream_epoch: Option<u64>,
         deadline: Instant,
     ) -> Result<AttachedStream, ConnectError> {
         self.check()?;
@@ -457,6 +612,7 @@ impl Client {
         let request = Request::Attach {
             from_offset,
             restore,
+            stream_epoch,
         };
         let info = match self.request(&request, deadline)? {
             Reply::Attached(a) => a,
@@ -493,6 +649,9 @@ pub enum UpgradeOutcome {
     },
     /// Rolled back: the old holder keeps serving; nothing was lost.
     Failed(String),
+    /// The holder REJECTED the request (`rejected`) and did nothing: no
+    /// successor was started, nothing was rolled back ([`upgrade_pane`]).
+    Rejected(String),
     /// This holder cannot be upgraded in place — a Windows holder (plan D12:
     /// leave it running, or end and resume it) or one built before Phase 8.
     Unsupported(String),
@@ -721,12 +880,71 @@ impl InputStream {
         Ok(())
     }
 
+    /// [`InputStream::input`], saying on failure whether the frame provably
+    /// did NOT reach the holder — what a caller needs to resend it without
+    /// ever duplicating it ([`InputFailure::not_delivered`]).
+    pub fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), InputFailure> {
+        let frame = encode_frame(KIND_DATA, bytes).map_err(|e| InputFailure {
+            error: ConnectError::Io(e),
+            // Nothing was written.
+            not_delivered: true,
+        })?;
+        let mut io = DeadlineIo::new(&mut self.conn, deadline);
+        if let Err(e) = io.write_all(&frame) {
+            return Err(InputFailure {
+                error: ConnectError::Io(e),
+                not_delivered: frame_cut_means_not_delivered(),
+            });
+        }
+        io.flush().map_err(|e| InputFailure {
+            error: ConnectError::Io(e),
+            // Every byte of the frame was already written: the holder may
+            // have it. UNKNOWN, so never resent.
+            not_delivered: false,
+        })
+    }
+
     /// See [`StreamWriter::shutdown_handle`].
     pub fn shutdown_handle(&self) -> io::Result<ShutdownHandle> {
         Ok(ShutdownHandle {
             conn: self.conn.try_clone()?,
         })
     }
+}
+
+/// Why [`InputStream::send`] failed.
+#[derive(Debug)]
+pub struct InputFailure {
+    pub error: ConnectError,
+    /// The frame provably did not reach the holder, so resending it on a NEW
+    /// input connection cannot duplicate it.
+    ///
+    /// The proof (Unix): the write failed before the frame's last byte was
+    /// handed to the kernel, so the holder can hold at most a TRUNCATED frame
+    /// on this connection — and a holder discards a truncated frame whole
+    /// (its dispatch drops the connection on a short read; a holder upgrade's
+    /// drain reads what the socket carries and then EOF, plan Phase 8
+    /// `handoff.rs`). A write that DID complete is never marked here, even
+    /// when what follows it fails: its bytes may be in the holder's queue.
+    ///
+    /// Windows: always `false`. A named-pipe write's completion is not that
+    /// proof, and no Windows holder is ever upgraded (plan D12), which is the
+    /// case a resend exists for.
+    pub not_delivered: bool,
+}
+
+impl std::fmt::Display for InputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.not_delivered {
+            write!(f, "{} (the frame did not reach the holder)", self.error)
+        } else {
+            write!(f, "{} (the holder may have the frame)", self.error)
+        }
+    }
+}
+
+const fn frame_cut_means_not_delivered() -> bool {
+    cfg!(unix)
 }
 
 /// Open a connection WITHOUT the handshake, for tests that must speak first

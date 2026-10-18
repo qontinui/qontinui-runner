@@ -136,6 +136,58 @@ pub struct PaneState {
     /// The reader is parked at the gate: no read is in flight, and none will
     /// start until the gate is [`ReadGate::Run`] again.
     pub read_parked: bool,
+    /// X, once this holder took its pane back from a successor that died
+    /// AFTER `serving` (a declared-loss take-back, plan Phase 8 / coord
+    /// finding f4672ed2): that successor may have streamed output past X that
+    /// this holder never produced, so a client's offset past X may belong to
+    /// the dead successor's stream. Every attach asking for an offset past X
+    /// gets an explicit `output_lost` from X instead of a replay of this
+    /// holder's own, differently-numbered bytes (`server::attach_start`).
+    pub stream_replaced_at: Option<u64>,
+    /// This holder's STREAM EPOCH (H1): a random token minted when this
+    /// process started serving the pane — at spawn, or at adoption by a
+    /// successor. Reported in `attached`; a consumer echoes it on a reattach.
+    pub stream_epoch: u64,
+    /// Every epoch whose offsets are offsets of THIS holder's stream: its own,
+    /// plus those of every predecessor it took over LOSSLESSLY (carried in the
+    /// upgrade snapshot). A declared-loss take-back adds nothing — the dead
+    /// successor's epoch is precisely the one whose offsets are not ours.
+    /// Bounded to [`MAX_LINEAGE_EPOCHS`], oldest dropped (a dropped epoch only
+    /// over-reports a loss).
+    pub lineage_epochs: Vec<u64>,
+}
+
+/// Most epochs a holder remembers in [`PaneState::lineage_epochs`].
+pub const MAX_LINEAGE_EPOCHS: usize = 64;
+
+/// A fresh random, nonzero stream epoch (std's per-instance random hash keys;
+/// no dependency, and not a secret — it only has to differ between holders).
+pub fn mint_stream_epoch() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    loop {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let e = h.finish();
+        if e != 0 {
+            return e;
+        }
+    }
+}
+
+/// `inherited` plus a fresh epoch for this holder, bounded.
+#[cfg(unix)]
+pub fn lineage_with_new_epoch(mut inherited: Vec<u64>) -> (u64, Vec<u64>) {
+    let epoch = mint_stream_epoch();
+    inherited.push(epoch);
+    let excess = inherited.len().saturating_sub(MAX_LINEAGE_EPOCHS);
+    inherited.drain(..excess);
+    (epoch, inherited)
 }
 
 /// The PTY master a pane drives.
@@ -420,6 +472,12 @@ pub struct AdoptedParts {
     /// The size the predecessor recorded; the master's own is preferred.
     pub size: (u16, u16),
     pub exit_linger: Duration,
+    /// The predecessor's [`PaneState::stream_replaced_at`]: a dead
+    /// successor's offsets are no more this holder's than its predecessor's.
+    pub stream_replaced_at: Option<u64>,
+    /// The predecessor's [`PaneState::lineage_epochs`]: this handoff is
+    /// lossless, so its consumers' offsets are this holder's too.
+    pub lineage_epochs: Vec<u64>,
 }
 
 impl Pane {
@@ -479,6 +537,7 @@ impl Pane {
         // that died within microseconds of spawn records no token, so its
         // descendants are left alone by a later reap rather than signalled.
         let child_start = crate::proc_identity::start_token(child_pid);
+        let spawn_epoch = mint_stream_epoch();
 
         let pane = Arc::new(Pane {
             child_pid,
@@ -494,6 +553,9 @@ impl Pane {
                 size: (spec.cols, spec.rows),
                 read_gate: ReadGate::Run,
                 read_parked: false,
+                stream_replaced_at: None,
+                stream_epoch: spawn_epoch,
+                lineage_epochs: vec![spawn_epoch],
                 observed_exit: None,
             }),
             changed: Condvar::new(),
@@ -575,6 +637,7 @@ impl Pane {
     /// the child is not ours, and its exit is the master's EOF.
     #[cfg(unix)]
     pub fn adopt(parts: AdoptedParts) -> io::Result<Arc<Pane>> {
+        let (adopted_epoch, adopted_lineage) = lineage_with_new_epoch(parts.lineage_epochs.clone());
         use std::os::unix::io::AsRawFd;
         let fd = parts.master.as_raw_fd();
         let reader = std::fs::File::from(dup_cloexec(fd, 0)?);
@@ -595,6 +658,9 @@ impl Pane {
                 size,
                 read_gate: ReadGate::Quiesce,
                 read_parked: false,
+                stream_replaced_at: parts.stream_replaced_at,
+                stream_epoch: adopted_epoch,
+                lineage_epochs: adopted_lineage,
                 observed_exit: None,
             }),
             changed: Condvar::new(),
@@ -844,6 +910,16 @@ impl Pane {
     #[cfg(unix)]
     pub fn inject_stream_notice(&self, bytes: &[u8]) {
         self.absorb_output(bytes);
+    }
+
+    /// A declared-loss take-back at stream offset `x` (see
+    /// [`PaneState::stream_replaced_at`]). Kept at the EARLIEST such offset:
+    /// a client's offset past any of them may come from a dead successor, and
+    /// over-reporting a loss is the honest direction.
+    #[cfg(unix)]
+    pub fn record_stream_replaced_at(&self, x: u64) {
+        let mut st = self.lock_state();
+        st.stream_replaced_at = Some(st.stream_replaced_at.map_or(x, |was| was.min(x)));
     }
 
     /// An adopted pane: the child's exit code its predecessor observed.

@@ -25,8 +25,8 @@ mod unix {
     };
     use qontinui_pty_holder::frame::KIND_CONTROL;
     use qontinui_pty_holder::handoff::{
-        upgrade_loss_notice, ACK_TIMEOUT_ENV, ADOPT_FAULT_ENV, COMMIT_DELAY_ENV,
-        SERVING_POLL_DELAY_ENV,
+        upgrade_loss_notice, ACK_TIMEOUT_ENV, ADOPT_FAULT_ENV, ADOPT_FAULT_ONCE_ENV,
+        COMMIT_DELAY_ENV, SERVING_POLL_DELAY_ENV,
     };
     use qontinui_pty_holder::lock::read_record;
     use qontinui_pty_holder::pane::{lock_path, snapshot_path, snapshot_tmp_path, PaneId};
@@ -125,6 +125,7 @@ mod unix {
     fn is_seam(k: &std::ffi::OsStr) -> bool {
         [
             ADOPT_FAULT_ENV,
+            ADOPT_FAULT_ONCE_ENV,
             ACK_TIMEOUT_ENV,
             COMMIT_DELAY_ENV,
             SERVING_POLL_DELAY_ENV,
@@ -183,6 +184,7 @@ mod unix {
             None => cmd.env_remove(ADOPT_FAULT_ENV),
         };
         cmd.env_remove(ACK_TIMEOUT_ENV)
+            .env_remove(ADOPT_FAULT_ONCE_ENV)
             .env_remove(COMMIT_DELAY_ENV)
             .env_remove(SERVING_POLL_DELAY_ENV);
         for (k, v) in seams {
@@ -1097,6 +1099,273 @@ mod unix {
         let _ = std::fs::remove_dir_all(&out);
         no_snapshot_left(&dir);
         assert!(!dir.join("p1.sock.upg").exists());
+    }
+
+    /// The first event on a fresh attach, skipping nothing: it must be the
+    /// loss report when one is owed.
+    fn first_event(s: &mut AttachedStream) -> Event {
+        s.reader
+            .next_event(Some(soon()))
+            .expect("an event")
+            .expect("the stream is open")
+    }
+
+    /// H1 (coord finding f4672ed2): after a declared-loss take-back at X, a
+    /// client whose offset is past X — one that had attached to the dead
+    /// successor and read ITS output — reattaches to the predecessor with an
+    /// EXPLICIT `output_lost` from X and is never replayed the predecessor's
+    /// own bytes at its misaligned offset. An attach at X itself still
+    /// replays from X (the notice first), with no loss.
+    #[test]
+    fn pty_holder_handoff_attach_past_a_declared_loss_is_told_the_loss() {
+        let mut pane = start_with(
+            "h1",
+            echo_spec(0),
+            Some("exit-after-serving"),
+            &[(COMMIT_DELAY_ENV, "1500"), (SERVING_POLL_DELAY_ENV, "2500")],
+        );
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        let mut live = attach(&dir, None);
+        let from = live.info.start_offset;
+        let r = read_until(&mut live, from, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"before-swap") > 0
+        });
+        let req_dir = dir.clone();
+        let request = std::thread::spawn(move || {
+            connect(&req_dir, &p1(), soon())
+                .unwrap()
+                .prepare_upgrade(upgrade_deadline())
+        });
+        let successor = logged_pid(&dir, "adopt: acked");
+        pane.adopt_cleanup(successor);
+        // Held across the swap: the successor writes it and reads its echo,
+        // so its stream really does run past X before it dies.
+        send_input(&dir, b"held\n");
+        let outcome = request.join().unwrap().expect("prepare_upgrade answered");
+        let UpgradeOutcome::Failed(why) = &outcome else {
+            panic!("expected a declared-loss take-back, got {outcome:?}");
+        };
+        let x: u64 = why
+            .split("output since offset ")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no take-back offset in {why:?}"));
+        served_by(&dir, pane.holder_pid);
+        // The live connection (never on the successor) reads the notice AT X.
+        let marker: &[u8] = b"holder upgrade: the successor holder died after taking over";
+        let r2 = read_until(&mut live, r.next, Duration::from_secs(10), |r| {
+            count(&r.bytes, marker) > 0
+        });
+        assert!(
+            !r2.lost,
+            "the connection that stayed on this holder lost nothing"
+        );
+        assert_eq!(
+            r2.bytes.first(),
+            Some(&0x18),
+            "the stream after X starts with the notice (r.next {} == X {x})",
+            r.next
+        );
+        assert_eq!(r.next, x, "the live connection had read exactly to X");
+
+        // 1. An offset past X but inside this holder's stream: lost from X to
+        //    the end, and nothing at an offset below it is ever replayed.
+        let mut h1 = attach(&dir, Some(x + 1));
+        assert_eq!(h1.info.start_offset, x, "start_offset names the break");
+        let end = h1.info.end_offset;
+        assert!(end > x + 1, "the notice is in the ring: end {end}, X {x}");
+        match first_event(&mut h1) {
+            Event::Lost {
+                from_offset,
+                to_offset,
+            } => assert_eq!((from_offset, to_offset), (x, end)),
+            other => panic!("expected output_lost first, got {other:?}"),
+        }
+        send_input(&dir, b"after\n");
+        let r3 = read_until(&mut h1, end, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:after") > 0
+        });
+        assert!(
+            !r3.lost,
+            "one loss report, then contiguous output from {end}"
+        );
+        assert_eq!(count(&r3.bytes, marker), 0, "nothing before `end` replayed");
+
+        // 2. An offset past this holder's END (the dead successor ran ahead):
+        //    lost from X to that offset; output resumes exactly there.
+        let h2 = attach(&dir, None);
+        let tail_end = h2.info.end_offset;
+        drop(h2);
+        let ahead = tail_end + 40;
+        let mut h3 = attach(&dir, Some(ahead));
+        assert_eq!(h3.info.start_offset, x);
+        match first_event(&mut h3) {
+            Event::Lost {
+                from_offset,
+                to_offset,
+            } => assert_eq!((from_offset, to_offset), (x, ahead)),
+            other => panic!("expected output_lost first, got {other:?}"),
+        }
+        let long = format!("{}\n", "z".repeat(200));
+        send_input(&dir, long.as_bytes());
+        let r4 = read_until(&mut h3, ahead, Duration::from_secs(10), |r| {
+            r.bytes.len() > 10
+        });
+        assert!(!r4.lost);
+        assert!(r4.next > ahead, "output resumed at the client's offset");
+
+        // 2b. The SAME offset from a consumer whose epoch is in THIS
+        //     holder's lineage (its own: what `live` was attached under) is
+        //     its own: a normal resume, no loss report.
+        let epoch_p = live
+            .info
+            .stream_epoch
+            .expect("the holder reports its epoch");
+        let mut own = connect(&dir, &p1(), soon())
+            .expect("handshake")
+            .attach_continuing(x + 1, epoch_p, false, soon())
+            .expect("attach");
+        assert_eq!(own.info.start_offset, x + 1);
+        assert_eq!(
+            own.info.stream_epoch,
+            Some(epoch_p),
+            "a take-back keeps its epoch"
+        );
+        match first_event(&mut own) {
+            Event::Output { offset, .. } => assert_eq!(offset, x + 1),
+            other => panic!("expected output at X+1, got {other:?}"),
+        }
+        // Any OTHER epoch (the dead successor's, or a stale one) is not.
+        let mut other = connect(&dir, &p1(), soon())
+            .expect("handshake")
+            .attach_continuing(x + 1, epoch_p ^ 1, false, soon())
+            .expect("attach");
+        assert_eq!(other.info.start_offset, x);
+        assert!(
+            matches!(first_event(&mut other), Event::Lost { from_offset, .. } if from_offset == x)
+        );
+
+        // 3. An attach AT X is a normal resume: no loss, the notice first.
+        let mut at_x = attach(&dir, Some(x));
+        assert_eq!(at_x.info.start_offset, x);
+        let r5 = read_until(&mut at_x, x, Duration::from_secs(10), |r| {
+            count(&r.bytes, marker) > 0
+        });
+        assert!(!r5.lost, "an offset at X is this holder's own");
+        assert_eq!(r5.bytes.first(), Some(&0x18));
+        no_snapshot_left(&dir);
+    }
+
+    /// H1, epoch lineage (review p8f r1, HIGH): after a declared-loss
+    /// take-back, a SUCCESSFUL second upgrade must not cost the consumer that
+    /// stayed on the predecessor anything. Its offset (past X) was counted on
+    /// the predecessor's epoch, which the new successor inherits in its
+    /// lineage: the reattach resumes exactly where it was — no loss report —
+    /// while a stale epoch at the same offset is still told the loss.
+    #[test]
+    fn pty_holder_handoff_take_back_then_a_successful_upgrade_loses_nothing() {
+        let token_dir = pane_dir("once");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        let token = token_dir.join("fault-once");
+        std::fs::write(&token, b"").unwrap();
+        let token_s = token.to_str().unwrap().to_string();
+        let mut pane = start_with(
+            "lin",
+            echo_spec(0),
+            Some("exit-after-serving"),
+            &[
+                (COMMIT_DELAY_ENV, "1500"),
+                (SERVING_POLL_DELAY_ENV, "2500"),
+                (ADOPT_FAULT_ONCE_ENV, token_s.as_str()),
+            ],
+        );
+        let dir = pane.dir.clone();
+        served_by(&dir, pane.holder_pid);
+        let mut live = attach(&dir, None);
+        let epoch_p = live.info.stream_epoch.expect("epoch");
+        let from = live.info.start_offset;
+        let r = read_until(&mut live, from, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"before-swap") > 0
+        });
+        // 1. The first upgrade dies after serving: declared-loss take-back.
+        let req_dir = dir.clone();
+        let request = std::thread::spawn(move || {
+            connect(&req_dir, &p1(), soon())
+                .unwrap()
+                .prepare_upgrade(upgrade_deadline())
+        });
+        let dead = logged_pid(&dir, "adopt: acked");
+        pane.adopt_cleanup(dead);
+        let outcome = request.join().unwrap().expect("answered");
+        let UpgradeOutcome::Failed(why) = &outcome else {
+            panic!("expected a declared-loss take-back, got {outcome:?}");
+        };
+        assert!(why.contains("AFTER reporting `serving`"), "{why}");
+        assert!(!token.exists(), "the faulted successor consumed the token");
+        let x: u64 = why
+            .split("output since offset ")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        // The consumer that stayed on P reads on past X.
+        send_input(&dir, b"one\n");
+        let r2 = read_until(&mut live, r.next, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:one") > 0
+        });
+        assert!(!r2.lost);
+        let y = r2.next;
+        assert!(y > x);
+        // 2. A second upgrade, now unfaulted, succeeds.
+        let outcome = connect(&dir, &p1(), soon())
+            .unwrap()
+            .prepare_upgrade(upgrade_deadline())
+            .expect("answered");
+        let UpgradeOutcome::Upgraded { successor_pid, .. } = outcome else {
+            panic!("expected upgraded, got {outcome:?}");
+        };
+        pane.adopt_cleanup(successor_pid);
+        served_by(&dir, successor_pid);
+        drop(live);
+        // 3. The consumer reattaches at y with P's epoch: its own stream.
+        let mut back = connect(&dir, &p1(), soon())
+            .expect("handshake")
+            .attach_continuing(y, epoch_p, false, soon())
+            .expect("attach");
+        assert_eq!(back.info.start_offset, y, "resumed exactly where it was");
+        let epoch_s2 = back.info.stream_epoch.expect("epoch");
+        assert_ne!(epoch_s2, epoch_p, "a successor mints its own epoch");
+        send_input(&dir, b"two\n");
+        let r3 = read_until(&mut back, y, Duration::from_secs(10), |r| {
+            count(&r.bytes, b"got:two") > 0
+        });
+        assert!(!r3.lost, "no loss after a lossless upgrade");
+        assert_eq!(
+            count(&r3.bytes, b"successor holder died"),
+            0,
+            "no notice replayed"
+        );
+        // 4. A stale epoch at the same offset (the dead successor's, or any
+        //    other) is still told the loss from X.
+        let mut stale = connect(&dir, &p1(), soon())
+            .expect("handshake")
+            .attach_continuing(y, epoch_p ^ 1, false, soon())
+            .expect("attach");
+        assert_eq!(stale.info.start_offset, x);
+        assert!(
+            matches!(first_event(&mut stale), Event::Lost { from_offset, .. } if from_offset == x)
+        );
+        // And the new successor's own epoch is its own.
+        let mut own = connect(&dir, &p1(), soon())
+            .expect("handshake")
+            .attach_continuing(y, epoch_s2, false, soon())
+            .expect("attach");
+        assert_eq!(own.info.start_offset, y);
+        assert!(matches!(first_event(&mut own), Event::Output { offset, .. } if offset == y));
+        no_snapshot_left(&dir);
+        let _ = std::fs::remove_dir_all(&token_dir);
     }
 
     /// Review r3 nit (path C): the successor's endpoint rename FAILS after the
