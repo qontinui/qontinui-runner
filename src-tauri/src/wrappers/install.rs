@@ -192,14 +192,11 @@ pub async fn install(
             }
         })?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            // Package-manager output can carry registry URLs and auth hints:
-            // only its allowlisted codes reach the error (and the HTTP body).
-            return Err(format!(
-                "{} install exited with {}: {}",
-                pm_owned,
+            return Err(install_exit_error(
+                &pm_owned,
                 output.status,
-                super::manager::classify_text(&stderr)
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
             ));
         }
         Ok(())
@@ -494,6 +491,26 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The error for a package-manager install that exited non-zero.
+/// Package-manager output can carry registry URLs and auth hints, so only the
+/// allowlisted codes of it reach the error (and the HTTP body) — from stdout
+/// as well as stderr (npm prints its `code E404` block on either), the last
+/// lines of each, where the verdict is.
+fn install_exit_error(
+    pm: &str,
+    status: impl std::fmt::Display,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    format!(
+        "{} install exited with {}: stdout: {}; stderr: {}",
+        pm,
+        status,
+        super::manager::classify_text(stdout),
+        super::manager::classify_text(stderr)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +521,25 @@ mod tests {
         assert!(validate_package_spec("name`whoami`").is_err());
         assert!(validate_package_spec("@qontinui/wrapper-v0").is_ok());
         assert!(validate_package_spec("@qontinui/wrapper-v0@0.1.0").is_ok());
+    }
+
+    /// A failed install reports the codes of BOTH streams and never their
+    /// text: a registry URL with an auth token in it does not reach the error.
+    #[test]
+    fn a_failed_install_reports_codes_from_both_streams_not_text() {
+        let token = concat!("npm_", "AbCdEf0123456789AbCdEf0123456789AbCd");
+        let stdout = format!(
+            "npm error code E401\nnpm error 401 Unauthorized - GET https://r.example/x?_authToken={token}"
+        );
+        let stderr = format!(" ERR_PNPM_FETCH_401  GET https://u:{token}@r.example/x");
+        let msg = install_exit_error("pnpm", "exit status: 1", &stdout, &stderr);
+        assert!(!msg.contains(token), "{msg}");
+        assert!(!msg.contains("r.example"), "{msg}");
+        assert!(msg.contains("E401"), "stdout is classified: {msg}");
+        assert!(
+            msg.contains("ERR_PNPM_FETCH_401"),
+            "stderr is classified: {msg}"
+        );
     }
 
     #[test]

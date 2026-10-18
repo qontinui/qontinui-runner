@@ -237,7 +237,6 @@ impl WrapperRegistry {
         self.inner.read().await.wrappers.values().cloned().collect()
     }
 
-    /// Look up a wrapper by id.
     /// Register a wrapper without a manifest scan (tests only).
     #[cfg(test)]
     pub(crate) async fn insert_for_test(&self, wrapper: Wrapper) {
@@ -248,6 +247,7 @@ impl WrapperRegistry {
             .insert(wrapper.id.clone(), wrapper);
     }
 
+    /// Look up a wrapper by id.
     pub async fn get(&self, id: &str) -> Option<Wrapper> {
         self.inner.read().await.wrappers.get(id).cloned()
     }
@@ -527,11 +527,7 @@ pub async fn scan_one(wrapper_dir: &Path) -> Result<Wrapper, RegistryError> {
     });
 
     let stdout = run_manifest_only(wrapper_dir, &entry).await?;
-    let parsed: ManifestOnlyOutput = serde_json::from_str(&stdout)
-        // Never quote a wrapper's output: only its allowlisted codes.
-        .map_err(|e| {
-            RegistryError::BadJson(format!("{}: {}", e, super::manager::classify_text(&stdout)))
-        })?;
+    let parsed = parse_manifest_output(&stdout)?;
 
     if parsed.manifest_version > SUPPORTED_MANIFEST_VERSION {
         return Err(RegistryError::UnsupportedVersion {
@@ -553,6 +549,33 @@ pub async fn scan_one(wrapper_dir: &Path) -> Result<Wrapper, RegistryError> {
         installed_at: now,
         updated_at: now,
     })
+}
+
+/// Parse a `--manifest-only` probe's stdout. Never quotes the wrapper's
+/// output: serde's own message can (`invalid type: string "…"`), so only the
+/// error's category and position are reported, beside the output's
+/// allowlisted codes.
+fn parse_manifest_output(stdout: &str) -> Result<ManifestOnlyOutput, RegistryError> {
+    serde_json::from_str(stdout).map_err(|e| {
+        RegistryError::BadJson(format!(
+            "{:?} error at line {} column {}: {}",
+            e.classify(),
+            e.line(),
+            e.column(),
+            super::manager::classify_text(stdout)
+        ))
+    })
+}
+
+/// The error for a `--manifest-only` probe that exited non-zero: its status
+/// and the allowlisted codes of its stderr, never the stderr itself.
+fn manifest_exit_error(entry: &Path, status: impl std::fmt::Display, stderr: &str) -> String {
+    format!(
+        "node {:?} --manifest-only exited with {}: {}",
+        entry,
+        status,
+        super::manager::classify_text(stderr)
+    )
 }
 
 /// Read `name` and `version` from a `package.json`.
@@ -608,12 +631,7 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
         })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "node {:?} --manifest-only exited with {}: {}",
-                entry,
-                output.status,
-                super::manager::classify_text(stderr.as_ref())
-            ));
+            return Err(manifest_exit_error(&entry, output.status, stderr.as_ref()));
         }
         if output.stdout.len() > MAX_MANIFEST_STDOUT_BYTES {
             return Err(format!(
@@ -851,6 +869,38 @@ mod tests {
     /// mismatch left `packageName`/`installPath`/`installedAt`/`updatedAt`
     /// always `undefined` at runtime, so installed-wrapper package names
     /// rendered blank.
+    #[test]
+    fn manifest_parse_errors_never_quote_the_output() {
+        let secret = concat!("sk-", "live-0123456789abcdef");
+        // A DATA error: serde's Display quotes the offending value.
+        let data = format!(r#"{{"manifestVersion":"{secret}","manifest":{{}},"actions":[]}}"#);
+        // A SYNTAX error on a line that is not JSON at all.
+        let syntax = format!("token={secret}");
+        for out in [data, syntax] {
+            let msg = match parse_manifest_output(&out) {
+                Err(RegistryError::BadJson(m)) => m,
+                Err(e) => panic!("{e:?}"),
+                Ok(_) => panic!("parsed"),
+            };
+            assert!(!msg.contains(secret), "{msg}");
+            assert!(!msg.contains("live-"), "{msg}");
+            assert!(msg.contains(" error at line 1 column "), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_failed_probe_reports_codes_not_stderr() {
+        let secret = concat!("ghp_", "0123456789abcdefABCDEF");
+        let msg = manifest_exit_error(
+            Path::new("/w/dist/index-node.js"),
+            "exit status: 1",
+            &format!("Error: token {secret} rejected\n    at x (ECONNREFUSED)"),
+        );
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!msg.contains("rejected"), "{msg}");
+        assert!(msg.contains("ECONNREFUSED"), "{msg}");
+    }
+
     #[test]
     fn wrapper_wire_shape_matches_the_ts_mirror() {
         let json = serde_json::to_value(synthetic_wrapper("w", 1)).unwrap();

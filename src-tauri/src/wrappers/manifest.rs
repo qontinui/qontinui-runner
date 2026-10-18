@@ -105,38 +105,35 @@ pub struct ActionDescriptor {
     pub exclusive: bool,
 }
 
+/// The longest wrapper id accepted.
+pub const MAX_WRAPPER_ID_LEN: usize = 64;
+
 /// Validate a freshly-parsed `WrapperManifest`.
 ///
-/// Currently only enforces the `id` charset constraint. Returns the manifest
-/// unchanged on success; an error string ready to embed in an HTTP response
-/// on failure.
+/// Currently only enforces the `id` shape: 1..=`MAX_WRAPPER_ID_LEN` of
+/// `[a-z0-9-]`, starting with a letter or digit. The id is wrapper-supplied,
+/// so a rejected one is NEVER echoed into the error (which reaches an HTTP
+/// body): only its length is. Returns an error string ready to embed in an
+/// HTTP response on failure.
 pub fn validate_manifest(m: &WrapperManifest) -> Result<(), String> {
-    if m.id.is_empty() {
-        return Err("wrapper manifest: id must not be empty".to_string());
+    if id_shape_ok(&m.id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "wrapper manifest: id (len={}) must be 1..={MAX_WRAPPER_ID_LEN} of [a-z0-9-] \
+             (lowercase letters, digits, hyphens), starting with a letter or digit",
+            m.id.len()
+        ))
     }
-    if !m
-        .id
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err(format!(
-            "wrapper manifest: id '{}' must match [a-z0-9-]+ (lowercase letters, digits, hyphens)",
-            m.id
-        ));
-    }
-    if !m
-        .id
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        return Err(format!(
-            "wrapper manifest: id '{}' must start with a lowercase letter or digit",
-            m.id
-        ));
-    }
-    Ok(())
+}
+
+fn id_shape_ok(id: &str) -> bool {
+    let mut chars = id.chars();
+    id.len() <= MAX_WRAPPER_ID_LEN
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 #[cfg(test)]
@@ -176,5 +173,35 @@ mod tests {
             env_vars: vec![],
         };
         assert!(validate_manifest(&m).is_err());
+    }
+
+    /// A rejected id is wrapper-supplied text: the error names its length,
+    /// never the id itself.
+    #[test]
+    fn a_rejected_id_is_never_echoed() {
+        let mut m = WrapperManifest {
+            id: String::new(),
+            display_name: "x".to_string(),
+            description: String::new(),
+            transport: "api".to_string(),
+            categories: vec![],
+            env_vars: vec![],
+        };
+        let secret = concat!("Bearer ", "abcDEF123");
+        for id in [
+            secret.to_string(),
+            "-leading-hyphen".to_string(),
+            String::new(),
+            "a".repeat(MAX_WRAPPER_ID_LEN + 1),
+        ] {
+            m.id = id.clone();
+            let err = validate_manifest(&m).unwrap_err();
+            assert!(id.is_empty() || !err.contains(&id), "{err}");
+            assert!(err.contains(&format!("len={}", id.len())), "{err}");
+        }
+        for ok in ["gemini-web", "v0", &"a".repeat(MAX_WRAPPER_ID_LEN)] {
+            m.id = ok.to_string();
+            assert!(validate_manifest(&m).is_ok(), "{ok}");
+        }
     }
 }
