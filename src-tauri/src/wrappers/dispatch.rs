@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::manager::{SpawnError, WrapperManager};
-use super::primary_proxy::{self, into_http as proxy_error_to_http};
+use super::primary_proxy::{self, into_http_for_dispatch as proxy_error_to_http};
 use super::registry::WrapperRegistry;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -65,9 +65,10 @@ pub const NOT_INITIALIZED_CODE: &str = "wrappers_not_initialized";
 /// The typed codes of the RUNNER's "nothing reached the wrapper" 503: a
 /// failed spawn, a booting runner, or (through a secondary) a primary the
 /// request never reached (`primary_proxy::PRIMARY_UNREACHABLE_CODE`). Every
-/// 503 this runner itself answers carries one; a wrapper's own 5xx is 502
-/// (`wrapper_failure`), and a secondary passes a primary's 503 on only when
-/// it carries one of these. A caller may park on these codes — and only on
+/// 503 the DISPATCH route answers carries one (other `/wrappers/*` routes
+/// still answer untyped 503s); a wrapper's own 5xx is 502
+/// (`wrapper_failure`), and on the dispatch route a secondary passes a
+/// primary's 503 on only when it carries one of these. A caller may park on these codes — and only on
 /// them — without risking a prompt the wrapper already sent. A 503 WITHOUT
 /// one (e.g. something else answering on the port) is not that verdict.
 pub const NOTHING_STARTED_CODES: &[&str] = &[

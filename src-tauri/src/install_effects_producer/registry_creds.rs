@@ -80,9 +80,11 @@ impl From<keyring::Error> for RegistryCredentialError {
 }
 
 /// Validate a registry env-var name: the standard unix env-var charset
-/// (`A-Z`, `0-9`, `_`), non-empty. Identical rule to
-/// `wrappers::credentials::validate_name` — kept local so the two stores stay
-/// independent but the contract is the same.
+/// (`A-Z`, `0-9`, `_`), non-empty. This is the same rule as
+/// `wrappers::credentials`' LEGACY rule (`legacy_name_ok`). The wrappers store
+/// now validates storing and reading with the stricter manifest rule
+/// (`^[A-Z_][A-Z0-9_]{0,63}$`) and keeps the legacy rule for removal only.
+/// Kept local so the two stores stay independent.
 pub fn validate_name(name: &str) -> Result<(), RegistryCredentialError> {
     if name.is_empty() {
         return Err(RegistryCredentialError::InvalidName(name.to_string()));
