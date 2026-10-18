@@ -37,8 +37,10 @@ pub fn keyring_service(wrapper_id: &str) -> String {
 /// Errors raised by credential operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
-    #[error("invalid env var name '{0}'")]
-    InvalidName(String),
+    /// Carries only the rejected name's LENGTH: a manifest's name is
+    /// wrapper-supplied, and this error's Display reaches logs and HTTP bodies.
+    #[error("invalid env var name (len={0})")]
+    InvalidName(usize),
     #[error("keyring error: {0}")]
     Keyring(String),
 }
@@ -55,16 +57,11 @@ impl From<keyring::Error> for CredentialError {
 /// (`A-Z`, `0-9`, `_`) and forbids the empty string. Helps surface
 /// frontend bugs before they corrupt the keyring with weird keys.
 fn validate_name(name: &str) -> Result<(), CredentialError> {
-    if name.is_empty() {
-        return Err(CredentialError::InvalidName(name.to_string()));
+    if super::manifest::env_var_name_ok(name) {
+        Ok(())
+    } else {
+        Err(CredentialError::InvalidName(name.len()))
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-    {
-        return Err(CredentialError::InvalidName(name.to_string()));
-    }
-    Ok(())
 }
 
 /// Per-wrapper credential namespace.
@@ -142,6 +139,17 @@ impl CredentialStore {
     /// keyring backend limitation, called out in the install docs.
     pub fn clear_for_wrapper(wrapper_id: &str, env_var_names: &[String]) {
         for name in env_var_names {
+            // A name outside the valid shape (a persisted index can predate
+            // scan-time validation) can hold no stored value — `set` refuses
+            // it — so it is skipped, and never logged.
+            if !super::manifest::env_var_name_ok(name) {
+                warn!(
+                    "wrappers.credentials: skipped an invalid env var name ({}) for wrapper '{}'",
+                    super::manifest::label_if(name, false),
+                    wrapper_id
+                );
+                continue;
+            }
             if let Err(e) = Self::delete(wrapper_id, name) {
                 warn!(
                     "wrappers.credentials: delete '{}' for wrapper '{}' failed: {}",
@@ -167,5 +175,24 @@ mod tests {
         assert!(validate_name("lowercase").is_err());
         assert!(validate_name("HAS-DASH").is_err());
         assert!(validate_name("V0_TOKEN").is_ok());
+        // The error carries the length, never the name.
+        let secret = concat!("sk-", "live-0123456789");
+        let msg = validate_name(secret).unwrap_err().to_string();
+        assert!(
+            !msg.contains(secret) && msg.contains(&format!("len={}", secret.len())),
+            "{msg}"
+        );
+    }
+
+    /// Uninstall over a persisted index whose env var name is invalid: the
+    /// name is skipped (no keyring call) and never logged.
+    #[test]
+    fn uninstall_never_logs_an_invalid_env_var_name() {
+        let secret = concat!("sk-", "live-0123456789");
+        let logs = super::super::capture_logs(|| {
+            CredentialStore::clear_for_wrapper("w", &[secret.to_string()]);
+        });
+        assert!(!logs.contains(secret), "{logs}");
+        assert!(logs.contains("skipped an invalid env var name"), "{logs}");
     }
 }

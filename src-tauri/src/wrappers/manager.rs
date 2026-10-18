@@ -995,11 +995,6 @@ impl WrapperManager {
     }
 }
 
-/// Build the env vars to inject into the subprocess. Pulls every declared
-/// `envVars[].name` from the credential store; missing-but-required vars
-/// are *not* surfaced as a hard error here — that's the wrapper's call
-/// (it can refuse to start, run a self-test, etc.). We log a warning for
-/// visibility.
 /// The error for a transport this runner does not spawn. The transport is
 /// wrapper-supplied: named only when it is a known kind (scan time refuses
 /// any other, but a persisted index can predate that check), else its length.
@@ -1015,12 +1010,25 @@ fn spawn_refusal(wrapper_id: &str, transport: &str) -> String {
     )
 }
 
+/// Build the env vars to inject into the subprocess. Pulls every declared
+/// `envVars[].name` from the credential store; missing-but-required vars
+/// are *not* surfaced as a hard error here — that's the wrapper's call
+/// (it can refuse to start, run a self-test, etc.). We log a warning for
+/// visibility. A name outside the valid shape (a persisted index can predate
+/// scan-time validation) is skipped without a keyring call and never logged.
 fn build_env(wrapper_id: &str, manifest: &WrapperManifest) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(manifest.env_vars.len());
     for spec in &manifest.env_vars {
-        // Wrapper-supplied: logged only in the validated shape.
-        let name =
-            super::manifest::label_if(&spec.name, super::manifest::env_var_name_ok(&spec.name));
+        if !super::manifest::env_var_name_ok(&spec.name) {
+            warn!(
+                "wrappers: skipped an invalid env var name ({}) for wrapper '{}'",
+                super::manifest::label_if(&spec.name, false),
+                wrapper_id
+            );
+            continue;
+        }
+        // Validated above: safe to log.
+        let name = &spec.name;
         match CredentialStore::get(wrapper_id, &spec.name) {
             Ok(Some(value)) => out.push((spec.name.clone(), value)),
             Ok(None) if spec.required => {
@@ -1468,6 +1476,24 @@ mod tests {
             "{}",
             logged[MAX_DIAG_LINES]
         );
+    }
+
+    /// Spawning over a persisted index whose env var name is invalid: the
+    /// name is skipped (no keyring call, so no keyring error quoting it) and
+    /// never logged.
+    #[test]
+    fn spawn_never_logs_an_invalid_env_var_name() {
+        let secret = concat!("sk-", "live-0123456789");
+        let manifest: WrapperManifest = serde_json::from_value(serde_json::json!({
+            "id": "w", "displayName": "w", "transport": "api",
+            "envVars": [{ "name": secret, "required": true }]
+        }))
+        .unwrap();
+        let mut env = Vec::new();
+        let logs = super::super::capture_logs(|| env = build_env("w", &manifest));
+        assert!(env.is_empty());
+        assert!(!logs.contains(secret), "{logs}");
+        assert!(logs.contains("skipped an invalid env var name"), "{logs}");
     }
 
     /// A transport outside the known kinds is reported by length, never

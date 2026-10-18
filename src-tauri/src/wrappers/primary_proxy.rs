@@ -43,9 +43,12 @@ struct ApiResponse<T> {
     pub code: Option<String>,
 }
 
-/// Shared HTTP client for all proxy requests (reuses connections).
+/// Shared HTTP client for all proxy requests (reuses connections). Every
+/// proxy client is loopback-only (`no_proxy`): a configured HTTP_PROXY must
+/// never carry a call to the primary on 127.0.0.1.
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(4)
         .build()
@@ -285,6 +288,7 @@ async fn delete_json<R: for<'de> Deserialize<'de>>(url: &str) -> Result<R, Proxy
 pub async fn install_wrapper(req: &InstallRequest) -> Result<InstallResponse, ProxyError> {
     let url = format!("{}/wrappers/install", base_url());
     let long_client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| ProxyError::Unreachable(format!("Failed to create HTTP client: {}", e)))?;
@@ -313,6 +317,7 @@ pub async fn update_wrapper(
     let url = format!("{}/wrappers/{}/update", base_url(), id);
     let body = UpdateBody { version };
     let long_client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| ProxyError::Unreachable(format!("Failed to create HTTP client: {}", e)))?;
@@ -445,6 +450,7 @@ pub async fn dispatch(
         .saturating_add(super::manager::PRE_DISPATCH_CEILING)
         .saturating_add(Duration::from_secs(30));
     let dispatch_client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(net_timeout)
         .pool_max_idle_per_host(4)
         .build()
@@ -480,8 +486,10 @@ pub async fn dispatch(
 ///   the secondary's caller sees the same status the primary returned.
 ///   A primary-side `400 BAD_REQUEST` for a malformed `InstallRequest`
 ///   stays a 400 instead of becoming a confusing 502.
-/// - Upstream HTTP 5xx → 502 BAD_GATEWAY (the secondary failed to get
-///   a useful response from the primary).
+/// - Upstream HTTP 503 carrying a typed "nothing started" code → passed
+///   through with its code.
+/// - Any other upstream 5xx, an untyped 503 included → 502 BAD_GATEWAY (the
+///   secondary failed to get a useful response from the primary).
 pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
     match e {
         ProxyError::NotFound(msg) => (StatusCode::NOT_FOUND, AxumJson(api_error(msg))),
@@ -512,11 +520,18 @@ pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
             code,
         } => {
             // 4xx upstream is the caller's fault — pass it through so the
-            // status describes the underlying problem. A 503 is passed
-            // through too: it is the primary's own "this wrapper could not
-            // be started" verdict, which a caller parks on, not a gateway
-            // failure. Reserve 502 for the other 5xx.
-            let mapped = if s.is_client_error() || s == StatusCode::SERVICE_UNAVAILABLE {
+            // status describes the underlying problem. A 503 passes through
+            // ONLY when it carries one of the primary's typed "nothing
+            // started" codes (`dispatch::NOTHING_STARTED_CODES`), which a
+            // caller parks on. An untyped 503 (an older primary, or anything
+            // else answering on that port) is not known to mean "nothing
+            // started", so like every other 5xx it becomes 502.
+            let typed_nothing_started = code
+                .as_deref()
+                .is_some_and(|c| super::dispatch::NOTHING_STARTED_CODES.contains(&c));
+            let mapped = if s.is_client_error()
+                || (s == StatusCode::SERVICE_UNAVAILABLE && typed_nothing_started)
+            {
                 s
             } else {
                 StatusCode::BAD_GATEWAY
@@ -534,18 +549,30 @@ pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
 mod tests {
     use super::*;
 
-    /// Through a secondary runner the primary's verdicts survive: a 503
-    /// (spawn failed: park) stays a 503, a typed 429 busy stays a 429 with
-    /// its code, and only another 5xx becomes 502.
+    /// Through a secondary runner the primary's typed verdicts survive: a
+    /// 503 with a "nothing started" code stays a 503 with it, a typed 429
+    /// busy stays a 429 with its code. An UNTYPED 503 is not known to mean
+    /// "nothing started" and becomes 502, like every other 5xx.
     #[test]
-    fn the_primarys_503_and_typed_429_pass_through() {
-        let (s, body) = into_http(ProxyError::from_status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "failed to spawn".into(),
-            None,
-        ));
-        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body.0.code.is_none());
+    fn the_primarys_typed_503_and_429_pass_through() {
+        for code in super::super::dispatch::NOTHING_STARTED_CODES {
+            let (s, body) = into_http(ProxyError::from_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "x".into(),
+                Some(code.to_string()),
+            ));
+            assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{code}");
+            assert_eq!(body.0.code.as_deref(), Some(*code));
+        }
+        for code in [None, Some("wrapper_busy".to_string())] {
+            let (s, body) = into_http(ProxyError::from_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "failed to spawn".into(),
+                code.clone(),
+            ));
+            assert_eq!(s, StatusCode::BAD_GATEWAY, "{code:?}");
+            assert_eq!(body.0.code, code);
+        }
         let (s, body) = into_http(ProxyError::from_status(
             StatusCode::TOO_MANY_REQUESTS,
             "busy".into(),
@@ -571,7 +598,10 @@ mod tests {
             let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             l.local_addr().unwrap().port()
         };
-        let e = reqwest::Client::new()
+        let e = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post(format!("http://127.0.0.1:{port}/x"))
             .send()
             .await
@@ -591,6 +621,7 @@ mod tests {
             drop(sock);
         });
         let e = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_millis(300))
             .build()
             .unwrap()
