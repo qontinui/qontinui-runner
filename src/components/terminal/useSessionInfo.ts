@@ -783,9 +783,10 @@ function boundSuffix(d: TenantDisplay): string {
 
 /** How a `registered` coord row's tenant became known, in words. Pure. */
 export function coordRowSourceText(source: string | null): string {
-  return source === "resume_probe"
-    ? "as coord answered this runner's resume probe"
-    : "as registered by this runner";
+  if (source === "resume_probe") return "as coord answered this runner's resume probe";
+  if (source === "registrar") return "as registered by this runner";
+  // An unrecognised or absent source is shown as such, never given a provenance.
+  return `source ${source ?? "unstated"}`;
 }
 
 /** The Tenant row's hover text: the full acting id, the full bound set, every

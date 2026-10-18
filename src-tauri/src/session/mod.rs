@@ -1278,16 +1278,21 @@ impl SessionRegistry {
 
         match probe {
             ResumeProbe::Found(row_tenant) => {
-                if let Some(row) = row_tenant {
-                    if intent.tenant_id != Some(row) {
-                        tracing::warn!(
-                            session = %persisted_id,
-                            row_tenant = %row,
-                            stamp = ?intent.tenant_id,
-                            "session: resumed coord row was created under a different tenant than \
-                             today's stamp — writes keep the stamp; session info shows the row's"
-                        );
-                    }
+                match (row_tenant, intent.tenant_id) {
+                    (Some(row), Some(stamp)) if stamp != row => tracing::warn!(
+                        session = %persisted_id,
+                        row_tenant = %row,
+                        stamp = %stamp,
+                        "session: resumed coord row was created under a different tenant than \
+                         today's stamp — writes keep the stamp; session info shows the row's"
+                    ),
+                    (Some(row), None) => tracing::warn!(
+                        session = %persisted_id,
+                        row_tenant = %row,
+                        "session: resumed coord row names its tenant but today's stamp is \
+                         unresolved — session info shows the row's"
+                    ),
+                    _ => {}
                 }
                 let observed = row_tenant.map_or(RowTenant::Unobserved, RowTenant::Observed);
                 self.insert_resumed_record(persisted_id, intent, observed);
