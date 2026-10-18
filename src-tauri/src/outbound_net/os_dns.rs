@@ -126,7 +126,9 @@ async fn resolve_host_with(
         .map_err(|e| -> BoxError { format!("spawn dns thread for {host}: {e}").into() })?;
     let addrs = rx
         .await
-        .map_err(|_| -> BoxError { format!("dns thread for {host} ended without an answer").into() })?
+        .map_err(|_| -> BoxError {
+            format!("dns thread for {host} ended without an answer").into()
+        })?
         .map_err(|e| -> BoxError { format!("resolve {host}: {e}").into() })?;
     if addrs.is_empty() {
         return Err(format!("resolve {host}: the OS resolver returned no addresses").into());
@@ -141,8 +143,10 @@ impl Resolve for OsResolver {
             let addrs = tokio::time::timeout(LOOKUP_TIMEOUT, resolve_host(host.clone()))
                 .await
                 .map_err(|_| -> BoxError {
-                    format!("resolve {host}: no answer from the OS resolver within {LOOKUP_TIMEOUT:?}")
-                        .into()
+                    format!(
+                        "resolve {host}: no answer from the OS resolver within {LOOKUP_TIMEOUT:?}"
+                    )
+                    .into()
                 })??;
             let it: Addrs = Box::new(addrs.into_iter());
             Ok(it)
@@ -240,7 +244,10 @@ mod tests {
         let lock = include_str!("../../../Cargo.lock");
         // Line-based, so a CRLF checkout of the lockfile matches too.
         let is_reqwest = |block: &str| block.lines().any(|l| l.trim_end() == "name = \"reqwest\"");
-        let reqwest_blocks: Vec<&str> = lock.split("[[package]]").filter(|b| is_reqwest(b)).collect();
+        let reqwest_blocks: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|b| is_reqwest(b))
+            .collect();
         // Guard the guard: finding no reqwest at all would make this vacuous.
         assert!(
             !reqwest_blocks.is_empty(),
@@ -265,7 +272,9 @@ mod tests {
     /// `reqwest` accepts the resolver and drives a real request through it.
     #[tokio::test]
     async fn a_reqwest_client_resolves_through_it() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
