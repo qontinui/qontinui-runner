@@ -56,10 +56,23 @@ pub const PRE_DISPATCH_WAIT: Duration = Duration::from_secs(30);
 /// wrapper is not broken.
 pub const BUSY_CODE: &str = "wrapper_busy";
 /// The typed code a failed spawn carries (HTTP 503): the RUNNER could not
-/// start the wrapper, so nothing reached it. The only 503 a dispatch answers
-/// with — a wrapper's own 5xx becomes 502 (`wrapper_failure`) — so a caller
-/// may park on this code without risking a prompt the wrapper already sent.
+/// start the wrapper, so nothing reached it.
 pub const SPAWN_FAILED_CODE: &str = "wrapper_spawn_failed";
+/// The typed code of the 503 a dispatch gets while the runner is still
+/// booting (its wrappers subsystem is not initialized): nothing reached any
+/// wrapper.
+pub const NOT_INITIALIZED_CODE: &str = "wrappers_not_initialized";
+/// Every 503 a dispatch answers with is the RUNNER's "nothing reached the
+/// wrapper", and each carries one of these typed codes: a failed spawn, a
+/// booting runner, or (through a secondary) a primary the request never
+/// reached (`primary_proxy::PRIMARY_UNREACHABLE_CODE`). A wrapper's own 5xx
+/// is 502 (`wrapper_failure`), so a caller may park on these codes — and only
+/// on them — without risking a prompt the wrapper already sent.
+pub const NOTHING_STARTED_CODES: &[&str] = &[
+    SPAWN_FAILED_CODE,
+    NOT_INITIALIZED_CODE,
+    primary_proxy::PRIMARY_UNREACHABLE_CODE,
+];
 
 /// Take `mtx`, or `None` once `wait` has passed.
 async fn acquire_bounded(
@@ -80,8 +93,8 @@ pub(crate) enum PreDispatchRefusal {
 
 /// The error envelope for a wrapper's non-2xx answer. Its body is NEVER
 /// quoted. Only typed fields pass through, all IN THE MESSAGE: the wrapper's
-/// `code` and `status` as `wrapper_code=` / `wrapper_status=` when they are
-/// short enum-like words, `retry_after_s` when a finite number in 0..=3600,
+/// `code` and `status` as `wrapper_code=` / `wrapper_status=` when each is a
+/// value of the closed diagnostic vocabulary (`manager::DIAG_CODES`), `retry_after_s` when a finite number in 0..=3600,
 /// `typed` when a bool, and the allowlisted codes extracted from its `error`
 /// text. The envelope's own `code` is NEVER set from a wrapper's body: that
 /// field is the runner's (`wrapper_busy` means "nothing was started"), and a
@@ -92,15 +105,13 @@ pub(crate) fn wrapper_error_body(
     status: u16,
     parsed: &serde_json::Value,
 ) -> ApiResponse<()> {
+    // Only a value from the closed diagnostic vocabulary passes: a short
+    // lowercase word is not trusted to be a code just by its shape.
     let word = |key: &str| {
         parsed
             .get(key)
             .and_then(|v| v.as_str())
-            .filter(|s| {
-                !s.is_empty()
-                    && s.len() <= 32
-                    && s.chars().all(|c| c.is_ascii_lowercase() || c == '_')
-            })
+            .filter(|s| super::manager::DIAG_CODES.contains(s))
             .map(str::to_string)
     };
     let mut fields: Vec<String> = Vec::new();
@@ -153,6 +164,18 @@ pub(crate) fn refusal_response(refusal: PreDispatchRefusal) -> (StatusCode, Json
             Json(ApiResponse::error_with_code(msg, SPAWN_FAILED_CODE)),
         ),
     }
+}
+
+/// The answer while the wrappers subsystem is not initialized (the runner is
+/// booting): a 503 typed `wrappers_not_initialized` — nothing was started.
+pub(crate) fn not_initialized() -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiResponse::error_with_code(
+            "wrappers subsystem is not initialized",
+            NOT_INITIALIZED_CODE,
+        )),
+    )
 }
 
 /// The HTTP answer for a wrapper's own non-2xx. A 4xx passes through (the
@@ -342,12 +365,7 @@ pub async fn dispatch_handler(
         .map(|ws| ws.dispatch.clone())
     {
         Some(c) => c,
-        None => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(api_error("wrappers subsystem is not initialized")),
-            ));
-        }
+        None => return Err(not_initialized()),
     };
 
     dispatch_local(ctx, wrapper_id, headers, req, PRE_DISPATCH_WAIT).await
@@ -508,7 +526,85 @@ mod tests {
             &serde_json::json!({ "success": false, "code": "wrapper_busy" }),
         );
         assert_eq!(env.code, None);
-        assert!(env.error.unwrap().contains("wrapper_code=wrapper_busy"));
+        // Not even in the message: `wrapper_busy` is not a diagnostic code.
+        assert!(!env.error.unwrap().contains("wrapper_busy"));
+    }
+
+    /// `wrapper_code` / `wrapper_status` pass only from the closed
+    /// vocabulary: a short lowercase word is not a code by its shape.
+    #[test]
+    fn wrapper_code_and_status_are_closed() {
+        let env = wrapper_error_body(
+            "w",
+            500,
+            &serde_json::json!({ "code": "sidabcdef", "status": "login_wall" }),
+        );
+        let msg = env.error.unwrap();
+        assert!(
+            !msg.contains("sidabcdef") && !msg.contains("wrapper_code="),
+            "{msg}"
+        );
+        assert!(msg.contains("wrapper_status=login_wall"), "{msg}");
+    }
+
+    /// A booting runner (no wrappers subsystem yet) answers the typed 503:
+    /// nothing was started, so a caller may park on it.
+    #[test]
+    fn a_booting_runner_answers_a_typed_503() {
+        let (s, body) = not_initialized();
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.code.as_deref(), Some(NOT_INITIALIZED_CODE));
+        assert!(NOTHING_STARTED_CODES.contains(&NOT_INITIALIZED_CODE));
+        assert!(NOTHING_STARTED_CODES.contains(&SPAWN_FAILED_CODE));
+    }
+
+    /// `dispatch_local` itself — not just the helper — answers a wrapper's
+    /// own 503 as 502 with no runner code: a real wrapper HTTP server answers
+    /// 503 with a body naming the runner's code, and the dispatch must not
+    /// pass for "nothing started".
+    #[tokio::test]
+    async fn dispatch_local_answers_a_wrapper_503_as_502() {
+        use axum::routing::post;
+        let wrapper = axum::Router::new().route(
+            "/dispatch",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "code": SPAWN_FAILED_CODE, "error": "x" })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, wrapper).await });
+
+        let (ctx, _tmp) = context().await;
+        ctx.registry
+            .insert_for_test(test_wrapper("w", "a", false))
+            .await;
+        ctx.manager.insert_running_for_test("w", port).await;
+        let req = DispatchRequest {
+            action: "a".to_string(),
+            params: serde_json::json!({}),
+        };
+        let got = dispatch_local(
+            ctx,
+            "w".to_string(),
+            HeaderMap::new(),
+            req,
+            Duration::from_secs(5),
+        )
+        .await;
+        match got {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+                assert_eq!(body.0.code, None);
+            }
+            Ok(_) => panic!("a wrapper 503 is not a success"),
+        }
+        server.abort();
     }
 
     /// The 429 through an axum route and its JSON serialisation, not just the
