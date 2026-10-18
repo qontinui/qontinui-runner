@@ -1257,6 +1257,57 @@ describe("tenantRow — the acting tenant, never the spawn stamp", () => {
     expect(row.title).toContain(`Conflict — coord_row: ${PIZZERIA}`);
   });
 
+  it("renders a mismatch with NO acting tenant as a mismatch, with the reason", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          status: "mismatch",
+          tenantId: null,
+          source: null,
+          reason: "no_session_nonce",
+          conflicts: [
+            { leg: "spawn_device_default", tenantId: QONTINUI },
+            { leg: "coord_row", tenantId: PIZZERIA },
+          ],
+        }),
+      ),
+    );
+    expect(row.value).toBeNull();
+    expect(row.display).toBe(
+      "MISMATCH c231d9da (spawn_device_default) ≠ 33333333 (coord_row) — acting tenant unknown — no_session_nonce",
+    );
+    expect(row.display).not.toContain("no reason given");
+    expect(row.title).toContain("Acting tenant: unknown — no_session_nonce");
+  });
+
+  it("says the credential is unknown beside a data-plane answer", () => {
+    for (const [source, via] of [
+      ["data_plane", "via runner data plane"],
+      ["data_plane_device", "via runner data plane (device default binding)"],
+    ]) {
+      const row = tenantRow(tenancyWith(display({ source, reason: "nonce_not_live" })));
+      expect(row.display, source).toBe(
+        `c231d9da · ${via} · credential unknown — nonce_not_live · 1 of 4 bound`,
+      );
+      expect(row.title, source).toContain("Credential: unknown — nonce_not_live");
+    }
+  });
+
+  it("describes a terminal-hosted (not_applicable) coord row without a warning", () => {
+    const t = tenancyWith(display());
+    t.coordRow = {
+      status: "not_applicable",
+      tenantId: null,
+      source: null,
+      reason: "terminal_plane_row_is_the_data_plane_leg",
+    };
+    const title = tenantRow(t).title ?? "";
+    expect(title).toContain(
+      "Coord session row: terminal-hosted — its tenant is the data-plane leg above",
+    );
+    expect(title).not.toContain("Coord session row: unknown");
+  });
+
   it("shows a verdict-only mismatch's detail inline", () => {
     const row = tenantRow(
       tenancyWith(
@@ -1335,6 +1386,21 @@ describe("normalizeTenantDisplay", () => {
     expect(d?.bound.tenantIds).toEqual([]);
   });
 
+  it("keeps the display when the bound set is missing or malformed, the set alone unknown", () => {
+    for (const bound of [undefined, null, "x", 7, []]) {
+      const d = normalizeTenantDisplay({ ...display(), bound });
+      expect(d, String(bound)).not.toBeNull();
+      expect(d?.tenantId).toBe(QONTINUI);
+      expect(d?.status).toBe("resolved");
+      expect(d?.bound).toEqual({ status: "unknown", tenantIds: [], reason: "malformed" });
+      expect(d?.multiBound).toBeNull();
+      expect(d?.actingInBoundSet).toBeNull();
+    }
+    const row = tenantRow(tenancyWith(normalizeTenantDisplay({ ...display(), bound: undefined })));
+    expect(row.display).toBe("c231d9da · via credential · bound set unknown — malformed");
+    expect(row.display).not.toContain("predates");
+  });
+
   it("drops conflict entries missing a leg or a tenant", () => {
     const d = normalizeTenantDisplay({
       ...display(),
@@ -1363,6 +1429,8 @@ describe("tenancy.display Rust-fixture contract", () => {
       "regression_2026_10_17",
       "coord_row_mismatch",
       "unknown_no_nonce",
+      "mismatch_no_acting_tenant",
+      "data_plane_credential_unknown",
     ]);
     for (const c of fixture) {
       expect(byName[c.name]?.display, c.name).not.toBeNull();
@@ -1374,6 +1442,10 @@ describe("tenancy.display Rust-fixture contract", () => {
     expect(tenantRow(byName.regression_2026_10_17).display).toBe(
       "qontinui (c231d9da) · via credential · 1 of 4 bound",
     );
+    // The real terminal shape: the coord-row leg is not applicable, and the
+    // comparison still AGREES.
+    expect(byName.regression_2026_10_17?.coordRow?.status).toBe("not_applicable");
+    expect(byName.regression_2026_10_17?.divergence).toBe("agree");
     expect(spawnStampRow(byName.regression_2026_10_17).display).toBe(
       `none — device default at spawn: ${QONTINUI}`,
     );
@@ -1391,5 +1463,17 @@ describe("tenancy.display Rust-fixture contract", () => {
     expect(t?.display?.multiBound).toBeNull();
     expect(t?.coordRow?.reason).toBe("not_registered_by_this_process");
     expect(t?.divergence).toBe("unknown");
+  });
+
+  it("renders the no-acting-tenant mismatch with its conflicts and reason", () => {
+    expect(tenantRow(byName.mismatch_no_acting_tenant).display).toBe(
+      "MISMATCH c231d9da (spawn_device_default) ≠ 33333333 (coord_row) — acting tenant unknown — no_session_nonce",
+    );
+  });
+
+  it("renders a data-plane answer beside an unknown credential", () => {
+    expect(tenantRow(byName.data_plane_credential_unknown).display).toBe(
+      "c231d9da · via runner data plane · credential unknown — nonce_not_live · 1 of 4 bound",
+    );
   });
 });

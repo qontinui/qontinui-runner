@@ -89,6 +89,9 @@ function coordRowText(tenancy: SessionTenancy): string {
   const row = tenancy.coordRow;
   if (!row) return "unknown (this runner does not report the coord-row leg)";
   if (row.status === "registered") return `${row.tenantId ?? "?"} (as registered by this runner)`;
+  if (row.status === "not_applicable") {
+    return "terminal-hosted — its tenant is what the runner writes under (above)";
+  }
   return `unknown (${row.reason ?? "no reason given"})`;
 }
 
@@ -187,13 +190,21 @@ export function tenantBadgeLabel(
             : "via the runner's data plane";
     const unconfirmed =
       tenancy?.divergence === "unknown" ? ` Whether every leg agrees could not be compared.` : "";
+    // A data-plane answer beside an unreadable credential is not a confident
+    // one: the coord-mcp writes' tenant is unknown, so the chip says so.
+    const unknownCredential =
+      credentialUnknown && tenancy
+        ? ` The tenant its coord-mcp writes go to is UNKNOWN (${
+            tenancy.credential.reason ?? display.reason ?? "no reason given"
+          }).`
+        : "";
     return {
-      text: stem(resolvedActing),
+      text: credentialUnknown ? `${stem(resolvedActing)}?` : stem(resolvedActing),
       title: `This session acts as tenant ${resolvedActing}${
         display.tenantSlug ? ` (${display.tenantSlug})` : ""
-      } ${how}. Its spawn chose no tenant (device default).${unconfirmed} ${fixed}`,
+      } ${how}. Its spawn chose no tenant (device default).${unknownCredential}${unconfirmed} ${fixed}`,
       diverged: false,
-      credentialUnknown: false,
+      credentialUnknown,
     };
   }
 

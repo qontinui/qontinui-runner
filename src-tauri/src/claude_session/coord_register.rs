@@ -128,6 +128,17 @@ pub struct ResumeParams {
     pub config_dir: Option<String>,
 }
 
+/// See [`AiCoordRegistrar::recorded_row`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedCoordRow {
+    /// The tenant the registrar recorded for the row (the create body's tenant
+    /// for a minted row; the caller's stamped tenant for an adopted one).
+    pub tenant: Option<Uuid>,
+    /// The row already existed and was bound by id — its create-time tenant
+    /// was not observed by this process.
+    pub adopted: bool,
+}
+
 /// Why [`AiCoordRegistrar::bind_transcript_session`] declined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptBindRefusal {
@@ -182,6 +193,12 @@ struct Inner {
     /// The thin rows' wire bodies are rebuilt from named fields, so the
     /// stamp only picks the credential slot; it never reaches coord.
     tenants: Mutex<HashMap<Uuid, Uuid>>,
+    /// The coord session ids this process ADOPTED (`bind_transcript_session`
+    /// with `adopt: Some(..)`) rather than minted. For those `tenants` holds
+    /// the tenant the runner STAMPS on its own rows, not the tenant coord
+    /// created the row under — the runner never wrote that create body — so
+    /// [`AiCoordRegistrar::recorded_row`] reports them as not observed.
+    adopted: Mutex<std::collections::HashSet<Uuid>>,
     /// Resolves a new session's tenant. [`crate::session::resolve_new_session_tenant`]
     /// in production (the same source `SessionRegistry` stamps from); tests
     /// that assert on tenants inject a fixed answer
@@ -289,6 +306,7 @@ impl AiCoordRegistrar {
                 forward: Mutex::new(HashMap::new()),
                 reverse: Mutex::new(HashMap::new()),
                 tenants: Mutex::new(HashMap::new()),
+                adopted: Mutex::new(std::collections::HashSet::new()),
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 terminal_coord_lookup: OnceLock::new(),
@@ -655,6 +673,11 @@ impl AiCoordRegistrar {
                     if let (Some(t), Ok(mut tenants)) = (tenant, self.inner.tenants.lock()) {
                         tenants.insert(session_id, t);
                     }
+                    if adopt_coord_session.is_some() {
+                        if let Ok(mut adopted) = self.inner.adopted.lock() {
+                            adopted.insert(session_id);
+                        }
+                    }
                     None
                 }
             }
@@ -814,6 +837,9 @@ impl AiCoordRegistrar {
             }
             if let Ok(mut tenants) = self.inner.tenants.lock() {
                 tenants.remove(&session_id);
+            }
+            if let Ok(mut adopted) = self.inner.adopted.lock() {
+                adopted.remove(&session_id);
             }
             return Err(TranscriptBindRefusal::RegistrationDisabled);
         }
@@ -1067,6 +1093,29 @@ impl AiCoordRegistrar {
             .lock()
             .ok()
             .and_then(|g| g.get(&session_id).copied())
+    }
+
+    /// What this process knows about `session_key`'s coord row: `None` when it
+    /// has not registered it since boot; otherwise the recorded tenant and
+    /// whether the row was ADOPTED (an existing coord row bound by id, whose
+    /// create-time tenant the runner never wrote) rather than minted here.
+    /// In-process only — no I/O.
+    pub(crate) fn recorded_row(&self, session_key: &str) -> Option<RecordedCoordRow> {
+        let session_id = self.session_id_for(session_key)?;
+        let tenant = self
+            .inner
+            .tenants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&session_id).copied());
+        let adopted = self
+            .inner
+            .adopted
+            .lock()
+            .map(|g| g.contains(&session_id))
+            // A poisoned set cannot say the row was minted here.
+            .unwrap_or(true);
+        Some(RecordedCoordRow { tenant, adopted })
     }
 
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
@@ -1406,6 +1455,9 @@ impl AiCoordRegistrar {
         let payload = self.stamp_tenant(session_id, json!({ "id": session_id }));
         if let Ok(mut tenants) = self.inner.tenants.lock() {
             tenants.remove(&session_id);
+        }
+        if let Ok(mut adopted) = self.inner.adopted.lock() {
+            adopted.remove(&session_id);
         }
 
         // A `Closed` row carries no body — the drain loop maps it to
@@ -2256,6 +2308,53 @@ mod tests {
         // Closing evicts it along with the rest of the R4 index.
         reg.close_session(&trid);
         assert_eq!(reg.recorded_tenant(&trid), None);
+    }
+
+    #[test]
+    fn recorded_row_tells_a_minted_row_from_an_adopted_one() {
+        // An adopted row already existed coord-side: the tenant the registrar
+        // holds for it is the caller's stamp, not the tenant coord created it
+        // under, so it must not be reported as the row's observed tenant.
+        const CALLER_TENANT: Uuid = Uuid::from_u128(0x0b0b_0000_0000_4000_8000_000000000002);
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+
+        let minted_key = Uuid::new_v4().to_string();
+        reg.bind_transcript_session(&minted_key, None, None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            reg.recorded_row(&minted_key),
+            Some(RecordedCoordRow {
+                tenant: Some(OWNING_TENANT),
+                adopted: false
+            })
+        );
+
+        let adopted_key = Uuid::new_v4().to_string();
+        let existing_row = Uuid::new_v4();
+        let bound = reg
+            .bind_transcript_session(
+                &adopted_key,
+                Some(existing_row),
+                Some(CALLER_TENANT),
+                ResumeParams::default(),
+            )
+            .unwrap();
+        assert_eq!(bound, existing_row);
+        assert_eq!(
+            reg.recorded_row(&adopted_key),
+            Some(RecordedCoordRow {
+                tenant: Some(CALLER_TENANT),
+                adopted: true
+            })
+        );
+
+        // An unregistered key has no row; closing evicts the adopted mark.
+        assert_eq!(reg.recorded_row("never-registered"), None);
+        reg.close_session(&adopted_key);
+        assert_eq!(reg.recorded_row(&adopted_key), None);
+        assert!(reg.inner.adopted.lock().unwrap().is_empty());
     }
 
     #[test]
