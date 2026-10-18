@@ -868,12 +868,18 @@ impl AiCoordRegistrar {
                     rev.remove(claude_session_id);
                 }
             }
-            if let Ok(mut tenants) = self.inner.tenants.lock() {
-                tenants.remove(&session_id);
-            }
-            if let Ok(mut adopted) = self.inner.adopted.lock() {
-                adopted.remove(&session_id);
-            }
+            // Through a poisoned lock, as the insert side writes: a skipped
+            // removal would leave a stale mark for a later row under this id.
+            self.inner
+                .tenants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id);
+            self.inner
+                .adopted
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id);
             return Err(TranscriptBindRefusal::RegistrationDisabled);
         }
 
@@ -1173,11 +1179,32 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         adopted_from: Option<&str>,
     ) -> Option<RecordedCoordRow> {
+        self.recorded_row_for_record_pinned(claude_session_id, adopted_from, None)
+            .0
+    }
+
+    /// [`Self::recorded_row_for_record`], also reporting whether any link the
+    /// walk VISITED is `pin` (the hosting terminal's pinned session id). The
+    /// walk stops at the first link that resolves, so the flag covers the whole
+    /// chain exactly when the row is `None` — the only case its caller uses it
+    /// for (naming the reason of a miss). `None` / an empty pin is never
+    /// matched. In-process only — no I/O.
+    pub(crate) fn recorded_row_for_record_pinned(
+        &self,
+        claude_session_id: &str,
+        adopted_from: Option<&str>,
+        pin: Option<&str>,
+    ) -> (Option<RecordedCoordRow>, bool) {
         let store = self.inner.lifecycle_store.get();
-        resolve_adoption_chain(
+        let pin = pin.map(str::trim).filter(|p| !p.is_empty());
+        let mut pinned_link = false;
+        let row = resolve_adoption_chain(
             claude_session_id.trim(),
             adopted_from,
             |id| {
+                if pin == Some(id.trim()) {
+                    pinned_link = true;
+                }
                 self.recorded_row(id).or_else(|| {
                     self.inner
                         .terminal_coord_lookup
@@ -1190,7 +1217,8 @@ impl AiCoordRegistrar {
                 })
             },
             |id| store.and_then(|s| s.get(id)).and_then(|r| r.adopted_from),
-        )
+        );
+        (row, pinned_link)
     }
 
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
@@ -1528,12 +1556,18 @@ impl AiCoordRegistrar {
         // Read the tenant for the `Closed` row, then evict it with the rest of
         // the R4 index.
         let payload = self.stamp_tenant(session_id, json!({ "id": session_id }));
-        if let Ok(mut tenants) = self.inner.tenants.lock() {
-            tenants.remove(&session_id);
-        }
-        if let Ok(mut adopted) = self.inner.adopted.lock() {
-            adopted.remove(&session_id);
-        }
+        // Through a poisoned lock, as the insert side writes: a skipped
+        // removal would leave a stale mark for a later row under this id.
+        self.inner
+            .tenants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
+        self.inner
+            .adopted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
 
         // A `Closed` row carries no body — the drain loop maps it to
         // `PATCH /sessions/:id {state:"closed"}`. Coord finalizes it like any
@@ -2532,6 +2566,51 @@ mod tests {
         assert_eq!(
             reg.recorded_row_for_record("cleared-1", Some(pinned)),
             adopted
+        );
+    }
+
+    /// The pin is matched against EVERY link the walk visits, not only the
+    /// session and its direct predecessor: a 2nd+ `/clear` successor of the
+    /// pinned id whose terminal carries no coord row yet is still "pinned
+    /// here" (so session-info names `terminal_row_not_wired`, not
+    /// `not_registered_by_this_process`).
+    #[test]
+    fn the_pinned_flag_covers_every_link_of_the_adoption_chain() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        // No terminal lookup wired: no link resolves to a row.
+        let terminal = "term-unwired";
+        open_on(&store, "root-pin", terminal, None);
+        open_on(&store, "succ-1", terminal, Some("root-pin"));
+        open_on(&store, "succ-2", terminal, Some("succ-1"));
+        open_on(&store, "succ-3", terminal, Some("succ-2"));
+
+        for (id, pred) in [
+            ("root-pin", None),
+            ("succ-1", Some("root-pin")),
+            ("succ-2", Some("succ-1")),
+            ("succ-3", Some("succ-2")),
+        ] {
+            assert_eq!(
+                reg.recorded_row_for_record_pinned(id, pred, Some("root-pin")),
+                (None, true),
+                "{id} reaches the pin through its chain"
+            );
+            assert_eq!(
+                reg.recorded_row_for_record_pinned(id, pred, Some("some-other-pin")),
+                (None, false)
+            );
+        }
+        // An empty or absent pin never matches.
+        assert_eq!(
+            reg.recorded_row_for_record_pinned("succ-2", Some("succ-1"), Some("  ")),
+            (None, false)
+        );
+        assert_eq!(
+            reg.recorded_row_for_record_pinned("succ-2", Some("succ-1"), None),
+            (None, false)
         );
     }
 

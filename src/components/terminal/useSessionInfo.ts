@@ -233,15 +233,17 @@ export interface TenancyCoordRow {
   /** `registered` | `unknown` (with `reason`) | `not_applicable` (the
    * session's coord row IS the hosting terminal's own `SessionRegistry` row,
    * decided by coord id — whether reached through the pinned terminal or a
-   * registrar entry auto-bind adopted — and the `dataPlane` leg named its
-   * tenant: never a warning, never blocks agreement). */
+   * registrar entry auto-bind adopted — and the `dataPlane` leg named the
+   * tenant the row was OBSERVED to be created under (a fresh registration,
+   * not a post-restart resume): never a warning, never blocks agreement). */
   status: string;
   tenantId: string | null;
   /** `registrar` when registered. */
   source: string | null;
   /** unknown: `not_registered_by_this_process` | `registered_without_tenant` |
    * `adopted_row_tenant_not_observed` | `terminal_row_not_wired` |
-   * `terminal_row_tenant_unresolved` | `registrar_state_poisoned` |
+   * `terminal_row_tenant_unresolved` | `terminal_row_resume_unconfirmed` |
+   * `registrar_state_poisoned` |
    * `row_of_another_terminal` | `registrar_unavailable`;
    * not_applicable: `terminal_plane_row_is_the_data_plane_leg`. */
   reason: string | null;

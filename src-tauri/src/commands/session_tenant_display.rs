@@ -300,9 +300,10 @@ mod tests {
     use crate::claude_session::coord_register::{RecordedCoordRow, RecordedRowOrigin};
     use crate::commands::session_info::{
         coord_row_from_registrar, project_tenancy, CoordRowRead, SpawnDefaultRead, TenancyCoordRow,
-        TenancyRepoExpected, COORD_ROW_ADOPTED, COORD_ROW_NOT_APPLICABLE, COORD_ROW_NOT_REGISTERED,
-        COORD_ROW_OTHER_TERMINAL, COORD_ROW_REGISTRAR_POISONED, COORD_ROW_TERMINAL_PLANE,
-        COORD_ROW_TERMINAL_ROW_NOT_WIRED, COORD_ROW_TERMINAL_ROW_TENANT_UNRESOLVED,
+        TenancyRepoExpected, TerminalRowTenant, COORD_ROW_ADOPTED, COORD_ROW_NOT_APPLICABLE,
+        COORD_ROW_NOT_REGISTERED, COORD_ROW_OTHER_TERMINAL, COORD_ROW_REGISTRAR_POISONED,
+        COORD_ROW_TERMINAL_PLANE, COORD_ROW_TERMINAL_ROW_NOT_WIRED,
+        COORD_ROW_TERMINAL_ROW_RESUME_UNCONFIRMED, COORD_ROW_TERMINAL_ROW_TENANT_UNRESOLVED,
         DIVERGENCE_AGREE, DIVERGENCE_DIVERGED, TENANCY_UNKNOWN,
     };
     use crate::coord_mcp::CredentialTenantRead;
@@ -361,26 +362,54 @@ mod tests {
         })
     }
 
+    /// What `read_session_tenancy` would pass for the terminal's row of `t`:
+    /// the data plane's own answer, with `observed` from the registry.
+    fn terminal_tenant(t: &SessionTenancy, observed: bool) -> TerminalRowTenant {
+        TerminalRowTenant::from_reads(t.data_plane.tenant_id.is_some(), Some(observed))
+    }
+
     /// The coord-row leg of a terminal-hosted session with no registrar entry:
-    /// the pinned terminal names its own row, and the data plane read it.
-    fn terminal_plane_row() -> TenancyCoordRow {
+    /// the pinned terminal names its own row (freshly registered by this
+    /// process), and the data plane of `t` read it.
+    fn terminal_plane_row(t: &SessionTenancy) -> TenancyCoordRow {
         TenancyCoordRow::from_read(coord_row_from_registrar(
             row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
             Some(TERMINAL_ROW),
             true,
-            true,
+            terminal_tenant(t, true),
         ))
     }
 
     /// The same session after transcript auto-bind ADOPTED the terminal's own
     /// row into the registrar.
-    fn adopted_terminal_row() -> TenancyCoordRow {
+    fn adopted_terminal_row(t: &SessionTenancy) -> TenancyCoordRow {
         TenancyCoordRow::from_read(coord_row_from_registrar(
             row(TERMINAL_ROW, RecordedRowOrigin::Adopted),
             Some(TERMINAL_ROW),
             true,
-            true,
+            terminal_tenant(t, true),
         ))
+    }
+
+    /// The same pane restored after a runner restart: `resume_external`
+    /// re-stamped the row's tenant from today's resolution and nothing
+    /// observed the tenant coord created the row under.
+    fn resumed_unconfirmed_terminal_row(t: &SessionTenancy) -> TenancyCoordRow {
+        TenancyCoordRow::from_read(coord_row_from_registrar(
+            row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
+            Some(TERMINAL_ROW),
+            true,
+            terminal_tenant(t, false),
+        ))
+    }
+
+    /// `t` with its terminal-plane coord-row leg attached.
+    fn with_terminal_row(
+        t: SessionTenancy,
+        leg: fn(&SessionTenancy) -> TenancyCoordRow,
+    ) -> SessionTenancy {
+        let row = leg(&t);
+        t.with_coord_row(row)
     }
 
     /// The 2026-10-17 session: no spawn stamp, a per-tenant credential and an
@@ -828,7 +857,7 @@ mod tests {
             row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
             Some(TERMINAL_ROW),
             true,
-            true,
+            TerminalRowTenant::Observed,
         );
         assert_eq!(read, CoordRowRead::NotApplicable(COORD_ROW_TERMINAL_PLANE));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
@@ -852,7 +881,7 @@ mod tests {
         // `adopted`, but it is the hosting terminal's row by coord id, so the
         // leg is not applicable — it must not read
         // unknown(adopted_row_tenant_not_observed).
-        let t = regression_tenancy().with_coord_row(adopted_terminal_row());
+        let t = with_terminal_row(regression_tenancy(), adopted_terminal_row);
         assert_eq!(t.coord_row.status, COORD_ROW_NOT_APPLICABLE);
         assert_eq!(
             t.coord_row.reason.as_deref(),
@@ -864,6 +893,59 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_pane_whose_row_tenant_is_unconfirmed_is_unknown_not_agree() {
+        // A pane restored after a runner restart goes through
+        // `resume_external`, which re-stamps the row's tenant from TODAY's
+        // resolution. Created under A, now resolving B, the data plane says B
+        // while coord's row is A — so the leg must not stand aside.
+        for origin in [
+            RecordedRowOrigin::TerminalPinned,
+            RecordedRowOrigin::Adopted,
+        ] {
+            assert_eq!(
+                coord_row_from_registrar(
+                    row(TERMINAL_ROW, origin),
+                    Some(TERMINAL_ROW),
+                    true,
+                    TerminalRowTenant::ResumeUnconfirmed,
+                ),
+                CoordRowRead::Unknown(COORD_ROW_TERMINAL_ROW_RESUME_UNCONFIRMED)
+            );
+        }
+        let t = with_terminal_row(regression_tenancy(), resumed_unconfirmed_terminal_row);
+        assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
+        assert_eq!(
+            t.coord_row.reason.as_deref(),
+            Some("terminal_row_resume_unconfirmed")
+        );
+        assert!(!t.diverged);
+        assert_eq!(t.divergence, "unknown");
+        // The acting tenant is unaffected: the credential still answers.
+        let d = project_tenant_display(&t, four_bindings(), no_slug);
+        assert_eq!(d.status, "resolved");
+
+        // The confirmed counterpart — a row this process registered fresh —
+        // stands aside and keeps agreement.
+        let t = with_terminal_row(regression_tenancy(), terminal_plane_row);
+        assert_eq!(t.coord_row.status, COORD_ROW_NOT_APPLICABLE);
+        assert_eq!(t.divergence, DIVERGENCE_AGREE);
+    }
+
+    #[test]
+    fn the_terminal_row_tenant_is_observed_only_when_the_registry_says_so() {
+        use TerminalRowTenant::*;
+        assert_eq!(TerminalRowTenant::from_reads(false, Some(true)), Unresolved);
+        assert_eq!(TerminalRowTenant::from_reads(false, None), Unresolved);
+        assert_eq!(TerminalRowTenant::from_reads(true, Some(true)), Observed);
+        assert_eq!(
+            TerminalRowTenant::from_reads(true, Some(false)),
+            ResumeUnconfirmed
+        );
+        // The registry not holding the row is not an observation.
+        assert_eq!(TerminalRowTenant::from_reads(true, None), ResumeUnconfirmed);
+    }
+
+    #[test]
     fn a_clear_successor_resolving_to_the_terminal_row_is_not_applicable() {
         // W2: a `/clear` successor's id is not the pin, but its adoption chain
         // resolves to the pinned terminal's row — the same coord id the hosting
@@ -872,7 +954,7 @@ mod tests {
             row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
             Some(TERMINAL_ROW),
             true,
-            true,
+            TerminalRowTenant::Observed,
         );
         assert_eq!(read, CoordRowRead::NotApplicable(COORD_ROW_TERMINAL_PLANE));
         // Its own later mint (a registrar row of its own) answers for itself.
@@ -886,7 +968,7 @@ mod tests {
                 ),
                 Some(TERMINAL_ROW),
                 true,
-                true,
+                TerminalRowTenant::Observed,
             ),
             CoordRowRead::Registered(u(QONTINUI))
         );
@@ -895,7 +977,7 @@ mod tests {
     #[test]
     fn the_terminal_row_stands_aside_only_when_wired_and_its_tenant_resolved() {
         // W1: no coord id on the terminal — nothing read the row.
-        let not_wired = coord_row_from_registrar(None, None, true, false);
+        let not_wired = coord_row_from_registrar(None, None, true, TerminalRowTenant::Unresolved);
         assert_eq!(
             not_wired,
             CoordRowRead::Unknown(COORD_ROW_TERMINAL_ROW_NOT_WIRED)
@@ -910,7 +992,7 @@ mod tests {
                     row(TERMINAL_ROW, origin),
                     Some(TERMINAL_ROW),
                     true,
-                    false
+                    TerminalRowTenant::Unresolved
                 ),
                 CoordRowRead::Unknown(COORD_ROW_TERMINAL_ROW_TENANT_UNRESOLVED)
             );
@@ -928,7 +1010,8 @@ mod tests {
 
     #[test]
     fn a_session_this_process_resolves_no_row_for_makes_divergence_unknown() {
-        let read = coord_row_from_registrar(None, Some(TERMINAL_ROW), false, true);
+        let read =
+            coord_row_from_registrar(None, Some(TERMINAL_ROW), false, TerminalRowTenant::Observed);
         assert_eq!(read, CoordRowRead::Unknown(COORD_ROW_NOT_REGISTERED));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
         assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
@@ -953,7 +1036,7 @@ mod tests {
                         row(OTHER_ROW, origin),
                         terminal_row,
                         pinned_here,
-                        true,
+                        TerminalRowTenant::Observed,
                     )
                 };
                 assert_eq!(
@@ -989,7 +1072,7 @@ mod tests {
             row(OTHER_ROW, RecordedRowOrigin::Adopted),
             Some(TERMINAL_ROW),
             false,
-            true,
+            TerminalRowTenant::Observed,
         );
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
         assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
@@ -1007,7 +1090,7 @@ mod tests {
             row(OTHER_ROW, RecordedRowOrigin::StatePoisoned),
             Some(TERMINAL_ROW),
             false,
-            true,
+            TerminalRowTenant::Observed,
         );
         assert_eq!(read, CoordRowRead::Unknown(COORD_ROW_REGISTRAR_POISONED));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
@@ -1069,8 +1152,7 @@ mod tests {
                 // A terminal-hosted session, whose coord row is
                 // SessionRegistry's, so the coord-row leg is not applicable.
                 "regression_2026_10_17",
-                regression_tenancy()
-                    .with_coord_row(terminal_plane_row())
+                with_terminal_row(regression_tenancy(), terminal_plane_row)
                     .with_display(four_bindings(), |t| {
                         slug_from_answer(Some(&qontinui_answer), t)
                     }),
@@ -1080,8 +1162,17 @@ mod tests {
                 // terminal's own row into the registrar: still the terminal's
                 // row by coord id, so still not applicable and still `agree`.
                 "adopted_terminal_row",
-                regression_tenancy()
-                    .with_coord_row(adopted_terminal_row())
+                with_terminal_row(regression_tenancy(), adopted_terminal_row)
+                    .with_display(four_bindings(), |t| {
+                        slug_from_answer(Some(&qontinui_answer), t)
+                    }),
+            ),
+            (
+                // The same pane restored after a runner restart: its row's
+                // tenant is today's re-stamp, never observed on coord's row,
+                // so the leg is unknown and the comparison cannot agree.
+                "resumed_unconfirmed_terminal_row",
+                with_terminal_row(regression_tenancy(), resumed_unconfirmed_terminal_row)
                     .with_display(four_bindings(), |t| {
                         slug_from_answer(Some(&qontinui_answer), t)
                     }),
@@ -1095,7 +1186,7 @@ mod tests {
                         row(OTHER_ROW, RecordedRowOrigin::Adopted),
                         Some(TERMINAL_ROW),
                         false,
-                        true,
+                        TerminalRowTenant::Observed,
                     )))
                     .with_display(four_bindings(), no_slug),
             ),
@@ -1136,17 +1227,15 @@ mod tests {
                 ))))
                 .with_display(four_bindings(), no_slug),
             ),
-            (
-                "data_plane_credential_unknown",
-                tenancy(
+            ("data_plane_credential_unknown", {
+                let t = tenancy(
                     None,
                     Some(TenantScope::Owned(u(QONTINUI))),
                     CredentialTenantRead::NotLive,
                     BindingTenantRead::Unknown,
-                )
-                .with_coord_row(terminal_plane_row())
-                .with_display(four_bindings(), no_slug),
-            ),
+                );
+                with_terminal_row(t, terminal_plane_row).with_display(four_bindings(), no_slug)
+            }),
         ]
     }
 
