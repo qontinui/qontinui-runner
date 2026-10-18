@@ -184,13 +184,14 @@ enum DeviceCmd {
     Show,
     /// Print the absolute machine.json path.
     Path,
-    /// Bind this device to a web-backend user. Default mode opens
-    /// /connect-runner in the system browser and waits for the user's
-    /// confirmation; `--auth-token <token>` takes a pre-issued OAuth token
-    /// and headlessly POSTs to the web backend's pair-cli route (resolved
-    /// from $QONTINUI_WEB_BASE, the profile's api_url, or production — never
-    /// the coord host). On success persists the device-token JWT + paired
-    /// user_id locally.
+    /// Bind this device to a web-backend user. Default mode opens the web
+    /// FRONTEND's /connect-runner (https://qontinui.io in production; derived
+    /// from the API base below, or $QONTINUI_WEB_FRONTEND_BASE) in the system
+    /// browser and waits for the user's confirmation; `--auth-token <token>`
+    /// takes a pre-issued OAuth token and headlessly POSTs to the web
+    /// backend's pair-cli route (resolved from $QONTINUI_WEB_BASE, the
+    /// profile's api_url, or production — never the coord host). On success
+    /// persists the device-token JWT + paired user_id locally.
     Pair {
         /// Headless mode: use a pre-issued OAuth token. Mutually exclusive
         /// with `--browser` and `--pair-code`.
@@ -915,12 +916,14 @@ fn cmd_device_show() -> ExitCode {
 //
 // Three modes:
 //
-// 1. `--browser` (default): opens `{web_backend}/connect-runner?state=<nonce>
+// 1. `--browser` (default): opens `{web_frontend}/connect-runner?state=<nonce>
 //    &callback=http://127.0.0.1:<port>/auth/runner-token-callback
 //    &device_name=<hostname>` in the user's default browser. We spin up a
 //    one-shot localhost axum server, wait for the redirect, capture
 //    `(state, token, token_id=device_id)`, POST `(state, token)` to coord's
 //    `POST /coord/devices/pair-complete`, and receive a device-token JWT.
+//    `{web_frontend}` is the Next.js origin (`qontinui.io`), NOT the API base
+//    (`api.qontinui.io` 404s the page): `pair::resolve_browser_pair_page`.
 //
 // 2. `--auth-token <oauth>`: headless. POSTs `Authorization: Bearer <oauth>`
 //    to the qontinui-WEB backend's `POST {web_base}/api/v1/devices/pair-cli`
