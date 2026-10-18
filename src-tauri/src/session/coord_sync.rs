@@ -558,9 +558,18 @@ impl CoordSync {
     /// Maps the response to a coarse [`ResumeProbe`]:
     /// - 2xx → [`ResumeProbe::Found`] (row exists, now re-activated)
     /// - 404 / 410 → [`ResumeProbe::NotFound`] (GC'd or never existed)
+    /// - 401 / 403 → [`ResumeProbe::Refused`] (coord answered and refused the
+    ///   credential — not an outage; the caller still resumes, but must not
+    ///   claim to have observed anything about the row)
     /// - everything else (network, timeout, 5xx, other 4xx) →
     ///   [`ResumeProbe::Unreachable`] (treat as transient; caller resumes
     ///   optimistically and the drain loop retries).
+    ///
+    /// Even [`ResumeProbe::Found`] proves only that a row with this id
+    /// exists: coord's non-close `PATCH /sessions/:id` matches by id alone
+    /// (`update_session_with_close_outcome` scopes only a close or a
+    /// harness-id bind to the caller's device + tenant), so a 2xx confirms
+    /// nothing about the tenant the row was created under.
     ///
     /// Called by [`SessionRegistry::resume_external`].
     ///
@@ -596,6 +605,13 @@ impl CoordSync {
                     ResumeProbe::Found
                 } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
                     ResumeProbe::NotFound
+                } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    tracing::warn!(
+                        session = %session_id,
+                        %status,
+                        "coord_sync: resume probe REFUSED by coord — the credential, not the transport"
+                    );
+                    ResumeProbe::Refused(status.as_u16())
                 } else {
                     tracing::debug!(
                         session = %session_id,
@@ -874,6 +890,10 @@ pub enum ResumeProbe {
     /// resumes optimistically under the persisted id; the drain loop
     /// retries.
     Unreachable,
+    /// Coord ANSWERED 401 / 403 (the status carried): it refused the probe's
+    /// credential. Distinct from [`Self::Unreachable`] so a refusal is never
+    /// reported as an outage; the caller's resume behaviour is the same.
+    Refused(u16),
 }
 
 // ---------------------------------------------------------------------------
@@ -3936,6 +3956,9 @@ mod tests {
         /// When true, every PATCH returns 404 (simulates a GC'd / missing
         /// coord row — drives the R2 resume 404-fallback path).
         patch_returns_404: bool,
+        /// When set (and `patch_returns_404` is not), every PATCH answers
+        /// this status instead of 200 — drives the resume-probe refusal arm.
+        patch_status: Option<u16>,
         /// When set, `POST /sessions/:id/events` answers this status instead
         /// of 201 (still recording the body) — drives the mirror-drop arms
         /// (404 unknown session id, 405 no ingest route).
@@ -4097,6 +4120,13 @@ mod tests {
                             return (
                                 AxumStatus::NOT_FOUND,
                                 Json(json!({"error": "session not found"})),
+                            )
+                                .into_response();
+                        }
+                        if let Some(code) = g.patch_status {
+                            return (
+                                AxumStatus::from_u16(code).unwrap(),
+                                Json(json!({"error": "refused"})),
                             )
                                 .into_response();
                         }
@@ -7344,6 +7374,90 @@ mod tests {
         );
         let probe = coord.probe_resume(Uuid::new_v4(), None).await;
         assert_eq!(probe, ResumeProbe::Unreachable);
+    }
+
+    /// `probe_resume` maps a 401 / 403 to `Refused` — a distinct outcome from
+    /// `Unreachable` — and `resume_external` still resumes under the persisted
+    /// id, but marks the record tenant-UNOBSERVED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_resume_401_403_is_refused_not_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
+        for code in [401u16, 403] {
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = build_outbox(dir.path());
+            let (base, rec) = spawn_fake_coord().await;
+            rec.lock().await.patch_status = Some(code);
+            let coord = CoordSync::new_for_test(
+                outbox,
+                base,
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            assert_eq!(
+                coord.probe_resume(Uuid::new_v4(), None).await,
+                ResumeProbe::Refused(code)
+            );
+            let registry = build_registry(coord.clone());
+            let persisted = Uuid::new_v4();
+            let resumed = registry
+                .resume_external(persisted, make_test_intent())
+                .await
+                .unwrap();
+            assert_eq!(resumed, persisted, "a refusal does not change resumption");
+            assert_eq!(registry.tenant_observed_of(persisted), Some(false));
+        }
+    }
+
+    /// Only a FRESH registration observes its row's tenant: a resume — even a
+    /// 2xx `Found`, since coord's PATCH is not tenant-scoped — and an
+    /// optimistic one do not; the 404 fallback's fresh row does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_marks_the_tenant_observed_only_for_a_fresh_row() {
+        let _amb = crate::test_env::isolated_ambient();
+        // Found.
+        let dir = tempfile::tempdir().unwrap();
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            build_outbox(dir.path()),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord.clone());
+        let persisted = Uuid::new_v4();
+        registry
+            .resume_external(persisted, make_test_intent())
+            .await
+            .unwrap();
+        assert_eq!(registry.tenant_observed_of(persisted), Some(false));
+        // A fresh register on the same registry: observed.
+        let fresh = registry.register_external(make_test_intent()).unwrap();
+        assert_eq!(registry.tenant_observed_of(fresh), Some(true));
+        // 404 fallback: the NEW row is fresh, so observed.
+        rec.lock().await.patch_returns_404 = true;
+        let gone = Uuid::new_v4();
+        let replacement = registry
+            .resume_external(gone, make_test_intent())
+            .await
+            .unwrap();
+        assert_ne!(replacement, gone);
+        assert_eq!(registry.tenant_observed_of(replacement), Some(true));
+        assert_eq!(registry.tenant_observed_of(gone), None);
+        // Unreachable: optimistic, unobserved.
+        let dir2 = tempfile::tempdir().unwrap();
+        let down = CoordSync::new_for_test(
+            build_outbox(dir2.path()),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry2 = build_registry(down);
+        let optimistic = Uuid::new_v4();
+        registry2
+            .resume_external(optimistic, make_test_intent())
+            .await
+            .unwrap();
+        assert_eq!(registry2.tenant_observed_of(optimistic), Some(false));
     }
 
     /// `resume_external` on an existing row REUSES the persisted id (no new
