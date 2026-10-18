@@ -2373,7 +2373,8 @@ pub(crate) enum BindingSetRead {
     /// absent — an unpaired device, measured.
     Measured(Vec<String>),
     /// Nothing was established; the reason says why: `no_storage_dir`,
-    /// `paired_user_unreadable`, `paired_user_unparseable`, `bindings_unstated`.
+    /// `paired_user_unreadable`, `paired_user_unparseable`, `bindings_unstated`,
+    /// `bindings_blank_tenant_id`.
     Unknown(&'static str),
 }
 
@@ -2404,7 +2405,13 @@ pub(crate) fn binding_set_in(base: &std::path::Path) -> BindingSetRead {
 /// The parse half of [`binding_set_probe`]. It does not re-implement the shape
 /// rules: [`measured_binding_count_from_value`] decides whether the file states
 /// a set at all, and this only lifts the ids out of the shape it accepted — so
-/// the set's length can never disagree with [`MeasuredBindingCount`].
+/// a MEASURED set's length can never disagree with [`MeasuredBindingCount`].
+///
+/// The one place this reader is stricter: an entry whose `tenant_id` trims to
+/// empty. The count accepts it (any string), but a blank id names no tenant, so
+/// rather than list it, or drop it and report a set one shorter than the count,
+/// the set is `Unknown("bindings_blank_tenant_id")`. Display-only; the count
+/// and every decision made from it are unchanged.
 pub(crate) fn binding_set_from_value(value: &serde_json::Value) -> BindingSetRead {
     let tenant_of = |e: &serde_json::Value| {
         e.get("tenant_id")
@@ -2418,6 +2425,9 @@ pub(crate) fn binding_set_from_value(value: &serde_json::Value) -> BindingSetRea
                 Some(arr) => arr.iter().filter_map(tenant_of).collect(),
                 None => tenant_of(value).into_iter().collect(),
             };
+            if ids.iter().any(|id| id.is_empty()) {
+                return BindingSetRead::Unknown("bindings_blank_tenant_id");
+            }
             BindingSetRead::Measured(ids)
         }
     }
@@ -5999,6 +6009,30 @@ mod binding_set_tests {
             assert_eq!(
                 binding_set_from_value(&v),
                 BindingSetRead::Unknown("bindings_unstated"),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_tenant_id_makes_the_set_unknown_rather_than_shorter_or_blank() {
+        for v in [
+            json!({"bindings": [{"tenant_id": A}, {"tenant_id": "  "}]}),
+            json!({"bindings": [{"tenant_id": ""}]}),
+            json!({"tenant_id": " "}),
+        ] {
+            // The count still measures it (unchanged, decision-bearing)...
+            assert!(
+                matches!(
+                    measured_binding_count_from_value(&v),
+                    MeasuredBindingCount::Measured(_)
+                ),
+                "{v}"
+            );
+            // ...the display set refuses to list a blank or under-count.
+            assert_eq!(
+                binding_set_from_value(&v),
+                BindingSetRead::Unknown("bindings_blank_tenant_id"),
                 "{v}"
             );
         }

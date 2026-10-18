@@ -200,13 +200,18 @@ export interface TenantDisplay {
   /** `resolved` | `mismatch` | `stamp_only` (only the spawn stamp names one) |
    * `unknown` (with `reason`). */
   status: "resolved" | "mismatch" | "stamp_only" | "unknown";
-  /** The acting tenant the precedence picked; `null` only when `unknown`. */
+  /** The acting tenant the precedence picked; `null` when `unknown`, and in a
+   * `mismatch` where no leg could be picked as the acting one. */
   tenantId: string | null;
   /** Coord's own slug, only from an answer that tenant gave this session. */
   tenantSlug: string | null;
   /** `credential` | `credential_default_slot` | `data_plane` |
    * `data_plane_device` | `row_stamp`. */
   source: string | null;
+  /** Why the acting tenant is not (fully) established: set when no tenant was
+   * picked (`unknown`, or a `mismatch` with no acting tenant), for
+   * `stamp_only`, and — as the credential's reason — for a data-plane source
+   * while the credential is unknown. */
   reason: string | null;
   conflicts: TenantConflict[];
   conflictDetail: string | null;
@@ -225,13 +230,16 @@ export interface TenantDisplay {
 /** The fifth leg: the tenant coord's own session row was created under, as
  * this runner process registered it. */
 export interface TenancyCoordRow {
-  /** `registered` | `unknown` (with `reason`). */
+  /** `registered` | `unknown` (with `reason`) | `not_applicable` (a
+   * terminal-hosted session: its coord row is `SessionRegistry`'s, whose tenant
+   * is the `dataPlane` leg — never a warning, never blocks agreement). */
   status: string;
   tenantId: string | null;
   /** `registrar` when registered. */
   source: string | null;
-  /** `not_registered_by_this_process` | `registered_without_tenant` |
-   * `registrar_unavailable`. */
+  /** unknown: `not_registered_by_this_process` | `registered_without_tenant` |
+   * `adopted_row_tenant_not_observed` | `registrar_unavailable`;
+   * not_applicable: `terminal_plane_row_is_the_data_plane_leg`. */
   reason: string | null;
 }
 
@@ -745,6 +753,10 @@ const DISPLAY_SOURCE_TEXT: Record<string, string> = {
   row_stamp: "spawn stamp only — acting tenant not observed",
 };
 
+/** Display sources that do NOT come from the credential — a `reason` beside
+ * one of these is the credential's own unknown reason. */
+export const DATA_PLANE_SOURCES: ReadonlySet<string> = new Set(["data_plane", "data_plane_device"]);
+
 /** The Tenant row's text when the runner sends no display. */
 export const TENANT_DISPLAY_ABSENT_TEXT = "unknown — runner predates tenancy.display";
 
@@ -773,6 +785,9 @@ function tenantRowTitle(d: TenantDisplay, coordRow: TenancyCoordRow | null): str
       `Only the spawn stamp names it; the acting tenant is unknown (${d.reason ?? "no reason given"}).`,
     );
   }
+  if (d.tenantId && DATA_PLANE_SOURCES.has(d.source ?? "") && d.reason) {
+    lines.push(`Credential: unknown — ${d.reason}`);
+  }
   for (const c of d.conflicts) lines.push(`Conflict — ${c.leg}: ${c.tenantId}`);
   if (d.conflictDetail) lines.push(`Detail: ${d.conflictDetail}`);
   lines.push(
@@ -785,7 +800,9 @@ function tenantRowTitle(d: TenantDisplay, coordRow: TenancyCoordRow | null): str
       ? "Coord session row: unknown — runner predates the leg"
       : coordRow.status === "registered"
         ? `Coord session row: ${coordRow.tenantId ?? "?"} (as registered by this runner)`
-        : `Coord session row: unknown — ${coordRow.reason ?? "no reason given"}`,
+        : coordRow.status === "not_applicable"
+          ? "Coord session row: terminal-hosted — its tenant is the data-plane leg above"
+          : `Coord session row: unknown — ${coordRow.reason ?? "no reason given"}`,
   );
   return lines.join("\n");
 }
@@ -801,10 +818,8 @@ export function tenantRow(
   const d = tenancy?.display ?? null;
   if (!d) return { value: null, display: TENANT_DISPLAY_ABSENT_TEXT };
   const title = tenantRowTitle(d, tenancy?.coordRow ?? null);
-  if (d.status === "unknown" || !d.tenantId) {
-    return { value: null, display: `unknown — ${d.reason ?? "no reason given"}`, title };
-  }
-  const id = shortId(d.tenantId);
+  // Checked BEFORE the no-tenant fallback: a mismatch with no acting tenant is
+  // still a mismatch, and its conflict groups are the point.
   if (d.status === "mismatch") {
     // Grouped by tenant, so two legs that AGREE are not printed as unequal.
     const byTenant = new Map<string, string[]>();
@@ -817,11 +832,24 @@ export function tenantRow(
     // A verdict-only mismatch (every leg names one tenant; coord answered from
     // another) is explained by the detail, so it is shown inline too.
     const detail = d.conflictDetail ? ` — ${d.conflictDetail}` : "";
-    return { value: d.tenantId, display: `MISMATCH ${text}${detail}`, title };
+    const acting = d.tenantId ? "" : ` — acting tenant unknown — ${d.reason ?? "no reason given"}`;
+    return { value: d.tenantId, display: `MISMATCH ${text}${detail}${acting}`, title };
   }
+  if (d.status === "unknown" || !d.tenantId) {
+    return { value: null, display: `unknown — ${d.reason ?? "no reason given"}`, title };
+  }
+  const id = shortId(d.tenantId);
   const name = d.tenantSlug ? `${d.tenantSlug} (${id})` : id;
   const via = DISPLAY_SOURCE_TEXT[d.source ?? ""] ?? `via ${d.source ?? "?"}`;
-  return { value: d.tenantId, display: `${name} · ${via}${boundSuffix(d)}`, title };
+  // A data-plane answer beside an UNREADABLE credential says so, rather than
+  // reading as if the credential agreed.
+  const credential =
+    DATA_PLANE_SOURCES.has(d.source ?? "") && d.reason ? ` · credential unknown — ${d.reason}` : "";
+  return {
+    value: d.tenantId,
+    display: `${name} · ${via}${credential}${boundSuffix(d)}`,
+    title,
+  };
 }
 
 /**
@@ -1142,8 +1170,13 @@ export function normalizeTenantDisplay(raw: unknown): TenantDisplay | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
   const status = DISPLAY_STATUSES.find((s) => s === r.status);
-  const bound = r.bound as Record<string, unknown> | undefined;
-  if (!status || !bound || typeof bound !== "object") return null;
+  if (!status) return null;
+  // A missing or malformed bound set does NOT discard the display — the acting
+  // tenant is still the runner's answer. The set alone reads `unknown`.
+  const bound: Record<string, unknown> =
+    r.bound && typeof r.bound === "object" && !Array.isArray(r.bound)
+      ? (r.bound as Record<string, unknown>)
+      : {};
   const boundStatus = bound.status === "measured" ? "measured" : "unknown";
   const strings = (x: unknown): string[] =>
     Array.isArray(x) ? x.filter((t): t is string => typeof t === "string") : [];
