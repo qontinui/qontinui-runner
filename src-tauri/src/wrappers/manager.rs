@@ -95,16 +95,25 @@ const OUTPUT_TAIL_LINES: usize = 40;
 const OUTPUT_LINE_MAX: usize = 400;
 const OUTPUT_ERROR_MAX: usize = 2000;
 
-/// A bounded ring of the wrapper's recent output lines.
+/// A bounded ring of the wrapper's recent output lines, and how many
+/// diagnostics it has kept (capped at `MAX_DIAG_LINES`).
 #[derive(Clone, Default)]
-struct OutputTail(Arc<std::sync::Mutex<VecDeque<String>>>);
+struct OutputTail(
+    Arc<std::sync::Mutex<VecDeque<String>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
 
 impl OutputTail {
     /// Keep what `classify_line` allows of a line the WRAPPER printed.
     fn push(&self, line: &str) {
-        let line = classify_line(line);
-        if !line.is_empty() {
-            self.push_own(line);
+        let mut kept = classify_line(line);
+        if kept.starts_with("[wrapper] ")
+            && self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_DIAG_LINES
+        {
+            kept = omitted(line.trim());
+        }
+        if !kept.is_empty() {
+            self.push_own(kept);
         }
     }
 
@@ -191,27 +200,130 @@ impl OutputTail {
     }
 }
 
-/// Header names whose whole line is dropped from quoted wrapper output.
-/// The one free-form-looking line a wrapper may print that is kept verbatim:
-/// the structured diagnostic the private wrappers emit. Every field is an
-/// enum-like word or a short identifier — no free text, no spaces in a value.
+/// The structured diagnostic the private wrappers emit, the ONE wrapper line
+/// kept verbatim — and only when every field is from a CLOSED set: `event` and
+/// `code` from the enums below, `detail` (optional) one of the known code
+/// shapes (`detail_allowed`). These lists mirror the wrappers' own constants
+/// (qontinui-private-wrappers `web-image-core` `DIAG_EVENTS` / `DIAG_CODES`);
+/// a value the runner does not know is not kept, whatever the wrapper sends.
 static WRAPPER_DIAG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"^\[wrapper\] event=[a-z_]{1,32} code=[a-z_]{1,32}(?: detail=[A-Za-z0-9_:.-]{1,64})?$",
+        r"^\[wrapper\] event=([a-z_]{1,32}) code=([a-z_]{1,32})(?: detail=(\S{1,48}))?$",
     )
     .expect("static regex")
 });
+pub(crate) const DIAG_EVENTS: &[&str] = &[
+    "spawn",
+    "spawn_failed",
+    "page_load_failed",
+    "composer_missing",
+    "latch",
+    "latch_failed",
+    "budget_cut",
+    "handler_error",
+];
+pub(crate) const DIAG_CODES: &[&str] = &[
+    "ok",
+    "missing_peer",
+    "fatal",
+    "net_error",
+    "error",
+    "ui_changed",
+    "login_wall",
+    "captcha",
+    "bot_challenge",
+    "rate_limited",
+    "state_unreadable",
+    "after_typing",
+    "before_typing",
+    "composer_wait",
+    "type_error",
+    "range_error",
+    "reference_error",
+    "syntax_error",
+    "timeout_error",
+    "unknown",
+];
+/// The site ids a `spawn` diagnostic may name as its detail.
+const DIAG_SITES: &[&str] = &["gemini-web", "chatgpt-web"];
+/// POSIX errno names worth keeping (a closed list: an all-caps word is not
+/// trusted to be an errno just by its shape).
+const ERRNOS: &[&str] = &[
+    "EACCES",
+    "EADDRINUSE",
+    "EADDRNOTAVAIL",
+    "EAGAIN",
+    "EAI_AGAIN",
+    "EBADF",
+    "ECONNABORTED",
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "EEXIST",
+    "EHOSTUNREACH",
+    "EINVAL",
+    "EIO",
+    "EISDIR",
+    "EMFILE",
+    "ENETUNREACH",
+    "ENOENT",
+    "ENOMEM",
+    "ENOSPC",
+    "ENOTDIR",
+    "ENOTEMPTY",
+    "EPERM",
+    "EPIPE",
+    "ETIMEDOUT",
+];
+/// At most this many diagnostics are kept per output stream; past it they are
+/// omitted like any other line, so a wrapper cannot flood logs with them.
+const MAX_DIAG_LINES: usize = 200;
+
+/// A `detail` value the runner accepts: a known code shape, never free text.
+fn detail_allowed(d: &str) -> bool {
+    NET_ERR_EXACT.is_match(d)
+        || NODE_ERR_EXACT.is_match(d)
+        || EXIT_DETAIL.is_match(d)
+        || ERRNOS.contains(&d)
+        || DIAG_SITES.contains(&d)
+}
+
+/// A well-formed diagnostic from the closed vocabulary, or `None`.
+fn wrapper_diag(t: &str) -> Option<String> {
+    let c = WRAPPER_DIAG.captures(t)?;
+    if !DIAG_EVENTS.contains(&&c[1]) || !DIAG_CODES.contains(&&c[2]) {
+        return None;
+    }
+    if let Some(d) = c.get(3) {
+        if !detail_allowed(d.as_str()) {
+            return None;
+        }
+    }
+    Some(t.to_string())
+}
+
 /// Codes worth keeping from any other line, each EXTRACTED (never the line):
-/// a Chromium network error, a Node error code, an error class name, an exit
-/// status, and Playwright's missing-browser message reduced to a code.
+/// a Chromium network error, a Node error code, an error class name, a POSIX
+/// errno from a closed list, `MODULE_NOT_FOUND`, an exit status, Playwright's
+/// missing-browser message and the wrapper runtime's missing-peer message,
+/// both reduced to codes.
 static NET_ERR: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"net::ERR_[A-Z_]{1,64}").expect("static regex"));
+    std::sync::LazyLock::new(|| regex::Regex::new(r"net::ERR_[A-Z_]{1,40}").expect("static regex"));
+static NET_ERR_EXACT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^net::ERR_[A-Z_]{1,40}$").expect("static regex")
+});
 static NODE_ERR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?:^|[^:A-Za-z0-9_])(ERR_[A-Z_]{1,64})\b").expect("static regex")
+    regex::Regex::new(r"(?:^|[^:A-Za-z0-9_])(ERR_[A-Z_]{1,40})\b").expect("static regex")
+});
+static NODE_ERR_EXACT: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^ERR_[A-Z_]{1,40}$").expect("static regex"));
+static EXIT_DETAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^exit_status=-?\d{1,4}$").expect("static regex")
 });
 static ERROR_CLASS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"\b((?:[A-Z][A-Za-z]{0,40})?Error)\b").expect("static regex")
 });
+static WORD: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\b[A-Z_]{3,20}\b").expect("static regex"));
 static EXIT_STATUS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"(?i)\bexit(?:ed with)? (?:code|status) (-?\d{1,4})\b")
         .expect("static regex")
@@ -220,33 +332,31 @@ static EXECUTABLE_MISSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
     regex::Regex::new(r"(?i)executable doesn't exist").expect("static regex")
 });
 
-/// A line's length and a sha256 prefix: the evidence that something was
-/// printed, without its content.
+/// A per-process random key: `omitted` digests are keyed, so a short secret
+/// cannot be confirmed offline by hashing guesses against a log line.
+static OMIT_KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+    let mut k = [0u8; 32];
+    rand::Rng::fill(&mut rand::rng(), &mut k);
+    k
+});
+
+/// A line's length and a keyed digest prefix: the evidence that something
+/// was printed — and whether two reports carry the same text — without its
+/// content.
 pub(crate) fn omitted(line: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(line.as_bytes());
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&*OMIT_KEY).expect("any key length");
+    mac.update(line.as_bytes());
+    let tag = mac.finalize().into_bytes();
     format!(
-        "omitted(len={}, sha256={})",
+        "omitted(len={}, hmac={})",
         line.len(),
-        hex::encode(&digest[..6])
+        hex::encode(&tag[..6])
     )
 }
 
-/// What may be kept of one line a wrapper printed. NOTHING is kept verbatim
-/// except a well-formed `[wrapper] event=… code=… [detail=…]` diagnostic;
-/// from any other line only the allowlisted codes are extracted, and a line
-/// holding none of them becomes `omitted(len, sha256)`. An allowlist, not a
-/// redaction: a cookie split across Node's multi-line `inspect` output, an
-/// escaped JSON body or a header shape nobody anticipated never reaches a log,
-/// an error tail or an HTTP body, because no pattern has to recognise it.
-fn classify_line(line: &str) -> String {
-    let t = line.trim();
-    if t.is_empty() {
-        return String::new();
-    }
-    if WRAPPER_DIAG.is_match(t) {
-        return t.to_string();
-    }
+/// The allowlisted codes in `t`, in order, deduplicated.
+pub(crate) fn extract_codes(t: &str) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
     let mut push = |v: String| {
         if !kept.contains(&v) {
@@ -255,6 +365,9 @@ fn classify_line(line: &str) -> String {
     };
     if EXECUTABLE_MISSING.is_match(t) {
         push("playwright:executable_missing".to_string());
+    }
+    if t.contains("@qontinui/ui-bridge-headless") && t.contains("peer") {
+        push("wrapper:missing_peer".to_string());
     }
     for m in ERROR_CLASS.captures_iter(t) {
         push(m[1].to_string());
@@ -265,13 +378,54 @@ fn classify_line(line: &str) -> String {
     for m in NODE_ERR.captures_iter(t) {
         push(m[1].to_string());
     }
+    for m in WORD.find_iter(t) {
+        let w = m.as_str();
+        if ERRNOS.contains(&w) || w == "MODULE_NOT_FOUND" {
+            push(w.to_string());
+        }
+    }
     for m in EXIT_STATUS.captures_iter(t) {
         push(format!("exit_status={}", &m[1]));
     }
+    kept
+}
+
+/// What may be kept of one line a wrapper printed. NOTHING is kept verbatim
+/// except a diagnostic from the closed vocabulary (`wrapper_diag`); from any
+/// other line only the allowlisted codes are extracted, and a line holding
+/// none of them becomes `omitted(len, hmac)`. An allowlist, not a redaction: a
+/// cookie split across Node's multi-line `inspect` output, an escaped JSON body
+/// or a header shape nobody anticipated never reaches a log, an error tail or
+/// an HTTP body, because no pattern has to recognise it.
+fn classify_line(line: &str) -> String {
+    let t = line.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if let Some(d) = wrapper_diag(t) {
+        return d;
+    }
+    let kept = extract_codes(t);
     if kept.is_empty() {
         omitted(t)
     } else {
         format!("{} ({})", kept.join(" "), omitted(t))
+    }
+}
+
+/// `classify_line` over every line of a block of text (a manifest probe's or
+/// a package manager's output), joined; bounded to the first 20 lines.
+pub(crate) fn classify_text(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .map(classify_line)
+        .filter(|l| !l.is_empty())
+        .take(20)
+        .collect();
+    if lines.is_empty() {
+        "no output".to_string()
+    } else {
+        lines.join("; ")
     }
 }
 
@@ -1129,9 +1283,36 @@ pub fn install_path_for(root: &Path, id: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// ONE number on both sides: qontinui-studio's
-    /// `adapters/ui_bridge_wrapper.py` `PRE_DISPATCH_ALLOWANCE_S` mirrors this
-    /// ceiling (100 s). Change both together.
+    #[test]
+    fn diagnostics_are_capped_per_stream() {
+        let tail = OutputTail::default();
+        for _ in 0..(MAX_DIAG_LINES + 5) {
+            tail.push("[wrapper] event=spawn code=ok");
+        }
+        let out = tail.render();
+        assert!(
+            out.lines().last().unwrap().starts_with("omitted(len="),
+            "{out}"
+        );
+    }
+
+    /// `omitted` is keyed: equal text gives an equal tag in this process
+    /// (correlation), but the tag is not the bare sha256 an offline guesser
+    /// could reproduce.
+    #[test]
+    fn omitted_digests_are_keyed() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(omitted("SID=abc"), omitted("SID=abc"));
+        assert_ne!(omitted("SID=abc"), omitted("SID=abd"));
+        let bare = hex::encode(&Sha256::digest(b"SID=abc")[..6]);
+        assert!(!omitted("SID=abc").contains(&bare));
+    }
+
+    /// REGRESSION PIN, not a behaviour test: ONE number on both sides.
+    /// qontinui-studio's `adapters/ui_bridge_wrapper.py`
+    /// `RUNNER_PRE_DISPATCH_CEILING_S` mirrors this ceiling (100 s) and pins
+    /// it the same way; no cross-repo test can read both, so a change here
+    /// that is not mirrored there fails this pin first. Change both together.
     #[test]
     fn the_pre_dispatch_ceiling_is_the_documented_100s() {
         assert_eq!(PRE_DISPATCH_CEILING, Duration::from_secs(100));
@@ -1142,16 +1323,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reap_force_kills_within_its_bound() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("trap '' TERM; sleep 30")
-            .spawn()
-            .unwrap();
+        // A single process (no grandchild to orphan) that outlives the grace:
+        // reap waits STOP_GRACE, then force-kills, and returns within the
+        // grace plus its own bounded kill.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         let started = Instant::now();
         reap("w", &mut child).await;
-        assert!(started.elapsed() < STOP_GRACE * 2 + Duration::from_secs(1));
-        // It is gone: the kill landed.
-        assert!(child.try_wait().unwrap().is_some());
+        let took = started.elapsed();
+        assert!(took >= STOP_GRACE, "it waited the grace first ({took:?})");
+        assert!(took < STOP_GRACE * 2 + Duration::from_secs(1), "{took:?}");
+        let status = child.try_wait().unwrap().expect("the kill landed");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     #[test]
@@ -1166,14 +1349,16 @@ mod tests {
     fn output_tail_is_bounded() {
         let tail = OutputTail::default();
         for i in 0..(OUTPUT_TAIL_LINES + 10) {
-            tail.push(&format!("[wrapper] event=line code=n detail=n{i}"));
+            tail.push(&format!(
+                "[wrapper] event=budget_cut code=before_typing detail=exit_status={i}"
+            ));
         }
         let rendered = tail.render();
         assert!(
-            !rendered.contains("detail=n0\n"),
+            !rendered.contains("detail=exit_status=0\n"),
             "the oldest lines are dropped"
         );
-        assert!(rendered.ends_with(&format!("detail=n{}", OUTPUT_TAIL_LINES + 9)));
+        assert!(rendered.ends_with(&format!("detail=exit_status={}", OUTPUT_TAIL_LINES + 9)));
         assert_eq!(rendered.lines().count(), OUTPUT_TAIL_LINES);
 
         let long = OutputTail::default();
@@ -1335,25 +1520,27 @@ mod tests {
     #[tokio::test]
     async fn the_drain_survives_bad_utf8_and_cuts_long_lines() {
         let tail = OutputTail::default();
-        let mut data: Vec<u8> = b"[wrapper] event=a code=first\n".to_vec();
+        let mut data: Vec<u8> = b"[wrapper] event=spawn code=ok detail=exit_status=1\n".to_vec();
         data.extend_from_slice(&[0xff, 0xfe, b'b', b'a', b'd', b'\n']);
         data.extend(std::iter::repeat_n(b'A', 100_000));
-        data.extend_from_slice(b"\n[wrapper] event=a code=after_long\n[wrapper] event=a code=last");
+        data.extend_from_slice(
+            b"\n[wrapper] event=spawn code=ok detail=exit_status=2\n[wrapper] event=spawn code=ok detail=exit_status=3",
+        );
         tail.drain("w", std::io::Cursor::new(data));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !tail.render().contains("code=last") && Instant::now() < deadline {
+        while !tail.render().contains("exit_status=3") && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let out = tail.render();
-        assert!(out.contains("code=first"), "{out}");
+        assert!(out.contains("exit_status=1"), "{out}");
         assert!(
             out.contains("omitted(len="),
             "the bad-UTF-8 line is kept as evidence: {out}"
         );
         assert!(!out.contains("bad"), "{out}");
         assert!(out.contains("[line cut]"), "{out}");
-        assert!(out.contains("code=after_long"), "it kept reading: {out}");
-        assert!(out.contains("code=last"), "{out}");
+        assert!(out.contains("exit_status=2"), "it kept reading: {out}");
+        assert!(out.contains("exit_status=3"), "{out}");
         assert!(out.len() <= OUTPUT_ERROR_MAX + OUTPUT_TAIL_LINES * 4);
     }
 
@@ -1522,12 +1709,36 @@ mod tests {
         );
         for bad in [
             "[wrapper] event=ready code=ok detail=hello world",
-            "[wrapper] event=x code=y detail=https://a.example/?q=1",
-            "[wrapper] event=x code=y detail='SID=abc'",
-            "[wrapper] event=x code=y extra=1",
+            "[wrapper] event=spawn code=ok detail=https://a.example/?q=1",
+            "[wrapper] event=spawn code=ok detail='SID=abc'",
+            "[wrapper] event=spawn code=ok extra=1",
+            // The vocabulary is CLOSED: an unknown event or code, or a detail
+            // that is an identifier rather than a known code shape, is not
+            // kept — however harmless its characters look.
+            "[wrapper] event=sid code=ok",
+            "[wrapper] event=spawn code=abcdefsecret",
+            "[wrapper] event=spawn code=ok detail=g.a000s3cr3tTokenValue",
+            // An AWS-key-shaped detail, assembled so the source holds no key literal.
+            concat!(
+                "[wrapper] event=spawn code=ok detail=AKIA",
+                "ABCDEFGHIJKLMNOP"
+            ),
         ] {
             assert!(classify_line(bad).starts_with("omitted(len="), "{bad}");
         }
+        // Operator diagnostics survive as codes.
+        let out = classify_line("Error: listen EADDRINUSE: address already in use 127.0.0.1:41000");
+        assert!(
+            out.contains("EADDRINUSE") && !out.contains("127.0.0.1"),
+            "{out}"
+        );
+        assert!(classify_line("code: 'MODULE_NOT_FOUND'").starts_with("MODULE_NOT_FOUND"));
+        let out = classify_line(
+            "Transport kind 'headed' needs the optional '@qontinui/ui-bridge-headless' peer, which is not installed.",
+        );
+        assert!(out.starts_with("wrapper:missing_peer"), "{out}");
+        // An all-caps word is not an errno just by its shape.
+        assert!(classify_line("token ESECRETVALUE").starts_with("omitted(len="));
     }
 
     /// A wrapper that exits at once (a missing peer, no display) fails the

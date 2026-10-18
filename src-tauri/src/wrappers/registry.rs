@@ -238,6 +238,16 @@ impl WrapperRegistry {
     }
 
     /// Look up a wrapper by id.
+    /// Register a wrapper without a manifest scan (tests only).
+    #[cfg(test)]
+    pub(crate) async fn insert_for_test(&self, wrapper: Wrapper) {
+        self.inner
+            .write()
+            .await
+            .wrappers
+            .insert(wrapper.id.clone(), wrapper);
+    }
+
     pub async fn get(&self, id: &str) -> Option<Wrapper> {
         self.inner.read().await.wrappers.get(id).cloned()
     }
@@ -518,7 +528,10 @@ pub async fn scan_one(wrapper_dir: &Path) -> Result<Wrapper, RegistryError> {
 
     let stdout = run_manifest_only(wrapper_dir, &entry).await?;
     let parsed: ManifestOnlyOutput = serde_json::from_str(&stdout)
-        .map_err(|e| RegistryError::BadJson(format!("{}: {}", e, truncate(&stdout, 200))))?;
+        // Never quote a wrapper's output: only its allowlisted codes.
+        .map_err(|e| {
+            RegistryError::BadJson(format!("{}: {}", e, super::manager::classify_text(&stdout)))
+        })?;
 
     if parsed.manifest_version > SUPPORTED_MANIFEST_VERSION {
         return Err(RegistryError::UnsupportedVersion {
@@ -599,7 +612,7 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
                 "node {:?} --manifest-only exited with {}: {}",
                 entry,
                 output.status,
-                truncate(stderr.as_ref(), 400)
+                super::manager::classify_text(stderr.as_ref())
             ));
         }
         if output.stdout.len() > MAX_MANIFEST_STDOUT_BYTES {
@@ -632,18 +645,6 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
         Ok(Ok(stdout)) => Ok(stdout),
         Ok(Err(e)) => Err(RegistryError::Spawn(e)),
         Err(e) => Err(RegistryError::Spawn(format!("join error: {}", e))),
-    }
-}
-
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
     }
 }
 
