@@ -230,15 +230,19 @@ export interface TenantDisplay {
 /** The fifth leg: the tenant coord's own session row was created under, as
  * this runner process registered it. */
 export interface TenancyCoordRow {
-  /** `registered` | `unknown` (with `reason`) | `not_applicable` (a
-   * terminal-hosted session: its coord row is `SessionRegistry`'s, whose tenant
-   * is the `dataPlane` leg — never a warning, never blocks agreement). */
+  /** `registered` | `unknown` (with `reason`) | `not_applicable` (the
+   * session's coord row IS the hosting terminal's own `SessionRegistry` row,
+   * decided by coord id — whether reached through the pinned terminal or a
+   * registrar entry auto-bind adopted — and the `dataPlane` leg named its
+   * tenant: never a warning, never blocks agreement). */
   status: string;
   tenantId: string | null;
   /** `registrar` when registered. */
   source: string | null;
   /** unknown: `not_registered_by_this_process` | `registered_without_tenant` |
-   * `adopted_row_tenant_not_observed` | `registrar_unavailable`;
+   * `adopted_row_tenant_not_observed` | `terminal_row_not_wired` |
+   * `terminal_row_tenant_unresolved` | `registrar_state_poisoned` |
+   * `row_of_another_terminal` | `registrar_unavailable`;
    * not_applicable: `terminal_plane_row_is_the_data_plane_leg`. */
   reason: string | null;
 }
@@ -1197,9 +1201,16 @@ export function normalizeTenantDisplay(raw: unknown): TenantDisplay | null {
     bound: {
       status: boundStatus,
       tenantIds: boundStatus === "measured" ? strings(bound.tenantIds) : [],
+      // An unknown set always carries a reason: `malformed` when the block
+      // itself was not a well-formed `bound`, `reason_missing` when it said
+      // `unknown` and gave none.
       reason:
         str(bound.reason) ??
-        (boundStatus === "unknown" && bound.status !== "unknown" ? "malformed" : null),
+        (boundStatus === "unknown"
+          ? bound.status === "unknown"
+            ? "reason_missing"
+            : "malformed"
+          : null),
     },
     // An unknown set never yields a confident `false`.
     multiBound:
