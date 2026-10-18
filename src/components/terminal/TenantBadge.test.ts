@@ -600,4 +600,67 @@ describe("tenantBadgeLabel — the acting tenant when no tenant was stamped (pla
     expect(label?.diverged).toBe(true);
     expect(label?.title).toContain(`Coord session row: ${B} (as registered by this runner)`);
   });
+
+  it("flags a data-plane answer beside an UNKNOWN credential instead of a confident stem", () => {
+    for (const source of ["data_plane", "data_plane_device"]) {
+      const label = tenantBadgeLabel(
+        undefined,
+        true,
+        tenancy({
+          dataPlane: A,
+          credentialStatus: "unknown",
+          credentialReason: "nonce_not_live",
+          diverged: false,
+          divergence: "unknown",
+          display: shownAs({ source, reason: "nonce_not_live" }),
+        }),
+      );
+      expect(label?.text, source).toBe("6b1f4b0e?");
+      expect(label?.credentialUnknown, source).toBe(true);
+      expect(label?.diverged, source).toBe(false);
+      expect(label?.title, source).toContain(
+        "The tenant its coord-mcp writes go to is UNKNOWN (nonce_not_live).",
+      );
+    }
+  });
+
+  it("keeps the confident stem when the credential resolved", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({ credential: A, dataPlane: A, diverged: false, display: shownAs() }),
+    );
+    expect(label?.text).toBe("6b1f4b0e");
+    expect(label?.credentialUnknown).toBe(false);
+    expect(label?.title).not.toContain("UNKNOWN");
+  });
+
+  it("describes a not-applicable coord row (terminal-hosted) as such, not as unknown", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        dataPlane: B,
+        diverged: true,
+        coordRow: {
+          status: "not_applicable",
+          tenantId: null,
+          source: null,
+          reason: "terminal_plane_row_is_the_data_plane_leg",
+        },
+        display: shownAs({
+          status: "mismatch",
+          conflicts: [
+            { leg: "credential", tenantId: A },
+            { leg: "data_plane", tenantId: B },
+          ],
+        }),
+      }),
+    );
+    expect(label?.title).toContain(
+      "Coord session row: terminal-hosted — its tenant is what the runner writes under (above)",
+    );
+    expect(label?.title).not.toContain("terminal_plane_row_is_the_data_plane_leg");
+  });
 });

@@ -30,7 +30,7 @@
 
 use serde::Serialize;
 
-use super::session_info::{SessionTenancy, TENANCY_RESOLVED};
+use super::session_info::{SessionTenancy, TENANCY_RESOLVED, TENANCY_UNKNOWN};
 use crate::auth::BindingSetRead;
 
 /// [`TenantDisplay::status`]: the acting tenant is resolved and no leg
@@ -98,8 +98,13 @@ pub struct TenantDisplay {
     pub tenant_slug: Option<String>,
     /// Which leg `tenant_id` came from — see the `SOURCE_*` constants.
     pub source: Option<String>,
-    /// Why the acting tenant is not resolved: set for `unknown` and
-    /// `stamp_only` (the credential / data-plane reason).
+    /// Why the acting tenant is not (fully) established:
+    /// - no tenant picked (`unknown`, and a `mismatch` with no acting tenant):
+    ///   the first reason a leg gave, else [`NO_LEG_RESOLVED`];
+    /// - `stamp_only`: the credential / data-plane reason;
+    /// - a data-plane source while the credential is UNKNOWN: the credential's
+    ///   reason, so a surface can say the credential could not be read;
+    /// - otherwise `None`.
     pub reason: Option<String>,
     /// Every leg's tenant, when `mismatch`; empty otherwise.
     pub conflicts: Vec<TenantConflict>,
@@ -140,14 +145,20 @@ pub(crate) fn project_tenant_display(
 ) -> TenantDisplay {
     let picked: Option<(&str, &'static str)> = acting_tenant(tenancy);
 
-    let (status, reason) = match picked {
-        _ if tenancy.diverged => (DISPLAY_MISMATCH, None),
-        Some((_, SOURCE_ROW_STAMP)) => (DISPLAY_STAMP_ONLY, unresolved_reason(tenancy)),
-        Some(_) => (DISPLAY_RESOLVED, None),
-        None => (
-            DISPLAY_UNKNOWN,
-            Some(unresolved_reason(tenancy).unwrap_or_else(|| NO_LEG_RESOLVED.to_string())),
-        ),
+    let source = picked.map(|(_, s)| s);
+    let status = match source {
+        _ if tenancy.diverged => DISPLAY_MISMATCH,
+        Some(SOURCE_ROW_STAMP) => DISPLAY_STAMP_ONLY,
+        Some(_) => DISPLAY_RESOLVED,
+        None => DISPLAY_UNKNOWN,
+    };
+    // Decided by the source alone, so a `mismatch` carries the same reason its
+    // non-diverged twin would — above all when it has no acting tenant.
+    let reason = match source {
+        None => Some(unresolved_reason(tenancy).unwrap_or_else(|| NO_LEG_RESOLVED.to_string())),
+        Some(SOURCE_ROW_STAMP) => unresolved_reason(tenancy),
+        Some(SOURCE_DATA_PLANE | SOURCE_DATA_PLANE_DEVICE) => credential_unknown_reason(tenancy),
+        Some(_) => None,
     };
 
     let (conflicts, conflict_detail) = if tenancy.diverged {
@@ -188,7 +199,7 @@ pub(crate) fn project_tenant_display(
         status: status.to_string(),
         tenant_slug: tenant_id.as_deref().and_then(&slug_for),
         tenant_id,
-        source: picked.map(|(_, s)| s.to_string()),
+        source: source.map(str::to_string),
         reason,
         conflicts,
         conflict_detail,
@@ -227,6 +238,15 @@ fn unresolved_reason(t: &SessionTenancy) -> Option<String> {
         .reason
         .clone()
         .or_else(|| t.data_plane.reason.clone())
+}
+
+/// The credential's reason when the credential leg is UNKNOWN — the context a
+/// data-plane-sourced display carries so it never reads as if the credential
+/// agreed.
+fn credential_unknown_reason(t: &SessionTenancy) -> Option<String> {
+    (t.credential.status == TENANCY_UNKNOWN)
+        .then(|| t.credential.reason.clone())
+        .flatten()
 }
 
 /// Every leg that names a tenant, in a fixed order. The spawn-time device
@@ -269,10 +289,11 @@ fn conflicting_legs(t: &SessionTenancy) -> Vec<TenantConflict> {
 mod tests {
     use super::*;
     use crate::auth::{BindingTenantRead, TenantScope};
+    use crate::claude_session::coord_register::RecordedCoordRow;
     use crate::commands::session_info::{
         coord_row_from_registrar, project_tenancy, CoordRowRead, SpawnDefaultRead, TenancyCoordRow,
-        TenancyRepoExpected, COORD_ROW_NOT_REGISTERED, DIVERGENCE_AGREE, DIVERGENCE_DIVERGED,
-        TENANCY_UNKNOWN,
+        TenancyRepoExpected, COORD_ROW_ADOPTED, COORD_ROW_NOT_APPLICABLE, COORD_ROW_NOT_REGISTERED,
+        COORD_ROW_TERMINAL_PLANE, DIVERGENCE_AGREE, DIVERGENCE_DIVERGED, TENANCY_UNKNOWN,
     };
     use crate::coord_mcp::CredentialTenantRead;
     use uuid::Uuid;
@@ -316,6 +337,12 @@ mod tests {
             Some(u(QONTINUI)),
             None,
         )
+    }
+
+    /// The coord-row leg of a terminal-hosted session: the registrar has no
+    /// entry and the hosting terminal is pinned to the session id.
+    fn terminal_plane_row() -> TenancyCoordRow {
+        TenancyCoordRow::from_read(coord_row_from_registrar(None, true))
     }
 
     /// The 2026-10-17 session: no spawn stamp, a per-tenant credential and an
@@ -425,6 +452,9 @@ mod tests {
         assert_eq!(d.status, "resolved");
         assert_eq!(d.source.as_deref(), Some("data_plane"));
         assert_eq!(d.tenant_id.as_deref(), Some(QONTINUI));
+        // The credential could not be read: the display says so rather than
+        // reading as if the credential agreed.
+        assert_eq!(d.reason.as_deref(), Some("nonce_not_live"));
     }
 
     #[test]
@@ -439,6 +469,23 @@ mod tests {
         assert_eq!(d.status, "resolved");
         assert_eq!(d.source.as_deref(), Some("data_plane_device"));
         assert_eq!(d.tenant_id.as_deref(), Some(QONTINUI));
+        assert_eq!(d.reason.as_deref(), Some("no_session_nonce"));
+    }
+
+    #[test]
+    fn a_data_plane_source_with_a_resolved_credential_carries_no_reason() {
+        // Only an UNKNOWN credential's reason reaches a data-plane display.
+        let mut t = tenancy(
+            None,
+            Some(TenantScope::Owned(u(QONTINUI))),
+            CredentialTenantRead::NotLive,
+            BindingTenantRead::Unknown,
+        );
+        t.credential.status = "resolved".into();
+        t.credential.tenant_id = None;
+        let d = project_tenant_display(&t, four_bindings(), no_slug);
+        assert_eq!(d.source.as_deref(), Some("data_plane"));
+        assert_eq!(d.reason, None);
     }
 
     #[test]
@@ -602,6 +649,41 @@ mod tests {
     }
 
     #[test]
+    fn a_mismatch_with_no_acting_tenant_still_says_why() {
+        // Nothing names an acting tenant (no nonce, an unresolved data plane,
+        // no stamp), yet the spawn-time default and coord's row disagree. The
+        // display is a mismatch AND carries the reason no tenant was picked.
+        let t = tenancy(
+            None,
+            Some(TenantScope::Unresolved),
+            CredentialTenantRead::NoNonce,
+            BindingTenantRead::Unknown,
+        )
+        .with_coord_row(TenancyCoordRow::from_read(CoordRowRead::Registered(u(
+            PIZZERIA,
+        ))));
+        assert!(t.diverged);
+        let d = project_tenant_display(&t, four_bindings(), no_slug);
+        assert_eq!(d.status, "mismatch");
+        assert_eq!(d.tenant_id, None);
+        assert_eq!(d.source, None);
+        assert_eq!(d.reason.as_deref(), Some("no_session_nonce"));
+        assert_eq!(
+            d.conflicts,
+            vec![
+                TenantConflict {
+                    leg: "spawn_device_default".into(),
+                    tenant_id: QONTINUI.into()
+                },
+                TenantConflict {
+                    leg: "coord_row".into(),
+                    tenant_id: PIZZERIA.into()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn a_several_owner_repo_lists_every_owner_in_the_conflict() {
         let t = regression_tenancy().with_repo_expected(TenancyRepoExpected::from_read(
             &crate::coord_mcp::RepoExpectationRead::Known {
@@ -699,8 +781,29 @@ mod tests {
     }
 
     #[test]
-    fn a_coord_row_this_process_did_not_register_makes_divergence_unknown() {
-        let read = coord_row_from_registrar(false, None);
+    fn a_terminal_plane_session_is_not_applicable_and_keeps_agreement() {
+        // The 2026-10-17 population: terminal-hosted sessions register through
+        // SessionRegistry, never through the registrar, so the registrar has no
+        // entry. That must not flip divergence from agree to unknown.
+        let read = coord_row_from_registrar(None, true);
+        assert_eq!(read, CoordRowRead::NotApplicable(COORD_ROW_TERMINAL_PLANE));
+        let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
+        assert_eq!(t.coord_row.status, COORD_ROW_NOT_APPLICABLE);
+        assert_eq!(
+            t.coord_row.reason.as_deref(),
+            Some("terminal_plane_row_is_the_data_plane_leg")
+        );
+        assert_eq!(t.coord_row.tenant_id, None);
+        assert!(!t.diverged);
+        assert_eq!(t.divergence, DIVERGENCE_AGREE);
+        let d = project_tenant_display(&t, four_bindings(), no_slug);
+        assert_eq!(d.status, "resolved");
+        assert!(d.conflicts.is_empty());
+    }
+
+    #[test]
+    fn a_registrar_plane_session_this_process_did_not_register_makes_divergence_unknown() {
+        let read = coord_row_from_registrar(None, false);
         assert_eq!(read, CoordRowRead::Unknown(COORD_ROW_NOT_REGISTERED));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
         assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
@@ -717,14 +820,54 @@ mod tests {
 
     #[test]
     fn the_registrar_read_maps_each_arm() {
-        assert_eq!(
-            coord_row_from_registrar(true, Some(u(QONTINUI))),
-            CoordRowRead::Registered(u(QONTINUI))
+        let minted = |tenant| {
+            Some(RecordedCoordRow {
+                tenant,
+                adopted: false,
+            })
+        };
+        for terminal_plane in [false, true] {
+            // A registrar entry answers on either plane.
+            assert_eq!(
+                coord_row_from_registrar(minted(Some(u(QONTINUI))), terminal_plane),
+                CoordRowRead::Registered(u(QONTINUI))
+            );
+            assert_eq!(
+                coord_row_from_registrar(minted(None), terminal_plane),
+                CoordRowRead::Unknown("registered_without_tenant")
+            );
+            assert_eq!(
+                coord_row_from_registrar(
+                    Some(RecordedCoordRow {
+                        tenant: Some(u(QONTINUI)),
+                        adopted: true
+                    }),
+                    terminal_plane
+                ),
+                CoordRowRead::Unknown(COORD_ROW_ADOPTED)
+            );
+        }
+    }
+
+    #[test]
+    fn an_adopted_row_reports_its_tenant_as_not_observed_and_blocks_agreement() {
+        // The registrar holds the CALLER's tenant for an adopted row, not the
+        // tenant coord created it under: it is a registrar-plane unknown.
+        let read = coord_row_from_registrar(
+            Some(RecordedCoordRow {
+                tenant: Some(u(QONTINUI)),
+                adopted: true,
+            }),
+            false,
         );
+        let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
+        assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
+        assert_eq!(t.coord_row.tenant_id, None);
         assert_eq!(
-            coord_row_from_registrar(true, None),
-            CoordRowRead::Unknown("registered_without_tenant")
+            t.coord_row.reason.as_deref(),
+            Some("adopted_row_tenant_not_observed")
         );
+        assert_eq!(t.divergence, "unknown");
     }
 
     #[test]
@@ -754,18 +897,17 @@ mod tests {
         include_str!("../../../src/components/terminal/__fixtures__/session-tenancy-display.json");
 
     fn fixture_cases() -> Vec<(&'static str, SessionTenancy)> {
-        let registered = |t: SessionTenancy| {
-            t.with_coord_row(TenancyCoordRow::from_read(CoordRowRead::Registered(u(
-                QONTINUI,
-            ))))
-        };
         let qontinui_answer = answer(QONTINUI, "qontinui");
         vec![
             (
+                // The real shape: a terminal-hosted session, whose coord row is
+                // SessionRegistry's, so the coord-row leg is not applicable.
                 "regression_2026_10_17",
-                registered(regression_tenancy()).with_display(four_bindings(), |t| {
-                    slug_from_answer(Some(&qontinui_answer), t)
-                }),
+                regression_tenancy()
+                    .with_coord_row(terminal_plane_row())
+                    .with_display(four_bindings(), |t| {
+                        slug_from_answer(Some(&qontinui_answer), t)
+                    }),
             ),
             (
                 "coord_row_mismatch",
@@ -790,6 +932,30 @@ mod tests {
                     COORD_ROW_NOT_REGISTERED,
                 )))
                 .with_display(BindingSetRead::Unknown("paired_user_unreadable"), no_slug),
+            ),
+            (
+                "mismatch_no_acting_tenant",
+                tenancy(
+                    None,
+                    Some(TenantScope::Unresolved),
+                    CredentialTenantRead::NoNonce,
+                    BindingTenantRead::Unknown,
+                )
+                .with_coord_row(TenancyCoordRow::from_read(CoordRowRead::Registered(u(
+                    PIZZERIA,
+                ))))
+                .with_display(four_bindings(), no_slug),
+            ),
+            (
+                "data_plane_credential_unknown",
+                tenancy(
+                    None,
+                    Some(TenantScope::Owned(u(QONTINUI))),
+                    CredentialTenantRead::NotLive,
+                    BindingTenantRead::Unknown,
+                )
+                .with_coord_row(terminal_plane_row())
+                .with_display(four_bindings(), no_slug),
             ),
         ]
     }
