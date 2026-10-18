@@ -199,7 +199,7 @@ mod tests {
             assert!(id.is_empty() || !err.contains(&id), "{err}");
             assert!(err.contains(&format!("len={}", id.len())), "{err}");
         }
-        for ok in ["gemini-web", "v0", &"a".repeat(MAX_WRAPPER_ID_LEN)] {
+        for ok in ["gemini-web", "v0", "a".repeat(MAX_WRAPPER_ID_LEN).as_str()] {
             m.id = ok.to_string();
             assert!(validate_manifest(&m).is_ok(), "{ok}");
         }
