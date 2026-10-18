@@ -73,6 +73,21 @@ pub(crate) enum PreDispatchRefusal {
     SpawnFailed(String),
 }
 
+/// The HTTP answer for a dispatch that never reached the wrapper. Busy is a
+/// 429 carrying the typed `code` `wrapper_busy` (nothing started, come back
+/// soon); a failed spawn is a 503 (the wrapper could not be started).
+pub(crate) fn refusal_response(refusal: PreDispatchRefusal) -> (StatusCode, Json<ApiResponse<()>>) {
+    match refusal {
+        PreDispatchRefusal::Busy(msg) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiResponse::error_with_code(msg, BUSY_CODE)),
+        ),
+        PreDispatchRefusal::SpawnFailed(msg) => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(api_error(msg)))
+        }
+    }
+}
+
 /// Everything before the wrapper receives the call, under ONE deadline: the
 /// exclusive turn (when the action is exclusive), then the spawn lock and the
 /// spawn. Returns the held turn guard and the wrapper's port.
@@ -273,12 +288,7 @@ pub async fn dispatch_handler(
     let (_exclusive_guard, port) =
         match turn_and_spawn(&ctx, &wrapper_id, &req.action, exclusive, PRE_DISPATCH_WAIT).await {
             Ok(ok) => ok,
-            Err(PreDispatchRefusal::Busy(msg)) => {
-                return Err((StatusCode::TOO_MANY_REQUESTS, Json(api_error(msg))))
-            }
-            Err(PreDispatchRefusal::SpawnFailed(msg)) => {
-                return Err((StatusCode::SERVICE_UNAVAILABLE, Json(api_error(msg))))
-            }
+            Err(refusal) => return Err(refusal_response(refusal)),
         };
 
     let url = format!("http://127.0.0.1:{}/dispatch", port);
@@ -360,6 +370,19 @@ mod tests {
         let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
         let manager = WrapperManager::new(registry.clone());
         (DispatchContext::new(registry, manager), tmp)
+    }
+
+    /// The dispatch handler's answer for each refusal: busy is HTTP 429 with
+    /// the typed code (a 503 here would park a caller for an hour on a merely
+    /// busy action), a failed spawn is 503 with no busy code.
+    #[test]
+    fn a_busy_refusal_is_a_typed_429_and_a_failed_spawn_a_503() {
+        let (status, body) = refusal_response(PreDispatchRefusal::Busy("b".into()));
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body.0.code.as_deref(), Some(BUSY_CODE));
+        let (status, body) = refusal_response(PreDispatchRefusal::SpawnFailed("f".into()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.code, None);
     }
 
     /// An exclusive action held by another call: the dispatch path refuses
