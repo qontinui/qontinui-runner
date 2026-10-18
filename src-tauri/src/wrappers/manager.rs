@@ -100,8 +100,16 @@ const OUTPUT_ERROR_MAX: usize = 2000;
 struct OutputTail(Arc<std::sync::Mutex<VecDeque<String>>>);
 
 impl OutputTail {
+    /// Keep what `classify_line` allows of a line the WRAPPER printed.
     fn push(&self, line: &str) {
-        let mut line = redact_query(line.trim_end());
+        let line = classify_line(line);
+        if !line.is_empty() {
+            self.push_own(line);
+        }
+    }
+
+    /// Keep a marker the RUNNER wrote itself (already safe, never classified).
+    fn push_own(&self, mut line: String) {
         if line.len() > OUTPUT_LINE_MAX {
             let mut cut = OUTPUT_LINE_MAX;
             while !line.is_char_boundary(cut) {
@@ -162,10 +170,10 @@ impl OutputTail {
                 for &b in buf.iter().take(n) {
                     if b == b'\n' {
                         let text = String::from_utf8_lossy(&line);
-                        debug!("wrapper[{}]: {}", id, redact_query(&text));
+                        debug!("wrapper[{}]: {}", id, classify_line(&text));
                         tail.push(&text);
                         if overflow {
-                            tail.push("[line cut]");
+                            tail.push_own("[line cut]".to_string());
                         }
                         line.clear();
                         overflow = false;
@@ -184,94 +192,87 @@ impl OutputTail {
 }
 
 /// Header names whose whole line is dropped from quoted wrapper output.
-/// A secret header named ANYWHERE in a line — `Cookie: …`, `"cookie": "…"`,
-/// Node's `{ cookie: '…' }`, `'set-cookie': [ … ]`, a Map's
-/// `'authorization' => '…'`, `- Authorization: …` — keeps its name and loses
-/// EVERYTHING after its separator, to the end of the line. Fail closed: a
-/// value can be an array, an object, or hold escaped quotes, so no closing
-/// delimiter is trusted to end it.
-static SECRET_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+/// The one free-form-looking line a wrapper may print that is kept verbatim:
+/// the structured diagnostic the private wrappers emit. Every field is an
+/// enum-like word or a short identifier — no free text, no spaces in a value.
+static WRAPPER_DIAG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r#"(?i)(^|[^a-z0-9_-])((?:proxy-authorization|authorization|set-cookie|cookie|x-api-key|api-key)["'\s]*(?:=>|[:=])).*$"#,
+        r"^\[wrapper\] event=[a-z_]{1,32} code=[a-z_]{1,32}(?: detail=[A-Za-z0-9_:.-]{1,64})?$",
     )
     .expect("static regex")
 });
-/// `Bearer` and the credential after it, however many spaces separate them.
-static BEARER: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(bearer)\s+\S+").expect("static regex"));
-/// A segment at least this long, made only of token characters
-/// (`[A-Za-z0-9._-]`, so JWTs and `g.a000…` cookies included), is masked: it
-/// reads like a token, a session id or a conversation id. The one exemption is
-/// a segment shaped like a hostname (see `hostname_shaped`).
-const TOKEN_SEGMENT_MIN: usize = 24;
+/// Codes worth keeping from any other line, each EXTRACTED (never the line):
+/// a Chromium network error, a Node error code, an error class name, an exit
+/// status, and Playwright's missing-browser message reduced to a code.
+static NET_ERR: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"net::ERR_[A-Z_]{1,64}").expect("static regex"));
+static NODE_ERR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?:^|[^:A-Za-z0-9_])(ERR_[A-Z_]{1,64})\b").expect("static regex")
+});
+static ERROR_CLASS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\b((?:[A-Z][A-Za-z]{0,40})?Error)\b").expect("static regex")
+});
+static EXIT_STATUS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bexit(?:ed with)? (?:code|status) (-?\d{1,4})\b")
+        .expect("static regex")
+});
+static EXECUTABLE_MISSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)executable doesn't exist").expect("static regex")
+});
 
-/// Wrapper output is quoted in errors and logs, so it is reduced before it is
-/// kept: a secret header's value is masked, the credential after `Bearer` is
-/// masked, a URL's query and fragment are cut, and any long token-like segment
-/// is masked — inside quotes, JSON and object literals too.
-fn redact_query(line: &str) -> String {
-    let line = SECRET_HEADER.replace_all(line, "${1}${2} …");
-    let line = BEARER.replace_all(&line, "$1 …");
-    let mut out = String::with_capacity(line.len());
-    for (i, word) in line.split(' ').enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        let word = match word.split_once(['?', '#']) {
-            Some((head, _)) if word.contains("://") => format!("{head}?…"),
-            _ => word.to_string(),
-        };
-        out.push_str(&mask_token_segments(&word));
+/// A line's length and a sha256 prefix: the evidence that something was
+/// printed, without its content.
+pub(crate) fn omitted(line: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(line.as_bytes());
+    format!(
+        "omitted(len={}, sha256={})",
+        line.len(),
+        hex::encode(&digest[..6])
+    )
+}
+
+/// What may be kept of one line a wrapper printed. NOTHING is kept verbatim
+/// except a well-formed `[wrapper] event=… code=… [detail=…]` diagnostic;
+/// from any other line only the allowlisted codes are extracted, and a line
+/// holding none of them becomes `omitted(len, sha256)`. An allowlist, not a
+/// redaction: a cookie split across Node's multi-line `inspect` output, an
+/// escaped JSON body or a header shape nobody anticipated never reaches a log,
+/// an error tail or an HTTP body, because no pattern has to recognise it.
+fn classify_line(line: &str) -> String {
+    let t = line.trim();
+    if t.is_empty() {
+        return String::new();
     }
-    out
-}
-
-/// A dotted, lowercase hostname: two or more labels of `[a-z0-9-]`, none
-/// empty or longer than 63, the last all letters. A JWT (upper case, `_`), a
-/// dotted cookie value whose last label holds digits, an all-digit id and an
-/// undotted base64url token all fail this, so they stay masked.
-fn hostname_shaped(segment: &str) -> bool {
-    let labels: Vec<&str> = segment.split('.').collect();
-    labels.len() >= 2
-        && labels.iter().all(|l| {
-            !l.is_empty()
-                && l.len() <= 63
-                && l.chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        })
-        && labels
-            .last()
-            .is_some_and(|l| l.len() >= 2 && l.chars().all(|c| c.is_ascii_lowercase()))
-}
-
-/// Mask every segment of `word` that looks like a token. Segments are split
-/// on path, assignment and quoting punctuation (`/ = : " ' ` , ; { } ( ) [ ]`),
-/// so a quoted or JSON value is a segment of its own.
-fn mask_token_segments(word: &str) -> String {
-    let mut out = String::with_capacity(word.len());
-    let mut segment = String::new();
-    let flush = |segment: &mut String, out: &mut String| {
-        let tokenish = segment.len() >= TOKEN_SEGMENT_MIN
-            && segment
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            && !hostname_shaped(segment);
-        out.push_str(if tokenish { "…" } else { segment.as_str() });
-        segment.clear();
+    if WRAPPER_DIAG.is_match(t) {
+        return t.to_string();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut push = |v: String| {
+        if !kept.contains(&v) {
+            kept.push(v);
+        }
     };
-    for c in word.chars() {
-        if matches!(
-            c,
-            '/' | '=' | ':' | '"' | '\'' | '`' | ',' | ';' | '{' | '}' | '(' | ')' | '[' | ']'
-        ) {
-            flush(&mut segment, &mut out);
-            out.push(c);
-        } else {
-            segment.push(c);
-        }
+    if EXECUTABLE_MISSING.is_match(t) {
+        push("playwright:executable_missing".to_string());
     }
-    flush(&mut segment, &mut out);
-    out
+    for m in ERROR_CLASS.captures_iter(t) {
+        push(m[1].to_string());
+    }
+    for m in NET_ERR.find_iter(t) {
+        push(m.as_str().to_string());
+    }
+    for m in NODE_ERR.captures_iter(t) {
+        push(m[1].to_string());
+    }
+    for m in EXIT_STATUS.captures_iter(t) {
+        push(format!("exit_status={}", &m[1]));
+    }
+    if kept.is_empty() {
+        omitted(t)
+    } else {
+        format!("{} ({})", kept.join(" "), omitted(t))
+    }
 }
 
 /// Transports a runner-spawned wrapper may declare.
@@ -1128,6 +1129,31 @@ pub fn install_path_for(root: &Path, id: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// ONE number on both sides: qontinui-studio's
+    /// `adapters/ui_bridge_wrapper.py` `PRE_DISPATCH_ALLOWANCE_S` mirrors this
+    /// ceiling (100 s). Change both together.
+    #[test]
+    fn the_pre_dispatch_ceiling_is_the_documented_100s() {
+        assert_eq!(PRE_DISPATCH_CEILING, Duration::from_secs(100));
+    }
+
+    /// `reap` force-kills a child that ignores the graceful wait, and returns
+    /// within its bound (the grace plus the bounded kill), never hanging.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_force_kills_within_its_bound() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        reap("w", &mut child).await;
+        assert!(started.elapsed() < STOP_GRACE * 2 + Duration::from_secs(1));
+        // It is gone: the kill landed.
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
     #[test]
     fn browser_transports_get_the_longer_readiness_wait() {
         assert_eq!(ready_timeout_for("api"), SPAWN_READY_TIMEOUT);
@@ -1137,17 +1163,17 @@ mod tests {
     }
 
     #[test]
-    fn output_tail_is_bounded_and_cuts_url_queries() {
+    fn output_tail_is_bounded() {
         let tail = OutputTail::default();
         for i in 0..(OUTPUT_TAIL_LINES + 10) {
-            tail.push(&format!("line {i}"));
+            tail.push(&format!("[wrapper] event=line code=n detail=n{i}"));
         }
         let rendered = tail.render();
         assert!(
-            !rendered.contains("line 0\n"),
+            !rendered.contains("detail=n0\n"),
             "the oldest lines are dropped"
         );
-        assert!(rendered.ends_with(&format!("line {}", OUTPUT_TAIL_LINES + 9)));
+        assert!(rendered.ends_with(&format!("detail=n{}", OUTPUT_TAIL_LINES + 9)));
         assert_eq!(rendered.lines().count(), OUTPUT_TAIL_LINES);
 
         let long = OutputTail::default();
@@ -1155,11 +1181,6 @@ mod tests {
             long.push(&"x".repeat(5000));
         }
         assert!(long.render().len() <= OUTPUT_ERROR_MAX + OUTPUT_TAIL_LINES * 4);
-
-        assert_eq!(
-            redact_query("went to https://accounts.example/signin?continue=SECRET now"),
-            "went to https://accounts.example/signin?… now"
-        );
     }
 
     /// Writes a fake wrapper into `root/w`: `--manifest-only` prints a
@@ -1314,24 +1335,25 @@ mod tests {
     #[tokio::test]
     async fn the_drain_survives_bad_utf8_and_cuts_long_lines() {
         let tail = OutputTail::default();
-        let mut data: Vec<u8> = b"first\n".to_vec();
+        let mut data: Vec<u8> = b"[wrapper] event=a code=first\n".to_vec();
         data.extend_from_slice(&[0xff, 0xfe, b'b', b'a', b'd', b'\n']);
         data.extend(std::iter::repeat_n(b'A', 100_000));
-        data.extend_from_slice(b"\nafter the long line\nno newline at end");
+        data.extend_from_slice(b"\n[wrapper] event=a code=after_long\n[wrapper] event=a code=last");
         tail.drain("w", std::io::Cursor::new(data));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !tail.render().contains("no newline at end") && Instant::now() < deadline {
+        while !tail.render().contains("code=last") && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let out = tail.render();
-        assert!(out.contains("first"), "{out}");
+        assert!(out.contains("code=first"), "{out}");
         assert!(
-            out.contains("\u{fffd}\u{fffd}bad"),
-            "lossy, and it kept reading: {out}"
+            out.contains("omitted(len="),
+            "the bad-UTF-8 line is kept as evidence: {out}"
         );
+        assert!(!out.contains("bad"), "{out}");
         assert!(out.contains("[line cut]"), "{out}");
-        assert!(out.contains("after the long line"), "{out}");
-        assert!(out.contains("no newline at end"), "{out}");
+        assert!(out.contains("code=after_long"), "it kept reading: {out}");
+        assert!(out.contains("code=last"), "{out}");
         assert!(out.len() <= OUTPUT_ERROR_MAX + OUTPUT_TAIL_LINES * 4);
     }
 
@@ -1432,91 +1454,72 @@ mod tests {
     }
 
     #[test]
-    fn secret_headers_bearer_tokens_and_token_segments_are_dropped() {
-        // A secret header keeps its name and loses everything after its
-        // separator, wherever it sits; what stands BEFORE it survives.
-        for (line, want) in [
-            ("Cookie: sid=abc; other=1", "Cookie: …"),
-            (
-                "  authorization : Bearer eyJhbGciOi.secret",
-                "  authorization : …",
-            ),
-            (r#"  "cookie": "SID=abc", "n": 1"#, r#"  "cookie": …"#),
-            ("{ cookie: 'SID=abc' }", "{ cookie: …"),
-            ("- Authorization: Bearer x", "- Authorization: …"),
-            ("headers: { 'x-api-key': 'k' }", "headers: { 'x-api-key': …"),
-            (
-                "request failed (no Authorization: header sent)",
-                "request failed (no Authorization: …",
-            ),
-            // Fail closed on values no single delimiter ends: Node's inspect
-            // of a set-cookie array,
-            (
-                "{ 'set-cookie': [ 'SID=abc; Path=/' ] }",
-                "{ 'set-cookie': …",
-            ),
-            // a Map / HeadersList arrow with a short Basic value,
-            (
-                "Map(1) { 'authorization' => 'Basic dXNlcjpwYXNz' }",
-                "Map(1) { 'authorization' => …",
-            ),
-            // escaped quotes inside the value.
-            (r#"{"cookie": "a=\"x\"; SID=s3cr3t"}"#, r#"{"cookie": …"#),
-        ] {
-            assert_eq!(redact_query(line), want, "{line}");
-        }
-        for line in [
-            "{ 'set-cookie': [ 'SID=abc; Path=/' ] }",
-            "Map(1) { 'authorization' => 'Basic dXNlcjpwYXNz' }",
-            r#"{"cookie": "a=\"x\"; SID=s3cr3t"}"#,
-        ] {
-            let out = redact_query(line);
-            for secret in ["SID=abc", "dXNlcjpwYXNz", "s3cr3t"] {
+    fn only_the_allowlist_survives_wrapper_output() {
+        // Node's util.inspect of real Set-Cookie headers: the array spans
+        // lines, and the values on the continuation lines are short.
+        let inspect = [
+            "  'set-cookie': [",
+            "    'HSID=AbC1; Path=/; Domain=.google.com',",
+            "    'SSID=xY2; Path=/; Secure'",
+            "  ],",
+        ];
+        // An escaped JSON body, a Map arrow with an object value, a Bearer.
+        let others = [
+            r#"{\"headers\":{\"cookie\":\"SID=s3cr3t\"}}"#,
+            "Map(1) { 'authorization' => { value: 'Basic dXNlcjpwYXNz' } }",
+            "    value: 'g.a000s3cr3t'",
+            "sending Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+            "went to https://accounts.example/signin?continue=SECRET now",
+        ];
+        for line in inspect.iter().chain(others.iter()) {
+            let out = classify_line(line);
+            assert!(out.starts_with("omitted(len="), "{line} -> {out}");
+            for secret in [
+                "HSID",
+                "SSID",
+                "set-cookie",
+                "SID=",
+                "s3cr3t",
+                "dXNlcjpwYXNz",
+                "eyJ",
+                "SECRET",
+                "authorization",
+            ] {
                 assert!(!out.contains(secret), "{line} -> {out}");
             }
         }
-        assert_eq!(
-            redact_query("sending Bearer eyJhbGciOiJIUzI1NiJ9 now"),
-            "sending Bearer … now"
+        // The diagnostics a human needs survive, extracted.
+        let out = classify_line(
+            "page.goto: net::ERR_CONNECTION_TIMED_OUT at https://gemini.google.com/app?x=1",
         );
-        // Bearer followed by several spaces still masks the credential.
-        assert_eq!(
-            redact_query("sent Bearer   abc.def.ghi ok"),
-            "sent Bearer … ok"
+        assert!(out.starts_with("net::ERR_CONNECTION_TIMED_OUT ("), "{out}");
+        assert!(!out.contains("https"), "{out}");
+        let out = classify_line(
+            "Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: Package subpath './x' is not defined",
         );
+        assert!(out.contains("ERR_PACKAGE_PATH_NOT_EXPORTED"), "{out}");
+        assert!(out.contains("Error"), "{out}");
+        assert!(!out.contains("subpath"), "{out}");
+        let out = classify_line("browserType.launch: Executable doesn't exist at /home/u/.cache/ms-playwright/chromium_headless_shell-1169/chrome");
+        assert!(out.starts_with("playwright:executable_missing"), "{out}");
+        assert!(!out.contains("/home"), "{out}");
+        assert!(classify_line("node exited with code 3").starts_with("exit_status=3"));
+        // The structured diagnostic is kept verbatim; one carrying free text,
+        // a URL or a quoted value is not.
         assert_eq!(
-            redact_query("at https://gemini.google.com/app/8f3a2c1d9e0b7a6c5d4e3f2a1b0c"),
-            "at https://gemini.google.com/app/…"
+            classify_line(
+                "[wrapper] event=page_load_failed code=net_error detail=net::ERR_NAME_NOT_RESOLVED"
+            ),
+            "[wrapper] event=page_load_failed code=net_error detail=net::ERR_NAME_NOT_RESOLVED"
         );
-        assert_eq!(
-            redact_query("dist/index-node.js ready"),
-            "dist/index-node.js ready"
-        );
-        // JWT-shaped and dotted cookie values, bare, quoted and in JSON.
-        assert_eq!(
-            redact_query("token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig done"),
-            "token=… done"
-        );
-        assert_eq!(
-            redact_query("value g.a000abcdefghijklmnopqrstuvwxyz"),
-            "value …"
-        );
-        assert_eq!(
-            redact_query(r#"{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}"#),
-            r#"{"token":"…"}"#
-        );
-        assert_eq!(
-            redact_query("{ value: 'g.a000abcdefghijklmnopqrstuvwxyz1' }"),
-            "{ value: '…' }"
-        );
-        // A 24-char base64url token with no digit, and an all-digit id, are
-        // tokens; a long dotted hostname is not.
-        assert_eq!(redact_query("t=abcdEFGHijklMNOPqrstUVWX"), "t=…");
-        assert_eq!(redact_query("id 123456789012345678901234"), "id …");
-        assert_eq!(
-            redact_query("GET https://generativelanguage.googleapis.com/v1"),
-            "GET https://generativelanguage.googleapis.com/v1"
-        );
+        for bad in [
+            "[wrapper] event=ready code=ok detail=hello world",
+            "[wrapper] event=x code=y detail=https://a.example/?q=1",
+            "[wrapper] event=x code=y detail='SID=abc'",
+            "[wrapper] event=x code=y extra=1",
+        ] {
+            assert!(classify_line(bad).starts_with("omitted(len="), "{bad}");
+        }
     }
 
     /// A wrapper that exits at once (a missing peer, no display) fails the
@@ -1533,7 +1536,7 @@ mod tests {
         fake_wrapper(
             tmp.path(),
             "headed",
-            "console.error(\"Transport kind 'headed' needs the optional '@qontinui/ui-bridge-headless' peer; see https://docs.example/x?token=SECRET\"); process.exit(1);",
+            "console.error('[wrapper] event=spawn_failed code=missing_peer'); console.error('see https://docs.example/x?token=SECRET'); process.exit(1);",
         );
         let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
         let manager = WrapperManager::new(registry);
@@ -1549,8 +1552,15 @@ mod tests {
             started.elapsed()
         );
         assert!(err.contains("exited first (exit status 1)"), "{err}");
-        assert!(err.contains("ui-bridge-headless"), "{err}");
-        assert!(!err.contains("SECRET"), "{err}");
+        assert!(
+            err.contains("[wrapper] event=spawn_failed code=missing_peer"),
+            "{err}"
+        );
+        assert!(err.contains("omitted(len="), "{err}");
+        assert!(
+            !err.contains("SECRET") && !err.contains("docs.example"),
+            "{err}"
+        );
     }
 
     #[test]
