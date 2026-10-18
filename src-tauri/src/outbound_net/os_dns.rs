@@ -37,11 +37,11 @@
 //! [`MAX_CONCURRENT_LOOKUPS`] permits. A stuck lookup can therefore hold one
 //! permit, never a blocking-pool slot.
 //!
-//! Hand it to a client with [`reqwest::ClientBuilder::dns_resolver`]:
+//! Build clients with [`client_builder`], which installs it:
 //!
 //! ```ignore
-//! let client = reqwest::Client::builder()
-//!     .dns_resolver(qontinui_runner_lib::outbound_net::os_dns::os_resolver())
+//! let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
+//!     .timeout(std::time::Duration::from_secs(5))
 //!     .build()?;
 //! ```
 
@@ -167,14 +167,23 @@ mod tests {
     #[tokio::test]
     async fn an_unresolvable_name_is_an_error_not_an_empty_answer() {
         // `.invalid` is reserved (RFC 6761) and never resolves.
-        let err = tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(30),
             resolve_host("no-such-host.invalid".to_string()),
         )
         .await
-        .expect("the OS resolver answers (with an error) within 30 s")
-        .expect_err("a reserved-invalid name must not resolve");
-        assert!(err.to_string().contains("no-such-host.invalid"), "{err}");
+        .expect("the OS resolver answers within 30 s");
+        match result {
+            // The normal case: the error names the host it failed on.
+            Err(err) => assert!(err.to_string().contains("no-such-host.invalid"), "{err}"),
+            // An NXDOMAIN-rewriting resolver (some ISPs) answers with a
+            // search page's address. That is the network's answer, not ours —
+            // but it must never be a loopback address or an empty list.
+            Ok(addrs) => assert!(
+                !addrs.is_empty() && addrs.iter().all(|a| !a.ip().is_loopback()),
+                "{addrs:?}"
+            ),
+        }
     }
 
     #[tokio::test]

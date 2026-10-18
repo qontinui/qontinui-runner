@@ -105,8 +105,8 @@ adb_client = { version = "3", features = ["usb", "mdns"] }
 # publisher) are also kept OFF tokio's
 # blocking pool, the reason hickory was enabled in #918; every other
 # `reqwest::Client::builder()` site uses reqwest's default GaiResolver, which
-# takes one blocking-pool slot per lookup. Migrating them is a tracked
-# follow-up. `os_dns::tests::no_reqwest_in_the_lockfile_depends_on_hickory`
+# takes one blocking-pool slot per lookup. Migrating them is the follow-up
+# recorded as coord finding 1d5d6c2e-d0f4-4a70-9e67-efc5ed158268. `os_dns::tests::no_reqwest_in_the_lockfile_depends_on_hickory`
 # pins the feature off.
 reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form"] }
 open = "5"
