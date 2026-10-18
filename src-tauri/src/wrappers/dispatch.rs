@@ -73,6 +73,54 @@ pub(crate) enum PreDispatchRefusal {
     SpawnFailed(String),
 }
 
+/// The error envelope for a wrapper's non-2xx answer. Its body is NEVER
+/// quoted: only allowlisted typed fields pass through — `code` and `status`
+/// when they are short enum-like words, `retry_after_s` when a number,
+/// `typed` when a bool — and the rest is `omitted(len, sha256)`.
+pub(crate) fn wrapper_error_body(
+    wrapper_id: &str,
+    status: u16,
+    parsed: &serde_json::Value,
+) -> ApiResponse<()> {
+    let word = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 32
+                    && s.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            })
+            .map(str::to_string)
+    };
+    let code = word("code");
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(c) = &code {
+        fields.push(format!("code={c}"));
+    }
+    if let Some(st) = word("status") {
+        fields.push(format!("status={st}"));
+    }
+    if let Some(r) = parsed.get("retry_after_s").and_then(|v| v.as_f64()) {
+        fields.push(format!("retry_after_s={r}"));
+    }
+    if let Some(t) = parsed.get("typed").and_then(|v| v.as_bool()) {
+        fields.push(format!("typed={t}"));
+    }
+    let message = format!(
+        "wrapper '{}' returned {}{}{}; body {}",
+        wrapper_id,
+        status,
+        if fields.is_empty() { "" } else { " " },
+        fields.join(" "),
+        super::manager::omitted(&parsed.to_string())
+    );
+    match code {
+        Some(c) => ApiResponse::error_with_code(message, c),
+        None => api_error(message),
+    }
+}
+
 /// The HTTP answer for a dispatch that never reached the wrapper. Busy is a
 /// 429 carrying the typed `code` `wrapper_busy` (nothing started, come back
 /// soon); a failed spawn is a 503 (the wrapper could not be started).
@@ -266,6 +314,19 @@ pub async fn dispatch_handler(
         }
     };
 
+    dispatch_local(ctx, wrapper_id, headers, req, PRE_DISPATCH_WAIT).await
+}
+
+/// The dispatch on THIS runner, given its wrapper context: everything the
+/// handler does once it is known not to be a secondary. `wait` is the
+/// pre-dispatch wait (`PRE_DISPATCH_WAIT` in production).
+pub(crate) async fn dispatch_local(
+    ctx: Arc<DispatchContext>,
+    wrapper_id: String,
+    headers: HeaderMap,
+    req: DispatchRequest,
+    wait: Duration,
+) -> Result<Json<ApiResponse<DispatchResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Verify the wrapper exists in the registry — surface a 404 instead
     // of a confusing readiness timeout.
     if ctx.registry.get(&wrapper_id).await.is_none() {
@@ -286,7 +347,7 @@ pub async fn dispatch_handler(
     // typed `wrapper_busy` code — nothing was started, so the caller retries
     // soon — never the 503 a broken wrapper gets.
     let (_exclusive_guard, port) =
-        match turn_and_spawn(&ctx, &wrapper_id, &req.action, exclusive, PRE_DISPATCH_WAIT).await {
+        match turn_and_spawn(&ctx, &wrapper_id, &req.action, exclusive, wait).await {
             Ok(ok) => ok,
             Err(refusal) => return Err(refusal_response(refusal)),
         };
@@ -345,10 +406,7 @@ pub async fn dispatch_handler(
             // upstream callers can distinguish "wrapper said 4xx" from
             // "infra failure".
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(api_error(format!(
-                "wrapper '{}' returned {}: {}",
-                wrapper_id, status, parsed
-            ))),
+            Json(wrapper_error_body(&wrapper_id, status.as_u16(), &parsed)),
         ));
     }
 
@@ -370,6 +428,105 @@ mod tests {
         let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
         let manager = WrapperManager::new(registry.clone());
         (DispatchContext::new(registry, manager), tmp)
+    }
+
+    /// A wrapper's non-2xx body is never quoted: a free-text message (here
+    /// carrying a cookie) is omitted, typed fields pass through.
+    #[test]
+    fn a_wrapper_error_body_is_not_quoted() {
+        let body = serde_json::json!({
+            "success": false,
+            "error": "fetch failed: Cookie: SID=s3cr3t at https://x.example/?t=1",
+            "code": "rate_limited",
+            "retry_after_s": 12,
+            "typed": true,
+        });
+        let env = wrapper_error_body("w", 429, &body);
+        let msg = env.error.clone().unwrap();
+        assert!(
+            !msg.contains("s3cr3t") && !msg.contains("Cookie") && !msg.contains("https"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("code=rate_limited")
+                && msg.contains("retry_after_s=12")
+                && msg.contains("typed=true"),
+            "{msg}"
+        );
+        assert!(msg.contains("omitted(len="), "{msg}");
+        assert_eq!(env.code.as_deref(), Some("rate_limited"));
+        // A code that is not an enum-like word is not passed through.
+        let env = wrapper_error_body("w", 500, &serde_json::json!({ "code": "SID=s3cr3t" }));
+        assert!(env.code.is_none() && !env.error.unwrap().contains("s3cr3t"));
+    }
+
+    /// The 429 through an axum route and its JSON serialisation, not just the
+    /// helper: a registered wrapper whose exclusive action is held answers
+    /// HTTP 429 with `"code":"wrapper_busy"` in the body.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_route_answers_a_held_exclusive_action_with_a_typed_429() {
+        use axum::{body::Body, http::Request, routing::post, Router};
+        use tower::ServiceExt;
+        let node = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !node {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("w");
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"w","version":"0.0.0"}"#,
+        )
+        .unwrap();
+        let manifest = r#"{"manifestVersion":1,"manifest":{"id":"w","displayName":"w","transport":"api"},"actions":[{"id":"a","paramSchema":{},"exclusive":true}]}"#;
+        std::fs::write(
+            dir.join("dist").join("index-node.js"),
+            format!("if (process.argv.includes('--manifest-only')) {{ console.log({manifest:?}); process.exit(0); }}"),
+        )
+        .unwrap();
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        let manager = WrapperManager::new(registry.clone());
+        let ctx = DispatchContext::new(registry, manager);
+        let held = ctx.exclusivity.lock_for("w", "a").await.lock_owned().await;
+
+        let app =
+            Router::new().route(
+                "/wrappers/{id}/dispatch",
+                post({
+                    let ctx = ctx.clone();
+                    move |AxumPath(id): AxumPath<String>,
+                          headers: HeaderMap,
+                          Json(req): Json<DispatchRequest>| {
+                        let ctx = ctx.clone();
+                        async move {
+                            dispatch_local(ctx, id, headers, req, Duration::from_millis(80)).await
+                        }
+                    }
+                }),
+            );
+        let resp = app
+            .oneshot(
+                Request::post("/wrappers/w/dispatch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"action":"a","params":{}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], BUSY_CODE);
+        drop(held);
     }
 
     /// The dispatch handler's answer for each refusal: busy is HTTP 429 with
