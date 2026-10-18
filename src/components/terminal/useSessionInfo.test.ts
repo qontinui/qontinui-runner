@@ -1438,6 +1438,7 @@ describe("tenancy.display Rust-fixture contract", () => {
     expect(fixture.map((c) => c.name)).toEqual([
       "regression_2026_10_17",
       "adopted_terminal_row",
+      "resumed_unconfirmed_terminal_row",
       "adopted_non_terminal_row",
       "coord_row_mismatch",
       "unknown_no_nonce",
@@ -1469,6 +1470,17 @@ describe("tenancy.display Rust-fixture contract", () => {
     expect(t?.coordRow?.reason).toBe("terminal_plane_row_is_the_data_plane_leg");
     expect(t?.divergence).toBe("agree");
     expect(tenantRow(t).display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
+  });
+
+  it("leaves a resumed pane's unconfirmed terminal row unknown, not agree", () => {
+    const t = byName.resumed_unconfirmed_terminal_row;
+    expect(t?.coordRow?.status).toBe("unknown");
+    expect(t?.coordRow?.reason).toBe("terminal_row_resume_unconfirmed");
+    expect(t?.divergence).toBe("unknown");
+    expect(tenantRow(t).display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
+    expect(tenantRow(t).title ?? "").toContain(
+      "Coord session row: unknown — terminal_row_resume_unconfirmed",
+    );
   });
 
   it("leaves an adopted row that is not the terminal's unknown", () => {
