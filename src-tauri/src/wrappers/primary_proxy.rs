@@ -39,6 +39,8 @@ struct ApiResponse<T> {
     pub success: bool,
     pub data: Option<T>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 /// Shared HTTP client for all proxy requests (reuses connections).
@@ -81,6 +83,10 @@ pub enum ProxyError {
     Other {
         status: Option<StatusCode>,
         message: String,
+        /// The upstream envelope's machine-readable `code` (e.g. the
+        /// dispatch's `wrapper_busy`), carried through so a caller of the
+        /// secondary can branch on it exactly as on the primary.
+        code: Option<String>,
     },
 }
 
@@ -89,16 +95,18 @@ impl ProxyError {
         Self::Other {
             status: None,
             message: message.into(),
+            code: None,
         }
     }
 
-    fn from_status(status: StatusCode, message: String) -> Self {
+    fn from_status(status: StatusCode, message: String, code: Option<String>) -> Self {
         if status == StatusCode::NOT_FOUND {
             ProxyError::NotFound(message)
         } else {
             ProxyError::Other {
                 status: Some(status),
                 message,
+                code,
             }
         }
     }
@@ -135,11 +143,10 @@ async fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, ProxyErr
             .text()
             .await
             .unwrap_or_else(|_| status.canonical_reason().unwrap_or("error").to_string());
-        let message = serde_json::from_str::<ApiResponse<serde_json::Value>>(&body_text)
-            .ok()
-            .and_then(|env| env.error)
-            .unwrap_or(body_text);
-        return Err(ProxyError::from_status(status, message));
+        let envelope = serde_json::from_str::<ApiResponse<serde_json::Value>>(&body_text).ok();
+        let code = envelope.as_ref().and_then(|env| env.code.clone());
+        let message = envelope.and_then(|env| env.error).unwrap_or(body_text);
+        return Err(ProxyError::from_status(status, message, code));
     }
 
     let api: ApiResponse<T> = resp
@@ -207,11 +214,10 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
             .text()
             .await
             .unwrap_or_else(|_| status.canonical_reason().unwrap_or("error").to_string());
-        let message = serde_json::from_str::<ApiResponse<serde_json::Value>>(&body_text)
-            .ok()
-            .and_then(|env| env.error)
-            .unwrap_or(body_text);
-        return Err(ProxyError::from_status(status, message));
+        let envelope = serde_json::from_str::<ApiResponse<serde_json::Value>>(&body_text).ok();
+        let code = envelope.as_ref().and_then(|env| env.code.clone());
+        let message = envelope.and_then(|env| env.error).unwrap_or(body_text);
+        return Err(ProxyError::from_status(status, message, code));
     }
 
     let api: ApiResponse<T> = resp
@@ -480,6 +486,7 @@ pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
         ProxyError::Other {
             status: None,
             message,
+            ..
         } => (
             StatusCode::SERVICE_UNAVAILABLE,
             AxumJson(api_error(format!(
@@ -490,16 +497,55 @@ pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
         ProxyError::Other {
             status: Some(s),
             message,
+            code,
         } => {
             // 4xx upstream is the caller's fault — pass it through so the
-            // status describes the underlying problem. Reserve 502 for
-            // genuine upstream failures (5xx, parse errors).
-            let mapped = if s.is_client_error() {
+            // status describes the underlying problem. A 503 is passed
+            // through too: it is the primary's own "this wrapper could not
+            // be started" verdict, which a caller parks on, not a gateway
+            // failure. Reserve 502 for the other 5xx.
+            let mapped = if s.is_client_error() || s == StatusCode::SERVICE_UNAVAILABLE {
                 s
             } else {
                 StatusCode::BAD_GATEWAY
             };
-            (mapped, AxumJson(api_error(message)))
+            let body = match code {
+                Some(code) => McpApiResponse::error_with_code(message, code),
+                None => api_error(message),
+            };
+            (mapped, AxumJson(body))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Through a secondary runner the primary's verdicts survive: a 503
+    /// (spawn failed: park) stays a 503, a typed 429 busy stays a 429 with
+    /// its code, and only another 5xx becomes 502.
+    #[test]
+    fn the_primarys_503_and_typed_429_pass_through() {
+        let (s, body) = into_http(ProxyError::from_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "failed to spawn".into(),
+            None,
+        ));
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.0.code.is_none());
+        let (s, body) = into_http(ProxyError::from_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy".into(),
+            Some("wrapper_busy".into()),
+        ));
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body.0.code.as_deref(), Some("wrapper_busy"));
+        let (s, _) = into_http(ProxyError::from_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "boom".into(),
+            None,
+        ));
+        assert_eq!(s, StatusCode::BAD_GATEWAY);
     }
 }

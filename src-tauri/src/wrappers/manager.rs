@@ -70,14 +70,16 @@ impl std::fmt::Display for SpawnError {
     }
 }
 
-/// The most a dispatch can spend BEFORE the wrapper receives it, by
-/// construction: the bounded waits for an exclusive turn and the spawn lock
-/// (dispatch.rs `PRE_DISPATCH_WAIT`, 30 s together), retiring a Degraded
-/// record (`terminate_runtime`: two `STOP_GRACE` waits), a browser wrapper's
-/// readiness wait, and terminating a spawn that never became ready (two more
-/// `STOP_GRACE` waits). A caller sizing its read timeout adds its dispatch
-/// timeout to this.
-pub const PRE_DISPATCH_CEILING: Duration = Duration::from_secs(30 + 10 + 30 + 10);
+/// An upper bound on what a dispatch spends BEFORE the wrapper receives it.
+/// Its named parts are each bounded: the waits for an exclusive turn and the
+/// spawn lock (dispatch.rs `PRE_DISPATCH_WAIT`, 30 s together), retiring a
+/// Degraded record (`terminate_runtime`: up to three `STOP_GRACE` waits), a
+/// browser wrapper's readiness wait (30 s) and terminating a spawn that never
+/// became ready (three more). Around them sit small costs that are not capped
+/// one by one — a readiness poll's overshoot, the 100 ms output settle, the
+/// `/proc` scans — so the bound carries a 10 s margin rather than claiming to
+/// be exact. A caller sizing its read timeout adds its dispatch timeout to it.
+pub const PRE_DISPATCH_CEILING: Duration = Duration::from_secs(30 + 15 + 30 + 15 + 10);
 
 /// The readiness wait for a wrapper declaring `transport`.
 fn ready_timeout_for(transport: &str) -> Duration {
@@ -183,12 +185,14 @@ impl OutputTail {
 
 /// Header names whose whole line is dropped from quoted wrapper output.
 /// A secret header named ANYWHERE in a line — `Cookie: …`, `"cookie": "…"`,
-/// Node's `{ cookie: '…' }`, `- Authorization: …` — keeps its name and loses
-/// its VALUE (to the closing quote or brace, else to the end of the line), so
-/// the rest of the line stays readable.
+/// Node's `{ cookie: '…' }`, `'set-cookie': [ … ]`, a Map's
+/// `'authorization' => '…'`, `- Authorization: …` — keeps its name and loses
+/// EVERYTHING after its separator, to the end of the line. Fail closed: a
+/// value can be an array, an object, or hold escaped quotes, so no closing
+/// delimiter is trusted to end it.
 static SECRET_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r#"(?i)(^|[^a-z0-9_-])((?:proxy-authorization|authorization|set-cookie|cookie|x-api-key|api-key)["'\s]*[:=]\s*)(["']?)[^"'\n}]*"#,
+        r#"(?i)(^|[^a-z0-9_-])((?:proxy-authorization|authorization|set-cookie|cookie|x-api-key|api-key)["'\s]*(?:=>|[:=])).*$"#,
     )
     .expect("static regex")
 });
@@ -196,9 +200,9 @@ static SECRET_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::n
 static BEARER: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(bearer)\s+\S+").expect("static regex"));
 /// A segment at least this long, made only of token characters
-/// (`[A-Za-z0-9._-]`, so JWTs and `g.a000…` cookies included) and holding both
-/// a letter and a digit, is masked: it reads like a token, a session id or a
-/// conversation id. A dotted hostname has no digit as a rule and survives.
+/// (`[A-Za-z0-9._-]`, so JWTs and `g.a000…` cookies included), is masked: it
+/// reads like a token, a session id or a conversation id. The one exemption is
+/// a segment shaped like a hostname (see `hostname_shaped`).
 const TOKEN_SEGMENT_MIN: usize = 24;
 
 /// Wrapper output is quoted in errors and logs, so it is reduced before it is
@@ -206,7 +210,7 @@ const TOKEN_SEGMENT_MIN: usize = 24;
 /// masked, a URL's query and fragment are cut, and any long token-like segment
 /// is masked — inside quotes, JSON and object literals too.
 fn redact_query(line: &str) -> String {
-    let line = SECRET_HEADER.replace_all(line, "${1}${2}${3}…");
+    let line = SECRET_HEADER.replace_all(line, "${1}${2} …");
     let line = BEARER.replace_all(&line, "$1 …");
     let mut out = String::with_capacity(line.len());
     for (i, word) in line.split(' ').enumerate() {
@@ -222,6 +226,24 @@ fn redact_query(line: &str) -> String {
     out
 }
 
+/// A dotted, lowercase hostname: two or more labels of `[a-z0-9-]`, none
+/// empty or longer than 63, the last all letters. A JWT (upper case, `_`), a
+/// dotted cookie value whose last label holds digits, an all-digit id and an
+/// undotted base64url token all fail this, so they stay masked.
+fn hostname_shaped(segment: &str) -> bool {
+    let labels: Vec<&str> = segment.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+        && labels
+            .last()
+            .is_some_and(|l| l.len() >= 2 && l.chars().all(|c| c.is_ascii_lowercase()))
+}
+
 /// Mask every segment of `word` that looks like a token. Segments are split
 /// on path, assignment and quoting punctuation (`/ = : " ' ` , ; { } ( ) [ ]`),
 /// so a quoted or JSON value is a segment of its own.
@@ -233,8 +255,7 @@ fn mask_token_segments(word: &str) -> String {
             && segment
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            && segment.chars().any(|c| c.is_ascii_digit())
-            && segment.chars().any(|c| c.is_ascii_alphabetic());
+            && !hostname_shaped(segment);
         out.push_str(if tokenish { "…" } else { segment.as_str() });
         segment.clear();
     };
@@ -780,8 +801,8 @@ async fn wait_for_port(
     let mut last_err = "no attempts".to_string();
     while Instant::now() < deadline {
         if let Some(c) = child.as_deref_mut() {
-            if exited_without_reaping(c) {
-                return Err("the wrapper process exited first".to_string());
+            if let Some(how) = exited_without_reaping(c) {
+                return Err(format!("the wrapper process exited first ({how})"));
             }
         }
         match probe_port(port).await {
@@ -793,14 +814,15 @@ async fn wait_for_port(
     Err(last_err)
 }
 
-/// Whether `child` has exited — WITHOUT reaping it on Unix (`WNOWAIT`), so
-/// its zombie keeps the process-group id reserved for `terminate_runtime`'s
-/// group kill. Elsewhere `try_wait` (a Windows job needs no pgid).
-fn exited_without_reaping(child: &mut Child) -> bool {
+/// How `child` exited (`exit status N` / `signal N`), or `None` while it
+/// runs — read WITHOUT reaping it on Unix (`WNOWAIT`), so its zombie keeps the
+/// process-group id reserved for `terminate_runtime`'s group kill. Elsewhere
+/// `try_wait` (a Windows job needs no pgid).
+fn exited_without_reaping(child: &mut Child) -> Option<String> {
     #[cfg(unix)]
     {
         let Some(pid) = child.id() else {
-            return true; // already reaped
+            return Some("already reaped".to_string());
         };
         // SAFETY: waitid with WNOHANG|WNOWAIT only inspects our own child.
         unsafe {
@@ -811,12 +833,22 @@ fn exited_without_reaping(child: &mut Child) -> bool {
                 &mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             );
-            rc == 0 && info.si_pid() != 0
+            if rc != 0 || info.si_pid() == 0 {
+                return None;
+            }
+            Some(if info.si_code == libc::CLD_EXITED {
+                format!("exit status {}", info.si_status())
+            } else {
+                format!("signal {}", info.si_status())
+            })
         }
     }
     #[cfg(not(unix))]
     {
-        matches!(child.try_wait(), Ok(Some(_)))
+        match child.try_wait() {
+            Ok(Some(status)) => Some(status.to_string()),
+            _ => None,
+        }
     }
 }
 
@@ -956,7 +988,9 @@ async fn reap(wrapper_id: &str, child: &mut Child) {
         Ok(Ok(status)) => debug!("wrappers: '{}' exited with {}", wrapper_id, status),
         Ok(Err(e)) => warn!("wrappers: wait('{}') failed: {}", wrapper_id, e),
         Err(_) => {
-            let _ = child.kill().await;
+            // Bounded too: a kill whose wait never returns must not hold the
+            // caller (and its pre-dispatch budget) open.
+            let _ = tokio::time::timeout(STOP_GRACE, child.kill()).await;
         }
     }
 }
@@ -1319,6 +1353,56 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
+    /// `terminate_runtime` on a record whose leader is ALREADY REAPED must not
+    /// signal its old process group: by then that pgid can name an unrelated
+    /// group. Here the group still holds a live member (the stand-in for a
+    /// reused group); the old code's group kill would take it, the disarm
+    /// leaves it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reaped_leaders_group_is_not_signalled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("member.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 30 & echo $! > {}; exit 0",
+            pid_file.to_string_lossy()
+        ));
+        ChildTreeGuard::arm_tokio(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let tree = ChildTreeGuard::attach_armed_tokio(&child);
+        child.wait().await.unwrap(); // the leader exits and is REAPED
+        assert!(child.id().is_none());
+        let member: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(alive(member), "precondition: the group still has a member");
+
+        let now = Instant::now();
+        let runtime = WrapperRuntime {
+            id: "w".to_string(),
+            port: 1,
+            pid: None,
+            child: Some(child),
+            tree: Some(tree),
+            output: OutputTail::default(),
+            started_at: now,
+            last_dispatch: now,
+            consecutive_failures: 0,
+            state: WrapperState::Running,
+        };
+        terminate_runtime("w", runtime).await;
+        let survived = alive(member);
+        // SAFETY: clean up the test's own sleep.
+        unsafe { libc::kill(member as i32, libc::SIGKILL) };
+        assert!(
+            survived,
+            "the stale group was signalled after its leader was reaped"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn stat_fields_are_read_after_the_last_paren() {
@@ -1349,30 +1433,47 @@ mod tests {
 
     #[test]
     fn secret_headers_bearer_tokens_and_token_segments_are_dropped() {
-        // A secret header keeps its name and loses its value, wherever it sits.
+        // A secret header keeps its name and loses everything after its
+        // separator, wherever it sits; what stands BEFORE it survives.
         for (line, want) in [
             ("Cookie: sid=abc; other=1", "Cookie: …"),
             (
                 "  authorization : Bearer eyJhbGciOi.secret",
                 "  authorization : …",
             ),
-            (
-                r#"  "cookie": "SID=abc", "n": 1"#,
-                r#"  "cookie": "…", "n": 1"#,
-            ),
-            ("{ cookie: 'SID=abc' }", "{ cookie: '…' }"),
+            (r#"  "cookie": "SID=abc", "n": 1"#, r#"  "cookie": …"#),
+            ("{ cookie: 'SID=abc' }", "{ cookie: …"),
             ("- Authorization: Bearer x", "- Authorization: …"),
-            (
-                "headers: { 'x-api-key': 'k' }",
-                "headers: { 'x-api-key': '…' }",
-            ),
-            // A line that merely mentions the header keeps the rest of itself.
+            ("headers: { 'x-api-key': 'k' }", "headers: { 'x-api-key': …"),
             (
                 "request failed (no Authorization: header sent)",
                 "request failed (no Authorization: …",
             ),
+            // Fail closed on values no single delimiter ends: Node's inspect
+            // of a set-cookie array,
+            (
+                "{ 'set-cookie': [ 'SID=abc; Path=/' ] }",
+                "{ 'set-cookie': …",
+            ),
+            // a Map / HeadersList arrow with a short Basic value,
+            (
+                "Map(1) { 'authorization' => 'Basic dXNlcjpwYXNz' }",
+                "Map(1) { 'authorization' => …",
+            ),
+            // escaped quotes inside the value.
+            (r#"{"cookie": "a=\"x\"; SID=s3cr3t"}"#, r#"{"cookie": …"#),
         ] {
             assert_eq!(redact_query(line), want, "{line}");
+        }
+        for line in [
+            "{ 'set-cookie': [ 'SID=abc; Path=/' ] }",
+            "Map(1) { 'authorization' => 'Basic dXNlcjpwYXNz' }",
+            r#"{"cookie": "a=\"x\"; SID=s3cr3t"}"#,
+        ] {
+            let out = redact_query(line);
+            for secret in ["SID=abc", "dXNlcjpwYXNz", "s3cr3t"] {
+                assert!(!out.contains(secret), "{line} -> {out}");
+            }
         }
         assert_eq!(
             redact_query("sending Bearer eyJhbGciOiJIUzI1NiJ9 now"),
@@ -1408,7 +1509,10 @@ mod tests {
             redact_query("{ value: 'g.a000abcdefghijklmnopqrstuvwxyz1' }"),
             "{ value: '…' }"
         );
-        // A long dotted hostname is not a token.
+        // A 24-char base64url token with no digit, and an all-digit id, are
+        // tokens; a long dotted hostname is not.
+        assert_eq!(redact_query("t=abcdEFGHijklMNOPqrstUVWX"), "t=…");
+        assert_eq!(redact_query("id 123456789012345678901234"), "id …");
         assert_eq!(
             redact_query("GET https://generativelanguage.googleapis.com/v1"),
             "GET https://generativelanguage.googleapis.com/v1"
@@ -1444,7 +1548,7 @@ mod tests {
             "waited {:?}",
             started.elapsed()
         );
-        assert!(err.contains("exited first"), "{err}");
+        assert!(err.contains("exited first (exit status 1)"), "{err}");
         assert!(err.contains("ui-bridge-headless"), "{err}");
         assert!(!err.contains("SECRET"), "{err}");
     }
