@@ -170,7 +170,7 @@ async fn collect_live_ws_components(
             )
             .await
         {
-            Ok(value) => unwrap_components_payload(value),
+            Ok(value) => unwrap_components_payload(value.into_raw()),
             Err(e) => {
                 warn!(
                     "[wrapper-manifest] getComponents WS dispatch to '{}' failed: {}",
