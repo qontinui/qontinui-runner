@@ -114,6 +114,7 @@ Do this first, regardless of which transport ends up carrying it.
 | A PR merging | `pr_merged` | `{repo, pr_number}` — works on coord-orchestrated repos too: since the land-aware `pr_merged_verdict` shipped it clears from coord's OWN ff-land provenance (`close_cause`), not a GitHub merge event, so the clear can lag GitHub's close slightly. Registration emits an informational steer, not a rejection. (The older "never fires on a coord-orchestrated repo" advice is STALE — corrected 2026-08-03 against `gates.rs` `pr_merged_verdict`.) ⚠️ If what you are really waiting on is a DEPLOY, this is the weaker predicate — see the deploy-order row below. A **work-unit-anchored** registration whose `phase_name` says so answers with a non-blocking `deploy_order_predicate_weaker:` steer; a **claim-anchored** one (`claim_kind` + `resource_key`) has no `phase_name` for the steer to read — coord refuses that field without a `work_unit_id` — so it gets **no steer at all** and the predicate choice is entirely yours. Both refusal and steer ship in qontinui-coord#2315, LANDED on coord `main` 2026-09-21 (`72c50b3f`) — landed, not necessarily serving, which is this row's own subject. |
 | Work landing on main of a **coord-orchestrated repo** | `commit_live` | `{repo, commit_sha, on_ref?}` — ancestor-of-main check; anchor a **post-land main SHA** (or use `unit_status` — **not `file_exists`, which is broken**), NEVER the pre-land branch-head SHA — rebase-land rewrites SHAs and the gate rots open |
 | A specific **device's running build** being at-or-past a SHA | `runner_served_sha` | `{device_id, repo, expected_sha}` — device-scoped, and NOT interchangeable with `commit_live`: `commit_live` only checks repo-main ancestry (the code has landed), while `runner_served_sha` checks that THAT device's currently-running binary is at-or-past `expected_sha` (the code has been rebuilt onto). Stays `open` while the commit has landed but the device hasn't restarted onto it — `verdict_reason` names the device's current build id when open (e.g. "device `<id>` is serving `<build>`, not yet at-or-past `<sha>` ... runner has not rebuilt onto the target"), which is the read-back signal for "still on the old build." Registered live 2026-09-02 (plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`); missing from this table until then. |
+| **Verify a runner fix once the device serves it** | `runner_served_sha` + a typed `continuation` | `{device_id, repo, expected_sha}` plus `continuation {action:"run_skill", skill, hint, target_device_id, repos}` and an `expires_at`. It replaces the `[VERIFICATION:PENDING]` output-text marker the runner deleted: output text never schedules verification. Register BEFORE the device rebuilds (a `continuation_dropped_born_cleared:` response means verify now, in-session); the `hint` opens with a device-identity guard, worded to run BEFORE the skill, because `target_device_id` is only a preference (canonical: `_gate-registration` → "Predicate choice guidance") |
 | A **fault firing** (an alert going open) | `alert_open` | `{alert_kind, alert_key?, alert_id?}` — clears while a `coord.alerts` row of `alert_kind` is UNRESOLVED: *"resume when X breaks"*, not *"resume when X is fixed"* (the negated form was deliberately not added). `alert_key` narrows to one watcher's dedupe key, `alert_id` to one episode — and a resolved/absent/wrong-kind `alert_id` REGISTERS `misconfigured` rather than being refused, so read the verdict back. The evaluator never returns `Failed`, but the sweep's unevaluable escalation still can, from outside it. Omit `tenant_id` — coord stamps it; another tenant's is refused, your own is accepted. Landed qontinui-coord#2239, 2026-09-19 (canonical: `_gate-registration`) |
 | A deploy going healthy | `deploy_healthy` | `{service, expected_rev}` — BOTH required; clears only when the service is healthy AND the deployed rev includes `expected_rev` (fail-closed if the deployed rev is unknown). `service` is an EXACT vocabulary, not free text — **`coord` or `web`, no variants**: not `qontinui-web`, not `qontinui-staging/web` (the target coord's own `coord_query_release_state` prints). The predicate conjoins three independently-implemented lookups that normalize differently, and the health one does raw `==` on an alert key's final `:`-segment, so a near-miss spelling names an observation but no alert and the health half is SILENTLY SKIPPED. Coord refuses an unresolvable `service`, and a blank `expected_rev`, at the door — **once the coord that answers you is SERVING qontinui-coord#2315**, which landed on coord `main` 2026-09-21 (`72c50b3f`) but whose deployment is a separate fact this file cannot state; read `coord_query_release_state` for `coord`. Until it does, a near-miss spelling is accepted and silently half-evaluates. Canonical: `_gate-registration` → "Merged is not deployed" |
 | **Repo A must not ship until repo B's change is LIVE on the serving backend** | `deploy_healthy` | **not `pr_merged`** — merged is not deployed. `pr_merged` is a fact about a pull request and has no unknown arm; a rollback leaves it cleared TERMINALLY while the backend no longer carries the code. Set `expected_rev` to the landed commit of the upstream half. Where coord does not observe the service at all, `deploy_healthy` cannot see it — use `commit_live` or `runner_served_sha` and say in the phase text which weaker thing you are gating on. Canonical: `_gate-registration` → "Merged is not deployed" |
@@ -396,8 +397,8 @@ Candidate order (cwd → repo root → siblings):
 
 ```bash
 COORD_RPC='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-# Workspace root = the directory containing the repo checkouts. $QONTINUI_ROOT
-# overrides; otherwise the parent of the MAIN checkout via `--git-common-dir`;
+# Workspace root = the directory containing your repo checkouts. $WORKSPACE_ROOT,
+# else the runner's $QONTINUI_ROOT, overrides; otherwise the parent of the MAIN checkout via `--git-common-dir`;
 # from a non-git cwd (e.g. the workspace root itself) fall back to $PWD.
 #
 # NOT `--show-toplevel`: inside a LINKED GIT WORKTREE that returns the worktree
@@ -407,7 +408,7 @@ COORD_RPC='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 # real root. Sessions run under QONTINUI_AGENT_WORKTREE_MODE=1, so this is the
 # common path, not an edge case. `--git-common-dir` resolves to the MAIN repo's
 # .git from a worktree and the canonical checkout alike.
-ROOT="${QONTINUI_ROOT:-}"
+ROOT="${WORKSPACE_ROOT:-${QONTINUI_ROOT:-}}"
 if [ -z "$ROOT" ]; then
   GC="$(git rev-parse --git-common-dir 2>/dev/null)"
   [ -n "$GC" ] && GC="$(cd "$GC" 2>/dev/null && pwd)"
@@ -791,12 +792,18 @@ bare file another runner start has since rewritten), `..._INVALID_BODY` /
 > doors. Name both probes you ran.
 >
 > **The stamped form of both probes is one command:**
-> `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` runs this same
+> `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` runs this same
 > unauthenticated probe as one door of its cascade and prints a `FLOOR-CLAIM:`
 > block carrying the probe time, the runner build, this box's load and a
 > per-door table — the block Step 5's report pastes. The bare `curl` stays
 > here because it needs nothing at all; the block is what makes the answer
 > quotable a day later.
+> `<session-workdir>` is the coord-revive skill directory's root: the session
+> workdir the runner provisioned the skill into, else — for a hand-started session
+> whose cwd carries no copy, as most agent worktrees do not — a checked-out copy
+> of your deployment's agent config. Substitute it; an unsubstituted
+> `<session-workdir>` produces `No such file or directory`, which is a paste
+> error, not a missing door.
 
 > **(b) and (c) below end in HAND-WRITTEN REST routes** — they reach the two
 > `/coord/…` paths spelled out under each. If what you need is a coord tool
@@ -908,7 +915,7 @@ COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
 # this wrong here doesn't just mis-sweep: $ROOT locates the helper script below,
 # so a worktree session silently reports "no acting bearer" for a missing PATH
 # rather than a missing credential.
-ROOT="${QONTINUI_ROOT:-}"
+ROOT="${WORKSPACE_ROOT:-${QONTINUI_ROOT:-}}"
 if [ -z "$ROOT" ]; then
   GC="$(git rev-parse --git-common-dir 2>/dev/null)"
   [ -n "$GC" ] && GC="$(cd "$GC" 2>/dev/null && pwd)"
@@ -1191,8 +1198,8 @@ An axis you skipped is not an axis that failed.
 
 **This rung works, and it is the last one before Step 5's honest failure. Try it
 before you write that block.** Measured against production coord from
-`merytshost` on 2026-09-04, from the Windows operator box on 2026-09-06, and
-again from `merytshost` on **2026-09-13** (this file's own re-probe): the
+a Linux fleet box on 2026-09-04, from a Windows fleet box on 2026-09-06, and
+again from that Linux box on **2026-09-13** (this file's own re-probe): the
 anonymous `POST $COORD_HTTP_URL/agents/credential` answered **`200`** with
 `{token, token_exp, token_jti}`, and the control read
 `GET $COORD_HTTP_URL/coord/agent-findings?limit=1` answered **`200`** over that
@@ -1419,7 +1426,7 @@ and point at the self-check:
 > PASS that refutes a fleet-wide claim).
 > Run **`coord doctor`** (runner self-check — names the one failing link + its
 > fix) to diagnose the missing credential, then re-run `/gate`.
-> `FLOOR-CLAIM:` <the block `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed,
+> `FLOOR-CLAIM:` <the block `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed,
 > pasted verbatim — probe time, runner build, this box's load, one line per
 > door>.
 
@@ -1464,17 +1471,19 @@ a gate here — a seven-line probe report is still a sample, not a search:
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run
-> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
-> — spelled absolutely, because a bare `scripts/...` resolves only from a
-> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> that a capability is ABSENT, run the route census,
+> `coord-route-census.sh <fragment>`, from wherever your deployment installs
+> it — spelled by its absolute path, because a bare relative path resolves
+> only from the checkout that ships it, and a session standing anywhere else
 > gets exit 127
 > (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
 > a working tree and never a live host) — and paste its trailer verbatim
 > beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
-> — the line that parses under `CENSUS_TRAILER_RE` in
-> `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
+> — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
+> Where no census tool is reachable at all, the negative cannot be settled and
+> is UNVERIFIED.
+> A 401, 404 or 405 on ONE spelling of
 > ONE host is a sample, not a search: `/api/v1/memory` refuses on
 > `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
 > trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
@@ -1536,8 +1545,8 @@ directory's evidence. Its **absence proves nothing** either: a healthy provision
 and a workdir the runner never provisioned both write nothing at all, and the
 runner writes into the workdir IT provisioned, which from a linked worktree is
 often the primary checkout rather than your cwd.
-Reason table, the stamp and the freshness rule:
-`qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`.)
+Reason table, the stamp and the freshness rule: your deployment's coord
+gates-and-access reference, where it ships one.)
 
 ---
 
