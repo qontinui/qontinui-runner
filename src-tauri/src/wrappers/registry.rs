@@ -862,13 +862,7 @@ mod tests {
         assert!(debris.is_empty(), "temp files left behind: {debris:?}");
     }
 
-    /// `Wrapper` has no `#[serde(rename_all = "camelCase")]`, so `GET
-    /// /wrappers` and `GET /wrappers/:id` serialize it snake_case. TS
-    /// `InstalledWrapper` (src/lib/wrappers/types.ts) must mirror that exact
-    /// shape — plan 2026-08-23-single-source-derived-facts follow-up: the
-    /// mismatch left `packageName`/`installPath`/`installedAt`/`updatedAt`
-    /// always `undefined` at runtime, so installed-wrapper package names
-    /// rendered blank.
+    /// A `--manifest-only` parse error never quotes the probe's output.
     #[test]
     fn manifest_parse_errors_never_quote_the_output() {
         let secret = concat!("sk-", "live-0123456789abcdef");
@@ -901,6 +895,13 @@ mod tests {
         assert!(msg.contains("ECONNREFUSED"), "{msg}");
     }
 
+    /// `Wrapper` has no `#[serde(rename_all = "camelCase")]`, so `GET
+    /// /wrappers` and `GET /wrappers/:id` serialize it snake_case. TS
+    /// `InstalledWrapper` (src/lib/wrappers/types.ts) must mirror that exact
+    /// shape — plan 2026-08-23-single-source-derived-facts follow-up: the
+    /// mismatch left `packageName`/`installPath`/`installedAt`/`updatedAt`
+    /// always `undefined` at runtime, so installed-wrapper package names
+    /// rendered blank.
     #[test]
     fn wrapper_wire_shape_matches_the_ts_mirror() {
         let json = serde_json::to_value(synthetic_wrapper("w", 1)).unwrap();

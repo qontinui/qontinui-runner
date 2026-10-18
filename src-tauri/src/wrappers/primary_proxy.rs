@@ -76,7 +76,13 @@ pub enum ProxyError {
     /// Upstream primary returned 404 (or an `ApiResponse` with that
     /// status). Secondary should map this to a 404, not a 503.
     NotFound(String),
-    /// Anything else: connection failure, parse error, non-success
+    /// The request never reached the primary: the connect failed (or the
+    /// client could not be built). Nothing was started there, so this is the
+    /// one proxy failure a caller may park on (HTTP 503 with
+    /// [`PRIMARY_UNREACHABLE_CODE`]).
+    Unreachable(String),
+    /// Anything else: a send that failed or timed out AFTER connecting (the
+    /// primary may have acted on it), a parse error, a non-success
     /// envelope, 5xx, etc. Carries the upstream HTTP status when the
     /// failure originated from a non-success response so the handler can
     /// preserve it; `None` means we never got a parsable response.
@@ -90,7 +96,24 @@ pub enum ProxyError {
     },
 }
 
+/// The typed code of a proxy 503 whose request never reached the primary.
+pub const PRIMARY_UNREACHABLE_CODE: &str = "primary_unreachable";
+
 impl ProxyError {
+    /// A failed send, split on whether the request can have reached the
+    /// primary: a connect failure cannot (`Unreachable`); a timeout or any
+    /// other failure after connecting can (`Other`, answered 502).
+    fn send(e: reqwest::Error) -> Self {
+        if e.is_connect() {
+            Self::Unreachable(format!("Failed to reach primary runner: {}", e))
+        } else {
+            Self::other(format!(
+                "primary runner did not answer after the request was sent: {}",
+                e
+            ))
+        }
+    }
+
     fn other(message: impl Into<String>) -> Self {
         Self::Other {
             status: None,
@@ -115,7 +138,7 @@ impl ProxyError {
 impl std::fmt::Display for ProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProxyError::NotFound(m) => write!(f, "{}", m),
+            ProxyError::NotFound(m) | ProxyError::Unreachable(m) => write!(f, "{}", m),
             ProxyError::Other { message, .. } => write!(f, "{}", message),
         }
     }
@@ -129,11 +152,7 @@ impl std::error::Error for ProxyError {}
 /// before deserializing so a primary 404 maps to `ProxyError::NotFound`
 /// even if the body parses as `ApiResponse<T> { success: false, ... }`.
 async fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, ProxyError> {
-    let resp = client()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| ProxyError::other(format!("Failed to reach primary runner: {}", e)))?;
+    let resp = client().get(url).send().await.map_err(ProxyError::send)?;
     parse_response::<T>(resp).await
 }
 
@@ -230,10 +249,7 @@ where
     if let Some(b) = body {
         req = req.json(b);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| ProxyError::other(format!("Failed to reach primary runner: {}", e)))?;
+    let resp = req.send().await.map_err(ProxyError::send)?;
     parse_response::<R>(resp).await
 }
 
@@ -248,7 +264,7 @@ where
         .json(body)
         .send()
         .await
-        .map_err(|e| ProxyError::other(format!("Failed to reach primary runner: {}", e)))?;
+        .map_err(ProxyError::send)?;
     parse_response::<R>(resp).await
 }
 
@@ -258,7 +274,7 @@ async fn delete_json<R: for<'de> Deserialize<'de>>(url: &str) -> Result<R, Proxy
         .delete(url)
         .send()
         .await
-        .map_err(|e| ProxyError::other(format!("Failed to reach primary runner: {}", e)))?;
+        .map_err(ProxyError::send)?;
     parse_response::<R>(resp).await
 }
 
@@ -271,13 +287,13 @@ pub async fn install_wrapper(req: &InstallRequest) -> Result<InstallResponse, Pr
     let long_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
-        .map_err(|e| ProxyError::other(format!("Failed to create HTTP client: {}", e)))?;
+        .map_err(|e| ProxyError::Unreachable(format!("Failed to create HTTP client: {}", e)))?;
     let resp = long_client
         .post(&url)
         .json(req)
         .send()
         .await
-        .map_err(|e| ProxyError::other(format!("Failed to reach primary runner: {}", e)))?;
+        .map_err(ProxyError::send)?;
     parse_response::<InstallResponse>(resp).await
 }
 
@@ -299,13 +315,13 @@ pub async fn update_wrapper(
     let long_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
-        .map_err(|e| ProxyError::other(format!("Failed to create HTTP client: {}", e)))?;
+        .map_err(|e| ProxyError::Unreachable(format!("Failed to create HTTP client: {}", e)))?;
     let resp = long_client
         .post(&url)
         .json(&body)
         .send()
         .await
-        .map_err(|e| ProxyError::other(format!("Failed to reach primary runner: {}", e)))?;
+        .map_err(ProxyError::send)?;
     parse_response::<InstallResponse>(resp).await
 }
 
@@ -432,7 +448,7 @@ pub async fn dispatch(
         .timeout(net_timeout)
         .pool_max_idle_per_host(4)
         .build()
-        .map_err(|e| ProxyError::other(format!("Failed to create HTTP client: {}", e)))?;
+        .map_err(|e| ProxyError::Unreachable(format!("Failed to create HTTP client: {}", e)))?;
     let resp = dispatch_client
         .post(&url)
         .header(
@@ -442,7 +458,7 @@ pub async fn dispatch(
         .json(req)
         .send()
         .await
-        .map_err(|e| ProxyError::other(format!("Failed to reach primary runner: {}", e)))?;
+        .map_err(ProxyError::send)?;
     parse_response::<DispatchResponse>(resp).await
 }
 
@@ -455,9 +471,11 @@ pub async fn dispatch(
 /// reuse it without introducing a cross-module visibility hop.
 ///
 /// - `NotFound` → 404 (preserves "missing wrapper" semantics).
-/// - Connection / parse failures (no upstream status) → 503 with the
-///   "primary runner is not reachable" message that matches the
-///   `require_wrapper_state` shape.
+/// - `Unreachable` (the request never reached the primary) → 503 with the
+///   typed code [`PRIMARY_UNREACHABLE_CODE`] and the "primary runner is not
+///   reachable" message that matches the `require_wrapper_state` shape.
+/// - A failure after the request was sent, or an unparsable answer (no
+///   upstream status) → 502: the primary may have acted on it.
 /// - Upstream HTTP 4xx (client error from primary) → forwarded as-is so
 ///   the secondary's caller sees the same status the primary returned.
 ///   A primary-side `400 BAD_REQUEST` for a malformed `InstallRequest`
@@ -467,14 +485,24 @@ pub async fn dispatch(
 pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
     match e {
         ProxyError::NotFound(msg) => (StatusCode::NOT_FOUND, AxumJson(api_error(msg))),
+        ProxyError::Unreachable(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            AxumJson(McpApiResponse::error_with_code(
+                format!(
+                    "primary runner is not reachable; install wrappers from the primary's UI ({})",
+                    message
+                ),
+                PRIMARY_UNREACHABLE_CODE,
+            )),
+        ),
         ProxyError::Other {
             status: None,
             message,
             ..
         } => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_GATEWAY,
             AxumJson(api_error(format!(
-                "primary runner is not reachable; install wrappers from the primary's UI ({})",
+                "primary runner gave no usable answer ({})",
                 message
             ))),
         ),
@@ -531,6 +559,51 @@ mod tests {
             None,
         ));
         assert_eq!(s, StatusCode::BAD_GATEWAY);
+    }
+
+    /// A send that never connected is the typed 503 (nothing reached the
+    /// primary: park); one that timed out AFTER connecting is 502 (the
+    /// primary may have acted on it: count it).
+    #[tokio::test]
+    async fn a_connect_failure_is_a_typed_503_and_a_post_send_timeout_is_502() {
+        // Closed port: bind, read the port, drop the listener.
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let e = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/x"))
+            .send()
+            .await
+            .unwrap_err();
+        let (s, body) = into_http(ProxyError::send(e));
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.code.as_deref(), Some(PRIMARY_UNREACHABLE_CODE));
+
+        // A primary that accepts the connection and never answers.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+        let e = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap()
+            .post(format!("http://{addr}/x"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_timeout() && !e.is_connect(), "{e:?}");
+        let (s, body) = into_http(ProxyError::send(e));
+        assert_eq!(s, StatusCode::BAD_GATEWAY);
+        assert_eq!(body.0.code, None);
+        held.abort();
     }
 
     /// A non-envelope body from the primary (a proxy's HTML page, a crash

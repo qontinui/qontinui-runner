@@ -169,8 +169,19 @@ impl OutputTail {
     /// buffered past `OUTPUT_LINE_MAX` bytes (the rest of a long line — a base64
     /// dump — is read and discarded up to its newline).
     fn drain<R: AsyncRead + Unpin + Send + 'static>(&self, wrapper_id: &str, stream: R) {
-        let tail = self.clone();
         let id = wrapper_id.to_string();
+        self.drain_logging(stream, move |kept| debug!("wrapper[{}]: {}", id, kept));
+    }
+
+    /// `drain`, with each line's kept form handed to `log` (the debug log in
+    /// production). The log gets exactly what the ring keeps — the capped
+    /// classification — never a second, uncapped one.
+    fn drain_logging<R, L>(&self, stream: R, log: L)
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        L: Fn(&str) + Send + 'static,
+    {
+        let tail = self.clone();
         tokio::spawn(async move {
             let mut stream = stream;
             let mut buf = [0u8; 4096];
@@ -192,7 +203,7 @@ impl OutputTail {
                     if b == b'\n' {
                         let text = String::from_utf8_lossy(&line);
                         let kept = tail.push(&text, &mut diags);
-                        debug!("wrapper[{}]: {}", id, kept);
+                        log(&kept);
                         if overflow {
                             tail.push_own("[line cut]".to_string());
                         }
@@ -207,7 +218,7 @@ impl OutputTail {
             }
             if !line.is_empty() {
                 let kept = tail.push(&String::from_utf8_lossy(&line), &mut diags);
-                debug!("wrapper[{}]: {}", id, kept);
+                log(&kept);
             }
         });
     }
@@ -476,14 +487,16 @@ const CLASSIFY_TEXT_LINES: usize = 20;
 /// a package manager's output), joined; bounded to its last
 /// `CLASSIFY_TEXT_LINES` non-empty lines.
 pub(crate) fn classify_text(text: &str) -> String {
+    // From the end, stopping once enough are kept: a huge output is never
+    // classified past the lines that are reported.
     let mut lines: Vec<String> = text
         .lines()
+        .rev()
         .map(classify_line)
         .filter(|l| !l.is_empty())
+        .take(CLASSIFY_TEXT_LINES)
         .collect();
-    if lines.len() > CLASSIFY_TEXT_LINES {
-        lines.drain(..lines.len() - CLASSIFY_TEXT_LINES);
-    }
+    lines.reverse();
     if lines.is_empty() {
         "no output".to_string()
     } else {
@@ -611,6 +624,28 @@ impl WrapperManager {
             .map_err(SpawnError::Failed)
     }
 
+    /// Record `id` as Running on `port` with no child process (tests only):
+    /// what a successful spawn leaves, so a dispatch routes to `port`.
+    #[cfg(test)]
+    pub(crate) async fn insert_running_for_test(&self, id: &str, port: u16) {
+        let now = Instant::now();
+        self.runtimes.write().await.insert(
+            id.to_string(),
+            WrapperRuntime {
+                id: id.to_string(),
+                port,
+                pid: None,
+                child: None,
+                tree: None,
+                output: OutputTail::default(),
+                started_at: now,
+                last_dispatch: now,
+                consecutive_failures: 0,
+                state: WrapperState::Running,
+            },
+        );
+    }
+
     /// The spawn itself; the caller holds this wrapper's spawn lock.
     async fn spawn_locked(&self, wrapper_id: &str) -> Result<u16, String> {
         // Fast path: already routable. `port_for` is the one Rust definition
@@ -629,10 +664,7 @@ impl WrapperManager {
         // Refuse early a transport whose wrapper never binds `WRAPPER_PORT`,
         // so callers don't get a confusing readiness timeout.
         if !transport_is_spawnable(&wrapper.manifest.transport) {
-            return Err(format!(
-                "wrapper '{}' declares transport '{}', but only {:?} are enabled in this runner",
-                wrapper_id, wrapper.manifest.transport, SPAWNABLE_TRANSPORTS
-            ));
+            return Err(spawn_refusal(wrapper_id, &wrapper.manifest.transport));
         }
 
         let install_path = PathBuf::from(&wrapper.install_path);
@@ -968,27 +1000,45 @@ impl WrapperManager {
 /// are *not* surfaced as a hard error here — that's the wrapper's call
 /// (it can refuse to start, run a self-test, etc.). We log a warning for
 /// visibility.
+/// The error for a transport this runner does not spawn. The transport is
+/// wrapper-supplied: named only when it is a known kind (scan time refuses
+/// any other, but a persisted index can predate that check), else its length.
+fn spawn_refusal(wrapper_id: &str, transport: &str) -> String {
+    format!(
+        "wrapper '{}' declares transport '{}', but only {:?} are enabled in this runner",
+        wrapper_id,
+        super::manifest::label_if(
+            transport,
+            super::manifest::KNOWN_TRANSPORTS.contains(&transport)
+        ),
+        SPAWNABLE_TRANSPORTS
+    )
+}
+
 fn build_env(wrapper_id: &str, manifest: &WrapperManifest) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(manifest.env_vars.len());
     for spec in &manifest.env_vars {
+        // Wrapper-supplied: logged only in the validated shape.
+        let name =
+            super::manifest::label_if(&spec.name, super::manifest::env_var_name_ok(&spec.name));
         match CredentialStore::get(wrapper_id, &spec.name) {
             Ok(Some(value)) => out.push((spec.name.clone(), value)),
             Ok(None) if spec.required => {
                 warn!(
                     "wrappers: required env var '{}' for wrapper '{}' is not set",
-                    spec.name, wrapper_id
+                    name, wrapper_id
                 );
             }
             Ok(None) => {
                 debug!(
                     "wrappers: optional env var '{}' for wrapper '{}' not set",
-                    spec.name, wrapper_id
+                    name, wrapper_id
                 );
             }
             Err(e) => {
                 warn!(
                     "wrappers: env var '{}' for wrapper '{}' read error: {}",
-                    spec.name, wrapper_id, e
+                    name, wrapper_id, e
                 );
             }
         }
@@ -1392,6 +1442,43 @@ mod tests {
             "{}",
             tail.render()
         );
+    }
+
+    /// The log sees the CAPPED classification: past the per-stream cap a
+    /// diagnostic is logged as `omitted(…)`, exactly as the ring keeps it —
+    /// a log that re-classified the raw line would print it verbatim.
+    #[tokio::test]
+    async fn the_log_gets_the_capped_line() {
+        let logged: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let sink = logged.clone();
+        let tail = OutputTail::default();
+        let flood = "[wrapper] event=spawn code=ok\n".repeat(MAX_DIAG_LINES + 1);
+        tail.drain_logging(std::io::Cursor::new(flood.into_bytes()), move |l| {
+            sink.lock().unwrap().push(l.to_string())
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while logged.lock().unwrap().len() < MAX_DIAG_LINES + 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let logged = logged.lock().unwrap();
+        assert_eq!(logged.len(), MAX_DIAG_LINES + 1);
+        assert_eq!(logged[MAX_DIAG_LINES - 1], "[wrapper] event=spawn code=ok");
+        assert!(
+            logged[MAX_DIAG_LINES].starts_with("omitted(len="),
+            "{}",
+            logged[MAX_DIAG_LINES]
+        );
+    }
+
+    /// A transport outside the known kinds is reported by length, never
+    /// echoed (a persisted index may predate scan-time validation).
+    #[test]
+    fn an_unknown_transport_is_never_echoed() {
+        let secret = concat!("sk-", "live-0123456789");
+        let msg = spawn_refusal("w", secret);
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(msg.contains(&format!("len={}", secret.len())), "{msg}");
+        assert!(spawn_refusal("w", "injected").contains("'injected'"));
     }
 
     /// REGRESSION PIN, not a behaviour test: the closed vocabulary, literally.
