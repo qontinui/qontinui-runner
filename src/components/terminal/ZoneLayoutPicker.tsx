@@ -10,7 +10,7 @@ import {
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { callRegistry, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
-import { usePageSessionGetter } from "./contexts";
+import { usePageSessionGetter, useTerminalSession } from "./contexts";
 
 /** Hoisted so the registration and its guarded handler read one declaration. */
 const SELECT_LAYOUT_SCHEMA = {
@@ -21,7 +21,8 @@ const SELECT_LAYOUT_SCHEMA = {
 } as const;
 
 const GET_PAGE_LAYOUT_SCHEMA = {
-  pageId: "string (terminal page id from GET /terminal-pages)",
+  pageId:
+    "string (optional terminal page id from GET /terminal-pages; defaults to the active page)",
 } as const;
 
 interface ZoneLayoutPickerProps {
@@ -81,6 +82,7 @@ export function ZoneLayoutPicker({
 }: ZoneLayoutPickerProps) {
   const [open, setOpen] = useState(false);
   const getPageSession = usePageSessionGetter();
+  const { pageId: activePageId } = useTerminalSession();
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -162,7 +164,7 @@ export function ZoneLayoutPicker({
           // grid mode, as `terminal.layout` does.
           const tabs = pageId ? (getPageSession(pageId)?.tabs.length ?? tabCount) : tabCount;
           const settled = computeAutoGrowLayoutId(requested, tabs, "grid") ?? requested;
-          return { requested, layoutId: settled, pageId: pageId || null, tabCount: tabs };
+          return { requested, layoutId: settled, pageId: pageId || activePageId, tabCount: tabs };
         }),
       },
       {
@@ -170,13 +172,12 @@ export function ZoneLayoutPicker({
         label: "Get Page Layout",
         description:
           "Return {pageId, layoutId, zoneCount, tabCount, maximizedZone} for one terminal page, " +
-          "whether or not it is the page on screen.",
+          "whether or not it is the page on screen; with no pageId, for the page on screen.",
         paramSchema: GET_PAGE_LAYOUT_SCHEMA,
         // `read` — reports one page's grid state; changes nothing.
         effect: "read",
         handler: guardedHandler("get-page-layout", GET_PAGE_LAYOUT_SCHEMA, (args) => {
-          const pageId = textArg(args, "pageId");
-          if (!pageId) throw new Error("get-page-layout requires { pageId: string }");
+          const pageId = textArg(args, "pageId") || activePageId;
           const page = getPageSession(pageId);
           if (!page) throw new Error(`No terminal page with id "${pageId}"`);
           return {
