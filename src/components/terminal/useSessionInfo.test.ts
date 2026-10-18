@@ -1401,6 +1401,16 @@ describe("normalizeTenantDisplay", () => {
     expect(row.display).not.toContain("predates");
   });
 
+  it("gives an unknown bound set with no reason the reason_missing reason", () => {
+    const d = normalizeTenantDisplay({ ...display(), bound: { status: "unknown" } });
+    expect(d?.bound).toEqual({ status: "unknown", tenantIds: [], reason: "reason_missing" });
+    const kept = normalizeTenantDisplay({
+      ...display(),
+      bound: { status: "unknown", reason: "paired_user_unreadable" },
+    });
+    expect(kept?.bound.reason).toBe("paired_user_unreadable");
+  });
+
   it("drops conflict entries missing a leg or a tenant", () => {
     const d = normalizeTenantDisplay({
       ...display(),
@@ -1427,6 +1437,8 @@ describe("tenancy.display Rust-fixture contract", () => {
   it("normalizes every Rust case without dropping the display", () => {
     expect(fixture.map((c) => c.name)).toEqual([
       "regression_2026_10_17",
+      "adopted_terminal_row",
+      "adopted_non_terminal_row",
       "coord_row_mismatch",
       "unknown_no_nonce",
       "mismatch_no_acting_tenant",
@@ -1448,6 +1460,24 @@ describe("tenancy.display Rust-fixture contract", () => {
     expect(byName.regression_2026_10_17?.divergence).toBe("agree");
     expect(spawnStampRow(byName.regression_2026_10_17).display).toBe(
       `none — device default at spawn: ${QONTINUI}`,
+    );
+  });
+
+  it("keeps agreement when auto-bind adopted the terminal's own row", () => {
+    const t = byName.adopted_terminal_row;
+    expect(t?.coordRow?.status).toBe("not_applicable");
+    expect(t?.coordRow?.reason).toBe("terminal_plane_row_is_the_data_plane_leg");
+    expect(t?.divergence).toBe("agree");
+    expect(tenantRow(t).display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
+  });
+
+  it("leaves an adopted row that is not the terminal's unknown", () => {
+    const t = byName.adopted_non_terminal_row;
+    expect(t?.coordRow?.status).toBe("unknown");
+    expect(t?.coordRow?.reason).toBe("adopted_row_tenant_not_observed");
+    expect(t?.divergence).toBe("unknown");
+    expect(tenantRow(t).title ?? "").toContain(
+      "Coord session row: unknown — adopted_row_tenant_not_observed",
     );
   });
 
