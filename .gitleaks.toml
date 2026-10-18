@@ -12,7 +12,7 @@ paths = [
 ]
 regexes = [
   '''(?i)(dummy|example|sample|test|placeholder|changeme|your[-_]?)[-_]?(secret|token|key|password)''',
-  '''AKIAIOSFODNN7EXAMPLE''',
+  '''^AKIAIOSFODNN7EXAMPLE$''',
   # Synthetic fixtures in src-tauri/src/session_archive/secret_detector.rs's own
   # unit tests. A secret DETECTOR has to contain secret-shaped strings to prove
   # it fires on them -- and, for the JWT, to prove it deliberately does NOT.
@@ -25,7 +25,7 @@ regexes = [
   # place in this repo most likely to grow a copy-pasted live credential.
   # Every literal entry below is ANCHORED (^…$): an allowlist regex is matched
   # against the finding's secret, so an unanchored entry also excused any
-  # longer token that merely contains it. Changing either literal by one
+  # longer token that merely contains it. Changing any one of them by one
   # character re-arms the rule.
   # The token fixture is the 42-character `ghp_…abcdef` the test feeds its
   # detector, and two rules fire on it with different secrets: `github-pat`

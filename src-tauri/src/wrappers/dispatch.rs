@@ -62,12 +62,14 @@ pub const SPAWN_FAILED_CODE: &str = "wrapper_spawn_failed";
 /// booting (its wrappers subsystem is not initialized): nothing reached any
 /// wrapper.
 pub const NOT_INITIALIZED_CODE: &str = "wrappers_not_initialized";
-/// Every 503 a dispatch answers with is the RUNNER's "nothing reached the
-/// wrapper", and each carries one of these typed codes: a failed spawn, a
-/// booting runner, or (through a secondary) a primary the request never
-/// reached (`primary_proxy::PRIMARY_UNREACHABLE_CODE`). A wrapper's own 5xx
-/// is 502 (`wrapper_failure`), so a caller may park on these codes — and only
-/// on them — without risking a prompt the wrapper already sent.
+/// The typed codes of the RUNNER's "nothing reached the wrapper" 503: a
+/// failed spawn, a booting runner, or (through a secondary) a primary the
+/// request never reached (`primary_proxy::PRIMARY_UNREACHABLE_CODE`). Every
+/// 503 this runner itself answers carries one; a wrapper's own 5xx is 502
+/// (`wrapper_failure`), and a secondary passes a primary's 503 on only when
+/// it carries one of these. A caller may park on these codes — and only on
+/// them — without risking a prompt the wrapper already sent. A 503 WITHOUT
+/// one (e.g. something else answering on the port) is not that verdict.
 pub const NOTHING_STARTED_CODES: &[&str] = &[
     SPAWN_FAILED_CODE,
     NOT_INITIALIZED_CODE,
@@ -291,7 +293,10 @@ impl DispatchContext {
     pub fn new(registry: Arc<WrapperRegistry>, manager: Arc<WrapperManager>) -> Arc<Self> {
         // No global timeout on the client — we apply per-call timeouts
         // via tokio::time::timeout so the header override is exact.
+        // Loopback only (the wrapper's own port): never through a configured
+        // HTTP proxy.
         let http = reqwest::Client::builder()
+            .no_proxy()
             .pool_max_idle_per_host(4)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
