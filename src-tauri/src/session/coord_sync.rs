@@ -607,7 +607,7 @@ impl CoordSync {
                 let status = resp.status();
                 if status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    let tenant = resume_answer_tenant(&body);
+                    let tenant = resume_answer_tenant(&body, session_id);
                     if tenant.is_none() {
                         tracing::debug!(
                             session = %session_id,
@@ -890,10 +890,16 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
 // ---------------------------------------------------------------------------
 
 /// The `tenant_id` of coord's 2xx answer to the resume probe (the updated
-/// `SessionRow`). `None` for an empty / non-JSON body, an absent field, or a
-/// value that is not a UUID — never an error. Pure.
-fn resume_answer_tenant(body: &str) -> Option<Uuid> {
+/// `SessionRow`). `None` for an empty / non-JSON body, an absent field, a
+/// value that is not a UUID, or an answer whose `id` is not the probed row —
+/// coord's self-registration arm answers with a server-minted row carrying
+/// the CALLER's tenant, which is not this row's. Never an error. Pure.
+fn resume_answer_tenant(body: &str, session_id: Uuid) -> Option<Uuid> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let answered = Uuid::parse_str(v.get("id")?.as_str()?.trim()).ok()?;
+    if answered != session_id {
+        return None;
+    }
     Uuid::parse_str(v.get("tenant_id")?.as_str()?.trim()).ok()
 }
 
@@ -7472,11 +7478,31 @@ mod tests {
                 "tenant_id field {field:?}"
             );
         }
-        assert_eq!(resume_answer_tenant(""), None);
-        assert_eq!(resume_answer_tenant("<html>"), None);
+        let probed = Uuid::new_v4();
+        assert_eq!(resume_answer_tenant("", probed), None);
+        assert_eq!(resume_answer_tenant("<html>", probed), None);
         assert_eq!(
-            resume_answer_tenant(&format!(r#"{{"tenant_id":" {row_tenant} "}}"#)),
+            resume_answer_tenant(
+                &format!(r#"{{"id":"{probed}","tenant_id":" {row_tenant} "}}"#),
+                probed
+            ),
             Some(row_tenant)
+        );
+        // An answer about another row (coord's self-registration arm) or one
+        // naming no row is not an observation of THIS row's tenant.
+        assert_eq!(
+            resume_answer_tenant(
+                &format!(
+                    r#"{{"id":"{}","tenant_id":"{row_tenant}"}}"#,
+                    Uuid::new_v4()
+                ),
+                probed
+            ),
+            None
+        );
+        assert_eq!(
+            resume_answer_tenant(&format!(r#"{{"tenant_id":"{row_tenant}"}}"#), probed),
+            None
         );
     }
 

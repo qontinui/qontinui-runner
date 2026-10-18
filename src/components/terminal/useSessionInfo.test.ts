@@ -31,6 +31,7 @@ const invokeMock = vi.hoisted(() =>
 );
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 import {
+  coordRowSourceText,
   deriveTrigger,
   formatEpochMs,
   formatRecordedZone,
@@ -1544,5 +1545,17 @@ describe("tenancy.display Rust-fixture contract", () => {
     expect(tenantRow(byName.data_plane_credential_unknown).display).toBe(
       "c231d9da · via runner data plane · credential unknown — nonce_not_live · 1 of 4 bound",
     );
+  });
+});
+
+describe("coordRowSourceText", () => {
+  it("names the two known provenances", () => {
+    expect(coordRowSourceText("registrar")).toBe("as registered by this runner");
+    expect(coordRowSourceText("resume_probe")).toBe("as coord answered this runner's resume probe");
+  });
+
+  it("never gives an unknown or absent source a provenance", () => {
+    expect(coordRowSourceText("something_new")).toBe("source something_new");
+    expect(coordRowSourceText(null)).toBe("source unstated");
   });
 });
