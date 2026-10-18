@@ -74,9 +74,14 @@ pub(crate) enum PreDispatchRefusal {
 }
 
 /// The error envelope for a wrapper's non-2xx answer. Its body is NEVER
-/// quoted: only allowlisted typed fields pass through — `code` and `status`
-/// when they are short enum-like words, `retry_after_s` when a number,
-/// `typed` when a bool — and the rest is `omitted(len, sha256)`.
+/// quoted. Only typed fields pass through, all IN THE MESSAGE: the wrapper's
+/// `code` and `status` as `wrapper_code=` / `wrapper_status=` when they are
+/// short enum-like words, `retry_after_s` when a finite number in 0..=3600,
+/// `typed` when a bool, and the allowlisted codes extracted from its `error`
+/// text. The envelope's own `code` is NEVER set from a wrapper's body: that
+/// field is the runner's (`wrapper_busy` means "nothing was started"), and a
+/// wrapper that could forge it would make a caller retry a prompt it already
+/// sent.
 pub(crate) fn wrapper_error_body(
     wrapper_id: &str,
     status: u16,
@@ -93,32 +98,37 @@ pub(crate) fn wrapper_error_body(
             })
             .map(str::to_string)
     };
-    let code = word("code");
     let mut fields: Vec<String> = Vec::new();
-    if let Some(c) = &code {
-        fields.push(format!("code={c}"));
+    if let Some(c) = word("code") {
+        fields.push(format!("wrapper_code={c}"));
     }
     if let Some(st) = word("status") {
-        fields.push(format!("status={st}"));
+        fields.push(format!("wrapper_status={st}"));
     }
-    if let Some(r) = parsed.get("retry_after_s").and_then(|v| v.as_f64()) {
+    if let Some(r) = parsed
+        .get("retry_after_s")
+        .and_then(|v| v.as_f64())
+        .filter(|r| r.is_finite() && (0.0..=3600.0).contains(r))
+    {
         fields.push(format!("retry_after_s={r}"));
     }
     if let Some(t) = parsed.get("typed").and_then(|v| v.as_bool()) {
         fields.push(format!("typed={t}"));
     }
-    let message = format!(
+    if let Some(e) = parsed.get("error").and_then(|v| v.as_str()) {
+        let codes = super::manager::extract_codes(e);
+        if !codes.is_empty() {
+            fields.push(format!("codes={}", codes.join(",")));
+        }
+    }
+    api_error(format!(
         "wrapper '{}' returned {}{}{}; body {}",
         wrapper_id,
         status,
         if fields.is_empty() { "" } else { " " },
         fields.join(" "),
         super::manager::omitted(&parsed.to_string())
-    );
-    match code {
-        Some(c) => ApiResponse::error_with_code(message, c),
-        None => api_error(message),
-    }
+    ))
 }
 
 /// The HTTP answer for a dispatch that never reached the wrapper. Busy is a
@@ -436,7 +446,7 @@ mod tests {
     fn a_wrapper_error_body_is_not_quoted() {
         let body = serde_json::json!({
             "success": false,
-            "error": "fetch failed: Cookie: SID=s3cr3t at https://x.example/?t=1",
+            "error": "fetch failed: Cookie: SID=s3cr3t at https://x.example/?t=1 (net::ERR_CONNECTION_RESET, ECONNREFUSED)",
             "code": "rate_limited",
             "retry_after_s": 12,
             "typed": true,
@@ -448,50 +458,51 @@ mod tests {
             "{msg}"
         );
         assert!(
-            msg.contains("code=rate_limited")
+            msg.contains("wrapper_code=rate_limited")
                 && msg.contains("retry_after_s=12")
                 && msg.contains("typed=true"),
             "{msg}"
         );
+        // The operator still gets the codes from the wrapper's error text.
+        assert!(
+            msg.contains("codes=net::ERR_CONNECTION_RESET,ECONNREFUSED"),
+            "{msg}"
+        );
         assert!(msg.contains("omitted(len="), "{msg}");
-        assert_eq!(env.code.as_deref(), Some("rate_limited"));
-        // A code that is not an enum-like word is not passed through.
-        let env = wrapper_error_body("w", 500, &serde_json::json!({ "code": "SID=s3cr3t" }));
-        assert!(env.code.is_none() && !env.error.unwrap().contains("s3cr3t"));
+        // A wrapper's code never becomes the envelope's.
+        assert_eq!(env.code, None);
+        // An out-of-range or non-finite retry_after_s is dropped.
+        let env = wrapper_error_body("w", 500, &serde_json::json!({ "retry_after_s": 1e12 }));
+        assert!(!env.error.unwrap().contains("retry_after_s"));
+    }
+
+    /// A wrapper cannot forge the runner's `wrapper_busy`: a wrapper 429 whose
+    /// body says `{"code":"wrapper_busy"}` leaves the envelope's `code` unset,
+    /// so a caller cannot read it as "nothing was started" and retry a prompt
+    /// the wrapper may already have sent.
+    #[test]
+    fn a_wrapper_cannot_forge_the_runner_busy_code() {
+        let env = wrapper_error_body(
+            "w",
+            429,
+            &serde_json::json!({ "success": false, "code": "wrapper_busy" }),
+        );
+        assert_eq!(env.code, None);
+        assert!(env.error.unwrap().contains("wrapper_code=wrapper_busy"));
     }
 
     /// The 429 through an axum route and its JSON serialisation, not just the
     /// helper: a registered wrapper whose exclusive action is held answers
     /// HTTP 429 with `"code":"wrapper_busy"` in the body.
-    #[cfg(unix)]
     #[tokio::test]
     async fn the_route_answers_a_held_exclusive_action_with_a_typed_429() {
         use axum::{body::Body, http::Request, routing::post, Router};
         use tower::ServiceExt;
-        let node = std::process::Command::new("node")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !node {
-            eprintln!("skipped: node is not on PATH");
-            return;
-        }
+        // Registered directly (no node, no manifest scan): the test runs on
+        // every CI image.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("w");
-        std::fs::create_dir_all(dir.join("dist")).unwrap();
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"name":"w","version":"0.0.0"}"#,
-        )
-        .unwrap();
-        let manifest = r#"{"manifestVersion":1,"manifest":{"id":"w","displayName":"w","transport":"api"},"actions":[{"id":"a","paramSchema":{},"exclusive":true}]}"#;
-        std::fs::write(
-            dir.join("dist").join("index-node.js"),
-            format!("if (process.argv.includes('--manifest-only')) {{ console.log({manifest:?}); process.exit(0); }}"),
-        )
-        .unwrap();
         let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        registry.insert_for_test(test_wrapper("w", "a", true)).await;
         let manager = WrapperManager::new(registry.clone());
         let ctx = DispatchContext::new(registry, manager);
         let held = ctx.exclusivity.lock_for("w", "a").await.lock_owned().await;
@@ -527,6 +538,25 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["code"], BUSY_CODE);
         drop(held);
+    }
+
+    fn test_wrapper(id: &str, action: &str, exclusive: bool) -> super::super::registry::Wrapper {
+        super::super::registry::Wrapper {
+            id: id.to_string(),
+            package_name: String::new(),
+            version: String::new(),
+            manifest: serde_json::from_value(serde_json::json!({
+                "id": id, "displayName": id, "transport": "api"
+            }))
+            .unwrap(),
+            actions: vec![serde_json::from_value(serde_json::json!({
+                "id": action, "paramSchema": {}, "exclusive": exclusive
+            }))
+            .unwrap()],
+            install_path: String::new(),
+            installed_at: 0,
+            updated_at: 0,
+        }
     }
 
     /// The dispatch handler's answer for each refusal: busy is HTTP 429 with

@@ -193,9 +193,13 @@ pub async fn install(
         })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            // Package-manager output can carry registry URLs and auth hints:
+            // only its allowlisted codes reach the error (and the HTTP body).
             return Err(format!(
                 "{} install exited with {}: {}",
-                pm_owned, output.status, stderr
+                pm_owned,
+                output.status,
+                super::manager::classify_text(&stderr)
             ));
         }
         Ok(())

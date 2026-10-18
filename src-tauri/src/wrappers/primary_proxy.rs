@@ -145,7 +145,11 @@ async fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, ProxyErr
             .unwrap_or_else(|_| status.canonical_reason().unwrap_or("error").to_string());
         let envelope = serde_json::from_str::<ApiResponse<serde_json::Value>>(&body_text).ok();
         let code = envelope.as_ref().and_then(|env| env.code.clone());
-        let message = envelope.and_then(|env| env.error).unwrap_or(body_text);
+        // An unparseable primary body is not forwarded raw: only its typed
+        // envelope fields are, and otherwise a digest of it.
+        let message = envelope
+            .and_then(|env| env.error)
+            .unwrap_or_else(|| super::manager::omitted(&body_text));
         return Err(ProxyError::from_status(status, message, code));
     }
 
@@ -216,7 +220,11 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
             .unwrap_or_else(|_| status.canonical_reason().unwrap_or("error").to_string());
         let envelope = serde_json::from_str::<ApiResponse<serde_json::Value>>(&body_text).ok();
         let code = envelope.as_ref().and_then(|env| env.code.clone());
-        let message = envelope.and_then(|env| env.error).unwrap_or(body_text);
+        // An unparseable primary body is not forwarded raw: only its typed
+        // envelope fields are, and otherwise a digest of it.
+        let message = envelope
+            .and_then(|env| env.error)
+            .unwrap_or_else(|| super::manager::omitted(&body_text));
         return Err(ProxyError::from_status(status, message, code));
     }
 
