@@ -302,11 +302,12 @@ mod tests {
         coord_row_from_registrar, project_tenancy, CoordRowRead, SpawnDefaultRead, TenancyCoordRow,
         TenancyRepoExpected, TerminalRowTenant, COORD_ROW_ADOPTED, COORD_ROW_NOT_APPLICABLE,
         COORD_ROW_NOT_REGISTERED, COORD_ROW_OTHER_TERMINAL, COORD_ROW_REGISTRAR_POISONED,
-        COORD_ROW_TERMINAL_PLANE, COORD_ROW_TERMINAL_ROW_NOT_WIRED,
+        COORD_ROW_SOURCE_RESUME_PROBE, COORD_ROW_TERMINAL_PLANE, COORD_ROW_TERMINAL_ROW_NOT_WIRED,
         COORD_ROW_TERMINAL_ROW_RESUME_UNCONFIRMED, COORD_ROW_TERMINAL_ROW_TENANT_UNRESOLVED,
         DIVERGENCE_AGREE, DIVERGENCE_DIVERGED, TENANCY_UNKNOWN,
     };
     use crate::coord_mcp::CredentialTenantRead;
+    use crate::session::RowTenant;
     use uuid::Uuid;
 
     /// The 2026-10-17 measurement's acting tenant (`qontinui`).
@@ -363,21 +364,33 @@ mod tests {
     }
 
     /// What `read_session_tenancy` would pass for the terminal's row of `t`:
-    /// the data plane's own answer, with `observed` from the registry.
-    fn terminal_tenant(t: &SessionTenancy, observed: bool) -> TerminalRowTenant {
-        TerminalRowTenant::from_reads(t.data_plane.tenant_id.is_some(), Some(observed))
+    /// the data plane's own answer, with the row's tenant from the registry.
+    fn terminal_tenant(t: &SessionTenancy, row_tenant: RowTenant) -> TerminalRowTenant {
+        TerminalRowTenant::from_reads(
+            t.data_plane
+                .tenant_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok()),
+            Some(row_tenant),
+        )
     }
 
-    /// The coord-row leg of a terminal-hosted session with no registrar entry:
-    /// the pinned terminal names its own row (freshly registered by this
-    /// process), and the data plane of `t` read it.
-    fn terminal_plane_row(t: &SessionTenancy) -> TenancyCoordRow {
+    /// The pinned terminal's own row of `t`, with `row_tenant` from the
+    /// registry.
+    fn terminal_row_with(t: &SessionTenancy, row_tenant: RowTenant) -> TenancyCoordRow {
         TenancyCoordRow::from_read(coord_row_from_registrar(
             row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
             Some(TERMINAL_ROW),
             true,
-            terminal_tenant(t, true),
+            terminal_tenant(t, row_tenant),
         ))
+    }
+
+    /// The coord-row leg of a terminal-hosted session with no registrar entry:
+    /// the pinned terminal names its own row (freshly registered — its create
+    /// body authored — by this process), and the data plane of `t` read it.
+    fn terminal_plane_row(t: &SessionTenancy) -> TenancyCoordRow {
+        terminal_row_with(t, RowTenant::Authored)
     }
 
     /// The same session after transcript auto-bind ADOPTED the terminal's own
@@ -387,20 +400,28 @@ mod tests {
             row(TERMINAL_ROW, RecordedRowOrigin::Adopted),
             Some(TERMINAL_ROW),
             true,
-            terminal_tenant(t, true),
+            terminal_tenant(t, RowTenant::Authored),
         ))
     }
 
-    /// The same pane restored after a runner restart: `resume_external`
-    /// re-stamped the row's tenant from today's resolution and nothing
-    /// observed the tenant coord created the row under.
+    /// The same pane after `resume_external` (a runner restart or an
+    /// in-process pane re-creation) re-stamped the row's tenant from today's
+    /// resolution, and the resume probe observed nothing (`Found(None)`,
+    /// unreachable, or refused).
     fn resumed_unconfirmed_terminal_row(t: &SessionTenancy) -> TenancyCoordRow {
-        TenancyCoordRow::from_read(coord_row_from_registrar(
-            row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
-            Some(TERMINAL_ROW),
-            true,
-            terminal_tenant(t, false),
-        ))
+        terminal_row_with(t, RowTenant::Unobserved)
+    }
+
+    /// The resumed pane whose probe answer named the acting tenant
+    /// (`Found(Some(QONTINUI))`).
+    fn resumed_observed_same_terminal_row(t: &SessionTenancy) -> TenancyCoordRow {
+        terminal_row_with(t, RowTenant::Observed(u(QONTINUI)))
+    }
+
+    /// The resumed pane whose probe answer named ANOTHER tenant
+    /// (`Found(Some(PIZZERIA))`): the row was created under pizzeria.
+    fn resumed_observed_other_terminal_row(t: &SessionTenancy) -> TenancyCoordRow {
+        terminal_row_with(t, RowTenant::Observed(u(PIZZERIA)))
     }
 
     /// `t` with its terminal-plane coord-row leg attached.
@@ -857,7 +878,7 @@ mod tests {
             row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
             Some(TERMINAL_ROW),
             true,
-            TerminalRowTenant::Observed,
+            TerminalRowTenant::Authored,
         );
         assert_eq!(read, CoordRowRead::NotApplicable(COORD_ROW_TERMINAL_PLANE));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
@@ -932,17 +953,83 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_row_tenant_is_observed_only_when_the_registry_says_so() {
+    fn the_terminal_row_tenant_is_read_from_the_registry_and_coords_answer() {
         use TerminalRowTenant::*;
-        assert_eq!(TerminalRowTenant::from_reads(false, Some(true)), Unresolved);
-        assert_eq!(TerminalRowTenant::from_reads(false, None), Unresolved);
-        assert_eq!(TerminalRowTenant::from_reads(true, Some(true)), Observed);
-        assert_eq!(
-            TerminalRowTenant::from_reads(true, Some(false)),
-            ResumeUnconfirmed
-        );
+        let q = Some(u(QONTINUI));
+        let p = u(PIZZERIA);
+        let from = TerminalRowTenant::from_reads;
+        assert_eq!(from(None, Some(RowTenant::Authored)), Unresolved);
+        assert_eq!(from(None, Some(RowTenant::Unobserved)), Unresolved);
+        assert_eq!(from(None, None), Unresolved);
+        assert_eq!(from(q, Some(RowTenant::Authored)), Authored);
+        assert_eq!(from(q, Some(RowTenant::Unobserved)), ResumeUnconfirmed);
         // The registry not holding the row is not an observation.
-        assert_eq!(TerminalRowTenant::from_reads(true, None), ResumeUnconfirmed);
+        assert_eq!(from(q, None), ResumeUnconfirmed);
+        // Coord's answer decides, whatever the data plane says.
+        assert_eq!(
+            from(q, Some(RowTenant::Observed(u(QONTINUI)))),
+            ResumeConfirmed
+        );
+        assert_eq!(from(q, Some(RowTenant::Observed(p))), ResumeObserved(p));
+        assert_eq!(from(None, Some(RowTenant::Observed(p))), ResumeObserved(p));
+    }
+
+    #[test]
+    fn a_resumed_pane_whose_probe_answer_names_the_acting_tenant_is_not_applicable() {
+        // `Found(Some(QONTINUI))`: coord's row IS the data-plane tenant.
+        let t = with_terminal_row(regression_tenancy(), resumed_observed_same_terminal_row);
+        assert_eq!(t.coord_row.status, COORD_ROW_NOT_APPLICABLE);
+        assert_eq!(
+            t.coord_row.reason.as_deref(),
+            Some(COORD_ROW_TERMINAL_PLANE)
+        );
+        assert!(!t.diverged);
+        assert_eq!(t.divergence, DIVERGENCE_AGREE);
+        let d = project_tenant_display(&t, four_bindings(), no_slug);
+        assert_eq!(d.status, "resolved");
+        assert!(d.conflicts.is_empty());
+    }
+
+    #[test]
+    fn a_resumed_pane_whose_probe_answer_names_another_tenant_shows_the_mismatch() {
+        // `Found(Some(PIZZERIA))`: the row was created under pizzeria while
+        // today's stamp (and the credential) is qontinui. The stamp is NOT
+        // rewritten — the coord-row leg reports the row's tenant instead.
+        let t = with_terminal_row(regression_tenancy(), resumed_observed_other_terminal_row);
+        assert_eq!(t.coord_row.status, "registered");
+        assert_eq!(t.coord_row.tenant_id.as_deref(), Some(PIZZERIA));
+        assert_eq!(
+            t.coord_row.source.as_deref(),
+            Some(COORD_ROW_SOURCE_RESUME_PROBE)
+        );
+        assert_eq!(t.data_plane.tenant_id.as_deref(), Some(QONTINUI));
+        assert!(t.diverged);
+        assert_eq!(t.divergence, DIVERGENCE_DIVERGED);
+        let d = project_tenant_display(&t, four_bindings(), no_slug);
+        assert_eq!(d.status, "mismatch");
+        assert_eq!(
+            d.conflicts.last(),
+            Some(&TenantConflict {
+                leg: "coord_row".into(),
+                tenant_id: PIZZERIA.into()
+            })
+        );
+        // Directly: the terminal arm maps ResumeObserved to the row's tenant,
+        // for an adopted registrar entry of the terminal's row too.
+        for origin in [
+            RecordedRowOrigin::TerminalPinned,
+            RecordedRowOrigin::Adopted,
+        ] {
+            assert_eq!(
+                coord_row_from_registrar(
+                    row(TERMINAL_ROW, origin),
+                    Some(TERMINAL_ROW),
+                    true,
+                    TerminalRowTenant::ResumeObserved(u(PIZZERIA)),
+                ),
+                CoordRowRead::ResumeObserved(u(PIZZERIA))
+            );
+        }
     }
 
     #[test]
@@ -954,7 +1041,7 @@ mod tests {
             row(TERMINAL_ROW, RecordedRowOrigin::TerminalPinned),
             Some(TERMINAL_ROW),
             true,
-            TerminalRowTenant::Observed,
+            TerminalRowTenant::Authored,
         );
         assert_eq!(read, CoordRowRead::NotApplicable(COORD_ROW_TERMINAL_PLANE));
         // Its own later mint (a registrar row of its own) answers for itself.
@@ -968,7 +1055,7 @@ mod tests {
                 ),
                 Some(TERMINAL_ROW),
                 true,
-                TerminalRowTenant::Observed,
+                TerminalRowTenant::Authored,
             ),
             CoordRowRead::Registered(u(QONTINUI))
         );
@@ -1011,7 +1098,7 @@ mod tests {
     #[test]
     fn a_session_this_process_resolves_no_row_for_makes_divergence_unknown() {
         let read =
-            coord_row_from_registrar(None, Some(TERMINAL_ROW), false, TerminalRowTenant::Observed);
+            coord_row_from_registrar(None, Some(TERMINAL_ROW), false, TerminalRowTenant::Authored);
         assert_eq!(read, CoordRowRead::Unknown(COORD_ROW_NOT_REGISTERED));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
         assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
@@ -1036,7 +1123,7 @@ mod tests {
                         row(OTHER_ROW, origin),
                         terminal_row,
                         pinned_here,
-                        TerminalRowTenant::Observed,
+                        TerminalRowTenant::Authored,
                     )
                 };
                 assert_eq!(
@@ -1072,7 +1159,7 @@ mod tests {
             row(OTHER_ROW, RecordedRowOrigin::Adopted),
             Some(TERMINAL_ROW),
             false,
-            TerminalRowTenant::Observed,
+            TerminalRowTenant::Authored,
         );
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
         assert_eq!(t.coord_row.status, TENANCY_UNKNOWN);
@@ -1090,7 +1177,7 @@ mod tests {
             row(OTHER_ROW, RecordedRowOrigin::StatePoisoned),
             Some(TERMINAL_ROW),
             false,
-            TerminalRowTenant::Observed,
+            TerminalRowTenant::Authored,
         );
         assert_eq!(read, CoordRowRead::Unknown(COORD_ROW_REGISTRAR_POISONED));
         let t = regression_tenancy().with_coord_row(TenancyCoordRow::from_read(read));
@@ -1168,7 +1255,8 @@ mod tests {
                     }),
             ),
             (
-                // The same pane restored after a runner restart: its row's
+                // The same pane resumed (runner restart or in-process pane
+                // re-creation) with no tenant in the probe's answer: its row's
                 // tenant is today's re-stamp, never observed on coord's row,
                 // so the leg is unknown and the comparison cannot agree.
                 "resumed_unconfirmed_terminal_row",
@@ -1176,6 +1264,23 @@ mod tests {
                     .with_display(four_bindings(), |t| {
                         slug_from_answer(Some(&qontinui_answer), t)
                     }),
+            ),
+            (
+                // A resumed pane whose probe answer named the acting tenant:
+                // coord's row is the data-plane tenant, so not applicable.
+                "resumed_observed_same_terminal_row",
+                with_terminal_row(regression_tenancy(), resumed_observed_same_terminal_row)
+                    .with_display(four_bindings(), |t| {
+                        slug_from_answer(Some(&qontinui_answer), t)
+                    }),
+            ),
+            (
+                // A resumed pane whose probe answer named ANOTHER tenant: the
+                // coord-row leg carries it (source resume_probe) and the
+                // display is a mismatch listing coord_row.
+                "resumed_observed_other_terminal_row",
+                with_terminal_row(regression_tenancy(), resumed_observed_other_terminal_row)
+                    .with_display(four_bindings(), no_slug),
             ),
             (
                 // An adopted row that is NOT the hosting terminal's: its
@@ -1186,7 +1291,7 @@ mod tests {
                         row(OTHER_ROW, RecordedRowOrigin::Adopted),
                         Some(TERMINAL_ROW),
                         false,
-                        TerminalRowTenant::Observed,
+                        TerminalRowTenant::Authored,
                     )))
                     .with_display(four_bindings(), no_slug),
             ),
