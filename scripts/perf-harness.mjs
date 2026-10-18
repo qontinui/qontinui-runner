@@ -10,8 +10,10 @@
  *   (a) p50/p95/max `terminal_create` wall time — timed client-side over
  *       `POST /terminals`, per spawn, so the distribution is real rather than
  *       an average;
- *   (b) frontend long-task count and frame time — **via the UI Bridge only**
- *       (`POST /ui-bridge/control/page/evaluate`). Playwright is a standing
+ *   (b) frontend long-task count and frame time — **via the UI Bridge only**,
+ *       through the bundled `perf-probe` component's actions
+ *       (`POST /ui-bridge/control/component/perf-probe/action/{action}`), never
+ *       `page/evaluate`, which the webview CSP refuses. Playwright is a standing
  *       project prohibition and this harness never reaches for it;
  *   (c) chunk→paint rates — backend bytes/s from `totalBytesProduced` deltas
  *       against in-page paint (rAF) and webview `terminal-output` delivery
@@ -46,13 +48,16 @@ import {
   unwrapTransportStats,
   normalizeFrontendTransport,
   foldTransport,
+  HTTP_PATH_UNOPENED_SPANS,
 } from "./perf-harness-lib.mjs";
+// The supervisor and temp-runner HTTP clients are shared with termhost-bench
+// (plan 2026-10-11-terminal-page-performance-kpis-across-setups, Phase 3). The
+// shared `RunnerClient` refuses the primary's port (PRIMARY_RUNNER_PORT) at
+// construction, exactly as the private copy this file used to carry did.
+import { PRIMARY_RUNNER_PORT, RunnerClient, SupervisorClient, sleep } from "./lib/runner-clients.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..");
-
-/** The primary runner's port. The harness refuses to drive it, ever. */
-const PRIMARY_RUNNER_PORT = 9876;
 
 /** Geometry every harness terminal is created at (and the presets repaint). */
 const TERMINAL_COLS = 120;
@@ -108,8 +113,10 @@ RUNNER SELECTION
   --git-ref REF          Build and run REF (implies --rebuild).
   --worktree PATH        Build and run a worktree checkout (implies --rebuild).
   --use-lkg              Pin the spawn to the supervisor's last-known-good exe.
-  --keep-runner          Leave the temp runner running at the end (default is to
-                         POST /runners/<id>/stop).
+  --keep-runner          Leave the temp runner — and the terminals this run
+                         created — running at the end (default: DELETE each
+                         harness terminal, then POST /runners/<id>/stop; with
+                         --runner-url only the terminals are closed).
 
 LOAD SHAPE
   --sessions 10,20,40    Cumulative session levels to measure (default
@@ -117,6 +124,11 @@ LOAD SHAPE
                          runner up to S terminals and times only the new ones,
                          so create latency is measured against a growing
                          population — the O(N) hypothesis this plan tests.
+                         Terminals are created on the page the Terminal tab is
+                         showing (terminal-page.get-zone-view-state over the UI
+                         Bridge; "default" without it), so they mount and render: a
+                         terminal on any other page is unwatched and gets no
+                         webview output.
   --generator CMD        Noisy generator run in every terminal. Default is a
                          PowerShell 20 Hz timestamp loop.
   --generator-preset P   Run scripts/tui-repaint-generator.mjs under node in every
@@ -272,8 +284,6 @@ export function parseSessionLevels(text) {
 // Small utilities
 // ---------------------------------------------------------------------------
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 /**
  * Read the tail of a file from `offset`, tolerating rotation (a file smaller
  * than the recorded offset is treated as a fresh file and read whole).
@@ -324,389 +334,132 @@ function fileSize(path) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// In-page probe (UI Bridge only — never Playwright, never page/evaluate)
+// ---------------------------------------------------------------------------
+
 /**
- * JSON HTTP call with a timeout and a readable failure.
+ * The frontend probe is the `perf-probe` UI Bridge component, shipped in the
+ * runner's bundle (`src/lib/perfProbe.ts`, registered by
+ * `src/components/app/usePerfProbeComponent.ts`). It collects long tasks, paint
+ * gaps, `terminal-output` delivery counts and the IPC fallback, and snapshots
+ * `window.__qontinuiTransportStats`.
  *
- * @param {string} url
- * @param {{method?:string, body?:unknown, timeoutMs?:number}} [options]
- * @returns {Promise<unknown>}
- */
-async function httpJson(url, options = {}) {
-  const { method = "GET", body, timeoutMs = 30000 } = options;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method,
-      signal: controller.signal,
-      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const text = await res.text();
-    let parsed;
-    try {
-      parsed = text ? JSON.parse(text) : null;
-    } catch {
-      throw new Error(`${method} ${url} -> ${res.status}, non-JSON body: ${text.slice(0, 400)}`);
-    }
-    if (!res.ok) {
-      throw new Error(`${method} ${url} -> ${res.status} ${JSON.stringify(parsed).slice(0, 600)}`);
-    }
-    return parsed;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Unwrap the runner's `{success, data}` envelope. */
-function unwrap(payload) {
-  if (payload && typeof payload === "object" && "data" in payload && "success" in payload) {
-    if (payload.success === false) throw new Error(`runner API error: ${JSON.stringify(payload)}`);
-    return payload.data;
-  }
-  return payload;
-}
-
-// ---------------------------------------------------------------------------
-// In-page probe (UI Bridge only — never Playwright)
-// ---------------------------------------------------------------------------
-
-/**
- * JS installed in the runner webview to collect long tasks, paint gaps and
- * `terminal-output` delivery counts. Returned as one expression because that
- * is what `POST /ui-bridge/control/page/evaluate` accepts.
+ * It used to be JavaScript strings sent to `POST /ui-bridge/control/page/evaluate`,
+ * and the webview's CSP (`script-src 'self'`, no `'unsafe-eval'`) refuses every
+ * evaluated string wherever it is enforced — so every frontend number was
+ * UNKNOWN on linux-xvfb (plan
+ * `2026-10-14-perf-harness-frontend-probe-evaluates-strings-the-csp-refuses`).
+ * The component-action door is eval-free.
  *
- * The probe stores raw samples and does no maths — percentiles are computed in
- * Node by the unit-tested `perf-harness-lib` so the harness has exactly one
- * implementation of them.
+ * Each action answers the same JSON the evaluated expression did, so the
+ * `perf-harness-lib` folds are unchanged. The probe stores raw samples and does
+ * no maths — percentiles are computed in Node by the unit-tested lib.
  */
-const PROBE_INSTALL = `(() => {
-  const w = window;
-  if (w.__qontinuiPerfProbe && typeof w.__qontinuiPerfProbe.stop === 'function') {
-    try { w.__qontinuiPerfProbe.stop(); } catch (e) { /* previous probe already torn down */ }
-  }
-  const state = {
-    startedAt: performance.now(),
-    frameGapsMs: [],
-    longTasks: [],
-    webviewOutputEvents: 0,
-    webviewHooked: false,
-    errors: [],
-    ipc: { fallbackWarned: false, postMessageHooked: false, postMessageCalls: 0 },
-    _raf: 0,
-    _obs: null,
-    _unlisten: null,
-    _restore: [],
-  };
-  // Tauri keeps its custom-protocol->postMessage flip in a closure-private
-  // flag and only logs it (ipc-protocol.js): watch the warning, and count
-  // window.ipc.postMessage calls when the object lets us wrap it.
-  try {
-    const origWarn = console.warn;
-    console.warn = function (...args) {
-      try {
-        if (typeof args[0] === 'string' && args[0].indexOf('IPC custom protocol failed') >= 0) {
-          state.ipc.fallbackWarned = true;
-        }
-      } catch (e) { /* never break the page's logging */ }
-      return origWarn.apply(this, args);
-    };
-    state._restore.push(() => { console.warn = origWarn; });
-  } catch (e) {
-    state.errors.push('warn-hook: ' + String(e));
-  }
-  try {
-    const ipc = w.ipc;
-    if (ipc && typeof ipc.postMessage === 'function') {
-      const origPost = ipc.postMessage;
-      const wrapped = function (...args) {
-        state.ipc.postMessageCalls += 1;
-        return origPost.apply(this, args);
-      };
-      try { ipc.postMessage = wrapped; } catch (e) { /* frozen */ }
-      if (ipc.postMessage === wrapped) {
-        state.ipc.postMessageHooked = true;
-        state._restore.push(() => { try { ipc.postMessage = origPost; } catch (e) { /* frozen */ } });
-      }
-    }
-  } catch (e) {
-    state.errors.push('ipc-hook: ' + String(e));
-  }
-  try {
-    const obs = new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) {
-        state.longTasks.push({ start: e.startTime, duration: e.duration });
-        if (state.longTasks.length > 20000) state.longTasks.shift();
-      }
-    });
-    obs.observe({ entryTypes: ['longtask'] });
-    state._obs = obs;
-  } catch (e) {
-    state.errors.push('longtask-observer: ' + String(e));
-  }
-  let last = performance.now();
-  const tick = () => {
-    const now = performance.now();
-    state.frameGapsMs.push(now - last);
-    if (state.frameGapsMs.length > 20000) state.frameGapsMs.shift();
-    last = now;
-    state._raf = requestAnimationFrame(tick);
-  };
-  state._raf = requestAnimationFrame(tick);
-  try {
-    const ev = w.__TAURI__ && w.__TAURI__.event;
-    if (ev && typeof ev.listen === 'function') {
-      ev.listen('terminal-output', () => { state.webviewOutputEvents += 1; })
-        .then((un) => { state._unlisten = un; state.webviewHooked = true; })
-        .catch((e) => { state.errors.push('listen: ' + String(e)); });
-    } else {
-      state.errors.push('tauri-event-api-unavailable');
-    }
-  } catch (e) {
-    state.errors.push('tauri-hook: ' + String(e));
-  }
-  state.stop = () => {
-    try { cancelAnimationFrame(state._raf); } catch (e) { /* already cancelled */ }
-    try { if (state._obs) state._obs.disconnect(); } catch (e) { /* already disconnected */ }
-    try { if (state._unlisten) state._unlisten(); } catch (e) { /* already unlistened */ }
-    for (const r of state._restore) { try { r(); } catch (e) { /* best effort */ } }
-  };
-  state.reset = () => {
-    state.startedAt = performance.now();
-    state.frameGapsMs.length = 0;
-    state.longTasks.length = 0;
-    state.webviewOutputEvents = 0;
-    state.ipc.postMessageCalls = 0;
-    last = performance.now();
-  };
-  w.__qontinuiPerfProbe = state;
-  return { installed: true, longTaskObserver: !!state._obs, errors: state.errors };
-})()`;
+export const PERF_PROBE_COMPONENT = "perf-probe";
 
-/** Restart the probe's collection window without reinstalling the observers. */
-const PROBE_RESET = `(() => {
-  const s = window.__qontinuiPerfProbe;
-  if (!s) return { error: 'probe-not-installed' };
-  s.reset();
-  return { reset: true };
-})()`;
-
-/** Read the probe's raw samples back. */
-const PROBE_SAMPLE = `(() => {
-  const s = window.__qontinuiPerfProbe;
-  if (!s) return { error: 'probe-not-installed' };
-  return {
-    elapsedMs: performance.now() - s.startedAt,
-    frameGapsMs: s.frameGapsMs.slice(),
-    longTasks: s.longTasks.slice(),
-    webviewOutputEvents: s.webviewOutputEvents,
-    webviewHooked: s.webviewHooked,
-    errors: s.errors.slice(),
-    ipc: Object.assign({}, s.ipc),
-  };
-})()`;
+/** The `perf-probe` actions perf-harness drives. */
+export const PERF_PROBE_ACTIONS = Object.freeze({
+  install: "install",
+  reset: "reset",
+  sample: "sample",
+  stop: "stop",
+  transportReset: "transport-reset",
+  transportSample: "transport-sample",
+});
 
 /**
- * Zero the webview's transport counters (`src/components/terminal/transportStats.ts`).
- * Answers `{available:false}` on a build that predates the object.
+ * Run one `perf-probe` action and return the handler's own answer.
+ *
+ * The control door answers `{success, result}` around the handler's return
+ * (the same envelope `resolveTerminalPage` unwraps). A component the webview
+ * has not registered — a build that predates it — answers 404 `Component not
+ * found`; that throws with a reason naming the absence, so the caller records
+ * the frontend half as UNKNOWN with that reason, never as zero.
+ *
+ * @param {{componentAction: Function}} runner
+ * @param {string} action one of {@link PERF_PROBE_ACTIONS}
+ * @param {number} [timeoutMs]
  */
-const TRANSPORT_RESET = `(() => {
-  const t = window.__qontinuiTransportStats;
-  if (!t || typeof t.reset !== 'function') return { available: false };
-  t.reset();
-  return { available: true };
-})()`;
-
-/** Snapshot the webview's transport counters as plain JSON. */
-const TRANSPORT_SAMPLE = `(() => {
-  const t = window.__qontinuiTransportStats;
-  if (!t) return { available: false };
-  return {
-    available: true,
-    stats: {
-      enabled: t.enabled,
-      sinceResetMs: performance.now() - t.resetAt,
-      decodeNs: Object.assign({}, t.decodeNs),
-      decodeCalls: Object.assign({}, t.decodeCalls),
-      decodeBytes: Object.assign({}, t.decodeBytes),
-      writeToRenderNs: t.writeToRenderNs,
-      writeToRenderCount: t.writeToRenderCount,
-      writeToRenderBytes: t.writeToRenderBytes,
-      eventsDelivered: t.eventsDelivered,
-      eventsForeign: t.eventsForeign,
-      ringReplay: Object.assign({}, t.ringReplay),
-      rawIpc: t.rawIpc,
-    },
-  };
-})()`;
-
-/** Tear the probe down so a later harness run starts clean. */
-const PROBE_STOP = `(() => {
-  const s = window.__qontinuiPerfProbe;
-  if (!s) return { stopped: false };
-  s.stop();
-  delete window.__qontinuiPerfProbe;
-  return { stopped: true };
-})()`;
-
-// ---------------------------------------------------------------------------
-// Live clients
-// ---------------------------------------------------------------------------
-
-/** Supervisor client — spawn-test and stop only. Never touches the primary. */
-class SupervisorClient {
-  constructor(baseUrl, log) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
-    this.log = log;
-  }
-
-  async health() {
-    return httpJson(`${this.baseUrl}/health`, { timeoutMs: 20000 });
-  }
-
-  /**
-   * `POST /runners/spawn-test`. Temp runners land on 9877+; the primary is
-   * untouched by construction — this endpoint cannot address it.
-   *
-   * @param {object} body
-   * @param {number} timeoutMs
-   */
-  async spawnTest(body, timeoutMs) {
-    this.log(`supervisor: POST /runners/spawn-test ${JSON.stringify(body)}`);
-    return httpJson(`${this.baseUrl}/runners/spawn-test`, {
-      method: "POST",
-      body,
-      timeoutMs,
-    });
-  }
-
-  /**
-   * @param {string} id temp-runner id returned by spawn-test
-   */
-  async stopRunner(id) {
-    this.log(`supervisor: POST /runners/${id}/stop`);
-    return httpJson(`${this.baseUrl}/runners/${encodeURIComponent(id)}/stop`, {
-      method: "POST",
-      body: {},
-      timeoutMs: 60000,
-    });
-  }
-}
-
-/** Temp-runner client: terminals API, log-sink resolution and the UI Bridge. */
-class RunnerClient {
-  constructor(baseUrl, log) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
-    const port = Number.parseInt(new URL(this.baseUrl).port || "0", 10);
-    if (port === PRIMARY_RUNNER_PORT) {
+export async function probeAction(runner, action, timeoutMs = 30000) {
+  let raw;
+  try {
+    raw = await runner.componentAction(PERF_PROBE_COMPONENT, action, {}, timeoutMs);
+  } catch (e) {
+    const msg = String(e?.message ?? e);
+    if (e?.status === 404 || /component not found/i.test(msg)) {
       throw new Error(
-        `refusing to drive port ${PRIMARY_RUNNER_PORT}: that is the primary runner. ` +
-          `Spawn a temp runner via the supervisor (the harness does this by default).`,
+        `the ${PERF_PROBE_COMPONENT} UI Bridge component is not registered (a runner build that predates it): ${msg}`,
+        { cause: e },
       );
     }
-    this.log = log;
+    throw e;
   }
-
-  async health() {
-    return httpJson(`${this.baseUrl}/health`, { timeoutMs: 20000 });
+  if (raw && typeof raw === "object" && raw.success === false) {
+    throw new Error(`${PERF_PROBE_COMPONENT}.${action} failed: ${raw.error ?? "no error"}`);
   }
+  return raw && typeof raw === "object" && "result" in raw ? raw.result : raw;
+}
 
-  /** Wait for `/health` to answer, polling until `timeoutMs` elapses. */
-  async waitHealthy(timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    let lastError = null;
-    while (Date.now() < deadline) {
-      try {
-        const h = await this.health();
-        if (h) return h;
-      } catch (e) {
-        lastError = e;
-      }
-      await sleep(1000);
+// ---------------------------------------------------------------------------
+// Which terminal page the harness creates its terminals on
+// ---------------------------------------------------------------------------
+
+/**
+ * The page the frontend falls back to when none is persisted, and the page a
+ * `POST /terminals` with no `page_id` lands on (`terminal/manager.rs`).
+ */
+export const DEFAULT_TERMINAL_PAGE = "default";
+
+/**
+ * The perf-probe actions ride the component-action route, which waits the
+ * runner's UI Bridge IPC budget — 10 s by default (`timeout_config.rs`
+ * `ui_bridge_ipc`) — not the per-call timeout the harness passes to `fetch`.
+ * A sample under a render storm can take longer than that, and a timeout there
+ * would read as a wedge, so a runner the harness spawns gets the harness's own
+ * budget. An attached `--runner-url` runner keeps whatever it was started with.
+ */
+export const PROBE_IPC_ENV = Object.freeze({ QONTINUI_TIMEOUT_UI_BRIDGE_IPC: "60" });
+
+/** The Terminal page's UI Bridge component, and its eval-free view-state read. */
+export const TERMINAL_PAGE_COMPONENT = "terminal-page";
+export const VIEW_STATE_ACTION = "get-zone-view-state";
+
+/**
+ * Resolve the page to create terminals on: the one the Terminal tab is showing,
+ * as its own `get-zone-view-state` action reports it (`pageId`).
+ *
+ * Terminals on any OTHER page are `unwatched` and get no webview output by
+ * default. The original `page_id: "perf-harness"` only rendered when the
+ * frontend happened to switch to that page — which it does on a fresh runner,
+ * where `default` is empty and hidden, but not once the active page holds a
+ * terminal (an operator's box): there it measured an idle page.
+ *
+ * Not a page-evaluate read of the persisted key: the webview's CSP
+ * (`script-src 'self'`, no `'unsafe-eval'`) refuses every evaluated string.
+ * Without the UI Bridge (`--skip-frontend`), or from a build whose action
+ * predates `pageId`, it is `default` — where a page-less create lands — and the
+ * source says why.
+ *
+ * @returns {Promise<{pageId: string, source: string}>}
+ */
+export async function resolveTerminalPage(runner, { skipFrontend = false } = {}) {
+  if (skipFrontend) {
+    return { pageId: DEFAULT_TERMINAL_PAGE, source: "fallback: --skip-frontend (the UI Bridge is not used)" };
+  }
+  try {
+    const raw = await runner.componentAction(TERMINAL_PAGE_COMPONENT, VIEW_STATE_ACTION, {}, 20000);
+    // The control door answers `{success, result}` around the handler's return.
+    const v = raw && typeof raw === "object" && "result" in raw ? raw.result : raw;
+    if (raw && raw.success === false) {
+      return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} failed (${raw.error ?? "no error"})` };
     }
-    throw new Error(`runner ${this.baseUrl} never became healthy: ${lastError?.message ?? "?"}`);
-  }
-
-  async logSink() {
-    return unwrap(await httpJson(`${this.baseUrl}/log-sources/runner-log-sink`, { timeoutMs: 20000 }));
-  }
-
-  async listTerminals() {
-    const data = unwrap(await httpJson(`${this.baseUrl}/terminals`, { timeoutMs: 30000 }));
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data?.terminals)) return data.terminals;
-    if (Array.isArray(data?.sessions)) return data.sessions;
-    return [];
-  }
-
-  /** @returns {Promise<{info:object, wallMs:number}>} */
-  async createTerminal(body, timeoutMs) {
-    const t0 = performance.now();
-    const data = unwrap(
-      await httpJson(`${this.baseUrl}/terminals`, { method: "POST", body, timeoutMs }),
-    );
-    return { info: data, wallMs: performance.now() - t0 };
-  }
-
-  async writeTerminal(id, text) {
-    return httpJson(`${this.baseUrl}/terminals/${encodeURIComponent(id)}/write`, {
-      method: "POST",
-      body: { data: Buffer.from(text, "utf8").toString("base64") },
-      timeoutMs: 20000,
-    });
-  }
-
-  async closeTerminal(id) {
-    return httpJson(`${this.baseUrl}/terminals/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-      timeoutMs: 30000,
-    });
-  }
-
-  /** UI Bridge page evaluation — the ONLY frontend measurement channel here. */
-  async evaluate(expression, timeoutMs = 30000) {
-    const payload = await httpJson(`${this.baseUrl}/ui-bridge/control/page/evaluate`, {
-      method: "POST",
-      body: { expression, unwrap: true, timeoutMs: Math.max(1000, timeoutMs - 2000) },
-      timeoutMs,
-    });
-    const data = unwrap(payload);
-    // `evaluate` answers `{type, value}` when it can classify the result.
-    if (data && typeof data === "object" && "value" in data && "type" in data) return data.value;
-    return data;
-  }
-
-  /** Zero the runner's transport counters. */
-  async resetTransportStats() {
-    return httpJson(`${this.baseUrl}/terminals/transport-stats`, {
-      method: "POST",
-      body: {},
-      timeoutMs: 20000,
-    });
-  }
-
-  /** Raw `GET /terminals/transport-stats` body (envelope or bare). */
-  async transportStats() {
-    return httpJson(`${this.baseUrl}/terminals/transport-stats`, { timeoutMs: 20000 });
-  }
-
-  /** The runner grid's `alt_screen` flag for one terminal. */
-  async gridAltScreen(id) {
-    const data = unwrap(
-      await httpJson(
-        `${this.baseUrl}/ui-bridge/sdk/terminal/sessions/${encodeURIComponent(id)}/grid`,
-        { timeoutMs: 20000 },
-      ),
-    );
-    return typeof data?.alt_screen === "boolean" ? data.alt_screen : null;
-  }
-
-  async activateTab(tabId) {
-    return httpJson(`${this.baseUrl}/ui-bridge/control/tab/activate`, {
-      method: "POST",
-      body: { tabId },
-      timeoutMs: 20000,
-    });
+    if (v && typeof v.pageId === "string" && v.pageId.trim()) {
+      return { pageId: v.pageId, source: `frontend active page (${TERMINAL_PAGE_COMPONENT}.${VIEW_STATE_ACTION})` };
+    }
+    return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} reported no pageId (a build that predates it)` };
+  } catch (e) {
+    return { pageId: DEFAULT_TERMINAL_PAGE, source: `fallback: ${VIEW_STATE_ACTION} failed (${e.message})` };
   }
 }
 
@@ -793,9 +546,9 @@ class FakeRunner {
       ["terminal_spawn.shim_materialize", wallMs * 0.15],
       ["terminal_spawn.record_open", wallMs * 0.22],
       ["terminal_spawn.identity_seam", wallMs * 0.5],
-      ["terminal_spawn.manager_create", wallMs * 0.85],
-      ["terminal_spawn.coord_register", wallMs * 0.06],
     ];
+    // Only spans the `POST /terminals` path opens: the fake reproduces the real
+    // path's log, so it must not invent `HTTP_PATH_UNOPENED_SPANS`.
     for (const [span, ms] of segments) {
       const busy = (ms * 0.8).toFixed(3);
       const idle = (ms * 0.2).toFixed(3);
@@ -822,6 +575,17 @@ class FakeRunner {
 
   async activateTab() {
     return { success: true };
+  }
+
+  async componentAction(componentId, actionId) {
+    if (componentId === TERMINAL_PAGE_COMPONENT && actionId === VIEW_STATE_ACTION) {
+      return { success: true, result: { maximizedZone: null, zoneCount: 1, layoutId: "single", pageId: DEFAULT_TERMINAL_PAGE } };
+    }
+    if (componentId === PERF_PROBE_COMPONENT) {
+      const result = this.#perfProbe(actionId);
+      if (result !== undefined) return { success: true, result, durationMs: 1 };
+    }
+    throw new Error(`dry-run: no component action ${componentId}.${actionId}`);
   }
 
   async resetTransportStats() {
@@ -864,12 +628,13 @@ class FakeRunner {
     return false;
   }
 
-  async evaluate(expression) {
-    if (expression === PROBE_INSTALL) return { installed: true, longTaskObserver: true, errors: [] };
-    if (expression === PROBE_RESET) return { reset: true };
-    if (expression === PROBE_STOP) return { stopped: true };
-    if (expression === TRANSPORT_RESET) return { available: true };
-    if (expression === TRANSPORT_SAMPLE) {
+  /** The `perf-probe` component's answers, in the shapes `src/lib/perfProbe.ts` returns. */
+  #perfProbe(actionId) {
+    if (actionId === PERF_PROBE_ACTIONS.install) return { installed: true, longTaskObserver: true, errors: [] };
+    if (actionId === PERF_PROBE_ACTIONS.reset) return { reset: true };
+    if (actionId === PERF_PROBE_ACTIONS.stop) return { stopped: true };
+    if (actionId === PERF_PROBE_ACTIONS.transportReset) return { available: true };
+    if (actionId === PERF_PROBE_ACTIONS.transportSample) {
       const n = this.terminals.size;
       const events = n * 450;
       return {
@@ -890,7 +655,7 @@ class FakeRunner {
         },
       };
     }
-    if (expression === PROBE_SAMPLE) {
+    if (actionId === PERF_PROBE_ACTIONS.sample) {
       const n = this.terminals.size;
       const elapsedMs = 15000;
       // Frame gaps degrade with session count — the A1/A3 render storm.
@@ -913,7 +678,7 @@ class FakeRunner {
         ipc: { fallbackWarned: false, postMessageHooked: true, postMessageCalls: 0 },
       };
     }
-    return null;
+    return undefined;
   }
 
   /** Log text the fake "wrote" since `offset` lines. */
@@ -937,7 +702,7 @@ class FakeRunner {
  *
  * @returns {Promise<object>} one `levels[]` entry
  */
-async function measureLevel({ runner, target, existing, config, logSinkPath, isDry, log }) {
+async function measureLevel({ runner, target, existing, created: allCreated, pageId, config, logSinkPath, isDry, log, probeInstallError = null }) {
   const toCreate = Math.max(0, target - existing.length);
   log(`S=${target}: creating ${toCreate} terminal(s) (population before: ${existing.length})`);
 
@@ -953,13 +718,14 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
           title: `perf-harness S${target} #${existing.length + i + 1}`,
           cols: TERMINAL_COLS,
           rows: TERMINAL_ROWS,
-          page_id: "perf-harness",
+          page_id: pageId,
         },
         config.createTimeoutMs,
       );
       wallTimes.push(wallMs);
       created.push(info);
       existing.push(info);
+      allCreated.push(info);
     } catch (e) {
       failures.push(String(e?.message ?? e));
       log(`S=${target}: create #${i + 1} FAILED: ${e?.message ?? e}`);
@@ -981,10 +747,17 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
 
   // Frontend probe window covers the soak only.
   let frontend = null;
-  let frontendError = config.skipFrontend ? "skipped (--skip-frontend)" : null;
-  if (!config.skipFrontend) {
+  // A probe that never installed reads UNKNOWN with the install's own reason —
+  // never a zero-filled sample.
+  let frontendError = config.skipFrontend
+    ? "skipped (--skip-frontend)"
+    : probeInstallError
+      ? `probe install failed: ${probeInstallError}`
+      : null;
+  if (!frontendError) {
     try {
-      await runner.evaluate(PROBE_RESET);
+      const r = await probeAction(runner, PERF_PROBE_ACTIONS.reset);
+      if (r?.error) frontendError = `probe reset: ${r.error}`;
     } catch (e) {
       frontendError = `probe reset: ${String(e?.message ?? e)}`;
     }
@@ -1000,7 +773,7 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
   }
   if (!config.skipFrontend) {
     try {
-      const r = await runner.evaluate(TRANSPORT_RESET);
+      const r = await probeAction(runner, PERF_PROBE_ACTIONS.transportReset);
       if (!r?.available) {
         transportFrontendError =
           "window.__qontinuiTransportStats is absent (webview build predates it)";
@@ -1017,9 +790,9 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
   const bytesAfter = await totalBytes(runner);
 
   let probeSample = null;
-  if (!config.skipFrontend) {
+  if (!frontendError) {
     try {
-      const sample = await runner.evaluate(PROBE_SAMPLE, 60000);
+      const sample = await probeAction(runner, PERF_PROBE_ACTIONS.sample, 60000);
       if (sample && !sample.error) {
         probeSample = sample;
         frontend = foldFrontendSample(sample);
@@ -1060,13 +833,18 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
     // event loop has stopped servicing IPC. Under this harness's load that is
     // not a transport hiccup — it is the freeze the plan exists to fix — so it
     // gets its own field rather than hiding inside an error string.
+    // The perf-probe component route waits the runner's UI Bridge IPC budget
+    // (`QONTINUI_TIMEOUT_UI_BRIDGE_IPC`), and its timeouts feed the UI Bridge
+    // circuit breaker, whose open state is the same wedge seen one call later.
     webviewWedged: typeof frontendError === "string"
       ? frontendError.includes("failed to send message to the webview") ||
-        frontendError.includes("page_evaluate timed out")
+        frontendError.includes("UI Bridge request timed out") ||
+        frontendError.includes("circuit breaker open")
       : false,
     chunks,
     transport,
     spawnSpans,
+    spawnSpansNotApplicable: { ...HTTP_PATH_UNOPENED_SPANS },
     spawnSpanSampleCount: spanRecords.length,
     logBytesScanned: logText.length,
   };
@@ -1091,7 +869,7 @@ async function sampleTransport({ runner, config, backendError, frontendError, ip
   let frontend = null;
   if (!frontendError) {
     try {
-      const r = await runner.evaluate(TRANSPORT_SAMPLE, 30000);
+      const r = await probeAction(runner, PERF_PROBE_ACTIONS.transportSample, 30000);
       if (r?.available) frontend = normalizeFrontendTransport(r.stats);
       if (!frontend) frontendError = "window.__qontinuiTransportStats sample was empty";
     } catch (e) {
@@ -1100,7 +878,7 @@ async function sampleTransport({ runner, config, backendError, frontendError, ip
   }
 
   // The runner's own grid is the one alt-screen reading available without a
-  // new API; the panes' xterm buffers are not reachable from page/evaluate.
+  // new API; the panes' xterm buffers are not reachable from the perf-probe component.
   let sampled = 0;
   let onAltScreen = 0;
   let unreadable = 0;
@@ -1148,7 +926,7 @@ async function totalBytes(runner) {
  * @param {object} config
  * @param {(msg:string)=>void} log
  */
-export async function runHarness(config, log) {
+export async function runHarness(config, log, deps = {}) {
   const isDry = Boolean(config.dryRun);
   const notes = [];
   const startedAt = new Date().toISOString();
@@ -1156,6 +934,10 @@ export async function runHarness(config, log) {
   let supervisor = null;
   let runner = null;
   let spawned = null;
+  // Test seam: `deps.fetch` reaches the shared clients' fetch injection.
+  const clientOpts = deps.fetch ? { fetch: deps.fetch } : {};
+  /** Every terminal this run created — and so must close. */
+  const created = [];
 
   if (isDry) {
     runner = new FakeRunner(log);
@@ -1165,11 +947,15 @@ export async function runHarness(config, log) {
     );
     log("dry-run: using the in-process FakeRunner (no supervisor, no HTTP)");
   } else if (config.runnerUrl) {
-    runner = new RunnerClient(config.runnerUrl, log);
-    notes.push(`Attached to an existing runner at ${config.runnerUrl} (not spawned by the harness).`);
+    runner = new RunnerClient(config.runnerUrl, log, clientOpts);
+    notes.push(
+      `Attached to an existing runner at ${config.runnerUrl} (not spawned by the harness). Its UI Bridge ` +
+        `IPC budget is whatever it was started with (QONTINUI_TIMEOUT_UI_BRIDGE_IPC; 10 s by default), ` +
+        `so a frontend sample slower than that reads as a timeout.`,
+    );
     log(`attaching to existing runner ${config.runnerUrl}`);
   } else {
-    supervisor = new SupervisorClient(config.supervisor, log);
+    supervisor = new SupervisorClient(config.supervisor, log, clientOpts);
     const health = await supervisor.health().catch((e) => {
       throw new Error(
         `supervisor at ${config.supervisor} is unreachable (${e.message}). ` +
@@ -1192,7 +978,7 @@ export async function runHarness(config, log) {
       wait_timeout_secs: config.spawnTimeoutSecs,
       requester_id: `perf-harness/${config.label}`,
       health_probe_timeout_ms: 30000,
-      extra_env: { RUST_LOG: config.rustLog },
+      extra_env: { RUST_LOG: config.rustLog, ...PROBE_IPC_ENV },
     };
     if (config.gitRef) body.git_ref = config.gitRef;
     if (config.worktree) body.worktree_path = config.worktree;
@@ -1205,7 +991,7 @@ export async function runHarness(config, log) {
     if (spawned?.lkg_stale_warning?.stale) {
       notes.push(`supervisor LKG staleness: ${spawned.lkg_stale_warning.message}`);
     }
-    runner = new RunnerClient(apiUrl, log);
+    runner = new RunnerClient(apiUrl, log, clientOpts);
   }
 
   const run = {
@@ -1249,6 +1035,8 @@ export async function runHarness(config, log) {
       notes.push("No runner log sink resolved — the spawn-segment breakdown will be empty.");
     }
 
+    /** Why the perf-probe did not install; each level's frontend is then UNKNOWN with it. */
+    let probeInstallError = null;
     if (config.skipFrontend) {
       notes.push(
         "--skip-frontend: the UI Bridge probe was NOT installed and the terminal tab was not " +
@@ -1266,7 +1054,10 @@ export async function runHarness(config, log) {
       }
 
       try {
-        const installed = await runner.evaluate(PROBE_INSTALL, 45000);
+        const installed = await probeAction(runner, PERF_PROBE_ACTIONS.install, 45000);
+        if (installed?.installed !== true) {
+          throw new Error(`${PERF_PROBE_ACTIONS.install} answered ${JSON.stringify(installed)}`);
+        }
         log(`ui-bridge: probe installed (longTaskObserver=${installed?.longTaskObserver})`);
         if (installed?.errors?.length) {
           notes.push(`probe install warnings: ${installed.errors.join("; ")}`);
@@ -1278,9 +1069,13 @@ export async function runHarness(config, log) {
           );
         }
       } catch (e) {
-        notes.push(`UI Bridge probe install FAILED (${e.message}) — frontend metrics unavailable.`);
+        probeInstallError = String(e?.message ?? e);
+        notes.push(`UI Bridge probe install FAILED (${probeInstallError}) — frontend metrics are UNKNOWN, not zero.`);
       }
     }
+
+    run.terminalPage = await resolveTerminalPage(runner, { skipFrontend: config.skipFrontend });
+    log(`terminals go on page "${run.terminalPage.pageId}" (${run.terminalPage.source})`);
 
     const existing = await runner.listTerminals().catch(() => []);
     if (existing.length) {
@@ -1293,10 +1088,13 @@ export async function runHarness(config, log) {
         runner,
         target,
         existing,
+        created,
+        pageId: run.terminalPage.pageId,
         config,
         logSinkPath,
         isDry,
         log,
+        probeInstallError,
       });
       run.levels.push(level);
       log(
@@ -1328,10 +1126,19 @@ export async function runHarness(config, log) {
   } finally {
     if (!config.skipFrontend) {
       try {
-        await runner.evaluate(PROBE_STOP, 15000);
+        await probeAction(runner, PERF_PROBE_ACTIONS.stop, 15000);
       } catch {
         /* probe teardown is best effort; a dead webview is not a run failure */
       }
+    }
+    // Close what this run created — on an attached runner (`--runner-url`) too,
+    // where nothing else would. Pre-existing terminals are never touched.
+    run.cleanup = await closeCreated(runner, created, { keep: Boolean(config.keepRunner), log });
+    if (run.cleanup.failed.length) {
+      run.notes.push(
+        `${run.cleanup.failed.length} of ${created.length} harness terminal(s) could not be closed: ` +
+          run.cleanup.failed.map((f) => `${f.id} (${f.error})`).join("; "),
+      );
     }
     if (spawned?.id && !config.keepRunner) {
       try {
@@ -1348,6 +1155,33 @@ export async function runHarness(config, log) {
 
   run.finishedAt = new Date().toISOString();
   return run;
+}
+
+/**
+ * `DELETE /terminals/{id}` every terminal the run created. With `keep`
+ * (`--keep-runner`, which leaves the runner up for inspection) they are left
+ * running and listed. A failed close is recorded, never thrown: teardown must
+ * still reach the runner stop.
+ *
+ * @returns {Promise<{created: number, closed: string[], kept: string[], failed: {id: string, error: string}[]}>}
+ */
+export async function closeCreated(runner, created, { keep = false, log = () => {} } = {}) {
+  const out = { created: created.length, closed: [], kept: [], failed: [] };
+  if (keep) {
+    out.kept = created.map((t) => t.id);
+  } else {
+    // In parallel: on a wedged runner each DELETE waits out its own timeout,
+    // and serially that would hold the temp-runner stop for minutes.
+    const results = await Promise.allSettled(created.map((t) => runner.closeTerminal(t.id)));
+    results.forEach((r, i) => {
+      const id = created[i].id;
+      if (r.status === "fulfilled") out.closed.push(id);
+      else out.failed.push({ id, error: String(r.reason?.message ?? r.reason) });
+    });
+  }
+  if (out.kept.length) log(`left ${out.kept.length} harness terminal(s) running (--keep-runner)`);
+  else if (created.length) log(`closed ${out.closed.length} of ${created.length} harness terminal(s)`);
+  return out;
 }
 
 const fmt = (v) => (Number.isFinite(v) ? v.toFixed(1) : "?");

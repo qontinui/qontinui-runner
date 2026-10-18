@@ -111,6 +111,7 @@ import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID, TAB_LIST } from "@/components/a
 import { toTabCanonical } from "@/hooks/ui-bridge-events/utils";
 import { acquireSingletonListener } from "@/hooks/ui-bridge-events/singleton-listener";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { usePerfProbeComponent } from "@/components/app/usePerfProbeComponent";
 
 import {
   NavigationProvider,
@@ -267,6 +268,12 @@ function AppContent() {
       },
     ],
   });
+
+  // perf-harness's eval-free frontend probe (plan
+  // 2026-10-14-perf-harness-frontend-probe-evaluates-strings-the-csp-refuses).
+  // Here, beside `setup-wizard` and before any early return, so it is
+  // registered whenever the main window runs. Idle until its `install` action.
+  usePerfProbeComponent();
 
   const { data: recentTaskRuns = [] } = useTaskRuns(1);
   const lastRun = recentTaskRuns.length > 0 ? recentTaskRuns[0] : null;
