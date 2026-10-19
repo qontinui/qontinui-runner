@@ -455,15 +455,6 @@ mod tests {
     use qontinui_runner_lib::env_agent::pull::SectionPolicy;
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// The runner's [`ProcessSpawn::command`] gives a `git` program the
-    /// runner's git posture: every repository-local variable is removed
-    /// (`get_envs` reports a removal as `None`), so a `GIT_DIR` inherited from
-    /// the runner's launcher cannot point a CI step or a checkout at another
-    /// repo. This is the runner half of what `build_step_command`'s test pinned
-    /// before the executor moved into ci-exec (qontinui-runner 0aca8ff42).
-    /// ci-exec builds every process through this method, manifest STEP
-    /// commands included (qontinui-schemas#242, c98b5258, which ports
-    /// 238439693). A bare `Command::new` fails this.
     /// CI steps lose the runner's login passwords, the same list a session
     /// child loses. An empty override (the trait default) fails this.
     #[test]
@@ -473,6 +464,15 @@ mod tests {
         assert_eq!(scrubbed, crate::terminal::CREDENTIAL_VALUE_ENV_VARS);
     }
 
+    /// The runner's [`ProcessSpawn::command`] gives a `git` program the
+    /// runner's git posture: every repository-local variable is removed
+    /// (`get_envs` reports a removal as `None`), so a `GIT_DIR` inherited from
+    /// the runner's launcher cannot point a CI step or a checkout at another
+    /// repo. This is the runner half of what `build_step_command`'s test pinned
+    /// before the executor moved into ci-exec (qontinui-runner 0aca8ff42).
+    /// ci-exec builds every process through this method, manifest STEP
+    /// commands included (qontinui-schemas#242, c98b5258, which ports
+    /// 238439693). A bare `Command::new` fails this.
     #[test]
     fn a_git_command_is_scrubbed_of_the_repo_local_env() {
         let cmd = RunnerProcess.command("git");

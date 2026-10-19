@@ -388,8 +388,10 @@ fn result_body(
         Some(outcome) => outcome.to_json(),
         None => serde_json::json!({ "status": "not_evaluated" }),
     };
-    summary["model"] = serde_json::to_value(model)
-        .unwrap_or_else(|_| serde_json::json!({ "status": "not_evaluated" }));
+    // A failed serialization must not claim the checks never ran: say so.
+    summary["model"] = serde_json::to_value(model).unwrap_or_else(
+        |_| serde_json::json!({ "status": "unknown", "detail": "serialize_failed" }),
+    );
     let mut body = serde_json::json!({
         "conclusion": conclusion,
         "summary": summary,
