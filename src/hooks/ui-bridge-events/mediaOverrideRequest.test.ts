@@ -1,8 +1,8 @@
 /**
  * The runner-webview half of the media override answers through the SDK's
  * dev-controls gate: refused (typed) until the realm opts in — the state of
- * every exe-mode, i.e. published, runner — and served by the SDK engine once
- * it has. Node environment (no DOM), so the opted-in arm is exercised through
+ * every runner, since every runner is an exe-mode build — and served by the
+ * SDK engine once it has. Node environment (no DOM), so the opted-in arm is exercised through
  * the two commands that need no document: list and restore-all.
  */
 
@@ -34,7 +34,7 @@ describe("media override in the runner webview", () => {
   });
 
   it.each(["media_override_apply", "media_override_restore", "media_override_list"] as const)(
-    "%s is refused, typed, while dev controls are off (every published runner)",
+    "%s is refused, typed, while dev controls are off (every runner)",
     async (type) => {
       const reply = await runMediaOverrideRequest(type, { slotId: "hero", src: "/c.png" });
       expect(reply.success).toBe(false);
