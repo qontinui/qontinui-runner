@@ -1210,11 +1210,19 @@ mod tests {
     #[test]
     fn pinned_postgres_requirement_parses_only_the_pin_line() {
         assert_eq!(
-            pinned_postgres_requirement("[env]\n# POSTGRESQL_VERSION = \"=1.0.0\"\nPOSTGRESQL_VERSION = \"=18.6.0\"\n"),
+            pinned_postgres_requirement(
+                "[env]\n# POSTGRESQL_VERSION = \"=1.0.0\"\nPOSTGRESQL_VERSION = \"=18.6.0\"\n"
+            ),
             Some("=18.6.0")
         );
-        assert_eq!(pinned_postgres_requirement("POSTGRESQL_VERSION_X = \"=1.0.0\"\n"), None);
-        assert_eq!(pinned_postgres_requirement("[env]\nSCCACHE_SERVER_PORT = \"4230\"\n"), None);
+        assert_eq!(
+            pinned_postgres_requirement("POSTGRESQL_VERSION_X = \"=1.0.0\"\n"),
+            None
+        );
+        assert_eq!(
+            pinned_postgres_requirement("[env]\nSCCACHE_SERVER_PORT = \"4230\"\n"),
+            None
+        );
     }
 
     // ---- Data-root isolation (manual-test-loop iter 18, item 2) ----
