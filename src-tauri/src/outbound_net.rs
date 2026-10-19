@@ -100,6 +100,8 @@ use crate::coord_ws::CoordWs;
 use crate::profiles::NetworkProfile;
 pub use crate::profiles::TrustMode;
 
+/// The OS DNS resolver for reqwest clients, off tokio's blocking pool.
+pub mod os_dns;
 /// Corporate CA trust: the per-stack census and its measurements (Phase 5).
 pub mod tls_trust;
 
