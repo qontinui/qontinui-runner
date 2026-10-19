@@ -716,8 +716,10 @@ pub enum SettingsJsonPathSource {
     /// No `QONTINUI_CONFIG_DIR`; the platform config dir +
     /// `com.qontinui.runner` was used.
     PlatformConfigDir,
-    /// Neither available — `dirs::config_dir()` returned `None`, so there is no
-    /// path at all. The value is `None`, never a guess.
+    /// Neither available — the platform config dir
+    /// (`instance_env::platform_dir`, which always resolves under an instance
+    /// root) returned `None`, so there is no path at all. The value is `None`,
+    /// never a guess.
     Unresolvable,
 }
 
@@ -748,18 +750,13 @@ impl std::fmt::Display for SettingsJsonPathSource {
 /// [`SettingsJsonPathSource::EnvConfigDir`] for why that has to hold now that
 /// this module WRITES the file as well as reading it.
 pub fn settings_json_path() -> (Option<PathBuf>, SettingsJsonPathSource) {
-    if let Some(dir) = std::env::var("QONTINUI_CONFIG_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        return (
-            Some(PathBuf::from(dir).join("settings.json")),
+    match crate::instance_env::runner_config_dir() {
+        Some((dir, true)) => (
+            Some(dir.join("settings.json")),
             SettingsJsonPathSource::EnvConfigDir,
-        );
-    }
-    match dirs::config_dir() {
-        Some(d) => (
-            Some(d.join("com.qontinui.runner").join("settings.json")),
+        ),
+        Some((dir, false)) => (
+            Some(dir.join("settings.json")),
             SettingsJsonPathSource::PlatformConfigDir,
         ),
         None => (None, SettingsJsonPathSource::Unresolvable),

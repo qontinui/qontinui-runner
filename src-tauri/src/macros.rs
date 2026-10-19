@@ -212,9 +212,11 @@ impl Macro {
 
 /// Get the base storage directory (per-runner for secondary instances).
 fn get_storage_dir() -> PathBuf {
-    let base = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-runner");
+    let base = qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("qontinui-runner");
     let base_dir = crate::instance::scope_path(&base);
 
     // Create directory if it doesn't exist
