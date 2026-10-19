@@ -9175,6 +9175,31 @@ fn provision_agent_definitions_from_root(
         .join("agents");
     let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
 
+    // TRACKED DESTINATIONS ARE KEPT, in both layers below. Decided ONCE, before
+    // either writes, so the UNKNOWN arm keys on what was on disk before this
+    // pass (see `provision_guard::KeepDecisions`). In a qontinui-claude-config
+    // worktree `.claude/agents/*.md` is tracked content: the floor wrote this
+    // binary's render over it and the overlay wrote the PRIMARY checkout's copy
+    // (a different commit) over it, which left every such worktree dirty and fed
+    // the wip-custody snapshots a stream of junk refs. Same guard, same probe, as
+    // `fleet_commands` and `fleet_skills`.
+    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
+    let mut candidates = crate::fleet_agents::embedded_agent_names();
+    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+        candidates.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+        );
+    }
+    let keep = crate::provision_guard::KeepDecisions::decide(
+        &tracked,
+        &dst_dir,
+        candidates.iter().map(String::as_str),
+    );
+
     // FLOOR FIRST: write the defs bundled into this binary, so a device with no
     // qontinui-claude-config checkout gets a working subagent set instead of
     // none. This is the fleet-portability follow-up this function's docstring
@@ -9183,7 +9208,7 @@ fn provision_agent_definitions_from_root(
     // Deliberately NOT fatal: if the embedded write fails we warn and continue
     // to the checkout overlay, because a checkout present on this device is a
     // complete answer on its own.
-    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir) {
+    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, &keep) {
         Ok(report) => report,
         Err(e) => {
             warn!(
@@ -9266,6 +9291,16 @@ fn provision_agent_definitions_from_root(
         };
         let dst = dst_dir.join(name);
         report.expected += 1;
+        let unit = name.to_string_lossy().into_owned();
+        if let Some(reason) = keep.reason(&unit) {
+            info!(
+                "agent_runtime: keeping {} as it is on disk — {}",
+                dst.display(),
+                reason.describe()
+            );
+            report.skip(unit, reason.clone());
+            continue;
+        }
         // Idempotent: overwrite is fine (std::fs::copy truncates the target).
         if let Err(e) = std::fs::copy(&path, &dst) {
             warn!(
@@ -12994,6 +13029,78 @@ mod tests {
         // Idempotent: a second run over the same dst overwrites cleanly.
         provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
         assert!(dst.join("merge-specialist.md").is_file());
+    }
+
+    /// The measured clobber: a session worktree of qontinui-claude-config,
+    /// where `.claude/agents/*.md` is TRACKED, had its definitions overwritten on
+    /// every spawn — by the embedded floor (this binary's render) and then by the
+    /// PRIMARY checkout's copy, which sits at a different commit. A tracked,
+    /// existing definition must be kept by BOTH layers and reported as such; an
+    /// untracked one is still refreshed from the checkout.
+    #[test]
+    fn provision_agent_defs_keep_tracked_definitions_in_both_layers() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        // The operator's primary checkout: the overlay's source.
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("merge-specialist.md"), "# PRIMARY copy").unwrap();
+        std::fs::write(src.join("loose.md"), "# PRIMARY loose").unwrap();
+
+        // The session worktree: a repo tracking its own definitions.
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        let tracked_overlay = dst.join("merge-specialist.md");
+        let tracked_floor = dst.join("code-reviewer.md");
+        std::fs::write(&tracked_overlay, "# WORKTREE's own").unwrap();
+        std::fs::write(&tracked_floor, "# WORKTREE's own reviewer").unwrap();
+        git_add(wt.path(), &tracked_overlay);
+        git_add(wt.path(), &tracked_floor);
+        // Present but untracked: still the checkout's to refresh.
+        std::fs::write(dst.join("loose.md"), "# stale loose").unwrap();
+        assert!(
+            crate::fleet_agents::embedded_agent_names()
+                .iter()
+                .any(|n| n == "code-reviewer.md"),
+            "fixture: code-reviewer.md must be an embedded definition, or the              floor half of this test pins nothing"
+        );
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&tracked_overlay).unwrap(),
+            "# WORKTREE's own",
+            "the checkout overlay must not overwrite a tracked definition"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked_floor).unwrap(),
+            "# WORKTREE's own reviewer",
+            "the embedded floor must not overwrite a tracked definition"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("loose.md")).unwrap(),
+            "# PRIMARY loose",
+            "an untracked definition is still refreshed from the checkout"
+        );
+        let kept: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.unit.as_str(), s.reason.wire()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("merge-specialist.md", "git_tracked")],
+            "the overlay reports exactly the tracked definition it kept"
+        );
+        assert_eq!(report.written, 1, "only loose.md is overlaid");
     }
 
     #[test]
