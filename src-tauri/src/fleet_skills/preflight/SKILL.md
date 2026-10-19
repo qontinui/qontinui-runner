@@ -162,12 +162,15 @@ and returns exactly one of:
   second session on this box also reads `renewed`; an absent `owner_scope` (coord
   predating qontinui-coord#2697) means the same. On `"device"` or absent, if
   nothing earlier in THIS session reserved the plan, treat it as a same-box peer
-  holding it (see `held`). The reverse does not hold: after an earlier
-  `"device"` reserve, a `"session"` re-reserve answers `held` naming THIS
-  machine (coord's acquire compares tokens exactly), and a reserve `held`
-  carries only `holder`, never a session — so it is indistinguishable from a
-  same-box peer (`coord_claim_check` reports only the machine too). Treat it
-  as one. A coord build predating the `renewed` outcome answered `granted`
+  holding it (see `held`). The reverse needs the holder session: after an
+  earlier `"device"` reserve, a `"session"` re-reserve answers `held` naming
+  THIS machine (`holder`; coord's acquire compares tokens exactly). Read its
+  `current_holder_session` — equal to your own session id = yours, different =
+  that peer. With none it is a bare-device hold: yours only if THIS session, or
+  the chain enclosing it, received `granted` on a device-scoped reserve of this
+  key (a `renewed` does not count); otherwise a same-box peer. A coord
+  predating qontinui-coord#3213 sends no `current_holder_session` on a reserve
+  `held`, so read every such `held` as a same-box peer. A coord build predating the `renewed` outcome answered `granted`
   here on both doors, so an older coord cannot tell you this case apart.
 - **`held`** — a peer is **already implementing this plan** (the response carries
   the holder identity). Do **not** start. Coordinate (hand off / sequence behind
