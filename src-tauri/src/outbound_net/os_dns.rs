@@ -392,85 +392,190 @@ mod tests {
         "reqwest::ClientBuilder::default",
     ];
     /// The constructor names a bare `<imported name>::` may be followed by.
-    const RAW_BARE_FNS: [&str; 3] = ["new(", "builder(", "default("];
+    const RAW_BARE_FNS: [&str; 3] = ["new", "builder", "default"];
     /// The line of the one sanctioned raw call, in [`client_builder`].
     const DOOR_LINE: &str = "reqwest::Client::builder().dns_resolver(os_resolver())";
 
-    /// The file's lines with string-literal CONTENTS blanked and `//`
-    /// comments dropped, so a constructor quoted in a string or a comment is
-    /// not code. String state carries across lines (a `\`-continued message).
-    /// Raw strings (`r#"…"#`) are not modelled; none quote a constructor.
-    fn mask_code(text: &str) -> Vec<String> {
-        let mut in_string = false;
-        let mut out = Vec::new();
-        for line in text.lines() {
-            let chars: Vec<char> = line.chars().collect();
-            let mut masked = String::with_capacity(line.len());
-            let mut k = 0;
-            while k < chars.len() {
-                let c = chars[k];
-                if in_string {
+    fn is_ident(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// A small Rust lexer: the file's lines with the CONTENTS of every string
+    /// literal (plain, byte, raw `r#"…"#`), char literal and comment (`//`,
+    /// nested `/* */`) blanked, so only code is matched. The second value is
+    /// `true` when the file ENDS inside a literal or block comment — a lexer
+    /// that lost its place, which the scan treats as a failure rather than
+    /// silently blanking the rest of the file.
+    fn mask_code(text: &str) -> (Vec<String>, bool) {
+        #[derive(Clone, Copy)]
+        enum State {
+            Code,
+            Str,
+            Raw(usize),
+            Block(usize),
+            Line,
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut state = State::Code;
+        let mut out = String::with_capacity(text.len());
+        let mut k = 0;
+        // Emit `c`, or a blank in its place; newlines always survive.
+        let blank = |out: &mut String, c: char| out.push(if c == '\n' { '\n' } else { ' ' });
+        while k < chars.len() {
+            let c = chars[k];
+            let next = chars.get(k + 1).copied();
+            match state {
+                State::Code => {
+                    if c == '/' && next == Some('/') {
+                        state = State::Line;
+                        k += 2;
+                        continue;
+                    }
+                    if c == '/' && next == Some('*') {
+                        state = State::Block(1);
+                        out.push_str("  ");
+                        k += 2;
+                        continue;
+                    }
+                    // `r"`, `r#"`, `br##"` … — `r` must start a token.
+                    let starts_token = k == 0 || !is_ident(chars[k - 1]) || {
+                        chars[k - 1] == 'b' && (k < 2 || !is_ident(chars[k - 2]))
+                    };
+                    if c == 'r' && starts_token {
+                        let mut j = k + 1;
+                        while chars.get(j) == Some(&'#') {
+                            j += 1;
+                        }
+                        if chars.get(j) == Some(&'"') {
+                            state = State::Raw(j - k - 1);
+                            out.extend(&chars[k..=j]);
+                            k = j + 1;
+                            continue;
+                        }
+                    }
+                    if c == '"' {
+                        state = State::Str;
+                        out.push('"');
+                        k += 1;
+                        continue;
+                    }
+                    if c == '\'' {
+                        // '\x', '\n', '\u{…}', '\'' — an escaped char literal.
+                        if next == Some('\\') {
+                            if let Some(end) =
+                                (k + 3..chars.len().min(k + 12)).find(|&j| chars[j] == '\'')
+                            {
+                                out.push('\'');
+                                for &ch in &chars[k + 1..end] {
+                                    blank(&mut out, ch);
+                                }
+                                out.push('\'');
+                                k = end + 1;
+                                continue;
+                            }
+                        }
+                        // 'x' (including '"') — otherwise it is a lifetime.
+                        if chars.get(k + 2) == Some(&'\'') {
+                            out.push_str("' '");
+                            k += 3;
+                            continue;
+                        }
+                    }
+                    out.push(c);
+                    k += 1;
+                }
+                State::Str => {
                     if c == '\\' {
-                        masked.push_str("  ");
+                        blank(&mut out, c);
+                        if let Some(n) = next {
+                            blank(&mut out, n);
+                        }
                         k += 2;
                         continue;
                     }
                     if c == '"' {
-                        in_string = false;
-                        masked.push('"');
+                        state = State::Code;
+                        out.push('"');
                     } else {
-                        masked.push(' ');
+                        blank(&mut out, c);
                     }
                     k += 1;
-                    continue;
                 }
-                if c == '/' && chars.get(k + 1) == Some(&'/') {
-                    break;
-                }
-                if c == '"' {
-                    in_string = true;
-                    masked.push('"');
+                State::Raw(hashes) => {
+                    if c == '"' && (1..=hashes).all(|h| chars.get(k + h) == Some(&'#')) {
+                        out.push('"');
+                        out.extend(std::iter::repeat_n('#', hashes));
+                        k += 1 + hashes;
+                        state = State::Code;
+                        continue;
+                    }
+                    blank(&mut out, c);
                     k += 1;
-                    continue;
                 }
-                // A char literal: '"' or '\"' must not open a string.
-                if c == '\'' {
-                    if chars.get(k + 1) == Some(&'\\') && chars.get(k + 3) == Some(&'\'') {
-                        masked.push_str("' '");
-                        k += 4;
+                State::Block(depth) => {
+                    if c == '/' && next == Some('*') {
+                        state = State::Block(depth + 1);
+                        out.push_str("  ");
+                        k += 2;
                         continue;
                     }
-                    if chars.get(k + 2) == Some(&'\'') {
-                        masked.push_str("' '");
-                        k += 3;
+                    if c == '*' && next == Some('/') {
+                        state = if depth == 1 {
+                            State::Code
+                        } else {
+                            State::Block(depth - 1)
+                        };
+                        out.push_str("  ");
+                        k += 2;
                         continue;
                     }
+                    blank(&mut out, c);
+                    k += 1;
                 }
-                masked.push(c);
-                k += 1;
+                State::Line => {
+                    if c == '\n' {
+                        state = State::Code;
+                        out.push('\n');
+                    }
+                    k += 1;
+                }
             }
-            out.push(masked);
         }
-        out
+        let lost = matches!(state, State::Str | State::Raw(_) | State::Block(_));
+        (out.lines().map(str::to_string).collect(), lost)
     }
 
     /// The names a bare constructor call may use in this file: `Client` /
     /// `ClientBuilder` (and any `as` alias) from a `use reqwest::…;`
-    /// statement, grouped or not, that is not the blocking client's.
-    fn imported_client_names(masked: &[String]) -> Vec<String> {
-        let joined = masked.join("\n");
-        let mut names = Vec::new();
+    /// statement, grouped or not — except the blocking client's — plus any
+    /// alias of the crate itself (`use reqwest as rq;` makes `rq::Client`).
+    fn imported_client_names(masked: &[String]) -> (Vec<String>, Vec<String>) {
+        let joined = masked.join("\n").replace("use ::reqwest", "use reqwest");
+        let (mut names, mut crate_aliases) = (Vec::new(), Vec::new());
         let mut rest = joined.as_str();
-        while let Some(at) = rest.find("use reqwest::") {
+        while let Some(at) = rest.find("use reqwest") {
             let tail = rest.get(at..).unwrap_or("");
             let end = tail.find(';').unwrap_or(tail.len());
             let stmt = tail.get(..end).unwrap_or("");
             rest = tail.get(end..).unwrap_or("");
-            if stmt.contains("blocking") {
+            let words: Vec<&str> = stmt
+                .split(|c: char| !is_ident(c))
+                .filter(|t| !t.is_empty())
+                .collect();
+            // `use reqwest_middleware::…` is another crate.
+            if words.get(1) != Some(&"reqwest") {
                 continue;
             }
+            if let ["use", "reqwest", "as", alias] = words.as_slice() {
+                crate_aliases.push((*alias).to_string());
+                continue;
+            }
+            // `blocking::Client` (aliased or not) is a different type.
+            let stmt = stmt
+                .replace("blocking::ClientBuilder", "blocking::_")
+                .replace("blocking::Client", "blocking::_");
             let tokens: Vec<&str> = stmt
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .split(|c: char| !is_ident(c))
                 .filter(|t| !t.is_empty())
                 .collect();
             for (j, t) in tokens.iter().enumerate() {
@@ -485,30 +590,50 @@ mod tests {
                 }
             }
         }
-        names
+        (names, crate_aliases)
     }
 
-    /// Every raw-constructor hit in one file's code, as `line: text`.
-    fn raw_constructor_hits(text: &str) -> Vec<String> {
+    /// Does `pat` occur in `line` as a whole path — nothing path-like (an
+    /// identifier char or `:`) before it, no identifier char after it? So
+    /// `EmbeddingClient::new(` and `reqwest::blocking::Client::new(` do not
+    /// match `Client::new`, and `Client::newer` does not either.
+    fn has_whole_path(line: &str, pat: &str) -> bool {
+        line.match_indices(pat).any(|(at, _)| {
+            let before_ok = line
+                .get(..at)
+                .and_then(|b| b.chars().next_back())
+                .is_none_or(|c| !(is_ident(c) || c == ':'));
+            let after_ok = line
+                .get(at + pat.len()..)
+                .and_then(|a| a.chars().next())
+                .is_none_or(|c| !is_ident(c));
+            before_ok && after_ok
+        })
+    }
+
+    /// Every raw-constructor hit in one file's code, as `line: text`, and
+    /// whether the lexer lost its place (see [`mask_code`]).
+    fn raw_constructor_hits(text: &str) -> (Vec<String>, bool) {
         let raw: Vec<&str> = text.lines().collect();
-        let masked = mask_code(text);
-        let names = imported_client_names(&masked);
+        let (masked, lost) = mask_code(text);
+        let (names, crate_aliases) = imported_client_names(&masked);
+        let mut bare_paths: Vec<String> = Vec::new();
+        for name in &names {
+            for f in RAW_BARE_FNS {
+                bare_paths.push(format!("{name}::{f}"));
+            }
+        }
+        for alias in &crate_aliases {
+            for q in RAW_QUALIFIED {
+                if let Some(path) = q.strip_prefix("reqwest::") {
+                    bare_paths.push(format!("{alias}::{path}"));
+                }
+            }
+        }
         let mut hits = Vec::new();
         for (i, line) in masked.iter().enumerate() {
             let qualified = RAW_QUALIFIED.iter().any(|p| line.contains(p));
-            // A bare `Client::new(` counts only where nothing path-like (an
-            // identifier char or `:`) precedes it, so `EmbeddingClient::new(`
-            // and `reqwest::blocking::Client::new(` do not.
-            let bare = names.iter().any(|name| {
-                RAW_BARE_FNS.iter().any(|f| {
-                    let pat = format!("{name}::{f}");
-                    line.match_indices(&pat).any(|(at, _)| {
-                        line.get(..at)
-                            .and_then(|before| before.chars().next_back())
-                            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == ':'))
-                    })
-                })
-            });
+            let bare = bare_paths.iter().any(|p| has_whole_path(line, p));
             // `client_builder()…build().unwrap_or_default()` reaches
             // `Client::default()` through a generic, which clippy cannot see.
             // Judged over the whole statement: back to the previous line that
@@ -539,19 +664,25 @@ mod tests {
                 ));
             }
         }
-        hits
+        (hits, lost)
     }
 
     /// The source-level half of the guard (module doc): no raw async reqwest
     /// constructor in the code of `src-tauri/src` or `src-tauri/tests`, test
     /// code included. This file is scanned too, and may hold exactly one hit:
-    /// the door's own call.
+    /// the door's own call. Every file must lex to its end in code, so a
+    /// literal the lexer misreads cannot blank the rest of a file unnoticed.
+    ///
+    /// Not seen (clippy still sees the non-test ones): a builder held in a
+    /// variable and built later with `.unwrap_or_default()`, and
+    /// `<reqwest::Client as Default>::default()`.
     #[test]
     fn no_raw_async_reqwest_constructor_outside_the_door() {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let door = manifest.join("src").join("outbound_net").join("os_dns.rs");
         let mut stack = vec![manifest.join("src"), manifest.join("tests")];
-        let (mut walked, mut offenders, mut door_hits) = (0usize, Vec::new(), Vec::new());
+        let (mut walked, mut offenders, mut lost_files) = (0usize, Vec::new(), Vec::new());
+        let mut door_hits = Vec::new();
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).expect("read_dir") {
                 let path = entry.expect("dir entry").path();
@@ -567,7 +698,10 @@ mod tests {
                 }
                 walked += 1;
                 let text = std::fs::read_to_string(&path).expect("read source");
-                let hits = raw_constructor_hits(&text);
+                let (hits, lost) = raw_constructor_hits(&text);
+                if lost {
+                    lost_files.push(path.display().to_string());
+                }
                 if path == door {
                     door_hits = hits;
                     continue;
@@ -579,6 +713,11 @@ mod tests {
         }
         // Guard the guard: a walker that lost the tree reports a clean zero.
         assert!(walked > 1000, "walked only {walked} .rs files");
+        assert!(
+            lost_files.is_empty(),
+            "the scan's lexer ended inside a literal or comment in these files, so it may have \
+             blanked real code — fix `mask_code` for the construct it misread: {lost_files:#?}"
+        );
         // The door's file holds exactly its one call — which also proves the
         // matcher still sees a raw call at all.
         assert!(
@@ -595,12 +734,17 @@ mod tests {
     }
 
     /// The matcher on the shapes it must and must not flag. Each shape is a
-    /// string here, which the masking itself keeps out of this file's hits.
+    /// string here, which the lexer itself keeps out of this file's hits.
     #[test]
     fn the_raw_constructor_matcher_flags_exactly_the_raw_shapes() {
-        let flagged = |src: &str| !raw_constructor_hits(src).is_empty();
-        // Qualified calls, and a function-pointer spelling.
+        let flagged = |src: &str| {
+            let (hits, lost) = raw_constructor_hits(src);
+            assert!(!lost, "the lexer lost its place in {src:?}");
+            !hits.is_empty()
+        };
+        // Qualified calls, and function-pointer spellings.
         assert!(flagged("let c = reqwest::Client::new();"));
+        assert!(flagged("let c = ::reqwest::Client::new();"));
         assert!(flagged("let c = reqwest::Client::builder().build()?;"));
         assert!(flagged("let c = reqwest::ClientBuilder::new();"));
         assert!(flagged("CELL.get_or_init(reqwest::Client::new);"));
@@ -615,6 +759,9 @@ mod tests {
             "use reqwest::Client;\nfn f() { let c = Client::builder(); }"
         ));
         assert!(flagged(
+            "use reqwest::Client;\nCELL.get_or_init(Client::new);"
+        ));
+        assert!(flagged(
             "use reqwest::{Client, StatusCode};\nlet c = Client::new();"
         ));
         assert!(flagged(
@@ -625,6 +772,14 @@ mod tests {
         ));
         assert!(flagged(
             "use reqwest::ClientBuilder;\nlet b = ClientBuilder::new();"
+        ));
+        assert!(flagged("use ::reqwest::Client;\nlet c = Client::new();"));
+        assert!(flagged("use reqwest as rq;\nlet c = rq::Client::new();"));
+        assert!(flagged(
+            "use reqwest::{blocking, Client};\nlet c = Client::new();"
+        ));
+        assert!(flagged(
+            "use reqwest::{blocking::Client as B, Client};\nlet c = Client::new();"
         ));
         // The generic-Default fallback, on one line, split, through `.ok()`,
         // and with comments between the chain calls (the coord_sync shape).
@@ -640,6 +795,30 @@ mod tests {
         assert!(flagged(
             "let c = client_builder()\n    // one\n    .timeout(t)\n    // two\n    // three\n    // four\n    // five\n    // six\n    // seven\n    // eight\n    .pool_max_idle_per_host(32)\n    .build()\n    // why the fallback\n    .unwrap_or_default();"
         ));
+        // A literal or comment the lexer must step over without losing its
+        // place: the raw call AFTER it must still be seen.
+        assert!(flagged(
+            "let re = r#\"class=\"a\"\"#;\nlet c = reqwest::Client::new();"
+        ));
+        assert!(flagged(
+            "let p = r\"C:\\dir\\\";\nlet c = reqwest::Client::new();"
+        ));
+        assert!(flagged(
+            "let j = br##\"{\"k\": \"#\"}\"##;\nlet c = reqwest::Client::new();"
+        ));
+        assert!(flagged("/* a \" quote */\nlet c = reqwest::Client::new();"));
+        assert!(flagged(
+            "/* outer /* \" */ still */\nlet c = reqwest::Client::new();"
+        ));
+        assert!(flagged(
+            "let q = '\"'; let e = '\\''; let u = '\\u{22}';\nlet c = reqwest::Client::new();"
+        ));
+        assert!(flagged(
+            "fn f<'a>(s: &'a str) -> &'a str { s }\nlet c = reqwest::Client::new();"
+        ));
+        assert!(flagged(
+            "let s = \"multi \\\n line \\\" still\";\nlet c = reqwest::Client::new();"
+        ));
         // Not raw: the door's helpers, the blocking client, other `Client`s,
         // comments, strings, and an unrelated `unwrap_or_default`.
         assert!(!flagged(
@@ -653,13 +832,19 @@ mod tests {
             "use reqwest::blocking::Client;\nlet c = Client::new();"
         ));
         assert!(!flagged(
+            "use reqwest::blocking::Client as B;\nlet c = B::new();"
+        ));
+        assert!(!flagged(
             "use reqwest::Client;\nlet e = EmbeddingClient::new();"
         ));
+        assert!(!flagged("use reqwest::Client;\nlet n = Client::newer();"));
         assert!(!flagged("let m = mcp::Client::new();"));
         assert!(!flagged("let c = Client::new();"));
         assert!(!flagged("// reqwest::Client::new() in a comment"));
         assert!(!flagged("let x = 1; // reqwest::Client::new() trailing"));
+        assert!(!flagged("/* reqwest::Client::new() */ let x = 1;"));
         assert!(!flagged("let s = \"reqwest::Client::new()\";"));
+        assert!(!flagged("let s = r#\"reqwest::Client::new()\"#;"));
         assert!(!flagged(
             "let q = '\"'; let s = \"reqwest::Client::new()\";"
         ));
@@ -670,6 +855,11 @@ mod tests {
         assert!(!flagged(
             "let c = qontinui_runner_lib::outbound_net::client_builder().build()?;\nlet t = resp.text().await.unwrap_or_default();"
         ));
+        // The lexer reports a file it could not finish in code.
+        assert!(mask_code("let s = \"unterminated").1);
+        assert!(mask_code("let s = r#\"unterminated\"").1);
+        assert!(mask_code("/* unterminated").1);
+        assert!(!mask_code("let s = \"done\"; // \"").1);
     }
 
     /// `reqwest` accepts the resolver and drives a real request through it.
