@@ -1200,9 +1200,10 @@ mod tests {
         assert_eq!(
             Settings::default().version.to_string(),
             pin,
-            "the binary embeds a different PostgreSQL release than the pin; a stale \
-             postgresql_embedded OUT_DIR survives a pin change, so remove \
-             target/<profile>/{{build,.fingerprint}}/postgresql_embedded-* and rebuild"
+            "the binary embeds a different PostgreSQL release than the pin. Either \
+             POSTGRESQL_VERSION is set in the build environment (it overrides the \
+             [env] pin), or a stale postgresql_embedded OUT_DIR survived a pin change: \
+             run `bash scripts/ci/purge-stale-bundled-postgres.sh <target-dir>` and rebuild"
         );
     }
 

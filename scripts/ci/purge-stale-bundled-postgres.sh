@@ -10,13 +10,15 @@
 # GLIBC 2.36. Removing the unit's build/ and .fingerprint/ dirs makes cargo
 # rebuild the crate and run the script against an empty OUT_DIR.
 #
-# Usage: purge-stale-bundled-postgres.sh [target-dir]   (default: <repo>/target)
+# Usage: purge-stale-bundled-postgres.sh [target-dir]
+#   target-dir defaults to $CARGO_TARGET_DIR (the runner CI-node lane exports
+#   its persistent per-repo target dir there), else <repo>/target (Actions).
 # Exit: 0 = done (purged or nothing to purge), 1 = no exact pin found.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CONFIG="$ROOT/src-tauri/.cargo/config.toml"
-TARGET="${1:-$ROOT/target}"
+TARGET="${1:-${CARGO_TARGET_DIR:-$ROOT/target}}"
 
 pin="$(sed -nE 's/^[[:space:]]*POSTGRESQL_VERSION[[:space:]]*=[[:space:]]*"=([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$CONFIG" | head -n1)"
 if [ -z "$pin" ]; then
@@ -26,7 +28,6 @@ fi
 echo "bundled PostgreSQL pin: $pin (target dir: $TARGET)"
 
 shopt -s nullglob
-kept=0
 purged=0
 # target/<profile>/build/... and target/<triple>/<profile>/build/...
 for vf in "$TARGET"/*/build/postgresql_embedded-*/out/postgresql.version \
@@ -37,12 +38,13 @@ for vf in "$TARGET"/*/build/postgresql_embedded-*/out/postgresql.version \
   unit="$(dirname "$(dirname "$vf")")"
   profile_dir="$(dirname "$(dirname "$unit")")"
   if [ "$have" = "$pin" ]; then
-    echo "keep  $unit (embeds $have)"
-    kept=$((kept + 1))
+    echo "match $unit (embeds $have)"
     continue
   fi
+  # Purges the WHOLE profile's postgresql_embedded units, matching ones too:
+  # the cost is one extra rebuild, and it leaves no fingerprint half-present.
   echo "purge $profile_dir/{build,.fingerprint}/postgresql_embedded-* ($unit embeds $have)"
   rm -rf "$profile_dir"/build/postgresql_embedded-* "$profile_dir"/.fingerprint/postgresql_embedded-*
   purged=$((purged + 1))
 done
-echo "bundled PostgreSQL units: kept=$kept purged=$purged"
+echo "bundled PostgreSQL: purged $purged profile(s) holding a release other than $pin"
