@@ -476,6 +476,7 @@ elif [ -f "$PENDING_LIB" ]; then
     case "$PENDING_STATE" in
         none) : ;;
         ok)
+            log "pending registrations read at qontinui-schemas ${PENDING_HEAD_SHA:0:12} (its HEAD)"
             # Every declared wait that is NOT active, with the module's own
             # reason. An expired token, a rate limit or a network error reads
             # `INERT (unknown(...))`; without this line the push would be

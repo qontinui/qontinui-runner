@@ -144,6 +144,26 @@ pending_registration_active_types() {
         PENDING_UNKNOWN_REASON="$PENDING_REGISTRATION_TOML_REL declares waits but commit $sha has no $PENDING_REGISTRATION_MODULE_REL"
         return 0
     fi
+    # "Committed" is not "reviewed": the shared checkout's HEAD may be a
+    # feature branch or a peer's unpushed commit, and this module runs with the
+    # borrowed token. Run it only when the pinned commit is already on the
+    # remote default branch (a pinned sibling behind main is the usual case),
+    # or its module is byte-identical to the one there: code CI itself runs.
+    local default_ref want got
+    default_ref="$(git -C "$schemas" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    [ -n "$default_ref" ] || default_ref="origin/main"
+    if ! git -C "$schemas" merge-base --is-ancestor "$sha" "$default_ref" >/dev/null 2>&1; then
+        want="$(git -C "$schemas" rev-parse --verify --quiet "$default_ref:$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null || true)"
+        got="$(git -C "$schemas" rev-parse --verify --quiet "$sha:$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null || true)"
+        if [ -z "$want" ]; then
+            PENDING_UNKNOWN_REASON="commit $sha is not on $default_ref and $default_ref has no $PENDING_REGISTRATION_MODULE_REL here, so the module is not run"
+            return 0
+        fi
+        if [ "$want" != "$got" ]; then
+            PENDING_UNKNOWN_REASON="$PENDING_REGISTRATION_MODULE_REL at $sha is not the one on $default_ref (commit not on it, module differs), so it is not run"
+            return 0
+        fi
+    fi
     local py
     if ! py="$(pending_registration_python)"; then
         PENDING_UNKNOWN_REASON="no Python 3.11+ (python3/python) to run $PENDING_REGISTRATION_MODULE_REL"
@@ -154,6 +174,10 @@ pending_registration_active_types() {
     # unauthenticated call without one. A developer box usually has `gh`
     # signed in rather than the variable exported, so borrow its token for
     # this one child — never exported to the rest of the hook.
+    # xtrace off while the token is in a variable: `bash -x` on a hook is a
+    # normal way to debug it, and its trace is what people paste into reports.
+    local had_xtrace=0
+    case $- in *x*) had_xtrace=1; set +x ;; esac
     local token="${GITHUB_TOKEN:-}"
     if [ -z "$token" ] && command -v gh >/dev/null 2>&1; then
         token="$(gh auth token 2>/dev/null || true)"
@@ -183,9 +207,14 @@ except Exception as exc:  # an import failure is an answer, not a crash
 
 def at_commit(path):
     """The file at the pinned commit; None when absent; raise when git fails."""
-    r = subprocess.run(["git", "-C", schemas, "cat-file", "-e", "%s:%s" % (sha, path)],
+    # ls-tree, not cat-file -e: an empty listing is "absent", while a git that
+    # failed raises, so the whole answer goes UNKNOWN (as the CI Trees.head does)
+    # instead of one entry reading "not committed" for the wrong reason.
+    r = subprocess.run(["git", "-C", schemas, "ls-tree", sha, "--", path],
                        capture_output=True)
     if r.returncode != 0:
+        raise RuntimeError("git ls-tree %s -- %s failed" % (sha, path))
+    if not r.stdout.strip():
         return None
     r = subprocess.run(["git", "-C", schemas, "show", "%s:%s" % (sha, path)],
                        capture_output=True)
@@ -240,6 +269,11 @@ except Exception as exc:
     print("ERROR\t%s: %s" % (type(exc).__name__, exc))
     sys.exit(3)
 ' "$head" "$schemas" "$sha" 2>&1)" || rc=$?
+    # Only whether there WAS a token outlives the xtrace-off window.
+    local had_token=0
+    [ -z "$token" ] || had_token=1
+    token=""
+    [ "$had_xtrace" = 0 ] || set -x
     # A Windows Python ends its lines with CRLF; a CR left on a type name would
     # make it match no file and silently absorb nothing.
     out="$(printf '%s' "$out" | tr -d '\r')"
@@ -279,7 +313,7 @@ except Exception as exc:
     PENDING_ROWS="${PENDING_ROWS%$'\n'}"
     # A token-less reader answers unknown(no token) for every entry. Name that
     # case: it is the common local one, and its remedy is a sign-in, not a fix.
-    if [ -z "$token" ] && [ -z "$PENDING_ACTIVE_TYPES" ]; then
+    if [ "$had_token" = 0 ] && [ -z "$PENDING_ACTIVE_TYPES" ]; then
         PENDING_UNKNOWN_REASON="no GitHub token (GITHUB_TOKEN unset and 'gh auth token' gave none), so no declared wait could be confirmed ACTIVE"
         PENDING_ROWS=""
         return 0
@@ -301,13 +335,17 @@ _pending_registration_count_line() {
 # Copy stdin to stdout without the FIRST line equal to $1 (a trailing CR is
 # ignored for the comparison and kept on every line that stays).
 _pending_registration_drop_line() {
-    local want="$1" l removed=0
-    while IFS= read -r l || [ -n "$l" ]; do
+    local want="$1" l removed=0 nl
+    while :; do
+        # A last line with no newline is written back without one, so the
+        # copy differs from the regeneration only by the dropped line.
+        if IFS= read -r l; then nl=$'\n'; elif [ -n "$l" ]; then nl=""; else break; fi
         if [ "$removed" = 0 ] && [ "${l%$'\r'}" = "$want" ]; then
             removed=1
-            continue
+        else
+            printf '%s%s' "$l" "$nl"
         fi
-        printf '%s\n' "$l"
+        [ -n "$nl" ] || break
     done
 }
 
@@ -365,9 +403,11 @@ pending_registration_absorb() {
         fi
         # A bash read loop, not awk: Git Bash's awk opens files in text mode
         # and drops every CR, which would rewrite a CRLF index.ts wholesale.
-        tmp="$out/index.ts.pending-tmp"
+        # The temp file lives OUTSIDE the copy, so no entry copied from the
+        # baseline (a symlink, say) can be written through.
+        tmp="$(mktemp "${TMPDIR:-/tmp}/pending-index-XXXXXXXX")" || return 1
         _pending_registration_drop_line "$line" < "$out/index.ts" > "$tmp" \
-            && mv -f -- "$tmp" "$out/index.ts" || return 1
+            && mv -f -- "$tmp" "$out/index.ts" || { rm -f -- "$tmp"; return 1; }
         rm -f -- "$out/$t.d.ts" || return 1
         PENDING_ABSORBED+="$t"$'\n'
     done

@@ -127,6 +127,9 @@ def lines_of(text):
     return [] if text is None else text.splitlines()
 PY
     commit_all "$dir"
+    # What CI runs is the module on the remote default branch; the fixture's
+    # "remote" is its first commit.
+    git -C "$dir" update-ref refs/remotes/origin/main HEAD
     printf '%s' "$dir"
 }
 HEAD_N=0
@@ -180,6 +183,55 @@ else
     printf '\n\ndef metadata_verdict(entry, reader, today):\n    return True, ""\n' >> "$S/scripts/pending_registration.py"
     GITHUB_TOKEN=t STUB_ACTIVE= active "$S"
     check "an uncommitted edit to the MODULE is never run" "ok|" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
+
+    S="$(fake_schemas localmodule)"
+    printf '
+
+def metadata_verdict(entry, reader, today):
+    return True, ""
+' >> "$S/scripts/pending_registration.py"
+    commit_all "$S" "a local, unpushed module change"
+    GITHUB_TOKEN=t STUB_ACTIVE= active "$S"
+    check "a COMMITTED module that differs from origin's is not run: UNKNOWN" "unknown||yes" \
+        "$PENDING_STATE|$PENDING_ACTIVE_TYPES|$(has "is not the one on origin/main" "$PENDING_UNKNOWN_REASON")"
+
+    S="$(fake_schemas localother)"
+    printf 'local note\n' > "$S/NOTES"
+    commit_all "$S" "a local commit that leaves the module alone"
+    GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
+    check "a local commit whose module equals origin's still runs" "ok|Alpha" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
+
+    S="$(fake_schemas behindmain)"
+    printf '\n# a later main edit\n' >> "$S/scripts/pending_registration.py"
+    commit_all "$S" "main moves the module on"
+    git -C "$S" update-ref refs/remotes/origin/main HEAD
+    git -C "$S" reset --quiet --hard HEAD~1
+    GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
+    check "a pinned commit BEHIND origin's main runs its own (reviewed) module" "ok|Alpha" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
+
+    S="$(fake_schemas noend)"
+    printf '
+import sys
+sys.exit(0)
+' >> "$S/scripts/pending_registration.py"
+    commit_all "$S"; git -C "$S" update-ref refs/remotes/origin/main HEAD
+    GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
+    check "a module that exits 0 without its END line is UNKNOWN (incomplete answer)" "unknown|yes"         "$PENDING_STATE|$(has "incomplete answer" "$PENDING_UNKNOWN_REASON")"
+
+    S="$(fake_schemas importerror)"
+    printf '
+raise RuntimeError("boom at import")
+' >> "$S/scripts/pending_registration.py"
+    commit_all "$S"; git -C "$S" update-ref refs/remotes/origin/main HEAD
+    GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
+    check "a module that fails at import is UNKNOWN, naming the failure" "unknown|yes"         "$PENDING_STATE|$(has "boom at import" "$PENDING_UNKNOWN_REASON")"
+
+    S="$(fake_schemas xtrace)"
+    # The token is exported BEFORE xtrace starts, so only the library's own
+    # trace can carry it.
+    XT="$( ( export GITHUB_TOKEN=sekrit-token-value STUB_ACTIVE=Alpha; set -x; active "$S"; set +x ) 2>&1 )"
+    HEAD_N=$((HEAD_N + 1))  # the subshell's increment does not come back
+    check "under bash -x the token never reaches the trace" "no" "$(has "sekrit-token-value" "$XT")"
 
     S="$(fake_schemas nomodule)"
     rm -f "$S/scripts/pending_registration.py"; commit_all "$S"
@@ -287,6 +339,12 @@ pending_registration_absorb "$BASE" "$REGEN" "$OUT" Alpha
 check "a binding the regeneration deleted is absorbed" "Alpha|same" "$PENDING_ABSORBED|$(same "$OUT" "$REGEN")"
 check "  and the baseline itself is untouched" "yes|yes" \
     "$([ -f "$BASE/Alpha.d.ts" ] && echo yes || echo no)|$(grep -qF "{ Alpha }" "$BASE/index.ts" && echo yes || echo no)"
+
+mk_trees nofinalnl
+printf "export type { Alpha } from './Alpha';\nexport type { Beta } from './Beta';\nexport type { Gamma } from './Gamma';" > "$BASE/index.ts"
+printf "export type { Beta } from './Beta';\nexport type { Gamma } from './Gamma';" > "$REGEN/index.ts"
+pending_registration_absorb "$BASE" "$REGEN" "$OUT" Alpha
+check "an index.ts with no final newline is absorbed without gaining one" "Alpha|same" "$PENDING_ABSORBED|$(same "$OUT" "$REGEN")"
 
 mk_trees nodecl
 pending_registration_absorb "$BASE" "$REGEN" "$OUT"
