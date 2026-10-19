@@ -6,10 +6,12 @@
  *
  * It runs the SDK's own engine (`@qontinui/ui-bridge` `control/media-override`)
  * — the same code the relay dispatcher and the injected runtime run — behind
- * the SDK's dev-controls gate. The runner's webview opts in only on a Vite dev
- * build (`App.tsx`, `features.devControls: import.meta.env.DEV`); an exe-mode
- * runner never is one, so on every published runner these messages answer the
- * typed refusal below and no page-altering capability reaches a user.
+ * the SDK's dev-controls gate. The runner's webview opts in only under a Vite
+ * dev server (`App.tsx`, `features.devControls: import.meta.env.DEV`), and
+ * every runner — published, dev and temp alike — is an exe-mode build, so on
+ * every runner these messages answer the typed refusal below. The gate is not
+ * a security boundary: the override adds nothing beyond the existing
+ * `page_evaluate` / eval surface.
  */
 
 import {
@@ -75,7 +77,7 @@ export async function runMediaOverrideRequest(
           (id) => getGlobalRegistry().getElement(id)?.element,
         )
       : type === "media_override_restore"
-        ? restoreMediaOverrides(overrideBody(payload))
+        ? await restoreMediaOverrides(overrideBody(payload))
         : listMediaOverrides();
   return result.success
     ? { success: true, data: result }
