@@ -2341,11 +2341,7 @@ pub(crate) fn default_binding_tenant() -> Option<Uuid> {
 
 /// [`default_binding_tenant`] without the collapse.
 pub(crate) fn default_binding_tenant_probe() -> BindingTenantRead {
-    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")));
+    let base = qontinui_runner_lib::instance_env::secure_storage_dir();
     // No storage dir resolvable at all — a machine that cannot say where its
     // own state lives has not established anything.
     let Some(base) = base else {
@@ -2422,11 +2418,7 @@ pub(crate) fn device_binding_count() -> usize {
 /// or the file does not parse. The one file read both binding-count parsers
 /// share; each classifies the absence its own way.
 fn read_paired_user_value() -> Option<serde_json::Value> {
-    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
+    let base = qontinui_runner_lib::instance_env::secure_storage_dir()?;
     let bytes = std::fs::read(base.join("paired_user.json")).ok()?;
     serde_json::from_slice::<serde_json::Value>(&bytes).ok()
 }

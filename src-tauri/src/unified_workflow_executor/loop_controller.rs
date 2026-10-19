@@ -314,7 +314,7 @@ impl LoopController {
         // CREATE ARTIFACT DIRECTORY
         // =====================================================================
         if config.artifact_dir.is_none() {
-            if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
+            if let Some(app_data_dir) = qontinui_runner_lib::instance_env::runner_app_data_dir() {
                 let artifact_dir = app_data_dir.join("artifacts").join(&config.execution_id);
                 if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
                     warn!(

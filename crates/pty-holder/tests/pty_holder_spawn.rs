@@ -113,7 +113,10 @@ fn pty_holder_spawn_parent_helper() {
                 h.holder_pid,
                 h.child_pid,
                 h.route.as_str(),
-                h.unprotected.as_ref().map(|u| u.to_string()).unwrap_or_default()
+                h.unprotected
+                    .as_ref()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default()
             );
             // Keep the Child handle alive, exactly as a runner would, until
             // the outer test kills this process.
@@ -156,7 +159,10 @@ fn pty_holder_spawn_spawns_attaches_and_tears_down() {
     }
     if let Some((ppid, sid)) = ppid_and_session(child_pid) {
         assert_eq!(ppid, holder as i32, "the PTY child is the holder's");
-        assert_eq!(sid, child_pid as i32, "and leads its own session on the PTY");
+        assert_eq!(
+            sid, child_pid as i32,
+            "and leads its own session on the PTY"
+        );
     }
     let s = connect(&dir, &pane, soon())
         .unwrap()
@@ -188,7 +194,10 @@ fn pty_holder_spawn_second_spawn_for_a_live_pane_is_lock_held() {
     assert_eq!(err.holder_error_kind(), Some("lock_held"), "{err}");
     assert!(matches!(err, SpawnError::HolderFailed { .. }));
     assert!(alive(first.holder_pid) && alive(first.child_pid));
-    assert!(!dir.join("p1.spec").exists(), "the failed attempt's spec is gone");
+    assert!(
+        !dir.join("p1.spec").exists(),
+        "the failed attempt's spec is gone"
+    );
     first.teardown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -206,7 +215,10 @@ fn pty_holder_spawn_plain_route_flags_an_unprotected_cgroup() {
     let h = spawn_holder(&req).expect("plain spawn");
     assert_eq!(h.route, ResolvedRoute::Plain);
     let in_unit = HostFacts::probe().in_unit_cgroup;
-    eprintln!("pty_holder_spawn: plain in_unit_cgroup={in_unit} unprotected={:?}", h.unprotected);
+    eprintln!(
+        "pty_holder_spawn: plain in_unit_cgroup={in_unit} unprotected={:?}",
+        h.unprotected
+    );
     assert_eq!(
         h.unprotected,
         in_unit.then_some(Unprotected::Cgroup {
