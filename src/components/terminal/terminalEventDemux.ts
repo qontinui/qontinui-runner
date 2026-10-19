@@ -22,7 +22,10 @@
 
 import type { Event } from "@tauri-apps/api/event";
 import type { TerminalOutputEvent, TerminalExitEvent } from "@qontinui/shared-types/tauri-events";
-import { acquireSingletonListener } from "@/hooks/ui-bridge-events/singleton-listener";
+import {
+  acquireSingletonListener,
+  singletonListenerReady,
+} from "@/hooks/ui-bridge-events/singleton-listener";
 import { isOwnedByThisWindow } from "./terminalVisibilityTiers";
 import { noteOutputEvent } from "./transportStats";
 
@@ -158,6 +161,18 @@ export function registerTerminalOutputHandler(
   handler: (payload: TerminalOutputPayload) => void,
 ): () => void {
   return outputDemux.register(terminalId, handler);
+}
+
+/**
+ * Resolves once this window's `terminal-output` listener is live in the
+ * runner (`true`), or `false` when none is registered, or its `listen()`
+ * failed and the one retry this call makes failed too.
+ * `registerTerminalOutputHandler` returns before that: a pane that resets the
+ * runner's flow-control counters and must receive every byte counted after
+ * the reset awaits this between the two.
+ */
+export function terminalOutputListening(): Promise<boolean> {
+  return singletonListenerReady("terminal-output");
 }
 
 /** Receive `terminal-exit` payloads for ONE terminal. */

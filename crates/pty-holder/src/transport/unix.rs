@@ -76,6 +76,17 @@ impl Conn {
         Conn { stream }
     }
 
+    /// Stop READING this connection. **Linux** semantics, on which a holder
+    /// upgrade's input drain relies: data already queued stays readable,
+    /// then reads return EOF, and the peer's further writes fail (`EPIPE`).
+    /// BSD-family kernels (macOS included) may instead discard the queued
+    /// data and accept later writes silently, so this is Linux-only and the
+    /// drain elsewhere never shuts a connection down (`Pane::drain_input_for_handoff`).
+    #[cfg(target_os = "linux")]
+    pub fn shutdown_read(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Read);
+    }
+
     /// Half-close nothing, close everything: used after a rejection.
     pub fn shutdown(&self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
@@ -126,6 +137,31 @@ impl Listener {
         })
     }
 
+    /// Bind a holder upgrade's successor endpoint BESIDE `path`, at
+    /// [`staged_path`] — before the successor acks, so a bind failure is a
+    /// `nak` (the predecessor keeps the pane) rather than a failure after
+    /// the commit. [`StagedListener::publish`] then moves it over `path` with
+    /// one `rename`.
+    pub fn bind_staged(path: &Path) -> io::Result<StagedListener> {
+        let tmp = staged_path(path);
+        check_path_len(&tmp)?;
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let inner = UnixListener::bind(&tmp)?;
+        let staged = StagedListener {
+            listener: Some(Listener {
+                inner,
+                path: path.to_path_buf(),
+            }),
+            tmp,
+        };
+        std::fs::set_permissions(&staged.tmp, std::fs::Permissions::from_mode(0o600))?;
+        Ok(staged)
+    }
+
     pub fn accept(&self) -> io::Result<Conn> {
         let (stream, _) = self.inner.accept()?;
         Ok(Conn { stream })
@@ -133,6 +169,55 @@ impl Listener {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Where [`Listener::bind_staged`] binds: `<path>.upg`.
+pub fn staged_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".upg");
+    PathBuf::from(tmp)
+}
+
+/// A successor's listener, bound but not yet at the pane's endpoint path.
+/// Dropped unpublished, it removes its staged socket file.
+#[derive(Debug)]
+pub struct StagedListener {
+    listener: Option<Listener>,
+    tmp: PathBuf,
+}
+
+impl StagedListener {
+    /// `rename` the staged socket over the endpoint path: one atomic step, so
+    /// a client connecting by path reaches the predecessor's socket or this
+    /// one. (The predecessor's socket may already be dead by then — its
+    /// holder exits once the successor reports `serving`, or after a bound;
+    /// a client in that window gets a refusal and retries.) A failed rename
+    /// is retried briefly; if it still fails the listener is returned anyway
+    /// with the error: the pane keeps running UNREACHABLE (its lock held, so
+    /// a census reads it UNKNOWN), never ended for an I/O error.
+    pub fn publish(mut self) -> (Listener, io::Result<()>) {
+        let listener = self.listener.take().expect("published once");
+        let mut result = Ok(());
+        for attempt in 0..5 {
+            result = std::fs::rename(&self.tmp, &listener.path);
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20 << attempt));
+        }
+        if result.is_err() {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+        (listener, result)
+    }
+}
+
+impl Drop for StagedListener {
+    fn drop(&mut self) {
+        if self.listener.is_some() {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
     }
 }
 
