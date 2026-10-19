@@ -516,8 +516,7 @@ A refusal is UNKNOWN for the candidate, never a pass. Target a slot by
 `elementId`. A candidate URL must be reachable FROM THE PAGE — serve local
 files over loopback, e.g. `python3 -m http.server 8090 --bind 127.0.0.1`.
 
-Resolve the CLI the way `/verify-web` does (`scripts/verify-page-verdict.sh`,
-`resolve_inject_cli`): the monorepo build
+Resolve the CLI the way `/verify-web` does: the monorepo build
 `$ROOT/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs`, else
 `node_modules/@qontinui/ui-bridge-wrapper/dist/inject-cli.cjs`, run with
 `node` — never through the `.bin` symlink, through which it silently does
@@ -539,7 +538,7 @@ axis), each cell a fresh browser context running the same plan — swap, hover,
 capture, read the slot's media facts, restore, prove it.
 
 ```bash
-PAGE=http://127.0.0.1:3001/        # the page that owns the slot
+PAGE="$PAGE_URL"                   # the page that owns the slot
 CAND=http://127.0.0.1:8090/hero-candidate-2.avif
 OUT="$WORK/matrix-candidate-2"     # must be empty or absent
 cat > "$WORK/plan.ndjson" <<EOF
@@ -562,13 +561,19 @@ page itself reported), and `results.ndjson` with one line per action. Read, per
 cell:
 
 - the `mediaOverride` line: `ready.currentSrc` is the candidate and
-  `ready.naturalWidth`/`naturalHeight` are what decoded — a candidate smaller
-  than its slot at that DPR shows here before any judge looks;
+  `ready.naturalWidth`/`naturalHeight` are its size in image PIXELS, measured
+  on a detached decode (the slot's own `naturalWidth` is divided by a srcset
+  density, and Chromium keeps the slot's PREVIOUS density after a swap).
+  Against the slot's rendered size × DPR, a candidate too small for its slot
+  shows here before any judge looks; `null` is unmeasured, never small;
 - the `find` line: each media row's `mediaMetadata` envelope — `objectFit`,
   `effectiveResolution` (natural ÷ rendered × DPR), `dimsReserved`,
   `isLcpCandidate`, `clsSources`, and `encodedBodySize` keyed on `currentSrc`;
   a dimension it could not measure sits in `coverage.unmeasured` with its code,
-  never as `0`;
+  never as `0`. The rows are the PAGE's registrations, so a page whose own SDK
+  predates that envelope answers the old shape (an `oversizeRatio`, no
+  `coverage` — what qontinui.io served on 2026-10-19): there every one of those
+  facts is UNKNOWN, never "absent, so fine";
 - the last two lines: `restored[].verified: true` for every override and
   `mediaOverrideList` → `active: []`. **A cell whose list is not empty did not
   end restored — report it, do not average it away.** A `drift` entry names an
