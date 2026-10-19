@@ -382,8 +382,8 @@ mod tests {
         });
     }
 
-    /// Raw async constructors, spelled the way a source line names them. The
-    /// door's own file is the only place these may appear in code.
+    /// Raw async constructors, as a CODE line names them (string literals and
+    /// comments are masked out first, see [`mask_code`]).
     const RAW_QUALIFIED: [&str; 5] = [
         "reqwest::Client::new",
         "reqwest::Client::builder",
@@ -391,68 +391,167 @@ mod tests {
         "reqwest::ClientBuilder::new",
         "reqwest::ClientBuilder::default",
     ];
-    /// The same, unqualified, for a file that imports `reqwest::Client`.
-    const RAW_BARE: [&str; 5] = [
-        "Client::new(",
-        "Client::builder(",
-        "Client::default(",
-        "ClientBuilder::new(",
-        "ClientBuilder::default(",
-    ];
+    /// The constructor names a bare `<imported name>::` may be followed by.
+    const RAW_BARE_FNS: [&str; 3] = ["new(", "builder(", "default("];
+    /// The line of the one sanctioned raw call, in [`client_builder`].
+    const DOOR_LINE: &str = "reqwest::Client::builder().dns_resolver(os_resolver())";
 
-    /// Every raw-constructor hit in one file's CODE lines (`//` lines are
-    /// skipped), as `line: text`.
-    fn raw_constructor_hits(text: &str) -> Vec<String> {
-        let imports_client = text.lines().any(|l| {
-            let l = l.trim();
-            l == "use reqwest::Client;" || l == "use reqwest::ClientBuilder;"
-        });
-        let lines: Vec<&str> = text.lines().collect();
-        let mut hits = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if line.trim_start().starts_with("//") {
+    /// The file's lines with string-literal CONTENTS blanked and `//`
+    /// comments dropped, so a constructor quoted in a string or a comment is
+    /// not code. String state carries across lines (a `\`-continued message).
+    /// Raw strings (`r#"…"#`) are not modelled; none quote a constructor.
+    fn mask_code(text: &str) -> Vec<String> {
+        let mut in_string = false;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let chars: Vec<char> = line.chars().collect();
+            let mut masked = String::with_capacity(line.len());
+            let mut k = 0;
+            while k < chars.len() {
+                let c = chars[k];
+                if in_string {
+                    if c == '\\' {
+                        masked.push_str("  ");
+                        k += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                        masked.push('"');
+                    } else {
+                        masked.push(' ');
+                    }
+                    k += 1;
+                    continue;
+                }
+                if c == '/' && chars.get(k + 1) == Some(&'/') {
+                    break;
+                }
+                if c == '"' {
+                    in_string = true;
+                    masked.push('"');
+                    k += 1;
+                    continue;
+                }
+                // A char literal: '"' or '\"' must not open a string.
+                if c == '\'' {
+                    if chars.get(k + 1) == Some(&'\\') && chars.get(k + 3) == Some(&'\'') {
+                        masked.push_str("' '");
+                        k += 4;
+                        continue;
+                    }
+                    if chars.get(k + 2) == Some(&'\'') {
+                        masked.push_str("' '");
+                        k += 3;
+                        continue;
+                    }
+                }
+                masked.push(c);
+                k += 1;
+            }
+            out.push(masked);
+        }
+        out
+    }
+
+    /// The names a bare constructor call may use in this file: `Client` /
+    /// `ClientBuilder` (and any `as` alias) from a `use reqwest::…;`
+    /// statement, grouped or not, that is not the blocking client's.
+    fn imported_client_names(masked: &[String]) -> Vec<String> {
+        let joined = masked.join("\n");
+        let mut names = Vec::new();
+        let mut rest = joined.as_str();
+        while let Some(at) = rest.find("use reqwest::") {
+            let tail = rest.get(at..).unwrap_or("");
+            let end = tail.find(';').unwrap_or(tail.len());
+            let stmt = tail.get(..end).unwrap_or("");
+            rest = tail.get(end..).unwrap_or("");
+            if stmt.contains("blocking") {
                 continue;
             }
+            let tokens: Vec<&str> = stmt
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|t| !t.is_empty())
+                .collect();
+            for (j, t) in tokens.iter().enumerate() {
+                if *t == "Client" || *t == "ClientBuilder" {
+                    if tokens.get(j + 1) == Some(&"as") {
+                        if let Some(alias) = tokens.get(j + 2) {
+                            names.push((*alias).to_string());
+                        }
+                    } else {
+                        names.push((*t).to_string());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// Every raw-constructor hit in one file's code, as `line: text`.
+    fn raw_constructor_hits(text: &str) -> Vec<String> {
+        let raw: Vec<&str> = text.lines().collect();
+        let masked = mask_code(text);
+        let names = imported_client_names(&masked);
+        let mut hits = Vec::new();
+        for (i, line) in masked.iter().enumerate() {
             let qualified = RAW_QUALIFIED.iter().any(|p| line.contains(p));
             // A bare `Client::new(` counts only where nothing path-like (an
             // identifier char or `:`) precedes it, so `EmbeddingClient::new(`
             // and `reqwest::blocking::Client::new(` do not.
-            let bare = imports_client
-                && RAW_BARE.iter().any(|p| {
-                    line.match_indices(p).any(|(at, _)| {
+            let bare = names.iter().any(|name| {
+                RAW_BARE_FNS.iter().any(|f| {
+                    let pat = format!("{name}::{f}");
+                    line.match_indices(&pat).any(|(at, _)| {
                         line.get(..at)
                             .and_then(|before| before.chars().next_back())
                             .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == ':'))
                     })
-                });
-            // `client_builder()...build().unwrap_or_default()` reaches
+                })
+            });
+            // `client_builder()…build().unwrap_or_default()` reaches
             // `Client::default()` through a generic, which clippy cannot see.
-            let on_a_build = line.contains(".build().unwrap_or_default()")
-                || (line.trim_start().starts_with(".unwrap_or_default()")
-                    && i > 0
-                    && lines[i - 1].trim_end().ends_with(".build()"));
-            let default_fallback = on_a_build
-                && lines[i.saturating_sub(8)..=i]
-                    .iter()
-                    .any(|l| l.contains("client_builder()"));
+            // Judged over the whole statement: back to the previous line that
+            // ends one (`;`, `{`, `}`), comments masked, whitespace removed.
+            let default_fallback = line.contains(".unwrap_or_default()") && {
+                let mut start = i;
+                while start > 0 && i - start < 64 {
+                    let prev = masked[start - 1].trim_end();
+                    if prev.ends_with(';') || prev.ends_with('{') || prev.ends_with('}') {
+                        break;
+                    }
+                    start -= 1;
+                }
+                let stmt: String = masked[start..=i]
+                    .concat()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                stmt.contains("client_builder()")
+                    && (stmt.contains(".build().unwrap_or_default()")
+                        || stmt.contains(".build().ok().unwrap_or_default()"))
+            };
             if qualified || bare || default_fallback {
-                hits.push(format!("{}: {}", i + 1, line.trim()));
+                hits.push(format!(
+                    "{}: {}",
+                    i + 1,
+                    raw.get(i).map_or("", |l| l.trim())
+                ));
             }
         }
         hits
     }
 
     /// The source-level half of the guard (module doc): no raw async reqwest
-    /// constructor anywhere in `src-tauri/src` or `src-tauri/tests`, test code
-    /// included, outside this file. `expect_ratchet.rs` is also skipped: it
-    /// spells the `clippy.toml` entries as string literals to pin them.
+    /// constructor in the code of `src-tauri/src` or `src-tauri/tests`, test
+    /// code included. This file is scanned too, and may hold exactly one hit:
+    /// the door's own call.
     #[test]
     fn no_raw_async_reqwest_constructor_outside_the_door() {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let door = manifest.join("src").join("outbound_net").join("os_dns.rs");
-        let skipped = [door.clone(), manifest.join("src").join("expect_ratchet.rs")];
         let mut stack = vec![manifest.join("src"), manifest.join("tests")];
-        let (mut walked, mut offenders) = (0usize, Vec::new());
+        let (mut walked, mut offenders, mut door_hits) = (0usize, Vec::new(), Vec::new());
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).expect("read_dir") {
                 let path = entry.expect("dir entry").path();
@@ -463,27 +562,29 @@ mod tests {
                     }
                     continue;
                 }
-                if path.extension().and_then(|e| e.to_str()) != Some("rs")
-                    || skipped.contains(&path)
-                {
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                     continue;
                 }
                 walked += 1;
                 let text = std::fs::read_to_string(&path).expect("read source");
-                for hit in raw_constructor_hits(&text) {
+                let hits = raw_constructor_hits(&text);
+                if path == door {
+                    door_hits = hits;
+                    continue;
+                }
+                for hit in hits {
                     offenders.push(format!("{}:{hit}", path.display()));
                 }
             }
         }
         // Guard the guard: a walker that lost the tree reports a clean zero.
         assert!(walked > 1000, "walked only {walked} .rs files");
-        // And the matcher must see the door's own call, or it sees nothing.
-        let door_text = std::fs::read_to_string(&door).expect("read the door");
+        // The door's file holds exactly its one call — which also proves the
+        // matcher still sees a raw call at all.
         assert!(
-            raw_constructor_hits(&door_text)
-                .iter()
-                .any(|h| h.contains("reqwest::Client::builder().dns_resolver(os_resolver())")),
-            "the matcher no longer recognises the door's own raw call"
+            door_hits.len() == 1 && door_hits[0].contains(DOOR_LINE),
+            "{} must hold exactly one raw constructor, the door's `{DOOR_LINE}`; found {door_hits:#?}",
+            door.display()
         );
         assert!(
             offenders.is_empty(),
@@ -493,11 +594,12 @@ mod tests {
         );
     }
 
-    /// The matcher on the shapes it must and must not flag. Written as
-    /// strings so this file's own code stays free of raw calls.
+    /// The matcher on the shapes it must and must not flag. Each shape is a
+    /// string here, which the masking itself keeps out of this file's hits.
     #[test]
     fn the_raw_constructor_matcher_flags_exactly_the_raw_shapes() {
         let flagged = |src: &str| !raw_constructor_hits(src).is_empty();
+        // Qualified calls, and a function-pointer spelling.
         assert!(flagged("let c = reqwest::Client::new();"));
         assert!(flagged("let c = reqwest::Client::builder().build()?;"));
         assert!(flagged("let c = reqwest::ClientBuilder::new();"));
@@ -505,6 +607,7 @@ mod tests {
         assert!(flagged(
             "let c: reqwest::Client = reqwest::Client::default();"
         ));
+        // Bare calls under every import shape.
         assert!(flagged(
             "use reqwest::Client;\nfn f() { let c = Client::new(); }"
         ));
@@ -512,8 +615,33 @@ mod tests {
             "use reqwest::Client;\nfn f() { let c = Client::builder(); }"
         ));
         assert!(flagged(
+            "use reqwest::{Client, StatusCode};\nlet c = Client::new();"
+        ));
+        assert!(flagged(
+            "use reqwest::{\n    StatusCode,\n    Client,\n};\nlet c = Client::new();"
+        ));
+        assert!(flagged(
+            "use reqwest::Client as Http;\nlet c = Http::builder();"
+        ));
+        assert!(flagged(
+            "use reqwest::ClientBuilder;\nlet b = ClientBuilder::new();"
+        ));
+        // The generic-Default fallback, on one line, split, through `.ok()`,
+        // and with comments between the chain calls (the coord_sync shape).
+        assert!(flagged(
+            "let c = qontinui_runner_lib::outbound_net::client_builder().build().unwrap_or_default();"
+        ));
+        assert!(flagged(
             "let c = qontinui_runner_lib::outbound_net::client_builder()\n    .build()\n    .unwrap_or_default();"
         ));
+        assert!(flagged(
+            "let c = client_builder().build().ok().unwrap_or_default();"
+        ));
+        assert!(flagged(
+            "let c = client_builder()\n    // one\n    .timeout(t)\n    // two\n    // three\n    // four\n    // five\n    // six\n    // seven\n    // eight\n    .pool_max_idle_per_host(32)\n    .build()\n    // why the fallback\n    .unwrap_or_default();"
+        ));
+        // Not raw: the door's helpers, the blocking client, other `Client`s,
+        // comments, strings, and an unrelated `unwrap_or_default`.
         assert!(!flagged(
             "let c = qontinui_runner_lib::outbound_net::client_builder().build()?;"
         ));
@@ -522,16 +650,22 @@ mod tests {
             "let c = reqwest::blocking::Client::builder().build()?;"
         ));
         assert!(!flagged(
+            "use reqwest::blocking::Client;\nlet c = Client::new();"
+        ));
+        assert!(!flagged(
             "use reqwest::Client;\nlet e = EmbeddingClient::new();"
         ));
         assert!(!flagged("let m = mcp::Client::new();"));
+        assert!(!flagged("let c = Client::new();"));
         assert!(!flagged("// reqwest::Client::new() in a comment"));
-        assert!(flagged(
-            "let c = qontinui_runner_lib::outbound_net::client_builder().build().unwrap_or_default();"
+        assert!(!flagged("let x = 1; // reqwest::Client::new() trailing"));
+        assert!(!flagged("let s = \"reqwest::Client::new()\";"));
+        assert!(!flagged(
+            "let q = '\"'; let s = \"reqwest::Client::new()\";"
         ));
         assert!(!flagged("let v = map.get(k).cloned().unwrap_or_default();"));
         assert!(!flagged(
-            "let c = qontinui_runner_lib::outbound_net::client()\nmatch c.get(u).send().await {\n    Ok(resp) => resp.text().await.unwrap_or_default(),"
+            "let c = qontinui_runner_lib::outbound_net::client();\nmatch c.get(u).send().await {\n    Ok(resp) => resp.text().await.unwrap_or_default(),"
         ));
         assert!(!flagged(
             "let c = qontinui_runner_lib::outbound_net::client_builder().build()?;\nlet t = resp.text().await.unwrap_or_default();"
