@@ -98,16 +98,12 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
     execution_mode: "auto",
     timeout_seconds: 600,
     config_dir: undefined,
-    // Default to highest-expected-usage so a multi-account runner
-    // auto-balances across accounts (and never pins to a single,
-    // possibly-exhausted one). No-op with fewer than two config dirs, so
-    // safe as the default. Matches the Rust default (settings.rs
-    // AccountSelectionMode::HighestExpectedUsage).
-    account_selection_mode: "highest_expected_usage",
-    // `account_selection_pinned` is deliberately ABSENT: these defaults are
-    // what the form shows when the load failed, and an unknown pin must be
-    // sent as "not provided" (the runner keeps the stored value), never as an
-    // explicit `false` that would unpin the machine.
+    // `account_selection_mode` and `account_selection_pinned` are deliberately
+    // ABSENT: these defaults are what the form shows when the load failed, and
+    // both are MACHINE-GLOBAL (mirrored into claude-accounts.json). An unknown
+    // value must be sent as "not provided" (the runner keeps the stored one) —
+    // never as an explicit default that would re-point or unpin every runner
+    // on the machine. The selector shows nothing selected until loaded.
   },
   claude_api: {
     model: "claude-sonnet-4-20250514",

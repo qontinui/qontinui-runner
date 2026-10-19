@@ -10,8 +10,9 @@
 //! 1. **Take a handle on the process first** — Linux `pidfd_open`, Windows
 //!    `OpenProcess`. From here on the handle refers to ONE process, whatever
 //!    later happens to the pid.
-//! 2. **Then verify** that this pane's lock is HELD right now and its record
-//!    names `holder_pid`. A holder that had died before step 1 left its lock
+//! 2. **Then verify** that this pane's lock is HELD right now, its record
+//!    names `holder_pid`, and — when the record carries the holder's start
+//!    token (Phase 3) — the process behind the handle is that holder. A holder that had died before step 1 left its lock
 //!    acquirable (the lock is an `flock` on a close-on-exec descriptor, so no
 //!    child inherits it), so a held lock naming the pid after step 1 means the
 //!    process behind the handle is that live holder.
@@ -63,6 +64,21 @@ fn verify_holder(pane_dir: &Path, pane_id: &PaneId, holder_pid: u32) -> Result<(
         Err(e) => return Err(format!("lock unreadable: {e}")),
     }
     match read_record(&lock_file) {
+        // A held lock can be a transient hold (a prober, a forked child —
+        // finding 9bbe1079) on a dead holder's file whose pid was since
+        // reused: when the record carries the holder's start token, the
+        // process behind the handle must BE that holder.
+        Some(r)
+            if r.holder_pid == holder_pid
+                && r.holder_start.as_deref().is_some_and(|t| {
+                    !crate::proc_identity::is_same_process(holder_pid, Some(t))
+                }) =>
+        {
+            Err(format!(
+                "pid {holder_pid} is not the live holder the lock record names (its start \
+                 token differs or is gone): the holder has exited or the pid was reused"
+            ))
+        }
         Some(r) if r.holder_pid == holder_pid => Ok(()),
         Some(r) => Err(format!(
             "the lock names holder pid {}, not {holder_pid}",
@@ -217,6 +233,10 @@ mod tests {
             versions: vec![2],
             started_at_unix_ms: 0,
             holder_build: "test".into(),
+            child_start: None,
+            scope_unit: None,
+            holder_start: None,
+            ended: None,
         }
     }
 
@@ -245,6 +265,18 @@ mod tests {
             };
             lock.write_record(&record(victim.id())).unwrap();
         }
+        // The lock is free now — once no child that another test in this
+        // process forks shares its open file description any more (the
+        // fork-before-exec hold of finding 9bbe1079). Wait for that, so the
+        // case below is the free-lock case it means to be.
+        let end = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            PaneLock::try_acquire_existing(&lock_file),
+            Ok(TryLock::Acquired(_))
+        ) {
+            assert!(Instant::now() < end, "the dropped lock never became free");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(!t.signalled, "{t:?}");
         assert!(
@@ -260,7 +292,18 @@ mod tests {
         assert!(!t.signalled, "{t:?}");
         assert!(victim.try_wait().unwrap().is_none());
 
-        lock.write_record(&record(victim.id())).unwrap();
+        // Review round 2, N5: the record names the pid, but its start token
+        // says the holder was another process — a reused pid is refused.
+        let mut reused = record(victim.id());
+        reused.holder_start = Some("linux:another-boot:1".into());
+        lock.write_record(&reused).unwrap();
+        let t = terminate_verified_holder(&dir, &id, victim.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(victim.try_wait().unwrap().is_none());
+
+        let mut genuine = record(victim.id());
+        genuine.holder_start = crate::proc_identity::start_token(victim.id());
+        lock.write_record(&genuine).unwrap();
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(t.signalled, "{t:?}");
         assert!(t.detail.contains("pidfd"), "{t:?}");
@@ -274,6 +317,59 @@ mod tests {
             "pid 1 is never signalled"
         );
         drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review round 6, nit (b): a dead holder's lock held TRANSIENTLY — by
+    /// another open description, as a forked-but-not-yet-exec'd child or a
+    /// prober holds it (finding 9bbe1079) — over a record whose `holder_start`
+    /// does not match the process now behind that pid: the kill is refused.
+    #[test]
+    fn pty_holder_terminate_refuses_a_transient_hold_over_a_mismatched_token() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("ptytt-{}-{nanos:x}", std::process::id()));
+        crate::pane::prepare_private_dir(&dir).unwrap();
+        let id = PaneId::new("t").unwrap();
+        let lock_file = lock_path(&dir, &id);
+        // The process the reused pid now names — this test's own.
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // The dead holder wrote its record, with ITS start token.
+        {
+            let TryLock::Acquired(mut lock) = PaneLock::try_acquire(&lock_file).unwrap() else {
+                panic!("fresh lock");
+            };
+            let mut dead = record(stranger.id());
+            dead.holder_start = Some("linux:the-dead-holders-boot:1".into());
+            lock.write_record(&dead).unwrap();
+        }
+        // A transient hold of the same file by another open description (a
+        // fork of another test may hold it an instant longer: wait it out).
+        let end = Instant::now() + Duration::from_secs(5);
+        let _transient = loop {
+            if let Ok(TryLock::Acquired(lock)) = PaneLock::try_acquire_existing(&lock_file) {
+                break lock;
+            }
+            assert!(
+                Instant::now() < end,
+                "the dead holder's lock never came free"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let t = terminate_verified_holder(&dir, &id, stranger.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(t.detail.contains("start token"), "{t:?}");
+        assert!(
+            stranger.try_wait().unwrap().is_none(),
+            "the stranger behind the reused pid was signalled"
+        );
+        let _ = stranger.kill();
+        let _ = stranger.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -380,6 +380,13 @@ mod env_test_lock_hierarchy_guard;
 // 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
 #[cfg(test)]
 mod expect_ratchet;
+// A harness runner and a subject runner (QONTINUI_INSTANCE_ROOT) on one host:
+// the subject driven through the real writers leaves the harness's files
+// byte-identical. Plan
+// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+// Phase 3.
+#[cfg(test)]
+mod subject_isolation_harness;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
@@ -869,6 +876,28 @@ fn runner_plans_dir_setting() -> Option<String> {
         paths.plans_dir,
         &paths.plans_dir_by_tenant,
         None,
+    )
+}
+
+/// The env collector's account-selection door: the effective mode and the
+/// input that decided it, as wire strings. Re-resolved per call, so a fleet
+/// policy change or a pin edit reaches the next capture.
+///
+/// The source reads `unknown` (the mode is still what applies right now)
+/// until coord has answered the fleet-policy domain in this process: a
+/// capture taken before the poller's first answer would otherwise report
+/// `local` on a machine the fleet is about to override. A PINNED machine is
+/// `pinned` regardless — the fleet's answer cannot change that.
+fn runner_effective_account_selection() -> (&'static str, &'static str) {
+    // Flag FIRST (Acquire), value second: the poller stores the fleet value
+    // and THEN raises the flag (Release), so reading in this order can never
+    // pair a raised flag with the pre-answer `None` (which would report
+    // `local` on a fleet-managed machine).
+    let answered = crate::mcp::fleet_policy_poller::account_selection_answered();
+    let (mode, source) = crate::claude_accounts::effective_selection();
+    (
+        mode.as_str(),
+        crate::claude_accounts::reported_selection_source(source, answered),
     )
 }
 
@@ -2150,6 +2179,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // capture and the scan agree on what "unset" means.
                 qontinui_runner_lib::env_agent::collectors::publish_plans_dir(
                     runner_plans_dir_setting,
+                );
+                // And for the effective account-selection mode + its source
+                // (`fleet` | `local` | `pinned`): the resolver and the
+                // fleet-policy cache it reads live in this crate, so the
+                // `claude_accounts` section reports what actually governs
+                // through this door rather than a re-derived second rule.
+                qontinui_runner_lib::env_agent::collectors::publish_account_selection(
+                    runner_effective_account_selection,
                 );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's
@@ -3523,6 +3560,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_claude_session_list_live,
             commands::terminal::terminal_session_list_history,
             commands::terminal::terminal_session_list_open,
+            commands::terminal::terminal_holder_sweep_settled,
+            commands::terminal::terminal_holder_sweep_status,
             commands::terminal::terminal_session_mark_restore_pending,
             commands::terminal::terminal_session_record_close,
             commands::terminal::terminal_session_set_finished,
@@ -4449,6 +4488,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Detached for the process lifetime (like the liveness poll
                 // below); best-effort at startup then every 30s.
                 session_pr_reconciler::start(lifecycle_store.clone());
+                let holder_sweep_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
@@ -4469,6 +4509,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         terminal::vt_sanitize::VtSanitizeHook::new(),
                     ));
                 }
+
+                // PTY-holder boot sweep (plan 2026-09-12-out-of-process-pty-
+                // owner-for-terminal-hosted-sessions, Phase 3): adopt every
+                // pane a holder kept alive across the last runner exit, and
+                // reap the dead — AFTER the sanitizer hook (an adopted pane's
+                // replay is untrusted output too). It runs on its own thread
+                // and never blocks setup; the webview's restore awaits its
+                // "settled" signal (`terminal_holder_sweep_settled`) before
+                // reading `terminal_list`. One `stat` when no pane directory
+                // exists.
+                terminal::holder_boot_sweep::run(
+                    &term_for_session,
+                    app.handle(),
+                    Some(holder_sweep_store),
+                );
 
                 // (The usage-limit watcher and the fleet auto-response matcher
                 // are both grid-scan pollers spawned once at startup alongside
@@ -4722,6 +4777,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .allows();
                         let mut held_for_restore: usize = 0;
 
+                        // Review F1 (plan 2026-09-12 Phase 5): a pane a
+                        // restarted runner ADOPTED from its PTY holder runs a
+                        // shell and `claude` that predate this boot, so the
+                        // PID-reuse guard below would call them recycled and
+                        // close the record `poll-dead` — restorable, i.e. a
+                        // second `claude --resume` against a live session.
+                        // Its identity is proven instead by the holder's lock
+                        // record (`child_start` against the live pid), and a
+                        // proven pid is exempt from the boot-time comparison.
+                        let holder_verified: std::collections::HashSet<u32> =
+                            crate::terminal::holder_census::verified_holder_children(
+                                &live
+                                    .iter()
+                                    .filter_map(|i| i.pid.map(|p| (i.id.clone(), p)))
+                                    .collect::<Vec<_>>(),
+                            );
+
                         let mut live_by_id: StdHashMap<&str, &_> =
                             StdHashMap::with_capacity(live.len());
                         let mut live_by_triple: StdHashMap<(&str, &str, &str), &_> =
@@ -4793,7 +4865,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     let claude_present = crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
                                         pid,
                                         &snap,
-                                        primary_boot_unix_millis,
+                                        crate::session::tracking_health::pid_reuse_reference(
+                                            pid,
+                                            &holder_verified,
+                                            primary_boot_unix_millis,
+                                        ),
                                     );
                                     (Some(alive), claude_present, tick_snapshot_ok)
                                 }
@@ -4860,6 +4936,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     },
                                 },
                             };
+                            // A PTY holder is alive for this record's terminal
+                            // and its adoption is still pending or retrying
+                            // (plan 2026-09-12 Phase 3): held like a withheld
+                            // restore — never closed `no-terminal` meanwhile.
+                            let adoption_pending =
+                                terminal::holder_boot_sweep::adoption_pending(&rec.terminal_id);
                             let action = hold_for_withheld_boot_restore(
                                 classify(
                                     live_is_alive,
@@ -4871,8 +4953,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     confirmed,
                                     worker_plane,
                                 ),
-                                held,
+                                held || adoption_pending,
                             );
+                            if adoption_pending && action == PollAction::Skip {
+                                consecutive_no_match.remove(&rec.claude_session_id);
+                            }
                             if held && action == PollAction::Skip {
                                 held_for_restore += 1;
                                 // A held record is waiting, not missing: any
@@ -5179,13 +5264,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 //   Phase 7 receiver subscribes to coord's `/ws` Redis fan-out
                 //   (`qontinui.sessions.*`) + a one-shot on-(re)connect catch-up
                 //   GET, materializing each handoff_request as a child session.
-                //   Phase 10 flag-poll only spawns when an `active_tenant_id`
-                //   resolved from machine.json (None → dormant); dual-write
-                //   stays off until `session_coordination_enabled` flips.
+                //   Phase 10 flag-poll always spawns and re-reads the
+                //   machine.json `active_tenant_id` every tick (unpinned →
+                //   it asks coord nothing), so a tenant switch is followed
+                //   without a restart; dual-write stays off until that
+                //   tenant's `session_coordination_enabled` flips.
                 //   Multi-tenant (Phase 8b) disposition: the flag-poll is a
-                //   DEVICE-scoped surface — it polls the DEFAULT binding's
-                //   tenant policy and presents the default device-JWT slot
-                //   (unparameterized `coord_get`) by construction.
+                //   DEVICE-scoped surface — it polls the PINNED tenant's
+                //   policy and presents that tenant's own device-JWT slot
+                //   (`tenant_policy_scope`).
                 let loop_registry = registry.clone();
                 tauri::async_runtime::spawn(async move {
                     let _drain = loop_registry.coord_sync().start_drain_task();
@@ -5268,7 +5355,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // gets the same per-runner profile layout. The launch_env
                 // field delegates to crate::instance::webview2_data_dir(),
                 // which prefers the env var and falls back to the shared
-                // qontinui_types helper. Returns None on non-Windows.
+                // qontinui_types helper. Off Windows: None except under an
+                // instance root (a subject's own `<root>/webview`).
                 let data_dir: Option<std::path::PathBuf> =
                     setup_launch_env.webview2_user_data_dir.clone();
                 let is_secondary = instance::is_secondary();
@@ -5934,8 +6022,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     } else {
                         info!("Restate durable execution enabled — preparing server");
-                        let app_data_dir = dirs::data_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        let app_data_dir = qontinui_runner_lib::instance_env::platform_dir(
+                            qontinui_runner_lib::instance_env::PlatformDir::Data,
+                        )
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
                             .join("qontinui-runner");
                         match restate::lifecycle::ensure_restate_binary(
                             &restate_settings,
