@@ -127,6 +127,11 @@ type = "Beta"
     GITHUB_TOKEN=t STUB_FROM_TOML=1 STUB_ACTIVE=Alpha,Beta active "$S"
     check "a row added to the toml but not committed is not read" "ok|Alpha" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
 
+    S="$(fake_schemas nested)"
+    mkdir -p "$S/plain/codegen" && cp "$S/codegen/pending-registration.toml" "$S/plain/codegen/"
+    GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_ACTIVE=Alpha active "$S/plain"
+    check "a plain dir nested in another checkout is UNKNOWN (never that repo's HEAD)" "unknown|yes"         "$PENDING_STATE|$(case "$PENDING_UNKNOWN_REASON" in *"not the top of a git checkout"*) echo yes ;; *) echo no ;; esac)"
+
     S="$(fake_schemas notgit)"
     rm -rf "$S/.git"
     GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_ACTIVE=Alpha active "$S"
@@ -300,18 +305,35 @@ check "an uncommitted barrel edit does not change the verdict (HEAD is read, as 
 
 echo "pending-registration: inputs that must never become paths or links"
 
-mk_trees ts-dirty-index
+echo "pending-registration: the TS shape is read from the committed tree"
+
+mk_trees ts-head-twice
 sed -i "/{ Alpha }/d" "$BASE/index.ts"
-printf "export type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"
+printf "export type { Alpha } from './Alpha';\nexport type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"; commit_py
+sed -i "0,/{ Alpha }/{/{ Alpha }/d}" "$BASE/index.ts"
+check "precondition: the working index.ts exports Alpha exactly once" 1 "$(grep -c '{ Alpha }' "$BASE/index.ts")"
+pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
+check "an export line COMMITTED twice is declined though the working copy has it once" "|yes" \
+    "$PENDING_ABSORBED|$(case "$PENDING_NOT_ABSORBED" in *"committed index.ts 2 times"*) echo yes ;; *) echo no ;; esac)"
+
+mk_trees ts-head-nofile
+git -C "$SCH" rm --cached --quiet "ts/src/generated/Alpha.d.ts"
+# Committed WITHOUT commit_py's `add -A`, which would stage the file again.
+git -C "$SCH" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false     -c core.hooksPath=/nonexistent commit --quiet -m "drop Alpha.d.ts from HEAD"
+check "precondition: Alpha.d.ts is still on disk" yes "$([ -f "$BASE/Alpha.d.ts" ] && echo yes || echo no)"
+pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
+check "a .d.ts on disk but not in HEAD is declined" "|Alpha: shape: Alpha.d.ts is not in HEAD" \
+    "$PENDING_ABSORBED|$PENDING_NOT_ABSORBED"
+
+mk_trees ts-lone-cr
+sed -i "/{ Alpha }/d" "$BASE/index.ts"
+printf "export type { Al\rpha } from './Alpha';\n" >> "$BASE/index.ts"; commit_py
+# The working copy is made correct, so only the COMMITTED line can decline it.
+sed -i "/Al.pha/d" "$BASE/index.ts"
 printf "export type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"
 pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
-check "an uncommitted index.ts edit cannot pass a shape the committed one fails" "" "$PENDING_ABSORBED"
-git -C "$SCH" checkout --quiet -- .
-sed -i "/{ Alpha }/d" "$BASE/index.ts"; commit_py
-printf "export type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"
-pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
-check "an export line committed 0 times is declined even if the working copy has it" "|yes" \
-    "$PENDING_ABSORBED|$(case "$PENDING_NOT_ABSORBED" in *"committed index.ts 0 times"*) echo yes ;; *) echo no ;; esac)"
+check "a CR INSIDE a committed line is a line break (as splitlines sees it), not ignored" "" "$PENDING_ABSORBED"
+
 
 mk_trees badname
 pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" "../Alpha"

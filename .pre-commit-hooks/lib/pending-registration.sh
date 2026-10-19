@@ -93,26 +93,36 @@ pending_registration_active_types() {
     PENDING_ACTIVE_TYPES=""
     PENDING_ROWS=""
     PENDING_UNKNOWN_REASON=""
+    PENDING_HEAD_SHA=""
+    PENDING_HEAD_SCHEMAS=""
 
-    if ! git -C "$schemas" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
-        PENDING_UNKNOWN_REASON="cannot read HEAD of $schemas"
+    local sha listing
+    if ! sha="$(_pending_registration_head_sha "$schemas")"; then
+        PENDING_UNKNOWN_REASON="$sha"
         return 0
     fi
-    # Absent from HEAD is the one confident "nothing declared". Any other
-    # shape question (how the table is spelled, whether it is empty) is the
-    # module's to answer, so a valid file is never dismissed by a grep here.
-    if ! git -C "$schemas" cat-file -e "HEAD:$PENDING_REGISTRATION_TOML_REL" 2>/dev/null; then
+    PENDING_HEAD_SHA="$sha"
+    PENDING_HEAD_SCHEMAS="$schemas"
+    # Absent from the commit is the one confident "nothing declared"; a git
+    # that FAILED to answer is unknown, never "none". Any other shape question
+    # (how the table is spelled, whether it is empty) is the module's to
+    # answer, so a valid file is never dismissed by a grep here.
+    if ! listing="$(git -C "$schemas" ls-tree "$sha" -- "$PENDING_REGISTRATION_TOML_REL" 2>/dev/null)"; then
+        PENDING_UNKNOWN_REASON="git ls-tree $sha failed in $schemas"
+        return 0
+    fi
+    if [ -z "$listing" ]; then
         PENDING_STATE="none"
         return 0
     fi
     mkdir -p "$head/codegen" "$head/scripts" || {
         PENDING_UNKNOWN_REASON="cannot create $head"; return 0; }
-    if ! git -C "$schemas" show "HEAD:$PENDING_REGISTRATION_TOML_REL" > "$head/$PENDING_REGISTRATION_TOML_REL" 2>/dev/null; then
-        PENDING_UNKNOWN_REASON="cannot read HEAD:$PENDING_REGISTRATION_TOML_REL"
+    if ! git -C "$schemas" show "$sha:$PENDING_REGISTRATION_TOML_REL" > "$head/$PENDING_REGISTRATION_TOML_REL" 2>/dev/null; then
+        PENDING_UNKNOWN_REASON="cannot read $sha:$PENDING_REGISTRATION_TOML_REL"
         return 0
     fi
-    if ! git -C "$schemas" show "HEAD:$PENDING_REGISTRATION_MODULE_REL" > "$head/$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null; then
-        PENDING_UNKNOWN_REASON="$PENDING_REGISTRATION_TOML_REL declares waits but HEAD has no $PENDING_REGISTRATION_MODULE_REL"
+    if ! git -C "$schemas" show "$sha:$PENDING_REGISTRATION_MODULE_REL" > "$head/$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null; then
+        PENDING_UNKNOWN_REASON="$PENDING_REGISTRATION_TOML_REL declares waits but commit $sha has no $PENDING_REGISTRATION_MODULE_REL"
         return 0
     fi
     local py
@@ -227,7 +237,7 @@ _pending_registration_drop_line() {
     done
 }
 
-# _pending_registration_py_shape <schemas_dir> <type>
+# _pending_registration_py_shape <schemas_dir> <type> <sha>
 #
 # The Python half of CI's shape check (`absorb_set` in the schemas module):
 # exactly one `from .per_type.<m> import T` line and exactly one `    "T",`
@@ -240,11 +250,47 @@ _pending_registration_drop_line() {
 # line ending in CR does not match CI's `^...$` either. Writes nothing. Exit 0
 # when the shape holds, else prints why and exits 1.
 PENDING_REGISTRATION_PY_DIR_REL="src/qontinui_schemas/generated"
+
+# _pending_registration_head_sha <schemas_dir> — the ONE commit every read is
+# made at. Resolved once and reused, because the checkout is shared: a peer's
+# commit or checkout between two `HEAD:` reads would otherwise mix commits,
+# where CI reads everything at one. Refuses a directory that is not itself the
+# top of a git checkout (a plain directory nested in some other repo would
+# otherwise read THAT repo's HEAD). Prints the sha, or why not and exits 1.
+_pending_registration_head_sha() {
+    local schemas="$1" top want sha
+    if ! top="$(git -C "$schemas" rev-parse --show-toplevel 2>/dev/null)" || [ -z "$top" ]; then
+        printf '%s is not a git checkout, so its committed declaration cannot be read' "$schemas"
+        return 1
+    fi
+    want="$(cd "$schemas" 2>/dev/null && pwd -P)"
+    top="$(cd "$top" 2>/dev/null && pwd -P)"
+    if [ -z "$want" ] || [ "$want" != "$top" ]; then
+        printf '%s is not the top of a git checkout (git resolves %s)' "$schemas" "${top:-nothing}"
+        return 1
+    fi
+    if ! sha="$(git -C "$schemas" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || [ -z "$sha" ]; then
+        printf 'cannot resolve HEAD of %s' "$schemas"
+        return 1
+    fi
+    printf '%s' "$sha"
+}
+
+# _pending_registration_count_line <line> — how many lines of stdin equal it,
+# ignoring only a TRAILING CR. Not `tr -d '\r'`: that deletes a CR anywhere,
+# where Python's splitlines (CI's count) breaks the line there instead.
+_pending_registration_count_line() {
+    local want="$1" l n=0
+    while IFS= read -r l || [ -n "$l" ]; do
+        [ "${l%$'\r'}" = "$want" ] && n=$((n + 1))
+    done
+    printf '%s' "$n"
+}
 PENDING_REGISTRATION_TS_DIR_REL="ts/src/generated"
 _pending_registration_py_shape() {
-    local schemas="$1" t="$2" barrel l module="" from_count=0 all_count=0
-    if ! barrel="$(git -C "$schemas" show "HEAD:$PENDING_REGISTRATION_PY_DIR_REL/__init__.py" 2>/dev/null)"; then
-        printf 'cannot read HEAD:%s/__init__.py in %s' "$PENDING_REGISTRATION_PY_DIR_REL" "$schemas"
+    local schemas="$1" t="$2" sha="$3" barrel l module="" from_count=0 all_count=0
+    if ! barrel="$(git -C "$schemas" show "$sha:$PENDING_REGISTRATION_PY_DIR_REL/__init__.py" 2>/dev/null)"; then
+        printf 'cannot read %s:%s/__init__.py in %s' "$sha" "$PENDING_REGISTRATION_PY_DIR_REL" "$schemas"
         return 1
     fi
     while IFS= read -r l; do
@@ -268,7 +314,7 @@ _pending_registration_py_shape() {
         printf 'the committed Python barrel lists "%s" in __all__ %s times, not once' "$t" "$all_count"
         return 1
     fi
-    if ! git -C "$schemas" cat-file -e "HEAD:$PENDING_REGISTRATION_PY_DIR_REL/per_type/$module.py" 2>/dev/null; then
+    if ! git -C "$schemas" cat-file -e "$sha:$PENDING_REGISTRATION_PY_DIR_REL/per_type/$module.py" 2>/dev/null; then
         printf 'per_type/%s.py is not in HEAD' "$module"
         return 1
     fi
@@ -293,6 +339,18 @@ pending_registration_absorb() {
     shift 4
     PENDING_ABSORBED=""
     PENDING_NOT_ABSORBED=""
+
+    # The same commit the ACTIVE decision read, when it read THIS checkout.
+    local sha=""
+    [ "${PENDING_HEAD_SCHEMAS:-}" != "$schemas" ] || sha="${PENDING_HEAD_SHA:-}"
+    if [ -z "$sha" ] && ! sha="$(_pending_registration_head_sha "$schemas")"; then
+        local t
+        for t in "$@"; do
+            [ -z "$t" ] || PENDING_NOT_ABSORBED+="$t: shape: $sha"$'\n'
+        done
+        PENDING_NOT_ABSORBED="${PENDING_NOT_ABSORBED%$'\n'}"
+        return 0
+    fi
 
     rm -rf -- "$out" 2>/dev/null
     # Copy the CONTENTS into a fresh directory: `cp -R <symlink> <dest>`
@@ -319,15 +377,15 @@ pending_registration_absorb() {
         # CI's absorb_set asks these of HEAD, not of the working tree: the
         # file is committed, and its export line is committed exactly once.
         # (Python's splitlines, which CI uses for that count, drops a CR.)
-        if ! git -C "$schemas" cat-file -e "HEAD:$PENDING_REGISTRATION_TS_DIR_REL/$t.d.ts" 2>/dev/null; then
+        if ! git -C "$schemas" cat-file -e "$sha:$PENDING_REGISTRATION_TS_DIR_REL/$t.d.ts" 2>/dev/null; then
             PENDING_NOT_ABSORBED+="$t: shape: $t.d.ts is not in HEAD"$'\n'; continue
         fi
-        count="$(git -C "$schemas" show "HEAD:$PENDING_REGISTRATION_TS_DIR_REL/index.ts" 2>/dev/null \
-            | tr -d '\r' | grep -cxF -- "$line" || true)"
+        count="$(git -C "$schemas" show "$sha:$PENDING_REGISTRATION_TS_DIR_REL/index.ts" 2>/dev/null \
+            | _pending_registration_count_line "$line" || true)"
         if [ "$count" != "1" ]; then
             PENDING_NOT_ABSORBED+="$t: shape: its export line is in the committed index.ts ${count:-0} times, not once"$'\n'; continue
         fi
-        if ! why="$(_pending_registration_py_shape "$schemas" "$t")"; then
+        if ! why="$(_pending_registration_py_shape "$schemas" "$t" "$sha")"; then
             PENDING_NOT_ABSORBED+="$t: shape: $why"$'\n'; continue
         fi
         if [ -e "$regen/$t.d.ts" ]; then
@@ -335,11 +393,11 @@ pending_registration_absorb() {
         fi
         # Compared with any CR stripped, so a CRLF checkout matches; removed
         # whole, so the bytes that remain are the baseline's own.
-        count="$(tr -d '\r' < "$base/index.ts" | grep -cxF -- "$line" || true)"
+        count="$(_pending_registration_count_line "$line" < "$base/index.ts")"
         if [ "$count" != "1" ]; then
             PENDING_NOT_ABSORBED+="$t: its export line is in the baseline index.ts $count times, not once"$'\n'; continue
         fi
-        if [ -f "$regen/index.ts" ] && tr -d '\r' < "$regen/index.ts" | grep -qxF -- "$line"; then
+        if [ -f "$regen/index.ts" ] && [ "$(_pending_registration_count_line "$line" < "$regen/index.ts")" != 0 ]; then
             PENDING_NOT_ABSORBED+="$t: the regenerated index.ts still exports it"$'\n'; continue
         fi
         # A bash read loop, not awk: Git Bash's awk opens files in text mode
