@@ -1034,7 +1034,7 @@ async fn confirm_adoption_with_coord(
         .ok_or_else(|| "no usable device credential for the session's tenant".to_string())?;
     let (base, _) = crate::coord_mcp::coord_base_url_with_source();
     let url = format!("{base}/sessions/{claude_session}/output?stream=transcript&limit=1");
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("http client: {e}"))?;

@@ -14,7 +14,7 @@ use reqwest::Client;
 use std::time::Duration;
 
 fn client() -> Client {
-    Client::builder()
+    qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap()

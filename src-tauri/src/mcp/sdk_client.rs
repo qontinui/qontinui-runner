@@ -643,7 +643,7 @@ pub async fn connect_sdk_app(
     // Create HTTP client with timeout
     // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
     // endpoints proxy through the IPC layer and can take >10s on cold pages.
-    let mut builder = reqwest::Client::builder()
+    let mut builder = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5));
 
@@ -3214,11 +3214,11 @@ async fn handle_check_health(State(state): State<Arc<ApiState>>) -> Json<serde_j
     let mut stale_urls = Vec::new();
 
     // Create a short-timeout client for health checks
-    let health_client = reqwest::Client::builder()
+    let health_client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(2))
         .connect_timeout(std::time::Duration::from_secs(2))
         .build()
-        .unwrap_or_default();
+        .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
 
     for (url, conn) in &manager.connections {
         let health_url = format!("{}{}/health", conn.app_url, conn.base_path);
@@ -3444,7 +3444,7 @@ async fn handle_discover_and_cache(
     info!(url = %url, app_name = %app_name, "Discover-and-cache specs");
 
     // Step 1: Ensure connected to the app
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()

@@ -766,7 +766,10 @@ async fn fetch_skills_async(base_url: &str) -> FetchOutcome {
         }
     };
 
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return FetchOutcome::Unavailable(format!("could not build an HTTP client: {e}")),
     };

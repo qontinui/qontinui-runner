@@ -35,10 +35,10 @@ pub fn start_health_check(
         // Track when we last fired for each URL (for re-trigger interval)
         let mut last_fired: HashMap<String, std::time::Instant> = HashMap::new();
 
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
 
         loop {
             if stop_signal.load(Ordering::SeqCst) {

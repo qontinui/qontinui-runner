@@ -369,7 +369,7 @@ pub async fn register_with_primary() -> Option<String> {
         primary, own_name, own_port
     );
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;

@@ -1098,7 +1098,7 @@ impl FlowExecutor {
         );
 
         // Build the HTTP request
-        let client = match reqwest::Client::builder()
+        let client = match qontinui_runner_lib::outbound_net::client_builder()
             .timeout(std::time::Duration::from_secs(
                 self.config.default_step_timeout_secs,
             ))

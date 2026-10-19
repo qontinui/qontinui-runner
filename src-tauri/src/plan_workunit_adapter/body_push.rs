@@ -1723,7 +1723,7 @@ impl HttpArtifactSink {
             // One long-lived client per sink: `reqwest::Client` owns the
             // connection pool and the TLS config, so building one per call
             // would defeat connection reuse entirely.
-            client: reqwest::Client::builder()
+            client: qontinui_runner_lib::outbound_net::client_builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 // `build()` only fails on a broken TLS backend, which a default
@@ -1735,7 +1735,7 @@ impl HttpArtifactSink {
                         "plan library: could not build a timeout-bearing HTTP client; \
                          falling back to the default (no timeout)"
                     );
-                    reqwest::Client::new()
+                    qontinui_runner_lib::outbound_net::client()
                 }),
         }
     }

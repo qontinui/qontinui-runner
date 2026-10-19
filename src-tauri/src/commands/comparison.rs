@@ -116,7 +116,7 @@ pub(crate) async fn launch_comparison(
     let vtype_for_spawn = variation_type.clone();
 
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let base = format!("http://127.0.0.1:{}", api_port);
         let mut updated_entries = entries;
 

@@ -675,7 +675,7 @@ async fn post_budget_with_retry(
     body: &DeviceBudgetRequest,
 ) -> Result<(), String> {
     let url = format!("{}/coord/devices/{}/budget", coord_base, device_id);
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest client build: {e}"))?;
@@ -5640,7 +5640,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
         coord_base, device_id
     );
 
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     // coord-tenant-scope(device): device_id (:3310) is the only identity; read-only, and coord serves the union of this device's own bindings unless a tenant_id query param narrows it.
     let response = crate::auth::attach_device_auth(client.get(&url))
         .send()
@@ -5697,7 +5697,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
 async fn runner_has_active_tasks() -> bool {
     let port = crate::mcp::types::get_mcp_api_port();
     let probe = async move {
-        let resp = reqwest::Client::new()
+        let resp = qontinui_runner_lib::outbound_net::client()
             .get(format!("http://localhost:{port}/task-runs/running"))
             .send()
             .await

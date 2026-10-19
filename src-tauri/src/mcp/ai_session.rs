@@ -4106,7 +4106,7 @@ pub mod emergency_quit {
                     let _ = pg.cleanup_dead_runner_instances(0).await;
                     info!("Shutdown: deregistered secondary instance (port={own_port})");
                     if let Some(pp) = primary_port {
-                        if let Ok(client) = reqwest::Client::builder()
+                        if let Ok(client) = qontinui_runner_lib::outbound_net::client_builder()
                             .timeout(Duration::from_secs(2))
                             .build()
                         {

@@ -48,7 +48,7 @@ struct ApiResponse<T> {
 /// proxy client is loopback-only (`no_proxy`): a configured HTTP_PROXY must
 /// never carry a call to the primary on 127.0.0.1.
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
+    qontinui_runner_lib::outbound_net::client_builder()
         .no_proxy()
         .timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(4)
@@ -288,7 +288,7 @@ async fn delete_json<R: for<'de> Deserialize<'de>>(url: &str) -> Result<R, Proxy
 /// 10s `CLIENT` timeout is too tight. Use a fresh long-timeout client.
 pub async fn install_wrapper(req: &InstallRequest) -> Result<InstallResponse, ProxyError> {
     let url = format!("{}/wrappers/install", base_url());
-    let long_client = reqwest::Client::builder()
+    let long_client = qontinui_runner_lib::outbound_net::client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(600))
         .build()
@@ -317,7 +317,7 @@ pub async fn update_wrapper(
 ) -> Result<InstallResponse, ProxyError> {
     let url = format!("{}/wrappers/{}/update", base_url(), id);
     let body = UpdateBody { version };
-    let long_client = reqwest::Client::builder()
+    let long_client = qontinui_runner_lib::outbound_net::client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(600))
         .build()
@@ -450,7 +450,7 @@ pub async fn dispatch(
     let net_timeout = timeout
         .saturating_add(super::manager::PRE_DISPATCH_CEILING)
         .saturating_add(Duration::from_secs(30));
-    let dispatch_client = reqwest::Client::builder()
+    let dispatch_client = qontinui_runner_lib::outbound_net::client_builder()
         .no_proxy()
         .timeout(net_timeout)
         .pool_max_idle_per_host(4)

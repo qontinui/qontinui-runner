@@ -102,6 +102,9 @@ pub use crate::profiles::TrustMode;
 
 /// The OS DNS resolver for reqwest clients, off tokio's blocking pool.
 pub mod os_dns;
+/// The runner's async `reqwest` client constructors (`os_dns` module doc):
+/// the raw `reqwest::Client::{new, builder}` are clippy-denied.
+pub use os_dns::{client, client_builder};
 /// Corporate CA trust: the per-stack census and its measurements (Phase 5).
 pub mod tls_trust;
 
