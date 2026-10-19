@@ -31,7 +31,9 @@ chain instead of three fighting over it.
 It also **labels the session** so the vet → implement run is easy to find in
 the session list: a provisional plan-slug label at the start (Step 1.5), then a
 final PR-numbered name at the end via the `/name` command, once implementation
-has opened the PRs (Step 5).
+has opened the PRs (Step 5). A run inside a **subagent** writes no title — it
+inherits its parent's session id — and reports a `/rename` line for the parent
+instead (Step 1.5's subagent arm).
 
 ## Arguments
 
@@ -409,14 +411,26 @@ also what makes the nested renewals below work at all: without an owner token,
 - **`renewed`**, or a **`held` whose `current_holder_session` equals your own
   `$AGENT_SESSION_ID`** — this session already holds it. Proceed, and leave the
   release to whoever acquired it.
-  **`renewed` is only as narrow as the door's owner token.** Over
-  `coord_reserve_resource` (MCP) that token is the bare DEVICE, so a second
-  session on this same box re-reserving the plan ALSO reads `renewed`; only the
-  HTTP `/claims/acquire` fallback, which carries `agent_session_id`, makes it
-  session-scoped. So a `renewed` is YOUR hold only if something earlier in THIS
-  session reserved the plan (you are nested under `/vet-imp`, or this run
-  re-reserves its own key). If nothing did, treat it as `held` by a same-box
-  peer — the rule below.
+  **`renewed` is only as narrow as the door's owner token, and the MCP result
+  says which.** The HTTP `/claims/acquire` fallback is session-scoped
+  when it carries `agent_session_id`. Over `coord_reserve_resource`
+  (MCP) read the result's `owner_scope`: `"session"` means coord scoped the
+  token to your verified session, so `renewed` is YOUR hold — a second session
+  on this box would read `held`. `"device"` means the runner did not resolve
+  your session on that call, so the token is the bare DEVICE and a second
+  session on this same box ALSO reads `renewed`; an ABSENT `owner_scope` (a
+  coord build predating qontinui-coord#2697) means the same. On `"device"` or
+  absent, a `renewed` is YOUR hold only if something earlier in THIS session
+  reserved the plan (you are nested under `/vet-imp`, or this run re-reserves
+  its own key). If nothing did, treat it as `held` by a same-box peer — the
+  rule below.
+  A scope flip does NOT license the reverse inference. Coord's acquire
+  compares tokens exactly, so if THIS session's earlier reserve read
+  `"device"` and this one reads `"session"`, your own bare-device hold answers
+  `held` naming THIS machine — but a reserve `held` carries only `holder` (a
+  machine, never a session), so it is indistinguishable from a same-box peer's
+  hold, or a peer that adopted yours (`coord_claim_check` reports only the
+  holder's machine too). Treat it as `held` by a same-box peer — the rule below.
 - **`held` by a DIFFERENT owner — STOP.** Do not push, do not invoke `/vet-plan`.
   Report the holder and surface to the operator via `AskUserQuestion` (header
   `Plan reserved`, options **Abort** / **Wait** — poll every 30 s, then
@@ -748,6 +762,23 @@ folders, the leading `YYYY-MM-DD-` date prefix, and the `.md` extension stripped
 `coord-cancelled-ci-not-main-red`; the backslashes are deliberate — the snippet
 below normalizes Windows separators) — and set it as this session's title.
 
+> ⚠️ **FIRST: are you a SUBAGENT? If so, write NO title — report a `/rename`
+> line instead.**
+>
+> A Claude Code subagent inherits its parent's `$CLAUDE_CODE_SESSION_ID` — it is
+> a context inside one harness session, not a session of its own — so the
+> transcript the snippet below finds is the **parent's**. A `/vet-imp` run inside
+> a batch subagent would retitle the orchestrator with its own plan slug, and
+> every later subagent would overwrite the one before. The two contexts are
+> **not separable by any mechanical signal** (measured 2026-09-04: identical
+> environment, identical pid, no per-context marker), so you are the only thing
+> that knows — the same arm `/unattended` Step 5 and `/finish-session` Part A
+> step 0 carry. In a subagent, derive the slug (the block's first four lines)
+> but skip the transcript append, here and in Step 5, and put the name you would
+> have written in your report as a ready-to-paste `/rename <name>` line for the
+> parent to apply. Plan
+> `2026-10-12-vet-imp-session-label-writes-the-parent-transcript-from-a-subagent`.
+
 The built-in `/rename` command can't be invoked from inside a slash command, so
 write the same record `/rename` writes: a `custom-title` entry appended to the
 current session's transcript JSONL. Run this once, substituting the resolved
@@ -761,14 +792,45 @@ slug="${slug#[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-}"   # drop YYYY-MM-DD- 
 
 # Append the same entry /rename writes, to THIS session's transcript.
 # Best-effort only — never block the vet → implement chain if it can't run.
-if [ -n "$CLAUDE_CODE_SESSION_ID" ]; then
-  sf="$(find "$HOME/.claude/projects" -name "$CLAUDE_CODE_SESSION_ID.jsonl" 2>/dev/null | head -1)"
-  if [ -n "$sf" ]; then
-    uuid="$(python -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || echo "00000000-0000-4000-8000-000000000000")"
+# Transcripts live under $CLAUDE_CONFIG_DIR/projects when Claude Code runs with
+# a per-account config dir (this fleet does: accounts.json), else under
+# $HOME/.claude/projects. Search both, in the root order
+# the vet-imp Stop hook's continuation guard uses, plus backslash normalisation of
+# CLAUDE_CONFIG_DIR, skipping an unset one.
+if [ -z "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  echo "label not written: CLAUDE_CODE_SESSION_ID unset (searched nothing)"
+else
+  cfg="${CLAUDE_CONFIG_DIR:-}"; cfg="${cfg//\\//}"
+  sf=""; searched=""
+  for root in "${cfg:+$cfg/projects}" "${HOME:+$HOME/.claude/projects}"; do
+    [ -n "$root" ] || continue
+    searched="${searched:+$searched, }$root"
+    [ -d "$root" ] || continue
+    sf="$(find "$root" -maxdepth 2 -name "$CLAUDE_CODE_SESSION_ID.jsonl" -print -quit 2>/dev/null)"
+    [ -n "$sf" ] && break
+  done
+  if [ -z "$sf" ]; then
+    echo "label not written: no transcript for $CLAUDE_CODE_SESSION_ID (searched ${searched:-nothing})"
+  else
+    # A distinct uuid per entry: python3 first (the only Python on many Linux
+    # boxes), then python, then the kernel's generator; the constant is the
+    # last resort, because a constant repeated across entries is a defect.
+    uuid="$(python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null \
+      || python -c 'import uuid;print(uuid.uuid4())' 2>/dev/null \
+      || cat /proc/sys/kernel/random/uuid 2>/dev/null \
+      || echo "00000000-0000-4000-8000-000000000000")"
     ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-    printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s","uuid":"%s","timestamp":"%s"}\n' \
-      "$slug" "$CLAUDE_CODE_SESSION_ID" "$uuid" "$ts" >> "$sf"
-    echo "session labeled: $slug"
+    # JSON-escape the title before it goes into the printf: drop control
+    # characters (a tab or newline is invalid in a JSON string), then escape
+    # backslash and double quote (Step 5 passes the /name result through here
+    # too), which would otherwise end the string early.
+    title="$(printf '%s' "$slug" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    if printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s","uuid":"%s","timestamp":"%s"}\n' \
+         "$title" "$CLAUDE_CODE_SESSION_ID" "$uuid" "$ts" >> "$sf" 2>/dev/null; then
+      echo "session labeled: $slug"
+    else
+      echo "label not written: append to $sf failed (searched $searched)"
+    fi
   fi
 fi
 ```
@@ -780,8 +842,11 @@ running session (that value lives in process memory and only the interactive
 session list / on resume. If a live title-bar update is wanted this run, mention
 the derived slug in the Step 5 report so the operator can paste `/rename <slug>`.
 
-This step is best-effort: if `$CLAUDE_CODE_SESSION_ID` is unset or the transcript
-file isn't found, skip silently and proceed — never let labeling block vetting.
+This step is best-effort and never blocks vetting: if `$CLAUDE_CODE_SESSION_ID`
+is unset or the transcript file isn't found, proceed — but do NOT skip silently.
+Carry the miss into the Step 5 report as `label not written: <reason> (searched
+<roots>)`, which is the line the snippet prints. A silent skip is what hid the
+config-dir miss above for as long as it lasted.
 
 ### Step 2 — Vet the plan
 
@@ -797,7 +862,10 @@ Let `/vet-plan` run to completion — it audits the claims, edits the plan in
 place, resolves open questions via its Decision policy, and stamps the plan
 `Status: VETTED <date>` (and, under this chain, registers the `time_elapsed`
 safety-net gate — **not** a `unit_ready` record gate; see the table below —
-unless it took its §5.4 step 6 **hold-gate skip**, which registers neither). Do
+unless it took its §5.4 step 6 **hold-gate skip**, which registers neither, or
+its **delivery skip**, which registers neither and makes no `→ vetted` transition,
+or its step 6 **no-withdraw-door skip**, which registers no net because this
+session could never withdraw it). Do
 not short-circuit any of it.
 
 **Collect its report; do not emit it.** `/vet-plan` Step 6 produces a complete,
@@ -816,15 +884,22 @@ point, so do not reintroduce it as a "quick summary of the vet" either.
 about the MIDPOINT, not a cap on output.)
 
 **`/vet-plan` registers exactly ONE gate for a `/vet-imp` run — the net
-(changed 2026-09-04) — or NONE when it takes its §5.4 step 6 hold-gate skip**
+(changed 2026-09-04) — or NONE when it takes its §5.4 step 6 hold-gate skip,
+its step 6 no-withdraw-door skip, or §5.4 delivery skip**
 (the plan is held behind a live trigger gate that already dispatches back to
-it; see Step 3's VETTED-HELD arm). If this chain drops after vetting, coord dispatches a
-fresh visible session to implement the plan instead of leaving it stranded.
+it; see Step 3's VETTED-HELD arm; or, under the delivery skip, the plan landed
+mid-vet and Step 3's arm-1 read routes to closeout; or, under the no-withdraw-door
+skip, this session holds no withdraw door, so a net would be a
+guaranteed redundant spawn). If this chain drops after vetting, coord dispatches a
+fresh visible session to implement the plan instead of leaving it stranded —
+**except under the no-withdraw-door skip**, where no net exists: a chain that
+drops then is recovered only by `/vet-imp-sweep` finding the `VETTED` stamp, and
+the vet report says `NO NET (no withdraw door: …)` so the gap is visible.
 
 | Gate | `phase_name` | Predicate | Continuation | Registered under `/vet-imp`? |
 |---|---|---|---|---|
 | **Record** | the plan title, or `"vet→implement handoff"` | `unit_ready` `{work_unit_id, ready_status}` | **NEVER** — unconditional | **NO — standalone `/vet-plan` only** |
-| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always**, except under `/vet-plan` §5.4 step 6's hold-gate skip |
+| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always**, except under `/vet-plan` §5.4's delivery skip, step 6's hold-gate skip or step 6's no-withdraw-door skip |
 
 > **The net's continuation carries a brief; `/vet-plan` §5.4 shows the shape in
 > step 5 and step 6 registers it.** The session coord dispatches has never read the plan and does
@@ -901,12 +976,14 @@ The net's window is genuinely unsatisfied for its whole 30 minutes, which is the
 property `unit_ready` could not provide: it is false the instant it is armed and
 becomes true only if nobody picks the plan up.
 
-`/implement-plan` Step 0.5 retires the net when it stamps IN PROGRESS — by
+`/implement-plan` Step 0.5 retires the net when it stamps IN PROGRESS (and
+Step 0.45 (d) does when it holds the plan behind a live peer) — by
 **withdrawing** the `"vet→implement safety net"` gate specifically:
 `coord_withdraw_gate {gate_id, reason}`, or its HTTP twin, the bare device-authed
 `POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` `{reason}` (no `/agent/`
 infix exists for withdraw), with reason
-`safety net retired: implementation taken over by session <id>`. One call sets
+`safety net retired: implementation taken over by session <id>` (Step 0.45 (d)
+uses `safety net retired: plan held behind <owner/repo#n>`). One call sets
 the terminal, non-clear, non-paging `withdrawn` verdict, cancels a
 dispatched-but-unconsumed continuation itself, and takes the row out of the open
 set (`withdraw_gate_core`, qontinui-coord `gates.rs:9131`). It replaced *cancel,
@@ -971,6 +1048,17 @@ states that legitimately stop the lifecycle must stop it here too:
      below)
   7. `evidence_gaps` carries no `NO PHASE ATTRIBUTION` entry
 
+  **Before routing to closeout, retire this run's net.** If Step 2's `/vet-plan`
+  registered a `vet→implement safety net` (its §5.4 step 6) that is still OPEN —
+  its `gate_id` is in `/vet-plan`'s step-6 report and step-8 read-back row
+  (`phase_name` `vet→implement safety net`), or read
+  `coord_gate_list {work_unit_id, open_only: true}` — withdraw it — `coord_withdraw_gate {gate_id, reason}`, or the bare
+  device-authed `POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw {reason}`;
+  on `NotRegistrant`, cancel then mute, exactly as `/implement-plan` Step 0.5 —
+  and name its `gate_id` in full in the Step 5 report. Left armed, it
+  dispatches an implement session onto delivered work in 30 minutes; nothing
+  else on this path retires it.
+
   Short of all seven it is a fall-through, not a stop. Read the response
   through `/vet-plan`'s arm table in its stated order — **4, 3, 2, 1, 5, then
   6** — with these seven as arm 1 here (a NON-EMPTY `phases_remaining` beside
@@ -982,7 +1070,8 @@ states that legitimately stop the lifecycle must stop it here too:
   **unidentified default**
   (an `IN PROGRESS` stamp with no session marker, or one that cannot be
   positively attributed at all, is a STOP, not an overwrite; a marker naming a
-  probed-dead peer is case 2, adopt), before it rewrote the stamp.
+  probed-dead peer is case 2, adopt, or the hold gate's own continuation is
+  case 2b, adopt), before it rewrote the stamp.
 
   **Conjunct 3 is carried explicitly even though that arm order already
   enforces it** — `/vet-plan`'s arm 3 pre-empts arm 1 on a
@@ -1104,7 +1193,9 @@ states that legitimately stop the lifecycle must stop it here too:
   > `/vet-plan` they read the status block captured from disk at §0.25 item 1,
   > and here the stamp is the `VETTED` this chain's own Step 2 just wrote. A
   > `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a foreign `IN PROGRESS`
-  > whose session left PRs, still stops at `/vet-plan`'s pre-edit capture; a
+  > whose session left PRs (unless `/vet-plan` case 2b adopts it — the stamp
+  > is gate-delegated and this run is that hold gate's continuation),
+  > still stops at `/vet-plan`'s pre-edit capture; a
   > complete plan still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT
   > STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL
   > guard is `/implement-plan` Step 0.45 check 2 — a `git log origin/main -20`
@@ -1312,10 +1403,12 @@ PR-numbered name is the better identifier.
 
 Persist that name as the session title using the **same transcript-append
 mechanic as Step 1.5** (substitute the name `/name` produced for `$slug` in that
-bash block). Same best-effort rules apply: if `$CLAUDE_CODE_SESSION_ID` or the
-transcript file is missing, skip silently. If `/name` finds zero open PRs (e.g.
-the run deferred to a gate without opening a PR), fall back to the Step 1.5 plan
-slug.
+bash block) — **unless you are a subagent**: then Step 1.5's subagent arm
+applies here too, so write no title and carry the `/rename <name>` line in the
+report for the parent. Same best-effort rules apply: if `$CLAUDE_CODE_SESSION_ID`
+or the transcript file is missing, proceed and report `label not written:
+<reason> (searched <roots>)`. If `/name` finds zero open PRs (e.g. the run
+deferred to a gate without opening a PR), fall back to the Step 1.5 plan slug.
 
 **Before writing a word of the summary, compute the chain's verdict.** When the
 `/implement-plan` half opened PRs it also took the pre-PR-review arm for them
@@ -1445,7 +1538,11 @@ verdict and `will_dispatch` as `/vet-plan` read them, and that
 stopped at its Step 0.45 held check (a cited hold gate still open but not
 usable as a trigger — unarmed, armed toward another target, or claim-anchored —
 so `/vet-plan` took no skip), say that instead, with the same gate
-fields — and name the unarmed gate as a missing trigger.
+fields — and name the unarmed gate as a missing trigger. When it held the plan
+behind a live peer instead (Step 0.45's live-peer hold), report the peer
+`<owner/repo#n>`, the resume `gate_id`, the non-dispatch script's verdict and
+the unit status it read back at the hold's step (c), and the safety-net row its
+step (d) withdrew (or that none was found), as `/implement-plan` reported it.
 **Fold in the vet report you collected at Step 2** — it was never emitted, so
 this is its only appearance; dropping it loses the vet outcome entirely. For the
 implement half, defer to `/implement-plan`'s own report rather than repeating it
@@ -1464,7 +1561,9 @@ read cannot tell apart.
 
 Surface the `/rename <name>` line from `/name` in the report so the operator can
 update the live title bar of the current session if they want it (persisting the
-title does not live-refresh the running session's title bar).
+title does not live-refresh the running session's title bar). In a subagent that
+line is the ONLY label this run produces — for the parent to apply. Quote any
+`label not written: …` line Step 1.5 or this step printed, too.
 
 Finally, **release the plan reserve** taken at Step 1.1 — the call and the
 acquirer-only rule are documented there. Do this in the same try/finally that
@@ -1522,8 +1621,12 @@ the since-when read out of the ledger — not as a clean idempotent no-op.
   from that same resolved path.
 - **Labeling is best-effort, never gating.** Neither the Step 1.5 provisional
   label nor the Step 5 `/name` final label may block, slow, or abort the vet →
-  implement chain. If the session id or transcript file is missing, skip
-  silently; if `/name` finds no PRs, keep the Step 1.5 slug.
+  implement chain. A **subagent** writes no title at all — it inherits the
+  parent's session id, so any write lands on the parent's transcript — and
+  reports a `/rename <name>` line instead (Step 1.5's subagent arm). If the
+  session id or transcript file is missing, proceed and report
+  `label not written: <reason> (searched <roots>)` — never skip silently; if
+  `/name` finds no PRs, keep the Step 1.5 slug.
 - **Never narrate the hand-off.** Do not write "proceeding to
   `/implement-plan`", "now implementing", "moving on to implementation", or any
   equivalent as the last text of a turn. Narration is not action, and this
@@ -1569,5 +1672,5 @@ the last line of defence: the rules above are what should prevent the stall, and
 a hook block means they were ignored. If the block is genuinely wrong (the vet
 aborted, the operator stopped the run, Step 3's VETTED-HELD arm ended the
 chain because the plan is held behind a live trigger gate, or `/implement-plan`
-Step 0.45 stopped on a held plan), state that reason in one line and
-stop — it will not ask twice.
+Step 0.45 stopped on a held plan or held it behind a live peer), state that
+reason in one line and stop — it will not ask twice.

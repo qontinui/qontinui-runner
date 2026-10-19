@@ -224,9 +224,9 @@ pub const EMBEDDED_PG_DIR_ENV: &str = "QONTINUI_EMBEDDED_PG_DIR";
 /// binaries and [`local_dsn`] must agree on this path or they will talk to
 /// different clusters. It was duplicated inline in `main.rs` before P4.
 pub fn default_data_root() -> PathBuf {
-    dirs::data_local_dir()
+    crate::instance_env::platform_dir(crate::instance_env::PlatformDir::DataLocal)
         .unwrap_or_else(std::env::temp_dir)
-        .join("com.qontinui.runner")
+        .join(crate::instance_env::RUNNER_BUNDLE_ID)
         .join("embedded-pg")
 }
 

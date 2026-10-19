@@ -155,10 +155,19 @@ and returns exactly one of:
   (typically `/vet-imp`, in this same session) heartbeats and releases it, so
   start no heartbeat and release nothing. The owner token is only as narrow as
   the door: `<machine_id>:<agent_session_id>` on the HTTP `/claims/acquire`
-  fallback, but the bare DEVICE over `coord_reserve_resource` — so over MCP a
-  second session on this box also reads `renewed`. If nothing earlier in THIS
-  session reserved the plan, treat it as a same-box peer holding it (see
-  `held`). A coord build predating the `renewed` outcome answered `granted`
+  fallback; over `coord_reserve_resource` the result's `owner_scope` says which.
+  `"session"` — the token is your verified session, so a second session on this
+  box would read `held`, and this `renewed` is yours. `"device"` — the runner did
+  not resolve your session on that call, the token is the bare DEVICE, and a
+  second session on this box also reads `renewed`; an absent `owner_scope` (coord
+  predating qontinui-coord#2697) means the same. On `"device"` or absent, if
+  nothing earlier in THIS session reserved the plan, treat it as a same-box peer
+  holding it (see `held`). The reverse does not hold: after an earlier
+  `"device"` reserve, a `"session"` re-reserve answers `held` naming THIS
+  machine (coord's acquire compares tokens exactly), and a reserve `held`
+  carries only `holder`, never a session — so it is indistinguishable from a
+  same-box peer (`coord_claim_check` reports only the machine too). Treat it
+  as one. A coord build predating the `renewed` outcome answered `granted`
   here on both doors, so an older coord cannot tell you this case apart.
 - **`held`** — a peer is **already implementing this plan** (the response carries
   the holder identity). Do **not** start. Coordinate (hand off / sequence behind
