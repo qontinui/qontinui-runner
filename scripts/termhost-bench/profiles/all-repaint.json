@@ -1,0 +1,29 @@
+{
+  "schema": "termhost-bench/profile/v1",
+  "id": "all-repaint",
+  "title": "Every session repainting full-screen at 30 fps (the worst case)",
+  "description": "One phase forever: a full-screen SGR-heavy synchronized repaint every frame at 30 fps. Phase boundaries fall on frame boundaries (60 s = 1800 frames), so the cadence never glitches, and every 10 Hz marker tick rides a frame.",
+  "calibrated": false,
+  "provenance": {
+    "kind": "synthetic",
+    "source": "Plan D3: the worst case by construction - qontinui-runner#1856's 120x40 full-screen synchronized repaint, every frame, at 30 fps."
+  },
+  "geometry": { "cols": 120, "rows": 40 },
+  "marker_hz": 10,
+  "alt_screen": false,
+  "initial_phase": "repaint",
+  "phases": {
+    "repaint": {
+      "kind": "repaint",
+      "fps": 30,
+      "rows": 40,
+      "duration_ms": [
+        [0, 60000],
+        [1, 60000]
+      ]
+    }
+  },
+  "transitions": {
+    "repaint": { "repaint": 1 }
+  }
+}
