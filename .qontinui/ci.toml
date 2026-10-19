@@ -313,6 +313,16 @@ command = ["cargo", "fmt", "--", "--check"]
 working_dir = "src-tauri"
 
 [[steps]]
+# ci.yml "Purge cached bundled-PostgreSQL units that do not match the pin".
+# This lane's persistent target dir is the case it exists for: a
+# postgresql_embedded OUT_DIR keeps whatever release was newest when it was
+# first built, even after the pin in src-tauri/.cargo/config.toml changes. The
+# script reads the CARGO_TARGET_DIR the executor exports. Placed before the
+# first compiling cargo step.
+name = "purge-stale-bundled-postgres"
+command = ["bash", "scripts/ci/purge-stale-bundled-postgres.sh"]
+
+[[steps]]
 name = "rust-clippy"
 # PLAIN clippy, exactly like ci.yml: lint levels come solely from
 # src-tauri/Cargo.toml [lints.clippy] (T1 correctness/suspicious = deny,

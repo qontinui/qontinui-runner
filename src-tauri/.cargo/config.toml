@@ -36,7 +36,10 @@ SCCACHE_SERVER_PORT = { value = "4230", force = false }
 # that embed another release. Keep the `NAME = "=X.Y.Z"` shape, which both of
 # them parse. A MAJOR bump also needs an upgrade path for users' existing
 # cluster data dirs. An explicit POSTGRESQL_VERSION in the environment still
-# wins (`[env]` does not force by default).
+# wins (`[env]` does not force by default). Cargo reads this file only for runs
+# started under src-tauri/ (every runner build today). A root-level cargo
+# command that compiles postgresql_embedded would float again, so move the pin
+# into a root .cargo/config.toml if one is ever added.
 POSTGRESQL_VERSION = "=18.6.0"
 
 # Increase linker stack size to prevent STATUS_STACK_BUFFER_OVERRUN
