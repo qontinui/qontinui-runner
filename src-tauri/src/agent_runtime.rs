@@ -13103,6 +13103,68 @@ mod tests {
         assert_eq!(report.written, 1, "only loose.md is overlaid");
     }
 
+    /// The probe-UNKNOWN arm inside a repository: existing definitions are
+    /// kept, and the decision is taken BEFORE the embedded floor writes. An
+    /// absent embedded+checkout definition (`merge-specialist.md`) is first
+    /// written by the floor; deciding per layer would then see it EXISTING and
+    /// keep the floor's render, so the session would never get the checkout's
+    /// copy. Deciding once keeps only what was on disk before the pass.
+    #[test]
+    fn provision_agent_defs_unknown_probe_keeps_existing_and_lets_the_overlay_win() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("merge-specialist.md"), "# PRIMARY copy").unwrap();
+        std::fs::write(src.join("code-reviewer.md"), "# PRIMARY reviewer").unwrap();
+        assert!(
+            crate::fleet_agents::embedded_agent_names()
+                .iter()
+                .any(|n| n == "merge-specialist.md"),
+            "fixture: merge-specialist.md must also be embedded, or the floor              never writes it first and this pins nothing"
+        );
+
+        // A linked-worktree `.git` FILE whose gitdir is gone: the probe cannot
+        // answer, and the workdir is inside a repository.
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wt.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-agent-defs-unknown-probe-test
+",
+        )
+        .unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("code-reviewer.md"), "# WORKTREE's own reviewer").unwrap();
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("code-reviewer.md")).unwrap(),
+            "# WORKTREE's own reviewer",
+            "an existing definition is kept when the probe cannot answer in a repo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("merge-specialist.md")).unwrap(),
+            "# PRIMARY copy",
+            "an absent definition is written, and the checkout overlay wins over the floor"
+        );
+        let kept: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.unit.as_str(), s.reason.wire()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("code-reviewer.md", "probe_unknown_in_repo")],
+            "the overlay keeps only what was on disk before the pass"
+        );
+    }
+
     #[test]
     fn provision_agent_defs_missing_source_falls_back_to_the_embedded_floor() {
         // qontinui-root exists but has no qontinui-claude-config/.claude/agents —
