@@ -58,6 +58,15 @@
 #   SCRIPT_DIR        the caller's own directory (root resolution starts there)
 #   prompt_mode()     a function mapping an UNESCAPED prompt to the mode word
 #                     the reports print (`act` / `shadow`, `write` / `report`)
+#   RS_ABSENT_NOTE    OPTIONAL: one extra line --check prints (indented) when the
+#                     task is ABSENT, before the fix -- a machine-greppable state
+#                     line such as `lane: not_installed` (schedule-reverify-
+#                     shipped.sh). Unset prints nothing extra.
+#   RS_PRESENT_NOTE   OPTIONAL: the same, printed when the task is PRESENT.
+#   RS_EMPTY_NOTE     OPTIONAL: printed INSTEAD of RS_ABSENT_NOTE when the list
+#                     was EMPTY -- the runner answers an empty list when its own
+#                     database read fails too, so absent there is not proven
+#                     (e.g. `lane: unknown`). Unset falls back to RS_ABSENT_NOTE.
 # After parsing it sets AT (HH:MM) -- or RS_CRON, a whole 5-field cron that
 # overrides AT for a cadence that is not once a day --, ROOT_ARG, DISABLED, PROMPT, MAX_TURNS,
 # TIMEOUT_SECONDS and DESC. Two optional overrides, for a schedule that is not
@@ -629,12 +638,18 @@ do_check() {
     n=${#TASKS[@]}
     if [ "$n" -eq 0 ]; then
         say "ABSENT -- no runner scheduler task named $TASK_NAME at $BASE ($ALL_COUNT task(s) with other names)"
+        if [ "$LIST_EMPTY" = 1 ] && [ -n "${RS_EMPTY_NOTE:-}" ]; then
+            printf '  %s\n' "$RS_EMPTY_NOTE"
+        elif [ -n "${RS_ABSENT_NOTE:-}" ]; then
+            printf '  %s\n' "$RS_ABSENT_NOTE"
+        fi
         [ "$LIST_EMPTY" = 1 ] && printf '  note: the list was EMPTY, and a runner built before qontinui-runner#1865 answers an empty list when its own database read fails too (mcp/scheduler.rs list_scheduled_tasks; #1865 makes it a 500), so on such a runner this is as good as that read\n'
         printf '  fix: %s\n' "$FIX_HINT"
         exit 1
     fi
     if [ "$n" -gt 1 ]; then refuse_duplicates; fi  # refuse-duplicates
     say "PRESENT -- runner scheduler task $TASK_NAME at $BASE"
+    [ -n "${RS_PRESENT_NOTE:-}" ] && printf '  %s\n' "$RS_PRESENT_NOTE"
     report_task "${TASKS[0]}"
     compute_drift "${TASKS[0]}"
     if [ -z "$DRIFT" ]; then
