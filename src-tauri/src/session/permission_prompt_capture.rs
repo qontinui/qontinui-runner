@@ -20,6 +20,20 @@
 //!   `permission-prompt-bash-git` would collapse. Also served verbatim by
 //!   `POST /permission-prompts/classify` so the `/permission-prompts record`
 //!   command classifies a pasted prompt identically.
+//!
+//!   **The command-token rule** (the hook-side key, since Phase 0 found no
+//!   reason text in either hook payload): the command is split into
+//!   command-position segments at unquoted `;` `&&` `||` `|` `&` `(` `)` `{`
+//!   `}` and newlines; each segment's command word skips shell keywords and
+//!   prefixes (`if then else elif fi for while until do done case esac ! time
+//!   { } ( ) env sudo command builtin exec nohup`) and `VAR=value`
+//!   assignments, and is reduced to its basename. If any command word is a
+//!   removal command (`rm`, `rmdir`) — what Claude Code's built-in
+//!   dangerous-removal check fires on — the first such word is the token, so
+//!   `if git show …; then rm -rf "$X/…"; fi` keys as `permission-prompt-bash-rm`,
+//!   exactly as its pasted "Dangerous rm operation …" reason does. Otherwise
+//!   the token is the FIRST command word (`cd /x && npm test` → `bash-cd`):
+//!   coarse, but stable, because no payload says which sub-command prompted.
 //! - [`redact_example`] — D6: the ONE redactor
 //!   ([`crate::session::redact::redact_secrets`]), then `VAR=value`
 //!   assignment values stripped, the command cut to
@@ -229,29 +243,94 @@ fn extract_reason(text: &str, command: Option<&str>) -> Option<String> {
     Some(para.join("\n"))
 }
 
-/// The first real program token of a command: env assignments skipped, path
-/// stripped to its basename, sanitized.
-fn first_command_token(command: &str) -> Option<String> {
-    command
-        .split_whitespace()
-        .find(|tok| {
-            let t = tok.trim_matches(['"', '\'']);
-            match t.split_once('=') {
-                // `NAME=value` — an env assignment, not the program.
-                Some((name, _)) => {
-                    !(!name.is_empty()
-                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        && !name.starts_with(|c: char| c.is_ascii_digit()))
+/// Shell words that open or close a construct, or prefix the real program,
+/// and so are never the command a prompt is about.
+const SHELL_KEYWORDS_AND_PREFIXES: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "!",
+    "time", "{", "}", "(", ")", "env", "sudo", "command", "builtin", "exec", "nohup",
+];
+
+/// Removal commands. Claude Code's built-in dangerous-removal check is the one
+/// that fires for these, and its "Dangerous <cmd> operation" reason names one
+/// of them, so a compound command containing one is keyed on it.
+const REMOVAL_COMMANDS: &[&str] = &["rm", "rmdir"];
+
+fn is_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Split a command into its command-position segments: a new segment starts
+/// at the beginning and after every unquoted `;`, `&&`, `||`, `|`, `&`, `(`,
+/// `)`, `{`, `}` and newline. Quote-aware (single and double quotes), so a
+/// separator inside a quoted argument does not split. A lexer for keying,
+/// not a shell parser.
+fn command_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
                 }
-                None => true,
+                cur.push(c);
             }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    cur.push(c);
+                }
+                ';' | '&' | '|' | '(' | ')' | '{' | '}' | '\n' => {
+                    segments.push(std::mem::take(&mut cur));
+                }
+                _ => cur.push(c),
+            },
+        }
+    }
+    segments.push(cur);
+    segments
+}
+
+/// The command word of one segment: leading shell keywords, prefixes
+/// (`sudo`, `env`, …) and `VAR=value` assignments skipped, path stripped to
+/// its basename, sanitized.
+fn segment_command_word(segment: &str) -> Option<String> {
+    segment
+        .split_whitespace()
+        .map(|tok| tok.trim_matches(['"', '\'']))
+        .find(|tok| {
+            !tok.is_empty() && !SHELL_KEYWORDS_AND_PREFIXES.contains(tok) && !is_assignment(tok)
         })
-        .map(|tok| {
-            let t = tok.trim_matches(['"', '\'', '(', ')']);
-            let base = t.rsplit(['/', '\\']).next().unwrap_or(t);
-            sanitize_token(base)
-        })
+        .map(|tok| sanitize_token(tok.rsplit(['/', '\\']).next().unwrap_or(tok)))
         .filter(|t| !t.is_empty())
+}
+
+/// The command token a prompt is keyed on (D3 fallback key). Rule:
+///
+/// 1. If any command-position word is a removal command (`rm`, `rmdir`), the
+///    first such word — so `if git show …; then rm -rf "$X/…"; fi` keys as
+///    `rm`, the same key a pasted "Dangerous rm operation" reason gets.
+/// 2. Otherwise the first command-position word that is not a shell keyword,
+///    prefix or assignment — `cd /x && npm test` keys as `cd`. Coarse but
+///    stable: the hook payload does not say which sub-command prompted.
+fn first_command_token(command: &str) -> Option<String> {
+    let words: Vec<String> = command_segments(command)
+        .iter()
+        .filter_map(|s| segment_command_word(s))
+        .collect();
+    words
+        .iter()
+        .find(|w| REMOVAL_COMMANDS.contains(&w.as_str()))
+        .or_else(|| words.first())
+        .cloned()
 }
 
 /// D3: classify one prompt.
@@ -926,7 +1005,11 @@ Do you want to proceed?
         for (pasted, command) in [
             (
                 PROMPT_2026_10_03,
-                "if git show $ref:$p > $f; then :; else rm -f $f; fi",
+                "if git show $ref:$p > $f 2>/dev/null; then :; else echo \"MISSING $ref $p\"; rm -f $f; fi",
+            ),
+            (
+                PROMPT_2026_10_03,
+                "if git show \"$ref:$p\" > \"$f\"; then rm -rf \"$X/out\"; fi",
             ),
             (
                 "Dangerous rm operation on possibly-empty variable path: $f in `rm -f $f`",
@@ -946,13 +1029,8 @@ Do you want to proceed?
             }))
             .unwrap()
             .class;
-            // The 2026-10-03 command's FIRST token is `if`, not `rm`: the
-            // hook path keys on the first token, so only the single-command
-            // fixtures must agree.
-            if !command.starts_with("if ") {
-                assert_eq!(manual.class_key, hook.class_key, "{pasted:?}");
-                assert_eq!(manual.dossier_slug, hook.dossier_slug);
-            }
+            assert_eq!(manual.class_key, hook.class_key, "{command:?}");
+            assert_eq!(manual.dossier_slug, hook.dossier_slug);
         }
         assert_eq!(
             classify(
@@ -962,6 +1040,41 @@ Do you want to proceed?
             )
             .class_key,
             "permission-prompt-bash-rmdir"
+        );
+    }
+
+    /// The command-token rule (module doc): a removal command anywhere in
+    /// command position wins; otherwise the first non-keyword command word.
+    #[test]
+    fn the_command_token_rule_handles_compound_commands() {
+        let key = |cmd: &str| classify(None, Some("Bash"), Some(cmd)).class_key;
+        for (cmd, want) in [
+            (
+                "if git show a:b > c; then rm -rf \"$X/y\"; fi",
+                "permission-prompt-bash-rm",
+            ),
+            ("cd /x && npm test", "permission-prompt-bash-cd"),
+            ("npm test || rmdir $D/", "permission-prompt-bash-rmdir"),
+            ("for f in *; do rm $f; done", "permission-prompt-bash-rm"),
+            ("(cd x; sudo /bin/rm -f y)", "permission-prompt-bash-rm"),
+            ("X=1 env Y=2 nohup git push", "permission-prompt-bash-git"),
+            (
+                "while true; do sleep 1; done",
+                "permission-prompt-bash-true",
+            ),
+            ("echo \"a; rm b\" | grep rmx", "permission-prompt-bash-echo"),
+            (
+                "ls
+rm -f z",
+                "permission-prompt-bash-rm",
+            ),
+            ("! grep -q x f", "permission-prompt-bash-grep"),
+        ] {
+            assert_eq!(key(cmd), want, "{cmd:?}");
+        }
+        assert_eq!(
+            classify(None, Some("Bash"), Some("if then fi")).class_key,
+            "permission-prompt-bash"
         );
     }
 
