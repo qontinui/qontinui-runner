@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(parsed.claude_config_dirs, vec!["/a".to_string()]);
         assert_eq!(
             parsed.account_selection_mode,
-            AccountSelectionMode::HighestExpectedUsage
+            AccountSelectionMode::default()
         );
         assert_eq!(parsed.config_dir, None);
         // A roster written before the pin existed decodes UNPINNED.

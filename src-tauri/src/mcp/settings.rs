@@ -1054,8 +1054,8 @@ pub struct DiscoveryPortsPayload {
 ///
 /// `dirs` is the list of Claude Code config directories (each containing a
 /// `.credentials.json` for one account) that the runner is allowed to
-/// rotate among in `AccountSelectionMode::LeastUsage` or
-/// `AccountSelectionMode::HighestExpectedUsage`. On `PUT`, entries
+/// rotate among in any automatic `AccountSelectionMode` (every mode but
+/// `Manual`). On `PUT`, entries
 /// without a `projects/` subdirectory are filtered out — the response
 /// echoes the accepted list so callers can detect the drop.
 #[derive(Debug, Clone, Serialize, Deserialize)]

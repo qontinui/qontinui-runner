@@ -101,11 +101,11 @@ fn resolve_saved_selection_mode(
     sent: Option<&str>,
     stored: AccountSelectionMode,
 ) -> AccountSelectionMode {
+    // A named mode is taken as given; an unknown spelling resolves to the
+    // default (`AccountSelectionMode::default()` in settings.rs).
     match sent {
         None => stored,
-        Some("manual") => AccountSelectionMode::Manual,
-        Some("least_usage") => AccountSelectionMode::LeastUsage,
-        Some(_) => AccountSelectionMode::HighestExpectedUsage,
+        Some(raw) => AccountSelectionMode::from_wire(raw).unwrap_or_default(),
     }
 }
 
@@ -2519,6 +2519,8 @@ mod save_selection_mode_tests {
             AccountSelectionMode::Manual,
             AccountSelectionMode::LeastUsage,
             AccountSelectionMode::HighestExpectedUsage,
+            AccountSelectionMode::WeightedRandom,
+            AccountSelectionMode::AlternatingHandoff,
         ] {
             assert_eq!(resolve_saved_selection_mode(None, stored), stored);
         }
@@ -2539,10 +2541,18 @@ mod save_selection_mode_tests {
             resolve_saved_selection_mode(Some("manual"), AccountSelectionMode::LeastUsage),
             AccountSelectionMode::Manual
         );
-        // An unknown spelling keeps the historical fallback to the default.
+        assert_eq!(
+            resolve_saved_selection_mode(Some("weighted_random"), stored),
+            AccountSelectionMode::WeightedRandom
+        );
+        assert_eq!(
+            resolve_saved_selection_mode(Some("alternating_handoff"), stored),
+            AccountSelectionMode::AlternatingHandoff
+        );
+        // An unknown spelling falls back to the default.
         assert_eq!(
             resolve_saved_selection_mode(Some("bogus"), stored),
-            AccountSelectionMode::HighestExpectedUsage
+            AccountSelectionMode::default()
         );
     }
 }

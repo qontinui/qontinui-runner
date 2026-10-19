@@ -132,5 +132,7 @@ describe("accountSelectionModeLabel", () => {
     expect(accountSelectionModeLabel("manual")).toBe("Manual");
     expect(accountSelectionModeLabel("least_usage")).toBe("Least Usage");
     expect(accountSelectionModeLabel("highest_expected_usage")).toBe("Highest Expected Usage");
+    expect(accountSelectionModeLabel("weighted_random")).toBe("Weighted Random");
+    expect(accountSelectionModeLabel("alternating_handoff")).toBe("Alternating Handoff");
   });
 });
