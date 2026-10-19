@@ -432,6 +432,49 @@ decide
 check "with neither, origin/main is the base" "origin/main" "$ATTRIBUTION_BASE_REF"
 check "and the verdict still holds" "mine" "$ATTRIBUTION_STATE"
 
+# A REBASED push (finding 8d16b76e). The branch was pushed, main then moved on
+# with a codegen input, and the branch was rebased onto it. Its upstream is
+# still the OLD remote branch, so merge-base(HEAD, @{upstream}) is the old base
+# and main's own input commit used to read as "committed in this push".
+rebased_branch_fixture() {
+    local own_path="$1"
+    fixture
+    git -C "$WORK" checkout --quiet -b feat
+    commit_change "$own_path" "// the branch's own change"
+    git -C "$WORK" push --quiet origin feat 2>/dev/null
+    git -C "$WORK" branch --quiet --set-upstream-to=origin/feat
+    printf '// main moved on\n' >> "$UPSTREAM/src-tauri/src/lib.rs"
+    git -C "$UPSTREAM" commit --quiet -am "main: a codegen input"
+    git -C "$WORK" fetch --quiet origin
+    git -C "$WORK" rebase --quiet origin/main
+}
+rebased_branch_fixture "src/app.ts"
+decide
+check "a rebased frontend-only push is PRE-EXISTING, not blamed for main's input" \
+    "pre-existing" "$ATTRIBUTION_STATE"
+check "  measured from the default branch's merge-base, not the old remote branch's" \
+    "origin/main|$(git -C "$WORK" rev-parse origin/main)" "$ATTRIBUTION_BASE_REF|$ATTRIBUTION_BASE_SHA"
+
+# The advance must never clear the push's OWN input: only commits main already
+# carries leave the measured range.
+rebased_branch_fixture "src-tauri/src/feat.rs"
+decide
+check "a rebased push's own input is still MINE, and only its own" \
+    "mine|src-tauri/src/feat.rs" "$ATTRIBUTION_STATE|$ATTRIBUTION_TOUCHED"
+
+# An upstream merge-base that is NEWER than main's (main behind the branch's
+# remote, e.g. a stale local origin/main) is kept: the advance only ever moves
+# the base forward.
+fixture
+git -C "$WORK" checkout --quiet -b feat
+commit_change "src-tauri/src/pushed.rs" "// already on the remote branch"
+git -C "$WORK" push --quiet origin feat 2>/dev/null
+git -C "$WORK" branch --quiet --set-upstream-to=origin/feat
+commit_change "src/app.ts" "// new in this push"
+decide
+check "a non-rebased branch keeps its upstream base" \
+    "origin/feat|pre-existing" "$ATTRIBUTION_BASE_REF|$ATTRIBUTION_STATE"
+
 echo "  -- a hook environment must not redirect the fixtures --"
 
 # The defect this pins, verbatim: git exports GIT_DIR to every hook, GIT_DIR
