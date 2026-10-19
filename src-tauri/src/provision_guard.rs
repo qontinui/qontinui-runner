@@ -233,13 +233,66 @@ impl TrackedPaths {
     }
 }
 
+/// Keep decisions for a FLAT destination directory that more than one layer
+/// writes into, taken ONCE, before any layer writes.
+///
+/// `.claude/agents/` is provisioned in two layers: the embedded floor
+/// ([`crate::fleet_agents`]) and then the checkout overlay
+/// (`agent_runtime::provision_agent_definitions_from_root`). Asking
+/// [`TrackedPaths::skip_reason`] per layer would be wrong in the UNKNOWN arm: a
+/// file the floor has just written now EXISTS, so the overlay would keep the
+/// floor's copy instead of the checkout's. Deciding up front keys the keep on
+/// what was on disk before this pass, which is the only content the guard
+/// exists to protect.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KeepDecisions {
+    reasons: std::collections::HashMap<String, SkipReason>,
+}
+
+impl KeepDecisions {
+    /// Decide, for each candidate file `name` directly under `dst_dir`, whether
+    /// it must be kept as it is on disk. `tracked` must have been probed over
+    /// `dst_dir` itself, so `name` is also its relative path.
+    pub(crate) fn decide<'a>(
+        tracked: &TrackedPaths,
+        dst_dir: &Path,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let reasons = names
+            .into_iter()
+            .filter_map(|name| {
+                tracked
+                    .skip_reason(&dst_dir.join(name), Path::new(name))
+                    .map(|reason| (name.to_string(), reason))
+            })
+            .collect();
+        Self { reasons }
+    }
+
+    /// Why `name` is kept, or `None` when this pass may write it.
+    pub(crate) fn reason(&self, name: &str) -> Option<&SkipReason> {
+        self.reasons.get(name)
+    }
+}
+
 /// True iff `root` or any ancestor carries a `.git` entry (a directory in a
 /// primary checkout, a file in a linked worktree). A pure filesystem test, so it
 /// cannot fail or hang the way a second git spawn could. (`repo_tenant` has the
 /// same predicate, but this module is also compiled into the `qontinui-runner`
 /// binary's own module tree, which does not carry `repo_tenant`.)
+///
+/// The walk runs over the root AS GIVEN and over its symlink-resolved form.
+/// The lexical walk alone misses the measured case: a session spawned at a
+/// workspace root whose `.claude` is a SYMLINK into a checkout
+/// (`<workspace>/.claude -> qontinui-claude-config/.claude`) probes
+/// `<workspace>/.claude/skills`, whose lexical ancestors hold no `.git` at all,
+/// while the files it writes are the checkout's tracked ones (operator box,
+/// 2026-10-13 22:03:52: `wrote 44/44` into that path with no skip line).
+/// `canonicalize` is a filesystem read, not a spawn; if it fails, the lexical
+/// answer stands.
 fn has_git_ancestor(root: &Path) -> bool {
-    root.ancestors().any(|dir| dir.join(".git").exists())
+    let any_git = |p: &Path| p.ancestors().any(|dir| dir.join(".git").exists());
+    any_git(root) || std::fs::canonicalize(root).is_ok_and(|real| any_git(&real))
 }
 
 /// Spawn `git ls-files` under `root` and return its stdout, or `None` on any
@@ -483,6 +536,59 @@ mod tests {
         let tracked = TrackedPaths::probe(tmp.path());
         assert!(!tracked.is_unknown_in_repo());
         assert!(!tracked.should_skip(&f, Path::new("loose.md")));
+    }
+
+    /// The measured shape: a workspace root (no `.git` anywhere above it) whose
+    /// `.claude` is a SYMLINK into a checkout. The lexical ancestors of
+    /// `<workspace>/.claude/skills` carry no `.git`, so an unanswered probe used
+    /// to read as "outside any repository" and overwrite the checkout's tracked
+    /// files. The resolved path's ancestors do carry one.
+    #[test]
+    fn an_unanswered_probe_through_a_symlink_into_a_repo_keeps_existing_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_not_in_any_repo(tmp.path());
+        let checkout = tmp.path().join("checkout");
+        let real_claude = checkout.join(".claude");
+        let real_skills = real_claude.join("skills");
+        std::fs::create_dir_all(&real_skills).unwrap();
+        // A `.git` file whose gitdir is gone: the probe cannot answer.
+        std::fs::write(
+            checkout.join(".git"),
+            b"gitdir: /nonexistent/qontinui-provision-guard-symlink-test\n",
+        )
+        .unwrap();
+        let existing = real_skills.join("existing.md");
+        std::fs::write(&existing, b"the checkout's own body").unwrap();
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let link = workspace.join(".claude");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&real_claude, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&real_claude, &link);
+        if let Err(e) = linked {
+            // Windows without Developer Mode cannot create a symlink; say so
+            // rather than pass on a fixture that was never built.
+            eprintln!("SKIP: cannot create a directory symlink here ({e})");
+            return;
+        }
+        let probed = link.join("skills");
+        assert!(
+            !probed.ancestors().any(|d| d.join(".git").exists()),
+            "fixture: the LEXICAL ancestors must carry no .git, or this pins nothing"
+        );
+
+        let tracked = TrackedPaths::probe(&probed);
+        assert!(
+            tracked.is_unknown_in_repo(),
+            "a probe that failed under a symlink into a repo is UNKNOWN in that repo"
+        );
+        assert_eq!(
+            tracked.skip_reason(&probed.join("existing.md"), Path::new("existing.md")),
+            Some(SkipReason::ProbeUnknownInRepo),
+            "the checkout's existing file must be kept, not overwritten"
+        );
     }
 
     /// Fail-soft: a directory that does not exist yields an empty set rather
