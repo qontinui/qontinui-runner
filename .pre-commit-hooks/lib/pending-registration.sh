@@ -149,16 +149,23 @@ pending_registration_active_types() {
     # borrowed token. Run it only when the pinned commit is already on the
     # remote default branch (a pinned sibling behind main is the usual case),
     # or its module is byte-identical to the one there: code CI itself runs.
-    local default_ref want got
-    # FULL refnames: a short `origin/main` resolves refs/heads/origin/main
-    # first, so a local branch of that name would stand in for the remote.
+    local default_ref default_sha want got
+    # FULL refnames, resolved EXACTLY: a short `origin/main` resolves
+    # refs/heads/origin/main first, and even a full name falls back to
+    # refs/heads/<it> when the remote-tracking ref is absent. show-ref
+    # --verify accepts only the exact ref; its sha is used from here on.
     default_ref="$(git -C "$schemas" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
     case "$default_ref" in
         refs/remotes/origin/?*) : ;;
         *) default_ref="refs/remotes/origin/main" ;;
     esac
-    if ! git -C "$schemas" merge-base --is-ancestor "$sha" "$default_ref" >/dev/null 2>&1; then
-        want="$(git -C "$schemas" rev-parse --verify --quiet "$default_ref:$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null || true)"
+    default_sha="$(git -C "$schemas" show-ref --verify -s -- "$default_ref" 2>/dev/null || true)"
+    if [ -z "$default_sha" ]; then
+        PENDING_UNKNOWN_REASON="$default_ref does not exist in $schemas, so commit $sha cannot be shown to be reviewed and $PENDING_REGISTRATION_MODULE_REL is not run"
+        return 0
+    fi
+    if ! git -C "$schemas" merge-base --is-ancestor "$sha" "$default_sha" >/dev/null 2>&1; then
+        want="$(git -C "$schemas" rev-parse --verify --quiet "$default_sha:$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null || true)"
         got="$(git -C "$schemas" rev-parse --verify --quiet "$sha:$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null || true)"
         if [ -z "$want" ]; then
             PENDING_UNKNOWN_REASON="commit $sha is not on $default_ref and $default_ref has no $PENDING_REGISTRATION_MODULE_REL here, so the module is not run"
@@ -340,22 +347,28 @@ _pending_registration_count_line() {
 # Copy stdin to stdout without the FIRST line equal to $1 (a trailing CR is
 # ignored for the comparison and kept on every line that stays).
 _pending_registration_drop_line() {
-    local want="$1" l removed=0 sep="" printed=0 last_nl=1
+    local want="$1" l removed=0 sep="" printed=0 last_nl=1 cr
     while :; do
         if IFS= read -r l; then last_nl=1; elif [ -n "$l" ]; then last_nl=0; else break; fi
         if [ "$removed" = 0 ] && [ "${l%$'\r'}" = "$want" ]; then
             removed=1
+        elif [ "$last_nl" = 1 ]; then
+            # A terminated line's ending (its CR, if any, and the newline) is
+            # held back and printed BEFORE the next kept line, so dropping the
+            # LAST line leaves no stray CR or newline behind the one before it.
+            cr=""; [ "${l%$'\r'}" = "$l" ] || cr=$'\r'
+            printf '%s%s' "$sep" "${l%$'\r'}"
+            sep="$cr"$'\n'; printed=1
         else
-            # The separator goes BEFORE a kept line, so dropping the LAST line
-            # leaves no stray newline behind the one before it.
+            # An unterminated last line is printed whole.
             printf '%s%s' "$sep" "$l"
-            sep=$'\n'; printed=1
+            sep=""; printed=1
         fi
         [ "$last_nl" = 1 ] || break
     done
-    # A final newline only when the input ended with one, so the copy differs
-    # from the regeneration only by the dropped line.
-    if [ "$printed" = 1 ] && [ "$last_nl" = 1 ]; then printf '\n'; fi
+    # The held ending is printed only when the input ended with one, so the
+    # copy differs from the regeneration only by the dropped line.
+    if [ "$printed" = 1 ] && [ "$last_nl" = 1 ]; then printf '%s' "$sep"; fi
 }
 
 # pending_registration_absorb <baseline_dir> <regenerated_dir> <out_dir> [<type>...]

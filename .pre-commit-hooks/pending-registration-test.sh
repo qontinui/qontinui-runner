@@ -202,7 +202,21 @@ def metadata_verdict(entry, reader, today):
     commit_all "$S" "a local module change"
     git -C "$S" branch origin/main HEAD  # a LOCAL branch shadowing the remote's short name
     GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
-    check "a local branch named origin/main does not vouch for an unpushed module" "unknown|"         "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
+    check "a local branch named origin/main does not vouch for an unpushed module" "unknown||yes" \
+        "$PENDING_STATE|$PENDING_ACTIVE_TYPES|$(has "is not the one on refs/remotes/origin/main" "$PENDING_UNKNOWN_REASON")"
+
+    S="$(fake_schemas shadowfull)"
+    printf '
+# an unpushed edit
+' >> "$S/scripts/pending_registration.py"
+    commit_all "$S" "a local module change"
+    git -C "$S" update-ref -d refs/remotes/origin/main
+    # With the remote-tracking ref ABSENT, even the full name would fall back
+    # to refs/heads/refs/remotes/origin/main.
+    git -C "$S" branch refs/remotes/origin/main HEAD
+    GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
+    check "with no remote-tracking ref, a local branch of its FULL name vouches for nothing" "unknown||yes" \
+        "$PENDING_STATE|$PENDING_ACTIVE_TYPES|$(has "does not exist in" "$PENDING_UNKNOWN_REASON")"
 
     S="$(fake_schemas localother)"
     printf 'local note\n' > "$S/NOTES"
@@ -225,7 +239,8 @@ sys.exit(0)
 ' >> "$S/scripts/pending_registration.py"
     commit_all "$S"; git -C "$S" update-ref refs/remotes/origin/main HEAD
     GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
-    check "a module that exits 0 without its END line is UNKNOWN (incomplete answer)" "unknown|yes"         "$PENDING_STATE|$(has "incomplete answer" "$PENDING_UNKNOWN_REASON")"
+    check "a module that exits 0 without its END line is UNKNOWN (incomplete answer)" "unknown|yes" \
+        "$PENDING_STATE|$(has "incomplete answer" "$PENDING_UNKNOWN_REASON")"
 
     S="$(fake_schemas importerror)"
     printf '
@@ -233,7 +248,8 @@ raise RuntimeError("boom at import")
 ' >> "$S/scripts/pending_registration.py"
     commit_all "$S"; git -C "$S" update-ref refs/remotes/origin/main HEAD
     GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
-    check "a module that fails at import is UNKNOWN, naming the failure" "unknown|yes"         "$PENDING_STATE|$(has "boom at import" "$PENDING_UNKNOWN_REASON")"
+    check "a module that fails at import is UNKNOWN, naming the failure" "unknown|yes" \
+        "$PENDING_STATE|$(has "boom at import" "$PENDING_UNKNOWN_REASON")"
 
     S="$(fake_schemas xtrace)"
     # The token is exported BEFORE xtrace starts, so only the library's own
@@ -356,13 +372,16 @@ pending_registration_absorb "$BASE" "$REGEN" "$OUT" Alpha
 check "an index.ts with no final newline is absorbed without gaining one" "Alpha|same" "$PENDING_ABSORBED|$(same "$OUT" "$REGEN")"
 
 mk_trees nofinalnl-last
-printf "export type { Beta } from './Beta';
-export type { Gamma } from './Gamma';
-export type { Alpha } from './Alpha';" > "$BASE/index.ts"
-printf "export type { Beta } from './Beta';
-export type { Gamma } from './Gamma';" > "$REGEN/index.ts"
+printf "export type { Beta } from './Beta';\nexport type { Gamma } from './Gamma';\nexport type { Alpha } from './Alpha';" > "$BASE/index.ts"
+printf "export type { Beta } from './Beta';\nexport type { Gamma } from './Gamma';" > "$REGEN/index.ts"
 pending_registration_absorb "$BASE" "$REGEN" "$OUT" Alpha
 check "dropping the LAST line of a no-final-newline index.ts leaves no stray newline" "Alpha|same" "$PENDING_ABSORBED|$(same "$OUT" "$REGEN")"
+
+mk_trees crlf-nofinalnl-last
+printf "export type { Beta } from './Beta';\r\nexport type { Gamma } from './Gamma';\r\nexport type { Alpha } from './Alpha';" > "$BASE/index.ts"
+printf "export type { Beta } from './Beta';\r\nexport type { Gamma } from './Gamma';" > "$REGEN/index.ts"
+pending_registration_absorb "$BASE" "$REGEN" "$OUT" Alpha
+check "dropping the LAST line of a CRLF no-final-newline index.ts leaves no stray CR" "Alpha|same" "$PENDING_ABSORBED|$(same "$OUT" "$REGEN")"
 
 mk_trees nodecl
 pending_registration_absorb "$BASE" "$REGEN" "$OUT"
