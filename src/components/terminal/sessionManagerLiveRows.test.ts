@@ -15,16 +15,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildTabRows,
-  isRowOffScreen,
   isRowOnScreen,
   mergeLiveRows,
-  sessionCardStatus,
-  tabLiveStatus,
+  visibleTabIdsForLayout,
   type LiveRowTab,
 } from "./sessionManagerLiveRows";
-import { sessionCardActions, sessionCardStatusInfo, sessionCardTooltip } from "./SessionCard";
+import { sessionCardActions, sessionCardStatusDisplay, sessionCardTooltip } from "./SessionCard";
+import { injectedStatus } from "./sessionStatusModel";
 import type { TranscriptSessionRow } from "./useSessionManager";
-import type { SessionState } from "./useZoneLayout";
 
 function tab(over: Partial<LiveRowTab> & { id: string }): LiveRowTab {
   return { title: "bash", isAlive: true, ...over };
@@ -45,7 +43,7 @@ function transcriptRow(over: Partial<TranscriptSessionRow> = {}): TranscriptSess
     messageCount: 12,
     lastModified: "2026-10-11T10:00:00.000Z",
     hasPlans: false,
-    liveStatus: "active-in-zone",
+    status: injectedStatus("on-screen", "working"),
     zoneTabId: "t-claude",
     zoneIndex: null,
     remoteDeviceLabel: null,
@@ -55,15 +53,10 @@ function transcriptRow(over: Partial<TranscriptSessionRow> = {}): TranscriptSess
     lastMessageTimestamp: "2026-10-11T10:00:00.000Z",
     lastMessagePreview: "",
     workSummaryHint: "",
-    likelyFrozen: false,
-    isOrphaned: false,
     _transcript: {} as TranscriptSessionRow["_transcript"],
     ...over,
   };
 }
-
-const none: Record<string, SessionState> = {};
-const noStale = new Set<string>();
 
 describe("buildTabRows", () => {
   it("lists a plain shell tab as a tab-sourced row keyed by its tab id", () => {
@@ -77,7 +70,6 @@ describe("buildTabRows", () => {
         }),
       ],
       representedTabIds: new Set(),
-      sessionStates: none,
     });
     expect(rows).toEqual([
       {
@@ -94,7 +86,6 @@ describe("buildTabRows", () => {
         messageCount: 0,
         lastModified: "2026-10-11T09:30:00.000Z",
         hasPlans: false,
-        liveStatus: "active-in-zone",
         zoneTabId: "t-shell",
         zoneIndex: null,
         remoteDeviceLabel: null,
@@ -104,8 +95,6 @@ describe("buildTabRows", () => {
         lastMessageTimestamp: "2026-10-11T09:30:00.000Z",
         lastMessagePreview: "",
         workSummaryHint: "",
-        likelyFrozen: false,
-        isOrphaned: false,
         _transcript: null,
       },
     ]);
@@ -118,45 +107,16 @@ describe("buildTabRows", () => {
         tab({ id: "t-2", title: "/home/u/project", workingDir: "/home/u/project" }),
       ],
       representedTabIds: new Set(),
-      sessionStates: none,
       registryNames: new Map([["s-1", "renamed by operator"]]),
     });
     expect(named.displayName).toBe("renamed by operator");
     expect(cwdTitled.displayName).toBe("Terminal");
   });
 
-  it("carries the tab's state chip, so a hidden session needing input reads as such", () => {
-    const rows = buildTabRows({
-      tabs: [tab({ id: "a" }), tab({ id: "b" }), tab({ id: "c" }), tab({ id: "d" })],
-      representedTabIds: new Set(),
-      sessionStates: { a: "needs-input", b: "error", c: "completed" },
-    });
-    expect(rows.map((r) => [r.sessionId, r.liveStatus])).toEqual([
-      ["a", "needs-input"],
-      ["b", "error"],
-      ["c", "completed"],
-      ["d", "active-in-zone"],
-    ]);
-  });
-
-  it("never reads an idle plain shell as stuck, however long it has been silent", () => {
-    // The live check: a never-typed-in, off-screen shell tab showed `frozen`
-    // and "Session appears stuck — may need resume". Silence is a shell's idle
-    // state, and a tab row has nothing to resume.
-    const staleShell = tab({ id: "t-shell" });
-    const [row] = mergeLiveRows([], {
-      tabs: [staleShell],
-      sessionStates: { "t-shell": "idle" },
-    });
+  it("leaves status to the classifier: a tab row carries none of its own", () => {
+    const [row] = mergeLiveRows([], { tabs: [tab({ id: "t-shell" })] });
     expect(row.source).toBe("tab");
-    expect(row.liveStatus).toBe("active-in-zone");
-    expect(row.likelyFrozen).toBe(false);
-  });
-
-  it("keeps the stuck heuristic for a transcript row joined to a silent tab", () => {
-    // A Claude conversation that has written messages and then went silent
-    // mid-run is what the staleness arm is for — unchanged by tab rows.
-    expect(tabLiveStatus("t-claude", { "t-claude": "idle" }, new Set(["t-claude"]))).toBe("frozen");
+    expect("status" in row).toBe(false);
   });
 
   it("lists a remote session tab, labelled with its device", () => {
@@ -175,7 +135,6 @@ describe("buildTabRows", () => {
         }),
       ],
       representedTabIds: new Set(),
-      sessionStates: none,
     });
     expect(row.source).toBe("tab");
     expect(row.zoneTabId).toBe("t-remote");
@@ -192,7 +151,6 @@ describe("buildTabRows", () => {
         tab({ id: "t-shell" }),
       ],
       representedTabIds: new Set(["t-claude"]),
-      sessionStates: none,
     });
     expect(rows.map((r) => r.sessionId)).toEqual(["t-shell"]);
   });
@@ -206,7 +164,6 @@ describe("mergeLiveRows", () => {
         tab({ id: "t-claude", claudeSessionId: transcript.sessionId }),
         tab({ id: "t-shell" }),
       ],
-      sessionStates: none,
     });
     expect(rows.map((r) => [r.source, r.zoneTabId])).toEqual([
       ["transcript", "t-claude"],
@@ -218,7 +175,6 @@ describe("mergeLiveRows", () => {
     // `message_count > 0` filtered its transcript out, so no row joins the tab.
     const rows = mergeLiveRows([], {
       tabs: [tab({ id: "t-new", claudeSessionId: "s-new", spawnName: "new session" })],
-      sessionStates: none,
     });
     expect(rows.map((r) => [r.source, r.sessionId, r.displayName])).toEqual([
       ["tab", "t-new", "new session"],
@@ -226,50 +182,43 @@ describe("mergeLiveRows", () => {
   });
 });
 
-describe("tabLiveStatus", () => {
-  it("prefers the tracked state over staleness, and is active otherwise", () => {
-    expect(tabLiveStatus("a", { a: "needs-input" }, new Set(["a"]))).toBe("needs-input");
-    expect(tabLiveStatus("a", {}, new Set(["a"]))).toBe("frozen");
-    expect(tabLiveStatus("a", { a: "working" }, noStale)).toBe("active-in-zone");
-  });
-});
-
 describe("SessionCard actions by row source", () => {
   it("a tab-sourced row hides every transcript-only action", () => {
-    const [row] = buildTabRows({
+    const [base] = buildTabRows({
       tabs: [tab({ id: "t-shell" })],
       representedTabIds: new Set(),
-      sessionStates: { "t-shell": "needs-input" },
     });
+    const row = { ...base, status: injectedStatus("hidden-here", "needs-you") };
     expect(sessionCardActions(row)).toEqual({
       resume: false,
       viewTranscript: false,
       copySessionId: false,
       promote: false,
       commit: false,
-      bulkSelect: false,
     });
   });
 
   it("a live transcript row keeps all of them", () => {
-    expect(sessionCardActions(transcriptRow({ liveStatus: "needs-input" }))).toEqual({
+    expect(
+      sessionCardActions(transcriptRow({ status: injectedStatus("hidden-here", "needs-you") })),
+    ).toEqual({
       resume: true,
       viewTranscript: true,
       copySessionId: true,
       promote: true,
       commit: true,
-      bulkSelect: true,
     });
   });
 
-  it("a dormant transcript row can be resumed but not promoted or committed", () => {
-    expect(sessionCardActions(transcriptRow({ liveStatus: "dormant" }))).toEqual({
+  it("a not-running transcript row can be resumed but not promoted or committed", () => {
+    expect(
+      sessionCardActions(transcriptRow({ status: injectedStatus("not-running", "exited") })),
+    ).toEqual({
       resume: true,
       viewTranscript: true,
       copySessionId: true,
       promote: false,
       commit: false,
-      bulkSelect: true,
     });
   });
 
@@ -277,7 +226,6 @@ describe("SessionCard actions by row source", () => {
     const [row] = buildTabRows({
       tabs: [tab({ id: "t-shell", spawnName: "build shell" })],
       representedTabIds: new Set(),
-      sessionStates: none,
     });
     expect(sessionCardTooltip(row)).toBe("Terminal t-shell\nbuild shell");
   });
@@ -295,50 +243,64 @@ describe("isRowOnScreen", () => {
   });
 });
 
-describe("off-screen wording in tmux mode", () => {
-  it("marks every row of this window but the shown one as off screen, in tmux only", () => {
-    const shown = transcriptRow({ zoneTabId: "t-a" });
-    const parked = transcriptRow({ zoneTabId: "t-b" });
-    const noTab = transcriptRow({ zoneTabId: null, liveStatus: "dormant" });
-    expect(isRowOffScreen(shown, "tmux", "t-a")).toBe(false);
-    expect(isRowOffScreen(parked, "tmux", "t-a")).toBe(true);
-    // A session not open in this window is not "off screen" — it is not here.
-    expect(isRowOffScreen(noTab, "tmux", "t-a")).toBe(false);
-    // tmux with nothing shown yet: every row of this window is off screen.
-    expect(isRowOffScreen(shown, "tmux", null)).toBe(true);
-    // Grid mode never says off screen.
-    expect(isRowOffScreen(parked, "grid", null)).toBe(false);
+describe("visibleTabIdsForLayout — the On screen / Hidden here split", () => {
+  const assignments = { 0: "t-a", 1: "t-b" };
+
+  it("tmux mode: only the shown tab is visible", () => {
+    expect([
+      ...visibleTabIdsForLayout({
+        workMode: "tmux",
+        shownTabId: "t-b",
+        assignments,
+        maximizedZone: null,
+      }),
+    ]).toEqual(["t-b"]);
+    expect(
+      visibleTabIdsForLayout({
+        workMode: "tmux",
+        shownTabId: null,
+        assignments,
+        maximizedZone: null,
+      }).size,
+    ).toBe(0);
   });
 
-  it("an off-screen running session reads 'Active, off screen', never 'in zone'", () => {
-    const parked = transcriptRow({ zoneTabId: "t-b" });
-    expect(sessionCardStatus("active-in-zone", true)).toBe("active-off-screen");
-    expect(sessionCardStatusInfo(parked, true)).toMatchObject({
-      status: "active-off-screen",
-      label: "Active, off screen",
+  it("grid mode: every zoned tab, or only the maximized zone's", () => {
+    expect(
+      [
+        ...visibleTabIdsForLayout({
+          workMode: "grid",
+          shownTabId: null,
+          assignments,
+          maximizedZone: null,
+        }),
+      ].sort(),
+    ).toEqual(["t-a", "t-b"]);
+    expect([
+      ...visibleTabIdsForLayout({
+        workMode: "grid",
+        shownTabId: null,
+        assignments,
+        maximizedZone: 1,
+      }),
+    ]).toEqual(["t-b"]);
+  });
+});
+
+describe("the card's status words", () => {
+  it("a hidden running session reads its location, never 'in zone'", () => {
+    expect(sessionCardStatusDisplay(injectedStatus("hidden-here", "working"))).toMatchObject({
+      location: "hidden-here",
+      activity: "working",
+      locationLabel: "Hidden here",
+      activityLabel: "Working",
     });
   });
 
-  it("keeps the grid wording, and every state chip, unchanged", () => {
-    expect(sessionCardStatusInfo(transcriptRow(), false)).toMatchObject({
-      status: "active-in-zone",
-      label: "Active in zone",
-    });
-    // A chip that describes the session, not its place, stays as it is.
-    for (const status of ["needs-input", "error", "completed", "frozen"] as const) {
-      expect(sessionCardStatus(status, true)).toBe(status);
-    }
-  });
-
-  it("the card renders the shown status as its data-session-status", () => {
+  it("renders data-session-location + data-session-activity, not data-session-status", () => {
     const source = readFileSync(resolve(__dirname, "./SessionCard.tsx"), "utf8");
-    expect(source).toContain("const statusInfo = sessionCardStatusInfo(session, isOffScreen);");
-    expect(source).toContain("data-session-status={cardStatus}");
-    const panel = readFileSync(resolve(__dirname, "./SessionManagerPanel.tsx"), "utf8");
-    expect(panel).toContain("isOffScreen={isRowOffScreen(session, workMode, onScreenTabId)}");
-    const page = readFileSync(resolve(__dirname, "./TerminalPage.tsx"), "utf8");
-    expect(page).toMatch(
-      /onScreenTabId=\{zoneLayout\.shownTabId\}\s*workMode=\{zoneLayout\.workMode\}/,
-    );
+    expect(source).toContain("data-session-location={statusInfo.location}");
+    expect(source).toContain("data-session-activity={statusInfo.activity}");
+    expect(source).not.toContain("data-session-status");
   });
 });

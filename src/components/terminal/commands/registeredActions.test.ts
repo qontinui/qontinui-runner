@@ -167,7 +167,12 @@ const err = (r: CommandResult): string => (r.ok ? "OK" : `${r.code}: ${r.message
 
 describe("registered actions — the cost/destruction declarations are not empty", () => {
   it("registers the whole set", () => {
-    expect(getAll().length).toBe(42);
+    expect(getAll().length).toBe(43);
+  });
+
+  it("/sessions.find reports a missing palette instead of claiming it opened", async () => {
+    const r = await run("terminal.sessions-find", {});
+    expect(err(r)).toMatch(/^no-palette: /);
   });
 
   /**

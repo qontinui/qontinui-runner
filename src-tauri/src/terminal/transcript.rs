@@ -26,29 +26,33 @@ pub struct TranscriptSession {
     pub first_message_preview: Option<String>, // first ~80 chars of first user message
     pub has_plans: bool,                       // true if any message has planContent
     pub display_name: String,                  // human-readable title derived from content
-    /// Optional override for the frontend's computed `liveStatus`.
+    /// Optional overrides for the two status axes the frontend's
+    /// `sessionStatusModel` classifies (location: where the process is;
+    /// activity: what it is doing).
     ///
-    /// `None` for real on-disk transcripts (the field is omitted from the
-    /// serialized JSON via `skip_serializing_if`, preserving the legacy wire
-    /// shape for every existing consumer). `Some(...)` is set only by the
-    /// debug-gated test-fixtures path (`mcp::test_fixtures`) when an injected
-    /// fake session is projected into this struct so that
-    /// `useSessionManager` can render Promote / Commit buttons without a
-    /// real PTY tab. Accepted values mirror the
-    /// `SessionLiveStatus` enum on the frontend
-    /// (`active-in-zone | needs-input | frozen | …`).
+    /// `None` for real on-disk transcripts (omitted from the serialized JSON
+    /// via `skip_serializing_if`, preserving the wire shape for every existing
+    /// consumer). `Some(...)` is set only by the debug-gated test-fixtures path
+    /// (`mcp::test_fixtures`) when an injected fake session is projected into
+    /// this struct, so `useSessionManager` can render a card in any
+    /// location × activity cell without a real PTY tab. Values are the
+    /// frontend's kebab-case `SessionLocation` / `SessionActivity` literals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub injected_live_status: Option<String>,
+    pub injected_location: Option<String>,
+    /// See [`Self::injected_location`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injected_activity: Option<String>,
     /// Optional synthetic-tab spec, set only by the debug-gated test-fixtures
     /// path (`mcp::test_fixtures`) for a *tab-backed* injected fake.
     ///
     /// `None` for real on-disk transcripts (omitted from the serialized JSON
     /// via `skip_serializing_if`). When `Some(...)`, the frontend derives a
     /// minimal `TerminalTab` from it (`syntheticTabs.ts`) and feeds it through
-    /// the REAL `useSessionManager` tab-correlation path so an injected fake
-    /// can land in the `idle` / tab-backed `error` / tab-backed `completed`
-    /// StatusStrip buckets that the `injected_live_status` short-circuit
-    /// cannot reach.
+    /// the REAL `useSessionManager` classification path, so an injected fake
+    /// exercises the production exit-code arm (`Exited` / `Exited — error`)
+    /// and the silent-tab-without-digest arm (`Unknown`) rather than having
+    /// its status stated by the `injected_location` / `injected_activity`
+    /// short-circuit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected_tab: Option<InjectedTabSpec>,
     /// The REAL `--resume` name for this session: the label set via Claude's
@@ -71,12 +75,13 @@ pub struct TranscriptSession {
 /// release build.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InjectedTabSpec {
-    /// `true` → a live synthetic tab the staleness sweep can age into
-    /// `frozen` (idle bucket). `false` → a dead tab whose `exit_code` the
-    /// dead-tab sweep branch maps to `completed` / `error`.
+    /// `true` → a live synthetic tab the staleness sweep ages silent; with no
+    /// transcript digest behind it the classifier reads activity `Unknown`.
+    /// `false` → a dead tab whose `exit_code` the classifier reads as
+    /// `Exited` / `Exited — error (code N)`.
     pub is_alive: bool,
-    /// Exit code for a dead synthetic tab (`0` → completed, non-zero →
-    /// error). `None` for a live (idle) tab.
+    /// Exit code for a dead synthetic tab (`0` → `Exited`, non-zero →
+    /// `Exited — error`). `None` for a live tab.
     pub exit_code: Option<i32>,
     /// Pre-age in ms for a live tab's `lastOutput` so the 60s staleness sweep
     /// classifies it stale. `None` for dead tabs.
@@ -629,8 +634,9 @@ pub fn list_sessions(
             has_plans,
             display_name,
             // Real on-disk sessions never carry a status override; the
-            // frontend computes `liveStatus` from tab/digest correlation.
-            injected_live_status: None,
+            // frontend classifies status from tab/registry/digest inputs.
+            injected_location: None,
+            injected_activity: None,
             injected_tab: None,
             resume_name,
         };
@@ -675,8 +681,15 @@ pub fn read_session(
     if !file_path.exists() {
         return Err(format!("Session file not found: {:?}", file_path));
     }
+    read_transcript_file(&file_path)
+}
 
-    let content = fs::read_to_string(&file_path)
+/// [`read_session`] addressed by the transcript's own path — for a caller that
+/// enumerated the files itself (`transcript_search` walks
+/// [`crate::session::reconcile::DiskTranscriptIndex::transcript_files`]) and
+/// has no project path to re-encode.
+pub fn read_transcript_file(file_path: &Path) -> Result<Vec<TranscriptMessage>, String> {
+    let content = fs::read_to_string(file_path)
         .map_err(|e| format!("Failed to read session file {:?}: {}", file_path, e))?;
 
     let mut messages = Vec::new();
@@ -1352,7 +1365,8 @@ pub fn get_latest_session_id(
                             has_plans,
                             display_name,
                             // Real on-disk session — no override.
-                            injected_live_status: None,
+                            injected_location: None,
+                            injected_activity: None,
                             injected_tab: None,
                             resume_name,
                         });
