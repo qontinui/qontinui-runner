@@ -673,9 +673,12 @@ mod tests {
     /// the door's own call. Every file must lex to its end in code, so a
     /// literal the lexer misreads cannot blank the rest of a file unnoticed.
     ///
-    /// Not seen (clippy still sees the non-test ones): a builder held in a
-    /// variable and built later with `.unwrap_or_default()`, and
-    /// `<reqwest::Client as Default>::default()`.
+    /// Not seen (clippy still sees the non-test ones; none occurs today): a
+    /// builder held in a variable and built later with `.unwrap_or_default()`;
+    /// `<reqwest::Client as Default>::default()` and `<reqwest::Client>::new()`;
+    /// `Client` reached through `use reqwest::*`, a `type` alias, a re-export
+    /// or a parent file's import under `use super::*`; a path assembled inside
+    /// a macro; and C strings (`c"…"`), which the lexer does not model.
     #[test]
     fn no_raw_async_reqwest_constructor_outside_the_door() {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
