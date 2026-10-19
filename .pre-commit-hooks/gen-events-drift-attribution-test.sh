@@ -1095,9 +1095,24 @@ index_hook_fixture() {
     fi
     # git puts its own exec-path first on a hook's PATH, so a shim on the
     # committer's PATH never reaches the hook; HOOK_PATH_PREFIX re-adds one.
+    #
+    # On Windows the value does not arrive as it was set. Git for Windows is a
+    # native program, and Git Bash rewrites a path-looking environment value on
+    # the way into one (`/tmp/x` -> `C:/Users/.../Temp/x`). Prepended as-is, the
+    # drive letter's colon splits PATH into `C` and `/Users/...`, the shim is
+    # never found, and a case that needs it reads as if the code under test
+    # were wrong (coord finding 34148bb3). `cygpath -u` turns it back.
     cat > "$hooks/pre-commit" <<HOOK
 #!/usr/bin/env bash
-[ -z "\${HOOK_PATH_PREFIX:-}" ] || PATH="\$HOOK_PATH_PREFIX:\$PATH"
+if [ -n "\${HOOK_PATH_PREFIX:-}" ]; then
+    case "\$HOOK_PATH_PREFIX" in
+        [A-Za-z]:[/\\\\]*)
+            if command -v cygpath >/dev/null 2>&1; then
+                HOOK_PATH_PREFIX="\$(cygpath -u "\$HOOK_PATH_PREFIX")"
+            fi ;;
+    esac
+    PATH="\$HOOK_PATH_PREFIX:\$PATH"
+fi
 . "$SCRIPT_DIR/lib/gen-events-attribution.sh"
 gen_events_clear_inherited_git_env
 printf '%s\n' "\$GEN_EVENTS_HOOK_INDEX_FILE" > "$WORK/.hook-index"
@@ -1259,30 +1274,63 @@ echo "  -- odd file names are shown as themselves --"
 
 # git C-quotes non-ASCII, `"` and `\` without `-z`, and the label would then
 # name a file that does not exist.
+#
+# Where the filesystem cannot hold the name, the path goes into the INDEX
+# instead, which holds any byte string on every OS. Windows is the case: NTFS
+# forbids `"` and TAB, and Git Bash does not refuse the write — Cygwin/MSYS
+# stores the name with those characters mapped into the Unicode private-use
+# area (`"` -> U+F022, TAB -> U+F009), so the write succeeds while git, a
+# native program, sees a DIFFERENT name. A `printf > file` probe therefore
+# cannot tell "the filesystem took it" from "the filesystem renamed it"; only
+# asking git can. The property under test — that a `-z` name reaches the label
+# byte-for-byte, never C-quoted — is the same through either source, so the
+# case still runs instead of being skipped (coord finding 34148bb3).
+#
+# Prints the source label the path will carry: `untracked` when git sees the
+# file by its real name, `staged` when it had to go through the index.
+odd_path() {
+    local rel="$1" body="$2" blob listing=""
+    # The same listing the library's `untracked` source makes
+    # (`--exclude-standard`), captured whole rather than piped into `grep -q`,
+    # whose early exit could fail the pipeline under pipefail.
+    if printf '%s\n' "$body" > "$WORK/$rel" 2>/dev/null; then
+        listing="$(git -C "$WORK" ls-files --others --exclude-standard -z -- 'src-tauri/src' 2>/dev/null | tr '\0' '\n')"
+    fi
+    if grep -qxF -- "$rel" <<<"$listing"; then
+        printf 'untracked'
+        return 0
+    fi
+    # Whatever the filesystem did store is not the name under test; remove it
+    # (the same spelling maps to the same stored name) so git cannot report it
+    # as an extra untracked input.
+    rm -f "$WORK/$rel" 2>/dev/null || true
+    blob="$(printf '%s\n' "$body" | git -C "$WORK" hash-object -w --stdin)" || return 1
+    # Git for Windows refuses such a path into the index too ("Invalid path")
+    # under its default core.protectNTFS, which guards CHECKOUTS from names
+    # NTFS cannot hold. Nothing is ever checked out here, so lift it for this
+    # one call; the reads the library makes accept the entry as-is.
+    git -C "$WORK" -c core.protectNTFS=false update-index --add --cacheinfo "100644,$blob,$rel" || return 1
+    printf 'staged'
+}
+
 fixture
 ODD_E='src-tauri/src/é b.rs'
 ODD_Q='src-tauri/src/q"t.rs'
+ODD_T="src-tauri/src/a"$'\t'"b.rs"
 printf '// e\n' > "$WORK/$ODD_E"
-printf '// q\n' > "$WORK/$ODD_Q"
-ODD_T=""
-if printf '// t\n' > "$WORK/src-tauri/src/a"$'\t'"b.rs" 2>/dev/null; then
-    ODD_T="src-tauri/src/a"$'\t'"b.rs"
-fi
+ODD_Q_SRC="$(odd_path "$ODD_Q" '// q')"
+ODD_T_SRC="$(odd_path "$ODD_T" '// t')"
 decide
 check "odd names are MINE" "mine" "$ATTRIBUTION_STATE"
 check "  é b.rs is labelled by its real name" yes \
     "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_E"$'\t'"untracked" && echo yes || echo no)"
-check "  q\"t.rs is labelled by its real name" yes \
-    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_Q"$'\t'"untracked" && echo yes || echo no)"
-if [ -n "$ODD_T" ]; then
-    ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
-    check "  a tab-named file is kept, in its %q form" yes \
-        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_T_SHOWN"$'\t'"untracked" && echo yes || echo no)"
-    check "  and counted in the flat list" yes \
-        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qxF "$ODD_T_SHOWN" && echo yes || echo no)"
-else
-    skip_note "tab-named file: this filesystem refuses a tab in a file name"
-fi
+check "  q\"t.rs is labelled by its real name ($ODD_Q_SRC)" yes \
+    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_Q"$'\t'"${ODD_Q_SRC:-none}" && echo yes || echo no)"
+ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
+check "  a tab-named file is kept, in its %q form ($ODD_T_SRC)" yes \
+    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_T_SHOWN"$'\t'"${ODD_T_SRC:-none}" && echo yes || echo no)"
+check "  and counted in the flat list" yes \
+    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qxF "$ODD_T_SHOWN" && echo yes || echo no)"
 RENDERED="$(gen_events_render_mine)"
 check "  the message shows é b.rs raw" yes \
     "$(printf '%s\n' "$RENDERED" | grep -qF "    $ODD_E  (untracked" && echo yes || echo no)"
