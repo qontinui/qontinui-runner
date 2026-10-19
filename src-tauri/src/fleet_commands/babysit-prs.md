@@ -1,5 +1,5 @@
 ---
-description: "Shepherd this session's PRs to landed — watch CI, fix red in-session, diagnose green-but-stuck PRs via coord's pr-merge events, hand a diagnosed coord defect to the operator (an agent does not merge — the recovery merge is denied to agents fleet-wide since PR #328), then write a remediation plan and run /vet-imp on it so coord itself gets fixed."
+description: "Shepherd this session's PRs to landed — watch CI, fix red in-session, diagnose green-but-stuck PRs via coord's pr-merge events, merge a diagnosed coord defect directly through the one notifying door (scripts/agent-direct-merge.sh; served policy git-operations direct-merge-with-notification, operator decision 2026-10-16), then write a remediation plan and run /vet-imp on it so coord itself gets fixed."
 argument-hint: "[repo#123 ...] [--threshold=45m] [--no-merge] [--no-remediate] [--once]"
 allowed-tools: Read, Write, Edit, Bash, PowerShell, Grep, Glob, Monitor, Skill, ToolSearch, TaskCreate, TaskUpdate
 ---
@@ -15,18 +15,17 @@ keeps CLAUDE.md's "coord is the sole merge authority" rule intact: coord is
 bypassed only when coord is provably the thing that's broken, and the bypass is
 always paid for with a fix.
 
-⚠️ **Since 2026-08-21 (PR #328) the bypass is not YOURS to perform.** The
-shared `.claude/settings.json` denies `Bash(gh pr merge)` / `Bash(gh pr
-merge:*)` fleet-wide. `git-guard.sh` additionally blocks the `gh api`
-REST and GraphQL spellings of the same act (#353) — briefly unwired
-fleet-wide (config-repo PR #567) along with its unrelated
-destructive git/rm/cargo arms (those stay removed, at the repo owner's
-explicit request), then re-wired the same day narrowed to ONLY this
-merge-route check. So for an agent this command's terminal state
-on a diagnosed defect is **hand-off, not merge**: post the audit comment, hand
-the PR to the operator with a gate or an escalation, and go write the
-remediation plan. Every "admin-merge" below describes the operator's step, not
-yours — Step 6 states this in full. Do not read any of it as latitude.
+⚠️ **Since 2026-10-16 the bypass IS yours to perform, through ONE door.**
+Served policy `git-operations` `direct-merge-with-notification` (operator
+decision 2026-10-16) made a direct merge take-and-notify: on a diagnosed coord
+defect, the agent merges, and
+`<workspace-root>/qontinui-claude-config/scripts/agent-direct-merge.sh` posts
+the operator notification (`force_merge`) after the merge. The raw spellings
+stay denied: the shared `.claude/settings.json` denies `Bash(gh pr merge)` /
+`Bash(gh pr merge:*)` (PR #328), and `git-guard.sh` blocks the `gh api` REST and
+GraphQL merge routes (#353), because each would skip the notification. From
+2026-08-21 until 2026-10-16 this step ended in an operator hand-off; Step 6
+states what replaced it.
 
 ## Arguments
 
@@ -37,16 +36,12 @@ yours — Step 6 states this in full. Do not read any of it as latitude.
     the diagnosis ladder fires. Default `45m`. Accepts `30m`, `2h`.
   - `--no-merge` — never admin-merge; diagnose, remediate the cause, and
     report only. Use when you want the investigation without the recovery.
-    **Its meaning shifted with PR #328, it did not go inert.** The deny already
-    makes the merge unreachable to you, so the flag no longer gates *your*
-    merge — nothing does, because you have none. What it still gates is the
-    **hand-off REQUEST**: with `--no-merge` you diagnose, remediate and report,
-    and you do **not** ask the operator to merge. Suppressing that request is
-    what the flag now buys. It re-arms against an agent's own merge the moment
-    the deny is lifted, so do **not** read its absence as permission — the same
-    reading `--max-recovery-merges` gets in `/merge-train-steward` where your deployment provides it. The audit
-    comment is owed either way; under `--no-merge` write it as a diagnosis-only
-    record.
+    Since 2026-10-16 it gates YOUR merge again: without it, a diagnosed coord
+    defect is merged through `scripts/agent-direct-merge.sh` (Step 6); with it,
+    you diagnose, remediate and report, and neither merge nor ask the operator
+    to. (From PR #328 on 2026-08-21 until 2026-10-16 agents had no merge, so the
+    flag only suppressed the hand-off request.) The audit comment is owed
+    either way; under `--no-merge` write it as a diagnosis-only record.
   - `--no-remediate` — skip the remediation-plan + `/vet-imp` step (recovery
     only). The defect evidence is still written to the PR comment.
   - `--once` — single pass (no watch loop): assess, act, report, exit.
@@ -106,17 +101,21 @@ design, so a multi-PR fan-out still goes through the Monitor tool — one
 need one table across PRs. Whichever you use, the traps below still apply.
 
 **Closeout exit — when the authoring session runs this on its own PRs** (see
-the scope rule under "Rules"). The test is what DISQUALIFIES, not what
-qualifies: leave the loop once no PR's head — the head this session last
-pushed — is red for a code error in this session's diff, and none has checks
-still PENDING that are younger than `--threshold` (Step 4's default, 45m).
-`pr-checks.sh` reports `queued` and `in_progress` alike as `pending`, so do not
-try to split them. Age a pending check from the first poll that SUCCESSFULLY
-read it pending on that head, stamped the way `no_ci_since` is: never from a
-poll that errored. Wait on it up to the threshold and no further. Past it,
-record it as `pending-past-threshold`, not as starved: it may simply be a long
-CI run. Either way it is coord's to carry. Every other head shape exits:
+the scope rule under "Rules"). Closeout mode does **not** loop and does not
+wait: read each PR's head — the head this session last pushed — once. Two
+shapes keep the session here, because each is something it can do right now: a
+check on that head that has already concluded red for a code error in this
+session's diff (send it to Step 3), and a textual conflict — `coord_pr_status`
+reads `rebase_block_disposition: author_acts` — which coord will not propose, so
+rebase and push once [policy: a-textual-conflict-is-owed-not-watched]. Every
+other head shape exits now (operator decision 2026-10-17, tightening [policy:
+pr-session-finished-when-prs-initially-green]: checks still running on the last
+push no longer hold the session open):
 
+- Checks still `pending` — `pr-checks.sh` reports `queued` and `in_progress`
+  alike as `pending`. Coord observes their results by webhook and pushes a
+  later red to the author: its `ci_rework` prompt to a live author, its
+  `pr_fix` fixer lane for a dead one. Waiting for them is not owed work.
 - `first_fully_green_at` was stamped at least once on that head. A later red
   flip, or a red that appeared because `main` moved, does not un-green it for
   this test. The stamp's reset rule below serves Step 4's clock, not this exit.
@@ -124,10 +123,8 @@ CI run. Either way it is coord's to carry. Every other head shape exits:
   starved or abandoned in a queue, or a real failure that a control on pristine
   `main` proves pre-existing [policy:
   a-red-check-is-not-automatically-a-code-error]. Record which class applies.
-- `no-ci` (never fired, once past the repo's normal push-to-first-check
-  delay, described below),
-  all-skipped, all-cancelled, or pending past the threshold. These are
-  stationary states, so they are coord's to carry rather than this session's to
+- `no-ci`, all-skipped, all-cancelled, BEHIND or UNSTABLE because `main`
+  moved, or queued for land. These are coord's to carry rather than this session's to
   wait on.
 
 For each exiting PR that has no live gate yet, register a `pr_merged` gate
@@ -135,19 +132,13 @@ through `/gate` and READ IT BACK [policy: gate-read-back]. A gate that is not
 read back leaves the unit DROPPED under `/unattended`'s rules, not WATCHED. A
 `pr_merged` gate on a PR that no longer carries the commit does not watch it:
 see `/unattended`'s `pr_merged` hazards. Report the PR as
-`green-handed-to-train (gate <id>)`. That is the state `/unattended` calls
-WATCHED and the session-protocol footer calls `in-train`, and the session owes
-nothing further on it [policy: finish-to-zero-means-zero-OWED-BY-THIS-SESSION].
+`handed-to-train (gate <id>)`, naming its check state (`green`, `pending`, or
+the non-code red class). That is the state `/unattended` calls WATCHED and the
+session-protocol footer calls `in-train`, and the session owes nothing further
+on it [policy: finish-to-zero-means-zero-OWED-BY-THIS-SESSION].
 
-Two consequences in closeout mode:
-
-- KEEP the time tick described below. A cancel, a head aging into `no-ci`, and
-  a pending check aging past the threshold are all stationary, so no transition
-  delivers them. The tick's bound is the same: `N × poll_interval ≤
-  --threshold`. Step 4's diagnosis itself does not run in closeout mode.
-- Under `--once`, apply the exit test once. Gate and report every PR that
-  passes it, report PRs whose checks are still pending as `pending`, and send
-  PRs red for a code error to Step 3.
+In closeout mode the time tick, Step 4's diagnosis and `--threshold` do not
+apply: nothing is waited on, so nothing ages. `--once` behaves the same.
 
 A dedicated shepherding session ignores this exit and keeps watching to
 `MERGED` / `CLOSED`.
@@ -600,10 +591,10 @@ reading it as clean.
 exactly one replica must report `is_leader: true`. No leader = coord outage →
 skip to Step 6 with class `coord-down`. **This is no longer a "CLAUDE.md
 hand-merge exception"** — that phrasing cited text CLAUDE.md no longer carries.
-CLAUDE.md's `merge-authority` bullet now says the #328 deny blocks this very
-recovery and that "**that path now ends in an operator hand-off**". A
-`coord-down` PR still enters Step 6; what it reaches there is the hand-off, not
-a merge you perform.
+A `coord-down` PR enters Step 6, where the merge is yours through
+`scripts/agent-direct-merge.sh`. Its notification is coord-carried, so with coord
+fully down the merge can exit 5 (merged, not notified) when the HTTP twin is
+down too. Post the notification by hand once coord answers.
 
 **4c. Coord's verdict** — mint a headless operator token and read the event
 stream (never echo the token):
@@ -653,9 +644,9 @@ error, not a missing door.
 | Class | Codes / signals | Action |
 |---|---|---|
 | **Transient — wait** | `ci-pending` (**only once you have PROVEN CI actually fired — see the note under this table**), `below-green-dwell`, `merge-state-unsettled` (young), in-flight proposal in `/merge/queue` | Nothing. Reset no clocks; check again next poll. |
-| **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red`, `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2/T kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
+| **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red` (except on the red-main fix PR itself, labelled `coord:red-main-fix`, which `scripts/agent-direct-merge.sh` may merge: it is the one PR that cannot pass a red main), `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2/T kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
 | **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
-| **Coord down** | no leader across 4–8 health samples, **and** `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — which for an agent ends in the operator hand-off, not a merge (#328). |
+| **Coord down** | no leader across 4–8 health samples, **and** `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — the merge through `scripts/agent-direct-merge.sh`; expect exit 5 (merged, notify later) while coord is down. |
 
 **`escalate-path-matched` is a hold with a named pending gate — read it before
 deciding who acts.** `coord_pr_merge_verdict {repo, pr_number}` returns an
@@ -888,51 +879,42 @@ to the watch loop — coord lands it, no admin-merge.
 > NOT mean `gh pr merge --admin` — that flag is not the mechanism (see item 2
 > of the procedure below).
 
-> ### ⚠️ An agent CANNOT complete this step (since 2026-08-21, PR #328)
+> ### An agent completes this step through the sanctioned door (since 2026-10-16)
 >
-> Read this before working the preconditions, so you do not spend a rebase and
-> a full CI cycle reaching a wall. PR #328 added
-> `deny: ["Bash(gh pr merge)", "Bash(gh pr merge:*)"]` to the shared
-> `.claude/settings.json` — which, via the workspace-root `.claude` symlink, is
-> this session's settings. A `deny` is evaluated before `ask` and `allow`, holds
-> in **every** permission mode including `bypassPermissions`, cannot be
-> overridden by `settings.local.json` / user settings / `--allowedTools`, and
-> **cannot be approved by a `PreToolUse` hook**. Compound and wrapped spellings
-> (`cd x && …`, `;`, `bash -c "…"`, a leading `VAR=…`) are split and matched
-> independently, so none of them evade it.
+> Served policy `git-operations` `direct-merge-with-notification` (operator
+> decision 2026-10-16, finding `53a7609b`) made the recovery merge
+> take-and-notify. Item 2's merge is yours, and it runs through ONE command:
 >
-> Item 2 below is therefore **denied to every agent in this fleet**. It is
-> left in place because it is still the correct procedure — it is just the
-> operator's to run now, not yours. ("Denied", not "impossible": the deny and
-> the guard cover the spellings an agent actually reaches for, not every
-> conceivable client — see "Do not route around the deny" below. The boundary
-> is the policy; the mechanism is a backstop.)
+> ```bash
+> bash <workspace-root>/qontinui-claude-config/scripts/agent-direct-merge.sh \
+>   --repo <owner/name> --pr <n> --reason "<diagnosis class + the block_reason_code evidence>"
+> ```
 >
-> **So: work Steps 1–5 fully, and when a genuine coord-defect diagnosis reaches
-> the merge, hand it over instead of attempting it.** Register the gate
-> (`/gate`) or escalation FIRST — naming the PR, the diagnosis class and the
-> `block_reason_code` evidence — then post the Step 6 item 1 audit comment
-> quoting that ref, so the PR is watched rather than silently dropped by a
-> session that just stopped. (This is the one place the "audit trail first"
-> ordering inverts, and it inverts because the hazard it guarded against is
-> gone: there is no merge left for you to perform ahead of the record. What the
-> comment now has to carry is the ref, and you cannot quote a ref you have not
-> yet obtained.) Then continue to Step 7 — the remediation plan is unaffected
-> and is the part that kills the defect class.
+> It refuses (exit 3, nothing merged) unless the PR is OPEN, not a draft,
+> `mergeStateStatus` CLEAN, and every check but coord's own merge gate is green
+> at the head it pins. It merges with `sha=<that head>`, so GitHub refuses if the
+> head moved, posts `coord_notify_sensitive_action` action `force_merge`, and
+> reads the merge sha back on the base. **Exit 5 means the merge STANDS but the
+> notification did not land: post it by hand at once** with the line it printed.
+> Exit 4 is no merge by this call (GitHub refused it, or the PR was merged some
+> other way); a ruleset refusal is final for an agent: hand that one PR to the
+> operator with a gate or an escalation, as this step did before. Exit 6 is
+> merged and notified but not read back on the base: re-read it. Exit 7 is
+> UNKNOWN (the merge call failed and the PR could not be re-read): check the PR
+> by hand before anything else.
 >
-> **Do not route around the deny.** `gh pr merge` wraps
-> `PUT /repos/{owner}/{repo}/pulls/{n}/merge`; reaching that endpoint via
-> `gh api` is the same act, and is blocked by `git-guard.sh` with a
-> typed reason — that hook was briefly unwired fleet-wide (config-repo
-> PR #567) along with its unrelated destructive git/rm/cargo arms (those stay
-> removed), then re-wired the same day narrowed to ONLY this merge-route
-> check, so it mechanically stops this spelling again.
+> It reads coord's gate code from the merge-gate check's title and checks it
+> against an allowlist. `none` proceeds; `main-red` only on the PR labelled
+> `coord:red-main-fix`; the coord-defect codes of 4d (`has-cross-repo-dependency`,
+> `merge-state-unsettled`, `unlandable_cycle`, or no gate check at all when coord
+> is down) only with `--override-gate`, which is recorded in the notification;
+> `escalate-path-matched` and every other code refuse, flag or no flag.
 >
-> Background, and why this diverges from served policy `git-operations`
-> `merge-authority` @8 (whose second sentence sanctions this recovery): the
-> coord merge-train reference in your deployment's knowledge base, where it ships one,
-> → "That last step is MECHANICALLY DENIED to agents". Whether the deny stays is
-> the operator's call; it is recorded as a policy gap, not resolved here.
+> **The raw spellings stay denied, so do not route around the door.**
+> `gh pr merge` (settings deny, PR #328) and the `gh api` REST and GraphQL
+> merge routes (`git-guard.sh`) are blocked because they skip the notification,
+> and `--admin` is never the mechanism (item 2). The script calls the REST route
+> itself, after its preflight.
 
 Preconditions — ALL must hold:
 - Diagnosis class is **coord defect** or **coord down** (never a legitimate
@@ -1023,15 +1005,17 @@ Then:
 
    ⚠️ **Write the disposition you actually performed.** This step used to
    dictate the closing line *"admin-merged as coord-defect recovery; remediation
-   plan follows"* — and since #328 an agent reaching here has **not** merged,
-   so that line publishes a false claim on a public PR and mislabels the
-   PR's state for coord, for the operator, and for the next session that reads
-   the thread. Item 1 is still yours; its wording had to follow item 2 into the
-   hand-off. Close the comment with, as applicable:
+   plan follows"* whatever happened — and from #328 until 2026-10-16 an agent
+   reaching here had **not** merged, so that line published false claims on
+   public PRs. Close the comment with the disposition that actually happened,
+   as applicable:
 
-   - **agent** — *"diagnosed coord-defect recovery; the recovery merge is denied
-     to agents fleet-wide (PR #328), so this PR is handed to the operator, who
-     holds the merge capability. Gate/escalation: `<ref>`. Remediation plan
+   - **agent, merged** — *"merged directly as coord-defect recovery through
+     agent-direct-merge.sh (`<merge sha>`; operator notified, force_merge).
+     Remediation plan follows."*
+   - **agent, GitHub refused the merge (exit 4)** — *"diagnosed coord-defect
+     recovery; GitHub refused the direct merge (`<the refusal>`), so this PR is
+     handed to the operator. Gate/escalation: `<ref>`. Remediation plan
      follows."*
    - **agent, under `--no-merge`** — the same record **without** the hand-off
      request: state the diagnosis and the evidence, and do not ask the operator
@@ -1079,14 +1063,15 @@ Then:
    carries-the-push check runs before and after it, re-testing the PRE-rebase
    head; a PR that landed under you while it read stuck needs no recovery, and
    the rebase would re-propose its landed commits), wait for the required
-   checks to go green on the up-to-date head, then plain
-   `gh pr merge <n> --rebase`. Strict rulesets (qontinui-web) need
+   checks to go green on the up-to-date head, then merge through
+   `scripts/agent-direct-merge.sh --repo <o/r> --pr <n> --reason "<…>"`
+   (it picks rebase when the repo allows it). Strict rulesets (qontinui-web) need
    the up-to-date head; non-strict ones (qontinui-coord) merge as soon as the
    required checks are green on the current head.
    **A peer's coord PROPOSAL is not its branch.** A proposal holding a merge
    slot past the repo's own `stall_window_secs` can be cancelled by any session,
    but only through the class A/B/C table and the per-target probe in
-   `/merge-train-steward` (the `self_blocking` arm; where your deployment does not provide that command, do not cancel the proposal at all: report it as a held proposal and continue to Step 6's operator hand-off) — `unblock: true` only, a
+   `/merge-train-steward` (the `self_blocking` arm; where your deployment does not provide that command, do not cancel the proposal at all: report it as a held proposal and continue to Step 6) — `unblock: true` only, a
    Stop-mode cancel is class C, and a 409 from the door is a successful guard,
    never something to retry.
    **Adopting a foreign branch (route-around) — the only shape it may take.**
@@ -1117,7 +1102,11 @@ Then:
    `Session-Id:` onto the author's commits, which is the corruption that PR
    closes, so check its state before trusting the trailers you produced),
    open a NEW PR from that branch, and leave the
-   original PR to be superseded. Open it in `/implement-plan` Step 4.5b's
+   original PR to be superseded. Before it opens, run `/implement-plan`
+   Step 4.3 (fold in open follow-ups on the files this diff touches) on the
+   new branch — one `Resolves-Followup:` line per fold, each moved to `fixing`
+   after the read-back; a follow-up `fixing` under the PR you supersede is
+   carried to the new PR, not skipped (Step 4.3's superseding-PR exception). Open it in `/implement-plan` Step 4.5b's
    served door order and READ it back — `gh pr list --repo <owner/repo>
    --head <new-branch> --state all --json number,url,state,headRefOid` must
    return a row whose `headRefOid` is the head you pushed; the create call's
@@ -1189,11 +1178,11 @@ an admin-merge happened — produces a plan so the defect class dies:
      `stuck_pr_watcher` / `coord.alerts` have caught this class? If yes, the
      plan includes the alert).
    - **Recovery taken**: labels removed, and — for each PR that reached the
-     merge step — the **hand-off** filed (gate id or escalation ref, and the
-     operator it went to), with links. Record `admin-merges performed` only when
-     an operator actually performed one; an agent's row is a hand-off, and
-     writing it as a merge puts a false recovery into the plan that the fix is
-     then designed against.
+     merge step — the merge sha and its `force_merge` notification, or, when
+     GitHub refused the merge (exit 4), the **hand-off** filed (gate id or
+     escalation ref), with links. Record a merge only when the script reported
+     one (`MERGED … as <sha>`); writing a refused merge as performed puts a false
+     recovery into the plan that the fix is then designed against.
 2. Invoke `Skill: vet-imp` with that plan path.
 3. If the session must end before the fix lands, register a coord gate via
    `/gate` (or `/blocked`) on the fix PR instead of leaving a silent stall.
@@ -1202,17 +1191,22 @@ an admin-merge happened — produces a plan so the defect class dies:
 
 - **Scope of a session's duty (operator instruction 2026-10-08; served policy
   `finished-criteria`, read it via `/policy` rather than from this line).** A
-  session that implements PRs is finished when those PRs are INITIALLY GREEN —
-  no code errors on the head it pushed [policy:
-  session-finished-at-green-not-at-merged]. Shepherding them to merge is coord's
+  session that implements PRs is finished once those PRs are pushed and nothing
+  it can act on right now remains — no check its own last push already turned
+  red for a code error, no textual conflict coord reads as `author_acts`, and
+  no missing gate [policy:
+  session-finished-at-green-not-at-merged, tightened by operator decision
+  2026-10-17: checks still running no longer hold it open]. Shepherding them to merge is coord's
   merge train, plus its `ci_rework` / `stuck_pr_nudge` dispatch [policy:
   finishing-is-a-handoff-not-an-abandonment]. That splits this command into two
   uses, and they stop at different points:
   - **Closeout of the authoring session** — the session that authored the PRs
-    runs this on its own PRs. Its goal is green, not landed: fix genuine reds
-    (Step 3), and stop at Step 2's closeout exit. A PR that went DIRTY or
-    UNSTABLE only because `main` moved, or sits queued behind a backed-up
-    runner pool, is coord's to carry, not a reason to stay. Step 4's
+    runs this on its own PRs. Its goal is pushed with nothing owed, not green
+    and not landed: fix a check its own push already turned red (Step 3),
+    rebase once on an `author_acts` textual conflict, gate the rest, and stop at
+    Step 2's closeout exit. Checks still running, a PR that went BEHIND or
+    UNSTABLE only because `main` moved, or one queued behind
+    a backed-up runner pool, is coord's to carry, not a reason to stay. Step 4's
     green-past-threshold clock does not keep this session alive.
   - **A dedicated shepherding session** — invoked as a gate's
     `run_skill babysit-prs` continuation, or launched to watch PRs it did not
@@ -1244,9 +1238,11 @@ an admin-merge happened — produces a plan so the defect class dies:
   the PR. "It's been a while" is not a diagnosis. The bar does not drop just
   because the act moved to the operator; it rises, because they are acting on
   your evidence rather than their own.
-- **Never report a merge you did not perform.** Since #328 an agent's terminal
-  state on a diagnosed defect is `handed-to-operator`. Both the PR audit comment
-  (Step 6 item 1) and the exit report must say so.
+- **Never report a merge you did not perform.** An agent's terminal state on a
+  diagnosed defect is `merged-direct` (the script printed `MERGED … as <sha>`
+  and exit 0, 5 or 6) or `handed-to-operator` (exit 4, GitHub refused). Exit 5 is
+  a merge whose notification is still owed. Both the PR audit comment (Step 6
+  item 1) and the exit report say which.
 - **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head,
   one remediation plan per defect class per run (dedupe: if `$QONTINUI_PLANS_DIR`
   already has a plan for this defect class, reference it instead of writing a
@@ -1264,8 +1260,8 @@ an admin-merge happened — produces a plan so the defect class dies:
 - **Don't race coord.** An in-flight queue proposal always wins; wait.
 - **Report on exit**: per-PR final state (merged-by-coord / **handed-to-operator**
   / admin-merged / fixed-and-waiting / blocked-legitimate / operator-escalated
-  / `green-handed-to-train (gate <id>)` for a closeout exit (Step 2) / `pending`
-  for a closeout `--once` run whose CI has not concluded),
+  / `handed-to-train (gate <id>)` for a closeout exit (Step 2), with its check
+  state),
   defects found, plan path + vet-imp outcome. `handed-to-operator` is the state
   a diagnosed defect ends in when an agent ran this command, and it carries the
   gate id or escalation ref that makes the PR watched; `admin-merged` is

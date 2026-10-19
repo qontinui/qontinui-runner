@@ -2478,6 +2478,14 @@ async fn health(
         // populated only when unauthenticated (incl. the gh-not-installed
         // case). /health never blocks on the probe.
         "prCredential": pr_credential_health(),
+        // The instance root this runner was launched under
+        // (`QONTINUI_INSTANCE_ROOT`), or `null` for a runner that is not a
+        // subject. Plan
+        // 2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-
+        // runner D5: a client that reached this port can tell a subject from
+        // the harness, and find the subject's own `~/.qontinui` (loopback key,
+        // api-port records) under `<instanceRoot>/home`.
+        "instanceRoot": crate::instance::instance_root().map(|r| r.display().to_string()),
         // Session-fabric Phase 0: how each proxied coord call resolved the
         // caller's own coord agent_session_id, since this process booted.
         // coord sees only "header present / absent" — this is the ONLY place
@@ -2683,6 +2691,11 @@ async fn health(
         // `{driftedTools: [], …}` = observed clean. Same producer as
         // `/coord-mcp/tool-policy`'s field, never re-derived.
         "coordMcpDrift": observed_coord_mcp_drift_json(),
+        // The reverse direction: names this door forwards that coord did not
+        // advertise to the DEVICE principal on the last readable `tools/list`.
+        // `null` = no device `tools/list` recorded since boot (UNKNOWN); an
+        // unreadable later answer leaves the previous reading in place.
+        "coordMcpForwardedUnadvertised": observed_forwarded_unadvertised_json(),
         // `coord_mcp_tenant_verdict_total{verdict}` since boot (plan
         // 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-
         // answer-names-its-tenant, Phase 2): how coord-mcp answers compared
@@ -2878,8 +2891,9 @@ async fn drain_handler(
 /// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
 /// registered proxy nonce (from `Authorization: Bearer <nonce>` or the legacy
 /// `X-Coord-Mcp-Proxy-Key`) AND the live bearer decodes
-/// `sub_type == "device"` — the proxy must never attach a non-device token
-/// (agent-spawn sessions carry their own narrower JWT and never route here).
+/// `sub_type == "device"` for a DEVICE nonce. A nonce bound to an agent
+/// (`ProxyPrincipal::Agent`) forwards with THAT agent's own JWT instead; the
+/// proxy never attaches the device credential on an agent's behalf.
 ///
 /// Transport: coord `/mcp` is single-shot `application/json` JSON-RPC per POST
 /// (no SSE, no session machinery), so this is a plain passthrough — forward
@@ -5186,8 +5200,9 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// dedicated `/vcs/pull-requests` loopback route, not this proxy), reservations
 /// (`coord_migration_reserve`, `coord_reserve_resource`), policy/state
 /// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`),
-/// and per-agent grants this device-only door never carries (`coord_fleet_drain`,
-/// `coord_fleet_undrain`, `coord_fleet_drain_host`, `coord_fleet_undrain_host`).
+/// and per-agent levers coord would also hand to every un-curated agent
+/// (`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
+/// `coord_fleet_undrain_host`).
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
@@ -5545,7 +5560,8 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// Finding `31a69d12` (posted by this runner itself on build `44691aaec4d4`)
 /// reported eleven names that coord ADVERTISED to this door's principal, which
 /// this list neither allowed nor named as deliberate. Each was classified; the
-/// design-fork record is coord finding `73b15a9b` (which revises `e652d447`).
+/// design-fork record is coord finding `4ba64e8b` (correcting `73b15a9b`, which
+/// revised `e652d447`).
 /// None of the eleven is on coord's device floor at coord `origin/main`
 /// `1e720228b802`, so which coord build and principal advertised them is
 /// unestablished. That is why forwarding
@@ -5567,6 +5583,19 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///
 /// The other eight are in [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its
 /// reason in that list's note.
+///
+/// `coord_merge_order` stays IN although coord keeps it off the device floor.
+/// It is a READ: it composes a safe merge ordering from the queue, the PR
+/// dependency edges and the plan `Depends-On` graph. coord grants it to the
+/// per-agent `merger` role template, and merger agents reach this door with
+/// their own JWT, so coord's allow-set is the gate for each principal: a device
+/// gets coord's refusal, and a merger gets the tool (the runner's merge-shepherd
+/// playbook names it as one of its merge levers). The reverse-parity
+/// observation reports it for a DEVICE principal, and that report is expected.
+/// It is not the only such name: about fifty forwarded names were off coord's
+/// device floor at `origin/main` `2e9c85585` (for example `coord_claim_acquire`,
+/// `coord_build_info`, `coord_yield`). That backlog is why the observation logs
+/// at INFO and is read from `/health`, not raised as a WARN on every boot.
 ///
 /// Forwarding a name coord does not yet serve is harmless — coord answers it as
 /// an unknown tool — so these entries may land ahead of the coord side.
@@ -5815,20 +5844,23 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 /// MUST stay sorted — membership is a `binary_search`.
 ///
 /// Eight of them were added on the classification of finding `31a69d12` (record:
-/// coord finding `73b15a9b`, revising `e652d447`). None of them was forwarded
+/// coord finding `4ba64e8b`, correcting `73b15a9b`). None of them was forwarded
 /// before, so listing it here takes nothing away. Four join an existing family
 /// in the note above, and the fleet-drain writes start a new one (per-agent
 /// grants):
 ///
 /// * `coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
 ///   `coord_fleet_undrain_host`: coord keeps these off its device floor and
-///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`).
-///   This door only ever attaches a DEVICE token: agent-spawn sessions carry
-///   their own JWT and never route here. So no agent holding the grant ever
-///   reaches it through this proxy. Forwarding could only matter if coord
-///   advertised them to a device, and in that case it would hand a fleet-wide
-///   capacity lever to every session on the box. That is exactly what the
-///   decision withholds from an ordinary implementation agent.
+///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`), so
+///   a dev-ops agent holds them and an ordinary implementation agent does not.
+///   Agents DO reach this door: a nonce bound to an agent (`ProxyPrincipal::Agent`)
+///   forwards with that agent's own JWT. But coord gives an agent token with NO
+///   `coord.agent_tool_access` rows its whole UN-CURATED catalog (`allow ==
+///   None`), which includes these four. Forwarding them would therefore hand a
+///   fleet-wide capacity lever to every spawned agent that has no rows, which is
+///   exactly the agent the decision withholds them from. They stay withheld
+///   here until coord curates row-less agents; then move them to the allowlist
+///   and let coord's per-agent grant decide.
 /// * `coord_push_credential`: code publication. It mints a `contents:write`
 ///   token for ANY repository under a tenant-bound owner, including existing
 ///   ones, which is a raw push that bypasses the PR path. That is a stronger
@@ -5849,6 +5881,28 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 ///   operator's release lever under the served `security-surface-implement-tier`
 ///   setting `draft-required` ("the operator undrafts to release it to the
 ///   train").
+///
+/// Two more are recorded here because coord grants them on the device floor and
+/// this list masks them on purpose. They were found while classifying the
+/// eleven above:
+///
+/// * `coord_create_pr`: coord grants it on the device floor (operator decision
+///   2026-08-04), and this door MASKS it anyway. That is a recorded deselection,
+///   not drift: served policy `git-operations`
+///   `masked-is-not-missing-and-the-loopback-door-precedes-the-fallback`, and the
+///   non-goal of plan `2026-08-22-primary-runner-build-drift-reads-as-a-policy-boundary`
+///   ("Do not allowlist it"). Sessions open PRs through the loopback
+///   `POST /vcs/pull-requests` door instead.
+/// * `coord_cancel_merge`: coord also put it on the device floor (2026-08-09,
+///   plan `2026-07-30-coord-tenant-self-service-merge-recovery`, coord#1409).
+///   Its HTTP twin `POST /pr-merge/tenant/proposals/:id/cancel` admits a device,
+///   so a session that must withdraw its own tenant's proposal still has that
+///   door. It stays withheld HERE for the same reason as `coord_create_pr`: the
+///   non-goal of plan
+///   `2026-08-22-primary-runner-build-drift-reads-as-a-policy-boundary` names it
+///   among the exclusions that are "decisions, not drift". It was explicitly
+///   left unmoved when `coord_reevaluate` was granted (2026-08-31). Reversing it
+///   is a decision to make on its own, not as a side effect of a parity sweep.
 const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
     "coord_attest_advisory_ci_override",
     "coord_attest_escalate_override",
@@ -5979,6 +6033,8 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         // as `/health`'s `coordMcpDrift`. `null` = no `tools/list` observed
         // since boot (UNKNOWN, not zero); `{driftedTools: [], …}` = clean.
         "coordMcpDrift": observed_coord_mcp_drift_json(),
+        // The reverse direction, same producer as `/health`'s field.
+        "coordMcpForwardedUnadvertised": observed_forwarded_unadvertised_json(),
         // Say what the numbers mean, in the response, because a reader who has
         // to go find the rule will assume the wrong one.
         "readThis": "These are the lists COMPILED INTO THE RUNNING BINARY. A -32601 from \
@@ -6264,6 +6320,105 @@ fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Ve
         }
     });
     true
+}
+
+/// The other direction of the parity check. Returns the exact names this door
+/// FORWARDS (`COORD_MCP_ALLOWED_TOOLS`) that coord's own `tools/list` for this
+/// principal does NOT advertise. coord filters `tools/list` by the caller's
+/// allow-set, so every name here is one this door would forward and coord would
+/// refuse: a capability the allowlist claims and the session does not have.
+///
+/// `None` means UNKNOWN, never "clean": the request is not a `tools/list`, the
+/// response is not JSON, there is no `result.tools` array, or coord paginated
+/// the list (`result.nextCursor`). One page cannot show what a later page
+/// carries. Names forwarded only through `COORD_MCP_ALLOWED_TOOL_PREFIXES` are
+/// never reported; an enumerated `coord_query_*` entry is. A name in this set
+/// is not necessarily wrong: an entry may land ahead of coord's grant on
+/// purpose (see the allowlist note). It is reported so that a
+/// forwarded-but-ungranted name is a visible, per-box fact, not a silent
+/// `-32601`.
+fn coord_mcp_forwarded_unadvertised(request: &[u8], response: &[u8]) -> Option<Vec<String>> {
+    if !coord_mcp_request_is_tools_list(request) {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(response).ok()?;
+    let result = parsed.get("result")?;
+    if result.get("nextCursor").is_some_and(|c| !c.is_null()) {
+        return None;
+    }
+    let advertised: std::collections::HashSet<&str> = result
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    Some(
+        COORD_MCP_ALLOWED_TOOLS
+            .iter()
+            .filter(|name| !advertised.contains(**name))
+            .map(|name| name.to_string())
+            .collect(),
+    )
+}
+
+/// One forwarded-but-unadvertised observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedForwardedUnadvertised {
+    /// Forwarded names coord did not advertise, sorted. Empty = observed clean.
+    names: Vec<String>,
+    /// Unix millis of the `tools/list` that produced it.
+    observed_at: i64,
+}
+
+/// The last forwarded-but-unadvertised observation (see
+/// [`coord_mcp_forwarded_unadvertised`]), served beside `coordMcpDrift`. Only a
+/// DEVICE principal's `tools/list` is recorded: coord's answer differs by
+/// principal (device floor, a role template, or an un-curated agent's whole
+/// catalog), and the allowlist's parity target is the device floor. An agent's
+/// answer would report most of the list and overwrite the device reading.
+static LAST_OBSERVED_FORWARDED_UNADVERTISED: std::sync::OnceLock<
+    std::sync::Mutex<Option<ObservedForwardedUnadvertised>>,
+> = std::sync::OnceLock::new();
+
+fn observed_forwarded_unadvertised_cell(
+) -> &'static std::sync::Mutex<Option<ObservedForwardedUnadvertised>> {
+    LAST_OBSERVED_FORWARDED_UNADVERTISED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Record one observation. Returns `true` when the set CHANGED from the last
+/// one this process recorded, so the caller warns once per distinct set rather
+/// than on every `tools/list`.
+fn record_forwarded_unadvertised_in(
+    cell: &std::sync::Mutex<Option<ObservedForwardedUnadvertised>>,
+    names: Vec<String>,
+) -> bool {
+    let Ok(mut g) = cell.lock() else {
+        return false;
+    };
+    let changed = g.as_ref().map(|o| o.names != names).unwrap_or(true);
+    *g = Some(ObservedForwardedUnadvertised {
+        names,
+        observed_at: chrono::Utc::now().timestamp_millis(),
+    });
+    changed
+}
+
+/// Wire shape: `null` = never observed (UNKNOWN); otherwise the names, their
+/// count and when. Same producer for `/health` and `/coord-mcp/tool-policy`.
+fn observed_forwarded_unadvertised_json() -> serde_json::Value {
+    match observed_forwarded_unadvertised_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+    {
+        Some(o) => serde_json::json!({
+            "principal": "device",
+            "forwardedUnadvertisedTools": o.names,
+            "forwardedUnadvertisedCount": o.names.len(),
+            "observedAt": o.observed_at,
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// What a `tools/list` entry with no string `name` is recorded as in the
@@ -8697,6 +8852,33 @@ async fn coord_mcp_proxy_handler(
     } else {
         bytes
     };
+
+    // The reverse direction, measured on the UNFILTERED upstream answer: names
+    // this door forwards that coord does not grant a DEVICE principal. Warned
+    // once per distinct set; served on `/health` + `/coord-mcp/tool-policy`.
+    // An agent's `tools/list` is not recorded (its grant is a different set).
+    let unadvertised = if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
+        coord_mcp_forwarded_unadvertised(&body, &bytes)
+    } else {
+        None
+    };
+    if let Some(unadvertised) = unadvertised {
+        let count = unadvertised.len();
+        let joined = unadvertised.join(",");
+        if record_forwarded_unadvertised_in(observed_forwarded_unadvertised_cell(), unadvertised)
+            && count > 0
+        {
+            // INFO, not WARN: a known backlog of forwarded names sits off coord's
+            // device floor (see the allowlist note), so a WARN on every boot would
+            // train readers to ignore it. `/health` serves the set.
+            info!(
+                forwarded_unadvertised_count = count,
+                forwarded_unadvertised = %joined,
+                "coord-mcp proxy: COORD_MCP_ALLOWED_TOOLS forwards tools coord does not grant \
+                 the device principal — a device session calling them gets coord's refusal"
+            );
+        }
+    }
 
     // Keep the two gates in agreement: a `tools/list` answer is filtered
     // through the same allowlist that gates `tools/call`, so this door never
@@ -17294,10 +17476,11 @@ mod memory_search_enrichment_tests {
 mod coord_mcp_body_gate_tests {
     use super::{
         coord_mcp_append_runner_local_tools, coord_mcp_body_gate,
-        coord_mcp_filter_tools_list_response, coord_mcp_runner_local_call,
-        coord_mcp_tool_is_allowed, coord_mcp_withholding_is_deliberate, CoordMcpToolsListFilter,
-        COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS, COORD_MCP_DELIBERATE_EXCLUSIONS,
-        RUNNER_LOCAL_REPORT_TOOL,
+        coord_mcp_filter_tools_list_response, coord_mcp_forwarded_unadvertised,
+        coord_mcp_runner_local_call, coord_mcp_tool_is_allowed,
+        coord_mcp_withholding_is_deliberate, record_forwarded_unadvertised_in,
+        CoordMcpToolsListFilter, COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS,
+        COORD_MCP_DELIBERATE_EXCLUSIONS, RUNNER_LOCAL_REPORT_TOOL,
     };
 
     fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
@@ -18023,9 +18206,139 @@ mod coord_mcp_body_gate_tests {
         }
     }
 
+    /// The proxy-vs-coord mismatches found beside finding `31a69d12`, pinned by
+    /// name. `coord_create_pr` and `coord_cancel_merge` are coord device grants
+    /// that this door masks on purpose (served policy `git-operations`
+    /// `masked-is-not-missing-and-the-loopback-door-precedes-the-fallback`).
+    /// `coord_merge_order` is off coord's device floor but granted to merger
+    /// agents, which reach this door with their own JWT, so it stays forwarded.
+    #[test]
+    fn proxy_and_coord_grant_mismatches_are_decided() {
+        assert!(coord_mcp_tool_is_allowed("coord_merge_order"));
+        assert!(!coord_mcp_withholding_is_deliberate("coord_merge_order"));
+        for tool in ["coord_create_pr", "coord_cancel_merge"] {
+            assert!(
+                !coord_mcp_tool_is_allowed(tool),
+                "{tool} must not be forwarded"
+            );
+            assert!(
+                coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must be a recorded exclusion, not drift"
+            );
+        }
+    }
+
+    fn tools_list_answer(names: &[&str], next_cursor: Option<&str>) -> Vec<u8> {
+        let tools: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect();
+        let mut result = serde_json::json!({ "tools": tools });
+        if let Some(c) = next_cursor {
+            result["nextCursor"] = serde_json::json!(c);
+        }
+        serde_json::to_vec(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+            .unwrap()
+    }
+
+    /// Proxy ⊆ coord grant. When coord advertises every forwarded name, the
+    /// reverse check reports nothing. Drop one from coord's answer and exactly
+    /// that name is reported. A `coord_query_*` name forwarded only by prefix is
+    /// never reported, but an ENUMERATED one is. A tool coord advertises that
+    /// this door does not forward is the OTHER direction's business, so it is
+    /// not reported here either.
+    #[test]
+    fn forwarded_unadvertised_reports_exactly_the_forwarded_names_coord_withholds() {
+        let mut all: Vec<&str> = COORD_MCP_ALLOWED_TOOLS.to_vec();
+        all.push("coord_create_pr");
+        all.push("coord_query_anything");
+        let clean = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&all, None),
+        );
+        assert_eq!(
+            clean,
+            Some(Vec::new()),
+            "every forwarded name advertised = clean"
+        );
+
+        let missing = COORD_MCP_ALLOWED_TOOLS[0];
+        let without: Vec<&str> = all.iter().copied().filter(|n| *n != missing).collect();
+        let got = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&without, None),
+        );
+        assert_eq!(got, Some(vec![missing.to_string()]));
+
+        // An enumerated `coord_query_*` entry IS reported when coord omits it.
+        let enumerated = "coord_query_verification_metrics";
+        assert!(COORD_MCP_ALLOWED_TOOLS.contains(&enumerated));
+        let without_query: Vec<&str> = all.iter().copied().filter(|n| *n != enumerated).collect();
+        let got = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&without_query, None),
+        );
+        assert_eq!(got, Some(vec![enumerated.to_string()]));
+    }
+
+    /// UNKNOWN is never reported as clean: a non-`tools/list` request, a
+    /// non-JSON body, a body with no `result.tools`, and a PAGINATED list (one
+    /// page cannot show what a later page carries) all answer `None`.
+    #[test]
+    fn forwarded_unadvertised_is_unknown_when_the_list_cannot_be_read_whole() {
+        let call =
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_orient"}}"#;
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(call, &tools_list_answer(&[], None)),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(TOOLS_LIST_REQ.as_bytes(), b"<html>gateway</html>"),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                &tools_list_answer(&["coord_orient"], Some("page-2"))
+            ),
+            None
+        );
+        // A batch `tools/list` answers with an array; no `result` at the top.
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                br#"[{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}]"#
+            ),
+            None
+        );
+    }
+
+    /// The warn fires once per DISTINCT set, not on every `tools/list`.
+    #[test]
+    fn forwarded_unadvertised_warns_once_per_distinct_set() {
+        let cell = std::sync::Mutex::new(None);
+        assert!(record_forwarded_unadvertised_in(
+            &cell,
+            vec!["coord_a".into()]
+        ));
+        assert!(!record_forwarded_unadvertised_in(
+            &cell,
+            vec!["coord_a".into()]
+        ));
+        assert!(record_forwarded_unadvertised_in(&cell, vec![]));
+        assert!(!record_forwarded_unadvertised_in(&cell, vec![]));
+    }
+
     /// Finding `31a69d12`: the eleven names coord advertised that this door had
     /// left unclassified. A literal enumeration of the decision recorded in
-    /// coord finding `73b15a9b`. Moving any name between the two lists reds
+    /// coord finding `4ba64e8b`. Moving any name between the two lists reds
     /// this test by name, so the decision cannot change by drift.
     #[test]
     fn finding_31a69d12_drift_is_classified() {
