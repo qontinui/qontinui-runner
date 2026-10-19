@@ -498,10 +498,26 @@ its `<picture>` (or per type with `sources`, the AVIF/WebP-plus-fallback
 shape), or an element's CSS `background-image`. It answers only after the
 browser **decoded** the candidate and `currentSrc` names it; an override it
 cannot confirm is rolled back and fails (`DECODE_FAILED`, `DECODE_TIMEOUT`,
-`CURRENT_SRC_MISMATCH`). `mediaOverrideRestore` puts every attribute back and
-**verifies** it reads back; `mediaOverrideList` returning `active: []` is the
-proof the page ended restored. A TTL (`ttlMs`, default 120 s) restores the page
-by itself if the caller dies.
+`CURRENT_SRC_MISMATCH`). A `loading="lazy"` slot is switched to eager loading
+for the override's lifetime, so an offscreen slot below the fold still decodes
+(and gets `lazy` back on restore). Candidate URLs must be http(s), `blob:`,
+`data:image/*` or relative to the page — anything else is refused as
+`UNSUPPORTED_URL_SCHEME` — and an override that a restore, the TTL or a later
+override on the same slot overtook while it decoded answers
+`OVERRIDE_CANCELLED`, not success. A TTL (`ttlMs`, default 120 s) restores the
+page by itself if the caller dies.
+
+`mediaOverrideRestore` puts every attribute back and then verifies what the
+browser RENDERS, not what it just wrote: the slot's `currentSrc` must be back
+on one of the page's original URLs (it waits for the original to load, bounded
+by the override's `decodeTimeoutMs`), or, for a background, the computed
+`background-image` must no longer show the candidate. **A clean restore is all
+three of: `status: "restored"`, `verified: true`, and `mediaOverrideList` →
+`active: []`.** `status: "restored_with_drift"` (a non-empty `drift`: the app
+rewrote a value after the swap and it was left as the app set it) is never
+verified, and `verified: false` with a `rendered.*` mismatch means the page may
+still show the candidate — both are an **UNKNOWN restore**, never a clean
+page, whatever `active` says.
 
 **Which surfaces serve it — it is a DEV CONTROL:**
 
@@ -509,7 +525,7 @@ by itself if the caller dies.
 |---|---|
 | `ui-bridge-inject` (the injected runtime, a browser the CLI launched) | **served** — the path this arm uses |
 | an embedded SDK whose app passes `features.devControls` on a dev build | served |
-| any production deployment, a published runner's own webview | `capability_unavailable_in_build` (typed refusal) |
+| any production deployment, any runner's own webview | `capability_unavailable_in_build` (typed refusal) |
 
 A refusal is UNKNOWN for the candidate, never a pass. Target a slot by
 `slotId` (its `data-ui-bridge-image-slot` value) or by a registered
@@ -561,11 +577,14 @@ page itself reported), and `results.ndjson` with one line per action. Read, per
 cell:
 
 - the `mediaOverride` line: `ready.currentSrc` is the candidate and
-  `ready.naturalWidth`/`naturalHeight` are its size in image PIXELS, measured
-  on a detached decode (the slot's own `naturalWidth` is divided by a srcset
-  density, and Chromium keeps the slot's PREVIOUS density after a swap).
-  Against the slot's rendered size × DPR, a candidate too small for its slot
-  shows here before any judge looks; `null` is unmeasured, never small;
+  `ready.naturalWidth`/`naturalHeight` are its size in image PIXELS, read from
+  the slot's own decoded image (`createImageBitmap`, no second request, so
+  `--no-cache` does not blank it) rather than the slot's `naturalWidth`, which
+  is divided by a srcset density — and Chromium keeps the slot's PREVIOUS
+  density after a swap. Against the slot's rendered size × DPR, a candidate
+  too small for its slot shows here before any judge looks; `null` is
+  unmeasured (an engine with no `createImageBitmap`, an image with no
+  intrinsic size), never small;
 - the `find` line: each media row's `mediaMetadata` envelope — `objectFit`,
   `effectiveResolution` (natural ÷ rendered × DPR), `dimsReserved`,
   `isLcpCandidate`, `clsSources`, and `encodedBodySize` keyed on `currentSrc`;
@@ -574,10 +593,15 @@ cell:
   predates that envelope answers the old shape (an `oversizeRatio`, no
   `coverage` — what qontinui.io served on 2026-10-19): there every one of those
   facts is UNKNOWN, never "absent, so fine";
-- the last two lines: `restored[].verified: true` for every override and
-  `mediaOverrideList` → `active: []`. **A cell whose list is not empty did not
-  end restored — report it, do not average it away.** A `drift` entry names an
-  attribute the app rewrote after the swap; it was left as the app set it.
+- the last two lines: every `restored[]` entry `status: "restored"` with
+  `verified: true`, and `mediaOverrideList` → `active: []`. **A cell whose list
+  is not empty did not end restored — report it, do not average it away.** An
+  entry with a non-empty `drift` (`status: "restored_with_drift"`) or
+  `verified: false` is an UNKNOWN restore for that cell even when `active` is
+  empty: `drift` names a value the app rewrote after the swap (left as the app
+  set it, so the slot shows the app's choice, possibly still the candidate),
+  and a `rendered.currentSrc` / `rendered.background-image` mismatch says the
+  browser still renders something other than the original.
 
 Hover targets are page-specific — take the id from the cell's own snapshot
 (the slot's link or card ancestor), never from this example.
@@ -594,16 +618,27 @@ stamped as `network` on every timeline result and matrix cell.
 ```bash
 # (a) The candidate ARRIVING in its slot over a slow network: the override runs
 #     concurrently with the frames, and still confirms decode before it answers.
+#     slow-3g is 2 s latency + 400 kbit/s (50 KB/s), so a 300 KB candidate takes
+#     ~8 s: decodeTimeoutMs well above that (the default 10 s is not), and
+#     frames x intervalMs (here 40 x 500 = 20 s) long enough to see it land.
 node "$INJECT" --url "$PAGE" --throttle slow-3g --no-cache --quiet \
-  --exec "captureTimeline {\"dir\":\"$WORK/arrival\",\"frames\":12,\"intervalMs\":250,\"during\":{\"action\":\"mediaOverride\",\"payload\":{\"slotId\":\"hero\",\"src\":\"$CAND\"}}}" \
+  --exec "captureTimeline {\"dir\":\"$WORK/arrival\",\"frames\":40,\"intervalMs\":500,\"during\":{\"action\":\"mediaOverride\",\"payload\":{\"slotId\":\"hero\",\"src\":\"$CAND\",\"decodeTimeoutMs\":45000}}}" \
   --exec 'mediaOverrideRestore {}' --exec 'mediaOverrideList {}'
 
 # (b) The slot's own loading-to-loaded timeline: reload under the throttle,
 #     frame 1 at the navigation commit, then read LCP/CLS from the media facts.
 node "$INJECT" --url "$PAGE" --throttle slow-3g --no-cache --quiet \
-  --exec "captureTimeline {\"dir\":\"$WORK/load\",\"frames\":16,\"intervalMs\":250,\"reload\":true}" \
+  --exec "captureTimeline {\"dir\":\"$WORK/load\",\"frames\":40,\"intervalMs\":500,\"reload\":true}" \
   --exec 'find {"mediaOnly":true,"includeHidden":true}'
 ```
+
+Size the timeline from the candidate's bytes: at 50 KB/s plus 2 s latency, the
+last frame must come after the arrival, or the frames record only the empty box
+and the "arrival" is unobserved. (a)'s `during.answeredAtMs` against the last
+frame's `offsetMs` says whether it did. The restore after a `--no-cache` run
+re-downloads the original under the same throttle; its wait is bounded by that
+`decodeTimeoutMs` too, so a short one there reads as `verified: false` — an
+UNKNOWN restore while the original is still in flight, not proof either way.
 
 (a)'s `during.answeredAtMs` is when the candidate was confirmed on screen and
 its frames show what stood in the slot until then (an empty box, the old image,
