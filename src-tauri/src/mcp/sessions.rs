@@ -1582,6 +1582,11 @@ async fn operator_touch_notification(
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> Json<serde_json::Value> {
+    // Permission-prompt capture (plan
+    // 2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote
+    // Phase 2): classify + count a `permission_prompt` payload, independently
+    // of the operator-touch emit below. Fail-open; never changes the answer.
+    crate::session::permission_prompt_capture::observe_notification(&id, &body);
     let payload: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     let outcome = crate::terminal::operator_touch_watch::on_notification_signal(&id, &payload);
@@ -1589,6 +1594,37 @@ async fn operator_touch_notification(
         "recorded": outcome.recorded,
         "kind": outcome.kind,
         "reason": outcome.reason,
+        "session": id,
+    }))
+}
+
+// =============================================================================
+// /sessions/<id>/permission-request
+// =============================================================================
+
+/// `POST /sessions/{id}/permission-request` — the Claude Code
+/// `PermissionRequest` hook's landing pad (plan
+/// `2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote`
+/// Phase 2). Phase 0 (CLI 2.1.303) found that this hook — not `Notification`
+/// — is the one that carries `tool_name` + `tool_input` for the built-in
+/// command-safety prompts, in `bypassPermissions`, `default` and subagents
+/// alike. `{id}` is the runner terminal id (`QONTINUI_TERMINAL_ID`), the same
+/// key the `/notification` pad uses, so the dialog's later `Notification` is
+/// recognized as its echo and not counted twice. Body = the raw hook payload,
+/// parsed LENIENTLY. Always 200 and observational only: the hook's caller
+/// must print nothing, so the prompt is left exactly as Claude Code shows it
+/// (D1); this answer is for curl probes and logs.
+async fn permission_request(
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Json<serde_json::Value> {
+    let outcome = crate::session::permission_prompt_capture::observe_permission_request(&id, &body);
+    let class = outcome.class();
+    Json(serde_json::json!({
+        "recorded": outcome.counted(),
+        "reason": outcome.label(),
+        "class_key": class.map(|c| c.class_key.as_str()),
+        "dossier_slug": class.map(|c| c.dossier_slug.as_str()),
         "session": id,
     }))
 }
@@ -2452,6 +2488,50 @@ mod tests {
     }
 }
 
+// =============================================================================
+// /permission-prompts/classify
+// =============================================================================
+
+/// Body of `POST /permission-prompts/classify`.
+#[derive(Debug, Default, Deserialize)]
+struct ClassifyPermissionPromptRequest {
+    /// The prompt text — pasted out of a blocked pane, or a `Notification`
+    /// `message`.
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+}
+
+/// `POST /permission-prompts/classify` — the D3 classifier as a pure,
+/// side-effect-free loopback door (plan
+/// `2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote`
+/// Phase 2), so the `/permission-prompts record` command keys a pasted prompt
+/// exactly as the Notification intake keys a captured one. Records nothing.
+/// Body is parsed leniently (empty / non-JSON → all fields absent → the
+/// `permission-prompt-unknown` class); always 200.
+async fn classify_permission_prompt(body: axum::body::Bytes) -> Json<serde_json::Value> {
+    let req: ClassifyPermissionPromptRequest = serde_json::from_slice(&body).unwrap_or_default();
+    let class = crate::session::permission_prompt_capture::classify(
+        req.text.as_deref(),
+        req.tool_name.as_deref(),
+        req.command.as_deref(),
+    );
+    let redacted = req
+        .text
+        .as_deref()
+        .map(crate::session::permission_prompt_capture::redact_pasted);
+    Json(serde_json::json!({
+        "class_key": class.class_key,
+        "dossier_slug": class.dossier_slug,
+        "redacted": redacted,
+        "reason": class.reason.as_deref().map(crate::session::permission_prompt_capture::redact_pasted),
+        "tool": class.tool,
+    }))
+}
+
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/sessions/spawn", post(spawn_session))
@@ -2470,6 +2550,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/sessions/{id}/notification",
             post(operator_touch_notification),
         )
+        .route(
+            "/sessions/{id}/permission-request",
+            post(permission_request),
+        )
         .route("/sessions/{id}/policy-context", get(policy_context))
         .route("/sessions/policy-context-stats", get(policy_context_stats))
         // Mark a session's WORK finished (or unmark it). NOTE: this family has
@@ -2486,4 +2570,290 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/sessions/transcript-bind", post(transcript_bind))
         // The tailer's coverage report — the read side of transcript-bind.
         .route("/sessions/transcript-coverage", get(transcript_coverage))
+        // The D3 permission-prompt classifier, pure (plan 2026-10-14 Phase 2).
+        .route(
+            "/permission-prompts/classify",
+            post(classify_permission_prompt),
+        )
+}
+
+/// Permission-prompt capture through the routes the population uses (plan
+/// `2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote`
+/// Phase 2). The handlers take no `State`, so each test mounts the REAL
+/// handler fn on its REAL path; `both_routes_are_registered_by_routes` pins
+/// that `routes()` registers those same paths.
+#[cfg(test)]
+mod permission_prompt_capture_route_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    async fn post_json(app: Router, uri: &str, body: String) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn notification_app() -> Router {
+        Router::new().route(
+            "/sessions/{id}/notification",
+            post(operator_touch_notification),
+        )
+    }
+
+    fn permission_request_app() -> Router {
+        Router::new().route(
+            "/sessions/{id}/permission-request",
+            post(permission_request),
+        )
+    }
+
+    fn class_count(slug: &str) -> u64 {
+        crate::session::permission_prompt_capture::snapshot()
+            .iter()
+            .filter(|b| b.dossier_slug == slug)
+            .map(|b| b.count)
+            .sum()
+    }
+
+    /// ARMING (detect_deliver), primary entry: a `PermissionRequest` payload —
+    /// the Phase 0 raw shape — posted to `/sessions/{id}/permission-request`
+    /// increments the aggregator's class count, and the same dialog's
+    /// `Notification` ~6 s later does NOT count it again.
+    #[tokio::test]
+    async fn a_permission_request_increments_the_class_count_once_per_dialog() {
+        // A command token no other test uses, so this class's global bucket
+        // is this test's alone.
+        let command = "qzx7armingprobe $PROBE_EMPTY_VAR/";
+        let payload = serde_json::json!({
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "C:\\work\\repo",
+            "prompt_id": "p1",
+            "permission_mode": "bypassPermissions",
+            "effort": {"level": "medium"},
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": {"command": command, "description": "probe"},
+            "permission_suggestions": [],
+        });
+        let class = crate::session::permission_prompt_capture::parse_payload(&payload)
+            .unwrap()
+            .class;
+        assert_eq!(class.class_key, "permission-prompt-bash-qzx7armingprobe");
+        let before = class_count(&class.dossier_slug);
+
+        let (status, body) = post_json(
+            permission_request_app(),
+            "/sessions/term-pr-arming/permission-request",
+            payload.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["recorded"], true, "{body}");
+        assert_eq!(body["class_key"], class.class_key.as_str());
+        assert_eq!(body["dossier_slug"], class.dossier_slug.as_str());
+        assert_eq!(class_count(&class.dossier_slug), before + 1);
+        let bucket = crate::session::permission_prompt_capture::snapshot()
+            .into_iter()
+            .find(|b| b.dossier_slug == class.dossier_slug)
+            .unwrap();
+        assert_eq!(bucket.safety_class(), Some(true));
+
+        // The dialog's Notification echo on the same terminal is not counted
+        // (its own class would be `permission-prompt-bash`).
+        let bash_only = crate::session::permission_prompt_capture::classify(
+            Some("Claude needs your permission to use Bash"),
+            None,
+            None,
+        );
+        let bash_before = class_count(&bash_only.dossier_slug);
+        let (status, body) = post_json(
+            notification_app(),
+            "/sessions/term-pr-arming/notification",
+            serde_json::json!({
+                "hook_event_name": "Notification",
+                "notification_type": "permission_prompt",
+                "message": "Claude needs your permission to use Bash",
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            class_count(&bash_only.dossier_slug),
+            bash_before,
+            "echo counted"
+        );
+        assert_eq!(class_count(&class.dossier_slug), before + 1);
+    }
+
+    #[tokio::test]
+    async fn the_permission_request_route_answers_200_on_garbage() {
+        for body in ["", "not json", "{}", "{\"hook_event_name\":\"Stop\"}"] {
+            let (status, json) = post_json(
+                permission_request_app(),
+                "/sessions/term-garbage/permission-request",
+                body.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body:?} -> {json}");
+            assert_eq!(json["recorded"], false);
+            assert_eq!(json["session"], "term-garbage");
+        }
+    }
+
+    /// ARMING (detect_deliver): a `permission_prompt` Notification posted to
+    /// `/sessions/{id}/notification` increments the aggregator's class count.
+    #[tokio::test]
+    async fn a_permission_prompt_notification_increments_the_class_count() {
+        // A reason no other test uses, so the global aggregator's bucket for
+        // this class is this test's alone.
+        let message = "Arming probe qzx7 capture reason for the notification route: $v in `rm $v`";
+        let class = crate::session::permission_prompt_capture::classify(Some(message), None, None);
+        let before = class_count(&class.dossier_slug);
+        let payload = serde_json::json!({
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": message,
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/home/u/ws/repo",
+        });
+        let (status, body) = post_json(
+            notification_app(),
+            "/sessions/term-arming/notification",
+            payload.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The operator-touch half answers as before (no app handle in a test).
+        assert_eq!(body["session"], "term-arming");
+        assert_eq!(body["recorded"], false);
+        assert_eq!(class_count(&class.dossier_slug), before + 1);
+
+        // A second prompt of the same class with a different variable counts
+        // in the SAME class.
+        let variant = payload.to_string().replace("$v", "$other");
+        let _ = post_json(
+            notification_app(),
+            "/sessions/term-arming/notification",
+            variant,
+        )
+        .await;
+        assert_eq!(class_count(&class.dossier_slug), before + 2);
+    }
+
+    #[tokio::test]
+    async fn the_notification_route_still_answers_200_on_garbage() {
+        for body in ["", "not json", "{\"notification_type\":\"idle_prompt\"}"] {
+            let (status, json) = post_json(
+                notification_app(),
+                "/sessions/term-garbage/notification",
+                body.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body:?} -> {json}");
+            assert_eq!(json["session"], "term-garbage");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_classify_route_matches_the_classifier_and_records_nothing() {
+        let app = || {
+            Router::new().route(
+                "/permission-prompts/classify",
+                post(classify_permission_prompt),
+            )
+        };
+        let text = "Dangerous rm operation on possibly-empty variable path: $f in `rm -f $f`";
+        let want = crate::session::permission_prompt_capture::classify(Some(text), None, None);
+        let before = class_count(&want.dossier_slug);
+        let (status, body) = post_json(
+            app(),
+            "/permission-prompts/classify",
+            serde_json::json!({"text": text}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["class_key"], want.class_key);
+        assert_eq!(body["dossier_slug"], want.dossier_slug);
+        assert_eq!(body["redacted"], text, "nothing secret to redact here");
+
+        // A paste carrying its own parsed command: the command line is not
+        // taken for the reason, and the response text is runner-redacted.
+        let paste = format!(
+            "TOKEN={} rmdir $X/\n\nClaude needs your permission to use Bash",
+            "ghp_zzz"
+        );
+        let (_, body) = post_json(
+            app(),
+            "/permission-prompts/classify",
+            serde_json::json!({"text": paste, "tool_name": "Bash", "command": "rmdir $X/"})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(body["class_key"], "permission-prompt-bash-rmdir", "{body}");
+        assert!(
+            !body["redacted"].as_str().unwrap().contains("ghp_zzz"),
+            "{body}"
+        );
+        assert_eq!(class_count(&want.dossier_slug), before, "classify is pure");
+
+        let (_, body) = post_json(
+            app(),
+            "/permission-prompts/classify",
+            serde_json::json!({"tool_name": "Bash", "command": "rm -f x"}).to_string(),
+        )
+        .await;
+        assert_eq!(body["class_key"], "permission-prompt-bash-rm");
+
+        let (status, body) =
+            post_json(app(), "/permission-prompts/classify", "garbage".to_string()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["class_key"], "permission-prompt-unknown");
+    }
+
+    /// The tests above mount the handlers themselves, so a tree-wide route
+    /// scan would find these paths in THIS module and prove nothing. Read the
+    /// body of `routes()` alone instead.
+    #[test]
+    fn both_routes_are_registered_by_routes() {
+        let src = include_str!("sessions.rs");
+        let (_, from_routes) = src
+            .split_once("pub fn routes() -> Router<Arc<ApiState>> {")
+            .expect("routes() is in this file");
+        let (body, _) = from_routes.split_once("\n}\n").expect("routes() closes");
+        for (path, handler) in [
+            (
+                "\"/sessions/{id}/permission-request\"",
+                "post(permission_request)",
+            ),
+            (
+                "\"/sessions/{id}/notification\"",
+                "post(operator_touch_notification)",
+            ),
+            (
+                "\"/permission-prompts/classify\"",
+                "post(classify_permission_prompt)",
+            ),
+        ] {
+            let (_, tail) = body
+                .split_once(path)
+                .unwrap_or_else(|| panic!("{path} not in routes()"));
+            let registration = tail.split(".route(").next().unwrap_or(tail);
+            assert!(
+                registration.contains(handler),
+                "{path} not routed to {handler}"
+            );
+        }
+    }
 }
