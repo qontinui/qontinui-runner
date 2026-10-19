@@ -1203,7 +1203,7 @@ mod tests {
             "the binary embeds a different PostgreSQL release than the pin. Either \
              POSTGRESQL_VERSION is set in the build environment (it overrides the \
              [env] pin), or a stale postgresql_embedded OUT_DIR survived a pin change: \
-             run `bash scripts/ci/purge-stale-bundled-postgres.sh <target-dir>` and rebuild"
+             run `node scripts/ci/purge-stale-bundled-postgres.mjs <target-dir>` and rebuild"
         );
     }
 

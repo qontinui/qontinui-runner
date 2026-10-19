@@ -515,8 +515,7 @@ jobs:
       # embedded_pg::tests::bundled_postgres_is_the_pinned_release fails if a
       # stale unit gets past this step.
       - name: Purge cached bundled-PostgreSQL units that do not match the pin
-        shell: bash
-        run: bash scripts/ci/purge-stale-bundled-postgres.sh
+        run: node scripts/ci/purge-stale-bundled-postgres.mjs
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
