@@ -946,7 +946,7 @@ pub(crate) fn latest() -> Option<Arc<CanonicalCorpus>> {
 /// The production mirror: under the per-instance runner config dir, fetching
 /// the URL [`resolve_url`] names. `None` when the platform has no config dir.
 fn default_mirror() -> Option<Mirror> {
-    let base = dirs::config_dir()?.join("com.qontinui.runner");
+    let base = qontinui_runner_lib::instance_env::runner_config_base()?;
     let git_dir = crate::instance::scope_path(&base).join(MIRROR_DIR);
     Some(Mirror::new(git_dir, resolve_url()))
 }

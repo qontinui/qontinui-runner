@@ -1579,6 +1579,11 @@ async fn reacquire_and_restore_session_worktree(
     //    original claim → idempotent renew within TTL / clean re-take after.
     let agent_session_id = crate::drain::stable_ai_session_id(task_run_id);
     let intent = format!("resume chat session {task_run_id}");
+    // Plan 2026-10-10 D7 (narrowed by vet V5): every NON-PRIMARY repo the
+    // session had its own worktree for is plausibly edited, so it is re-requested
+    // as an edit sibling — otherwise a co-requested consumer that declares it
+    // would have it redirected at the read-only sibling store on resume.
+    let edit_siblings = crate::agent_worktree::edit_sibling::resume_edit_siblings(&repos);
 
     match acquire(AcquireRequest {
         repos: &repos,
@@ -1589,6 +1594,7 @@ async fn reacquire_and_restore_session_worktree(
         agent_session_id: Some(agent_session_id),
         spawn_tenant: None,
         shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
+        edit_siblings: &edit_siblings,
     })
     .await
     {

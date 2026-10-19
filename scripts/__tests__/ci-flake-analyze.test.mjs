@@ -17,6 +17,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  ghApiText,
   normalizeLogLine,
   hasCargoTestOutput,
   parseFailingTests,
@@ -583,4 +584,58 @@ test("unparsed buckets downgrade a negative to ambiguous, never to a clean NOT M
   assert.equal(r.met, false);
   assert.equal(r.ambiguous, true);
   assert.equal(r.verdict, "MET-AMBIGUOUSLY (not met over what could be read)");
+});
+
+// ---------------------------------------------------------------------------
+// ghApiText — gh's escape-sequence refusal (run 38263126224)
+// ---------------------------------------------------------------------------
+
+const ESCAPE_REFUSAL =
+  "the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway";
+
+function refusingGh(onRetry) {
+  const calls = [];
+  const call = (args) => {
+    calls.push(args);
+    if (!args.includes("--allow-escape-sequences")) {
+      const e = new Error("Command failed: gh api");
+      e.stderr = ESCAPE_REFUSAL;
+      throw e;
+    }
+    return onRetry();
+  };
+  return { calls, call };
+}
+
+test("ghApiText: the escape-sequence refusal is retried once with --allow-escape-sequences", () => {
+  const { calls, call } = refusingGh(() => "\u001b[31mFAILED\u001b[0m");
+  assert.equal(ghApiText("repos/o/r/actions/jobs/1/logs", call), "\u001b[31mFAILED\u001b[0m");
+  assert.deepEqual(calls, [
+    ["api", "repos/o/r/actions/jobs/1/logs"],
+    ["api", "repos/o/r/actions/jobs/1/logs", "--allow-escape-sequences"],
+  ]);
+});
+
+test("ghApiText: a failed retry says the escape refusal is why it retried", () => {
+  const { call } = refusingGh(() => {
+    const e = new Error("Command failed");
+    e.stderr = "unknown flag: --allow-escape-sequences";
+    throw e;
+  });
+  assert.throws(
+    () => ghApiText("p", call),
+    (err) =>
+      /refused escape sequences/.test(err.stderr) && /unknown flag/.test(err.stderr),
+  );
+});
+
+test("ghApiText: any other failure is rethrown unchanged, with no retry", () => {
+  const calls = [];
+  const original = Object.assign(new Error("HTTP 410"), { stderr: "gone (HTTP 410)" });
+  const call = (args) => {
+    calls.push(args);
+    throw original;
+  };
+  assert.throws(() => ghApiText("p", call), (err) => err === original);
+  assert.equal(calls.length, 1);
 });
