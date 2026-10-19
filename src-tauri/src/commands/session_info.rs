@@ -1417,6 +1417,8 @@ mod tests {
         let unresolvable = crate::coord_mcp::tenant_unresolvable_error();
         assert!(refusal_reason(&unresolvable)
             .starts_with("COORD_MCP_PROXY_TENANT_UNRESOLVABLE: this machine"));
+    }
+
     /// A degraded LISTING row names its session on the wire
     /// (`claudeSessionId`) beside its reason, so the client can attach the
     /// real reason to the row; the single-session degraded envelope does not.
