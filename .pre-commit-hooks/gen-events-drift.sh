@@ -491,7 +491,6 @@ elif [ -f "$PENDING_LIB" ]; then
                 # shellcheck disable=SC2086  # one type name per word, by construction
                 if pending_registration_absorb "$BASELINE_DIR" "$SCRATCH_DIR" \
                         "$SCRATCH_ROOT/baseline-pending-absorbed" \
-                        "$SCHEMAS_DIR" \
                         $PENDING_ACTIVE_TYPES; then
                     # Only a copy that actually absorbed something replaces the
                     # baseline, so the OK message never claims an absorption.
