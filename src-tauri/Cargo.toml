@@ -150,9 +150,10 @@ qontinui-db = { path = "./clorinde" }
 # configured/reachable (see src/embedded_pg.rs), instead of panicking on boot.
 # `bundled` embeds the PG archive at COMPILE time — no runtime download, offline
 # first run. Provisioning only; the tokio-postgres/clorinde query layer above is
-# unchanged. Version resolves via the POSTGRESQL_VERSION build env (defaults to
-# the crate's latest); keep it consistent across builds for on-disk cluster
-# compatibility.
+# unchanged. Version resolves via the POSTGRESQL_VERSION build env, which is
+# PINNED in src-tauri/.cargo/config.toml. Unset, it floats to upstream's newest
+# release (see that file for why it must not); keep it consistent across builds
+# for on-disk cluster compatibility.
 postgresql_embedded = { version = "0.20.2", features = ["bundled"] }
 qontinui-spec-check = { path = "../crates/spec-check" }
 # Carved out of this crate's own module tree (plan
