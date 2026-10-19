@@ -165,12 +165,12 @@ impl TrackedPaths {
             if unknown_in_repo {
                 tracing::warn!(
                     root = %root.display(),
-                    "provision guard: tracked-file probe did not answer (git missing, failed or timed out);                      root is inside a repository, so existing destinations are kept (fleet_skills decides per skill)"
+                    "provision guard: tracked-file probe did not answer (git missing, failed or timed out); root is inside a repository, so existing destinations are kept (fleet_skills decides per skill)"
                 );
             } else {
                 tracing::debug!(
                     root = %root.display(),
-                    "provision guard: tracked-file probe did not answer; root is not inside a                      repository, so destinations are written as before"
+                    "provision guard: tracked-file probe did not answer; root is not inside a repository, so destinations are written as before"
                 );
             }
             return Self {

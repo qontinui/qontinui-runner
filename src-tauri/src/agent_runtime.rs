@@ -13069,7 +13069,7 @@ mod tests {
             crate::fleet_agents::embedded_agent_names()
                 .iter()
                 .any(|n| n == "code-reviewer.md"),
-            "fixture: code-reviewer.md must be an embedded definition, or the              floor half of this test pins nothing"
+            "fixture: code-reviewer.md must be an embedded definition, or the floor half of this test pins nothing"
         );
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
@@ -13124,7 +13124,7 @@ mod tests {
             crate::fleet_agents::embedded_agent_names()
                 .iter()
                 .any(|n| n == "merge-specialist.md"),
-            "fixture: merge-specialist.md must also be embedded, or the floor              never writes it first and this pins nothing"
+            "fixture: merge-specialist.md must also be embedded, or the floor never writes it first and this pins nothing"
         );
 
         // A linked-worktree `.git` FILE whose gitdir is gone: the probe cannot
@@ -13132,8 +13132,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         std::fs::write(
             wt.path().join(".git"),
-            b"gitdir: /nonexistent/qontinui-agent-defs-unknown-probe-test
-",
+            b"gitdir: /nonexistent/qontinui-agent-defs-unknown-probe-test\n",
         )
         .unwrap();
         let dst = wt.path().join(".claude").join("agents");
