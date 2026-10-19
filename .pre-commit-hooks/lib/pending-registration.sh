@@ -72,7 +72,14 @@ pending_registration_python() {
     return 1
 }
 
-# pending_registration_active_types <schemas_dir>
+# pending_registration_active_types <schemas_dir> <scratch_dir>
+#
+# Reads the declaration and the module from the schemas checkout's HEAD
+# COMMIT, as CI does, never from its working tree: that checkout is shared, and
+# a peer's uncommitted toml row or module edit must not be honoured here (nor
+# run with the borrowed token). Both are copied out with `git show` into
+# <scratch_dir>, which the caller owns and removes; the module is imported
+# from there, so nothing — not even `__pycache__` — can land in the checkout.
 #
 # Sets:
 #   PENDING_STATE          none | ok | unknown
@@ -81,19 +88,31 @@ pending_registration_python() {
 #   PENDING_UNKNOWN_REASON why the answer is unknown (unknown only)
 # Always returns 0: every outcome is an answer the caller must read.
 pending_registration_active_types() {
-    local schemas="$1"
+    local schemas="$1" head="$2"
     PENDING_STATE="unknown"
     PENDING_ACTIVE_TYPES=""
     PENDING_ROWS=""
     PENDING_UNKNOWN_REASON=""
 
-    local toml="$schemas/$PENDING_REGISTRATION_TOML_REL"
-    if [ ! -f "$toml" ] || ! grep -q '^\[\[pending\]\]' "$toml" 2>/dev/null; then
+    if ! git -C "$schemas" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+        PENDING_UNKNOWN_REASON="cannot read HEAD of $schemas"
+        return 0
+    fi
+    # Absent from HEAD is the one confident "nothing declared". Any other
+    # shape question (how the table is spelled, whether it is empty) is the
+    # module's to answer, so a valid file is never dismissed by a grep here.
+    if ! git -C "$schemas" cat-file -e "HEAD:$PENDING_REGISTRATION_TOML_REL" 2>/dev/null; then
         PENDING_STATE="none"
         return 0
     fi
-    if [ ! -f "$schemas/$PENDING_REGISTRATION_MODULE_REL" ]; then
-        PENDING_UNKNOWN_REASON="$PENDING_REGISTRATION_TOML_REL declares waits but $PENDING_REGISTRATION_MODULE_REL is missing"
+    mkdir -p "$head/codegen" "$head/scripts" || {
+        PENDING_UNKNOWN_REASON="cannot create $head"; return 0; }
+    if ! git -C "$schemas" show "HEAD:$PENDING_REGISTRATION_TOML_REL" > "$head/$PENDING_REGISTRATION_TOML_REL" 2>/dev/null; then
+        PENDING_UNKNOWN_REASON="cannot read HEAD:$PENDING_REGISTRATION_TOML_REL"
+        return 0
+    fi
+    if ! git -C "$schemas" show "HEAD:$PENDING_REGISTRATION_MODULE_REL" > "$head/$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null; then
+        PENDING_UNKNOWN_REASON="$PENDING_REGISTRATION_TOML_REL declares waits but HEAD has no $PENDING_REGISTRATION_MODULE_REL"
         return 0
     fi
     local py
@@ -147,7 +166,7 @@ try:
 except Exception as exc:
     print("ERROR\t%s: %s" % (type(exc).__name__, exc))
     sys.exit(3)
-' "$schemas/scripts" "$schemas" 2>&1)" || rc=$?
+' "$head/scripts" "$head" 2>&1)" || rc=$?
     # A Windows Python ends its lines with CRLF; a CR left on a type name would
     # make it match no file and silently absorb nothing.
     out="$(printf '%s' "$out" | tr -d '\r')"
@@ -221,6 +240,7 @@ _pending_registration_drop_line() {
 # line ending in CR does not match CI's `^...$` either. Writes nothing. Exit 0
 # when the shape holds, else prints why and exits 1.
 PENDING_REGISTRATION_PY_DIR_REL="src/qontinui_schemas/generated"
+PENDING_REGISTRATION_TS_DIR_REL="ts/src/generated"
 _pending_registration_py_shape() {
     local schemas="$1" t="$2" barrel l module="" from_count=0 all_count=0
     if ! barrel="$(git -C "$schemas" show "HEAD:$PENDING_REGISTRATION_PY_DIR_REL/__init__.py" 2>/dev/null)"; then
@@ -295,6 +315,17 @@ pending_registration_absorb() {
         line="export type { $t } from './$t';"
         if [ ! -f "$base/$t.d.ts" ]; then
             PENDING_NOT_ABSORBED+="$t: not in the baseline"$'\n'; continue
+        fi
+        # CI's absorb_set asks these of HEAD, not of the working tree: the
+        # file is committed, and its export line is committed exactly once.
+        # (Python's splitlines, which CI uses for that count, drops a CR.)
+        if ! git -C "$schemas" cat-file -e "HEAD:$PENDING_REGISTRATION_TS_DIR_REL/$t.d.ts" 2>/dev/null; then
+            PENDING_NOT_ABSORBED+="$t: shape: $t.d.ts is not in HEAD"$'\n'; continue
+        fi
+        count="$(git -C "$schemas" show "HEAD:$PENDING_REGISTRATION_TS_DIR_REL/index.ts" 2>/dev/null \
+            | tr -d '\r' | grep -cxF -- "$line" || true)"
+        if [ "$count" != "1" ]; then
+            PENDING_NOT_ABSORBED+="$t: shape: its export line is in the committed index.ts ${count:-0} times, not once"$'\n'; continue
         fi
         if ! why="$(_pending_registration_py_shape "$schemas" "$t")"; then
             PENDING_NOT_ABSORBED+="$t: shape: $why"$'\n'; continue

@@ -54,6 +54,11 @@ class _E:
 def load_entries(root):
     if os.environ.get("STUB_RAISE"):
         raise ModuleError("stub: toml unreadable")
+    if os.environ.get("STUB_FROM_TOML"):
+        import re
+        from pathlib import Path
+        text = (Path(root) / "codegen" / "pending-registration.toml").read_text()
+        return [_E(t) for t in re.findall(r'type = "(\w+)"', text)]
     return [_E(t) for t in os.environ.get("STUB_TYPES", "").split(",") if t]
 
 
@@ -70,7 +75,22 @@ def metadata_verdict(entry, reader, today):
         return True, ""
     return False, os.environ.get("STUB_WHY", "runner PR closed")
 PY
+    commit_all "$dir"
     printf '%s' "$dir"
+}
+# The library reads the declaration and the module from HEAD, so every fixture
+# edit is committed; an uncommitted one is a case of its own.
+commit_all() {
+    local repo="$1"
+    [ -d "$repo/.git" ] || { git init --quiet "$repo"; git -C "$repo" config core.autocrlf false; }
+    git -C "$repo" add -A >/dev/null
+    git -C "$repo" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
+        -c core.hooksPath=/nonexistent commit --quiet --allow-empty -m fixture
+}
+HEAD_N=0
+active() {  # pending_registration_active_types against a fresh scratch dir
+    HEAD_N=$((HEAD_N + 1))
+    pending_registration_active_types "$1" "$ROOT/head-$HEAD_N"
 }
 
 # A `gh` that has no token to give, first on PATH, so the no-token case never
@@ -84,29 +104,54 @@ if ! pending_registration_python >/dev/null; then
     skip "no Python 3.11+ here: the module-reading arms cannot run (the hook then reports UNKNOWN and absorbs nothing)"
 else
     S="$(fake_schemas none)"
-    rm -f "$S/codegen/pending-registration.toml"
-    pending_registration_active_types "$S"
-    check "no toml: nothing is declared" "none" "$PENDING_STATE"
+    rm -f "$S/codegen/pending-registration.toml"; commit_all "$S"
+    active "$S"
+    check "no toml in HEAD: nothing is declared" "none" "$PENDING_STATE"
+
+    S="$(fake_schemas spelled)"
+    printf '[[ pending ]]\ntype = "Alpha"\n' > "$S/codegen/pending-registration.toml"; commit_all "$S"
+    GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_ACTIVE=Alpha active "$S"
+    check "a table spelled [[ pending ]] is still read (no grep pre-filter)" "ok|Alpha" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
+
+    S="$(fake_schemas uncommitted)"
+    rm -f "$S/codegen/pending-registration.toml"; commit_all "$S"
+    printf '[[pending]]\ntype = "Alpha"\n' > "$S/codegen/pending-registration.toml"
+    GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_ACTIVE=Alpha active "$S"
+    check "an UNCOMMITTED toml row is not honoured (HEAD is read, as CI reads it)" "none|" \
+        "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
+
+    S="$(fake_schemas dirtyrow)"
+    printf '[[pending]]
+type = "Beta"
+' >> "$S/codegen/pending-registration.toml"
+    GITHUB_TOKEN=t STUB_FROM_TOML=1 STUB_ACTIVE=Alpha,Beta active "$S"
+    check "a row added to the toml but not committed is not read" "ok|Alpha" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
+
+    S="$(fake_schemas notgit)"
+    rm -rf "$S/.git"
+    GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_ACTIVE=Alpha active "$S"
+    check "a schemas dir that is not a git checkout is UNKNOWN, never a grant" "unknown|" \
+        "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
 
     S="$(fake_schemas nomodule)"
-    rm -f "$S/scripts/pending_registration.py"
-    pending_registration_active_types "$S"
+    rm -f "$S/scripts/pending_registration.py"; commit_all "$S"
+    active "$S"
     check "declared waits but no module: UNKNOWN, never a grant" "unknown|" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
 
     S="$(fake_schemas mixed)"
-    GITHUB_TOKEN=t STUB_TYPES=Alpha,Beta STUB_ACTIVE=Alpha pending_registration_active_types "$S"
+    GITHUB_TOKEN=t STUB_TYPES=Alpha,Beta STUB_ACTIVE=Alpha active "$S"
     check "only the ACTIVE entry is returned" "ok|Alpha" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
     check "  and the INERT one is reported with the module's reason" \
         "Alpha: ACTIVE"$'\n'"Beta: INERT (runner PR closed)" "$PENDING_ROWS"
-    check "  without writing bytecode into the schemas checkout" "no" \
-        "$([ -e "$S/scripts/__pycache__" ] && echo yes || echo no)"
+    check "  without writing anything into the schemas checkout" "no|" \
+        "$([ -e "$S/scripts/__pycache__" ] && echo yes || echo no)|$(git -C "$S" status --porcelain -uall)"
 
     S="$(fake_schemas noactive)"
-    GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_ACTIVE= pending_registration_active_types "$S"
+    GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_ACTIVE= active "$S"
     check "every entry INERT (with a token): an answer, absorbing nothing" "ok|" "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
 
     S="$(fake_schemas raise)"
-    GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_RAISE=1 pending_registration_active_types "$S"
+    GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_RAISE=1 active "$S"
     check "a module error is UNKNOWN" "unknown" "$PENDING_STATE"
     check "  and names the module's own reason" yes \
         "$(case "$PENDING_UNKNOWN_REASON" in *"toml unreadable"*) echo yes ;; *) echo no ;; esac)"
@@ -126,14 +171,15 @@ def metadata_verdict(entry, reader, today):
         return True, ""
     return _real_metadata_verdict(entry, reader, today)
 PY
+    commit_all "$S"
     PENDING_REGISTRATION_FIXTURE=/some/fixture.json GITHUB_TOKEN=t STUB_TYPES=Alpha STUB_ACTIVE= \
-        pending_registration_active_types "$S"
+        active "$S"
     check "a leftover PENDING_REGISTRATION_FIXTURE never reaches the module" "ok|" \
         "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
 
     S="$(fake_schemas notoken)"
     PATH="$NO_GH:$PATH" GITHUB_TOKEN= STUB_TYPES=Alpha STUB_ACTIVE= STUB_WHY="unknown(no token)" \
-        pending_registration_active_types "$S"
+        active "$S"
     check "no token anywhere: UNKNOWN naming the token, not 'nothing pending'" "unknown|yes" \
         "$PENDING_STATE|$(case "$PENDING_UNKNOWN_REASON" in *"no GitHub token"*) echo yes ;; *) echo no ;; esac)"
 fi
@@ -145,17 +191,18 @@ echo "pending-registration: absorbing a declared binding"
 # baseline: Alpha, Beta, Gamma exported; the regeneration lacks Alpha.
 mk_trees() {
     local name="$1" eol="${2:-}"
-    BASE="$ROOT/$name/base"; REGEN="$ROOT/$name/regen"; OUT="$ROOT/$name/out"
+    # The baseline is the schemas checkout's own ts/src/generated, as it is
+    # live; the library also reads that tree's HEAD, so cases re-commit.
+    SCH="$ROOT/$name/schemas"
+    BASE="$SCH/ts/src/generated"; REGEN="$ROOT/$name/regen"; OUT="$ROOT/$name/out"
     mkdir -p "$BASE" "$REGEN"
     local t
     for t in Alpha Beta Gamma; do printf 'export type %s = string;\n' "$t" > "$BASE/$t.d.ts"; done
     for t in Beta Gamma; do cp "$BASE/$t.d.ts" "$REGEN/$t.d.ts"; done
     printf "export type { Alpha } from './Alpha';$eol\nexport type { Beta } from './Beta';$eol\nexport type { Gamma } from './Gamma';$eol\n" > "$BASE/index.ts"
     printf "export type { Beta } from './Beta';$eol\nexport type { Gamma } from './Gamma';$eol\n" > "$REGEN/index.ts"
-    # A schemas checkout whose COMMITTED Python generated tree has the shape
-    # CI's `absorb_set` requires (one import, one `__all__` entry, the module
-    # file). The library reads HEAD, as CI does; cases edit and re-commit.
-    SCH="$ROOT/$name/schemas"
+    # The COMMITTED Python generated tree in the shape CI's `absorb_set`
+    # requires (one import, one `__all__` entry, the module file).
     PY="$SCH/src/qontinui_schemas/generated"
     mkdir -p "$PY/per_type"
     git init --quiet "$SCH"
@@ -199,7 +246,7 @@ check "a binding the regeneration PRODUCED is never absorbed (it is compared)" "
     "$PENDING_ABSORBED|$(case "$PENDING_NOT_ABSORBED" in "Alpha: the regeneration produced it"*) echo yes ;; *) echo no ;; esac)"
 
 mk_trees absent
-rm -f "$BASE/Alpha.d.ts"
+rm -f "$BASE/Alpha.d.ts"; commit_py
 pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
 check "a declared type absent from the baseline is not absorbed" "|Alpha: not in the baseline" "$PENDING_ABSORBED|$PENDING_NOT_ABSORBED"
 
@@ -209,7 +256,7 @@ pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
 check "a regenerated index.ts that still exports it is not absorbed" "" "$PENDING_ABSORBED"
 
 mk_trees twice
-printf "export type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"
+printf "export type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"; commit_py
 pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
 check "an export line present twice in the baseline is not absorbed" "" "$PENDING_ABSORBED"
 
@@ -252,6 +299,19 @@ pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
 check "an uncommitted barrel edit does not change the verdict (HEAD is read, as CI reads it)" "Alpha" "$PENDING_ABSORBED"
 
 echo "pending-registration: inputs that must never become paths or links"
+
+mk_trees ts-dirty-index
+sed -i "/{ Alpha }/d" "$BASE/index.ts"
+printf "export type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"
+printf "export type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"
+pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
+check "an uncommitted index.ts edit cannot pass a shape the committed one fails" "" "$PENDING_ABSORBED"
+git -C "$SCH" checkout --quiet -- .
+sed -i "/{ Alpha }/d" "$BASE/index.ts"; commit_py
+printf "export type { Alpha } from './Alpha';\n" >> "$BASE/index.ts"
+pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" Alpha
+check "an export line committed 0 times is declined even if the working copy has it" "|yes" \
+    "$PENDING_ABSORBED|$(case "$PENDING_NOT_ABSORBED" in *"committed index.ts 0 times"*) echo yes ;; *) echo no ;; esac)"
 
 mk_trees badname
 pending_registration_absorb "$BASE" "$REGEN" "$OUT" "$SCH" "../Alpha"

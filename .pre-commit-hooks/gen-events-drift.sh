@@ -472,7 +472,7 @@ elif [ -f "$PENDING_LIB" ]; then
     . "$PENDING_LIB"
     PENDING_ABSORBED=""
     PENDING_NOT_ABSORBED=""
-    pending_registration_active_types "$SCHEMAS_DIR"
+    pending_registration_active_types "$SCHEMAS_DIR" "$SCRATCH_ROOT/pending-head"
     case "$PENDING_STATE" in
         none) : ;;
         ok)
@@ -493,7 +493,9 @@ elif [ -f "$PENDING_LIB" ]; then
                         "$SCRATCH_ROOT/baseline-pending-absorbed" \
                         "$SCHEMAS_DIR" \
                         $PENDING_ACTIVE_TYPES; then
-                    COMPARE_DIR="$SCRATCH_ROOT/baseline-pending-absorbed"
+                    # Only a copy that actually absorbed something replaces the
+                    # baseline, so the OK message never claims an absorption.
+                    [ -z "$PENDING_ABSORBED" ] || COMPARE_DIR="$SCRATCH_ROOT/baseline-pending-absorbed"
                 else
                     PENDING_ABSORBED=""
                     PENDING_NOT_ABSORBED=""
