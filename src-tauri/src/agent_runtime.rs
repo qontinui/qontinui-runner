@@ -586,6 +586,27 @@ pub(crate) fn compose_continuation_system_prompt(
     append_continuation_brief(runner_context, brief)
 }
 
+/// Append coord's allocation notes (build siblings it could not expand) to a
+/// continuation's system prompt or prompt, after a blank line. No notes ⇒ `base`
+/// unchanged. The lines are already bounded single lines
+/// (`agent_worktree::sibling_note_log_line`), and are labelled as coord's
+/// report so the agent reads them as a fact about its checkout, not an order.
+pub(crate) fn append_sibling_notes(base: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return base;
+    }
+    let mut out = base;
+    out.push_str(
+        "\n\nAllocation notes from coord: it could not add these declared build siblings \
+         to your worktree, so a build that needs them will fail on a missing checkout:",
+    );
+    for note in notes {
+        out.push_str("\n- ");
+        out.push_str(note);
+    }
+    out
+}
+
 /// The HEADLESS half of the same seam.
 ///
 /// `Presentation::Headless` reaches `run_continuation_headless` ->
@@ -6124,9 +6145,12 @@ async fn run_gate_continuation_inner(
             // rides on the PROMPT — byte-for-byte how coord itself delivers a
             // registrant's `hint` (appended to `initial_prompt` after a blank
             // line), so the two halves of one brief arrive the same way.
-            let headless_prompt = compose_continuation_headless_prompt(
-                &payload.initial_prompt,
-                payload.brief.as_ref(),
+            let headless_prompt = append_sibling_notes(
+                compose_continuation_headless_prompt(
+                    &payload.initial_prompt,
+                    payload.brief.as_ref(),
+                ),
+                ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
             );
             // Known lag, accepted: the headless fn returns only after the child
             // EXITS, so on this presentation the `spawned` outcome — and the
@@ -6737,13 +6761,16 @@ async fn run_continuation_terminal(
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
         // stays inline otherwise.
         let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-            compose_continuation_system_prompt(
-                crate::terminal::runner_context(
-                    crate::terminal::spawn_seam_api_port(),
-                    coord_mcp,
-                    &served,
+            append_sibling_notes(
+                compose_continuation_system_prompt(
+                    crate::terminal::runner_context(
+                        crate::terminal::spawn_seam_api_port(),
+                        coord_mcp,
+                        &served,
+                    ),
+                    payload.brief.as_ref(),
                 ),
-                payload.brief.as_ref(),
+                ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
             ),
         ));
         // The marker the policy hook's route trusts as proof of delivery — taken
@@ -8688,6 +8715,7 @@ fn payload_to_allocate_result(
         token_jti: credential.jti, // bookkeeping only; maybe_refresh sends the bearer, not the jti
         token_exp: credential.exp,
         active_claims: Vec::new(), // unread by either daemon
+        sibling_notes: Vec::new(), // coord-delivered payloads carry none
     }
 }
 
@@ -10735,6 +10763,23 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn append_sibling_notes_lists_each_note_and_leaves_empty_alone() {
+        assert_eq!(super::append_sibling_notes("CTX".to_string(), &[]), "CTX");
+        let out = super::append_sibling_notes(
+            "CTX".to_string(),
+            &["qontinui/x: coord could not read .qontinui/ci.toml".to_string()],
+        );
+        assert!(
+            out.starts_with("CTX\n\nAllocation notes from coord:"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("\n- qontinui/x: coord could not read .qontinui/ci.toml"),
+            "{out}"
+        );
+    }
+
     use super::*;
 
     // ── presentation boot readiness (plan 2026-09-17-a-gate-continuation-
