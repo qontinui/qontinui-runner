@@ -213,14 +213,17 @@ impl WrapperRegistry {
         }
     }
 
-    /// Default app-data root: `<data_dir>/qontinui-runner/wrappers/`.
-    /// Falls back to `./qontinui-runner/wrappers` if `dirs::data_dir` is
-    /// unavailable (highly unusual).
+    /// Default app-data root: `<data_dir>/qontinui-runner/wrappers/`
+    /// (`instance_env::platform_dir(Data)`, inside the instance root for a
+    /// subject). Falls back to `./qontinui-runner/wrappers` if no data dir
+    /// resolves (highly unusual).
     pub fn default_root() -> PathBuf {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("qontinui-runner")
-            .join("wrappers")
+        qontinui_runner_lib::instance_env::platform_dir(
+            qontinui_runner_lib::instance_env::PlatformDir::Data,
+        )
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("qontinui-runner")
+        .join("wrappers")
     }
 
     /// Returns the wrappers root directory. Useful for installer / uninstall

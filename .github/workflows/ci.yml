@@ -1837,6 +1837,35 @@ jobs:
         # and RE-ASSESS IMMEDIATELY if anything ever enables rust_decimal's
         # `rkyv`/`rkyv-safe` feature — that would make the vulnerable code real
         # and this justification void. Tracking: qontinui/qontinui-runner#956.
+        #
+        # --ignore RUSTSEC-2026-0367 + RUSTSEC-2026-0368 + RUSTSEC-2026-0369:
+        # three zip < 9.0.0 extraction advisories (SUID/SGID bits preserved;
+        # symlink targets outside the destination; permissions applied through
+        # symlinks). All three live in `ZipArchive::extract()` and
+        # `ZipStreamReader::extract()`. The runner's OWN zip dependency is
+        # bumped to 9 (patched), and runner code never calls `extract()`.
+        #
+        # The ignore covers the SECOND copy, zip 4.6.1, which enters only as
+        #
+        #   qontinui-runner -> tauri-plugin-updater -> zip ^4
+        #
+        # and every published tauri-plugin-updater through 2.14.0 (the latest
+        # as of 2026-10-17) requires `zip ^4`, so it is not upgradable from
+        # here. Not exploitable in that path. The updater calls `extract()`
+        # only from its Windows `extract_zip`. 0367 and 0369 need Unix
+        # permission bits, which zip 4 never applies on Windows. 0368 is NOT
+        # ruled out by the platform: zip 4 creates symlinks on Windows too.
+        # What rules out all three is that `extract_zip` runs only AFTER
+        # `verify_signature` checks the downloaded bundle against our updater
+        # public key, so the archive is not attacker-controlled. The runner
+        # reaches the updater only through `download_and_install`
+        # (commands/execution/system_ops.rs), and the frontend is granted no
+        # `updater:` permission.
+        #
+        # Drop this ignore when tauri-plugin-updater ships a release on
+        # zip >= 9. Re-assess immediately if updater signature checking is
+        # ever disabled or bypassed, if runner code starts calling
+        # `extract()` on a zip 4 archive, or if the updater extracts on Unix.
         run: |
           # --locked: install cargo-audit against its OWN bundled Cargo.lock.
           # Without it, cargo resolves cargo-audit's transitive deps to latest
@@ -1845,7 +1874,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
