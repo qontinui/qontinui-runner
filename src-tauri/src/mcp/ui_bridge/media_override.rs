@@ -17,12 +17,19 @@
 //!
 //! It is a DEV CONTROL. The SDK engine answers `capability_unavailable_in_build`
 //! unless the realm opted in (`@qontinui/ui-bridge` `core/dev-controls.ts`): the
-//! injected runtime always does; the runner's webview does only on a Vite dev
-//! build (`import.meta.env.DEV`), which an exe-mode runner never is. So on a
-//! published runner this route is mounted (the SDK manifest-parity test
-//! requires every SDK route to be exposed) but answers a typed refusal from
-//! the runner's own webview — no page-altering capability ships to users. The
-//! `/sdk/` wrapper reaches it only on an app that opted in itself.
+//! injected runtime always does; the runner's webview opts in only when
+//! `import.meta.env.DEV` is true, i.e. under a Vite dev server. Every runner —
+//! the published one and every dev or temp runner alike — runs in exe mode, a
+//! Vite BUILD with the frontend embedded, so this direct route ALWAYS answers
+//! the typed refusal from the runner's own webview. It is mounted anyway
+//! because the SDK manifest-parity test requires every SDK route to be exposed.
+//! The `/sdk/` wrapper reaches the override only on an app that opted in itself.
+//!
+//! The gate is NOT a security boundary. The override adds no capability beyond
+//! the runner's existing `page_evaluate` / eval surface, through which a caller
+//! can already run script in the page and rewrite any `src` itself. The gate
+//! keeps a page-altering control off by default in an app's production build;
+//! it keeps nothing from a caller who can evaluate script.
 //!
 //! Validation mirrors the SDK's `validateMediaOverrideRequest` for an early
 //! 400; the SDK copy is the authority. One rule is runner-only: the decode wait
@@ -59,14 +66,15 @@ pub(crate) const SDK_DISPATCH_BUDGET_MS: u64 = 30_000;
 
 /// Headroom kept between the decode wait and the transport's own timeout, so
 /// the frontend's typed `DECODE_TIMEOUT` (with its rollback) reaches the
-/// caller instead of a bare transport timeout. It also covers the SDK's
-/// pixel-size probe after a successful decode, which gets at most the rest of
-/// the decode wait or a 1 s floor (`PIXEL_PROBE_FLOOR_MS` in the SDK's
-/// `control/media-override.ts`), so it must stay above 1 s.
+/// caller instead of a bare transport timeout. After its decode wait the SDK
+/// takes one more bounded step — measuring the candidate's pixels on success,
+/// or verifying the rollback against the rendered page on failure — each
+/// capped at `POST_DECODE_WAIT_MS` (1 s) in the SDK's
+/// `control/media-override.ts`, so this must stay above 1 s.
 pub(crate) const DECODE_HEADROOM_MS: u64 = 2_000;
 const _: () = assert!(
     DECODE_HEADROOM_MS > 1_000,
-    "headroom must cover the SDK pixel probe"
+    "headroom must cover the SDK's POST_DECODE_WAIT_MS"
 );
 
 fn non_empty_str(v: &Value) -> bool {
