@@ -32,7 +32,7 @@ SCCACHE_SERVER_PORT = { value = "4230", force = false }
 # The value is an EXACT requirement, so a version bump is a deliberate edit here.
 # `embedded_pg::tests::bundled_postgres_is_the_pinned_release` reads this line
 # and fails when the binary embeds anything else, and
-# scripts/ci/purge-stale-bundled-postgres.sh reads it to drop cached build units
+# scripts/ci/purge-stale-bundled-postgres.mjs reads it to drop cached build units
 # that embed another release. Keep the `NAME = "=X.Y.Z"` shape, which both of
 # them parse. A MAJOR bump also needs an upgrade path for users' existing
 # cluster data dirs. An explicit POSTGRESQL_VERSION in the environment still
