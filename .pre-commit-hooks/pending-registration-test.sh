@@ -193,7 +193,16 @@ def metadata_verdict(entry, reader, today):
     commit_all "$S" "a local, unpushed module change"
     GITHUB_TOKEN=t STUB_ACTIVE= active "$S"
     check "a COMMITTED module that differs from origin's is not run: UNKNOWN" "unknown||yes" \
-        "$PENDING_STATE|$PENDING_ACTIVE_TYPES|$(has "is not the one on origin/main" "$PENDING_UNKNOWN_REASON")"
+        "$PENDING_STATE|$PENDING_ACTIVE_TYPES|$(has "is not the one on refs/remotes/origin/main" "$PENDING_UNKNOWN_REASON")"
+
+    S="$(fake_schemas shadowref)"
+    printf '
+# an unpushed edit
+' >> "$S/scripts/pending_registration.py"
+    commit_all "$S" "a local module change"
+    git -C "$S" branch origin/main HEAD  # a LOCAL branch shadowing the remote's short name
+    GITHUB_TOKEN=t STUB_ACTIVE=Alpha active "$S"
+    check "a local branch named origin/main does not vouch for an unpushed module" "unknown|"         "$PENDING_STATE|$PENDING_ACTIVE_TYPES"
 
     S="$(fake_schemas localother)"
     printf 'local note\n' > "$S/NOTES"
@@ -345,6 +354,15 @@ printf "export type { Alpha } from './Alpha';\nexport type { Beta } from './Beta
 printf "export type { Beta } from './Beta';\nexport type { Gamma } from './Gamma';" > "$REGEN/index.ts"
 pending_registration_absorb "$BASE" "$REGEN" "$OUT" Alpha
 check "an index.ts with no final newline is absorbed without gaining one" "Alpha|same" "$PENDING_ABSORBED|$(same "$OUT" "$REGEN")"
+
+mk_trees nofinalnl-last
+printf "export type { Beta } from './Beta';
+export type { Gamma } from './Gamma';
+export type { Alpha } from './Alpha';" > "$BASE/index.ts"
+printf "export type { Beta } from './Beta';
+export type { Gamma } from './Gamma';" > "$REGEN/index.ts"
+pending_registration_absorb "$BASE" "$REGEN" "$OUT" Alpha
+check "dropping the LAST line of a no-final-newline index.ts leaves no stray newline" "Alpha|same" "$PENDING_ABSORBED|$(same "$OUT" "$REGEN")"
 
 mk_trees nodecl
 pending_registration_absorb "$BASE" "$REGEN" "$OUT"

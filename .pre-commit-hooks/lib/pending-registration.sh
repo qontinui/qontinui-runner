@@ -150,8 +150,13 @@ pending_registration_active_types() {
     # remote default branch (a pinned sibling behind main is the usual case),
     # or its module is byte-identical to the one there: code CI itself runs.
     local default_ref want got
-    default_ref="$(git -C "$schemas" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
-    [ -n "$default_ref" ] || default_ref="origin/main"
+    # FULL refnames: a short `origin/main` resolves refs/heads/origin/main
+    # first, so a local branch of that name would stand in for the remote.
+    default_ref="$(git -C "$schemas" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
+    case "$default_ref" in
+        refs/remotes/origin/?*) : ;;
+        *) default_ref="refs/remotes/origin/main" ;;
+    esac
     if ! git -C "$schemas" merge-base --is-ancestor "$sha" "$default_ref" >/dev/null 2>&1; then
         want="$(git -C "$schemas" rev-parse --verify --quiet "$default_ref:$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null || true)"
         got="$(git -C "$schemas" rev-parse --verify --quiet "$sha:$PENDING_REGISTRATION_MODULE_REL" 2>/dev/null || true)"
@@ -335,18 +340,22 @@ _pending_registration_count_line() {
 # Copy stdin to stdout without the FIRST line equal to $1 (a trailing CR is
 # ignored for the comparison and kept on every line that stays).
 _pending_registration_drop_line() {
-    local want="$1" l removed=0 nl
+    local want="$1" l removed=0 sep="" printed=0 last_nl=1
     while :; do
-        # A last line with no newline is written back without one, so the
-        # copy differs from the regeneration only by the dropped line.
-        if IFS= read -r l; then nl=$'\n'; elif [ -n "$l" ]; then nl=""; else break; fi
+        if IFS= read -r l; then last_nl=1; elif [ -n "$l" ]; then last_nl=0; else break; fi
         if [ "$removed" = 0 ] && [ "${l%$'\r'}" = "$want" ]; then
             removed=1
         else
-            printf '%s%s' "$l" "$nl"
+            # The separator goes BEFORE a kept line, so dropping the LAST line
+            # leaves no stray newline behind the one before it.
+            printf '%s%s' "$sep" "$l"
+            sep=$'\n'; printed=1
         fi
-        [ -n "$nl" ] || break
+        [ "$last_nl" = 1 ] || break
     done
+    # A final newline only when the input ended with one, so the copy differs
+    # from the regeneration only by the dropped line.
+    if [ "$printed" = 1 ] && [ "$last_nl" = 1 ]; then printf '\n'; fi
 }
 
 # pending_registration_absorb <baseline_dir> <regenerated_dir> <out_dir> [<type>...]
