@@ -26,25 +26,16 @@
 //! ## Every written body states its provenance
 //!
 //! A body is written with ONE generated key at line 2 of its YAML frontmatter
-//! (see [`with_provenance`]):
+//! (see [`crate::provenance::with_provenance`]):
 //!
 //! ```text
 //! qontinui-provenance: source=<builtin|served|disk_cache> canonical=qontinui-claude-config:.claude/commands/<name>.md blob=<sha1> runner_build=<RUNNER_BUILD_ID>
 //! ```
 //!
-//! `blob` is the git blob id of the body bytes with the key excluded. For a
-//! builtin it equals `git hash-object` of the VENDORED file this build
-//! embedded — and of the canonical file only while the two are in byte parity.
-//! After a fetch, `git -C qontinui-claude-config log --all --find-object=<blob>
-//! -- .claude/commands/<name>.md` separates a stale copy (the blob is an older
-//! canonical version) from a fork (no version of that file ever held it).
-//! A provisioned file is checkable on its own — no sibling checkout, no runner —
-//! by [`provenance_consistent`], or from a shell: when line 3 is `---` (a
-//! prepended block) `tail -n +4 <file> | git hash-object --stdin`, otherwise
-//! (the key was inserted into existing frontmatter) `sed 2d <file> | git
-//! hash-object --stdin`; with no git at all, the sha1 of
-//! `blob <byte-length>\0<body>`. The key is a write-time transform only: the
-//! embedded consts and the files beside this module never carry it.
+//! The grammar, the hash rule and the strip rule live in [`crate::provenance`],
+//! shared with the skill provisioner (`crate::fleet_skills`), which stamps each
+//! `SKILL.md` with the same key. What `blob` proves and how to check a file
+//! from a shell are documented there.
 //!
 //! Adding a command is adding a `.md` file next to them plus one line in
 //! [`FLEET_COMMANDS`]. Nothing in this module or its consumers may assume the
@@ -54,7 +45,9 @@
 //!
 //! What is embedded here is the **default**. A signed-in account may override
 //! any command by name, and `crate::agent_commands` resolves
-//! `fresh fetch → disk cache → embedded default` before anything is written.
+//! `account override (fresh fetch, else disk cache) → canonical
+//! qontinui-claude-config@origin/main (crate::canonical_corpus) → embedded
+//! default` before anything is written.
 //! Because the default is compiled in, an unauthenticated, offline, or
 //! first-run device still gets a working command set and the network is never
 //! on the critical path.
@@ -67,8 +60,12 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
-use crate::agent_commands::{AgentCommandRegistry, CommandSource};
+use crate::agent_commands::AgentCommandRegistry;
 use crate::capability_manifest::{self, CapabilityObservation, ProvisionReport};
+use crate::provenance::{
+    command_canonical, provenance_consistent, strip_provenance, with_provenance, ProvenanceError,
+    ProvenanceLine,
+};
 
 /// `/vet-plan` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/vet-plan.md` (canonical) — edit it
@@ -397,165 +394,6 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("workflow-runs", WORKFLOW_RUNS),
 ];
 
-/// The YAML frontmatter key [`with_provenance`] writes at line 2 of every
-/// provisioned command file.
-pub(crate) const PROVENANCE_KEY: &str = "qontinui-provenance:";
-
-/// The build identity stamped into `runner_build=` — the same compile-time
-/// value `/health` reports as `buildId`.
-const RUNNER_BUILD: &str = env!("RUNNER_BUILD_ID");
-
-/// The parsed fields of one `qontinui-provenance:` line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProvenanceLine {
-    /// `builtin` / `served` / `disk_cache` — [`CommandSource::as_str`].
-    pub source: String,
-    /// `qontinui-claude-config:.claude/commands/<name>.md`.
-    pub canonical: String,
-    /// Lowercase 40-hex git blob id of the body, provenance excluded.
-    pub blob: String,
-    /// The `RUNNER_BUILD_ID` of the binary that wrote the file.
-    pub runner_build: String,
-}
-
-impl ProvenanceLine {
-    /// Parse the text after [`PROVENANCE_KEY`]. `None` unless all four fields
-    /// are present.
-    fn parse(value: &str) -> Option<Self> {
-        let (mut source, mut canonical, mut blob, mut runner_build) = (None, None, None, None);
-        for token in value.split_whitespace() {
-            let (k, v) = token.split_once('=')?;
-            let slot = match k {
-                "source" => &mut source,
-                "canonical" => &mut canonical,
-                "blob" => &mut blob,
-                "runner_build" => &mut runner_build,
-                _ => continue,
-            };
-            *slot = Some(v.to_string());
-        }
-        Some(Self {
-            source: source?,
-            canonical: canonical?,
-            blob: blob?,
-            runner_build: runner_build?,
-        })
-    }
-}
-
-/// Why [`provenance_consistent`] refused a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProvenanceError {
-    /// No well-formed `qontinui-provenance:` line at line 2 of a frontmatter
-    /// block — the file carries no claim to check.
-    Missing,
-    /// The body no longer hashes to the blob the line recorded: it was edited
-    /// after it was written, or the line was copied onto another body.
-    BlobMismatch { recorded: String, actual: String },
-}
-
-/// Git blob id (`git hash-object`) of `bytes`, lowercase 40-hex.
-fn git_blob_id(bytes: &[u8]) -> String {
-    // Hashing an in-memory buffer cannot fail for the Blob type; the fallback
-    // keeps this total rather than panicking inside a fail-soft provisioner.
-    git2::Oid::hash_object(git2::ObjectType::Blob, bytes)
-        .map(|oid| oid.to_string())
-        .unwrap_or_default()
-}
-
-/// The content of a line with its terminator (`\n` or `\r\n`) removed.
-fn line_content(line: &str) -> &str {
-    line.strip_suffix('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .unwrap_or(line)
-}
-
-/// `text` split into its first line (terminator included) and the remainder.
-fn split_first_line(text: &str) -> (&str, &str) {
-    match text.find('\n') {
-        Some(i) => text.split_at(i + 1),
-        None => (text, ""),
-    }
-}
-
-/// `body` with ONE generated `qontinui-provenance:` key placed at line 2, in
-/// YAML frontmatter.
-///
-/// Placement, because YAML frontmatter is recognised only when it starts at
-/// line 1 (the convention Claude Code's command loader follows) — nothing is ever put above an existing `---`:
-/// - a body that opens a NON-EMPTY frontmatter block (`---\n` or `---\r\n`
-///   followed by anything but a closing `---`) gets the key inserted as the
-///   first line inside it, with the opener's own line ending;
-/// - every other body gets a new `---\n<key>\n---\n` block prepended and is
-///   otherwise unchanged. That includes a body opening an EMPTY block
-///   (`---\n---\n`): inserting into it would produce bytes identical to a
-///   prepended block over the empty block's remainder, and
-///   [`strip_provenance`] could not tell the two apart.
-///
-/// `blob` is computed over `body` BEFORE the key is added, so it equals
-/// `git hash-object` of the vendored file for an unmodified builtin (and of the
-/// canonical file only while the two are in byte parity).
-pub(crate) fn with_provenance(name: &str, body: &str, source: CommandSource) -> String {
-    let key = format!(
-        "{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \
-         blob={} runner_build={RUNNER_BUILD}",
-        source.as_str(),
-        git_blob_id(body.as_bytes()),
-    );
-    let (first, rest) = split_first_line(body);
-    let opens_block = first == "---\n" || first == "---\r\n";
-    let (second, _) = split_first_line(rest);
-    if opens_block && line_content(second) != "---" {
-        let eol = if first.ends_with("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        format!("{first}{key}{eol}{rest}")
-    } else {
-        format!("---\n{key}\n---\n{body}")
-    }
-}
-
-/// Undo [`with_provenance`]: remove exactly the one `qontinui-provenance:` line
-/// at line 2 — and the frontmatter block around it when that block is then
-/// empty (the one `with_provenance` created) — returning the parsed line and
-/// the original body, byte-for-byte. `None` when line 2 is not a well-formed
-/// provenance line inside a frontmatter opener.
-pub(crate) fn strip_provenance(text: &str) -> Option<(ProvenanceLine, String)> {
-    let (first, rest) = split_first_line(text);
-    if first != "---\n" && first != "---\r\n" {
-        return None;
-    }
-    let (key_line, after_key) = split_first_line(rest);
-    let value = line_content(key_line).strip_prefix(PROVENANCE_KEY)?;
-    let parsed = ProvenanceLine::parse(value)?;
-    let (third, after_third) = split_first_line(after_key);
-    let body = if line_content(third) == "---" {
-        // The block holds nothing but the key: `with_provenance` created it.
-        after_third.to_string()
-    } else {
-        format!("{first}{after_key}")
-    };
-    Some((parsed, body))
-}
-
-/// Check a provisioned command file against its own provenance line: strip the
-/// line, re-hash what remains, and compare with the recorded `blob`. Needs
-/// nothing but the file — no sibling checkout, no runner.
-pub(crate) fn provenance_consistent(text: &str) -> Result<ProvenanceLine, ProvenanceError> {
-    let (line, body) = strip_provenance(text).ok_or(ProvenanceError::Missing)?;
-    let actual = git_blob_id(body.as_bytes());
-    if actual == line.blob {
-        Ok(line)
-    } else {
-        Err(ProvenanceError::BlobMismatch {
-            recorded: line.blob,
-            actual,
-        })
-    }
-}
-
 /// What a destination that ALREADY EXISTS says about itself, read back from its
 /// own provenance line just before [`provision_fleet_commands_into`] overwrites
 /// it.
@@ -620,6 +458,7 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
                     canonical: String::new(),
                     blob: String::new(),
                     runner_build: String::new(),
+                    canonical_sha: None,
                 });
             Some(Existing::Edited(Box::new(EditedFile {
                 source: line.source,
@@ -724,7 +563,7 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// skipped write must never become an aborted spawn, and a failed or slow probe
 /// must never become one either. The probe runs ONCE per pass, not once per
 /// file, so this costs one process spawn rather than seven.
-fn provision_fleet_commands_into(
+pub(crate) fn provision_fleet_commands_into(
     commands_dir: &Path,
     registry: &AgentCommandRegistry,
 ) -> std::io::Result<ProvisionReport> {
@@ -789,15 +628,21 @@ fn provision_fleet_commands_into(
         }
         std::fs::write(
             &dst,
-            with_provenance(&command.name, &command.body, command.source),
+            with_provenance(
+                &command_canonical(&command.name),
+                &command.body,
+                command.source.as_str(),
+                command.canonical.as_ref().map(|c| c.short()),
+            ),
         )?;
         out.record_written();
     }
     // Built after the loop rather than at construction so it can carry the
     // read-back count; a pass that clobbered nobody's edits reads as before.
     let mut detail = format!(
-        "{} embedded default(s), {} account override(s)",
+        "{} embedded default(s), {} canonical body(ies), {} account override(s)",
         registry.builtin_count(),
+        registry.canonical_count(),
         registry.override_count()
     );
     if edited > 0 {
@@ -817,6 +662,8 @@ fn provision_fleet_commands_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_commands::CommandSource;
+    use crate::provenance::{git_blob_id, PROVENANCE_KEY, RUNNER_BUILD};
 
     #[test]
     fn provisions_every_embedded_command_into_dir() {
@@ -1187,11 +1034,6 @@ mod tests {
     /// the `git hash-object` of the vendored file itself.
     #[test]
     fn the_recorded_blob_is_the_git_blob_id_of_the_original_body() {
-        // Known answer: `printf 'hello\n' | git hash-object --stdin`.
-        assert_eq!(
-            git_blob_id(b"hello\n"),
-            "ce013625030ba8dba906f756967f9e9ca394464a"
-        );
         for name in ["vet-plan", "policy"] {
             let on_disk = provision_one(&AgentCommandRegistry::new(), name);
             let (line, _) = strip_provenance(&on_disk).expect("provenance line");
@@ -1240,7 +1082,7 @@ mod tests {
                 CommandSource::Served,
                 CommandSource::DiskCache,
             ] {
-                let written = with_provenance("x", body, source);
+                let written = with_provenance(&command_canonical("x"), body, source.as_str(), None);
                 assert!(
                     written.starts_with("---"),
                     "frontmatter must start at line 1"
@@ -1253,7 +1095,12 @@ mod tests {
             }
         }
         // CRLF frontmatter keeps its own line endings on the inserted line.
-        let crlf = with_provenance("x", "---\r\na: 1\r\n---\r\n", CommandSource::Builtin);
+        let crlf = with_provenance(
+            &command_canonical("x"),
+            "---\r\na: 1\r\n---\r\n",
+            "builtin",
+            None,
+        );
         assert!(crlf
             .split_once("\r\n")
             .unwrap()
@@ -1295,6 +1142,39 @@ mod tests {
             provenance_consistent("# no provenance\n"),
             Err(ProvenanceError::Missing)
         );
+    }
+
+    /// A canonical body is written with `source=canonical` and the 12-hex
+    /// `canonical_sha` of the `qontinui-claude-config` commit it was read at,
+    /// and the file stays self-consistent.
+    #[test]
+    fn a_canonical_body_is_stamped_with_its_snapshot() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let (name, _) = FLEET_COMMANDS[0];
+        let path = format!(".claude/commands/{name}.md");
+        let url = crate::canonical_corpus::test_support::remote_with(
+            tmp.path(),
+            &[(&path, "# canonical body\n")],
+        );
+        let mirror = crate::canonical_corpus::test_support::mirror(tmp.path(), &url);
+        let snapshot = mirror.refresh().expect("refresh");
+        let canonical = mirror.load(&snapshot, &[name], &[]).expect("load").commands;
+        let (registry, _) = crate::agent_commands::resolve_with(
+            crate::agent_commands::FetchOutcome::NoAccount,
+            None,
+            Some(&canonical),
+        );
+        let on_disk = provision_one(&registry, name);
+        let line = provenance_consistent(&on_disk).expect("self-consistent");
+        assert_eq!(line.source, "canonical");
+        assert_eq!(line.canonical_sha.as_deref(), Some(snapshot.short()));
+        assert_eq!(line.canonical, command_canonical(name));
+        assert_eq!(strip_provenance(&on_disk).unwrap().1, "# canonical body\n");
+        // A command the canonical rung did not supply carries no canonical_sha.
+        let (other, _) = FLEET_COMMANDS[1];
+        let other_line = provenance_consistent(&provision_one(&registry, other)).unwrap();
+        assert_eq!(other_line.source, "builtin");
+        assert_eq!(other_line.canonical_sha, None);
     }
 
     /// `source=` names the layer that actually supplied the body.

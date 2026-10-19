@@ -15,8 +15,8 @@
 //! unreachable from it. This module is the shared home that makes "every
 //! reader goes through one function" actually expressible.
 //!
-//! Declared in BOTH `lib.rs` and `main.rs`, like the other dual-rooted modules
-//! (`auth`, `fs_perms`, `secure_storage`).
+//! Owned by the lib (`lib.rs`); the runner bin imports this one copy
+//! (`pub(crate) use qontinui_runner_lib::coord_mcp_config;` in `main.rs`).
 
 /// Header carrying the per-session loopback nonce that authenticates a
 /// session's MCP client to the runner-local `/coord-mcp` proxy route.

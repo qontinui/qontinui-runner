@@ -671,12 +671,12 @@ async fn capture_pre_edit_snapshot(
     let sha = format!("{:x}", hasher.finalize());
 
     // 3. Compute the on-disk blob destination under runner_data_dir.
-    let blob_dir: PathBuf = match app_handle.path().app_data_dir() {
-        Ok(base) => base.join("session_snapshots").join(session_id),
-        Err(e) => {
+    let blob_dir: PathBuf = match qontinui_runner_lib::instance_env::runner_app_data_dir() {
+        Some(base) => base.join("session_snapshots").join(session_id),
+        None => {
             warn!(
-                "capture_pre_edit_snapshot: app_data_dir() failed (session={}): {} — skipping",
-                session_id, e
+                "capture_pre_edit_snapshot: no app data dir resolved (session={}) — skipping",
+                session_id
             );
             return;
         }

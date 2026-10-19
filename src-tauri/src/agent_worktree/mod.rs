@@ -65,6 +65,7 @@ pub mod custody;
 pub mod dirty;
 pub mod disk_survey;
 pub mod edit_effect_loop;
+pub mod edit_sibling;
 pub mod fs_backstop;
 pub mod fs_observer;
 pub mod isolated_edit;
@@ -1208,6 +1209,17 @@ struct CoordAllocateResponse {
     /// [`Isolation::default`] (junctioned worktree, today's behavior).
     #[serde(default)]
     isolation: Option<Isolation>,
+    /// Plan `2026-10-02-allocate-skips-a-declared-sibling-silently`: one
+    /// redacted line per thing coord could NOT establish while expanding the
+    /// requested repos' declared build siblings — a cold or stale canonical
+    /// mirror, an unparseable `.qontinui/ci.toml`, a repo missing from coord's
+    /// registry. A non-empty list means a sibling this allocation may need was
+    /// NOT provisioned, which otherwise surfaces minutes later as a cargo
+    /// `failed to read …/Cargo.toml`. Absent on an older coord, and empty
+    /// (key omitted) when there is nothing to report — absent is UNKNOWN, not
+    /// "nothing skipped", so nothing is logged for it either way.
+    #[serde(default)]
+    sibling_notes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1249,6 +1261,33 @@ struct CoordAllocatedWorktree {
     /// defaults, so an older coord's row reads `Unknown` / `None`.
     #[serde(flatten)]
     parent_sha_provenance: ParentShaProvenance,
+}
+
+/// One coord `sibling_notes` entry, made safe for a single log line. coord
+/// already sanitizes every note to one line, but the runner does not take a
+/// remote peer's word for what lands in its own log: control characters and
+/// every non-space whitespace (a newline, or U+2028/U+2029, would forge an
+/// extra apparent log line) and bidi overrides/isolates (which visually
+/// reorder a line) become spaces, and the line is bounded.
+fn sibling_note_log_line(note: &str) -> String {
+    const MAX_CHARS: usize = 600;
+    let one_line: String = note
+        .chars()
+        .map(|c| {
+            let bidi = matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+            if c.is_control() || (c.is_whitespace() && c != ' ') || bidi {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(MAX_CHARS)
+        .collect();
+    if note.chars().count() > MAX_CHARS {
+        format!("{one_line}…")
+    } else {
+        one_line
+    }
 }
 
 /// Error variants returned by [`allocate_and_materialize_with_claim`]. Distinct
@@ -1509,6 +1548,13 @@ fn reanchor_by_agent_id(contents: &str, agent_id: &str, local_root: &str) -> Str
 /// `2026-09-28-shared-cargo-target-holds-one-build-copy-per-sibling-checkout-path`
 /// Phase 2), because an override naming a store nobody filled fails every build
 /// in the allocation. An older coord ignores the unknown key.
+///
+/// `edit_siblings` is ALWAYS emitted, empty or not: the repos this session will
+/// EDIT, which coord must never redirect at the sibling store (plan
+/// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`
+/// Phase 2). Callers also list each one in `repos` (vet V1). The field exists on
+/// every coord since qontinui-coord `540f4a07`, and `AllocateRequest` has no
+/// `deny_unknown_fields`, so it is harmless against any coord.
 fn allocate_request_body(
     machine_id: &uuid::Uuid,
     agent_session_id: Option<uuid::Uuid>,
@@ -1516,6 +1562,7 @@ fn allocate_request_body(
     intent: Option<&str>,
     declared_overlap_paths: Option<&[String]>,
     tenant: crate::auth::TenantScope,
+    edit_siblings: &[String],
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "device_id": machine_id.to_string(),
@@ -1525,6 +1572,7 @@ fn allocate_request_body(
         "agent_session_id": agent_session_id,
         "accepts_shared_branch": true,
         "materializes_sibling_store": true,
+        "edit_siblings": edit_siblings,
     });
     if let Some(t) = tenant.declared_tenant() {
         body["tenant_id"] = serde_json::json!(t);
@@ -1608,6 +1656,15 @@ fn allocate_tenant_scope(
 /// honored or refused before any lease or branch switch — see
 /// [`SharedBranchPolicy`].
 ///
+/// `edit_siblings` names the repos this session will EDIT (each also in
+/// `repos`, vet V1). It is sent to coord, and enforced locally as well (plan D4,
+/// so it holds against a coord that ignores the field): their entries are
+/// dropped from coord's `cargo_config` before it is gated and written, their
+/// store entries are not filled, and `<agent_root>/.cargo/edit-siblings`
+/// records them — see [`edit_sibling`]. Under `isolation = shared_branch` an
+/// edit sibling is a requested repo, so its canonical checkout gets the lease
+/// and the branch switch like any requested repo (a declared sibling would not).
+///
 /// On success returns `AllocateResult`. On any non-claim error,
 /// returns `Err(AllocateError::Other(String))`. Partial failure is
 /// handled at the boundary: if any `git worktree add` fails after coord
@@ -1626,6 +1683,7 @@ pub async fn allocate_and_materialize_with_claim(
     phase: Option<&str>,
     spawn_tenant: Option<uuid::Uuid>,
     shared_branch: SharedBranchPolicy,
+    edit_siblings: &[String],
 ) -> Result<MaterializeOutcome, AllocateError> {
     if !worktree_mode_enabled() {
         return Err(AllocateError::Other(format!(
@@ -1678,6 +1736,7 @@ pub async fn allocate_and_materialize_with_claim(
         intent,
         declared_overlap_paths,
         scope,
+        edit_siblings,
     );
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
@@ -1744,6 +1803,13 @@ pub async fn allocate_and_materialize_with_claim(
     for w in &coord_resp.worktrees {
         w.parent_sha_provenance
             .warn_if_not_fresh(&w.repo, &w.parent_sha);
+    }
+    for note in &coord_resp.sibling_notes {
+        warn!(
+            "allocate: coord sibling note agent_id={}: {}",
+            coord_resp.agent_id,
+            sibling_note_log_line(note)
+        );
     }
 
     // `wait` — coord declined to materialize. Surface a typed Wait
@@ -1931,8 +1997,10 @@ pub async fn allocate_and_materialize_with_claim(
 
     // The declared build siblings this allocation materialised, captured before
     // `planned` is consumed: the sibling store below is cut from the same
-    // checkout at the same coord-pinned sha.
-    let sibling_sources = sibling_store_sources(&planned);
+    // checkout at the same coord-pinned sha. An edit sibling's entry is never
+    // filled: the override written below names none for it, so nothing would
+    // read it.
+    let sibling_sources = drop_edit_sibling_sources(sibling_store_sources(&planned), edit_siblings);
 
     let mut materialized: Vec<MaterializedWorktree> = Vec::with_capacity(planned.len());
     for row in planned {
@@ -1969,17 +2037,18 @@ pub async fn allocate_and_materialize_with_claim(
     // eligibility decision and only relocate the prefix. Best-effort: a write
     // failure logs + continues (the agent then builds against the canonical
     // sibling — degraded, not broken).
-    if let Some(cc) = &coord_resp.cargo_config {
-        // The local agent-root: `agent_worktree_root(<primary canonical>)/<agent_id>`.
-        // The primary repo is the first materialized worktree (the consumer
-        // whose PTY opens), matching coord's `render(primary_repo)`.
-        let local_agent_root = materialized
-            .first()
-            .and_then(|primary| repo_canonical_paths.get(&primary.repo))
-            .map(|canonical| {
-                canonical_paths::agent_worktree_root(canonical).join(&coord_resp.agent_id)
-            });
+    //
+    // The local agent-root: `agent_worktree_root(<primary canonical>)/<agent_id>`.
+    // The primary repo is the first materialized worktree (the consumer
+    // whose PTY opens), matching coord's `render(primary_repo)`.
+    let local_agent_root = materialized
+        .first()
+        .and_then(|primary| repo_canonical_paths.get(&primary.repo))
+        .map(|canonical| {
+            canonical_paths::agent_worktree_root(canonical).join(&coord_resp.agent_id)
+        });
 
+    if let Some(cc) = &coord_resp.cargo_config {
         let (write_path, write_contents) = match &local_agent_root {
             Some(root) => reroot_cargo_override(&cc.path, &cc.contents, root, &coord_resp.agent_id),
             None => {
@@ -1993,6 +2062,13 @@ pub async fn allocate_and_materialize_with_claim(
             }
         };
 
+        // Plan 2026-10-10 Phase 2 (D4): take every declared edit sibling off the
+        // RE-ROOTED body before it is gated, so the guarantee holds against a
+        // coord that ignores `edit_siblings`. Textual, header-preserving, and
+        // re-parsed; `None` = write no config at all.
+        let write_contents =
+            edit_sibling::filter_spawn_cargo_config(&write_contents, edit_siblings);
+
         // Plan 2026-09-28 Phase 2: coord's body is a relative `paths` override
         // into the SHA-keyed sibling store. Fill the store first, then write the
         // config only when every entry it names exists — an override naming a
@@ -2000,11 +2076,13 @@ pub async fn allocate_and_materialize_with_claim(
         // unwritten one only costs the old per-allocation rebuild.
         // Off the async worker: `git archive` + unpack of a sibling is blocking
         // I/O measured in seconds.
-        if let Some(worktree_root) = local_agent_root
-            .as_ref()
-            .and_then(|root| root.parent())
-            .map(Path::to_path_buf)
-        {
+        if let (Some(worktree_root), Some(_)) = (
+            local_agent_root
+                .as_ref()
+                .and_then(|root| root.parent())
+                .map(Path::to_path_buf),
+            write_contents.as_ref(),
+        ) {
             let sources = sibling_sources;
             if let Err(e) =
                 tokio::task::spawn_blocking(move || fill_sibling_store(&worktree_root, &sources))
@@ -2013,7 +2091,10 @@ pub async fn allocate_and_materialize_with_claim(
                 warn!("sibling store: fill task failed: {e}");
             }
         }
-        if cargo_override_is_backed(&write_path, &write_contents) {
+        if let Some(write_contents) = write_contents
+            .as_deref()
+            .filter(|contents| cargo_override_is_backed(&write_path, contents))
+        {
             if let Some(parent) = std::path::Path::new(&write_path).parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     warn!(
@@ -2022,7 +2103,7 @@ pub async fn allocate_and_materialize_with_claim(
                     );
                 }
             }
-            match std::fs::write(&write_path, &write_contents) {
+            match std::fs::write(&write_path, write_contents) {
                 Ok(()) => info!(
                     "phase5 cargo override written (re-rooted): {} ({} bytes)",
                     write_path,
@@ -2033,9 +2114,19 @@ pub async fn allocate_and_materialize_with_claim(
             // A store reaper may have taken an entry between the gate and the
             // write. A config naming a vanished entry fails every build, so
             // take it back rather than leave it.
-            withdraw_override_if_unbacked(&write_path, &write_contents);
+            withdraw_override_if_unbacked(&write_path, write_contents);
         }
     }
+
+    // Plan 2026-10-10 Phase 2: record every declared edit sibling in
+    // `<agent_root>/.cargo/edit-siblings` — whether or not coord emitted a
+    // `cargo_config` — so a census can tell this deliberate opt-out from a
+    // hand-disabled config. Best-effort: the allocation is already made.
+    record_spawn_edit_siblings(
+        local_agent_root.as_deref(),
+        edit_siblings,
+        &coord_resp.agent_id,
+    );
 
     // Install the git credential helper in each materialized worktree so
     // that direct `git push` from within the worktree routes through coord,
@@ -2210,6 +2301,66 @@ fn sibling_store_sources(planned: &[PlannedWorktreeRow]) -> Vec<SiblingSource> {
             let name = canonical_paths::canonical_segment(&p.row.repo).ok()?;
             Some((name, p.canonical.clone(), sha))
         })
+        .collect()
+}
+
+/// Record a spawn's declared edit siblings in `<agent_root>/.cargo/edit-siblings`
+/// — independent of whether coord emitted a `cargo_config`, so a census can
+/// tell the deliberate opt-out from a hand-disabled config. Best-effort: the
+/// allocation is already made, so a failure is logged, never raised. Returns
+/// the marker's contents when it was written.
+fn record_spawn_edit_siblings(
+    local_agent_root: Option<&Path>,
+    edit_siblings: &[String],
+    agent_id: &str,
+) -> Option<Vec<String>> {
+    if edit_siblings.is_empty() {
+        return None;
+    }
+    let Some(root) = local_agent_root else {
+        warn!(
+            "edit siblings: no agent root resolved for allocation {agent_id} — {edit_siblings:?} \
+             not recorded"
+        );
+        return None;
+    };
+    match edit_sibling::record_edit_siblings(root, edit_siblings) {
+        Ok(recorded) => {
+            info!(
+                "edit siblings recorded in {}: {}",
+                edit_sibling::marker_path(root).display(),
+                recorded.join(", ")
+            );
+            Some(recorded)
+        }
+        Err(e) => {
+            warn!(
+                "edit siblings: could not record {edit_siblings:?} in {}: {e}",
+                edit_sibling::marker_path(root).display()
+            );
+            None
+        }
+    }
+}
+
+/// `sources` without any declared edit sibling's entry (matched by bare name,
+/// case-insensitive). The cargo override never names an edit sibling's store
+/// entry, so archiving one would cost seconds of `git archive` for nothing.
+fn drop_edit_sibling_sources(
+    sources: Vec<SiblingSource>,
+    edit_siblings: &[String],
+) -> Vec<SiblingSource> {
+    if edit_siblings.is_empty() {
+        return sources;
+    }
+    let edit: Vec<String> = edit_siblings
+        .iter()
+        .filter_map(|e| edit_sibling::bare_repo_name(e).ok())
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    sources
+        .into_iter()
+        .filter(|(name, _, _)| !edit.contains(&name.to_ascii_lowercase()))
         .collect()
 }
 
@@ -2633,6 +2784,35 @@ pub fn coord_ws_to_http(coord_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// coord#2779 added `sibling_notes`; the runner must decode it (so it can
+    /// log it) and must still decode a coord that predates it.
+    #[test]
+    fn coord_allocate_response_decodes_sibling_notes_and_tolerates_their_absence() {
+        let with: CoordAllocateResponse = serde_json::from_value(serde_json::json!({
+            "agent_id": "a",
+            "worktrees": [],
+            "sibling_notes": ["qontinui/x: coord could not read .qontinui/ci.toml"],
+        }))
+        .unwrap();
+        assert_eq!(with.sibling_notes.len(), 1);
+
+        let without: CoordAllocateResponse =
+            serde_json::from_value(serde_json::json!({"agent_id": "a", "worktrees": []})).unwrap();
+        assert!(without.sibling_notes.is_empty());
+    }
+
+    /// A remote peer's text lands in the runner's own log: a newline in it
+    /// must not forge a second log line, and its length is bounded.
+    #[test]
+    fn sibling_note_log_line_is_one_bounded_line() {
+        assert_eq!(sibling_note_log_line("a\nFORGED: b\tc"), "a FORGED: b c");
+        assert_eq!(sibling_note_log_line("a\u{2028}b\u{202E}c"), "a b c");
+        let long = sibling_note_log_line(&"x".repeat(5000));
+        assert_eq!(long.chars().count(), 601, "600 chars plus the ellipsis");
+        assert!(long.ends_with('…'));
+        assert_eq!(sibling_note_log_line("short"), "short");
+    }
 
     // =======================================================================
     // D3 — the four `parent_sha_*` freshness fields on the allocate row
@@ -3110,6 +3290,7 @@ mod tests {
             Some("editing coord"),
             Some(paths.as_slice()),
             crate::auth::TenantScope::Unresolved,
+            &[],
         );
         assert_eq!(body["device_id"], machine.to_string());
         assert_eq!(body["agent_session_id"], session.to_string());
@@ -3136,12 +3317,135 @@ mod tests {
             None,
             None,
             crate::auth::TenantScope::Unresolved,
+            &[],
         );
         assert!(
             body2.as_object().unwrap().contains_key("agent_session_id"),
             "agent_session_id key must always be present on the wire"
         );
         assert!(body2["agent_session_id"].is_null());
+    }
+
+    /// Plan 2026-10-10 Phase 2: `edit_siblings` is always on the wire — an
+    /// empty array when the session declares none, the names verbatim when it
+    /// does.
+    #[test]
+    fn allocate_request_body_emits_edit_siblings() {
+        let machine = uuid::Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let repos = vec![
+            RepoRequest {
+                repo: "qontinui-coord".to_string(),
+                parent_sha: None,
+            },
+            RepoRequest {
+                repo: "qontinui-schemas".to_string(),
+                parent_sha: None,
+            },
+        ];
+        let none = allocate_request_body(
+            &machine,
+            None,
+            &repos,
+            None,
+            None,
+            crate::auth::TenantScope::Unresolved,
+            &[],
+        );
+        assert_eq!(none["edit_siblings"], serde_json::json!([]));
+
+        let edit = vec!["qontinui-schemas".to_string()];
+        let some = allocate_request_body(
+            &machine,
+            None,
+            &repos,
+            None,
+            None,
+            crate::auth::TenantScope::Unresolved,
+            &edit,
+        );
+        assert_eq!(
+            some["edit_siblings"],
+            serde_json::json!(["qontinui-schemas"])
+        );
+        // The edit sibling is requested too (vet V1) — the body carries both.
+        assert_eq!(some["repos"][1]["repo"], "qontinui-schemas");
+    }
+
+    /// The marker is written for a spawn's edit siblings even when coord sent
+    /// NO `cargo_config` (nothing else in the allocation touches `.cargo/`), and
+    /// never when the spawn declared none.
+    #[test]
+    fn spawn_records_edit_siblings_without_a_cargo_config() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!root.path().join(".cargo").exists());
+        let recorded = record_spawn_edit_siblings(
+            Some(root.path()),
+            &["qontinui/qontinui-schemas".to_string()],
+            "AGENT",
+        );
+        assert_eq!(recorded, Some(vec!["qontinui-schemas".to_string()]));
+        assert_eq!(
+            std::fs::read_to_string(edit_sibling::marker_path(root.path())).unwrap(),
+            "qontinui-schemas\n"
+        );
+        assert!(!edit_sibling::config_path(root.path()).exists());
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            record_spawn_edit_siblings(Some(empty.path()), &[], "AGENT"),
+            None
+        );
+        assert!(!edit_sibling::marker_path(empty.path()).exists());
+        assert_eq!(
+            record_spawn_edit_siblings(None, &["qontinui-schemas".to_string()], "AGENT"),
+            None
+        );
+    }
+
+    /// The spawn-time filter runs on the RE-ROOTED body: re-rooting rewrites
+    /// only coord's agent-root prefix, so the relative `../.siblings/` entries
+    /// survive it and the edit sibling's are then dropped while the header and
+    /// every other sibling stay.
+    #[test]
+    fn spawn_filter_applies_to_the_rerooted_body() {
+        let sha = "a".repeat(40);
+        let coord_body = format!(
+            "# Generated by qontinui-coord\n\npaths = [\n    \"../.siblings/qontinui-schemas@{sha}/rust\",\n    \"../.siblings/ui-bridge@{sha}\",\n]\n"
+        );
+        let (path, rerooted) = reroot_cargo_override(
+            "agent-worktrees/AG/.cargo/config.toml",
+            &coord_body,
+            Path::new("D:/w/qontinui-worktrees/AG"),
+            "AG",
+        );
+        assert_eq!(path, "D:/w/qontinui-worktrees/AG/.cargo/config.toml");
+        let filtered =
+            edit_sibling::filter_spawn_cargo_config(&rerooted, &["qontinui-schemas".to_string()])
+                .expect("ui-bridge remains");
+        assert!(filtered.starts_with("# Generated by qontinui-coord"));
+        assert_eq!(
+            sibling_store::override_path_entries(&filtered).unwrap(),
+            vec![format!("../.siblings/ui-bridge@{sha}")]
+        );
+        // Every entry an edit sibling's → no config to write, so the store
+        // fill (gated on a body to write) is skipped as well.
+        assert_eq!(
+            edit_sibling::filter_spawn_cargo_config(
+                &rerooted,
+                &["qontinui-schemas".to_string(), "ui-bridge".to_string()],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn drop_edit_sibling_sources_skips_only_edit_siblings() {
+        let src = |name: &str| (name.to_string(), PathBuf::from(name), "a".repeat(40));
+        let sources = vec![src("qontinui-schemas"), src("ui-bridge")];
+        let kept =
+            drop_edit_sibling_sources(sources.clone(), &["qontinui/QONTINUI-SCHEMAS".to_string()]);
+        assert_eq!(kept, vec![src("ui-bridge")]);
+        assert_eq!(drop_edit_sibling_sources(sources.clone(), &[]), sources);
     }
 
     #[test]
@@ -3198,7 +3502,8 @@ mod tests {
                 !claim.as_object().unwrap().contains_key("tenant_id"),
                 "{scope:?} must declare no tenant on a claim body"
             );
-            let alloc = allocate_request_body(&machine, Some(session), &repos, None, None, scope);
+            let alloc =
+                allocate_request_body(&machine, Some(session), &repos, None, None, scope, &[]);
             assert!(
                 !alloc.as_object().unwrap().contains_key("tenant_id"),
                 "{scope:?} must declare no tenant on an allocate body"
@@ -3215,7 +3520,7 @@ mod tests {
             serde_json::json!({}),
         );
         assert_eq!(claim["tenant_id"], tenant.to_string());
-        let alloc = allocate_request_body(&machine, Some(session), &repos, None, None, owned);
+        let alloc = allocate_request_body(&machine, Some(session), &repos, None, None, owned, &[]);
         assert_eq!(alloc["tenant_id"], tenant.to_string());
         // The pre-existing wire contract is untouched by the added field.
         assert_eq!(alloc["agent_session_id"], session.to_string());
@@ -3244,7 +3549,7 @@ mod tests {
         // The pre-session interactive spawn: no registry tenant, spawn chose B.
         let scope = allocate_tenant_scope(TenantScope::Unresolved, Some(b));
         assert_eq!(scope, TenantScope::Owned(b));
-        let body = allocate_request_body(&machine, None, &repos, None, None, scope);
+        let body = allocate_request_body(&machine, None, &repos, None, None, scope, &[]);
         assert_eq!(body["tenant_id"], b.to_string());
 
         // ...and the bearer attached to that allocate is B's slot, on a device

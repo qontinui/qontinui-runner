@@ -212,6 +212,41 @@ pub(crate) struct CiManifest {
     /// workflow, and coord alone writes the result.
     #[serde(default)]
     pub repair: Vec<CiRepair>,
+    /// Repos whose CI may READ this repo through coord's OIDC broker
+    /// (`POST /coord/ci/repo-read-token`, plan
+    /// `2026-10-10-repo-onboarding-is-agent-actionable-end-to-end` Phase 4).
+    /// The grant is honoured by coord from this repo's DEFAULT-branch tree in
+    /// its canonical mirror, never from a PR head. The runner PARSES and
+    /// VALIDATES the table so a repo can declare it without failing every
+    /// CI-node dispatch on `deny_unknown_fields`; it never acts on it.
+    #[serde(default)]
+    pub ci_readers: Vec<CiReader>,
+}
+
+/// One declared cross-repo CI reader: "the CI of `repo` may check this repo
+/// out, read-only".
+///
+/// # Land order: runner first, declarations after
+///
+/// Same coupling as `[[repair]]`, `[canonical]` and `[[siblings]]`: a
+/// `[[ci_readers]]` block is a hard parse error on any runner built before this
+/// field existed, so this lands and rolls out before any repo declares one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CiReader {
+    /// The consumer repo: a bare `name` (same owner as this repo) or
+    /// `owner/name`. Coord resolves it against the tenant's repos; the runner
+    /// only checks its shape.
+    ///
+    /// A grant is to the consumer REPO, not to a workflow or a branch: every
+    /// ref and event of the consumer is admitted, so anyone who can push a
+    /// workflow to the consumer inherits read access to this repo.
+    pub repo: String,
+    /// Admit the consumer's `pull_request_target` runs too. OFF by default:
+    /// that event runs with the base repo's identity on code a fork can
+    /// influence, so coord refuses it unless the entry opts in here.
+    #[serde(default)]
+    pub allow_pull_request_target: bool,
 }
 
 /// One declared repair.
@@ -556,6 +591,7 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
     validate_services(&manifest.services)?;
     validate_canonical(manifest.canonical.as_ref())?;
     validate_repairs(&manifest.repair)?;
+    validate_ci_readers(&manifest.ci_readers)?;
     for (i, step) in manifest.steps.iter().enumerate() {
         let label = if step.name.trim().is_empty() {
             format!("steps[{i}]")
@@ -565,16 +601,7 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
         if step.name.trim().is_empty() {
             return Err(format!("{label}: name must be non-empty"));
         }
-        if step.command.is_empty() || step.command[0].trim().is_empty() {
-            return Err(format!("{label}: command must be a non-empty argv array"));
-        }
-        for token in &step.command {
-            if token.contains(ARGV_BANNED_CHARS) {
-                return Err(format!(
-                    "{label}: command token {token:?} contains a banned shell metacharacter"
-                ));
-            }
-        }
+        validate_argv(&label, "command", &step.command)?;
         for key in step.env.keys() {
             if let Some((_, owner)) = EXECUTOR_OWNED_ENV
                 .iter()
@@ -670,6 +697,12 @@ fn validate_repairs(repairs: &[CiRepair]) -> Result<(), String> {
 /// enough to mean something. These globs bound what coord ACCEPTS from a
 /// repair, so a glob that names the whole repo, or that a glob engine could
 /// expand outside it, defeats the declaration.
+///
+/// This is an author-facing lint, best-effort by nature: a glob language can
+/// always spell "nearly everything" (`**/?a*`) or match `.git` through a
+/// bare `*` component. The enforcing check is coord's, on the actual patch
+/// paths. What this refuses is every SPELLING an author could reasonably
+/// believe was narrow.
 fn validate_allowed_path(glob: &str) -> Result<(), String> {
     let g = glob.trim();
     if g.is_empty() {
@@ -677,21 +710,114 @@ fn validate_allowed_path(glob: &str) -> Result<(), String> {
     }
     // Brace alternation (`{src,../x}`) expands past a component check, and a
     // backslash is a separator only on Windows — on a Linux runner `..\x`
-    // would pass as one component. Neither is needed to name a path set.
-    if g.contains(['{', '}', '\\']) {
+    // would pass as one component. A character class (`.gi[t]`) defeats the
+    // literal `.git` check below. None is needed to name a path set.
+    if g.contains(['{', '}', '[', ']', '\\']) {
         return Err(format!(
-            "allowed_paths {glob:?} must not use braces or backslashes"
+            "allowed_paths {glob:?} must not use braces, character classes or backslashes"
         ));
     }
-    if matches!(g, "." | "*" | "**" | "**/*" | "./**") {
+    validate_repo_relative("allowed_paths", g)?;
+    // Judge the components, not the whole string: `./.git/x` and `sub/.git/x`
+    // (a submodule's git dir) reach into `.git` as surely as `.git/x`, and
+    // `./**`, `**/**` or `?*` are as unbounded as `**`.
+    let components: Vec<&str> = g
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if components
+        .iter()
+        .all(|c| c.chars().all(|ch| matches!(ch, '*' | '?')))
+    {
         return Err(format!(
-            "allowed_paths {glob:?} names the whole repository — name the files the repair may change"
+            "allowed_paths {glob:?} is only wildcards, so it names the whole repository or \
+             nearly — name the files the repair may change"
         ));
     }
-    if g == ".git" || g.starts_with(".git/") {
-        return Err(format!("allowed_paths {glob:?} must not reach into .git"));
+    for c in &components {
+        // A bare `*` / `**` is the admitted limitation in the doc above; any
+        // other component is refused when it could resolve to `.git`.
+        if matches!(*c, "*" | "**") {
+            continue;
+        }
+        // Case-insensitive filesystems resolve `.GIT`, and Win32 strips a
+        // trailing dot or space, so `.git.` and `.git ` resolve there too —
+        // and a wildcard (`.g*`, `?git`, `*it`) can expand to `.git`.
+        let resolved = c.trim_end_matches(['.', ' ']);
+        if resolved.eq_ignore_ascii_case(".git") || wildcard_matches(c, ".git") {
+            return Err(format!(
+                "allowed_paths {glob:?} must not reach into .git (component {c:?})"
+            ));
+        }
     }
-    validate_working_dir(g).map_err(|e| format!("allowed_paths: {e}"))
+    Ok(())
+}
+
+/// Whether `pattern` (only `*` and `?` special, ASCII case-insensitive, and
+/// a leading `.` NOT special — the most permissive reading a glob engine may
+/// take) matches the single path component `name`.
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
+    fn go(p: &[u8], n: &[u8]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some((b'*', rest)) => (0..=n.len()).any(|i| go(rest, &n[i..])),
+            Some((b'?', rest)) => !n.is_empty() && go(rest, &n[1..]),
+            Some((c, rest)) => n
+                .first()
+                .is_some_and(|m| m.eq_ignore_ascii_case(c) && go(rest, &n[1..])),
+        }
+    }
+    go(pattern.as_bytes(), name.as_bytes())
+}
+
+/// Upper bound on declared CI readers. Each entry is a standing read grant on
+/// a private repo, so a long list is a review smell, not a convenience.
+const MAX_CI_READERS: usize = 16;
+
+fn validate_ci_readers(readers: &[CiReader]) -> Result<(), String> {
+    if readers.len() > MAX_CI_READERS {
+        return Err(format!(
+            "ci.toml declares {} [[ci_readers]] (max {MAX_CI_READERS})",
+            readers.len()
+        ));
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for (i, r) in readers.iter().enumerate() {
+        let label = format!("ci_readers[{i}]");
+        validate_ci_reader_repo(&r.repo).map_err(|e| format!("{label}: {e}"))?;
+        let key = r.repo.to_ascii_lowercase();
+        if seen.contains(&key) {
+            return Err(format!(
+                "{label}: repo {:?} is declared more than once",
+                r.repo
+            ));
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
+/// `name` or `owner/name`, each segment a GitHub-legal path segment.
+fn validate_ci_reader_repo(repo: &str) -> Result<(), String> {
+    if repo.len() > 200 {
+        return Err("repo slug too long".to_string());
+    }
+    let segs: Vec<&str> = repo.split('/').collect();
+    if segs.is_empty() || segs.len() > 2 {
+        return Err(format!("repo {repo:?} must be `name` or `owner/name`"));
+    }
+    for seg in segs {
+        if seg.is_empty() || seg == "." || seg == ".." || seg.starts_with('-') {
+            return Err(format!("repo {repo:?} has an invalid path segment {seg:?}"));
+        }
+        if !seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(format!("repo {repo:?} has an invalid path segment {seg:?}"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_siblings(siblings: &[CiSibling]) -> Result<(), String> {
@@ -976,18 +1102,23 @@ fn validate_tool_version(version: &str) -> Result<(), String> {
 /// no parent/root/prefix components. Execution additionally canonicalizes
 /// and prefix-checks against the real worktree path.
 fn validate_working_dir(wd: &str) -> Result<(), String> {
+    validate_repo_relative("working_dir", wd)
+}
+
+/// `field`'s value is a repo-relative path with no parent or root component.
+fn validate_repo_relative(field: &str, wd: &str) -> Result<(), String> {
     let path = std::path::Path::new(wd);
     // The `:` check rejects Windows drive-qualified paths (`C:\x`, `C:x`)
     // even when this code runs on a non-Windows host (cross-platform tests).
     if path.is_absolute() || wd.starts_with('/') || wd.starts_with('\\') || wd.contains(':') {
-        return Err(format!("working_dir {wd:?} must be repo-relative"));
+        return Err(format!("{field} {wd:?} must be repo-relative"));
     }
     for component in path.components() {
         match component {
             std::path::Component::Normal(_) | std::path::Component::CurDir => {}
             _ => {
                 return Err(format!(
-                    "working_dir {wd:?} must not contain parent/root components"
+                    "{field} {wd:?} must not contain parent/root components"
                 ))
             }
         }
@@ -1030,6 +1161,125 @@ check = ["cargo", "test", "workspace_assumptions"]
         assert_eq!(m.steps.len(), 1, "a repair is not a step the executor runs");
     }
 
+    const WITH_CI_READERS: &str = r#"
+version = 1
+
+[[steps]]
+name = "test"
+command = ["cargo", "test"]
+
+[[ci_readers]]
+repo = "consumer-evals"
+
+[[ci_readers]]
+repo = "example-org/other-consumer"
+"#;
+
+    #[test]
+    fn ci_readers_parse_and_are_never_steps() {
+        let m = parse_and_validate(WITH_CI_READERS).expect("valid");
+        assert_eq!(
+            m.ci_readers,
+            vec![
+                CiReader {
+                    repo: "consumer-evals".to_string(),
+                    allow_pull_request_target: false,
+                },
+                CiReader {
+                    repo: "example-org/other-consumer".to_string(),
+                    allow_pull_request_target: false,
+                },
+            ]
+        );
+        assert_eq!(m.steps.len(), 1, "a reader grant is not a step");
+    }
+
+    /// `pull_request_target` runs with the BASE repo's secrets and OIDC
+    /// identity on code a fork controls, so a grant is closed to it unless the
+    /// entry opts in explicitly.
+    #[test]
+    fn ci_reader_pull_request_target_is_an_explicit_opt_in_defaulting_off() {
+        let m = parse_and_validate(WITH_CI_READERS).expect("valid");
+        assert!(!m.ci_readers[0].allow_pull_request_target);
+        let text = WITH_CI_READERS.replace(
+            "repo = \"consumer-evals\"",
+            "repo = \"consumer-evals\"\nallow_pull_request_target = true",
+        );
+        let m = parse_and_validate(&text).expect("opt-in parses");
+        assert!(m.ci_readers[0].allow_pull_request_target);
+        assert!(!m.ci_readers[1].allow_pull_request_target);
+    }
+
+    #[test]
+    fn a_manifest_without_ci_readers_still_parses() {
+        let m = parse_and_validate(VALID).expect("valid");
+        assert!(m.ci_readers.is_empty());
+    }
+
+    #[test]
+    fn ci_reader_refuses_an_unknown_key() {
+        let text = WITH_CI_READERS.replace(
+            "repo = \"consumer-evals\"",
+            "repo = \"consumer-evals\"\nref = \"main\"",
+        );
+        let err = parse_and_validate(&text).expect_err("unknown key");
+        assert!(
+            err.contains("unknown field") && err.contains("ref"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ci_readers_reject_bad_declarations() {
+        let cases = [
+            (
+                WITH_CI_READERS.replace("\"consumer-evals\"", "\"a/b/c\""),
+                "must be `name` or `owner/name`",
+            ),
+            (
+                WITH_CI_READERS.replace("\"consumer-evals\"", "\"\""),
+                "invalid path segment",
+            ),
+            (
+                WITH_CI_READERS.replace("\"consumer-evals\"", "\"../x\""),
+                "invalid path segment",
+            ),
+            (
+                WITH_CI_READERS.replace("\"consumer-evals\"", "\"-flag\""),
+                "invalid path segment",
+            ),
+            (
+                WITH_CI_READERS.replace("\"consumer-evals\"", "\"a b\""),
+                "invalid path segment",
+            ),
+            (
+                WITH_CI_READERS.replace("\"example-org/other-consumer\"", "\"Consumer-Evals\""),
+                "declared more than once",
+            ),
+            (
+                WITH_CI_READERS.replace(
+                    "[[ci_readers]]\nrepo = \"consumer-evals\"",
+                    "[[ci_readers]]",
+                ),
+                "parse error",
+            ),
+        ];
+        for (text, needle) in cases {
+            let err = parse_and_validate(&text).expect_err(needle);
+            assert!(err.contains(needle), "expected {needle:?} in {err}");
+        }
+    }
+
+    #[test]
+    fn ci_readers_are_capped() {
+        let mut text = String::from("version = 1\n[[steps]]\nname = \"t\"\ncommand = [\"true\"]\n");
+        for i in 0..=MAX_CI_READERS {
+            text.push_str(&format!("[[ci_readers]]\nrepo = \"r{i}\"\n"));
+        }
+        let err = parse_and_validate(&text).expect_err("over cap");
+        assert!(err.contains("[[ci_readers]] (max 16)"), "{err}");
+    }
+
     #[test]
     fn a_manifest_without_repair_still_parses() {
         let m = parse_and_validate(VALID).expect("valid");
@@ -1046,6 +1296,23 @@ check = ["cargo", "test", "workspace_assumptions"]
             err.contains("unknown field") && err.contains("foo"),
             "{err}"
         );
+    }
+
+    /// The component checks must not over-refuse: a name that merely starts
+    /// with `.git`, or a wildcard narrowed by a literal, is a real path set.
+    #[test]
+    fn repair_accepts_narrow_globs_beside_the_refused_shapes() {
+        for g in [
+            ".github/workflows/*.yml",
+            ".gitignore",
+            "./src/**/*.rs",
+            "*/Cargo.toml",
+            ".env*",
+            ".cargo*/config.toml",
+        ] {
+            let text = WITH_REPAIR.replace("[\"**/*.rs\"]", &format!("[{g:?}]"));
+            parse_and_validate(&text).unwrap_or_else(|e| panic!("{g:?} refused: {e}"));
+        }
     }
 
     #[test]
@@ -1070,11 +1337,11 @@ check = ["cargo", "test", "workspace_assumptions"]
             ),
             (
                 WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"{src,../../etc}/**\"]"),
-                "braces or backslashes",
+                "braces, character classes or backslashes",
             ),
             (
                 WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"..\\\\x\\\\*.rs\"]"),
-                "braces or backslashes",
+                "braces, character classes or backslashes",
             ),
             (
                 WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"**\"]"),
@@ -1083,6 +1350,78 @@ check = ["cargo", "test", "workspace_assumptions"]
             (
                 WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".git/hooks/*\"]"),
                 ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"./**\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"**/**\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"*/*\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"./.git/hooks/*\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"vendor/sub/.git/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"?*\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"**/?*\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".gi?/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".*/hooks/*\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".git*/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".GIT/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".git./config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"?git/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"*git/hooks/*\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"?gi?/HEAD\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"*it/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".gi[t]/config\"]"),
+                "character classes",
             ),
             (
                 WITH_REPAIR.replace(

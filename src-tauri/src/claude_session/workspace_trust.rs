@@ -41,6 +41,13 @@
 //!   it; a negative git-root probe is a distinct sentinel from "no entry", and
 //!   the walk terminates when the candidate is no longer under that root.
 //!
+//! **(2) covers plain trust only.** The CLI has a second, *explicit* reading
+//! that gates a workspace's project permission grants, and for a linked
+//! worktree it is keyed on the PRIMARY checkout (the canonical root reached via
+//! `.git` → `gitdir` → `commondir`), not on the worktree root this module keys.
+//! A worktree trusted only here still raises the CLI's backstop dialog.
+//! [`super::trust_gate::mints_primary_checkout_trust`] owns that second key.
+//!
 //! Property (1) is corroborated by the same corpus: across the machine's
 //! account configs, every existing project key was either a git-repo root or a
 //! directory in no repo — never a subdirectory of a repo.
@@ -105,6 +112,21 @@ pub(crate) const CONFIG_FILE: &str = ".claude.json";
 pub(crate) const PROJECTS_KEY: &str = "projects";
 pub(crate) const TRUST_FLAG: &str = "hasTrustDialogAccepted";
 
+/// Marker the runner leaves beside a trust flag it CREATED rather than derived:
+/// the trust gate's underived mints (worktree key and primary-checkout key) and
+/// every write of the ungated [`ensure_workspace_trusted`]. The trust gate
+/// refuses to count a marked entry as a human grant, so a mint made under one
+/// autonomy dial cannot later satisfy conjunct 2 as "derived" trust under a
+/// stricter one. Entries written by builds that predate this marker carry no
+/// stamp and still read as human grants — the guard is forward-only.
+///
+/// The marker survives the CLI's own writes: its trust writer spreads the
+/// existing entry (`{...projects[key] ?? defaults, hasTrustDialogAccepted:
+/// true}`, read out of the 2.1.285 bundle, 2026-09-30). The cost is a
+/// permanent false negative if a human later accepts the dialog for a stamped
+/// key — that grant is not counted, which fails closed.
+pub(crate) const RUNNER_MINTED_FLAG: &str = "qontinuiRunnerMintedTrust";
+
 /// Which account configs a pre-trust should reach.
 #[derive(Debug, Clone, Copy)]
 pub enum TrustTargets<'a> {
@@ -141,7 +163,7 @@ pub enum TrustOutcome {
 /// drive path and `\\?\UNC\server\share` for a network path; the latter must
 /// become `//server/share`, NOT `UNC/server/share`. Drive-letter CASE is
 /// preserved deliberately — the CLI does not fold it, so neither may we.
-fn to_key_string(path: &Path) -> String {
+pub(crate) fn to_key_string(path: &Path) -> String {
     let s = path.to_string_lossy().into_owned();
     let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -189,6 +211,33 @@ pub fn project_key(dir: &Path) -> Option<String> {
 /// file, atomically and idempotently. See the module docs for the rules this
 /// enforces; each is a distinct [`TrustOutcome`] variant.
 pub fn ensure_trusted_in(config_file: &Path, key: &str) -> TrustOutcome {
+    ensure_trusted(config_file, key, false)
+}
+
+/// [`ensure_trusted_in`], additionally stamping [`RUNNER_MINTED_FLAG`] on an
+/// entry this call creates trust for. An entry that already reads trusted is
+/// left alone and NOT stamped: that trust predates the runner's write.
+pub fn ensure_runner_minted_trust_in(config_file: &Path, key: &str) -> TrustOutcome {
+    ensure_trusted(config_file, key, true)
+}
+
+/// True when `projects[key]` carries [`RUNNER_MINTED_FLAG`]` = true`. Any read
+/// or parse failure answers `false`; the caller only uses a `true` to REFUSE a
+/// derivation, so a failed read can never widen trust.
+pub fn is_runner_minted(config_file: &Path, key: &str) -> bool {
+    std::fs::read_to_string(config_file)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|doc| {
+            doc.get(PROJECTS_KEY)?
+                .get(key)?
+                .get(RUNNER_MINTED_FLAG)?
+                .as_bool()
+        })
+        .unwrap_or(false)
+}
+
+fn ensure_trusted(config_file: &Path, key: &str, mark_runner_minted: bool) -> TrustOutcome {
     let raw = match std::fs::read_to_string(config_file) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -228,6 +277,12 @@ pub fn ensure_trusted_in(config_file: &Path, key: &str) -> TrustOutcome {
         return TrustOutcome::AlreadyTrusted;
     }
     entry.insert(TRUST_FLAG.to_string(), serde_json::Value::Bool(true));
+    if mark_runner_minted {
+        entry.insert(
+            RUNNER_MINTED_FLAG.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
 
     match write_atomically(config_file, &doc, raw.len()) {
         Ok(bytes) => {
@@ -369,7 +424,9 @@ pub fn ensure_workspace_trusted(working_dir: &str, targets: TrustTargets<'_>) {
 /// inside [`ensure_trusted_in`] at `info!`, because it is the only record that
 /// we rewrote a live, credential-bearing account file.
 fn report(config_file: &Path, key: &str) {
-    match ensure_trusted_in(config_file, key) {
+    // This path mints with no derivation and no dial check, so every write it
+    // makes is stamped runner-minted.
+    match ensure_runner_minted_trust_in(config_file, key) {
         TrustOutcome::AlreadyTrusted | TrustOutcome::Trusted => {}
         TrustOutcome::Skipped(reason) => {
             debug!(

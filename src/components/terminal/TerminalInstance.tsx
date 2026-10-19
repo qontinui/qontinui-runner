@@ -48,25 +48,25 @@ import {
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
 import {
-  trimReplayedChunk,
-  isEmissionGap,
-  resyncSliceStart,
-  drainHeldChunks,
-  lostWindowBytes,
-  formatLostOutputMarker,
-  RESYNC_INCOMPLETE_MARKER,
-  type OffsetChunk,
-} from "./scrollbackReplay";
+  noteDecode,
+  noteRingReplay,
+  noteWriteRendered,
+  transportClockStart,
+} from "./transportStats";
 import { REMOTE_HISTORY_EVENT, type RemoteHistoryDetail } from "./remoteTabs";
 import { RenderAckAccumulator, ACK_FLOOR_INTERVAL_MS } from "./flowControl";
+import { AckedWriteQueue } from "./ackedWriteQueue";
+import { PaneOutputStream, decodeOutputPayload } from "./paneOutputStream";
+import { RingResync } from "./ringResync";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import {
   registerTerminalOutputHandler,
+  terminalOutputListening,
   registerTerminalExitHandler,
   type TerminalOutputPayload,
 } from "./terminalEventDemux";
 import { declarePaneTier } from "./terminalVisibilityTiers";
-import { PaneVisibilityService, routeOutputChunk } from "./paneVisibilityService";
+import { PaneVisibilityService } from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
 import { describeThrown } from "@/lib/utils";
 
@@ -230,15 +230,6 @@ const DEAD_TERMINAL_SCROLLBACK = 2000;
  * other mount-independent signals (state chips, sparklines).
  */
 const QUIET_TITLE_POLL_INTERVAL_MS = 2000;
-
-/**
- * Ring-refetch attempts one `resyncFromRing` pass makes before giving up and
- * marking the pane spliced. Each attempt costs one `readScrollbackRing` round
- * trip; the loop only re-runs when the previous window fell short (a hole the
- * fetch did not cover, or bytes dropped while it was in flight), so the common
- * case is exactly one.
- */
-const RESYNC_MAX_ATTEMPTS = 5;
 
 /**
  * `memo(forwardRef(...))` (plan `2026-07-28-runner-many-sessions-performance`
@@ -543,38 +534,16 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       // Ensure the dev instrumentation hook (window.__qontinuiTerminal) exists
       // so it's discoverable from the console even before any paint fires.
       getTerminalDebug();
-      // Bytes received before the backend finishes async init. Tauri does
-      // NOT queue events before listen() resolves, and createTerminalBackend
-      // (WASM load + open + key handlers + UI Bridge registration) takes
-      // ~200ms; without this buffer we'd silently drop everything Claude
-      // emits in that window and xterm would freeze on whatever the grid
-      // contained at bootstrap snapshot time. Chunks keep their absolute
-      // stream offset so the drain can dedup against the scrollback-ring
-      // replay (see scrollbackReplay.ts).
-      let pendingBytes: OffsetChunk[] = [];
-      let backendReady = false;
-      // End offset (exclusive) of the scrollback-ring replay written into
-      // this xterm instance during init. Live/pending chunks below this
-      // boundary are already in the buffer via the ring and must not be
-      // written again.
-      let replayedThrough = 0;
-      // Emission-gap resync state. The Rust reader gates WEBVIEW EMISSION
-      // (never the PTY read) on flow-control backpressure, so when this
-      // renderer falls behind — or the pane mounts onto a terminal whose
-      // emission was paused — the live stream carries an offset jump. We
-      // detect it via `nextExpectedOffset` (exclusive end of the last
-      // observed chunk), hold post-gap chunks in `resyncPending`, refetch
-      // the scrollback ring (which also resets the backend's flow-control
-      // counters, resuming emission), write the missed slice, then drain the
-      // held chunks trimmed against the advanced replay boundary.
-      // `writtenThrough` tracks the exclusive end of bytes actually written
-      // (ring replays + live chunks) — the resync slice boundary.
-      let nextExpectedOffset: number | null = null;
-      let writtenThrough = 0;
-      let resyncInFlight = false;
-      /** A resync was requested while one was already running (see `resyncFromRing`). */
-      let resyncAgainRequested = false;
-      let resyncPending: OffsetChunk[] = [];
+      // The pane's view of its output stream lives in `PaneOutputStream`
+      // (constructed below, once its write queue exists): the chunks buffered
+      // before the backend is ready, the chunks held behind an emission gap,
+      // and the offsets that line a ring replay up with the live stream
+      // (`replayedThrough`, `writtenThrough`, `nextExpectedOffset`). The Rust
+      // reader gates WEBVIEW EMISSION (never the PTY read) on flow-control
+      // backpressure, so a renderer that falls behind sees an offset jump; the
+      // stream detects it, holds post-gap chunks, and asks `resyncFromRing`
+      // to replay the missed slice from the scrollback ring (which also resets
+      // the backend's flow-control counters, resuming emission).
       // Phase 3 — render-based flow control. Tracks bytes the backend has
       // actually RENDERED (its `write` completion callback fired), not bytes
       // merely received off the wire, and decides when to ack the Rust reader
@@ -585,51 +554,83 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       const renderAck = new RenderAckAccumulator();
       const sendAck = (bytes: number) => {
         if (bytes <= 0) return;
-        invoke("terminal_ack", { terminalId, bytesAcked: bytes }).catch(() => {});
+        invoke("terminal_ack", { terminalId, bytesAcked: bytes }).catch((e) => {
+          // The runner still counts these bytes as unacked, and nothing will
+          // ack them again: above the Low watermark that can keep a paused
+          // gate shut. A resync's ring read resets the counters (and replays
+          // anything the gate skipped meanwhile). Not for a pane that is gone
+          // or whose process exited, where the ack failing is expected.
+          console.warn(`[Terminal ${terminalId}] terminal_ack failed:`, e);
+          if (!disposed && !exitedRef.current) void resyncFromRing();
+        });
       };
-      // Phase 4 — write coalescing. Per `terminal-output` event we trim the
-      // chunk against the ring-replay boundary and stage the unreplayed suffix
-      // here; a microtask flush concatenates everything staged into a SINGLE
+      // Phase 4 — write coalescing. Per `terminal-output` event the chunk is
+      // staged in `ackQueue`, which trims it against the ring-replay boundary;
+      // a microtask flush concatenates everything staged into a SINGLE
       // `backend.write()`. xterm's own RenderDebouncer then batches one reflow
-      // per frame — we add no rAF loop around xterm. The render-ack callback
-      // fires once for the whole coalesced write and accounts its full length.
-      let coalesceQueue: Uint8Array[] = [];
-      let coalesceLen = 0;
+      // per frame — we add no rAF loop around xterm. The queue owes the runner
+      // an ack for every byte it RECEIVED, trimmed prefix included, not just the
+      // bytes it wrote: an unacked remainder above the runner's Low watermark
+      // wedges a paused emission gate for good (see `ackedWriteQueue.ts`).
+      const ackQueue = new AckedWriteQueue(renderAck, sendAck);
+      // The hooks close over `paneService` (declared further down). They only
+      // run once a chunk arrives, which is after the handler is registered,
+      // and that is after `paneService` exists.
+      const stream = new PaneOutputStream(ackQueue, {
+        isPaused: () => paneService.paused,
+        hasBackend: () => backendRef.current !== null,
+        noteMissedOutput: (end) => paneService.noteMissedOutput(end),
+        requestResync: () => void resyncFromRing(),
+        scheduleFlush: () => scheduleFlush(),
+      });
+      /**
+       * Wait until this window's `terminal-output` listener is live in the
+       * runner, before a reset whose counted bytes must reach this pane. A
+       * `false` (its `listen()` failed, and the one retry the wait makes failed
+       * too) is logged, never dropped: a reset issued now can count bytes no
+       * listener receives.
+       */
+      const awaitOutputListener = async (why: string): Promise<boolean> => {
+        const live = await terminalOutputListening();
+        if (!live) {
+          console.warn(
+            `[Terminal ${terminalId}] terminal-output listener is not live (${why}); bytes counted after the next reset may never be acked`,
+          );
+        }
+        return live;
+      };
+      /**
+       * `terminal_flow_reset` (acked = sent). Its failure is logged, never
+       * swallowed: a reset that did not happen leaves a paused gate paused.
+       */
+      const flowReset = (why: string) => {
+        invoke("terminal_flow_reset", { terminalId }).catch((e) => {
+          console.warn(`[Terminal ${terminalId}] terminal_flow_reset (${why}) failed:`, e);
+        });
+      };
       let flushScheduled = false;
       const flushCoalesced = () => {
         flushScheduled = false;
-        if (coalesceLen === 0) return;
+        if (ackQueue.isEmpty) return;
         const b = backendRef.current;
-        if (!b) {
-          coalesceQueue = [];
-          coalesceLen = 0;
-          return;
-        }
-        let merged: Uint8Array;
-        if (coalesceQueue.length === 1) {
-          merged = coalesceQueue[0];
-        } else {
-          merged = new Uint8Array(coalesceLen);
-          let at = 0;
-          for (const c of coalesceQueue) {
-            merged.set(c, at);
-            at += c.length;
-          }
-        }
-        const writtenLen = merged.length;
-        coalesceQueue = [];
-        coalesceLen = 0;
-        renderAck.onWriteIssued(writtenLen);
         try {
-          b.write(merged, () => {
-            sendAck(renderAck.onRendered(writtenLen));
-          });
+          ackQueue.flush(
+            b && {
+              // Times each coalesced write for the transport stats; the
+              // queue still owns the write and its ack.
+              write: (coalesced, onRendered) => {
+                const writeStart = transportClockStart();
+                b.write(coalesced, () => {
+                  noteWriteRendered(writeStart, coalesced.length);
+                  onRendered();
+                });
+              },
+            },
+          );
         } catch (e) {
+          // The queue already settled the ack the failed write's render
+          // callback would have sent, so backpressure can't wedge on it.
           console.error(`[Terminal ${terminalId}] write error:`, e);
-          // The render callback won't fire for a failed write — settle the
-          // in-flight bytes so the accumulator and reader backpressure don't
-          // wedge on a permanently-unrendered chunk.
-          sendAck(renderAck.onRendered(writtenLen));
         }
       };
       const scheduleFlush = () => {
@@ -659,11 +660,12 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       const bootstrapPaint = (
         snapshot: GridSnapshot,
         reason: "mount-bootstrap" | "reconnect-bootstrap",
-      ) => {
+        allowPaint = true,
+      ): boolean => {
         const b = backendRef.current;
-        if (!b) return;
+        if (!b) return false;
         const altScreen = snapshot.alt_screen === true;
-        const applied = !altScreen;
+        const applied = allowPaint && !altScreen;
         if (applied) {
           paintGrid(b, snapshot);
         }
@@ -676,6 +678,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           bytesWritten: bytesReceivedRef.current,
           ts: Date.now(),
         });
+        return applied;
       };
 
       /**
@@ -695,150 +698,32 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         }
       };
 
-      /**
-       * Mid-session recovery for a webview-emission gap (flow-control drop).
-       * Each pass fetches the scrollback ring — which also resets the
-       * backend's flow-control counters, resuming emission — writes the
-       * slice the renderer missed, then drains held chunks only up to the
-       * first REMAINING hole (`drainHeldChunks`): post-hole chunks stay held
-       * so the next pass's (advanced) ring window can cover the hole first —
-       * writing them early would splice the hole out permanently. Bounded
-       * retries; on exhaustion or fetch failure the leftovers are written
-       * spliced rather than stranded (full-frame TUI redraws self-heal, and
-       * the next remount's ring replay reconciles scrollback).
-       *
-       * Also the catch-up path when a hidden pane is revealed (Phase 2 / A4),
-       * which is why a request that arrives while a pass is in flight is
-       * QUEUED rather than dropped: the running pass is working from a ring
-       * snapshot taken before the newly-missed bytes existed, so silently
-       * declining would leave a hole that no later gap detection can see
-       * (`nextExpectedOffset` keeps advancing across drops, so the stream
-       * looks contiguous afterwards).
-       */
+      // Mid-session recovery for a webview-emission gap, and the reveal
+      // catch-up: see `ringResync.ts`.
+      const ringResync = new RingResync(stream, {
+        isDisposed: () => disposed,
+        backend: () => {
+          const b = backendRef.current;
+          return b
+            ? {
+                readScrollbackRing: () => b.readScrollbackRing(terminalId),
+                write: (data) => b.write(data),
+              }
+            : null;
+        },
+        noteRingReplay,
+        noteResynced: (through) => paneService.noteResynced(through),
+        noteResyncFailed: () => paneService.noteResyncFailed(),
+        flushStaged: () => flushCoalesced(),
+        flowReset,
+        warn: (message, error) =>
+          error === undefined
+            ? console.warn(`[Terminal ${terminalId}] ${message}`)
+            : console.warn(`[Terminal ${terminalId}] ${message}:`, error),
+      });
+      // Deferred while a reconnect waits for its grid paint (see `mayResyncNow`).
       const resyncFromRing = async () => {
-        if (resyncInFlight) {
-          resyncAgainRequested = true;
-          return;
-        }
-        resyncInFlight = true;
-        // Set only on the one exit that PROVES the pane is caught up: a replay
-        // that covered every dropped byte AND left no held chunk behind a
-        // hole. Every other exit — a rejected fetch, an empty ring, a replay
-        // that stopped short of bytes dropped while it was in flight, the
-        // retry budget running out — falls through to the `finally`, which
-        // re-arms the pane and tells the operator the pane is spliced.
-        let caughtUp = false;
-        try {
-          for (let attempt = 0; attempt < RESYNC_MAX_ATTEMPTS; attempt++) {
-            const source = backendRef.current;
-            if (disposed || !source) return;
-            let ring: ScrollbackRingWindow | null;
-            try {
-              ring = await source.readScrollbackRing(terminalId);
-            } catch (e) {
-              console.warn(
-                `[Terminal ${terminalId}] emission-gap resync fetch failed (attempt ${attempt + 1}):`,
-                e,
-              );
-              continue;
-            }
-            const b = backendRef.current;
-            if (disposed || !b) return;
-            if (!ring) {
-              console.warn(
-                `[Terminal ${terminalId}] scrollback ring unavailable for resync (attempt ${attempt + 1})`,
-              );
-              continue;
-            }
-            const ringBytes = ring.bytes;
-            const ringWindow = {
-              startOffset: ring.startOffset,
-              endOffset: ring.endOffset,
-            };
-            // Ring overrun: the hole starts before the oldest byte the backend
-            // still holds, so those bytes are gone from every source and no
-            // retry can produce them. `resyncSliceStart` replays the whole
-            // ring, which would join the pane's last written byte straight to
-            // a later one — indistinguishable from continuous output. Say so
-            // in-band instead, and warn for the log.
-            const lost = lostWindowBytes(ringWindow, writtenThrough);
-            if (lost > 0) {
-              console.warn(
-                `[Terminal ${terminalId}] scrollback ring overran the missed window; ${lost} bytes of output are unrecoverable`,
-              );
-              b.write(formatLostOutputMarker(lost));
-            }
-            const from = resyncSliceStart(ringWindow, writtenThrough);
-            const slice = ringBytes.subarray(from);
-            if (slice.length > 0) {
-              // Direct write (not the coalesce queue): any pre-gap staged
-              // chunks flushed in an earlier microtask, and the held
-              // post-gap chunks drain AFTER this, so stream order holds.
-              b.write(slice);
-            }
-            replayedThrough = Math.max(replayedThrough, ringWindow.endOffset);
-            writtenThrough = Math.max(writtenThrough, ringWindow.endOffset);
-            nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, ringWindow.endOffset);
-            // Clears the pane's "behind" flag only if this ring window reached
-            // every byte that was dropped. A chunk dropped while the fetch was
-            // in flight sits beyond this (older) snapshot — the next attempt's
-            // ring covers it.
-            const covered = paneService.noteResynced(replayedThrough);
-
-            const drained = drainHeldChunks(resyncPending, writtenThrough, replayedThrough);
-            resyncPending = drained.reheld;
-            writtenThrough = drained.writtenThrough;
-            for (const w of drained.writable) {
-              coalesceQueue.push(w);
-              coalesceLen += w.length;
-            }
-            if (drained.writable.length > 0) scheduleFlush();
-            if (covered && drained.reheld.length === 0) {
-              caughtUp = true;
-              return;
-            }
-            console.warn(
-              `[Terminal ${terminalId}] emission gap persisted across resync (attempt ${attempt + 1}); retrying`,
-            );
-          }
-        } catch (e) {
-          console.warn(`[Terminal ${terminalId}] emission-gap resync failed:`, e);
-        } finally {
-          // Never strand held chunks: on success the loop drained them all;
-          // on retry exhaustion or fetch failure, write what remains even
-          // though a hole may precede it (spliced beats frozen).
-          const rest = resyncPending;
-          resyncPending = [];
-          for (const c of rest) {
-            const slice = trimReplayedChunk(c, replayedThrough);
-            if (slice && slice.length > 0) {
-              coalesceQueue.push(slice);
-              coalesceLen += slice.length;
-              scheduleFlush();
-            }
-            if (c.offset !== undefined) {
-              writtenThrough = Math.max(writtenThrough, c.offset + c.bytes.length);
-            }
-          }
-          // A request that arrived mid-pass ran against a stale ring snapshot;
-          // run exactly one more pass to cover what it could not see. That
-          // pass is the retry, so don't declare the gap unrecovered yet.
-          const retryQueued = resyncAgainRequested && !disposed;
-          if (!caughtUp && !disposed && !retryQueued) {
-            // Stay armed so the next reveal tries again — and surface it, because
-            // what the operator is looking at right now has a hole in it.
-            paneService.noteResyncFailed();
-            console.warn(
-              `[Terminal ${terminalId}] emission-gap resync did not complete; output is spliced`,
-            );
-            backendRef.current?.write(RESYNC_INCOMPLETE_MARKER);
-          }
-          resyncInFlight = false;
-          if (retryQueued) {
-            resyncAgainRequested = false;
-            void resyncFromRing();
-          }
-        }
+        if (stream.mayResyncNow()) await ringResync.run();
       };
 
       // ── Visibility tier (Phase 2 / A4) ──────────────────────────────────
@@ -968,90 +853,19 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
        * IPC deserialize + dispatch that every mounted pane paid.
        */
       const handleOutputPayload = (payload: TerminalOutputPayload) => {
-        const raw = atob(payload.data);
-        const bytes = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) {
-          bytes[i] = raw.charCodeAt(i);
+        // Routing, gap detection, trimming and acking all live in
+        // `PaneOutputStream` / `AckedWriteQueue` (leaf modules, unit-tested).
+        // Nothing here writes to the backend: every received byte has to go
+        // through the acked queue, or the runner's emission gate wedges.
+        // Session-state tracking is fed by the page-level tap in
+        // `TerminalSessionContext`, independently of this pane.
+        const decodeStart = transportClockStart();
+        const chunk = decodeOutputPayload(payload);
+        noteDecode("pane", decodeStart, chunk.bytes.length);
+        const route = stream.receive(chunk);
+        if (route !== "buffer" && route !== "discard") {
+          bytesReceivedRef.current += chunk.bytes.length;
         }
-        const offset = payload.offset;
-
-        // Emission-gap detection: the backend gates webview emission (not
-        // the PTY read) under backpressure, so a dropped chunk surfaces as
-        // the next delivered chunk starting beyond the end of the last one.
-        // Only meaningful once the backend is ready — pre-ready holes are
-        // covered wholesale by the mount ring replay.
-        const gapDetected = backendReady && isEmissionGap(nextExpectedOffset, offset);
-        // Keep the "last observed chunk end" advancing in EVERY tier,
-        // including while hidden: it is what stops the first chunk after a
-        // reveal from being misread as a fresh emission gap.
-        if (offset !== undefined) {
-          nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, offset + bytes.length);
-        }
-
-        const route = routeOutputChunk({
-          paused: paneService.paused,
-          backendReady,
-          gapDetected,
-          resyncInFlight,
-        });
-
-        if (route === "drop") {
-          // Hidden pane: no parse, no write, no ack. `writtenThrough` stays
-          // put, so the reveal resync replays exactly this window from the
-          // ring. State chips/sparklines keep updating — they are fed by the
-          // page-level output tap, which is mount- and visibility-independent.
-          // The chunk's end offset is what makes the reveal resync provable:
-          // a replay only clears the flag once it has reached this far.
-          paneService.noteMissedOutput(offset === undefined ? undefined : offset + bytes.length);
-          bytesReceivedRef.current += bytes.length;
-          return;
-        }
-
-        if (route === "buffer") {
-          // Backend not yet created — buffer the bytes; they'll be drained
-          // (and the idle timer primed) once the backend init completes.
-          pendingBytes.push({ bytes, offset });
-          return;
-        }
-
-        if (!backendRef.current) return;
-
-        if (route === "hold") {
-          // Hold post-gap chunks until the ring slice covering the hole is
-          // written so bytes land in stream order; the resync drain trims
-          // each held chunk against the advanced replay boundary.
-          resyncPending.push({ bytes, offset });
-          bytesReceivedRef.current += bytes.length;
-          if (gapDetected) void resyncFromRing();
-          return;
-        }
-        // A chunk emitted before the ring snapshot can still be DELIVERED
-        // after the replay (event delivery and invoke responses are not
-        // mutually ordered) — trim it to its unreplayed suffix so the
-        // boundary bytes aren't written twice. ack bookkeeping below stays on
-        // the full chunk: the content reached the terminal either way (via
-        // the ring), only the duplicate write is skipped.
-        //
-        // Session-state tracking is NOT fed from here anymore — the global
-        // `terminal-output` tap in `TerminalSessionContext` decodes + feeds
-        // `handleOutput` independently of this instance's mount state (Phase 2
-        // of the flow-grid virtualization plan). This handler is now purely
-        // the xterm write/render path.
-        const unreplayed = trimReplayedChunk({ bytes, offset }, replayedThrough);
-        if (unreplayed && unreplayed.length > 0) {
-          // Phase 4: stage the unreplayed suffix and flush once per microtask
-          // into a single coalesced backend.write() (offset-dedup already
-          // applied above, before coalescing). The render-ack accounts the
-          // coalesced length when its completion callback fires. Length
-          // guard: zero-length resume-marker events carry only an offset.
-          coalesceQueue.push(unreplayed);
-          coalesceLen += unreplayed.length;
-          scheduleFlush();
-        }
-        if (offset !== undefined) {
-          writtenThrough = Math.max(writtenThrough, offset + bytes.length);
-        }
-        bytesReceivedRef.current += bytes.length;
       };
 
       // Cold-mount path: register the output handler IMMEDIATELY — before any
@@ -1059,8 +873,8 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       // Registration is synchronous (the window's listener is already live, or
       // is installed by this call), so unlike the old per-instance
       // `await listen(...)` there is no attach window at all. Bytes arriving
-      // before backendReady are buffered into pendingBytes and drained once
-      // the backend is ready.
+      // before the backend is ready are buffered by `PaneOutputStream` and
+      // drained (`stream.drainPending()`) once it is.
       //
       // Reconnect path (Layer 4 polish): the PTY survived the page reload and
       // the Rust grid already holds the full state. Live bytes during the
@@ -1084,11 +898,11 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         const detail = (ev as CustomEvent<RemoteHistoryDetail>).detail;
         if (!detail || detail.terminalId !== terminalId) return;
         const b = backendRef.current;
-        if (!b || !backendReady || disposed) {
+        if (!b || !stream.backendReady || disposed) {
           detail.report?.({ rendered: false, reason: "the pane is not ready" });
           return;
         }
-        if (resyncInFlight) {
+        if (stream.resyncInFlight) {
           console.warn(
             `[Terminal ${terminalId}] earlier-output render skipped: a ring resync is in flight`,
           );
@@ -1128,9 +942,8 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           b.reset();
           b.write(detail.bytes);
           b.write(ring.bytes);
-          replayedThrough = ring.endOffset;
-          writtenThrough = ring.endOffset;
-          nextExpectedOffset = ring.endOffset;
+          noteRingReplay(ring.bytes.length, ring.bytes.length);
+          stream.reanchor(ring.endOffset);
           detail.report?.({ rendered: true, bytes: detail.bytes.length });
         })();
       };
@@ -1448,8 +1261,8 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // Layer 2 bootstrap (live-first):
         //   1. The live `terminal-output` listener was attached at the very
         //      top of this effect, BEFORE createTerminalBackend. Bytes that
-        //      arrived during async init were buffered into pendingBytes —
-        //      drain them here now that the backend exists.
+        //      arrived during async init were buffered by `stream` — drain
+        //      them here now that the backend exists.
         //   2. Forward motion is owned ENTIRELY by the live `terminal-output`
         //      stream (with offset-dedup + remount ring-replay as the recovery
         //      path). The periodic idle reconciliation paint was retired in
@@ -1469,12 +1282,26 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // default size; the bootstrap fit below reflows it to the real
         // viewport, same as the disk-based session-restore path.
         try {
+          // The ring read resets the flow-control counters, and the chunks
+          // counted after it are acked only if they reach this pane's
+          // handler. On a cold mount the handler is registered, but its
+          // runner-side listener may still be in flight: wait for it.
+          if (!isReconnecting) {
+            await awaitOutputListener("cold mount");
+            if (disposed) return;
+          }
           const ring = await backend.readScrollbackRing(terminalId);
           if (disposed) return;
-          if (ring && ring.bytes.length > 0) {
-            backend.write(ring.bytes);
-            replayedThrough = ring.endOffset;
-            writtenThrough = Math.max(writtenThrough, ring.endOffset);
+          if (ring) {
+            if (ring.bytes.length > 0) {
+              backend.write(ring.bytes);
+              noteRingReplay(ring.bytes.length, ring.bytes.length);
+            }
+            // For every ring, an empty one included: it seeds
+            // `nextExpectedOffset` and `writtenThrough`, so a hole after this
+            // ring reads as a gap, and the reconnect path's late-attach resync
+            // replays from here.
+            stream.applyMountRing(ring.endOffset);
           }
         } catch (e) {
           // Best-effort: a failed replay degrades to the pre-fix behavior
@@ -1482,24 +1309,15 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           console.warn(`[Terminal ${terminalId}] scrollback replay failed:`, e);
         }
 
-        for (const buffered of pendingBytes) {
-          // Drop/trim the part of each buffered chunk the ring replay above
-          // already wrote (ack bookkeeping stays on the full chunk).
-          const slice = trimReplayedChunk(buffered, replayedThrough);
-          if (slice) {
-            try {
-              backend.write(slice);
-            } catch (e) {
-              console.error(`[Terminal ${terminalId}] drain write error:`, e);
-            }
-          }
-          if (buffered.offset !== undefined) {
-            writtenThrough = Math.max(writtenThrough, buffered.offset + buffered.bytes.length);
-          }
-          bytesReceivedRef.current += buffered.bytes.length;
-        }
-        pendingBytes = [];
-        backendReady = true;
+        // Drop/trim the part of each buffered chunk the ring replay above
+        // already wrote, and owe an ack for the WHOLE chunk. The runner counted
+        // every one of these bytes as sent; writing them with no render
+        // callback (as this drain used to) left them on its books after every
+        // remount, until a burst wedged the emission gate. Flushed
+        // synchronously, so they land right behind the ring replay and ahead
+        // of any live chunk.
+        bytesReceivedRef.current += stream.drainPending();
+        flushCoalesced();
 
         // Wait for the container to have non-zero dimensions before
         // fitting. On fast initial mount the layout is already done; on
@@ -1540,6 +1358,11 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         const laidOut = await waitForLayout();
         if (disposed) return;
 
+        /** The reconnect path's paint: whether it ran, and the snapshot's stream offset. */
+        let lateAttachPaint: { painted: boolean; offset: number | undefined } = {
+          painted: false,
+          offset: undefined,
+        };
         try {
           if (laidOut) {
             backend.fit();
@@ -1561,25 +1384,74 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             }
           }
           if (disposed) return;
-          const result = await invoke<{ success: boolean; data: GridSnapshot | null }>(
-            "terminal_get_grid",
-            { terminalId },
-          );
-          if (result.success && result.data && !disposed) {
-            bootstrapPaint(result.data, isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap");
+          // Layer 4 polish: on the reconnect path the live `terminal-output`
+          // listener was deferred past the ring replay and the bootstrap
+          // resize. Attach it NOW, before asking for the grid, holding live
+          // chunks until the paint lands so none races it. Registering
+          // before the snapshot is what makes its `stream_offset` usable: a
+          // byte past it reaches this handler.
+          //
+          // On reconnect the snapshot also resets the flow-control counters,
+          // and `lateAttach` issues it only once the runner-side listener is
+          // live (Tauri's `listen()` resolves after registration), so every
+          // byte counted from the reset on reaches this pane and is acked.
+          // The mount ring read's reset could not: no listener existed yet,
+          // so a frame tee'd into the ring before it but counted after it
+          // went to nobody (see `PaneOutputStream.beginLateAttach`).
+          const fetchGrid = () =>
+            invoke<{ success: boolean; data: GridSnapshot | null }>("terminal_get_grid", {
+              terminalId,
+              resetFlowControl: isReconnecting,
+            });
+          const result =
+            isReconnecting && !outputUnsub
+              ? await stream.lateAttach({
+                  register: () => {
+                    outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
+                  },
+                  listening: () => awaitOutputListener("reconnect"),
+                  isCancelled: () => disposed,
+                  snapshot: fetchGrid,
+                })
+              : await fetchGrid();
+          if (result?.success && result.data && !disposed) {
+            // On reconnect, paint only a snapshot that says which stream bytes
+            // it reflects; otherwise the replay below covers them, and doing
+            // both would apply relative output twice.
+            const offset = result.data.stream_offset;
+            const painted = bootstrapPaint(
+              result.data,
+              isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap",
+              !isReconnecting || offset !== undefined,
+            );
+            lateAttachPaint = { painted, offset };
           }
         } catch (err) {
           console.warn(`[Terminal ${terminalId}] grid bootstrap failed:`, err);
         }
         if (disposed) return;
 
-        // Layer 4 polish: on the reconnect path the live `terminal-output`
-        // listener was deferred so it wouldn't race with the bootstrap
-        // paintGrid above. Attach it NOW that the grid has landed. The
-        // pendingBytes drain below is a no-op since nothing buffered while
-        // the listener wasn't attached, but the structure stays uniform.
-        if (isReconnecting && !outputUnsub) {
-          outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
+        if (isReconnecting) {
+          // Registered here only if the bootstrap above threw first. The
+          // resync this then requests resets the counters, so it too waits
+          // for the listener.
+          if (!outputUnsub) {
+            stream.beginLateAttach();
+            outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
+            await awaitOutputListener("reconnect fallback");
+            if (disposed) return;
+          }
+          // The bytes the runner sent between the mount ring read and the
+          // attach reached no handler; the snapshot's reset covered them. If
+          // the paint shows them, they are skipped; if not, they are replayed
+          // from the ring (a resync), unless the snapshot proves there were
+          // none.
+          const behind = stream.lateAttachSettled(lateAttachPaint.painted, lateAttachPaint.offset);
+          if (behind > 0) {
+            console.warn(
+              `[Terminal ${terminalId}] reconnect paint is ${behind} bytes behind the mount ring; replaying them from the paint`,
+            );
+          }
         }
         if (disposed) return;
 
@@ -1702,7 +1574,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // bytes it RECEIVES, so it could never reopen the gate on its own.
         // Resetting is safe: the unrendered backlog is being discarded with
         // the xterm buffer anyway.
-        invoke("terminal_flow_reset", { terminalId }).catch(() => {});
+        // Nothing to fall back to, since the pane is going, but a reset that
+        // did not happen can leave the tab's gate paused: `flowReset` says so.
+        flowReset("unmount");
         try {
           backendRef.current?.dispose();
         } catch {

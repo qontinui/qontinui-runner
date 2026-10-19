@@ -63,6 +63,7 @@ import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
+import { describeThrown } from "@/lib/utils";
 import type { ApprovalReport } from "../approveAll";
 
 /**
@@ -2006,6 +2007,30 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         },
       });
       return copied ? ok({ count: n }) : fail("clipboard-failed", "clipboard write failed");
+    },
+  });
+
+  // ── /elevated ────────────────────────────────────────────────────────
+  // Opens a separate Administrator PowerShell window through a UAC prompt. It
+  // is not a PTY tab (see `open_elevated_terminal`), so there is no tab id to
+  // report and nothing to zone-assign.
+  useCommandAction({
+    id: "terminal.elevated",
+    slash: "/elevated",
+    aliases: ["/admin"],
+    label: "Open elevated terminal",
+    description:
+      "Open an Administrator PowerShell window (Windows UAC prompt). The window is " +
+      "separate from the runner's terminal tabs.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^(?:open\s+)?(?:elevated|admin(?:istrator)?)\s+(?:terminal|shell|powershell)$/i],
+    handler: async (): Promise<CommandResult> => {
+      try {
+        await invoke("open_elevated_terminal");
+      } catch (err) {
+        return fail("elevation-failed", describeThrown(err, "could not open elevated terminal"));
+      }
+      return ok(effect("launched", "elevated terminal", 1));
     },
   });
 

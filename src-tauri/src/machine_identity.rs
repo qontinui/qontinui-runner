@@ -10,8 +10,7 @@
 //! This module is the reader on the paths that can WRITE or MINT an identity —
 //! [`crate::pair`], [`crate::auth`] and the `qontinui_profile device`
 //! subcommand — which is where a duplicated reader actually costs a second
-//! `coord.devices` row. It is declared in both `lib.rs` and `main.rs` because
-//! [`crate::auth`] compiles into both crates while [`crate::pair`] is lib-only,
+//! `coord.devices` row. It is owned by the lib and imported by the runner bin,
 //! and `auth.rs` must be able to consult the canonical identity before falling
 //! back to its own encrypted cache.
 //!

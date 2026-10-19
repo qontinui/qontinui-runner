@@ -2,11 +2,11 @@
 
 Perform hands-on manual testing of the application using the UI Bridge SDK. **Work completely autonomously — never ask the user for input, never ask the user to restart or rebuild anything, never report that something "needs a rebuild" and stop.**
 
-**CRITICAL: Never restart or kill active (non-temp) runners.** The primary runner and any named/protected runners must not be stopped. Always spawn a **temporary test runner** via the supervisor API (port 9875) for runner testing. The temp runner is built with the latest code, runs on a separate port, and is automatically cleaned up when stopped.
+**CRITICAL: Never restart or kill active (non-temp) runners.** The primary runner and any named/protected runners must not be stopped. Where your deployment runs a temp-runner spawner (`$SPAWNER`, next rule), always spawn a **temporary test runner** through it for runner testing. The temp runner is built with the latest code, runs on a separate port, and is automatically cleaned up when stopped.
 
-**CRITICAL: The supervisor (port 9875) is INDEPENDENT of the primary runner (port 9876).** The supervisor has its own parallel build pool and spawns temp runners directly — it does NOT depend on the primary runner being up, healthy, or recently rebuilt. You NEVER need to rebuild the primary runner to test code changes. Always use the supervisor's `POST /runners/spawn-test` instead. The supervisor builds from source into its own target directories (`target-pool/slot-{0,1,2}/`) and copies the binary for each temp runner.
+**CRITICAL: `$SPAWNER` is your deployment's temp-runner spawner, if it has one — and it is INDEPENDENT of the primary runner (`127.0.0.1:9876`).** Some deployments run a development supervisor that builds and spawns throwaway runners; its base URL is in your workspace's own docs (the workspace CLAUDE.md, where there is one). Set `SPAWNER=<that base URL>` before Phase 0 when one exists and leave it unset when none does — every `$SPAWNER` step below belongs to the temp-runner arm. A spawner has its own parallel build pool and spawns temp runners directly — it does NOT depend on the primary runner being up, healthy, or recently rebuilt. You NEVER need to rebuild the primary runner to test code changes: use the spawner's `POST /runners/spawn-test` instead (the maintainers' supervisor builds from source into its own target directories, `target-pool/slot-{0,1,2}/`, and copies the binary for each temp runner). **With no spawner** (declared `SPAWNER_NONE=1`, never inferred from an unset variable — shell env does not persist between Bash calls), the runner arm is the **own-runner arm**, which is READ-ONLY on your live runner at `127.0.0.1:9876` (see "The own-runner arm" under Arm selection): snapshot, discover and navigate; never change state, restart, rebuild or stop it; and record a change the running binary may not hold as UNVERIFIED (binary-freshness probe there) rather than test it against a binary that lacks it.
 
-**CRITICAL: Edit work runs in an allocated worktree, never the primary checkout.** Sibling rule to "never touch the primary runner" — same shape (don't edit the shared primary), different substrate (git worktree vs supervisor temp runner). If this skill needs to apply a fix mid-test (it usually doesn't — Phase 6 produces a Remediation Plan handed off to `/manual-test-loop`, which is the actual editing surface), allocate an isolated git worktree **through coord** — `bash <workspace-root>/qontinui-claude-config/scripts/allocate-worktree.sh --repo <repo> --intent "<what for>"`, which POSTs the literal, anonymous `https://coord.qontinui.io/agents/allocate` `{device_id, repos:[{repo}], intent}` and does the rest; by hand you would re-root the RELATIVE `worktrees[].worktree_path` under the workspace root, create it on coord's reserved `worktrees[].branch` from `worktrees[].parent_sha`, and use that as your repo root. Handle `isolation.mode` of `wait` / `shared_branch` rather than forcing a worktree. Only on HTTP 409 `repo_not_registered` (or an unreachable coord) fall back to `git -C <repo> worktree add -b <branch> <workspace-root>/<repo>-wt-<slug> origin/main`, and say in your report that the worktree is undeclared. (The HTTP `POST /agents/allocate-local` face was removed as dead code in runner #443.) A raw `git worktree add` produces a worktree coord cannot attribute, pin, or drain — see plan `2026-08-18-undeclared-worktree-exposure-and-classification`. **Why:** see `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
+**CRITICAL: Edit work runs in an allocated worktree, never the primary checkout.** Sibling rule to "never touch the primary runner" — same shape (don't edit the shared primary), different substrate (git worktree vs supervisor temp runner). If this skill needs to apply a fix mid-test (it usually doesn't — Phase 6 produces a Remediation Plan handed off to `/manual-test-loop`, which is the actual editing surface), allocate an isolated git worktree **through coord** — `bash <workspace-root>/qontinui-claude-config/scripts/allocate-worktree.sh --repo <repo> --intent "<what for>"`, which POSTs the literal, anonymous `https://coord.qontinui.io/agents/allocate` `{device_id, repos:[{repo}], intent}` and does the rest; by hand you would re-root the RELATIVE `worktrees[].worktree_path` under the workspace root, create it on coord's reserved `worktrees[].branch` from `worktrees[].parent_sha`, and use that as your repo root. Handle `isolation.mode` of `wait` / `shared_branch` rather than forcing a worktree. Only on HTTP 409 `repo_not_registered` (or an unreachable coord) fall back to `git -C <repo> worktree add -b <branch> ../<repo>-wt-<slug> origin/main` (a sibling of the checkout, in your workspace root), and say in your report that the worktree is undeclared. (The HTTP `POST /agents/allocate-local` face was removed as dead code in runner #443.) A raw `git worktree add` produces a worktree coord cannot attribute, pin, or drain — see plan `2026-08-18-undeclared-worktree-exposure-and-classification`. **Why:** see `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
 
 ### Runner Coordination (multi-session safety)
 
@@ -34,7 +34,12 @@ it, confirm it is idle using signals that actually exist:
 # -fsS (not -s) so a transport error is VISIBLE and an HTTP error is a non-zero
 # exit, and --max-time so it ends.
 curl -fsS --max-time 25 http://127.0.0.1:9876/restart-readiness   # safe_to_restart
-curl -fsS --max-time 20 http://127.0.0.1:9875/runners             # running / derived_status
+SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+if [ -n "$SPAWNER" ]; then
+  curl -fsS --max-time 20 "$SPAWNER/runners"   # running / derived_status
+else
+  echo "no spawner probed (SPAWNER unset in this shell -- re-set it if your deployment has one)"
+fi
 ```
 
 **Not `/task-runs/running`.** It is a port-filtered *workflow task-run* ledger,
@@ -69,12 +74,15 @@ the endpoint, which is an UNKNOWN and not an idle reading.
 > first, because every one of those sentences is a claim about a BINARY and you have
 > polled exactly one.
 >
-> Here the second instance is a **temp runner from the supervisor**, never the primary
+> Here the second instance is a **temp runner from `$SPAWNER`** (no spawner: another
+> door you can reach, such as the headless verdict arm), never the primary
 > on `:9876` — which is the move this file already prescribes, and it costs a build
 > slot rather than a restart:
 >
 > ```bash
-> curl -fsS --max-time 20 http://127.0.0.1:9875/runners     # every runner, not just yours
+> SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+> : "${SPAWNER:?SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none}"
+> curl -fsS --max-time 20 "$SPAWNER/runners"               # every runner, not just yours
 > curl -fsS --max-time 25 http://127.0.0.1:$PORT/health     # the temp runner's own build
 > ```
 >
@@ -123,7 +131,9 @@ Lifecycle". Only the operator may restart an active runner.
 # Spawn a temp runner (builds latest code, returns port).
 # The supervisor runs a parallel build pool (default N=3), so spawn-test is
 # BLOCKING by default — it holds the HTTP request open until a slot frees.
-curl -fsS -X POST http://localhost:9875/runners/spawn-test \
+SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+: "${SPAWNER:?SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none}"
+curl -fsS -X POST "$SPAWNER/runners/spawn-test" \
   -H "Content-Type: application/json" \
   -d '{"rebuild": true, "requester_id": "manual-test", "queue_timeout_secs": 600}'
 # Returns: {"id": "test-...", "port": 9877, "api_url": "http://localhost:9877", "ui_bridge_url": "..."}
@@ -133,7 +143,7 @@ RUNNER_BASE="http://localhost:$PORT/ui-bridge"
 
 # Stop when done (auto-removed). -f so a 404 (wrong/already-dead id) is a
 # non-zero exit rather than a silent leak of a build-pool slot.
-curl -fsS -X POST http://localhost:9875/runners/$ID/stop
+curl -fsS -X POST "$SPAWNER/runners/$ID/stop"
 ```
 
 ## Rebuilding & Restarting Non-Runner Services
@@ -164,13 +174,10 @@ debugging the old binary. `-S` still names the status (`curl: (22) … 500`), bu
 rather than the code, swap that one call to `--fail-with-body` (curl 7.76+),
 which fails the shell and keeps the body.
 
-### Alternative: Restart via dev-start.ps1
-Use this if the runner's Process Manager is unavailable:
-```bash
-.\dev-start.ps1 -Backend   # Restart backend only
-.\dev-start.ps1 -Frontend  # Restart frontend only
-# There is no -Web switch: run both switches, or use -All for the whole stack
-```
+### Alternative: Restart via your project's own service scripts
+Use this if the runner's Process Manager is unavailable: restart the backend or
+frontend with the start/restart command your project documents (its README or
+workspace docs name it). Restart only the service you changed — never a runner.
 
 ### Database migrations
 If new models/tables were added, run migrations before restarting:
@@ -194,14 +201,17 @@ cd qontinui-runner && npm run build
 
 # Then spawn a temp runner with rebuild to embed the new frontend.
 # spawn-test is blocking by default — it waits for a free slot in the
-# supervisor's parallel build pool (no retry loop needed).
-curl -fsS -X POST http://localhost:9875/runners/spawn-test \
+# supervisor's parallel build pool (no retry loop needed). Needs $SPAWNER;
+# without one, this change is UNVERIFIED on the own-runner arm.
+SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+: "${SPAWNER:?SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none}"
+curl -fsS -X POST "$SPAWNER/runners/spawn-test" \
   -H "Content-Type: application/json" \
   -d '{"rebuild": true, "requester_id": "manual-test", "queue_timeout_secs": 600}'
 ```
 
 ### General approach
-- **Backend/frontend:** Restart via runner Process Manager API (preferred) or dev-start.ps1 (fallback)
+- **Backend/frontend:** Restart via runner Process Manager API (preferred) or your project's own service scripts (fallback)
 - **Mobile:** Restart directly with `npx expo start`
 - **Runners:** NEVER restart active runners — always spawn temp runners for testing
 - **Shared packages** (ui-bridge-auto, workflow-ui, etc.): Build with `npm run build` before rebuilding consumers
@@ -232,6 +242,9 @@ here:
   would be a by-value snapshot of the line above, aimed at the **primary**
   runner — the one that arm forbids touching — while every other phase drove
   the temp one.
+- the **own-runner arm** (`SPAWNER_NONE=1`) binds `BASE="$RUNNER_BASE"` as
+  defined above — your own live runner, driven READ-ONLY (see "The own-runner
+  arm" below).
 - the **relay arm** binds it to `$RELAY_BASE` (`${ORIGIN}/api/ui-bridge`),
   which is not one of the three defined here.
 - auditing **prod web or mobile directly**, with no arm to bind it for you? Set
@@ -254,20 +267,94 @@ now wrong — row 3 works there.
 ```bash
 # One probe per precondition. Answer them BEFORE choosing an arm.
 # -f matters here: this line's whole verdict IS curl's exit code, and without it
-# a supervisor answering 503 is reported "up" — then the arm it selects fails.
-curl -fsS --max-time 20 http://127.0.0.1:9875/runners >/dev/null 2>&1 && echo "supervisor: up" || echo "supervisor: DOWN/UNKNOWN"
+# a spawner answering 503 is reported "up" — then the arm it selects fails.
+SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+SPAWNER_NONE="${SPAWNER_NONE:-}"   # 1 = your deployment has NO spawner (declared, never inferred)
+# Unset is not absent: an unset $SPAWNER in this shell selects NOTHING until you
+# say which it is.
+if [ -n "$SPAWNER" ]; then
+  if curl -fsS --max-time 20 "$SPAWNER/runners" >/dev/null 2>&1; then
+    echo "spawner: up at $SPAWNER -> temp-runner arm"
+  else
+    echo "spawner: DOWN/UNKNOWN at $SPAWNER -> NOT the own-runner arm; fix the spawner or re-probe"
+  fi
+elif [ "$SPAWNER_NONE" = 1 ]; then
+  echo "spawner: NONE (declared SPAWNER_NONE=1) -> own-runner arm, READ-ONLY"
+else
+  echo "spawner: UNSET -- SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none (declare that with SPAWNER_NONE=1)"
+fi
 command -v node >/dev/null && node -p 'process.versions.node' || echo "node: ABSENT"
 ```
 
 | # | If the target is… | Arm | Needs |
 |---|---|---|---|
-| 1 | the **Runner UI** (Tauri) | **temp-runner arm** — `POST :9875/runners/spawn-test`, everything below unchanged. **Never the primary runner.** | supervisor on `:9875` |
+| 1 | the **Runner UI** (Tauri) | **temp-runner arm** — `POST $SPAWNER/runners/spawn-test`, everything below unchanged. **Never the primary runner.** With no spawner (`SPAWNER_NONE=1`): the **own-runner arm** — `BASE="$RUNNER_BASE"` (`127.0.0.1:9876`), **READ-ONLY** (below): skip Step 1's spawn and Step 3's temp-runner stop (the `inject-cli` SIGTERM still runs). | a temp-runner spawner (`$SPAWNER`); none → your own runner, read-only |
 | 2 | a **web/mobile page you need to DRIVE interactively over many turns** (a parked, relay-registered tab another agent can also drive) | **relay arm** — `--transport=injected`, Phase 0 → Step 1.5 | a reachable relay on the page's own origin (+ `--auth-token` on prod) |
 | 3 | **any URL you need a VERDICT on** — "does my change look right?", a regression check, a headless box | **headless verdict arm** — `verify-page-verdict.sh`, below | node + a Playwright Chromium + the URL. **No display, no `pwsh`, no `docker`, no stack.** |
 
 Rows 2 and 3 are not rivals: row 2 gives you a *tab*, row 3 gives you a
 *verdict*. If you are verifying your own UI change and then tearing down, you
 want row 3.
+
+### The own-runner arm — READ-ONLY on your live runner
+
+Take it only when your deployment **has no spawner** (declare `SPAWNER_NONE=1`),
+never because `$SPAWNER` happened to be unset in one shell. Your runner on
+`127.0.0.1:9876` is the primary: its settings are machine-wide and it may host
+live sessions. This applies to EVERY phase (Phases 1 through 4, and any
+step elsewhere that drives the runner). On this arm:
+
+- **Allowed:** `snapshot`, `discover`, reading values (including an element's
+  `state` / disabled flag), and navigation between views.
+- **Always SKIPPED, recorded UNVERIFIED (naming the step) — no exception:**
+  every step that PERSISTS anything. That is creating, configuring or saving a
+  workflow; changing or saving settings (settings.json is machine-wide);
+  submitting forms; sending input to the terminal; registering a relay tab on
+  the runner; Phase 4's `sdk/connect`, which re-points the runner's SDK; and
+  the Process Manager restarts (`POST 127.0.0.1:9876/processes/<name>/restart`
+  and `…/rebuild-and-restart`), which restart the operator's own live backend
+  and frontend. These leave lasting changes on the operator's machine.
+- **Non-persisting interactions** — typing into an input without saving, and
+  clicks that only open or close UI (a menu, a dialog, a tab, an expander) —
+  are SKIPPED and recorded UNVERIFIED too, with one exception: the "Primary
+  runner (last resort)" rule above, `GET http://127.0.0.1:9876/restart-readiness`
+  answering an explicit `"safe_to_restart": true`. That verdict says a restart
+  would lose no live session; it says nothing about whether a write is
+  disposable, which is why it never covers the persisting list above. Report
+  that these ran on the primary under that verdict. Any other answer (`false`,
+  a timeout, a 404, a non-2xx) keeps them skipped.
+- **Never restart, rebuild or stop it.** Skip Step 1 (the spawn) and Step 3's
+  temp-runner stop; Step 3's `inject-cli` SIGTERM still runs.
+- A change the running binary may not hold is **UNVERIFIED** until the
+  binary-freshness probe below says `IN THE BINARY`.
+
+**Binary-freshness probe (own-runner arm).** Your runner was not built for this
+test, so before calling a change verified on it, prove the running binary holds
+the commit:
+
+```bash
+CHANGE_SHA="<the commit under test>"
+# The runner checkout that holds CHANGE_SHA -- $WS/qontinui-runner, as in Step 0 --
+# so the verdict does not depend on the cwd.
+RUNNER_REPO="${RUNNER_REPO:-${WS:?set WS to your workspace root, the directory holding your checkouts}/qontinui-runner}"
+if ! HEALTH=$(curl -fsS --max-time 25 http://127.0.0.1:9876/health); then
+  echo "UNKNOWN: /health probe failed -- cannot say whether the binary holds $CHANGE_SHA"
+else
+  GIT_SHA=$(printf '%s' "$HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('data') or {}).get('gitSha') or d.get('gitSha') or '')")  # envelope-ok: an absent gitSha prints '' and the next line reports UNKNOWN, never a default
+  if [ -z "$GIT_SHA" ]; then echo "UNKNOWN: /health carries no gitSha"
+  else
+    git -C "$RUNNER_REPO" merge-base --is-ancestor "$CHANGE_SHA" "$GIT_SHA"; RC=$?
+    case $RC in
+      0) echo "IN THE BINARY ($GIT_SHA) -- an absent behaviour here IS a finding" ;;
+      1) echo "UNVERIFIED: $CHANGE_SHA is not an ancestor of the running binary ($GIT_SHA) -- older, or divergent" ;;
+      *) echo "UNKNOWN: merge-base rc=$RC (a sha absent from this clone? fetch, then re-run)" ;;
+    esac
+  fi
+fi
+```
+
+rc 1 is UNVERIFIED (the change is provably not in the binary, which is older or
+divergent — never a regression); rc 128 or a failed probe is UNKNOWN, never either verdict.
 
 ### The headless verdict arm (`scripts/verify-page-verdict.sh`)
 
@@ -340,14 +427,14 @@ Notes that matter, all of them measured:
   `analyzer.pinnedSha` and `analyzer.shaVerified`; quote them. A build from
   `qontinui-schemas` HEAD answers a different question than the Style Gate does.
 - **What this arm does NOT reach:** a page behind qontinui-web's `(app)` auth
-  wall. That needs the `/verify-web` stack (`dev-start.ps1 -VerifyWebStack`,
-  which does need `pwsh` + `docker`) to mint the dev token and seed a
-  storageState — then pass it through with `--storage-state` and the verdict half
+  wall. That needs a signed-in storageState for the app — where your deployment
+  provides `/verify-web`, its stack (which does need `pwsh` + `docker`) mints
+  the dev token and seeds one — then pass it through with `--storage-state` and the verdict half
   is identical. Everything else on this box needs only node + Chromium + a URL.
 
 ### Injected transport — driving a bare pre-auth page (`--transport=injected`)
 
-Some pages ship **zero UI Bridge code** — the sign-in / register / forgot-password pages on prod and staging are plain HTML with no instrumentation. The standard targets above all assume the page already embeds the SDK, so they cannot drive a bare login page. The **injected transport** closes that gap: a Node-side CLI (`ui-bridge-inject`, shipped in `@qontinui/ui-bridge-wrapper`) launches a Chromium tab, navigates to the bare page, injects the UI Bridge engine bundle into it, and (by default) registers that tab as a **relay tab against the qontinui-web relay on the target page's own origin** (`<origin>/api/ui-bridge` — prod `https://qontinui.io/api/ui-bridge`, local dev `http://localhost:3001/api/ui-bridge`) — so the existing `/control/*` plane drives it exactly like any instrumented page.
+Some pages ship **zero UI Bridge code** — the sign-in / register / forgot-password pages on prod and staging are plain HTML with no instrumentation. The standard targets above all assume the page already embeds the SDK, so they cannot drive a bare login page. The **injected transport** closes that gap: a Node-side CLI (`ui-bridge-inject`, shipped in `@qontinui/ui-bridge-wrapper`) launches a Chromium tab, navigates to the bare page, injects the UI Bridge engine bundle into it, and (by default) registers that tab as a **relay tab against the qontinui-web relay on the target page's own origin** (`<origin>/api/ui-bridge` — prod `https://qontinui.io/api/ui-bridge`, local dev `http://localhost:<web-port>/api/ui-bridge`) — so the existing `/control/*` plane drives it exactly like any instrumented page.
 
 > **A runner relay IS available now — this note used to say the opposite, and that was stale for ~3 months.** The blockquote here read *"Runners have **no relay-tab protocol**: `GET /ui-bridge/tabs` → 404 … `POST /ui-bridge/heartbeat` is an IPC forward … Registration against a runner can never succeed"*, with the protocol described as "planned … once it ships, re-point this section's `RELAY_BASE` at the temp runner". **It shipped ~7 hours after that sentence was written** — qontinui-runner **#560** (`f58602ff2`, 2026-06-13), the remediation plan's own item 6(a) — and the note was never re-pointed. All three 404 claims are false today. This is the re-point.
 >
@@ -380,8 +467,8 @@ Select it with:
 
 | `--target-url` scheme | Drive path |
 |---|---|
-| `http://` local dev (e.g. `http://localhost:3001/login`) | **Relay mode (Variant B, the default)** — inject + register the tab against the SAME-ORIGIN local web relay `http://localhost:3001/api/ui-bridge`, drive via `/control/*`. No `--auth-token` needed while the local gate (`UI_BRIDGE_REQUIRE_AUTH`) is off. Full recipe: Phase 0 → Step 1.5. |
-| `https://` prod/staging (e.g. `https://qontinui.io/login`) | **Relay mode against the SAME-ORIGIN prod web relay** `https://qontinui.io/api/ui-bridge`, **with `--auth-token <Cognito operator IdToken>`** — the prod relay is auth-gated (Bearer-only). LNA never fires on this path: the page fetches its own https origin, no loopback involved. For quick snapshot/find-level checks without a parked session, **Variant A** (`--exec` one-shots, end of Step 1.5) also works; when you need a full login + parked authed session driven by another agent, the **`ui-bridge-login-web` flow** (`manual-test-coord.md` Phase 0.6) remains valid. |
+| `http://` local dev (e.g. `http://localhost:<web-port>/login`, your local web dev server) | **Relay mode (Variant B, the default)** — inject + register the tab against the SAME-ORIGIN local web relay `http://localhost:<web-port>/api/ui-bridge`, drive via `/control/*`. No `--auth-token` needed while the local gate (`UI_BRIDGE_REQUIRE_AUTH`) is off. Full recipe: Phase 0 → Step 1.5. |
+| `https://` prod/staging (e.g. `https://qontinui.io/login`) | **Relay mode against the SAME-ORIGIN prod web relay** `https://qontinui.io/api/ui-bridge`, **with `--auth-token <Cognito operator IdToken>`** — the prod relay is auth-gated (Bearer-only). LNA never fires on this path: the page fetches its own https origin, no loopback involved. For quick snapshot/find-level checks without a parked session, **Variant A** (`--exec` one-shots, end of Step 1.5) also works; when you need a full login + parked authed session driven by another agent, the **`ui-bridge-login-web` flow** (`/manual-test-coord` Phase 0.6, where your deployment provides that command) remains valid. |
 
 **One dead end remains here, and it is narrower than this section used to claim.** It listed two; the first is gone.
 
@@ -397,9 +484,9 @@ the prod relay. It supersedes the "no authed web surface" blocked-task note that
 re-derive it.** The four ingredients that were previously wrong or missing are
 called out inline — each was an independent blocker. The `-p playwright` peer
 below is **Playwright-as-host** — it only gives the UI Bridge a headless browser
-to attach to, never a locator to assert with; the full split is
-`qontinui-claude-config/knowledge-base/qontinui-specific/ui-bridge.md` →
-"The UI Bridge Is the Only Frontend-Inspection Tool".
+to attach to, never a locator to assert with; the full split is the
+`ui-bridge-debug` skill's rule that the UI Bridge is the only frontend-inspection
+tool.
 
 ```bash
 # ── 1. IDENTITY. Use the SECONDARY operator. tester2 is a dedicated test
@@ -608,7 +695,7 @@ npx -y -p @qontinui/ui-bridge-wrapper -p @qontinui/ui-bridge -p @qontinui/ui-bri
 `--expect-text` is itself a valid on-page PASS gate — the verified run returned
 `expectFound:["New Workflow","Search..."], expectMissing:[]`. Give
 `--screenshot` / `--storage-state-out` **Windows-style** paths (`D:/...`); a
-Git-Bash `/c/Users/...` path is written literally by Windows Node and the file
+Git-Bash drive path (`/c/...`) is written literally by Windows Node and the file
 lands somewhere you won't find it. If the replayed `--exec` snapshot comes back
 with only 1-2 elements the page had not painted yet — raise `--settle-timeout`
 or add `--expect-selector`; it is NOT an auth failure (check `route` first, it
@@ -646,7 +733,7 @@ These bit hard during the 2026-05-03 phone smoke. Skip the rediscovery.
 1. **Never use `adb exec-out screencap -p > file.png` on Windows.** Windows adb translates `\n` → `\r\n` in the binary stdout stream, corrupting the PNG past the header. The file ends up the right size but invalid; the Anthropic image upload returns `400 Could not process image`. Use file-mode instead:
    ```bash
    adb -s "$DEVICE_ID" shell screencap -p //sdcard/x.png
-   MSYS_NO_PATHCONV=1 adb -s "$DEVICE_ID" pull /sdcard/x.png "<workspace-root>/tmp_phone_screen.png"
+   MSYS_NO_PATHCONV=1 adb -s "$DEVICE_ID" pull /sdcard/x.png "./tmp_phone_screen.png"
    ```
    Two Git-Bash specifics: prefix the device path `//sdcard/` (single slash gets rewritten to `C:/Program Files/Git/sdcard/`); use `MSYS_NO_PATHCONV=1` on the `pull` so the source path passes through verbatim. Validate the header (`89 50 4E 47`) before relying on the PNG.
 
@@ -665,7 +752,7 @@ These bit hard during the 2026-05-03 phone smoke. Skip the rediscovery.
 
 ## UI Bridge Command Reference
 
-**Canonical reference:** `<workspace-root>/ui-bridge/docs-site/docs/api/runner-features.md`
+**Canonical reference:** `docs-site/docs/api/runner-features.md` in a ui-bridge checkout
 (public version: `https://github.com/qontinui/ui-bridge/blob/main/docs-site/docs/api/runner-features.md`).
 
 Read that doc once at the start of a testing session — it covers every
@@ -739,7 +826,7 @@ For full curl examples and response shapes, see the canonical reference.
 
 ## Phase 0: Spawn Test Runner & Health Check
 
-**Always spawn a temporary test runner via the supervisor (port 9875)** for manual testing. The supervisor builds and spawns temp runners independently — it does NOT require the primary runner to be running, rebuilt, or restarted. Never rebuild the primary runner to test changes.
+**Where your deployment runs a temp-runner spawner (`$SPAWNER`), always spawn a temporary test runner through it** for manual testing. The spawner builds and spawns temp runners independently — it does NOT require the primary runner to be running, rebuilt, or restarted. Never rebuild the primary runner to test changes. With no spawner (`SPAWNER_NONE=1`), take the READ-ONLY own-runner arm (Arm selection above): skip Step 1 and Step 3's temp-runner stop (the `inject-cli` SIGTERM still runs), and bind `BASE="$RUNNER_BASE"`.
 
 ### Auto-login for temp test runners (authenticated pages)
 
@@ -757,15 +844,17 @@ The runner's `AuthProvider` invokes the `get_test_auto_login` Tauri command on m
 
 **Before building/spawning, warn (do not gate) if any local checkout that feeds the build is behind its `origin/main`.** The injected→loopback test path builds from the **local working-tree dist** (e.g. `ui-bridge` → `dist/inject-cli.cjs`, `ui-bridge-wrapper`, `ui-bridge-headless`; the runner frontend → `qontinui-runner/dist`). If that checkout sits on a stale branch, the **built dist can lack already-merged fixes**, so the test silently runs pre-fix code and passes/fails against the wrong bytes with no signal. (Observed 2026-06-13: the local `ui-bridge` checkout was on `manual-test-loop/mobile-vision-bbox`, 31 commits behind `origin/main`, so its built `dist/inject-cli.cjs` had **zero** of the LNA fix even though `f4aaa0f` was correctly on `origin/main`.)
 
-A related stale surface used to be the supervisor's reused **`.spawn-<ref>` container** (`<workspace-root>/.spawn-<ref>/`): `prepare_worktree` force-resets the checkout to the ref but never touched `node_modules/`, so a spawn could build new source against old deps (observed 2026-07-13 as a phantom-red `TS2339 hasOwnPage` on a healthy `origin/main`). **Self-healing since supervisor `d685d03`** — `dep_install_reason()` re-runs `pnpm install --frozen-lockfile` whenever the SHA-256 of `pnpm-lock.yaml`/`package.json`/`pnpm-workspace.yaml` differs from the container's recorded hash. No operator action needed; if you see a container-only frontend build failure anyway, suspect this gate before suspecting main.
+A related stale surface used to be the supervisor's reused **`.spawn-<ref>` container** (`.spawn-<ref>/` in the supervisor's workspace root): `prepare_worktree` force-resets the checkout to the ref but never touched `node_modules/`, so a spawn could build new source against old deps (observed 2026-07-13 as a phantom-red `TS2339 hasOwnPage` on a healthy `origin/main`). **Self-healing since supervisor `d685d03`** — `dep_install_reason()` re-runs `pnpm install --frozen-lockfile` whenever the SHA-256 of `pnpm-lock.yaml`/`package.json`/`pnpm-workspace.yaml` differs from the container's recorded hash. No operator action needed; if you see a container-only frontend build failure anyway, suspect this gate before suspecting main.
 
 For **each repo whose code is on the injected/loopback test path** (the repo you edited + every repo whose dist gets rebuilt — at minimum `ui-bridge` for any `--transport=injected` run, plus the runner if you're testing runner code), check how far behind `origin/main` the checkout that will be BUILT is:
 
 ```bash
 # Repos whose built dist is on the test path for THIS run. Add/remove as needed.
+# $WS is your workspace root: the directory that holds your repo checkouts.
+WS="${WS:?set WS to your workspace root, the directory holding your checkouts}"
 STALE_CHECK_REPOS=(
-  "<workspace-root>/ui-bridge"        # inject-cli / wrapper / headless dist
-  # "<workspace-root>/qontinui-runner"  # add if testing runner frontend/Rust
+  "$WS/ui-bridge"          # inject-cli / wrapper / headless dist
+  # "$WS/qontinui-runner"  # add if testing runner frontend/Rust
 )
 STALE_WARN_THRESHOLD=5   # small threshold — warn when behind by more than this
 
@@ -828,6 +917,9 @@ to the local object database. `null` is UNKNOWN; say so rather than concluding t
 commit is absent [policy: `verification-and-evidence` `unknown-must-not-render-as-a-default`].
 
 ```bash
+# Temp-runner arm only. No spawner (SPAWNER_NONE=1) = own-runner arm: skip this step.
+SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+: "${SPAWNER:?SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none}"
 # 1. Identify the source files that contain the change you want to test.
 #    Pass them relative to qontinui-runner/src-tauri/ (the supervisor's project_dir).
 #    For "test the runner generally with no specific file changes," use src/main.rs
@@ -852,7 +944,7 @@ if [ -n "$UNDER_TEST_SHA" ]; then QUERY="${QUERY}&contains=${UNDER_TEST_SHA}"; f
 # ~25-minute rebuild path. -f alone only makes that loud -- the `||` is what
 # stops it, because guessing the spawn mode off a failed probe is the whole
 # defect class this recipe is guarding against.
-COVERAGE=$(curl -fsS "http://localhost:9875/lkg/coverage?${QUERY}") \
+COVERAGE=$(curl -fsS "$SPAWNER/lkg/coverage?${QUERY}") \
   || { echo "ERROR: LKG coverage probe failed -- refusing to guess the spawn mode" >&2; exit 1; }
 ALL_COVERED=$(echo "$COVERAGE" | python -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('all_covered'))")
 echo "LKG coverage: all_covered=$ALL_COVERED"
@@ -888,8 +980,9 @@ else
   # 2a. LKG misses some files — build the runner frontend first (Tauri embeds it
   #     at cargo build time), then trigger a rebuild via the build pool.
   echo "LKG missing some changes — frontend build + cargo rebuild required"
-  cd <workspace-root>/ui-bridge-auto && npm run build 2>&1 | tail -3 || true
-  cd <workspace-root>/qontinui-runner && npm run build 2>&1 | tail -3
+  WS="${WS:?set WS to your workspace root, the directory holding your checkouts}"
+  cd "$WS/ui-bridge-auto" && npm run build 2>&1 | tail -3 || true
+  cd "$WS/qontinui-runner" && npm run build 2>&1 | tail -3
   SPAWN_BODY="{\"rebuild\": true, \"requester_id\": \"${REQUESTER}\", \"queue_timeout_secs\": 600}"
 fi
 
@@ -900,7 +993,7 @@ fi
 # a failed probe must render UNKNOWN, never "0/3 permits free" — that reads as a
 # measured full pool, and it is the reading that makes the next step's 503 look
 # expected. A shrug and a measurement are not the same value.
-BUILDS=$(curl -fsS http://localhost:9875/builds) \
+BUILDS=$(curl -fsS "$SPAWNER/builds") \
   || { echo "Build pool probe FAILED — reporting UNKNOWN, falling through to the fail-fast probe below" >&2; BUILDS='{}'; }
 PERMITS=$(echo "$BUILDS" | python -c "import sys,json; print(json.load(sys.stdin).get('available_permits','UNKNOWN'))")
 QUEUED=$(echo "$BUILDS" | python -c "import sys,json; print(json.load(sys.stdin).get('queued','UNKNOWN'))")
@@ -908,7 +1001,7 @@ echo "Build pool: ${PERMITS}/3 permits free, ${QUEUED} queued"
 
 # 4. Fail-fast probe with X-Queue-Mode: no-wait. If pool full AND all active
 #    builds elapsed > 300s, bail (jammed). Otherwise fall through to blocking.
-PROBE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:9875/runners/spawn-test \
+PROBE=$(curl -s -w "\n%{http_code}" -X POST "$SPAWNER/runners/spawn-test" \
   -H "Content-Type: application/json" \
   -H "X-Queue-Mode: no-wait" \
   -d "$SPAWN_BODY")
@@ -930,7 +1023,7 @@ print('true' if builds and all(b.get('elapsed_secs', 0) > 300 for b in builds) e
     exit 1
   fi
   echo "Build pool busy — falling back to blocking spawn..."
-  SPAWN_RESULT=$(curl -fsS -X POST http://localhost:9875/runners/spawn-test \
+  SPAWN_RESULT=$(curl -fsS -X POST "$SPAWNER/runners/spawn-test" \
     -H "Content-Type: application/json" \
     -d "$SPAWN_BODY") \
     || { echo "ERROR: blocking spawn-test failed -- there is no temp runner to test against" >&2; exit 1; }
@@ -966,9 +1059,11 @@ them apart; `commit_provenance` can:
 ```bash
 # The commit under test — the merge sha, or the fix commit itself.
 UNDER_TEST_SHA="<sha>"
+SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+: "${SPAWNER:?SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none}"
 # A failed probe is UNKNOWN and must SAY so -- feeding the empty body to json.load
 # would die with a traceback, which reads as a broken recipe rather than a verdict.
-PROV=$(curl -fsS "http://127.0.0.1:9875/lkg/coverage?contains=${UNDER_TEST_SHA}") \
+PROV=$(curl -fsS "$SPAWNER/lkg/coverage?contains=${UNDER_TEST_SHA}") \
   || { echo "UNKNOWN: provenance probe failed -- cannot classify deploy-lag vs regression" >&2; PROV=""; }
 if [ -z "$PROV" ]; then echo "UNKNOWN: no provenance body"; else
 echo "$PROV" | python -c "
@@ -996,7 +1091,7 @@ Three verdicts, three responses, and the third is not one of the first two:
 | `false` | the commit is provably ABSENT | **deploy lag.** Rebuild (`{"rebuild": true}`) and re-test before classifying anything; do not file a regression |
 | `null` | **not computable — UNKNOWN** | classify as UNKNOWN and say which of the three causes applies (no `contains` asked / no `lkg_sha` / sha unknown to the local odb). Never collapse it into `false` |
 
-**Build pool behavior:** The supervisor runs N=3 concurrent cargo builds (configurable via `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`), each in its own `CARGO_TARGET_DIR` (`qontinui-runner/target-pool/slot-{k}/`). `POST /runners/spawn-test` **blocks by default** until a slot frees — no retry loop needed. Pass `queue_timeout_secs` to bound the wait, or send `X-Queue-Mode: no-wait` to opt out of blocking (returns HTTP 503 with `{error: "build_pool_full", queue_position, active_builds: [...]}`). Use `GET /builds` for a live snapshot of pool occupancy.
+**Build pool behavior:** The maintainers' supervisor runs N=3 concurrent cargo builds by default (configurable in its own settings), each in its own `CARGO_TARGET_DIR` (`qontinui-runner/target-pool/slot-{k}/`). `POST /runners/spawn-test` **blocks by default** until a slot frees — no retry loop needed. Pass `queue_timeout_secs` to bound the wait, or send `X-Queue-Mode: no-wait` to opt out of blocking (returns HTTP 503 with `{error: "build_pool_full", queue_position, active_builds: [...]}`). Use `GET /builds` for a live snapshot of pool occupancy.
 
 Wait for the runner to be ready (poll health):
 ```bash
@@ -1014,11 +1109,11 @@ Skip this step unless `--transport=injected` was passed. **This recipe drives a 
 
 > **For a LOCAL or CI page, the temp runner IS a supported relay** — `--relay http://127.0.0.1:<TEST_PORT>/ui-bridge`, served since qontinui-runner #560 (see the note under "Injected transport" above). That is the per-runner-isolated path: no prod relay, no Cognito `--auth-token`, and the runner's heartbeat is lenient. Substitute that for `$RELAY_BASE` below and drop the `CURL_AUTH` header; everything else in the recipe is unchanged.
 
-**Scheme branch (from the decision point above): both schemes use relay mode — the scheme decides the relay origin and whether auth is needed.** `http://localhost:3001` targets register against the local web relay with no token (local `UI_BRIDGE_REQUIRE_AUTH` gate is off); `https://` prod/staging targets register against the same-origin prod relay and REQUIRE `--auth-token` (the prod relay is Bearer-gated).
+**Scheme branch (from the decision point above): both schemes use relay mode — the scheme decides the relay origin and whether auth is needed.** `http://localhost:<web-port>` targets register against the local web relay with no token (local `UI_BRIDGE_REQUIRE_AUTH` gate is off); `https://` prod/staging targets register against the same-origin prod relay and REQUIRE `--auth-token` (the prod relay is Bearer-gated).
 
 ```bash
 # REQUIRED precondition for injected mode: TARGET_URL (from --target-url).
-WRAPPER_CLI="<workspace-root>/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs"
+WRAPPER_CLI="${WS:?set WS to your workspace root}/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs"
 # SAME-ORIGIN web relay — never a runner, never a foreign loopback, never bare /ui-bridge.
 ORIGIN=$(python -c "from urllib.parse import urlparse; u=urlparse('$TARGET_URL'); print(f'{u.scheme}://{u.netloc}')")
 RELAY_BASE="${ORIGIN}/api/ui-bridge"
@@ -1127,7 +1222,7 @@ echo "Injected tab registered: tabId=$INJECT_TAB_ID — drive it via $RELAY_BASE
 
 Drive surface for the rest of the run (injected mode): every `snapshot` / `discover` / `element/<id>/action` / `page/navigate` / `page/evaluate` call goes to `$RELAY_BASE/control/*` (the web relay — NOT the temp runner), with `"${CURL_AUTH[@]}"` on every call when the gate is on. **Always pin `?tabId=$INJECT_TAB_ID`** — the prod relay is shared, so other tabs (the operator's own browser, a hidden primary tab) may be registered. Pinning caveat (ui-bridge plan item 1, fix in flight): a pinned read whose relay leg fails can today silently fall back to ANOTHER tab's cached elements under `success:true` — sanity-check responses against a tab-unique element (e.g. the login form) before trusting them.
 
-> **Variant A (relay-free one-shot — optional, any scheme).** *If what you want is a **verdict** rather than raw action output, use the headless verdict arm above — it is Variant A plus normalization plus `vision-audit`, with a real exit code.* For a quick CI-style smoke that doesn't need a live parked tab — or when you can't mint an operator token — run the CLI with one or more `--exec '<action> <json>'` flags (repeatable) instead of `--relay`; it runs each action via the injected runtime in-page (no relay round-trip at all, so neither relay auth nor LNA applies) and prints `{"action","result"}` JSON lines, then exits. Use Variant A only for snapshot/find-level checks; the PASS-on-page gate still applies — a relay-free exec snapshot must itself show the authed DOM. If a run needs a full login + a parked, drivable authed session driven by another agent, the `ui-bridge-login-web` flow (`manual-test-coord.md` Phase 0.6) also registers against the page's same-origin relay.
+> **Variant A (relay-free one-shot — optional, any scheme).** *If what you want is a **verdict** rather than raw action output, use the headless verdict arm above — it is Variant A plus normalization plus `vision-audit`, with a real exit code.* For a quick CI-style smoke that doesn't need a live parked tab — or when you can't mint an operator token — run the CLI with one or more `--exec '<action> <json>'` flags (repeatable) instead of `--relay`; it runs each action via the injected runtime in-page (no relay round-trip at all, so neither relay auth nor LNA applies) and prints `{"action","result"}` JSON lines, then exits. Use Variant A only for snapshot/find-level checks; the PASS-on-page gate still applies — a relay-free exec snapshot must itself show the authed DOM. If a run needs a full login + a parked, drivable authed session driven by another agent, the `ui-bridge-login-web` flow (`/manual-test-coord` Phase 0.6, where your deployment provides it) also registers against the page's same-origin relay.
 
 ### Step 2: Health checks
 
@@ -1142,9 +1237,9 @@ curl -s http://localhost:${TEST_PORT}/ui-bridge/control/snapshot
 curl -s https://qontinui.io/api/ui-bridge/control/snapshot
 ```
 
-**If the temp runner fails to start:** Check supervisor logs, try spawning again. If the supervisor is down, use `dev-start.ps1 -Supervisor` as a last resort.
+**If the temp runner fails to start:** Check the spawner's logs, try spawning again. If the spawner is down, start it the way your deployment documents, or take the own-runner arm and record what needed a rebuilt binary as UNVERIFIED.
 
-**If the Web frontend is unresponsive:** Use `dev-start.ps1 -Frontend` as a fallback.
+**If the Web frontend is unresponsive:** Restart it with your project's own frontend start command as a fallback.
 
 ### Step 3: Cleanup (ALWAYS do this when testing is complete)
 
@@ -1160,10 +1255,19 @@ fi
 # that returned 404/500 — a leaked temp runner holds a build-pool slot.
 # if/then/else, not `a && b || c`: the exit code is the contract now, and in the
 # `&&`/`||` form a failing `echo` would report a SUCCESSFUL stop as a failure.
-if curl -fsS -X POST http://localhost:9875/runners/${TEST_ID}/stop; then
+SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+# Temp-runner arm only -- the own-runner arm spawned nothing and stops nothing.
+if [ -z "${TEST_ID:-}" ] && [ "${SPAWNER_NONE:-}" = 1 ]; then
+  echo "own-runner arm: no temp runner to stop"
+elif [ -z "$SPAWNER" ]; then
+  echo "SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none -- temp runner ${TEST_ID:-<unknown id>} NOT stopped" >&2
+  false
+elif ! : "${TEST_ID:?TEST_ID unset in this shell -- re-set it from the spawn result; never POST /runners//stop}"; then
+  false
+elif curl -fsS -X POST "$SPAWNER/runners/${TEST_ID}/stop"; then
   echo "Test runner stopped"
 else
-  echo "WARNING: stop FAILED for ${TEST_ID} — it may still be running; re-check GET :9875/runners" >&2
+  echo "WARNING: stop FAILED for ${TEST_ID} — it may still be running; re-check GET \$SPAWNER/runners" >&2
   false
 fi
 ```
@@ -1206,7 +1310,7 @@ Build a mental map of the application:
 
 ## Phase 2: Perform Real Tasks
 
-Using the application's UI, attempt to perform meaningful tasks. Choose tasks based on what the page offers. Examples:
+Using the application's UI, attempt to perform meaningful tasks. Choose tasks based on what the page offers. **On the own-runner arm, every step here that changes state is SKIPPED and recorded UNVERIFIED** — anything that saves or persists always, and non-persisting interactions unless `/restart-readiness` answered `safe_to_restart: true` (see "The own-runner arm"). Examples:
 
 ### If on a Workflow Builder page:
 - Create a new workflow
@@ -1242,14 +1346,14 @@ If `$ARGUMENTS` specifies a particular area or task to test, focus on that. Othe
 
 ## Phase 3: Edge Cases & Stress Points
 
-After basic tasks, probe edge cases:
+After basic tasks, probe edge cases (on the own-runner arm, only the read-only ones — empty states via navigation, disabled-element reads, scroll containers, console errors; the rest are SKIPPED and recorded UNVERIFIED, under the same persisting/non-persisting rule):
 
 - **Empty states:** Clear filters/inputs and see how the UI handles no results
 - **Long text:** Type very long strings into inputs
 - **Rapid actions:** Click the same button multiple times quickly
 - **Navigation during loading:** Try navigating while data is loading
 - **Form validation:** Submit forms with missing required fields
-- **Disabled elements:** Verify disabled buttons/inputs cannot be interacted with
+- **Disabled elements:** Read the element's `state` / disabled flag from `discover` or `snapshot` — never click it to prove it is inert
 - **Scroll containers:** Find elements in scroll containers, verify `scrollIntoView` works
 - **Console errors:** Check for JavaScript errors after each major interaction
 
@@ -1407,9 +1511,13 @@ skip the phase.
 If both Runner and Web are available:
 - Compare the same features across both apps
 - Verify shared UI components behave consistently
-- Test SDK connection from Runner to Web frontend:
+- Test SDK connection from Runner to Web frontend — **temp-runner arm only**
+  (`$BASE` is the temp runner's UI Bridge base there). On the own-runner arm it
+  would re-point your live runner's SDK, so it is SKIPPED and recorded
+  UNVERIFIED:
   ```bash
-  curl -s -X POST http://127.0.0.1:9876/ui-bridge/sdk/connect -H "Content-Type: application/json" -d '{"url": "https://qontinui.io/api/ui-bridge"}'
+  [ "${SPAWNER_NONE:-}" = 1 ] && { echo "own-runner arm: sdk/connect SKIPPED -- record UNVERIFIED"; exit 0; }
+  curl -s -X POST "${BASE:?BASE unbound -- bind it in your arm first}/sdk/connect" -H "Content-Type: application/json" -d '{"url": "https://qontinui.io/api/ui-bridge"}'  # envelope-ok: the reply is printed, never parsed into a verdict; no step observes the connection, so under Phase 5 it stays UNVERIFIED unless the tester sees it on the UI surface
   ```
 
 ## Phase 5: Report & Evaluate
@@ -1613,9 +1721,9 @@ After the per-repo sections, add an **Execution order** section — a numbered l
 
 ## Related Skills
 
-- **`/manual-test-coord`** — runner↔coord integration test. Drives the operator dashboard at `demo.staging.qontinui.io` via UI Bridge through pair-confirm, heartbeat, WS, tenant isolation, and dispatch round-trip. Cycles slower (~5–10 min/iter; touches ECS staging + RDS). Two-machine concurrent-session model with cross-tenant isolation invariant via `--rendezvous-slug`. Use for verifying multi-device coordination, not single-runner UI correctness.
-- **`/manual-test-coord-loop`** — operator-triggered loop wrapper for `/manual-test-coord`. Caps at 4 iterations.
-- **`/verify-web`** — the local **authenticated** qontinui-web specialization: stands up a hermetic stack + IdP, opens an admin-capable tab, and runs the same `verify-page-verdict.sh` analyzer arm against it. Use it when the page you need is behind the `(app)` auth wall; use the headless verdict arm here for everything else.
+- **`/manual-test-coord`** *(where your deployment provides it)* — runner↔coord integration test. Drives the operator dashboard at `demo.staging.qontinui.io` via UI Bridge through pair-confirm, heartbeat, WS, tenant isolation, and dispatch round-trip. Cycles slower (~5–10 min/iter; touches ECS staging + RDS). Two-machine concurrent-session model with cross-tenant isolation invariant via `--rendezvous-slug`. Use for verifying multi-device coordination, not single-runner UI correctness.
+- **`/manual-test-coord-loop`** *(where your deployment provides it)* — operator-triggered loop wrapper for `/manual-test-coord`. Caps at 4 iterations.
+- **`/verify-web`** *(where your deployment provides it)* — the local **authenticated** qontinui-web specialization: stands up a hermetic stack + IdP, opens an admin-capable tab, and runs the same `verify-page-verdict.sh` analyzer arm against it. Use it when the page you need is behind the `(app)` auth wall; use the headless verdict arm here for everything else.
 - **`/visual-audit`** — the declarative form of Phase 3.5: five analyzers plus the
   assertion DSL, with baselines for regression comparison. Use it when you want to
   PIN a page's layout, not merely sweep it once.
@@ -1626,13 +1734,13 @@ After the per-repo sections, add an **Execution order** section — a numbered l
 ## Rules
 
 - **NEVER infer the user's goal from backend data** — PASS requires observing the goal rendered on the actual page via the UI Bridge (`discover`/`snapshot`). An API/DB/registration/coord/log signal confirms plumbing, not the goal; when they disagree, the page wins. Goal unreachable on the surface → report UNVERIFIED, never PASS.
-- **NEVER conclude "UI cannot be verified from this box".** No display, no `pwsh` and no `docker` rule out the temp-runner and `/verify-web` arms — they do **not** rule out the headless verdict arm, which needs only node, a Playwright Chromium and a URL. Run the arm-selection predicate; do not decide by feel. Shipping a UI change on unit tests alone because the box looked bare is the specific failure this skill now forecloses.
-- **NEVER restart, kill, or rebuild the primary runner** — the supervisor spawns temp runners independently
-- **NEVER rebuild the primary runner to test changes** — the supervisor has its own build pool and builds from source directly
-- **ALWAYS spawn a temp runner via the supervisor (port 9875)** at the start of testing and stop it when done
+- **NEVER conclude "UI cannot be verified from this box".** No display, no `pwsh` and no `docker` rule out the temp-runner and (where your deployment provides it) `/verify-web` arms — they do **not** rule out the headless verdict arm, which needs only node, a Playwright Chromium and a URL. Run the arm-selection predicate; do not decide by feel. Shipping a UI change on unit tests alone because the box looked bare is the specific failure this skill now forecloses.
+- **NEVER restart, kill, or rebuild the primary runner** — a spawner, where you have one, spawns temp runners independently
+- **NEVER rebuild the primary runner to test changes** — a spawner has its own build pool and builds from source directly; without one, a change that needs a rebuild is UNVERIFIED
+- **Where a spawner exists (`$SPAWNER`), ALWAYS spawn a temp runner through it** at the start of testing and stop it when done; without one (`SPAWNER_NONE=1`), take the READ-ONLY own-runner arm
 - **NEVER ask the user for input** — make reasonable assumptions and proceed
-- **NEVER report "needs a rebuild" and stop** — spawn a temp runner with `{"rebuild": true}` on the supervisor
-- **ALWAYS use the temp runner's port** for all Runner UI Bridge calls (not 9876)
+- **NEVER report "needs a rebuild" and stop** — spawn a temp runner with `{"rebuild": true}` on the spawner (no spawner: record that check UNVERIFIED — the binary-freshness probe decides — and carry on with the rest)
+- **ALWAYS use the temp runner's port** for all Runner UI Bridge calls (not 9876) on the temp-runner arm
 - **ALWAYS stop the temp runner** when testing is complete — include the stop command in your report
 - **ALWAYS snapshot before and after interactions** to track changes
 - **ALWAYS run Phase 3.5 on every page you visit** — an element being in the
@@ -1651,7 +1759,7 @@ After the per-repo sections, add an **Execution order** section — a numbered l
 ### Runner Coordination Rules
 - **There is NO primary-runner lock.** `runner_lock.py` / `runner_status.py` / the whole `runner_coordination/` directory do not exist (verified 2026-07-21). Do not attempt to acquire or release a lock, and do not report having done so.
 - **Default to a temp runner.** With no lock available it is the only way to test without racing other sessions.
-- **If you must touch the primary:** confirm idle via `GET /restart-readiness` (`safe_to_restart` must be `true`) plus supervisor `GET /runners`, and declare scope with `coord_declare_intent` / coord claims so peers can see you. Not `/task-runs/running` — it returned `[]` with 25 sessions live (2026-08-29).
+- **If you must touch the primary:** confirm idle via `GET /restart-readiness` (`safe_to_restart` must be `true`) plus, where a spawner exists, `GET $SPAWNER/runners`, and declare scope with `coord_declare_intent` / coord claims so peers can see you. Not `/task-runs/running` — it returned `[]` with 25 sessions live (2026-08-29).
 - **NEVER restart the primary runner yourself** — see CLAUDE.md "Runner Lifecycle". Only the operator may restart an active runner.
 - **Temp runners do not need coordination** — they are isolated by design, but note `settings.json` is machine-shared (see CLAUDE.md), so avoid gratuitous temp runners while the primary is live.
 

@@ -41,6 +41,11 @@ import {
   foldChunkRates,
   renderSingleRun,
   renderComparison,
+  GENERATOR_PRESETS,
+  buildGeneratorCommand,
+  unwrapTransportStats,
+  normalizeFrontendTransport,
+  foldTransport,
 } from "./perf-harness-lib.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -48,6 +53,13 @@ const REPO_ROOT = resolve(HERE, "..");
 
 /** The primary runner's port. The harness refuses to drive it, ever. */
 const PRIMARY_RUNNER_PORT = 9876;
+
+/** Geometry every harness terminal is created at (and the presets repaint). */
+const TERMINAL_COLS = 120;
+const TERMINAL_ROWS = 30;
+
+/** The node TUI load generator the `--generator-preset` modes run. */
+const TUI_GENERATOR_SCRIPT = join(REPO_ROOT, "scripts", "tui-repaint-generator.mjs");
 
 const DEFAULTS = {
   supervisor: "http://127.0.0.1:9875",
@@ -107,6 +119,13 @@ LOAD SHAPE
                          population — the O(N) hypothesis this plan tests.
   --generator CMD        Noisy generator run in every terminal. Default is a
                          PowerShell 20 Hz timestamp loop.
+  --generator-preset P   Run scripts/tui-repaint-generator.mjs under node in every
+                         terminal instead (cross-platform; needs node on the
+                         terminal shell's PATH). P is one of:
+                           tui-repaint  30 fps full-screen SGR-heavy repaints
+                                        inside DEC 2026 sync blocks;
+                           spinner      30 fps one-row (spinner line) repaints.
+                         Exclusive with --generator.
   --soak-ms N            Generator soak before sampling (default ${DEFAULTS.soakMs}).
   --settle-ms N          Settle pause after creating terminals (default ${DEFAULTS.settleMs}).
   --skip-frontend        Do not install the UI Bridge probe. Use as the control
@@ -114,6 +133,13 @@ LOAD SHAPE
                          the probe or the load is responsible — and on any runner
                          whose webview is unavailable. Backend metrics (create
                          latency, chunk bytes/s, spawn spans) are unaffected.
+
+TRANSPORT COUNTERS
+  Every level resets and reads the runner's GET/POST /terminals/transport-stats
+  and the webview's window.__qontinuiTransportStats around its soak, and records
+  whether the webview IPC fell back to postMessage and how many terminals the
+  runner's grid reports on the alternate screen. A runner build without the
+  route or the window object reports those halves UNAVAILABLE, never zero.
 
 OUTPUT
   --label NAME           Run label, used in filenames and tables.
@@ -165,6 +191,7 @@ const VALUE_FLAGS = new Set([
   "worktree",
   "sessions",
   "generator",
+  "generator-preset",
   "soak-ms",
   "settle-ms",
   "spawn-timeout-secs",
@@ -365,10 +392,46 @@ const PROBE_INSTALL = `(() => {
     webviewOutputEvents: 0,
     webviewHooked: false,
     errors: [],
+    ipc: { fallbackWarned: false, postMessageHooked: false, postMessageCalls: 0 },
     _raf: 0,
     _obs: null,
     _unlisten: null,
+    _restore: [],
   };
+  // Tauri keeps its custom-protocol->postMessage flip in a closure-private
+  // flag and only logs it (ipc-protocol.js): watch the warning, and count
+  // window.ipc.postMessage calls when the object lets us wrap it.
+  try {
+    const origWarn = console.warn;
+    console.warn = function (...args) {
+      try {
+        if (typeof args[0] === 'string' && args[0].indexOf('IPC custom protocol failed') >= 0) {
+          state.ipc.fallbackWarned = true;
+        }
+      } catch (e) { /* never break the page's logging */ }
+      return origWarn.apply(this, args);
+    };
+    state._restore.push(() => { console.warn = origWarn; });
+  } catch (e) {
+    state.errors.push('warn-hook: ' + String(e));
+  }
+  try {
+    const ipc = w.ipc;
+    if (ipc && typeof ipc.postMessage === 'function') {
+      const origPost = ipc.postMessage;
+      const wrapped = function (...args) {
+        state.ipc.postMessageCalls += 1;
+        return origPost.apply(this, args);
+      };
+      try { ipc.postMessage = wrapped; } catch (e) { /* frozen */ }
+      if (ipc.postMessage === wrapped) {
+        state.ipc.postMessageHooked = true;
+        state._restore.push(() => { try { ipc.postMessage = origPost; } catch (e) { /* frozen */ } });
+      }
+    }
+  } catch (e) {
+    state.errors.push('ipc-hook: ' + String(e));
+  }
   try {
     const obs = new PerformanceObserver((list) => {
       for (const e of list.getEntries()) {
@@ -406,12 +469,14 @@ const PROBE_INSTALL = `(() => {
     try { cancelAnimationFrame(state._raf); } catch (e) { /* already cancelled */ }
     try { if (state._obs) state._obs.disconnect(); } catch (e) { /* already disconnected */ }
     try { if (state._unlisten) state._unlisten(); } catch (e) { /* already unlistened */ }
+    for (const r of state._restore) { try { r(); } catch (e) { /* best effort */ } }
   };
   state.reset = () => {
     state.startedAt = performance.now();
     state.frameGapsMs.length = 0;
     state.longTasks.length = 0;
     state.webviewOutputEvents = 0;
+    state.ipc.postMessageCalls = 0;
     last = performance.now();
   };
   w.__qontinuiPerfProbe = state;
@@ -437,6 +502,41 @@ const PROBE_SAMPLE = `(() => {
     webviewOutputEvents: s.webviewOutputEvents,
     webviewHooked: s.webviewHooked,
     errors: s.errors.slice(),
+    ipc: Object.assign({}, s.ipc),
+  };
+})()`;
+
+/**
+ * Zero the webview's transport counters (`src/components/terminal/transportStats.ts`).
+ * Answers `{available:false}` on a build that predates the object.
+ */
+const TRANSPORT_RESET = `(() => {
+  const t = window.__qontinuiTransportStats;
+  if (!t || typeof t.reset !== 'function') return { available: false };
+  t.reset();
+  return { available: true };
+})()`;
+
+/** Snapshot the webview's transport counters as plain JSON. */
+const TRANSPORT_SAMPLE = `(() => {
+  const t = window.__qontinuiTransportStats;
+  if (!t) return { available: false };
+  return {
+    available: true,
+    stats: {
+      enabled: t.enabled,
+      sinceResetMs: performance.now() - t.resetAt,
+      decodeNs: Object.assign({}, t.decodeNs),
+      decodeCalls: Object.assign({}, t.decodeCalls),
+      decodeBytes: Object.assign({}, t.decodeBytes),
+      writeToRenderNs: t.writeToRenderNs,
+      writeToRenderCount: t.writeToRenderCount,
+      writeToRenderBytes: t.writeToRenderBytes,
+      eventsDelivered: t.eventsDelivered,
+      eventsForeign: t.eventsForeign,
+      ringReplay: Object.assign({}, t.ringReplay),
+      rawIpc: t.rawIpc,
+    },
   };
 })()`;
 
@@ -576,6 +676,31 @@ class RunnerClient {
     return data;
   }
 
+  /** Zero the runner's transport counters. */
+  async resetTransportStats() {
+    return httpJson(`${this.baseUrl}/terminals/transport-stats`, {
+      method: "POST",
+      body: {},
+      timeoutMs: 20000,
+    });
+  }
+
+  /** Raw `GET /terminals/transport-stats` body (envelope or bare). */
+  async transportStats() {
+    return httpJson(`${this.baseUrl}/terminals/transport-stats`, { timeoutMs: 20000 });
+  }
+
+  /** The runner grid's `alt_screen` flag for one terminal. */
+  async gridAltScreen(id) {
+    const data = unwrap(
+      await httpJson(
+        `${this.baseUrl}/ui-bridge/sdk/terminal/sessions/${encodeURIComponent(id)}/grid`,
+        { timeoutMs: 20000 },
+      ),
+    );
+    return typeof data?.alt_screen === "boolean" ? data.alt_screen : null;
+  }
+
   async activateTab(tabId) {
     return httpJson(`${this.baseUrl}/ui-bridge/control/tab/activate`, {
       method: "POST",
@@ -699,10 +824,72 @@ class FakeRunner {
     return { success: true };
   }
 
+  async resetTransportStats() {
+    return { success: true, data: null };
+  }
+
+  /** Synthetic counters in the route's exact shape, inside the `{success,data}` envelope. */
+  async transportStats() {
+    const n = this.terminals.size;
+    const chunks = n * 450;
+    return {
+      success: true,
+      data: {
+        since_reset_ms: 15000,
+        reader: { chunks, bytes: chunks * 21000 },
+        encode: {
+          count: chunks,
+          ns: chunks * 38000,
+          bytes_in: chunks * 21000,
+          bytes_out: chunks * 28000,
+          waste: Math.floor(chunks * 0.6),
+          frame_count: Math.floor(chunks * 0.9),
+        },
+        legs: {
+          sse: { chunks: 0, bytes: 0 },
+          ws: { chunks, bytes: chunks * 28100 },
+          webview: { emits: chunks, emit_ns: chunks * 52000, bytes: chunks * 28100 },
+        },
+        pipe: { chunks, decode_ns: chunks * 20000, redact_ns: chunks * 9000, reencode_ns: chunks * 30000 },
+        ring_replay: { calls: n, bytes: n * 1048576 },
+        frame_size_hist: {
+          bounds: [1024, 4096, 16384, 49152, 65536, 262144],
+          counts: [chunks * 0.1, chunks * 0.1, chunks * 0.3, chunks * 0.4, chunks * 0.05, chunks * 0.05, 0].map(Math.floor),
+        },
+      },
+    };
+  }
+
+  async gridAltScreen() {
+    return false;
+  }
+
   async evaluate(expression) {
     if (expression === PROBE_INSTALL) return { installed: true, longTaskObserver: true, errors: [] };
     if (expression === PROBE_RESET) return { reset: true };
     if (expression === PROBE_STOP) return { stopped: true };
+    if (expression === TRANSPORT_RESET) return { available: true };
+    if (expression === TRANSPORT_SAMPLE) {
+      const n = this.terminals.size;
+      const events = n * 450;
+      return {
+        available: true,
+        stats: {
+          enabled: true,
+          sinceResetMs: 15000,
+          decodeNs: { pane: 450 * 40000, tap: events * 40000 },
+          decodeCalls: { pane: 450, tap: events },
+          decodeBytes: { pane: 450 * 21000, tap: events * 21000 },
+          writeToRenderNs: 450 * 9e6,
+          writeToRenderCount: 450,
+          writeToRenderBytes: 450 * 21000,
+          eventsDelivered: events,
+          eventsForeign: 0,
+          ringReplay: { fetches: 2, bytesFetched: 2 * 1048576, bytesWritten: 4096 },
+          rawIpc: null,
+        },
+      };
+    }
     if (expression === PROBE_SAMPLE) {
       const n = this.terminals.size;
       const elapsedMs = 15000;
@@ -723,6 +910,7 @@ class FakeRunner {
         webviewOutputEvents: Math.floor(n * n * 1.5),
         webviewHooked: true,
         errors: [],
+        ipc: { fallbackWarned: false, postMessageHooked: true, postMessageCalls: 0 },
       };
     }
     return null;
@@ -763,8 +951,8 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
       const { info, wallMs } = await runner.createTerminal(
         {
           title: `perf-harness S${target} #${existing.length + i + 1}`,
-          cols: 120,
-          rows: 30,
+          cols: TERMINAL_COLS,
+          rows: TERMINAL_ROWS,
           page_id: "perf-harness",
         },
         config.createTimeoutMs,
@@ -802,21 +990,53 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
     }
   }
 
+  // Transport counters cover the soak window only: reset both halves now.
+  let transportBackendError = null;
+  let transportFrontendError = config.skipFrontend ? "skipped (--skip-frontend)" : null;
+  try {
+    await runner.resetTransportStats();
+  } catch (e) {
+    transportBackendError = `POST /terminals/transport-stats: ${String(e?.message ?? e)}`;
+  }
+  if (!config.skipFrontend) {
+    try {
+      const r = await runner.evaluate(TRANSPORT_RESET);
+      if (!r?.available) {
+        transportFrontendError =
+          "window.__qontinuiTransportStats is absent (webview build predates it)";
+      }
+    } catch (e) {
+      transportFrontendError = `transport reset: ${String(e?.message ?? e)}`;
+    }
+  }
+
   const bytesBefore = await totalBytes(runner);
   const soakStart = performance.now();
   await sleep(config.soakMs);
   const soakElapsed = performance.now() - soakStart;
   const bytesAfter = await totalBytes(runner);
 
+  let probeSample = null;
   if (!config.skipFrontend) {
     try {
       const sample = await runner.evaluate(PROBE_SAMPLE, 60000);
-      if (sample && !sample.error) frontend = foldFrontendSample(sample);
-      else frontendError = frontendError ?? `probe sample: ${sample?.error ?? "empty"}`;
+      if (sample && !sample.error) {
+        probeSample = sample;
+        frontend = foldFrontendSample(sample);
+      } else frontendError = frontendError ?? `probe sample: ${sample?.error ?? "empty"}`;
     } catch (e) {
       frontendError = frontendError ?? `probe sample: ${String(e?.message ?? e)}`;
     }
   }
+
+  const transport = await sampleTransport({
+    runner,
+    config,
+    backendError: transportBackendError,
+    frontendError: transportFrontendError,
+    ipc: probeSample?.ipc ?? null,
+    terminals: existing,
+  });
 
   const chunks = foldChunkRates(
     { bytes: bytesAfter - bytesBefore, elapsedMs: soakElapsed },
@@ -845,10 +1065,67 @@ async function measureLevel({ runner, target, existing, config, logSinkPath, isD
         frontendError.includes("page_evaluate timed out")
       : false,
     chunks,
+    transport,
     spawnSpans,
     spawnSpanSampleCount: spanRecords.length,
     logBytesScanned: logText.length,
   };
+}
+
+/**
+ * Read both halves of the transport counters after a soak, plus the runner
+ * grid's alt-screen flag per terminal, and fold them. Every failure is carried
+ * as an error string on its half — an unreadable counter is UNKNOWN, not zero.
+ */
+async function sampleTransport({ runner, config, backendError, frontendError, ipc, terminals }) {
+  let backend = null;
+  if (!backendError) {
+    try {
+      backend = unwrapTransportStats(await runner.transportStats());
+      if (!backend) backendError = "GET /terminals/transport-stats answered an unrecognized shape";
+    } catch (e) {
+      backendError = `GET /terminals/transport-stats: ${String(e?.message ?? e)}`;
+    }
+  }
+
+  let frontend = null;
+  if (!frontendError) {
+    try {
+      const r = await runner.evaluate(TRANSPORT_SAMPLE, 30000);
+      if (r?.available) frontend = normalizeFrontendTransport(r.stats);
+      if (!frontend) frontendError = "window.__qontinuiTransportStats sample was empty";
+    } catch (e) {
+      frontendError = `transport sample: ${String(e?.message ?? e)}`;
+    }
+  }
+
+  // The runner's own grid is the one alt-screen reading available without a
+  // new API; the panes' xterm buffers are not reachable from page/evaluate.
+  let sampled = 0;
+  let onAltScreen = 0;
+  let unreadable = 0;
+  for (const t of terminals) {
+    if (!t?.id) continue;
+    try {
+      const alt = await runner.gridAltScreen(t.id);
+      if (alt === null) unreadable += 1;
+      else {
+        sampled += 1;
+        if (alt) onAltScreen += 1;
+      }
+    } catch {
+      unreadable += 1;
+    }
+  }
+  const altScreen = {
+    source: "runner grid snapshot (GET /ui-bridge/sdk/terminal/sessions/{id}/grid .alt_screen)",
+    generator: config.generatorPreset ?? "custom",
+    sampled,
+    onAltScreen: sampled > 0 ? onAltScreen : null,
+    unreadable,
+  };
+
+  return foldTransport({ backend, backendError, frontend, frontendError, ipc, altScreen });
 }
 
 /** Sum `totalBytesProduced` across the runner's live terminals. */
@@ -937,6 +1214,7 @@ export async function runHarness(config, log) {
     harnessVersion: 1,
     dryRun: isDry,
     generator: config.generator,
+    generatorPreset: config.generatorPreset ?? null,
     soakMs: config.soakMs,
     settleMs: config.settleMs,
     sessionLevels: config.sessions,
@@ -1121,6 +1399,27 @@ export async function main(argv) {
   }
 
   const label = String(args.label ?? (args["dry-run"] ? "dry-run" : "run"));
+  const generatorPreset = args["generator-preset"] ? String(args["generator-preset"]) : null;
+  let generator = String(args.generator ?? DEFAULTS.generator);
+  if (generatorPreset) {
+    if (args.generator) {
+      process.stderr.write("perf-harness: --generator and --generator-preset are exclusive\n");
+      return 2;
+    }
+    try {
+      generator = buildGeneratorCommand({
+        preset: generatorPreset,
+        scriptPath: TUI_GENERATOR_SCRIPT,
+        cols: TERMINAL_COLS,
+        rows: TERMINAL_ROWS,
+      });
+    } catch (e) {
+      process.stderr.write(
+        `perf-harness: ${e.message}\n(presets: ${GENERATOR_PRESETS.join(", ")})\n`,
+      );
+      return 2;
+    }
+  }
   const config = {
     dryRun: Boolean(args["dry-run"]),
     supervisor: String(args.supervisor ?? DEFAULTS.supervisor),
@@ -1132,7 +1431,8 @@ export async function main(argv) {
     keepRunner: Boolean(args["keep-runner"]),
     skipFrontend: Boolean(args["skip-frontend"]),
     sessions: parseSessionLevels(args.sessions ? String(args.sessions) : undefined),
-    generator: String(args.generator ?? DEFAULTS.generator),
+    generator,
+    generatorPreset,
     soakMs: Number(args["soak-ms"] ?? DEFAULTS.soakMs),
     settleMs: Number(args["settle-ms"] ?? DEFAULTS.settleMs),
     createTimeoutMs: DEFAULTS.createTimeoutMs,

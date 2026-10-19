@@ -264,8 +264,11 @@ For each plan, extract a small set (5–15) of verifiable claims. Examples by cl
 - **"New endpoint POST /foo/bar"** → grep `mcp` modules for the route
   registration; confirm a handler function exists.
 - **"New slash command /foo"** → confirm `.claude/commands/foo.md` exists.
-- **"New Tauri command foo"** → grep `generate_handler!` in `src-tauri/src/main.rs`
-  for the symbol.
+- **"New Tauri command foo"** → grep the `ipc_group!` list in the module that
+  defines `foo` for the symbol, and confirm that module has its
+  `ipc_registry::GROUPS` entry (`src-tauri/src/ipc_registry.rs`). On a runner
+  ref predating plan `2026-10-02-split-run-app-invoke-handler` the commands are
+  still in `main.rs`'s central `generate_handler!` — grep there too.
 - **"New React component Foo.tsx"** → confirm the file exists and is mounted
   in a parent component.
 - **"Phase N — Foundation: ..."** → check the phase's "Definition of done"
@@ -308,8 +311,8 @@ in the current branch's history with `git merge-base --is-ancestor 879c36bb4 HEA
 > the twin confirms it landed — they are not the authority on *whether* it
 > landed.
 
-For plans that span multiple repos (productivity-stack touches qontinui-runner,
-qontinui-navigation, ui-bridge, .claude, qontinui-dev-notes), check each repo's
+For plans that span multiple repos (a plan may touch several application repos,
+the agent config, and the plans repository itself), check each repo's
 log independently.
 
 ### 4. Categorize the plan
@@ -317,6 +320,8 @@ log independently.
 Based on the verification, place each plan in one of:
 
 - **SHIPPED** — every claim verified; no open phase, no missing file/symbol/endpoint.
+  Then read the plan's `## Done when` (below) to choose between bare `SHIPPED`
+  and `SHIPPED — UNCONFIRMED (<claim ids>)`.
 - **PARTIAL** — some claims verified, some missing. Note which.
 - **NOT STARTED** — zero claims verified. The plan is still aspirational.
 - **SUPERSEDED** — the plan's body says it's superseded by another plan, OR
@@ -361,6 +366,33 @@ For NOT STARTED:
 
 For SUPERSEDED / OBSOLETE: cite the replacement or the reason.
 
+**A SHIPPED verdict reads the plan's `## Done when` before it is written**
+(roster rule: `.claude/commands/_status-writers.md` → "The `Done when` rule").
+"Every claim verified live in code" is this skill's evidence that the code
+LANDED; the plan's `## Done when` says what it was FOR, as claims coord
+re-verdicts itself. Read every claim the section names — cited
+`domain_spec/<name>#<claim_id>` and the `claim:` ids of any appended probe blocks —
+from the served `claims[]` (`coord_get_prompt_document`):
+
+- all `confirmed` → the SHIPPED block above, plus one line
+  `Done when: <claim id> confirmed @<observed_at>; …`;
+- any `unknown` / `contradicted` / absent from the served array / unreadable →
+  ```markdown
+  > **Status: SHIPPED — UNCONFIRMED (<those claim ids>) <YYYY-MM-DD>.** <1–3
+  > line summary of what's live>. Done when: <claim id> <state> @<observed_at>; …
+  > Commits: <repo>@<sha> (<short msg>); …
+  ```
+- `Done when: no claim — <reason>`, or no such section (a plan predating the
+  template) → bare SHIPPED, quoting the escape or saying `no Done-when section`.
+- a section that is present but unparseable — no claim bullet and no escape
+  line → `SHIPPED — UNCONFIRMED (done-when-unparseable)`, in the UNCONFIRMED
+  block above with `Done when: unparseable` in place of the claim list.
+
+An existing `SHIPPED — UNCONFIRMED (…)` stamp is rewritten to bare `SHIPPED`
+only when every named claim now reads `confirmed`; the claims alone never move
+it to `PARTIAL` or `NOT STARTED` — the code landed. The runner normalises the
+qualified stamp to `shipped`; the qualifier is for the human reader.
+
 #### Single-stamp invariant — read before stamping
 
 A plan must have **exactly one** `> **Status:` blockquote between the H1
@@ -404,7 +436,8 @@ finding in the body. Don't leave both.
 
 | State | When |
 |---|---|
-| SHIPPED | every claim verified live in code |
+| SHIPPED | every claim verified live in code, and every `## Done when` claim reads `confirmed` (or the plan took the escape / predates the section) |
+| SHIPPED — UNCONFIRMED (<claim ids>) | every claim verified live in code, but the named `## Done when` claims do not read `confirmed` |
 | PARTIAL | some phases shipped, others open |
 | NOT STARTED | zero source evidence of any claim |
 | SUPERSEDED | a different approach landed; cite the replacement |
@@ -434,14 +467,19 @@ the subsection after it is this skill's own disposition.
 > and apply these five rules.
 >
 > 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
->    It protects a live peer's in-flight work.
+>    It protects a live peer's in-flight work. Read the whole HEADLINE, not only
+>    its first token: after a non-terminal first token, an `IN PROGRESS` /
+>    `IN_PROGRESS` anywhere in the headline makes it one
+>    (`VETTED-WITH-CORRECTIONS 2026-10-04, IN PROGRESS.` is; the headline rule is
+>    `/vet-imp-sweep` Step 3 filter 3b's).
 > 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
 >    PEER unless you can positively verify that session died with zero work
 >    products — transcript tail shows death, its worktrees clean and 0 ahead of
->    `origin/main`, and no PRs and no branches for the plan. Verified dead, and
->    only then, adopt it and append your own marker.
+>    `origin/main`, and no PRs and no branches for the plan — **or that it
+>    delegated the plan to a hold gate whose continuation you are (the arm
+>    table's case 2b)**. Only then adopt it and append your own marker.
 > 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
 >    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
 >    earned branch; stopping is the fallback.
@@ -498,7 +536,8 @@ The cases map onto this skill's verbs:
 | 0 — the marker **is your own** current session id | **Reachable, and not rare** — the marker names a *session*, not a command, and one session routinely runs `/implement-plan` (which stamps it) and later `/verify-plan-status`, directly or through `/pvi` or `/vet-imp`. There is no peer to protect here: **write the verified state freely**, naming the prior stamp as your own in the `History:` line. Evaluate this row FIRST — it is a positively attributed marker, so it must never fall to the unidentified default, which is defined by the absence of exactly that attribution. |
 | 1 — the work has **landed** (delivery arm 1) | The plan is closed in substance. Write **`SHIPPED`** — a state this skill owns — when your own evidence scan agrees. If it does **not** agree, that disagreement IS the finding (a `delivery:` drift class): report it and leave the block alone. Never resolve it by writing `NOT STARTED` or `PARTIAL` over the marker. **Deliberate divergence, do not "restore consistency":** `/vet-plan` case 1 says *refuse and route to closeout* because `/vet-plan` writes only `VETTED`. Writing `SHIPPED` here IS that closeout — §5's own closeout paragraph assigns the plan-file terminal status to whoever can write it ("always yours to write"), and `SHIPPED` is this skill's state. Flipping this row to "refuse" would delete the only path by which a landed plan ever gets closed. |
 | 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and** its worktrees are clean and 0 ahead of `origin/main`, **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
-| 3 — a **live peer** (marker ≠ yours and case 2's checks do not all hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
+| 2b — **gate-delegated**: you are the cleared continuation of the hold gate G that the block's last `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` line names (every `/vet-plan` case-2b conjunct read; the `anchor` token is parsed from the right) | Free to write the verified state. Name G and the prior marker, REPLACING the `Held behind gate` line with `History: adopted from <prior session id> via consumed hold <G full id>` — never keep it. |
+| 3 — a **live peer** (marker ≠ yours and neither case 2's nor case 2b's checks hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
 | — **unidentified default**: no marker at all, or one you cannot positively attribute | **Do not overwrite**, exactly as case 3. An absent marker cannot reach case 2, because case 2's probes are keyed on a session id and there is none to probe. |
 
 **Settling case 1 — and this command has no mandatory capture step, so there
@@ -618,7 +657,11 @@ Single message back to the user:
 Verified <N> plans in <scanned dir(s)>.
 
 SHIPPED:
-  - <plan>.md — <one-line shipment summary>
+  - <plan>.md — <one-line shipment summary>; Done when: <claims confirmed | escape | no section>
+  ...
+
+SHIPPED — UNCONFIRMED (landed; Done-when claims not confirmed):
+  - <plan>.md — <claim id> <state> @<observed_at>, ...
   ...
 
 PARTIAL:

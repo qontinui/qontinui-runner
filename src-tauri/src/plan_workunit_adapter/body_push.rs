@@ -3397,7 +3397,7 @@ mod tests {
     }
 
     /// Every state the runner can report satisfies the web door's rules —
-    /// the readings `measure_scan_divergence` actually produces, AND
+    /// the readings `measure_scan_divergence_pinned` actually produces, AND
     /// hand-broken ones that violate the source type's own invariants (a
     /// non-measured reading carrying counts, an unexplained UNKNOWN, a
     /// `measured` missing a count), which the projection must repair rather

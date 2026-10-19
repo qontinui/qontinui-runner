@@ -197,25 +197,42 @@ jobs:
     # still takes 84 min. What moved is the WORST BOUNDED Rust time, from 90 to
     # 90 + 20 = 110. So the sentence above is not wrong; it simply answers a
     # different question from the one the next person sizing this cap needs.
+    # (Its "150 min" is the pre-split cap; the value below is re-derived.)
     #
-    # Compute from 110, not 90. Attempt 1 of run 35043646051 ran 100m43s with
-    # the 90-min step, i.e. 10m43s outside it, so the same shape under the split
-    # reaches ~121m. The historical max windows job (110.6m) reaches ~130m ONLY
-    # IF its Rust step consumed the full 90 — an assumption, not a measurement.
-    # Substituting the step's own max(success) of 82 gives ~139m instead, but
-    # that figure is ALSO an assumption and a weaker one: 82 is recorded in the
-    # `Build Rust tests` step comment below, from "44 windows samples after
-    # 2026-09-08", while the 110.6m job max above is from "90 sampled
-    # successful job runs, 2026-08-08..08-20" — two disjoint windows, so the
-    # two numbers were never measured on the same run. Every one of ~121m,
-    # ~130m and ~139m still fits under 150, which is why this cap is NOT
-    # changed here; Phase 5 should re-measure both ends on one window rather
-    # than combining these. Re-sizing against a re-measured window is Phase 5 of
-    # 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound.
-    timeout-minutes: 150
+    # Compute from 110, not 90 — and add the MEASURED time outside the two
+    # Rust steps rather than projecting it. Re-measured on ONE window (Phase 5a
+    # of 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound),
+    # 881 successful windows `test` jobs, 2026-09-24..10-07: job p50 90.8 /
+    # p90 106.4 / max 143.2 min; time OUTSIDE `Build Rust tests` + `Run Rust
+    # tests` p50 36.4 / p99 45.7 / max 49.0 min. So the worst bounded case is
+    # 90 (build) + 20 (run) + 49 (measured overhead) = 159 min, which a 150 cap
+    # does NOT contain: a build that ran to its own bound became a JOB timeout,
+    # which GitHub concludes `cancelled` — and the `if: failure()` expiry
+    # summariser below never runs on a cancel, so the attribution the split
+    # bought was erased one level up. An outer cap must contain the inner
+    # bounds plus their measured overhead, or the inner bounds stop naming
+    # their own expiries.
+    #
+    # 180 = 90 + 20 + 10 (allowance for an `if: failure()` failure-path
+    # classifier with a 600 s budget, proposed in open PRs #1655/#1769) + 49
+    # (measured overhead max) = 169, rounded up to 180 (~6.5% for overhead
+    # growth). The cap
+    # still bounds a genuine hang at 3 h, half GitHub's 360-minute default.
+    # `ci_rust_test_steps_split.rs` pins this cap >= build + run + 50 so a
+    # future change to either step bound has to move this line too.
+    timeout-minutes: 180
 
     steps:
+      # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
+      # swap-rule base from `merge-base HEAD origin/main`, which a depth-1 clone
+      # cannot compute (it would print SWAP RULE UNKNOWN and enforce nothing).
+      # `filter: blob:none` keeps the fetch to commits and trees; the one roster
+      # blob it reads at the merge base is fetched lazily. Plan
+      # 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, A6.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -859,6 +876,16 @@ jobs:
           # nothing. Keeping the two logs distinct is what makes the split
           # transparent to the ingest; the expiry summariser below reads both.
           set -o pipefail
+          # The runner's `terminal::daemon_pane_io` end-to-end tests (plan
+          # 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+          # Phase 2; `cfg(target_os = "linux")`) drive the REAL holder binary,
+          # which is a bin of ANOTHER workspace package — `cargo test` from
+          # src-tauri never builds it, and those tests fail (never skip) when
+          # it is missing. Built here, in the compile half, so the run half
+          # still invokes no cargo. Linux only: the tests are Linux only.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo build -p qontinui-pty-holder
+          fi
           cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
         shell: bash
 
@@ -1100,6 +1127,18 @@ jobs:
       # from 2 toward cargo's default) is Phase 3 step 2 and waits on a soak
       # window of these readings; tuning first against an unmeasured quantity
       # is how the current value went stale.
+      #
+      # The reading goes to the job LOG as well as the summary (Phase 3 step
+      # 1b). A job summary is exposed by NO API — `gh api .../check-runs/<id>`
+      # returns `output.summary: ""`, the job log carries only the command
+      # text, and the web `summary_raw` URL 404s — so ~1,050 summary-only runs
+      # (2026-09-24..10-07) produced no peak anyone could collect, and the soak
+      # this step exists for could never complete. `tee -a` keeps the summary
+      # and puts every line in the log too; each pagefile also gets one
+      # greppable line,
+      #   MEMPEAK name=<path> alloc_mb=<n> peak_mb=<n> current_mb=<n> free_phys_kb=<n> build=<outcome> run=<outcome>
+      # so the soak is `gh api .../actions/jobs/<id>/logs | grep MEMPEAK`.
+      # A missing reading prints `MEMPEAK unknown=1 ...`, never a zero.
       # `matrix.platform == 'windows-latest'` rather than `runner.os` — every
       # other Windows gate in this file spells it that way (see `Configure
       # pagefile`), and one idiom is one grep.
@@ -1108,6 +1147,11 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          # An outcome that did not resolve is UNKNOWN, never an empty field.
+          BUILD_OUTCOME="${{ steps.build_rust_tests.outcome }}"
+          RUN_OUTCOME="${{ steps.run_rust_tests.outcome }}"
+          BUILD_OUTCOME="${BUILD_OUTCOME:-unknown}"
+          RUN_OUTCOME="${RUN_OUTCOME:-unknown}"
           {
             echo "### Windows memory after the Rust test steps"
             echo
@@ -1119,9 +1163,21 @@ jobs:
             powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Select-Object Name,AllocatedBaseSize,CurrentUsage,PeakUsage | Format-List; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List" || echo "(sampler failed: powershell exited non-zero — this is UNKNOWN, not a zero peak)"
             echo '```'
             echo
-            echo "build step outcome: ${{ steps.build_rust_tests.outcome }} - run step outcome: ${{ steps.run_rust_tests.outcome }}"
+            echo "build step outcome: ${BUILD_OUTCOME} - run step outcome: ${RUN_OUTCOME}"
             echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (the 32 GB the pagefile step configures) before changing CARGO_BUILD_JOBS."
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo
+            echo '```'
+            # One machine-greppable line per pagefile. `tr -d '\r'` because
+            # powershell emits CRLF; an empty capture (no pagefile rows, or
+            # powershell failed) is reported as UNKNOWN, never as a zero peak.
+            mem="$(powershell -NoProfile -Command '$os = Get-CimInstance Win32_OperatingSystem; Get-CimInstance Win32_PageFileUsage | ForEach-Object { $free = if ($os) { $os.FreePhysicalMemory } else { "unknown" }; "MEMPEAK name={0} alloc_mb={1} peak_mb={2} current_mb={3} free_phys_kb={4}" -f $_.Name,$_.AllocatedBaseSize,$_.PeakUsage,$_.CurrentUsage,$free }' | tr -d '\r')" || mem=""
+            if [ -n "$mem" ]; then
+              printf '%s\n' "$mem" | sed "s/\$/ build=${BUILD_OUTCOME} run=${RUN_OUTCOME}/"
+            else
+              echo "MEMPEAK unknown=1 reason=no-pagefile-reading build=${BUILD_OUTCOME} run=${RUN_OUTCOME}"
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Best-effort, non-gating: pushes this job's per-test outcomes into
       # coord.test_results so coord's already-shipped `flakiness_priors` has a
@@ -1781,6 +1837,35 @@ jobs:
         # and RE-ASSESS IMMEDIATELY if anything ever enables rust_decimal's
         # `rkyv`/`rkyv-safe` feature — that would make the vulnerable code real
         # and this justification void. Tracking: qontinui/qontinui-runner#956.
+        #
+        # --ignore RUSTSEC-2026-0367 + RUSTSEC-2026-0368 + RUSTSEC-2026-0369:
+        # three zip < 9.0.0 extraction advisories (SUID/SGID bits preserved;
+        # symlink targets outside the destination; permissions applied through
+        # symlinks). All three live in `ZipArchive::extract()` and
+        # `ZipStreamReader::extract()`. The runner's OWN zip dependency is
+        # bumped to 9 (patched), and runner code never calls `extract()`.
+        #
+        # The ignore covers the SECOND copy, zip 4.6.1, which enters only as
+        #
+        #   qontinui-runner -> tauri-plugin-updater -> zip ^4
+        #
+        # and every published tauri-plugin-updater through 2.14.0 (the latest
+        # as of 2026-10-17) requires `zip ^4`, so it is not upgradable from
+        # here. Not exploitable in that path. The updater calls `extract()`
+        # only from its Windows `extract_zip`. 0367 and 0369 need Unix
+        # permission bits, which zip 4 never applies on Windows. 0368 is NOT
+        # ruled out by the platform: zip 4 creates symlinks on Windows too.
+        # What rules out all three is that `extract_zip` runs only AFTER
+        # `verify_signature` checks the downloaded bundle against our updater
+        # public key, so the archive is not attacker-controlled. The runner
+        # reaches the updater only through `download_and_install`
+        # (commands/execution/system_ops.rs), and the frontend is granted no
+        # `updater:` permission.
+        #
+        # Drop this ignore when tauri-plugin-updater ships a release on
+        # zip >= 9. Re-assess immediately if updater signature checking is
+        # ever disabled or bypassed, if runner code starts calling
+        # `extract()` on a zip 4 archive, or if the updater extracts on Unix.
         run: |
           # --locked: install cargo-audit against its OWN bundled Cargo.lock.
           # Without it, cargo resolves cargo-audit's transitive deps to latest
@@ -1789,7 +1874,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

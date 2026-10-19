@@ -60,6 +60,8 @@ import { useHotField } from "./useTerminalHotStore";
 import { useWrapperTools } from "@/hooks/useWrapperTools";
 import { BatchActions } from "./BatchActions";
 import { MinimapToggle } from "./MinimapToggle";
+import { PruneTerminalsButton } from "./PruneTerminalsButton";
+import { usePrunePlan } from "./usePrunePlan";
 import {
   countLiveTabs,
   countTabsInState,
@@ -267,6 +269,11 @@ export function StatusStrip() {
   // colors; these new pills render in muted shades so they don't
   // compete visually with "needs attention" signals.
   const hasBreakdown = workingText !== null || completedCount > 0 || idleCount > 0;
+
+  // "Keep AI" button gate. Deliberately NOT a reason to show the strip (like
+  // `wrapperCount`): an oversized grid is not a condition needing attention,
+  // so the button rides along only when the strip is already up.
+  const canPrune = usePrunePlan().actionable && zoneLayout.isMultiZone;
 
   // Auto-hide gate — when nothing requires attention AND nothing
   // informational is worth showing either, the strip disappears
@@ -483,6 +490,10 @@ export function StatusStrip() {
           sessions), so gating on the wrong one yields a button that toggles
           a widget which never renders, or a visible widget with no button. */}
       {zoneLayout.isMultiZone && <MinimapToggle />}
+
+      {/* "Keep AI" — close the non-AI windows and compact the grid. Renders
+          nothing when that would change nothing. */}
+      {canPrune && <PruneTerminalsButton />}
 
       {/* Phase 9f — state-breakdown pill. Single combined pill listing
           the non-attention states (working / completed / idle); the

@@ -103,7 +103,7 @@ thread_local! {
 /// D4: a tenant slot vanished from the shared `auth_tokens.enc` with no log line
 /// naming the writer. Every slot write and clear now carries this, so the next
 /// foreign writer (CLI, instance runner, test binary) is named by the log.
-pub(crate) fn process_attribution() -> String {
+pub fn process_attribution() -> String {
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let exe = EXE.get_or_init(|| match std::env::current_exe() {
         Ok(p) => p.display().to_string(),
@@ -467,6 +467,19 @@ pub struct StoredGracedNonce {
     /// The pin's provenance — see [`StoredNonceBinding::session_tenant_origin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_tenant_origin: Option<StoredPinOrigin>,
+    /// The evicted binding's SETTLED repo expectation — see
+    /// [`StoredNonceBinding::expected_tenant`]. A superseded key is still
+    /// presented by a live session for the grace window, and row 1d of the
+    /// session-tenant authority order needs the same repo answer the live key
+    /// was served by, or one session gets two tenants. `None` for an entry
+    /// written before the field, or evicted before its resolution settled; the
+    /// restore reads that as PENDING and re-resolves from `workdir`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_expected_tenant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_tenant: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
 }
 
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
@@ -694,12 +707,8 @@ impl SecureStorage {
     ///
     /// The storage file will be created in the app's data directory.
     pub fn new() -> Result<Self> {
-        let data_dir = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-            .or_else(|| dirs::data_local_dir().map(|d| d.join(SERVICE_NAME)))
-            .context("Failed to get data directory")?;
+        let data_dir =
+            crate::instance_env::secure_storage_dir().context("Failed to get data directory")?;
 
         // Ensure directory exists
         fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
@@ -721,7 +730,14 @@ impl SecureStorage {
     /// Creates a SecureStorage instance with a custom storage path.
     ///
     /// This is primarily used for testing to ensure test isolation.
-    #[cfg(test)]
+    ///
+    /// Gated on `any(test, debug_assertions)` rather than `cfg(test)` because
+    /// the runner BIN's tests call it and this module is a lib module: `cargo
+    /// test` builds the bin's dependencies (this rlib included) without
+    /// `cfg(test)` but WITH `debug_assertions` — the same boundary as
+    /// `ambient::test_support`. A release build compiles none of it.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     pub fn with_path(storage_path: PathBuf) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = storage_path.parent() {
@@ -1845,12 +1861,11 @@ impl Default for SecureStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     /// Create an isolated storage instance for testing.
     /// Each test gets its own unique storage file to avoid test interference.
     fn create_test_storage(test_name: &str) -> SecureStorage {
-        let temp_dir = env::temp_dir().join("qontinui_test_storage");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_storage");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
@@ -2281,37 +2296,73 @@ mod tests {
         );
     }
 
+    /// Wait for a concurrent peer writer to reach a step, failing only if the
+    /// peer makes NO progress for [`PEER_STALL_LIMIT`] — a dead peer, not a
+    /// slow disk.
+    ///
+    /// The writers below run in LOCKSTEP: a writer starts write `i` only once
+    /// its peer has finished write `i - 1`. The store lock is polled and so not
+    /// fair, and with two free-running writers the one that releases re-takes
+    /// it within microseconds while the other sleeps between polls. On a slow
+    /// Windows disk a writer was starved behind the peer's whole burst of 120
+    /// writes for more than [`STORE_LOCK_TIMEOUT`] and failed "lock … still
+    /// held after 10s" although every single hold lasted milliseconds. In
+    /// lockstep a waiter waits behind at most ONE peer write, so nothing here
+    /// depends on how fast the disk is — and both writers still race for the
+    /// lock at every step, which is what the lost-update check needs (with
+    /// `QONTINUI_TEST_DISABLE_STORE_LOCK=1` they load together every round).
+    fn wait_for_peer(peer_reached: impl Fn() -> bool, what: &str) {
+        let stall_started = std::time::Instant::now();
+        while !peer_reached() {
+            assert!(
+                stall_started.elapsed() < PEER_STALL_LIMIT,
+                "peer writer made no progress for {PEER_STALL_LIMIT:?} waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// How long a lockstep writer waits for its peer's NEXT step before
+    /// concluding the peer died. One step is one store write.
+    const PEER_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// D4: two writers — separate `SecureStorage` instances (separate lock
     /// handles, exactly as two processes would hold them) on the SAME store —
-    /// each add a NEW tenant slot per iteration, concurrently. Every slot is a
-    /// distinct key, so any lost update (a load→insert→save interleaving that
-    /// drops a peer's insert) stays visible at the end rather than being
-    /// papered over by the next round.
+    /// each add a NEW tenant slot per iteration, concurrently and in lockstep
+    /// ([`wait_for_peer`]). Every slot is a distinct key, so any lost update (a
+    /// load→insert→save interleaving that drops a peer's insert) stays visible
+    /// at the end rather than being papered over by the next round.
     #[test]
     fn test_concurrent_writers_of_different_tenants_both_survive() {
-        const N: u128 = 120;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const N: usize = 120;
         let storage = create_test_storage("concurrent_tenant_writers");
         let path = storage.storage_path.clone();
         let _ = fs::remove_file(storage.lock_path());
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let writer = |base: u128| {
+        let done = std::sync::Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let writer = |me: usize, base: u128| {
             let path = path.clone();
-            let barrier = barrier.clone();
+            let done = done.clone();
             std::thread::spawn(move || {
                 let s = SecureStorage::with_path(path).unwrap();
-                barrier.wait();
+                let peer = 1 - me;
                 for i in 0..N {
-                    s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
+                    wait_for_peer(
+                        || done[peer].load(Ordering::Acquire) >= i,
+                        &format!("write {i}"),
+                    );
+                    s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i as u128), "x")
                         .unwrap();
+                    done[me].store(i + 1, Ordering::Release);
                 }
             })
         };
-        let a = writer(0xA000);
-        let b = writer(0xB000);
+        let a = writer(0, 0xA000);
+        let b = writer(1, 0xB000);
         a.join().unwrap();
         b.join().unwrap();
         let slots = storage.try_list_tenant_device_jwt_tenants().unwrap();
-        assert_eq!(slots.len() as u128, 2 * N, "a concurrent writer lost slots");
+        assert_eq!(slots.len(), 2 * N, "a concurrent writer lost slots");
         let _ = fs::remove_file(&storage.storage_path);
     }
 
@@ -2344,6 +2395,9 @@ mod tests {
     const LOCK_CHILD_STORE_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_STORE";
     /// Env var naming the first tenant (u128) of the range that child writes.
     const LOCK_CHILD_TENANT_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_TENANT";
+    /// Env var naming the PEER child's first tenant, whose step markers this
+    /// child waits on to stay in lockstep ([`wait_for_peer`]).
+    const LOCK_CHILD_PEER_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_PEER";
     /// Distinct tenant slots each child adds.
     const LOCK_CHILD_WRITES: u128 = 120;
 
@@ -2354,18 +2408,31 @@ mod tests {
         PathBuf::from(os)
     }
 
+    /// Remove both children's `ready.*` and `step.*` markers, so a stale one
+    /// from an earlier run cannot let a child skip a wait.
+    fn remove_child_markers(store: &std::path::Path) {
+        for base in [0xA000u128, 0xB000] {
+            let _ = fs::remove_file(lock_child_marker(store, &format!("ready.{base}")));
+            for i in 0..LOCK_CHILD_WRITES {
+                let _ = fs::remove_file(lock_child_marker(store, &format!("step.{base}.{i}")));
+            }
+        }
+    }
+
     /// Child half of the two-PROCESS test below: a no-op in a normal run; when
     /// the parent re-invokes this test binary with the env vars set, it
     /// hammers one tenant slot of the shared store.
     #[test]
     fn lock_child_process_writer() {
-        let (Ok(store), Ok(tenant)) = (
+        let (Ok(store), Ok(tenant), Ok(peer)) = (
             std::env::var(LOCK_CHILD_STORE_ENV),
             std::env::var(LOCK_CHILD_TENANT_ENV),
+            std::env::var(LOCK_CHILD_PEER_ENV),
         ) else {
             return;
         };
         let base: u128 = tenant.parse().unwrap();
+        let peer: u128 = peer.parse().unwrap();
         let store = PathBuf::from(store);
         let s = SecureStorage::with_path(store.clone()).unwrap();
         // Start barrier: announce readiness, then wait for the parent's GO so
@@ -2377,9 +2444,16 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "parent never said GO");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        // Lockstep with the peer child: write `i` starts once the peer has
+        // finished write `i - 1` (its `step.<peer>.<i - 1>` marker exists).
         for i in 0..LOCK_CHILD_WRITES {
+            if i > 0 {
+                let peer_step = lock_child_marker(&store, &format!("step.{peer}.{}", i - 1));
+                wait_for_peer(|| peer_step.exists(), &format!("peer step {}", i - 1));
+            }
             s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
                 .unwrap();
+            fs::write(lock_child_marker(&store, &format!("step.{base}.{i}")), b"").unwrap();
         }
     }
 
@@ -2391,7 +2465,7 @@ mod tests {
         let storage = create_test_storage("two_process_tenant_writers");
         let _ = fs::remove_file(storage.lock_path());
         let exe = std::env::current_exe().unwrap();
-        let spawn = |tenant: u128| {
+        let spawn = |tenant: u128, peer: u128| {
             std::process::Command::new(&exe)
                 .args([
                     "--exact",
@@ -2401,6 +2475,7 @@ mod tests {
                 ])
                 .env(LOCK_CHILD_STORE_ENV, &storage.storage_path)
                 .env(LOCK_CHILD_TENANT_ENV, tenant.to_string())
+                .env(LOCK_CHILD_PEER_ENV, peer.to_string())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -2408,14 +2483,9 @@ mod tests {
         };
         let go = lock_child_marker(&storage.storage_path, "go");
         let _ = fs::remove_file(&go);
-        for base in [0xA000u128, 0xB000] {
-            let _ = fs::remove_file(lock_child_marker(
-                &storage.storage_path,
-                &format!("ready.{base}"),
-            ));
-        }
-        let a = spawn(0xA000);
-        let b = spawn(0xB000);
+        remove_child_markers(&storage.storage_path);
+        let a = spawn(0xA000, 0xB000);
+        let b = spawn(0xB000, 0xA000);
         // Release both children together once each has reported ready.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while ![0xA000u128, 0xB000]
@@ -2451,12 +2521,7 @@ mod tests {
             "one process's slots were lost to the other"
         );
         let _ = fs::remove_file(&go);
-        for base in [0xA000u128, 0xB000] {
-            let _ = fs::remove_file(lock_child_marker(
-                &storage.storage_path,
-                &format!("ready.{base}"),
-            ));
-        }
+        remove_child_markers(&storage.storage_path);
         let _ = fs::remove_file(&storage.storage_path);
     }
 
@@ -3013,6 +3078,7 @@ mod tests {
                 grace_until_unix: 1_700_021_600,
                 session_tenant: None,
                 session_tenant_origin: None,
+                expected_tenant: None,
             },
         )]);
         storage
