@@ -58,6 +58,17 @@ describe("drainBannerModel", () => {
     );
     expect(both?.kind).toBe("drained");
     expect(both?.restoreNote).toBe(ROLE_RESTORE_NOTE);
+    // Unknown AND role-closed: same, no promise that a readable drain helps.
+    const unknownAndRole = drainBannerModel(
+      snap({
+        state: "unknown",
+        autonomousSpawnsAllowed: false,
+        bootReadPending: false,
+        agentLaneClosedByRole: true,
+      }),
+    );
+    expect(unknownAndRole?.kind).toBe("unknown");
+    expect(unknownAndRole?.restoreNote).toBe(ROLE_RESTORE_NOTE);
     // An open role, or a runner that predates the field, keeps today's banner.
     expect(drainBannerModel(snap({ dispatchRole: "workhorse", agentLaneClosedByRole: false }))).toBeNull();
     expect(drainBannerModel(snap({ state: "clear" }))).toBeNull();

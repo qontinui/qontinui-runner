@@ -213,7 +213,9 @@ export function describeRemoteCreateFailure(err: unknown): RemoteCreateRefusal {
       ],
     };
   }
-  if (code === "role_closes_agent_lane") {
+  // The relay passes only the codes it lists by name; until it lists this one
+  // it arrives prefixed `target_said_`, so match both spellings.
+  if (code === "role_closes_agent_lane" || code === "target_said_role_closes_agent_lane") {
     return {
       ...base,
       headline: "That device does not take sessions — its dispatch role closes the agent lane",

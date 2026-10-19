@@ -97,7 +97,8 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
       heading: UNKNOWN_HEADING,
       detail: s.cause,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
-      restoreNote: RESTORE_NOTE,
+      // A readable drain does not lift a closing dispatch role either.
+      restoreNote: s.agentLaneClosedByRole === true ? ROLE_RESTORE_NOTE : RESTORE_NOTE,
     };
   }
   // The drain is clear (or this is no coord device), but coord's dispatch role

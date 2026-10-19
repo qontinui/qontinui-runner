@@ -471,11 +471,10 @@ fn drain_admission(
         );
         return None;
     }
-    let decision = decide_drain_with_role(
-        &crate::coord_drain_state::current(),
-        crate::coord_drain_state::current_dispatch_role(),
-        admission,
-    )?;
+    // State and role under one lock, so a fold between two reads cannot pair
+    // them into an answer neither reading gives.
+    let (state, role) = crate::coord_drain_state::current_with_role();
+    let decision = decide_drain_with_role(&state, role, admission)?;
     if let DrainAdmission::Origin { origin, work_key } = admission {
         let key = work_key
             .clone()
@@ -3818,6 +3817,102 @@ mod drain_tests {
                 decide_drain_with_role(&CoordDrainState::Clear, role, &SpawnOrigin::Steward.into()),
                 None
             );
+        }
+    }
+
+    /// The SEAM, not the pure gate: a `ci_node` / `bench` role served on the
+    /// real heartbeat wire must reach the LIVE doors every runner-local spawn
+    /// site goes through — `coord_drain_state::drain_gate` (and so
+    /// `drain_gate_for_work` / `wait_until_allowed` / `held_until_allowed`),
+    /// `autonomous_spawns_allowed_now` (the replay edges), and this module's
+    /// `drain_admission` (the half of `authorize_spawn` that gate
+    /// continuations, the scheduler, looping agents and stewards pass). The
+    /// pure tests above pin `gate_with_role_at`; none of them reddens if a
+    /// live door stops reading the cached role, or if the heartbeat stops
+    /// caching it. This one does.
+    ///
+    /// It folds into the process-global cache, so it restores the boot state
+    /// on exit (even on panic). While it runs every autonomous origin is still
+    /// DEFERRED — `RoleClosed` instead of the boot `Unknown` — so a concurrent
+    /// test never sees a more permissive gate than it would have anyway.
+    #[tokio::test]
+    async fn a_heartbeat_served_closing_role_reaches_every_live_spawn_door() {
+        use crate::coord_drain_state::{
+            autonomous_spawns_allowed_now, current, current_dispatch_role, drain_gate,
+            note_heartbeat, parse_register_response, parse_register_role, reset_global_for_test,
+            DeferClass, DispatchRole, DrainGate, HeartbeatOutcome,
+        };
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                reset_global_for_test();
+            }
+        }
+        let _restore = Restore;
+
+        for (wire, role) in [
+            ("ci_node", DispatchRole::CiNode),
+            ("bench", DispatchRole::Bench),
+        ] {
+            // The register response shape coord serves (the role inside the
+            // `drain` object, the drain itself clear), parsed the way
+            // `fleet::heartbeat_to_coord` parses it.
+            let body = format!(r#"{{"drain":{{"state":"clear","dispatch_role":"{wire}"}}}}"#);
+            note_heartbeat(HeartbeatOutcome::Registered {
+                drain: parse_register_response(&body),
+                dispatch_role: parse_register_role(&body),
+            })
+            .await;
+
+            assert_eq!(
+                current(),
+                CoordDrainState::Clear,
+                "{wire}: the drain stays clear"
+            );
+            assert_eq!(
+                current_dispatch_role(),
+                Some(role),
+                "{wire}: the heartbeat cached it"
+            );
+            assert!(
+                !autonomous_spawns_allowed_now(),
+                "{wire}: replay edges stay shut"
+            );
+
+            for origin in SpawnOrigin::ALL {
+                let gate = drain_gate(origin);
+                let admission = drain_admission(
+                    Some("dispatch-role-seam-test"),
+                    SpawnPath::StandingContinuation,
+                    &origin.into(),
+                );
+                if origin.is_autonomous() {
+                    match gate {
+                        DrainGate::Defer { class, .. } => {
+                            assert_eq!(class, DeferClass::RoleClosed, "{wire} drain_gate {origin}")
+                        }
+                        DrainGate::Allow => panic!("{wire}: drain_gate let {origin} spawn"),
+                    }
+                    let d = admission
+                        .unwrap_or_else(|| panic!("{wire}: authorize_spawn let {origin} spawn"));
+                    assert_eq!(
+                        d.drain_class(),
+                        Some(DeferClass::RoleClosed),
+                        "{wire} {origin}"
+                    );
+                    assert!(
+                        d.refusal().unwrap().starts_with("role_closes_agent_lane: "),
+                        "{wire} {origin}"
+                    );
+                } else {
+                    assert_eq!(
+                        gate,
+                        DrainGate::Allow,
+                        "{wire}: the operator's {origin} passes"
+                    );
+                    assert_eq!(admission, None, "{wire}: the operator's {origin} passes");
+                }
+            }
         }
     }
 }

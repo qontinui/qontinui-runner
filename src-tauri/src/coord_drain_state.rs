@@ -65,8 +65,8 @@
 //!
 //! An ABSENT role (an older coord, or coord's role read failing) or a role
 //! spelling this build does not know keeps today's behaviour: the drain alone
-//! decides. Each successful read replaces the cached role, so a role coord
-//! stops serving stops applying on the next read. A failed read keeps it.
+//! decides. A read that serves the key replaces the cached role; a read that
+//! omits it (coord's failed role read, or any failed drain read) keeps it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
@@ -272,7 +272,8 @@ impl DrainGate {
 /// The gate for `origin` against the CURRENT cached state and dispatch role.
 /// Cheap and synchronous; never performs I/O.
 pub fn drain_gate(origin: SpawnOrigin) -> DrainGate {
-    gate_with_role_at(&current(), current_dispatch_role(), origin, Utc::now())
+    let (state, role) = current_with_role();
+    gate_with_role_at(&state, role, origin, Utc::now())
 }
 
 /// [`drain_gate`], also recording a deferral of `work_key` so the banner's
@@ -495,28 +496,49 @@ fn observation_from_wire(value: &serde_json::Value) -> DrainObservation {
     }
 }
 
-/// PURE: the `dispatch_role` key of a drain object. Absent, non-string or an
-/// unknown spelling is `None`, which keeps today's behaviour.
-fn role_from_wire(value: &serde_json::Value) -> Option<DispatchRole> {
-    value
-        .get("dispatch_role")
-        .and_then(|v| v.as_str())
-        .and_then(DispatchRole::parse)
+/// What one drain read said about the dispatch role.
+///
+/// Two different absences, kept apart because coord gives them different
+/// meanings (`qontinui-coord` `dispatch_role::device_drain_wire_from`): when
+/// coord's ROLE read succeeds it ALWAYS serves a role (`workhorse` for a
+/// machine with no row), and it omits the key only when that read FAILED,
+/// while still serving a readable drain `state`. So a missing key is a failed
+/// read of the role, never "the role is gone": it keeps the cached role. An
+/// older coord never sends the key, so its cached role stays `None` and
+/// today's behaviour holds exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedRole {
+    /// The key is absent (or not a string, or the body did not parse): the
+    /// role was not read. Keeps the cached role.
+    NotServed,
+    /// The key is present: `Some` for a spelling this build knows, `None` for
+    /// one it does not (which, like an absent role, keeps today's behaviour).
+    Served(Option<DispatchRole>),
+}
+
+/// PURE: the `dispatch_role` key of a drain object.
+fn role_from_wire(value: &serde_json::Value) -> ServedRole {
+    match value.get("dispatch_role").and_then(|v| v.as_str()) {
+        Some(s) => ServedRole::Served(DispatchRole::parse(s)),
+        None => ServedRole::NotServed,
+    }
 }
 
 /// PURE: the dispatch role out of a `POST /coord/devices/register` response
 /// body (the `dispatch_role` key of its `drain` object).
-pub fn parse_register_role(body: &str) -> Option<DispatchRole> {
+pub fn parse_register_role(body: &str) -> ServedRole {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|json| json.get("drain").and_then(role_from_wire))
+        .and_then(|json| json.get("drain").map(role_from_wire))
+        .unwrap_or(ServedRole::NotServed)
 }
 
 /// PURE: the dispatch role out of a `GET /coord/devices/me/drain` 200 body.
-pub fn parse_me_drain_role(body: &str) -> Option<DispatchRole> {
+pub fn parse_me_drain_role(body: &str) -> ServedRole {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|json| role_from_wire(&json))
+        .map(|json| role_from_wire(&json))
+        .unwrap_or(ServedRole::NotServed)
 }
 
 /// PURE: the `drain` object out of a `POST /coord/devices/register` response
@@ -798,8 +820,8 @@ fn autonomous_allowed(state: &CoordDrainState, role: Option<DispatchRole>) -> bo
 /// The edge detectors that replay deferred work use this rather than
 /// [`CoordDrainState::allows_autonomous_spawns`], which sees the drain alone.
 pub fn autonomous_spawns_allowed_now() -> bool {
-    let state = current();
-    autonomous_allowed(&state, current_dispatch_role())
+    let (state, role) = current_with_role();
+    autonomous_allowed(&state, role)
 }
 
 /// The dispatch role the last successful coord read served. Cheap and
@@ -810,9 +832,19 @@ pub fn current_dispatch_role() -> Option<DispatchRole> {
 
 /// The current state. Cheap and synchronous: one mutex, no I/O.
 pub fn current() -> CoordDrainState {
-    let (state, emit) = {
+    current_with_role().0
+}
+
+/// [`current`] and the cached dispatch role, read under ONE lock. A live gate
+/// must use this rather than `current()` followed by
+/// [`current_dispatch_role`]: a fold landing between two separate reads could
+/// pair a state from before it with a role from after it, and allow a spawn
+/// that neither reading allows.
+pub fn current_with_role() -> (CoordDrainState, Option<DispatchRole>) {
+    let (state, role, emit) = {
         let mut inner = lock_inner();
         let state = current_locked(&inner);
+        let role = inner.dispatch_role;
         let emit = inner.last_emitted.as_ref() != Some(&state) && inner.last_emitted.is_some();
         if emit {
             inner.last_emitted = Some(state.clone());
@@ -821,14 +853,14 @@ pub fn current() -> CoordDrainState {
                 inner.deferred_capped = false;
             }
         }
-        (state, emit)
+        (state, role, emit)
     };
     if emit {
         // A staleness flip observed by a reader, not by a fold.
         global().tx.send_replace(state.clone());
         emit_snapshot();
     }
-    state
+    (state, role)
 }
 
 /// Everything the UI and `/restart-readiness` render.
@@ -920,6 +952,30 @@ pub fn snapshot_fixture(state: &CoordDrainState) -> CoordDrainSnapshot {
     snapshot_of(state, &inner)
 }
 
+/// Put the process-global cache back to its boot state: no read folded, no
+/// role, `Unknown` "not read yet". For a test that drives the REAL fold path
+/// (`note_heartbeat`) and must not leave its reading behind for the rest of
+/// the test binary.
+#[cfg(test)]
+pub(crate) fn reset_global_for_test() {
+    let now = Utc::now();
+    let mut inner = lock_inner();
+    *inner = Inner {
+        tracker: DrainTracker::new(now),
+        last_fold: Instant::now(),
+        last_fold_at: now,
+        deferred: BTreeSet::new(),
+        deferred_capped: false,
+        last_emitted: None,
+        folded_once: false,
+        dispatch_role: None,
+    };
+    let state = current_locked(&inner);
+    drop(inner);
+    // A subscriber must not keep reading the test's state after the reset.
+    global().tx.send_replace(state);
+}
+
 /// The current snapshot.
 pub fn snapshot() -> CoordDrainSnapshot {
     let state = current();
@@ -952,15 +1008,18 @@ enum RoleUpdate {
     Set(Option<DispatchRole>),
 }
 
-/// PURE: the role update one read implies. A read whose drain object was
-/// absent or did not parse is not a successful read of the role either, and
-/// neither is coord answering `unreadable` (coord omits `dispatch_role`
-/// exactly when its lane read failed), so both KEEP the cached role. The drain
-/// itself folds to `Unknown` and defers either way.
-fn role_update_for(obs: &DrainObservation, role: Option<DispatchRole>) -> RoleUpdate {
-    match obs {
-        DrainObservation::Absent { .. } | DrainObservation::Unreadable => RoleUpdate::Keep,
-        _ => RoleUpdate::Set(role),
+/// PURE: the role update one read implies. Only a read that SERVED the key
+/// replaces the cached role. A missing key is coord's failed role read (see
+/// [`ServedRole`]) and keeps it, so a `ci_node` box whose role read fails once
+/// stays closed rather than reopening every autonomous door until the next
+/// good read. A read whose drain object was absent or did not parse, or that
+/// coord answered `unreadable`, is not a successful read either and keeps it
+/// too; the drain itself folds to `Unknown` and defers either way.
+fn role_update_for(obs: &DrainObservation, role: ServedRole) -> RoleUpdate {
+    match (obs, role) {
+        (DrainObservation::Absent { .. } | DrainObservation::Unreadable, _) => RoleUpdate::Keep,
+        (_, ServedRole::NotServed) => RoleUpdate::Keep,
+        (_, ServedRole::Served(r)) => RoleUpdate::Set(r),
     }
 }
 
@@ -988,7 +1047,7 @@ fn fold_with_role(
     f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition,
 ) -> Transition {
     let now = Utc::now();
-    let (transition, state, role_changed) = {
+    let (transition, state, role_changed, state_changed) = {
         let mut inner = lock_inner();
         let before = current_locked(&inner);
         let transition = f(&mut inner.tracker, now);
@@ -998,7 +1057,8 @@ fn fold_with_role(
         let (next_role, role_changed) = apply_role_update(inner.dispatch_role, role);
         inner.dispatch_role = next_role;
         let after = current_locked(&inner);
-        let changed = transition.changed || before != after || role_changed;
+        let state_changed = transition.changed || before != after;
+        let changed = state_changed || role_changed;
         if autonomous_allowed(&after, inner.dispatch_role) {
             inner.deferred.clear();
             inner.deferred_capped = false;
@@ -1013,13 +1073,18 @@ fn fold_with_role(
             },
             after,
             role_changed.then_some(next_role),
+            state_changed,
         )
     };
     if let Some(role) = role_changed {
         log_role(role);
     }
     if transition.changed {
-        log_transition(&state);
+        // A role-only change still publishes and emits (waiters re-check),
+        // but the drain line is logged only when the drain itself moved.
+        if state_changed {
+            log_transition(&state);
+        }
         global().tx.send_replace(state);
         emit_snapshot();
     }
@@ -1235,7 +1300,7 @@ pub enum HeartbeatOutcome {
     /// `dispatch_role` served inside it.
     Registered {
         drain: DrainObservation,
-        dispatch_role: Option<DispatchRole>,
+        dispatch_role: ServedRole,
     },
     /// No register POST was sent although this runner IS a coord device: a
     /// secondary instance (the primary owns the machine payload), or a device
@@ -1330,7 +1395,7 @@ fn enrollment() -> Enrollment {
 }
 
 /// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
-async fn read_me_drain(base: &str) -> Result<(DrainObservation, Option<DispatchRole>), String> {
+async fn read_me_drain(base: &str) -> Result<(DrainObservation, ServedRole), String> {
     let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
     // A per-read client, like the heartbeat's: the caller may run on the
     // heartbeat's dedicated current-thread runtime, and a pooled connection
@@ -1407,7 +1472,8 @@ async fn refresh_reason() {
     };
     match read_me_drain(&base).await {
         Ok((obs @ (DrainObservation::Drained { .. } | DrainObservation::Clear), role)) => {
-            fold_with_role(RoleUpdate::Set(role), |tr, now| tr.observe(obs, now));
+            let update = role_update_for(&obs, role);
+            fold_with_role(update, |tr, now| tr.observe(obs, now));
         }
         Ok(other) => debug!("coord_drain_state: me/drain reason read answered {other:?}; kept the heartbeat's state"),
         Err(e) => debug!("coord_drain_state: me/drain reason read failed ({e}); kept the heartbeat's state"),
@@ -1998,27 +2064,39 @@ mod tests {
 
     #[test]
     fn the_role_is_read_from_both_wires_and_absence_or_an_unknown_spelling_is_none() {
-        // The exact 2020Dell me/drain answer from finding d5142504.
+        // The me/drain answer coord serves a ci_node device with a clear drain.
         assert_eq!(
             parse_me_drain_role(r#"{"state":"clear","dispatch_role":"ci_node"}"#),
-            Some(DispatchRole::CiNode)
+            ServedRole::Served(Some(DispatchRole::CiNode))
         );
         assert_eq!(
             parse_register_role(r#"{"drain":{"state":"clear","dispatch_role":"bench"}}"#),
-            Some(DispatchRole::Bench)
+            ServedRole::Served(Some(DispatchRole::Bench))
         );
-        assert_eq!(parse_me_drain_role(r#"{"state":"clear"}"#), None);
-        assert_eq!(parse_register_role(r#"{"drain":{"state":"clear"}}"#), None);
+        // A missing key is a role that was NOT read, never "no role".
+        assert_eq!(
+            parse_me_drain_role(r#"{"state":"clear"}"#),
+            ServedRole::NotServed
+        );
+        assert_eq!(
+            parse_register_role(r#"{"drain":{"state":"clear"}}"#),
+            ServedRole::NotServed
+        );
+        assert_eq!(
+            parse_register_role(r#"{"drain":{"state":"clear","dispatch_role":7}}"#),
+            ServedRole::NotServed
+        );
+        // A served spelling this build does not know is served-but-unknown.
         assert_eq!(
             parse_register_role(r#"{"drain":{"state":"clear","dispatch_role":"mystery"}}"#),
-            None
+            ServedRole::Served(None)
         );
         assert_eq!(
             parse_register_role(r#"{"dispatch_role":"ci_node"}"#),
-            None,
+            ServedRole::NotServed,
             "only the drain object's key counts on the register wire"
         );
-        assert_eq!(parse_me_drain_role("not json"), None);
+        assert_eq!(parse_me_drain_role("not json"), ServedRole::NotServed);
         // The role never changes how the drain itself parses.
         assert_eq!(
             parse_me_drain_response(r#"{"state":"clear","dispatch_role":"ci_node"}"#),
@@ -2075,19 +2153,23 @@ mod tests {
 
     #[test]
     fn a_read_whose_drain_object_did_not_parse_keeps_the_role() {
+        use ServedRole::{NotServed, Served};
+        let ci = Some(DispatchRole::CiNode);
         let absent = DrainObservation::Absent { detail: "x".into() };
-        assert_eq!(role_update_for(&absent, None), RoleUpdate::Keep);
+        assert_eq!(role_update_for(&absent, NotServed), RoleUpdate::Keep);
+        assert_eq!(role_update_for(&absent, Served(ci)), RoleUpdate::Keep);
         assert_eq!(
-            role_update_for(&DrainObservation::Clear, None),
-            RoleUpdate::Set(None)
-        );
-        assert_eq!(
-            role_update_for(&DrainObservation::Clear, Some(DispatchRole::CiNode)),
-            RoleUpdate::Set(Some(DispatchRole::CiNode))
-        );
-        assert_eq!(
-            role_update_for(&DrainObservation::Unreadable, None),
+            role_update_for(&DrainObservation::Unreadable, Served(ci)),
             RoleUpdate::Keep
+        );
+        assert_eq!(
+            role_update_for(&DrainObservation::Clear, Served(ci)),
+            RoleUpdate::Set(ci)
+        );
+        // Served, but a spelling this build does not know: today's behaviour.
+        assert_eq!(
+            role_update_for(&DrainObservation::Clear, Served(None)),
+            RoleUpdate::Set(None)
         );
         assert_eq!(
             role_update_for(
@@ -2095,9 +2177,32 @@ mod tests {
                     until: None,
                     reason: None
                 },
-                Some(DispatchRole::Bench)
+                Served(Some(DispatchRole::Bench))
             ),
             RoleUpdate::Set(Some(DispatchRole::Bench))
+        );
+    }
+
+    /// Review S1: coord omits `dispatch_role` exactly when its ROLE read
+    /// failed, and still serves a readable `clear`. That must not reopen the
+    /// agent lane on a `ci_node` box: the cached role is kept.
+    #[test]
+    fn a_readable_drain_that_omits_the_role_keeps_a_closing_role() {
+        let ci = Some(DispatchRole::CiNode);
+        let update = role_update_for(
+            &DrainObservation::Clear,
+            parse_me_drain_role(r#"{"state":"clear"}"#),
+        );
+        assert_eq!(update, RoleUpdate::Keep);
+        assert_eq!(apply_role_update(ci, update), (ci, false));
+        // The next read that serves the key does replace it.
+        let reopened = role_update_for(
+            &DrainObservation::Clear,
+            parse_me_drain_role(r#"{"state":"clear","dispatch_role":"workhorse"}"#),
+        );
+        assert_eq!(
+            apply_role_update(ci, reopened),
+            (Some(DispatchRole::Workhorse), true)
         );
     }
 
@@ -2154,7 +2259,7 @@ mod tests {
         assert_eq!(apply_role_update(ci, RoleUpdate::Keep), (ci, false));
         assert_eq!(apply_role_update(ci, RoleUpdate::Set(ci)), (ci, false));
         assert_eq!(apply_role_update(None, RoleUpdate::Set(ci)), (ci, true));
-        // coord stopped serving it (older coord, failed role read): today's behaviour.
+        // A served role this build does not know: today's behaviour.
         assert_eq!(apply_role_update(ci, RoleUpdate::Set(None)), (None, true));
     }
 
@@ -2184,5 +2289,47 @@ mod tests {
         assert!(snap.autonomous_spawns_allowed);
         assert!(!snap.agent_lane_closed_by_role);
         assert_eq!(snap.dispatch_role, None);
+    }
+
+    /// The other half of what a `ci_node` box needs: the role closes the AGENT
+    /// lane only, so coord-dispatched CI builds keep running. They do because
+    /// the CI-node lane (`src/ci_node/`) never consults this gate or the spawn
+    /// authorization at all. A tripwire on DIRECT references only (a helper
+    /// elsewhere that gates internally would not trip it): a CI lane that
+    /// started asking the drain gate would be closed by `ci_node`, the very
+    /// role that exists to run it.
+    #[test]
+    fn the_ci_node_lane_never_consults_the_agent_lane_gate() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read ci_node dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ci_node");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(files.len() >= 5, "found only {files:?} under {root:?}");
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read ci_node source");
+            for needle in [
+                "coord_drain_state",
+                "agent_authorization",
+                "drain_gate",
+                "authorize_spawn",
+                "SpawnOrigin",
+            ] {
+                assert!(
+                    !text.contains(needle),
+                    "{} references `{needle}`: the CI-node lane must stay outside the \
+                     agent-lane gate, or a `ci_node` dispatch role closes CI too",
+                    file.display()
+                );
+            }
+        }
     }
 }
