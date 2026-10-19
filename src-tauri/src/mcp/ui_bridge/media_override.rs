@@ -59,8 +59,15 @@ pub(crate) const SDK_DISPATCH_BUDGET_MS: u64 = 30_000;
 
 /// Headroom kept between the decode wait and the transport's own timeout, so
 /// the frontend's typed `DECODE_TIMEOUT` (with its rollback) reaches the
-/// caller instead of a bare transport timeout.
+/// caller instead of a bare transport timeout. It also covers the SDK's
+/// pixel-size probe after a successful decode, which gets at most the rest of
+/// the decode wait or a 1 s floor (`PIXEL_PROBE_FLOOR_MS` in the SDK's
+/// `control/media-override.ts`), so it must stay above 1 s.
 pub(crate) const DECODE_HEADROOM_MS: u64 = 2_000;
+const _: () = assert!(
+    DECODE_HEADROOM_MS > 1_000,
+    "headroom must cover the SDK pixel probe"
+);
 
 fn non_empty_str(v: &Value) -> bool {
     v.as_str().is_some_and(|s| !s.trim().is_empty())
