@@ -759,14 +759,26 @@ send an empty string.)
   same call on this same key inside the same harness session. **A re-reserve by
   the same owner token is a renewal, not a conflict** — proceed, and do **not**
   release at the end of this run; the acquirer releases.
-  **`renewed` is only as narrow as the door's owner token.** Over
-  `coord_reserve_resource` (MCP) that token is the bare DEVICE, so a second
-  session on this same box re-reserving the plan ALSO reads `renewed`; only the
-  HTTP `/claims/acquire` fallback, which carries `agent_session_id`, makes it
-  session-scoped. So a `renewed` is YOUR hold only if something earlier in THIS
-  session reserved the plan (you are nested under `/vet-imp`, or this run
-  re-reserves its own key). If nothing did, treat it as `held` by a same-box
-  peer — the rule below.
+  **`renewed` is only as narrow as the door's owner token, and the MCP result
+  says which.** The HTTP `/claims/acquire` fallback is session-scoped
+  when it carries `agent_session_id`. Over `coord_reserve_resource`
+  (MCP) read the result's `owner_scope`: `"session"` means coord scoped the
+  token to your verified session, so `renewed` is YOUR hold — a second session
+  on this box would read `held`. `"device"` means the runner did not resolve
+  your session on that call, so the token is the bare DEVICE and a second
+  session on this same box ALSO reads `renewed`; an ABSENT `owner_scope` (a
+  coord build predating qontinui-coord#2697) means the same. On `"device"` or
+  absent, a `renewed` is YOUR hold only if something earlier in THIS session
+  reserved the plan (you are nested under `/vet-imp`, or this run re-reserves
+  its own key). If nothing did, treat it as `held` by a same-box peer — the
+  rule below.
+  A scope flip does NOT license the reverse inference. Coord's acquire
+  compares tokens exactly, so if THIS session's earlier reserve read
+  `"device"` and this one reads `"session"`, your own bare-device hold answers
+  `held` naming THIS machine — but a reserve `held` carries only `holder` (a
+  machine, never a session), so it is indistinguishable from a same-box peer's
+  hold, or a peer that adopted yours (`coord_claim_check` reports only the
+  holder's machine too). Treat it as `held` by a same-box peer — the rule below.
 - **`held` by a DIFFERENT owner — STOP.** Do not stamp, do not edit the plan, do
   not launch a phase agent. Report the holder, then run **Step 0.6's
   conflict-resolution flow verbatim** (`AskUserQuestion`, header `Claim
@@ -2163,10 +2175,13 @@ agent prompt:
 >   (Reserve answers **exclusion only** now — there is no `forking_siblings`
 >   field to check here either; see the next bullet.)
 > - **`renewed`** → your owner token already held it and coord extended it —
->   proceed to author, but whoever reserved it first owns the release. Over the
->   MCP door the owner token is the DEVICE, so this also answers a second
->   session on the same box; if you did not reserve this key earlier in THIS
->   session, treat `renewed` as `held` by a same-box peer and coordinate.
+>   proceed to author, but whoever reserved it first owns the release. Read
+>   the result's `owner_scope`: `"session"` means the owner token is your
+>   verified session, so this `renewed` is yours. `"device"` — or no
+>   `owner_scope` at all, on a coord predating qontinui-coord#2697 — means the
+>   token is the bare DEVICE and this also answers a second session on the same
+>   box; then, if you did not reserve this key earlier in THIS session, treat
+>   `renewed` as `held` by a same-box peer and coordinate.
 > - **`Held { holder }`** → another agent owns it. **Do NOT hand-pick a
 >   value.** Wait for release (poll `coord_claim_check`) or coordinate with
 >   the holder, then re-reserve.

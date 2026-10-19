@@ -60,8 +60,19 @@ pub struct RestoreResult {
 ///
 /// `settings.json` is intentionally shared across all runners on the machine,
 /// so this path is NOT scoped to the current instance.
+///
+/// A SUBJECT runner's `settings.json` is its own (`QONTINUI_CONFIG_DIR`, which
+/// its startup always points inside the root), so that is the file it backs up.
 fn get_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
+    settings_dir().map(|d| d.join("settings.json"))
+}
+
+/// The directory [`get_settings_path`] resolves in.
+fn settings_dir() -> Option<PathBuf> {
+    if qontinui_runner_lib::instance_env::instance_root().is_some() {
+        return qontinui_runner_lib::instance_env::runner_config_dir().map(|(d, _)| d);
+    }
+    qontinui_runner_lib::instance_env::runner_config_base()
 }
 
 /// Get the path to prompts.json.
@@ -71,14 +82,14 @@ fn get_settings_path() -> Option<PathBuf> {
 /// backup would always miss the real prompts file). Scoped per-runner for
 /// secondary instances.
 fn get_prompts_path() -> Option<PathBuf> {
-    dirs::config_dir()
-        .map(|d| crate::instance::scope_path(&d.join("com.qontinui.runner")).join("prompts.json"))
+    qontinui_runner_lib::instance_env::runner_config_base()
+        .map(|d| crate::instance::scope_path(&d).join("prompts.json"))
 }
 
 /// Get the path to playwright-tests.json (per-runner for secondary instances).
 fn get_playwright_tests_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| {
-        crate::instance::scope_path(&d.join("com.qontinui.runner"))
+    qontinui_runner_lib::instance_env::runner_config_base().map(|d| {
+        crate::instance::scope_path(&d)
             .join("playwright")
             .join("playwright-tests.json")
     })
@@ -238,12 +249,14 @@ pub fn restore_backup(data: &[u8]) -> Result<RestoreResult, String> {
             Ok(mut file) => match dest_path_opt {
                 Some(dest_path) => {
                     // Validate the destination path stays within expected directories
-                    let allowed_bases: Vec<PathBuf> =
-                        vec![dirs::config_dir(), dirs::data_local_dir()]
-                            .into_iter()
-                            .flatten()
-                            .map(|d| d.join("com.qontinui.runner"))
-                            .collect();
+                    let allowed_bases: Vec<PathBuf> = vec![
+                        qontinui_runner_lib::instance_env::runner_config_base(),
+                        qontinui_runner_lib::instance_env::runner_data_local_base(),
+                        settings_dir(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
 
                     if let Some(parent) = dest_path.parent() {
                         if let Err(e) = fs::create_dir_all(parent) {
