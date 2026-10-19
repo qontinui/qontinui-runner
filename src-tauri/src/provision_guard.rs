@@ -158,16 +158,21 @@ impl TrackedPaths {
         }
         let Some(stdout) = run_bounded_git_ls_files(root) else {
             let unknown_in_repo = has_git_ancestor(root);
-            tracing::warn!(
-                root = %root.display(),
-                unknown_in_repo,
-                "provision guard: tracked-file probe did not answer (git missing, failed or timed out); {}",
-                if unknown_in_repo {
-                    "root is inside a repository, so existing destinations are kept (fleet_skills decides per skill)"
-                } else {
-                    "root is not inside a repository, so destinations are written as before"
-                }
-            );
+            // `warn` only where the answer changes behaviour. Outside any
+            // repository `git ls-files` ALWAYS fails (exit 128), so a warn
+            // there would fire on every spawn into a plain directory and bury
+            // the in-repo warning that matters.
+            if unknown_in_repo {
+                tracing::warn!(
+                    root = %root.display(),
+                    "provision guard: tracked-file probe did not answer (git missing, failed or timed out);                      root is inside a repository, so existing destinations are kept (fleet_skills decides per skill)"
+                );
+            } else {
+                tracing::debug!(
+                    root = %root.display(),
+                    "provision guard: tracked-file probe did not answer; root is not inside a                      repository, so destinations are written as before"
+                );
+            }
             return Self {
                 relative: HashSet::new(),
                 unknown_in_repo,
