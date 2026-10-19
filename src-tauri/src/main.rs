@@ -177,6 +177,7 @@ mod install_effects_producer;
 mod instance;
 mod instance_health;
 mod instance_manager;
+mod ipc_registry; // Per-module Tauri IPC groups + name router (plan 2026-10-02-split-run-app-invoke-handler)
 mod iteration_bundle;
 mod journey;
 mod knowledge_acquisition;
@@ -379,6 +380,13 @@ mod env_test_lock_hierarchy_guard;
 // 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
 #[cfg(test)]
 mod expect_ratchet;
+// A harness runner and a subject runner (QONTINUI_INSTANCE_ROOT) on one host:
+// the subject driven through the real writers leaves the harness's files
+// byte-identical. Plan
+// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+// Phase 3.
+#[cfg(test)]
+mod subject_isolation_harness;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
@@ -868,6 +876,28 @@ fn runner_plans_dir_setting() -> Option<String> {
         paths.plans_dir,
         &paths.plans_dir_by_tenant,
         None,
+    )
+}
+
+/// The env collector's account-selection door: the effective mode and the
+/// input that decided it, as wire strings. Re-resolved per call, so a fleet
+/// policy change or a pin edit reaches the next capture.
+///
+/// The source reads `unknown` (the mode is still what applies right now)
+/// until coord has answered the fleet-policy domain in this process: a
+/// capture taken before the poller's first answer would otherwise report
+/// `local` on a machine the fleet is about to override. A PINNED machine is
+/// `pinned` regardless — the fleet's answer cannot change that.
+fn runner_effective_account_selection() -> (&'static str, &'static str) {
+    // Flag FIRST (Acquire), value second: the poller stores the fleet value
+    // and THEN raises the flag (Release), so reading in this order can never
+    // pair a raised flag with the pre-answer `None` (which would report
+    // `local` on a fleet-managed machine).
+    let answered = crate::mcp::fleet_policy_poller::account_selection_answered();
+    let (mode, source) = crate::claude_accounts::effective_selection();
+    (
+        mode.as_str(),
+        crate::claude_accounts::reported_selection_source(source, answered),
     )
 }
 
@@ -1618,6 +1648,11 @@ static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
     qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc::runner();
 
 fn main() {
+    // A SUBJECT runner (`QONTINUI_INSTANCE_ROOT` set) validates its launch env
+    // and roots its locations BEFORE anything below reads a path; a no-op for
+    // the primary. First, while still single-threaded — see the fn's doc.
+    instance::enforce_instance_root_at_startup();
+
     // The capability manifest (`--capability-manifest[ --json]`,
     // `--capability-manifest-doc`). Same posture as the `env …` CLI below and
     // for the same reason: it must run BEFORE the single-instance plugin, or a
@@ -1639,19 +1674,24 @@ fn main() {
         std::process::exit(code as i32);
     }
 
-    // PTY holder survival spike (plan
-    // `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
-    // Phase 0). `--pty-holder-spike` must run BEFORE the single-instance plugin
-    // for the same reason `try_headless_manifest` does — a holder launched
-    // while a GUI runner is open would otherwise be forwarded to that GUI and
-    // hold nothing — and before `install_app_runtime`, because a holder is a
-    // few threads, not a 16-worker runtime. Matches only an exact argv[1].
-    if let Some(code) = qontinui_runner_lib::pty_holder::try_run_spike() {
-        std::process::exit(code);
-    }
-
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
+
+    // Export the machine profile's outbound-network settings (HTTPS_PROXY /
+    // HTTP_PROXY from `network.proxy_url` when the operator set neither, and
+    // NO_PROXY always including loopback) into this process's environment, so
+    // every reqwest client, the three WebSocket transports (through
+    // `outbound_net::connect_ws`), `git` and the spawned `claude` CLI agree
+    // (plan `2026-10-10-spec-front-end-phase-9-generic-boundary`, C2). HERE,
+    // beside the other `set_var`, because writing the environment is sound only
+    // while no other thread exists — before the runtime below. The one thing
+    // the step runs besides env writes is the Windows-only `git config` probe
+    // (when the profile says `network.trust: "os"`); it runs FIRST and waits
+    // (bounded) for its pipe-reader threads to finish, and every env write
+    // happens after it. Nothing is logged here — logging does not exist yet;
+    // the outcome, including a failed probe, is logged by
+    // `outbound_net::log_startup_posture` in `run_app`.
+    qontinui_runner_lib::outbound_net::apply_profile_environment_at_startup();
 
     // Install the startup-panic hook FIRST, before any other setup. Panics
     // during early init (database connection, Tauri builder, axum router
@@ -1738,6 +1778,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ..LoggingConfig::default()
     })?;
     setup_panic_handler();
+
+    // The proxy rung `main` resolved before logging existed (and an explicit
+    // UNKNOWN when a PAC script is configured, which is not evaluated).
+    qontinui_runner_lib::outbound_net::log_startup_posture();
 
     // Best-effort live crash writer for the CATCHABLE subset (Windows
     // deliverable structured exceptions). The panic hooks above already write
@@ -2135,6 +2179,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // capture and the scan agree on what "unset" means.
                 qontinui_runner_lib::env_agent::collectors::publish_plans_dir(
                     runner_plans_dir_setting,
+                );
+                // And for the effective account-selection mode + its source
+                // (`fleet` | `local` | `pinned`): the resolver and the
+                // fleet-policy cache it reads live in this crate, so the
+                // `claude_accounts` section reports what actually governs
+                // through this door rather than a re-derived second rule.
+                qontinui_runner_lib::env_agent::collectors::publish_account_selection(
+                    runner_effective_account_selection,
                 );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's
@@ -2648,8 +2700,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             None,
         ))
         .plugin(ui_bridge_plugin::init())
-        // All other in-app Tauri commands are registered via the central
-        // `generate_handler!` below rather than per-module plugins.
+        // All other in-app Tauri commands are app-level, never per-module
+        // plugins: modules moved onto `crate::ipc_group!` are routed by
+        // `ipc_registry`, the rest by the central `generate_handler!` below
+        // (plan 2026-10-02-split-run-app-invoke-handler moves them all).
         //
         // Rationale: the 90-module plugin split (Workstream B of
         // REFACTOR_WAVE_3_PLAN) compiled clean but broke runtime IPC. Tauri 2
@@ -2668,8 +2722,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // `ui_bridge_plugin` remains the one exception — its handler fns are
         // non-`pub` and the frontend talks to them only via HTTP, not IPC.
         //
-        // The per-module `plugin()` fns are left in place for future reuse
-        // even though nothing invokes them now.
+        // The remaining per-module `plugin()` fns are dead code; each is
+        // deleted as its module moves onto `ipc_group!`.
         //
         // 2026-05-21 audit-trail shim — every IPC dispatch is observed once
         // before being forwarded to the macro-generated handler. We record
@@ -3214,52 +3268,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::mcp::list_mcp_server_tools,
             commands::mcp::list_mcp_servers,
             commands::mcp::update_mcp_server,
-            commands::meta_optimizer::activate_prompt_variant,
-            commands::meta_optimizer::apply_meta_optimizer_recommendation,
-            commands::meta_optimizer::build_golden_dataset,
-            commands::meta_optimizer::capture_meta_optimizer_baseline,
-            commands::meta_optimizer::convert_comparison_to_recommendation,
-            commands::meta_optimizer::start_recommendation_validation_comparison,
-            commands::meta_optimizer::create_eval_spec,
-            commands::meta_optimizer::create_prompt_canary,
-            commands::meta_optimizer::delete_eval_spec,
-            commands::meta_optimizer::evaluate_with_io,
-            commands::meta_optimizer::generate_default_eval_spec,
-            commands::meta_optimizer::get_agent_cascade_effect,
-            commands::meta_optimizer::get_agent_cost_effectiveness,
-            commands::meta_optimizer::get_agent_effectiveness,
-            commands::meta_optimizer::get_agent_interaction_matrix,
-            commands::meta_optimizer::get_canary_rollouts,
-            commands::meta_optimizer::get_eval_results,
-            commands::meta_optimizer::get_eval_specs,
-            commands::meta_optimizer::get_golden_datasets,
-            commands::meta_optimizer::get_meta_optimizer_failure_analysis,
-            commands::meta_optimizer::get_meta_optimizer_progress,
-            commands::meta_optimizer::get_meta_optimizer_recommendations,
-            commands::meta_optimizer::get_meta_optimizer_runs,
-            commands::meta_optimizer::get_meta_optimizer_snapshots,
-            commands::meta_optimizer::get_model_profiles,
-            commands::meta_optimizer::get_model_recommendations,
-            commands::meta_optimizer::get_prompt_canary_status,
-            commands::meta_optimizer::get_prompt_evolution_diff,
-            commands::meta_optimizer::get_prompt_evolution_history,
-            commands::meta_optimizer::get_prompt_group_metrics,
-            commands::meta_optimizer::get_prompt_optimization_evidence,
-            commands::meta_optimizer::get_prompt_optimization_status,
-            commands::meta_optimizer::get_prompt_variant_content,
-            commands::meta_optimizer::get_prompt_variants,
-            commands::meta_optimizer::get_recommendation_outcomes,
-            commands::meta_optimizer::get_robustness_reports,
-            commands::meta_optimizer::promote_canary_rollout,
-            commands::meta_optimizer::reevaluate_recommendation_outcome,
-            commands::meta_optimizer::refresh_model_profiles,
-            commands::meta_optimizer::reject_meta_optimizer_recommendation,
-            commands::meta_optimizer::rollback_canary_rollout,
-            commands::meta_optimizer::rollback_meta_optimizer_recommendation,
-            commands::meta_optimizer::run_recommendation_eval,
-            commands::meta_optimizer::run_robustness_test,
-            commands::meta_optimizer::start_canary_rollout,
-            commands::meta_optimizer::trigger_meta_optimizer,
             commands::mobile::capture_mobile_feedback,
             commands::mobile::capture_mobile_logcat,
             commands::mobile::capture_mobile_screenshot,
@@ -3552,6 +3560,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_claude_session_list_live,
             commands::terminal::terminal_session_list_history,
             commands::terminal::terminal_session_list_open,
+            commands::terminal::terminal_holder_sweep_settled,
+            commands::terminal::terminal_holder_sweep_status,
             commands::terminal::terminal_session_mark_restore_pending,
             commands::terminal::terminal_session_record_close,
             commands::terminal::terminal_session_set_finished,
@@ -3574,6 +3584,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal_windows::focus_runner_window,
             commands::terminal_windows::get_window_assignments,
             commands::terminal_windows::list_runner_windows,
+            commands::terminal_windows::open_elevated_terminal,
             commands::terminal_windows::open_terminal_window,
             commands::test_orchestrator::delete_orchestration_plan,
             commands::test_orchestrator::execute_test_orchestration,
@@ -3684,7 +3695,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             ]);
             move |invoke: tauri::ipc::Invoke<tauri::Wry>| -> bool {
                 tauri_command_audit::record(invoke.message.command());
-                inner(invoke)
+                // Route by name BEFORE calling: a generated handler consumes
+                // the `Invoke` even when it does not own the command, so
+                // handlers cannot be chained. Commands moved onto a module's
+                // `ipc_group!` dispatch through that group's small frame;
+                // the rest still go through the central list above until
+                // Phase 2c of plan 2026-10-02-split-run-app-invoke-handler
+                // deletes it.
+                match ipc_registry::lookup(invoke.message.command()) {
+                    Some(group) => group(invoke),
+                    None => inner(invoke),
+                }
             }
         })
         .manage(shared_app_state)
@@ -3705,16 +3726,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(std::sync::Arc::new(
             commands::spec_sync_state::SpecSyncStateBus::new(),
         )) // P2 SSE remediation: useSpecSync progress mirror, consumed by /ui-bridge/sdk/spec-sync/{status,stream}
-        // Tauri command handlers are registered via the central
-        // `tauri::generate_handler![...]` block above. Each command module
-        // (`commands/*.rs` and a few subsystem `commands.rs` files) ALSO
-        // exposes a `pub fn plugin<R: Runtime>() -> TauriPlugin<R>` for
-        // future plugin-based registration, but those are not currently
-        // wired — Tauri 2's plugin path requires `plugin:<name>|<cmd>`
-        // invoke prefixes and the frontend invokes commands bare, so the
-        // plugin form was rolled back to the central handler at commit
-        // `1f1d807f6`. The `plugin()` fns are kept as ready-to-go scaffolding
-        // for any future migration that updates the frontend invoke sites.
+        // Tauri command handlers are registered through `.invoke_handler`
+        // above: modules moved onto `crate::ipc_group!` are routed by
+        // `ipc_registry`, the rest by the central `generate_handler!` list
+        // until plan 2026-10-02-split-run-app-invoke-handler moves them too.
+        // The remaining per-module `plugin()` fns are dead — Tauri 2 plugin
+        // commands are reachable only as `plugin:<name>|<cmd>` and the
+        // frontend invokes bare names (rolled back at `1f1d807f6`) — and are
+        // deleted as each module moves.
         .setup(|app| {
             info!("Tauri application setup starting");
 
@@ -3858,11 +3877,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // believes exist. Merge the copies under a path THIS process
                 // would itself compute — the bare `data_local_dir()` default
                 // and a set `$QONTINUI_SECURE_STORAGE_DIR`, nothing found by
-                // scanning — into the canonical one, and leave each absorbed
-                // copy as `.superseded-<date>` rather than deleting it.
+                // scanning — into the canonical one. Absorbed copies are only
+                // read; converge never renames, rewrites or deletes one.
                 // Best-effort and fail-open: with no env override the
                 // candidate set is one path and this is a no-op.
                 let _ = qontinui_runner_lib::pair::converge_binding_store();
+                // After convergence, heal a canonical `paired_user.json` that
+                // is absent or blank while valid credentials coord still binds
+                // exist (plan 2026-09-29-vanished-paired-user-json-…, Phase 1).
+                // OFF the setup thread, fire-and-forget: a heal that has work
+                // to do opens the credential store and may write the legacy
+                // slot, and a keychain call can block up to its timeout —
+                // which on this thread stalls window creation. It logs its own
+                // outcome, and the refresher repeats it every tick, so a
+                // thread that fails to spawn loses nothing but latency.
+                if let Err(e) = std::thread::Builder::new()
+                    .name("paired-user-heal".into())
+                    .spawn(|| {
+                        let _ = qontinui_runner_lib::pair::heal_vanished_paired_user();
+                    })
+                {
+                    tracing::debug!(
+                        "startup paired_user.json heal thread did not spawn ({e}); the \
+                         refresher's next tick runs it"
+                    );
+                }
 
                 let app_handle = app.handle().clone();
                 let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =
@@ -4449,6 +4488,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Detached for the process lifetime (like the liveness poll
                 // below); best-effort at startup then every 30s.
                 session_pr_reconciler::start(lifecycle_store.clone());
+                let holder_sweep_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
@@ -4469,6 +4509,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         terminal::vt_sanitize::VtSanitizeHook::new(),
                     ));
                 }
+
+                // PTY-holder boot sweep (plan 2026-09-12-out-of-process-pty-
+                // owner-for-terminal-hosted-sessions, Phase 3): adopt every
+                // pane a holder kept alive across the last runner exit, and
+                // reap the dead — AFTER the sanitizer hook (an adopted pane's
+                // replay is untrusted output too). It runs on its own thread
+                // and never blocks setup; the webview's restore awaits its
+                // "settled" signal (`terminal_holder_sweep_settled`) before
+                // reading `terminal_list`. One `stat` when no pane directory
+                // exists.
+                terminal::holder_boot_sweep::run(
+                    &term_for_session,
+                    app.handle(),
+                    Some(holder_sweep_store),
+                );
 
                 // (The usage-limit watcher and the fleet auto-response matcher
                 // are both grid-scan pollers spawned once at startup alongside
@@ -4722,6 +4777,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .allows();
                         let mut held_for_restore: usize = 0;
 
+                        // Review F1 (plan 2026-09-12 Phase 5): a pane a
+                        // restarted runner ADOPTED from its PTY holder runs a
+                        // shell and `claude` that predate this boot, so the
+                        // PID-reuse guard below would call them recycled and
+                        // close the record `poll-dead` — restorable, i.e. a
+                        // second `claude --resume` against a live session.
+                        // Its identity is proven instead by the holder's lock
+                        // record (`child_start` against the live pid), and a
+                        // proven pid is exempt from the boot-time comparison.
+                        let holder_verified: std::collections::HashSet<u32> =
+                            crate::terminal::holder_census::verified_holder_children(
+                                &live
+                                    .iter()
+                                    .filter_map(|i| i.pid.map(|p| (i.id.clone(), p)))
+                                    .collect::<Vec<_>>(),
+                            );
+
                         let mut live_by_id: StdHashMap<&str, &_> =
                             StdHashMap::with_capacity(live.len());
                         let mut live_by_triple: StdHashMap<(&str, &str, &str), &_> =
@@ -4793,7 +4865,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     let claude_present = crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
                                         pid,
                                         &snap,
-                                        primary_boot_unix_millis,
+                                        crate::session::tracking_health::pid_reuse_reference(
+                                            pid,
+                                            &holder_verified,
+                                            primary_boot_unix_millis,
+                                        ),
                                     );
                                     (Some(alive), claude_present, tick_snapshot_ok)
                                 }
@@ -4860,6 +4936,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     },
                                 },
                             };
+                            // A PTY holder is alive for this record's terminal
+                            // and its adoption is still pending or retrying
+                            // (plan 2026-09-12 Phase 3): held like a withheld
+                            // restore — never closed `no-terminal` meanwhile.
+                            let adoption_pending =
+                                terminal::holder_boot_sweep::adoption_pending(&rec.terminal_id);
                             let action = hold_for_withheld_boot_restore(
                                 classify(
                                     live_is_alive,
@@ -4871,8 +4953,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     confirmed,
                                     worker_plane,
                                 ),
-                                held,
+                                held || adoption_pending,
                             );
+                            if adoption_pending && action == PollAction::Skip {
+                                consecutive_no_match.remove(&rec.claude_session_id);
+                            }
                             if held && action == PollAction::Skip {
                                 held_for_restore += 1;
                                 // A held record is waiting, not missing: any
@@ -5179,13 +5264,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 //   Phase 7 receiver subscribes to coord's `/ws` Redis fan-out
                 //   (`qontinui.sessions.*`) + a one-shot on-(re)connect catch-up
                 //   GET, materializing each handoff_request as a child session.
-                //   Phase 10 flag-poll only spawns when an `active_tenant_id`
-                //   resolved from machine.json (None → dormant); dual-write
-                //   stays off until `session_coordination_enabled` flips.
+                //   Phase 10 flag-poll always spawns and re-reads the
+                //   machine.json `active_tenant_id` every tick (unpinned →
+                //   it asks coord nothing), so a tenant switch is followed
+                //   without a restart; dual-write stays off until that
+                //   tenant's `session_coordination_enabled` flips.
                 //   Multi-tenant (Phase 8b) disposition: the flag-poll is a
-                //   DEVICE-scoped surface — it polls the DEFAULT binding's
-                //   tenant policy and presents the default device-JWT slot
-                //   (unparameterized `coord_get`) by construction.
+                //   DEVICE-scoped surface — it polls the PINNED tenant's
+                //   policy and presents that tenant's own device-JWT slot
+                //   (`tenant_policy_scope`).
                 let loop_registry = registry.clone();
                 tauri::async_runtime::spawn(async move {
                     let _drain = loop_registry.coord_sync().start_drain_task();
@@ -5268,7 +5355,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // gets the same per-runner profile layout. The launch_env
                 // field delegates to crate::instance::webview2_data_dir(),
                 // which prefers the env var and falls back to the shared
-                // qontinui_types helper. Returns None on non-Windows.
+                // qontinui_types helper. Off Windows: None except under an
+                // instance root (a subject's own `<root>/webview`).
                 let data_dir: Option<std::path::PathBuf> =
                     setup_launch_env.webview2_user_data_dir.clone();
                 let is_secondary = instance::is_secondary();
@@ -5934,8 +6022,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     } else {
                         info!("Restate durable execution enabled — preparing server");
-                        let app_data_dir = dirs::data_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        let app_data_dir = qontinui_runner_lib::instance_env::platform_dir(
+                            qontinui_runner_lib::instance_env::PlatformDir::Data,
+                        )
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
                             .join("qontinui-runner");
                         match restate::lifecycle::ensure_restate_binary(
                             &restate_settings,
@@ -6134,6 +6224,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             crate::database::pg::session_file_snapshots::start_session_snapshot_pruner(
                 snapshot_pruner_pg,
             );
+
+            // Review notes left `submitted` by the previous runner process:
+            // their targets died with it, so no exit hook will ever settle
+            // them. One pass, settling only notes whose target is not live
+            // here; safe this early because it never relies on the terminal /
+            // session managers being POPULATED (terminal ids are fresh per
+            // spawn) — see `start_stranded_note_sweep`.
+            crate::mcp::session_review::start_stranded_note_sweep(app.handle().clone());
 
             // Start the Rust deconflicter loop — §4.1 of
             // plans/2026-05-13-coord-as-deconflicter-plan.md. Consumes

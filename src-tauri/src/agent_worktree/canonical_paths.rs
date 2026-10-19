@@ -671,6 +671,14 @@ fn allocated_worktree_for_path_with(
     // `path` must be the `<agent_id>/<repo_name>` dir or a descendant of it.
     let agent_id = path_parts.next()?;
     let repo_name = path_parts.next()?;
+    // Both must be NORMAL segments: `<root>/../<checkout>` would otherwise
+    // "resolve" to an allocation outside the worktree root.
+    if [agent_id, repo_name]
+        .iter()
+        .any(|s| *s == "." || *s == "..")
+    {
+        return None;
+    }
 
     let candidate = worktree_root.join(agent_id).join(repo_name);
     if is_live(&candidate) {
@@ -1052,6 +1060,25 @@ mod allocated_worktree_probe_tests {
                 "D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-runner"
             ))
         );
+    }
+
+    /// A `.` / `..` segment where the agent id or repo name belongs never
+    /// names an allocation — `<root>/../<checkout>` would otherwise resolve to
+    /// a directory OUTSIDE the worktree root (review of plan 2026-10-10).
+    #[test]
+    fn dot_segments_never_name_an_allocation() {
+        for p in [
+            "D:/qontinui-root/qontinui-worktrees/../qontinui-runner",
+            "D:/qontinui-root/qontinui-worktrees/./qontinui-runner",
+            "D:/qontinui-root/qontinui-worktrees/019e-agent/..",
+            "D:/qontinui-root/qontinui-worktrees/019e-agent/.",
+        ] {
+            assert_eq!(
+                allocated_worktree_for_path_with(Path::new(ROOT), Path::new(p), live),
+                None,
+                "{p}"
+            );
+        }
     }
 
     /// A pane whose cwd is a SUBDIRECTORY of the allocation still resolves to

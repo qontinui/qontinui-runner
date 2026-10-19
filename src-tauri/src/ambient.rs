@@ -221,6 +221,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
     "QONTINUI_INSTALL_OVERRIDE",
     "QONTINUI_INSTANCE_NAME",
+    "QONTINUI_INSTANCE_ROOT",
     "QONTINUI_LOOPING_AGENT_TICK_MS",
     "QONTINUI_MACHINE_ID",
     "QONTINUI_MAINTENANCE_INTERVAL_SECS",
@@ -772,6 +773,9 @@ pub mod test_support {
     /// configured developer box exports and a clean CI runner does not.
     pub const KEYS_REMOVED: &[&str] = &[
         "CLAUDE_CONFIG_DIR",
+        // A subject runner's root: a test that inherited one would run as a
+        // secondary with the keychain gated off.
+        "QONTINUI_INSTANCE_ROOT",
         "COORD_HTTP_URL",
         "QONTINUI_WORKSPACE_ROOT",
         "QONTINUI_SERVER_MODE",
@@ -2171,5 +2175,500 @@ mod tests {
             "env keys read but not declared in ambient::AMBIENT_ENV_KEYS (add them, sorted):\n  {}",
             violations.into_iter().collect::<Vec<_>>().join("\n  ")
         );
+    }
+    /// Tauri `PathResolver` methods that resolve the app's machine-global
+    /// directories (`app_data_dir()` is `<data_dir>/com.qontinui.runner`).
+    /// `resource_dir` is the installer's read-only bundle and `temp_dir` the
+    /// OS temp dir — neither is runner state, so neither is listed.
+    const TAURI_APP_DIR_METHODS: &[&str] = &[
+        "app_cache_dir",
+        "app_config_dir",
+        "app_data_dir",
+        "app_local_data_dir",
+        "app_log_dir",
+    ];
+
+    /// Tauri `PathResolver` methods that resolve a machine-global directory,
+    /// matched only on `.path().<method>` — a positive list, so `Path::is_dir`
+    /// or `read_dir` on an `entry.path()` is never mistaken for one.
+    const TAURI_PATH_RESOLVER_DIR_METHODS: &[&str] = &[
+        "audio_dir",
+        "cache_dir",
+        "config_dir",
+        "data_dir",
+        "desktop_dir",
+        "document_dir",
+        "download_dir",
+        "executable_dir",
+        "font_dir",
+        "home_dir",
+        "local_data_dir",
+        "picture_dir",
+        "public_dir",
+        "runtime_dir",
+        "template_dir",
+        "video_dir",
+    ];
+
+    /// The machine-global directory a call at `leaves[i]` resolves, if one
+    /// starts there: `dirs::<x>_dir` (called or passed as a fn), a Tauri
+    /// `.app_*_dir()`, or the seam's explicit `.machine_dir()` escape hatch.
+    fn machine_global_dir_call(leaves: &[Leaf], i: usize) -> Option<String> {
+        let ident = leaf_ident(&leaves[i])?;
+        if ident == "dirs"
+            && leaves.get(i + 1).is_some_and(|l| l.is_punct(':'))
+            && leaves.get(i + 2).is_some_and(|l| l.is_punct(':'))
+        {
+            let item = leaves.get(i + 3).and_then(leaf_ident)?;
+            return item.ends_with("_dir").then(|| format!("dirs::{item}"));
+        }
+        // `BaseDirectory::<X>` for a `PathResolver::resolve` — every variant
+        // but the read-only bundle and the OS temp dir is a machine dir.
+        if ident == "BaseDirectory"
+            && leaves.get(i + 1).is_some_and(|l| l.is_punct(':'))
+            && leaves.get(i + 2).is_some_and(|l| l.is_punct(':'))
+        {
+            let variant = leaves.get(i + 3).and_then(leaf_ident)?;
+            return (!matches!(variant, "Resource" | "Temp"))
+                .then(|| format!("BaseDirectory::{variant}"));
+        }
+        let after_dot = i > 0 && leaves[i - 1].is_punct('.');
+        if !after_dot {
+            return None;
+        }
+        let called = leaves
+            .get(i + 1)
+            .is_some_and(|l| l.is_open(Delimiter::Parenthesis));
+        // `.path().<x>_dir()` — Tauri's `PathResolver` (`home_dir`,
+        // `data_dir`, `document_dir`, …), whatever its name.
+        let on_path_resolver = i >= 4
+            && leaves[i - 2].is_close(Delimiter::Parenthesis)
+            && leaves[i - 3].is_open(Delimiter::Parenthesis)
+            && leaves[i - 4].is_ident("path");
+        let resolver_dir = on_path_resolver && TAURI_PATH_RESOLVER_DIR_METHODS.contains(&ident);
+        if resolver_dir
+            || (called && (TAURI_APP_DIR_METHODS.contains(&ident) || ident == "machine_dir"))
+        {
+            return Some(format!(".{ident}()"));
+        }
+        None
+    }
+
+    /// The census (plan
+    /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// Phase 1 / D4): every PRODUCTION file that still resolves a
+    /// machine-global directory directly, how many call sites it has, and why
+    /// each is genuinely user-global (or is a seam). Every OTHER runner-owned
+    /// location resolves through `instance_env::platform_dir` and its
+    /// wrappers, so a subject runner keeps it under its instance root.
+    ///
+    /// The COUNT is exact: a new call site in a listed file fails the guard
+    /// just as one in an unlisted file does, and a removed one demands the
+    /// entry shrink — so the list cannot quietly cover more than it says.
+    const USER_GLOBAL_DIRS_ALLOWLIST: &[(&str, usize, &str)] = &[
+        (
+            "ambient.rs",
+            1,
+            "SEAM: `qontinui_dir()`'s `~/.qontinui` fallback. Under an instance root \
+             startup always exports `QONTINUI_HOME=<root>/home`, which wins",
+        ),
+        (
+            "instance_env.rs",
+            10,
+            "SEAM: `PlatformDir::machine_dir` (the one door to the platform dirs) and \
+             `machine_global_dirs`, which names the dirs an instance root must not contain",
+        ),
+        (
+            "pair.rs",
+            1,
+            "`paired_user_path_with`: the BARE-DEFAULT binding-store candidate, consulted only \
+             without an instance root (`pair/subject_isolation.rs` replaces the candidate set \
+             under one, D2)",
+        ),
+        (
+            "coord_doctor.rs",
+            1,
+            "Claude Code's own `~/.claude/.credentials.json` — the user's Claude login, read \
+             only, not runner state",
+        ),
+        (
+            "ai_provider/oauth_refresh.rs",
+            1,
+            "Claude Code's own `~/.claude/.credentials.json` (the user's Claude login)",
+        ),
+        (
+            "commands/ai_settings.rs",
+            1,
+            "Claude Code's own `~/.claude/.credentials.json` (the user's Claude login)",
+        ),
+        (
+            "claude_session/workspace_trust.rs",
+            2,
+            "the ambient Claude config (`~/.claude.json`) a child with no account resolves — \
+             Claude Code's own file, reported, never runner state",
+        ),
+        (
+            "claude_session/spawn_preconditions.rs",
+            1,
+            "the ambient Claude config (`~/.claude.json`) a child with no account reads",
+        ),
+        (
+            "claude_session/trust_gate.rs",
+            1,
+            "the ambient Claude config (`~/.claude.json`) a child with no account reads",
+        ),
+        (
+            "session_archive/discovery.rs",
+            1,
+            "the user's Claude session archives (`~/.claude/projects`) — Claude Code's data",
+        ),
+        (
+            "wrappers/clients.rs",
+            8,
+            "third-party AI clients' own config files (Claude CLI/Desktop, Cursor, Continue, \
+             Cline) the user asked the runner to wire",
+        ),
+        (
+            "env_agent/collectors.rs",
+            6,
+            "environment PROBES of the user's machine (home-scoped tool probes, shell profiles, \
+             the machine's Claude roster and harness layout as a report) — read-only",
+        ),
+        (
+            "env_agent/apply_versions.rs",
+            2,
+            "the user's home as the default probe scope and the user's `~/.nvm` install",
+        ),
+        (
+            "mcp/file_browser.rs",
+            3,
+            "the user's home, Desktop and Documents offered as browse roots",
+        ),
+        (
+            "commands/file_browser.rs",
+            1,
+            "the user's home output folders offered as browse roots",
+        ),
+        (
+            "commands/mobile.rs",
+            1,
+            "the user's Android SDK install (`~/Android/Sdk`)",
+        ),
+        (
+            "terminal/session.rs",
+            1,
+            "a terminal with no working dir opens in the user's home",
+        ),
+        (
+            "test_executor/repo_test_runner.rs",
+            1,
+            "`${HOME}` substitution in a user's test command",
+        ),
+        (
+            "mcp_api.rs",
+            1,
+            "refuses the user's home directory as a workspace root (a check, not a store)",
+        ),
+    ];
+
+    /// Drift guard (d), plan
+    /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// D4: outside the census in [`USER_GLOBAL_DIRS_ALLOWLIST`], no PRODUCTION
+    /// code resolves a machine-global directory directly — it goes through
+    /// `instance_env::platform_dir` (or `runner_config_base`,
+    /// `runner_data_local_base`, `runner_app_data_dir`, `secure_storage_dir`,
+    /// `runner_config_dir`), which re-roots under an instance root. Also
+    /// refused: `use dirs…`, which would let a bare `config_dir()` past the
+    /// token match.
+    #[test]
+    fn no_machine_global_dir_outside_the_seams() {
+        let mut violations = Vec::new();
+        let mut counts: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut total = 0usize;
+        for (rel, leaves) in production_sources() {
+            for i in 0..leaves.len() {
+                if leaves[i].is_ident("use")
+                    && leaves.get(i + 1).is_some_and(|l| l.is_ident("dirs"))
+                {
+                    violations.push(format!(
+                        "{rel}:{} imports from `dirs`; call `dirs::<x>_dir` by path, or better the seam",
+                        leaves[i].line
+                    ));
+                }
+                if let Some(call) = machine_global_dir_call(&leaves, i) {
+                    total += 1;
+                    counts
+                        .entry(rel.clone())
+                        .or_default()
+                        .push(format!("{call} at line {}", leaves[i].line));
+                }
+            }
+        }
+        for (rel, sites) in &counts {
+            match USER_GLOBAL_DIRS_ALLOWLIST.iter().find(|(f, _, _)| f == rel) {
+                None => violations.push(format!(
+                    "{rel}: {} — runner-owned state must resolve through \
+                     instance_env::platform_dir (or list a GENUINELY user-global use, with a \
+                     reason, in USER_GLOBAL_DIRS_ALLOWLIST)",
+                    sites.join(", ")
+                )),
+                Some((_, expected, _)) if *expected != sites.len() => violations.push(format!(
+                    "{rel}: USER_GLOBAL_DIRS_ALLOWLIST says {expected} site(s), found {}: {}",
+                    sites.len(),
+                    sites.join(", ")
+                )),
+                Some(_) => {}
+            }
+        }
+        for (f, _, _) in USER_GLOBAL_DIRS_ALLOWLIST {
+            if !counts.contains_key(*f) {
+                violations.push(format!(
+                    "{f} is in USER_GLOBAL_DIRS_ALLOWLIST but no longer resolves a machine-global \
+                     dir — remove the entry"
+                ));
+            }
+        }
+        // A scan that sees far fewer has stopped recognising the call shape.
+        assert!(total >= 30, "only {total} machine-global dir calls found");
+        assert!(
+            violations.is_empty(),
+            "machine-global directory resolved outside the seams:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    /// The call matcher behind guard (d) sees each shape it claims to, and not
+    /// a lookalike.
+    #[test]
+    fn machine_global_dir_call_matches_its_shapes_only() {
+        let src = r#"
+            fn f(app: &App) {
+                let a = dirs::config_dir();
+                let b = x.or_else(dirs::data_local_dir);
+                let c = app.path().app_data_dir();
+                let d = PlatformDir::Home.machine_dir();
+                let e = app.path().resource_dir();
+                let g = dirs::config_dir_fake_not;
+                let h = my::config_dir();
+                let i = machine_dir();
+                let j = app.path().home_dir();
+                let k = app.path().resolve("x", BaseDirectory::AppLocalData);
+                let l = app.path().resolve("x", BaseDirectory::Resource);
+                let m = app.path().temp_dir();
+                let n = entry.path().is_dir();
+                let o = entry.path().read_dir();
+            }
+        "#;
+        let leaves = prod_tokens(src, "synthetic.rs").leaves;
+        let found: Vec<String> = (0..leaves.len())
+            .filter_map(|i| machine_global_dir_call(&leaves, i))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "dirs::config_dir",
+                "dirs::data_local_dir",
+                ".app_data_dir()",
+                ".machine_dir()",
+                ".home_dir()",
+                "BaseDirectory::AppLocalData",
+            ]
+        );
+    }
+
+    /// The gate every `keyring::Entry::new*` must name, in the same fn and
+    /// before the entry is built.
+    const KEYCHAIN_GATE: &str = "os_keychain_allowed";
+
+    /// Files whose keychain access goes through a DIFFERENT per-fn gate, with
+    /// the gate identifier each such fn must name and the reason.
+    const KEYCHAIN_GATE_EXCEPTIONS: &[(&str, &str, &str)] = &[(
+        "auth.rs",
+        "keychain_enabled",
+        "`AuthManager::keychain_enabled` reads `QONTINUI_DISABLE_KEYCHAIN`, which every \
+         binary's startup exports as `1` under an instance root \
+         (`instance_env::instance_root_defaults`); auth's switch is kept so a primary's \
+         behaviour is unchanged",
+    )];
+
+    fn leaf_ident(leaf: &Leaf) -> Option<&str> {
+        match &leaf.tok {
+            Tok::Ident(i) => Some(i.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The index of the `fn` keyword whose body (its first top-level `{…}`
+    /// after the signature) contains leaf `at`, innermost first; `None` when
+    /// `at` is inside no fn body at all.
+    fn enclosing_fn(leaves: &[Leaf], at: usize) -> Option<usize> {
+        (0..at)
+            .rev()
+            .filter(|&j| leaves[j].is_ident("fn"))
+            .find(|&j| {
+                // Find the body's opening brace: the first `{` at paren/bracket
+                // depth 0 before any `;` at that depth (a bodiless `fn x();`).
+                let mut depth = 0i32;
+                let mut open = None;
+                for (k, leaf) in leaves.iter().enumerate().skip(j + 1) {
+                    if leaf.is_open(Delimiter::Parenthesis) || leaf.is_open(Delimiter::Bracket) {
+                        depth += 1;
+                    } else if leaf.is_close(Delimiter::Parenthesis)
+                        || leaf.is_close(Delimiter::Bracket)
+                    {
+                        depth -= 1;
+                    } else if depth == 0 && leaf.is_punct(';') {
+                        return false;
+                    } else if depth == 0 && leaf.is_open(Delimiter::Brace) {
+                        open = Some(k);
+                        break;
+                    }
+                }
+                let Some(open) = open else { return false };
+                if open > at {
+                    return false;
+                }
+                let mut braces = 0i32;
+                for (k, leaf) in leaves.iter().enumerate().skip(open) {
+                    if leaf.is_open(Delimiter::Brace) {
+                        braces += 1;
+                    } else if leaf.is_close(Delimiter::Brace) {
+                        braces -= 1;
+                        if braces == 0 {
+                            return k > at;
+                        }
+                    }
+                }
+                false
+            })
+    }
+
+    /// Drift guard (c), plan
+    /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// D2: keychain service names are machine-wide, so an ungated entry lets a
+    /// subject runner read or overwrite the harness's secrets. In PRODUCTION
+    /// code:
+    ///
+    /// - every `Entry::new*` (`new`, `new_with_target`, `new_with_credential`, …)
+    ///   sits inside a fn body (never a `static` / `Lazy` initialiser) and names
+    ///   [`KEYCHAIN_GATE`] — or its file's [`KEYCHAIN_GATE_EXCEPTIONS`] gate — in
+    ///   that fn, BEFORE the entry is built;
+    /// - nothing swaps the credential builder (`set_default_credential_builder`
+    ///   / `default_credential_builder`), which would re-route every entry;
+    /// - nothing aliases the crate or its items with `use keyring… as …`, which
+    ///   would hide an entry from this scan.
+    ///
+    /// A stale exception fails too.
+    #[test]
+    fn every_keyring_entry_is_behind_the_keychain_gate() {
+        let mut violations = Vec::new();
+        let mut entries_seen = 0usize;
+        let mut exceptions_used: BTreeSet<&str> = BTreeSet::new();
+        for (rel, leaves) in production_sources() {
+            let exception = KEYCHAIN_GATE_EXCEPTIONS.iter().find(|(f, _, _)| *f == rel);
+            let gate = exception.map_or(KEYCHAIN_GATE, |(_, g, _)| *g);
+            for i in 0..leaves.len() {
+                if let Some(id) = leaf_ident(&leaves[i]) {
+                    if id.ends_with("default_credential_builder") {
+                        violations.push(format!(
+                            "{rel}:{} swaps the credential builder",
+                            leaves[i].line
+                        ));
+                    }
+                    if id == "use" {
+                        let stmt_end = (i..leaves.len())
+                            .find(|&j| leaves[j].is_punct(';'))
+                            .unwrap_or(leaves.len());
+                        let stmt = &leaves[i..stmt_end];
+                        if stmt.iter().any(|l| l.is_ident("keyring"))
+                            && stmt.iter().any(|l| l.is_ident("as"))
+                        {
+                            violations.push(format!(
+                                "{rel}:{} aliases keyring with `as`",
+                                leaves[i].line
+                            ));
+                        }
+                    }
+                }
+                let is_entry_new = leaves[i].is_ident("Entry")
+                    && leaves.get(i + 1).is_some_and(|l| l.is_punct(':'))
+                    && leaves.get(i + 2).is_some_and(|l| l.is_punct(':'))
+                    && leaves
+                        .get(i + 3)
+                        .and_then(leaf_ident)
+                        .is_some_and(|id| id.starts_with("new"));
+                if !is_entry_new {
+                    continue;
+                }
+                entries_seen += 1;
+                if let Some((f, _, _)) = exception {
+                    exceptions_used.insert(f);
+                }
+                // The enclosing fn: the nearest preceding `fn` whose BODY
+                // contains this call. None (a `static` / `Lazy` initialiser, a
+                // `const`) is a violation in itself: there is no fn to gate in.
+                let Some(fn_start) = enclosing_fn(&leaves, i) else {
+                    violations.push(format!(
+                        "{rel}:{} Entry::new* outside any fn (a static initialiser cannot be gated)",
+                        leaves[i].line
+                    ));
+                    continue;
+                };
+                if !leaves[fn_start..i].iter().any(|l| l.is_ident(gate)) {
+                    violations.push(format!(
+                        "{rel}:{} Entry::new* without `{gate}`",
+                        leaves[i].line
+                    ));
+                }
+            }
+        }
+        // Measured when written: 10 gated sites outside auth.rs plus 8 in
+        // auth.rs. A scan that sees fewer has stopped recognising the call.
+        assert!(
+            entries_seen >= 18,
+            "only {entries_seen} `Entry::new*` found"
+        );
+        assert!(
+            violations.is_empty(),
+            "keychain access not behind its gate (instance_env::os_keychain_allowed(), or the \
+             file's KEYCHAIN_GATE_EXCEPTIONS gate):\n  {}",
+            violations.join("\n  ")
+        );
+        let stale: Vec<&str> = KEYCHAIN_GATE_EXCEPTIONS
+            .iter()
+            .map(|(f, _, _)| *f)
+            .filter(|f| !exceptions_used.contains(f))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "stale KEYCHAIN_GATE_EXCEPTIONS entries: {stale:?}"
+        );
+    }
+
+    /// The scope finder behind the keychain guard: an `Entry::new` in a
+    /// `static` initialiser has NO enclosing fn (so the guard refuses it), and
+    /// one in a fn body is attributed to that fn, not to an earlier one.
+    #[test]
+    fn enclosing_fn_sees_fn_bodies_and_not_static_initialisers() {
+        let src = r#"
+            fn earlier() { let _ = 1; }
+            static E: Lazy<Entry> = Lazy::new(|| Entry::new("s", "k").unwrap());
+            trait T { fn bodiless(&self); }
+            fn later(x: u8) -> u8 { if os_keychain_allowed() { Entry::new("s", "k"); } x }
+        "#;
+        let leaves = prod_tokens(src, "synthetic.rs").leaves;
+        let entries: Vec<usize> = (0..leaves.len())
+            .filter(|&i| {
+                leaves[i].is_ident("Entry") && leaves.get(i + 3).is_some_and(|l| l.is_ident("new"))
+            })
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            enclosing_fn(&leaves, entries[0]),
+            None,
+            "a static initialiser"
+        );
+        let in_later = enclosing_fn(&leaves, entries[1]).expect("inside `later`");
+        assert!(leaves[in_later + 1].is_ident("later"));
     }
 }

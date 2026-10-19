@@ -69,14 +69,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::auth::TenantScope;
 
 use super::coord_sync::CoordSync;
-use super::redact::redact_secrets;
 
 /// Flush the coalescing buffer at least this often, even if it hasn't hit
 /// the byte threshold. Keeps live-tail latency low (sub-100ms) while still
@@ -156,12 +154,10 @@ async fn run_pipe(
             recv = rx.recv() => {
                 match recv {
                     Ok(encoded) => {
-                        match base64::engine::general_purpose::STANDARD
-                            .decode(encoded.as_bytes())
-                        {
+                        match crate::terminal::transport_stats::pipe_decode(&encoded) {
                             Ok(raw) => {
                                 let processed = if redact {
-                                    redact_secrets(&raw)
+                                    crate::terminal::transport_stats::pipe_redact(&raw)
                                 } else {
                                     raw
                                 };
@@ -242,10 +238,11 @@ async fn run_pipe(
 /// POST the buffered bytes as one coalesced chunk + advance the offset.
 /// Best-effort: a coord-side failure (network, 429 quota, 5xx) is logged
 /// and the buffer is cleared — output streaming is a courtesy mirror, so
-/// we never block the operator's session or retry-storm coord. A 429
-/// (tenant warm quota exceeded) is logged at info and treated as
-/// "stop trying for now"; the next flush simply tries again on fresh
-/// output (coord re-checks the quota each call).
+/// we never block the operator's session or retry-storm coord. A 429 is
+/// logged at info naming coord's parsed reason (`warm_quota_exceeded`,
+/// `transcript_sync_disabled`, … — see [`refusal_log_reason`]) and treated
+/// as "stop trying for now"; the next flush simply tries again on fresh
+/// output (coord re-checks its policy each call).
 async fn flush(
     http: &reqwest::Client,
     url: &str,
@@ -257,7 +254,7 @@ async fn flush(
     if buffer.is_empty() {
         return;
     }
-    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&buffer[..]);
+    let payload_b64 = crate::terminal::transport_stats::pipe_reencode(&buffer[..]);
     let offset = *next_offset;
     let len = buffer.len() as i64;
     let body = serde_json::json!({
@@ -277,9 +274,11 @@ async fn flush(
                 // on coord). On success, the bytes are durably in warm.
                 *next_offset += len;
             } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let reason = refusal_log_reason(&resp.text().await.unwrap_or_default());
                 tracing::info!(
                     session = %session_id,
-                    "session output_pipe: coord warm quota exceeded — dropping chunk"
+                    reason = %reason,
+                    "session output_pipe: coord refused chunk (429 {reason}) — dropping chunk"
                 );
                 // Drop the chunk (don't advance offset — but also don't
                 // resend; the bytes are gone for the shared tail). Clearing
@@ -301,4 +300,46 @@ async fn flush(
         }
     }
     buffer.clear();
+}
+
+/// The reason a 429 on `POST /sessions/:id/output` is logged under: coord's
+/// parsed `error` code through the same parser `coord_sync`'s outbox drain
+/// uses, or a generic "rate limited" when the body carries none (an edge or
+/// proxy limit). Every 429 is dropped here either way — this only names it.
+fn refusal_log_reason(body: &str) -> String {
+    crate::session::coord_sync::output_chunk_429_log_reason(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refusal_log_reason;
+
+    #[test]
+    fn a_429_is_logged_under_coords_parsed_reason() {
+        assert_eq!(
+            refusal_log_reason(r#"{"error":"warm_quota_exceeded","quota":5}"#),
+            "warm_quota_exceeded"
+        );
+        assert_eq!(
+            refusal_log_reason(r#"{"error":"transcript_sync_disabled","column_missing":false}"#),
+            "transcript_sync_disabled"
+        );
+        assert_eq!(
+            refusal_log_reason(r#"{"error":"transcript_sync_disabled","column_missing":true}"#),
+            "transcript_sync_disabled (coord column not provisioned yet)"
+        );
+    }
+
+    #[test]
+    fn a_429_without_a_parsed_reason_is_logged_as_rate_limited() {
+        assert_eq!(refusal_log_reason(""), "rate limited");
+        assert_eq!(
+            refusal_log_reason("upstream says warm_quota_exceeded"),
+            "rate limited"
+        );
+        assert_eq!(
+            refusal_log_reason(r#"{"detail":"slow down"}"#),
+            "rate limited"
+        );
+    }
 }
