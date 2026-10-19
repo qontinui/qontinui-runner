@@ -1,0 +1,32 @@
+{
+  "schema": "termhost-bench/profile/v1",
+  "id": "bulk",
+  "title": "Bulk throughput: tool output scheduled at 4 MiB/s per session",
+  "description": "One phase forever: 16 KiB tool-output chunks 256 times a second. That is more than a host is expected to drain at N = 15, so delivered_ratio and producer_stall_pct read the host's throughput ceiling rather than the profile's rate.",
+  "calibrated": false,
+  "provenance": {
+    "kind": "synthetic",
+    "source": "Plan D3: throughput - 16 KiB compiler/test/log-line chunks at 256 per second (4 MiB/s scheduled per session)."
+  },
+  "geometry": { "cols": 120, "rows": 40 },
+  "marker_hz": 10,
+  "alt_screen": false,
+  "initial_phase": "burst",
+  "phases": {
+    "burst": {
+      "kind": "burst",
+      "fps": 256,
+      "chunk_bytes": [
+        [0, 16384],
+        [1, 16384]
+      ],
+      "duration_ms": [
+        [0, 60000],
+        [1, 60000]
+      ]
+    }
+  },
+  "transitions": {
+    "burst": { "burst": 1 }
+  }
+}

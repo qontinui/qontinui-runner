@@ -1,0 +1,81 @@
+{
+  "schema": "termhost-bench/profile/v1",
+  "id": "claude-tui",
+  "title": "Claude-Code-shaped AI session",
+  "description": "A session that idles, thinks behind a spinner, streams prose, repaints its TUI and dumps tool output. NOT CALIBRATED: replace with `calibrate.mjs` output from a `script --log-timing` recording; until then every results row carries profile_calibrated: false.",
+  "calibrated": false,
+  "provenance": {
+    "kind": "assumption",
+    "source": "qontinui-runner#1856 tui-repaint-generator defaults: 120x40 full-screen SGR-heavy synchronized repaints and one-row spinner repaints at 30 fps (its spinner preset). Every other number - stream and burst rates and chunk sizes, phase durations and transitions - is an ASSUMPTION pending calibration, not a measurement."
+  },
+  "geometry": { "cols": 120, "rows": 40 },
+  "marker_hz": 10,
+  "alt_screen": false,
+  "initial_phase": "idle",
+  "phases": {
+    "idle": {
+      "kind": "idle",
+      "duration_ms": [
+        [0, 1000],
+        [0.5, 2500],
+        [1, 8000]
+      ]
+    },
+    "thinking": {
+      "kind": "spinner",
+      "fps": 30,
+      "duration_ms": [
+        [0, 1000],
+        [0.5, 4000],
+        [1, 15000]
+      ]
+    },
+    "stream": {
+      "kind": "stream",
+      "fps": 20,
+      "chunk_bytes": [
+        [0, 16],
+        [0.5, 96],
+        [0.9, 320],
+        [1, 1024]
+      ],
+      "duration_ms": [
+        [0, 500],
+        [0.5, 3000],
+        [1, 12000]
+      ]
+    },
+    "repaint": {
+      "kind": "repaint",
+      "fps": 30,
+      "rows": 40,
+      "duration_ms": [
+        [0, 200],
+        [0.5, 1000],
+        [1, 4000]
+      ]
+    },
+    "tool_burst": {
+      "kind": "burst",
+      "fps": 60,
+      "chunk_bytes": [
+        [0, 512],
+        [0.5, 4096],
+        [0.9, 16384],
+        [1, 65536]
+      ],
+      "duration_ms": [
+        [0, 100],
+        [0.5, 600],
+        [1, 3000]
+      ]
+    }
+  },
+  "transitions": {
+    "idle": { "thinking": 1 },
+    "thinking": { "stream": 4, "repaint": 3, "tool_burst": 3 },
+    "stream": { "thinking": 5, "repaint": 3, "idle": 2 },
+    "repaint": { "thinking": 5, "stream": 3, "idle": 2 },
+    "tool_burst": { "thinking": 6, "repaint": 4 }
+  }
+}

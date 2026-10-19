@@ -282,6 +282,44 @@ command = [
 ]
 
 [[steps]]
+# ci.yml "Run termhost-bench unit tests" — node built-ins only, beside the
+# CI-tooling tests exactly as ci.yml places it, including runner#1856's
+# frame-builder tests. A command here is an argv with no shell, so the files are
+# listed where ci.yml lets bash expand the glob;
+# scripts/termhost-bench/__tests__/ci-toml-parity.test.mjs fails when this list
+# and that directory disagree.
+name = "termhost-bench-node-tests"
+timeout_secs = 600
+command = [
+  "node",
+  "--test",
+  "scripts/termhost-bench/__tests__/adapters.test.mjs",
+  "scripts/termhost-bench/__tests__/calibrate.test.mjs",
+  "scripts/termhost-bench/__tests__/ci-toml-parity.test.mjs",
+  "scripts/termhost-bench/__tests__/cli.test.mjs",
+  "scripts/termhost-bench/__tests__/compare-report.test.mjs",
+  "scripts/termhost-bench/__tests__/crosscheck-replay.test.mjs",
+  "scripts/termhost-bench/__tests__/doctor.test.mjs",
+  "scripts/termhost-bench/__tests__/generator.test.mjs",
+  "scripts/termhost-bench/__tests__/kpi-catalog.test.mjs",
+  "scripts/termhost-bench/__tests__/kpis.test.mjs",
+  "scripts/termhost-bench/__tests__/marker.test.mjs",
+  "scripts/termhost-bench/__tests__/neutrality.test.mjs",
+  "scripts/termhost-bench/__tests__/no-image-kill.test.mjs",
+  "scripts/termhost-bench/__tests__/probe-driver.test.mjs",
+  "scripts/termhost-bench/__tests__/results-fixtures.test.mjs",
+  "scripts/termhost-bench/__tests__/run-loop.test.mjs",
+  "scripts/termhost-bench/__tests__/rundir.test.mjs",
+  "scripts/termhost-bench/__tests__/runner-clients.test.mjs",
+  "scripts/termhost-bench/__tests__/stats.test.mjs",
+  "scripts/termhost-bench/__tests__/validate.test.mjs",
+  "scripts/termhost-bench/__tests__/vscode-adapter.test.mjs",
+  "scripts/termhost-bench/__tests__/vscode-extension.test.mjs",
+  "scripts/termhost-bench/__tests__/windows-hosted.test.mjs",
+  "scripts/__tests__/tui-repaint-generator.test.mjs",
+]
+
+[[steps]]
 name = "frontend-install"
 command = ["pnpm", "install", "--frozen-lockfile"]
 
