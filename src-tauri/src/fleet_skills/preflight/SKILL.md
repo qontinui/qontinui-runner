@@ -361,19 +361,116 @@ incident on `2026-09-04-plan-status-drift-reconciliation-and-sweep-selection-rep
 which used both `#phase-3` and `:phase-2` and neither collided with the other
 or with an implementer's `kind:phase` claim).
 
+### 0d. Which tenants must the recon reads consult? (before steps 1, 3, 4a, 5)
+
+*(Plan `2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`, D2.)*
+Most reads below are TENANT-SCOPED. On a device bound to several tenants the
+session's MCP proxy credential resolves the DEFAULT binding, so each of them can
+answer *clear* correctly for one tenant while the peer sits in another — two
+sessions implemented one plan in parallel on exactly that (coord finding
+`c376a90e`, as cited by the plan). The repo OWNER's tenant is not enough: a peer's intent, gates and
+(on older runner builds) work units are written under whichever tenant ITS
+credential resolved. So a clear must hold in **every tenant this device is bound
+to**. Ask which those are, from the SAME cwd whose `.mcp.json` serves this
+session's coord tools (from anywhere else the verdict describes a different
+door):
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/recon-tenant.sh <owner/repo>...   # every one of the plan's Repo(s)
+```
+
+- **`MATCH <tenant>`** (exit 0) — one tenant in play: run the reads as written.
+- **`MULTI read=<t> plan=<t> tenants=<t1,t2,...> set=<h>`** (exit 1) — one
+  `bearer <tenant>=<path>` line follows per listed tenant. Re-issue each READ
+  below under EACH bearer — including the read tenant's, so every answer comes
+  through one door. MCP reads go over coord's generic MCP door (the same door
+  `/gate` uses with a device JWT):
+  `curl -sS -X POST https://coord.qontinui.io/mcp -H "@<path>" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_conflict_check","arguments":{...}}}'`.
+  Then **union** the answers: a read is *clear* only when every listed tenant
+  answered and none found anything; any tenant that failed makes it UNKNOWN.
+  Fold them with
+  `printf '<tenant> clear|found|unknown\n…' | bash <workspace-root>/qontinui-claude-config/scripts/recon-tenant.sh --union --tenants <t1,t2,...> --set <h>`,
+  copying `tenants=` and `set=` off the MULTI line verbatim (`CLEAR` exit 0,
+  `FOUND in=<t>` exit 1, `UNKNOWN` exit 3 — including for a tenant list that does
+  not match its `set`). Then **delete the bearers**: `rm -rf` the directory
+  the printed bearer paths sit in — recon-tenant.sh's own per-run directory,
+  even when you exported `CTC_TMP` (it is created INSIDE yours), so this never
+  touches anything else.
+- **`UNKNOWN <why>`** (exit 3) — ownership is not proven, the identity read or
+  the device's binding list failed, or a bound tenant could not be staged.
+  Every *clear* from steps 1, 3, 4a and the overlap reads is then **UNKNOWN,
+  never clear**; say so, and do not write the first line on it.
+- **No verdict line** (exit 2, a usage error, e.g. bare repo names instead of
+  `owner/repo`) — the same as `UNKNOWN`: fix the argument and re-run. A missing
+  verdict is never `MATCH`.
+
+**Which reads are re-issued per tenant under MULTI, and which are not:**
+
+| Read | Per tenant? | Why |
+|---|---|---|
+| Step 1's work-unit read | **yes** | `GET https://coord.qontinui.io/coord/agent-work-units/<plan-slug>` with `-H "@<path>"`: the handler takes the tenant from the bearer's `tenant_id` claim (step 1 says what to read in it). |
+| Step 3's `coord_conflict_check` | **yes** | tenant-scoped MCP read |
+| Step 4a's `coord_query_train_health` candidates | **yes** | tenant-scoped MCP read |
+| `coord_who_is_working_on` over the plan slug and globs, and any `coord_session_worktrees` / `coord_orient` read you add | **yes** | tenant-scoped MCP reads, and with step 3 the ONLY place a peer declared in ANOTHER tenant shows up |
+| Step 0's plan reserve (`coord_reserve_resource` / `POST /claims/acquire`) | **no** | Exempt, because a `held` there is FLEET-GLOBAL: coord keys the claim as `claim:<kind>:<resource_key>` with no tenant in it (`qontinui-coord` `crates/coord/src/claims.rs` `key()`, and `acquire` builds its key from it), while the optional `tenant_id` is only validated and stamped into the audit row. One reserve already collides across tenants, and acquiring it N times would be N writes. |
+| Step 5's `coord_declare_intent` | **no** | A WRITE. Declare ONCE, under the session's own door. Its `overlapping_peers` covers the session's tenant only; peers in the other bound tenants come from the `coord_who_is_working_on` and `coord_conflict_check` rows above. |
+
+**Record every tenant consulted beside every verdict** (`consulted=` from
+`--union`, or the stderr detail line's `read_tenant=… plan_tenant=… bound=…`).
+A verdict with no tenant beside it cannot be told apart from one read under the
+wrong credential. On a single-bound device this costs one identity read and
+answers `MATCH`.
+
+**The residual, stated so a clear is not over-read:** a peer writing under a
+tenant this device is NOT bound to is invisible to all of this. That is why a
+clear here licenses starting work, never adopting someone else's — adoption
+needs `/vet-plan`'s positive dead-or-done signal ("Case 2 across machines"),
+IN ADDITION to that case's worktree, PR and branch checks, never instead of them.
+
 ### 1. Durable cross-time check (catches already-merged work)
 
 The reserve claim in step 0 is **TTL'd** — it expires and is released on
 completion, so it does **not** survive a peer's merge+delete. It catches
 *concurrent* agents, not *finished* work. For the cross-time signal, read the
-durable plan registry:
+durable work-unit registry. The `GET /coord/plans/<slug>` route this step used
+to name was REMOVED from coord (P4 Phase 3, `crates/coord/src/routes.rs`, the
+"`/coord/plans*` HTTP surface ... was REMOVED" block); it answers `404
+no_such_route` for every caller, so a read of it proves nothing either way.
+The device door that replaced it is `GET /coord/agent-work-units/<plan-slug>`,
+which takes the tenant from the caller's bearer (`require_jwt`, then the
+`tenant_id` claim — `work_unit_registry::get_by_slug_agent` via
+`agent_desired_state::caller_tenant`):
 
-```bash
-curl -s "$COORD_HTTP_URL/coord/plans/<plan-slug>"
-```
+- Under step 0d's `MULTI`, read it under EACH bearer:
+  `curl -sS -H "@<path>" https://coord.qontinui.io/coord/agent-work-units/<plan-slug>`.
+  Classify each tenant's answer with `/vet-plan` §0.25's per-tenant fold (by
+  response shape) and fold the results with
+  `recon-tenant.sh --union --tenants <…> --set <h>`,
+  never with a two-way "404 or not" rule:
+  - `404 no work-unit with that slug` (arm 4), or a `200` whose `delivery` is a
+    clean arm 5 and whose `work_unit.status` is not terminal → `clear`;
+  - a `200` whose `work_unit.status` is terminal, or whose `delivery` reads
+    arm 1 → `found` — **STOP**, the plan is already done in that tenant;
+  - a `200` carrying `delivery_error` / `citations_error`, a top-level
+    `merged_degraded_reason`, `evidence_complete: false`, or no `delivery`;
+    any other status; or no answer at all → `unknown`.
+- Under `MATCH`, read the same row through the session's own door, which
+  carries MCP tools but not a raw HTTP GET: `coord_work_unit_list` with
+  `slug_prefix: "<plan-slug>"` for `status`, keeping only the row whose `slug`
+  equals the stem exactly. The list PAGES and answers `count` / `limit` /
+  `offset`, so "no such row" is `clear` only off the LAST page, the one whose
+  `count < limit`. On a full page (`count == limit`), page on with
+  `offset = offset + count` until a short page arrives, and a page that cannot
+  be read makes it `unknown`. Read `delivery` with
+  `coord_work_unit_list_citations(<plan-slug>)`. Both read the
+  `coord.work_units` row the HTTP route serves, so the same STOP applies on a
+  single-bound device. The HTTP route itself works too under a device bearer
+  whose `tenant_id` claim is that tenant. Classify the answer exactly as above
+  (`delivery_error` / `citations_error` → `unknown`).
 
-If `status` is `shipped` (or otherwise terminal) the plan is **already done** —
-STOP. This is the durable signal the TTL'd claim and the path-based tools miss.
+If `work_unit.status` is `shipped` (or otherwise terminal), or `delivery` reads
+`/vet-plan` §0.25 arm 1, in ANY tenant, the plan is **already done** — STOP.
+This is the durable signal the TTL'd claim and the path-based tools miss.
 
 ### 2. Derive concrete globs from the plan (not free text)
 
@@ -666,7 +763,14 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
 
 - **Release symmetrically**: `remove` each glob row, then `stop` the loop, then
   release the claims. A loop still running past the release renews keys nobody
-  holds.
+  holds. `stop` reports only what it observed: `6` refuses while rows remain,
+  and — for `stop` or a `remove` of the last row, which returns `stop`'s exit
+  code — `9` means the loop outlived KILL or the signal was refused, and `10` is
+  UNKNOWN. None of them means "stopped". On a 9 or a 10, quote the `stop-failed …` / `unknown=1 …`
+  line in your report, still release the claims, and name a loop that outlived
+  KILL as left behind: it is not known to have ended, and no wake of its own can
+  be relied on to end it. Line-by-line meanings:
+  `scripts/README.md` → "`stop` reports only what it observes".
 
 ### 7. If any signal is non-empty → coordinate, don't proceed
 
@@ -682,6 +786,13 @@ convert "I could not look" into "I looked and it was clean."
 Step 0b's branch advisory is not on this list either, in the other direction: it
 is a fact about the checkout you are standing in, not a signal about the plan,
 and it never withholds the first line. Surface it and carry on.
+
+A *clear* read under a step 0d verdict of `MULTI` (before every listed tenant
+answered clear) or `UNKNOWN` is not a clear either: it answered for one tenant of
+several, or for one nobody could name. Step 0's `held` is the exception that needs no
+re-issue: the reserve key carries no tenant, so one answer is already
+fleet-wide (step 0d's table). Step 5's `overlapping_peers` is the other way
+round: it is the session's tenant only, so it never stands alone as "no peer".
 
 Only an all-clear sweep — every gating step run, and step 4b at exit 0 — lets you
 write the first line.
@@ -750,12 +861,13 @@ Either way, the second agent stops **before** implementing.
 
 ## See Also
 
-These references live in repos you may not have checked out
-(`qontinui-dev-notes`, `qontinui-coord`); skip any whose repo is absent
-under `<workspace-root>/`.
+The tool-shape reference below lives in a repo you may not have checked out
+(`qontinui-coord`); skip it when that repo is absent under `<workspace-root>/`.
 
-- `<workspace-root>/qontinui-dev-notes/plans/2026-06-13-coord-parallel-duplication-prevention.md` —
-  the source plan (Layer A pre-flight + Layer B conventions + Layer C server work).
+- Qontinui's plan `2026-06-13-coord-parallel-duplication-prevention` — the
+  source plan (Layer A pre-flight + Layer B conventions + Layer C server work).
+  It is held in the maintainers' plan corpus, not yours, and nothing above
+  depends on reading it.
 - `<workspace-root>/qontinui-coord/crates/coord/src/mcp/tools.rs` — `coord_reserve_resource`
   (`:3183`), `coord_conflict_check`, `coord_declare_intent` (single source of
   truth for the tool shapes above).
