@@ -345,7 +345,8 @@ _pending_registration_count_line() {
 }
 
 # Copy stdin to stdout without the FIRST line equal to $1 (a trailing CR is
-# ignored for the comparison and kept on every line that stays).
+# ignored for the comparison). The output is the input minus that line, byte
+# for byte: line endings, and the absence of a final newline, are preserved.
 _pending_registration_drop_line() {
     local want="$1" l removed=0 sep="" printed=0 last_nl=1 cr
     while :; do
