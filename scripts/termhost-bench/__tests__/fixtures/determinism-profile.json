@@ -1,0 +1,75 @@
+{
+  "schema": "termhost-bench/profile/v1",
+  "id": "determinism-fixture",
+  "title": "Test fixture: every phase kind, short phases, frame_bytes repaints",
+  "description": "Pinned by the generator determinism test. Independent of the shipped profiles, so calibrating claude-tui does not move the pinned hash.",
+  "calibrated": false,
+  "provenance": { "kind": "synthetic", "source": "termhost-bench unit-test fixture" },
+  "geometry": { "cols": 80, "rows": 24 },
+  "marker_hz": 10,
+  "alt_screen": true,
+  "initial_phase": "idle",
+  "phases": {
+    "idle": {
+      "kind": "idle",
+      "duration_ms": [
+        [0, 200],
+        [1, 600]
+      ]
+    },
+    "thinking": {
+      "kind": "spinner",
+      "fps": 12,
+      "duration_ms": [
+        [0, 300],
+        [1, 900]
+      ]
+    },
+    "stream": {
+      "kind": "stream",
+      "fps": 25,
+      "chunk_bytes": [
+        [0, 8],
+        [0.5, 64],
+        [1, 400]
+      ],
+      "duration_ms": [
+        [0, 300],
+        [1, 1200]
+      ]
+    },
+    "repaint": {
+      "kind": "repaint",
+      "fps": 24,
+      "frame_bytes": [
+        [0, 2000],
+        [0.5, 9000],
+        [1, 20000]
+      ],
+      "duration_ms": [
+        [0, 200],
+        [1, 800]
+      ]
+    },
+    "tool_burst": {
+      "kind": "burst",
+      "fps": 40,
+      "chunk_bytes": [
+        [0, 256],
+        [0.5, 2048],
+        [1, 8192]
+      ],
+      "duration_ms": [
+        [0, 100],
+        [1, 500]
+      ]
+    }
+  },
+  "transitions": {
+    "idle": { "thinking": 2, "stream": 1 },
+    "thinking": { "stream": 1, "repaint": 1, "tool_burst": 1 },
+    "stream": { "thinking": 1, "repaint": 1, "idle": 1 },
+    "repaint": { "thinking": 1, "tool_burst": 1, "idle": 1 },
+    "tool_burst": { "repaint": 1, "stream": 1 }
+  }
+}

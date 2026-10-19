@@ -318,6 +318,21 @@ jobs:
       - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary)
         run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs
 
+      # termhost-bench's measurement contract (plan
+      # 2026-10-11-terminal-page-performance-kpis-across-setups, Phase 1): the KPI
+      # catalog, the result schema and its validator, the marker codec's golden
+      # vectors, the AI-session generator, the calibrator and the statistics — plus
+      # the tests of runner#1856's frame builders the generator is built on, which no
+      # other step runs. Node built-ins only, so no `pnpm install`. `shell: bash` so
+      # the shell expands the glob on windows-latest too (pwsh would pass it to node
+      # literally), whatever node itself does with one. Bounded because some tests
+      # run real generator processes. Mirrored in .qontinui/ci.toml as
+      # `termhost-bench-node-tests`.
+      - name: Run termhost-bench unit tests
+        shell: bash
+        timeout-minutes: 10
+        run: node --test scripts/termhost-bench/__tests__/*.test.mjs scripts/__tests__/tui-repaint-generator.test.mjs
+
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
       # rustfmt/clippy components must be installed for 1.95.0 specifically —

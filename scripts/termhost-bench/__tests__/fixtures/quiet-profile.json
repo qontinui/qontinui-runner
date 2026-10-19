@@ -1,0 +1,23 @@
+{
+  "schema": "termhost-bench/profile/v1",
+  "id": "quiet-fixture",
+  "title": "Test fixture: idle forever (markers only)",
+  "description": "For the CLI tests that run real generator processes: markers at 10 Hz and nothing else, so a pipe never fills.",
+  "calibrated": false,
+  "provenance": { "kind": "synthetic", "source": "termhost-bench unit-test fixture" },
+  "geometry": { "cols": 80, "rows": 24 },
+  "marker_hz": 10,
+  "initial_phase": "idle",
+  "phases": {
+    "idle": {
+      "kind": "idle",
+      "duration_ms": [
+        [0, 60000],
+        [1, 60000]
+      ]
+    }
+  },
+  "transitions": {
+    "idle": { "idle": 1 }
+  }
+}

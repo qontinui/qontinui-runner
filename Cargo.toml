@@ -18,6 +18,11 @@ members = [
     # decided 2026-09-28): a dedicated minimal binary plus the frame protocol
     # and transport library both it and the runner link.
     "crates/pty-holder",
+    # termhost-bench's outside-in instrument (plan
+    # 2026-10-11-terminal-page-performance-kpis-across-setups, Phase 2): screen
+    # capture + marker decoding, process sampling and D9-safe input injection.
+    # A standalone binary; nothing in the runner links it.
+    "crates/termhost-probe",
 ]
 resolver = "2"
 
