@@ -18,8 +18,8 @@ Any other sender that passes a non-literal command name is likewise out of reach
 It does see ``send_command_async(`` calls, and the hand-built
 ``ExecutorCommand { command: "...".to_string() }`` literals under ``src-tauri/src/executor/``.
 
-**No CI job runs this file yet** (no workflow runs ``python-bridge/tests``); run it
-locally with ``cd python-bridge && python -m pytest tests/test_executor_command_table.py``
+CI runs this file in ``.github/workflows/python-executor-command-table.yml``. Locally:
+``cd python-bridge && python -m pytest tests/test_executor_command_table.py``
 (``tests/conftest.py`` imports ``models``, so pytest must run from ``python-bridge/``).
 """
 

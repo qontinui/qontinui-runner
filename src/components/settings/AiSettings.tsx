@@ -31,10 +31,31 @@ interface AiSettingsProps {
   onLog: LogFunction;
 }
 
+/** The READ-ONLY account-selection view fields of a `get_ai_settings`
+ * response (the mode that governs, why, and the raw fleet value). Display-only:
+ * `saveSettings` passes explicit arguments, so these are never sent back. */
+function selectionViewFrom(
+  data: AiSettingsType,
+): Pick<
+  AiSettingsType,
+  "effective_account_selection_mode" | "account_selection_source" | "fleet_account_selection_mode"
+> {
+  return {
+    effective_account_selection_mode: data.effective_account_selection_mode,
+    account_selection_source: data.account_selection_source,
+    fleet_account_selection_mode: data.fleet_account_selection_mode,
+  };
+}
+
 export function AiSettings({ onLog }: AiSettingsProps) {
   const [settings, setSettings] = useState<AiSettingsType>(DEFAULT_AI_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  // True only after a SUCCESSFUL load. Until then the form holds
+  // DEFAULT_AI_SETTINGS, and saving it would write those defaults — including
+  // an explicit `config_dir: null`, which clears the MACHINE-GLOBAL config dir
+  // — so Save stays disabled.
+  const [loaded, setLoaded] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -91,6 +112,22 @@ export function AiSettings({ onLog }: AiSettingsProps) {
     }
   };
 
+  /** Re-read ONLY the read-only account-selection view fields, leaving the
+   * form's own state alone. A failed read keeps the last view: the page then
+   * still describes the current form state through
+   * `displayedAccountSelection`, which re-applies the runner's rule. */
+  const refreshSelectionView = async () => {
+    try {
+      const result = await invoke<TauriResult<AiSettingsType>>("get_ai_settings");
+      if (result?.success && result.data) {
+        const view = selectionViewFrom(result.data);
+        setSettings((prev) => ({ ...prev, ...view }));
+      }
+    } catch (err) {
+      console.error("Failed to refresh account-selection view:", err);
+    }
+  };
+
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -110,9 +147,13 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               result.data.claude_cli?.timeout_seconds ||
               DEFAULT_AI_SETTINGS.claude_cli.timeout_seconds,
             config_dir: result.data.claude_cli?.config_dir,
-            account_selection_mode:
-              result.data.claude_cli?.account_selection_mode ||
-              DEFAULT_AI_SETTINGS.claude_cli.account_selection_mode,
+            // Left undefined when the runner did not report it (like the
+            // pin), so a save sends "not provided" and the stored
+            // machine-global mode is kept — never a substituted default.
+            account_selection_mode: result.data.claude_cli?.account_selection_mode,
+            // Left undefined when the runner did not report it, so a save
+            // sends "not provided" and the stored pin is kept.
+            account_selection_pinned: result.data.claude_cli?.account_selection_pinned,
             auto_migrate_on_token_exhaustion:
               result.data.claude_cli?.auto_migrate_on_token_exhaustion ?? true,
             auto_continue_after_migration:
@@ -149,8 +190,17 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           interactive_sessions_enabled:
             result.data.interactive_sessions_enabled ??
             DEFAULT_AI_SETTINGS.interactive_sessions_enabled,
+          // READ-ONLY view fields (the mode that actually governs and why).
+          // Display-only: `saveSettings` passes explicit arguments, so these
+          // are never sent back as stored settings.
+          ...selectionViewFrom(result.data),
         });
+        setLoaded(true);
         onLog("debug", "AI settings loaded");
+      } else {
+        const errorMsg = result?.message || "the runner returned no settings";
+        setError(`Failed to load settings: ${errorMsg}`);
+        onLog("error", `Failed to load AI settings: ${errorMsg}`);
       }
     } catch (err) {
       console.error("Failed to load AI settings:", err);
@@ -224,8 +274,13 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         customPath: settings.claude_cli.custom_path || null,
         timeoutSeconds: settings.claude_cli.timeout_seconds,
         configDir: settings.claude_cli.config_dir || null,
-        accountSelectionMode:
-          settings.claude_cli.account_selection_mode || "highest_expected_usage",
+        // `undefined` (unknown — the load failed) is omitted by the invoke
+        // and read as `None` by the command, which KEEPS the stored
+        // machine-global mode rather than resetting it.
+        accountSelectionMode: settings.claude_cli.account_selection_mode,
+        // `undefined` (unknown — never loaded, never toggled) is omitted by the
+        // invoke and read as `None` by the command, which KEEPS the stored pin.
+        accountSelectionPinned: settings.claude_cli.account_selection_pinned,
         autoMigrateOnTokenExhaustion: settings.claude_cli.auto_migrate_on_token_exhaustion ?? true,
         autoContinueAfterMigration: settings.claude_cli.auto_continue_after_migration ?? true,
         model: settings.claude_api.model,
@@ -240,6 +295,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         onLog("error", `Failed to save AI settings: ${errorMsg}`);
         return;
       }
+
+      // The Claude save may have changed which mode governs (a new local
+      // mode, a pin toggled) — re-read the runner's view of it now, so it is
+      // fresh even if the Gemini save below fails.
+      await refreshSelectionView();
 
       const geminiResult = await invoke<TauriResult<null>>("save_gemini_settings", {
         executionMode: settings.gemini_cli?.execution_mode || "auto",
@@ -677,7 +737,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       <div className="flex justify-end">
         <button
           onClick={saveSettings}
-          disabled={saving}
+          disabled={saving || !loaded}
+          title={loaded ? undefined : "Settings did not load — saving now would overwrite them"}
           className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
         >
           {saving ? (

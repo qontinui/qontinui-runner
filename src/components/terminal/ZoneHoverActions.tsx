@@ -50,12 +50,17 @@ interface ZoneHoverActionsProps {
    *  Optional so the export button can degrade to disabled rather than
    *  throwing when the prop isn't wired (unusual; covers test mounts). */
   onExportZone?: (zoneIdx: number, format: "text" | "markdown" | "json") => void;
+  /**
+   * Render as a static, always-visible cluster for embedding in a header (the
+   * maximized view's title bar) instead of the hover-revealed top-right overlay.
+   */
+  inline?: boolean;
 }
 
 const EXPORT_FORMATS = ["text", "markdown", "json"] as const;
 type ExportFormat = (typeof EXPORT_FORMATS)[number];
 
-export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProps) {
+export function ZoneHoverActions({ zoneIdx, onExportZone, inline }: ZoneHoverActionsProps) {
   const session = useTerminalSession();
   const { zoneLayout, closeTerminal, sessionStates } = session;
   const transitionEffects = useTransitionEffects();
@@ -222,7 +227,15 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
       // buttons are clickable once visible. Enter delay lives on the
       // group-hover variant only — exit transition fires immediately
       // for a snappy "mouse left" feel.
-      className="absolute top-1 right-1 z-30 opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-100 group-hover:pointer-events-auto group-hover:delay-150"
+      className={
+        inline
+          ? "relative shrink-0"
+          : "absolute top-1 right-1 z-30 opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-100 group-hover:pointer-events-auto group-hover:delay-150"
+      }
+      // Inline (maximized header): keep clicks/double-clicks from reaching the
+      // header, whose double-click restores the zone.
+      onDoubleClick={inline ? (e) => e.stopPropagation() : undefined}
+      onMouseDown={inline ? (e) => e.stopPropagation() : undefined}
       data-page-element="zone-hover-actions"
       data-zone-index={zoneIdx}
     >

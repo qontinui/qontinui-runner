@@ -22,7 +22,12 @@
 
 import type { Event } from "@tauri-apps/api/event";
 import type { TerminalOutputEvent, TerminalExitEvent } from "@qontinui/shared-types/tauri-events";
-import { acquireSingletonListener } from "@/hooks/ui-bridge-events/singleton-listener";
+import {
+  acquireSingletonListener,
+  singletonListenerReady,
+} from "@/hooks/ui-bridge-events/singleton-listener";
+import { isOwnedByThisWindow } from "./terminalVisibilityTiers";
+import { noteOutputEvent } from "./transportStats";
 
 /**
  * The runner's reader thread stamps each `terminal-output` event with the
@@ -51,7 +56,14 @@ class TerminalEventDemux<P extends { terminalId: string }> {
   /** Release fn for the shared listener; non-null exactly while any handler is registered. */
   private release: (() => void) | null = null;
 
-  constructor(private readonly eventName: string) {}
+  /**
+   * @param onEvent called once per received payload, before dispatch — the
+   *   output demux uses it to feed the transport counters.
+   */
+  constructor(
+    private readonly eventName: string,
+    private readonly onEvent?: (payload: P) => void,
+  ) {}
 
   register(terminalId: string, handler: PayloadHandler<P>): () => void {
     let set = this.handlers.get(terminalId);
@@ -63,9 +75,10 @@ class TerminalEventDemux<P extends { terminalId: string }> {
     set.add(box);
     // First handler in this window installs the one real listener.
     if (!this.release) {
-      this.release = acquireSingletonListener<P>(this.eventName, (event: Event<P>) =>
-        this.dispatch(event.payload),
-      );
+      this.release = acquireSingletonListener<P>(this.eventName, (event: Event<P>) => {
+        this.onEvent?.(event.payload);
+        this.dispatch(event.payload);
+      });
     }
 
     let unregistered = false;
@@ -116,7 +129,26 @@ class TerminalEventDemux<P extends { terminalId: string }> {
   }
 }
 
-const outputDemux = new TerminalEventDemux<TerminalOutputPayload>("terminal-output");
+/**
+ * The last `terminal-output` payload counted. The demux and the page tap sit
+ * behind the SAME `listen()`, whose trampoline hands every consumer the same
+ * event object — so an identity check counts each event exactly once per
+ * window, whichever consumer sees it first, and whether or not a pane is
+ * mounted.
+ */
+let lastCountedOutput: unknown = null;
+
+/** Feed `transportStats` one delivered (and possibly foreign) output event. */
+function countOutputEvent(payload: { terminalId: string }): void {
+  if (payload === lastCountedOutput) return;
+  lastCountedOutput = payload;
+  noteOutputEvent(!isOwnedByThisWindow(payload.terminalId));
+}
+
+const outputDemux = new TerminalEventDemux<TerminalOutputPayload>(
+  "terminal-output",
+  countOutputEvent,
+);
 const exitDemux = new TerminalEventDemux<TerminalExitEvent>("terminal-exit");
 
 /**
@@ -129,6 +161,18 @@ export function registerTerminalOutputHandler(
   handler: (payload: TerminalOutputPayload) => void,
 ): () => void {
   return outputDemux.register(terminalId, handler);
+}
+
+/**
+ * Resolves once this window's `terminal-output` listener is live in the
+ * runner (`true`), or `false` when none is registered, or its `listen()`
+ * failed and the one retry this call makes failed too.
+ * `registerTerminalOutputHandler` returns before that: a pane that resets the
+ * runner's flow-control counters and must receive every byte counted after
+ * the reset awaits this between the two.
+ */
+export function terminalOutputListening(): Promise<boolean> {
+  return singletonListenerReady("terminal-output");
 }
 
 /** Receive `terminal-exit` payloads for ONE terminal. */
@@ -151,7 +195,10 @@ export function subscribeTerminalOutputStream(
 ): () => void {
   return acquireSingletonListener<TerminalOutputEvent>(
     "terminal-output",
-    (event: Event<TerminalOutputEvent>) => handler(event.payload),
+    (event: Event<TerminalOutputEvent>) => {
+      countOutputEvent(event.payload);
+      handler(event.payload);
+    },
   );
 }
 
@@ -196,6 +243,7 @@ export function __terminalDemuxStats(): {
 
 /** Test-only: drop every handler and the shared listeners. */
 export function __resetTerminalDemuxForTest(): void {
+  lastCountedOutput = null;
   outputDemux.resetForTest();
   exitDemux.resetForTest();
 }

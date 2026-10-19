@@ -239,7 +239,8 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     # (`qontinui-db = { path = "./clorinde" }`,
     #  `qontinui-spec-check = { path = "../crates/spec-check" }`,
     #  `qontinui-runner-stats = { path = "../crates/runner-stats" }`,
-    #  `qontinui-runner-win32 = { path = "../crates/runner-win32" }`), and the
+    #  `qontinui-runner-win32 = { path = "../crates/runner-win32" }`,
+    #  `qontinui-pty-holder = { path = "../crates/pty-holder" }`), and the
     # vendored crate the root manifest's `[patch.crates-io]` substitutes into
     # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
     # crates were missing until 2026-09-30: an edit to either cleared a guilty
@@ -252,6 +253,7 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     "crates/spec-check/"
     "crates/runner-stats/"
     "crates/runner-win32/"
+    "crates/pty-holder/"
     "vendor/"
     "Cargo.toml"
     "Cargo.lock"

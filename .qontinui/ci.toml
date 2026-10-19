@@ -324,6 +324,12 @@ working_dir = "src-tauri"
 timeout_secs = 7200
 
 [[steps]]
+# Also carries the harness/subject isolation test (src-tauri/src/
+# subject_isolation_harness.rs, plan 2026-10-04-a-subject-runner-must-be-
+# fully-isolated-from-the-harness-runner Phase 3) on whatever OS the CI node
+# runs — the byte-identical drive on Linux/macOS, the resolve-only half on
+# Windows — so it needs no step of its own and stays in parity with ci.yml's
+# `cargo test` on both matrix legs. It touches nothing outside a temp fixture.
 name = "rust-test"
 command = ["cargo", "test"]
 working_dir = "src-tauri"

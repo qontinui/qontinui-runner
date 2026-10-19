@@ -16,9 +16,13 @@ import {
   FLAKE_LABEL,
   MAIN_RED_CAP,
   MAX_TITLE_LEN,
+  RETRY_BACKOFF_MS,
   TITLE_PREFIX,
   applyAction,
   classifyFlakinessResponse,
+  describeReadFailure,
+  isRetryableRead,
+  readWithOneRetry,
   ensureLabel,
   fetchRunJobs,
   issueTitle,
@@ -674,6 +678,59 @@ test("fetchRunJobs: a log that cannot be read is marked unreadable, and the arm 
   assert.deepEqual(r.escalations, []);
 });
 
+test("fetchRunJobs: gh's escape-sequence refusal is retried with --allow-escape-sequences and the coloured log parses", () => {
+  // Run 38263126224: a coloured Windows cargo log made `gh api` refuse, and the
+  // arm went DARK instead of filing the failing test.
+  const coloured = RED_WINDOWS_LOG.replace(
+    "evicts_oldest ... FAILED",
+    "evicts_oldest ... \u001b[31mFAILED\u001b[0m",
+  );
+  const { calls, gh } = recorder({
+    "api repos/o/r/actions/runs/5/jobs?per_page=100": JSON.stringify({
+      jobs: [{ id: 7, name: "test (windows-latest)", conclusion: "failure" }],
+    }),
+    "api repos/o/r/actions/jobs/7/logs": (args) => {
+      if (args.includes("--allow-escape-sequences")) return coloured;
+      const e = new Error("Command failed: gh api");
+      e.stderr =
+        "the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway";
+      throw e;
+    },
+  });
+  const jobs = fetchRunJobs("o/r", "5", { gh });
+  assert.equal(jobs[0].unreadable, undefined);
+  assert.equal(calls.length, 3, "list, refused read, one retry");
+  assert.deepEqual(calls[2].args, [
+    "api",
+    "repos/o/r/actions/jobs/7/logs",
+    "--allow-escape-sequences",
+  ]);
+  const r = selectMainRedEscalations(jobs);
+  assert.deepEqual(r.unreadable, []);
+  assert.deepEqual(r.escalations, [
+    {
+      testId: "qontinui_runner_lib::spill::tests::evicts_oldest",
+      mainRed: { shards: ["windows-latest"] },
+    },
+  ]);
+});
+
+test("fetchRunJobs: only the escape-sequence refusal is retried — any other read failure stays unreadable", () => {
+  const { calls, gh } = recorder({
+    "api repos/o/r/actions/runs/5/jobs?per_page=100": JSON.stringify({
+      jobs: [{ id: 1, name: "test (ubuntu-22.04)", conclusion: "failure" }],
+    }),
+    "api repos/o/r/actions/jobs/1/logs": () => {
+      const e = new Error("HTTP 410");
+      e.stderr = "gone (HTTP 410)";
+      throw e;
+    },
+  });
+  const jobs = fetchRunJobs("o/r", "5", { gh });
+  assert.equal(jobs[0].unreadable, true);
+  assert.equal(calls.length, 2, "no retry for an unrelated failure");
+});
+
 // ---------------------------------------------------------------------------
 // sliceGatingStep — only the gate's output is parsed, never the smoke step's
 // ---------------------------------------------------------------------------
@@ -860,4 +917,75 @@ test("a test id with shell metacharacters reaches gh as one argv entry, unchange
   const { calls, gh } = recorder({ "issue create": "u" });
   applyAction({ action: "create", title: issueTitle(id) }, "BODY", "o/r", gh);
   assert.equal(calls[0].args[3], `${TITLE_PREFIX}${id}`);
+});
+
+// ---------------------------------------------------------------------------
+// One retry on a server-side read failure — never a pretended success
+// ---------------------------------------------------------------------------
+
+const FAILED_READ = {
+  body: { history_read: "failed", priors: {}, history_read_error: { pg_code: "57014" } },
+  ms: 60961,
+};
+const OK_READ = { body: { history_read: "ok", priors: LIVE_PRIORS }, ms: 4200 };
+
+test("server-side failures are retryable; client errors and readable verdicts are not", () => {
+  assert.equal(isRetryableRead(FAILED_READ), true);
+  assert.equal(isRetryableRead({ error: "HTTP 502", retryable: true }), true);
+  assert.equal(isRetryableRead({ error: "ABORTED", retryable: true }), true);
+  assert.equal(isRetryableRead({ error: "HTTP 422", retryable: false }), false);
+  assert.equal(isRetryableRead({ error: "non-JSON body" }), false);
+  assert.equal(isRetryableRead(OK_READ), false);
+  assert.equal(isRetryableRead({ body: { history_read: "thin", priors: {} } }), false);
+  assert.equal(isRetryableRead({ body: { history_read: "bogus", priors: {} } }), false);
+  assert.equal(isRetryableRead(undefined), false);
+});
+
+test("a server-side failure is retried exactly once, after the backoff", async () => {
+  const reads = [FAILED_READ, OK_READ];
+  const slept = [];
+  const retried = [];
+  const read = await readWithOneRetry(async () => reads.shift(), {
+    sleep: async (ms) => slept.push(ms),
+    onRetry: (first) => retried.push(first),
+  });
+  assert.deepEqual(slept, [RETRY_BACKOFF_MS]);
+  assert.equal(retried.length, 1);
+  assert.equal(read.attempts, 2);
+  assert.equal(read.body.history_read, "ok");
+  assert.equal(read.firstFailure, FAILED_READ);
+});
+
+test("a second failure is returned as a failure — the retry never turns it green", async () => {
+  let calls = 0;
+  const read = await readWithOneRetry(
+    async () => {
+      calls += 1;
+      return FAILED_READ;
+    },
+    { sleep: async () => {} },
+  );
+  assert.equal(calls, 2, "one retry, not a loop");
+  assert.equal(read.attempts, 2);
+  assert.equal(classifyFlakinessResponse(read.body).kind, "failed");
+});
+
+test("a success, a thin read, or a client error is not retried", async () => {
+  for (const first of [OK_READ, { body: { history_read: "thin", priors: {} } }, { error: "HTTP 400", retryable: false }]) {
+    let calls = 0;
+    const read = await readWithOneRetry(
+      async () => {
+        calls += 1;
+        return first;
+      },
+      { sleep: async () => assert.fail("must not sleep") },
+    );
+    assert.equal(calls, 1);
+    assert.equal(read.attempts, 1);
+  }
+});
+
+test("the retry warning names the SQLSTATE or the transport error", () => {
+  assert.match(describeReadFailure(FAILED_READ), /60961ms.*57014/);
+  assert.equal(describeReadFailure({ error: "HTTP 502 from coord" }), "HTTP 502 from coord");
 });

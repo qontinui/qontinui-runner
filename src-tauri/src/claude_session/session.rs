@@ -1267,6 +1267,16 @@ impl ClaudeSession {
                 session_id_for_waiter, is_rate_limited
             );
 
+            // Review notes sent into this worker are never confirmed from a
+            // transcript (worker transcripts are not tailed); with the process
+            // gone they can no longer arrive, so settle them `unknown` — unless
+            // a rate-limit restart above already registered a live successor
+            // under the same id. Fire-and-forget.
+            crate::mcp::session_review::settle_on_task_run_end(
+                app_handle_for_waiter.clone(),
+                session_id_for_waiter.clone(),
+            );
+
             // Phase 1b — terminal coord agent_logs milestone + final flush.
             // No-op unless the emitter was built (gate ON). Done last so the
             // `session_closed` row reflects the real process-exit moment.
@@ -1676,6 +1686,17 @@ impl ClaudeSession {
         if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
             *slot = Some(ctx);
         }
+    }
+
+    /// `(worktree_path, parent_sha)` of every coord-allocated worktree the
+    /// parked `IsolatedEditContext` holds; empty for a fresh or
+    /// shared-checkout session. Mirrors `TerminalSession::allocation_bases`.
+    pub fn allocation_bases(&self) -> Vec<(std::path::PathBuf, String)> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ctx| ctx.allocation_bases()))
+            .unwrap_or_default()
     }
 
     #[expect(
