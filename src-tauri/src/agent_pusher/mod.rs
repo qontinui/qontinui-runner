@@ -1196,6 +1196,7 @@ mod tests {
             token_jti: uuid::Uuid::nil(),
             token_exp: 0,
             active_claims: vec![],
+            sibling_notes: vec![],
         };
         let token: SharedToken = Arc::new(tokio::sync::RwLock::new(TokenSlot {
             token: "t".into(),
