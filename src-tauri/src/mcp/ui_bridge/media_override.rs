@@ -32,11 +32,19 @@
 //! it keeps nothing from a caller who can evaluate script.
 //!
 //! Validation mirrors the SDK's `validateMediaOverrideRequest` for an early
-//! 400; the SDK copy is the authority. One rule is runner-only: the decode wait
-//! must finish inside the IPC envelope's own budget, or the envelope times out
-//! while the frontend is still waiting and the reply is lost. An absent
-//! `decodeTimeoutMs` is filled with a value that fits; a caller's value that
-//! does not fit is refused, naming the budget.
+//! 400; the SDK copy is the authority. One rule is runner-only: the page-side
+//! wait must finish inside the transport's own budget, or the transport times
+//! out while the page is still waiting and the reply is lost. That holds for
+//! both waits — an apply's `decodeTimeoutMs` and a restore's `verifyTimeoutMs`.
+//! An absent wait is filled with a value that fits; a caller's value that does
+//! not fit is refused, naming the budget.
+//!
+//! The restore's FILL is the one deliberate divergence from the SDK's relay (it
+//! fills the full ceiling, not 10 s; `fit_verify_budget` says why).
+//! The restore fit matters on its own: an override can be APPLIED with a longer
+//! decode wait than this transport allows (the injected runtime accepts up to
+//! 60 s), and the SDK's restore waits up to that override's own
+//! `decodeTimeoutMs` unless the request bounds it with `verifyTimeoutMs`.
 //!
 //! Redaction: the request body carries candidate URLs (which can be presigned
 //! asset-store URLs) and the response carries the page's original URLs. Neither
@@ -161,7 +169,8 @@ pub(crate) fn validate_override_body(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a `DELETE /control/media/override` body (`{}` or `{overrideId}`).
+/// Validate a `DELETE /control/media/override` body (`{}` or `{overrideId}`,
+/// each with an optional `verifyTimeoutMs`). Mirrors the SDK rules.
 pub(crate) fn validate_restore_body(body: &Value) -> Result<(), String> {
     let obj = body.as_object().ok_or("body must be a JSON object")?;
     if let Some(v) = obj.get("overrideId") {
@@ -169,35 +178,87 @@ pub(crate) fn validate_restore_body(body: &Value) -> Result<(), String> {
             return Err("overrideId must be a non-empty string".into());
         }
     }
+    bounded_int(body, "verifyTimeoutMs", 0, MAX_DECODE_TIMEOUT_MS)?;
     Ok(())
+}
+
+/// The longest page-side wait that still leaves [`DECODE_HEADROOM_MS`] inside a
+/// transport budget of `budget_ms` — never zero.
+fn wait_ceiling(budget_ms: u64) -> u64 {
+    budget_ms.saturating_sub(DECODE_HEADROOM_MS).max(1)
+}
+
+/// Refuse a caller's `field` wait that would outlive the transport, or fill an
+/// absent one with `fill_ms`. `result` names what the headroom lets reach the
+/// caller. A present non-integer is left for validation (run first) to answer.
+fn fit_wait(
+    body: &mut Value,
+    field: &str,
+    budget_ms: u64,
+    fill_ms: u64,
+    result: &str,
+) -> Result<(), String> {
+    let ceiling = wait_ceiling(budget_ms);
+    let obj = body.as_object_mut().ok_or("body must be a JSON object")?;
+    match obj.get(field).map(Value::as_u64) {
+        Some(Some(n)) if n > ceiling => Err(format!(
+            "{field} {n} would outlive the transport's {budget_ms} ms budget (at most \
+             {ceiling} ms leaves room for {result} to reach you); lower it, or raise the \
+             runner's UI Bridge IPC timeout"
+        )),
+        Some(_) => Ok(()),
+        None => {
+            obj.insert(field.into(), Value::from(fill_ms));
+            Ok(())
+        }
+    }
 }
 
 /// Fit the decode wait inside a transport budget of `budget_ms`: fill an
 /// absent `decodeTimeoutMs`, refuse one that would outlive the transport.
 pub(crate) fn fit_decode_budget(body: &mut Value, budget_ms: u64) -> Result<(), String> {
-    let ceiling = budget_ms.saturating_sub(DECODE_HEADROOM_MS).max(1);
-    let obj = body.as_object_mut().ok_or("body must be a JSON object")?;
-    match obj.get("decodeTimeoutMs").and_then(Value::as_u64) {
-        Some(n) if n > ceiling => Err(format!(
-            "decodeTimeoutMs {n} would outlive the transport's {budget_ms} ms budget (at most \
-             {ceiling} ms leaves room for the typed DECODE_TIMEOUT and its rollback to reach \
-             you); lower it, or raise the runner's UI Bridge IPC timeout"
-        )),
-        Some(_) => Ok(()),
-        None => {
-            obj.insert(
-                "decodeTimeoutMs".into(),
-                Value::from(ceiling.min(DEFAULT_DECODE_TIMEOUT_MS)),
-            );
-            Ok(())
-        }
-    }
+    let fill = wait_ceiling(budget_ms).min(DEFAULT_DECODE_TIMEOUT_MS);
+    fit_wait(
+        body,
+        "decodeTimeoutMs",
+        budget_ms,
+        fill,
+        "the typed DECODE_TIMEOUT and its rollback",
+    )
+}
+
+/// Fit a restore's verify wait inside a transport budget of `budget_ms`: fill
+/// an absent `verifyTimeoutMs` with the full ceiling, refuse one that would
+/// outlive the transport.
+///
+/// RUNNER-ONLY RULE (the SDK's relay fills `min(10 s, ceiling)` instead): the
+/// fill is the CEILING, not the apply's 10 s default, because the SDK waits
+/// `min(override's decodeTimeoutMs, verifyTimeoutMs)` — so the fill only ever
+/// SHORTENS a wait that would not fit, and leaves every override applied with a
+/// wait that does fit exactly as it was applied. It is capped at the SDK's own
+/// [`MAX_DECODE_TIMEOUT_MS`], which the SDK refuses above: a raised IPC timeout
+/// on the direct route must not turn every restore into an `INVALID_REQUEST`.
+pub(crate) fn fit_verify_budget(body: &mut Value, budget_ms: u64) -> Result<(), String> {
+    fit_wait(
+        body,
+        "verifyTimeoutMs",
+        budget_ms,
+        wait_ceiling(budget_ms).min(MAX_DECODE_TIMEOUT_MS),
+        "the restore's verdict",
+    )
 }
 
 /// Validate + budget-fit an override body. Shared with the `/sdk/` wrapper.
 pub(crate) fn prepare_override_body(mut body: Value, budget_ms: u64) -> Result<Value, String> {
     validate_override_body(&body)?;
     fit_decode_budget(&mut body, budget_ms)?;
+    Ok(body)
+}
+
+/// Validate + budget-fit a restore body. Shared with the `/sdk/` wrapper.
+pub(crate) fn prepare_restore_body(mut body: Value, budget_ms: u64) -> Result<Value, String> {
+    validate_restore_body(&body)?;
+    fit_verify_budget(&mut body, budget_ms)?;
     Ok(body)
 }
 
@@ -251,7 +312,7 @@ pub async fn ui_bridge_media_override_restore_handler(
     let body = body
         .map(|Json(b)| b)
         .unwrap_or_else(|| serde_json::json!({}));
-    validate_restore_body(&body).map_err(bad_request)?;
+    let body = prepare_restore_body(body, get_ui_bridge_timeout_ms()).map_err(bad_request)?;
     info!("UI Bridge API: media override restore");
     wrap_ipc_result_keeping_failure_data(
         ui_bridge_request_sync(&state, "media_override_restore", body).await,
@@ -395,6 +456,84 @@ mod tests {
             10_000
         )
         .is_ok());
+    }
+
+    #[test]
+    fn preparing_an_override_body_validates_it_first() {
+        // Every case is a JSON OBJECT the budget fit alone would accept, so
+        // only the validation step inside `prepare_override_body` refuses it.
+        let cases = [
+            (
+                json!({"slotId": "a"}),
+                "one of src, srcset, sources or backgroundImage",
+            ),
+            (
+                json!({"src": "/c.png"}),
+                "exactly one of slotId or elementId",
+            ),
+            (
+                json!({"slotId": "a", "src": "x", "decodeTimeoutMs": -5}),
+                "decodeTimeoutMs must be an integer",
+            ),
+        ];
+        for (body, needle) in cases {
+            let err = prepare_override_body(body.clone(), SDK_DISPATCH_BUDGET_MS)
+                .expect_err(&body.to_string());
+            assert!(err.contains(needle), "{body}: {err} lacks {needle}");
+        }
+    }
+
+    #[test]
+    fn restore_bounds_its_verify_wait_like_the_sdk() {
+        assert!(validate_restore_body(&json!({"verifyTimeoutMs": 0})).is_ok());
+        assert!(validate_restore_body(&json!({"verifyTimeoutMs": 60_000})).is_ok());
+        for bad in [json!(60_001), json!(-1), json!("5000"), json!(1.5)] {
+            let err = validate_restore_body(&json!({ "verifyTimeoutMs": bad })).unwrap_err();
+            assert!(err.contains("verifyTimeoutMs must be an integer"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_absent_verify_wait_is_fitted_inside_the_sdk_dispatch_budget() {
+        // The /sdk/ DELETE: an override applied with a 60 s decode wait (the
+        // injected runtime allows it) would otherwise be restored with a 60 s
+        // verify wait over a 30 s transport.
+        let body = prepare_restore_body(json!({}), SDK_DISPATCH_BUDGET_MS).unwrap();
+        assert_eq!(
+            body["verifyTimeoutMs"],
+            json!(SDK_DISPATCH_BUDGET_MS - DECODE_HEADROOM_MS)
+        );
+        assert!(body["verifyTimeoutMs"].as_u64().unwrap() < SDK_DISPATCH_BUDGET_MS);
+        let body =
+            prepare_restore_body(json!({"overrideId": "mo-1"}), SDK_DISPATCH_BUDGET_MS).unwrap();
+        assert_eq!(body["overrideId"], json!("mo-1"));
+        assert_eq!(body["verifyTimeoutMs"], json!(28_000));
+        // A tiny budget still leaves a positive wait rather than zero.
+        let body = prepare_restore_body(json!({}), 1_500).unwrap();
+        assert_eq!(body["verifyTimeoutMs"], json!(1));
+        // A raised IPC timeout never fills past the SDK's own bound, which the
+        // SDK refuses — and the filled body still passes the runner's mirror.
+        let body = prepare_restore_body(json!({}), 120_000).unwrap();
+        assert_eq!(body["verifyTimeoutMs"], json!(MAX_DECODE_TIMEOUT_MS));
+        assert!(validate_restore_body(&body).is_ok());
+    }
+
+    #[test]
+    fn a_verify_wait_that_would_outlive_the_transport_is_refused_naming_the_budget() {
+        let err = prepare_restore_body(json!({"verifyTimeoutMs": 28_001}), SDK_DISPATCH_BUDGET_MS)
+            .unwrap_err();
+        assert!(err.contains("verifyTimeoutMs 28001"), "{err}");
+        assert!(err.contains("30000 ms budget"), "{err}");
+        // A caller's wait that fits is kept, not replaced by the fill.
+        let body = prepare_restore_body(json!({"verifyTimeoutMs": 5_000}), SDK_DISPATCH_BUDGET_MS)
+            .unwrap();
+        assert_eq!(body["verifyTimeoutMs"], json!(5_000));
+        // Validation runs before the fit: a malformed body is refused, not filled.
+        assert!(
+            prepare_restore_body(json!({"overrideId": ""}), SDK_DISPATCH_BUDGET_MS)
+                .unwrap_err()
+                .contains("overrideId")
+        );
     }
 
     #[test]
