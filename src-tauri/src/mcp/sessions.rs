@@ -1580,13 +1580,18 @@ async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<se
 /// `QONTINUI_OPERATOR_TOUCH_HOOK`, default ARMED).
 async fn operator_touch_notification(
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Json<serde_json::Value> {
     // Permission-prompt capture (plan
     // 2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote
     // Phase 2): classify + count a `permission_prompt` payload, independently
     // of the operator-touch emit below. Fail-open; never changes the answer.
-    crate::session::permission_prompt_capture::observe_notification(&id, &body);
+    // A browser-borne body (an `Origin` header; the hook's curl sends none) is
+    // not captured — only the capture is skipped, the emit below is unchanged.
+    if !has_browser_origin(&headers) {
+        crate::session::permission_prompt_capture::observe_notification(&id, &body);
+    }
     let payload: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     let outcome = crate::terminal::operator_touch_watch::on_notification_signal(&id, &payload);
@@ -2821,6 +2826,33 @@ mod permission_prompt_capture_route_tests {
             class_count(&class.dossier_slug),
             before,
             "browser body counted"
+        );
+
+        // The Notification pad: the capture is skipped for a browser body,
+        // the operator-touch answer is unchanged.
+        let note = serde_json::json!({
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "Claude needs your permission to use Qzx7OriginNoteTool",
+        });
+        let note_class = crate::session::permission_prompt_capture::parse_payload(&note)
+            .unwrap()
+            .class;
+        let note_before = class_count(&note_class.dossier_slug);
+        let (status, body) = send(
+            notification_app(),
+            "POST",
+            "/sessions/term-origin-note/notification",
+            Some("https://evil.example"),
+            note.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["session"], "term-origin-note");
+        assert_eq!(
+            class_count(&note_class.dossier_slug),
+            note_before,
+            "browser Notification captured"
         );
 
         let classify_app = Router::new().route(

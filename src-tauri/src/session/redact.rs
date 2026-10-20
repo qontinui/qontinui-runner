@@ -50,12 +50,13 @@ static JWT_RE: Lazy<Regex> = Lazy::new(|| {
 /// becomes `scheme://***@host` (same plan, D6). Greedy to the LAST `@` in the
 /// authority, so a userinfo that itself holds an `@` (the Azure Database for
 /// PostgreSQL `user@server:password@host` shape) is masked whole. The
-/// authority ends at the first `/`, `?`, `#`, whitespace, or any character
-/// RFC 3986 does not allow in it (`"` `<` `>` `\` `{` `}` `|` `^` `` ` `` `[`
-/// `]`), so an `@` in a path, a query, or a later field of compact JSON is
-/// not userinfo.
+/// authority ends at the first `/`, `?`, `#`, whitespace, `"`, `<`, `>`, `\`
+/// or `` ` `` — characters that delimit a URL in JSON, HTML and shell text —
+/// so an `@` in a path, a query, or a later field of compact JSON is not
+/// userinfo. Other RFC 3986-illegal characters (`{` `}` `|` `^` `[` `]`) are
+/// deliberately NOT excluded: a password may contain them unescaped.
 static URL_USERINFO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"\b([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s"<>\\{}|^`\[\]]*@"#)
+    Regex::new(r#"\b([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s"<>\\`]*@"#)
         .expect("url-userinfo redaction regex is a valid literal")
 });
 
@@ -250,6 +251,13 @@ mod tests {
         assert_eq!(redact_secrets(input), input);
         let input = br#"<a href="https://h.io">x</a> mail a@b.c"#;
         assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
+    fn a_password_with_unescaped_punctuation_stays_masked() {
+        let input = format!("psql postgres://u:{}@h/db", "p|w^x{y");
+        let out = String::from_utf8(redact_secrets(input.as_bytes())).unwrap();
+        assert_eq!(out, "psql postgres://***@h/db");
     }
 
     #[test]

@@ -78,7 +78,16 @@ pub const MAX_BUCKETS: usize = 512;
 /// a `Notification` follow a `PermissionRequest` ~6 s later; whether Claude
 /// Code REPEATS the `Notification` while a dialog stays open was not
 /// measured, so the window guards against it rather than relying on it.
+/// Cost: on a Notification-only intake (no `PermissionRequest` hook), two
+/// distinct prompts less than 60 s apart on one terminal count as ONE —
+/// that intake undercounts rapid prompts.
 pub const DEDUP_WINDOW_SECS: i64 = 60;
+/// How many terminals the dedup table remembers. When full, stale entries are
+/// pruned and then the oldest is evicted, so a flood of distinct ids cannot
+/// grow it without bound.
+pub const MAX_TERMINAL_SIGNALS: usize = 1024;
+/// Cap on a stored terminal id (bytes, cut on a char boundary).
+pub const MAX_TERMINAL_ID_BYTES: usize = 128;
 /// Cap on a tool name or command word inside a class key.
 pub const MAX_KEY_TOKEN_CHARS: usize = 48;
 /// Cap on a stored cwd excerpt (after reduction to two components).
@@ -776,16 +785,15 @@ impl Aggregator {
         now: DateTime<Utc>,
     ) -> ObserveOutcome {
         let window = chrono::Duration::seconds(DEDUP_WINDOW_SECS);
+        let terminal_id = crate::str_utils::truncate_str(terminal_id, MAX_TERMINAL_ID_BYTES);
         let recent = self.last_signal.get(terminal_id).is_some_and(|at| {
             let age = now.signed_duration_since(*at);
             age >= chrono::Duration::zero() && age < window
         });
         // Every signal (counted or suppressed) refreshes its terminal's entry,
-        // so a dialog left open stays ONE prompt; stale entries are pruned.
-        self.last_signal
-            .retain(|_, at| now.signed_duration_since(*at) < window);
+        // so a dialog left open stays ONE prompt.
         if !terminal_id.is_empty() {
-            self.last_signal.insert(terminal_id.to_string(), now);
+            self.remember_signal(terminal_id, now, window);
         }
         if obs.kind == PayloadKind::Notification && recent {
             return ObserveOutcome::Deduplicated(obs.class);
@@ -796,6 +804,30 @@ impl Aggregator {
         } else {
             ObserveOutcome::Dropped(class)
         }
+    }
+
+    /// Record `now` as `terminal_id`'s last signal, keeping the table within
+    /// [`MAX_TERMINAL_SIGNALS`]: only when a NEW id meets a full table are
+    /// stale entries pruned, and if none were stale the oldest is evicted —
+    /// so an ordinary observe never walks the table.
+    fn remember_signal(&mut self, terminal_id: &str, now: DateTime<Utc>, window: chrono::Duration) {
+        if !self.last_signal.contains_key(terminal_id)
+            && self.last_signal.len() >= MAX_TERMINAL_SIGNALS
+        {
+            self.last_signal
+                .retain(|_, at| now.signed_duration_since(*at) < window);
+            if self.last_signal.len() >= MAX_TERMINAL_SIGNALS {
+                let oldest = self
+                    .last_signal
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = oldest {
+                    self.last_signal.remove(&id);
+                }
+            }
+        }
+        self.last_signal.insert(terminal_id.to_string(), now);
     }
 
     /// Count one observation at `now`. At [`MAX_BUCKETS`] a NEW bucket evicts
@@ -1751,9 +1783,42 @@ rm -f z",
         for i in 0..100 {
             agg.observe(&format!("t{i}"), pr("rm x", serde_json::json!([])), t0);
         }
-        assert_eq!(agg.last_signal.len(), 100);
+        assert_eq!(
+            agg.last_signal.len(),
+            100,
+            "under the cap nothing is pruned"
+        );
         let later = t0 + chrono::Duration::seconds(DEDUP_WINDOW_SECS * 2);
         agg.observe("fresh", pr("rm x", serde_json::json!([])), later);
-        assert_eq!(agg.last_signal.len(), 1);
+        assert_eq!(agg.last_signal.len(), 101);
+        // A flood of distinct ids — e.g. a caller cycling terminal ids — stays
+        // within the cap, whether the old entries are stale or fresh.
+        for i in 0..10_000 {
+            agg.observe(
+                &format!("flood{i}"),
+                pr("rm x", serde_json::json!([])),
+                later,
+            );
+        }
+        assert!(agg.last_signal.len() <= MAX_TERMINAL_SIGNALS);
+        let much_later = later + chrono::Duration::seconds(DEDUP_WINDOW_SECS * 2);
+        for i in 0..10_000 {
+            agg.observe(
+                &format!("again{i}"),
+                pr("rm x", serde_json::json!([])),
+                much_later,
+            );
+        }
+        assert!(agg.last_signal.len() <= MAX_TERMINAL_SIGNALS);
+        // A very long id is stored truncated.
+        agg.observe(
+            &"z".repeat(10_000),
+            pr("rm x", serde_json::json!([])),
+            much_later,
+        );
+        assert!(agg
+            .last_signal
+            .keys()
+            .all(|k| k.len() <= MAX_TERMINAL_ID_BYTES));
     }
 }
