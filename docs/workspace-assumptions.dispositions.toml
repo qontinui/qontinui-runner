@@ -274,6 +274,16 @@ reviewed = [
 ]
 
 [[disposition]]
+class = "dev_ports"
+file = "src/mcp/origin_guard.rs"
+symbol = "const GRACE_ORIGINS"
+disposition = "dev_only_surface"
+note = "The transitional dev-origin grace: only the qontinui-web dev frontend on :3001 is admitted at TRUSTED_DOOR_GRACE doors. A dev-only surface that no published build serves from that origin; plan 2026-09-17-retire-the-runner-origin-guard-dev-grace retires it (Phase 6 deletes the constant)."
+reviewed = [
+    "pub const GRACE_ORIGINS: &[&str] = &[\"http://localhost:3001\", \"http://127.0.0.1:3001\"];",
+]
+
+[[disposition]]
 class = "supervisor_dependency"
 file = "src/mcp/session_briefing.rs"
 symbol = "session_briefing_handler"

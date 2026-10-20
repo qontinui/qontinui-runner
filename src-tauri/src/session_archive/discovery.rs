@@ -201,7 +201,7 @@ pub fn claude_root_for(home: Option<&Path>, windows: bool) -> Option<PathBuf> {
 /// rather than abort a backfill.
 pub fn roster_config_dirs() -> Vec<String> {
     let Some(path) =
-        dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("claude-accounts.json"))
+        crate::instance_env::runner_config_base().map(|d| d.join("claude-accounts.json"))
     else {
         return Vec::new();
     };

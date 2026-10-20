@@ -27,8 +27,8 @@ python $PWD/qontinui-claude-config/scripts/qontinui-http.py status
 
 If the runner is not available, inform the user:
 ```
-The qontinui-runner is not running. Start it with:
-  .\dev-start.ps1 -Runner
+The qontinui-runner is not running. Start the Qontinui Runner app (or your
+deployment's runner launcher), then re-run /run-automation.
 ```
 
 ### Step 2: Load the Configuration

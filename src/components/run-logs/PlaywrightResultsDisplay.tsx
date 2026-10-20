@@ -54,17 +54,18 @@ function getTestStatusStyle(status: string) {
 }
 
 export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
-  const [pageSize, setPageSize] = useState(PAGE_SIZE);
   const {
     data: playwrightData,
     isLoading,
     error,
-  } = useTaskRunPlaywrightResults(taskRunId, pageSize);
+    fetchNextPage,
+    isFetchingNextPage,
+  } = useTaskRunPlaywrightResults(taskRunId, PAGE_SIZE);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const loadMore = useCallback(() => {
-    setPageSize((prev) => prev + PAGE_SIZE);
-  }, []);
+    void fetchNextPage();
+  }, [fetchNextPage]);
 
   const getImageSrc = useMemo(() => {
     return (path: string) => {
@@ -106,7 +107,7 @@ export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
     );
   }
 
-  if (!playwrightData || playwrightData.results.length === 0) {
+  if (!playwrightData || playwrightData.rows.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
         <FileJson className="w-8 h-8 mb-3 opacity-50" />
@@ -127,7 +128,7 @@ export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
           className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}
         >
           <CheckCircle className="w-4 h-4" />
-          {playwrightData.passed} passed
+          {playwrightData.first.passed ?? "—"} passed
         </span>
         <span
           data-content-role="metric"
@@ -135,19 +136,19 @@ export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
           className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}
         >
           <XCircle className="w-4 h-4" />
-          {playwrightData.failed} failed
+          {playwrightData.first.failed ?? "—"} failed
         </span>
         <span
           data-content-role="metric"
           data-content-label="total tests"
           className="text-xs text-muted-foreground ml-auto"
         >
-          {playwrightData.count} total tests
+          {playwrightData.first.total ?? playwrightData.rows.length} total tests
         </span>
       </div>
 
       <div className="space-y-2">
-        {playwrightData.results.map((result: TaskRunPlaywrightResultDb) => {
+        {playwrightData.rows.map((result: TaskRunPlaywrightResultDb) => {
           const statusStyle = getTestStatusStyle(result.status);
           const isExpanded = expandedIds.has(result.id);
           const hasExpandableContent =
@@ -289,13 +290,14 @@ export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
             </div>
           );
         })}
-        {playwrightData.has_more && (
+        {playwrightData.hasMore && (
           <button
             onClick={loadMore}
+            disabled={isFetchingNextPage}
             className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
           >
             <ChevronDown className="w-3 h-3" />
-            Show more ({playwrightData.count - playwrightData.results.length} remaining)
+            Show more ({playwrightData.remaining ?? "more"} remaining)
           </button>
         )}
       </div>

@@ -80,6 +80,609 @@ use crate::mcp::types::ApiState;
 use crate::str_utils::truncate_str;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+/// Every source file of the `mcp_api` module, as `(path relative to src/, text)`:
+/// this root file first, then every `*.rs` under `src/mcp_api/` (recursive),
+/// sorted by path.
+///
+/// Read at RUNTIME from `CARGO_MANIFEST_DIR`, because `include_str!` cannot
+/// glob a directory. The directory may not exist yet: until the split moves an
+/// item into it, this returns the root alone.
+///
+/// Source-text scans of this module go through here (or [`mcp_api_sources`])
+/// rather than naming `mcp_api.rs`, so moving an item into a child file cannot
+/// leave a scan reading only part of the module. Plan
+/// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+/// D5.
+#[cfg(test)]
+pub(crate) fn mcp_api_source_files() -> Vec<(String, String)> {
+    mcp_api_source_files_under(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+}
+
+/// [`mcp_api_source_files`] over an arbitrary `src` root, so the walk can be
+/// driven against a fixture tree that HAS an `mcp_api/` directory.
+#[cfg(test)]
+fn mcp_api_source_files_under(src: &std::path::Path) -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut paths = vec![src.join("mcp_api.rs")];
+    let children = src.join("mcp_api");
+    if children.is_dir() {
+        walk(&children, &mut paths);
+    }
+    let mut files: Vec<(String, String)> = paths
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(src)
+                .expect("every mcp_api source lives under src/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            (rel, text)
+        })
+        .collect();
+    // By the relative path STRING, so the root (`mcp_api.rs`) sorts before its
+    // children (`mcp_api/…`): `.` is below `/`.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+/// The whole `mcp_api` module's source text: [`mcp_api_source_files`]
+/// concatenated in order, each file ending in a newline. For scans asking
+/// "does this text exist anywhere in the module"; a scan that must name a
+/// file or a line, or mutate one file, uses [`mcp_api_source_files`].
+#[cfg(test)]
+pub(crate) fn mcp_api_sources() -> String {
+    join_sources(&mcp_api_source_files())
+}
+
+/// Concatenate `(path, text)` pairs in order, each file ending in a newline so
+/// one file's last line never fuses with the next file's first.
+#[cfg(test)]
+fn join_sources(files: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (_, text) in files {
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The `mcp_api` module's PRODUCTION text, per file: each file's lines with
+/// its column-0 `#[cfg(test)]` items removed, and every file that is itself an
+/// out-of-line test module left out whole. Returned as `(path, text)` pairs in
+/// [`mcp_api_source_files`] order, so a scan that must not cross a file
+/// boundary can stay inside one file.
+///
+/// `split("#[cfg(test)]").next()` was WRONG for this — it stops at the FIRST
+/// occurrence, which in `mcp_api.rs` was about 62% of the way in, so a
+/// construction added after that line was invisible and a scan passed by
+/// placement luck.
+///
+/// A column-0 `#[cfg(test)]` is skipped by its item's SHAPE, and any other
+/// shape is asserted rather than assumed, because guessing wrong swallows
+/// production code up to the next column-0 brace:
+/// - a braced `mod … {` or `fn … {` (rustfmt closes it with a column-0
+///   `}`) is skipped through that brace;
+/// - an out-of-line `mod name;` is skipped as one line, and the file it
+///   names (`<dir>/name.rs`, or anything under `<dir>/name/`) is excluded.
+///
+/// Positions are reported as `file:line`, per file, never as an offset into a
+/// concatenation.
+#[cfg(test)]
+pub(crate) fn production_files(files: &[(String, String)]) -> Vec<(String, String)> {
+    fn child_dir(rel: &str) -> String {
+        match rel.strip_suffix("/mod.rs") {
+            Some(dir) => dir.to_string(),
+            None => rel.strip_suffix(".rs").unwrap_or(rel).to_string(),
+        }
+    }
+    let mut test_files: Vec<String> = Vec::new();
+    let mut kept: Vec<(String, String)> = Vec::new();
+    for (rel, text) in files {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut production = String::new();
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i] != "#[cfg(test)]" {
+                production.push_str(lines[i]);
+                production.push('\n');
+                i += 1;
+                continue;
+            }
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            let item = strip_visibility(next);
+            if let Some(name) = item
+                .strip_prefix("mod ")
+                .and_then(|rest| rest.strip_suffix(';'))
+            {
+                test_files.push(format!("{}/{}", child_dir(rel), name.trim()));
+                i += 2;
+                continue;
+            }
+            assert!(
+                (item.starts_with("mod ") || item.starts_with("fn ")) && next.ends_with('{'),
+                "column-0 #[cfg(test)] at {rel}:{} gates `{next}`, not a braced \
+                 `mod`/`fn` or an out-of-line `mod name;` — this scan would \
+                 swallow production code up to the next column-0 brace",
+                i + 1
+            );
+            i += 1;
+            while i < lines.len() && lines[i] != "}" {
+                i += 1;
+            }
+            i += 1;
+        }
+        kept.push((rel.clone(), production));
+    }
+    kept.into_iter()
+        .filter(|(rel, _)| {
+            !test_files.iter().any(|t| {
+                rel.strip_prefix(t.as_str())
+                    .is_some_and(|rest| rest == ".rs" || rest.starts_with('/'))
+            })
+        })
+        .collect()
+}
+
+/// A line with one leading `pub(crate) ` / `pub(super) ` / `pub ` removed —
+/// the visibilities this module's items are declared with.
+#[cfg(test)]
+fn strip_visibility(line: &str) -> &str {
+    ["pub(crate) ", "pub(super) ", "pub "]
+        .iter()
+        .find_map(|v| line.strip_prefix(v))
+        .unwrap_or(line)
+}
+
+/// The source of the ONE production item in the `mcp_api` module whose
+/// column-0 declaration starts with `signature` (after an optional
+/// visibility), e.g. `"async fn coord_mcp_proxy_handler("`: from that line
+/// through the first column-0 `}` after it, in the SAME file. Comments are
+/// kept; a caller that must not be satisfied by a comment strips them.
+///
+/// Every file is searched, so the item may live in any of them — which is the
+/// point once the split moves it out of `mcp_api.rs` (plan
+/// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+/// D5). The three rules each close a vacuous pass a `find` over the
+/// concatenation allowed:
+/// - test code is filtered out first ([`production_files`]), so a test that
+///   QUOTES the signature in a string literal is never mistaken for the item;
+/// - the declaration must sit at column 0, so an indented mention cannot match;
+/// - the body ends inside its own file, so it can never run on into the next
+///   file's text; and the item must be declared exactly once, so a duplicate
+///   cannot shadow the real one by sorting first.
+///
+/// Two shapes the line-based scan cannot bound, stated so nobody relies on
+/// them:
+/// - a declaration that ENDS on its signature line (a one-line `fn x() {}`,
+///   with or without a trailing comment, or a one-line `const` / `static`
+///   ending in `;`) has no column-0 `}` of its own, so the body would run on
+///   into the next item — it is REFUSED with a panic naming the line rather
+///   than returned wrong ([`declaration_ends_on_its_line`]);
+/// - a raw string (or any literal) inside a `#[cfg(test)]` span that holds a
+///   line consisting of exactly `}` ends that span's skip early, so the test
+///   text after it would read as production code. Nothing in the module does
+///   that today; a test fixture that needs a column-0 `}` must build it with
+///   an escape (`"\n}\n"`) instead of a literal line.
+#[cfg(test)]
+pub(crate) fn mcp_api_item_source(signature: &str) -> String {
+    item_source_in(&mcp_api_source_files(), signature)
+}
+
+/// [`mcp_api_item_source`] over arbitrary `(path, text)` files, so its rules
+/// can be driven against a split-shaped fixture.
+#[cfg(test)]
+fn item_source_in(files: &[(String, String)], signature: &str) -> String {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for (rel, text) in production_files(files) {
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !strip_visibility(line).starts_with(signature) {
+                continue;
+            }
+            assert!(
+                !declaration_ends_on_its_line(line),
+                "`{signature}` in {rel}:{} is declared on one line (`{line}`); its \
+                 body has no column-0 `}}` of its own, so this scan would run on \
+                 into the next item — spread the item over several lines",
+                i + 1
+            );
+            let close = lines
+                .iter()
+                .skip(i + 1)
+                .position(|l| *l == "}")
+                .unwrap_or_else(|| {
+                    panic!("`{signature}` in {rel} has no column-0 `}}` closing it in that file")
+                });
+            found.push((rel.clone(), lines[i..=i + 1 + close].join("\n")));
+        }
+    }
+    assert!(
+        found.len() == 1,
+        "`{signature}` must be declared exactly once at column 0 in the mcp_api \
+         module's production code; found it in {:?}",
+        found.iter().map(|(rel, _)| rel).collect::<Vec<_>>()
+    );
+    found
+        .pop()
+        .map(|(_, body)| body)
+        .expect("exactly one, asserted above")
+}
+
+/// Does the item declared on `line` END on that line — so the column-0 `}`
+/// [`item_source_in`] looks for belongs to some LATER item?
+///
+/// Read from the line's CODE only: string literals (plain, byte, and raw —
+/// `r"…"`, `r#"a"b"#`, `br#"…"#`), char literals and comments (`/* … */`,
+/// nested as Rust nests them, and a trailing `//`) are skipped, so neither a
+/// `"{"` in a literal, a `"` inside a raw string, a `/* { */` nor a `// why`
+/// after the body can change the answer. A literal or block comment still
+/// open at the end of the line hides the rest of that line. Two shapes end on
+/// the line: a body whose braces open AND close there (`fn tiny() {} // why`,
+/// `struct S { a: u8 }`), and a bodiless item ending in `;` (a one-line
+/// `const` / `static` / `type` / `use`). Anything else — a signature ending in
+/// `{`, `(`, `,`, or a return type whose `where` / `{` follows on the next
+/// line — continues below.
+#[cfg(test)]
+fn declaration_ends_on_its_line(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    // Does a token start at `i` (nothing identifier-like glued before it)?
+    let token_start = |i: usize| i == 0 || !is_ident(chars[i - 1]);
+    let mut code = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        // A raw string: `r` (or `br`) opening a token, then N `#`, then `"`;
+        // it closes at the first `"` followed by N `#`, escapes and all.
+        if c == 'r' && (token_start(i) || (i >= 1 && chars[i - 1] == 'b' && token_start(i - 1))) {
+            let hashes = chars[i + 1..].iter().take_while(|h| **h == '#').count();
+            if chars.get(i + 1 + hashes) == Some(&'"') {
+                let body = i + 2 + hashes;
+                let close = (body..chars.len()).find(|&j| {
+                    chars[j] == '"'
+                        && chars.len() - j > hashes
+                        && chars[j + 1..=j + hashes].iter().all(|h| *h == '#')
+                });
+                i = close.map_or(chars.len(), |j| j + 1 + hashes);
+                continue;
+            }
+        }
+        match c {
+            '"' => {
+                // A string literal: skip to its unescaped closing quote.
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => i += 2,
+                        '"' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            '\'' => {
+                // A char literal (`'{'`, `'\''`) is skipped; a lifetime (`'a`)
+                // has no closing quote within two chars and is kept as code.
+                let literal_len = match next {
+                    Some('\\') => (chars.get(i + 3) == Some(&'\'')).then_some(4),
+                    Some(_) => (chars.get(i + 2) == Some(&'\'')).then_some(3),
+                    None => None,
+                };
+                match literal_len {
+                    Some(n) => i += n,
+                    None => {
+                        code.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            '/' if next == Some('/') => break,
+            '/' if next == Some('*') => {
+                // A block comment, nested as Rust nests them.
+                let mut depth = 0usize;
+                while i < chars.len() {
+                    match (chars[i], chars.get(i + 1)) {
+                        ('/', Some('*')) => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        ('*', Some('/')) => {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            _ => {
+                code.push(c);
+                i += 1;
+            }
+        }
+    }
+    let opens = code.matches('{').count();
+    let closes = code.matches('}').count();
+    (opens > 0 && opens == closes) || code.trim_end().ends_with(';')
+}
+
+#[cfg(test)]
+mod mcp_api_sources_tests {
+    /// The helper sees the module as it will be once split: the root FIRST,
+    /// then every `.rs` under `mcp_api/` at any depth in path order, and
+    /// nothing that is not Rust. Driven against a fixture `src/`, because the
+    /// real tree has no `mcp_api/` yet and a walk that skipped it would be
+    /// green there.
+    #[test]
+    fn walks_the_root_then_every_child_file_in_path_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path();
+        for (rel, text) in [
+            ("mcp_api.rs", "ROOT"),
+            ("mcp_api/vcs_pr.rs", "VCS\n"),
+            ("mcp_api/coord_mcp_proxy/tool_policy.rs", "POLICY"),
+            ("mcp_api/notes.md", "NOT RUST"),
+            ("mcp_api_other.rs", "NOT THE MODULE"),
+        ] {
+            let path = src.join(rel);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write fixture");
+        }
+        let files = super::mcp_api_source_files_under(src);
+        let names: Vec<&str> = files.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "mcp_api.rs",
+                "mcp_api/coord_mcp_proxy/tool_policy.rs",
+                "mcp_api/vcs_pr.rs",
+            ]
+        );
+        // A file without a trailing newline never fuses with the next one.
+        assert_eq!(super::join_sources(&files), "ROOT\nPOLICY\nVCS\n");
+    }
+
+    /// The real tree: the root is read, and is the first file.
+    #[test]
+    fn the_real_module_starts_with_its_root() {
+        let files = super::mcp_api_source_files();
+        assert_eq!(
+            files.first().map(|(rel, _)| rel.as_str()),
+            Some("mcp_api.rs")
+        );
+        assert!(super::mcp_api_sources().contains("pub(crate) fn mcp_api_sources() -> String {"));
+    }
+
+    /// The production filter, driven against a split-shaped fixture so each of
+    /// its rules is seen to bite: an inline test `mod`, a test-only `fn`, an
+    /// out-of-line test module and its file (plus a nested one under it) are
+    /// all dropped, and production text in every file survives, per file.
+    #[test]
+    fn production_files_drop_every_test_shape_and_keep_production() {
+        let files = vec![
+            (
+                "mcp_api.rs".to_string(),
+                "fn keep_root() {}\n#[cfg(test)]\npub(crate) fn helper() {\n    BUILD();\n}\n\
+                 #[cfg(test)]\nmod extracted_tests;\n#[cfg(test)]\nmod inline_tests {\n    BUILD();\n}\n\
+                 fn keep_after() {}\n"
+                    .to_string(),
+            ),
+            (
+                "mcp_api/extracted_tests.rs".to_string(),
+                "fn fixture() { BUILD(); }\n".to_string(),
+            ),
+            (
+                "mcp_api/extracted_tests/deeper.rs".to_string(),
+                "fn fixture() { BUILD(); }\n".to_string(),
+            ),
+            (
+                "mcp_api/extracted_tests_not.rs".to_string(),
+                "fn keep_sibling() {}\n".to_string(),
+            ),
+            (
+                "mcp_api/vcs_pr.rs".to_string(),
+                "fn keep_child() {}\n#[cfg(test)]\nmod tests {\n    BUILD();\n}\n".to_string(),
+            ),
+        ];
+        let production = super::production_files(&files);
+        let names: Vec<&str> = production.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "mcp_api.rs",
+                "mcp_api/extracted_tests_not.rs",
+                "mcp_api/vcs_pr.rs"
+            ]
+        );
+        let text = super::join_sources(&production);
+        assert!(!text.contains("BUILD"), "{text}");
+        for kept in ["keep_root", "keep_after", "keep_sibling", "keep_child"] {
+            assert!(text.contains(kept), "{kept} dropped:\n{text}");
+        }
+    }
+
+    /// A `#[cfg(test)]` on a shape the filter cannot bound is refused, named by
+    /// file and line — never silently swallowed.
+    #[test]
+    #[should_panic(expected = "mcp_api/vcs_pr.rs:2 gates `use foo;`")]
+    fn production_files_refuse_an_unboundable_cfg_test_item() {
+        super::production_files(&[(
+            "mcp_api/vcs_pr.rs".to_string(),
+            "fn a() {}\n#[cfg(test)]\nuse foo;\nfn b() {}\n".to_string(),
+        )]);
+    }
+
+    /// The post-split shape the finder exists for: the item lives in a CHILD
+    /// file, while the root (which sorts first) carries the tests that quote
+    /// its signature in a string literal and mention it in an indented line.
+    /// The finder must return the child's real body, stop at that body's own
+    /// closing brace, and never run on into the next file.
+    #[test]
+    fn item_source_finds_the_moved_body_not_the_tests_quoting_it() {
+        let files = vec![
+            (
+                "mcp_api.rs".to_string(),
+                "mod coord_mcp_proxy;\n    async fn handler( indented mention\n\
+                 #[cfg(test)]\nmod tests {\n    fn t() { find(\"async fn handler(\"); QUOTED(); }\n}\n"
+                    .to_string(),
+            ),
+            (
+                "mcp_api/coord_mcp_proxy.rs".to_string(),
+                "/// docs\npub(super) async fn handler(\n    x: u8,\n) {\n    REAL();\n}\n\
+                 fn after() { AFTER(); }\n"
+                    .to_string(),
+            ),
+            (
+                "mcp_api/zz_next.rs".to_string(),
+                "fn next_file() { NEXT(); }\n".to_string(),
+            ),
+        ];
+        let body = super::item_source_in(&files, "async fn handler(");
+        assert!(body.starts_with("pub(super) async fn handler("), "{body}");
+        assert!(body.contains("REAL()") && body.ends_with("\n}"), "{body}");
+        for absent in ["QUOTED", "AFTER", "NEXT", "indented"] {
+            assert!(!body.contains(absent), "{absent} leaked into:\n{body}");
+        }
+    }
+
+    /// Declared twice is refused, naming both files: the first-sorting copy
+    /// must not silently shadow the other.
+    #[test]
+    #[should_panic(expected = "found it in [\"mcp_api.rs\", \"mcp_api/b.rs\"]")]
+    fn item_source_refuses_a_duplicate_declaration() {
+        super::item_source_in(
+            &[
+                ("mcp_api.rs".to_string(), "fn dup() {\n}\n".to_string()),
+                ("mcp_api/b.rs".to_string(), "fn dup() {\n}\n".to_string()),
+            ],
+            "fn dup(",
+        );
+    }
+
+    /// Absent is refused too — a scan over nothing must not pass.
+    #[test]
+    #[should_panic(expected = "found it in []")]
+    fn item_source_refuses_an_absent_item() {
+        super::item_source_in(
+            &[("mcp_api.rs".to_string(), "fn other() {\n}\n".to_string())],
+            "fn missing(",
+        );
+    }
+
+    /// A one-line item is refused by name: its `{}` closes on the signature
+    /// line, so the next column-0 `}` belongs to some LATER item and the
+    /// returned "body" would carry that item's text.
+    #[test]
+    #[should_panic(expected = "`fn tiny(` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_declaration() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "fn tiny() {}\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "fn tiny(",
+        );
+    }
+
+    /// The same one-line body with a trailing comment: `// why` must not hide
+    /// the `}` that already closed it.
+    #[test]
+    #[should_panic(expected = "`fn tiny(` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_declaration_with_a_trailing_comment() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "fn tiny() {} // why\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "fn tiny(",
+        );
+    }
+
+    /// A one-line `const` has no braces at all and ends in `;` — it too would
+    /// run on into the next item's body.
+    #[test]
+    #[should_panic(expected = "`const LIMIT:` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_const() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "const LIMIT: usize = 4;\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "const LIMIT:",
+        );
+    }
+
+    /// What the refusal must NOT catch: a signature line that continues — an
+    /// opening `{`, a split parameter list, a return type whose `{` is on the
+    /// next line — and literals or comments that only LOOK like a close.
+    #[test]
+    fn a_continuing_signature_line_is_not_a_one_line_declaration() {
+        for line in [
+            "async fn health(State(s): State<S>) -> Json<Value> {",
+            "async fn coord_mcp_proxy_handler(",
+            "fn split(a: A,",
+            "fn returns() -> impl Fn() -> u8",
+            "fn braces_in_a_literal() -> &'static str { // \"}\" is text",
+            "const URL: &str = concat!(\"http://x\", {",
+            "fn ch() -> char { '}' // a char literal",
+            "fn raw() -> &'static str { r#\"a\"b}\"#",
+            "fn raw() -> &'static [u8] { br#\"}\"#",
+            "fn plain_raw() -> &'static str { r\"}\"",
+            "fn commented() { /* } */",
+            "fn nested() { /* /* } */ } */",
+            "fn esc() -> char { '\\'' // }",
+        ] {
+            assert!(
+                !super::declaration_ends_on_its_line(line),
+                "{line:?} continues on the next line"
+            );
+        }
+        for line in [
+            "fn tiny() {}",
+            "fn tiny() {} // why",
+            "struct S { a: u8 }",
+            "const URL: &str = \"http://x\";",
+            "static N: AtomicU64 = AtomicU64::new(0); // count",
+            "fn ch() -> char { '{' }",
+            "fn raw() -> &'static str { r#\"a\"b{\"# }",
+            "fn commented() {} /* { */",
+            "fn tail() {} /* an open comment {",
+            "fn ident_r() -> u8 { for_r(\"{\") }",
+        ] {
+            assert!(
+                super::declaration_ends_on_its_line(line),
+                "{line:?} ends on its own line"
+            );
+        }
+    }
+
+    /// The real module: the handler the source-scan pins read is found once.
+    #[test]
+    fn item_source_finds_the_real_coord_mcp_proxy_handler() {
+        let body = super::mcp_api_item_source("async fn coord_mcp_proxy_handler(");
+        assert!(body.contains("coord_mcp_url_with_source"), "{body}");
+    }
+}
+
 // Cached embedding-service probe state. Module-scope so heartbeats can read
 // the reachability bit without running the full async probe path — the
 // /health handler is the sole writer (compare_exchange-gated on 30s stale).
@@ -1616,6 +2219,7 @@ async fn health(
         native_ui_wedged: native_ui.wedged,
         embedding_reachable: embedding_reachable_cached(),
         pg_reachable,
+        pg_schema_ok: schema_ok,
         relay_connected,
         // M7: a credential-dark runner is DEGRADED, not healthy. `None` while
         // no refresher pass has concluded — UNKNOWN, never health.
@@ -1874,6 +2478,14 @@ async fn health(
         // populated only when unauthenticated (incl. the gh-not-installed
         // case). /health never blocks on the probe.
         "prCredential": pr_credential_health(),
+        // The instance root this runner was launched under
+        // (`QONTINUI_INSTANCE_ROOT`), or `null` for a runner that is not a
+        // subject. Plan
+        // 2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-
+        // runner D5: a client that reached this port can tell a subject from
+        // the harness, and find the subject's own `~/.qontinui` (loopback key,
+        // api-port records) under `<instanceRoot>/home`.
+        "instanceRoot": crate::instance::instance_root().map(|r| r.display().to_string()),
         // Session-fabric Phase 0: how each proxied coord call resolved the
         // caller's own coord agent_session_id, since this process booted.
         // coord sees only "header present / absent" — this is the ONLY place
@@ -2079,6 +2691,11 @@ async fn health(
         // `{driftedTools: [], …}` = observed clean. Same producer as
         // `/coord-mcp/tool-policy`'s field, never re-derived.
         "coordMcpDrift": observed_coord_mcp_drift_json(),
+        // The reverse direction: names this door forwards that coord did not
+        // advertise to the DEVICE principal on the last readable `tools/list`.
+        // `null` = no device `tools/list` recorded since boot (UNKNOWN); an
+        // unreadable later answer leaves the previous reading in place.
+        "coordMcpForwardedUnadvertised": observed_forwarded_unadvertised_json(),
         // `coord_mcp_tenant_verdict_total{verdict}` since boot (plan
         // 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-
         // answer-names-its-tenant, Phase 2): how coord-mcp answers compared
@@ -2274,8 +2891,9 @@ async fn drain_handler(
 /// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
 /// registered proxy nonce (from `Authorization: Bearer <nonce>` or the legacy
 /// `X-Coord-Mcp-Proxy-Key`) AND the live bearer decodes
-/// `sub_type == "device"` — the proxy must never attach a non-device token
-/// (agent-spawn sessions carry their own narrower JWT and never route here).
+/// `sub_type == "device"` for a DEVICE nonce. A nonce bound to an agent
+/// (`ProxyPrincipal::Agent`) forwards with THAT agent's own JWT instead; the
+/// proxy never attaches the device credential on an agent's behalf.
 ///
 /// Transport: coord `/mcp` is single-shot `application/json` JSON-RPC per POST
 /// (no SSE, no session machinery), so this is a plain passthrough — forward
@@ -4573,14 +5191,18 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// defense-in-depth, not the sole authority.
 ///
 /// DELIBERATELY EXCLUDED (add only with a security rationale): the onboarding
-/// / enrollment family (`coord_onboard_*`, `coord_onboarding_doctor`),
-/// privilege escalation (`coord_attest_escalate_override`), merge authority
-/// (`coord_request_merge`, `coord_cancel_merge`, `coord_pr_merge_verdict`,
-/// `coord_pr_merge_profile`), code publication (`coord_create_pr`,
-/// `coord_push_to_branch` — sessions open PRs via the dedicated
-/// `/vcs/pull-requests` loopback route, not this proxy), reservations
-/// (`coord_migration_reserve`, `coord_reserve_resource`), and policy/state
-/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`).
+/// / enrollment family (`coord_onboard_*`, `coord_onboarding_doctor`,
+/// `coord_enroll_repo`), privilege escalation (`coord_attest_escalate_override`,
+/// `coord_attest_advisory_ci_override`), merge authority (`coord_request_merge`,
+/// `coord_cancel_merge`, `coord_pr_merge_verdict`, `coord_pr_merge_profile`,
+/// `coord_set_pr_draft`), code publication (`coord_create_pr`,
+/// `coord_push_to_branch`, `coord_push_credential` — sessions open PRs via the
+/// dedicated `/vcs/pull-requests` loopback route, not this proxy), reservations
+/// (`coord_migration_reserve`, `coord_reserve_resource`), policy/state
+/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`),
+/// and per-agent levers coord would also hand to every un-curated agent
+/// (`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
+/// `coord_fleet_undrain_host`).
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
@@ -4823,11 +5445,32 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// carrying the continuation, and withdraws the source — the ONLY way to re-arm a
 /// superseded watch, because `continuation_spawn` is write-once at registration.
 /// coord grants it on the device floor and its core enforces the REGISTRANT rule
-/// (the same floor `coord_withdraw_gate`, already here, rests on), so forwarding it
-/// reaches only gates this device registered. Withheld, the remedy
-/// `coord_gate_doctor`'s `continuation_cancelled_not_rearmed` smell names would
-/// answer `-32601` from inside the product — the supersede would keep losing its
-/// arm silently, which is the defect the verb exists to end.
+/// (the same floor `coord_withdraw_gate`, already here, rests on). Withheld, the
+/// remedy `coord_gate_doctor`'s `continuation_cancelled_not_rearmed` smell names
+/// would answer `-32601` from inside the product — the supersede would keep losing
+/// its arm silently, which is the defect the verb exists to end.
+///
+/// The registrant rule is no longer the WHOLE rule, so forwarding it does not reach
+/// "only gates this device registered" (plan
+/// `2026-09-23-an-adopter-cannot-re-anchor-a-gate-it-did-not-register`). When the
+/// registrant check fails, coord runs a narrower SUPERSESSION arm: a non-registrant
+/// device may re-point a `pr_merged` gate, including a system-registered one with
+/// no recorded registrant. It may do so only when the source's continuation was
+/// never cancelled, and when coord holds a live, tenant-confined
+/// `supersession_declared` row naming the supplied predicate as a recorded
+/// successor. That is a wider REACH under a coord-provable precondition, not a
+/// wider TRUST. `coord_declare_supersession`, forwarded beside it, is the direct
+/// door that writes that row when the successor's title token recorded nothing.
+/// coord verifies every precondition itself (`record_agent_declaration`): it holds a
+/// record of the predecessor, the caller's tenant owns both repos, the successor
+/// LANDED by coord's own record and is not a fork, the successor's title or body
+/// references the predecessor (the provenance link that stops a device pairing two
+/// arbitrary PRs), its author is trusted or may write to the repo, and the
+/// predecessor has not itself landed. Such a row feeds the gate move, the card's
+/// `superseded_by` and the deferred-fail probe, NEVER a coord close: the
+/// superseded-predecessor closer skips agent-declared rows and closes only on a
+/// title declaration. Without that door, when the title recorded nothing, only the
+/// gate's registrant could move it, and no operator twin of the re-point exists.
 ///
 /// `coord_citations_reenrich` is IN because it is a SHIPPED REPAIR ROUTE, and a
 /// repair route an agent cannot reach is the defect it was built to close (plan
@@ -4914,6 +5557,46 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   same shape as `coord_post_finding`: it records what an overlord did, and
 ///   performs nothing.
 ///
+/// Finding `31a69d12` (posted by this runner itself on build `44691aaec4d4`)
+/// reported eleven names that coord ADVERTISED to this door's principal, which
+/// this list neither allowed nor named as deliberate. Each was classified; the
+/// design-fork record is coord finding `4ba64e8b` (correcting `73b15a9b`, which
+/// revised `e652d447`).
+/// None of the eleven is on coord's device floor at coord `origin/main`
+/// `1e720228b802`, so which coord build and principal advertised them is
+/// unestablished. That is why forwarding
+/// is limited to names whose call is harmless if coord refuses it, and safe if
+/// coord grants it. Three are IN:
+///
+/// * `coord_check_repo_name`: an availability probe.
+/// * `coord_create_repo`: creates an EMPTY repository under an owner bound to
+///   the caller's tenant. It publishes no code (its sibling
+///   `coord_push_credential` is excluded), but a repository it creates can be
+///   PUBLIC (`private: false`), which is visible outside the tenant. That side
+///   effect is accepted: the call is owner-bound and rate-limited per caller,
+///   and the repository is empty.
+/// * `coord_pin_worktree`: sets a worktree's retention. Pinning keeps reclaim
+///   off it. Unpinning (`retention: auto`) applies to any `agent_id` in the
+///   tenant and hands the worktree back to reclaim. Reclaim's own dirtiness
+///   guard still refuses to remove a tree with uncommitted work, so nothing is
+///   deleted by this call itself.
+///
+/// The other eight are in [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its
+/// reason in that list's note.
+///
+/// `coord_merge_order` stays IN although coord keeps it off the device floor.
+/// It is a READ: it composes a safe merge ordering from the queue, the PR
+/// dependency edges and the plan `Depends-On` graph. coord grants it to the
+/// per-agent `merger` role template, and merger agents reach this door with
+/// their own JWT, so coord's allow-set is the gate for each principal: a device
+/// gets coord's refusal, and a merger gets the tool (the runner's merge-shepherd
+/// playbook names it as one of its merge levers). The reverse-parity
+/// observation reports it for a DEVICE principal, and that report is expected.
+/// It is not the only such name: about fifty forwarded names were off coord's
+/// device floor at `origin/main` `2e9c85585` (for example `coord_claim_acquire`,
+/// `coord_build_info`, `coord_yield`). That backlog is why the observation logs
+/// at INFO and is read from `/health`, not raised as a WARN on every boot.
+///
 /// Forwarding a name coord does not yet serve is harmless — coord answers it as
 /// an unknown tool — so these entries may land ahead of the coord side.
 ///
@@ -4951,21 +5634,26 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_check_gate_predicate",
     "coord_check_install_safety",
     "coord_check_publish_safety",
+    "coord_check_repo_name",
     "coord_citations_reenrich",
     "coord_claim_acquire",
     "coord_claim_check",
     "coord_claim_heartbeat",
     "coord_claim_release",
     "coord_conflict_check",
+    "coord_create_repo",
     "coord_declare_intent",
     // The direct supersession-declaration door (qontinui-coord, operator
     // directive 2026-10-03, served policy `git-operations`
     // `a-landed-adoption-closes-its-predecessor`). It records the declaration
     // `coord_repoint_gate`'s supersession arm needs when a successor's title
-    // token was missing or not recorded — every precondition (tenant owns both
-    // repos, successor LANDED, successor not a fork) is verified by coord.
-    // Withheld here it would answer `-32601`, and the adoption's last two steps
-    // (move the gate, close the predecessor) would stay operator-only.
+    // token was missing or not recorded — every precondition (coord knows the
+    // predecessor, tenant owns both repos, successor LANDED and not a fork,
+    // successor's text references the predecessor, author trusted or a repo
+    // writer, predecessor not landed) is verified by coord. Withheld here it
+    // would answer `-32601`, and only the gate's registrant could move it. It
+    // never authorizes a coord CLOSE of the predecessor: the
+    // closer skips agent-declared rows and acts only on a title declaration.
     "coord_declare_supersession",
     "coord_diagnose",
     "coord_diff_impact",
@@ -4975,6 +5663,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_expectation_checkin",
     "coord_expectation_close",
     "coord_expectation_register",
+    // Plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b: the
+    // READ-BACK of an expedited-land request. A read — it reports a request's
+    // state, refusal and land sha, and lands nothing. Its write twin,
+    // `coord_request_expedited_land`, is a DELIBERATE exclusion (below).
+    "coord_expedited_land_status",
     "coord_explain_isolation_decision",
     "coord_explain_pr_close",
     "coord_explain_ref_event",
@@ -5009,6 +5702,12 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_memory_search",
     "coord_memory_supersede",
     "coord_merge_order",
+    // Plan 2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant
+    // Phase 1: coord's sender-side receipt read — the messaging family's
+    // sender-side verb beside `coord_send_message` / `coord_inbox` / `coord_ack_message`,
+    // so a sender can see whether its message was delivered and acked. coord's
+    // device grant is the authority; this list only forwards.
+    "coord_message_status",
     "coord_migration_queue",
     "coord_mute_gate",
     "coord_next_step_settings_effective",
@@ -5018,6 +5717,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_overlord_interventions",
     "coord_overlord_record",
     "coord_pending_agent_questions",
+    "coord_pin_worktree",
     "coord_post_finding",
     // The agent-facing coord:* PR-label door (plan
     // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a) — the pair an
@@ -5146,20 +5846,116 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 /// "stale_binary"`, which is the refusal saying the same thing.
 ///
 /// MUST stay sorted — membership is a `binary_search`.
+///
+/// Eight of them were added on the classification of finding `31a69d12` (record:
+/// coord finding `4ba64e8b`, correcting `73b15a9b`). None of them was forwarded
+/// before, so listing it here takes nothing away. Four join an existing family
+/// in the note above, and the fleet-drain writes start a new one (per-agent
+/// grants):
+///
+/// * `coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
+///   `coord_fleet_undrain_host`: coord keeps these off its device floor and
+///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`), so
+///   a dev-ops agent holds them and an ordinary implementation agent does not.
+///   Agents DO reach this door: a nonce bound to an agent (`ProxyPrincipal::Agent`)
+///   forwards with that agent's own JWT. But coord gives an agent token with NO
+///   `coord.agent_tool_access` rows its whole UN-CURATED catalog (`allow ==
+///   None`), which includes these four. Forwarding them would therefore hand a
+///   fleet-wide capacity lever to every spawned agent that has no rows, which is
+///   exactly the agent the decision withholds them from. They stay withheld
+///   here until coord curates row-less agents; then move them to the allowlist
+///   and let coord's per-agent grant decide.
+/// * `coord_push_credential`: code publication. It mints a `contents:write`
+///   token for ANY repository under a tenant-bound owner, including existing
+///   ones, which is a raw push that bypasses the PR path. That is a stronger
+///   form of what `coord_push_to_branch` is excluded for. Its HTTP twin admits
+///   a device, so whether devices should hold it at all is coord's decision to
+///   make in one place; this door does not pre-empt it.
+/// * `coord_enroll_repo`: the onboarding / enrollment family the allowlist note
+///   excludes. The `coord_onboard` prefix does not catch its name, so it is
+///   listed explicitly. Its HTTP twin is on coord's device/agent router, so a
+///   session that created a repository can still enroll it over HTTP.
+/// * `coord_attest_advisory_ci_override`: one of coord's four
+///   `require_strategy_admin` tools. No device or agent token carries
+///   `strategy_admin` today. That is a mint convention, not a structural
+///   guarantee, so this exclusion keeps the override in the operator family. Its
+///   twin `coord_attest_escalate_override` is excluded as privilege escalation
+///   (and is also `require_strategy_admin`).
+/// * `coord_set_pr_draft`: merge authority. A PR's draft state is the
+///   operator's release lever under the served `security-surface-implement-tier`
+///   setting `draft-required` ("the operator undrafts to release it to the
+///   train").
+///
+/// Two more are recorded here because coord grants them on the device floor and
+/// this list masks them on purpose. They were found while classifying the
+/// eleven above:
+///
+/// * `coord_create_pr`: coord grants it on the device floor (operator decision
+///   2026-08-04), and this door MASKS it anyway. That is a recorded deselection,
+///   not drift: served policy `git-operations`
+///   `masked-is-not-missing-and-the-loopback-door-precedes-the-fallback`, and the
+///   non-goal of plan `2026-08-22-primary-runner-build-drift-reads-as-a-policy-boundary`
+///   ("Do not allowlist it"). Sessions open PRs through the loopback
+///   `POST /vcs/pull-requests` door instead.
+/// * `coord_cancel_merge`: coord also put it on the device floor (2026-08-09,
+///   plan `2026-07-30-coord-tenant-self-service-merge-recovery`, coord#1409).
+///   Its HTTP twin `POST /pr-merge/tenant/proposals/:id/cancel` admits a device,
+///   so a session that must withdraw its own tenant's proposal still has that
+///   door. It stays withheld HERE for the same reason as `coord_create_pr`: the
+///   non-goal of plan
+///   `2026-08-22-primary-runner-build-drift-reads-as-a-policy-boundary` names it
+///   among the exclusions that are "decisions, not drift". It was explicitly
+///   left unmoved when `coord_reevaluate` was granted (2026-08-31). Reversing it
+///   is a decision to make on its own, not as a side effect of a parity sweep.
 const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
+    "coord_attest_advisory_ci_override",
     "coord_attest_escalate_override",
     "coord_cancel_merge",
     "coord_create_pr",
+    "coord_enroll_repo",
     "coord_flag_state",
     "coord_flag_states",
+    "coord_fleet_drain",
+    "coord_fleet_drain_host",
+    "coord_fleet_undrain",
+    "coord_fleet_undrain_host",
     "coord_migration_reserve",
     "coord_pr_merge_profile",
     "coord_pr_merge_verdict",
+    "coord_push_credential",
     "coord_push_to_branch",
+    // Plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b. Merge
+    // authority, withheld on purpose: through this proxy a call carries the
+    // runner's PAIRED-DEVICE JWT, which passes coord's possession check, and
+    // coord's caller-session check is advisory — so a leaked session nonce
+    // would reach a land lever. Merge tools are owed their own argument, not a
+    // sweep. Sessions use the device-JWT HTTP twin instead
+    // (`COORD_MCP_DELIBERATE_EXCLUSION_DOORS`), which the -32601 names.
+    "coord_request_expedited_land",
     "coord_request_merge",
     "coord_request_policy",
     "coord_reserve_resource",
+    "coord_set_pr_draft",
 ];
+
+/// For a deliberate exclusion that HAS a sanctioned door elsewhere, the door a
+/// `-32601` names instead of the generic "reach coord's /mcp directly". A
+/// mechanical pointer, not authority: coord enforces its own checks on that
+/// door (`security-and-autonomy` content trigger 6 — the denial names an
+/// alternative path, deliberately).
+const COORD_MCP_DELIBERATE_EXCLUSION_DOORS: &[(&str, &str)] = &[(
+    "coord_request_expedited_land",
+    "POST /pr-merge/repos/:repo/pulls/:number/agent/expedite on coord with a device JWT and \
+     your session id as X-Coord-Caller-Session (the expedited-land HTTP twin)",
+)];
+
+/// The sanctioned alternative door for a deliberately-excluded tool, if any.
+fn coord_mcp_deliberate_exclusion_door(name: &str) -> Option<&'static str> {
+    COORD_MCP_DELIBERATE_EXCLUSION_DOORS
+        .iter()
+        .find(|(t, _)| *t == name)
+        .map(|(_, door)| *door)
+}
 
 /// Deliberately-excluded FAMILIES by prefix. `coord_onboard` is deliberately
 /// short of a trailing underscore so it covers both the `coord_onboard_*` calls
@@ -5241,6 +6037,8 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         // as `/health`'s `coordMcpDrift`. `null` = no `tools/list` observed
         // since boot (UNKNOWN, not zero); `{driftedTools: [], …}` = clean.
         "coordMcpDrift": observed_coord_mcp_drift_json(),
+        // The reverse direction, same producer as `/health`'s field.
+        "coordMcpForwardedUnadvertised": observed_forwarded_unadvertised_json(),
         // Say what the numbers mean, in the response, because a reader who has
         // to go find the rule will assume the wrong one.
         "readThis": "These are the lists COMPILED INTO THE RUNNING BINARY. A -32601 from \
@@ -5526,6 +6324,105 @@ fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Ve
         }
     });
     true
+}
+
+/// The other direction of the parity check. Returns the exact names this door
+/// FORWARDS (`COORD_MCP_ALLOWED_TOOLS`) that coord's own `tools/list` for this
+/// principal does NOT advertise. coord filters `tools/list` by the caller's
+/// allow-set, so every name here is one this door would forward and coord would
+/// refuse: a capability the allowlist claims and the session does not have.
+///
+/// `None` means UNKNOWN, never "clean": the request is not a `tools/list`, the
+/// response is not JSON, there is no `result.tools` array, or coord paginated
+/// the list (`result.nextCursor`). One page cannot show what a later page
+/// carries. Names forwarded only through `COORD_MCP_ALLOWED_TOOL_PREFIXES` are
+/// never reported; an enumerated `coord_query_*` entry is. A name in this set
+/// is not necessarily wrong: an entry may land ahead of coord's grant on
+/// purpose (see the allowlist note). It is reported so that a
+/// forwarded-but-ungranted name is a visible, per-box fact, not a silent
+/// `-32601`.
+fn coord_mcp_forwarded_unadvertised(request: &[u8], response: &[u8]) -> Option<Vec<String>> {
+    if !coord_mcp_request_is_tools_list(request) {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(response).ok()?;
+    let result = parsed.get("result")?;
+    if result.get("nextCursor").is_some_and(|c| !c.is_null()) {
+        return None;
+    }
+    let advertised: std::collections::HashSet<&str> = result
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    Some(
+        COORD_MCP_ALLOWED_TOOLS
+            .iter()
+            .filter(|name| !advertised.contains(**name))
+            .map(|name| name.to_string())
+            .collect(),
+    )
+}
+
+/// One forwarded-but-unadvertised observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedForwardedUnadvertised {
+    /// Forwarded names coord did not advertise, sorted. Empty = observed clean.
+    names: Vec<String>,
+    /// Unix millis of the `tools/list` that produced it.
+    observed_at: i64,
+}
+
+/// The last forwarded-but-unadvertised observation (see
+/// [`coord_mcp_forwarded_unadvertised`]), served beside `coordMcpDrift`. Only a
+/// DEVICE principal's `tools/list` is recorded: coord's answer differs by
+/// principal (device floor, a role template, or an un-curated agent's whole
+/// catalog), and the allowlist's parity target is the device floor. An agent's
+/// answer would report most of the list and overwrite the device reading.
+static LAST_OBSERVED_FORWARDED_UNADVERTISED: std::sync::OnceLock<
+    std::sync::Mutex<Option<ObservedForwardedUnadvertised>>,
+> = std::sync::OnceLock::new();
+
+fn observed_forwarded_unadvertised_cell(
+) -> &'static std::sync::Mutex<Option<ObservedForwardedUnadvertised>> {
+    LAST_OBSERVED_FORWARDED_UNADVERTISED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Record one observation. Returns `true` when the set CHANGED from the last
+/// one this process recorded, so the caller warns once per distinct set rather
+/// than on every `tools/list`.
+fn record_forwarded_unadvertised_in(
+    cell: &std::sync::Mutex<Option<ObservedForwardedUnadvertised>>,
+    names: Vec<String>,
+) -> bool {
+    let Ok(mut g) = cell.lock() else {
+        return false;
+    };
+    let changed = g.as_ref().map(|o| o.names != names).unwrap_or(true);
+    *g = Some(ObservedForwardedUnadvertised {
+        names,
+        observed_at: chrono::Utc::now().timestamp_millis(),
+    });
+    changed
+}
+
+/// Wire shape: `null` = never observed (UNKNOWN); otherwise the names, their
+/// count and when. Same producer for `/health` and `/coord-mcp/tool-policy`.
+fn observed_forwarded_unadvertised_json() -> serde_json::Value {
+    match observed_forwarded_unadvertised_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+    {
+        Some(o) => serde_json::json!({
+            "principal": "device",
+            "forwardedUnadvertisedTools": o.names,
+            "forwardedUnadvertisedCount": o.names.len(),
+            "observedAt": o.observed_at,
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// What a `tools/list` entry with no string `name` is recorded as in the
@@ -5901,11 +6798,17 @@ fn coord_mcp_refusal_cause(
             in_deliberate_exclusions,
             trunk_sha: trunk.map(|t| t.trunk_sha.clone()),
             trunk_source: trunk.map(|t| t.source),
-            remedy: format!(
-                "none — {tool} is withheld on purpose (COORD_MCP_DELIBERATE_EXCLUSIONS); do \
-                 not \"fix\" it. Reach coord's /mcp directly with a device JWT if the call \
-                 is genuinely yours to make."
-            ),
+            remedy: match coord_mcp_deliberate_exclusion_door(tool) {
+                Some(door) => format!(
+                    "none — {tool} is withheld on purpose (COORD_MCP_DELIBERATE_EXCLUSIONS); do \
+                     not \"fix\" it. Use {door}."
+                ),
+                None => format!(
+                    "none — {tool} is withheld on purpose (COORD_MCP_DELIBERATE_EXCLUSIONS); do \
+                     not \"fix\" it. Reach coord's /mcp directly with a device JWT if the call \
+                     is genuinely yours to make."
+                ),
+            },
         };
     }
     let Some(trunk) = trunk else {
@@ -7946,6 +8849,33 @@ async fn coord_mcp_proxy_handler(
         bytes
     };
 
+    // The reverse direction, measured on the UNFILTERED upstream answer: names
+    // this door forwards that coord does not grant a DEVICE principal. Warned
+    // once per distinct set; served on `/health` + `/coord-mcp/tool-policy`.
+    // An agent's `tools/list` is not recorded (its grant is a different set).
+    let unadvertised = if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
+        coord_mcp_forwarded_unadvertised(&body, &bytes)
+    } else {
+        None
+    };
+    if let Some(unadvertised) = unadvertised {
+        let count = unadvertised.len();
+        let joined = unadvertised.join(",");
+        if record_forwarded_unadvertised_in(observed_forwarded_unadvertised_cell(), unadvertised)
+            && count > 0
+        {
+            // INFO, not WARN: a known backlog of forwarded names sits off coord's
+            // device floor (see the allowlist note), so a WARN on every boot would
+            // train readers to ignore it. `/health` serves the set.
+            info!(
+                forwarded_unadvertised_count = count,
+                forwarded_unadvertised = %joined,
+                "coord-mcp proxy: COORD_MCP_ALLOWED_TOOLS forwards tools coord does not grant \
+                 the device principal — a device session calling them gets coord's refusal"
+            );
+        }
+    }
+
     // Keep the two gates in agreement: a `tools/list` answer is filtered
     // through the same allowlist that gates `tools/call`, so this door never
     // advertises a tool it would refuse to forward. See
@@ -8084,8 +9014,9 @@ async fn coord_mcp_proxy_handler(
 /// settled answer is returned as is; a transient unknown is returned at once
 /// and, once its retry window has passed, retried in a background task — a
 /// retry never delays a `tools/call`. A key with no live
-/// binding — a superseded key inside its grace window — carries no
-/// expectation, which is UNKNOWN and said, never agreement.
+/// binding and no grace entry carries no expectation, which is UNKNOWN and
+/// said, never agreement. A superseded key inside its grace window shares its
+/// evicted binding's expectation.
 async fn coord_mcp_apply_tenant_verdict(
     nonce: Option<&str>,
     request: &[u8],
@@ -8105,8 +9036,8 @@ async fn coord_mcp_apply_tenant_verdict(
             ),
             None => (
                 qontinui_runner_lib::repo_tenant::CwdTenant::unknown(
-                    "this proxy key has no live binding to carry an expectation \
-                     (a superseded key inside its grace window)",
+                    "this proxy key has no live binding or grace entry to carry an \
+                     expectation",
                 ),
                 None,
             ),
@@ -12846,6 +13777,7 @@ pub fn create_router(
         .merge(crate::mcp::disk_reclaim::routes())
         .merge(crate::mcp::agent_tokens::routes())
         .merge(crate::install_effects_producer::routes())
+        .merge(crate::session::resume_door::routes())
         .merge(crate::mcp::token_analytics::routes())
         .merge(crate::mcp::otel_status::routes())
         .merge(crate::mcp::container_status::routes())
@@ -12854,6 +13786,7 @@ pub fn create_router(
         .merge(crate::mcp::knowledge_acquisition_api::routes())
         .merge(crate::mcp::reviews::routes())
         .merge(crate::mcp::snapshots::routes())
+        .merge(crate::mcp::session_review::routes())
         .merge(crate::mcp::session_recap::routes())
         .merge(crate::mcp::api_surface::routes())
         .merge(crate::mcp::api_surface_diff::routes())
@@ -13294,7 +14227,7 @@ pub async fn start_server(
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
     // This can happen on Windows when previous process crashes leave orphaned sockets
-    let ports_to_try = [port, port + 1, port + 2];
+    let ports_to_try = crate::instance::api_ports_to_try(port);
     let mut last_error = None;
 
     for try_port in ports_to_try {
@@ -14089,17 +15022,11 @@ mod transport_rung_counter_tests {
         );
     }
 
-    /// The body of one `async fn` / `fn` in this file, comments stripped.
+    /// The body of one `async fn` / `fn` in the `mcp_api` module (whichever of
+    /// its files declares it — [`crate::mcp_api::mcp_api_item_source`]),
+    /// comments stripped.
     fn fn_body(name_with_paren: &str) -> String {
-        let text = include_str!("mcp_api.rs");
-        let start = text
-            .find(name_with_paren)
-            .unwrap_or_else(|| panic!("{name_with_paren} exists"));
-        let end = text[start..]
-            .find("\n}\n")
-            .map(|i| start + i)
-            .expect("its body ends");
-        text[start..end]
+        crate::mcp_api::mcp_api_item_source(name_with_paren)
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -14124,7 +15051,9 @@ mod transport_rung_counter_tests {
             record < forward,
             "the rung row must be written BEFORE the upstream forward"
         );
-        let call = &code[record..forward];
+        let call = code
+            .get(record..forward)
+            .expect("`find` returns char boundaries");
         assert!(
             call.contains("OPERATION_WRITE"),
             "the forwarder's row must say `write`, not a body-classified operation"
@@ -14147,7 +15076,10 @@ mod transport_rung_counter_tests {
             .find(") -> axum::response::Response")
             .expect("signature ends");
         assert!(
-            !code[..sig_end].contains("HeaderMap"),
+            !code
+                .get(..sig_end)
+                .expect("`find` returns a char boundary")
+                .contains("HeaderMap"),
             "forward_coord_write must not take the caller's request headers"
         );
         assert!(
@@ -14162,7 +15094,9 @@ mod transport_rung_counter_tests {
         }
         // …and the handler hands the leg no header map either.
         let handler = fn_body("async fn coord_write_proxy_handler(");
-        let call = &handler[handler.find("forward_coord_write(").unwrap()..];
+        let call = handler
+            .get(handler.find("forward_coord_write(").unwrap()..)
+            .expect("`find` returns a char boundary");
         assert!(
             !call.contains("&headers") && !call.contains("headers,"),
             "the handler must not pass request headers to the upstream leg"
@@ -16538,10 +17472,11 @@ mod memory_search_enrichment_tests {
 mod coord_mcp_body_gate_tests {
     use super::{
         coord_mcp_append_runner_local_tools, coord_mcp_body_gate,
-        coord_mcp_filter_tools_list_response, coord_mcp_runner_local_call,
-        coord_mcp_tool_is_allowed, coord_mcp_withholding_is_deliberate, CoordMcpToolsListFilter,
-        COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS, COORD_MCP_DELIBERATE_EXCLUSIONS,
-        RUNNER_LOCAL_REPORT_TOOL,
+        coord_mcp_filter_tools_list_response, coord_mcp_forwarded_unadvertised,
+        coord_mcp_runner_local_call, coord_mcp_tool_is_allowed,
+        coord_mcp_withholding_is_deliberate, record_forwarded_unadvertised_in,
+        CoordMcpToolsListFilter, COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS,
+        COORD_MCP_DELIBERATE_EXCLUSIONS, RUNNER_LOCAL_REPORT_TOOL,
     };
 
     fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
@@ -16574,8 +17509,7 @@ mod coord_mcp_body_gate_tests {
                 .is_ok(),
             "membership is a binary_search, so the entry must sit in sorted position"
         );
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         assert_eq!(
             parsed
                 .allowed
@@ -16595,8 +17529,7 @@ mod coord_mcp_body_gate_tests {
     /// entry back exactly once despite the comments above them.
     #[test]
     fn phase_attestation_tools_are_allowed_and_parse_from_source() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         for tool in [
             "coord_work_unit_attest_phase",
             "coord_work_unit_retract_phase_attestation",
@@ -16674,6 +17607,36 @@ mod coord_mcp_body_gate_tests {
                 }))
                 .is_ok(),
                 "{tool} must be callable through the proxy"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`
+    /// Phase 1: coord's sender-side receipt read forwards beside its messaging
+    /// siblings, sits in sorted position, and the source-text parser reads it
+    /// back exactly once despite the comment above it.
+    #[test]
+    fn coord_message_status_is_allowed_beside_its_messaging_siblings() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_ack_message",
+            "coord_inbox",
+            "coord_message_status",
+            "coord_send_message",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position"
             );
             assert_eq!(
                 parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
@@ -17244,6 +18207,174 @@ mod coord_mcp_body_gate_tests {
         }
     }
 
+    /// The proxy-vs-coord mismatches found beside finding `31a69d12`, pinned by
+    /// name. `coord_create_pr` and `coord_cancel_merge` are coord device grants
+    /// that this door masks on purpose (served policy `git-operations`
+    /// `masked-is-not-missing-and-the-loopback-door-precedes-the-fallback`).
+    /// `coord_merge_order` is off coord's device floor but granted to merger
+    /// agents, which reach this door with their own JWT, so it stays forwarded.
+    #[test]
+    fn proxy_and_coord_grant_mismatches_are_decided() {
+        assert!(coord_mcp_tool_is_allowed("coord_merge_order"));
+        assert!(!coord_mcp_withholding_is_deliberate("coord_merge_order"));
+        for tool in ["coord_create_pr", "coord_cancel_merge"] {
+            assert!(
+                !coord_mcp_tool_is_allowed(tool),
+                "{tool} must not be forwarded"
+            );
+            assert!(
+                coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must be a recorded exclusion, not drift"
+            );
+        }
+    }
+
+    fn tools_list_answer(names: &[&str], next_cursor: Option<&str>) -> Vec<u8> {
+        let tools: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect();
+        let mut result = serde_json::json!({ "tools": tools });
+        if let Some(c) = next_cursor {
+            result["nextCursor"] = serde_json::json!(c);
+        }
+        serde_json::to_vec(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+            .unwrap()
+    }
+
+    /// Proxy ⊆ coord grant. When coord advertises every forwarded name, the
+    /// reverse check reports nothing. Drop one from coord's answer and exactly
+    /// that name is reported. A `coord_query_*` name forwarded only by prefix is
+    /// never reported, but an ENUMERATED one is. A tool coord advertises that
+    /// this door does not forward is the OTHER direction's business, so it is
+    /// not reported here either.
+    #[test]
+    fn forwarded_unadvertised_reports_exactly_the_forwarded_names_coord_withholds() {
+        let mut all: Vec<&str> = COORD_MCP_ALLOWED_TOOLS.to_vec();
+        all.push("coord_create_pr");
+        all.push("coord_query_anything");
+        let clean = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&all, None),
+        );
+        assert_eq!(
+            clean,
+            Some(Vec::new()),
+            "every forwarded name advertised = clean"
+        );
+
+        let missing = COORD_MCP_ALLOWED_TOOLS[0];
+        let without: Vec<&str> = all.iter().copied().filter(|n| *n != missing).collect();
+        let got = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&without, None),
+        );
+        assert_eq!(got, Some(vec![missing.to_string()]));
+
+        // An enumerated `coord_query_*` entry IS reported when coord omits it.
+        let enumerated = "coord_query_verification_metrics";
+        assert!(COORD_MCP_ALLOWED_TOOLS.contains(&enumerated));
+        let without_query: Vec<&str> = all.iter().copied().filter(|n| *n != enumerated).collect();
+        let got = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&without_query, None),
+        );
+        assert_eq!(got, Some(vec![enumerated.to_string()]));
+    }
+
+    /// UNKNOWN is never reported as clean: a non-`tools/list` request, a
+    /// non-JSON body, a body with no `result.tools`, and a PAGINATED list (one
+    /// page cannot show what a later page carries) all answer `None`.
+    #[test]
+    fn forwarded_unadvertised_is_unknown_when_the_list_cannot_be_read_whole() {
+        let call =
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_orient"}}"#;
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(call, &tools_list_answer(&[], None)),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(TOOLS_LIST_REQ.as_bytes(), b"<html>gateway</html>"),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                &tools_list_answer(&["coord_orient"], Some("page-2"))
+            ),
+            None
+        );
+        // A batch `tools/list` answers with an array; no `result` at the top.
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                br#"[{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}]"#
+            ),
+            None
+        );
+    }
+
+    /// The warn fires once per DISTINCT set, not on every `tools/list`.
+    #[test]
+    fn forwarded_unadvertised_warns_once_per_distinct_set() {
+        let cell = std::sync::Mutex::new(None);
+        assert!(record_forwarded_unadvertised_in(
+            &cell,
+            vec!["coord_a".into()]
+        ));
+        assert!(!record_forwarded_unadvertised_in(
+            &cell,
+            vec!["coord_a".into()]
+        ));
+        assert!(record_forwarded_unadvertised_in(&cell, vec![]));
+        assert!(!record_forwarded_unadvertised_in(&cell, vec![]));
+    }
+
+    /// Finding `31a69d12`: the eleven names coord advertised that this door had
+    /// left unclassified. A literal enumeration of the decision recorded in
+    /// coord finding `4ba64e8b`. Moving any name between the two lists reds
+    /// this test by name, so the decision cannot change by drift.
+    #[test]
+    fn finding_31a69d12_drift_is_classified() {
+        for tool in [
+            "coord_check_repo_name",
+            "coord_create_repo",
+            "coord_pin_worktree",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not also read as a deliberate withholding"
+            );
+        }
+        for tool in [
+            "coord_fleet_drain",
+            "coord_fleet_undrain",
+            "coord_fleet_drain_host",
+            "coord_fleet_undrain_host",
+            "coord_push_credential",
+            "coord_enroll_repo",
+            "coord_attest_advisory_ci_override",
+            "coord_set_pr_draft",
+        ] {
+            assert!(
+                !coord_mcp_tool_is_allowed(tool),
+                "{tool} must stay withheld"
+            );
+            assert!(
+                coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must be recorded as a deliberate exclusion, not drift"
+            );
+        }
+    }
+
     /// The agent escalate-evidence door and the ten device-floor names found
     /// beside it (see [`COORD_MCP_ALLOWED_TOOLS`]'s note) must be forwarded,
     /// while the operator escape hatch for the same block stays withheld. A
@@ -17383,14 +18514,32 @@ mod coord_mcp_body_gate_tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The parser reads THIS file's four consts back exactly as they compiled.
-    /// A reformat that breaks the parser breaks this test, not production
-    /// (production degrades to `cause: "unknown"`), so the parser cannot rot
-    /// silently against the one file it exists to read.
+    /// The tool policy as PRODUCTION reads it — through
+    /// [`crate::build_drift::first_parsable_tool_policy`], ONE file at a time
+    /// from its path list — but over this working tree instead of `git show`
+    /// at trunk. Parsing the whole module's concatenation instead would stay
+    /// green while production answered `cause: "unknown"`: consts moved to a
+    /// file not on the path list, or split across two files, both still parse
+    /// as one text.
+    fn working_tree_tool_policy() -> crate::build_drift::ParsedToolPolicy {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        crate::build_drift::first_parsable_tool_policy(|rel| {
+            std::fs::read_to_string(repo_root.join(rel)).ok()
+        })
+        .expect(
+            "one file on build_drift's TOOL_POLICY_SOURCE_PATHS declares all four \
+             consts in a shape its parser reads",
+        )
+    }
+
+    /// The parser reads THIS module's four consts back exactly as they compiled,
+    /// along production's own path ([`working_tree_tool_policy`]). A reformat
+    /// that breaks the parser, or a move of the consts off the path list, breaks
+    /// this test, not production (production degrades to `cause: "unknown"`),
+    /// so the reader cannot rot silently against the source it exists to read.
     #[test]
     fn trunk_policy_parser_round_trips_this_files_consts() {
-        let p = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let p = working_tree_tool_policy();
         assert_eq!(p.allowed, strings(COORD_MCP_ALLOWED_TOOLS));
         assert_eq!(
             p.allowed_prefixes,
@@ -17416,6 +18565,64 @@ mod coord_mcp_body_gate_tests {
         // The prefix family counts as deliberate too.
         let d = super::coord_mcp_refusal_cause("coord_onboarding_doctor", None);
         assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+    }
+
+    /// T-no-proxy-door (plan 2026-10-13-coord-expedited-land-lever-for-agents,
+    /// Phase 3b): the proxy masks the expedited-land REQUEST as `deliberate`,
+    /// never `drift`, and its -32601 names the HTTP twin; the READ-BACK is
+    /// allowed.
+    #[test]
+    fn expedited_land_request_is_deliberate_and_status_is_allowed() {
+        assert!(!super::coord_mcp_tool_is_allowed(
+            "coord_request_expedited_land"
+        ));
+        assert!(super::coord_mcp_withholding_is_deliberate(
+            "coord_request_expedited_land"
+        ));
+        let d = super::coord_mcp_refusal_cause("coord_request_expedited_land", None);
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+        assert!(
+            d.remedy
+                .contains("/pr-merge/repos/:repo/pulls/:number/agent/expedite")
+                && d.remedy.contains("X-Coord-Caller-Session"),
+            "{}",
+            d.remedy
+        );
+        assert!(super::coord_mcp_tool_is_allowed(
+            "coord_expedited_land_status"
+        ));
+        assert!(!super::coord_mcp_withholding_is_deliberate(
+            "coord_expedited_land_status"
+        ));
+        // A deliberate exclusion with no sanctioned door keeps the generic text.
+        let d = super::coord_mcp_refusal_cause("coord_create_pr", None);
+        assert!(d.remedy.contains("/mcp directly"), "{}", d.remedy);
+        // Every door row names a tool that IS deliberately excluded.
+        for (tool, _) in super::COORD_MCP_DELIBERATE_EXCLUSION_DOORS {
+            assert!(
+                COORD_MCP_DELIBERATE_EXCLUSIONS.binary_search(tool).is_ok(),
+                "{tool} has a door row but is not a deliberate exclusion"
+            );
+        }
+        // The trunk-policy source parser reads both new names exactly once.
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("parses");
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| *t == "coord_expedited_land_status")
+                .count(),
+            1
+        );
+        assert_eq!(
+            parsed
+                .deliberate
+                .iter()
+                .filter(|t| *t == "coord_request_expedited_land")
+                .count(),
+            1
+        );
     }
 
     /// (b) No trunk read ⇒ `unknown` with a reason, never a confident default.
@@ -18238,24 +19445,8 @@ mod coord_claims_proxy_tests {
     /// technique `ui_error`'s writer guard uses. It fails against a
     /// `coord_mcp_proxy_handler` that does not make the call.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
-        // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
-        // from anywhere.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
-        let start = text
-            .find("async fn coord_mcp_proxy_handler(")
-            .expect("coord_mcp_proxy_handler exists");
-        // The next top-level item ends the handler's body.
-        let end = text[start..]
-            .find("\n/// ")
-            .map(|i| start + i)
-            .unwrap_or(text.len());
-        let body = &text[start..end];
+        let body = &crate::mcp_api::mcp_api_item_source("async fn coord_mcp_proxy_handler(");
         assert!(
             body.contains("note_coord_upstream_verdict"),
             "the highest-volume device-credential consumer must report coord's \
@@ -18380,21 +19571,8 @@ mod coord_claims_proxy_tests {
     /// `coord_mcp_url_with_source()` would still dial coord and still hand the
     /// caller `token_expired`, which is the whole incident.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
-        let start = text
-            .find("async fn coord_mcp_proxy_handler(")
-            .expect("coord_mcp_proxy_handler exists");
-        let end = text[start..]
-            .find("\n/// ")
-            .map(|i| start + i)
-            .unwrap_or(text.len());
-        let body = &text[start..end];
+        let body = &crate::mcp_api::mcp_api_item_source("async fn coord_mcp_proxy_handler(");
 
         let gate = body.find("runner_credential_local_refusal").expect(
             "the forwarder must ask whether THIS RUNNER's credential can answer before \
@@ -19367,21 +20545,10 @@ mod coord_provision_session_gate_tests {
     /// `the_health_handler_emits_the_supervised_workers_block`).
     #[test]
     fn the_health_handler_emits_the_active_tenant_fields() {
-        let src = include_str!("mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let src = &crate::mcp_api::mcp_api_sources();
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -19410,21 +20577,9 @@ mod coord_provision_session_gate_tests {
     /// `Condition` task (same source-scan technique as the tests around it).
     #[test]
     fn the_health_handler_emits_the_scheduler_conditions_capability() {
-        let src = include_str!("mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -19457,21 +20612,9 @@ mod coord_provision_session_gate_tests {
     /// pin the active-tenant fields use.
     #[test]
     fn the_health_handler_emits_the_thread_census_and_the_tails_gauge() {
-        let src = include_str!("mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -19614,6 +20757,7 @@ mod coord_provision_session_gate_tests {
             CoordCredentialPosture::Absent,
             CoordCredentialPosture::Unrefreshable,
             CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+            CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding),
         ];
         for posture in dark {
             let v =
@@ -21622,12 +22766,20 @@ mod oauth_dcr_surface_absent_tests {
     }
 
     /// The one that actually catches someone "fixing" this by standing up OAuth
-    /// later: no `.route("<oauth path>"` registration exists anywhere in this
-    /// file. The needle is composed at runtime so this test's own source cannot
-    /// match it.
+    /// later: no `.route("<oauth path>"` registration exists anywhere in the
+    /// `mcp_api` module. The needles are composed at runtime so this test's own
+    /// source cannot match them.
     #[test]
     fn no_oauth_or_dcr_route_is_registered_in_this_router() {
-        let src = include_str!("mcp_api.rs");
+        let src = &crate::mcp_api::mcp_api_sources();
+        // An absence proves nothing about text that was never read: the scan
+        // must see the router's real registrations before it may vouch that
+        // none of them is an OAuth path.
+        let health_route = format!(".route(\"{}\"", "/health");
+        assert!(
+            src.contains(&health_route),
+            "the scanned text carries no `{health_route}` — it is not the router"
+        );
         for (_, path) in OAUTH_PATHS {
             let needle = format!(".route(\"{path}\"");
             assert!(
@@ -22043,24 +23195,10 @@ mod supervised_workers_health_tests {
 
     #[test]
     fn the_health_handler_emits_the_supervised_workers_block() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
-        )
-        .expect("read mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let src = crate::mcp_api::mcp_api_sources();
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -22144,24 +23282,10 @@ mod ui_bridge_binding_health_tests {
 
     #[test]
     fn the_health_handler_emits_the_ui_bridge_binding_block() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
-        )
-        .expect("read mcp_api.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let src = crate::mcp_api::mcp_api_sources();
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -22187,45 +23311,9 @@ mod ui_bridge_binding_health_tests {
     /// once, and `RelayState`'s `FromRef` only ever clones that `Arc`.
     #[test]
     fn production_constructs_exactly_one_relay_binding() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
-        )
-        .expect("read mcp_api.rs");
-        // Strip the test modules: their fixtures legitimately build their own.
-        //
-        // `split("#[cfg(test)]").next()` was WRONG here — it stops at the
-        // FIRST occurrence, which in this file is about 62% of the way in, so
-        // a second construction added after that line was invisible and the
-        // test passed by placement luck.
-        //
-        // Skip only a column-0 `#[cfg(test)]` that gates a `mod` — that is the
-        // shape whose body closes with a column-0 `}`. A `#[cfg(test)]` on a
-        // bare `fn` or `use` would otherwise make this swallow production code
-        // up to the next column-0 brace, so it is asserted, not assumed.
-        let lines: Vec<&str> = src.lines().collect();
-        let mut production = String::new();
-        let mut i = 0usize;
-        while i < lines.len() {
-            if lines[i] == "#[cfg(test)]" {
-                let next = lines.get(i + 1).copied().unwrap_or("");
-                assert!(
-                    next.starts_with("mod "),
-                    "column-0 #[cfg(test)] at line {} gates `{next}`, not a `mod` — \
-                     this scan would swallow production code up to the next \
-                     column-0 brace",
-                    i + 1
-                );
-                i += 1;
-                while i < lines.len() && lines[i] != "}" {
-                    i += 1;
-                }
-                i += 1;
-                continue;
-            }
-            production.push_str(lines[i]);
-            production.push('\n');
-            i += 1;
-        }
+        let production = crate::mcp_api::join_sources(&crate::mcp_api::production_files(
+            &crate::mcp_api::mcp_api_source_files(),
+        ));
         // Anchor on known production symbols rather than a line-count ratio:
         // the ratio flips to a spurious failure the day the test modules
         // exceed half the file, which is a property of test volume, not of

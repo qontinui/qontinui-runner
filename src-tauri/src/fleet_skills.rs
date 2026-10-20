@@ -135,8 +135,10 @@ pub(crate) const PROVISIONED_FILE_MODE: u32 = 0o644;
 /// guessed at: the served half of this corpus is a `files` map of
 /// `path -> text`, so a non-text file has no representation in the layer this
 /// floor has to be interchangeable with. Nothing in the shipped bundle is
-/// non-UTF-8 today (measured 2026-09-14: 15 files, all `.md`/`.sh`), and
-/// [`tests::every_embedded_file_is_text`] is what keeps that true.
+/// non-UTF-8 — it is `.md`, `.sh` and `.py` text (the `.py` files are the
+/// `command-scripts` helpers and a `lib/` reader) — and
+/// [`tests::every_embedded_file_is_text`] is what keeps that true, so no file
+/// count is pinned here to go stale.
 pub(crate) fn embedded_skills() -> Vec<ResolvedSkill> {
     let mut out = Vec::new();
     for skill in FLEET_SKILLS.dirs() {
@@ -260,6 +262,27 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
             crate::capability_manifest::record_provision(workdir, report);
         }
     }
+}
+
+/// Whether the skill `name` is in the fleet corpus this runner SERVES into
+/// sessions: the embedded bundle. The canonical rung only refreshes the BODIES
+/// of skills the bundle already names (`canonical_corpus::bundled_skill_names`,
+/// `SkillSource::choose`), so the bundle alone decides which skills a session
+/// receives — and therefore which skills this runner may advertise.
+///
+/// A NEW fleet skill does not reach the bundle automatically:
+/// `scripts/fleet-bundle-sync.sh` in qontinui-claude-config only carries files
+/// the runner already bundles. Adding one is its own runner PR that vendors the
+/// skill directory byte-identical to qontinui-claude-config's copy (plan
+/// `2026-10-13-coord-expedited-land-lever-for-agents`, Phase 6).
+///
+/// NOT consulted: the account layer (`agent_skills` overrides), whose read is a
+/// network fetch — an account-supplied skill of this name is served but not
+/// advertised. That under-advertises (coord counts the review `unreviewed`),
+/// never over-advertises. Cheap — a directory lookup in the binary — because
+/// the heartbeat calls it every tick.
+pub(crate) fn skill_is_served(name: &str) -> bool {
+    FLEET_SKILLS.get_dir(name).is_some()
 }
 
 /// Number of embedded SKILLS — immediate subdirectories of [`FLEET_SKILLS`],
@@ -614,8 +637,17 @@ fn apply_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::agent_skills::tests::{bundle, skill_unit};
     use crate::agent_skills::{AgentSkillSource, ResolvedSkill};
+
+    /// `skill_is_served` reads the real embedded bundle (plan
+    /// 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b).
+    #[test]
+    fn skill_is_served_reads_the_embedded_bundle() {
+        assert!(skill_is_served("page-health"));
+        assert!(!skill_is_served("no-such-skill-for-this-test"));
+    }
 
     #[test]
     fn provisions_every_embedded_skill_into_dir() {
