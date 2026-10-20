@@ -75,6 +75,14 @@ pub const MAX_BUCKETS: usize = 512;
 /// terminal is that dialog's echo (Claude Code fires it on a ~6 s timer while
 /// the dialog is open), so it is not counted again.
 pub const DEDUP_WINDOW_SECS: i64 = 60;
+/// Cap on a tool name or command word inside a class key.
+pub const MAX_KEY_TOKEN_CHARS: usize = 48;
+/// Cap on the prompt text and the command `classify` looks at — a pathological
+/// payload must not cost unbounded regex work.
+pub const MAX_CLASSIFY_INPUT_BYTES: usize = 16 * 1024;
+/// How many distinct permission modes one bucket keeps, and their length cap.
+pub const MAX_PERMISSION_MODES: usize = 8;
+pub const MAX_PERMISSION_MODE_CHARS: usize = 32;
 /// How many readable words of the normalized reason go into the class key.
 const MAX_KEY_WORDS: usize = 6;
 
@@ -188,6 +196,11 @@ fn sanitize_token(s: &str) -> String {
             dash = true;
         }
     }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    // ASCII-only by construction, so a char cut is a byte cut.
+    let mut out: String = out.chars().take(MAX_KEY_TOKEN_CHARS).collect();
     while out.ends_with('-') {
         out.pop();
     }
@@ -350,7 +363,8 @@ fn first_command_token(command: &str) -> Option<String> {
 /// `permission-prompt-<tool>` (tool parsed from the stock message when not
 /// given), then `permission-prompt-unknown`.
 pub fn classify(text: Option<&str>, tool_name: Option<&str>, command: Option<&str>) -> PromptClass {
-    let text = text.unwrap_or("");
+    let text = crate::str_utils::truncate_str(text.unwrap_or(""), MAX_CLASSIFY_INPUT_BYTES);
+    let command = command.map(|c| crate::str_utils::truncate_str(c, MAX_CLASSIFY_INPUT_BYTES));
     let tool = tool_name
         .map(sanitize_token)
         .filter(|t| !t.is_empty())
@@ -380,8 +394,10 @@ pub fn classify(text: Option<&str>, tool_name: Option<&str>, command: Option<&st
             format!("{CLASS_KEY_PREFIX}-{tool}-{cmd}")
         }
         (Some(reason), None) => {
-            let first_line = reason.lines().next().unwrap_or(reason);
-            let normalized = normalize_reason(first_line);
+            // Words and hash come from REDACTED text: a secret in a pasted
+            // reason must never reach the class key, which leaves the machine.
+            let first_line = redact_and_strip(reason.lines().next().unwrap_or(reason));
+            let normalized = normalize_reason(&first_line);
             let head = match normalized.split_once(": ") {
                 Some((head, _)) if head.split_whitespace().count() >= 2 => head.to_string(),
                 _ => normalized.clone(),
@@ -526,8 +542,38 @@ pub struct Observation {
     /// payload had no such key (every `Notification`).
     pub safety_class: Option<bool>,
     pub permission_mode: Option<String>,
-    pub command: Option<String>,
-    pub cwd: Option<String>,
+    /// Already redacted (D6) — built outside the aggregator lock.
+    pub example: RedactedExample,
+    /// The class's reason text, already redacted and capped.
+    pub reason: Option<String>,
+}
+
+impl Observation {
+    /// Build an observation, doing ALL redaction here — before the caller
+    /// takes the aggregator lock.
+    pub fn new(
+        class: PromptClass,
+        kind: PayloadKind,
+        safety_class: Option<bool>,
+        permission_mode: Option<&str>,
+        command: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Self {
+        let reason = class
+            .reason
+            .as_deref()
+            .map(|r| truncate_chars(&redact_and_strip(r), REASON_MAX_CHARS));
+        Self {
+            class,
+            kind,
+            safety_class,
+            permission_mode: permission_mode
+                .filter(|m| !m.is_empty())
+                .map(|m| m.chars().take(MAX_PERMISSION_MODE_CHARS).collect()),
+            example: redact_example(command, cwd),
+            reason,
+        }
+    }
 }
 
 /// The counts for one (class, UTC hour).
@@ -665,7 +711,11 @@ pub enum ObserveOutcome {
     /// A `Notification` within [`DEDUP_WINDOW_SECS`] of a counted
     /// `PermissionRequest` on the same terminal — the same dialog, not counted.
     Deduplicated(PromptClass),
-    /// Not a permission prompt (or unparseable): nothing recorded.
+    /// A permission prompt the aggregator could not hold: it was at
+    /// [`MAX_BUCKETS`] and every held bucket was newer than this one.
+    Dropped(PromptClass),
+    /// Not a permission prompt (or unparseable), or refused at the door:
+    /// nothing recorded.
     Ignored,
 }
 
@@ -676,7 +726,7 @@ impl ObserveOutcome {
 
     pub fn class(&self) -> Option<&PromptClass> {
         match self {
-            Self::Counted(c) | Self::Deduplicated(c) => Some(c),
+            Self::Counted(c) | Self::Deduplicated(c) | Self::Dropped(c) => Some(c),
             Self::Ignored => None,
         }
     }
@@ -687,6 +737,7 @@ impl ObserveOutcome {
             Self::Deduplicated(_) => {
                 "deduplicated: a PermissionRequest for this dialog was already counted"
             }
+            Self::Dropped(_) => "dropped: the aggregator is full of newer buckets",
             Self::Ignored => "not a permission prompt",
         }
     }
@@ -727,32 +778,53 @@ impl Aggregator {
                         age >= chrono::Duration::zero() && age < window
                     });
                 if echo {
+                    // The dialog is still open (Claude Code repeats the
+                    // Notification every ~6 s): keep the window sliding so a
+                    // long-open dialog stays ONE prompt.
+                    self.last_permission_request
+                        .insert(terminal_id.to_string(), now);
                     return ObserveOutcome::Deduplicated(obs.class);
                 }
             }
         }
         let class = obs.class.clone();
-        self.record(obs, now);
-        ObserveOutcome::Counted(class)
+        if self.record(obs, now) {
+            ObserveOutcome::Counted(class)
+        } else {
+            ObserveOutcome::Dropped(class)
+        }
     }
 
-    /// Count one observation at `now`.
-    pub fn record(&mut self, obs: Observation, now: DateTime<Utc>) {
+    /// Count one observation at `now`. At [`MAX_BUCKETS`] a NEW bucket evicts
+    /// the oldest-hour bucket (its count goes to [`Self::dropped`]); an
+    /// observation older than every held bucket is itself dropped and this
+    /// returns `false`.
+    pub fn record(&mut self, obs: Observation, now: DateTime<Utc>) -> bool {
         let hour = hour_bucket(now);
         let key = (obs.class.dossier_slug.clone(), hour);
         if !self.buckets.contains_key(&key) && self.buckets.len() >= MAX_BUCKETS {
-            self.dropped += 1;
-            return;
+            let oldest = self
+                .buckets
+                .keys()
+                .min_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)))
+                .cloned();
+            match oldest {
+                Some(old) if old.1 <= hour => {
+                    if let Some(evicted) = self.buckets.remove(&old) {
+                        self.dropped += evicted.count;
+                    }
+                }
+                _ => {
+                    self.dropped += 1;
+                    return false;
+                }
+            }
         }
-        let example = redact_example(obs.command.as_deref(), obs.cwd.as_deref());
+        let example = obs.example;
         let bucket = self.buckets.entry(key).or_insert_with(|| ClassBucket {
             dossier_slug: obs.class.dossier_slug.clone(),
             class_key: obs.class.class_key.clone(),
-            reason: obs
-                .class
-                .reason
-                .as_deref()
-                .map(|r| truncate_chars(&redact_text(r), REASON_MAX_CHARS)),
+            reason: obs.reason.clone(),
             tool: obs.class.tool.clone(),
             hour_start: Utc.timestamp_opt(hour * 3600, 0).single().unwrap_or(now),
             count: 0,
@@ -771,8 +843,12 @@ impl Aggregator {
             Some(false) => bucket.ordinary_asks += 1,
             None => {}
         }
-        if let Some(mode) = obs.permission_mode.filter(|m| !m.is_empty()) {
-            bucket.permission_modes.insert(mode);
+        if let Some(mode) = obs.permission_mode {
+            if bucket.permission_modes.len() < MAX_PERMISSION_MODES
+                || bucket.permission_modes.contains(&mode)
+            {
+                bucket.permission_modes.insert(mode);
+            }
         }
         let has_content = example.command.is_some() || example.cwd.is_some();
         if has_content
@@ -781,6 +857,7 @@ impl Aggregator {
         {
             bucket.examples.push(example);
         }
+        true
     }
 
     /// Every live bucket, oldest hour first.
@@ -808,7 +885,8 @@ impl Aggregator {
         out
     }
 
-    /// Observations refused because [`MAX_BUCKETS`] was reached.
+    /// Observations lost to the [`MAX_BUCKETS`] bound: the counts of evicted
+    /// buckets plus refused observations.
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -829,6 +907,11 @@ fn with_global<R>(f: impl FnOnce(&mut Aggregator) -> R) -> R {
 /// Snapshot of the process-global aggregator.
 pub fn snapshot() -> Vec<ClassBucket> {
     with_global(|a| a.snapshot())
+}
+
+/// The process-global aggregator's [`Aggregator::dropped`] count.
+pub fn dropped() -> u64 {
+    with_global(|a| a.dropped())
 }
 
 /// Drain the process-global aggregator's completed hours.
@@ -891,14 +974,14 @@ pub fn parse_payload(payload: &Value) -> Option<Observation> {
         .get("permission_suggestions")
         .and_then(Value::as_array)
         .map(Vec::is_empty);
-    Some(Observation {
+    Some(Observation::new(
         class,
         kind,
         safety_class,
-        permission_mode: str_field(payload, "permission_mode").map(str::to_string),
-        command,
-        cwd: str_field(payload, "cwd").map(str::to_string),
-    })
+        str_field(payload, "permission_mode"),
+        command.as_deref(),
+        str_field(payload, "cwd"),
+    ))
 }
 
 /// The `POST /sessions/{id}/notification` intake: called with the raw body.
@@ -1218,14 +1301,14 @@ rm -f z",
     // ---- D4 aggregator -----------------------------------------------------
 
     fn obs(class: &PromptClass, mode: &str, cmd: &str) -> Observation {
-        Observation {
-            class: class.clone(),
-            kind: PayloadKind::PermissionRequest,
-            safety_class: None,
-            permission_mode: Some(mode.to_string()),
-            command: Some(cmd.to_string()),
-            cwd: Some("/home/u/ws/repo".to_string()),
-        }
+        Observation::new(
+            class.clone(),
+            PayloadKind::PermissionRequest,
+            None,
+            Some(mode),
+            Some(cmd),
+            Some("/home/u/ws/repo"),
+        )
     }
 
     #[test]
@@ -1280,6 +1363,127 @@ rm -f z",
         assert!(agg
             .drain_completed_hours(utc("2026-10-14T11:10:00Z"))
             .is_empty());
+    }
+
+    #[test]
+    fn at_the_bound_a_new_bucket_evicts_the_oldest_hour() {
+        let mut agg = Aggregator::new();
+        let ten = utc("2026-10-14T10:00:00Z");
+        let c0 = classify(None, Some("Bash"), Some("first0"));
+        agg.record(obs(&c0, "default", "x"), utc("2026-10-14T09:30:00Z"));
+        agg.record(obs(&c0, "default", "x"), utc("2026-10-14T09:31:00Z"));
+        for i in 1..MAX_BUCKETS {
+            let c = classify(None, Some("Bash"), Some(&format!("cmd{i}")));
+            assert!(agg.record(obs(&c, "default", "x"), ten));
+        }
+        assert_eq!(agg.snapshot().len(), MAX_BUCKETS);
+        let fresh = classify(None, Some("Bash"), Some("fresh"));
+        assert!(agg.record(obs(&fresh, "default", "x"), ten));
+        assert_eq!(agg.snapshot().len(), MAX_BUCKETS);
+        assert_eq!(agg.dropped(), 2, "the evicted 09:00 bucket held 2");
+        assert!(!agg
+            .snapshot()
+            .iter()
+            .any(|b| b.dossier_slug == c0.dossier_slug));
+        assert!(agg
+            .snapshot()
+            .iter()
+            .any(|b| b.dossier_slug == fresh.dossier_slug));
+        // An observation older than every held bucket is itself dropped.
+        let stale = classify(None, Some("Bash"), Some("stale"));
+        assert!(!agg.record(obs(&stale, "default", "x"), utc("2026-10-14T08:00:00Z")));
+        assert_eq!(agg.dropped(), 3);
+        let mut o = obs(&stale, "default", "x");
+        o.kind = PayloadKind::PermissionRequest;
+        assert!(matches!(
+            agg.observe("t", o, utc("2026-10-14T08:00:00Z")),
+            ObserveOutcome::Dropped(_)
+        ));
+    }
+
+    #[test]
+    fn a_secret_in_a_pasted_reason_never_reaches_the_class_key() {
+        let c = classify(
+            Some(&format!(
+                "Command sends TOKEN={} to a remote host",
+                "zzsecret77"
+            )),
+            None,
+            None,
+        );
+        assert!(
+            c.class_key
+                .starts_with("permission-prompt-command-sends-token"),
+            "{c:?}"
+        );
+        assert!(!c.class_key.contains("zzsecret77"), "{c:?}");
+        let same = classify(
+            Some(&format!(
+                "Command sends TOKEN={} to a remote host",
+                "other999"
+            )),
+            None,
+            None,
+        );
+        assert_eq!(c.class_key, same.class_key, "the hash is of redacted text");
+    }
+
+    #[test]
+    fn key_tokens_and_permission_modes_are_capped() {
+        let long_tool = "T".repeat(200);
+        let c = classify(
+            None,
+            Some(&long_tool),
+            Some(&format!("{} x", "c".repeat(200))),
+        );
+        for tok in c
+            .class_key
+            .strip_prefix("permission-prompt-")
+            .unwrap()
+            .split('-')
+        {
+            assert!(tok.len() <= MAX_KEY_TOKEN_CHARS, "{}", c.class_key);
+        }
+        let huge = "y ".repeat(MAX_CLASSIFY_INPUT_BYTES);
+        let _ = classify(Some(&huge), None, Some(&huge)); // bounded, no panic
+
+        let mut agg = Aggregator::new();
+        let now = utc("2026-10-14T10:00:00Z");
+        let k = classify(None, Some("Bash"), Some("rm x"));
+        for i in 0..20 {
+            let mode = format!("mode{i}{}", "m".repeat(100));
+            agg.record(obs(&k, &mode, "rm x"), now);
+        }
+        let b = &agg.snapshot()[0];
+        assert_eq!(b.permission_modes.len(), MAX_PERMISSION_MODES);
+        assert!(b
+            .permission_modes
+            .iter()
+            .all(|m| m.chars().count() <= MAX_PERMISSION_MODE_CHARS));
+    }
+
+    /// Claude Code repeats the Notification every ~6 s while a dialog stays
+    /// open: a dialog open for two minutes is still ONE prompt.
+    #[test]
+    fn a_long_open_dialog_counts_once() {
+        let mut agg = Aggregator::new();
+        let t0 = utc("2026-10-14T10:00:00Z");
+        assert!(agg
+            .observe("tl", pr("rm -f $f", serde_json::json!([])), t0)
+            .counted());
+        for s in (6..=120).step_by(6) {
+            let o = agg.observe(
+                "tl",
+                note("Claude needs your permission to use Bash"),
+                t0 + chrono::Duration::seconds(s),
+            );
+            assert!(
+                matches!(o, ObserveOutcome::Deduplicated(_)),
+                "at {s}s: {o:?}"
+            );
+        }
+        let total: u64 = agg.snapshot().iter().map(|b| b.count).sum();
+        assert_eq!(total, 1);
     }
 
     #[test]
@@ -1339,14 +1543,7 @@ rm -f z",
             None,
         );
         agg.record(
-            Observation {
-                class: c,
-                kind: PayloadKind::Notification,
-                safety_class: None,
-                permission_mode: None,
-                command: None,
-                cwd: None,
-            },
+            Observation::new(c, PayloadKind::Notification, None, None, None, None),
             utc("2026-10-14T10:00:00Z"),
         );
         let b = &agg.snapshot()[0];
@@ -1481,9 +1678,10 @@ rm -f z",
         assert!(matches!(echo, ObserveOutcome::Deduplicated(_)), "{echo:?}");
         // Another terminal's Notification is its own dialog.
         assert!(agg.observe("t2", notification(), at(6)).counted());
-        // Past the window the same terminal's Notification is a new dialog.
+        // Past the window — measured from the LAST echo, which slides it — the
+        // same terminal's Notification is a new dialog.
         assert!(agg
-            .observe("t1", notification(), at(DEDUP_WINDOW_SECS + 1))
+            .observe("t1", notification(), at(6 + DEDUP_WINDOW_SECS + 1))
             .counted());
 
         let total: u64 = agg.snapshot().iter().map(|b| b.count).sum();
