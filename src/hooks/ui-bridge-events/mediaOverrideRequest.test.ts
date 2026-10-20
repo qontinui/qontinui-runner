@@ -38,8 +38,12 @@ describe("media override in the runner webview", () => {
     async (type) => {
       const reply = await runMediaOverrideRequest(type, { slotId: "hero", src: "/c.png" });
       expect(reply.success).toBe(false);
+      // Spelled as literals, not `DEV_CONTROLS_REFUSAL.code`: the wire values are
+      // the contract (a caller branches on them), and a `.code` read would put this
+      // file on globalChords' keyboard-field roster for a non-keyboard field.
+      expect(reply.data).toEqual({ ...DEV_CONTROLS_REFUSAL });
       expect(reply.data).toMatchObject({
-        code: DEV_CONTROLS_REFUSAL.code,
+        code: "capability_unavailable_in_build",
         reason: "dev_controls_disabled",
       });
     },

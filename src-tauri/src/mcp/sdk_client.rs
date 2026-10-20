@@ -3453,8 +3453,9 @@ async fn handle_page_scroll_dispatch(
 // In-situ asset override — a dev control (plan
 // 2026-10-13-image-generation-and-visual-judgment, Phase 18). The SDK app
 // enforces the dev-controls gate itself: an app that has not opted in answers
-// `capability_unavailable_in_build`. Validation and the decode-budget fit are
-// shared with the direct route (`ui_bridge/media_override.rs`). Not a journey
+// `capability_unavailable_in_build`. Validation and the wait-budget fits (an
+// apply's `decodeTimeoutMs`, a restore's `verifyTimeoutMs`) are shared with
+// the direct route (`ui_bridge/media_override.rs`). Not a journey
 // action (`journey/route_coverage.rs` R20): it rewrites what the page renders
 // for a capture, then is undone.
 // ============================================================================
@@ -3498,11 +3499,20 @@ async fn handle_media_override_restore(
     let body = body
         .map(|Json(b)| b)
         .unwrap_or_else(|| serde_json::json!({}));
-    if let Err(e) = crate::mcp::ui_bridge::media_override::validate_restore_body(&body) {
-        return Json(
-            serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e }),
-        );
-    }
+    // Fit `verifyTimeoutMs` inside this transport's budget: without it the SDK
+    // waits up to the override's own `decodeTimeoutMs`, which an override
+    // applied elsewhere (the injected runtime allows 60 s) can set past 30 s.
+    let body = match crate::mcp::ui_bridge::media_override::prepare_restore_body(
+        body,
+        crate::mcp::ui_bridge::media_override::SDK_DISPATCH_BUDGET_MS,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e }),
+            )
+        }
+    };
     match dispatch_app_request(
         &state,
         "mediaOverrideRestore",
