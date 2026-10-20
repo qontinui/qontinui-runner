@@ -6644,7 +6644,7 @@ dependencies = [
  "toml 1.0.7+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "zip 8.3.0",
+ "zip 9.0.4",
 ]
 
 [[package]]
