@@ -999,6 +999,12 @@ pub struct AllocateResult {
     pub token_exp: i64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub active_claims: Vec<ActiveClaim>,
+    /// coord's `sibling_notes` for this allocation, each already forced onto one
+    /// bounded line by [`sibling_note_log_line`]. A spawn path with a prompt to
+    /// carry them puts them in front of the agent, so a skipped build sibling is
+    /// known before cargo fails on the missing checkout.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sibling_notes: Vec<String>,
 }
 
 /// Per-spawn active claim — the resource_key / kind / TTL acquired
@@ -2142,6 +2148,11 @@ pub async fn allocate_and_materialize_with_claim(
         });
     }
 
+    let sibling_notes: Vec<String> = coord_resp
+        .sibling_notes
+        .iter()
+        .map(|n| sibling_note_log_line(n))
+        .collect();
     Ok(MaterializeOutcome::Worktrees(AllocateResult {
         agent_id: coord_resp.agent_id,
         worktrees: materialized,
@@ -2149,6 +2160,7 @@ pub async fn allocate_and_materialize_with_claim(
         token_jti: coord_resp.token_jti.unwrap_or(uuid::Uuid::nil()),
         token_exp: coord_resp.token_exp.unwrap_or(0),
         active_claims,
+        sibling_notes,
     }))
 }
 
