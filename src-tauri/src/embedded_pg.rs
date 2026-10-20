@@ -1164,6 +1164,67 @@ mod tests {
         )
     }
 
+    // ---- Bundled PostgreSQL release pin ----
+
+    /// The exact requirement `POSTGRESQL_VERSION = "=X.Y.Z"` declares in
+    /// `src-tauri/.cargo/config.toml`, or `None` when no such line exists.
+    fn pinned_postgres_requirement(config_toml: &str) -> Option<&str> {
+        config_toml.lines().find_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("POSTGRESQL_VERSION")?
+                .trim_start()
+                .strip_prefix('=')?
+                .trim();
+            value.strip_prefix('"')?.split('"').next()
+        })
+    }
+
+    /// The binary embeds exactly the PostgreSQL release pinned in
+    /// `.cargo/config.toml`. Unpinned, the `bundled` build script took
+    /// upstream's newest release. On 2026-10-18 that was 18.6.1, whose initdb
+    /// needs GLIBC 2.36, and every boot test above failed on ubuntu-22.04.
+    ///
+    /// This also catches a STALE build: the build script keeps whatever
+    /// archive its OUT_DIR already holds, even after the pin changes, so a
+    /// warm target dir (a CI cache restore, a developer's tree) can embed a
+    /// release the pin no longer names.
+    #[test]
+    fn bundled_postgres_is_the_pinned_release() {
+        let pin = pinned_postgres_requirement(include_str!("../.cargo/config.toml"))
+            .expect("src-tauri/.cargo/config.toml must pin POSTGRESQL_VERSION = \"=X.Y.Z\"");
+        assert!(
+            pin.starts_with('=') && pin.matches('.').count() == 2,
+            "POSTGRESQL_VERSION must be an exact `=X.Y.Z` requirement, got {pin:?}"
+        );
+        assert_eq!(
+            Settings::default().version.to_string(),
+            pin,
+            "the binary embeds a different PostgreSQL release than the pin. Either \
+             POSTGRESQL_VERSION is set in the build environment (it overrides the \
+             [env] pin), or a stale postgresql_embedded OUT_DIR survived a pin change: \
+             run `node scripts/ci/purge-stale-bundled-postgres.mjs <target-dir>` and rebuild"
+        );
+    }
+
+    #[test]
+    fn pinned_postgres_requirement_parses_only_the_pin_line() {
+        assert_eq!(
+            pinned_postgres_requirement(
+                "[env]\n# POSTGRESQL_VERSION = \"=1.0.0\"\nPOSTGRESQL_VERSION = \"=18.6.0\"\n"
+            ),
+            Some("=18.6.0")
+        );
+        assert_eq!(
+            pinned_postgres_requirement("POSTGRESQL_VERSION_X = \"=1.0.0\"\n"),
+            None
+        );
+        assert_eq!(
+            pinned_postgres_requirement("[env]\nSCCACHE_SERVER_PORT = \"4230\"\n"),
+            None
+        );
+    }
+
     // ---- Data-root isolation (manual-test-loop iter 18, item 2) ----
 
     #[test]
