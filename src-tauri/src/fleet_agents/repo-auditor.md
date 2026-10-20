@@ -76,8 +76,10 @@ settings.
    and only a bearer you have checked.** The candidates are `$COORD_DEVICE_JWT`,
    then `~/.qontinui/coord-device-jwt`, and the order falls through on VALIDITY,
    not presence. Decode each candidate's payload (base64url, no secret needed)
-   and use it only when its `exp` is in the future AND its `tenant_id` claim
-   equals `INPUT_JSON.tenant_id`; otherwise skip to the next candidate. Stage
+   and use it only when its `exp` is in the future AND its `tenant_id` claim is
+   absent or equals `INPUT_JSON.tenant_id` (coord's `writer_attestation`
+   refuses only a claim naming a DIFFERENT tenant); otherwise skip to the next
+   candidate. Stage
    the chosen token in a header file (`-H @file`) and never echo it or put it
    on argv. Why:
    the route itself is still anonymous (`post_profile_callback` lets an
@@ -398,7 +400,8 @@ the device/agent onboarding accept.
    ```
    and this device's coord bearer as `Authorization: Bearer <token>`: the first
    of `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, whose `exp` is
-   in the future and whose `tenant_id` claim equals `INPUT_JSON.tenant_id` (a
+   in the future and whose `tenant_id` claim is absent or equals
+   `INPUT_JSON.tenant_id` (a
    candidate failing either check is skipped, not sent); stage it in a header
    file (`-H @file`), never on argv, never echoed. Coord validates the
    `agent_id` against `coord.agent_worktrees`, writes a structured
