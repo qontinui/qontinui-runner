@@ -29,6 +29,8 @@ pub fn hold_echo_confirmed(v: &serde_json::Value) -> bool {
 /// `Some(true)`/`Some(false)` only for a well-formed answer carrying a
 /// `result.tools` array; `None` for anything else (an error object, an
 /// unparseable body, a body with no tools array) — UNKNOWN, never "absent".
+/// A page that does not list `tool` but carries `result.nextCursor` is also
+/// `None`: the tool may sit on a later page, so absence is not established.
 /// Accepts a plain JSON body or a streamable-HTTP `text/event-stream` body,
 /// whose `data:` lines carry the JSON-RPC message.
 pub fn tools_list_serves(body: &[u8], tool: &str) -> Option<bool> {
@@ -36,11 +38,20 @@ pub fn tools_list_serves(body: &[u8], tool: &str) -> Option<bool> {
     let from_json = |s: &str| -> Option<bool> {
         let v: serde_json::Value = serde_json::from_str(s.trim()).ok()?;
         let tools = v.pointer("/result/tools")?.as_array()?;
-        Some(
-            tools
-                .iter()
-                .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(tool)),
-        )
+        if tools
+            .iter()
+            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(tool))
+        {
+            return Some(true);
+        }
+        let more = v
+            .pointer("/result/nextCursor")
+            .is_some_and(|c| !c.is_null());
+        if more {
+            None
+        } else {
+            Some(false)
+        }
     };
     if let Some(found) = from_json(text) {
         return Some(found);
@@ -81,6 +92,11 @@ mod tests {
             tools_list_serves(absent, COORD_SET_PR_HOLD_TOOL),
             Some(false)
         );
+        let served_paged = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"coord_set_pr_hold"}],"nextCursor":"p2"}}"#;
+        assert_eq!(
+            tools_list_serves(served_paged, COORD_SET_PR_HOLD_TOOL),
+            Some(true)
+        );
         let sse = format!(
             "event: message\ndata: {}\n\n",
             std::str::from_utf8(served).unwrap()
@@ -94,6 +110,7 @@ mod tests {
             b"not json",
             b"",
             br#"{"result":{}}"#,
+            br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"coord_orient"}],"nextCursor":"p2"}}"#,
         ] {
             assert_eq!(tools_list_serves(unknown, COORD_SET_PR_HOLD_TOOL), None);
         }

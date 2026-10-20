@@ -7206,8 +7206,9 @@ fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBod
     Ok(())
 }
 
-/// The coord hold tool (plan `2026-10-04-coord-pr-hold-without-github-drafts`).
-const COORD_SET_PR_HOLD_TOOL: &str = "coord_set_pr_hold";
+// The coord hold tool (plan `2026-10-04-coord-pr-hold-without-github-drafts`),
+// shared with the held-create probe so the two cannot drift.
+use qontinui_runner_lib::pr_hold_echo::COORD_SET_PR_HOLD_TOOL;
 
 /// Why this proxy forwards only PLACING a hold. Through `/coord-mcp` a call
 /// carries this box's paired-DEVICE JWT, so every session on the box (and a
