@@ -47,10 +47,13 @@ static JWT_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// URL-userinfo sweep: `scheme://user:pass@host` (or `scheme://token@host`)
-/// becomes `scheme://***@host` (same plan, D6). The userinfo may not contain
-/// `/`, whitespace or `@`, so a path segment holding an `@` is not matched.
+/// becomes `scheme://***@host` (same plan, D6). Greedy to the LAST `@` in the
+/// authority, so a userinfo that itself holds an `@` (the Azure / Atlas
+/// `user@server:password@host` shape) is masked whole; the authority ends at
+/// the first `/`, `?`, `#` or whitespace, so an `@` in a path or query is
+/// not userinfo.
 static URL_USERINFO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@")
+    Regex::new(r"\b([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s]*@")
         .expect("url-userinfo redaction regex is a valid literal")
 });
 
@@ -230,9 +233,29 @@ mod tests {
     }
 
     #[test]
-    fn an_at_sign_in_a_url_path_is_not_userinfo() {
+    fn an_at_sign_in_a_url_path_or_query_is_not_userinfo() {
         let input = b"see https://example.com/users/@me and mail a@b.c";
         assert_eq!(redact_secrets(input), input);
+        let input = b"open https://example.com?x=a@b now";
+        assert_eq!(redact_secrets(input), input);
+        let input = b"open https://example.com#frag@x now";
+        assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
+    fn a_userinfo_holding_an_at_sign_is_masked_whole() {
+        // The Azure Database for PostgreSQL / Atlas shape: the user name itself
+        // carries `@server`. Assembled at runtime so scanners see no literal.
+        let input = format!(
+            "psql postgres://{}@mydemoserver:{}@srv.example.com:5432/db",
+            "myadmin", "mypassword"
+        );
+        let out = String::from_utf8(redact_secrets(input.as_bytes())).unwrap();
+        assert!(
+            !out.contains("mypassword") && !out.contains("myadmin"),
+            "{out}"
+        );
+        assert_eq!(out, "psql postgres://***@srv.example.com:5432/db");
     }
 
     #[test]

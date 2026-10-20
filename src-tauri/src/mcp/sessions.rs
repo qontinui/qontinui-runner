@@ -1616,8 +1616,21 @@ async fn operator_touch_notification(
 /// (D1); this answer is for curl probes and logs.
 async fn permission_request(
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Json<serde_json::Value> {
+    // The hook is a `curl` from the CLI and sends no `Origin`; a browser
+    // always does. A browser-borne body is never counted (still 200 — the
+    // pad is fail-open).
+    if has_browser_origin(&headers) {
+        return Json(serde_json::json!({
+            "recorded": false,
+            "reason": "refused: a browser Origin header is not a hook",
+            "class_key": null,
+            "dossier_slug": null,
+            "session": id,
+        }));
+    }
     let outcome = crate::session::permission_prompt_capture::observe_permission_request(&id, &body);
     let class = outcome.class();
     Json(serde_json::json!({
@@ -1627,6 +1640,26 @@ async fn permission_request(
         "dossier_slug": class.map(|c| c.dossier_slug.as_str()),
         "session": id,
     }))
+}
+
+/// True when the request carries an `Origin` header — a browser. The
+/// permission-prompt doors serve CLI callers (`curl` from a hook or a slash
+/// command), which send none.
+fn has_browser_origin(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(axum::http::header::ORIGIN)
+}
+
+/// The refusal the permission-prompt read doors give a browser.
+fn browser_origin_refusal() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "refused: a browser Origin header is not a permission-prompt caller",
+            "code": "ORIGIN_REFUSED",
+        })),
+    )
+        .into_response()
 }
 
 // =============================================================================
@@ -2511,8 +2544,16 @@ struct ClassifyPermissionPromptRequest {
 /// Phase 2), so the `/permission-prompts record` command keys a pasted prompt
 /// exactly as the Notification intake keys a captured one. Records nothing.
 /// Body is parsed leniently (empty / non-JSON → all fields absent → the
-/// `permission-prompt-unknown` class); always 200.
-async fn classify_permission_prompt(body: axum::body::Bytes) -> Json<serde_json::Value> {
+/// `permission-prompt-unknown` class); 200, except 403 to a request carrying
+/// a browser `Origin`.
+async fn classify_permission_prompt(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if has_browser_origin(&headers) {
+        return browser_origin_refusal();
+    }
     let req: ClassifyPermissionPromptRequest = serde_json::from_slice(&body).unwrap_or_default();
     let class = crate::session::permission_prompt_capture::classify(
         req.text.as_deref(),
@@ -2530,6 +2571,29 @@ async fn classify_permission_prompt(body: axum::body::Bytes) -> Json<serde_json:
         "reason": class.reason.as_deref().map(crate::session::permission_prompt_capture::redact_pasted),
         "tool": class.tool,
     }))
+    .into_response()
+}
+
+/// `GET /permission-prompts/snapshot` — read-only view of the in-memory
+/// aggregator (plan
+/// `2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote`
+/// Phase 2), so a live box can observe the capture arm before Phase 3's flush
+/// exists. Every field is already redacted (D6). 403 to a browser `Origin`.
+async fn permission_prompts_snapshot(headers: axum::http::HeaderMap) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if has_browser_origin(&headers) {
+        return browser_origin_refusal();
+    }
+    let buckets: Vec<serde_json::Value> = crate::session::permission_prompt_capture::snapshot()
+        .iter()
+        .map(|b| b.to_json())
+        .collect();
+    Json(serde_json::json!({
+        "bucket_count": buckets.len(),
+        "dropped": crate::session::permission_prompt_capture::dropped(),
+        "buckets": buckets,
+    }))
+    .into_response()
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
@@ -2574,6 +2638,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/permission-prompts/classify",
             post(classify_permission_prompt),
+        )
+        .route(
+            "/permission-prompts/snapshot",
+            get(permission_prompts_snapshot),
         )
 }
 
@@ -2642,14 +2710,17 @@ mod permission_prompt_capture_route_tests {
             "permission_mode": "bypassPermissions",
             "effort": {"level": "medium"},
             "hook_event_name": "PermissionRequest",
-            "tool_name": "Bash",
+            "tool_name": "Qzx7EchoTool",
             "tool_input": {"command": command, "description": "probe"},
             "permission_suggestions": [],
         });
         let class = crate::session::permission_prompt_capture::parse_payload(&payload)
             .unwrap()
             .class;
-        assert_eq!(class.class_key, "permission-prompt-bash-qzx7armingprobe");
+        assert_eq!(
+            class.class_key,
+            "permission-prompt-qzx7echotool-qzx7armingprobe"
+        );
         let before = class_count(&class.dossier_slug);
 
         let (status, body) = post_json(
@@ -2669,10 +2740,11 @@ mod permission_prompt_capture_route_tests {
             .unwrap();
         assert_eq!(bucket.safety_class(), Some(true));
 
-        // The dialog's Notification echo on the same terminal is not counted
-        // (its own class would be `permission-prompt-bash`).
+        // The dialog's Notification echo on the same terminal is not counted.
+        // Its own class would be `permission-prompt-qzx7echotool` — a tool no
+        // other test names, so the global count cannot collide.
         let bash_only = crate::session::permission_prompt_capture::classify(
-            Some("Claude needs your permission to use Bash"),
+            Some("Claude needs your permission to use Qzx7EchoTool"),
             None,
             None,
         );
@@ -2683,7 +2755,7 @@ mod permission_prompt_capture_route_tests {
             serde_json::json!({
                 "hook_event_name": "Notification",
                 "notification_type": "permission_prompt",
-                "message": "Claude needs your permission to use Bash",
+                "message": "Claude needs your permission to use Qzx7EchoTool",
             })
             .to_string(),
         )
@@ -2695,6 +2767,132 @@ mod permission_prompt_capture_route_tests {
             "echo counted"
         );
         assert_eq!(class_count(&class.dossier_slug), before + 1);
+    }
+
+    async fn send(
+        app: Router,
+        method: &str,
+        uri: &str,
+        origin: Option<&str>,
+        body: String,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+        }
+        let resp = app
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// A browser-borne body is never counted, and the read doors refuse a
+    /// browser outright.
+    #[tokio::test]
+    async fn a_browser_origin_is_refused_by_every_permission_prompt_door() {
+        let payload = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Qzx7OriginTool",
+            "tool_input": {"command": "rm -f x"},
+        });
+        let class = crate::session::permission_prompt_capture::parse_payload(&payload)
+            .unwrap()
+            .class;
+        let before = class_count(&class.dossier_slug);
+        let (status, body) = send(
+            permission_request_app(),
+            "POST",
+            "/sessions/term-origin/permission-request",
+            Some("https://evil.example"),
+            payload.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["recorded"], false);
+        assert_eq!(
+            class_count(&class.dossier_slug),
+            before,
+            "browser body counted"
+        );
+
+        let classify_app = Router::new().route(
+            "/permission-prompts/classify",
+            post(classify_permission_prompt),
+        );
+        let (status, body) = send(
+            classify_app,
+            "POST",
+            "/permission-prompts/classify",
+            Some("http://localhost:3001"),
+            "{}".to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "ORIGIN_REFUSED");
+
+        let snap = || {
+            Router::new().route(
+                "/permission-prompts/snapshot",
+                get(permission_prompts_snapshot),
+            )
+        };
+        let (status, _) = send(
+            snap(),
+            "GET",
+            "/permission-prompts/snapshot",
+            Some("https://evil.example"),
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// The snapshot door shows what the intake counted.
+    #[tokio::test]
+    async fn the_snapshot_route_shows_a_counted_class() {
+        let payload = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Qzx7SnapshotTool",
+            "tool_input": {"command": "rmdir $X/"},
+            "permission_suggestions": [],
+        });
+        let (status, _) = post_json(
+            permission_request_app(),
+            "/sessions/term-snapshot/permission-request",
+            payload.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = send(
+            Router::new().route(
+                "/permission-prompts/snapshot",
+                get(permission_prompts_snapshot),
+            ),
+            "GET",
+            "/permission-prompts/snapshot",
+            None,
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["dropped"].is_u64(), "{body}");
+        let found = body["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["class_key"] == "permission-prompt-qzx7snapshottool-rmdir")
+            .cloned()
+            .unwrap_or_else(|| panic!("class not in snapshot: {body}"));
+        assert!(found["count"].as_u64().unwrap() >= 1);
+        assert_eq!(found["safety_class"], true);
     }
 
     #[tokio::test]
@@ -2844,6 +3042,10 @@ mod permission_prompt_capture_route_tests {
             (
                 "\"/permission-prompts/classify\"",
                 "post(classify_permission_prompt)",
+            ),
+            (
+                "\"/permission-prompts/snapshot\"",
+                "get(permission_prompts_snapshot)",
             ),
         ] {
             let (_, tail) = body
