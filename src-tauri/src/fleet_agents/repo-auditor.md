@@ -67,8 +67,14 @@ settings.
    the literal, and do not conclude from it that Channel 1 is unavailable.
 
    **Send it WITH this device's coord bearer: `Authorization: Bearer <token>`,
-   read from `$COORD_DEVICE_JWT`, else `~/.qontinui/coord-device-jwt`.** Stage
-   it in a header file (`-H @file`) and never echo it or put it on argv. Why:
+   chosen on VALIDITY, not presence.** Candidates in order: `$COORD_DEVICE_JWT`,
+   then `~/.qontinui/coord-device-jwt`. Decode each candidate's payload (base64,
+   not encrypted; read it locally, never print the token) and take the first
+   whose `exp` is in the future AND whose `tenant_id` claim equals
+   `INPUT_JSON.tenant_id`; an expired or other-tenant candidate is skipped, not
+   sent. If none qualifies, the profile you deliver will be UNATTESTED: POST
+   without a bearer and say so in `audit_notes`. Stage the chosen token in a
+   header file (`-H @file`) and never echo it or put it on argv. Why:
    the route itself is still anonymous (`post_profile_callback` lets an
    unauthenticated write land, keyed on the `agent_id` in the body), but since
    qontinui-coord `5dac6d6c2` coord stamps a server-reserved `coord_writer` on
@@ -79,18 +85,29 @@ settings.
    anyone who saw it; that is why it is no longer trusted. A profile delivered
    with no bearer is kept for operator review only, and the agent accept
    answers `409 audit_profile_unattested` for it. `build_auditor_prompt` says
-   the same in the input it hands you. With no credential on this box, POST
-   anyway (the operator route can still read it) and say so in `audit_notes`.
+   the same in the input it hands you. With no qualifying credential on this
+   box, POST anyway (the operator route can still read it) and say so in
+   `audit_notes`.
 
-   ⚠️ **So a `401` from that route is NOT about your credential**, and reading
-   it as one costs you the only delivery channel you had left. Its body is
+   ⚠️ **A `200 {"ok":true}` does NOT prove the row was attested.** Coord stamps
+   no `coord_writer` for a wrong-tenant or invalid token and still answers 200,
+   so the response cannot tell an attested delivery from an unattested one.
+   The attested state is read back from `GET
+   /pr-merge/onboarding/audit-status?agent_id=<agent_id>` → `attested`; do not
+   report the profile as attested from the 200 alone.
+
+   ⚠️ **A `401` from that route is USUALLY NOT about your credential**, and
+   reading it as one costs you the only delivery channel you had left. Since
+   you now attach a bearer, a malformed or expired one may itself cause a
+   refusal, so re-check the chosen token's `exp` before anything else. The
+   `agent_id` 401's body is
    always `{"error":"agent_id not found in coord.agent_worktrees"}`, and it
    covers **two** states, not one: the `agent_id` you sent has no allocation row
    (wrong id, or the row is gone), **or the existence query itself failed** —
    the handler collapses an `Err` from that `SELECT EXISTS` into
    `agent_exists = false` and returns the identical 401, so a transient coord/DB
    fault is indistinguishable from a bad id. Only a pool-acquire failure ahead
-   of it maps to 500. So: re-read the `agent_id` out of your spawn payload and
+   of it maps to 500. So: re-read the `agent_id` out of `INPUT_JSON` and
    retry — the right move for both states — but record the outcome as
    **UNKNOWN** rather than "my `agent_id` was wrong", and if a retry with an id
    you have verified still 401s, that is a coord-side fault to report, not a
@@ -117,11 +134,18 @@ Coord supplies a JSON document via `INPUT_JSON` in the spawn prompt:
 ```json
 {
   "tenant_id": "<uuid>",
+  "agent_id": "<uuid>",
   "repo": "owner/name",
   "github_app_token": "<short-lived install token>",
   "callback_url": "<COORD_URL>/pr-merge/onboarding/profile-callback"
 }
 ```
+
+`agent_id` is your own audit agent's id, the one the profile-callback body
+carries. qontinui-coord#3322 is adding it to `INPUT_JSON`; a coord that predates
+that change sends only `tenant_id`, `repo`, the token and `callback_url`. If it
+is absent, the id is UNKNOWN to you: say so in `audit_notes` and deliver over
+the stdout fallback rather than POSTing a guessed id.
 
 The token is supplied via the `GITHUB_APP_TOKEN` environment variable.
 Do NOT echo it.
@@ -373,10 +397,12 @@ the device/agent onboarding accept.
 1. **HTTP callback (primary)**: POST the JSON to `<callback_url>` (from the
    input) with body:
    ```json
-   { "agent_id": "<your agent_id from spawn payload>", "profile": { ... } }
+   { "agent_id": "<INPUT_JSON.agent_id>", "profile": { ... } }
    ```
-   and this device's coord bearer as `Authorization: Bearer <token>`, from
-   `$COORD_DEVICE_JWT`, else `~/.qontinui/coord-device-jwt`; stage it in a
+   and this device's coord bearer as `Authorization: Bearer <token>`, the
+   first of `$COORD_DEVICE_JWT`, `~/.qontinui/coord-device-jwt` whose `exp` is in
+   the future and whose `tenant_id` claim equals `INPUT_JSON.tenant_id` (Hard
+   contract 2; none qualifying means an unattested profile); stage it in a
    header file (`-H @file`), never on argv, never echoed. Coord validates the
    `agent_id` against `coord.agent_worktrees`, writes a structured
    `coord.agent_logs (event='starter_profile')` row, and stamps the verified
@@ -385,8 +411,11 @@ the device/agent onboarding accept.
    with a `user_id`) for the device the audit was dispatched to; the file
    token carries `user_id`. An unauthenticated POST still lands, for operator
    review only, and the agent accept answers `409 audit_profile_unattested`
-   for it. Read a `401` here as "that `agent_id` has no allocation row", never
-   as a rejected credential. Why the GET-only grant does not forbid this POST:
+   for it. Read a `401` here as "that `agent_id` has no allocation row" first;
+   a malformed or expired bearer may also cause a refusal, so re-check the
+   token's `exp`. A `200 {"ok":true}` does not prove attestation (a
+   wrong-tenant or invalid token is stamped nothing and still answers 200);
+   read `attested` from `audit-status`. Why the GET-only grant does not forbid this POST:
    Hard contract 2.
 2. **Stdout line (operator-review fallback)**: only when the POST could not be
    made (no credential on this box, or the route unreachable), emit one line of
