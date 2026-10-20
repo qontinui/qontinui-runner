@@ -505,6 +505,18 @@ jobs:
           # refs are one-shot, so a per-ref save buys nothing.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The restore above can return a `postgresql_embedded` build unit whose
+      # OUT_DIR embeds a different PostgreSQL release than the pin in
+      # src-tauri/.cargo/config.toml. Cargo re-runs the build script when the pin
+      # changes, but the script keeps an archive that is already in OUT_DIR, so
+      # the stale release survives. Measured 2026-10-19: main's ubuntu-22.04
+      # cache held 18.6.1, whose initdb needs GLIBC 2.36. This drops such units
+      # so this run embeds the pin; a cache that already matches is untouched.
+      # embedded_pg::tests::bundled_postgres_is_the_pinned_release fails if a
+      # stale unit gets past this step.
+      - name: Purge cached bundled-PostgreSQL units that do not match the pin
+        run: node scripts/ci/purge-stale-bundled-postgres.mjs
+
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
