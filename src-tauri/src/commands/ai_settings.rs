@@ -92,9 +92,8 @@ fn get_ai_settings_impl() -> Result<CommandResponse, AppError> {
 /// An ABSENT mode (`None` — a caller that does not send it) KEEPS the stored
 /// mode: the mode is machine-global (mirrored into `claude-accounts.json`), so
 /// defaulting it would silently re-point every runner on the machine. A sent
-/// value is parsed: `manual` and `least_usage` select those modes, anything
-/// else (including `highest_expected_usage`) is `HighestExpectedUsage`, the
-/// settings.rs default. Plan
+/// value is parsed with `AccountSelectionMode::from_wire`; an unknown spelling
+/// is `AccountSelectionMode::default()` (settings.rs). Plan
 /// `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
 /// Phase 1.
 fn resolve_saved_selection_mode(
@@ -1673,7 +1672,8 @@ mod usage_twin_report {
         /// stored by coord in its own `coord.prepaid_balances` table.
         prepaid: Vec<WirePrepaid<'a>>,
         /// The machine-global selection strategy, snake_case
-        /// (`"manual"` | `"least_usage"` — see
+        /// (`"manual"` | `"least_usage"` | `"highest_expected_usage"` |
+        /// `"weighted_random"` | `"alternating_handoff"` — see
         /// [`crate::settings::AccountSelectionMode::as_str`]). Per-REPORT, not
         /// per-account: the roster file holds one mode for the whole box.
         ///
