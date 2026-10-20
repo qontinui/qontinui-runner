@@ -67,16 +67,22 @@ pub const COMMAND_EXAMPLE_MAX_CHARS: usize = 300;
 /// The reason-text cap. The reason is recorded verbatim (after redaction), but
 /// a pathological payload must not grow the aggregator without bound.
 pub const REASON_MAX_CHARS: usize = 500;
-/// How many live buckets the aggregator holds before it starts refusing NEW
-/// buckets (existing ones keep counting). A flood of distinct classes is
-/// bounded here; the refusals are counted in [`Aggregator::dropped`].
+/// How many live buckets the aggregator holds. At the bound a NEW bucket
+/// evicts the oldest-hour bucket, and an observation older than every held
+/// bucket is refused; both losses are counted in [`Aggregator::dropped`].
 pub const MAX_BUCKETS: usize = 512;
-/// A `Notification` arriving this soon after a `PermissionRequest` on the same
-/// terminal is that dialog's echo (Claude Code fires it on a ~6 s timer while
-/// the dialog is open), so it is not counted again.
+/// A `Notification` arriving within this window of the last prompt signal on
+/// the same terminal — a counted `PermissionRequest`, or a counted or
+/// suppressed `Notification` — is treated as the same dialog and not counted
+/// again. The window slides with each suppressed `Notification`. Phase 0 saw
+/// a `Notification` follow a `PermissionRequest` ~6 s later; whether Claude
+/// Code REPEATS the `Notification` while a dialog stays open was not
+/// measured, so the window guards against it rather than relying on it.
 pub const DEDUP_WINDOW_SECS: i64 = 60;
 /// Cap on a tool name or command word inside a class key.
 pub const MAX_KEY_TOKEN_CHARS: usize = 48;
+/// Cap on a stored cwd excerpt (after reduction to two components).
+pub const CWD_EXAMPLE_MAX_CHARS: usize = 200;
 /// Cap on the prompt text and the command `classify` looks at — a pathological
 /// payload must not cost unbounded regex work.
 pub const MAX_CLASSIFY_INPUT_BYTES: usize = 16 * 1024;
@@ -417,7 +423,11 @@ pub fn classify(text: Option<&str>, tool_name: Option<&str>, command: Option<&st
             format!("{CLASS_KEY_PREFIX}-{words}-{}", hash_hex(&head, 6))
         }
         (None, None) => {
-            let cmd_tok = command.and_then(first_command_token);
+            // Keyed on the REDACTED command: a credential in the command word
+            // (a URL with userinfo, a bare JWT) must never reach the key.
+            let cmd_tok = command
+                .map(redact_and_strip)
+                .and_then(|c| first_command_token(&c));
             match (&tool, cmd_tok) {
                 (Some(t), Some(c)) => format!("{CLASS_KEY_PREFIX}-{t}-{c}"),
                 (Some(t), None) => format!("{CLASS_KEY_PREFIX}-{t}"),
@@ -509,10 +519,12 @@ pub fn reduce_cwd(cwd: &str) -> String {
 pub fn redact_example(command: Option<&str>, cwd: Option<&str>) -> RedactedExample {
     RedactedExample {
         command: command
-            .map(str::trim)
+            .map(|c| crate::str_utils::truncate_str(c, MAX_CLASSIFY_INPUT_BYTES).trim())
             .filter(|c| !c.is_empty())
             .map(redact_command),
-        cwd: cwd.map(reduce_cwd).filter(|c| !c.is_empty()),
+        cwd: cwd
+            .map(|c| truncate_chars(&reduce_cwd(c), CWD_EXAMPLE_MAX_CHARS))
+            .filter(|c| !c.is_empty()),
     }
 }
 
@@ -524,7 +536,8 @@ pub fn redact_example(command: Option<&str>, cwd: Option<&str>) -> RedactedExamp
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {
     /// `Notification` with `notification_type: permission_prompt` — only a
-    /// stock `message`, fired on a ~6 s timer while the dialog is open.
+    /// stock `message` (Phase 0: seen ~6 s after the dialog's
+    /// `PermissionRequest`; whether it repeats is unmeasured).
     Notification,
     /// `PermissionRequest` — fires before the dialog, with `tool_name`,
     /// `tool_input` and `permission_suggestions`.
@@ -698,9 +711,9 @@ fn hour_bucket(t: DateTime<Utc>) -> i64 {
 pub struct Aggregator {
     buckets: BTreeMap<(String, i64), ClassBucket>,
     dropped: u64,
-    /// Per terminal id, when its last `PermissionRequest` was counted — so the
-    /// `Notification` the same dialog raises ~6 s later is not counted twice.
-    last_permission_request: HashMap<String, DateTime<Utc>>,
+    /// Per terminal id, the last prompt signal: a counted `PermissionRequest`
+    /// or a counted or suppressed `Notification` (see [`DEDUP_WINDOW_SECS`]).
+    last_signal: HashMap<String, DateTime<Utc>>,
 }
 
 /// What [`Aggregator::observe`] did with one observation.
@@ -748,11 +761,14 @@ impl Aggregator {
         Self::default()
     }
 
-    /// Count `obs` from terminal `terminal_id` unless it is the `Notification`
-    /// echo of a `PermissionRequest` already counted for that terminal within
-    /// [`DEDUP_WINDOW_SECS`]. A `Notification` with no preceding
-    /// `PermissionRequest` (an older CLI, or a carrier that registers only
-    /// `Notification`) still counts, under its coarser class.
+    /// Count `obs` from terminal `terminal_id`. A `PermissionRequest` always
+    /// counts (it fires once, before its dialog). A `Notification` is NOT
+    /// counted when it arrives within [`DEDUP_WINDOW_SECS`] of the last prompt
+    /// signal on that terminal — the echo of a counted `PermissionRequest`, or
+    /// a repeat of an earlier `Notification` for a dialog still open — and it
+    /// slides the window. A `Notification` with no recent signal (an older CLI,
+    /// or a carrier that registers only `Notification`) counts, under its
+    /// coarser class.
     pub fn observe(
         &mut self,
         terminal_id: &str,
@@ -760,32 +776,19 @@ impl Aggregator {
         now: DateTime<Utc>,
     ) -> ObserveOutcome {
         let window = chrono::Duration::seconds(DEDUP_WINDOW_SECS);
-        match obs.kind {
-            PayloadKind::PermissionRequest => {
-                self.last_permission_request
-                    .retain(|_, at| now.signed_duration_since(*at) < window);
-                if !terminal_id.is_empty() {
-                    self.last_permission_request
-                        .insert(terminal_id.to_string(), now);
-                }
-            }
-            PayloadKind::Notification => {
-                let echo = self
-                    .last_permission_request
-                    .get(terminal_id)
-                    .is_some_and(|at| {
-                        let age = now.signed_duration_since(*at);
-                        age >= chrono::Duration::zero() && age < window
-                    });
-                if echo {
-                    // The dialog is still open (Claude Code repeats the
-                    // Notification every ~6 s): keep the window sliding so a
-                    // long-open dialog stays ONE prompt.
-                    self.last_permission_request
-                        .insert(terminal_id.to_string(), now);
-                    return ObserveOutcome::Deduplicated(obs.class);
-                }
-            }
+        let recent = self.last_signal.get(terminal_id).is_some_and(|at| {
+            let age = now.signed_duration_since(*at);
+            age >= chrono::Duration::zero() && age < window
+        });
+        // Every signal (counted or suppressed) refreshes its terminal's entry,
+        // so a dialog left open stays ONE prompt; stale entries are pruned.
+        self.last_signal
+            .retain(|_, at| now.signed_duration_since(*at) < window);
+        if !terminal_id.is_empty() {
+            self.last_signal.insert(terminal_id.to_string(), now);
+        }
+        if obs.kind == PayloadKind::Notification && recent {
+            return ObserveOutcome::Deduplicated(obs.class);
         }
         let class = obs.class.clone();
         if self.record(obs, now) {
@@ -1462,8 +1465,8 @@ rm -f z",
             .all(|m| m.chars().count() <= MAX_PERMISSION_MODE_CHARS));
     }
 
-    /// Claude Code repeats the Notification every ~6 s while a dialog stays
-    /// open: a dialog open for two minutes is still ONE prompt.
+    /// IF Claude Code repeats the Notification while a dialog stays open
+    /// (unmeasured), a dialog open for two minutes is still ONE prompt.
     #[test]
     fn a_long_open_dialog_counts_once() {
         let mut agg = Aggregator::new();
@@ -1484,6 +1487,53 @@ rm -f z",
         }
         let total: u64 = agg.snapshot().iter().map(|b| b.count).sum();
         assert_eq!(total, 1);
+    }
+
+    /// Today's fleet intake is Notification-only: a dialog whose Notification
+    /// repeats must still count once, and a later dialog counts again.
+    #[test]
+    fn a_repeating_notification_without_a_permission_request_counts_once() {
+        let mut agg = Aggregator::new();
+        let t0 = utc("2026-10-14T10:00:00Z");
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let n = || note("Claude needs your permission to use Bash");
+        assert!(agg.observe("tn", n(), t0).counted());
+        for s in (6..=120).step_by(6) {
+            let o = agg.observe("tn", n(), at(s));
+            assert!(
+                matches!(o, ObserveOutcome::Deduplicated(_)),
+                "at {s}s: {o:?}"
+            );
+        }
+        assert!(agg
+            .observe("tn", n(), at(120 + DEDUP_WINDOW_SECS + 1))
+            .counted());
+        // A PermissionRequest always counts, even right after a Notification.
+        assert!(agg
+            .observe("tn", pr("rm x", serde_json::json!([])), at(200))
+            .counted());
+        let total: u64 = agg.snapshot().iter().map(|b| b.count).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn a_credential_in_the_command_word_never_reaches_the_class_key() {
+        for cmd in [
+            format!("https://u:{}@h.example/x", "zzpw77"),
+            format!("postgres://u:{}@h/db --list", "zzpw77"),
+            format!("eyJ{}.eyJ{}.zzpw77sig", "hbGciOiJIUzI1NiJ9", "zdWIiOiJ4In0"),
+        ] {
+            let c = classify(None, Some("Bash"), Some(&cmd));
+            assert!(!c.class_key.contains("zzpw77"), "{cmd} -> {c:?}");
+            assert!(!c.class_key.contains("hbgcioijiuzi1nij9"), "{cmd} -> {c:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_cwd_is_capped() {
+        let cwd = format!("/a/{}", "d".repeat(1000));
+        let ex = redact_example(Some("ls"), Some(&cwd));
+        assert_eq!(ex.cwd.unwrap().chars().count(), CWD_EXAMPLE_MAX_CHARS + 1);
     }
 
     #[test]
@@ -1662,8 +1712,8 @@ rm -f z",
         assert!(parse_payload(&serde_json::json!({"message": "hello"})).is_none());
     }
 
-    /// One dialog yields a PermissionRequest and, ~6 s later, a Notification:
-    /// count it once.
+    /// One dialog yields a PermissionRequest and (Phase 0) a Notification ~6 s
+    /// later: count it once.
     #[test]
     fn the_notification_echo_of_a_permission_request_is_not_counted_twice() {
         let mut agg = Aggregator::new();
@@ -1701,9 +1751,9 @@ rm -f z",
         for i in 0..100 {
             agg.observe(&format!("t{i}"), pr("rm x", serde_json::json!([])), t0);
         }
-        assert_eq!(agg.last_permission_request.len(), 100);
+        assert_eq!(agg.last_signal.len(), 100);
         let later = t0 + chrono::Duration::seconds(DEDUP_WINDOW_SECS * 2);
         agg.observe("fresh", pr("rm x", serde_json::json!([])), later);
-        assert_eq!(agg.last_permission_request.len(), 1);
+        assert_eq!(agg.last_signal.len(), 1);
     }
 }

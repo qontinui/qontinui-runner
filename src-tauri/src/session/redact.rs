@@ -48,12 +48,14 @@ static JWT_RE: Lazy<Regex> = Lazy::new(|| {
 
 /// URL-userinfo sweep: `scheme://user:pass@host` (or `scheme://token@host`)
 /// becomes `scheme://***@host` (same plan, D6). Greedy to the LAST `@` in the
-/// authority, so a userinfo that itself holds an `@` (the Azure / Atlas
-/// `user@server:password@host` shape) is masked whole; the authority ends at
-/// the first `/`, `?`, `#` or whitespace, so an `@` in a path or query is
+/// authority, so a userinfo that itself holds an `@` (the Azure Database for
+/// PostgreSQL `user@server:password@host` shape) is masked whole. The
+/// authority ends at the first `/`, `?`, `#`, whitespace, or any character
+/// RFC 3986 does not allow in it (`"` `<` `>` `\` `{` `}` `|` `^` `` ` `` `[`
+/// `]`), so an `@` in a path, a query, or a later field of compact JSON is
 /// not userinfo.
 static URL_USERINFO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s]*@")
+    Regex::new(r#"\b([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s"<>\\{}|^`\[\]]*@"#)
         .expect("url-userinfo redaction regex is a valid literal")
 });
 
@@ -243,8 +245,16 @@ mod tests {
     }
 
     #[test]
+    fn compact_json_with_an_email_after_a_url_is_left_alone() {
+        let input = br#"{"url":"https://api.x.io","user":"a@b.c"}"#;
+        assert_eq!(redact_secrets(input), input);
+        let input = br#"<a href="https://h.io">x</a> mail a@b.c"#;
+        assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
     fn a_userinfo_holding_an_at_sign_is_masked_whole() {
-        // The Azure Database for PostgreSQL / Atlas shape: the user name itself
+        // The Azure Database for PostgreSQL shape: the user name itself
         // carries `@server`. Assembled at runtime so scanners see no literal.
         let input = format!(
             "psql postgres://{}@mydemoserver:{}@srv.example.com:5432/db",

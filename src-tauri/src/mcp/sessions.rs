@@ -2696,8 +2696,8 @@ mod permission_prompt_capture_route_tests {
 
     /// ARMING (detect_deliver), primary entry: a `PermissionRequest` payload —
     /// the Phase 0 raw shape — posted to `/sessions/{id}/permission-request`
-    /// increments the aggregator's class count, and the same dialog's
-    /// `Notification` ~6 s later does NOT count it again.
+    /// increments the aggregator's class count, and the same dialog's later
+    /// `Notification` does NOT count it again.
     #[tokio::test]
     async fn a_permission_request_increments_the_class_count_once_per_dialog() {
         // A command token no other test uses, so this class's global bucket
@@ -2939,11 +2939,12 @@ mod permission_prompt_capture_route_tests {
         assert_eq!(class_count(&class.dossier_slug), before + 1);
 
         // A second prompt of the same class with a different variable counts
-        // in the SAME class.
+        // in the SAME class. Another terminal: on the same one it would be
+        // inside the dedup window and read as the same dialog.
         let variant = payload.to_string().replace("$v", "$other");
         let _ = post_json(
             notification_app(),
-            "/sessions/term-arming/notification",
+            "/sessions/term-arming-2/notification",
             variant,
         )
         .await;
