@@ -247,6 +247,14 @@ jsonpath-rust = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
+    # NtQueryObject(ObjectTypesInformation) and
+    # NtQuerySystemInformation(SystemPoolTagInformation) — the kernel Token /
+    # Process object counts and the pool-tag table the `os-health` thread reads
+    # (`os_health::windows`). Through these bindings, never a hand-declared
+    # extern: `crates/runner-win32/src/lib.rs` records the load-time
+    # STATUS_ENTRYPOINT_NOT_FOUND risk of raw externs.
+    "Wdk_Foundation",
+    "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     # GetExtendedTcpTable — the peer-user guard resolves a loopback peer's

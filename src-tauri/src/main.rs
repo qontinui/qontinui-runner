@@ -208,6 +208,10 @@ mod online_learning;
 mod orchestration_loop;
 mod orchestration_loop_configs;
 mod orchestrator;
+/// Kernel pool, kernel objects and OS process-creation latency, measured on
+/// EVERY instance by one `os-health` thread (plan
+/// `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`).
+mod os_health;
 mod otel;
 mod outbound_trace; // Plan 2026-07-08-ui-bridge-reach-and-verify-gated-flows P5 — redacted outbound-call trace
 mod paths;
@@ -1796,6 +1800,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start health monitoring to detect resource exhaustion
     health_monitor::start_health_monitor();
+
+    // Kernel objects, kernel pool and OS process-creation latency (plan
+    // `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`
+    // D1): ONE `os-health` std::thread, started here on EVERY instance —
+    // primary, secondary/temp, with or without a coord credential. It is
+    // deliberately NOT behind `fleet::machine_state_publish_allowed` or the
+    // secondary-instance gate (those govern PUBLISHING, which the primary's
+    // resource sampler still alone does), and it never runs on a tokio
+    // runtime: it must keep measuring while every runtime here is starved.
+    os_health::start();
 
     // Initialize Windows Job Object so spawned AI processes are auto-killed
     // if the runner crashes (safety net for the explicit taskkill in shutdown).
