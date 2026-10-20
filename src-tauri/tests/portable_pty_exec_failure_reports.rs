@@ -51,10 +51,16 @@ fn an_inheritable_fd_is_still_closed_in_the_child() {
     assert!(leaked > 2);
 
     let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.args(["-c", &format!("[ -e /proc/$$/fd/{leaked} ] && exit 7; exit 0")]);
+    cmd.args([
+        "-c",
+        &format!("[ -e /proc/$$/fd/{leaked} ] && exit 7; exit 0"),
+    ]);
     let mut child = open_pty().slave.spawn_command(cmd).unwrap();
     let status = child.wait().unwrap();
     // SAFETY: closing the duplicate we made.
     unsafe { libc::close(leaked) };
-    assert!(status.success(), "inheritable fd {leaked} leaked into the child: {status:?}");
+    assert!(
+        status.success(),
+        "inheritable fd {leaked} leaked into the child: {status:?}"
+    );
 }
