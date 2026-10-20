@@ -1,0 +1,76 @@
+{
+  "captured_at": "2026-10-19T08:20:52.188206+00:00",
+  "host": "spaceship",
+  "windows": "10.0.26200",
+  "python_bits": 64,
+  "elevated": true,
+  "get_performance_info": {
+    "ok": true,
+    "kernel_paged_bytes": 24282075136,
+    "kernel_nonpaged_bytes": 15075627008,
+    "handle_count": 406585,
+    "process_count": 1442,
+    "thread_count": 12531,
+    "page_size": 4096
+  },
+  "object_types_information": {
+    "status": "0x00000000",
+    "bytes": 10056,
+    "type_count": 75,
+    "token": {
+      "objects": 4365962,
+      "handles": 2447
+    },
+    "process": {
+      "objects": 2930,
+      "handles": 11843
+    }
+  },
+  "pool_tag_information": {
+    "status": "0x00000000",
+    "bytes": 135168,
+    "tag_count": 3379,
+    "top8": [
+      {
+        "tag": "File",
+        "bytes": 9693669888,
+        "outstanding_allocs": 24238128
+      },
+      {
+        "tag": "Toke",
+        "bytes": 9499968256,
+        "outstanding_allocs": 4365962
+      },
+      {
+        "tag": "SeAt",
+        "bytes": 1727989760,
+        "outstanding_allocs": 17816508
+      },
+      {
+        "tag": "D2d ",
+        "bytes": 759218944,
+        "outstanding_allocs": 23725583
+      },
+      {
+        "tag": "SeTd",
+        "bytes": 628488688,
+        "outstanding_allocs": 4365962
+      },
+      {
+        "tag": "FMfn",
+        "bytes": 566967584,
+        "outstanding_allocs": 1043957
+      },
+      {
+        "tag": "SeTl",
+        "bytes": 558843136,
+        "outstanding_allocs": 4365962
+      },
+      {
+        "tag": "NtfF",
+        "bytes": 544487424,
+        "outstanding_allocs": 327216
+      }
+    ]
+  }
+}
