@@ -11,6 +11,7 @@ import {
   deferredLabel,
   RESTORE_NOTE,
   ROLE_RESTORE_NOTE,
+  ROLE_UNKNOWN_HEADING,
   UNKNOWN_HEADING,
 } from "./RunnerDrainBanner";
 import {
@@ -70,8 +71,66 @@ describe("drainBannerModel", () => {
     expect(unknownAndRole?.kind).toBe("unknown");
     expect(unknownAndRole?.restoreNote).toBe(ROLE_RESTORE_NOTE);
     // An open role, or a runner that predates the field, keeps today's banner.
-    expect(drainBannerModel(snap({ dispatchRole: "workhorse", agentLaneClosedByRole: false }))).toBeNull();
+    expect(
+      drainBannerModel(snap({ dispatchRole: "workhorse", agentLaneClosedByRole: false })),
+    ).toBeNull();
     expect(drainBannerModel(snap({ state: "clear" }))).toBeNull();
+  });
+
+  it("says autonomous spawns are paused when the drain is clear but the dispatch role is unknown", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: null,
+        agentLaneClosedByRole: false,
+        dispatchRoleSource: "unknown",
+        deferredCount: 1,
+      }),
+    );
+    expect(m?.kind).toBe("unknown");
+    expect(m?.status).toBe("error");
+    expect(m?.heading).toBe(ROLE_UNKNOWN_HEADING);
+    expect(m?.detail).toMatch(/dispatch role/);
+    expect(m?.restoreNote).toBe(RESTORE_NOTE);
+    expect(m?.deferredLabel).toBe("1 deferred work item");
+    // A known source, or a runner predating the field, shows nothing.
+    expect(drainBannerModel(snap({ dispatchRoleSource: "coord" }))).toBeNull();
+    expect(
+      drainBannerModel(snap({ dispatchRoleSource: "not_enrolled", state: "not_enrolled" })),
+    ).toBeNull();
+    // A drained device still shows the drain.
+    expect(
+      drainBannerModel(
+        snap({ state: "drained", autonomousSpawnsAllowed: false, dispatchRoleSource: "unknown" }),
+      )?.kind,
+    ).toBe("drained");
+  });
+
+  it("says a closing role carried over from before the restart is not re-confirmed yet", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: "ci_node",
+        agentLaneClosedByRole: true,
+        dispatchRoleSource: "persisted",
+        dispatchRoleObservedAt: "2026-10-20T08:00:00Z",
+      }),
+    );
+    expect(m?.kind).toBe("role_closed");
+    expect(m?.detail).toMatch(/before this runner started/);
+    expect(m?.detail).toMatch(/not re-confirmed/);
+    const fresh = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: "ci_node",
+        agentLaneClosedByRole: true,
+        dispatchRoleSource: "coord",
+      }),
+    );
+    expect(fresh?.detail).toBeNull();
   });
 
   it("renders nothing before the first read, when clear, and when not a coord device", () => {

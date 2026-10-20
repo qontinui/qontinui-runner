@@ -2133,6 +2133,103 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Dedupe the "machine.json present but unloadable" heartbeat warning.
+static MACHINE_JSON_UNLOADABLE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// PURE: what the heartbeat reports when [`load_device_file`] produced no
+/// device, given the fallible read of the same file.
+///
+/// `NotEnrolled` ALLOWS autonomous spawns and makes the drain gate ignore a
+/// cached dispatch role, so it is reported only when the file is positively
+/// ABSENT (or there is no home directory to hold one). A file that exists but
+/// could not be read or parsed, or that names no device_id / hostname, is
+/// `NotSent`, which `coord_drain_state::note_heartbeat` settles through its
+/// own `enrollment()` read. The same split `enrollment()` makes.
+pub(crate) fn unloadable_device_outcome(
+    read: &Result<
+        qontinui_runner_lib::ambient::MachineJson,
+        qontinui_runner_lib::ambient::MachineJsonError,
+    >,
+) -> crate::coord_drain_state::HeartbeatOutcome {
+    use crate::coord_drain_state::HeartbeatOutcome;
+    use qontinui_runner_lib::ambient::MachineJsonError;
+    match read {
+        Err(MachineJsonError::NoHomeDir) => HeartbeatOutcome::NotEnrolled {
+            why: "no home directory, so there is no machine.json",
+        },
+        Err(e) if e.is_missing() => HeartbeatOutcome::NotEnrolled {
+            why: "~/.qontinui/machine.json is missing",
+        },
+        Err(_) => HeartbeatOutcome::NotSent {
+            why: "~/.qontinui/machine.json is present but could not be read",
+        },
+        Ok(_) => HeartbeatOutcome::NotSent {
+            why: "~/.qontinui/machine.json names no device_id or hostname",
+        },
+    }
+}
+
+#[cfg(test)]
+mod unloadable_device_outcome_tests {
+    use super::unloadable_device_outcome;
+    use crate::coord_drain_state::HeartbeatOutcome;
+    use qontinui_runner_lib::ambient::{try_parse_machine_json, MachineJsonError};
+    use std::io::{Error, ErrorKind};
+    use std::path::PathBuf;
+
+    fn read_err(kind: ErrorKind) -> MachineJsonError {
+        MachineJsonError::Read {
+            path: PathBuf::from("machine.json"),
+            source: Error::from(kind),
+        }
+    }
+
+    /// Only a positively absent file is "not enrolled"; anything merely
+    /// unreadable or incomplete must not be, or one transient read opens a
+    /// ci_node box's agent lane (the drain gate ignores the role while not
+    /// enrolled).
+    #[test]
+    fn only_an_absent_machine_json_is_not_enrolled() {
+        for read in [
+            Err(read_err(ErrorKind::NotFound)),
+            Err(MachineJsonError::NoHomeDir),
+        ] {
+            assert!(
+                matches!(
+                    unloadable_device_outcome(&read),
+                    HeartbeatOutcome::NotEnrolled { .. }
+                ),
+                "{read:?}"
+            );
+        }
+        let parse = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let unreadable = [
+            Err(read_err(ErrorKind::PermissionDenied)),
+            Err(read_err(ErrorKind::Other)),
+            Err(MachineJsonError::Parse {
+                path: PathBuf::from("machine.json"),
+                source: parse,
+            }),
+            // Readable, but no hostname / no device_id.
+            Ok(
+                try_parse_machine_json(br#"{"device_id":"6c2f8a3e-1d1b-4c86-9d1e-2b9f6a2a0f10"}"#)
+                    .unwrap(),
+            ),
+            Ok(try_parse_machine_json(br#"{"hostname":"box"}"#).unwrap()),
+        ];
+        for read in unreadable {
+            assert!(
+                matches!(
+                    unloadable_device_outcome(&read),
+                    HeartbeatOutcome::NotSent { .. }
+                ),
+                "{read:?}"
+            );
+        }
+    }
+}
+
 /// POST `{device_id, hostname, claude_code_available}` to
 /// `<base>/coord/devices/register`.
 ///
@@ -2161,16 +2258,37 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             why: "a secondary instance sends no register payload",
         });
     }
+    // `NotEnrolled` ALLOWS autonomous spawns and makes the drain gate ignore a
+    // cached dispatch role, so it is reported only when the device file is
+    // positively ABSENT. Anything that merely could not be read — a locked or
+    // half-written machine.json, one with no hostname, a garbage device_id, a
+    // coord base that did not resolve — is `NotSent`, which
+    // `coord_drain_state::note_heartbeat` settles through its own `enrollment()`
+    // read (a miss, trending to Unknown, unless that read proves "not a coord
+    // device"). One transient read must not open a `ci_node` box's agent lane.
     let device = match load_device_file() {
         Some(d) => d,
         None => {
-            info!(
-                "fleet::heartbeat: ~/.qontinui/machine.json missing — \
-                 run `qontinui_profile device init` to enable fleet visibility. Skipping."
-            );
-            return Ok(HeartbeatOutcome::NotEnrolled {
-                why: "~/.qontinui/machine.json is missing",
-            });
+            let outcome =
+                unloadable_device_outcome(&qontinui_runner_lib::ambient::try_read_machine_json());
+            match outcome {
+                HeartbeatOutcome::NotEnrolled { .. } => info!(
+                    "fleet::heartbeat: ~/.qontinui/machine.json missing — \
+                     run `qontinui_profile device init` to enable fleet visibility. Skipping."
+                ),
+                _ => {
+                    if !MACHINE_JSON_UNLOADABLE_WARNED
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        warn!(
+                            "fleet::heartbeat: ~/.qontinui/machine.json is present but could \
+                             not be read, or names no device_id/hostname. Skipping the \
+                             register POST; the drain state reads it as a miss. (Logged once.)"
+                        );
+                    }
+                }
+            }
+            return Ok(outcome);
         }
     };
 
@@ -2178,7 +2296,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         Ok(id) => id,
         Err(e) => {
             warn!("fleet::heartbeat: machine.json device_id is not a valid UUID ({e}). Skipping.");
-            return Ok(HeartbeatOutcome::NotEnrolled {
+            return Ok(HeartbeatOutcome::NotSent {
                 why: "machine.json device_id is not a UUID",
             });
         }
@@ -2191,8 +2309,10 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
                 "fleet::heartbeat: ~/.qontinui/profiles.json missing or active profile \
                  has no coord_url — no coord to heartbeat to. Skipping."
             );
-            return Ok(HeartbeatOutcome::NotEnrolled {
-                why: "the active profile has no coord_url",
+            // `enrollment()` tells a profile with no coord_url (not enrolled)
+            // from a settings.json it could not read (indeterminate).
+            return Ok(HeartbeatOutcome::NotSent {
+                why: "no coord base resolved for the register POST",
             });
         }
     };

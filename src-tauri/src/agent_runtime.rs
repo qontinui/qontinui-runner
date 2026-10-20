@@ -2166,7 +2166,11 @@ fn apply_drain_to_claim(
     decision: SpawnDecision,
     drain: &crate::coord_drain_state::CoordDrainState,
 ) -> SpawnDecision {
-    apply_drain_to_claim_with_role(decision, drain, None)
+    apply_drain_to_claim_with_role(
+        decision,
+        drain,
+        crate::coord_drain_state::RoleReading::Known(None),
+    )
 }
 
 /// PURE: [`apply_drain_to_claim`] with the device's dispatch role, so the
@@ -2175,7 +2179,7 @@ fn apply_drain_to_claim(
 fn apply_drain_to_claim_with_role(
     decision: SpawnDecision,
     drain: &crate::coord_drain_state::CoordDrainState,
-    role: Option<crate::coord_drain_state::DispatchRole>,
+    role: impl Into<crate::coord_drain_state::RoleReading>,
 ) -> SpawnDecision {
     match decision {
         SpawnDecision::SpawnDespiteClaimError { cause } => {

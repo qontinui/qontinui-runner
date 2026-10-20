@@ -41,6 +41,16 @@ export interface CoordDrainSnapshot {
    * spawn whatever `state` says. Optional for the same reason as `dispatchRole`.
    */
   agentLaneClosedByRole?: boolean;
+  /**
+   * Where `dispatchRole` came from: `coord` (served this run), `persisted`
+   * (the reading a previous run saved, not yet re-confirmed), `not_enrolled`
+   * (no coord device, no role), or `unknown` (nothing — autonomous spawns are
+   * deferred until coord serves one). Optional: a runner predating it sends
+   * nothing, and that runner never defers on an unknown role.
+   */
+  dispatchRoleSource?: "coord" | "persisted" | "not_enrolled" | "unknown";
+  /** When coord served that role (for `coord` and `persisted`). */
+  dispatchRoleObservedAt?: string | null;
   until: string | null;
   reason: string | null;
   /** For `unknown`: since when. */

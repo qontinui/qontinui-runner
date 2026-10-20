@@ -206,14 +206,15 @@ pub fn decide_tick(state: &CoordDrainState, owes_undrain: bool, now: DateTime<Ut
 /// is untouched), and the first tick after the role reopens the lane undrains.
 pub fn hold_undrain_for_role(
     action: TickAction,
-    role: Option<crate::coord_drain_state::DispatchRole>,
+    drain: &crate::coord_drain_state::CoordDrainState,
+    role: impl Into<crate::coord_drain_state::RoleReading>,
 ) -> TickAction {
+    // Held exactly when the gate would defer the steward restarts the undrain
+    // makes — a closing role, or an UNKNOWN one — and never while the state is
+    // not enrolled, where the gate ignores the role.
+    let blocked = !crate::coord_drain_state::autonomous_allowed(drain, role.into());
     match action {
-        TickAction::Undrain
-            if role.is_some_and(crate::coord_drain_state::DispatchRole::closes_agent_lane) =>
-        {
-            TickAction::Nothing
-        }
+        TickAction::Undrain if blocked => TickAction::Nothing,
         other => other,
     }
 }
@@ -449,7 +450,9 @@ async fn tick_once(state: &mut ExecutorState) {
     let Some(app) = crate::tauri_app_handle::current() else {
         return; // headless / unit-test context
     };
-    let drain = crate::coord_drain_state::current();
+    // Drain and role under ONE lock, so a fold between two reads cannot pair
+    // them into an answer neither reading gives.
+    let (drain, role) = crate::coord_drain_state::current_with_role();
     // `was_drained` is in-memory, so a runner RESTARTED mid-drain would forget
     // what it owes and the stewards the drain stopped would never come back.
     // The persisted set is the durable half of the same fact — consulted ONCE
@@ -495,7 +498,8 @@ async fn tick_once(state: &mut ExecutorState) {
 
     let action = hold_undrain_for_role(
         decide_tick(&drain, state.was_drained, Utc::now()),
-        crate::coord_drain_state::current_dispatch_role(),
+        &drain,
+        role,
     );
     match action {
         TickAction::Nothing => {}
@@ -1127,28 +1131,52 @@ mod tests {
     /// is held instead, and every other action passes through untouched.
     #[test]
     fn an_undrain_is_held_while_the_dispatch_role_closes_the_agent_lane() {
-        use crate::coord_drain_state::DispatchRole;
+        use crate::coord_drain_state::{CoordDrainState, DispatchRole};
+        let clear = CoordDrainState::Clear;
         for role in [DispatchRole::CiNode, DispatchRole::Bench] {
             assert_eq!(
-                hold_undrain_for_role(TickAction::Undrain, Some(role)),
+                hold_undrain_for_role(TickAction::Undrain, &clear, Some(role)),
                 TickAction::Nothing
             );
             // A role never stops a wind-down: that is the drain's alone.
             assert_eq!(
-                hold_undrain_for_role(TickAction::WindDown, Some(role)),
+                hold_undrain_for_role(TickAction::WindDown, &clear, Some(role)),
                 TickAction::WindDown
             );
         }
         for role in [None, Some(DispatchRole::Workhorse)] {
             assert_eq!(
-                hold_undrain_for_role(TickAction::Undrain, role),
+                hold_undrain_for_role(TickAction::Undrain, &clear, role),
                 TickAction::Undrain
             );
         }
         assert_eq!(
-            hold_undrain_for_role(TickAction::Nothing, Some(DispatchRole::CiNode)),
+            hold_undrain_for_role(TickAction::Nothing, &clear, Some(DispatchRole::CiNode)),
             TickAction::Nothing
         );
+        // An unknown role defers the steward restarts too, so it holds as well,
+        // and still never stops a wind-down.
+        use crate::coord_drain_state::RoleReading;
+        assert_eq!(
+            hold_undrain_for_role(TickAction::Undrain, &clear, RoleReading::Unknown),
+            TickAction::Nothing
+        );
+        assert_eq!(
+            hold_undrain_for_role(TickAction::WindDown, &clear, RoleReading::Unknown),
+            TickAction::WindDown
+        );
+        // Not enrolled: the gate ignores every reading, so the undrain runs.
+        let not_enrolled = CoordDrainState::NotEnrolled { why: "x" };
+        for role in [
+            RoleReading::Unknown,
+            RoleReading::Known(Some(DispatchRole::CiNode)),
+        ] {
+            assert_eq!(
+                hold_undrain_for_role(TickAction::Undrain, &not_enrolled, role),
+                TickAction::Undrain,
+                "{role:?}"
+            );
+        }
     }
 
     // ── Invariant 1: no kill path from this module ───────────────────────

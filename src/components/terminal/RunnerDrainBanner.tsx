@@ -12,7 +12,8 @@
  * Renders nothing when the drain is clear, or when this runner is not a coord
  * device at all (no drain can apply) — unless coord's dispatch role for this
  * machine (`bench` / `ci_node`) closes the agent lane, which keeps autonomous
- * spawns off with the drain clear, and says so.
+ * spawns off with the drain clear, and says so — or that role is UNKNOWN (never
+ * served to this runner, none persisted), which keeps them off too.
  */
 
 import { AlertTriangle, PauseCircle } from "lucide-react";
@@ -37,6 +38,9 @@ export interface DrainBannerModel {
 
 /** The copy the UNKNOWN state must carry, verbatim (plan Phase 3). */
 export const UNKNOWN_HEADING = "drain state unknown — autonomous spawns paused";
+
+/** The heading while the drain is clear but the dispatch role is unknown. */
+export const ROLE_UNKNOWN_HEADING = "dispatch role unknown — autonomous spawns paused";
 
 /**
  * Review N3. While the drain holds, `terminal_session_list_open` withholds the
@@ -108,9 +112,29 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
       kind: "role_closed",
       status: "warning",
       heading: `Dispatch role ${s.dispatchRole ?? "unknown"} — autonomous spawns off on this machine`,
-      detail: null,
+      // A role carried over from before this runner started, which coord has
+      // not re-served since, says so rather than reading as fresh.
+      detail:
+        s.dispatchRoleSource === "persisted"
+          ? `as coord last served it${
+              s.dispatchRoleObservedAt ? ` (${formatUntil(s.dispatchRoleObservedAt)})` : ""
+            }, before this runner started — not re-confirmed yet`
+          : null,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
       restoreNote: ROLE_RESTORE_NOTE,
+    };
+  }
+  // The drain is clear, but coord has never served this machine's dispatch
+  // role and none was persisted: the runner fails closed, as coord itself does
+  // on an unreadable role.
+  if (s.dispatchRoleSource === "unknown" && s.state === "clear" && !s.autonomousSpawnsAllowed) {
+    return {
+      kind: "unknown",
+      status: "error",
+      heading: ROLE_UNKNOWN_HEADING,
+      detail: "coord has not served this machine's dispatch role since the runner started",
+      deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
+      restoreNote: RESTORE_NOTE,
     };
   }
   return null;
