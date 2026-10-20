@@ -23,6 +23,9 @@
 # 237 -> 239 (rebase onto main eefa3a189): main re-split plans_dir_migration's
 # seed log lines into `outcome_message` (3 rows replacing 1), +2 unreviewed
 # plans_dir rows landed by main, not by this PR. Exact count, not a loosening.
+# 238 -> 236 (runner#1995): three os_bound_tooling rows left with ci_node's
+# executor/services/tools moving into qontinui-schemas ci-exec, and one
+# repo_layout row (ci_node/host.rs RunnerIdentity::ci_root) arrived.
 unreviewed_ceiling = 236
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
