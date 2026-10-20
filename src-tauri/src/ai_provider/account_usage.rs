@@ -751,7 +751,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn under(rows: &[(&str, f64, f64)]) -> Vec<UnderPace> {
+    fn ranked_under_pace(rows: &[(&str, f64, f64)]) -> Vec<UnderPace> {
         let mut v: Vec<UnderPace> = rows
             .iter()
             .map(|(d, e, s)| (d.to_string(), *e, *s))
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn alternating_pick_follows_the_one_two_one_three_sequence() {
-        let cands = under(&[
+        let cands = ranked_under_pace(&[
             ("b", 0.6, 0.1),
             ("a", 0.8, 0.1),
             ("d", 0.2, 0.1),
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn alternating_pick_without_history_is_account_one() {
-        let cands = under(&[("a", 0.3, 0.1), ("b", 0.7, 0.1)]);
+        let cands = ranked_under_pace(&[("a", 0.3, 0.1), ("b", 0.7, 0.1)]);
         assert_eq!(
             alternating_pick(&cands, std::iter::empty()),
             Some("b".into())
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn alternating_pick_returns_to_account_one_after_any_other_target() {
-        let cands = under(&[("a", 0.8, 0.1), ("b", 0.6, 0.1)]);
+        let cands = ranked_under_pace(&[("a", 0.8, 0.1), ("b", 0.6, 0.1)]);
         // The last handoff went to an account that no longer qualifies.
         assert_eq!(
             alternating_pick(&cands, ["gone"].into_iter()),
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn alternating_pick_continues_after_the_last_other_in_the_window() {
-        let cands = under(&[("a", 0.8, 0.1), ("b", 0.6, 0.1), ("c", 0.4, 0.1)]);
+        let cands = ranked_under_pace(&[("a", 0.8, 0.1), ("b", 0.6, 0.1), ("c", 0.4, 0.1)]);
         assert_eq!(
             alternating_pick(&cands, ["b", "a"].into_iter()),
             Some("c".into())
@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     fn alternating_pick_single_account_and_empty() {
-        let one = under(&[("a", 0.5, 0.1)]);
+        let one = ranked_under_pace(&[("a", 0.5, 0.1)]);
         assert_eq!(alternate(&one, 3), vec![1, 1, 1]);
         assert_eq!(alternating_pick(&[], std::iter::empty()), None);
     }
@@ -831,7 +831,7 @@ mod tests {
     fn weighted_pick_maps_the_roll_onto_consecutive_ranges() {
         // Weights: a = 0.5*0.2 = 0.1, b = 0.25*0.4 = 0.1, c = 0.8*0.25 = 0.2;
         // sorted by expected: c [0, 0.2), a [0.2, 0.3), b [0.3, 0.4).
-        let cands = under(&[("a", 0.5, 0.2), ("b", 0.25, 0.4), ("c", 0.8, 0.25)]);
+        let cands = ranked_under_pace(&[("a", 0.5, 0.2), ("b", 0.25, 0.4), ("c", 0.8, 0.25)]);
         assert_eq!(weighted_pick(&cands, 0.0), Some("c".into()));
         assert_eq!(weighted_pick(&cands, 0.49), Some("c".into()));
         assert_eq!(weighted_pick(&cands, 0.51), Some("a".into()));
@@ -842,7 +842,10 @@ mod tests {
     #[test]
     fn weighted_pick_has_nothing_to_draw_from_zero_weights() {
         assert_eq!(weighted_pick(&[], 0.5), None);
-        assert_eq!(weighted_pick(&under(&[("a", 0.0, 0.3)]), 0.5), None);
+        assert_eq!(
+            weighted_pick(&ranked_under_pace(&[("a", 0.0, 0.3)]), 0.5),
+            None
+        );
     }
 
     #[test]
@@ -865,7 +868,7 @@ mod tests {
     fn alternating_pick_neither_repeats_nor_skips_when_ranks_move() {
         // b and c were served; c's rank has since risen above b's, and d was
         // never served. The next "other" is d, not b again.
-        let cands = under(&[
+        let cands = ranked_under_pace(&[
             ("a", 0.9, 0.1),
             ("c", 0.7, 0.1),
             ("b", 0.6, 0.1),
@@ -884,7 +887,7 @@ mod tests {
 
     #[test]
     fn choose_handoff_target_dispatches_on_mode() {
-        let cands = under(&[("a", 0.8, 0.1), ("b", 0.6, 0.3)]);
+        let cands = ranked_under_pace(&[("a", 0.8, 0.1), ("b", 0.6, 0.3)]);
         let none: [&str; 0] = [];
         assert_eq!(
             choose_handoff_target(
@@ -931,7 +934,7 @@ mod tests {
     fn alternating_pick_without_the_exhausted_source_starts_from_the_next_account() {
         // Account 1 ("a") ran out and is the source, so it is not a candidate:
         // the sequence runs over the remaining accounts, b first.
-        let cands = under(&[("b", 0.6, 0.1), ("c", 0.4, 0.1)]);
+        let cands = ranked_under_pace(&[("b", 0.6, 0.1), ("c", 0.4, 0.1)]);
         assert_eq!(
             alternating_pick(&cands, ["a", "b", "a"].into_iter()),
             Some("b".into())
