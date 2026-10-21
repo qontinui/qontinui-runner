@@ -126,14 +126,26 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // pane alive — whose `--resume` repaint can re-render the old limit
     // banner — the resume door, the respawn receiver). Stand down before the
     // cap below charges a slot for an attempt the in-flight claim would refuse.
-    if crate::session::in_flight::is_in_flight(&record.claude_session_id) {
-        info!(
-            terminal_id,
-            session = %record.claude_session_id,
-            "usage-limit hint on a session a respawn is already moving — ignoring"
-        );
-        return;
-    }
+    //
+    // TAKE the claim here rather than only reading it: two near-simultaneous
+    // hints for one session would otherwise both pass a read, both await the
+    // usage probe and the trust dial, and both charge a cap slot before the
+    // second is refused inside `migrate_session`. Held until this returns.
+    let in_flight = match crate::session::in_flight::SessionInFlight::claim(
+        &record.claude_session_id,
+        "account-migration",
+    ) {
+        Ok(claim) => claim,
+        Err(holder) => {
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                holder,
+                "usage-limit hint on a session a respawn is already moving — ignoring"
+            );
+            return;
+        }
+    };
 
     // Source account: the dir the session launched under, else the runner's
     // currently-resolved global dir (pre-existing sessions registered before
@@ -231,7 +243,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // cache's.
     crate::claude_session::trust_gate::warm_dial().await;
 
-    match migrate_session(&app, &record, &src, &dst).await {
+    match migrate_session_claimed(&app, &record, &src, &dst, in_flight).await {
         Ok(outcome) => {
             info!(
                 session = %record.claude_session_id,
@@ -892,29 +904,42 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
 /// already confirmed exhaustion) and the manual Tauri command
 /// (`terminal_migrate_session_account`, where the operator's click is the
 /// confirmation).
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
 pub async fn migrate_session(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,
     src_config_dir: &str,
     dst_config_dir: &str,
 ) -> Result<MigrationOutcome, MigrationError> {
-    use tauri::Manager;
-    use MigrationError::NotMoved;
-
     // 0. One mover per session, held until this returns.
-    let _in_flight = crate::session::in_flight::SessionInFlight::claim(
+    let in_flight = crate::session::in_flight::SessionInFlight::claim(
         &record.claude_session_id,
         "account-migration",
     )
     .map_err(|holder| {
-        NotMoved(format!(
+        MigrationError::NotMoved(format!(
             "in_flight: {holder} is already moving this session"
         ))
     })?;
+    migrate_session_claimed(app, record, src_config_dir, dst_config_dir, in_flight).await
+}
+
+/// [`migrate_session`] for a caller that already holds the session's in-flight
+/// claim (the usage-limit hint, which claims before it spends a cap slot).
+/// The claim is held until this returns.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
+pub(crate) async fn migrate_session_claimed(
+    app: &tauri::AppHandle,
+    record: &TerminalSessionRecord,
+    src_config_dir: &str,
+    dst_config_dir: &str,
+    in_flight: crate::session::in_flight::SessionInFlight,
+) -> Result<MigrationOutcome, MigrationError> {
+    use tauri::Manager;
+    use MigrationError::NotMoved;
+    let _in_flight = in_flight;
 
     let working_dir = record.working_dir.clone().ok_or_else(|| {
         NotMoved("session record has no working_dir — cannot locate transcript".to_string())
@@ -982,12 +1007,18 @@ pub async fn migrate_session(
     // the ONE settle call, which re-pins onto whichever terminal hosts the
     // session when the respawn has ended. Everything between is infallible:
     // no `?`, no `return`, no `unwrap`/`expect` — every fallible step of this
-    // function is deliberately ABOVE this line. `OwedSettle` makes an early
-    // exit inside the window loud (a `debug_assert` in its drop, a `warn!` in
-    // release) instead of a silent anchor release; the reservation's own RAII
-    // drop stays the PANIC backstop.
+    // function is deliberately ABOVE this line. `OwedSettle` turns an early
+    // exit or a cancelled future inside the window into a `warn!` and a re-pin
+    // onto the old terminal instead of a silent anchor release; the
+    // reservation's own RAII drop stays the PANIC backstop.
+    let fallback_host = record.terminal_id.clone();
     let carried = super::respawn_liveness::OwedSettle::new(
         crate::agent_runtime::take_continuation_registration(&record.terminal_id),
+        // A cancelled migration (task abort, shutdown) re-pins onto the OLD
+        // terminal rather than releasing the anchor.
+        move |(c, reservation)| {
+            crate::agent_runtime::restore_continuation_registration(fallback_host, c, reservation);
+        },
     );
 
     let title = record.title.clone().unwrap_or_else(|| {

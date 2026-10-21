@@ -3004,6 +3004,10 @@ mod tests {
                 requested: "s".to_string(),
                 terminal_id: "t-old".to_string(),
             },
+            CloseOutcome::HeldInFlight {
+                requested: "s".to_string(),
+                terminal_id: "t-new".to_string(),
+            },
         ] {
             assert!(
                 close_outcome_response(&resolved).success,

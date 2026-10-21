@@ -21,16 +21,24 @@
 //! 1. **One updater** ([`run_periodic`]): at boot (after [`BOOT_DELAY`]) and then
 //!    every [`TICK_INTERVAL`] it reads the installed version (`claude --version`
 //!    through [`crate::agent_runtime::resolve_claude_bin`]) and the published one
-//!    (`npm view @anthropic-ai/claude-code version`), and installs **only when
-//!    they differ**, pinned to the version it read, into the npm prefix that owns
-//!    the resolved binary. A same-version install cannot happen here. After an
+//!    (`npm view @anthropic-ai/claude-code version`, the `latest` dist-tag), and
+//!    installs **only when the published version is semver-NEWER** than the
+//!    installed one, pinned to the version it read, into the npm prefix that owns
+//!    the resolved binary. A same-version install cannot happen here, and neither
+//!    can a downgrade of an `@next` / `rc` install that is ahead of `latest`.
+//!    When a Claude settings file sets `autoUpdatesChannel` to anything but
+//!    `latest` (the CLI's own schema: `latest | stable | rc`), the updater
+//!    installs nothing and children keep the CLI's own updater, which follows
+//!    the channel the user chose ([`non_default_channel_in`]). After an
 //!    install it reads the version again. If that is not the published version
 //!    it logs `cli-update: install-did-not-take` and backs off for
 //!    [`DID_NOT_TAKE_BACKOFF`], so a prefix mismatch cannot loop.
 //! 2. **Children defer to it** ([`child_env_pairs`]): every runner-spawned
 //!    `claude` gets `DISABLE_AUTOUPDATER=1`, which Claude Code honours (Phase 1a,
 //!    verified against a control that did install). The pair is set **only** when
-//!    the updater can actually serve this box, see [`ChildEnvGate`]. Setting it
+//!    the updater can actually serve this box AND is able to update right now —
+//!    not inside the did-not-take backoff, not deferring to another channel —
+//!    see [`ChildEnvGate`]. Setting it
 //!    anywhere else would stop updates altogether (option B, which the plan
 //!    rejected).
 //!
@@ -225,13 +233,22 @@ pub struct ChildEnvGate {
     /// The updater has read both the installed and the published version at
     /// least once. Until then it has not shown it works on this box.
     pub version_read_completed: bool,
+    /// The updater is able to update right now: not inside a
+    /// [`DID_NOT_TAKE_BACKOFF`] and not deferring to a non-default CLI release
+    /// channel. Without it, an install that did not take would leave every
+    /// child on `DISABLE_AUTOUPDATER=1` with nothing updating the CLI for a day.
+    pub updater_serving: bool,
 }
 
 const SUPPRESS_PAIRS: &[(&str, &str)] = &[(SUPPRESS_ENV, SUPPRESS_VALUE)];
 
 /// The env pairs for one [`ChildEnvGate`]. Pure.
 pub fn child_env_pairs_for(gate: ChildEnvGate) -> &'static [(&'static str, &'static str)] {
-    if gate.setting_on && gate.install_method_supported && gate.version_read_completed {
+    if gate.setting_on
+        && gate.install_method_supported
+        && gate.version_read_completed
+        && gate.updater_serving
+    {
         SUPPRESS_PAIRS
     } else {
         &[]
@@ -255,7 +272,8 @@ pub fn child_env_pairs() -> &'static [(&'static str, &'static str)] {
     let state = box_state();
     let version_read_completed = state.version_read_completed.load(Ordering::Acquire);
     let install_method_supported = state.install_method_supported.load(Ordering::Acquire);
-    if !(version_read_completed && install_method_supported) {
+    let updater_serving = state.updater_serving.load(Ordering::Acquire);
+    if !(version_read_completed && install_method_supported && updater_serving) {
         // Short-circuit before the settings read. In unit tests no updater tick
         // ever runs, so every seam test that sets no override lands here.
         return &[];
@@ -264,6 +282,7 @@ pub fn child_env_pairs() -> &'static [(&'static str, &'static str)] {
         setting_on: runner_manages_cli_updates() == Some(true),
         install_method_supported,
         version_read_completed,
+        updater_serving,
     })
 }
 
@@ -308,10 +327,11 @@ pub(crate) mod test_gates {
         setting_on: true,
         install_method_supported: true,
         version_read_completed: true,
+        updater_serving: true,
     };
 
     /// `(name, gate)` for each arm that must yield no pair.
-    pub(crate) const OFF_ARMS: [(&str, ChildEnvGate); 3] = [
+    pub(crate) const OFF_ARMS: [(&str, ChildEnvGate); 4] = [
         (
             "setting off",
             ChildEnvGate {
@@ -333,6 +353,13 @@ pub(crate) mod test_gates {
                 ..ON
             },
         ),
+        (
+            "updater backing off or deferring to another channel",
+            ChildEnvGate {
+                updater_serving: false,
+                ..ON
+            },
+        ),
     ];
 }
 
@@ -347,6 +374,8 @@ const SETTING_ON: u8 = 2;
 struct BoxState {
     install_method_supported: AtomicBool,
     version_read_completed: AtomicBool,
+    /// [`ChildEnvGate::updater_serving`], as of the last tick.
+    updater_serving: AtomicBool,
     /// The last authoritative read of the setting (`SETTING_*`).
     last_known_setting: AtomicU8,
 }
@@ -356,6 +385,7 @@ fn box_state() -> &'static BoxState {
     STATE.get_or_init(|| BoxState {
         install_method_supported: AtomicBool::new(false),
         version_read_completed: AtomicBool::new(false),
+        updater_serving: AtomicBool::new(false),
         last_known_setting: AtomicU8::new(SETTING_UNKNOWN),
     })
 }
@@ -448,6 +478,14 @@ pub(crate) enum SkipReason {
     InstalledUnreadable,
     PublishedUnreadable,
     UpToDate,
+    /// The installed version is NEWER than npm `latest` (an `@next` / `rc`
+    /// install, or a hand install ahead of the dist-tag). Never downgraded.
+    InstalledNewer,
+    /// One of the two versions is not semver, so "newer" cannot be decided.
+    VersionsUncomparable,
+    /// The CLI's own settings pick a release channel other than `latest`
+    /// (`autoUpdatesChannel`); the CLI's own updater follows it.
+    NonDefaultChannel(String),
     /// An earlier install did not take; installs are paused until the backoff ends.
     BackingOff,
 }
@@ -462,6 +500,9 @@ impl SkipReason {
             Self::InstalledUnreadable => "installed-unreadable".into(),
             Self::PublishedUnreadable => "published-unreadable".into(),
             Self::UpToDate => "up-to-date".into(),
+            Self::InstalledNewer => "installed-newer".into(),
+            Self::VersionsUncomparable => "versions-uncomparable".into(),
+            Self::NonDefaultChannel(c) => format!("non-default-channel:{c}"),
             Self::BackingOff => "backing-off".into(),
         }
     }
@@ -483,6 +524,9 @@ pub(crate) struct TickInputs {
     pub installed: Option<String>,
     pub published: Option<String>,
     pub backing_off: bool,
+    /// The CLI release channel configured in a Claude settings file, when it is
+    /// not the default `latest`.
+    pub non_default_channel: Option<String>,
 }
 
 /// The decision table. The user's opt-outs come first, then whether this box
@@ -498,6 +542,12 @@ pub(crate) fn decide(i: &TickInputs) -> Decision {
         Some(false) => return Decision::Skip(SkipReason::SettingOff),
         Some(true) => {}
     }
+    // `npm view` reads the `latest` dist-tag. A user who picked `stable` or
+    // `rc` in the CLI's own settings is not served by it: their CLI keeps its
+    // own updater, which follows the channel they chose.
+    if let Some(channel) = &i.non_default_channel {
+        return Decision::Skip(SkipReason::NonDefaultChannel(channel.clone()));
+    }
     if !i.install_method_supported {
         return Decision::Skip(SkipReason::UnsupportedInstallMethod);
     }
@@ -507,8 +557,19 @@ pub(crate) fn decide(i: &TickInputs) -> Decision {
     let Some(published) = &i.published else {
         return Decision::Skip(SkipReason::PublishedUnreadable);
     };
-    if installed == published {
-        return Decision::Skip(SkipReason::UpToDate);
+    // Install only an UPGRADE. A plain inequality would downgrade an `@next`
+    // install (or anything ahead of `latest`) back to `latest` every tick.
+    match (
+        semver::Version::parse(installed),
+        semver::Version::parse(published),
+    ) {
+        (Ok(have), Ok(want)) => match want.cmp(&have) {
+            std::cmp::Ordering::Equal => return Decision::Skip(SkipReason::UpToDate),
+            std::cmp::Ordering::Less => return Decision::Skip(SkipReason::InstalledNewer),
+            std::cmp::Ordering::Greater => {}
+        },
+        _ if installed == published => return Decision::Skip(SkipReason::UpToDate),
+        _ => return Decision::Skip(SkipReason::VersionsUncomparable),
     }
     if i.backing_off {
         return Decision::Skip(SkipReason::BackingOff);
@@ -557,6 +618,9 @@ pub(crate) struct InstallRun {
 pub(crate) trait CliOps {
     fn opt_out_env(&self) -> Option<String>;
     fn setting(&self) -> impl Future<Output = Option<bool>> + Send;
+    /// The `autoUpdatesChannel` a Claude settings file names, when it is not
+    /// the default `latest`.
+    fn non_default_channel(&self) -> impl Future<Output = Option<String>> + Send;
     fn locate(&self) -> impl Future<Output = Option<NpmGlobalInstall>> + Send;
     fn installed_version(
         &self,
@@ -579,6 +643,8 @@ pub(crate) struct UpdaterState {
     pub backoff_until: Option<Instant>,
     pub install_method_supported: bool,
     pub version_read_completed: bool,
+    /// [`ChildEnvGate::updater_serving`] as of the end of the last tick.
+    pub updater_serving: bool,
 }
 
 /// What one tick saw and did. Logged by [`run_periodic`]; asserted by tests.
@@ -613,6 +679,7 @@ pub(crate) async fn tick<O: CliOps>(
     }
     let mut located = None;
     if inputs.opt_out_env.is_none() && inputs.setting == Some(true) {
+        inputs.non_default_channel = ops.non_default_channel().await;
         located = ops.locate().await;
         inputs.install_method_supported = located.is_some();
         state.install_method_supported = inputs.install_method_supported;
@@ -649,6 +716,11 @@ pub(crate) async fn tick<O: CliOps>(
             state.backoff_until = None;
         }
     }
+    // Children defer their updates to the runner only while it can actually
+    // update: not backing off after an install that did not take (including
+    // one that just failed above), not deferring to another release channel.
+    state.updater_serving = inputs.non_default_channel.is_none()
+        && state.backoff_until.is_none_or(|until| now >= until);
     report
 }
 
@@ -696,6 +768,47 @@ fn publish_state(state: &UpdaterState) {
         .store(state.install_method_supported, Ordering::Release);
     if state.version_read_completed {
         s.version_read_completed.store(true, Ordering::Release);
+    }
+    s.updater_serving
+        .store(state.updater_serving, Ordering::Release);
+}
+
+/// The Claude settings files whose `autoUpdatesChannel` this box's CLI reads:
+/// `$CLAUDE_CONFIG_DIR` (the runner's own), the runner's resolved default
+/// account dir, and `~/.claude`. Per-account dirs beyond the default are not
+/// enumerated — a channel set only in a secondary account is not seen.
+fn channel_settings_files() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(d));
+    }
+    if let Some(d) = crate::ai_provider::get_resolved_config_dir() {
+        dirs.push(PathBuf::from(d));
+    }
+    if let Some(h) = dirs::home_dir() {
+        dirs.push(h.join(".claude"));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        let f = d.join("settings.json");
+        if !out.contains(&f) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// Pure: the non-default `autoUpdatesChannel` in one settings file's text.
+/// The CLI's schema is `"latest" | "stable" | "rc"`, optional, default
+/// `latest`; anything that is not a string `latest` (or absent) is reported.
+pub(crate) fn non_default_channel_in(settings_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(settings_json).ok()?;
+    let ch = v.get("autoUpdatesChannel")?;
+    match ch.as_str() {
+        Some("latest") => None,
+        Some(other) => Some(other.to_string()),
+        None if ch.is_null() => None,
+        None => Some(ch.to_string()),
     }
 }
 
@@ -799,6 +912,18 @@ impl CliOps for RealOps {
             .flatten()
     }
 
+    async fn non_default_channel(&self) -> Option<String> {
+        tokio::task::spawn_blocking(|| {
+            channel_settings_files()
+                .iter()
+                .filter_map(|f| std::fs::read_to_string(f).ok())
+                .find_map(|text| non_default_channel_in(&text))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     async fn locate(&self) -> Option<NpmGlobalInstall> {
         tokio::task::spawn_blocking(locate_npm_global_install)
             .await
@@ -886,6 +1011,7 @@ mod tests {
             installed: Some(installed.to_string()),
             published: Some(published.to_string()),
             backing_off: false,
+            non_default_channel: None,
         }
     }
 
@@ -1078,6 +1204,7 @@ mod tests {
         installs: AtomicUsize,
         flag_seen_during_install: Mutex<Option<bool>>,
         flag: std::sync::Arc<UpdateFlag>,
+        channel: Option<String>,
     }
 
     impl FakeOps {
@@ -1095,6 +1222,7 @@ mod tests {
                 installs: AtomicUsize::new(0),
                 flag_seen_during_install: Mutex::new(None),
                 flag: std::sync::Arc::new(UpdateFlag::new()),
+                channel: None,
             }
         }
     }
@@ -1105,6 +1233,10 @@ mod tests {
         }
         fn setting(&self) -> impl Future<Output = Option<bool>> + Send {
             let v = self.setting;
+            async move { v }
+        }
+        fn non_default_channel(&self) -> impl Future<Output = Option<String>> + Send {
+            let v = self.channel.clone();
             async move { v }
         }
         fn locate(&self) -> impl Future<Output = Option<NpmGlobalInstall>> + Send {
@@ -1331,5 +1463,113 @@ mod tests {
             assert_eq!(child_env_pairs(), &[("DISABLE_AUTOUPDATER", "1")]);
         });
         assert!(child_env_pairs().is_empty(), "the override resets");
+    }
+
+    // ---- Review findings 5 and 6 -------------------------------------------
+
+    #[test]
+    fn cli_update_decide_never_downgrades_a_newer_install() {
+        assert_eq!(
+            decide(&inputs("2.2.0-next.3", "2.1.304")),
+            Decision::Skip(SkipReason::InstalledNewer)
+        );
+        assert_eq!(
+            decide(&inputs("2.1.305", "2.1.304")),
+            Decision::Skip(SkipReason::InstalledNewer)
+        );
+        // Numeric, not lexical: 2.1.1000 is newer than 2.1.999.
+        assert_eq!(
+            decide(&inputs("2.1.999", "2.1.1000")),
+            Decision::Install {
+                published: "2.1.1000".into()
+            }
+        );
+        assert_eq!(
+            decide(&inputs("2.1.1000", "2.1.999")),
+            Decision::Skip(SkipReason::InstalledNewer)
+        );
+        assert_eq!(
+            decide(&inputs("2.1", "2.1.304")),
+            Decision::Skip(SkipReason::VersionsUncomparable)
+        );
+    }
+
+    #[test]
+    fn cli_update_decide_defers_to_a_non_default_channel() {
+        let i = TickInputs {
+            non_default_channel: Some("stable".into()),
+            ..inputs("2.1.303", "2.1.304")
+        };
+        assert_eq!(
+            decide(&i),
+            Decision::Skip(SkipReason::NonDefaultChannel("stable".into()))
+        );
+    }
+
+    #[test]
+    fn cli_update_reads_the_auto_updates_channel_key() {
+        assert_eq!(non_default_channel_in("{}"), None);
+        assert_eq!(
+            non_default_channel_in(r#"{"autoUpdatesChannel":"latest"}"#),
+            None
+        );
+        assert_eq!(
+            non_default_channel_in(r#"{"autoUpdatesChannel":"stable"}"#).as_deref(),
+            Some("stable")
+        );
+        assert_eq!(
+            non_default_channel_in(r#"{"autoUpdatesChannel":"rc","model":"x"}"#).as_deref(),
+            Some("rc")
+        );
+        assert_eq!(non_default_channel_in("not json"), None);
+    }
+
+    /// Finding 6: an install that did not take must hand updates back to the
+    /// children for the length of the backoff, and take them again after.
+    #[tokio::test]
+    async fn cli_update_children_keep_their_own_updater_while_backing_off() {
+        let ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
+        let mut state = UpdaterState::default();
+        let now = Instant::now();
+        tick(&ops, &mut state, &ops.flag, now).await;
+        assert!(state.version_read_completed && state.install_method_supported);
+        assert!(!state.updater_serving, "did-not-take: not serving");
+        let gate = |st: &UpdaterState| ChildEnvGate {
+            setting_on: true,
+            install_method_supported: st.install_method_supported,
+            version_read_completed: st.version_read_completed,
+            updater_serving: st.updater_serving,
+        };
+        assert!(child_env_pairs_for(gate(&state)).is_empty());
+
+        tick(&ops, &mut state, &ops.flag, now + Duration::from_secs(3600)).await;
+        assert!(!state.updater_serving, "still inside the backoff");
+        assert!(child_env_pairs_for(gate(&state)).is_empty());
+
+        // After the backoff, a tick whose install takes serves again.
+        let ops = FakeOps::new(&[Some("2.1.303"), Some("2.1.304")], Some("2.1.304"));
+        tick(
+            &ops,
+            &mut state,
+            &ops.flag,
+            now + DID_NOT_TAKE_BACKOFF + Duration::from_secs(1),
+        )
+        .await;
+        assert!(state.updater_serving);
+        assert_eq!(child_env_pairs_for(gate(&state)), SUPPRESS_PAIRS);
+    }
+
+    #[tokio::test]
+    async fn cli_update_a_non_default_channel_installs_nothing_and_does_not_serve() {
+        let mut ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
+        ops.channel = Some("stable".into());
+        let mut state = UpdaterState::default();
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        assert_eq!(
+            r.decision,
+            Decision::Skip(SkipReason::NonDefaultChannel("stable".into()))
+        );
+        assert_eq!(ops.installs.load(Ordering::SeqCst), 0);
+        assert!(!state.updater_serving);
     }
 }

@@ -911,6 +911,16 @@ pub struct SessionLifecycleStore {
     /// superseded PTY cannot outlive the runner that spawned it, so there is
     /// nothing to persist. Consumed on first match.
     superseded_terminals: Mutex<HashSet<String>>,
+    /// Terminal ids a respawn is still PROVING alive
+    /// ([`Self::hold_terminal_closes`]). A close naming one of them is HELD —
+    /// answered [`CloseOutcome::HeldInFlight`], nothing mutated — and the first
+    /// such close is remembered so whoever releases the hold can replay it once
+    /// the respawn has decided who owns the row. Without it, a respawned child
+    /// that exits 127 has its pty-exit close land on the row that is still
+    /// bound to it, enqueue a coord `Closed` and revoke the workdir nonce the
+    /// still-running OLD pane uses. Process-local, like `superseded_terminals`.
+    /// LOCK ORDER — never held together with `map`.
+    held_terminals: Mutex<HashMap<String, Option<HeldClose>>>,
     /// Process-local ORDER of provider SessionStart hooks: a monotonic counter
     /// and, per session id, the counter value of the most recent hook that
     /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
@@ -1178,6 +1188,7 @@ impl SessionLifecycleStore {
             wal: Mutex::new(WalWriter::default()),
             map: Mutex::new(map),
             superseded_terminals: Mutex::new(HashSet::new()),
+            held_terminals: Mutex::new(HashMap::new()),
             session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
@@ -1729,8 +1740,84 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// Hold every close naming `terminal_id` until [`Self::release_terminal_hold`]
+    /// — a respawn is still proving that pane alive, so who owns the row is not
+    /// decided yet. See `held_terminals`.
+    pub fn hold_terminal_closes(&self, terminal_id: &str) {
+        let t = terminal_id.trim();
+        if t.is_empty() {
+            return;
+        }
+        match self.held_terminals.lock() {
+            Ok(mut held) => {
+                held.entry(t.to_string()).or_insert(None);
+            }
+            Err(e) => warn!(
+                error = %e,
+                "session_lifecycle_store: lock poisoned on hold_terminal_closes"
+            ),
+        }
+    }
+
+    /// End a [`Self::hold_terminal_closes`]. Returns the first close that
+    /// arrived while it was held (the caller decides whether to replay it), or
+    /// `None` when none did or `terminal_id` was not held.
+    pub fn release_terminal_hold(&self, terminal_id: &str) -> Option<HeldClose> {
+        match self.held_terminals.lock() {
+            Ok(mut held) => held.remove(terminal_id.trim()).flatten(),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "session_lifecycle_store: lock poisoned on release_terminal_hold"
+                );
+                None
+            }
+        }
+    }
+
     #[cfg(test)]
-    fn superseded_terminal_count(&self) -> usize {
+    pub(crate) fn held_terminal_count(&self) -> usize {
+        self.held_terminals.lock().map(|h| h.len()).unwrap_or(0)
+    }
+
+    /// Put `rec` back EXACTLY as given, open — the respawn rollback's restore of
+    /// the pre-respawn record. Unlike [`Self::record_open`] no field is sticky:
+    /// a destination `account_label` / `account_wrapper` / `session_name` the
+    /// failed respawn stamped is replaced by the old record's value, including
+    /// its `None`. `opened_at` is the old record's own. Not a bind of a NEW
+    /// session, so no sibling-eviction scan runs.
+    pub fn restore_record_exact(&self, rec: TerminalSessionRecord) {
+        let now = Utc::now().timestamp_millis();
+        let restored = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on restore_record_exact");
+                    return;
+                }
+            };
+            let restored = TerminalSessionRecord {
+                state: "open".to_string(),
+                closed_at: None,
+                close_reason: None,
+                last_seen_at: now,
+                ..rec
+            };
+            m.insert(restored.claude_session_id.clone(), restored.clone());
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(restored.clone()),
+                }],
+            );
+            restored
+        };
+        self.snapshot_change(std::iter::once(restored.clone()));
+        self.mirror_restore_record(&restored);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn superseded_terminal_count(&self) -> usize {
         self.superseded_terminals
             .lock()
             .map(|s| s.len())
@@ -1826,6 +1913,54 @@ impl SessionLifecycleStore {
                 return CloseOutcome::TerminalSuperseded {
                     requested: claude_session_id.to_string(),
                     terminal_id: t.to_string(),
+                };
+            }
+        }
+
+        // A close naming a terminal a respawn is still PROVING alive is held,
+        // not applied: until the proof decides, the row may be bound to a pane
+        // whose child just exited, and closing it would end a session that the
+        // retry or the rollback is about to rebind (coord `Closed`, the workdir
+        // nonce revoked under the old pane). The first such close is kept for
+        // the hold's owner to replay. A terminal-less close (`poll-dead`) is
+        // held when the row it names is bound to a held terminal.
+        let hold_key = expect.map(str::to_string).or_else(|| {
+            self.get(claude_session_id)
+                .filter(|r| r.state == "open" && !r.terminal_id.trim().is_empty())
+                .map(|r| r.terminal_id)
+        });
+        if let Some(t) = hold_key {
+            let held = match self.held_terminals.lock() {
+                Ok(mut held) => match held.get_mut(t.as_str()) {
+                    Some(slot) => {
+                        if slot.is_none() {
+                            *slot = Some(HeldClose {
+                                claude_session_id: claude_session_id.to_string(),
+                                reason: reason.to_string(),
+                            });
+                        }
+                        true
+                    }
+                    None => false,
+                },
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "session_lifecycle_store: lock poisoned on the held-terminal register — treating the close as not held"
+                    );
+                    false
+                }
+            };
+            if held {
+                info!(
+                    claude_session_id = %claude_session_id,
+                    terminal_id = %t,
+                    reason = %reason,
+                    "session-close: HELD — a respawn is still proving this pane alive; the close is kept for replay"
+                );
+                return CloseOutcome::HeldInFlight {
+                    requested: claude_session_id.to_string(),
+                    terminal_id: t,
                 };
             }
         }
@@ -3659,6 +3794,14 @@ impl SessionLifecycleStore {
     }
 }
 
+/// A close that arrived while its terminal was held
+/// ([`SessionLifecycleStore::hold_terminal_closes`]) — enough to replay it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldClose {
+    pub claude_session_id: String,
+    pub reason: String,
+}
+
 /// Typed outcome of [`SessionLifecycleStore::record_close_checked`].
 ///
 /// Serialized into `CommandResponse.data` (never into `message`): the outcome
@@ -3707,6 +3850,15 @@ pub enum CloseOutcome {
     /// this retires a terminal and closes nothing.
     #[serde(rename_all = "camelCase")]
     TerminalSuperseded {
+        requested: String,
+        terminal_id: String,
+    },
+    /// The named terminal is a respawned pane still being PROVEN alive
+    /// ([`SessionLifecycleStore::hold_terminal_closes`]). Nothing mutated, no
+    /// observer, the workdir nonce kept; the close is remembered and replayed
+    /// by the respawn once it has decided who owns the row.
+    #[serde(rename_all = "camelCase")]
+    HeldInFlight {
         requested: String,
         terminal_id: String,
     },

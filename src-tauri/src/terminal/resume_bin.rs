@@ -24,7 +24,10 @@
 //!   two, `claude` exists, is executable, prints "claude native binary not
 //!   installed" and exits. `install.cjs` itself tells the stub from the real
 //!   binary by size (`< 4096` bytes; the real one is ~290 MB), and so does
-//!   [`judge_resolved`];
+//!   [`judge_resolved`] — but only for the package's own binary
+//!   (`…/@anthropic-ai/claude-code/bin/claude.exe`, the `bin` field's target,
+//!   reached through the symlink npm installs). A small pnpm / asdf / mise shim
+//!   or a wrapper script is a valid launcher, not the stub;
 //! - the file's size could not be read at all (it vanished between the walk
 //!   and the stat).
 //!
@@ -82,14 +85,41 @@ impl std::fmt::Display for ResolveMiss {
     }
 }
 
+/// The package-relative path of the native binary npm's `bin` field points at
+/// (`"bin": { "claude": "bin/claude.exe" }`) — the one file `install.cjs`
+/// copies over its placeholder. Only a resolved `claude` whose CANONICAL path
+/// ends here can be the stub.
+const PACKAGE_BINARY_TAIL: [&str; 4] = ["@anthropic-ai", "claude-code", "bin", "claude.exe"];
+
+/// Is `canonical` the npm package's own native binary (the file the
+/// placeholder stub sits at mid-install)? A pnpm / asdf / mise shim or a
+/// user's wrapper script is a different, legitimately small file.
+pub(crate) fn is_npm_package_binary(canonical: &Path) -> bool {
+    let names: Vec<&std::ffi::OsStr> = canonical
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    names.len() >= PACKAGE_BINARY_TAIL.len()
+        && names[names.len() - PACKAGE_BINARY_TAIL.len()..]
+            .iter()
+            .zip(PACKAGE_BINARY_TAIL)
+            .all(|(have, want)| *have == std::ffi::OsStr::new(want))
+}
+
 /// Pure: is `resolved` a usable argv head for the respawn?
 ///
-/// `bare` is [`crate::agent_runtime::claude_bin_path`]; `len` is the resolved
-/// file's size, `None` when it could not be read.
+/// `bare` is [`crate::agent_runtime::claude_bin_path`]; `target` is the
+/// resolved file's CANONICAL path (symlinks followed) and size, `None` when it
+/// could not be read. The size test applies only when that canonical path is
+/// the npm package's own binary ([`is_npm_package_binary`]): a small launcher
+/// anywhere else is a shim or wrapper, not the stub.
 pub(crate) fn judge_resolved(
     resolved: &str,
     bare: &str,
-    len: Option<u64>,
+    target: Option<(&Path, u64)>,
 ) -> Result<(), ResolveMiss> {
     // An absolute override is launched as-is (the resolver does the same).
     if Path::new(bare).is_absolute() {
@@ -98,14 +128,18 @@ pub(crate) fn judge_resolved(
     if resolved == bare {
         return Err(ResolveMiss::Bare);
     }
-    match len {
+    match target {
         None => Err(ResolveMiss::Unreadable {
             path: resolved.to_string(),
         }),
-        Some(len) if len < PLACEHOLDER_STUB_MAX_BYTES => Err(ResolveMiss::PlaceholderStub {
-            path: resolved.to_string(),
-            len,
-        }),
+        Some((canonical, len))
+            if len < PLACEHOLDER_STUB_MAX_BYTES && is_npm_package_binary(canonical) =>
+        {
+            Err(ResolveMiss::PlaceholderStub {
+                path: resolved.to_string(),
+                len,
+            })
+        }
         Some(_) => Ok(()),
     }
 }
@@ -182,8 +216,15 @@ async fn resolve_once_blocking() -> Result<String, ResolveMiss> {
         let resolved =
             crate::agent_runtime::launchable_or_bare(crate::agent_runtime::resolve_claude_bin());
         let bare = crate::agent_runtime::claude_bin_path();
-        let len = std::fs::metadata(&resolved).ok().map(|m| m.len());
-        judge_resolved(&resolved, &bare, len).map(|()| resolved)
+        let target = std::fs::canonicalize(&resolved)
+            .ok()
+            .and_then(|c| std::fs::metadata(&c).ok().map(|m| (c, m.len())));
+        judge_resolved(
+            &resolved,
+            &bare,
+            target.as_ref().map(|(c, len)| (c.as_path(), *len)),
+        )
+        .map(|()| resolved)
     })
     .await
     .unwrap_or(Err(ResolveMiss::Bare))
@@ -207,11 +248,16 @@ mod tests {
     use std::sync::Arc;
 
     const REAL: u64 = 290_532_720;
+    const PKG_BIN: &str = "/n/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe";
+
+    fn at(p: &str, len: u64) -> Option<(&Path, u64)> {
+        Some((Path::new(p), len))
+    }
 
     #[test]
     fn judge_accepts_a_real_sized_absolute_binary() {
         assert_eq!(
-            judge_resolved("/usr/bin/claude", "claude", Some(REAL)),
+            judge_resolved("/n/bin/claude", "claude", at(PKG_BIN, REAL)),
             Ok(())
         );
     }
@@ -225,21 +271,55 @@ mod tests {
     }
 
     /// Phase 1(c)'s hazard: the stub is executable and present, so only its
-    /// size tells it apart.
+    /// size tells it apart — at the package's own binary path.
     #[test]
     fn judge_refuses_npms_placeholder_stub() {
         assert_eq!(
-            judge_resolved("/n/bin/claude", "claude", Some(600)),
+            judge_resolved("/n/bin/claude", "claude", at(PKG_BIN, 600)),
             Err(ResolveMiss::PlaceholderStub {
                 path: "/n/bin/claude".into(),
                 len: 600
             })
         );
         assert_eq!(
-            judge_resolved("/n/bin/claude", "claude", Some(PLACEHOLDER_STUB_MAX_BYTES)),
+            judge_resolved(
+                "/n/bin/claude",
+                "claude",
+                at(PKG_BIN, PLACEHOLDER_STUB_MAX_BYTES)
+            ),
             Ok(()),
             "the bound is install.cjs's own `< 4096`"
         );
+    }
+
+    /// Review finding 4: a small launcher that is NOT the package's binary — a
+    /// pnpm / asdf / mise shim, a user's wrapper script — is accepted.
+    #[test]
+    fn judge_accepts_a_small_shim_or_wrapper_that_is_not_the_package_binary() {
+        for shim in [
+            "/home/u/.local/share/pnpm/claude",
+            "/home/u/.asdf/shims/claude",
+            "/home/u/.local/share/mise/shims/claude",
+            "/home/u/bin/claude",
+            "/n/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.sh",
+        ] {
+            assert_eq!(
+                judge_resolved(shim, "claude", at(shim, 600)),
+                Ok(()),
+                "{shim}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_package_binary_is_recognised_only_by_its_full_tail() {
+        assert!(is_npm_package_binary(Path::new(PKG_BIN)));
+        assert!(!is_npm_package_binary(Path::new(
+            "/x/claude-code/bin/claude.exe"
+        )));
+        assert!(!is_npm_package_binary(Path::new(
+            "/n/lib/node_modules/@anthropic-ai/other/bin/claude.exe"
+        )));
     }
 
     #[test]
@@ -253,7 +333,11 @@ mod tests {
     #[test]
     fn judge_passes_an_absolute_override_through() {
         assert_eq!(
-            judge_resolved("/fixtures/mock_claude", "/fixtures/mock_claude", Some(10)),
+            judge_resolved(
+                "/fixtures/mock_claude",
+                "/fixtures/mock_claude",
+                at("/fixtures/mock_claude", 10)
+            ),
             Ok(())
         );
     }
