@@ -654,7 +654,7 @@ fn run_loop(mut collector: Collector, publish: &dyn Fn(OsHealthSnapshot), stop: 
             }
             if consecutive_panics >= FLAP_WARN_BUDGET {
                 error!(
-                    "os-health: {consecutive_panics} collector ticks in a row panicked ({what});                      the os-health thread STOPS so the panic hook stops writing crash dumps.                      osHealth reads UNKNOWN (stale) until the runner restarts"
+                    "os-health: {consecutive_panics} collector ticks in a row panicked ({what}); the os-health thread STOPS so the panic hook stops writing crash dumps; osHealth reads UNKNOWN (stale) until the runner restarts"
                 );
                 return;
             }
