@@ -1094,8 +1094,10 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
         tokio::time::sleep(crate::terminal::respawn_liveness::retry_delay(retry)).await;
     }
 
-    fn close_pane(&mut self, terminal_id: &str) -> Result<(), String> {
-        self.terminal_manager.close(terminal_id)
+    fn panes(&self) -> std::sync::Arc<dyn crate::terminal::respawn_liveness::PaneOps> {
+        std::sync::Arc::new(crate::terminal::respawn_liveness::ManagerPanes(
+            std::sync::Arc::clone(&self.terminal_manager),
+        ))
     }
 }
 

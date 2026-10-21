@@ -726,15 +726,29 @@ pub(crate) async fn tick<O: CliOps>(
             state.backoff_until = None;
         }
     }
-    // Children defer their updates to the runner only while it can actually
-    // update: not backing off after an install that did not take (including
-    // one that just failed above), not deferring to another release channel.
-    // Nor while the versions cannot be ordered: the runner never installs then,
-    // so a child told to defer would never be updated by anyone.
-    state.updater_serving = inputs.non_default_channel.is_none()
-        && decision != Decision::Skip(SkipReason::VersionsUncomparable)
-        && state.backoff_until.is_none_or(|until| now >= until);
+    // A tick that finds the CLI current has nothing pending: any backoff from
+    // an earlier install that did not take is over.
+    if decision == Decision::Skip(SkipReason::UpToDate) {
+        state.backoff_until = None;
+    }
+    state.updater_serving = serves_children(&decision, state.backoff_until, now);
     report
+}
+
+/// Do children defer their CLI updates to the runner after this tick? Only
+/// when THIS tick showed the runner able to update: it read both versions and
+/// they compare (`UpToDate`, `InstalledNewer`, `Install`), and it is not
+/// backing off from an install that did not take. Every other decision — an
+/// unreadable version, uncomparable versions, a non-default channel, the
+/// setting or an opt-out — means nothing would update a child told to defer.
+fn serves_children(decision: &Decision, backoff_until: Option<Instant>, now: Instant) -> bool {
+    let able = matches!(
+        decision,
+        Decision::Install { .. }
+            | Decision::Skip(SkipReason::UpToDate)
+            | Decision::Skip(SkipReason::InstalledNewer)
+    );
+    able && backoff_until.is_none_or(|until| now >= until)
 }
 
 fn log_report(r: &TickReport) {
@@ -1613,5 +1627,44 @@ mod tests {
             !state.updater_serving,
             "the runner never installs here, so children must keep their own updater"
         );
+    }
+
+    // ---- Round 3 -----------------------------------------------------------
+
+    /// Finding 4: a later tick that cannot read a version stops serving, even
+    /// after an earlier successful read.
+    #[tokio::test]
+    async fn cli_update_an_unreadable_tick_after_a_good_one_stops_serving() {
+        let ops = FakeOps::new(&[Some("2.1.304")], Some("2.1.304"));
+        let mut state = UpdaterState::default();
+        tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        assert!(state.updater_serving, "fixture: an up-to-date tick serves");
+        for (installed, published) in [(Some("2.1.304"), None), (None, Some("2.1.304"))] {
+            let ops = FakeOps::new(&[installed], published);
+            tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+            assert!(
+                !state.updater_serving,
+                "installed={installed:?} published={published:?}: nothing updates a deferring child"
+            );
+            assert!(
+                state.version_read_completed,
+                "the earlier read still counts as completed"
+            );
+        }
+    }
+
+    /// Nit: a tick inside the backoff that finds the CLI up to date serves
+    /// again (the backoff is over: nothing is pending).
+    #[tokio::test]
+    async fn cli_update_an_up_to_date_tick_ends_the_backoff_and_serves() {
+        let ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
+        let mut state = UpdaterState::default();
+        let now = Instant::now();
+        tick(&ops, &mut state, &ops.flag, now).await;
+        assert!(!state.updater_serving, "fixture: did-not-take backs off");
+        let ops = FakeOps::new(&[Some("2.1.304")], Some("2.1.304"));
+        tick(&ops, &mut state, &ops.flag, now + Duration::from_secs(60)).await;
+        assert!(state.updater_serving);
+        assert!(state.backoff_until.is_none());
     }
 }

@@ -874,8 +874,10 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
         tokio::time::sleep(super::respawn_liveness::retry_delay(retry)).await;
     }
 
-    fn close_pane(&mut self, terminal_id: &str) -> Result<(), String> {
-        self.terminal_manager.close(terminal_id)
+    fn panes(&self) -> std::sync::Arc<dyn crate::terminal::respawn_liveness::PaneOps> {
+        std::sync::Arc::new(crate::terminal::respawn_liveness::ManagerPanes(
+            std::sync::Arc::clone(&self.terminal_manager),
+        ))
     }
 }
 
@@ -1094,7 +1096,7 @@ pub(crate) async fn migrate_session_claimed(
         // and the session is back on the old pane, which still runs.
         RespawnOutcome::ClosedByUser { .. } => {
             return Err(NotMoved(
-                "closed_by_user: the new pane was closed before it painted — rolled back onto the old pane"
+                "closed_by_user: the user closed a pane mid-migration — nothing retried (the new pane's close rolls back onto the old pane; the old pane's close ends the session)"
                     .to_string(),
             ))
         }
