@@ -5277,6 +5277,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // (it records each outcome there).
                 session::wind_down_executor::start();
 
+                // Operator restart prepare's notice loop (plan
+                // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+                // Phase 4): while a prepare is in its window, tell each live
+                // session to save and pause, read each row's state from the
+                // restart census, and keep `ready_to_restart` current. A tick
+                // with no prepare does nothing.
+                restart_prep::notice::start();
+
                 // Session-tracking health check (plan 2026-07-03-runner-
                 // session-tracking-drift-and-guardrails Phase 3 item 2): every
                 // 10 min cross-reference the live claude descendants of this

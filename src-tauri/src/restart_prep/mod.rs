@@ -29,10 +29,20 @@
 //! freeze, and the runner-local hold that gates `drain_gate` where there is
 //! no coord lever (D1, D3).
 //!
-//! The notice loop and the restore are later phases.
+//!
+//! ## Phase 4: the notice loop and the verdict
+//!
+//! [`notice`] tells each live session to save its work and pause — through the
+//! session message poller's idle arm, or its busy-prompt arm for a session
+//! still mid-turn (D2) — reads every row's state from the restart census each
+//! tick, and computes `ready_to_restart`, served in the record here and as the
+//! `restart_prep` block of `GET /restart-readiness`.
+//!
+//! The restore is a later phase.
 
 pub mod cohort;
 pub mod effort;
+pub mod notice;
 pub mod prepare;
 
 pub use prepare::{accounts_frozen, freeze_hit, local_hold_reason, on_boot};
@@ -173,6 +183,15 @@ pub struct PrepareRecord {
     /// The release, once the hold was let go.
     #[serde(default)]
     pub release: Option<ReleaseReport>,
+    /// Unix millis of the last change to a row that the cohort's re-capture
+    /// did not itself produce — a notice delivered, a `limit_hit` marked. The
+    /// verdict is ready only once the cohort was re-captured at or after it
+    /// (Phase 4, condition 3). `None` reads as `started_at_ms`.
+    #[serde(default)]
+    pub last_change_at_ms: Option<i64>,
+    /// The notice loop's last verdict (Phase 4). `None` before its first tick.
+    #[serde(default)]
+    pub verdict: Option<notice::PrepVerdict>,
 }
 
 impl PrepareRecord {
@@ -191,6 +210,8 @@ impl PrepareRecord {
             hold_until_ms: None,
             hold_until: None,
             release: None,
+            last_change_at_ms: None,
+            verdict: None,
         }
     }
 
@@ -281,7 +302,10 @@ pub fn load_from(path: &Path) -> Option<PrepareRecord> {
 #[derive(Debug, Clone, Serialize)]
 pub struct RestartPrepStatus {
     /// The persisted prepare, when one exists. `None` means no readable
-    /// record — not proof that no prepare ever ran.
+    /// record — not proof that no prepare ever ran. Since Phase 4 it carries
+    /// each row's `pause_state` and the notice loop's last `verdict`
+    /// (`ready_to_restart` and its `blockers`); `GET /restart-readiness`
+    /// re-evaluates the same verdict against its own fresh census.
     pub record: Option<PrepareRecord>,
     /// Where the record lives (or would).
     pub record_path: String,
@@ -426,6 +450,7 @@ mod tests {
                 finished: Some(finished),
                 model: Some("claude-opus-5-5".to_string()),
                 settings_effort: None,
+                provider: Some("claude".to_string()),
             },
         )
     }

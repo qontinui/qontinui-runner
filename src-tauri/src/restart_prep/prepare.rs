@@ -520,8 +520,12 @@ pub struct RestartPrep {
     path: PathBuf,
     record: Mutex<Option<PrepareRecord>>,
     same_build_restart: AtomicBool,
-    /// Serializes prepare / cancel / boot so two clicks cannot race.
-    ops: tokio::sync::Mutex<()>,
+    /// A notice-loop change that is in memory but not yet on disk (its write
+    /// failed); [`Self::update_quiet`] retries the write on every call.
+    persist_pending: AtomicBool,
+    /// Serializes prepare / cancel / boot / the notice tick so two clicks
+    /// (or a click and a tick) cannot race.
+    pub(super) ops: tokio::sync::Mutex<()>,
     on_change: Option<ChangeHook>,
 }
 
@@ -553,12 +557,13 @@ impl RestartPrep {
             path,
             record: Mutex::new(record),
             same_build_restart: AtomicBool::new(false),
+            persist_pending: AtomicBool::new(false),
             ops: tokio::sync::Mutex::new(()),
             on_change,
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<PrepareRecord>> {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Option<PrepareRecord>> {
         match self.record.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -596,7 +601,7 @@ impl RestartPrep {
         self.lock().as_ref().is_some_and(|r| r.is_active(now_ms))
     }
 
-    fn emit(&self, rec: &PrepareRecord) {
+    pub(super) fn emit(&self, rec: &PrepareRecord) {
         if let Some(hook) = &self.on_change {
             hook(&PrepChanged {
                 record: rec.clone(),
@@ -646,6 +651,60 @@ impl RestartPrep {
         Ok(rec)
     }
 
+    /// [`Self::update`] for the notice loop, which re-reads the census every
+    /// tick: apply `f` to the current record, keep the result in memory, and
+    /// persist and announce `restart-prep-changed` ONLY when something an
+    /// observer can see changed ([`material`]) — a row state, a stamp, the
+    /// verdict, the prepare state. A tick that merely re-read the same world
+    /// moves the re-capture and evaluation times in memory and writes nothing.
+    ///
+    /// Unlike [`Self::update`], a failed write does NOT roll memory back: the
+    /// tick's delivery stamps record text that already reached a pane, and
+    /// dropping them would re-send the notice on the next tick. The change is
+    /// kept and announced, the write failure is logged, and every later call
+    /// retries the write until it lands (the same posture as
+    /// [`Self::freeze_hit`]).
+    pub(super) fn update_quiet(
+        &self,
+        prepare_id: &str,
+        f: impl FnOnce(&mut PrepareRecord),
+    ) -> Result<(PrepareRecord, bool), String> {
+        let (rec, changed) = {
+            let mut guard = self.lock();
+            let Some(current) = guard
+                .as_ref()
+                .filter(|r| r.prepare_id == prepare_id)
+                .cloned()
+            else {
+                return Err(format!(
+                    "restart_prep: the record is no longer prepare {prepare_id}"
+                ));
+            };
+            let mut next = current.clone();
+            f(&mut next);
+            let changed = material(&current) != material(&next);
+            if changed || self.persist_pending.load(Ordering::SeqCst) {
+                let written = persist_to(&self.path, &next);
+                self.persist_pending
+                    .store(written.is_err(), Ordering::SeqCst);
+                if let Err(e) = written {
+                    warn!(
+                        error = %e,
+                        path = %self.path.display(),
+                        "restart_prep: the notice loop's change is kept in memory but the record \
+                         write failed"
+                    );
+                }
+            }
+            *guard = Some(next.clone());
+            (next, changed)
+        };
+        if changed {
+            self.emit(&rec);
+        }
+        Ok((rec, changed))
+    }
+
     /// While a prepare is active, a confirmed usage-limit hit freezes the
     /// account: mark the session's cohort row `limit_hit` (with the reset
     /// time, when known) and tell the caller not to move it.
@@ -674,6 +733,9 @@ impl RestartPrep {
                     if limit_reset_at_ms.is_some() {
                         row.limit_reset_at = limit_reset_at_ms;
                     }
+                    // A row change the cohort's last re-capture did not see:
+                    // the verdict waits for the next one (Phase 4, condition 3).
+                    rec.last_change_at_ms = Some(now_ms);
                     if let Err(e) = persist_to(&self.path, rec) {
                         warn!(
                             error = %e,
@@ -966,7 +1028,7 @@ impl RestartPrep {
 
 static LIVE: OnceLock<RestartPrep> = OnceLock::new();
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -1029,6 +1091,21 @@ pub async fn on_boot() {
     info!(step = ?step, "restart_prep: boot step");
 }
 
+/// What [`RestartPrep::update_quiet`] compares: the record minus the fields a
+/// tick moves every time it looks — the re-capture time and the verdict's
+/// evaluation time.
+fn material(rec: &PrepareRecord) -> PrepareRecord {
+    let mut m = rec.clone();
+    m.cohort.captured_at_ms = 0;
+    m.cohort.captured_at.clear();
+    if let Some(v) = m.verdict.as_mut() {
+        v.evaluated_at_ms = 0;
+        v.evaluated_at.clear();
+        v.cohort_captured_at_ms = 0;
+    }
+    m
+}
+
 fn changed_payload(ctl: &RestartPrep, rec: PrepareRecord) -> PrepChanged {
     PrepChanged {
         view: view_of(&rec, ctl.same_build_restart(), now_ms()),
@@ -1051,6 +1128,8 @@ pub async fn prepare_from_app(
             .map_err(|e| format!("restart_prep cohort task failed: {e}"))?
         })
         .await?;
+    // The first notice pass now rather than on the loop's next tick.
+    tauri::async_runtime::spawn(super::notice::tick_live());
     Ok(changed_payload(ctl, rec))
 }
 
@@ -1058,6 +1137,10 @@ pub async fn prepare_from_app(
 pub async fn cancel_from_app() -> Result<PrepChanged, String> {
     let ctl = install_live().ok_or("restart prepare is not available in this build")?;
     let rec = ctl.cancel(&LiveDoor, now_ms()).await?;
+    // The sessions that were told to pause get one "resume your work" line
+    // now, through the same two input arms; the notice loop retries any it
+    // could not reach yet.
+    tauri::async_runtime::spawn(super::notice::tick_live());
     Ok(changed_payload(ctl, rec))
 }
 

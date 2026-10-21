@@ -547,6 +547,13 @@ pub struct RestartReadiness {
     /// `0`.
     #[serde(rename = "windDownCandidates")]
     pub wind_down_candidates: Option<usize>,
+    /// The operator restart prepare's verdict (plan
+    /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+    /// Phase 4): `ready_to_restart` and its `blockers`, re-evaluated against
+    /// THIS request's census over the prepare's cohort. ADDITIVE — it never
+    /// feeds `safe_to_restart`, which keeps its own meaning. `null` when this
+    /// runner holds no prepare record.
+    pub restart_prep: Option<crate::restart_prep::notice::RestartPrepBlock>,
     pub boundary: &'static str,
 }
 
@@ -1015,6 +1022,7 @@ pub fn build_verdict(
             census,
             session_status_source: status_source,
             wind_down_candidates,
+            restart_prep: None,
             boundary: BOUNDARY,
         };
     }
@@ -1191,6 +1199,7 @@ pub fn build_verdict(
         census,
         session_status_source: status_source,
         wind_down_candidates,
+        restart_prep: None,
         boundary: BOUNDARY,
     }
 }
@@ -1365,6 +1374,15 @@ pub async fn restart_readiness_handler(
         observed,
         unknowns: pass_unknowns,
     } = fresh;
+    // The restart-prep block's census cause, before the pass's unknowns are
+    // folded into the verdict's.
+    let prep_census_error = pass.is_none().then(|| {
+        if pass_unknowns.is_empty() {
+            "the restart census could not be taken".to_string()
+        } else {
+            pass_unknowns.join("; ")
+        }
+    });
     unknowns.extend(pass_unknowns);
     let status_source = SessionStatusSource::from(&status_fetch);
 
@@ -1434,7 +1452,17 @@ pub async fn restart_readiness_handler(
 
     let census = census_info(tracking_health::latest().as_ref(), now_ms);
 
-    Json(build_verdict(
+    // The operator prepare's verdict over the same census (additive; never
+    // read by `safe_to_restart`).
+    let restart_prep = crate::restart_prep::notice::readiness_block(
+        app,
+        pass.as_ref().map(|p| &p.report),
+        prep_census_error,
+        &activity_evidence,
+        now_ms,
+    );
+
+    let mut verdict = build_verdict(
         terminal,
         headless,
         holder,
@@ -1444,7 +1472,9 @@ pub async fn restart_readiness_handler(
         drain,
         census,
         status_source,
-    ))
+    );
+    verdict.restart_prep = restart_prep;
+    Json(verdict)
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1585,33 @@ mod tests {
         assert_eq!(json["is_draining"], false, "the local drain is untouched");
         assert_eq!(json["coordDrain"]["state"], "drained");
         assert_eq!(json["coordDrain"]["reason"], "rebuild");
+    }
+
+    /// The operator restart prepare's block is additive: `build_verdict`
+    /// never sets it (only the handler does), and it serializes as
+    /// `restart_prep` beside an unchanged `safe_to_restart`.
+    #[test]
+    fn the_restart_prep_block_is_additive_and_null_without_a_prepare() {
+        let v = build_verdict(
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            idle_drain(),
+            census_info(None, 0),
+            SessionStatusSource::from(
+                &crate::mcp::session_work_status::StatusFetch::store_unavailable(),
+            ),
+        );
+        assert_eq!(v.restart_prep, None);
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(
+            json.get("restart_prep").is_some_and(|b| b.is_null()),
+            "{json}"
+        );
+        assert_eq!(json["safe_to_restart"], false);
     }
 
     /// A census pass with every class empty — an idle box.

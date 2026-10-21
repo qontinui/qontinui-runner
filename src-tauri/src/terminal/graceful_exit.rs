@@ -232,14 +232,23 @@ pub fn input_prompt_ready(screen: &ScreenText) -> Result<(), String> {
 /// delivers it at the next input point, is the plan's Phase 1 probe 2 — this
 /// predicate only says the box is safe to type into.
 pub fn busy_prompt_accepts_input(screen: &ScreenText) -> Result<(), String> {
-    let normalized = super::output_scan::normalize(&screen.lines.join("\n"));
-    if !normalized.contains(super::account_migration::BUSY_MARKER) {
+    if !shows_busy_marker(screen) {
         return Err(format!(
             "no busy marker (`{}`) on screen — not a busy turn",
             super::account_migration::BUSY_MARKER
         ));
     }
     prompt_ready_with(screen, DIALOG_CHROME_MARKERS, false)
+}
+
+/// Whether Claude's busy marker
+/// ([`crate::terminal::account_migration::BUSY_MARKER`], `esc to interrupt`) is
+/// painted anywhere on `screen`. Claude Code 2.1.306 paints it on the BOTTOM
+/// status line of a running turn (`⏵⏵ bypass permissions on … · esc to
+/// interrupt`), not on the spinner line, so the whole grid is scanned.
+pub fn shows_busy_marker(screen: &ScreenText) -> bool {
+    super::output_scan::normalize(&screen.lines.join("\n"))
+        .contains(super::account_migration::BUSY_MARKER)
 }
 
 /// The shared screen check behind [`exit_prompt_ready`],
@@ -709,6 +718,36 @@ where
     }
 }
 
+/// Real Claude Code 2.1.306 screens captured by the plan's Phase 1 probe 2
+/// (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`),
+/// verbatim except the banner's working-directory path. Each is a 71-row grid
+/// whose cursor sat at column 2 of row 68, the `❯` input row.
+#[cfg(test)]
+pub(crate) mod probe_fixtures {
+    use super::ScreenText;
+
+    /// A busy turn inside a tool call: `esc to interrupt` sits on the BOTTOM
+    /// status line (`⏵⏵ bypass permissions on · 1 shell · esc to interrupt ·
+    /// ↓ to manage`), not the spinner line; the input row is an empty `❯`.
+    pub(crate) const BUSY_TOOL_CALL: &str =
+        include_str!("fixtures/claude-2.1.306-busy-tool-call.txt");
+    /// A busy turn streaming its answer; the marker on the status line again.
+    pub(crate) const BUSY_STREAMING: &str =
+        include_str!("fixtures/claude-2.1.306-busy-streaming.txt");
+    /// The same busy turn after a message was typed and queued: the input row
+    /// reads `❯ Press up to edit queued messages`.
+    pub(crate) const BUSY_QUEUED: &str = include_str!("fixtures/claude-2.1.306-busy-queued.txt");
+
+    /// The cursor as the probe read it: column 2, row 68.
+    pub(crate) fn screen(raw: &str) -> ScreenText {
+        ScreenText {
+            lines: raw.lines().map(str::to_string).collect(),
+            cursor_row: 68,
+            cursor_col: 2,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +904,67 @@ mod tests {
         assert_eq!(busy_prompt_accepts_input(&s), Ok(()));
         let why = input_prompt_ready(&s).unwrap_err();
         assert!(why.contains("idle"), "refused for the idle check: {why}");
+    }
+
+    /// The REAL busy shape (Claude Code 2.1.306): the marker on the bottom
+    /// status line, not the spinner line, and the cursor on an empty `❯` row.
+    #[test]
+    fn the_real_2_1_306_busy_screens_pass_the_busy_arm_and_fail_the_idle_one() {
+        use super::probe_fixtures::{screen, BUSY_STREAMING, BUSY_TOOL_CALL};
+        for (name, raw) in [("tool call", BUSY_TOOL_CALL), ("streaming", BUSY_STREAMING)] {
+            let s = screen(raw);
+            assert_eq!(s.lines.len(), 71, "{name}: the probe's 71-row grid");
+            assert!(
+                s.lines[68].starts_with('❯'),
+                "{name}: the cursor row is the input row"
+            );
+            let marker_rows: Vec<usize> = s
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains("esc to interrupt"))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                marker_rows,
+                [70],
+                "{name}: the busy marker is on the bottom status line only"
+            );
+            let spinner = s
+                .lines
+                .iter()
+                .find(|l| l.contains('…'))
+                .expect("a spinner line");
+            assert!(!spinner.contains("esc to interrupt"), "{name}: {spinner}");
+            assert!(shows_busy_marker(&s), "{name}");
+            assert_eq!(busy_prompt_accepts_input(&s), Ok(()), "{name}");
+            assert!(input_prompt_ready(&s).is_err(), "{name}: not idle");
+            assert!(
+                exit_prompt_ready(&s).is_err(),
+                "{name}: never /exit a busy turn"
+            );
+        }
+    }
+
+    /// After one message is queued the input row reads `Press up to edit
+    /// queued messages`: the busy arm refuses a second paste until the turn
+    /// ends.
+    #[test]
+    fn a_queued_message_line_refuses_a_second_busy_paste() {
+        use super::probe_fixtures::{screen, BUSY_QUEUED};
+        let s = screen(BUSY_QUEUED);
+        assert!(s.lines[68].contains("Press up to edit queued messages"));
+        assert!(shows_busy_marker(&s));
+        let why = busy_prompt_accepts_input(&s).unwrap_err();
+        assert!(
+            why.contains("not the empty-prompt placeholder"),
+            "refused for the queued line: {why}"
+        );
+        // Wherever the cursor sits on that row, it is refused.
+        let mut end = s.clone();
+        end.cursor_col = 34;
+        assert!(busy_prompt_accepts_input(&end).is_err());
+        assert!(input_prompt_ready(&s).is_err());
     }
 
     #[test]

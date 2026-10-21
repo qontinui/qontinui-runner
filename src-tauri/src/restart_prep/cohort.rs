@@ -50,6 +50,33 @@ pub enum StateAtPrepare {
     Unknown,
 }
 
+/// A row's state as the notice loop last read it from the census (Phase 4).
+///
+/// Derived each tick from observed evidence, never set by intent: `paused`
+/// means the row was told AND its own process reads idle at a prompt with no
+/// live children; a `hasLiveChildren` that is null, or an activity that could
+/// not be classified, is `unknown` — never `paused`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseState {
+    /// Not yet told to save and pause (still running its own work, or idle
+    /// but the notice could not be delivered yet — `pause_reason` says which).
+    Working,
+    /// Told, and not yet idle with no live children.
+    Notified,
+    /// Told, and now idle at a prompt with no live children.
+    Paused,
+    /// Declared finished on the work axis; still running until wind-down.
+    Finished,
+    /// Its session is no longer running here: closed (a finished row closed by
+    /// the drain's wind-down executor, or a session closed since the prepare).
+    Closed,
+    /// Its account ran out of usage during the prepare (the freeze kept it).
+    LimitHit,
+    /// An input the state needs could not be read.
+    Unknown,
+}
+
 /// One cohort session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CohortRow {
@@ -74,6 +101,59 @@ pub struct CohortRow {
     /// The work axis at capture: `Some(true)` when the session declared itself
     /// finished. `None` when the lifecycle record could not be read.
     pub finished: Option<bool>,
+    /// The lifecycle record's provider (`claude` for a Claude Code session);
+    /// `None` when the record could not be read.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Phase 4: the row's state at the notice loop's last read. `None` before
+    /// the first tick.
+    #[serde(default)]
+    pub pause_state: Option<PauseState>,
+    /// What that state was read from, or which input could not be read.
+    #[serde(default)]
+    pub pause_reason: Option<String>,
+    /// Idle at a prompt with no live children at the last read: `Some(true)`;
+    /// not idle (or a live child attached): `Some(false)`; unread: `None`.
+    #[serde(default)]
+    pub idle_now: Option<bool>,
+    /// Why the notice loop does not reach this row (no live terminal, not a
+    /// Claude session). `None` while it can be reached.
+    #[serde(default)]
+    pub notice_skipped: Option<String>,
+    /// Why the last delivery attempt did not paste; it is retried next tick.
+    #[serde(default)]
+    pub notice_deferred: Option<String>,
+    /// The input arm the notice went through: `idle`, `busy_prompt`, or
+    /// `shared_terminal` (the same pane and process were told through another
+    /// record).
+    #[serde(default)]
+    pub notice_arm: Option<String>,
+    /// The `claude` pid the census attributed to this session when it was
+    /// told; `None` when unread. The re-send guard matches a pane's told
+    /// process by it.
+    #[serde(default)]
+    pub notified_pid: Option<u32>,
+    /// Unix millis the "restart cancelled — resume your work" notice was
+    /// delivered, for a row that had been told to pause and whose prepare was
+    /// then cancelled.
+    #[serde(default)]
+    pub resume_notified_at: Option<i64>,
+    /// Unix millis the session's lifecycle record was first seen NOT open by a
+    /// re-capture (closed by wind-down, or by its own exit). Cleared when it is
+    /// open again.
+    #[serde(default)]
+    pub left_capture_at: Option<i64>,
+}
+
+impl CohortRow {
+    /// The name the panel and the verdict show: the session name, else the
+    /// tab title.
+    pub fn display_name(&self) -> Option<String> {
+        self.session
+            .session_name
+            .clone()
+            .or_else(|| self.session.title.clone())
+    }
 }
 
 /// The pinned capture.
@@ -98,6 +178,8 @@ pub struct RowFacts {
     pub model: Option<String>,
     /// The account's `settings.json` `effortLevel`.
     pub settings_effort: Option<String>,
+    /// The lifecycle record's provider.
+    pub provider: Option<String>,
 }
 
 /// The per-row reads the builder needs.
@@ -113,8 +195,7 @@ fn state_of(facts: &RowFacts) -> StateAtPrepare {
     let Some(screen) = &facts.screen else {
         return StateAtPrepare::Unknown;
     };
-    let normalized = crate::terminal::output_scan::normalize(&screen.lines.join("\n"));
-    if normalized.contains(crate::terminal::account_migration::BUSY_MARKER) {
+    if crate::terminal::graceful_exit::shows_busy_marker(screen) {
         return StateAtPrepare::Working;
     }
     if qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle(
@@ -146,6 +227,80 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
         notified_at: None,
         limit_reset_at: None,
         finished: facts.finished,
+        provider: facts.provider,
+        pause_state: None,
+        pause_reason: None,
+        idle_now: None,
+        notice_skipped: None,
+        notice_deferred: None,
+        notice_arm: None,
+        notified_pid: None,
+        resume_notified_at: None,
+        left_capture_at: None,
+    }
+}
+
+/// Fold a fresh capture into the pinned cohort (Phase 4: "re-taken on every
+/// prepare state change", D4) without losing what the prepare recorded.
+///
+/// * A session in both keeps its prepare-time row — effort, baseline, model,
+///   `held`, `state_at_prepare` (a `limit_hit` mark included), the notice and
+///   usage-limit stamps — and takes the fresh ledger entry (a tab may have
+///   moved) and work axis. An effort that was unread at prepare and is read
+///   now is taken from the fresh row; a read one is never overwritten.
+/// * A session only in the fresh capture (opened during the prepare) joins.
+/// * A session only in the pinned cohort is kept — every session is recorded —
+///   and stamped `left_capture_at` the first time it is missing.
+///
+/// Rows stay in ledger order (by Claude session id). The capture time and
+/// reason are the fresh capture's.
+pub fn merge_recapture(pinned: &Cohort, fresh: Cohort, now_ms: i64) -> Cohort {
+    use std::collections::BTreeMap;
+    let mut by_id: BTreeMap<String, CohortRow> = pinned
+        .rows
+        .iter()
+        .map(|r| (r.session.claude_session_id.clone(), r.clone()))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for fresh_row in fresh.rows {
+        let id = fresh_row.session.claude_session_id.clone();
+        seen.insert(id.clone());
+        match by_id.get_mut(&id) {
+            Some(row) => {
+                row.session = fresh_row.session;
+                if fresh_row.finished.is_some() {
+                    row.finished = fresh_row.finished;
+                }
+                if fresh_row.provider.is_some() {
+                    row.provider = fresh_row.provider;
+                }
+                if row.model.is_none() {
+                    row.model = fresh_row.model;
+                }
+                if row.effort.source == effort::EffortSource::Unknown
+                    && fresh_row.effort.source != effort::EffortSource::Unknown
+                {
+                    row.effort = fresh_row.effort;
+                    row.baseline = fresh_row.baseline;
+                    row.held = fresh_row.held;
+                }
+                row.left_capture_at = None;
+            }
+            None => {
+                by_id.insert(id, fresh_row);
+            }
+        }
+    }
+    for (id, row) in by_id.iter_mut() {
+        if !seen.contains(id) && row.left_capture_at.is_none() {
+            row.left_capture_at = Some(now_ms);
+        }
+    }
+    Cohort {
+        captured_at_ms: fresh.captured_at_ms,
+        captured_at: fresh.captured_at,
+        reason: fresh.reason,
+        rows: by_id.into_values().collect(),
     }
 }
 
@@ -198,10 +353,9 @@ impl CohortProbe for LiveCohortProbe {
             .as_ref()
             .and_then(|tm| tm.get(&entry.terminal_id))
             .map(|session| session.grid_screen());
-        let finished = self
-            .store
-            .get(&entry.claude_session_id)
-            .map(|r| r.finished_at.is_some());
+        let record = self.store.get(&entry.claude_session_id);
+        let finished = record.as_ref().map(|r| r.finished_at.is_some());
+        let provider = record.map(|r| r.provider);
         let config_dir = entry
             .config_dir
             .as_deref()
@@ -227,6 +381,7 @@ impl CohortProbe for LiveCohortProbe {
             finished,
             model,
             settings_effort,
+            provider,
         }
     }
 }
@@ -333,6 +488,7 @@ mod tests {
                     finished: Some(false),
                     model: Some("claude-opus-5-5".to_string()),
                     settings_effort: None,
+                    provider: None,
                 },
             )]),
         );
@@ -466,6 +622,99 @@ mod tests {
         assert!(!r.held);
         assert_eq!(r.state_at_prepare, StateAtPrepare::Unknown);
         assert_eq!(r.finished, None);
+    }
+
+    #[test]
+    fn a_recapture_keeps_the_prepare_stamps_adds_new_sessions_and_marks_closed_ones() {
+        let unread = || RowFacts {
+            finished: Some(false),
+            ..Default::default()
+        };
+        let mut pinned = build_cohort(
+            ledger(&["a", "b"]),
+            &fixed(vec![
+                (
+                    "a",
+                    RowFacts {
+                        screen: Some(idle_at("◉ max · /effort")),
+                        finished: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                ("b", unread()),
+            ]),
+        );
+        pinned.rows[0].notified_at = Some(7);
+        pinned.rows[0].state_at_prepare = StateAtPrepare::LimitHit;
+        pinned.rows[0].limit_reset_at = Some(9);
+        // The re-capture: `a` moved to zone 5 and now reads `low`; `b` is
+        // gone; `c` opened during the prepare.
+        let mut moved = ledger(&["a", "c"]);
+        moved.sessions[0].zone_index = 5;
+        moved.captured_at_ms = 2_000;
+        let fresh = build_cohort(
+            moved,
+            &fixed(vec![
+                (
+                    "a",
+                    RowFacts {
+                        screen: Some(idle_at("○ low · /effort")),
+                        finished: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                ("c", unread()),
+            ]),
+        );
+        let merged = merge_recapture(&pinned, fresh, 3_000);
+        assert_eq!(merged.captured_at_ms, 2_000);
+        let ids: Vec<&str> = merged
+            .rows
+            .iter()
+            .map(|r| r.session.claude_session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "b", "c"], "every session is still recorded");
+        let a = &merged.rows[0];
+        assert_eq!(a.session.zone_index, 5, "the fresh ledger entry");
+        assert_eq!(a.notified_at, Some(7), "the notice stamp survives");
+        assert_eq!(a.state_at_prepare, StateAtPrepare::LimitHit);
+        assert_eq!(a.limit_reset_at, Some(9));
+        assert_eq!(
+            a.effort.level.as_deref(),
+            Some("max"),
+            "a read effort is kept"
+        );
+        assert!(a.held);
+        assert_eq!(a.left_capture_at, None);
+        assert_eq!(merged.rows[1].left_capture_at, Some(3_000), "b closed");
+        assert_eq!(merged.rows[2].left_capture_at, None, "c joined");
+
+        // A later re-capture keeps b's first-missing time; b reappearing clears it.
+        let again = merge_recapture(&merged, build_cohort(ledger(&["a"]), &fixed(vec![])), 4_000);
+        assert_eq!(again.rows[1].left_capture_at, Some(3_000));
+        let back = merge_recapture(
+            &again,
+            build_cohort(ledger(&["a", "b", "c"]), &fixed(vec![])),
+            5_000,
+        );
+        assert_eq!(back.rows[1].left_capture_at, None);
+        // An effort unread at prepare is taken once it is read.
+        assert_eq!(back.rows[1].effort.source, EffortSource::Unknown);
+        let read = merge_recapture(
+            &back,
+            build_cohort(
+                ledger(&["b"]),
+                &fixed(vec![(
+                    "b",
+                    RowFacts {
+                        screen: Some(idle_at("● high · /effort")),
+                        ..Default::default()
+                    },
+                )]),
+            ),
+            6_000,
+        );
+        assert_eq!(read.rows[1].effort.level.as_deref(), Some("high"));
     }
 
     fn open_record(

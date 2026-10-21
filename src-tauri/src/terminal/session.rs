@@ -1109,6 +1109,10 @@ pub enum PtyWriteCaller {
     /// (`mcp/session_review.rs`) — the operator's composed review notes,
     /// submitted as a turn or inserted as an unsent draft.
     ReviewNotes,
+    /// The operator restart prepare's notice loop (`restart_prep::notice`) —
+    /// the save-and-pause notice, and the "restart cancelled" line after a
+    /// cancel (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`).
+    RestartPrepNotice,
     // ---- `write` producers ----------------------------------------------
     /// The Tauri `terminal_write` command — the pane's own keystrokes.
     TauriTerminalWrite,
@@ -1157,6 +1161,7 @@ impl PtyWriteCaller {
             }
             Self::WorkerSession => "worker_session",
             Self::ReviewNotes => "review_notes",
+            Self::RestartPrepNotice => "restart_prep_notice",
             Self::TauriTerminalWrite => "tauri_terminal_write",
             Self::TauriInvokeProxy => "tauri_invoke_proxy",
             Self::RemoteTerminalInput => "remote_terminal_input",
@@ -8034,6 +8039,7 @@ pub(crate) mod tests {
             },
             PtyWriteCaller::WorkerSession,
             PtyWriteCaller::ReviewNotes,
+            PtyWriteCaller::RestartPrepNotice,
             PtyWriteCaller::TauriTerminalWrite,
             PtyWriteCaller::TauriInvokeProxy,
             PtyWriteCaller::RemoteTerminalInput,
@@ -8066,6 +8072,7 @@ pub(crate) mod tests {
                 "auto_response:rule-7",
                 "worker_session",
                 "review_notes",
+                "restart_prep_notice",
                 "tauri_terminal_write",
                 "tauri_invoke_proxy",
                 "remote_terminal_input",

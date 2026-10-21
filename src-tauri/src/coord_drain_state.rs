@@ -1316,6 +1316,14 @@ pub async fn boot_read() {
     );
 }
 
+/// Whether [`boot_read`] has completed (including the restart prepare's boot
+/// step).
+pub fn boot_read_complete() -> bool {
+    global()
+        .boot_read_finished
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Wait (bounded) for [`boot_read`] to have completed, so a boot resume or
 /// restore decides against a real read rather than the not-yet-read state.
 /// Returns on timeout too — the gate then sees `Unknown` and defers.
