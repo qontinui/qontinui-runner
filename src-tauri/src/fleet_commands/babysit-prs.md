@@ -58,7 +58,28 @@ gh pr list --repo <owner/repo> --state open --head "$BRANCH" --json number,title
 Include PRs the session opened via stacked worktrees. Build a table:
 `repo | PR | branch | head_sha | labels | deps` — record `coord:stacked-on=` /
 `coord:upstream-of=` labels as dependency edges (parents land before children).
-Skip drafts. If zero PRs found and none given, report and exit.
+Skip drafts, **and skip PRs coord reports held**: read each PR's card with
+`coord_pr_status {repo, number}` and apply the hold-read rule. A `hold` object
+(`{held_by, reason, kind, since}`, placed with `coord_set_pr_hold`) is held;
+`hold: null` is not held. A card with `hold_unknown: true`, or no card at all, is
+UNKNOWN. A card with NO `hold` key depends on whether COORD serves the hold —
+check ONCE whether coord's own `tools/list` offers `coord_set_pr_hold`, read
+through a door that does not filter it. Your session's visible tool list does
+not answer this: a runner proxy filters it through its own allowlist, so a tool
+absent there may still be served. Ask that proxy what it withheld:
+`GET <proxy base>/coord-mcp/tool-policy` — `coordMcpDrift.driftedTools` names
+the tools coord granted and the proxy filtered (trust it only when its
+`observedAt` is after you started the check, i.e. before your own
+`tools/list`), and `deliberateExclusions` /
+`deliberateExclusionPrefixes` name the ones it filters on purpose, which leave
+the answer unknown. If coord's list is read and lacks it, no PR can be
+coord-held, so the missing key means not held and a draft is the hold signal;
+if coord serves it (whether or not your door passes it), or you cannot tell,
+the missing key is UNKNOWN. Treat every UNKNOWN as held, never as releasable, and
+say so in the table. Once the GitHub Free downgrade is in effect a draft no longer
+exists on a private repo, so `isDraft` alone misses every hold there. A
+held PR is not stuck: do not "recover" it, and never release a hold you did not
+place. If zero PRs found and none given, report and exit.
 
 **Then declare the hand-off of each PR's worktree** once its branch is pushed,
 so a session that waits days on the train stops holding a worktree slot. Run
