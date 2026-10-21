@@ -121,6 +121,7 @@ mod display;
 mod doctor;
 mod dom_capture;
 mod drain;
+mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 — per-tenant egress switches
 #[cfg(test)]
 mod runner_spawn_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
@@ -267,6 +268,9 @@ mod session_pr_reconciler; // Runner-local per-session PR attribution → projec
 mod session_attribution;
 mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
 mod settings;
+// Model gateway (plan 2026-10-09-spec-front-end-of-the-software-factory Phase 9, D12):
+// where every model call goes when an install declares a gateway.
+mod model_gateway;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
 // axum router construction) write a `runner-panic.log` the supervisor can
@@ -1822,23 +1826,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Sentry for crash reporting (release builds only).
     // The guard must live for the entire application lifetime — when it drops, Sentry shuts down.
+    //
+    // Gated on the tenant's `egress_telemetry` switch (plan
+    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), read at
+    // boot: a flip applies at the next start, and the persisted answer makes a
+    // tenant `off` hold before the first poll from the second start onwards.
     #[cfg(not(debug_assertions))]
-    let _sentry_guard = std::env::var("SENTRY_DSN").ok().map(|dsn| {
-        let guard = sentry::init((
-            dsn,
-            sentry::ClientOptions {
-                release: sentry::release_name!(),
-                environment: Some("beta".into()),
-                before_send: Some(std::sync::Arc::new(|event| {
-                    info!("Sending error to Sentry: {:?}", event);
-                    Some(event)
-                })),
-                ..Default::default()
-            },
-        ));
-        info!("Sentry crash reporting initialized");
-        guard
-    });
+    let _sentry_guard = std::env::var("SENTRY_DSN")
+        .ok()
+        .filter(|_| egress::telemetry_permitted_at_boot())
+        .map(|dsn| {
+            let guard = sentry::init((
+                dsn,
+                sentry::ClientOptions {
+                    release: sentry::release_name!(),
+                    environment: Some("beta".into()),
+                    before_send: Some(std::sync::Arc::new(|event| {
+                        info!("Sending error to Sentry: {:?}", event);
+                        Some(event)
+                    })),
+                    ..Default::default()
+                },
+            ));
+            info!("Sentry crash reporting initialized");
+            guard
+        });
 
     // Initialize DisplayProcessor with ActionLogProfile
     let mut display_processor = DisplayProcessor::new();
@@ -2970,10 +2982,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::comparison::list_comparisons,
             commands::comparison::start_comparison,
             commands::config::build_ai_launch_command,
+            commands::config::build_ai_resume_command,
             commands::config::get_auto_load_last_config,
             commands::config::get_claude_account_launch_commands,
             commands::config::get_claude_config_dirs,
             commands::config::get_claude_default_launch_command,
+            commands::config::get_claude_session_permission,
+            commands::config::get_model_gateway,
             commands::config::get_current_configuration,
             commands::config::get_include_summary_step_by_default,
             commands::config::get_last_config_path,
@@ -2983,6 +2998,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::save_claude_account_launch_commands,
             commands::config::save_claude_config_dirs,
             commands::config::save_claude_default_launch_command,
+            commands::config::save_claude_session_permission,
+            commands::config::save_model_gateway,
             commands::config::save_include_summary_step_by_default,
             commands::config::save_last_monitor_index,
             commands::config::save_last_monitor_indices,
@@ -3670,10 +3687,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             ui_error::clear_ui_error,
             ui_error::get_ui_error,
             ui_error::report_ui_error,
-            commands::verification::clear_pending_verification,
-            commands::verification::load_pending_verification,
-            commands::verification::save_pending_verification,
-            commands::verification::update_verification_status,
             commands::video::get_video_recording_status,
             commands::video::start_video_recording,
             commands::video::stop_video_recording,
@@ -4491,6 +4504,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 session_pr_reconciler::start(lifecycle_store.clone());
                 let holder_sweep_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
+                // The egress switches' session-tenant lookups (relay frames,
+                // remote attach) read the lifecycle store and the AI-session
+                // registrar through this handle; both are managed by now.
+                egress::install_session_tenant_lookup(app.handle().clone());
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
                 // child process / remote host / `cat`'d file emits). This hook

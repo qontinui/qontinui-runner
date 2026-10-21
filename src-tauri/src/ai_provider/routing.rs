@@ -25,6 +25,13 @@ use crate::doctor::DoctorHandle;
 use crate::settings::{self, AiProvider};
 use tracing::{debug, info, warn};
 
+/// The refusal for a provider that cannot route through a declared model
+/// gateway (review M5): Gemini, pi and OpenAI-compatible are refused with a
+/// clear error rather than run around the gateway.
+fn gateway_refusal(provider: &AiProvider) -> Option<AiResponse> {
+    crate::model_gateway::provider_refusal(provider).map(AiResponse::error)
+}
+
 /// Run an AI prompt synchronously and return the response.
 ///
 /// This function selects the appropriate provider based on settings and
@@ -49,6 +56,9 @@ pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> Ai
 
     retry_with_backoff_tracked("AI prompt (sync)", Some(&cb_key), || {
         let ai_settings = settings::get_ai_settings();
+        if let Some(refused) = gateway_refusal(&ai_settings.provider) {
+            return refused;
+        }
         match ai_settings.provider {
             AiProvider::ClaudeCli => {
                 run_claude_cli(prompt, &ai_settings.claude_cli, None, doctor_handle)
@@ -174,6 +184,9 @@ pub fn run_prompt_with_routing(
     // Wrap provider call in retry with account rotation on rate-limit.
     retry_with_backoff_tracked("AI prompt (routed)", Some(&cb_key), || {
         let ai_settings = settings::get_ai_settings();
+        if let Some(refused) = gateway_refusal(&ai_settings.provider) {
+            return refused;
+        }
         match ai_settings.provider {
             AiProvider::ClaudeCli => run_claude_cli(
                 prompt,
@@ -439,6 +452,9 @@ fn run_prompt_with_overrides_inner(
             prompt.len()
         );
 
+        if let Some(refused) = gateway_refusal(&effective_provider) {
+            return refused;
+        }
         return match effective_provider {
             AiProvider::ClaudeCli => {
                 if temperature_override.is_some() || max_tokens_override.is_some() {
@@ -687,6 +703,9 @@ pub fn run_prompt_multimodal(
         prompt.has_images()
     );
 
+    if let Some(refused) = gateway_refusal(&ai_settings.provider) {
+        return refused;
+    }
     match ai_settings.provider {
         AiProvider::ClaudeCli => {
             if prompt.has_images() {
@@ -801,6 +820,9 @@ pub fn run_prompt_with_routing_multimodal(
         None
     };
 
+    if let Some(refused) = gateway_refusal(&ai_settings.provider) {
+        return refused;
+    }
     match ai_settings.provider {
         AiProvider::ClaudeCli => {
             if prompt.has_images() {
@@ -976,6 +998,9 @@ pub fn run_prompt_with_model_override_multimodal(
         prompt.has_images()
     );
 
+    if let Some(refused) = gateway_refusal(&effective_provider) {
+        return refused;
+    }
     match effective_provider {
         AiProvider::ClaudeCli => {
             if prompt.has_images() {
@@ -1143,6 +1168,9 @@ pub fn run_prompt_with_structured_output(
         prompt.len()
     );
 
+    if let Some(refused) = gateway_refusal(&effective_provider) {
+        return refused;
+    }
     match effective_provider {
         AiProvider::ClaudeApi => run_claude_api_with_structured_output(
             prompt,
