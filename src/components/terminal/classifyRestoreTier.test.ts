@@ -35,76 +35,97 @@ import { classifyRestoreAction } from "./useTerminalInitialization";
 describe("classifyRestoreAction — restore-tier gate (Phase 5)", () => {
   it("CONFIRMED authoritative + FULL-tier provider ⇒ auto-resume", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "authoritative",
-        confirmedAt: 1,
-        provider: "full-provider",
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "authoritative",
+          confirmedAt: 1,
+          provider: "full-provider",
+        },
+        null,
+      ),
     ).toBe("auto-resume");
   });
 
   it("CONFIRMED authoritative + TERMINAL-ONLY-tier provider ⇒ terminal-only (no resume)", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "authoritative",
-        confirmedAt: 1,
-        provider: "terminal-only-provider",
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "authoritative",
+          confirmedAt: 1,
+          provider: "terminal-only-provider",
+        },
+        null,
+      ),
     ).toBe("terminal-only");
   });
 
   it("UNCONFIRMED authoritative is a phantom shell ⇒ terminal-only regardless of tier", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "authoritative",
-        provider: "full-provider",
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "authoritative",
+          provider: "full-provider",
+        },
+        null,
+      ),
     ).toBe("terminal-only");
   });
 
   it("CONFIRMED observed + FULL-tier provider ⇒ auto-resume (mirrors authoritative)", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "observed",
-        confirmedAt: 1,
-        provider: "full-provider",
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "observed",
+          confirmedAt: 1,
+          provider: "full-provider",
+        },
+        null,
+      ),
     ).toBe("auto-resume");
   });
 
   it("CONFIRMED observed + TERMINAL-ONLY-tier provider ⇒ terminal-only (no resume)", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "observed",
-        confirmedAt: 1,
-        provider: "terminal-only-provider",
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "observed",
+          confirmedAt: 1,
+          provider: "terminal-only-provider",
+        },
+        null,
+      ),
     ).toBe("terminal-only");
   });
 
   it("UNCONFIRMED observed is a phantom shell ⇒ terminal-only regardless of tier", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "observed",
-        provider: "full-provider",
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "observed",
+          provider: "full-provider",
+        },
+        null,
+      ),
     ).toBe("terminal-only");
   });
 
   it("reconciled origin restores terminal-only regardless of provider tier", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "reconciled",
-        confirmedAt: 1,
-        provider: "full-provider",
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "reconciled",
+          confirmedAt: 1,
+          provider: "full-provider",
+        },
+        null,
+      ),
     ).toBe("terminal-only");
   });
 });
@@ -127,13 +148,13 @@ describe("classifyRestoreAction — transcript gate", () => {
   } as const;
 
   it("CONFIRMED but probed-ABSENT transcript ⇒ terminal-only (never a doomed --resume)", () => {
-    expect(classifyRestoreAction({ ...CONFIRMED_FULL, transcriptExists: false })).toBe(
+    expect(classifyRestoreAction({ ...CONFIRMED_FULL, transcriptExists: false }, null)).toBe(
       "terminal-only",
     );
   });
 
   it("CONFIRMED with a transcript on disk ⇒ auto-resume", () => {
-    expect(classifyRestoreAction({ ...CONFIRMED_FULL, transcriptExists: true })).toBe(
+    expect(classifyRestoreAction({ ...CONFIRMED_FULL, transcriptExists: true }, null)).toBe(
       "auto-resume",
     );
   });
@@ -141,8 +162,8 @@ describe("classifyRestoreAction — transcript gate", () => {
   it("NOT PROBED (undefined) is UNKNOWN, not absent ⇒ auto-resume unchanged", () => {
     // No probe attached backend-side omits the field. Downgrading on `undefined`
     // would silently disable auto-resume for every record.
-    expect(classifyRestoreAction(CONFIRMED_FULL)).toBe("auto-resume");
-    expect(classifyRestoreAction({ ...CONFIRMED_FULL, transcriptExists: undefined })).toBe(
+    expect(classifyRestoreAction(CONFIRMED_FULL, null)).toBe("auto-resume");
+    expect(classifyRestoreAction({ ...CONFIRMED_FULL, transcriptExists: undefined }, null)).toBe(
       "auto-resume",
     );
   });
@@ -151,21 +172,27 @@ describe("classifyRestoreAction — transcript gate", () => {
     // A transcript on disk is necessary, never sufficient: an unconfirmed
     // phantom and a reconciled (possibly foreign) id keep their own tiers.
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "authoritative",
-        provider: "full-provider",
-        transcriptExists: true,
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "authoritative",
+          provider: "full-provider",
+          transcriptExists: true,
+        },
+        null,
+      ),
     ).toBe("terminal-only");
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "reconciled",
-        confirmedAt: 1,
-        provider: "full-provider",
-        transcriptExists: true,
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "reconciled",
+          confirmedAt: 1,
+          provider: "full-provider",
+          transcriptExists: true,
+        },
+        null,
+      ),
     ).toBe("terminal-only");
   });
 });
