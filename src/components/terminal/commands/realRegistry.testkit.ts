@@ -127,8 +127,11 @@ export interface EffectArms {
   planContent: "none" | "loaded";
   /** `writeClipboard`. */
   clipboard: "written" | "failed";
-  /** `invoke("terminal_claude_session_list_live")`. */
-  liveSessions: "none" | "two";
+  /**
+   * `invoke("session_ledger_report")` — the roster `/copy-names` reads. `two`
+   * holds two unfinished sessions plus one finished one (which is skipped).
+   */
+  roster: "none" | "two";
   /**
    * How much the RESULT CARDS have in them.
    *
@@ -173,7 +176,7 @@ export const DEFAULT_ARMS: EffectArms = {
   generateWorkflow: "no-session",
   planContent: "none",
   clipboard: "written",
-  liveSessions: "none",
+  roster: "none",
   cards: "empty",
   spawn: "full",
   sessionStates: "waiting",
@@ -204,11 +207,11 @@ export const ARM_VARIANTS: ReadonlyArray<{ name: string; arms: Partial<EffectArm
   { name: "analyze=failed", arms: { analyze: "failed" } },
   { name: "generateWorkflow=generated", arms: { generateWorkflow: "generated" } },
   { name: "planContent=loaded", arms: { planContent: "loaded" } },
-  // `liveSessions` too: `/copy-names` is the only clipboard writer, and it
-  // fails with `no-sessions` before reaching the clipboard when the registry
-  // is empty. Same prerequisite shape as the restart arms above.
-  { name: "clipboard=failed", arms: { liveSessions: "two", clipboard: "failed" } },
-  { name: "liveSessions=two", arms: { liveSessions: "two" } },
+  // `roster` too: `/copy-names` is the only clipboard writer, and it fails
+  // with `no-sessions` before reaching the clipboard when the roster is
+  // empty. Same prerequisite shape as the restart arms above.
+  { name: "clipboard=failed", arms: { roster: "two", clipboard: "failed" } },
+  { name: "roster=two", arms: { roster: "two" } },
   { name: "cards=populated", arms: { cards: "populated" } },
   { name: "spawn=short", arms: { spawn: "short" } },
 ];
@@ -348,13 +351,39 @@ async function build(): Promise<RealRegistryHarness> {
     }
   };
 
-  /** The `liveSessions` arm's rows, in the Rust command's own camelCase shape. */
-  const liveSessionRows = (): unknown[] =>
-    arms.liveSessions === "none"
+  /** The `roster` arm's ledger entries (only the fields `/copy-names` reads). */
+  const rosterEntries = (): unknown[] =>
+    arms.roster === "none"
       ? []
       : [
-          { sessionId: "sess-1", name: "alpha", pid: 101, account: { label: "gmail" } },
-          { sessionId: "sess-2", name: "beta", pid: 102, account: { label: "hotmail" } },
+          {
+            claudeSessionId: "sess-1",
+            sessionName: "alpha",
+            nameSource: null,
+            title: "claude",
+            accountLabel: "gmail",
+            finished: false,
+            resumeCommand:
+              'cd "D:/repo" && CLAUDE_CONFIG_DIR="C:/claude/.claude-gmail" claude --resume sess-1',
+          },
+          {
+            claudeSessionId: "sess-2",
+            sessionName: "beta",
+            nameSource: null,
+            title: "claude",
+            accountLabel: "hotmail",
+            finished: false,
+            resumeCommand: null,
+          },
+          {
+            claudeSessionId: "sess-3",
+            sessionName: "done",
+            nameSource: null,
+            title: "claude",
+            accountLabel: "gmail",
+            finished: true,
+            resumeCommand: null,
+          },
         ];
 
   const syncTerminalRefs = (): void => {
@@ -366,14 +395,14 @@ async function build(): Promise<RealRegistryHarness> {
 
   // ── Module stubs ───────────────────────────────────────────────────
   // `invoke` answers the two commands the registry actually calls
-  // (`terminal_claude_session_list_live`, `start_orchestration_run`) and a
+  // (`session_ledger_report`, `start_orchestration_run`) and a
   // generic empty object for anything else, so a newly added invoke does not
   // crash the suite — it shows up in the ledger instead.
   vi.doMock("@tauri-apps/api/core", () => ({
     invoke: async (cmd: string, payload?: unknown) => {
       calls.push({ name: "invoke", args: [cmd, payload], evidence: true });
-      if (cmd === "terminal_claude_session_list_live") {
-        return { success: true, data: { sessions: liveSessionRows() } };
+      if (cmd === "session_ledger_report") {
+        return { current: { sessions: rosterEntries() } };
       }
       if (cmd === "start_orchestration_run") {
         return { id: "run-1", status: "running" };
@@ -410,11 +439,6 @@ async function build(): Promise<RealRegistryHarness> {
   // over plain data and run fine under `environment: "node"`
   // (`result-card/builders.test.tsx` already does exactly that), so the
   // handlers now build real specs from the `cards` arm's data.
-  vi.doMock("../liveClaudeSessions", () => ({
-    extractLiveSessions: () => liveSessionRows(),
-    groupByAccount: () => new Map(),
-    sharedSessionIds: () => new Set(),
-  }));
   vi.doMock("../contexts", () => ({
     useTerminalSession: () => ({
       tabs: [{ id: "tab-a" }, { id: "tab-b" }],
