@@ -1,5 +1,8 @@
 import { useState, useEffect, useCallback, useReducer } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useUIComponent } from "@qontinui/ui-bridge";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { textArg } from "@/components/terminal/commands/parse";
 import { listen } from "@tauri-apps/api/event";
 import { Bot, Check, X, Play, Video, MessageSquare } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
@@ -30,6 +33,9 @@ import { ProviderHealthStatus } from "./ai-settings/ProviderHealthStatus";
 interface AiSettingsProps {
   onLog: LogFunction;
 }
+
+/** Param schema of the `set-runner-manages-cli-updates` UI Bridge action. */
+const CLI_UPDATES_SCHEMA = { enabled: 'string ("on" or "off")' } as const;
 
 /** The READ-ONLY account-selection view fields of a `get_ai_settings`
  * response (the mode that governs, why, and the raw fleet value). Display-only:
@@ -158,6 +164,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               result.data.claude_cli?.auto_migrate_on_token_exhaustion ?? true,
             auto_continue_after_migration:
               result.data.claude_cli?.auto_continue_after_migration ?? true,
+            runner_manages_cli_updates: result.data.claude_cli?.runner_manages_cli_updates ?? true,
           },
           claude_api: {
             model: result.data.claude_api?.model || DEFAULT_AI_SETTINGS.claude_api.model,
@@ -283,6 +290,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         accountSelectionPinned: settings.claude_cli.account_selection_pinned,
         autoMigrateOnTokenExhaustion: settings.claude_cli.auto_migrate_on_token_exhaustion ?? true,
         autoContinueAfterMigration: settings.claude_cli.auto_continue_after_migration ?? true,
+        runnerManagesCliUpdates: settings.claude_cli.runner_manages_cli_updates ?? true,
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
@@ -463,6 +471,42 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       setTesting(false);
     }
   };
+
+  // UI Bridge: the CLI-updates toggle (plan
+  // `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`,
+  // Phase 2). Declared before the `loading` early return so the hook order is
+  // stable.
+  useUIComponent({
+    id: "ai-settings-panel",
+    name: "AI Settings Panel",
+    description: "AI provider settings, including the Claude CLI account and update options",
+    actions: [
+      {
+        id: "set-runner-manages-cli-updates",
+        label: "Set runner-managed Claude CLI updates",
+        description:
+          'Set the "Runner manages Claude CLI updates" toggle in the form ("on" or "off"). ' +
+          "Does NOT persist on its own — the panel's Save button writes " +
+          "claude_cli.runner_manages_cli_updates.",
+        paramSchema: CLI_UPDATES_SCHEMA,
+        // `write` — changes form state that Save persists as a setting; reversible
+        // by setting it back. Nothing is installed by this action.
+        effect: "write",
+        handler: guardedHandler("set-runner-manages-cli-updates", CLI_UPDATES_SCHEMA, (args) => {
+          const value = textArg(args, "enabled");
+          if (value !== "on" && value !== "off") {
+            throw new Error('set-runner-manages-cli-updates requires { enabled: "on" | "off" }');
+          }
+          const enabled = value === "on";
+          setSettings((prev) => ({
+            ...prev,
+            claude_cli: { ...prev.claude_cli, runner_manages_cli_updates: enabled },
+          }));
+          return { runner_manages_cli_updates: enabled, persisted: false };
+        }),
+      },
+    ],
+  });
 
   if (loading) {
     return (

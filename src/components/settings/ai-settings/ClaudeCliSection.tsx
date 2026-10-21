@@ -895,6 +895,37 @@ export function ClaudeCliSection({
             </div>
           )}
 
+          <div className="space-y-2 pt-2">
+            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+              CLI Updates
+            </span>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.claude_cli.runner_manages_cli_updates ?? true}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    claude_cli: {
+                      ...prev.claude_cli,
+                      runner_manages_cli_updates: e.target.checked,
+                    },
+                  }))
+                }
+                className="mt-0.5 accent-primary"
+              />
+              <span>
+                <span className="text-xs font-medium block">Runner manages Claude CLI updates</span>
+                <span className="text-[10px] text-muted-foreground block">
+                  The runner installs a new Claude Code release once, when one is published, and
+                  stops each session's own updater from reinstalling it. Off: every session updates
+                  itself, as the CLI does by default. A DISABLE_AUTOUPDATER or DISABLE_UPDATES
+                  setting in the runner&apos;s environment always wins.
+                </span>
+              </span>
+            </label>
+          </div>
+
           {settings.claude_cli.account_selection_mode === "manual" && (
             <div className="space-y-1">
               {selectionFleetManaged && (
