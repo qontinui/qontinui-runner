@@ -33,13 +33,19 @@
 //!    settings.json that already wrote an explicit `false` keeps it.
 //!    Checked before anything is written: with the toggle off, no outbox
 //!    entry is created and nothing leaves the machine.
-//! 2. **Per-tenant** — coord-side, on ingest (warm/cold quotas, and the
-//!    per-tenant consent column `coord.tenant_policies.transcript_sync_enabled`
-//!    from plan
-//!    `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
-//!    §3.1–§3.3 — NOT `session_coordination_enabled`, which is the unrelated
-//!    Phase 10 dual-write flag). Whether coord enforces it is coord's code;
-//!    the drain simply forwards and this module makes no tenant-policy check.
+//! 2. **Per-tenant** — checked HERE, at the source, before anything is
+//!    written: the tenant's `egress_transcript_sync` fleet-policy switch
+//!    (plan `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 7,
+//!    which retired the `coord.tenant_policies.transcript_sync_enabled`
+//!    column into that domain). [`Self::emit`] reads
+//!    [`crate::egress::transcript_sync_permitted`], which is gate 1 AND this
+//!    switch, so with either off no outbox entry is created. The outbox drain
+//!    (`coord_sync::push_record`) re-checks the same verdict and ACKs-and-drops
+//!    a chunk queued before a flip to `off`, so a backlog never leaves after
+//!    the switch closes. Coord still refuses on ingest (and enforces its
+//!    warm/cold quotas) as a second line, never as the switch. NOT
+//!    `session_coordination_enabled`, which is the unrelated Phase 10
+//!    dual-write flag.
 //! 3. **Per-session** — redaction, which ALWAYS runs. Workflow runs have no
 //!    coord-native [`super::Intent`] carrying a per-session opt-out (the
 //!    registrar binding is a plain id ↔ id index), so every transcript byte
@@ -501,9 +507,11 @@ impl TranscriptEmitter {
         &self.offsets
     }
 
-    /// Emit one transcript block for `session_key`. Gate 1
-    /// (`Settings.cloud_sync_enabled`) is checked first — when off, this
-    /// returns before any allocation or I/O and nothing leaves the machine.
+    /// Emit one transcript block for `session_key`. Gates 1 and 2 (the user's
+    /// `Settings.cloud_sync_enabled` and the tenant's `egress_transcript_sync`,
+    /// via [`crate::egress::transcript_sync_permitted`]) are checked first —
+    /// when either is off, this returns before any allocation or I/O and
+    /// nothing leaves the machine.
     /// Never fails the caller: all errors are logged and swallowed.
     ///
     /// **The parameter is the `claude_session_id`, for BOTH planes.** The
@@ -513,7 +521,13 @@ impl TranscriptEmitter {
     /// [`AiCoordRegistrar::session_id_for`], whose own doc records that the
     /// old `task_run_id` parameter name "described one caller, not the key".
     pub fn emit(&self, session_key: &str, text: &str) {
-        if !crate::settings::get_cloud_sync_enabled() {
+        // Asked in the tenant the registrar recorded for this session — the
+        // strictest bound tenant when it recorded none.
+        if !crate::egress::transcript_sync_gate_session(crate::egress::SessionScope::from_lookup(
+            self.registrar.recorded_tenant(session_key),
+        ))
+        .is_open()
+        {
             return;
         }
         self.emit_inner(session_key, text);
@@ -538,7 +552,7 @@ impl TranscriptEmitter {
     /// Gate-2/3 + append path, split from [`Self::emit`] so tests can drive
     /// it without touching the machine's real `settings.json`.
     ///
-    /// **Gate 1 (`Settings.cloud_sync_enabled`) is NOT checked here.** It is
+    /// **Gates 1 and 2 (`crate::egress::transcript_sync_permitted`) are NOT checked here.** It is
     /// the caller's obligation, and skipping it means transcript bytes leave
     /// the machine without consent. `pub(crate)` for exactly one production
     /// caller — [`super::session_transcript_tailer`], which must know the
