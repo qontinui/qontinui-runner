@@ -33,6 +33,7 @@ import {
   type SessionLocation,
 } from "./sessionStatusModel";
 import type { UnifiedSession, UseSessionManagerReturn } from "./useSessionManager";
+import type { UnseenVerdict } from "./sessionUnseen";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -89,6 +90,15 @@ function runningTabRow(
   };
 }
 
+// Stable across renders: the panel memoizes on these, so a fresh value per
+// render would re-render it without end.
+const seenOf = (): UnseenVerdict => ({ state: "seen" });
+const NOTHING_CLOSED = { entries: [], total: 0, unknownReason: null };
+// Grouping keys on these too; a fresh one re-derives the rendered ids, which
+// the selection prunes against while rendering.
+const ORG_LOADING = { phase: "loading" } as const;
+const keyById = (s: UnifiedSession) => s.sessionId;
+
 /** The manager surface the panel reads, over a fixed list of rows. */
 function managerOver(
   sessions: UnifiedSession[],
@@ -117,6 +127,10 @@ function managerOver(
     queryUnknown: [],
     liveFacts: [],
     factsById: new Map(),
+    unseenOf: seenOf,
+    recentlyClosed: NOTHING_CLOSED,
+    reopenClosed: noop,
+    reopenLastClosed: noop,
     groupBy: "status",
     setGroupBy: noop,
     sortBy: "recent",
@@ -136,9 +150,9 @@ function managerOver(
     clearSelection: noop,
     bulkResume: noop,
     allSessions: sessions,
-    org: { phase: "loading" },
+    org: ORG_LOADING,
     applyOrg: () => Promise.resolve(),
-    sessionKeyOf: (s: UnifiedSession) => s.sessionId,
+    sessionKeyOf: keyById,
     allAccounts: [],
     savedConfigDirs: [],
     activityCounts: Object.fromEntries(

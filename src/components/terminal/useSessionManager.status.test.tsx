@@ -89,16 +89,24 @@ function serve(backend: Backend) {
             observed_at_ms: 0,
           },
         });
-      case "terminal_session_list_history":
+      case "session_info_list": {
+        // The finished marker rides each row's lifecycle; a session with no
+        // marker recorded carries `finishedAt: null`.
+        const ids = (args?.ids as string[]) ?? [];
         return Promise.resolve({
-          success: true,
-          data: {
-            sessions: Object.entries(backend.finished ?? {}).map(([claudeSessionId, finished]) => ({
-              claudeSessionId,
-              finished,
-            })),
-          },
+          status: "ok",
+          sessions: ids.map((claudeSessionId) => ({
+            available: true,
+            identity: { claudeSessionId },
+            name: { value: null, source: null },
+            account: {},
+            placement: {},
+            lifecycle: { finishedAt: backend.finished?.[claudeSessionId] ? 1 : null },
+          })),
+          notFound: [],
+          branches: [],
         });
+      }
       case "transcript_session_digests": {
         const ids = (args?.sessionIds as string[]) ?? [];
         return Promise.resolve({
