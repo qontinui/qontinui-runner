@@ -272,10 +272,15 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
     PinSurface {
         surface: "new_session_tenant",
         timing: PinTiming::Live,
-        readers: &["session/mod.rs::resolve_new_session_tenant"],
+        readers: &[
+            "session/mod.rs::resolve_new_session_tenant",
+            "session/mod.rs::resolve_new_session_tenant_in",
+        ],
         detail: "the tenant a NEW session is recorded under, read at its creation \
                  (also reached through claude_session/coord_register.rs, which calls this \
-                 resolver per registration)",
+                 resolver per registration; the `_in` form, for a session whose spawn \
+                 directory is known, reads the pin only after the workspace and repo tiers \
+                 named no tenant)",
     },
     PinSurface {
         surface: "transcript_autobind_mint",
@@ -366,6 +371,18 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
         ],
         detail: "read per request (/health, session info, the ui-bridge session route, repo \
                  registration, the coord-mcp doctor, GET /tenant/active)",
+    },
+    PinSurface {
+        surface: "egress_switch_scope",
+        timing: PinTiming::Live,
+        readers: &[
+            "mcp/fleet_policy_poller.rs::poll_egress_once",
+            "egress.rs::production_scope",
+        ],
+        detail: "the tenant whose egress switches (plan 2026-10-10-spec-front-end-phase-9-\
+                 generic-boundary) are polled and applied to calls that name no tenant: sampled \
+                 at the first egress check of the process, then re-read on every \
+                 fleet-policy poll (≤ 45 s)",
     },
     PinSurface {
         surface: "session_coordination_dual_write_gate",
