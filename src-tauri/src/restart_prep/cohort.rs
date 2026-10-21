@@ -112,10 +112,17 @@ pub struct CohortRow {
     /// What that state was read from, or which input could not be read.
     #[serde(default)]
     pub pause_reason: Option<String>,
-    /// Idle at a prompt with no live children at the last read: `Some(true)`;
-    /// not idle (or a live child attached): `Some(false)`; unread: `None`.
+    /// The row's activity classification at the last read: idle `Some(true)`,
+    /// working or stale `Some(false)`, unclassified `None`. Live children do
+    /// not enter it.
     #[serde(default)]
     pub idle_now: Option<bool>,
+    /// The census children hint at the last read, INFORMATION ONLY: `true`
+    /// when the row's `claude` has a child process attached (its MCP servers,
+    /// a background shell), which a restart ends. `None` when uncomputable or
+    /// unread. Never blocks the verdict.
+    #[serde(default)]
+    pub has_live_children: Option<bool>,
     /// Why the notice loop does not reach this row (no live terminal, not a
     /// Claude session). `None` while it can be reached.
     #[serde(default)]
@@ -231,6 +238,7 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
         pause_state: None,
         pause_reason: None,
         idle_now: None,
+        has_live_children: None,
         notice_skipped: None,
         notice_deferred: None,
         notice_arm: None,

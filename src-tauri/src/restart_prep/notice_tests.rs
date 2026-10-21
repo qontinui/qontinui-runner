@@ -536,9 +536,10 @@ fn restart_prep_verdict_truth_table_over_every_row_state() {
             ..base
         },
         Case {
-            name: "told, idle, a child attached",
+            name: "told, idle, a child attached (children are reported, not required)",
             proc: Some(proc(Activity::Idle, Some(true))),
-            want: PauseState::Notified,
+            want: PauseState::Paused,
+            blocks: false,
             ..base
         },
         Case {
@@ -556,7 +557,8 @@ fn restart_prep_verdict_truth_table_over_every_row_state() {
         Case {
             name: "told, idle, children NULL",
             proc: Some(proc(Activity::Idle, None)),
-            want: PauseState::Unknown,
+            want: PauseState::Paused,
+            blocks: false,
             ..base
         },
         Case {
@@ -583,7 +585,7 @@ fn restart_prep_verdict_truth_table_over_every_row_state() {
             name: "not told, children NULL",
             notified: false,
             proc: Some(proc(Activity::Working, None)),
-            want: PauseState::Unknown,
+            want: PauseState::Working,
             ..base
         },
         Case {
@@ -652,9 +654,17 @@ fn restart_prep_verdict_truth_table_over_every_row_state() {
             ..base
         },
         Case {
-            name: "limit hit, children NULL",
+            name: "limit hit, idle, children NULL",
             limit_hit: true,
             proc: Some(proc(Activity::Idle, None)),
+            want: PauseState::LimitHit,
+            blocks: false,
+            ..base
+        },
+        Case {
+            name: "limit hit, activity unknown",
+            limit_hit: true,
+            proc: Some(proc(Activity::Unknown, Some(false))),
             want: PauseState::LimitHit,
             ..base
         },
@@ -1165,7 +1175,14 @@ fn restart_prep_the_notice_is_one_fixed_paragraph() {
     let n = notice_text("abc");
     assert!(!n.contains('\n'), "one paragraph");
     assert!(n.contains("abc"));
-    for needed in ["commit", "WIP", "note", "wait", "finished"] {
+    for needed in [
+        "commit",
+        "WIP",
+        "note",
+        "background shells or watchers",
+        "wait",
+        "finished",
+    ] {
         assert!(n.contains(needed), "{needed}");
     }
     assert!(!resume_text("abc").contains('\n'));
@@ -1449,4 +1466,58 @@ async fn restart_prep_a_told_session_running_under_a_new_process_is_not_told_aga
     let rec = ctl.record().unwrap();
     assert_eq!(row_of(&rec, "a").notified_at, Some(T0));
     assert_eq!(row_of(&rec, "a").pause_state, Some(PauseState::Paused));
+}
+
+/// The falsified premise (plan Phase 4 results): every `claude` on a box using
+/// the stdio coord-mcp shim holds a permanent `python3` child. A told session
+/// whose activity reads idle is `paused` anyway, and the verdict can turn
+/// ready; the child is reported on the row, never a blocker.
+#[tokio::test]
+async fn restart_prep_an_idle_told_session_holding_an_mcp_shim_child_is_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctl, _) = controller(&dir, &record(vec![row("s")], HoldStatus::Confirmed));
+    let terms = FakeTerminals::with(vec![("term-s", idle_pane())]);
+    // Idle (from its Claude Code record, the pane arm being vetoed by the
+    // child), with the shim attached.
+    let shim = census(vec![("s", proc(Activity::Idle, Some(true)))]);
+    ctl.notice_tick(&terms, recapture(&["s"], T0 + 1), &shim, T0 + 1)
+        .await;
+    assert_eq!(terms.sent("term-s").len(), 1, "told");
+    let out = ctl
+        .notice_tick(&terms, recapture(&["s"], T0 + 2), &shim, T0 + 2)
+        .await;
+    assert!(
+        matches!(
+            out,
+            TickOutcome::Ran {
+                ready_to_restart: true,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    let rec = ctl.record().unwrap();
+    let s_row = row_of(&rec, "s");
+    assert_eq!(s_row.pause_state, Some(PauseState::Paused));
+    assert_eq!(
+        s_row.has_live_children,
+        Some(true),
+        "reported, not required"
+    );
+    assert_eq!(rec.state, PrepState::Ready);
+    let block = evaluate_fresh(&rec, &shim, T0 + 3);
+    assert!(
+        block.verdict.ready_to_restart,
+        "{:?}",
+        block.verdict.blockers
+    );
+    let json = serde_json::to_value(&block).unwrap();
+    assert_eq!(json["rows"][0]["has_live_children"], true);
+    // A foreground tool call still reads working, and is not paused.
+    let tool_call = census(vec![("s", proc(Activity::Working, Some(true)))]);
+    assert!(
+        !evaluate_fresh(&rec, &tool_call, T0 + 4)
+            .verdict
+            .ready_to_restart
+    );
 }

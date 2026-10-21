@@ -36,8 +36,17 @@
 //! per row and classified with `claude_activity::classify` the way
 //! `restart_readiness.rs` classifies each process — into `working`,
 //! `notified`, `paused`, `finished`, `closed`, `limit_hit` or `unknown`.
-//! `paused` = told, activity `idle`, AND `hasLiveChildren == false`; a null
-//! `hasLiveChildren` is `unknown`, never `paused` (`restart_readiness::BOUNDARY`).
+//! `paused` = told AND the row's activity classification reads `idle`. Live
+//! children are NOT a conjunct: every `claude` on a box using the stdio
+//! coord-mcp shim holds a permanent `python3` child, so requiring none made
+//! `paused` unreachable (the plan's Phase 4 results). The classifier already
+//! treats a live child as a veto on its pane arm and falls back to Claude
+//! Code's own per-process record, so a foreground tool call still reads
+//! `working`. An `unknown` activity is `unknown`, never `paused`. Each row
+//! carries the census children hint (`has_live_children`, null =
+//! uncomputable, `restart_readiness::BOUNDARY`) as information only — a
+//! restart ends that row's MCP servers and background shells — and it never
+//! blocks.
 //!
 //! ## The verdict
 //!
@@ -75,7 +84,7 @@ use crate::session::tracking_health::{SessionWorkStatus, TrackingHealthReport};
 
 /// Bumped when the notice wording changes, so a transcript can be matched to
 /// the template that produced it.
-pub const NOTICE_TEMPLATE_VERSION: u32 = 1;
+pub const NOTICE_TEMPLATE_VERSION: u32 = 2;
 
 /// The notice loop's cadence while a prepare is in its window.
 pub const TICK: Duration = Duration::from_secs(15);
@@ -90,7 +99,8 @@ pub fn notice_text(prepare_id: &str) -> String {
         "[runner restart prep {prepare_id}, notice v{NOTICE_TEMPLATE_VERSION}] The operator is \
          preparing to restart this runner. Please commit and push your work now (or WIP-save it if \
          it is not ready to push), write a one-paragraph note here saying where you are and what \
-         comes next, then end your turn and wait: do not start any new long task. This session \
+         comes next, stop any background shells or watchers you started, then end your turn and \
+         wait: do not start any new long task. This session \
          will be resumed with this conversation after the restart, so do not mark yourself \
          finished unless your work really is finished."
     )
@@ -425,25 +435,19 @@ pub fn row_state(row: &CohortRow, ev: &CensusEvidence) -> (PauseState, Option<bo
         };
         return (PauseState::Unknown, None, why);
     };
-    let idle_now = match (p.activity, p.has_live_children) {
-        (_, None) | (Activity::Unknown, _) => None,
-        (Activity::Idle, Some(false)) => Some(true),
-        _ => Some(false),
+    // The activity classification alone: children are reported, not required.
+    let idle_now = match p.activity {
+        Activity::Unknown => None,
+        Activity::Idle => Some(true),
+        Activity::Working | Activity::Stale => Some(false),
     };
     if row.state_at_prepare == StateAtPrepare::LimitHit {
         let why = match idle_now {
-            Some(true) => "usage limit hit; idle with no live children",
+            Some(true) => "usage limit hit; idle",
             Some(false) => "usage limit hit; not idle",
-            None => "usage limit hit; activity or children unreadable",
+            None => "usage limit hit; activity unreadable",
         };
         return (PauseState::LimitHit, idle_now, why.to_string());
-    }
-    if p.has_live_children.is_none() {
-        return (
-            PauseState::Unknown,
-            None,
-            "hasLiveChildren is null — uncomputable, never read as paused".to_string(),
-        );
     }
     if p.activity == Activity::Unknown {
         return (
@@ -455,18 +459,13 @@ pub fn row_state(row: &CohortRow, ev: &CensusEvidence) -> (PauseState, Option<bo
     }
     if row.notified_at.is_some() {
         if idle_now == Some(true) {
-            return (
-                PauseState::Paused,
-                idle_now,
-                "told; now idle at a prompt with no live children".to_string(),
-            );
+            return (PauseState::Paused, idle_now, "told; now idle".to_string());
         }
-        let why = if p.activity == Activity::Idle {
-            "told; idle but a child process is attached"
-        } else {
-            "told; still working"
-        };
-        return (PauseState::Notified, idle_now, why.to_string());
+        return (
+            PauseState::Notified,
+            idle_now,
+            "told; still working".to_string(),
+        );
     }
     let why = match (&row.notice_skipped, &row.notice_deferred) {
         (Some(skip), _) => format!("not told: {skip}"),
@@ -483,6 +482,10 @@ pub fn refresh_rows(cohort: &mut Cohort, ev: &CensusEvidence) {
         row.pause_state = Some(state);
         row.idle_now = idle_now;
         row.pause_reason = Some(reason);
+        row.has_live_children = ev
+            .by_session
+            .get(&row.session.claude_session_id)
+            .and_then(|p| p.has_live_children);
     }
 }
 
@@ -902,6 +905,9 @@ pub struct RowReading {
     pub state: Option<PauseState>,
     pub reason: Option<String>,
     pub notified_at: Option<i64>,
+    /// The census children hint, information only (see
+    /// [`CohortRow::has_live_children`]).
+    pub has_live_children: Option<bool>,
 }
 
 /// The `restart_prep` block: the verdict re-evaluated against THIS request's
@@ -937,6 +943,7 @@ pub fn evaluate_fresh(rec: &PrepareRecord, ev: &CensusEvidence, now_ms: i64) -> 
                 state: row.pause_state,
                 reason: row.pause_reason.clone(),
                 notified_at: row.notified_at,
+                has_live_children: row.has_live_children,
             })
             .collect(),
         source: READINESS_SOURCE,
