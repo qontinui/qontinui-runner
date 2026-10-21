@@ -199,6 +199,10 @@ pub enum RespawnError {
         "{0} — not retried: coord counts the dead attempts as materialized; re-issue the respawn"
     )]
     Died(String),
+    /// The user closed the resumed pane before it painted. Not retried: a
+    /// respawn behind the user's own close would reopen what they closed.
+    #[error("the user closed the resumed pane before it painted — not retried")]
+    ClosedByUser,
     /// Another mover (an account migration, the resume door) holds this
     /// Claude session right now.
     #[error("{0} is already moving this Claude session — left for retry")]
@@ -300,15 +304,9 @@ pub(super) async fn run_catchup(
 ) {
     match fetch_pending(http, coord_url, device_id).await {
         Ok(pending) => {
-            if !pending.is_empty() {
-                tracing::info!(
-                    count = pending.len(),
-                    "session respawn: on-connect catch-up replaying pending respawns"
-                );
-            }
-            for respawn in pending {
-                spawn_materialize(registry, lifecycle_store, http, coord_url, respawn);
-            }
+            replay_pending_with(running_respawns(), respawn_permits(), pending, |r| {
+                materialize_task(registry, lifecycle_store, http, coord_url, r)
+            });
         }
         Err(HandoffError::Status(401 | 403, _)) => {
             tracing::warn!(
@@ -332,6 +330,29 @@ pub(super) async fn handle_push_frame(
     device_id: Uuid,
     text: &str,
 ) {
+    handle_push_frame_with(
+        running_respawns(),
+        respawn_permits(),
+        device_id,
+        text,
+        |r| materialize_task(registry, lifecycle_store, http, coord_url, r),
+    );
+}
+
+/// [`handle_push_frame`] with the materializer injected — the delivery wiring
+/// itself, testable without a registry. The materialize runs on its own task
+/// ([`spawn_tracked`]); this returns at once, so the `/ws` read loop that calls
+/// it is never held for a liveness proof.
+pub(super) fn handle_push_frame_with<M, F>(
+    running: &Arc<RunningRespawns>,
+    permits: &Arc<tokio::sync::Semaphore>,
+    device_id: Uuid,
+    text: &str,
+    materialize: M,
+) where
+    M: FnOnce(PendingRespawn) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let Some(respawn) = parse_respawn_push(text, device_id) else {
         return;
     };
@@ -339,7 +360,31 @@ pub(super) async fn handle_push_frame(
         source = %respawn.source_session_id,
         "session respawn: push received; materializing"
     );
-    spawn_materialize(registry, lifecycle_store, http, coord_url, respawn);
+    let source = respawn.source_session_id;
+    spawn_tracked(running, permits, source, materialize(respawn));
+}
+
+/// The catch-up's half of [`handle_push_frame_with`]: every pending respawn
+/// on its own task; returns once they are started.
+pub(super) fn replay_pending_with<M, F>(
+    running: &Arc<RunningRespawns>,
+    permits: &Arc<tokio::sync::Semaphore>,
+    pending: Vec<PendingRespawn>,
+    mut materialize: M,
+) where
+    M: FnMut(PendingRespawn) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if !pending.is_empty() {
+        tracing::info!(
+            count = pending.len(),
+            "session respawn: catch-up replaying pending respawns"
+        );
+    }
+    for respawn in pending {
+        let source = respawn.source_session_id;
+        spawn_tracked(running, permits, source, materialize(respawn));
+    }
 }
 
 /// Respawns this process may materialize at once. Each one can take minutes
@@ -428,26 +473,21 @@ fn respawn_permits() -> &'static Arc<tokio::sync::Semaphore> {
     &PERMITS
 }
 
-/// [`materialize_logged`] on its own task ([`spawn_tracked`]).
-fn spawn_materialize(
+/// [`materialize_logged`] as an owned, `'static` future for [`spawn_tracked`].
+fn materialize_task(
     registry: &Arc<SessionRegistry>,
     lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
     coord_url: &str,
     respawn: PendingRespawn,
-) {
+) -> impl std::future::Future<Output = ()> + Send + 'static {
     let registry = Arc::clone(registry);
     let lifecycle_store = Arc::clone(lifecycle_store);
     let http = http.clone();
     let coord_url = coord_url.to_string();
-    spawn_tracked(
-        running_respawns(),
-        respawn_permits(),
-        respawn.source_session_id,
-        async move {
-            materialize_logged(&registry, &lifecycle_store, &http, &coord_url, &respawn).await;
-        },
-    );
+    async move {
+        materialize_logged(&registry, &lifecycle_store, &http, &coord_url, &respawn).await;
+    }
 }
 
 /// Materialize a respawn and log (but swallow) any error. A refusal before
@@ -842,10 +882,9 @@ async fn materialize(
     //    (`RESPAWN_PENDING_SQL`) does not read the child's state — so once any
     //    attempt has spawned, a respawn whose attempts ALL die is not replayed
     //    by catch-up either. That is reported in `RespawnError::Died`. Whether
-    //    coord offers any door to set a parent later is UNVERIFIED (a route
-    //    census for `parent`/`lineage` read routes=UNKNOWN on 2026-10-21);
-    //    making a dead attempt not count is a coord-side change (the
-    //    predicate filtering on the child's fate).
+    //    coord offers any door to set a parent later is UNVERIFIED; making a
+    //    dead attempt not count is a coord-side change (the predicate
+    //    filtering on the child's fate).
     let app = crate::tauri_app_handle::current().ok_or(RespawnError::NoAppHandle)?;
     let (terminal_manager, session_registry) = managed_handles(&app)?;
     let title = format!(
@@ -965,6 +1004,7 @@ fn proven_terminal(
             Ok(terminal_id)
         }
         RespawnOutcome::NotSpawned(e) => Err(RespawnError::Spawn(e)),
+        RespawnOutcome::ClosedByUser { .. } => Err(RespawnError::ClosedByUser),
         RespawnOutcome::Died {
             exit_code,
             attempts,
@@ -996,6 +1036,10 @@ struct ReceiverRespawn<'a> {
 }
 
 impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
+    fn claude_session_id(&self) -> &str {
+        self.claude_session_id
+    }
+
     async fn spawn_next(&mut self) -> Result<String, String> {
         // The async pre-step: the ABSOLUTE binary, retried, never bare.
         let claude_bin = crate::terminal::resume_bin::resolve_resume_bin().await?;
@@ -1759,5 +1803,71 @@ mod tests {
         }
         assert!(running.0.lock().unwrap().is_empty());
         assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Round 2, finding 4b: the push and catch-up WIRING hand the materialize
+    /// to its own task — both return while it is still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_and_catch_up_delivery_never_wait_for_the_materialize() {
+        let device = Uuid::from_u128(0xd1);
+        let pending = |n: u128| -> PendingRespawn {
+            serde_json::from_value(json!({
+                "source_session_id": Uuid::from_u128(n),
+                "target_device_id": device,
+            }))
+            .unwrap()
+        };
+        let slow = |done: Arc<std::sync::atomic::AtomicUsize>| {
+            move |_r: PendingRespawn| {
+                let done = Arc::clone(&done);
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        };
+        let running = Arc::new(RunningRespawns::default());
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESPAWNS));
+
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frame = json!({
+            "channel": format!("qontinui.sessions.t.{device}.respawn_request"),
+            "payload": serde_json::to_string(&json!({
+                "source_session_id": Uuid::from_u128(1),
+                "target_device_id": device,
+            })).unwrap(),
+        })
+        .to_string();
+        handle_push_frame_with(&running, &permits, device, &frame, slow(Arc::clone(&done)));
+        assert_eq!(
+            running.0.lock().unwrap().len(),
+            1,
+            "the push started a task"
+        );
+        assert_eq!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the push wiring returned before the materialize finished"
+        );
+
+        replay_pending_with(
+            &running,
+            &permits,
+            vec![pending(2), pending(3)],
+            slow(Arc::clone(&done)),
+        );
+        assert_eq!(running.0.lock().unwrap().len(), 3);
+        assert_eq!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the catch-up wiring returned before any materialize finished"
+        );
+        for _ in 0..100 {
+            if done.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(done.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }

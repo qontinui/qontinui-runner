@@ -70,9 +70,54 @@ pub fn hold_for_in_flight_respawn(action: PollAction, in_flight: bool) -> PollAc
     }
 }
 
+/// The liveness poll's FINAL verdict for one record: the classified action,
+/// held for a withheld boot restore / pending PTY adoption (`withheld`), then
+/// for an in-flight respawn of `claude_session_id`. The poll calls this, so the
+/// in-flight hold cannot be dropped from the poll without reddening its test.
+pub fn hold_poll_action(
+    classified: PollAction,
+    withheld: bool,
+    claude_session_id: &str,
+) -> PollAction {
+    hold_for_in_flight_respawn(
+        super::session_lifecycle_store::hold_for_withheld_boot_restore(classified, withheld),
+        is_in_flight(claude_session_id),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 2, finding 4a: the poll's composed verdict holds a session a
+    /// respawn is moving — the wiring `main.rs`'s liveness poll goes through.
+    #[test]
+    fn the_poll_verdict_holds_an_in_flight_session_and_only_that() {
+        let id = "in-flight-test-poll-wiring";
+        assert_eq!(
+            hold_poll_action(PollAction::Close, false, id),
+            PollAction::Close
+        );
+        let claim = SessionInFlight::claim(id, "respawn-receiver").expect("free");
+        assert_eq!(
+            hold_poll_action(PollAction::Close, false, id),
+            PollAction::Skip
+        );
+        assert_eq!(
+            hold_poll_action(PollAction::KeepAlive, false, id),
+            PollAction::KeepAlive
+        );
+        drop(claim);
+        assert_eq!(
+            hold_poll_action(PollAction::Close, false, id),
+            PollAction::Close
+        );
+        assert_eq!(
+            hold_poll_action(PollAction::CloseNoTerminal, true, id),
+            PollAction::Skip,
+            "the withheld-restore hold still composes"
+        );
+    }
     use crate::session::session_lifecycle_store::{classify, WorkerPlane};
 
     #[test]

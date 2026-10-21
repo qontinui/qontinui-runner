@@ -4563,7 +4563,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     use session::session_lifecycle_store::{
                         boot_restore_phase, classify, close_reason_for_dead_shell,
-                        hold_for_withheld_boot_restore, match_live_terminal,
+                        match_live_terminal,
                         withheld_boot_restore_candidate, PollAction, WorkerPlane,
                     };
 
@@ -4964,23 +4964,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // close here would destroy what the retry or the
                             // rollback rebinds (plan
                             // 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn).
-                            let respawn_in_flight =
-                                session::in_flight::is_in_flight(&rec.claude_session_id);
-                            let action = session::in_flight::hold_for_in_flight_respawn(
-                                hold_for_withheld_boot_restore(
-                                    classify(
-                                        live_is_alive,
-                                        claude_present,
-                                        prior,
-                                        prior_no_match,
-                                        snapshot_ok,
-                                        restore_pending,
-                                        confirmed,
-                                        worker_plane,
-                                    ),
-                                    held || adoption_pending,
+                            let action = session::in_flight::hold_poll_action(
+                                classify(
+                                    live_is_alive,
+                                    claude_present,
+                                    prior,
+                                    prior_no_match,
+                                    snapshot_ok,
+                                    restore_pending,
+                                    confirmed,
+                                    worker_plane,
                                 ),
-                                respawn_in_flight,
+                                held || adoption_pending,
+                                &rec.claude_session_id,
                             );
                             if adoption_pending && action == PollAction::Skip {
                                 consecutive_no_match.remove(&rec.claude_session_id);

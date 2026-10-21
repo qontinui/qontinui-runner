@@ -804,6 +804,10 @@ struct MigrationRespawn<'a> {
 }
 
 impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
+    fn claude_session_id(&self) -> &str {
+        &self.record.claude_session_id
+    }
+
     async fn spawn_next(&mut self) -> Result<String, String> {
         // The async pre-step (D3.1): the ABSOLUTE binary, retried, never bare.
         let claude_bin = super::resume_bin::resolve_resume_bin().await?;
@@ -1075,7 +1079,9 @@ pub(crate) async fn migrate_session_claimed(
         RespawnOutcome::Alive { terminal_id, .. } | RespawnOutcome::Unconfirmed { terminal_id } => {
             terminal_id.clone()
         }
-        RespawnOutcome::NotSpawned(_) | RespawnOutcome::Died { .. } => record.terminal_id.clone(),
+        RespawnOutcome::NotSpawned(_)
+        | RespawnOutcome::Died { .. }
+        | RespawnOutcome::ClosedByUser { .. } => record.terminal_id.clone(),
     };
     carried.settle(|(c, reservation)| {
         crate::agent_runtime::restore_continuation_registration(host, c, reservation);
@@ -1084,6 +1090,14 @@ pub(crate) async fn migrate_session_claimed(
     let new_terminal_id = match outcome {
         RespawnOutcome::Alive { terminal_id, .. } => terminal_id,
         RespawnOutcome::NotSpawned(e) => return Err(NotMoved(e)),
+        // The user closed the new pane while it was being proven: no retry,
+        // and the session is back on the old pane, which still runs.
+        RespawnOutcome::ClosedByUser { .. } => {
+            return Err(NotMoved(
+                "closed_by_user: the new pane was closed before it painted — rolled back onto the old pane"
+                    .to_string(),
+            ))
+        }
         RespawnOutcome::Died {
             exit_code,
             attempts,

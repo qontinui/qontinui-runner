@@ -9,7 +9,8 @@
 //! share of wall time. A respawn that resolves inside that window used to get
 //! the bare name; the PTY child then found the identity shim first on its own
 //! `PATH`, the shim's 10 s wait missed too, and the pane exited 127 (five of
-//! sixty migrations on merytshost, every one a lost session).
+//! sixty migrations on merytshost, every one a lost session — measured in plan
+//! `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`, Phase 1).
 //!
 //! So a miss here is a MISS: the resolver is retried on
 //! [`crate::claude_cli_spawn::RETRY_DELAYS`], each attempt off the async worker

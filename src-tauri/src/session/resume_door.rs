@@ -620,6 +620,11 @@ fn proven_terminal(
         RespawnOutcome::NotSpawned(e) => {
             Err(Box::new(ResumeRow::failed(id, format!("spawn: {e}"), None)))
         }
+        // The user closed the pane while it was being proven: their answer,
+        // not a failure to retry.
+        RespawnOutcome::ClosedByUser { .. } => {
+            Err(Box::new(ResumeRow::failed(id, "closed_by_user", None)))
+        }
         RespawnOutcome::Died {
             exit_code,
             attempts,
@@ -654,6 +659,10 @@ struct DoorRespawn {
 }
 
 impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
+    fn claude_session_id(&self) -> &str {
+        &self.cand.id
+    }
+
     async fn spawn_next(&mut self) -> Result<String, String> {
         // The async pre-step: the ABSOLUTE binary, retried, never bare.
         let claude_bin = crate::terminal::resume_bin::resolve_resume_bin().await?;

@@ -11,7 +11,7 @@
 //! every long-lived session started on an older binary runs
 //! `npm install --global @anthropic-ai/claude-code@<latest>` every 30 minutes for
 //! as long as it lives, even though the current version is already installed.
-//! Measured on merytshost (Phase 1b): 32 same-version installs in 16 minutes from
+//! Measured on merytshost in plan `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn` Phase 1b: 32 same-version installs in 16 minutes from
 //! 32 distinct stale sessions, 27 of them runner-spawned. npm's reify moves
 //! `bin/claude` aside for each install, and a migration respawn that resolves
 //! `claude` inside that window dies with exit 127.
@@ -584,8 +584,18 @@ pub(crate) fn decide(i: &TickInputs) -> Decision {
 pub(crate) fn opt_out_env_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     OPT_OUT_ENV_VARS
         .iter()
-        .find(|name| get(name).is_some_and(|v| !v.trim().is_empty()))
+        .find(|name| get(name).is_some_and(|v| env_truthy(&v)))
         .map(|name| name.to_string())
+}
+
+/// A set, non-empty variable that does not spell "off": `0`, `false`, `no`
+/// and `off` (any case) are a user saying the opt-out is NOT on.
+fn env_truthy(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty()
+        && !["0", "false", "no", "off"]
+            .iter()
+            .any(|f| v.eq_ignore_ascii_case(f))
 }
 
 // =============================================================================
@@ -719,7 +729,10 @@ pub(crate) async fn tick<O: CliOps>(
     // Children defer their updates to the runner only while it can actually
     // update: not backing off after an install that did not take (including
     // one that just failed above), not deferring to another release channel.
+    // Nor while the versions cannot be ordered: the runner never installs then,
+    // so a child told to defer would never be updated by anyone.
     state.updater_serving = inputs.non_default_channel.is_none()
+        && decision != Decision::Skip(SkipReason::VersionsUncomparable)
         && state.backoff_until.is_none_or(|until| now >= until);
     report
 }
@@ -1571,5 +1584,34 @@ mod tests {
         );
         assert_eq!(ops.installs.load(Ordering::SeqCst), 0);
         assert!(!state.updater_serving);
+    }
+
+    // ---- Round 2 nits ------------------------------------------------------
+
+    #[test]
+    fn cli_update_an_opt_out_spelled_off_is_not_an_opt_out() {
+        for off in ["0", "false", "FALSE", "no", "off", " 0 "] {
+            assert_eq!(
+                opt_out_env_from(|k| (k == "DISABLE_AUTOUPDATER").then(|| off.to_string())),
+                None,
+                "{off:?}"
+            );
+        }
+        assert_eq!(
+            opt_out_env_from(|k| (k == "DISABLE_AUTOUPDATER").then(|| "1".to_string())),
+            Some("DISABLE_AUTOUPDATER".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_update_uncomparable_versions_do_not_serve() {
+        let ops = FakeOps::new(&[Some("2.1")], Some("2.1.304"));
+        let mut state = UpdaterState::default();
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        assert_eq!(r.decision, Decision::Skip(SkipReason::VersionsUncomparable));
+        assert!(
+            !state.updater_serving,
+            "the runner never installs here, so children must keep their own updater"
+        );
     }
 }
