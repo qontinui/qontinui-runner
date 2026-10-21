@@ -9299,8 +9299,14 @@ async fn run_agent_subprocess(
         // `2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer`
         // Phase 4). The token read is a local RwLock, and the POST itself is
         // spawned, so the report never delays or fails this loop.
-        let agent_token = agent_token_slot.read().await.token.clone();
-        let credential = exit_report_credential(Some(&agent_token));
+        let credential = {
+            let slot = agent_token_slot.read().await;
+            exit_report_credential(
+                &slot.token,
+                slot.is_rejected(),
+                slot.ttl_secs(chrono::Utc::now().timestamp()) <= 0,
+            )
+        };
         tokio::spawn(report_spawn_exited(payload.agent_id, body, credential));
         return Ok(());
     }
@@ -10481,26 +10487,51 @@ struct SpawnExitedBody {
 }
 
 /// The credential a `spawn-exited` report presents.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written so a JWT never reaches a log line.
+#[derive(Clone, PartialEq, Eq)]
 enum ExitReportCredential {
-    /// The agent's own coord JWT. coord's reporter check accepts it for this
-    /// agent on ANY device, so the exit row is recorded as verified.
+    /// The agent's own coord JWT. coord's reporter check
+    /// (`credential_speaks_for_allocation`) accepts it when the JWT's
+    /// `device_id` is one of the allocation's devices — which holds for the
+    /// device this runner launched the agent on, whichever tenant binding is
+    /// this device's default.
     Agent(String),
     /// The default binding's device JWT — verified only when that binding is
     /// one of the allocation's paired devices.
     Device,
 }
 
-/// Prefer the agent's own token; fall back to the device token when there is
-/// none (an empty slot).
+impl std::fmt::Debug for ExitReportCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Agent(_) => f.write_str("Agent(<redacted>)"),
+            Self::Device => f.write_str("Device"),
+        }
+    }
+}
+
+/// Prefer the agent's own token; fall back to the device token when the agent
+/// token is empty, latched rejected by coord, or past the slot's expiry.
 ///
 /// The red-main evidence reader ignores an exit row whose reporter is not
 /// verified, so on a device whose DEFAULT binding is not the allocation's
 /// paired device, a device-token report would leave the exit looking silent.
-fn exit_report_credential(agent_token: Option<&str>) -> ExitReportCredential {
-    match agent_token.map(str::trim) {
-        Some(token) if !token.is_empty() => ExitReportCredential::Agent(token.to_string()),
-        _ => ExitReportCredential::Device,
+/// A token coord has rejected, or one past expiry, would fail the reporter
+/// check outright, so the device token is the better of two imperfect choices.
+/// `expired` comes from the slot's bookkeeping `exp`, which in a release build
+/// is the JWT's own; a debug-build compression of it only moves the choice to
+/// the device token, never to a dead bearer.
+fn exit_report_credential(
+    agent_token: &str,
+    rejected: bool,
+    expired: bool,
+) -> ExitReportCredential {
+    let token = agent_token.trim();
+    if token.is_empty() || rejected || expired {
+        ExitReportCredential::Device
+    } else {
+        ExitReportCredential::Agent(token.to_string())
     }
 }
 
@@ -10557,9 +10588,10 @@ fn spawn_exited_request(
         ExitReportCredential::Agent(token) => {
             // coord-auth-exempt(agent-jwt): presents the per-agent coord JWT of
             // the agent whose exit this reports. coord's reporter check
-            // (`spawn_admission::reporter_owns_allocation`) accepts the agent's
-            // own token on any device, which the default binding's device JWT
-            // only matches when it is one of the allocation's devices.
+            // (`credential_speaks_for_allocation`) accepts it when its
+            // `device_id` is one of the allocation's devices, as this launching
+            // device is; the default binding's device JWT matches only when that
+            // binding is the allocation's device.
             client.post(url).bearer_auth(token)
         }
         ExitReportCredential::Device => {
@@ -10611,24 +10643,39 @@ async fn report_spawn_exited(
             }
         };
         let status = resp.status();
-        let retryable = if status.as_u16() == 503 {
-            resp.json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("retryable").and_then(serde_json::Value::as_bool))
-                .unwrap_or(false)
+        let reply: Option<serde_json::Value> = if status.is_success() || status.as_u16() == 503 {
+            resp.json::<serde_json::Value>().await.ok()
         } else {
-            false
+            None
         };
+        let retryable = reply
+            .as_ref()
+            .and_then(|v| v.get("retryable"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let route_seen = SPAWN_EXITED_ROUTE_SEEN.load(Ordering::Relaxed);
         match classify_exit_report_response(status.as_u16(), retryable, route_seen) {
             ExitReportResponse::Delivered => {
                 SPAWN_EXITED_ROUTE_SEEN.store(true, Ordering::Relaxed);
-                info!(
-                    "agent_runtime: spawn-exited posted agent_id={agent_id} restarts={} \
-                     credential={credential_kind}",
-                    body.restarts
-                );
+                let verified = reply
+                    .as_ref()
+                    .and_then(|v| v.get("reporter_device_verified"))
+                    .and_then(serde_json::Value::as_bool);
+                if verified == Some(false) {
+                    warn!(
+                        "agent_runtime: spawn-exited for agent_id={agent_id} was recorded \
+                         reporter_device_verified=false (credential={credential_kind}) — \
+                         coord's red-main evidence ignores unverified rows, so this clean \
+                         exit may still read as silent"
+                    );
+                } else {
+                    info!(
+                        "agent_runtime: spawn-exited posted agent_id={agent_id} restarts={} \
+                         credential={credential_kind} reporter_device_verified={}",
+                        body.restarts,
+                        verified.map_or("unknown", |v| if v { "true" } else { "false" })
+                    );
+                }
                 return;
             }
             ExitReportResponse::RetryOnce if attempt == 0 => {
@@ -10643,8 +10690,8 @@ async fn report_spawn_exited(
                 if !SPAWN_EXITED_ROUTE_ABSENT_LOGGED.swap(true, Ordering::Relaxed) {
                     info!(
                         "agent_runtime: coord answered {status} to spawn-exited for \
-                         agent_id={agent_id} — a coord predating the route; clean exits \
-                         are not reported to it (logged once)"
+                         agent_id={agent_id} — a coord predating the route, or an unknown \
+                         agent; clean exits may not be reported to it (logged once)"
                     );
                 }
                 return;
@@ -11161,20 +11208,43 @@ mod tests {
     }
 
     #[test]
-    fn exit_report_credential_prefers_the_agent_token() {
+    fn exit_report_credential_prefers_a_healthy_agent_token() {
         assert_eq!(
-            exit_report_credential(Some("agent.jwt.tok")),
+            exit_report_credential("agent.jwt.tok", false, false),
             ExitReportCredential::Agent("agent.jwt.tok".to_string())
         );
+        // Empty, rejected or expired -> the device token.
         assert_eq!(
-            exit_report_credential(Some("")),
+            exit_report_credential("", false, false),
             ExitReportCredential::Device
         );
         assert_eq!(
-            exit_report_credential(Some("   ")),
+            exit_report_credential("   ", false, false),
             ExitReportCredential::Device
         );
-        assert_eq!(exit_report_credential(None), ExitReportCredential::Device);
+        assert_eq!(
+            exit_report_credential("agent.jwt.tok", true, false),
+            ExitReportCredential::Device
+        );
+        assert_eq!(
+            exit_report_credential("agent.jwt.tok", false, true),
+            ExitReportCredential::Device
+        );
+        assert_eq!(
+            exit_report_credential("agent.jwt.tok", true, true),
+            ExitReportCredential::Device
+        );
+    }
+
+    #[test]
+    fn exit_report_credential_debug_never_prints_the_token() {
+        let shown = format!(
+            "{:?}",
+            ExitReportCredential::Agent("eyJhbGciOi.secret.sig".to_string())
+        );
+        assert_eq!(shown, "Agent(<redacted>)");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(format!("{:?}", ExitReportCredential::Device), "Device");
     }
 
     #[test]
