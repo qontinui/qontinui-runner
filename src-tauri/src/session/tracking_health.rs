@@ -1273,6 +1273,7 @@ mod tests {
 
     fn record(claude_session_id: &str, terminal_id: &str, opened_at: i64) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: claude_session_id.to_string(),
             config_dir: None,
             working_dir: Some("D:/work".to_string()),

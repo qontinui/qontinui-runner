@@ -112,7 +112,7 @@ const OPEN_STALE_MS: i64 = 604_800_000;
 /// runner restart firing `handleExit` on every live PTY) is still restorable
 /// for this long after the close. Beyond the window, or for any other close
 /// reason (explicit user close), it is NOT restorable. 10 minutes in millis.
-const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
+pub const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
 /// A record closed with reason `"poll-dead"` (the liveness poll saw a live
 /// shell with zero descendants for several consecutive idle ticks) is still
 /// restorable for this long after the close. A `poll-dead` close is far less
@@ -810,6 +810,41 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
+    /// The flags a `--resume` relaunch of this session replays — DERIVED once
+    /// from its launch argv when its `SessionStart` hook POSTed
+    /// `/control/session-open` with `source: "startup"` (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6 / D11): the allowlisted, shell-inert flags, or a refusal (the
+    /// relaunch then falls back to the default resume command). See
+    /// [`crate::session::resume_argv::derive_resume_flags`].
+    ///
+    /// NEVER the raw argv: an argv can carry an initial prompt or an inline
+    /// secret, and this file is plaintext (review r1, H1). Written ONLY by
+    /// [`SessionLifecycleStore::set_resume_flags`] — first write wins — and
+    /// never by `record_open`: a re-record carries no flags and must not erase
+    /// them. `None` = never derived (a record that predates the field, a launch
+    /// with no identity shim in the chain, a session first seen on a resume):
+    /// the relaunch then uses the default resume command, exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_flags: Option<crate::session::resume_argv::ResumeFlags>,
+}
+
+pub use crate::session::resume_argv::CLOSED_NOT_STARTUP;
+
+/// What [`SessionLifecycleStore::set_resume_flags`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeFlagsWrite {
+    /// Persisted.
+    Written,
+    /// The record already carries flags — the first write wins (review r1,
+    /// M2: a later report cannot swap in other flags).
+    AlreadySet,
+    /// The FIRST report was not a `startup`: the slot was CLOSED with a
+    /// refusal (the relaunch uses the default resume command), so no later
+    /// report — a spoofed `startup` included — can fill it (review r2, N4).
+    ClosedNotStartup,
+    /// No OPEN record for that session on that terminal — nothing written.
+    NoOpenRecordOnTerminal,
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -2548,6 +2583,87 @@ impl SessionLifecycleStore {
                 }],
             );
         }
+    }
+
+    /// Persist the relaunch flags derived for `claude_session_id` from its
+    /// launch argv (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6). See [`TerminalSessionRecord::resume_flags`].
+    ///
+    /// The arms:
+    /// - only onto an OPEN record bound to `terminal_id`, the terminal whose
+    ///   hook reported it ([`ResumeFlagsWrite::NoOpenRecordOnTerminal`]);
+    /// - FIRST WRITE WINS ([`ResumeFlagsWrite::AlreadySet`]): anything able to
+    ///   POST a later report must not swap in other flags (review r1, M2);
+    /// - the first report must be a `source: "startup"`: a resume, `/clear`,
+    ///   compact or unknown source did not launch the process, and its argv
+    ///   is not the operator's launch. Such a first report CLOSES the slot with
+    ///   a refusal ([`ResumeFlagsWrite::ClosedNotStartup`]), so a later
+    ///   spoofed `startup` gets `AlreadySet` (review r2, N4);
+    /// - NEVER creates a record (a flags-only row would be a phantom restore
+    ///   candidate).
+    pub fn set_resume_flags(
+        &self,
+        claude_session_id: &str,
+        terminal_id: &str,
+        source: Option<&str>,
+        flags: crate::session::resume_argv::ResumeFlags,
+    ) -> ResumeFlagsWrite {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on set_resume_flags");
+                return ResumeFlagsWrite::NoOpenRecordOnTerminal;
+            }
+        };
+        let Some(rec) = m
+            .get_mut(claude_session_id)
+            .filter(|r| r.state == "open" && r.terminal_id == terminal_id)
+        else {
+            return ResumeFlagsWrite::NoOpenRecordOnTerminal;
+        };
+        if rec.resume_flags.is_some() {
+            return ResumeFlagsWrite::AlreadySet;
+        }
+        let outcome = if source == Some("startup") {
+            rec.resume_flags = Some(flags);
+            ResumeFlagsWrite::Written
+        } else {
+            rec.resume_flags = Some(crate::session::resume_argv::ResumeFlags::Refused {
+                reason: CLOSED_NOT_STARTUP.to_string(),
+            });
+            ResumeFlagsWrite::ClosedNotStartup
+        };
+        let changed = rec.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        outcome
+    }
+
+    /// Close `claude_session_id`'s relaunch-flag slot if it is still empty
+    /// and this report is not a `startup` — the first report was not the
+    /// launch (review r2, N4). Same arms as [`Self::set_resume_flags`].
+    pub fn close_resume_flags(
+        &self,
+        claude_session_id: &str,
+        terminal_id: &str,
+        source: Option<&str>,
+    ) -> ResumeFlagsWrite {
+        if source == Some("startup") {
+            // A startup with no argv (the identity shim's own early POST, or a
+            // launch with no shim): the hook's POST that follows carries it.
+            return ResumeFlagsWrite::NoOpenRecordOnTerminal;
+        }
+        self.set_resume_flags(
+            claude_session_id,
+            terminal_id,
+            source,
+            crate::session::resume_argv::ResumeFlags::Replay { flags: vec![] },
+        )
     }
 
     /// Merge a best-effort identity overlay onto an existing record — the D1
@@ -4542,6 +4658,7 @@ pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
 #[cfg(test)]
 pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
     TerminalSessionRecord {
+        resume_flags: None,
         claude_session_id: id.to_string(),
         config_dir: None,
         working_dir: None,
@@ -4764,6 +4881,7 @@ mod tests {
 
     fn rec(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: id.to_string(),
             config_dir: Some("C:/cfg".to_string()),
             working_dir: Some("C:/repo".to_string()),
@@ -4874,6 +4992,113 @@ mod tests {
             reopened.get("sess-spawn").unwrap().spawn_device_default,
             Some(sdd(Some("tenant-a"))),
             "the value of the SPAWN must survive a restart"
+        );
+    }
+
+    /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+    /// Phase 6 (review r1, M2/L3): `set_resume_flags` writes only a `startup`
+    /// report, only onto an open record on the reporting terminal, only once,
+    /// and never creates a record; `record_open` and a reopen keep the flags.
+    #[test]
+    fn set_resume_flags_startup_only_terminal_match_first_write_wins_never_creates() {
+        use crate::session::resume_argv::ResumeFlags;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let flags = |f: &[&str]| ResumeFlags::Replay {
+            flags: f.iter().map(|s| s.to_string()).collect(),
+        };
+        let term = rec("sess-f").terminal_id;
+
+        assert_eq!(
+            store.set_resume_flags("sess-f", &term, Some("startup"), flags(&["--verbose"])),
+            ResumeFlagsWrite::NoOpenRecordOnTerminal,
+            "never creates a record"
+        );
+        assert!(store.get("sess-f").is_none());
+
+        store.record_open(rec("sess-f"));
+        assert_eq!(
+            store.set_resume_flags("sess-f", "other-term", Some("startup"), flags(&["--ide"])),
+            ResumeFlagsWrite::NoOpenRecordOnTerminal,
+            "only the reporting terminal's record"
+        );
+
+        assert_eq!(
+            store.set_resume_flags(
+                "sess-f",
+                &term,
+                Some("startup"),
+                flags(&["--model", "opus"])
+            ),
+            ResumeFlagsWrite::Written
+        );
+        assert_eq!(
+            store.set_resume_flags("sess-f", &term, Some("startup"), flags(&["--ide"])),
+            ResumeFlagsWrite::AlreadySet,
+            "first write wins"
+        );
+        assert_eq!(
+            store.get("sess-f").unwrap().resume_flags,
+            Some(flags(&["--model", "opus"]))
+        );
+
+        // A re-record carries no flags and must not erase them.
+        store.record_open(rec("sess-f"));
+        assert_eq!(
+            store.get("sess-f").unwrap().resume_flags,
+            Some(flags(&["--model", "opus"]))
+        );
+        // Durable across a reopen of the store.
+        drop(store);
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("sess-f").unwrap().resume_flags,
+            Some(flags(&["--model", "opus"]))
+        );
+
+        // A FIRST report that is not a startup closes the slot: a later
+        // (spoofed) startup cannot fill it (review r2, N4).
+        for (n, source) in [None, Some("resume"), Some("clear"), Some("compact")]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("sess-r{n}");
+            reopened.record_open(rec(&id));
+            assert_eq!(
+                reopened.set_resume_flags(&id, &term, source, flags(&["--ide"])),
+                ResumeFlagsWrite::ClosedNotStartup,
+                "{source:?}"
+            );
+            assert_eq!(
+                reopened.get(&id).unwrap().resume_flags,
+                Some(ResumeFlags::Refused {
+                    reason: CLOSED_NOT_STARTUP.into()
+                })
+            );
+            assert_eq!(
+                reopened.set_resume_flags(&id, &term, Some("startup"), flags(&["--ide"])),
+                ResumeFlagsWrite::AlreadySet
+            );
+        }
+        // A startup with no argv leaves the slot open for the hook's POST.
+        reopened.record_open(rec("sess-shim"));
+        assert_eq!(
+            reopened.close_resume_flags("sess-shim", &term, Some("startup")),
+            ResumeFlagsWrite::NoOpenRecordOnTerminal
+        );
+        assert_eq!(reopened.get("sess-shim").unwrap().resume_flags, None);
+        assert_eq!(
+            reopened.close_resume_flags("sess-shim", &term, Some("resume")),
+            ResumeFlagsWrite::ClosedNotStartup
+        );
+
+        // A closed record is not written either.
+        reopened.record_open(rec("sess-closed"));
+        reopened.record_close("sess-closed", "explicit");
+        assert_eq!(
+            reopened.set_resume_flags("sess-closed", &term, Some("startup"), flags(&["--ide"])),
+            ResumeFlagsWrite::NoOpenRecordOnTerminal
         );
     }
 
@@ -8612,6 +8837,7 @@ mod tests {
         close_reason: Option<&str>,
     ) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: id.to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),

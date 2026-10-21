@@ -44,6 +44,14 @@ import {
   decideColdResume,
   decideDrainSkipDisposition,
   applyDrainSkip,
+  isShellInertArg,
+  resumePlanFor,
+  liveTabShowsSession,
+  withoutReleasedHolders,
+  pruneReleasedTerminalIds,
+  releaseAndRelaunch,
+  declineLeftoverDeadPanes,
+  replacesDeadPane,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -663,6 +671,214 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
     const unbound = buildResumeCmd("sess-1", undefined, "summary");
     expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
     expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  });
+});
+
+// Plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+// Phase 6 (D11): a session whose PTY holder died is relaunched with the flags
+// it was launched with — every typed token shell-inert, or nothing typed.
+describe("relaunch from the persisted launch argv (Phase 6)", () => {
+  it("isShellInertArg accepts only the runner's inert set", () => {
+    for (const ok of ["--model", "opus", "/srv/a", "--model=sonnet", "a.b:c+d_e-f", ".x", "-x"]) {
+      expect(isShellInertArg(ok)).toBe(true);
+    }
+    for (const bad of [
+      "",
+      "a b",
+      "$(id)",
+      "a;b",
+      "`x`",
+      "a|b",
+      "~/x",
+      "@splat",
+      "a,b",
+      "50%",
+      'q"',
+      "a\nb",
+      "x".repeat(257),
+      // The runner's first-character rule (review r2 nit): never zsh `=`.
+      "=cmd",
+      ":x",
+      "+x",
+      "_x",
+      7,
+      null,
+    ]) {
+      expect(isShellInertArg(bad)).toBe(false);
+    }
+  });
+
+  it("resumePlanFor: no argv → default; offered args → replay; a refusal or an unsafe arg → default resume", () => {
+    expect(resumePlanFor(rec({}))).toEqual({ kind: "default" });
+    expect(resumePlanFor(rec({ resumeArgs: ["--model", "opus"] }))).toEqual({
+      kind: "replay",
+      args: ["--model", "opus"],
+    });
+    expect(resumePlanFor(rec({ resumeArgs: [] }))).toEqual({ kind: "replay", args: [] });
+    // An unsafe argv falls back to the DEFAULT resume — the session is still
+    // resumed, only the extra flags are dropped.
+    const refusal = "launch argument 2 (flag --add-dir) is not shell-inert";
+    expect(resumePlanFor(rec({ resumeRefusal: refusal }))).toEqual({
+      kind: "default",
+      fallbackReason: refusal,
+    });
+    // Defense in depth: the webview re-checks what the runner offered.
+    expect(resumePlanFor(rec({ resumeArgs: ["--add-dir", "/srv/my project"] })).kind).toBe(
+      "default",
+    );
+    // And a default plan types exactly the pre-Phase-6 command.
+    expect(buildResumeCmd("sess-1", undefined, "summary", undefined, undefined)).toBe(
+      "claude --permission-mode bypassPermissions --resume sess-1\r",
+    );
+  });
+
+  it("a missing or unsafe session id still relaunches nothing (classifyRestoreAction gate)", () => {
+    for (const id of ["", "a b", "x;rm", "$(id)"]) {
+      expect(
+        classifyRestoreAction(
+          rec({ claudeSessionId: id, origin: "authoritative", confirmedAt: 1, resumeArgs: [] }),
+        ),
+      ).toBe("skip-invalid");
+    }
+  });
+
+  it("buildResumeCmd replays the flags before --resume, keeping the autonomous default", () => {
+    expect(buildResumeCmd("sess-1", undefined, "summary", undefined, ["--model", "opus"])).toBe(
+      "claude --permission-mode bypassPermissions --model opus --resume sess-1\r",
+    );
+    // An empty replay is the default command.
+    expect(buildResumeCmd("sess-1", undefined, "summary", undefined, [])).toBe(
+      "claude --permission-mode bypassPermissions --resume sess-1\r",
+    );
+  });
+
+  it("buildResumeCmd lets the launch's own permission choice win, and never types a non-inert arg", () => {
+    expect(
+      buildResumeCmd("sess-1", undefined, "summary", undefined, ["--permission-mode", "plan"]),
+    ).toBe("claude --permission-mode plan --resume sess-1\r");
+    // The runner never replays the dangerous-skip flags; if one arrived it
+    // would not stand in for a permission choice.
+    expect(
+      buildResumeCmd("sess-1", undefined, "summary", undefined, ["--dangerously-skip-permissions"]),
+    ).toBe(
+      "claude --permission-mode bypassPermissions --dangerously-skip-permissions --resume sess-1\r",
+    );
+    expect(
+      buildResumeCmd("sess-1", undefined, "summary", undefined, ["--model", "$(rm -rf ~)"]),
+    ).not.toContain("$(");
+  });
+
+  it("liveTabShowsSession ignores the dead pane whose holder was lost", () => {
+    const tabs = [{ id: "dead-pane", claudeSessionId: "s-1" }];
+    expect(liveTabShowsSession(tabs, "s-1", new Set())).toBe(true);
+    expect(liveTabShowsSession(tabs, "s-1", new Set(["dead-pane"]))).toBe(false);
+    // Another live tab still showing it does block a second relaunch.
+    expect(
+      liveTabShowsSession(
+        [...tabs, { id: "live", claudeSessionId: "s-1" }],
+        "s-1",
+        new Set(["dead-pane"]),
+      ),
+    ).toBe(true);
+  });
+});
+
+// Phase 6, review r1 (L1/M3): the dead pane of a released session is closed so
+// the relaunch takes its zone, or carries the not-relaunched banner.
+describe("a lost holder's dead pane (Phase 6)", () => {
+  it("withoutReleasedHolders frees exactly the zones dead panes hold", () => {
+    expect(withoutReleasedHolders({ 0: "dead", 1: "live" }, new Set(["dead"]))).toEqual({
+      1: "live",
+    });
+  });
+
+  it("pruneReleasedTerminalIds keeps only ids that still have a tab", () => {
+    const released = new Set(["dead", "gone", "never-a-tab"]);
+    pruneReleasedTerminalIds(released, [{ id: "dead" }, { id: "live" }]);
+    expect([...released]).toEqual(["dead"]);
+  });
+
+  it("releaseAndRelaunch: not hosted → scheduled, and the dead pane REMEMBERED (closed only once replaced)", async () => {
+    const scheduled: Array<[string, string[]]> = [];
+    const remembered: Array<[string, string]> = [];
+    const withheld: unknown[] = [];
+    const out = await releaseAndRelaunch(
+      { sessionId: "s-1", terminalId: "dead", pageId: "p" },
+      (page, ids) => scheduled.push([page, ids]),
+      (sid, tid) => remembered.push([sid, tid]),
+      (w) => withheld.push(w),
+      undefined,
+      async () => new Set(["other"]),
+    );
+    expect(out).toBe(true);
+    expect(scheduled).toEqual([["p", ["s-1"]]]);
+    expect(remembered).toEqual([["s-1", "dead"]]);
+    expect(withheld).toEqual([]);
+  });
+
+  it("only an auto-resume tab replaces a dead pane (review r3, R2)", () => {
+    expect(replacesDeadPane("auto-resume")).toBe(true);
+    expect(replacesDeadPane("terminal-only")).toBe(false);
+    expect(replacesDeadPane("skip-invalid")).toBe(false);
+    // An UNCONFIRMED authoritative record classifies terminal-only: no replacement.
+    expect(
+      replacesDeadPane(
+        classifyRestoreAction(rec({ origin: "authoritative", confirmedAt: undefined })),
+      ),
+    ).toBe(false);
+  });
+
+  it("a slot-closure refusal is the plain default resume, not a warned fallback (review r3)", () => {
+    for (const reason of ["first report was not startup", "no argv reported"]) {
+      expect(resumePlanFor(rec({ resumeRefusal: reason }))).toEqual({ kind: "default" });
+    }
+  });
+
+  it("declineLeftoverDeadPanes banners only the declined sessions' dead panes", () => {
+    const deadPaneFor = new Map([
+      ["s-made", "dead-1"],
+      ["s-declined", "dead-2"],
+      ["s-other-run", "dead-3"],
+    ]);
+    const marked: unknown[] = [];
+    declineLeftoverDeadPanes(
+      new Set(["s-made", "s-declined", "s-no-pane"]),
+      new Set(["s-made"]),
+      deadPaneFor,
+      "page-1",
+      (w) => marked.push(w),
+    );
+    expect(marked).toEqual([
+      {
+        sessionId: "s-declined",
+        terminalId: "dead-2",
+        pageId: "page-1",
+        reason: "restore-declined",
+      },
+    ]);
+    expect([...deadPaneFor.keys()].sort()).toEqual(["s-made", "s-other-run"]);
+  });
+
+  it("releaseAndRelaunch: still hosted (or unreadable) → no relaunch, the banner instead", async () => {
+    for (const live of [new Set(["s-1"]), null]) {
+      const scheduled: unknown[] = [];
+      const closed: unknown[] = [];
+      const withheld: unknown[] = [];
+      const out = await releaseAndRelaunch(
+        { sessionId: "s-1", terminalId: "dead", pageId: null },
+        (page, ids) => scheduled.push([page, ids]),
+        (sid, tid) => closed.push([sid, tid]),
+        (w) => withheld.push(w),
+        "liveness-unknown",
+        async () => live,
+      );
+      expect(out).toBe(false);
+      expect(scheduled).toEqual([]);
+      expect(closed).toEqual([]);
+      expect(withheld).toEqual([
+        { sessionId: "s-1", terminalId: "dead", pageId: null, reason: "liveness-unknown" },
+      ]);
+    }
   });
 });
 

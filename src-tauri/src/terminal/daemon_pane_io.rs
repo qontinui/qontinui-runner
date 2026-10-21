@@ -109,7 +109,7 @@ use qontinui_runner_lib::pty_holder::spawn::{
 };
 use tracing::{debug, info, warn};
 
-use super::pane_io::{CredentialScrub, PaneIo, ScrubbedCommand};
+use super::pane_io::{CredentialScrub, HolderLoss, PaneIo, ScrubbedCommand};
 use super::pane_output::PaneOutput;
 use super::remote_pane_io::{DetachOutcome, DETACH_EXIT_CODE};
 use crate::settings::TerminalSettings;
@@ -501,6 +501,9 @@ impl<P: PaneIo> PaneIo for WithNotice<P> {
     fn unwatched_pauses_source(&self) -> bool {
         self.inner.unwatched_pauses_source()
     }
+    fn holder_loss(&self) -> Option<HolderLoss> {
+        self.inner.holder_loss()
+    }
     fn credential_scrub(&self) -> CredentialScrub {
         self.inner.credential_scrub()
     }
@@ -525,6 +528,57 @@ pub fn holder_gone_notice(holder_pid: u32, child_pid: u32) -> Vec<u8> {
         "\r\n\x1b[1;31m[qontinui] the PTY holder for this pane (pid {holder_pid}) is gone — \
          its connection closed without reporting how pane process {child_pid} exited, so \
          the exit code is unknown\x1b[0m\r\n"
+    )
+    .into_bytes()
+}
+
+/// How [`PumpCtx::give_up`] lost the holder: [`HolderLoss::Ended`] when its
+/// child was killed through it or the verified holder was terminated,
+/// [`HolderLoss::Unreachable`] when NEITHER landed — the holder and its
+/// `claude` may still be alive, so nothing may relaunch that session over it
+/// (review r1, M3). Pure, so the mapping is tested on its own.
+pub fn loss_after_give_up(kill_landed: bool, terminated: bool) -> HolderLoss {
+    if kill_landed || terminated {
+        HolderLoss::Ended
+    } else {
+        HolderLoss::Unreachable
+    }
+}
+
+/// The pump's record of a holder loss, read by the waiter after `wait`
+/// returns. Written BEFORE the pane settles, so the read after `wait` sees it.
+#[derive(Default)]
+pub struct LossSlot(std::sync::atomic::AtomicU8);
+
+impl LossSlot {
+    const NONE: u8 = 0;
+    const ENDED: u8 = 1;
+    const UNREACHABLE: u8 = 2;
+
+    fn set(&self, loss: HolderLoss) {
+        let v = match loss {
+            HolderLoss::Ended => Self::ENDED,
+            HolderLoss::Unreachable => Self::UNREACHABLE,
+        };
+        self.0.store(v, Ordering::Release);
+    }
+
+    fn get(&self) -> Option<HolderLoss> {
+        match self.0.load(Ordering::Acquire) {
+            Self::ENDED => Some(HolderLoss::Ended),
+            Self::UNREACHABLE => Some(HolderLoss::Unreachable),
+            _ => None,
+        }
+    }
+}
+
+/// In-band notice for a holder that stopped answering and could be neither
+/// killed through nor terminated: its `claude` may still be running.
+pub fn holder_unreachable_notice(holder_pid: u32, how: &str) -> Vec<u8> {
+    format!(
+        "\r\n\x1b[1;31m[qontinui] the PTY holder for this pane (pid {holder_pid}) stopped \
+         answering and could not be ended ({how}). The session in it MAY STILL BE RUNNING, \
+         unreachable — it is not relaunched automatically.\x1b[0m\r\n"
     )
     .into_bytes()
 }
@@ -991,6 +1045,12 @@ pub struct DaemonPaneIo {
     /// the connection as the detach it is, never as a holder death, and never
     /// reattaches.
     detached: Arc<AtomicBool>,
+    /// Set by the pump BEFORE it settles the pane over a lost holder — dead
+    /// (lock released) or ended after it stayed unreachable
+    /// ([`HolderLoss::Ended`]), or unreachable and NOT endable
+    /// ([`HolderLoss::Unreachable`]) — so the waiter, which reads it after
+    /// `wait` returns, sees it ([`PaneIo::holder_loss`], plan Phase 6).
+    holder_lost: Arc<LossSlot>,
     detach: Arc<Mutex<DetachOutcome>>,
     cols: Arc<AtomicU16>,
     rows: Arc<AtomicU16>,
@@ -1018,6 +1078,7 @@ struct PumpCtx {
     conn: Arc<HolderConn>,
     control: Arc<ControlQueue>,
     detached: Arc<AtomicBool>,
+    holder_lost: Arc<LossSlot>,
     cols: Arc<AtomicU16>,
     rows: Arc<AtomicU16>,
     paused: Arc<AtomicBool>,
@@ -1257,6 +1318,7 @@ impl DaemonPaneIo {
         conn.install(stream.writer);
         let control = Arc::new(ControlQueue::new());
         let detached = Arc::new(AtomicBool::new(false));
+        let holder_lost = Arc::new(LossSlot::default());
         let (want_cols, want_rows) = match restore_at {
             Some(RestoreAt::Fitted(cols, rows)) => (cols, rows),
             Some(RestoreAt::PtySize) | None => (info.cols, info.rows),
@@ -1286,6 +1348,7 @@ impl DaemonPaneIo {
             conn: conn.clone(),
             control: control.clone(),
             detached: detached.clone(),
+            holder_lost: holder_lost.clone(),
             cols: cols.clone(),
             rows: rows.clone(),
             paused: paused.clone(),
@@ -1314,6 +1377,7 @@ impl DaemonPaneIo {
             kill_requested: AtomicBool::new(false),
             released: AtomicBool::new(false),
             detached,
+            holder_lost,
             detach: Arc::new(Mutex::new(DetachOutcome::NotAttempted)),
             cols,
             rows,
@@ -1734,16 +1798,26 @@ impl PumpCtx {
     /// kill its child on a fresh connection; if it will not answer even that,
     /// end the verified holder itself. Then say exactly what happened.
     fn give_up(&self, last: &str) {
-        let how = match self.conn.kill(GIVE_UP_KILL_BUDGET) {
-            Ok(()) => "its child was killed through the holder's `kill`".to_string(),
+        let (how, loss) = match self.conn.kill(GIVE_UP_KILL_BUDGET) {
+            Ok(()) => (
+                "its child was killed through the holder's `kill`".to_string(),
+                loss_after_give_up(true, false),
+            ),
             Err(asked) => {
                 let t = self.conn.terminate(self.holder_pid());
-                format!("`kill` not answered ({asked}); {}", t.detail)
+                (
+                    format!("`kill` not answered ({asked}); {}", t.detail),
+                    loss_after_give_up(false, t.signalled),
+                )
             }
         };
-        warn!(pane = %self.key, holder_pid = self.holder_pid(), last = %last, how = %how, "pty holder: unreachable for the reconnect window — ending it");
-        self.out
-            .push_local(&holder_terminated_notice(self.holder_pid(), &how));
+        warn!(pane = %self.key, holder_pid = self.holder_pid(), last = %last, how = %how, ?loss, "pty holder: unreachable for the reconnect window — ending it");
+        self.holder_lost.set(loss);
+        let notice = match loss {
+            HolderLoss::Ended => holder_terminated_notice(self.holder_pid(), &how),
+            HolderLoss::Unreachable => holder_unreachable_notice(self.holder_pid(), &how),
+        };
+        self.out.push_local(&notice);
         self.out.settle(Err(format!(
             "PTY holder pid {} for pane {} could not be reached for {:?} ({last}); ending it: \
              {how} — exit code of pane process {} unknown",
@@ -1763,6 +1837,7 @@ impl PumpCtx {
             reason = %ended,
             "pty holder: connection ended without an exit report and {why}; exit code unknown"
         );
+        self.holder_lost.set(HolderLoss::Ended);
         self.out
             .push_local(&holder_gone_notice(self.holder_pid(), self.child_pid));
         self.out.settle(Err(format!(
@@ -1900,6 +1975,13 @@ impl PaneIo for DaemonPaneIo {
     /// flowing — unlike a remote pane, whose state is tracked on its target.
     fn unwatched_pauses_source(&self) -> bool {
         false
+    }
+
+    /// The holder died (its lock released) or was ended for staying
+    /// unreachable — never a child exit, a `kill`, an incompatible holder left
+    /// running, or a detach.
+    fn holder_loss(&self) -> Option<HolderLoss> {
+        self.holder_lost.get()
     }
 
     fn credential_scrub(&self) -> CredentialScrub {
@@ -2101,6 +2183,7 @@ mod tests {
             kill_requested: AtomicBool::new(false),
             released: AtomicBool::new(false),
             detached: Arc::new(AtomicBool::new(false)),
+            holder_lost: Arc::new(LossSlot::default()),
             detach: Arc::new(Mutex::new(DetachOutcome::NotAttempted)),
             cols: Arc::new(AtomicU16::new(80)),
             rows: Arc::new(AtomicU16::new(24)),
@@ -2172,11 +2255,36 @@ mod tests {
             out,
             control: Arc::new(ControlQueue::new()),
             detached: Arc::new(AtomicBool::new(false)),
+            holder_lost: Arc::new(LossSlot::default()),
             cols: Arc::new(AtomicU16::new(80)),
             rows: Arc::new(AtomicU16::new(24)),
             paused: Arc::new(AtomicBool::new(false)),
             restore,
         }
+    }
+
+    /// Review r1 (M3, L3): `give_up` records a holder loss — `Ended` when its
+    /// kill or termination landed, `Unreachable` when neither did, so a holder
+    /// that may still host a live `claude` is never relaunched over.
+    #[test]
+    fn pty_holder_give_up_records_the_loss_and_never_claims_an_unreachable_holder_ended() {
+        assert_eq!(loss_after_give_up(true, false), HolderLoss::Ended);
+        assert_eq!(loss_after_give_up(false, true), HolderLoss::Ended);
+        assert_eq!(loss_after_give_up(false, false), HolderLoss::Unreachable);
+
+        // The real `give_up` over a holder that answers nothing: no socket
+        // (`kill` fails) and pid 0 (`terminate` refuses before any signal).
+        let out = Arc::new(PaneOutput::new(
+            "t-giveup",
+            Vec::new(),
+            0,
+            holder_lost_output_marker,
+        ));
+        let mut pump = bare_pump(out.clone(), None);
+        pump.holder_pid.store(0, Ordering::Release);
+        pump.give_up("test");
+        assert_eq!(pump.holder_lost.get(), Some(HolderLoss::Unreachable));
+        assert!(out.is_finished(), "the pane settles");
     }
 
     fn synthetic(part: SyntheticPart, bytes: &[u8]) -> Event {
@@ -3117,6 +3225,10 @@ mod tests {
                 Ok(code) => panic!("holder death fabricated exit code {code}"),
             }
             t.join().expect("the reader reached EOF");
+            assert!(
+                pane.holder_loss() == Some(HolderLoss::Ended),
+                "a dead holder is a holder LOSS — the waiter's cue for a tier-2 relaunch (Phase 6)"
+            );
             let notice = holder_gone_notice(holder_pid, child_pid);
             assert!(
                 contains(&collected.lock().unwrap(), &notice),
@@ -3172,6 +3284,10 @@ mod tests {
                 Ok(DETACH_EXIT_CODE)
             );
             t1.join().unwrap();
+            assert!(
+                first.holder_loss().is_none(),
+                "a detach is never a holder loss: nothing may relaunch a live session (Phase 6)"
+            );
             let offset = first.stream_offset();
             std::thread::sleep(Duration::from_millis(200));
             assert!(alive(child_pid), "detach must leave the child running");
@@ -3225,6 +3341,10 @@ mod tests {
                 "kill ends the child; its signal exit is LocalPty's 1, not the detach code"
             );
             t3.join().unwrap();
+            assert!(
+                third.holder_loss().is_none(),
+                "a kill is never a holder loss (Phase 6)"
+            );
             third.release(Duration::from_secs(1)).unwrap();
             let end = Instant::now() + Duration::from_secs(5);
             while alive(child_pid) && Instant::now() < end {

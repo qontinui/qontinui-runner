@@ -126,6 +126,16 @@ pub struct Grid {
     /// cheap before/after shape the first-OSC-title detection already uses.
     /// Never reset, so a drained-then-refilled slot is still detectable.
     agent_status_sideband_seq: u64,
+    /// Latest OSC 9999 `session_start` report (raw, UNPARSED) — the provider
+    /// session id a `SessionStart` hook wrote to the PTY (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D11). A SEPARATE slot from [`Self::agent_status_sideband`]: that one is
+    /// latest-wins because a status is a level, and a report arriving in the
+    /// same chunk as a status must not be the thing that loses. An arrival
+    /// bumps the same [`Self::agent_status_sideband_seq`], so the reader
+    /// thread's one before/after check covers both. See
+    /// [`OSC_SESSION_START_TAG`].
+    session_start_sideband: Option<String>,
 }
 
 // ---- OSC 9999 agent-status sideband --------------------------------------
@@ -152,6 +162,17 @@ pub const OSC_AGENT_STATUS: &[u8] = b"9999";
 /// so this cap is the only one in the path once the sequence is dispatched.)
 pub const MAX_AGENT_STATUS_SIDEBAND_BYTES: usize = 8192;
 
+/// The first parameter after [`OSC_AGENT_STATUS`] that marks a `SessionStart`
+/// report rather than a status: `ESC ] 9999 ; session_start ; {json} BEL`.
+///
+/// A typed sub-tag, not a JSON key, so the grid routes the report without
+/// parsing JSON on the PTY reader thread — and a status payload, which always
+/// begins with `{`, can never be mistaken for one. Plan
+/// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, D11:
+/// the hook-reported session id rides the PTY itself, needing no socket, port
+/// or file. Bounded by the same [`MAX_AGENT_STATUS_SIDEBAND_BYTES`].
+pub const OSC_SESSION_START_TAG: &[u8] = b"session_start";
+
 /// How long a DEC 2026 synchronized-output block may stay open before the grid
 /// stops reporting it.
 ///
@@ -165,6 +186,27 @@ pub const MAX_AGENT_STATUS_SIDEBAND_BYTES: usize = 8192;
 /// Apache-2.0, no code taken): long enough for any real frame, which the
 /// coalescer already caps at 50 ms / 256 KiB anyway.
 pub const SYNC_OUTPUT_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Rejoin an OSC 9999 payload's `;`-split parts (vte splits every `;`, so a
+/// JSON body containing one arrives in pieces), or `None` when it is over
+/// [`MAX_AGENT_STATUS_SIDEBAND_BYTES`] — dropped whole, never truncated — or
+/// is not UTF-8. The size check runs BEFORE the joined payload is allocated:
+/// `parts.len() - 1` is the count of separators the rejoin puts back.
+fn join_sideband(parts: &[&[u8]]) -> Option<String> {
+    let joined_len: usize =
+        parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_sub(1);
+    if joined_len > MAX_AGENT_STATUS_SIDEBAND_BYTES {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(joined_len);
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            raw.push(b';');
+        }
+        raw.extend_from_slice(part);
+    }
+    String::from_utf8(raw).ok()
+}
 
 impl Grid {
     pub fn new(cols: u16, rows: u16) -> Self {
@@ -196,6 +238,7 @@ impl Grid {
             dirty: false,
             agent_status_sideband: None,
             agent_status_sideband_seq: 0,
+            session_start_sideband: None,
         }
     }
 
@@ -298,6 +341,14 @@ impl Grid {
     /// it counts arrivals, not pending items.
     pub fn take_agent_status_sideband(&mut self) -> Option<String> {
         self.agent_status_sideband.take()
+    }
+
+    /// Drain the latest OSC 9999 `session_start` report, leaving the slot
+    /// empty. RAW and UNTRUSTED, exactly like
+    /// [`Self::take_agent_status_sideband`]: parse it with
+    /// `terminal::session_start_sideband` and never log it verbatim.
+    pub fn take_session_start_sideband(&mut self) -> Option<String> {
+        self.session_start_sideband.take()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -418,21 +469,15 @@ impl Grid {
     ///   truncated (a truncated JSON body can parse as a *different* status);
     /// * not valid UTF-8.
     fn accept_agent_status_sideband(&mut self, parts: &[&[u8]]) {
-        // Size check BEFORE allocating the joined payload: `parts.len() - 1`
-        // is the count of `;` separators the rejoin puts back.
-        let joined_len: usize =
-            parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_sub(1);
-        if joined_len > MAX_AGENT_STATUS_SIDEBAND_BYTES {
+        // `9999;session_start;{json}` is a SessionStart report, not a status.
+        if parts.first() == Some(&OSC_SESSION_START_TAG) {
+            if let Some(text) = join_sideband(&parts[1..]) {
+                self.session_start_sideband = Some(text);
+                self.agent_status_sideband_seq = self.agent_status_sideband_seq.wrapping_add(1);
+            }
             return;
         }
-        let mut raw = Vec::with_capacity(joined_len);
-        for (i, part) in parts.iter().enumerate() {
-            if i > 0 {
-                raw.push(b';');
-            }
-            raw.extend_from_slice(part);
-        }
-        let Ok(text) = String::from_utf8(raw) else {
+        let Some(text) = join_sideband(parts) else {
             return;
         };
         self.agent_status_sideband = Some(text);
@@ -1648,6 +1693,46 @@ mod tests {
             grid.take_agent_status_sideband().as_deref(),
             Some(r#"{"state":"finished"}"#)
         );
+    }
+
+    /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+    /// Phase 6 (D11): a `session_start` report lands in ITS OWN slot — a
+    /// status in the same chunk does not overwrite it, nor it the status —
+    /// bumps the shared seq, keeps a `;` inside the JSON, and is bounded by
+    /// the same cap.
+    #[test]
+    fn osc9999_session_start_report_has_its_own_slot() {
+        let mut grid = Grid::new(80, 24);
+        feed(
+            &mut grid,
+            b"\x1b]9999;session_start;{\"session_id\":\"abc\",\"argv\":[\"a;b\"]}\x07\
+              \x1b]9999;{\"state\":\"working\"}\x07",
+        );
+        assert_eq!(grid.agent_status_sideband_seq(), 2, "both arrivals counted");
+        assert_eq!(
+            grid.take_session_start_sideband().as_deref(),
+            Some(r#"{"session_id":"abc","argv":["a;b"]}"#),
+            "the report survives a status in the same chunk, `;` and all"
+        );
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"working"}"#),
+            "and the status is not displaced by the report"
+        );
+        assert!(grid.take_session_start_sideband().is_none());
+
+        // Over the cap: dropped whole, slot and seq untouched.
+        let mut grid = Grid::new(80, 24);
+        let mut big = b"\x1b]9999;session_start;".to_vec();
+        big.extend(std::iter::repeat_n(
+            b'x',
+            MAX_AGENT_STATUS_SIDEBAND_BYTES + 1,
+        ));
+        big.push(0x07);
+        feed(&mut grid, &big);
+        assert_eq!(grid.agent_status_sideband_seq(), 0);
+        assert!(grid.take_session_start_sideband().is_none());
+        assert!(grid.take_agent_status_sideband().is_none());
     }
 
     #[test]

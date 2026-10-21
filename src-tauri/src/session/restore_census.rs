@@ -660,6 +660,7 @@ mod tests {
 
     fn record(id: &str, confirmed: bool) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: id.to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),

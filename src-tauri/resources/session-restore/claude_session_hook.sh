@@ -29,6 +29,9 @@
 # Env (injected by the runner at PTY spawn — the identity seam):
 #   QONTINUI_TERMINAL_ID            the per-PTY terminal id to correlate on
 #   QONTINUI_INSTALL_INTERCEPT_PORT the bound runner loopback API port
+#   QONTINUI_LAUNCH_ARGV            (set by the identity shim) this launch's
+#                                   argv as a JSON array — sent in the POST
+#                                   body below, NEVER over the PTY
 set -u
 
 # Drain stdin with a BUILTIN, not `cat` — the same drain the policy and stop
@@ -41,8 +44,11 @@ payload=""
 IFS= read -r -t 1 -d '' payload || true
 port="${QONTINUI_INSTALL_INTERCEPT_PORT:-}"
 term="${QONTINUI_TERMINAL_ID:-}"
-[ -z "$port" ] && exit 0
-command -v curl >/dev/null 2>&1 || exit 0
+# No port or no curl means no POST — but NOT no report: the OSC 9999
+# `session_start` report at the end rides the PTY and needs neither.
+qh_can_post=1
+[ -z "$port" ] && qh_can_post=0
+command -v curl >/dev/null 2>&1 || qh_can_post=0
 
 # Extract session_id + source from the stdin JSON. The field names are stable
 # across Claude versions (session_id, source).
@@ -300,9 +306,58 @@ fi
 # produce a body the route rejects as malformed, silently.
 term_json="$(qh_json_escape "$term")"
 sid_json="$(qh_json_escape "$sid")"
-body="{\"terminal_id\":\"$term_json\",\"session_id\":\"$sid_json\"$src_field,\"provider\":\"claude\",\"cwd\":\"$cwd_json\"$cfg_field}"
-curl -fsS --connect-timeout 3 --max-time 10 \
-  -X POST "http://127.0.0.1:${port}/control/session-open" \
-  -H 'Content-Type: application/json' \
-  -d "$body" >/dev/null 2>&1 || true
+# The launch argv the identity shim exported, for a tier-2 relaunch (plan
+# 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6).
+# It rides THIS loopback body, never the PTY: the PTY stream is relayed,
+# ringed and stored, and an argv can carry a prompt or an inline secret. The
+# runner keeps only the relaunch flags it derives from it, never the argv.
+# Spliced in only when it is a JSON array of PRINTABLE ASCII (the shims escape
+# everything else as \uXXXX) of at most 4 KiB. The key is ALWAYS sent — `null`
+# when there is no usable argv — so the runner can tell this report from the
+# identity shim's early POST, which omits it (review r3, R1); a relaunch then
+# uses the default resume command.
+argv_field=",\"argv\":null"
+qh_argv="${QONTINUI_LAUNCH_ARGV:-}"
+if [ -n "$qh_argv" ] && [ "$(LC_ALL=C; printf '%s' "${#qh_argv}")" -le 4096 ] \
+    && [[ $qh_argv == "["*"]" ]] && ! (LC_ALL=C; [[ $qh_argv == *[^\ -~]* ]]); then
+  argv_field=",\"argv\":$qh_argv"
+fi
+body="{\"terminal_id\":\"$term_json\",\"session_id\":\"$sid_json\"$src_field,\"provider\":\"claude\",\"cwd\":\"$cwd_json\"$cfg_field$argv_field}"
+if [ "$qh_can_post" = 1 ]; then
+  curl -fsS --connect-timeout 3 --max-time 10 \
+    -X POST "http://127.0.0.1:${port}/control/session-open" \
+    -H 'Content-Type: application/json' \
+    -d "$body" >/dev/null 2>&1 || true
+fi
+
+# The same id, reported over the PTY itself: an OSC 9999 `session_start`
+# report written to /dev/tty (plan
+# 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 6 /
+# D11; transport idea from tty7, which reports the id the same way). It needs
+# no port, socket or file — whoever reads the pane's PTY sees it: the runner's
+# grid parses it (`terminal::session_start_sideband`) and keeps the id a
+# relaunch uses if the pane's PTY holder dies, including after a /clear.
+#
+# It carries the session id and source ONLY — never the argv, which went in
+# the POST above: the PTY stream is relayed and stored. Nothing goes to
+# stdout (a SessionStart hook's stdout becomes session context). The id must
+# be a hyphenated UUID and the source one of four words, so the sequence is
+# fixed-shape printable ASCII with nothing that could end it early. It is
+# built first and written with ONE printf of under 1 KiB — a single write(2)
+# to the terminal — so the TUI's own drawing cannot land inside it.
+# No controlling terminal (a headless run, a test harness) is a silent no-op.
+qh_emit_session_start() {
+  local LC_ALL=C
+  local osc_src="" osc=""
+  [[ $sid =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+    || return 0
+  case "$src" in
+    startup | resume | clear | compact) osc_src=",\"source\":\"$src\"" ;;
+  esac
+  printf -v osc '\033]9999;session_start;{"session_id":"%s"%s}\007' "$sid" "$osc_src"
+  [ "${#osc}" -le 1024 ] || return 0
+  { printf '%s' "$osc" >/dev/tty; } 2>/dev/null || true
+  return 0
+}
+qh_emit_session_start
 exit 0

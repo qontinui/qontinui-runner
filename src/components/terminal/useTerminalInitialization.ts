@@ -14,7 +14,7 @@ import {
   type TypeAndVerifyOptions,
 } from "./resumeVerification";
 import { providerDescriptorFor } from "./providerAdapter";
-import type { TerminalTab } from "./useTerminalManager";
+import type { RelaunchWithheldReason, TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
@@ -23,6 +23,7 @@ import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
 import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
+import { createLogger } from "@/lib/logger";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
 
 /**
@@ -214,6 +215,117 @@ export function ownsReleasedPage(
 ): boolean {
   if (pinnedPageId !== null) return pageId === pinnedPageId;
   return !bindings[pageId];
+}
+
+/**
+ * Whether a LIVE tab already shows `sessionId`, so a merging re-run must not
+ * restore it a second time. A tab in `releasedTerminalIds` does not count: its
+ * PTY holder was lost and the runner handed its session back for a relaunch
+ * (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+ * Phase 6) — that dead pane is exactly the one the relaunch replaces, and
+ * counting it would block the relaunch forever. Pure + exported for tests.
+ */
+export function liveTabShowsSession(
+  tabs: ReadonlyArray<{ id: string; claudeSessionId?: string }>,
+  sessionId: string,
+  releasedTerminalIds: ReadonlySet<string>,
+): boolean {
+  return tabs.some((t) => t.claudeSessionId === sessionId && !releasedTerminalIds.has(t.id));
+}
+
+/**
+ * The zone assignments with every zone a released (dead) holder pane holds
+ * treated as FREE, so the relaunch that replaces that pane claims its zone
+ * (review r1, L1). Pure + exported for tests.
+ */
+export function withoutReleasedHolders(
+  assignments: Record<number, string>,
+  releasedTerminalIds: ReadonlySet<string>,
+): Record<number, string> {
+  const out: Record<number, string> = {};
+  for (const [zone, tabId] of Object.entries(assignments)) {
+    if (!releasedTerminalIds.has(tabId)) out[Number(zone)] = tabId;
+  }
+  return out;
+}
+
+/**
+ * Drop the released ids whose tab is gone (closed, or never had one — a holder
+ * the boot sweep found dead), so the set stays bounded by the live tabs.
+ * Pure + exported for tests.
+ */
+export function pruneReleasedTerminalIds(
+  released: Set<string>,
+  tabs: ReadonlyArray<{ id: string }>,
+): void {
+  for (const id of [...released]) {
+    if (!tabs.some((t) => t.id === id)) released.delete(id);
+  }
+}
+
+/** The runner's event for a lost holder's session it did NOT release (Rust: `RELAUNCH_WITHHELD_EVENT`). */
+export const HOLDER_RELAUNCH_WITHHELD_EVENT = "pty-holder-relaunch-withheld";
+
+/** Its payload. */
+export interface HolderRelaunchWithheld {
+  sessionId: string;
+  terminalId: string;
+  pageId: string | null;
+  reason: RelaunchWithheldReason;
+}
+
+/**
+ * Hand a released session to the restore (Phase 3's {@link onHolderSessionReleased},
+ * which re-checks liveness). When a relaunch was scheduled, remember the dead
+ * pane it replaces (`rememberDeadPane`): the re-run closes it only once the
+ * replacement tab EXISTS, or banners it if the re-run declines (review r2,
+ * N3). When it was not — a live process hosts the session, or liveness is
+ * unreadable — put the not-relaunched banner on it (`markWithheld`). Returns
+ * whether a relaunch was scheduled. Exported for tests.
+ */
+export async function releaseAndRelaunch(
+  payload: HolderSessionReleased,
+  schedule: (pageId: string, sessionIds: string[]) => void,
+  rememberDeadPane: (sessionId: string, terminalId: string) => void,
+  markWithheld: (w: HolderRelaunchWithheld) => void,
+  withheldReason: RelaunchWithheldReason = "still-hosted",
+  liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+): Promise<boolean> {
+  const scheduled = await onHolderSessionReleased(payload, schedule, liveIds);
+  if (scheduled) {
+    rememberDeadPane(payload.sessionId, payload.terminalId);
+  } else {
+    markWithheld({
+      sessionId: payload.sessionId,
+      terminalId: payload.terminalId,
+      pageId: payload.pageId,
+      reason: withheldReason,
+    });
+  }
+  return scheduled;
+}
+
+/**
+ * After a restore re-run that completed (not aborted, not deferred): every
+ * session it was asked to relaunch (`recheckOnly`) that still has a remembered
+ * dead pane and got NO replacement tab (`created`) was declined — skipped as
+ * live, past its restorable window, refused by the resource guard. Banner its
+ * dead pane instead of leaving it silently (review r2, N3), and forget it.
+ * Pure + exported for tests.
+ */
+export function declineLeftoverDeadPanes(
+  recheckOnly: ReadonlySet<string>,
+  created: ReadonlySet<string>,
+  deadPaneFor: Map<string, string>,
+  pageId: string,
+  markWithheld: (w: HolderRelaunchWithheld) => void,
+): void {
+  for (const sessionId of recheckOnly) {
+    const terminalId = deadPaneFor.get(sessionId);
+    if (terminalId === undefined || created.has(sessionId)) continue;
+    deadPaneFor.delete(sessionId);
+    markWithheld({ sessionId, terminalId, pageId, reason: "restore-declined" });
+  }
 }
 
 /** How many times an ABORTED restore re-runs on its own for ids it still owes (review V1). */
@@ -536,6 +648,105 @@ export function recordBelongsToRestore(
 }
 
 /**
+ * One argument the restore may TYPE into a shell as-is: the runner's
+ * shell-inert set (`session::resume_argv::is_shell_inert` — inert in bash, zsh,
+ * POSIX sh and PowerShell alike), at most 256 bytes, and the runner's
+ * first-character rule (alphanumeric, `-`, `/` or `.`; never zsh's `=`). Plan
+ * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, D11.
+ */
+const SHELL_INERT_ARG_RE = /^[A-Za-z0-9/.-][A-Za-z0-9_./:=+-]{0,255}$/;
+
+/** Whether `arg` may be typed into a shell unquoted. Exported for tests. */
+export function isShellInertArg(arg: unknown): arg is string {
+  return typeof arg === "string" && SHELL_INERT_ARG_RE.test(arg);
+}
+
+/**
+ * How a cold-restored session is relaunched (plan
+ * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 6):
+ *
+ * - `"default"` — the default resume command, as before argv persistence
+ *   existed. Used when no launch argv was ever reported, AND when the persisted
+ *   argv must not be replayed (the runner's `resumeRefusal`, or an argument that
+ *   fails the inert re-check here): D11 rejects the WHOLE replay rather than
+ *   escaping it, but the session is still resumed — only its extra flags are
+ *   dropped. `fallbackReason` then says why, for a warn line (it names a flag,
+ *   never a value);
+ * - `"replay"` — type these flags (the runner's `resumeArgs`, re-checked
+ *   shell-inert here) before `--resume <id>`, so the session comes back the way
+ *   its operator launched it.
+ *
+ * A missing or unsafe session id is not decided here: `classifyRestoreAction`
+ * (`skip-invalid`) relaunches nothing for it. Pure + exported for unit tests.
+ */
+export type ResumePlan =
+  | { kind: "default"; fallbackReason?: string }
+  | { kind: "replay"; args: readonly string[] };
+
+/**
+ * Refusals that only mean "no launch flags are known" — the runner closed the
+ * slot because the first report was not a startup, or it carried no argv. The
+ * runner already serves these as the plain default; the webview maps them the
+ * same way (debug, no warning) for a runner that predates that (review r3).
+ */
+const resumeLog = createLogger("TerminalRestore");
+
+const SLOT_CLOSURE_REASONS: ReadonlySet<string> = new Set([
+  "first report was not startup",
+  "no argv reported",
+]);
+
+export function resumePlanFor(
+  rec: Pick<TerminalSessionRecord, "resumeArgs" | "resumeRefusal">,
+): ResumePlan {
+  if (typeof rec.resumeRefusal === "string" && rec.resumeRefusal.length > 0) {
+    if (SLOT_CLOSURE_REASONS.has(rec.resumeRefusal)) {
+      resumeLog.debug(`no launch flags known (${rec.resumeRefusal}) — default resume`);
+      return { kind: "default" };
+    }
+    return { kind: "default", fallbackReason: rec.resumeRefusal };
+  }
+  if (rec.resumeArgs === undefined || rec.resumeArgs === null) return { kind: "default" };
+  if (!Array.isArray(rec.resumeArgs) || !rec.resumeArgs.every(isShellInertArg)) {
+    return {
+      kind: "default",
+      fallbackReason: "the runner offered a relaunch argument that is not shell-inert",
+    };
+  }
+  return { kind: "replay", args: rec.resumeArgs };
+}
+
+/**
+ * Whether a restored tab REPLACES a lost holder's dead pane: only when it will
+ * type a resume (`auto-resume`). A `terminal-only` or invalid record gets a tab
+ * that does not bring the session back, so the dead pane stays, with the
+ * `restore-declined` banner (review r3, R2). Pure + exported for tests.
+ */
+export function replacesDeadPane(action: RestoreAction): boolean {
+  return action === "auto-resume";
+}
+
+/** A flag that already says how the resumed session handles permissions. */
+function choosesPermissionMode(arg: string): boolean {
+  // The runner replays at most one `--permission-mode`, and never the
+  // dangerous-skip flags (review r2, permission rule).
+  return arg === "--permission-mode" || arg.startsWith("--permission-mode=");
+}
+
+/**
+ * `claude [--permission-mode bypassPermissions] [args...] --resume <id>`. The
+ * autonomous permission mode is added unless the replayed launch chose one of
+ * its own — the operator's explicit choice wins over the restore's default.
+ * Non-inert `args` never reach here ({@link resumePlanFor}); they are dropped
+ * defensively all the same, never quoted.
+ */
+function claudeResumeBase(sessionId: string, resumeArgs?: readonly string[]): string {
+  const args = (resumeArgs ?? []).filter(isShellInertArg);
+  const perm = args.some(choosesPermissionMode) ? [] : ["--permission-mode", "bypassPermissions"];
+  return ["claude", ...perm, ...args, "--resume", sessionId].join(" ");
+}
+
+/**
  * Build a `claude --resume <id>` command, optionally prefixed with
  * CLAUDE_CONFIG_DIR and (under the default full-resume policy) with the CLI's
  * resume-size thresholds raised so the interactive "Resume from summary?"
@@ -570,6 +781,7 @@ export function buildResumeCmd(
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
   provider?: string,
+  resumeArgs?: readonly string[],
 ): string {
   // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
   // ["gemini","--resume",id]. The descriptor owns the program + flags so the
@@ -577,9 +789,7 @@ export function buildResumeCmd(
   const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
   const program = argv[0];
   const isClaude = program === "claude";
-  const base = isClaude
-    ? `claude --permission-mode bypassPermissions --resume ${sessionId}`
-    : argv.join(" ");
+  const base = isClaude ? claudeResumeBase(sessionId, resumeArgs) : argv.join(" ");
   const env: Array<[string, string]> = [];
   if (configDir && isClaude) env.push(["CLAUDE_CONFIG_DIR", configDir]);
   if (isClaude && policy === "full") {
@@ -614,6 +824,11 @@ export async function runVerifiedResume(params: {
   configDir?: string;
   /** Provider owning the session — selects the adapter resume + handshake. */
   provider?: string;
+  /**
+   * Flags to replay before `--resume <id>` — a {@link resumePlanFor} `"replay"`
+   * plan's args (plan Phase 6). Omitted: the default resume command.
+   */
+  resumeArgs?: readonly string[];
   updateTab: (
     id: string,
     updates: Partial<{ isReconnecting?: boolean; resumeFailed?: boolean }>,
@@ -637,12 +852,13 @@ export async function runVerifiedResume(params: {
     claudeSessionId,
     configDir,
     provider,
+    resumeArgs,
     updateTab,
     recordOpen,
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider, resumeArgs);
   // Per-adapter handshake patterns (Phase 4): the verification loop matches the
   // resume success/failure against the descriptor's patterns instead of the
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
@@ -1182,6 +1398,7 @@ interface UseTerminalInitializationParams {
       isReconnecting?: boolean;
       resumeFailed?: boolean;
       restoreTerminalOnly?: boolean;
+      relaunchWithheld?: TerminalTab["relaunchWithheld"];
     }>,
   ) => void;
   zoneLayout: {
@@ -1331,8 +1548,14 @@ export function useTerminalInitialization({
   // Live tabs, for the re-run's "already open" check (the init effect does not
   // re-run on every tab change, so it cannot close over `tabs`).
   const liveTabsRef = useRef(tabs);
+  // Terminals whose PTY holder the runner reported lost (the released event
+  // below): their dead tab must not count as "already showing" the session a
+  // re-run is about to relaunch (see `liveTabShowsSession`), and its zone is
+  // the relaunch's to claim (`withoutReleasedHolders`). Pruned as tabs go.
+  const releasedTerminalIds = useRef<Set<string>>(new Set());
   useEffect(() => {
     liveTabsRef.current = tabs;
+    pruneReleasedTerminalIds(releasedTerminalIds.current, tabs);
   }, [tabs]);
   const [drainResumeEpoch, setDrainResumeEpoch] = useState(0);
   // Sessions a restore refused as "live" BEFORE the PTY-holder boot sweep
@@ -1373,26 +1596,97 @@ export function useTerminalInitialization({
     },
     [rerun],
   );
+  // A released session's dead pane: closed once its relaunch is scheduled, or
+  // given the not-relaunched banner when it is not (plan Phase 6; review r1,
+  // L1/M3). The pane's PTY is gone either way — only its tab remains.
+  const closeDeadPane = useCallback(
+    (terminalId: string) => {
+      updateTab(terminalId, { relaunchWithheld: undefined });
+      invoke("terminal_close", { terminalId }).catch(() => {
+        // A holder the boot sweep found dead never had a tab: nothing to close.
+      });
+    },
+    [updateTab],
+  );
+  const markWithheld = useCallback(
+    (w: HolderRelaunchWithheld) => {
+      updateTab(w.terminalId, {
+        relaunchWithheld: { sessionId: w.sessionId, pageId: w.pageId, reason: w.reason },
+      });
+    },
+    [updateTab],
+  );
+  // Released sessions whose relaunch is scheduled → the dead pane it
+  // replaces. The re-run closes the pane once the replacement tab exists, or
+  // banners it when it declines (review r2, N3).
+  const deadPaneFor = useRef<Map<string, string>>(new Map());
+  const rememberDeadPane = useCallback((sessionId: string, terminalId: string) => {
+    deadPaneFor.current.set(sessionId, terminalId);
+  }, []);
+  const relaunchReleased = useCallback(
+    (payload: HolderSessionReleased, withheldReason?: RelaunchWithheldReason) => {
+      releasedTerminalIds.current.add(payload.terminalId);
+      return releaseAndRelaunch(
+        payload,
+        scheduleRecheckRerun,
+        rememberDeadPane,
+        markWithheld,
+        withheldReason,
+      );
+    },
+    [scheduleRecheckRerun, rememberDeadPane, markWithheld],
+  );
+  // The effect below runs restores with a stale closure; reach the current
+  // dead-pane handlers through a ref.
+  const deadPaneActions = useRef({ closeDeadPane, markWithheld });
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    deadPaneActions.current = { closeDeadPane, markWithheld };
+  }, [closeDeadPane, markWithheld]);
+  useEffect(() => {
     let disposed = false;
+    const unlistens: Array<() => void> = [];
+    const keep = (fn: () => void) => {
+      if (disposed) fn();
+      else unlistens.push(fn);
+    };
     void listen<HolderSessionReleased>(HOLDER_SESSION_RELEASED_EVENT, (event) => {
       // Broadcast to every window: only the one that restores the page acts.
       const releasedPage = event.payload.pageId ?? "default";
       if (!ownsReleasedPage(releasedPage, readPinnedPageId(), getPageBindings())) return;
       console.warn(
-        `[TerminalPage] a PTY holder died before adoption; re-deciding session ${event.payload.sessionId}`,
+        `[TerminalPage] a PTY holder was lost; re-deciding session ${event.payload.sessionId}`,
       );
-      void onHolderSessionReleased(event.payload, scheduleRecheckRerun);
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    });
+      void relaunchReleased(event.payload);
+    }).then(keep);
+    void listen<HolderRelaunchWithheld>(HOLDER_RELAUNCH_WITHHELD_EVENT, (event) => {
+      const page = event.payload.pageId ?? "default";
+      if (!ownsReleasedPage(page, readPinnedPageId(), getPageBindings())) return;
+      console.warn(
+        `[TerminalPage] session ${event.payload.sessionId} was not relaunched after its PTY ` +
+          `holder was lost (${event.payload.reason})`,
+      );
+      markWithheld(event.payload);
+    }).then(keep);
     return () => {
       disposed = true;
-      unlisten?.();
+      for (const fn of unlistens) fn();
     };
-  }, [scheduleRecheckRerun]);
+  }, [relaunchReleased, markWithheld]);
+  // The banner's Resume on a withheld dead pane: the same release path, so
+  // liveness is re-checked before anything is typed.
+  const resumeWithheld = useCallback(
+    (tabId: string) => {
+      const tab = liveTabsRef.current.find((t) => t.id === tabId);
+      const w = tab?.relaunchWithheld;
+      if (!w) return;
+      updateTab(tabId, { relaunchWithheld: undefined });
+      void relaunchReleased(
+        { sessionId: w.sessionId, terminalId: tabId, pageId: w.pageId },
+        w.reason,
+      );
+    },
+    [relaunchReleased, updateTab],
+  );
   useEffect(
     () =>
       subscribeCoordDrainState(
@@ -1423,6 +1717,8 @@ export function useTerminalInitialization({
     const recheckOnly = beginRestoreRun(rerun, initPageId);
     // Sessions this run claimed for a cold resume; released when it ends.
     const coldClaims: string[] = [];
+    // Sessions this run created a replacement tab for (review r2, N3).
+    const createdThisRun = new Set<string>();
     // The drain withheld the restore set: this run restored nothing.
     let restoreDeferred = false;
     // Sessions THIS run refuses as live while the sweep is unsettled, and
@@ -1441,6 +1737,8 @@ export function useTerminalInitialization({
       claudeConfigDir?: string;
       /** Which provider owns this session — drives the adapter resume. */
       provider?: string;
+      /** How the session is relaunched — the default resume or a replayed argv (Phase 6). */
+      resumePlan?: ResumePlan;
       /** Deferred registry re-assert — applied only on VERIFIED resume. */
       recordOpen?: SessionOpenArgs;
     }> = [];
@@ -1628,7 +1926,14 @@ export function useTerminalInitialization({
           //    the zone + re-attach the claudeSessionId; no resume needed.
           if (reconnectedSet.has(rec.terminalId)) {
             const tabId = rec.terminalId;
-            if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
+            if (
+              mayClaimRecordedZone(
+                isDrainRerun,
+                rec.zoneIndex,
+                tabId,
+                withoutReleasedHolders(zoneLayout.assignments, releasedTerminalIds.current),
+              )
+            ) {
               zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
               applyZoneCosmetics(rec.zoneIndex);
             }
@@ -1672,7 +1977,11 @@ export function useTerminalInitialization({
           // A drain re-run never duplicates a session a live tab already shows.
           if (
             isDrainRerun &&
-            liveTabsRef.current.some((t) => t.claudeSessionId === rec.claudeSessionId)
+            liveTabShowsSession(
+              liveTabsRef.current,
+              rec.claudeSessionId,
+              releasedTerminalIds.current,
+            )
           ) {
             continue;
           }
@@ -1694,6 +2003,9 @@ export function useTerminalInitialization({
             queued: openRecords.length - recIndex,
           });
           if (!tabId) continue;
+          // Only a tab that will type a resume replaces a dead pane (review
+          // r3, R2); any other leaves it for the restore-declined banner.
+          if (replacesDeadPane(restoreAction)) createdThisRun.add(rec.claudeSessionId);
           // A record with no recorded zone (`UNZONED_INDEX`) is NOT force-placed
           // here, and is deliberately not clamped to zone 0: zone 0 belongs to
           // whichever tab actually holds it, and `assignTabToZone` RESERVES the
@@ -1707,7 +2019,14 @@ export function useTerminalInitialization({
           // `runVerifiedResume`). What is NOT done is re-asserting the record
           // from here: that refreshes `last_seen_at` and is what made ghost
           // rows immortal.
-          if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
+          if (
+            mayClaimRecordedZone(
+              isDrainRerun,
+              rec.zoneIndex,
+              tabId,
+              withoutReleasedHolders(zoneLayout.assignments, releasedTerminalIds.current),
+            )
+          ) {
             zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
           }
@@ -1736,6 +2055,13 @@ export function useTerminalInitialization({
             restoreTerminalOnly: restoreAction === "terminal-only" && rec.confirmedAt != null,
           });
           rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
+          // A lost holder's dead pane is closed only NOW, once its replacement
+          // exists and holds its zone (review r2, N3).
+          const deadPane = deadPaneFor.current.get(rec.claudeSessionId);
+          if (deadPane !== undefined && deadPane !== tabId && replacesDeadPane(restoreAction)) {
+            deadPaneFor.current.delete(rec.claudeSessionId);
+            deadPaneActions.current.closeDeadPane(deadPane);
+          }
 
           // Re-point the record at the tab we JUST created for it.
           //
@@ -1802,6 +2128,8 @@ export function useTerminalInitialization({
               // Provider drives the adapter-supplied resume command + handshake
               // patterns (Phase 4) — defaults to "claude" on pre-provider rows.
               provider: rec.provider,
+              // The persisted launch argv's relaunch (plan Phase 6).
+              resumePlan: resumePlanFor(rec),
               // Deferred re-assert payload: applied by `runVerifiedResume`
               // on VERIFIED handshake only. No `origin` — the backend
               // preserves the existing (authoritative) origin on unasserted writes.
@@ -1924,6 +2252,16 @@ export function useTerminalInitialization({
                     });
                     continue;
                   }
+                  // A refused replay (plan Phase 6, D11): the persisted launch
+                  // argv cannot be typed safely, so its flags are dropped —
+                  // never escaped — and the DEFAULT resume is typed instead.
+                  const plan: ResumePlan = restore.resumePlan ?? { kind: "default" };
+                  if (plan.kind === "default" && plan.fallbackReason) {
+                    console.warn(
+                      `[TerminalPage] session ${restore.claudeSessionId}: its launch argv cannot ` +
+                        `be replayed (${plan.fallbackReason}) — resuming with the default command`,
+                    );
+                  }
                   // Type the resume and VERIFY the handshake (retry once on
                   // failure). Fire-and-forget per tab so one slow/failed
                   // verification (up to ~30s) doesn't serialize the drain;
@@ -1935,6 +2273,7 @@ export function useTerminalInitialization({
                     claudeSessionId: restore.claudeSessionId,
                     configDir: restore.claudeConfigDir,
                     provider: restore.provider,
+                    resumeArgs: plan.kind === "replay" ? plan.args : undefined,
                     updateTab,
                     recordOpen: restore.recordOpen,
                     // The pane was created as a plain shell just above, so no
@@ -1993,6 +2332,17 @@ export function useTerminalInitialization({
         // fewer tabs than expected" (recoverable, and the console carries the
         // cause) instead of a permanently blank window.
         setInitialized(true);
+        // A completed re-run that declined a released session: banner its
+        // dead pane rather than leave it silently (review r2, N3).
+        if (recheckOnly && !restoreAborted && !restoreDeferred) {
+          declineLeftoverDeadPanes(
+            recheckOnly,
+            createdThisRun,
+            deadPaneFor.current,
+            initPageId,
+            deadPaneActions.current.markWithheld,
+          );
+        }
         // The PTY-holder boot sweep had not settled, and this run refused
         // some sessions as live or held some back for an adoption in flight:
         // once it settles, re-run the restore (merging, like a drain re-run)
@@ -2155,4 +2505,6 @@ export function useTerminalInitialization({
       unlisten?.();
     };
   }, [handleWindowClose]);
+
+  return { resumeWithheld };
 }

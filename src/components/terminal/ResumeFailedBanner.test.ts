@@ -7,7 +7,12 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { failedResumeTabs, terminalOnlyRestoreTabs } from "./ResumeFailedBanner";
+import {
+  failedResumeTabs,
+  relaunchWithheldTabs,
+  relaunchWithheldText,
+  terminalOnlyRestoreTabs,
+} from "./ResumeFailedBanner";
 import type { TerminalTab } from "./useTerminalManager";
 
 const tab = (id: string, overrides: Partial<TerminalTab> = {}): TerminalTab => ({
@@ -60,5 +65,27 @@ describe("terminalOnlyRestoreTabs (Phase 5 honest tiers)", () => {
   it("dead terminal-only tabs are dropped", () => {
     const tabs = [tab("t-1", { restoreTerminalOnly: true, isAlive: false })];
     expect(terminalOnlyRestoreTabs(tabs)).toEqual([]);
+  });
+});
+
+// Plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+// Phase 6 (review r1, M3): a lost holder's session that was NOT relaunched is
+// surfaced on its DEAD tab, with the reason.
+describe("relaunchWithheldTabs", () => {
+  it("surfaces a withheld relaunch even on a dead tab", () => {
+    const tabs = [
+      tab("dead", {
+        isAlive: false,
+        relaunchWithheld: { sessionId: "s", pageId: null, reason: "liveness-unknown" },
+      }),
+      tab("plain"),
+    ];
+    expect(relaunchWithheldTabs(tabs).map((t) => t.id)).toEqual(["dead"]);
+  });
+
+  it("names every reason, and says an unreachable holder's session may still run", () => {
+    expect(relaunchWithheldText("still-hosted")).toContain("still hosts");
+    expect(relaunchWithheldText("liveness-unknown")).toContain("could not be read");
+    expect(relaunchWithheldText("holder-unreachable")).toContain("may still be running");
   });
 });

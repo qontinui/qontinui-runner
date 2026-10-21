@@ -1318,6 +1318,7 @@ pub fn terminal_session_record_open(
     // and for why `config_dir` is deliberately not among them.
     validate_record_open_identity(&claude_session_id, &terminal_id)?;
     let record = TerminalSessionRecord {
+        resume_flags: None,
         claude_session_id,
         config_dir,
         working_dir,
@@ -1522,6 +1523,10 @@ pub fn terminal_session_clear_restore_pending(
     claude_session_id: String,
 ) -> Result<CommandResponse, String> {
     store.clear_restore_pending(&claude_session_id);
+    // The restore resumed this session (or settled why not): a lost holder's
+    // relaunch decision for it still waiting must not fire later (plan
+    // 2026-09-12 Phase 6; review r2, N2).
+    crate::terminal::holder_relaunch::cancel_for_session(&claude_session_id);
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -1774,6 +1779,45 @@ struct RestoreCandidate {
     /// rather than "no transcript".
     #[serde(rename = "transcriptExists", skip_serializing_if = "Option::is_none")]
     transcript_exists: Option<bool>,
+    /// The flags to replay before `--resume <id>`, from the record's persisted
+    /// `resumeFlags` (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// Phase 6): allowlisted, and every token re-checked shell-inert here.
+    /// Absent when none were ever derived — the webview then types its default
+    /// resume. The raw launch argv is never stored, so it is never sent.
+    #[serde(rename = "resumeArgs", skip_serializing_if = "Option::is_none")]
+    resume_args: Option<Vec<String>>,
+    /// Why the launch argv must NOT be replayed (D11: the whole replay is
+    /// refused rather than escaped). Present ⇒ the webview types the DEFAULT
+    /// resume command instead (its extra flags dropped) and logs why. Names a
+    /// position and a flag, never a value.
+    #[serde(rename = "resumeRefusal", skip_serializing_if = "Option::is_none")]
+    resume_refusal: Option<String>,
+}
+
+impl RestoreCandidate {
+    fn new(record: TerminalSessionRecord, transcript_exists: Option<bool>) -> Self {
+        let relaunch =
+            crate::session::resume_argv::Relaunch::for_record(record.resume_flags.as_ref());
+        // A refused replay still RESUMES — with the default command; only the
+        // extra flags are dropped. Say so at warn, naming the flag (the
+        // refusal's text never carries a token's value).
+        if let crate::session::resume_argv::Relaunch::Fallback(why) = &relaunch {
+            tracing::warn!(
+                session = %record.claude_session_id,
+                refusal = %why,
+                "restore: the session's launch flags cannot be replayed — resuming with the \
+                 default resume command, its extra flags dropped"
+            );
+        }
+        let (resume_args, resume_refusal) = relaunch.wire_fields();
+        RestoreCandidate {
+            record,
+            transcript_exists,
+            resume_args,
+            resume_refusal,
+        }
+    }
 }
 
 /// The boot-restore set [`terminal_session_list_open`] returns: exactly the
@@ -1806,10 +1850,7 @@ fn restore_candidates(
         .map(|rec| {
             let transcript_exists =
                 store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
-            RestoreCandidate {
-                record: rec,
-                transcript_exists,
-            }
+            RestoreCandidate::new(rec, transcript_exists)
         })
         .collect()
 }
@@ -2715,6 +2756,7 @@ async fn poll_and_record_session<F>(
     loop {
         if let Some(claude_session_id) = resolve() {
             let record = TerminalSessionRecord {
+                resume_flags: None,
                 claude_session_id: claude_session_id.clone(),
                 config_dir: config_dir.clone(),
                 working_dir: Some(working_dir.clone()),
@@ -2809,6 +2851,7 @@ pub(crate) fn record_pinned_session_open(
         .as_deref()
         .map(|d| crate::session::past_sessions::account_from_config_dir(Some(d)));
     store.record_open(TerminalSessionRecord {
+        resume_flags: None,
         claude_session_id: claude_session_id.clone(),
         config_dir,
         working_dir: Some(working_dir),
@@ -3010,6 +3053,7 @@ mod tests {
 
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
+            resume_flags: None,
             claude_session_id: id.to_string(),
             config_dir: None,
             working_dir: Some("C:/repo".to_string()),
@@ -3055,10 +3099,10 @@ mod tests {
     /// would silently disable auto-resume for every session.
     #[test]
     fn restore_candidate_flattens_record_and_omits_unprobed_transcript_bit() {
-        let probed_absent = serde_json::to_value(RestoreCandidate {
-            record: restore_candidate_record("sess-absent"),
-            transcript_exists: Some(false),
-        })
+        let probed_absent = serde_json::to_value(RestoreCandidate::new(
+            restore_candidate_record("sess-absent"),
+            Some(false),
+        ))
         .expect("probed-absent candidate serializes");
         assert_eq!(probed_absent["claudeSessionId"], "sess-absent");
         assert_eq!(
@@ -3067,20 +3111,20 @@ mod tests {
             "a probed-absent transcript must be reported as an explicit false"
         );
 
-        let probed_present = serde_json::to_value(RestoreCandidate {
-            record: restore_candidate_record("sess-present"),
-            transcript_exists: Some(true),
-        })
+        let probed_present = serde_json::to_value(RestoreCandidate::new(
+            restore_candidate_record("sess-present"),
+            Some(true),
+        ))
         .expect("probed-present candidate serializes");
         assert_eq!(
             probed_present["transcriptExists"],
             serde_json::Value::Bool(true)
         );
 
-        let unprobed = serde_json::to_value(RestoreCandidate {
-            record: restore_candidate_record("sess-unprobed"),
-            transcript_exists: None,
-        })
+        let unprobed = serde_json::to_value(RestoreCandidate::new(
+            restore_candidate_record("sess-unprobed"),
+            None,
+        ))
         .expect("unprobed candidate serializes");
         assert_eq!(
             unprobed["claudeSessionId"], "sess-unprobed",
@@ -3089,6 +3133,43 @@ mod tests {
         assert!(
             unprobed.get("transcriptExists").is_none(),
             "no probe attached must OMIT the field, never emit false: {unprobed}"
+        );
+        assert!(
+            unprobed.get("resumeArgs").is_none() && unprobed.get("resumeRefusal").is_none(),
+            "no persisted argv: neither relaunch field, so the default resume is unchanged"
+        );
+    }
+
+    /// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+    /// Phase 6: the record carries only the DERIVED relaunch flags
+    /// (`resumeFlags`), and the restore set turns them into `resumeArgs`, or a
+    /// `resumeRefusal` that makes the webview type the default resume.
+    #[test]
+    fn restore_candidate_serves_the_derived_relaunch_never_an_argv() {
+        use crate::session::resume_argv::ResumeFlags;
+        let mut rec = restore_candidate_record("sess-flags");
+        rec.resume_flags = Some(ResumeFlags::Replay {
+            flags: vec!["--model".into(), "opus".into()],
+        });
+        let v = serde_json::to_value(RestoreCandidate::new(rec.clone(), None)).unwrap();
+        assert!(
+            v.get("launchArgv").is_none(),
+            "no raw argv on the wire: {v}"
+        );
+        assert_eq!(v["resumeArgs"], serde_json::json!(["--model", "opus"]));
+        assert!(v.get("resumeRefusal").is_none());
+
+        rec.resume_flags = Some(ResumeFlags::Refused {
+            reason: "launch argument 2 (flag --add-dir) is not shell-inert".into(),
+        });
+        let v = serde_json::to_value(RestoreCandidate::new(rec, None)).unwrap();
+        assert!(
+            v.get("resumeArgs").is_none(),
+            "a refused replay offers no args, so the webview types the default resume: {v}"
+        );
+        assert!(
+            v["resumeRefusal"].as_str().unwrap().contains("--add-dir"),
+            "{v}"
         );
     }
 
