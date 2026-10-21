@@ -3,7 +3,7 @@
  * Wiring: the REAL `useSessionManager`, mounted in React, classifies every row
  * through `sessionStatusModel` from the sources the runner serves — the live
  * registry (`terminal_claude_session_list_live`, with `runnerManaged`), the
- * external scan, the session history's finished marker, and digests requested
+ * external scan, the finished marker (`session_info_list` lifecycle), and digests requested
  * BY ID (plan
  * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
  * Phase 1). Only the Tauri boundary is faked.
@@ -253,12 +253,12 @@ describe("useSessionManager → sessionStatusModel wiring", () => {
     expect(loc("s-b")).toBe("hidden-here");
   });
 
-  it("reads the finished marker from the session history", async () => {
+  it("reads the finished marker from the session-info lifecycle", async () => {
     serve({ registry: [], externalPids: [], finished: { "s-1": true } });
     const get = await mount([transcript("s-1"), transcript("s-2", 1)]);
     const act_ = (id: string) => get().sessions.find((s) => s.sessionId === id)!.status.activity;
     expect(act_("s-1")).toBe("finished");
-    // No marker recorded ⇒ not a claim of "not finished": the process is gone.
+    // Lifecycle says not finished (`finishedAt: null`) and the process is gone.
     expect(act_("s-2")).toBe("exited");
   });
 
