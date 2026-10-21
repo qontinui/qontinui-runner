@@ -4,16 +4,16 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 175
+# total: 177
 #   guarded: 22
 #   literal: 54
-#   registry: 42
+#   registry: 44
 #   delegated: 9
 #   builtin: 15
 #   fixture: 33
 
-src/App.tsx:218	literal	component	complete	schema=no	arity=0	effect=write
-src/App.tsx:234	guarded	component	go-to-step	schema=yes	arity=-	effect=read
+src/App.tsx:219	literal	component	complete	schema=no	arity=0	effect=write
+src/App.tsx:235	guarded	component	go-to-step	schema=yes	arity=-	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:89	literal	component	start-run	schema=no	arity=0	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:109	literal	component	stop-run	schema=no	arity=0	effect=destructive
 src/components/active-dashboard/ActiveDashboardPage.tsx:120	literal	component	refresh	schema=no	arity=0	effect=read
@@ -126,6 +126,8 @@ src/components/terminal/commands/uibridge.test.ts:404	fixture	free	test.ai-text	
 src/components/terminal/commands/usePromptLibraryCommands.test.ts:77	fixture	free	terminal.help	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.test.ts:105	fixture	free	terminal.doc-finder	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.ts:118	registry	free	-	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTabBarCommands.ts:30	registry	free	terminal.close-empty-tabs	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTabBarCommands.ts:55	registry	free	terminal.reorganize-tabs	schema=yes	arity=0	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:655	registry	free	terminal.focus	schema=yes	arity=1	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:729	registry	free	terminal.spawn	schema=yes	arity=1	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:756	registry	free	terminal.spawn-ai	schema=yes	arity=1	effect=-

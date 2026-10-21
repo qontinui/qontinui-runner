@@ -16,7 +16,7 @@ import {
   closeEmptyPagesWith,
   type TerminalPageConfig,
 } from "./useTerminalPages";
-import { TerminalPageTabBar } from "./TerminalPageTabBar";
+import { TerminalPageTabBar, scrollEdges } from "./TerminalPageTabBar";
 
 function answer(terminals: unknown, sessions: unknown) {
   invokeMock.mockImplementation(async (cmd: string) => {
@@ -180,5 +180,53 @@ describe("closeEmptyPagesWith (the close loop)", () => {
       },
     );
     expect(removed).toEqual(["b", "c"]);
+  });
+});
+
+describe("tab bar overflow", () => {
+  it("scrollEdges: no toggles when everything fits", () => {
+    expect(scrollEdges(0, 500, 500)).toEqual({ left: false, right: false });
+  });
+
+  it("scrollEdges: right only at the start of an overflowing strip", () => {
+    expect(scrollEdges(0, 500, 1200)).toEqual({ left: false, right: true });
+  });
+
+  it("scrollEdges: both in the middle, left only at the end", () => {
+    expect(scrollEdges(300, 500, 1200)).toEqual({ left: true, right: true });
+    expect(scrollEdges(700, 500, 1200)).toEqual({ left: true, right: false });
+  });
+
+  it("scrollEdges: sub-pixel rounding at an edge does not keep a dead toggle", () => {
+    expect(scrollEdges(699.5, 500, 1200)).toEqual({ left: true, right: false });
+    expect(scrollEdges(0.5, 500, 1200)).toEqual({ left: false, right: true });
+  });
+
+  it("renders the action buttons OUTSIDE the scrolling tab strip", () => {
+    const pages = Array.from({ length: 40 }, (_, i) => ({ id: `p${i}`, name: `Page ${i}` }));
+    const html = renderToStaticMarkup(
+      <TerminalPageTabBar
+        pages={pages as TerminalPageConfig[]}
+        activePageId="p0"
+        onSelectPage={() => {}}
+        onAddPage={() => {}}
+        onRemovePage={() => {}}
+        onRenamePage={() => {}}
+        onReorganize={() => {}}
+        onCloseEmptyPages={async () => 0}
+        emptyPageCount={3}
+      />,
+    );
+    const stripStart = html.indexOf("overflow-x-auto");
+    const lastTab = html.lastIndexOf('role="tab"');
+    const closeEmpty = html.indexOf('aria-label="Close empty tabs"');
+    const reorganize = html.indexOf("Reorganize pages by topic");
+    expect(stripStart).toBeGreaterThan(-1);
+    // Both buttons come after the last tab AND after the strip's closing tag.
+    expect(closeEmpty).toBeGreaterThan(lastTab);
+    expect(reorganize).toBeGreaterThan(lastTab);
+    const stripHtml = html.slice(stripStart, html.indexOf('aria-label="Add terminal page"'));
+    expect(stripHtml).not.toContain("Close empty tabs");
+    expect(stripHtml).not.toContain("Reorganize pages");
   });
 });
