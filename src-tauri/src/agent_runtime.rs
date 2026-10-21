@@ -30,8 +30,9 @@
 //! 4. Append each line to a per-agent log file AND POST to
 //!    `/agents/:agent_id/log` (Phase 5 endpoint).
 //! 5. Heartbeat the claim every 30s via `/claims/heartbeat`.
-//! 6. On subprocess exit, POST `spawn-failed` (non-zero) or
-//!    `spawn-complete` (clean exit). Restart up to 3× on crash.
+//! 6. `spawn-complete` once the child has started; on subprocess exit, POST
+//!    `spawn-failed` (non-zero, stopped, blocked) or `spawn-exited` (clean
+//!    exit, see [`terminal_report`]). Restart up to 3× on crash.
 //!
 //! ## Identity
 //!
@@ -9121,6 +9122,9 @@ async fn run_agent_subprocess(
     // every arm that had a child; a trust-gate refusal never started one, and
     // saying `exited` there would tell coord a process ran and stopped.
     let mut final_phase = SpawnPhase::Exited;
+    // Set by both operator-stop breaks; [`terminal_report`] reads it so a stop
+    // keeps its `spawn-failed` report whatever the last attempt's exit code was.
+    let mut stop_requested = false;
 
     // Select the most-available account once before the (re)spawn loop. On a
     // mid-run rate-limit the inference path rotates via
@@ -9140,6 +9144,7 @@ async fn run_agent_subprocess(
         // bail without (re)spawning.
         if stop.is_cancelled() {
             final_reason = Some("stopped by operator before (re)spawn".to_string());
+            stop_requested = true;
             break;
         }
         // Pin this attempt's Claude session id so coord can be told which
@@ -9213,6 +9218,7 @@ async fn run_agent_subprocess(
                         }
                         final_reason =
                             Some("stopped by operator (events.agent.stop_requested)".to_string());
+                        stop_requested = true;
                         break;
                     }
                 };
@@ -9275,10 +9281,18 @@ async fn run_agent_subprocess(
 
     hb_task.abort();
 
-    if final_exit_code == Some(0) {
-        // Clean exit was already reported via spawn-complete; nothing
-        // more to send. The runner can release the claim explicitly via
-        // a follow-up POST if desired.
+    if terminal_report(final_exit_code, stop_requested, final_phase) == TerminalReport::SpawnExited
+    {
+        // A clean exit is REPORTED, not left silent: `spawn-complete` only
+        // said the child started, so without this coord cannot tell a fixer
+        // that finished from one that is still running (plan
+        // `2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer`
+        // Phase 4). Spawned, so the report never delays or fails this loop.
+        tokio::spawn(report_spawn_exited(
+            payload.agent_id,
+            restarts,
+            primary_push_ref.clone(),
+        ));
         return Ok(());
     }
 
@@ -10390,6 +10404,105 @@ fn continuation_dispatch_allocation(
         .filter(|id| *id != own_agent_id)
 }
 
+/// Which terminal lifecycle POST the subprocess loop sends once it stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalReport {
+    /// `POST /agents/:id/spawn-exited` — the child exited 0 on its own.
+    SpawnExited,
+    /// `POST /agents/:id/spawn-failed` in the loop's recorded phase — a
+    /// non-zero exit, a pump or spawn failure, a trust-gate block, or an
+    /// operator stop.
+    SpawnFailed,
+}
+
+/// The terminal-report decision of the agent subprocess loop, kept pure so
+/// every arm is unit-tested.
+///
+/// Only a clean exit (code 0) that was neither stopped nor blocked reports
+/// `spawn-exited`; every other ending keeps the `spawn-failed` report it has
+/// always sent. A stop or a block is checked first so that neither can ever be
+/// reported as a clean exit, even if a later change let an exit code of 0
+/// coexist with either.
+fn terminal_report(
+    final_exit_code: Option<i64>,
+    stop_requested: bool,
+    final_phase: SpawnPhase,
+) -> TerminalReport {
+    if stop_requested || final_phase == SpawnPhase::Blocked {
+        return TerminalReport::SpawnFailed;
+    }
+    if final_exit_code == Some(0) {
+        TerminalReport::SpawnExited
+    } else {
+        TerminalReport::SpawnFailed
+    }
+}
+
+/// Body of `POST /agents/:id/spawn-exited`. `push_ref` is omitted, not sent as
+/// `null`, when the spawn carried none.
+#[derive(Debug, Clone, Serialize)]
+struct SpawnExitedBody {
+    exit_code: i64,
+    restarts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    push_ref: Option<String>,
+}
+
+/// Set once the first `404`/`405` from a coord without the `spawn-exited`
+/// route has been logged, so an older coord costs one info line per process.
+static SPAWN_EXITED_ROUTE_ABSENT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Tell coord that `agent_id`'s child exited cleanly (code 0).
+///
+/// Same client, device auth and 5 s timeout as [`report_spawn_complete`], and
+/// like it a single best-effort attempt: the agent loop has already finished,
+/// so an undelivered report costs coord's visibility, never work. A coord that
+/// predates the route answers `404` (or `405`); that is logged once at info and
+/// dropped.
+async fn report_spawn_exited(agent_id: uuid::Uuid, restarts: u32, push_ref: Option<String>) {
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/spawn-exited");
+    let body = SpawnExitedBody {
+        exit_code: 0,
+        restarts,
+        push_ref,
+    };
+    // coord-tenant-scope(session-noop): agent_id is a parameter and sits in the
+    // path; like its spawn-complete / spawn-failed siblings this route keys the
+    // row by agent_id, verifies the reporter against the allocation and
+    // persists no tenant. Nothing to thread. Terminal.
+    match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!("agent_runtime: spawn-exited posted agent_id={agent_id} restarts={restarts}");
+        }
+        Ok(resp) if resp.status() == 404 || resp.status() == 405 => {
+            if !SPAWN_EXITED_ROUTE_ABSENT_LOGGED.swap(true, Ordering::Relaxed) {
+                info!(
+                    "agent_runtime: coord answered {} to spawn-exited for agent_id={agent_id} \
+                     (a coord predating the route, or an unknown agent); clean exits are \
+                     not reported to it — logged once",
+                    resp.status()
+                );
+            }
+        }
+        Ok(resp) => warn!(
+            "agent_runtime: spawn-exited POST agent_id={agent_id} returned {}",
+            resp.status()
+        ),
+        Err(e) => warn!("agent_runtime: spawn-exited POST agent_id={agent_id} failed: {e:#}"),
+    }
+}
+
 async fn report_spawn_complete(
     agent_id: uuid::Uuid,
     pid: Option<i64>,
@@ -10786,6 +10899,81 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::{terminal_report, SpawnExitedBody, SpawnPhase, TerminalReport};
+
+    #[test]
+    fn terminal_report_clean_exit_posts_spawn_exited() {
+        assert_eq!(
+            terminal_report(Some(0), false, SpawnPhase::Exited),
+            TerminalReport::SpawnExited
+        );
+    }
+
+    #[test]
+    fn terminal_report_non_zero_exit_posts_spawn_failed() {
+        for code in [1, 2, 137, -1] {
+            assert_eq!(
+                terminal_report(Some(code), false, SpawnPhase::Exited),
+                TerminalReport::SpawnFailed,
+                "exit code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_report_no_exit_code_posts_spawn_failed() {
+        // A pump or spawn failure records no exit code.
+        assert_eq!(
+            terminal_report(None, false, SpawnPhase::Exited),
+            TerminalReport::SpawnFailed
+        );
+    }
+
+    #[test]
+    fn terminal_report_stop_requested_posts_spawn_failed() {
+        // Unchanged: a stop is reported as spawn-failed whatever the last
+        // attempt's exit code, including none and an earlier 0.
+        for code in [None, Some(0), Some(1)] {
+            assert_eq!(
+                terminal_report(code, true, SpawnPhase::Exited),
+                TerminalReport::SpawnFailed,
+                "exit code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_report_blocked_posts_spawn_failed() {
+        for code in [None, Some(0)] {
+            assert_eq!(
+                terminal_report(code, false, SpawnPhase::Blocked),
+                TerminalReport::SpawnFailed,
+                "exit code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_exited_body_shape_omits_unknown_push_ref() {
+        let without = serde_json::to_value(SpawnExitedBody {
+            exit_code: 0,
+            restarts: 2,
+            push_ref: None,
+        })
+        .unwrap();
+        assert_eq!(without, serde_json::json!({"exit_code": 0, "restarts": 2}));
+        let with = serde_json::to_value(SpawnExitedBody {
+            exit_code: 0,
+            restarts: 0,
+            push_ref: Some("refs/heads/agent/x".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            with,
+            serde_json::json!({"exit_code": 0, "restarts": 0, "push_ref": "refs/heads/agent/x"})
+        );
+    }
+
     #[test]
     fn append_sibling_notes_lists_each_note_and_leaves_empty_alone() {
         assert_eq!(super::append_sibling_notes("CTX".to_string(), &[]), "CTX");
