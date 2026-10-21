@@ -438,7 +438,16 @@ mod tests {
     fn health_json_reads_the_cell_and_grades_it() {
         let mut s = incident_snapshot_for_tests();
         s.read_at = Utc::now();
-        let platform = OsPlatform::current();
+        // The platform is spelled out rather than taken from
+        // `OsPlatform::current()`, so this test names only the entry point
+        // `/health` calls (`health_json`) and never a producer-side symbol.
+        let platform = if cfg!(windows) {
+            OsPlatform::Windows
+        } else if cfg!(target_os = "linux") {
+            OsPlatform::Linux
+        } else {
+            OsPlatform::Unsupported
+        };
         s.platform = platform;
         {
             let _cell = store_for_tests(Some(s));
