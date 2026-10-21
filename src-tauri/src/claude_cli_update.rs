@@ -151,11 +151,16 @@ impl UpdateFlag {
             return UpdateWait::NotUpdating;
         }
         let started = Instant::now();
-        match tokio::time::timeout(timeout, rx.wait_for(|updating| !*updating)).await {
-            // `Err` from `wait_for` means the sender is gone, so no install can
-            // still be running.
-            Ok(_) => UpdateWait::Finished(started.elapsed()),
-            Err(_) => UpdateWait::TimedOut(started.elapsed()),
+        // `Ok(Err(_))` from `wait_for` means the sender is gone, so no install
+        // can still be running. Reduced to a bool so the `Ref` the inner
+        // result borrows from `rx` is dropped before `rx` is.
+        let finished = tokio::time::timeout(timeout, rx.wait_for(|updating| !*updating))
+            .await
+            .is_ok();
+        if finished {
+            UpdateWait::Finished(started.elapsed())
+        } else {
+            UpdateWait::TimedOut(started.elapsed())
         }
     }
 }
