@@ -17,10 +17,48 @@ import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { ShowToastFn } from "./useToast";
 
+interface SessionDirCarry {
+  copied?: number;
+  skippedPresent?: number;
+  skippedOther?: number;
+  failed?: number;
+}
+
 interface MigratedPayload {
   claudeSessionId?: string;
   fromConfigDir?: string;
   toConfigDir?: string;
+  /** Tally of the `<sid>/` (subagent transcripts) carry; absent on older builds. */
+  sessionDirCarry?: SessionDirCarry;
+}
+
+/**
+ * Suffix describing the subagent-transcript carry. A partial carry is an
+ * error-level toast: those subagents cannot be resumed on the new account.
+ */
+function carrySummary(c: SessionDirCarry | undefined): { text: string; partial: boolean } {
+  if (!c) return { text: "", partial: false };
+  const failed = c.failed ?? 0;
+  const carried = (c.copied ?? 0) + (c.skippedPresent ?? 0);
+  if (failed > 0) {
+    return {
+      text: ` — ${failed} session file(s) (subagent transcripts) could NOT be carried; see the runner log — those subagents may not resume`,
+      partial: true,
+    };
+  }
+  const refused = c.skippedOther ?? 0;
+  if (refused > 0 && carried === 0) {
+    // The carry refused its root (a linked `<sid>` or a rejected session id):
+    // not "no subagents", so never a plain success.
+    return {
+      text: ` — the session directory was NOT carried (${refused} entr(ies) not followed; see the runner log)`,
+      partial: true,
+    };
+  }
+  return {
+    text: carried > 0 ? ` (${carried} session file(s) incl. subagent transcripts carried)` : "",
+    partial: false,
+  };
 }
 
 interface SkippedPayload {
@@ -40,25 +78,23 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
   useEffect(() => {
     const unlistenMigrated = listen<MigratedPayload>("session-account-migrated", (event) => {
       const p = event.payload ?? {};
+      const carry = carrySummary(p.sessionDirCarry);
       showToast(
         `Session ${(p.claudeSessionId ?? "").slice(0, 8)} migrated: ${accountLabel(
           p.fromConfigDir,
-        )} ran out of tokens → resumed on ${accountLabel(p.toConfigDir)}`,
-        "success",
+        )} ran out of tokens → resumed on ${accountLabel(p.toConfigDir)}${carry.text}`,
+        carry.partial ? "error" : "success",
       );
     });
-    const unlistenSkipped = listen<SkippedPayload>(
-      "session-account-migration-skipped",
-      (event) => {
-        const p = event.payload ?? {};
-        showToast(
-          `Session ${(p.claudeSessionId ?? "").slice(0, 8)} is out of tokens on ${accountLabel(
-            p.fromConfigDir,
-          )} but was NOT migrated: ${p.reason ?? "unknown reason"}`,
-          "error",
-        );
-      },
-    );
+    const unlistenSkipped = listen<SkippedPayload>("session-account-migration-skipped", (event) => {
+      const p = event.payload ?? {};
+      showToast(
+        `Session ${(p.claudeSessionId ?? "").slice(0, 8)} is out of tokens on ${accountLabel(
+          p.fromConfigDir,
+        )} but was NOT migrated: ${p.reason ?? "unknown reason"}`,
+        "error",
+      );
+    });
     return () => {
       unlistenMigrated.then((fn) => fn());
       unlistenSkipped.then((fn) => fn());
