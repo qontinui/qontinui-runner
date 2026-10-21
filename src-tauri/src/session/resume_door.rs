@@ -304,11 +304,13 @@ fn cohort_member(
 /// manager, then the PTY holder's adoption state.
 fn live_terminal_blocker(tm: &TerminalManager, terminal_id: &str) -> Option<&'static str> {
     use crate::terminal::holder_boot_sweep as sweep;
-    if tm.get(terminal_id).is_some() {
-        return Some("live_terminal");
-    }
+    // Pending first: an adoption that lands between two reads moves a pane
+    // from pending into the manager, never the other way.
     if sweep::adoption_pending(terminal_id) {
         return Some("holder_adoption_pending");
+    }
+    if tm.get(terminal_id).is_some() {
+        return Some("live_terminal");
     }
     if sweep::holder_left_running(terminal_id) {
         return Some("holder_alive_not_adopted");
@@ -739,7 +741,8 @@ async fn verify(
 /// Resume one session: gate, budget, spawn, verify. The spawn site registered
 /// in `runner_spawn_sites.txt` — the drain gate lives HERE and branches on its
 /// result. It gates on the `origin` it is handed: [`HTTP_ORIGIN`] from the
-/// route, the operator origin from the twin.
+/// route, the operator origin from the twin. The caller holds the id's
+/// [`InFlight`] claim across this call AND the recording of its verdict.
 async fn resume_one(
     app: &tauri::AppHandle,
     tm: &Arc<TerminalManager>,
@@ -748,10 +751,6 @@ async fn resume_one(
     cand: Candidate,
     origin: SpawnOrigin,
 ) -> ResumeRow {
-    // One call per id at a time, held through spawn AND verify.
-    let Some(_in_flight) = InFlight::claim(&cand.id) else {
-        return ResumeRow::skipped(&cand.id, "in_flight");
-    };
     // Under a model gateway the resumed pane runs with the gateway's
     // CLAUDE_CONFIG_DIR (finalize_child_env pins it), where this session's
     // transcript does not exist, so `--resume` would find nothing. Refuse the
@@ -783,6 +782,10 @@ async fn resume_one(
             DrainGate::Allow => DrainGate::Allow,
             deferred => deferred,
         };
+    // A drain deferral answers first, so a busy box never masks it.
+    if let DrainGate::Defer { reason, .. } = &gate {
+        return ResumeRow::skipped(&cand.id, format!("drain: {reason}"));
+    }
     // A busy box is a skip that must not spend one of the session's
     // `MIGRATION_CAP` slots, so the resource guard is asked BEFORE the
     // budget; the spawn seam's own gate stays the authority (see below).
@@ -943,9 +946,20 @@ async fn run_batch(
         let member = cohort_member(cohort.as_ref(), id, rec.as_ref(), |t| {
             live_terminal_blocker(&tm, t)
         });
+        // One call per id at a time, held through spawn, verify AND the
+        // recording of the verdict below — so the lifecycle poll's `running`
+        // observation (skipped while the id is in flight) can never land
+        // between the resume and its own verdict.
+        let mut claim = None;
         let row = match classify(id, rec.as_ref(), member.as_ref(), operator) {
             Err(why) => ResumeRow::skipped(id, why),
-            Ok(cand) => resume_one(&app, &tm, &registry, &store, cand, origin).await,
+            Ok(cand) => match InFlight::claim(&cand.id) {
+                None => ResumeRow::skipped(id, "in_flight"),
+                Some(c) => {
+                    claim = Some(c);
+                    resume_one(&app, &tm, &registry, &store, cand, origin).await
+                }
+            },
         };
         info!(id = %row.id, verdict = %row.verdict, effort = ?row.effort, "resume_door: verdict");
         // A cohort row's verdict also lands on the row itself, except a skip
@@ -959,6 +973,7 @@ async fn run_batch(
                 row.effort.clone(),
             );
         }
+        drop(claim);
         results.push(row);
     }
     results
@@ -1499,7 +1514,8 @@ mod tests {
         let mut finished = rec("closed");
         finished.finished_at = Some(9);
         let member = cohort_member(Some(&cohort), ID, Some(&finished), no_blocker);
-        // The operator: admitted, and the core will lift the mark before the spawn.
+        // The operator: admitted, and the core lifts the mark once the resume
+        // is verified.
         let cand = classify(ID, Some(&finished), member.as_ref(), true).expect("admitted");
         assert!(cand.lift_finish);
         // The route never lifts a finish mark, cohort or not.
@@ -1586,6 +1602,26 @@ mod tests {
             !body.contains("SpawnOrigin::"),
             "resume_one must not name a literal origin"
         );
+        // ...and runs the live-holder guard for every candidate it is handed,
+        // a cohort row admitted while `open` included.
+        assert!(body.contains("holder_skip(&cand.id, live_holder(&cand.id).await)"));
+        // The HTTP route hands the core `HTTP_ORIGIN`.
+        let (_, route) = src
+            .split_once("async fn post_sessions_resume(")
+            .expect("the route exists");
+        let (route, _) = route.split_once("\n}\n").expect("the route's body ends");
+        assert!(route.contains("resume_sessions(state, req, HTTP_ORIGIN)"));
+        // The batch holds the id's in-flight claim across the verdict's
+        // recording, so the poll's observation cannot land in between.
+        let (_, batch) = src.split_once("async fn run_batch(").expect("run_batch");
+        let (batch, _) = batch.split_once("\n}\n").expect("run_batch's body ends");
+        let (claim_at, _) = batch
+            .match_indices("InFlight::claim(")
+            .next()
+            .expect("claim");
+        let (note_at, _) = batch.match_indices("note_restore(").next().expect("note");
+        let (drop_at, _) = batch.match_indices("drop(claim)").next().expect("drop");
+        assert!(claim_at < note_at && note_at < drop_at);
     }
 
     #[test]

@@ -922,9 +922,9 @@ impl RestartPrep {
 
     /// Cancel the prepare (and the same-build banner's Release hold): release
     /// the hold and record `cancelled`, which lifts the freeze and any local
-    /// hold — or, on a runner REBUILT since the prepare (whose boot step could
-    /// not settle the release), `restoring`, exactly as that boot step would
-    /// have. A release that does not SETTLE ([`release_settled`]) leaves the
+    /// hold — or, once the runner has restarted since the prepare (rebuilt
+    /// with a boot release that did not settle, or on the same build),
+    /// `restoring`: the cohort is restored by hand, never auto-restored at once. A release that does not SETTLE ([`release_settled`]) leaves the
     /// prepare in force — the hold still stands — records the attempt, and
     /// errs, so the operator can try again.
     pub async fn cancel(&self, door: &dyn HoldDoor, now_ms: i64) -> Result<PrepareRecord, String> {
@@ -942,7 +942,11 @@ impl RestartPrep {
         // is the one the boot step owed: the cohort moves to `restoring`, as
         // the boot step would have moved it, instead of `cancelled`, which
         // would hand every cohort row to the auto-restore at once (D6).
-        let rebuilt = rec.prepared_build != running_build();
+        // The same holds after a restart on the SAME build: the sessions died
+        // with that restart exactly as with a rebuild, and D6 covers every
+        // prepared restart. Only a cancel before any restart — the sessions
+        // still running — is a true cancel.
+        let rebuilt = rec.prepared_build != running_build() || self.same_build_restart();
         let rec = self.update(&rec.prepare_id, |r| {
             if settled {
                 r.hold = HoldStatus::ReleaseSent {
@@ -1662,9 +1666,12 @@ mod tests {
         let view = ctl.view(T0 + 60_000).unwrap();
         assert!(view.same_build_hold, "the banner flag is raised");
         assert_eq!(view.hold, "confirmed");
-        // Release hold IS the cancel path.
+        // Release hold IS the cancel path — but after a restart the sessions
+        // died with it, so it starts the hand restore (Phase 6, D6), never the
+        // auto-restore of every row at once that `cancelled` would hand them to.
         let rec = ctl.cancel(&*door, T0 + 70_000).await.unwrap();
-        assert_eq!(rec.state, PrepState::Cancelled);
+        assert_eq!(rec.state, PrepState::Restoring);
+        assert_eq!(door.release_count(), 1);
         assert!(!ctl.view(T0 + 70_000).unwrap().same_build_hold);
     }
 

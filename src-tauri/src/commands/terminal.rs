@@ -1870,7 +1870,10 @@ fn live_restore_set_body(
                 .as_ref()
                 .is_some_and(|tm| tm.get(terminal_id).is_some())
                 || crate::terminal::holder_boot_sweep::adoption_pending(terminal_id)
-                || crate::terminal::holder_boot_sweep::holder_left_running(terminal_id)
+        },
+        |terminal_id| {
+            crate::terminal::holder_boot_sweep::holder_left_running(terminal_id)
+                .then_some("holder_alive_not_adopted")
         },
         crate::terminal::holder_boot_sweep::sweep_status(std::time::Duration::ZERO)
             .held
@@ -1891,16 +1894,20 @@ fn live_restore_set_body(
 /// poll holds those rows open meanwhile (`in_active_cohort`).
 ///
 /// A cohort row whose terminal is live (`terminal_live`: this runner holds
-/// it, or a PTY holder kept it alive — adoption pending, or left running with
-/// no tab) is running,
+/// it, or a PTY holder kept it alive and its adoption is pending) is running,
 /// not waiting: it stays wherever the ordinary restore set put it and is no
-/// placeholder. With no restoring cohort — a crash boot, or no prepare at
+/// placeholder. A row whose live PTY holder the sweep LEFT running with no tab
+/// is neither: its `claude` may still run the session, so it is kept out of
+/// the auto-restore and returned as a placeholder carrying `blocker`
+/// (`placeholder_blocker`, `holder_alive_not_adopted`) — the resume core
+/// refuses it the same way. With no restoring cohort — a crash boot, or no prepare at
 /// all — the body is exactly `{"sessions": [...]}`, as before.
 fn restore_set_body(
     rows: Vec<RestoreCandidate>,
     cohort: Option<&crate::restart_prep::restore::RestoringCohort>,
     placeholder_of: impl Fn(&str) -> Option<RestoreCandidate>,
     terminal_live: impl Fn(&str) -> bool,
+    placeholder_blocker: impl Fn(&str) -> Option<&'static str>,
     holder_sweep_pending: bool,
 ) -> serde_json::Value {
     let Some(cohort) = cohort else {
@@ -1915,10 +1922,18 @@ fn restore_set_body(
         .collect();
     let mut ids: Vec<&String> = waiting.iter().collect();
     ids.sort();
-    let placeholders: Vec<RestoreCandidate> = ids
+    let placeholders: Vec<serde_json::Value> = ids
         .into_iter()
         .filter_map(|id| placeholder_of(id))
         .filter(|r| !terminal_live(&r.record.terminal_id))
+        .map(|r| {
+            let blocker = placeholder_blocker(&r.record.terminal_id);
+            let mut v = serde_json::to_value(&r).unwrap_or(serde_json::Value::Null);
+            if let (Some(obj), Some(b)) = (v.as_object_mut(), blocker) {
+                obj.insert("blocker".to_string(), serde_json::json!(b));
+            }
+            v
+        })
         .collect();
     serde_json::json!({
         "sessions": sessions,
@@ -3272,7 +3287,10 @@ mod tests {
             })
         };
         let none_live = |_: &str| false;
-        let crash_boot = restore_set_body(candidates(), None, record_of, none_live, false);
+        let no_blocker = |_: &str| None;
+        let b_left_running = |t: &str| (t == "term-b").then_some("holder_alive_not_adopted");
+        let crash_boot =
+            restore_set_body(candidates(), None, record_of, none_live, no_blocker, false);
         assert_eq!(ids(&crash_boot, "sessions"), ["a", "b", "c"]);
         assert_eq!(
             crash_boot.as_object().map(|o| o.len()),
@@ -3292,6 +3310,7 @@ mod tests {
             Some(&cohort),
             record_or_gone,
             none_live,
+            no_blocker,
             false,
         );
         assert_eq!(ids(&prepared, "sessions"), ["a"]);
@@ -3319,11 +3338,20 @@ mod tests {
             Some(&cohort),
             record_or_gone,
             c_live,
+            b_left_running,
             true,
         );
         assert_eq!(ids(&held, "sessions"), ["a", "c"]);
         assert_eq!(ids(&held, "placeholders"), ["b", "finished-closed"]);
         assert_eq!(held["restartPrep"]["holderSweepPending"], true);
+        // b's holder was left running with no tab: kept out of the
+        // auto-restore, offered as a placeholder that names why it waits.
+        assert_eq!(
+            held["placeholders"][0]["blocker"],
+            "holder_alive_not_adopted"
+        );
+        assert!(held["placeholders"][1].get("blocker").is_none());
+        assert!(prepared["placeholders"][0].get("blocker").is_none());
     }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never

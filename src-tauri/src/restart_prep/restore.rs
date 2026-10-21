@@ -28,10 +28,14 @@
 //!   back — resumed, or observed running — leaves the waiting set for good, so
 //!   a later crash boot auto-restores it like any other session.
 //!
-//! Restore on a FINISHED cohort row lifts the finish mark first (D4); the
-//! resume core does that itself, for the operator origin only, after every
-//! guard has passed and immediately before the spawn — so a refused Restore
-//! leaves the mark where it was.
+//! Restore on a FINISHED cohort row lifts its finish mark (D4); the resume
+//! core does that itself, for the operator origin only, once the resume is
+//! verified — a refused or failed Restore never touches the mark.
+//!
+//! [`dismiss_on`] ends a restore the operator does not want to finish: the
+//! record moves to `done`, which lifts the placeholder shield for every row
+//! still waiting (held, finished, or never restorable) — `done` means every
+//! row is back, or the cohort was dismissed.
 //!
 //! The withheld-boot-restore shield's `in_active_cohort` arm
 //! (`session_lifecycle_store::withheld_boot_restore_candidate`) reads
@@ -258,6 +262,35 @@ pub fn note_restore_on(
         }
     })
     .map(|_| true)
+}
+
+/// Dismiss the restoring cohort `prepare_id`: the record moves to `done`, so
+/// no row is a placeholder or held against the orphan close any more — every
+/// row still waiting stays in Past Sessions, resumable by hand. Idempotent on
+/// a record that is already `done`; errs on any other state or prepare.
+pub fn dismiss_on(ctl: &RestartPrep, prepare_id: &str) -> Result<PrepareRecord, String> {
+    let current = ctl
+        .record()
+        .filter(|r| r.prepare_id == prepare_id)
+        .ok_or_else(|| format!("no restart cohort {prepare_id} to dismiss"))?;
+    match current.state {
+        PrepState::Done => Ok(current),
+        PrepState::Restoring => ctl.update(prepare_id, |r| {
+            if r.state == PrepState::Restoring {
+                r.state = PrepState::Done;
+            }
+        }),
+        other => Err(format!(
+            "restart cohort {prepare_id} is {other:?}, not restoring — nothing to dismiss"
+        )),
+    }
+}
+
+/// [`dismiss_on`] on the live controller (the Tauri `restart_prep_dismiss`).
+pub fn dismiss(prepare_id: &str) -> Result<PrepareRecord, String> {
+    let ctl =
+        super::prepare::install_live().ok_or("restart prepare is not available in this build")?;
+    dismiss_on(ctl, prepare_id)
 }
 
 /// [`note_restore_on`] on the live controller. A failed write is logged: the
@@ -583,6 +616,36 @@ mod tests {
         rec.cohort.rows[1].restore = Some(r("skipped(live_terminal)"));
         let waiting = RestoringCohort::of(&rec).unwrap();
         assert!(!waiting.contains("a") && waiting.contains("b"));
+    }
+
+    #[test]
+    fn dismissing_a_restoring_cohort_lifts_every_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &["s1", "s2"], 1_000);
+        let prepare_id = ctl.record().unwrap().prepare_id;
+        // Still preparing: there is no restore to dismiss.
+        assert!(dismiss_on(&ctl, &prepare_id).is_err());
+        ctl.update(&prepare_id, |r| r.state = PrepState::Restoring)
+            .unwrap();
+        assert!(dismiss_on(&ctl, "another-prepare").is_err());
+        let done = dismiss_on(&ctl, &prepare_id).unwrap();
+        assert_eq!(done.state, PrepState::Done);
+        assert_eq!(
+            RestoringCohort::of(&done),
+            None,
+            "no row is waiting any more"
+        );
+        // Idempotent.
+        assert_eq!(
+            dismiss_on(&ctl, &prepare_id).unwrap().state,
+            PrepState::Done
+        );
+        assert_eq!(
+            crate::restart_prep::load_from(&dir.path().join("restart-prep.json"))
+                .unwrap()
+                .state,
+            PrepState::Done
+        );
     }
 
     #[test]

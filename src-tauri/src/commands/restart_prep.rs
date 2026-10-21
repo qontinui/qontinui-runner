@@ -40,8 +40,20 @@ pub async fn restart_prep_cancel() -> Result<crate::restart_prep::prepare::PrepC
     crate::restart_prep::prepare::cancel_from_app().await
 }
 
+/// `restart_prep_dismiss` — end a rebuilt runner's restore of the cohort
+/// `prepare_id` (Phase 6): the record moves to `done`, so its waiting rows are
+/// no longer placeholders nor held from the orphan close. Operator-only, like
+/// the doors above.
+#[tauri::command]
+pub async fn restart_prep_dismiss(
+    prepare_id: String,
+) -> Result<crate::restart_prep::PrepareRecord, String> {
+    crate::restart_prep::restore::dismiss(&prepare_id)
+}
+
 crate::ipc_group!(
     restart_prep_status,
     restart_prep_prepare,
-    restart_prep_cancel
+    restart_prep_cancel,
+    restart_prep_dismiss
 );

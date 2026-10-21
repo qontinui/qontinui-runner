@@ -226,10 +226,10 @@ pub async fn operator_resume_task_run(
 /// gated as the operator, so a residual drain never defers the operator's
 /// click; the in-flight and live-process guards, the transcript check and
 /// `MIGRATION_CAP` apply exactly as on the route. Being the operator, it may
-/// restore a cohort row held for a hand restore, and a FINISHED cohort row:
-/// the core lifts that row's finish mark after every guard, just before the
-/// spawn, and puts it back if the resume does not land (D4) — the route does
-/// neither. The door's reply is returned unchanged.
+/// restore a cohort row held for a hand restore, and a FINISHED cohort row,
+/// whose finish mark the core lifts once the resume is verified — a refused
+/// or failed Restore never touches it (D4). The route does neither. The door's
+/// reply is returned unchanged.
 #[tauri::command]
 pub async fn operator_resume_sessions(
     app_handle: tauri::AppHandle,
