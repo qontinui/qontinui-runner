@@ -2037,7 +2037,11 @@ pub async fn terminal_migrate_session_account(
         return Err("target account equals the session's current account".to_string());
     }
 
-    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)?;
+    // Resolves only once the resumed CLI is proven alive; a respawn that died
+    // (rolled back) or never painted (both panes kept) is an error naming which.
+    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(

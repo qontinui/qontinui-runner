@@ -72,6 +72,10 @@
 //!    fresh PTY, pinned via `capture_hint.config_dir` (which threads
 //!    `CLAUDE_CONFIG_DIR` into the PTY **and** keeps the durable restore record
 //!    consistent).
+//!    The resumed CLI is then PROVEN alive (running and painting,
+//!    [`crate::terminal::respawn_liveness`]); a pane that dies is retried, and
+//!    when every attempt dies the respawn fails here — before step 7 — so a
+//!    dead respawn never re-acquires claims under this device.
 //! 7. **Claims re-acquired** under this device and **`parent_session_id`
 //!    stamped**, exactly as [`super::handoff`] does, so the respawn is one link
 //!    in the lineage chain rather than an orphan.
@@ -185,6 +189,15 @@ pub enum RespawnError {
     Transcript(String),
     #[error("respawn spawn failed: {0}")]
     Spawn(String),
+    /// Every resumed pane exited before painting (`respawn-died: exit <code>
+    /// after <n> attempts`). Nothing is left running and no claim was
+    /// re-acquired; the durable coord row stays pending for retry.
+    #[error("{0}")]
+    Died(String),
+    /// Another mover (an account migration, the resume door) holds this
+    /// Claude session right now.
+    #[error("{0} is already moving this Claude session — left for retry")]
+    InFlight(&'static str),
     #[error("the Tauri app handle is not available — cannot spawn a PTY")]
     NoAppHandle,
     /// Coord's device drain deferred this respawn. Not a failure: the durable
@@ -637,6 +650,12 @@ async fn materialize(
         .ok_or(RespawnError::NoClaudeSession(respawn.source_session_id))?
         .to_string();
 
+    // 1b. One mover per Claude session (the shared in-flight registry), held
+    //     through spawn, proof and claim re-acquire.
+    let _in_flight =
+        super::in_flight::SessionInFlight::claim(&claude_session_id, "respawn-receiver")
+            .map_err(RespawnError::InFlight)?;
+
     // 2. 🔒 The pin. Fails loud; never degrades to rotation.
     let config_dir = resolve_target_config_dir(respawn.account.as_deref())?;
 
@@ -705,42 +724,42 @@ async fn materialize(
         &working_dir,
         &claude_session_id,
     );
-    let (terminal_id, _coord_id) = crate::terminal::account_migration::spawn_resumed_pane(
-        &app,
-        &terminal_manager,
-        &session_registry,
-        crate::terminal::account_migration::ResumeSpawn {
-            claude_session_id: &claude_session_id,
-            working_dir: &working_dir,
-            model_transcript,
-            config_dir: &config_dir,
-            title,
-            // Land back on the tile the session used to occupy when this box
-            // still remembers it; otherwise the default page, zone 0 (a wrong
-            // tile beats a lost session).
-            page_id: local
-                .as_ref()
-                .map(|r| r.page_id.clone())
-                .unwrap_or_else(|| "default".to_string()),
-            zone_index: local.as_ref().map(|r| r.zone_index).unwrap_or(0),
-            work_unit_slug: child_intent.work_unit_slug.clone(),
-            correlation_topic: child_intent.correlation_topic.clone(),
-            intent_repo: child_intent.repo.clone(),
-            coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
-                parent_session_id: Some(respawn.source_session_id),
-                claude_code_session_id: Some(claude_session_id.clone()),
-            }),
-            // NOT the migration's `true`. A respawn genuinely CREATES something
-            // (its source is already closed and gone), so it must respect the
-            // spawn-time resource floor like every other new autonomous spawn.
-            resource_override: false,
-            // A cross-machine respawn's source session ran on ANOTHER device,
-            // so its continuation registration — and the consuming device id
-            // coord keys the outcome write on — are not this box's to carry.
-            gate_identity: None,
-        },
+    let mut effects = ReceiverRespawn {
+        app,
+        terminal_manager,
+        session_registry,
+        claude_session_id: &claude_session_id,
+        working_dir: &working_dir,
+        config_dir: &config_dir,
+        model_transcript,
+        title,
+        // Land back on the tile the session used to occupy when this box
+        // still remembers it; otherwise the default page, zone 0 (a wrong
+        // tile beats a lost session).
+        page_id: local
+            .as_ref()
+            .map(|r| r.page_id.clone())
+            .unwrap_or_else(|| "default".to_string()),
+        zone_index: local.as_ref().map(|r| r.zone_index).unwrap_or(0),
+        work_unit_slug: child_intent.work_unit_slug.clone(),
+        correlation_topic: child_intent.correlation_topic.clone(),
+        intent_repo: child_intent.repo.clone(),
+        source_session_id: respawn.source_session_id,
+    };
+    // 6b. PROVE the resumed CLI alive before anything below treats the respawn
+    //     as done — in particular before step 7 re-acquires claims under this
+    //     device. There is no old pane to keep (the source ran elsewhere), so a
+    //     death is retried and, when every attempt dies, the dead pane is
+    //     closed and the respawn reported failed through the receiver's error
+    //     path (the coord row stays pending for retry).
+    let outcome = crate::terminal::respawn_liveness::confirm_respawn(
+        &mut effects,
+        lifecycle_store,
+        None,
+        crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
     )
-    .map_err(RespawnError::Spawn)?;
+    .await;
+    let terminal_id = proven_terminal(respawn.source_session_id, outcome)?;
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.
@@ -787,6 +806,118 @@ async fn materialize(
     // 9. NO `close_source`. The source is already closed — see the fn docstring.
 
     Ok(terminal_id)
+}
+
+/// Pure: the terminal a respawn may go on with (claims, prompt), or the error
+/// the receiver reports. A death is [`RespawnError::Died`] — never success —
+/// so step 7 never re-acquires claims for a dead respawn.
+fn proven_terminal(
+    source: Uuid,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+) -> Result<String, RespawnError> {
+    use crate::terminal::respawn_liveness::RespawnOutcome;
+    match outcome {
+        RespawnOutcome::Alive { terminal_id, .. } => Ok(terminal_id),
+        // Running but unpainted: UNKNOWN, and a process DOES hold the session —
+        // reporting failure would let the catch-up spawn a second one beside
+        // it. Kept, and said so.
+        RespawnOutcome::Unconfirmed { terminal_id } => {
+            tracing::warn!(
+                source = %source,
+                terminal = %terminal_id,
+                "session respawn: the resumed CLI is running but never painted its prompt — kept as UNCONFIRMED"
+            );
+            Ok(terminal_id)
+        }
+        RespawnOutcome::NotSpawned(e) => Err(RespawnError::Spawn(e)),
+        RespawnOutcome::Died {
+            exit_code,
+            attempts,
+            ..
+        } => Err(RespawnError::Died(RespawnOutcome::died_reason(
+            exit_code, attempts,
+        ))),
+    }
+}
+
+/// The receiver's side of
+/// [`crate::terminal::respawn_liveness::RespawnEffects`]: one resumed pane,
+/// pinned to the target account, per call.
+struct ReceiverRespawn<'a> {
+    app: tauri::AppHandle,
+    terminal_manager: Arc<crate::terminal::TerminalManager>,
+    session_registry: Arc<SessionRegistry>,
+    claude_session_id: &'a str,
+    working_dir: &'a str,
+    config_dir: &'a str,
+    model_transcript: std::path::PathBuf,
+    title: String,
+    page_id: String,
+    zone_index: i32,
+    work_unit_slug: Option<String>,
+    correlation_topic: Option<String>,
+    intent_repo: Option<String>,
+    source_session_id: Uuid,
+}
+
+impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
+    async fn spawn_next(&mut self) -> Result<String, String> {
+        // The async pre-step: the ABSOLUTE binary, retried, never bare.
+        let claude_bin = crate::terminal::resume_bin::resolve_resume_bin().await?;
+        crate::terminal::account_migration::spawn_resumed_pane(
+            &self.app,
+            &self.terminal_manager,
+            &self.session_registry,
+            crate::terminal::account_migration::ResumeSpawn {
+                claude_bin,
+                claude_session_id: self.claude_session_id,
+                working_dir: self.working_dir,
+                model_transcript: self.model_transcript.clone(),
+                config_dir: self.config_dir,
+                title: self.title.clone(),
+                page_id: self.page_id.clone(),
+                zone_index: self.zone_index,
+                work_unit_slug: self.work_unit_slug.clone(),
+                correlation_topic: self.correlation_topic.clone(),
+                intent_repo: self.intent_repo.clone(),
+                coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
+                    parent_session_id: Some(self.source_session_id),
+                    claude_code_session_id: Some(self.claude_session_id.to_string()),
+                }),
+                // NOT the migration's `true`. A respawn genuinely CREATES
+                // something (its source is already closed and gone), so it must
+                // respect the spawn-time resource floor like every other new
+                // autonomous spawn.
+                resource_override: false,
+                // A cross-machine respawn's source session ran on ANOTHER
+                // device, so its continuation registration — and the consuming
+                // device id coord keys the outcome write on — are not this
+                // box's to carry.
+                gate_identity: None,
+            },
+        )
+        .map(|(terminal_id, _coord_id)| terminal_id)
+    }
+
+    async fn await_liveness(
+        &mut self,
+        terminal_id: &str,
+    ) -> crate::terminal::respawn_liveness::LivenessVerdict {
+        crate::terminal::respawn_liveness::await_resumed_cli(
+            &self.terminal_manager,
+            terminal_id,
+            crate::terminal::respawn_liveness::RESUME_LIVENESS_DEADLINE,
+        )
+        .await
+    }
+
+    async fn pause_before_retry(&mut self, retry: usize) {
+        tokio::time::sleep(crate::terminal::respawn_liveness::retry_delay(retry)).await;
+    }
+
+    fn close_pane(&mut self, terminal_id: &str) -> Result<(), String> {
+        self.terminal_manager.close(terminal_id)
+    }
 }
 
 /// The two Tauri-managed handles the resume seam needs.
@@ -1261,6 +1392,39 @@ mod tests {
     // -----------------------------------------------------------------------
     // Transcript materialization helpers
     // -----------------------------------------------------------------------
+
+    /// The receiver reports a respawn whose every attempt died as a failure
+    /// (the durable coord row stays pending) — never success.
+    #[test]
+    fn the_receiver_reports_failure_on_died() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        let err = proven_terminal(
+            Uuid::nil(),
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, RespawnError::Died(_)), "{err:?}");
+        assert_eq!(err.to_string(), "respawn-died: exit 127 after 3 attempts");
+        assert!(matches!(
+            proven_terminal(Uuid::nil(), RespawnOutcome::NotSpawned("x".into())),
+            Err(RespawnError::Spawn(_))
+        ));
+        assert_eq!(
+            proven_terminal(
+                Uuid::nil(),
+                RespawnOutcome::Alive {
+                    terminal_id: "t".into(),
+                    attempts: 1
+                }
+            )
+            .unwrap(),
+            "t"
+        );
+    }
 
     #[test]
     fn transcript_bytes_concatenates_chunks_in_order() {
