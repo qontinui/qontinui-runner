@@ -3465,10 +3465,10 @@ async fn handle_media_override(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let body = match crate::mcp::ui_bridge::media_override::prepare_override_body(
-        body,
-        crate::mcp::ui_bridge::media_override::SDK_DISPATCH_BUDGET_MS,
-    ) {
+    // The WS arm is engine-direct and gets an absent decode wait filled; the
+    // HTTP arm's app server fits it to its own relay budget (see
+    // `media_override::WaitFill`).
+    let bodies = match crate::mcp::ui_bridge::media_override::sdk_override_bodies(body) {
         Ok(b) => b,
         Err(e) => {
             return Json(
@@ -3479,10 +3479,10 @@ async fn handle_media_override(
     match dispatch_app_request(
         &state,
         "mediaOverride",
-        body.clone(),
+        bodies.ws,
         Method::POST,
         "/control/media/override",
-        Some(body),
+        Some(bodies.http),
     )
     .await
     {
@@ -3499,13 +3499,11 @@ async fn handle_media_override_restore(
     let body = body
         .map(|Json(b)| b)
         .unwrap_or_else(|| serde_json::json!({}));
-    // Fit `verifyTimeoutMs` inside this transport's budget: without it the SDK
-    // waits up to the override's own `decodeTimeoutMs`, which an override
-    // applied elsewhere (the injected runtime allows 60 s) can set past 30 s.
-    let body = match crate::mcp::ui_bridge::media_override::prepare_restore_body(
-        body,
-        crate::mcp::ui_bridge::media_override::SDK_DISPATCH_BUDGET_MS,
-    ) {
+    // Bound `verifyTimeoutMs` to this transport: without it the SDK waits up to
+    // the override's own `decodeTimeoutMs`, which an override applied elsewhere
+    // (the injected runtime allows 60 s) can set past 30 s. The WS arm fills an
+    // absent one; the HTTP arm's app server fits it to its own relay budget.
+    let bodies = match crate::mcp::ui_bridge::media_override::sdk_restore_bodies(body) {
         Ok(b) => b,
         Err(e) => {
             return Json(
@@ -3516,10 +3514,10 @@ async fn handle_media_override_restore(
     match dispatch_app_request(
         &state,
         "mediaOverrideRestore",
-        body.clone(),
+        bodies.ws,
         Method::DELETE,
         "/control/media/override",
-        Some(body),
+        Some(bodies.http),
     )
     .await
     {
