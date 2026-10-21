@@ -1828,7 +1828,40 @@ pub fn terminal_session_list_open(
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": rows })),
+        data: Some(restore_set_body(
+            rows,
+            crate::restart_prep::restore::restoring_cohort().as_ref(),
+        )),
+    })
+}
+
+/// The body [`terminal_session_list_open`] answers with its restore set.
+///
+/// While a restart cohort is `restoring` (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D6), its
+/// rows are NOT in `sessions`, which the webview auto-resumes: they come back
+/// under `placeholders`, each to be shown in its recorded page and zone with a
+/// Restore button (the backend resume through `operator_resume_sessions`), and
+/// `restartPrep` names the prepare. A planned restart leaves the operator in
+/// control; the lifecycle poll holds those rows open meanwhile
+/// (`in_active_cohort`). With no restoring cohort — a crash boot, or no
+/// prepare at all — the body is exactly `{"sessions": [...]}`, as before.
+fn restore_set_body(
+    rows: Vec<RestoreCandidate>,
+    cohort: Option<&crate::restart_prep::restore::RestoringCohort>,
+) -> serde_json::Value {
+    let Some(cohort) = cohort else {
+        return serde_json::json!({ "sessions": rows });
+    };
+    let (sessions, placeholders) = crate::restart_prep::restore::split_placeholders(
+        rows,
+        |r| r.record.claude_session_id.as_str(),
+        &cohort.ids(),
+    );
+    serde_json::json!({
+        "sessions": sessions,
+        "placeholders": placeholders,
+        "restartPrep": { "prepareId": cohort.prepare_id, "state": "restoring" },
     })
 }
 
@@ -3128,6 +3161,50 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Phase 6 (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`):
+    /// while a restart cohort is `restoring`, its rows leave the auto-restore
+    /// `sessions` and come back as `placeholders`; with none (a crash boot, no
+    /// prepare record) the body is exactly the old `{"sessions": [...]}`.
+    #[test]
+    fn restore_set_body_withholds_cohort_rows_as_placeholders_only_while_restoring() {
+        let candidates = || {
+            ["a", "b", "c"]
+                .iter()
+                .map(|id| RestoreCandidate {
+                    record: restore_candidate_record(id),
+                    transcript_exists: Some(true),
+                })
+                .collect::<Vec<_>>()
+        };
+        let ids = |v: &serde_json::Value, key: &str| -> Vec<String> {
+            v[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is an array: {v}"))
+                .iter()
+                .map(|r| {
+                    r["claudeSessionId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        };
+
+        let crash_boot = restore_set_body(candidates(), None);
+        assert_eq!(ids(&crash_boot, "sessions"), ["a", "b", "c"]);
+        assert_eq!(
+            crash_boot.as_object().map(|o| o.len()),
+            Some(1),
+            "a boot with no restoring cohort answers exactly as before: {crash_boot}"
+        );
+
+        let cohort = crate::restart_prep::restore::restoring_cohort_for_test(&["b", "c", "gone"]);
+        let prepared = restore_set_body(candidates(), Some(&cohort));
+        assert_eq!(ids(&prepared, "sessions"), ["a"]);
+        assert_eq!(ids(&prepared, "placeholders"), ["b", "c"]);
+        assert_eq!(prepared["restartPrep"]["prepareId"], "prep-test");
+    }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never
     /// as prose in `message` — `message` is for humans, `data` is for callers.

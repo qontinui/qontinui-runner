@@ -2840,6 +2840,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::operator_doors::operator_run_composed_workflow,
             commands::operator_doors::operator_generate_unified_workflow_async,
             commands::operator_doors::operator_resume_task_run,
+            commands::operator_doors::operator_resume_sessions,
             commands::operator_doors::scheduler_run_task_now,
             mcp::steward::steward_start,
             commands::ai_session::generate_workflow_from_session,
@@ -4812,6 +4813,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             crate::coord_drain_state::SpawnOrigin::BootResume,
                         )
                         .allows();
+                        // The rows of a restart cohort the rebuilt runner is
+                        // restoring by hand (plan
+                        // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+                        // Phase 6): placeholders the boot restore deliberately
+                        // left alone, held against the orphan close until they
+                        // are restored, Finished or dismissed. Empty when no
+                        // record is `restoring` — the crash-boot path.
+                        let tick_restoring_cohort =
+                            crate::restart_prep::restore::restoring_cohort_ids();
                         let mut held_for_restore: usize = 0;
 
                         // Review F1 (plan 2026-09-12 Phase 5): a pane a
@@ -4868,6 +4878,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 tick_boot_at_ms,
                                 tick_restore_phase,
                                 tick_drain_defers_boot_resume,
+                                session::session_lifecycle_store::in_active_cohort(
+                                    &tick_restoring_cohort,
+                                    rec,
+                                ),
                             );
 
                             // Match the live terminal: by id first, then the

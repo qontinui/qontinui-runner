@@ -150,6 +150,11 @@ pub struct CohortRow {
     /// open again.
     #[serde(default)]
     pub left_capture_at: Option<i64>,
+    /// Phase 6: the last restore of this row by the rebuilt runner — its
+    /// resume verdict and, when an effort was re-applied, whether the prompt
+    /// line read back confirmed it. `None` until a restore was attempted.
+    #[serde(default)]
+    pub restore: Option<super::restore::RowRestore>,
 }
 
 impl CohortRow {
@@ -245,6 +250,7 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
         notified_pid: None,
         resume_notified_at: None,
         left_capture_at: None,
+        restore: None,
     }
 }
 

@@ -38,12 +38,21 @@
 //! tick, and computes `ready_to_restart`, served in the record here and as the
 //! `restart_prep` block of `GET /restart-readiness`.
 //!
-//! The restore is a later phase.
+//! ## Phase 6: the backend restore of the cohort
+//!
+//! [`restore`] is what a rebuilt runner restores the cohort through: which
+//! rows the backend resume core may take while the record is `restoring`, the
+//! effort each row is resumed at, the read-back that confirms it, the
+//! per-row restore verdicts, and the boot-side split that turns cohort rows
+//! into placeholders instead of auto-resuming them. The resume itself is the
+//! backend door (`session::resume_door`), reached by the operator through its
+//! twin `operator_resume_sessions`.
 
 pub mod cohort;
 pub mod effort;
 pub mod notice;
 pub mod prepare;
+pub mod restore;
 
 pub use prepare::{accounts_frozen, freeze_hit, local_hold_reason, on_boot};
 

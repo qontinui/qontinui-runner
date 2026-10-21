@@ -713,6 +713,8 @@ async fn materialize(
             claude_session_id: &claude_session_id,
             working_dir: &working_dir,
             model_transcript,
+            // A cross-machine respawn has no effort reading of its own.
+            effort: None,
             config_dir: &config_dir,
             title,
             // Land back on the tile the session used to occupy when this box

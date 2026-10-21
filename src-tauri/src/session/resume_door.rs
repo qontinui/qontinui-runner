@@ -65,6 +65,33 @@
 //!
 //! The admission-lease path (plan 2026-09-13 spawn-admission) is not landed
 //! here; once it is, a mid-batch refusal marks the rest `skipped(admission)`.
+//!
+//! ## A prepared cohort (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D7)
+//!
+//! While the operator restart prepare's record is `restoring`
+//! ([`crate::restart_prep::restore::RestoringCohort`]), the core is widened in
+//! one way: a cohort row that is `open` but has NO live terminal here — the
+//! shape every cohort row has after a restart — is admitted alongside
+//! `closed`. An open row outside the cohort is still `skipped(not_closed)`, an
+//! open cohort row whose terminal IS live is `skipped(live_terminal)`, and the
+//! in-flight and live-process guards are unchanged. A cohort row is resumed at
+//! the effort it ran at (`--effort <level>`, when that differs from its
+//! account's baseline) and the verdict, with the effort read-back, is
+//! recorded on the cohort row.
+//!
+//! ## Origin
+//!
+//! The core gates on the [`SpawnOrigin`] its caller hands it. This HTTP route
+//! passes [`HTTP_ORIGIN`] (`Respawn`, autonomous: deferred while the device is
+//! drained); the runner UI's operator twin
+//! (`commands::operator_doors::operator_resume_sessions`) passes the operator
+//! origin, so a residual drain never defers an operator's Restore click.
+//!
+//! ## A busy box is a skip
+//!
+//! A spawn the resource guard refuses (`resource_guard:critical:<lane>: …`)
+//! never started anything, so it is `skipped(resource_guard:<lane>)` — a retry
+//! once headroom returns — not `failed(spawn: …)`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -81,7 +108,13 @@ use super::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecor
 use super::SessionRegistry;
 use crate::coord_drain_state::{DrainGate, SpawnOrigin};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::restart_prep::restore::RestoringCohort;
 use crate::terminal::TerminalManager;
+
+/// The origin the HTTP route resumes as: autonomous, so coord's device drain
+/// (and a restart prepare's runner-local hold) defers it. The operator twin
+/// passes the operator origin instead.
+pub const HTTP_ORIGIN: SpawnOrigin = SpawnOrigin::Respawn;
 
 /// Most ids one call will act on. Each resume is verified by a process read, so
 /// an unbounded batch would pin the request for minutes.
@@ -134,6 +167,13 @@ pub struct ResumeRow {
     /// What the process read observed (only on `resumed`, or on a `failed`
     /// that got far enough to observe something).
     pub evidence: Option<ProcessEvidence>,
+    /// A restored cohort row only: the level passed as `--effort`, when one
+    /// was (see the module docs).
+    pub effort_applied: Option<String>,
+    /// A restored cohort row only: `effort_restored` |
+    /// `effort_not_restored(<reason>)`, from reading the resumed pane's status
+    /// row. `None` when no effort was re-applied or the resume did not land.
+    pub effort: Option<String>,
 }
 
 impl ResumeRow {
@@ -144,6 +184,8 @@ impl ResumeRow {
             reason: None,
             verdict: "resumed".to_string(),
             evidence: Some(evidence),
+            effort_applied: None,
+            effort: None,
         }
     }
     fn failed(id: &str, reason: impl Into<String>, evidence: Option<ProcessEvidence>) -> Self {
@@ -154,6 +196,8 @@ impl ResumeRow {
             verdict: format!("failed({reason})"),
             reason: Some(reason),
             evidence,
+            effort_applied: None,
+            effort: None,
         }
     }
     fn skipped(id: &str, reason: impl Into<String>) -> Self {
@@ -164,6 +208,8 @@ impl ResumeRow {
             verdict: format!("skipped({reason})"),
             reason: Some(reason),
             evidence: None,
+            effort_applied: None,
+            effort: None,
         }
     }
 }
@@ -205,10 +251,46 @@ struct Candidate {
     title: String,
     page_id: String,
     zone_index: i32,
+    /// Set when the id is a row of the restoring cohort.
+    cohort: Option<CohortMember>,
+}
+
+/// What the restoring cohort says about one id (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CohortMember {
+    prepare_id: String,
+    /// Whether the row's recorded terminal is live in this runner. An open row
+    /// is admitted only when it is not.
+    terminal_live: bool,
+    /// The level to pass as `--effort`.
+    effort: Option<String>,
+}
+
+/// The cohort membership of `id`, when `cohort` holds it. `terminal_live`
+/// reads the row's recorded terminal in this runner's manager.
+fn cohort_member(
+    cohort: Option<&RestoringCohort>,
+    id: &str,
+    rec: Option<&TerminalSessionRecord>,
+    terminal_live: impl Fn(&str) -> bool,
+) -> Option<CohortMember> {
+    let cohort = cohort?;
+    let target = cohort.target(id)?;
+    Some(CohortMember {
+        prepare_id: cohort.prepare_id.clone(),
+        terminal_live: rec.is_some_and(|r| terminal_live(&r.terminal_id)),
+        effort: target.effort.clone(),
+    })
 }
 
 /// Why a lifecycle row cannot be resumed, or the candidate it yields.
-fn classify(id: &str, rec: Option<&TerminalSessionRecord>) -> Result<Candidate, String> {
+/// `cohort` is the id's membership in the restoring cohort, which admits an
+/// `open` row whose terminal is not live (D7).
+fn classify(
+    id: &str,
+    rec: Option<&TerminalSessionRecord>,
+    cohort: Option<&CohortMember>,
+) -> Result<Candidate, String> {
     if !super::session_id::is_valid_session_id(id) {
         return Err("invalid_id".to_string());
     }
@@ -218,8 +300,13 @@ fn classify(id: &str, rec: Option<&TerminalSessionRecord>) -> Result<Candidate, 
     if rec.provider != super::session_lifecycle_store::DEFAULT_PROVIDER {
         return Err(format!("provider_{}", rec.provider));
     }
-    if rec.state != "closed" {
-        return Err("not_closed".to_string());
+    match (rec.state.as_str(), cohort) {
+        ("closed", _) => {}
+        ("open", Some(member)) if member.terminal_live => {
+            return Err("live_terminal".to_string());
+        }
+        ("open", Some(_)) => {}
+        _ => return Err("not_closed".to_string()),
     }
     if rec.finished_at.is_some() {
         return Err("finished".to_string());
@@ -248,6 +335,7 @@ fn classify(id: &str, rec: Option<&TerminalSessionRecord>) -> Result<Candidate, 
             .unwrap_or_else(|| format!("Resumed {short}")),
         page_id: rec.page_id.clone(),
         zone_index: rec.zone_index,
+        cohort: cohort.cloned(),
     })
 }
 
@@ -332,6 +420,45 @@ fn gateway_refusal(gateway_declared: bool) -> Option<String> {
 /// [`gateway_refusal`] over the live gateway state.
 fn live_gateway_refusal() -> Option<String> {
     gateway_refusal(crate::model_gateway::gateway_declared())
+}
+
+/// `skipped(resource_guard:<lane>)`'s reason for a spawn error that is the
+/// resource guard's CRITICAL refusal, `None` for any other spawn error. The
+/// refusal's wire is `resource_guard:critical:<lane>: <text>`
+/// ([`crate::resource_guard::CRITICAL_REFUSAL_PREFIX`]), where `<lane>` is the
+/// metric that refused (`free_commit_bytes` | `thread_count`). Matched
+/// anywhere in the error, so a seam that prefixes its own context still reads
+/// as the refusal; a lane token that is missing or malformed reads `unknown`.
+fn resource_guard_skip(spawn_error: &str) -> Option<String> {
+    let (_, rest) = spawn_error.split_once(crate::resource_guard::CRITICAL_REFUSAL_PREFIX)?;
+    let lane = rest
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or("unknown");
+    Some(format!("resource_guard:{lane}"))
+}
+
+/// The verdict for a spawn that returned `Err(e)` before any pane existed: a
+/// resource-guard refusal is a skip, anything else a failure.
+fn spawn_error_row(id: &str, e: &str) -> ResumeRow {
+    match resource_guard_skip(e) {
+        Some(reason) => ResumeRow::skipped(id, reason),
+        None => ResumeRow::failed(id, format!("spawn: {e}"), None),
+    }
+}
+
+/// The skip a process-table read of `id`'s holder imposes, if any: a live
+/// `claude` already running the id (`live_process`), or a table that could not
+/// be read — which must never read as "nobody holds it". Checked for EVERY
+/// candidate, a cohort row admitted while `open` included.
+fn holder_skip(id: &str, holder: Result<Option<u32>, String>) -> Option<ResumeRow> {
+    match holder {
+        Ok(None) => None,
+        Ok(Some(pid)) => Some(ResumeRow::skipped(id, format!("live_process(pid {pid})"))),
+        Err(why) => Some(ResumeRow::skipped(id, why)),
+    }
 }
 
 /// One live `claude` process as read from the process table.
@@ -549,12 +676,15 @@ async fn verify(
 
 /// Resume one session: gate, budget, spawn, verify. The spawn site registered
 /// in `runner_spawn_sites.txt` — the drain gate lives HERE and branches on its
-/// result.
+/// result. It gates on the `origin` it is handed: [`HTTP_ORIGIN`] from the
+/// route, the operator origin from the twin.
 async fn resume_one(
     app: &tauri::AppHandle,
     tm: &Arc<TerminalManager>,
     registry: &Arc<SessionRegistry>,
+    store: &Arc<SessionLifecycleStore>,
     cand: Candidate,
+    origin: SpawnOrigin,
 ) -> ResumeRow {
     // One call per id at a time, held through spawn AND verify.
     let Some(_in_flight) = InFlight::claim(&cand.id) else {
@@ -569,10 +699,8 @@ async fn resume_one(
     }
     // A live claude already running this id: resuming would be a second
     // process on one transcript.
-    match live_holder(&cand.id).await {
-        Ok(None) => {}
-        Ok(Some(pid)) => return ResumeRow::skipped(&cand.id, format!("live_process(pid {pid})")),
-        Err(why) => return ResumeRow::skipped(&cand.id, why),
+    if let Some(skip) = holder_skip(&cand.id, live_holder(&cand.id).await) {
+        return skip;
     }
     // The transcript, local — a missing one must never become `--resume` of
     // nothing.
@@ -587,13 +715,12 @@ async fn resume_one(
     if !Path::new(&cand.working_dir).is_dir() {
         return ResumeRow::skipped(&cand.id, "working_dir_missing");
     }
-    let gate = match crate::coord_drain_state::drain_gate_for_work(
-        SpawnOrigin::Respawn,
-        &format!("resume:{}", cand.id),
-    ) {
-        DrainGate::Allow => DrainGate::Allow,
-        deferred => deferred,
-    };
+    let gate =
+        match crate::coord_drain_state::drain_gate_for_work(origin, &format!("resume:{}", cand.id))
+        {
+            DrainGate::Allow => DrainGate::Allow,
+            deferred => deferred,
+        };
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Err(why) = admit(gate, || {
         crate::terminal::account_migration::migration_cap_permits(&cand.id, now_ms)
@@ -601,8 +728,15 @@ async fn resume_one(
         return ResumeRow::skipped(&cand.id, why);
     }
 
+    let effort = cand.cohort.as_ref().and_then(|m| m.effort.clone());
     let spawn = {
-        let (app, tm, registry, cand) = (app.clone(), tm.clone(), registry.clone(), cand.clone());
+        let (app, tm, registry, cand, effort) = (
+            app.clone(),
+            tm.clone(),
+            registry.clone(),
+            cand.clone(),
+            effort.clone(),
+        );
         tokio::task::spawn_blocking(move || {
             let model_transcript = crate::terminal::transcript::session_transcript_path(
                 Path::new(&cand.config_dir),
@@ -617,6 +751,8 @@ async fn resume_one(
                     claude_session_id: &cand.id,
                     working_dir: &cand.working_dir,
                     model_transcript,
+                    // A restored cohort row comes back at the effort it ran at.
+                    effort,
                     config_dir: &cand.config_dir,
                     title: cand.title.clone(),
                     page_id: cand.page_id.clone(),
@@ -641,11 +777,38 @@ async fn resume_one(
     };
     let terminal_id = match spawn {
         Ok(Ok((terminal_id, _coord_id))) => terminal_id,
-        Ok(Err(e)) => return ResumeRow::failed(&cand.id, format!("spawn: {e}"), None),
+        // Refused before anything started: the box is busy, retry later.
+        Ok(Err(e)) => return spawn_error_row(&cand.id, &e),
         Err(e) => return ResumeRow::failed(&cand.id, format!("spawn_task: {e}"), None),
     };
+    // A cohort row's resume was attempted: stamp the restore marker now (tier
+    // `failed` until the process read below proves it), never at boot — a
+    // placeholder nobody has restored yet is not a failed boot restore.
+    if cand.cohort.is_some() {
+        store.mark_restore_pending(&cand.id);
+    }
     match verify(tm, &cand, &terminal_id).await {
-        Ok(ev) => ResumeRow::resumed(&cand.id, ev),
+        Ok(ev) => {
+            if cand.cohort.is_some() {
+                store.clear_restore_pending(&cand.id);
+            }
+            let mut row = ResumeRow::resumed(&cand.id, ev);
+            if let Some(wanted) = effort {
+                let tm = tm.clone();
+                let read = move || tm.get(&terminal_id).map(|s| s.grid_screen());
+                row.effort = Some(
+                    crate::restart_prep::restore::read_back_effort(
+                        &wanted,
+                        read,
+                        crate::restart_prep::restore::EFFORT_READ_BACK_DEADLINE,
+                        crate::restart_prep::restore::EFFORT_READ_BACK_POLL,
+                    )
+                    .await,
+                );
+                row.effort_applied = Some(wanted);
+            }
+            row
+        }
         Err(reason) => ResumeRow::failed(
             &cand.id,
             reason,
@@ -681,14 +844,32 @@ async fn run_batch(
     registry: Arc<SessionRegistry>,
     store: Arc<SessionLifecycleStore>,
     ids: Vec<String>,
+    cohort: Option<RestoringCohort>,
+    origin: SpawnOrigin,
 ) -> Vec<ResumeRow> {
     let mut results = Vec::new();
     for id in &ids {
-        let row = match classify(id, store.get(id).as_ref()) {
+        let rec = store.get(id);
+        let member = cohort_member(cohort.as_ref(), id, rec.as_ref(), |t| tm.get(t).is_some());
+        let row = match classify(id, rec.as_ref(), member.as_ref()) {
             Err(why) => ResumeRow::skipped(id, why),
-            Ok(cand) => resume_one(&app, &tm, &registry, cand).await,
+            Ok(cand) => resume_one(&app, &tm, &registry, &store, cand, origin).await,
         };
-        info!(id = %row.id, verdict = %row.verdict, "resume_door: verdict");
+        info!(id = %row.id, verdict = %row.verdict, effort = ?row.effort, "resume_door: verdict");
+        // A cohort row's verdict also lands on the row itself, except a skip
+        // that is another call's in-flight restore of the same row.
+        if let Some(m) = member
+            .as_ref()
+            .filter(|_| row.reason.as_deref() != Some("in_flight"))
+        {
+            crate::restart_prep::restore::note_restore(
+                &m.prepare_id,
+                id,
+                &row.verdict,
+                row.effort_applied.clone(),
+                row.effort.clone(),
+            );
+        }
         results.push(row);
     }
     results
@@ -718,7 +899,6 @@ async fn post_sessions_resume(
     body: Bytes,
 ) -> Result<Json<ApiResponse<ResumeReport>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
     use axum::http::StatusCode;
-    use tauri::Manager;
 
     if !is_json_content_type(&headers) {
         return Err((
@@ -736,6 +916,20 @@ async fn post_sessions_resume(
             ))),
         )
     })?;
+    resume_sessions(state, req, HTTP_ORIGIN).await
+}
+
+/// The door's core, shared by the HTTP route ([`HTTP_ORIGIN`]) and the runner
+/// UI's operator twin (the operator origin): validate the scope, resolve the
+/// app state, and run the batch to completion in a detached task.
+pub(crate) async fn resume_sessions(
+    state: Arc<ApiState>,
+    req: ResumeRequest,
+    origin: SpawnOrigin,
+) -> Result<Json<ApiResponse<ResumeReport>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
+    use axum::http::StatusCode;
+    use tauri::Manager;
+
     let scope = req
         .scope()
         .map_err(|why| (StatusCode::BAD_REQUEST, Json(api_error(why))))?;
@@ -786,6 +980,9 @@ async fn post_sessions_resume(
     );
 
     let requested = ids.len();
+    // Read once per call: the record is `restoring` for the whole batch or not
+    // at all, and a row's admission must not change halfway through it.
+    let cohort = crate::restart_prep::restore::restoring_cohort();
     // Detached: a caller that hangs up mid-batch must not cancel the ids still
     // to come (nor orphan a spawn between its start and its verification).
     // Every id's verdict is logged by `run_batch` whether or not anyone is
@@ -796,6 +993,8 @@ async fn post_sessions_resume(
         registry,
         store,
         ids,
+        cohort,
+        origin,
     ));
     let results = batch.await.map_err(|e| {
         (
@@ -892,24 +1091,24 @@ mod tests {
     #[test]
     fn classify_names_every_skip_reason() {
         assert_eq!(
-            reason(classify("bad id!", Some(&rec("closed")))),
+            reason(classify("bad id!", Some(&rec("closed")), None)),
             "invalid_id"
         );
-        assert_eq!(reason(classify(ID, None)), "not_found");
-        assert_eq!(reason(classify(ID, Some(&rec("open")))), "not_closed");
+        assert_eq!(reason(classify(ID, None, None)), "not_found");
+        assert_eq!(reason(classify(ID, Some(&rec("open")), None)), "not_closed");
         let mut finished = rec("closed");
         finished.finished_at = Some(9);
-        assert_eq!(reason(classify(ID, Some(&finished))), "finished");
+        assert_eq!(reason(classify(ID, Some(&finished), None)), "finished");
         let mut other = rec("closed");
         other.provider = "gemini".to_string();
-        assert_eq!(reason(classify(ID, Some(&other))), "provider_gemini");
+        assert_eq!(reason(classify(ID, Some(&other), None)), "provider_gemini");
         let mut nocfg = rec("closed");
         nocfg.config_dir = Some("  ".to_string());
-        assert_eq!(reason(classify(ID, Some(&nocfg))), "no_config_dir");
+        assert_eq!(reason(classify(ID, Some(&nocfg), None)), "no_config_dir");
         let mut nowd = rec("closed");
         nowd.working_dir = None;
-        assert_eq!(reason(classify(ID, Some(&nowd))), "no_working_dir");
-        let ok = classify(ID, Some(&rec("closed"))).unwrap();
+        assert_eq!(reason(classify(ID, Some(&nowd), None)), "no_working_dir");
+        let ok = classify(ID, Some(&rec("closed")), None).unwrap();
         assert_eq!((ok.config_dir.as_str(), ok.zone_index), ("/cfg", 2));
     }
 
@@ -1050,7 +1249,7 @@ mod tests {
     }
 
     fn cand() -> Candidate {
-        classify(ID, Some(&rec("closed"))).unwrap()
+        classify(ID, Some(&rec("closed")), None).unwrap()
     }
 
     fn proc(cmd: &str, cwd: Option<&str>, cfg: Option<&str>) -> ClaudeProc {
@@ -1097,6 +1296,138 @@ mod tests {
             .unwrap()
             .starts_with("config_dir_mismatch"));
         assert!(judge(&[proc(&good, Some("/work/"), Some("/cfg"))], &cand(), "t").is_ok());
+    }
+
+    // --- Phase 6 (plan 2026-10-21-operator-prepare-for-restart-and-progressive-restore)
+
+    fn restoring(ids: &[&str]) -> RestoringCohort {
+        crate::restart_prep::restore::restoring_cohort_for_test(ids)
+    }
+
+    #[test]
+    fn an_open_cohort_row_with_no_terminal_resumes_and_outside_the_cohort_is_refused() {
+        let cohort = restoring(&[ID]);
+        let open = rec("open");
+        let no_terminal = |_: &str| false;
+        let member = cohort_member(Some(&cohort), ID, Some(&open), no_terminal);
+        let cand = classify(ID, Some(&open), member.as_ref()).expect("admitted in cohort mode");
+        let m = cand
+            .cohort
+            .expect("the candidate carries its cohort membership");
+        assert_eq!(m.prepare_id, "prep-test");
+        assert_eq!(m.effort.as_deref(), Some("max"));
+        // The same open row with no cohort, or with a cohort that does not hold it.
+        assert_eq!(reason(classify(ID, Some(&open), None)), "not_closed");
+        let other = restoring(&["11111111-1111-4111-8111-111111111111"]);
+        let not_member = cohort_member(Some(&other), ID, Some(&open), no_terminal);
+        assert_eq!(not_member, None);
+        assert_eq!(
+            reason(classify(ID, Some(&open), not_member.as_ref())),
+            "not_closed"
+        );
+        // A closed cohort row is admitted and still carries its effort.
+        let closed = rec("closed");
+        let member = cohort_member(Some(&cohort), ID, Some(&closed), no_terminal);
+        let cand = classify(ID, Some(&closed), member.as_ref()).unwrap();
+        assert_eq!(cand.cohort.and_then(|m| m.effort).as_deref(), Some("max"));
+        // Cohort mode widens nothing else: a finished cohort row is refused
+        // until its mark is lifted.
+        let mut finished = rec("open");
+        finished.finished_at = Some(9);
+        let member = cohort_member(Some(&cohort), ID, Some(&finished), no_terminal);
+        assert_eq!(
+            reason(classify(ID, Some(&finished), member.as_ref())),
+            "finished"
+        );
+    }
+
+    #[test]
+    fn an_open_cohort_row_whose_terminal_is_live_is_refused() {
+        let cohort = restoring(&[ID]);
+        let open = rec("open");
+        let member = cohort_member(Some(&cohort), ID, Some(&open), |t| t == "t");
+        assert!(member.as_ref().is_some_and(|m| m.terminal_live));
+        assert_eq!(
+            reason(classify(ID, Some(&open), member.as_ref())),
+            "live_terminal"
+        );
+    }
+
+    #[test]
+    fn an_admitted_open_cohort_row_with_a_live_holder_is_still_skipped() {
+        let cohort = restoring(&[ID]);
+        let open = rec("open");
+        let member = cohort_member(Some(&cohort), ID, Some(&open), |_| false);
+        let cand = classify(ID, Some(&open), member.as_ref()).expect("admitted");
+        // The live-holder guard runs for every candidate, cohort rows included.
+        let skip = holder_skip(&cand.id, Ok(Some(4242))).expect("a live holder skips");
+        assert_eq!(skip.verdict, "skipped(live_process(pid 4242))");
+        let unreadable = holder_skip(&cand.id, Err("process_table_unreadable".to_string()))
+            .expect("an unreadable table skips");
+        assert_eq!(unreadable.verdict, "skipped(process_table_unreadable)");
+        assert_eq!(holder_skip(&cand.id, Ok(None)), None);
+    }
+
+    #[test]
+    fn a_resource_guard_refusal_is_a_skip_and_any_other_spawn_error_a_failure() {
+        let prefix = crate::resource_guard::CRITICAL_REFUSAL_PREFIX;
+        for lane in ["free_commit_bytes", "thread_count"] {
+            let refusal = format!(
+                "{prefix}{lane}: Not starting a new terminal session: the host lane has 1.00 GiB. \
+                 The limits live in Settings > Resource Guard."
+            );
+            let row = spawn_error_row(ID, &refusal);
+            assert_eq!(row.outcome, "skipped", "{lane}");
+            assert_eq!(row.verdict, format!("skipped(resource_guard:{lane})"));
+            // A seam that prefixes its own context still reads as the refusal.
+            let wrapped = spawn_error_row(ID, &format!("create terminal: {refusal}"));
+            assert_eq!(wrapped.verdict, format!("skipped(resource_guard:{lane})"));
+        }
+        assert_eq!(
+            spawn_error_row(ID, &format!("{prefix}: no token")).verdict,
+            "skipped(resource_guard:unknown)"
+        );
+        let real = spawn_error_row(ID, "pty open failed: os error 24");
+        assert_eq!(real.outcome, "failed");
+        assert_eq!(real.verdict, "failed(spawn: pty open failed: os error 24)");
+    }
+
+    #[test]
+    fn a_drain_defers_the_route_and_never_the_operator_twin() {
+        use crate::coord_drain_state::{gate_with_local_hold, CoordDrainState};
+        let now = chrono::Utc::now();
+        let drained = CoordDrainState::Drained {
+            until: None,
+            reason: Some("operator drain".to_string()),
+        };
+        let operator = crate::commands::operator_doors::OPERATOR;
+        for local_hold in [None, Some("prepare p — hold local")] {
+            let route = admit(
+                gate_with_local_hold(&drained, HTTP_ORIGIN, local_hold, now),
+                || true,
+            );
+            assert!(
+                route.as_ref().is_err_and(|e| e.starts_with("drain: ")),
+                "the route under a drain is deferred: {route:?}"
+            );
+            let twin = admit(
+                gate_with_local_hold(&drained, operator, local_hold, now),
+                || true,
+            );
+            assert_eq!(twin, Ok(()), "the operator twin is never deferred");
+        }
+        // A runner-local restart hold alone (coord clear) defers the route too.
+        let held = admit(
+            gate_with_local_hold(&CoordDrainState::Clear, HTTP_ORIGIN, Some("hold"), now),
+            || true,
+        );
+        assert!(held.is_err());
+    }
+
+    #[test]
+    fn the_http_route_resumes_as_an_autonomous_respawn() {
+        assert_eq!(HTTP_ORIGIN, SpawnOrigin::Respawn);
+        assert!(HTTP_ORIGIN.is_autonomous());
     }
 
     #[test]

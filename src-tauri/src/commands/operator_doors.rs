@@ -52,7 +52,7 @@ use crate::mcp::types::ApiState;
 
 /// The origin every twin passes: an operator at this runner's own UI. The drain
 /// never defers it; the draining banner tells the operator what is paused.
-const OPERATOR: SpawnOrigin = SpawnOrigin::OperatorChat;
+pub(crate) const OPERATOR: SpawnOrigin = SpawnOrigin::OperatorChat;
 
 /// A door's answer: its HTTP status and JSON body.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -218,6 +218,47 @@ pub async fn operator_resume_task_run(
     ))
 }
 
+/// `POST /control/sessions/resume {ids}`, as the runner UI — the Restore button
+/// of a restart cohort's placeholder (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D7).
+///
+/// The same core as the route ([`crate::session::resume_door::resume_sessions`]),
+/// gated as the operator, so a residual drain never defers the operator's
+/// click; the in-flight and live-process guards, the transcript check and
+/// `MIGRATION_CAP` apply exactly as on the route. While a cohort is
+/// `restoring`, a FINISHED cohort row named here has its finish mark lifted
+/// first, because the core refuses finished rows (D4) — the route never does
+/// that. The door's reply is returned unchanged.
+#[tauri::command]
+pub async fn operator_resume_sessions(
+    app_handle: tauri::AppHandle,
+    ids: Vec<String>,
+) -> Result<DoorReply, String> {
+    let state = api_state(&app_handle)?;
+    if let Some(store) = app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .map(|s| s.inner().clone())
+    {
+        let cohort = crate::restart_prep::restore::restoring_cohort();
+        let unfinished =
+            crate::restart_prep::restore::unfinish_for_restore(&store, &ids, cohort.as_ref());
+        if !unfinished.is_empty() {
+            tracing::info!(
+                ids = ?unfinished,
+                "operator_resume_sessions: lifted the finish mark of cohort rows before restore"
+            );
+        }
+    }
+    let request = crate::session::resume_door::ResumeRequest {
+        ids: Some(ids),
+        all: None,
+        generation: None,
+    };
+    Ok(door_reply(
+        crate::session::resume_door::resume_sessions(state, request, OPERATOR).await,
+    ))
+}
+
 /// The scheduler's "Run now", as the runner UI. `POST /scheduler/tasks/{id}/run`
 /// stays an autonomous (`unknown`) caller.
 #[tauri::command]
@@ -275,6 +316,27 @@ mod tests {
         assert_eq!(unified_workflow_run_id("/prompts/run"), None);
     }
 
+    /// The restore twin passes the OPERATOR origin to the shared core — the
+    /// route passes `HTTP_ORIGIN` (`resume_door`'s own test pins that) — so a
+    /// drain defers the route's resume and never the operator's Restore click.
+    /// The gate decision itself is pinned in `resume_door`
+    /// (`a_drain_defers_the_route_and_never_the_operator_twin`); this pins
+    /// which origin the twin hands it, read off the twin's own source because
+    /// the call needs a running app.
+    #[test]
+    fn the_restore_twin_resumes_as_the_operator() {
+        let src = include_str!("operator_doors.rs");
+        let (_, rest) = src
+            .split_once("pub async fn operator_resume_sessions(")
+            .expect("the twin exists");
+        let (body, _) = rest.split_once("\n}\n").expect("the twin's body ends");
+        assert!(
+            body.contains("resume_door::resume_sessions(state, request, OPERATOR)"),
+            "the restore twin must hand the shared core the operator origin: {body}"
+        );
+        assert!(!body.contains("SpawnOrigin::Respawn") && !body.contains("HTTP_ORIGIN"));
+    }
+
     #[test]
     fn the_twins_are_not_reachable_through_the_ui_bridge_allowlist() {
         // Derived from the ROSTER, not from a hardcoded list. The list this
@@ -305,6 +367,7 @@ mod tests {
             "operator_run_composed_workflow",
             "operator_generate_unified_workflow_async",
             "operator_resume_task_run",
+            "operator_resume_sessions",
             "scheduler_run_task_now",
             "steward_start",
         ] {

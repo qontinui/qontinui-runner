@@ -622,7 +622,7 @@ impl RestartPrep {
     /// Apply `f` to the CURRENT record — under the lock, so a `limit_hit` the
     /// freeze wrote while an operation awaited coord is kept — then persist
     /// and announce. Errs when the record is no longer `prepare_id`'s.
-    fn update(
+    pub(super) fn update(
         &self,
         prepare_id: &str,
         f: impl FnOnce(&mut PrepareRecord),

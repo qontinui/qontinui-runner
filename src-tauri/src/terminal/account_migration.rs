@@ -658,6 +658,13 @@ pub(crate) struct ResumeSpawn<'a> {
     /// does not silently drop to the target account's default model. A missing
     /// or unreadable file simply omits `--model`.
     pub model_transcript: std::path::PathBuf,
+    /// Effort level to re-apply as `--effort <level>`, through
+    /// [`crate::claude_session::launch_spec::LaunchSpec::effort`]. `None` omits
+    /// the flag (the account's own default applies) — every caller but the
+    /// restart restore, which passes the level the session ran at when that
+    /// differs from the account's baseline (plan
+    /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D5).
+    pub effort: Option<String>,
     /// `CLAUDE_CONFIG_DIR` for the new PTY — the TARGET account's dir. It also
     /// keeps the durable restore record consistent (the record stores the dir
     /// the session actually launched under).
@@ -730,6 +737,7 @@ pub(crate) fn spawn_resumed_pane(
         &crate::agent_runtime::resolve_claude_bin(),
         spec.claude_session_id,
         model,
+        spec.effort.clone(),
         &launch_cfg,
         // The hook carrier, spelled out because this respawn execs the
         // resolved `resolve_claude_bin()` DIRECTLY — the identity shim,
@@ -831,6 +839,7 @@ fn resume_respawn_argv(
     claude_bin: &str,
     claude_session_id: &str,
     model: Option<String>,
+    effort: Option<String>,
     launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
     extra_required: Vec<String>,
 ) -> Vec<String> {
@@ -839,6 +848,7 @@ fn resume_respawn_argv(
             permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
             resume_id: Some(claude_session_id.to_string()),
             model,
+            effort,
             extra_required,
             ..Default::default()
         },
@@ -1020,6 +1030,9 @@ pub fn migrate_session(
                 &working_dir,
                 &record.claude_session_id,
             ),
+            // A migration carries no effort re-apply: the session is still
+            // running, and its effort is not this path's to change.
+            effort: None,
             config_dir: dst_config_dir,
             title: title.clone(),
             page_id: record.page_id.clone(),
@@ -1513,6 +1526,7 @@ mod tests {
             bin,
             "7b4a9fb4-5526-4ab0-b89e-f13b6316874a",
             Some("claude-opus-5".to_string()),
+            None,
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             vec!["--settings".to_string(), "hooks.json".to_string()],
         );
@@ -1539,6 +1553,32 @@ mod tests {
             argv.windows(2).any(|w| w == ["--settings", "hooks.json"]),
             "extra_required tail must survive: {argv:?}"
         );
+    }
+
+    /// The restart restore's effort re-apply (plan
+    /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D5):
+    /// a `ResumeSpawn.effort` is rendered as one `--effort <level>` pair in the
+    /// resume argv, and no effort means no flag at all.
+    #[test]
+    fn resume_respawn_argv_renders_the_effort_re_apply() {
+        let sid = "7b4a9fb4-5526-4ab0-b89e-f13b6316874a";
+        let cfg = crate::claude_session::launch_spec::LaunchConfig::default();
+        let argv = resume_respawn_argv(
+            "/fake/bin/claude",
+            sid,
+            None,
+            Some("max".to_string()),
+            &cfg,
+            vec![],
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["--effort", "max"]),
+            "{argv:?}"
+        );
+        assert_eq!(argv.iter().filter(|a| *a == "--effort").count(), 1);
+        assert!(argv.windows(2).any(|w| w == ["--resume", sid]), "{argv:?}");
+        let without = resume_respawn_argv("/fake/bin/claude", sid, None, None, &cfg, vec![]);
+        assert!(!without.iter().any(|a| a == "--effort"), "{without:?}");
     }
 
     #[test]

@@ -4776,11 +4776,22 @@ pub(crate) fn reset_boot_restore_phase_for_test() {
 ///   (drained, or drain state unknown). This covers a poll tick that lands
 ///   before the frontend's first ask; when the gate allows, today's handling
 ///   applies (the restore is about to run, or there is no consumer for it).
+/// - `in_active_cohort` ⇒ hold, whatever the phase: the record is an
+///   unfinished row of a restart cohort the rebuilt runner is restoring by
+///   hand (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+///   Phase 6). The boot restore deliberately does NOT take it — it waits as a
+///   placeholder for the operator's Restore — so the latch reading `Ran` says
+///   nothing about it. The hold ends when the row is restored (a this-boot
+///   record), Finished (the caller passes `false` for a finished record) or
+///   the cohort is dismissed (no longer `restoring`). Deliberately not
+///   `mark_restore_pending`, which would stamp a FAILED boot restore on every
+///   placeholder nobody has restored yet.
 pub fn withheld_boot_restore_candidate(
     last_seen_at: i64,
     boot_at_ms: Option<i64>,
     phase: BootRestorePhase,
     drain_defers_boot_resume: bool,
+    in_active_cohort: bool,
 ) -> bool {
     let Some(boot_at) = boot_at_ms else {
         return false;
@@ -4788,11 +4799,23 @@ pub fn withheld_boot_restore_candidate(
     if last_seen_at >= boot_at {
         return false;
     }
+    if in_active_cohort {
+        return true;
+    }
     match phase {
         BootRestorePhase::Ran => false,
         BootRestorePhase::Withheld => true,
         BootRestorePhase::NotYetRun => drain_defers_boot_resume,
     }
+}
+
+/// The `in_active_cohort` input of [`withheld_boot_restore_candidate`] for
+/// `rec`: an UNFINISHED row of the restart cohort being restored (`cohort` is
+/// [`crate::restart_prep::restore::restoring_cohort_ids`], read once per poll
+/// tick, empty when nothing is restoring). A Finished placeholder is let go:
+/// nothing will restore it, and the orphan close may take it.
+pub fn in_active_cohort(cohort: &HashSet<String>, rec: &TerminalSessionRecord) -> bool {
+    rec.finished_at.is_none() && cohort.contains(&rec.claude_session_id)
 }
 
 /// Match an open record to a live terminal the way the lifecycle poll does: by
@@ -10951,6 +10974,27 @@ mod tests {
         phase: BootRestorePhase,
         drain_defers_boot_resume: bool,
     ) {
+        simulate_no_terminal_poll_ticks_with_cohort(
+            store,
+            ticks,
+            boot_at_ms,
+            phase,
+            drain_defers_boot_resume,
+            &HashSet::new(),
+        );
+    }
+
+    /// [`simulate_no_terminal_poll_ticks`] with a restoring restart cohort,
+    /// whose unfinished rows the poll passes as `in_active_cohort` exactly as
+    /// `main.rs` does.
+    fn simulate_no_terminal_poll_ticks_with_cohort(
+        store: &SessionLifecycleStore,
+        ticks: u32,
+        boot_at_ms: Option<i64>,
+        phase: BootRestorePhase,
+        drain_defers_boot_resume: bool,
+        cohort: &HashSet<String>,
+    ) {
         let mut consecutive_no_match: HashMap<String, u32> = HashMap::new();
         for _ in 0..ticks {
             for rec in store.open_records() {
@@ -10963,6 +11007,7 @@ mod tests {
                     boot_at_ms,
                     phase,
                     drain_defers_boot_resume,
+                    in_active_cohort(cohort, &rec),
                 );
                 let action = hold_for_withheld_boot_restore(
                     classify(
@@ -11205,24 +11250,118 @@ mod tests {
         assert_eq!(store.get("victim-a").unwrap().state, "open");
     }
 
+    /// Phase 6 (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`):
+    /// after a prepared restart the boot restore HAS run (`Ran`, nothing
+    /// drained) but deliberately left the cohort rows as placeholders. They
+    /// match no terminal on every tick, and must survive far more ticks than
+    /// the orphan debounce — while a non-cohort prior-boot record is closed as
+    /// before, and a Finished placeholder is let go. Nothing here stamps a
+    /// restore tier, so the restore census counts no placeholder as a FAILED
+    /// boot restore.
+    #[test]
+    fn restart_cohort_placeholders_survive_the_orphan_close_and_are_no_failed_restore() {
+        let dir = tempdir().unwrap();
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let store = crash_cohort_store(dir.path(), crash, None);
+        store.set_finished("victim-b", true, None).unwrap();
+        let cohort: HashSet<String> = ["victim-a", "victim-b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            NO_TERMINAL_ORPHAN_TICKS < 5,
+            "5 ticks must exceed the debounce"
+        );
+
+        simulate_no_terminal_poll_ticks_with_cohort(
+            &store,
+            5,
+            Some(boot),
+            BootRestorePhase::Ran,
+            false,
+            &cohort,
+        );
+
+        let a = store.get("victim-a").unwrap();
+        assert_eq!(a.state, "open", "an unfinished placeholder stays open");
+        assert_eq!(a.restore_pending_at, None);
+        assert_eq!(a.restore_tier, None);
+        assert_eq!(a.restored_from_boot_at, None);
+        // Not in the cohort: the ordinary orphan close, exactly as before.
+        let ghost = store.get("ghost").unwrap();
+        assert_eq!(ghost.state, "closed");
+        assert_eq!(ghost.close_reason.as_deref(), Some("no-terminal"));
+        // Finished: the shield lets it go.
+        assert_eq!(store.get("victim-b").unwrap().state, "closed");
+
+        let observed = crate::session::restore_census::observe_restored(&store, boot);
+        assert!(
+            observed.is_empty(),
+            "no placeholder may read as an attempted (failed) boot restore: {observed:?}"
+        );
+    }
+
+    /// The same 5 ticks with NO restoring cohort (a crash boot, no prepare
+    /// record): the prior-boot records are closed as orphans, exactly as before.
+    #[test]
+    fn without_a_restoring_cohort_the_orphan_close_is_unchanged() {
+        let dir = tempdir().unwrap();
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let store = crash_cohort_store(dir.path(), crash, None);
+        simulate_no_terminal_poll_ticks(&store, 5, Some(boot), BootRestorePhase::Ran, false);
+        for id in ["victim-a", "victim-b", "ghost"] {
+            assert_eq!(store.get(id).unwrap().state, "closed", "{id}");
+        }
+    }
+
     #[test]
     fn withheld_boot_restore_candidate_truth_table() {
         let boot = Some(1_000);
         use BootRestorePhase::*;
         // Prior-boot record.
-        assert!(withheld_boot_restore_candidate(999, boot, Withheld, false));
-        assert!(withheld_boot_restore_candidate(999, boot, Withheld, true));
-        assert!(withheld_boot_restore_candidate(999, boot, NotYetRun, true));
-        assert!(!withheld_boot_restore_candidate(
-            999, boot, NotYetRun, false
+        assert!(withheld_boot_restore_candidate(
+            999, boot, Withheld, false, false
         ));
-        assert!(!withheld_boot_restore_candidate(999, boot, Ran, true));
+        assert!(withheld_boot_restore_candidate(
+            999, boot, Withheld, true, false
+        ));
+        assert!(withheld_boot_restore_candidate(
+            999, boot, NotYetRun, true, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, boot, NotYetRun, false, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, boot, Ran, true, false
+        ));
         // This-boot record: never held.
         assert!(!withheld_boot_restore_candidate(
-            1_000, boot, Withheld, true
+            1_000, boot, Withheld, true, false
         ));
         // No boot instant: nothing is provably prior-boot.
-        assert!(!withheld_boot_restore_candidate(999, None, Withheld, true));
+        assert!(!withheld_boot_restore_candidate(
+            999, None, Withheld, true, false
+        ));
+        // A prior-boot row of a restoring restart cohort is held in EVERY phase,
+        // the restore having run included (it is a placeholder, not restored).
+        for phase in [NotYetRun, Withheld, Ran] {
+            for drain in [false, true] {
+                assert!(
+                    withheld_boot_restore_candidate(999, boot, phase, drain, true),
+                    "{phase:?} drain={drain}"
+                );
+            }
+        }
+        // ...but not once it is a this-boot record (restored), nor with no boot
+        // instant.
+        assert!(!withheld_boot_restore_candidate(
+            1_000, boot, Ran, false, true
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, None, Ran, false, true
+        ));
     }
 
     #[test]
