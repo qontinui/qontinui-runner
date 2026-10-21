@@ -1293,6 +1293,30 @@ mod tests {
         }
     }
 
+    /// Phase 3 seam test for `agent_runtime::finalize_headless_child_env`
+    /// (kept here rather than in the 18k-line `agent_runtime.rs`): the headless
+    /// seam carries `DISABLE_AUTOUPDATER=1` when the runner owns CLI updates,
+    /// and nothing on each of the three off arms.
+    #[test]
+    fn headless_finalize_child_env_defers_cli_updates_to_the_runner() {
+        let build = || {
+            let mut cmd = tokio::process::Command::new("dummy");
+            crate::agent_runtime::finalize_headless_child_env(
+                &mut cmd,
+                crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+                &crate::served_corpus::ServedCorpus::unknown("test"),
+            );
+            cmd.as_std()
+                .get_envs()
+                .find(|(k, _)| *k == "DISABLE_AUTOUPDATER")
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()))
+        };
+        assert_eq!(with_gate(test_gates::ON, build).as_deref(), Some("1"));
+        for (arm, gate) in test_gates::OFF_ARMS {
+            assert_eq!(with_gate(gate, build), None, "off arm: {arm}");
+        }
+    }
+
     #[test]
     fn cli_update_child_env_pairs_without_a_tick_is_empty() {
         // No updater tick runs in unit tests, so the process-wide gate has no

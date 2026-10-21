@@ -9828,6 +9828,11 @@ pub(crate) fn finalize_headless_child_env(
     // silently regresses. See `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_tokio(cmd);
 
+    // `DISABLE_AUTOUPDATER=1` when the runner owns CLI updates on this box.
+    crate::claude_cli_update::apply_child_env(|k, v| {
+        cmd.env(k, v);
+    });
+
     crate::terminal::scrub_credential_env_tokio(cmd);
 }
 
