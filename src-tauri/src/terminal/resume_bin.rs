@@ -31,11 +31,12 @@
 //! An explicit absolute `QONTINUI_CLAUDE_BIN` override is the operator's (or a
 //! test fixture's) choice and is passed through unjudged.
 //!
-//! **The CLI-update flag seam.** Phase 2 of the plan adds a runner-owned CLI
-//! updater whose in-progress flag every resume must wait on before resolving.
-//! It has not landed. [`await_cli_update_quiescent`] is where it plugs in;
-//! today it returns at once, and [`resolve_with_retry`] already calls it before
-//! every attempt.
+//! **The CLI-update flag seam.** The runner-owned CLI updater
+//! ([`crate::claude_cli_update`]) holds an in-progress flag for the length of
+//! each install. [`await_cli_update_quiescent`] waits on it before every
+//! attempt [`resolve_with_retry`] makes, so a resume never resolves into an
+//! install the runner itself is running. The wait is bounded by
+//! [`CLI_UPDATE_WAIT`]; past it the resolve's own retry schedule decides.
 
 use std::future::Future;
 use std::path::Path;
@@ -152,10 +153,28 @@ where
     ))
 }
 
-/// The CLI-update flag seam (plan Phase 2, not landed): returns once no
-/// runner-owned CLI install is in progress. Today there is no such updater, so
-/// it returns at once.
-async fn await_cli_update_quiescent() {}
+/// How long a resume waits out a runner-owned CLI install before resolving
+/// anyway. An install that outlives it is logged, and the resolve's retry
+/// schedule then applies as it would to any other miss.
+const CLI_UPDATE_WAIT: Duration = Duration::from_secs(120);
+
+/// Returns once no runner-owned CLI install is in progress, or after
+/// [`CLI_UPDATE_WAIT`].
+async fn await_cli_update_quiescent() {
+    use crate::claude_cli_update::{wait_if_updating, UpdateWait};
+    match wait_if_updating(CLI_UPDATE_WAIT).await {
+        UpdateWait::NotUpdating => {}
+        UpdateWait::Finished(waited) => {
+            tracing::info!(?waited, "resume-bin: waited out a runner CLI install");
+        }
+        UpdateWait::TimedOut(waited) => {
+            tracing::warn!(
+                ?waited,
+                "resume-bin: a runner CLI install is still running — resolving anyway"
+            );
+        }
+    }
+}
 
 /// One resolution attempt, off the async worker.
 async fn resolve_once_blocking() -> Result<String, ResolveMiss> {
