@@ -472,6 +472,10 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 "--model" => template_model = unit.values.first().cloned(),
                 // Effort is decided below the same way (spec beats template).
                 "--effort" => template_effort = unit.values.first().cloned(),
+                // The attached spelling, `--effort=<level>`, is the same flag.
+                n if n.starts_with("--effort=") => {
+                    template_effort = n.strip_prefix("--effort=").map(str::to_string);
+                }
                 // Name is spec-owned when the caller supplies one: drop the
                 // template's `--name` / `-n` (either spelling) so two never ship.
                 "--name" | "-n" if name.is_some() => {}
@@ -1334,6 +1338,16 @@ mod tests {
     fn template_effort_kept_and_no_effort_flag_without_either() {
         let argv = render_argv(&spec(), &tmpl("claude --effort low"), "claude");
         assert_eq!(value_after(&argv, "--effort"), Some("low"));
+        let attached = render_argv(&spec(), &tmpl("claude --effort=low"), "claude");
+        assert_eq!(value_after(&attached, "--effort"), Some("low"));
+        let mut s = spec();
+        s.effort = Some("max".to_string());
+        let over = render_argv(&s, &tmpl("claude --effort=low"), "claude");
+        assert_eq!(value_after(&over, "--effort"), Some("max"));
+        assert!(
+            !over.iter().any(|a| a.starts_with("--effort=")),
+            "the attached template spelling is dropped, not shipped beside the spec: {over:?}"
+        );
         let bare = render_argv(&spec(), &LaunchConfig::default(), "claude");
         assert!(!bare.iter().any(|a| a == "--effort"), "{bare:?}");
     }

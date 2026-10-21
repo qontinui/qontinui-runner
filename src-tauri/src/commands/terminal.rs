@@ -1785,16 +1785,23 @@ pub fn terminal_session_list_open(
                 true,
             ),
         );
+        // The drain withholds the AUTO-restore only. A restart cohort's
+        // placeholders are restored by the operator, whom no drain defers
+        // (D7), so they are offered even now.
+        let mut data = live_restore_set_body(&store, Vec::new());
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert(
+                "deferredByDrain".to_string(),
+                serde_json::json!({
+                    "state": crate::coord_drain_state::current().label(),
+                    "reason": reason,
+                }),
+            );
+        }
         return Ok(CommandResponse {
             success: true,
             message: Some(reason.clone()),
-            data: Some(serde_json::json!({
-                "sessions": [],
-                "deferredByDrain": {
-                    "state": crate::coord_drain_state::current().label(),
-                    "reason": reason,
-                },
-            })),
+            data: Some(data),
         });
     }
     // The prior shutdown marker's `at` is one input to the anchor. It is
@@ -1828,36 +1835,85 @@ pub fn terminal_session_list_open(
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(restore_set_body(
-            rows,
-            crate::restart_prep::restore::restoring_cohort().as_ref(),
-        )),
+        data: Some(live_restore_set_body(&store, rows)),
     })
+}
+
+/// [`restore_set_body`] in the running app: the live restoring cohort, its
+/// rows read from the lifecycle store, and a terminal counted live when this
+/// runner's manager holds it or a PTY holder kept it alive across the restart
+/// and its adoption is pending.
+fn live_restore_set_body(
+    store: &SessionLifecycleStore,
+    rows: Vec<RestoreCandidate>,
+) -> serde_json::Value {
+    use tauri::Manager;
+    let terminals = crate::tauri_app_handle::current().and_then(|app| {
+        app.try_state::<Arc<crate::terminal::TerminalManager>>()
+            .map(|t| t.inner().clone())
+    });
+    restore_set_body(
+        rows,
+        crate::restart_prep::restore::restoring_cohort().as_ref(),
+        |id| {
+            store.get(id).map(|rec| {
+                let transcript_exists = store
+                    .probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+                RestoreCandidate {
+                    record: rec,
+                    transcript_exists,
+                }
+            })
+        },
+        |terminal_id| {
+            terminals
+                .as_ref()
+                .is_some_and(|tm| tm.get(terminal_id).is_some())
+                || crate::terminal::holder_boot_sweep::adoption_pending(terminal_id)
+        },
+    )
 }
 
 /// The body [`terminal_session_list_open`] answers with its restore set.
 ///
 /// While a restart cohort is `restoring` (plan
 /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D6), its
-/// rows are NOT in `sessions`, which the webview auto-resumes: they come back
-/// under `placeholders`, each to be shown in its recorded page and zone with a
-/// Restore button (the backend resume through `operator_resume_sessions`), and
-/// `restartPrep` names the prepare. A planned restart leaves the operator in
-/// control; the lifecycle poll holds those rows open meanwhile
-/// (`in_active_cohort`). With no restoring cohort — a crash boot, or no
-/// prepare at all — the body is exactly `{"sessions": [...]}`, as before.
+/// waiting rows are NOT in `sessions`, which the webview auto-resumes: they
+/// come back under `placeholders` — EVERY waiting row with a lifecycle record,
+/// finished and closed ones included, not only the restorable set — each to
+/// be shown in its recorded page and zone with Restore and Finish (the backend
+/// resume through `operator_resume_sessions`), and `restartPrep` names the
+/// prepare. A planned restart leaves the operator in control; the lifecycle
+/// poll holds those rows open meanwhile (`in_active_cohort`).
+///
+/// A cohort row whose terminal is live (`terminal_live`: this runner holds
+/// it, or a PTY holder kept it alive and its adoption is pending) is running,
+/// not waiting: it stays wherever the ordinary restore set put it and is no
+/// placeholder. With no restoring cohort — a crash boot, or no prepare at
+/// all — the body is exactly `{"sessions": [...]}`, as before.
 fn restore_set_body(
     rows: Vec<RestoreCandidate>,
     cohort: Option<&crate::restart_prep::restore::RestoringCohort>,
+    placeholder_of: impl Fn(&str) -> Option<RestoreCandidate>,
+    terminal_live: impl Fn(&str) -> bool,
 ) -> serde_json::Value {
     let Some(cohort) = cohort else {
         return serde_json::json!({ "sessions": rows });
     };
-    let (sessions, placeholders) = crate::restart_prep::restore::split_placeholders(
-        rows,
-        |r| r.record.claude_session_id.as_str(),
-        &cohort.ids(),
-    );
+    let waiting = cohort.ids();
+    let sessions: Vec<RestoreCandidate> = rows
+        .into_iter()
+        .filter(|r| {
+            !waiting.contains(&r.record.claude_session_id) || terminal_live(&r.record.terminal_id)
+        })
+        .collect();
+    let mut ids: Vec<&String> = waiting.iter().collect();
+    ids.sort();
+    let placeholders: Vec<RestoreCandidate> = ids
+        .into_iter()
+        .filter_map(|id| placeholder_of(id))
+        .filter(|r| !terminal_live(&r.record.terminal_id))
+        .collect();
     serde_json::json!({
         "sessions": sessions,
         "placeholders": placeholders,
@@ -3191,7 +3247,20 @@ mod tests {
                 .collect()
         };
 
-        let crash_boot = restore_set_body(candidates(), None);
+        let record_of = |id: &str| {
+            let mut record = restore_candidate_record(id);
+            record.terminal_id = format!("term-{id}");
+            if id == "finished-closed" {
+                record.state = "closed".to_string();
+                record.finished_at = Some(5);
+            }
+            Some(RestoreCandidate {
+                record,
+                transcript_exists: Some(true),
+            })
+        };
+        let none_live = |_: &str| false;
+        let crash_boot = restore_set_body(candidates(), None, record_of, none_live);
         assert_eq!(ids(&crash_boot, "sessions"), ["a", "b", "c"]);
         assert_eq!(
             crash_boot.as_object().map(|o| o.len()),
@@ -3199,11 +3268,36 @@ mod tests {
             "a boot with no restoring cohort answers exactly as before: {crash_boot}"
         );
 
-        let cohort = crate::restart_prep::restore::restoring_cohort_for_test(&["b", "c", "gone"]);
-        let prepared = restore_set_body(candidates(), Some(&cohort));
+        let cohort = crate::restart_prep::restore::restoring_cohort_for_test(&[
+            "b",
+            "c",
+            "finished-closed",
+            "gone",
+        ]);
+        let record_or_gone = |id: &str| if id == "gone" { None } else { record_of(id) };
+        let prepared = restore_set_body(candidates(), Some(&cohort), record_or_gone, none_live);
         assert_eq!(ids(&prepared, "sessions"), ["a"]);
-        assert_eq!(ids(&prepared, "placeholders"), ["b", "c"]);
+        // Every waiting row with a record — a finished, closed one too, which
+        // the restorable set never offers — and nothing without a record.
+        assert_eq!(
+            ids(&prepared, "placeholders"),
+            ["b", "c", "finished-closed"]
+        );
         assert_eq!(prepared["restartPrep"]["prepareId"], "prep-test");
+
+        // A cohort row whose terminal is live (a PTY holder kept it) is running,
+        // not waiting: it stays in `sessions` and is no placeholder.
+        let rows_with_live_c = || {
+            let mut rows = candidates();
+            for r in &mut rows {
+                r.record.terminal_id = format!("term-{}", r.record.claude_session_id);
+            }
+            rows
+        };
+        let c_live = |t: &str| t == "term-c";
+        let held = restore_set_body(rows_with_live_c(), Some(&cohort), record_or_gone, c_live);
+        assert_eq!(ids(&held, "sessions"), ["a", "c"]);
+        assert_eq!(ids(&held, "placeholders"), ["b", "finished-closed"]);
     }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never

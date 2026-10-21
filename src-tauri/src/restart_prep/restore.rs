@@ -19,11 +19,19 @@
 //!   seen is a failure to confirm, not a success.
 //! * [`note_restore_on`] — the per-row restore verdict, recorded on the cohort
 //!   row itself so the panel and the placeholders read one record.
-//! * [`split_placeholders`] — the boot side: while a cohort is `restoring`,
-//!   its rows are returned to the webview as placeholders, NOT in the
-//!   auto-restore set (D6). A crash boot with no record is unchanged.
-//! * [`unfinish_for_restore`] — Restore on a finished cohort row first lifts
-//!   the finish mark, because the resume core refuses finished rows (D4).
+//! * The boot side (`commands::terminal::terminal_session_list_open`) reads
+//!   [`RestoringCohort`] to return the waiting rows as placeholders, NOT in
+//!   the auto-restore set (D6). A crash boot with no record is unchanged.
+//! * [`note_running`] — the lifecycle poll's observation that a cohort row is
+//!   running again (a pane the PTY holder kept alive across the restart and
+//!   the runner adopted, or a session resumed by another path). A row that is
+//!   back — resumed, or observed running — leaves the waiting set for good, so
+//!   a later crash boot auto-restores it like any other session.
+//!
+//! Restore on a FINISHED cohort row lifts the finish mark first (D4); the
+//! resume core does that itself, for the operator origin only, after every
+//! guard has passed and immediately before the spawn — so a refused Restore
+//! leaves the mark where it was.
 //!
 //! The withheld-boot-restore shield's `in_active_cohort` arm
 //! (`session_lifecycle_store::withheld_boot_restore_candidate`) reads
@@ -40,7 +48,6 @@ use super::cohort::CohortRow;
 use super::effort::{self, EffortSource};
 use super::prepare::RestartPrep;
 use super::{rfc3339, PrepState, PrepareRecord};
-use crate::session::session_lifecycle_store::SessionLifecycleStore;
 use crate::terminal::graceful_exit::ScreenText;
 
 /// The read-back verdict when the pane's status row shows the re-applied level.
@@ -72,16 +79,26 @@ pub struct RowRestore {
     pub effort: Option<String>,
 }
 
+/// The verdict [`note_running`] records: the lifecycle poll observed the
+/// row's session alive in a live terminal.
+pub const VERDICT_RUNNING: &str = "running";
+
 impl RowRestore {
-    /// The resume landed (verified by a process read).
-    pub fn is_resumed(&self) -> bool {
+    /// The row's session is back: the resume landed (verified by a process
+    /// read), the poll observed it running ([`VERDICT_RUNNING`]), or a Restore
+    /// found it already running here (`skipped(live_terminal)` /
+    /// `skipped(live_process(..))`). A pending holder adoption is NOT back yet.
+    pub fn is_back(&self) -> bool {
         self.verdict == "resumed"
+            || self.verdict == VERDICT_RUNNING
+            || self.verdict == "skipped(live_terminal)"
+            || self.verdict.starts_with("skipped(live_process(")
     }
 }
 
-/// Whether `row` was restored by this cohort's restore already.
+/// Whether `row`'s session is back (see [`RowRestore::is_back`]).
 fn restored(row: &CohortRow) -> bool {
-    row.restore.as_ref().is_some_and(RowRestore::is_resumed)
+    row.restore.as_ref().is_some_and(RowRestore::is_back)
 }
 
 /// What one cohort row is resumed with.
@@ -90,6 +107,8 @@ pub struct RestoreTarget {
     /// The level to pass as `--effort`, or `None` to let the account's own
     /// default apply ([`effort_to_apply`]).
     pub effort: Option<String>,
+    /// Held for a hand restore (D6): only the operator restores it.
+    pub held: bool,
 }
 
 /// The level a row is resumed at: the effort it RAN at, when that was read
@@ -144,6 +163,7 @@ impl RestoringCohort {
                         row.session.claude_session_id.clone(),
                         RestoreTarget {
                             effort: effort_to_apply(row),
+                            held: row.held,
                         },
                     )
                 })
@@ -180,9 +200,11 @@ pub fn restoring_cohort_ids() -> HashSet<String> {
 
 /// Record a restore verdict on the cohort row `claude_session_id` of prepare
 /// `prepare_id`, while that record is `restoring`. `Ok(false)` when the record
-/// is no longer restoring or carries no such row (nothing written). Once every
-/// row is restored the record moves to `done`; a row that is never restored
-/// (held, Finished) keeps it `restoring` until the cohort is dismissed.
+/// is no longer restoring or carries no such row (nothing written), and when
+/// the row is already back — a later call's stale skip never overwrites a
+/// landed restore. Once every row is back the record moves to `done`; a row
+/// that is never restored (held, Finished) keeps it `restoring` until the
+/// cohort is dismissed.
 pub fn note_restore_on(
     ctl: &RestartPrep,
     prepare_id: &str,
@@ -195,7 +217,7 @@ pub fn note_restore_on(
             && r.cohort
                 .rows
                 .iter()
-                .any(|row| row.session.claude_session_id == claude_session_id)
+                .any(|row| row.session.claude_session_id == claude_session_id && !restored(row))
     });
     if !applies {
         return Ok(false);
@@ -208,7 +230,7 @@ pub fn note_restore_on(
             .cohort
             .rows
             .iter_mut()
-            .find(|row| row.session.claude_session_id == claude_session_id)
+            .find(|row| row.session.claude_session_id == claude_session_id && !restored(row))
         {
             row.restore = Some(restore);
         }
@@ -246,6 +268,26 @@ pub fn note_restore(
             "restart_prep: restore verdict not recorded on the cohort row"
         );
     }
+}
+
+/// The lifecycle poll observed cohort row `claude_session_id` alive in a live
+/// terminal: record it as back ([`VERDICT_RUNNING`]) so it leaves the waiting
+/// set. A no-op when there is no restoring cohort, the row is not in it, or it
+/// is back already — so a poll tick that sees it again writes nothing.
+pub fn note_running(claude_session_id: &str) {
+    let Some(cohort) = restoring_cohort() else {
+        return;
+    };
+    if !cohort.contains(claude_session_id) {
+        return;
+    }
+    note_restore(
+        &cohort.prepare_id,
+        claude_session_id,
+        VERDICT_RUNNING,
+        None,
+        None,
+    );
 }
 
 /// PURE: what one read of the pane says about the re-applied `wanted` level.
@@ -291,48 +333,6 @@ pub async fn read_back_effort(
         }
         tokio::time::sleep(poll).await;
     }
-}
-
-/// The boot side (D6): split the auto-restore set into the rows the webview
-/// restores now and the cohort rows it shows as placeholders instead. With an
-/// empty `cohort` — no record, or a record that is not `restoring` —
-/// everything is restored exactly as before.
-pub fn split_placeholders<T>(
-    rows: Vec<T>,
-    id_of: impl Fn(&T) -> &str,
-    cohort: &HashSet<String>,
-) -> (Vec<T>, Vec<T>) {
-    rows.into_iter().partition(|r| !cohort.contains(id_of(r)))
-}
-
-/// Restore on a FINISHED cohort row lifts the finish mark first, because the
-/// resume core refuses a finished row (D4). Only rows of the restoring
-/// `cohort` are touched — an operator Restore of any other finished session
-/// still reads `skipped(finished)`. Returns the ids un-finished.
-pub fn unfinish_for_restore(
-    store: &SessionLifecycleStore,
-    ids: &[String],
-    cohort: Option<&RestoringCohort>,
-) -> Vec<String> {
-    let Some(cohort) = cohort else {
-        return Vec::new();
-    };
-    ids.iter()
-        .filter(|id| cohort.contains(id))
-        .filter(|id| store.get(id).is_some_and(|r| r.finished_at.is_some()))
-        .filter_map(|id| match store.set_finished(id, false, None) {
-            Ok(_) => Some(id.clone()),
-            Err(e) => {
-                warn!(
-                    session = %id,
-                    error = ?e,
-                    "restart_prep: could not lift the finish mark before restore — the resume \
-                     core will refuse the row as finished"
-                );
-                None
-            }
-        })
-        .collect()
 }
 
 /// A `restoring` cohort over `ids` (prepare `prep-test`), each row captured at
@@ -504,6 +504,40 @@ mod tests {
     }
 
     #[test]
+    fn a_row_is_back_when_resumed_running_or_found_running_and_not_otherwise() {
+        let r = |v: &str| RowRestore {
+            at_ms: 0,
+            at: String::new(),
+            verdict: v.to_string(),
+            effort_applied: None,
+            effort: None,
+        };
+        for back in [
+            "resumed",
+            VERDICT_RUNNING,
+            "skipped(live_terminal)",
+            "skipped(live_process(pid 7))",
+        ] {
+            assert!(r(back).is_back(), "{back}");
+        }
+        for waiting in [
+            "skipped(holder_adoption_pending)",
+            "skipped(resource_guard:thread_count)",
+            "failed(no_claude_resume_process_observed)",
+            "skipped(held_for_hand_restore)",
+        ] {
+            assert!(!r(waiting).is_back(), "{waiting}");
+        }
+        // A row found running leaves the waiting set.
+        let mut rec = record(PrepState::Restoring, &["a", "b"]);
+        rec.cohort.rows[0].restore = Some(r("skipped(live_terminal)"));
+        let waiting = RestoringCohort::of(&rec).unwrap();
+        assert!(!waiting.contains("a") && waiting.contains("b"));
+        // With no live controller, the poll's observation writes nothing.
+        note_running("a");
+    }
+
+    #[test]
     fn judge_effort_reads_the_status_row() {
         let shows = |l: &str| screen(&["transcript", l, "────", "❯\u{a0}"]);
         assert_eq!(judge_effort("max", &shows("◉ max · /effort")), Ok(()));
@@ -565,20 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn cohort_rows_become_placeholders_and_a_crash_boot_restores_as_before() {
-        let rows = vec!["a", "b", "c"];
-        // A crash boot / no record: nothing is a placeholder.
-        let (restore, placeholders) = split_placeholders(rows.clone(), |r| r, &HashSet::new());
-        assert_eq!(restore, ["a", "b", "c"]);
-        assert!(placeholders.is_empty());
-        // A restoring cohort holding b and c (and z, which is not open here).
-        let cohort: HashSet<String> = ["b", "c", "z"].iter().map(|s| s.to_string()).collect();
-        let (restore, placeholders) = split_placeholders(rows, |r| r, &cohort);
-        assert_eq!(restore, ["a"]);
-        assert_eq!(placeholders, ["b", "c"]);
-    }
-
-    #[test]
     fn a_restore_verdict_lands_on_the_row_only_while_restoring() {
         let dir = tempfile::tempdir().unwrap();
         let ctl = active_controller_for_test(dir.path(), &["s1", "s2"], 1_000);
@@ -622,6 +642,19 @@ mod tests {
         let on_disk = crate::restart_prep::load_from(&dir.path().join("restart-prep.json"))
             .expect("record on disk");
         assert_eq!(on_disk.cohort.rows[0].restore, rec.cohort.rows[0].restore);
+        // A later call's stale verdict never overwrites a landed restore.
+        assert_eq!(
+            note_restore_on(&ctl, &prepare_id, "s1", verdict("skipped(not_closed)")),
+            Ok(false)
+        );
+        assert_eq!(
+            ctl.record().unwrap().cohort.rows[0]
+                .restore
+                .as_ref()
+                .map(|r| r.verdict.as_str()),
+            Some("resumed")
+        );
+        let rec = ctl.record().unwrap();
         // A restored row leaves the cohort still waiting; the other stays.
         let waiting = RestoringCohort::of(&rec).expect("still restoring");
         assert!(!waiting.contains("s1") && waiting.contains("s2"));
@@ -641,36 +674,5 @@ mod tests {
         note_restore_on(&ctl, &prepare_id, "s2", verdict("resumed")).unwrap();
         assert_eq!(ctl.record().unwrap().state, PrepState::Done);
         assert_eq!(RestoringCohort::of(&ctl.record().unwrap()), None);
-    }
-
-    #[test]
-    fn a_finished_cohort_row_is_un_finished_and_then_admitted_and_nothing_else_is() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
-        for id in ["in-cohort", "outside"] {
-            store.record_open(crate::session::session_lifecycle_store::test_open_record(
-                id,
-            ));
-            store
-                .set_finished(id, true, Some("done".to_string()))
-                .unwrap();
-        }
-        let cohort = RestoringCohort::of(&record(PrepState::Restoring, &["in-cohort"])).unwrap();
-        let ids = vec!["in-cohort".to_string(), "outside".to_string()];
-        // No restoring cohort: nothing is touched.
-        assert!(unfinish_for_restore(&store, &ids, None).is_empty());
-        assert!(store.get("in-cohort").unwrap().finished_at.is_some());
-
-        assert_eq!(
-            unfinish_for_restore(&store, &ids, Some(&cohort)),
-            ["in-cohort"]
-        );
-        assert!(store.get("in-cohort").unwrap().finished_at.is_none());
-        assert!(
-            store.get("outside").unwrap().finished_at.is_some(),
-            "a finished session outside the cohort keeps its mark"
-        );
-        // Idempotent: a second Restore un-finishes nothing more.
-        assert!(unfinish_for_restore(&store, &ids, Some(&cohort)).is_empty());
     }
 }

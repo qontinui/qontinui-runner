@@ -5058,6 +5058,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                         poll_lifecycle_store
                                             .clear_restore_pending(&rec.claude_session_id);
                                     }
+                                    // A restart-cohort row seen alive (a pane a
+                                    // PTY holder kept and the runner adopted, or
+                                    // one resumed by any path) is back: it
+                                    // leaves the waiting set, so a later crash
+                                    // boot auto-restores it like any session.
+                                    if tick_restoring_cohort.contains(&rec.claude_session_id) {
+                                        crate::restart_prep::restore::note_running(
+                                            &rec.claude_session_id,
+                                        );
+                                    }
                                     poll_lifecycle_store.touch(&rec.claude_session_id);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);

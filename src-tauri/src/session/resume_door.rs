@@ -73,8 +73,14 @@
 //! one way: a cohort row that is `open` but has NO live terminal here — the
 //! shape every cohort row has after a restart — is admitted alongside
 //! `closed`. An open row outside the cohort is still `skipped(not_closed)`, an
-//! open cohort row whose terminal IS live is `skipped(live_terminal)`, and the
-//! in-flight and live-process guards are unchanged. A cohort row is resumed at
+//! open cohort row whose terminal IS live is `skipped(live_terminal)` — or
+//! `skipped(holder_adoption_pending | holder_sweep_pending)` while a PTY
+//! holder that kept its pane alive across the restart may still be adopted —
+//! and the in-flight and live-process guards are unchanged. A row held for a
+//! hand restore is the operator's only (`skipped(held_for_hand_restore)` for
+//! an autonomous caller), and only the operator's Restore lifts a finished
+//! cohort row's finish mark — after every guard, just before the spawn, put
+//! back if the resume does not land. A cohort row is resumed at
 //! the effort it ran at (`--effort <level>`, when that differs from its
 //! account's baseline) and the verdict, with the effort read-back, is
 //! recorded on the cohort row.
@@ -253,43 +259,72 @@ struct Candidate {
     zone_index: i32,
     /// Set when the id is a row of the restoring cohort.
     cohort: Option<CohortMember>,
+    /// A FINISHED cohort row restored by the operator: the core lifts the
+    /// finish mark immediately before the spawn (D4), and puts it back if the
+    /// resume does not land.
+    lift_finish: bool,
 }
 
 /// What the restoring cohort says about one id (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CohortMember {
     prepare_id: String,
-    /// Whether the row's recorded terminal is live in this runner. An open row
-    /// is admitted only when it is not.
-    terminal_live: bool,
+    /// Why the row's recorded terminal rules out a cold resume of an OPEN row:
+    /// `live_terminal` (live in this runner), `holder_adoption_pending` (a PTY
+    /// holder kept its pane alive across the restart and the runner is still
+    /// adopting it), `holder_sweep_pending` (the holder census is not in, so
+    /// that cannot be ruled out yet). `None` when nothing does.
+    terminal_blocker: Option<&'static str>,
     /// The level to pass as `--effort`.
     effort: Option<String>,
+    /// Held for a hand restore (D6): only the operator origin restores it.
+    held: bool,
 }
 
-/// The cohort membership of `id`, when `cohort` holds it. `terminal_live`
-/// reads the row's recorded terminal in this runner's manager.
+/// The cohort membership of `id`, when `cohort` holds it. `terminal_blocker`
+/// judges the row's recorded terminal (see [`CohortMember::terminal_blocker`]).
 fn cohort_member(
     cohort: Option<&RestoringCohort>,
     id: &str,
     rec: Option<&TerminalSessionRecord>,
-    terminal_live: impl Fn(&str) -> bool,
+    terminal_blocker: impl Fn(&str) -> Option<&'static str>,
 ) -> Option<CohortMember> {
     let cohort = cohort?;
     let target = cohort.target(id)?;
     Some(CohortMember {
         prepare_id: cohort.prepare_id.clone(),
-        terminal_live: rec.is_some_and(|r| terminal_live(&r.terminal_id)),
+        terminal_blocker: rec.and_then(|r| terminal_blocker(&r.terminal_id)),
         effort: target.effort.clone(),
+        held: target.held,
     })
+}
+
+/// [`CohortMember::terminal_blocker`] in the running app: the terminal
+/// manager, then the PTY holder's adoption state.
+fn live_terminal_blocker(tm: &TerminalManager, terminal_id: &str) -> Option<&'static str> {
+    use crate::terminal::holder_boot_sweep as sweep;
+    if tm.get(terminal_id).is_some() {
+        return Some("live_terminal");
+    }
+    if sweep::adoption_pending(terminal_id) {
+        return Some("holder_adoption_pending");
+    }
+    if sweep::sweep_status(Duration::ZERO).held.is_none() {
+        return Some("holder_sweep_pending");
+    }
+    None
 }
 
 /// Why a lifecycle row cannot be resumed, or the candidate it yields.
 /// `cohort` is the id's membership in the restoring cohort, which admits an
-/// `open` row whose terminal is not live (D7).
+/// `open` row whose terminal rules nothing out (D7). `operator` is whether the
+/// caller is the operator: only the operator restores a row held for a hand
+/// restore, and only the operator's Restore lifts a cohort row's finish mark.
 fn classify(
     id: &str,
     rec: Option<&TerminalSessionRecord>,
     cohort: Option<&CohortMember>,
+    operator: bool,
 ) -> Result<Candidate, String> {
     if !super::session_id::is_valid_session_id(id) {
         return Err("invalid_id".to_string());
@@ -302,13 +337,18 @@ fn classify(
     }
     match (rec.state.as_str(), cohort) {
         ("closed", _) => {}
-        ("open", Some(member)) if member.terminal_live => {
-            return Err("live_terminal".to_string());
+        ("open", Some(member)) => {
+            if let Some(blocker) = member.terminal_blocker {
+                return Err(blocker.to_string());
+            }
         }
-        ("open", Some(_)) => {}
         _ => return Err("not_closed".to_string()),
     }
-    if rec.finished_at.is_some() {
+    if cohort.is_some_and(|m| m.held) && !operator {
+        return Err("held_for_hand_restore".to_string());
+    }
+    let lift_finish = rec.finished_at.is_some();
+    if lift_finish && !(operator && cohort.is_some()) {
         return Err("finished".to_string());
     }
     let config_dir = rec
@@ -336,7 +376,25 @@ fn classify(
         page_id: rec.page_id.clone(),
         zone_index: rec.zone_index,
         cohort: cohort.cloned(),
+        lift_finish,
     })
+}
+
+/// Lift `id`'s finish mark for a restore: `Ok(reason)` with the reason it
+/// carried, so [`restore_finish`] can put it back if the resume does not land.
+fn lift_finish(store: &SessionLifecycleStore, id: &str) -> Result<Option<String>, String> {
+    let prior = store.get(id).and_then(|r| r.finish_reason);
+    store
+        .set_finished(id, false, None)
+        .map(|_| prior)
+        .map_err(|e| format!("finish_mark_unliftable({e:?})"))
+}
+
+/// Put back a finish mark [`lift_finish`] lifted for a resume that did not land.
+fn restore_finish(store: &SessionLifecycleStore, id: &str, reason: Option<String>) {
+    if let Err(e) = store.set_finished(id, true, reason) {
+        warn!(id, error = ?e, "resume_door: could not restore the finish mark after a failed resume");
+    }
 }
 
 /// What a request asked for, once validated.
@@ -727,6 +785,22 @@ async fn resume_one(
     }) {
         return ResumeRow::skipped(&cand.id, why);
     }
+    // Every guard passed: lift a finished cohort row's mark now, never before
+    // — a refused Restore leaves it where it was.
+    let lifted = if cand.lift_finish {
+        match lift_finish(store, &cand.id) {
+            Ok(reason) => Some(reason),
+            Err(why) => return ResumeRow::skipped(&cand.id, why),
+        }
+    } else {
+        None
+    };
+    let refinish = |row: ResumeRow| {
+        if let Some(reason) = lifted.clone() {
+            restore_finish(store, &cand.id, reason);
+        }
+        row
+    };
 
     let effort = cand.cohort.as_ref().and_then(|m| m.effort.clone());
     let spawn = {
@@ -778,8 +852,14 @@ async fn resume_one(
     let terminal_id = match spawn {
         Ok(Ok((terminal_id, _coord_id))) => terminal_id,
         // Refused before anything started: the box is busy, retry later.
-        Ok(Err(e)) => return spawn_error_row(&cand.id, &e),
-        Err(e) => return ResumeRow::failed(&cand.id, format!("spawn_task: {e}"), None),
+        Ok(Err(e)) => return refinish(spawn_error_row(&cand.id, &e)),
+        Err(e) => {
+            return refinish(ResumeRow::failed(
+                &cand.id,
+                format!("spawn_task: {e}"),
+                None,
+            ))
+        }
     };
     // A cohort row's resume was attempted: stamp the restore marker now (tier
     // `failed` until the process read below proves it), never at boot — a
@@ -809,7 +889,7 @@ async fn resume_one(
             }
             row
         }
-        Err(reason) => ResumeRow::failed(
+        Err(reason) => refinish(ResumeRow::failed(
             &cand.id,
             reason,
             Some(ProcessEvidence {
@@ -819,7 +899,7 @@ async fn resume_one(
                 cwd: None,
                 claude_config_dir: None,
             }),
-        ),
+        )),
     }
 }
 
@@ -838,20 +918,28 @@ fn tally(generation: Option<String>, requested: usize, results: Vec<ResumeRow>) 
 
 /// Run the batch to completion, one id at a time. Spawned DETACHED by the
 /// handler: it owns everything it needs and is not tied to the request future.
+/// Each id is bounded by the process-read verify (20 s) and, for a cohort row
+/// whose effort is re-applied, the effort read-back (30 s); the restart
+/// restore's queue sends one id per call.
 async fn run_batch(
     app: tauri::AppHandle,
     tm: Arc<TerminalManager>,
     registry: Arc<SessionRegistry>,
     store: Arc<SessionLifecycleStore>,
     ids: Vec<String>,
-    cohort: Option<RestoringCohort>,
     origin: SpawnOrigin,
 ) -> Vec<ResumeRow> {
     let mut results = Vec::new();
+    let operator = !origin.is_autonomous();
     for id in &ids {
         let rec = store.get(id);
-        let member = cohort_member(cohort.as_ref(), id, rec.as_ref(), |t| tm.get(t).is_some());
-        let row = match classify(id, rec.as_ref(), member.as_ref()) {
+        // Re-read per id: an overlapping call may have restored a row since
+        // this batch began, and a restored row is no longer in the cohort.
+        let cohort = crate::restart_prep::restore::restoring_cohort();
+        let member = cohort_member(cohort.as_ref(), id, rec.as_ref(), |t| {
+            live_terminal_blocker(&tm, t)
+        });
+        let row = match classify(id, rec.as_ref(), member.as_ref(), operator) {
             Err(why) => ResumeRow::skipped(id, why),
             Ok(cand) => resume_one(&app, &tm, &registry, &store, cand, origin).await,
         };
@@ -980,9 +1068,6 @@ pub(crate) async fn resume_sessions(
     );
 
     let requested = ids.len();
-    // Read once per call: the record is `restoring` for the whole batch or not
-    // at all, and a row's admission must not change halfway through it.
-    let cohort = crate::restart_prep::restore::restoring_cohort();
     // Detached: a caller that hangs up mid-batch must not cancel the ids still
     // to come (nor orphan a spawn between its start and its verification).
     // Every id's verdict is logged by `run_batch` whether or not anyone is
@@ -993,7 +1078,6 @@ pub(crate) async fn resume_sessions(
         registry,
         store,
         ids,
-        cohort,
         origin,
     ));
     let results = batch.await.map_err(|e| {
@@ -1091,24 +1175,39 @@ mod tests {
     #[test]
     fn classify_names_every_skip_reason() {
         assert_eq!(
-            reason(classify("bad id!", Some(&rec("closed")), None)),
+            reason(classify("bad id!", Some(&rec("closed")), None, true)),
             "invalid_id"
         );
-        assert_eq!(reason(classify(ID, None, None)), "not_found");
-        assert_eq!(reason(classify(ID, Some(&rec("open")), None)), "not_closed");
+        assert_eq!(reason(classify(ID, None, None, true)), "not_found");
+        assert_eq!(
+            reason(classify(ID, Some(&rec("open")), None, true)),
+            "not_closed"
+        );
         let mut finished = rec("closed");
         finished.finished_at = Some(9);
-        assert_eq!(reason(classify(ID, Some(&finished), None)), "finished");
+        assert_eq!(
+            reason(classify(ID, Some(&finished), None, true)),
+            "finished"
+        );
         let mut other = rec("closed");
         other.provider = "gemini".to_string();
-        assert_eq!(reason(classify(ID, Some(&other), None)), "provider_gemini");
+        assert_eq!(
+            reason(classify(ID, Some(&other), None, true)),
+            "provider_gemini"
+        );
         let mut nocfg = rec("closed");
         nocfg.config_dir = Some("  ".to_string());
-        assert_eq!(reason(classify(ID, Some(&nocfg), None)), "no_config_dir");
+        assert_eq!(
+            reason(classify(ID, Some(&nocfg), None, true)),
+            "no_config_dir"
+        );
         let mut nowd = rec("closed");
         nowd.working_dir = None;
-        assert_eq!(reason(classify(ID, Some(&nowd), None)), "no_working_dir");
-        let ok = classify(ID, Some(&rec("closed")), None).unwrap();
+        assert_eq!(
+            reason(classify(ID, Some(&nowd), None, true)),
+            "no_working_dir"
+        );
+        let ok = classify(ID, Some(&rec("closed")), None, true).unwrap();
         assert_eq!((ok.config_dir.as_str(), ok.zone_index), ("/cfg", 2));
     }
 
@@ -1249,7 +1348,7 @@ mod tests {
     }
 
     fn cand() -> Candidate {
-        classify(ID, Some(&rec("closed")), None).unwrap()
+        classify(ID, Some(&rec("closed")), None, true).unwrap()
     }
 
     fn proc(cmd: &str, cwd: Option<&str>, cfg: Option<&str>) -> ClaudeProc {
@@ -1304,61 +1403,71 @@ mod tests {
         crate::restart_prep::restore::restoring_cohort_for_test(ids)
     }
 
+    /// No terminal rules a cold resume out.
+    fn no_blocker(_: &str) -> Option<&'static str> {
+        None
+    }
+
     #[test]
     fn an_open_cohort_row_with_no_terminal_resumes_and_outside_the_cohort_is_refused() {
         let cohort = restoring(&[ID]);
         let open = rec("open");
-        let no_terminal = |_: &str| false;
-        let member = cohort_member(Some(&cohort), ID, Some(&open), no_terminal);
-        let cand = classify(ID, Some(&open), member.as_ref()).expect("admitted in cohort mode");
+        let member = cohort_member(Some(&cohort), ID, Some(&open), no_blocker);
+        let cand =
+            classify(ID, Some(&open), member.as_ref(), true).expect("admitted in cohort mode");
+        assert!(!cand.lift_finish);
         let m = cand
             .cohort
             .expect("the candidate carries its cohort membership");
         assert_eq!(m.prepare_id, "prep-test");
         assert_eq!(m.effort.as_deref(), Some("max"));
+        // The route (an autonomous caller) is admitted too: one core (D7).
+        assert!(classify(ID, Some(&open), member.as_ref(), false).is_ok());
         // The same open row with no cohort, or with a cohort that does not hold it.
-        assert_eq!(reason(classify(ID, Some(&open), None)), "not_closed");
+        assert_eq!(reason(classify(ID, Some(&open), None, true)), "not_closed");
         let other = restoring(&["11111111-1111-4111-8111-111111111111"]);
-        let not_member = cohort_member(Some(&other), ID, Some(&open), no_terminal);
+        let not_member = cohort_member(Some(&other), ID, Some(&open), no_blocker);
         assert_eq!(not_member, None);
         assert_eq!(
-            reason(classify(ID, Some(&open), not_member.as_ref())),
+            reason(classify(ID, Some(&open), not_member.as_ref(), true)),
             "not_closed"
         );
         // A closed cohort row is admitted and still carries its effort.
         let closed = rec("closed");
-        let member = cohort_member(Some(&cohort), ID, Some(&closed), no_terminal);
-        let cand = classify(ID, Some(&closed), member.as_ref()).unwrap();
+        let member = cohort_member(Some(&cohort), ID, Some(&closed), no_blocker);
+        let cand = classify(ID, Some(&closed), member.as_ref(), true).unwrap();
         assert_eq!(cand.cohort.and_then(|m| m.effort).as_deref(), Some("max"));
-        // Cohort mode widens nothing else: a finished cohort row is refused
-        // until its mark is lifted.
-        let mut finished = rec("open");
-        finished.finished_at = Some(9);
-        let member = cohort_member(Some(&cohort), ID, Some(&finished), no_terminal);
-        assert_eq!(
-            reason(classify(ID, Some(&finished), member.as_ref())),
-            "finished"
-        );
     }
 
     #[test]
-    fn an_open_cohort_row_whose_terminal_is_live_is_refused() {
+    fn an_open_cohort_row_whose_terminal_is_live_or_being_adopted_is_refused() {
         let cohort = restoring(&[ID]);
         let open = rec("open");
-        let member = cohort_member(Some(&cohort), ID, Some(&open), |t| t == "t");
-        assert!(member.as_ref().is_some_and(|m| m.terminal_live));
-        assert_eq!(
-            reason(classify(ID, Some(&open), member.as_ref())),
-            "live_terminal"
-        );
+        for blocker in [
+            "live_terminal",
+            "holder_adoption_pending",
+            "holder_sweep_pending",
+        ] {
+            let member = cohort_member(Some(&cohort), ID, Some(&open), |t| {
+                (t == "t").then_some(blocker)
+            });
+            assert_eq!(
+                reason(classify(ID, Some(&open), member.as_ref(), true)),
+                blocker
+            );
+        }
+        // A CLOSED cohort row's old terminal is not consulted.
+        let closed = rec("closed");
+        let member = cohort_member(Some(&cohort), ID, Some(&closed), |_| Some("live_terminal"));
+        assert!(classify(ID, Some(&closed), member.as_ref(), true).is_ok());
     }
 
     #[test]
     fn an_admitted_open_cohort_row_with_a_live_holder_is_still_skipped() {
         let cohort = restoring(&[ID]);
         let open = rec("open");
-        let member = cohort_member(Some(&cohort), ID, Some(&open), |_| false);
-        let cand = classify(ID, Some(&open), member.as_ref()).expect("admitted");
+        let member = cohort_member(Some(&cohort), ID, Some(&open), no_blocker);
+        let cand = classify(ID, Some(&open), member.as_ref(), true).expect("admitted");
         // The live-holder guard runs for every candidate, cohort rows included.
         let skip = holder_skip(&cand.id, Ok(Some(4242))).expect("a live holder skips");
         assert_eq!(skip.verdict, "skipped(live_process(pid 4242))");
@@ -1366,6 +1475,87 @@ mod tests {
             .expect("an unreadable table skips");
         assert_eq!(unreadable.verdict, "skipped(process_table_unreadable)");
         assert_eq!(holder_skip(&cand.id, Ok(None)), None);
+    }
+
+    #[test]
+    fn a_held_cohort_row_is_the_operators_to_restore() {
+        let mut cohort_rec = rec("open");
+        cohort_rec.claude_session_id = ID.to_string();
+        let cohort = restoring(&[ID]);
+        let mut member = cohort_member(Some(&cohort), ID, Some(&cohort_rec), no_blocker).unwrap();
+        member.held = true;
+        assert_eq!(
+            reason(classify(ID, Some(&cohort_rec), Some(&member), false)),
+            "held_for_hand_restore"
+        );
+        assert!(classify(ID, Some(&cohort_rec), Some(&member), true).is_ok());
+    }
+
+    #[test]
+    fn only_the_operators_restore_of_a_finished_cohort_row_lifts_its_mark() {
+        let cohort = restoring(&[ID]);
+        let mut finished = rec("closed");
+        finished.finished_at = Some(9);
+        let member = cohort_member(Some(&cohort), ID, Some(&finished), no_blocker);
+        // The operator: admitted, and the core will lift the mark before the spawn.
+        let cand = classify(ID, Some(&finished), member.as_ref(), true).expect("admitted");
+        assert!(cand.lift_finish);
+        // The route never lifts a finish mark, cohort or not.
+        assert_eq!(
+            reason(classify(ID, Some(&finished), member.as_ref(), false)),
+            "finished"
+        );
+        // Outside a cohort the operator is refused as before.
+        assert_eq!(
+            reason(classify(ID, Some(&finished), None, true)),
+            "finished"
+        );
+    }
+
+    #[test]
+    fn a_lifted_finish_mark_is_put_back_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(super::super::session_lifecycle_store::test_open_record(ID));
+        store
+            .set_finished(ID, true, Some("work done".to_string()))
+            .unwrap();
+        let reason = lift_finish(&store, ID).expect("lifted");
+        assert_eq!(reason.as_deref(), Some("work done"));
+        let lifted = store.get(ID).unwrap();
+        assert!(lifted.finished_at.is_none());
+        // Admitted now as an ordinary row (no cohort needed once un-finished).
+        assert!(classify(ID, Some(&lifted), None, false).is_err_and(|e| e == "not_closed"));
+        restore_finish(&store, ID, reason);
+        let back = store.get(ID).unwrap();
+        assert!(back.finished_at.is_some());
+        assert_eq!(back.finish_reason.as_deref(), Some("work done"));
+        assert!(lift_finish(&store, "never-seen").is_err());
+    }
+
+    /// `resume_one` gates on the origin its caller hands it — never a literal
+    /// one — so the route's `HTTP_ORIGIN` is deferred under a drain and the
+    /// operator twin's origin is not. Read off the source because the call
+    /// needs a running app; the spawn-sites guard accepts a literal `Respawn`,
+    /// so nothing else would notice the origin being hardcoded again.
+    #[test]
+    fn resume_one_gates_on_the_origin_it_is_handed() {
+        let src = include_str!("resume_door.rs");
+        let (_, rest) = src
+            .split_once("async fn resume_one(")
+            .expect("resume_one exists");
+        let (body, _) = rest.split_once("\n}\n").expect("resume_one's body ends");
+        let (_, after_gate) = body
+            .split_once("drain_gate_for_work(")
+            .expect("resume_one calls the drain gate");
+        assert!(
+            after_gate.trim_start().starts_with("origin,"),
+            "the gate's first argument must be the handed origin: {after_gate}"
+        );
+        assert!(
+            !body.contains("SpawnOrigin::"),
+            "resume_one must not name a literal origin"
+        );
     }
 
     #[test]

@@ -225,30 +225,17 @@ pub async fn operator_resume_task_run(
 /// The same core as the route ([`crate::session::resume_door::resume_sessions`]),
 /// gated as the operator, so a residual drain never defers the operator's
 /// click; the in-flight and live-process guards, the transcript check and
-/// `MIGRATION_CAP` apply exactly as on the route. While a cohort is
-/// `restoring`, a FINISHED cohort row named here has its finish mark lifted
-/// first, because the core refuses finished rows (D4) — the route never does
-/// that. The door's reply is returned unchanged.
+/// `MIGRATION_CAP` apply exactly as on the route. Being the operator, it may
+/// restore a cohort row held for a hand restore, and a FINISHED cohort row:
+/// the core lifts that row's finish mark after every guard, just before the
+/// spawn, and puts it back if the resume does not land (D4) — the route does
+/// neither. The door's reply is returned unchanged.
 #[tauri::command]
 pub async fn operator_resume_sessions(
     app_handle: tauri::AppHandle,
     ids: Vec<String>,
 ) -> Result<DoorReply, String> {
     let state = api_state(&app_handle)?;
-    if let Some(store) = app_handle
-        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
-        .map(|s| s.inner().clone())
-    {
-        let cohort = crate::restart_prep::restore::restoring_cohort();
-        let unfinished =
-            crate::restart_prep::restore::unfinish_for_restore(&store, &ids, cohort.as_ref());
-        if !unfinished.is_empty() {
-            tracing::info!(
-                ids = ?unfinished,
-                "operator_resume_sessions: lifted the finish mark of cohort rows before restore"
-            );
-        }
-    }
     let request = crate::session::resume_door::ResumeRequest {
         ids: Some(ids),
         all: None,
