@@ -355,6 +355,9 @@ mod tests {
             "operator_generate_unified_workflow_async",
             "operator_resume_task_run",
             "operator_resume_sessions",
+            "restart_prep_prepare",
+            "restart_prep_cancel",
+            "restart_prep_dismiss",
             "scheduler_run_task_now",
             "steward_start",
         ] {

@@ -823,8 +823,21 @@ impl RestartPrep {
     }
 
     /// Whether `rec` still owes a "resume your work" line at `now_ms`.
+    ///
+    /// Also a same-build Release hold (Phase 6): the record moves to
+    /// `restoring`, and a told session that survived the restart (a pane a PTY
+    /// holder kept and the runner adopted) is still waiting to be told to
+    /// resume. A release on a REBUILT runner owes nothing — every session ended
+    /// with the old build.
     pub fn owes_resume(rec: &PrepareRecord, now_ms: i64) -> bool {
-        rec.state == PrepState::Cancelled
+        let released_by_cancel = match rec.state {
+            PrepState::Cancelled => true,
+            PrepState::Restoring => rec.release.as_ref().is_some_and(|r| {
+                r.trigger == super::ReleaseTrigger::Cancel && r.on_build == rec.prepared_build
+            }),
+            _ => false,
+        };
+        released_by_cancel
             && rec
                 .release
                 .as_ref()

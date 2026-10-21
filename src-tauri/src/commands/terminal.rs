@@ -1759,7 +1759,13 @@ pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 pub fn terminal_session_list_open(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
     purpose: Option<String>,
+    placeholders: Option<bool>,
 ) -> Result<CommandResponse, String> {
+    // Only a caller that DRAWS restart-cohort placeholders opts in (plan
+    // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+    // Phase 7). Every other caller gets the restore set exactly as before, so a
+    // cohort row is never withheld from a webview that would not show it.
+    let placeholders = placeholders == Some(true);
     let is_boot_restore = purpose.as_deref() == Some(LIST_OPEN_PURPOSE_RESTORE);
     // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     // D3): restoring tabs respawns `claude --resume` sessions autonomously, so
@@ -1788,7 +1794,7 @@ pub fn terminal_session_list_open(
         // The drain withholds the AUTO-restore only. A restart cohort's
         // placeholders are restored by the operator, whom no drain defers
         // (D7), so they are offered even now.
-        let mut data = live_restore_set_body(&store, Vec::new());
+        let mut data = live_restore_set_body(&store, Vec::new(), placeholders);
         if let Some(obj) = data.as_object_mut() {
             obj.insert(
                 "deferredByDrain".to_string(),
@@ -1835,7 +1841,7 @@ pub fn terminal_session_list_open(
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(live_restore_set_body(&store, rows)),
+        data: Some(live_restore_set_body(&store, rows, placeholders)),
     })
 }
 
@@ -1846,7 +1852,11 @@ pub fn terminal_session_list_open(
 fn live_restore_set_body(
     store: &SessionLifecycleStore,
     rows: Vec<RestoreCandidate>,
+    placeholders: bool,
 ) -> serde_json::Value {
+    if !placeholders {
+        return restore_set_body(rows, None, |_| None, |_| false, |_| None, false);
+    }
     use tauri::Manager;
     let terminals = crate::tauri_app_handle::current().and_then(|app| {
         app.try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -1883,7 +1893,8 @@ fn live_restore_set_body(
 
 /// The body [`terminal_session_list_open`] answers with its restore set.
 ///
-/// While a restart cohort is `restoring` (plan
+/// For a caller that draws placeholders (`placeholders: true`), while a restart
+/// cohort is `restoring` (plan
 /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D6), its
 /// waiting rows are NOT in `sessions`, which the webview auto-resumes: they
 /// come back under `placeholders` — EVERY waiting row with a lifecycle record,

@@ -306,7 +306,12 @@ fn live_terminal_blocker(tm: &TerminalManager, terminal_id: &str) -> Option<&'st
     use crate::terminal::holder_boot_sweep as sweep;
     // Pending first: an adoption that lands between two reads moves a pane
     // from pending into the manager, never the other way.
-    if sweep::adoption_pending(terminal_id) {
+    let census = sweep::sweep_status(Duration::ZERO).held;
+    if sweep::adoption_pending(terminal_id)
+        || census
+            .as_ref()
+            .is_some_and(|held| held.iter().any(|h| h == terminal_id))
+    {
         return Some("holder_adoption_pending");
     }
     if tm.get(terminal_id).is_some() {
@@ -315,7 +320,7 @@ fn live_terminal_blocker(tm: &TerminalManager, terminal_id: &str) -> Option<&'st
     if sweep::holder_left_running(terminal_id) {
         return Some("holder_alive_not_adopted");
     }
-    if sweep::sweep_status(Duration::ZERO).held.is_none() {
+    if census.is_none() {
         return Some("holder_sweep_pending");
     }
     None
@@ -896,17 +901,22 @@ async fn resume_one(
             }
             row
         }
-        Err(reason) => ResumeRow::failed(
-            &cand.id,
-            reason,
-            Some(ProcessEvidence {
-                terminal_id,
-                pid: None,
-                cmdline: None,
-                cwd: None,
-                claude_config_dir: None,
-            }),
-        ),
+        Err(reason) => {
+            let mut row = ResumeRow::failed(
+                &cand.id,
+                reason,
+                Some(ProcessEvidence {
+                    terminal_id,
+                    pid: None,
+                    cmdline: None,
+                    cwd: None,
+                    claude_config_dir: None,
+                }),
+            );
+            // The spawn carried the flag even though the resume did not land.
+            row.effort_applied = effort;
+            row
+        }
     }
 }
 

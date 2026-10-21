@@ -908,6 +908,9 @@ impl RestartPrep {
             }
             return self.take_hold(door, &rec).await;
         }
+        // A fresh prepare is not the one a past same-build boot saw: the flag
+        // (the banner, and Release hold's restart test) belongs to that record.
+        self.same_build_restart.store(false, Ordering::SeqCst);
         let cohort = capture().await?;
         let mut rec = PrepareRecord::new(uuid::Uuid::new_v4().to_string(), now_ms, cohort);
         rec.reason = sanitize_reason(reason);
@@ -961,6 +964,9 @@ impl RestartPrep {
             r.release = Some(report);
         })?;
         if settled {
+            // The record left its window: the same-build flag was its, not the
+            // next prepare's.
+            self.same_build_restart.store(false, Ordering::SeqCst);
             Ok(rec)
         } else {
             Err(format!(
@@ -1560,6 +1566,63 @@ mod tests {
             crate::restart_prep::restore::RestoringCohort::of(&released).is_some(),
             "the cohort is restored by hand"
         );
+    }
+
+    /// Review round 4: the same-build flag belongs to the record the boot step
+    /// saw. A later prepare in the same process, cancelled before any restart,
+    /// is a true cancel — its told sessions get the resume line.
+    #[tokio::test]
+    async fn a_prepare_after_a_same_build_restart_cancels_as_a_true_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        prepare(&ctl, &door).await;
+        ctl.on_boot(&*door, running_build(), T0 + 1_000).await;
+        assert!(ctl.same_build_restart());
+        let first = ctl.cancel(&*door, T0 + 2_000).await.unwrap();
+        assert_eq!(first.state, PrepState::Restoring);
+        assert!(!ctl.same_build_restart(), "the flag left with its record");
+        let second = ctl
+            .prepare(&*door, "again", T0 + 3_000, || async {
+                Ok(cohort(&["s1"]))
+            })
+            .await
+            .unwrap();
+        assert_ne!(second.prepare_id, first.prepare_id);
+        assert!(!ctl.view(T0 + 3_000).unwrap().same_build_hold);
+        let cancelled = ctl.cancel(&*door, T0 + 4_000).await.unwrap();
+        assert_eq!(cancelled.state, PrepState::Cancelled);
+    }
+
+    /// A same-build Release hold still owes the resume line to the told
+    /// sessions that survived the restart; a release on a rebuilt runner owes
+    /// nothing (every session ended with the old build).
+    #[tokio::test]
+    async fn a_same_build_release_owes_the_resume_line_and_a_rebuilt_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        let rec = prepare(&ctl, &door).await;
+        ctl.update(&rec.prepare_id, |r| {
+            r.cohort.rows[0].notified_at = Some(T0 + 10)
+        })
+        .unwrap();
+        ctl.on_boot(&*door, running_build(), T0 + 1_000).await;
+        let released = ctl.cancel(&*door, T0 + 2_000).await.unwrap();
+        assert_eq!(released.state, PrepState::Restoring);
+        assert!(RestartPrep::owes_resume(&released, T0 + 2_001));
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let rec = prepare(&ctl, &door).await;
+        ctl.update(&rec.prepare_id, |r| {
+            r.cohort.rows[0].notified_at = Some(T0 + 10);
+            r.prepared_build = "an-older-build".to_string();
+        })
+        .unwrap();
+        let rebuilt = ctl.cancel(&*door, T0 + 2_000).await.unwrap();
+        assert_eq!(rebuilt.state, PrepState::Restoring);
+        assert!(!RestartPrep::owes_resume(&rebuilt, T0 + 2_001));
     }
 
     #[tokio::test]
