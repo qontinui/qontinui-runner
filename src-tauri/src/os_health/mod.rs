@@ -68,7 +68,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub(crate) use parse::PoolTag;
 use parse::{instrument, GaugeReading};
@@ -621,6 +621,12 @@ pub(crate) fn spawn_collector_thread(
 fn run_loop(mut collector: Collector, publish: &dyn Fn(OsHealthSnapshot), stop: &AtomicBool) {
     let period = collector.cfg.period;
     let mut panics: u32 = 0;
+    // Consecutive panics. Every panic also runs the process panic hook, which
+    // rewrites `runner-panic.log` and writes a fresh crash dump, so a tick
+    // that panics EVERY time must not be retried forever (about 2,880 dumps
+    // a day at the 30 s period). After `FLAP_WARN_BUDGET` panics in a row the
+    // thread stops; the stale gate (`STALE_AFTER_SECS`) then reads UNKNOWN.
+    let mut consecutive_panics: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         let tick_started = Instant::now();
         // A panic in one tick (a parser bug on a build we have never seen, a
@@ -630,8 +636,12 @@ fn run_loop(mut collector: Collector, publish: &dyn Fn(OsHealthSnapshot), stop: 
         let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             collector.step(publish);
         }));
+        if stepped.is_ok() {
+            consecutive_panics = 0;
+        }
         if let Err(payload) = stepped {
             panics = panics.saturating_add(1);
+            consecutive_panics = consecutive_panics.saturating_add(1);
             let what = payload
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
@@ -641,6 +651,12 @@ fn run_loop(mut collector: Collector, publish: &dyn Fn(OsHealthSnapshot), stop: 
                 warn!("os-health: a collector tick panicked ({what}); the thread carries on (panic #{panics})");
             } else {
                 debug!("os-health: a collector tick panicked ({what}) (panic #{panics})");
+            }
+            if consecutive_panics >= FLAP_WARN_BUDGET {
+                error!(
+                    "os-health: {consecutive_panics} collector ticks in a row panicked ({what});                      the os-health thread STOPS so the panic hook stops writing crash dumps.                      osHealth reads UNKNOWN (stale) until the runner restarts"
+                );
+                return;
             }
         }
         // A tick that overran (a 30 s probe timeout) starts the next at once.
@@ -1431,6 +1447,47 @@ mod tests {
         });
         stop_and_join(&stop, handle);
         assert!(got.is_some(), "the thread died with its first tick");
+    }
+
+    /// A tick that panics EVERY time stops the thread after `FLAP_WARN_BUDGET`
+    /// consecutive panics instead of retrying (and crash-dumping) forever.
+    #[test]
+    fn a_tick_that_always_panics_stops_the_thread_after_the_budget() {
+        use std::sync::atomic::AtomicU32;
+        struct AlwaysPanics {
+            calls: Arc<AtomicU32>,
+        }
+        impl GaugeSource for AlwaysPanics {
+            fn gauges(&mut self, _log: &mut FailureLog) -> GaugeReading {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                panic!("os-health test: every tick panics");
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let cfg = CollectorConfig {
+            platform: OsPlatform::Windows,
+            period: Duration::from_millis(5),
+            probe_every_ticks: PROBE_EVERY_TICKS,
+            pool_tags_every_ticks: POOL_TAGS_EVERY_TICKS,
+            source: Box::new(AlwaysPanics {
+                calls: Arc::clone(&calls),
+            }),
+            probe: None,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle =
+            spawn_collector_thread(Collector::new(cfg), |_s| {}, Arc::clone(&stop)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let finished = handle.is_finished();
+        stop_and_join(&stop, handle);
+        assert!(
+            finished,
+            "the thread kept ticking a source that always panics"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), FLAP_WARN_BUDGET);
     }
 
     /// The debug-only live injection: `incident` grades breach and is flagged
