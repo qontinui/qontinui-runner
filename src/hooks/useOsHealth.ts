@@ -183,9 +183,14 @@ async function readNow() {
 function ensureStarted() {
   if (started) return;
   started = true;
-  void listen<unknown>(OS_HEALTH_EVENT, (event) => publish(event.payload)).then((fn) => {
-    unlisten = fn;
-  });
+  void listen<unknown>(OS_HEALTH_EVENT, (event) => publish(event.payload))
+    .then((fn) => {
+      unlisten = fn;
+    })
+    .catch((err) => {
+      // Outside Tauri, or with no event plugin: the 30 s poll still runs.
+      console.warn("[os-health] listen failed:", err);
+    });
   void readNow();
   pollId = setInterval(() => void readNow(), POLL_MS);
 }
