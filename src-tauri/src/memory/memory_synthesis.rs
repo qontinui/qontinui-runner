@@ -1221,7 +1221,7 @@ mod tests {
             Box::new(|| None),
             ok_synth(),
         );
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let outcome = p.poll_once_inner(&client, "http://127.0.0.1:9").await;
         let h = render_poller_health(true, outcome_code(&outcome), 1);
         assert_eq!(h["blockedBy"], json!("egress_transcript_sync"));

@@ -624,7 +624,7 @@ mod tests {
             let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             l.local_addr().unwrap().port()
         };
-        let e = reqwest::Client::builder()
+        let e = qontinui_runner_lib::outbound_net::client_builder()
             .no_proxy()
             .build()
             .unwrap()
@@ -646,7 +646,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
             drop(sock);
         });
-        let e = reqwest::Client::builder()
+        let e = qontinui_runner_lib::outbound_net::client_builder()
             .no_proxy()
             .timeout(Duration::from_millis(300))
             .build()

@@ -371,7 +371,7 @@ pub(crate) mod egress_tests {
     async fn flush_once(level: Level) -> (usize, bool) {
         let counter = ConnCounter::start();
         let url = format!("{}/sessions/{}/output", counter.http_base(), Uuid::nil());
-        let http = reqwest::Client::builder()
+        let http = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(5))
             .no_proxy()
             .build()
