@@ -168,6 +168,13 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // is safe only because every caller is a path where the session definitively
     // did not spawn.
     ("agent_runtime.rs", "capability-token", 1),
+    // `spawn_exited_request`'s agent arm (plan
+    // `2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer`
+    // Phase 4): the clean-exit report presents the agent's OWN coord JWT, which
+    // coord's reporter check accepts on any device, so the exit row is recorded
+    // verified even where the default binding is not the allocation's device.
+    // Its device-token fallback arm is the `session-noop` 7 -> 8 below.
+    ("agent_runtime.rs", "agent-jwt", 1),
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
     ("ci_node/reporting.rs", "device-jwt-required", 2),
@@ -834,7 +841,11 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     // sparse-to-derive-a-terminal-state Phase 4) — POST /agents/{agent_id}/session;
     // coord resolves the tenant from the allocation's own rows (like post_log); route
     // and its reporter_owns_allocation check land in qontinui-coord#2746.
-    ("agent_runtime.rs", "session-noop", 7),
+    // 8th: `spawn_exited_request`'s device-token fallback arm (plan
+    // 2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer
+    // Phase 4) — POST /agents/{agent_id}/spawn-exited; coord resolves and persists
+    // the tenant from the path agent_id, like its spawn-failed sibling.
+    ("agent_runtime.rs", "session-noop", 8),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("claude_session/spawn_preconditions.rs", "device", 1),
     ("claude_session/trust_gate.rs", "device", 1),
@@ -959,9 +970,15 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
 /// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
 /// refuses any principal that does not prove a device. So `device` 21 -> 22.
+///
+/// Plan `2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer`
+/// Phase 4 added `agent_runtime`'s `spawn-exited` clean-exit report. Its
+/// device-token fallback arm is `session-noop` for the same reason as its
+/// `spawn-failed` sibling: keyed by the path `agent_id`, the tenant resolved
+/// server-side. So `session-noop` 11 -> 12.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
-    ("session-noop", 11),
+    ("session-noop", 12),
     ("session-owed", 0),
     ("work-owed", 8),
     ("escalated", 2),
