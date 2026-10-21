@@ -2146,6 +2146,10 @@ impl ClaudeSession {
         // is an infinite silent hang. One shared list, eight seams; see
         // `credential_helper::non_interactive_git_env`.
         crate::credential_helper::apply_non_interactive_git_env_std(cmd);
+        // `DISABLE_AUTOUPDATER=1` when the runner owns CLI updates on this box.
+        crate::claude_cli_update::apply_child_env(|k, v| {
+            cmd.env(k, v);
+        });
         crate::terminal::scrub_credential_env_std(cmd);
     }
 
@@ -2215,6 +2219,28 @@ mod tests {
     // from it reddens this test. Highest consequence of the eight seams: this
     // one runs bypassPermissions and persists a transcript.
     // =======================================================================
+
+    /// Phase 3: the stream-json seam carries `DISABLE_AUTOUPDATER=1` when the
+    /// runner owns CLI updates, and nothing on each of the three off arms.
+    #[test]
+    fn stream_json_session_finalize_child_env_defers_cli_updates_to_the_runner() {
+        use crate::claude_cli_update::{test_gates, with_gate};
+        let build = || {
+            let mut cmd = std::process::Command::new("dummy");
+            super::ClaudeSession::finalize_child_env(
+                &mut cmd,
+                Some("/tmp/claude-config"),
+                "session-under-test",
+            );
+            cmd.get_envs()
+                .find(|(k, _)| *k == "DISABLE_AUTOUPDATER")
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()))
+        };
+        assert_eq!(with_gate(test_gates::ON, build).as_deref(), Some("1"));
+        for (arm, gate) in test_gates::OFF_ARMS {
+            assert_eq!(with_gate(gate, build), None, "off arm: {arm}");
+        }
+    }
 
     #[test]
     fn stream_json_session_finalize_child_env_scrubs_credential_values() {
