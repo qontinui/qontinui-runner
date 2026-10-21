@@ -45,6 +45,11 @@ pub enum FederationSkipReason {
     DeviceIdMissing,
     /// No effective Claude config dir could be resolved.
     NoConfigDir,
+    /// The session's tenant resolution REFUSED (its repo or workspace names a
+    /// tenant this device may not act as, several owners without the default,
+    /// or a repo still unsettled on a multi-tenant device). The session runs
+    /// UNFEDERATED rather than federating the default tenant's pool.
+    TenantRefused,
 }
 
 impl FederationSkipReason {
@@ -54,6 +59,7 @@ impl FederationSkipReason {
             FederationSkipReason::TenantUnresolved => "tenant-unresolved",
             FederationSkipReason::DeviceIdMissing => "device-id-missing",
             FederationSkipReason::NoConfigDir => "no-config-dir",
+            FederationSkipReason::TenantRefused => "tenant-refused",
         }
     }
 }
@@ -106,26 +112,39 @@ pub fn session_uuid(session_id: &str) -> Uuid {
 ///
 /// The home-dir identity PIN (`federation.rs` device identity) is
 /// deliberately untouched (plan §6).
+///
+/// `session_tenant` is LAZY and runs last: it may read the session's repo →
+/// tenant from coord (bounded by `repo_tenant::CWD_TENANT_BUDGET`), so the
+/// instant skips — no device id, no config dir — are taken first and a box that
+/// cannot federate anyway pays nothing for it. An `Err` from it is a refusal:
+/// the session runs UNFEDERATED ([`FederationSkipReason::TenantRefused`]) and
+/// the default tenant is NOT substituted.
 pub fn build_federation_ctx(
     session_id: &str,
     working_dir: &str,
     cli_settings: &ClaudeCliSettings,
-    session_tenant: Option<Uuid>,
+    session_tenant: impl FnOnce() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
 ) -> Result<SessionContext, FederationSkipReason> {
-    let tenant_id = match resolve_session_context_tenant(session_tenant) {
-        Some(t) => t,
-        None => {
-            warn!(
-                "claude_session::federation: tenant_id unresolvable \
-                 (no session tenant, no paired_user.json::tenant_id, no claim in \
-                 cached device-token JWT); \
-                 skipping federation for session {session_id}"
-            );
-            return Err(FederationSkipReason::TenantUnresolved);
-        }
-    };
+    build_federation_ctx_with(
+        session_id,
+        working_dir,
+        resolve_device_id,
+        || crate::ai_provider::get_effective_config_dir(cli_settings).0,
+        session_tenant,
+    )
+}
 
-    let device_id = match resolve_device_id() {
+/// [`build_federation_ctx`] with its identity reads injected, so the ORDER —
+/// the instant skips before the (possibly slow) tenant closure — and the
+/// refusal mapping are unit-testable without a machine.json or a network.
+fn build_federation_ctx_with(
+    session_id: &str,
+    working_dir: &str,
+    device_id: impl FnOnce() -> Option<Uuid>,
+    config_dir: impl FnOnce() -> Option<String>,
+    session_tenant: impl FnOnce() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal>,
+) -> Result<SessionContext, FederationSkipReason> {
+    let device_id = match device_id() {
         Some(d) => d,
         None => {
             warn!(
@@ -136,9 +155,7 @@ pub fn build_federation_ctx(
         }
     };
 
-    let (effective_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir(cli_settings);
-    let config_dir_str = match effective_config_dir {
+    let config_dir_str = match config_dir() {
         Some(s) => s,
         None => {
             warn!(
@@ -146,6 +163,31 @@ pub fn build_federation_ctx(
                  skipping federation for session {session_id}"
             );
             return Err(FederationSkipReason::NoConfigDir);
+        }
+    };
+
+    let session_tenant = match session_tenant() {
+        Ok(t) => t,
+        Err(refusal) => {
+            warn!(
+                "claude_session::federation: session {session_id} is UNFEDERATED — its tenant \
+                 resolution refused ({}): {}. Federation stays off for this session rather \
+                 than binding the device's default tenant.",
+                refusal.code, refusal.message
+            );
+            return Err(FederationSkipReason::TenantRefused);
+        }
+    };
+    let tenant_id = match resolve_session_context_tenant(session_tenant) {
+        Some(t) => t,
+        None => {
+            warn!(
+                "claude_session::federation: tenant_id unresolvable \
+                 (no session tenant, no paired_user.json::tenant_id, no claim in \
+                 cached device-token JWT); \
+                 skipping federation for session {session_id}"
+            );
+            return Err(FederationSkipReason::TenantUnresolved);
         }
     };
 
@@ -190,9 +232,10 @@ pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<Re
 /// that populates [`SessionContext::tenant_id`] (B2). The session's
 /// RECORDED tenant wins (`session_tenant`, threaded by the spawn site from
 /// `coord_register::federation_session_tenant` — the tenant `AiCoordRegistrar`
-/// stamped the coord record and JWT slot with, else the registrar's own
-/// resolver `session::resolve_new_session_tenant`), so the coord record + JWT
-/// slot + federated pool agree. Only when no tenant
+/// stamped the coord record and JWT slot with, else
+/// `session::resolve_new_session_tenant_at` — the coord-mcp proxy's authority
+/// order for the spawn directory, its repo tier included), so the coord
+/// record, the JWT slot and the federated pool agree. Only when no tenant
 /// resolved (an unresolvable or unpaired machine) does this fall back to
 /// [`resolve_tenant_id`] (paired file, then the OAuth claim). Split out so the B2 precedence is
 /// hermetically testable without the file/home-dir reads the rest of
@@ -259,6 +302,64 @@ pub(crate) fn derive_account_name(config_dir: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn refusal() -> crate::coord_mcp::ProxyRefusal {
+        crate::coord_mcp::ProxyRefusal {
+            status: 403,
+            code: "terminal:tenant_not_paired",
+            retryable: false,
+            message: "test refusal".to_string(),
+        }
+    }
+
+    fn tenant_closure_must_not_run() -> Result<Option<Uuid>, crate::coord_mcp::ProxyRefusal> {
+        panic!("the tenant closure (a possibly slow repo read) ran before an instant skip")
+    }
+
+    /// Review round 2 (NIT 4a): the instant skips run BEFORE the tenant
+    /// closure, so a box that cannot federate never pays for a repo read.
+    #[test]
+    fn instant_skips_never_run_the_tenant_closure() {
+        assert_eq!(
+            build_federation_ctx_with(
+                "s",
+                "/w",
+                || None,
+                || Some("/c".to_string()),
+                tenant_closure_must_not_run,
+            )
+            .err(),
+            Some(FederationSkipReason::DeviceIdMissing)
+        );
+        assert_eq!(
+            build_federation_ctx_with(
+                "s",
+                "/w",
+                || Some(Uuid::from_u128(1)),
+                || None,
+                tenant_closure_must_not_run,
+            )
+            .err(),
+            Some(FederationSkipReason::NoConfigDir)
+        );
+    }
+
+    /// Review round 2 (NIT 4b): a refused tenant is `TenantRefused` — the
+    /// default tenant is never substituted.
+    #[test]
+    fn a_refused_tenant_is_tenant_refused_not_the_default() {
+        assert_eq!(
+            build_federation_ctx_with(
+                "s",
+                "/w",
+                || Some(Uuid::from_u128(1)),
+                || Some("/c".to_string()),
+                || Err(refusal()),
+            )
+            .err(),
+            Some(FederationSkipReason::TenantRefused)
+        );
+    }
     use super::*;
 
     #[test]

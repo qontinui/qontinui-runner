@@ -272,10 +272,14 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
     PinSurface {
         surface: "new_session_tenant",
         timing: PinTiming::Live,
-        readers: &["session/mod.rs::resolve_new_session_tenant"],
+        readers: &[
+            "session/mod.rs::resolve_new_session_tenant",
+            "session/mod.rs::decide_new_session_tenant",
+        ],
         detail: "the tenant a NEW session is recorded under, read at its creation \
                  (also reached through claude_session/coord_register.rs, which calls this \
-                 resolver per registration)",
+                 resolver per registration; the repo-aware path decides through \
+                 decide_new_session_tenant, which reads the same pin)",
     },
     PinSurface {
         surface: "transcript_autobind_mint",
