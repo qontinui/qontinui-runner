@@ -622,6 +622,12 @@ fn proven_terminal(
         }
         // The user closed the pane while it was being proven: their answer,
         // not a failure to retry.
+        // Only a migration (which has an old pane) rolls back; never here.
+        RespawnOutcome::UnconfirmedRolledBack { .. } => Err(Box::new(ResumeRow::failed(
+            id,
+            "resumed_cli_never_painted",
+            None,
+        ))),
         RespawnOutcome::ClosedByUser { .. } => {
             Err(Box::new(ResumeRow::failed(id, "closed_by_user", None)))
         }

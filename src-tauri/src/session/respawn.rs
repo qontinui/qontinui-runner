@@ -1005,6 +1005,10 @@ fn proven_terminal(
         }
         RespawnOutcome::NotSpawned(e) => Err(RespawnError::Spawn(e)),
         RespawnOutcome::ClosedByUser { .. } => Err(RespawnError::ClosedByUser),
+        // Only a migration (which has an old pane) rolls back; never here.
+        RespawnOutcome::UnconfirmedRolledBack { terminal_id } => Err(RespawnError::Spawn(format!(
+            "{terminal_id} never painted and was rolled back"
+        ))),
         RespawnOutcome::Died {
             exit_code,
             attempts,

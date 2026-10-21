@@ -1743,18 +1743,17 @@ impl SessionLifecycleStore {
         }
     }
 
-    /// Hold every close of `claude_session_id` — except one naming `exclude`
-    /// (the old pane, which keeps its own fate) — until
-    /// [`Self::release_session_hold`]. Called BEFORE a respawn spawns, so the
-    /// hold is in force for the whole window in which the row is re-keyed onto
-    /// a pane that may die at once. See `held_sessions`.
-    pub fn hold_session_closes(&self, claude_session_id: &str, exclude: Option<&str>) {
+    /// Hold every close of `claude_session_id` — of every pane, the old pane
+    /// of a migration included — until [`Self::release_session_hold`]. Called
+    /// BEFORE a respawn spawns, so the hold is in force for the whole window in
+    /// which the row is re-keyed onto a pane that may die at once. See
+    /// `held_sessions`.
+    pub fn hold_session_closes(&self, claude_session_id: &str) {
         match self.held_sessions.lock() {
             Ok(mut held) => {
                 held.insert(
                     claude_session_id.to_string(),
                     SessionHold {
-                        exclude: exclude.map(|t| t.trim().to_string()),
                         arrivals: HashMap::new(),
                     },
                 );
@@ -1781,6 +1780,48 @@ impl SessionLifecycleStore {
         held.get_mut(claude_session_id)?
             .arrivals
             .remove(terminal_id.trim())
+    }
+
+    /// A USER close held for ANY pane of the session other than `except`
+    /// (peek). A user close of a pane the respawn already retired is still the
+    /// user's answer, so it is looked for session-wide, not per terminal.
+    pub fn peek_held_user_close(
+        &self,
+        claude_session_id: &str,
+        except: Option<&str>,
+    ) -> Option<HeldClose> {
+        let held = self.held_sessions.lock().ok()?;
+        held.get(claude_session_id)?
+            .arrivals
+            .values()
+            .find(|c| c.is_user_close() && Some(c.terminal_id.as_str()) != except)
+            .cloned()
+    }
+
+    /// End a [`Self::hold_session_closes`] and, IN THE SAME LOCK, take the close
+    /// held for `terminal_id` — so no close can land between the take and the
+    /// release and be lost. Returns `(that close, every other close still held)`.
+    pub fn release_session_hold_taking(
+        &self,
+        claude_session_id: &str,
+        terminal_id: Option<&str>,
+    ) -> (Option<HeldClose>, Vec<HeldClose>) {
+        match self.held_sessions.lock() {
+            Ok(mut held) => match held.remove(claude_session_id) {
+                Some(mut h) => {
+                    let mine = terminal_id.and_then(|t| h.arrivals.remove(t.trim()));
+                    (mine, h.arrivals.into_values().collect())
+                }
+                None => (None, Vec::new()),
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "session_lifecycle_store: lock poisoned on release_session_hold_taking"
+                );
+                (None, Vec::new())
+            }
+        }
     }
 
     /// End a [`Self::hold_session_closes`]. Returns every close still held, so
@@ -1941,9 +1982,6 @@ impl SessionLifecycleStore {
             }
         };
         let hold = held.get_mut(&session)?;
-        if hold.exclude.as_deref() == Some(terminal.trim()) {
-            return None;
-        }
         let incoming = HeldClose {
             claude_session_id: claude_session_id.to_string(),
             terminal_id: terminal.clone(),
@@ -2020,8 +2058,7 @@ impl SessionLifecycleStore {
         // whose child just exited, and closing it would end a session the retry
         // or the rollback is about to rebind (coord `Closed`, the workdir nonce
         // revoked under the old pane). The session is the one the caller names,
-        // or the one that owns the caller's terminal. The excluded terminal (the
-        // old pane) is never held. A terminal-less close (`poll-dead`) is held
+        // or the one that owns the caller's terminal. A terminal-less close (`poll-dead`) is held
         // against the terminal the row is bound to. An `explicit` close (the
         // user) wins the slot over an exit-close, so the respawn can see it.
         if let Some(held) = self.hold_close_if_moving(claude_session_id, expect, reason) {
@@ -3882,7 +3919,6 @@ impl HeldClose {
 /// One [`SessionLifecycleStore::hold_session_closes`] entry.
 #[derive(Debug, Clone)]
 struct SessionHold {
-    exclude: Option<String>,
     /// Per terminal, the close that arrived (an explicit close wins over any
     /// other reason).
     arrivals: HashMap<String, HeldClose>,

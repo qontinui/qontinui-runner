@@ -751,9 +751,13 @@ pub enum MigrationError {
         exit_code: Option<i32>,
         attempts: usize,
     },
-    /// The resumed child runs but never painted by the deadline. UNKNOWN, so
-    /// BOTH panes are kept; the new one owns the row.
-    Unconfirmed { new_terminal_id: String },
+    /// The resumed child runs but never painted by the deadline. With the old
+    /// pane still running the migration was ROLLED BACK onto it (the unproven
+    /// pane closed); with the old pane gone the new pane keeps the row.
+    Unconfirmed {
+        new_terminal_id: String,
+        rolled_back: bool,
+    },
 }
 
 impl std::fmt::Display for MigrationError {
@@ -766,10 +770,21 @@ impl std::fmt::Display for MigrationError {
             } => f.write_str(&super::respawn_liveness::RespawnOutcome::died_reason(
                 *exit_code, *attempts,
             )),
-            Self::Unconfirmed { new_terminal_id } => write!(
+            Self::Unconfirmed {
+                new_terminal_id,
+                rolled_back: true,
+            } => write!(
+                f,
+                "migration-unconfirmed: the resumed pane {new_terminal_id} never painted its \
+                 prompt — rolled back onto the old pane, which still runs"
+            ),
+            Self::Unconfirmed {
+                new_terminal_id,
+                rolled_back: false,
+            } => write!(
                 f,
                 "migration-unconfirmed: the resumed pane {new_terminal_id} is running but never \
-                 painted its prompt — both panes were kept"
+                 painted its prompt — kept, the old pane being gone"
             ),
         }
     }
@@ -898,7 +913,8 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
 ///   dead one is superseded and closed), and when every attempt dies the
 ///   pre-migration record is restored onto the old pane
 ///   ([`MigrationError::RespawnDied`]);
-/// - a child alive but unpainted at the deadline keeps BOTH panes
+/// - a child alive but unpainted at the deadline is rolled back onto the old
+///   pane while that still runs, else keeps the row
 ///   ([`MigrationError::Unconfirmed`]).
 ///
 /// `session migrated` (in each caller) and `session-account-migrated` (here)
@@ -1083,7 +1099,8 @@ pub(crate) async fn migrate_session_claimed(
         }
         RespawnOutcome::NotSpawned(_)
         | RespawnOutcome::Died { .. }
-        | RespawnOutcome::ClosedByUser { .. } => record.terminal_id.clone(),
+        | RespawnOutcome::ClosedByUser { .. }
+        | RespawnOutcome::UnconfirmedRolledBack { .. } => record.terminal_id.clone(),
     };
     carried.settle(|(c, reservation)| {
         crate::agent_runtime::restore_continuation_registration(host, c, reservation);
@@ -1120,6 +1137,15 @@ pub(crate) async fn migrate_session_claimed(
         RespawnOutcome::Unconfirmed { terminal_id } => {
             let err = MigrationError::Unconfirmed {
                 new_terminal_id: terminal_id,
+                rolled_back: false,
+            };
+            emit_skipped(app, record, src_config_dir, &err.skip_reason());
+            return Err(err);
+        }
+        RespawnOutcome::UnconfirmedRolledBack { terminal_id } => {
+            let err = MigrationError::Unconfirmed {
+                new_terminal_id: terminal_id,
+                rolled_back: true,
             };
             emit_skipped(app, record, src_config_dir, &err.skip_reason());
             return Err(err);

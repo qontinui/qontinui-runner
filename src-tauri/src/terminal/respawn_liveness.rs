@@ -269,9 +269,13 @@ pub(crate) enum RespawnOutcome {
         terminal_id: String,
         attempts: usize,
     },
-    /// `terminal_id` runs but never painted. Both panes are kept; with an old
-    /// pane, the old one is marked superseded by the new (the new owns the row).
+    /// `terminal_id` runs but never painted, and there was no old pane to fall
+    /// back on: it keeps the row. UNKNOWN, never resolved to the destructive arm.
     Unconfirmed { terminal_id: String },
+    /// A migration's new CLI on `terminal_id` never painted while the OLD CLI
+    /// still ran: the session was kept on the old pane (restored exactly) and
+    /// the unproven pane superseded and closed.
+    UnconfirmedRolledBack { terminal_id: String },
     /// The USER closed a pane (an `explicit` close). Of the pane being proven:
     /// nothing is retried; with an old pane still running the pre-respawn
     /// record is restored onto it, otherwise the user's close is applied. Of
@@ -338,7 +342,7 @@ impl<'s> SessionCloseHold<'s> {
         session: &str,
         old: Option<&TerminalSessionRecord>,
     ) -> Self {
-        store.hold_session_closes(session, None);
+        store.hold_session_closes(session);
         Self {
             store,
             panes,
@@ -353,11 +357,34 @@ impl<'s> SessionCloseHold<'s> {
         self.current = Some(terminal_id.to_string());
     }
 
-    /// Did the USER close `terminal_id` while the respawn held its closes?
-    fn user_closed(&self, terminal_id: &str) -> bool {
+    fn old_terminal(&self) -> Option<&str> {
+        self.old.as_ref().map(|o| o.terminal_id.as_str())
+    }
+
+    /// Did the USER close ANY pane this respawn spawned — the one under proof
+    /// or one it already retired? (The old pane is [`Self::old_pane`]'s.) Read
+    /// session-wide, so a user close landing on a pane after it was retired is
+    /// not lost while a retry runs.
+    fn user_closed(&self) -> bool {
+        self.store
+            .peek_held_user_close(&self.session, self.old_terminal())
+            .is_some()
+    }
+
+    /// Take the user close [`Self::user_closed`] sees.
+    fn take_user_close(&self) -> Option<HeldClose> {
+        let c = self
+            .store
+            .peek_held_user_close(&self.session, self.old_terminal())?;
+        self.take(&c.terminal_id)
+    }
+
+    /// Is any close held for `terminal_id`? A pane with one has exited (or
+    /// been closed), whatever its last screen read said.
+    fn has_held(&self, terminal_id: &str) -> bool {
         self.store
             .peek_held_close(&self.session, terminal_id)
-            .is_some_and(|c| c.is_user_close())
+            .is_some()
     }
 
     fn take(&self, terminal_id: &str) -> Option<HeldClose> {
@@ -443,8 +470,10 @@ fn finish_replaying(
     session: &str,
     terminal_id: Option<&str>,
 ) -> Option<HeldClose> {
-    let mine = terminal_id.and_then(|t| store.take_held_close(session, t));
-    log_dropped(store.release_session_hold(session));
+    // One lock for the take AND the release: a close landing between two
+    // separate calls would be neither taken nor held, and lost.
+    let (mine, rest) = store.release_session_hold_taking(session, terminal_id);
+    log_dropped(rest);
     let held = mine?;
     let outcome = store.record_close_checked(
         &held.claude_session_id,
@@ -604,6 +633,23 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
     let session = effects.claude_session_id().to_string();
     let panes = effects.panes();
     let mut hold = SessionCloseHold::new(store, Arc::clone(&panes), &session, old);
+    // A migration's `old` record was read before this hold existed (and before
+    // the caller's network awaits). A close of the old pane in that window was
+    // APPLIED, not held — so re-read: the row must still be open on the old
+    // pane, and the pane alive. Otherwise nothing moves: the spawn's re-key
+    // would reopen a session the user closed.
+    if let Some(old) = old {
+        let row_still_there = store
+            .get(&session)
+            .is_some_and(|r| r.state == "open" && r.terminal_id == old.terminal_id);
+        if !row_still_there || !panes.alive(&old.terminal_id) {
+            hold.finish_replaying_all();
+            return RespawnOutcome::NotSpawned(
+                "old_pane_gone: the session's pane closed before the migration began — nothing moved"
+                    .to_string(),
+            );
+        }
+    }
     let mut current = match effects.spawn_next().await {
         Ok(t) => t,
         Err(e) => {
@@ -615,24 +661,56 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
     let mut attempts = 1;
     'proof: loop {
         // The old pane can be closed by the user at any await (the spawn can
-        // wait out a CLI install for minutes): check before acting on a verdict.
+        // wait out a CLI install for minutes): checked before the 3-minute
+        // proof is started, and again after it.
         if hold.old_pane() == Some(OldPane::ClosedByUser) {
             hold.abort_for_closed_old(&current);
             return RespawnOutcome::ClosedByUser { attempts };
+        }
+        if let Some(c) = hold.take_user_close() {
+            return end_failed(
+                hold,
+                store,
+                old,
+                &current,
+                attempts,
+                Failure::ClosedByUser(c),
+            );
         }
         let verdict = effects.await_liveness(&current).await;
         if hold.old_pane() == Some(OldPane::ClosedByUser) {
             hold.abort_for_closed_old(&current);
             return RespawnOutcome::ClosedByUser { attempts };
         }
+        if let Some(c) = hold.take_user_close() {
+            return end_failed(
+                hold,
+                store,
+                old,
+                &current,
+                attempts,
+                Failure::ClosedByUser(c),
+            );
+        }
+        // A pane whose exit-close is already held has EXITED, whatever its
+        // last screen read said — it must not be handed the session.
+        let verdict = match verdict {
+            LivenessVerdict::Died(code) => LivenessVerdict::Died(code),
+            other if hold.has_held(&current) => {
+                warn!(
+                    terminal_id = %current,
+                    verdict = ?other,
+                    "respawn-liveness: the pane's exit-close is already held — judged Died"
+                );
+                LivenessVerdict::Died(None)
+            }
+            other => other,
+        };
         match verdict {
             LivenessVerdict::Alive => {
                 if let (Some(old), Some(OldPane::Running)) = (old, hold.old_pane()) {
                     hand_off(store, &*panes, &old.terminal_id, &current);
                 }
-                // A close held here means the child exited right after it
-                // painted (or the user closed it): that is this session's own
-                // end, and it is applied.
                 hold.finish_replaying(Some(&current));
                 return RespawnOutcome::Alive {
                     terminal_id: current,
@@ -640,17 +718,32 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                 };
             }
             LivenessVerdict::Unconfirmed | LivenessVerdict::Pending => {
-                // UNKNOWN: keep both panes. The new pane owns the row; a still
-                // running old pane is marked so whichever closes first closes
-                // nothing it does not own (an old pane that is gone gets no
-                // mark: no close of it is coming to consume one).
                 if let (Some(old), Some(OldPane::Running)) = (old, hold.old_pane()) {
-                    store.mark_terminal_superseded(&old.terminal_id, &current);
+                    // A migration whose new CLI never painted, while the old
+                    // CLI still runs: keep the session where it is PROVEN to
+                    // live. Leaving the row on the unpainted pane would strand
+                    // the old CLI with no row, and that pane's later close
+                    // would end the session (coord `Closed`, the workdir nonce
+                    // revoked) under the still-running old CLI. The unproven
+                    // pane is superseded and closed; it held nothing the old
+                    // pane does not.
+                    store.restore_record_exact(old.clone());
+                    let _ = hold.retire(&current, &old.terminal_id);
+                    hold.finish_dropping();
+                    warn!(
+                        terminal_id = %current,
+                        "respawn-liveness: resumed CLI is running but never painted — the migration is rolled back onto the old pane"
+                    );
+                    return RespawnOutcome::UnconfirmedRolledBack {
+                        terminal_id: current,
+                    };
                 }
+                // No old pane to fall back on: the new pane is the session's
+                // only host and keeps the row. UNKNOWN, not dead.
                 hold.finish_replaying(Some(&current));
                 warn!(
                     terminal_id = %current,
-                    "respawn-liveness: resumed CLI is running but never painted — keeping every pane (migration-unconfirmed)"
+                    "respawn-liveness: resumed CLI is running but never painted — kept (respawn-unconfirmed)"
                 );
                 return RespawnOutcome::Unconfirmed {
                     terminal_id: current,
@@ -665,16 +758,16 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                 );
                 let mut retry_spawn_error = None;
                 // Each retry consumes an attempt whether or not its spawn
-                // succeeds. A USER close of the dead pane is checked before the
-                // pause, after it, and once more when the pane is retired —
+                // succeeds. A USER close of any pane of this respawn is checked
+                // before the pause, after it, and when the pane is retired —
                 // never respawned behind.
-                while attempts < max_attempts && !hold.user_closed(&current) {
+                while attempts < max_attempts && !hold.user_closed() {
                     effects.pause_before_retry(attempts).await;
-                    if hold.user_closed(&current) {
-                        break;
-                    }
                     if hold.old_pane() == Some(OldPane::ClosedByUser) {
                         continue 'proof;
+                    }
+                    if hold.user_closed() {
+                        break;
                     }
                     attempts += 1;
                     match effects.spawn_next().await {
@@ -702,14 +795,7 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                         }
                     }
                 }
-                // Peek first: a held EXIT-close must stay for `end_failed` to
-                // apply; only the user's close is taken here.
-                let user = if hold.user_closed(&current) {
-                    hold.take(&current)
-                } else {
-                    None
-                };
-                let failure = match user {
+                let failure = match hold.take_user_close() {
                     Some(c) => Failure::ClosedByUser(c),
                     None => Failure::Died {
                         exit_code: code,
@@ -1023,6 +1109,24 @@ mod tests {
         user_close_in_pause: bool,
         /// When set, the USER closes the dead pane while the RETRY spawns.
         user_close_prev_in_spawn: bool,
+        /// Every pane `await_liveness` was asked to prove, in order.
+        awaited: Vec<String>,
+        /// When set, the USER closes the OLD pane during the retry pause.
+        close_old_in_pause: bool,
+        /// When set, the USER closes the OLD pane while a RETRY spawns.
+        close_old_in_retry_spawn: bool,
+        /// When set, the OLD pane's CLI EXITS (a `pty-exit`, not the user)
+        /// while the first spawn runs; the pane itself still reads alive.
+        old_exits_in_spawn: bool,
+        /// When set, the OLD pane VANISHES (no close seen) while the first
+        /// spawn runs.
+        old_vanishes_in_spawn: bool,
+        /// When set, the FIRST pane judged `Alive` has already exited: its
+        /// pty-exit close is delivered before the verdict returns.
+        exit_on_first_alive: bool,
+        /// When set, the USER closes `new-1` (already retired) while `new-2`
+        /// is being proven.
+        user_close_retired_while_proving: bool,
     }
 
     impl Fake<'_> {
@@ -1046,6 +1150,13 @@ mod tests {
                 close_old_in_spawn: false,
                 user_close_in_pause: false,
                 user_close_prev_in_spawn: false,
+                awaited: Vec::new(),
+                close_old_in_pause: false,
+                close_old_in_retry_spawn: false,
+                old_exits_in_spawn: false,
+                old_vanishes_in_spawn: false,
+                exit_on_first_alive: false,
+                user_close_retired_while_proving: false,
             }
         }
     }
@@ -1057,6 +1168,22 @@ mod tests {
         async fn spawn_next(&mut self) -> Result<String, String> {
             if let Some(Some(e)) = self.spawn_errors.pop_front() {
                 return Err(e);
+            }
+            if self.old_vanishes_in_spawn && self.spawned.is_empty() {
+                self.panes.gone.lock().unwrap().push("old".into());
+            }
+            if self.old_exits_in_spawn && self.spawned.is_empty() {
+                let o = self
+                    .store
+                    .record_close_checked(SID, Some("old"), "pty-exit");
+                self.exit_close_outcomes.push(o);
+            }
+            if self.close_old_in_retry_spawn && !self.spawned.is_empty() {
+                let o = self
+                    .store
+                    .record_close_checked(SID, Some("old"), "explicit");
+                self.exit_close_outcomes.push(o);
+                self.panes.gone.lock().unwrap().push("old".into());
             }
             if self.close_old_in_spawn && self.spawned.is_empty() {
                 let o = self
@@ -1081,10 +1208,23 @@ mod tests {
             Ok(id)
         }
         async fn await_liveness(&mut self, terminal_id: &str) -> LivenessVerdict {
+            self.awaited.push(terminal_id.to_string());
             let v = self
                 .verdicts
                 .pop_front()
                 .expect("a scripted verdict per pane");
+            if self.exit_on_first_alive && v == LivenessVerdict::Alive && self.awaited.len() == 1 {
+                let o = self
+                    .store
+                    .record_close_checked(SID, Some(terminal_id), "pty-exit");
+                self.exit_close_outcomes.push(o);
+            }
+            if self.user_close_retired_while_proving && terminal_id == "new-2" {
+                let o = self
+                    .store
+                    .record_close_checked(SID, Some("new-1"), "explicit");
+                self.exit_close_outcomes.push(o);
+            }
             if self.user_close && matches!(v, LivenessVerdict::Died(_)) {
                 let o = self
                     .store
@@ -1100,6 +1240,13 @@ mod tests {
             v
         }
         async fn pause_before_retry(&mut self, _retry: usize) {
+            if self.close_old_in_pause {
+                let o = self
+                    .store
+                    .record_close_checked(SID, Some("old"), "explicit");
+                self.exit_close_outcomes.push(o);
+                self.panes.gone.lock().unwrap().push("old".into());
+            }
             if self.user_close_in_pause {
                 if let Some(prev) = self.spawned.last() {
                     let o = self.store.record_close_checked(SID, Some(prev), "explicit");
@@ -1294,24 +1441,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alive_but_unpainted_keeps_both_panes_and_hands_the_row_to_the_new_one() {
-        let (_d, store) = fresh_store();
+    async fn alive_but_unpainted_with_the_old_pane_running_rolls_back_onto_it() {
+        // Round 4, finding 1: the unproven pane is closed and the session stays
+        // on the old pane, whose CLI still runs — never stranded with no row.
+        let (_d, store, closes) = observed_store();
         let old = record("old", "/src");
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Unconfirmed]);
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::UnconfirmedRolledBack {
+                terminal_id: "new-1".into()
+            }
+        );
+        assert_eq!(
+            fx.closed(),
+            vec!["new-1".to_string()],
+            "the unproven pane is closed"
+        );
+        let row = store.get(SID).unwrap();
+        assert_eq!(
+            (
+                row.state.as_str(),
+                row.terminal_id.as_str(),
+                row.config_dir.as_deref()
+            ),
+            ("open", "old", Some("/src"))
+        );
+        assert!(
+            superseded(&store, "new-1"),
+            "the unproven pane's exit-close closes nothing"
+        );
+        assert_eq!(
+            closes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no coord Closed, nonce kept"
+        );
+        assert_eq!(store.get(SID).unwrap().state, "open");
+    }
+
+    /// Without an old pane (respawn receiver, resume door) an unpainted pane is
+    /// the session's only host: it keeps the row, UNKNOWN.
+    #[tokio::test]
+    async fn alive_but_unpainted_without_an_old_pane_keeps_the_row() {
+        let (_d, store) = fresh_store();
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Unconfirmed]);
+        let out = confirm_respawn(&mut fx, &store, None, MAX_RESPAWN_ATTEMPTS).await;
         assert_eq!(
             out,
             RespawnOutcome::Unconfirmed {
                 terminal_id: "new-1".into()
             }
         );
-        assert!(fx.closed().is_empty(), "no pane is closed on an unknown");
+        assert!(fx.closed().is_empty());
         assert_eq!(store.get(SID).unwrap().terminal_id, "new-1");
-        assert!(
-            superseded(&store, "old"),
-            "the old pane closing later closes nothing"
-        );
-        assert_eq!(store.get(SID).unwrap().state, "open");
     }
 
     /// The existing `unmark` arm: the old pane was closed by the operator after
@@ -1321,7 +1504,7 @@ mod tests {
         let (_d, store) = fresh_store();
         let old = record("old", "/src");
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Alive]);
-        fx.panes.gone.lock().unwrap().push("old".into());
+        fx.old_vanishes_in_spawn = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
         assert!(matches!(out, RespawnOutcome::Alive { .. }));
         assert!(
@@ -1805,7 +1988,7 @@ mod tests {
         let (_d, store, closes) = observed_store();
         let old = record("old", "/src");
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 3]);
-        fx.panes.gone.lock().unwrap().push("old".into());
+        fx.old_vanishes_in_spawn = true;
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
         assert!(
             matches!(out, RespawnOutcome::Died { attempts: 3, .. }),
@@ -1866,8 +2049,166 @@ mod tests {
         let (_d, store) = fresh_store();
         let old = record("old", "/src");
         let mut fx = Fake::new(&store, vec![LivenessVerdict::Unconfirmed]);
-        fx.panes.gone.lock().unwrap().push("old".into());
+        fx.old_vanishes_in_spawn = true;
         confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
         assert_eq!(store.superseded_terminal_count(), 0);
+    }
+
+    // ---- round 4 -----------------------------------------------------------
+
+    /// Finding 2: the old pane was closed BEFORE the respawn's hold existed
+    /// (during the caller's usage probe / transcript copy). Its close was
+    /// applied; nothing may move, or the spawn's re-key would reopen it.
+    #[tokio::test]
+    async fn an_old_pane_closed_before_the_hold_moves_nothing() {
+        let (_d, store, closes) = observed_store();
+        let old = record("old", "/src");
+        store.record_close_checked(SID, Some("old"), "explicit");
+        assert_eq!(
+            closes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fixture: applied"
+        );
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Alive]);
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert!(matches!(out, RespawnOutcome::NotSpawned(_)), "{out:?}");
+        assert!(fx.spawned.is_empty(), "no pane is spawned");
+        let row = store.get(SID).unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.close_reason.as_deref()),
+            ("closed", Some("explicit")),
+            "the user's close stands"
+        );
+        assert_eq!(store.held_session_count(), 0);
+
+        // The same when the old pane is simply gone while its row is open.
+        let (_d2, store2) = fresh_store();
+        let mut fx2 = Fake::new(&store2, vec![LivenessVerdict::Alive]);
+        fx2.panes.gone.lock().unwrap().push("old".into());
+        let out2 = confirm_respawn(&mut fx2, &store2, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert!(matches!(out2, RespawnOutcome::NotSpawned(_)), "{out2:?}");
+        assert!(fx2.spawned.is_empty());
+    }
+
+    /// Finding 3: a pane judged Alive whose exit-close is already held has
+    /// exited. It must not be handed the session (closing the healthy old
+    /// pane); it is treated as Died and retried.
+    #[tokio::test]
+    async fn an_alive_verdict_on_a_pane_whose_exit_is_held_is_treated_as_died() {
+        let (_d, store, closes) = observed_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Alive, LivenessVerdict::Alive]);
+        fx.exit_on_first_alive = true;
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::Alive {
+                terminal_id: "new-2".into(),
+                attempts: 2
+            }
+        );
+        assert_eq!(fx.closed(), vec!["new-1".to_string(), "old".to_string()]);
+        let row = store.get(SID).unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.terminal_id.as_str()),
+            ("open", "new-2")
+        );
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Note: the top-of-loop old-pane check aborts BEFORE the next 3-minute
+    /// proof starts — the pane spawned after the user closed the old pane is
+    /// never awaited.
+    #[tokio::test]
+    async fn an_old_pane_closed_during_a_retry_spawn_aborts_before_the_next_proof() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(
+            &store,
+            vec![LivenessVerdict::Died(Some(127)), LivenessVerdict::Alive],
+        );
+        fx.close_old_in_retry_spawn = true;
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(out, RespawnOutcome::ClosedByUser { attempts: 2 });
+        assert_eq!(
+            fx.awaited,
+            vec!["new-1".to_string()],
+            "new-2 is never proven"
+        );
+        assert!(fx.closed().contains(&"new-2".to_string()));
+        assert_eq!(store.get(SID).unwrap().state, "closed");
+    }
+
+    /// Note: the old-pane check after the retry PAUSE — no retry is spawned
+    /// once the user closed the old pane.
+    #[tokio::test]
+    async fn an_old_pane_closed_during_the_retry_pause_spawns_no_retry() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 3]);
+        fx.close_old_in_pause = true;
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(out, RespawnOutcome::ClosedByUser { attempts: 1 });
+        assert_eq!(
+            fx.spawned.len(),
+            1,
+            "no retry spawned after the old pane's close"
+        );
+        assert_eq!(store.get(SID).unwrap().state, "closed");
+    }
+
+    /// Note: the `Some(_) => Gone` arm — the old pane's CLI EXITED (a held
+    /// pty-exit, the pane still listed) — nothing is restored onto it.
+    #[tokio::test]
+    async fn an_old_pane_whose_cli_exited_is_never_restored_onto() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127)); 3]);
+        fx.old_exits_in_spawn = true;
+        let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert!(
+            matches!(out, RespawnOutcome::Died { attempts: 3, .. }),
+            "{out:?}"
+        );
+        let row = store.get(SID).unwrap();
+        assert_eq!(row.state, "closed", "not restored onto the exited old CLI");
+        assert_ne!(row.terminal_id, "old");
+    }
+
+    /// Note: a user close of a pane the respawn already RETIRED (its exit had
+    /// been taken, so no supersede mark absorbs it) is read session-wide and
+    /// ends the respawn — not lost while the retry pane runs.
+    #[tokio::test]
+    async fn a_user_close_of_a_retired_pane_ends_the_respawn() {
+        let (_d, store, closes) = observed_store();
+        let mut fx = Fake::new(
+            &store,
+            vec![LivenessVerdict::Died(Some(127)), LivenessVerdict::Alive],
+        );
+        fx.exit_close = true;
+        fx.user_close_retired_while_proving = true;
+        let out = confirm_respawn(&mut fx, &store, None, MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(out, RespawnOutcome::ClosedByUser { attempts: 2 });
+        assert!(fx.closed().contains(&"new-2".to_string()));
+        let row = store.get(SID).unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.close_reason.as_deref()),
+            ("closed", Some("explicit"))
+        );
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Note: the take and the release of the current pane's close are ONE
+    /// store operation.
+    #[test]
+    fn take_and_release_is_one_store_operation() {
+        let (_d, store) = fresh_store();
+        store.hold_session_closes(SID);
+        store.record_close_checked(SID, Some("old"), "pty-exit");
+        store.record_close_checked(SID, Some("x"), "explicit");
+        let (mine, rest) = store.release_session_hold_taking(SID, Some("old"));
+        assert_eq!(mine.map(|c| c.terminal_id), Some("old".to_string()));
+        assert_eq!(rest.len(), 1);
+        assert_eq!(store.held_session_count(), 0);
     }
 }

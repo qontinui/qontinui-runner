@@ -655,6 +655,12 @@ pub(crate) struct UpdaterState {
     pub version_read_completed: bool,
     /// [`ChildEnvGate::updater_serving`] as of the end of the last tick.
     pub updater_serving: bool,
+    /// An install of OURS left the CLI unreadable (killed mid-reify by the
+    /// timeout, or failed with `bin/claude` moved aside). The next tick repairs
+    /// it — once — through this remembered install, even though `locate` /
+    /// `claude --version` can no longer find it; a repair that also fails
+    /// starts the ordinary [`DID_NOT_TAKE_BACKOFF`].
+    pub repair: Option<NpmGlobalInstall>,
 }
 
 /// What one tick saw and did. Logged by [`run_periodic`]; asserted by tests.
@@ -702,7 +708,33 @@ pub(crate) async fn tick<O: CliOps>(
         }
     }
 
-    let decision = decide(&inputs);
+    let mut decision = decide(&inputs);
+    let mut install_target = located.clone();
+    let mut is_repair = false;
+    if let Some(broken) = state.repair.clone() {
+        let cannot_read = matches!(
+            decision,
+            Decision::Skip(SkipReason::InstalledUnreadable)
+                | Decision::Skip(SkipReason::UnsupportedInstallMethod)
+        );
+        if cannot_read {
+            // Our own install broke it: repair rather than skip forever.
+            if let Some(p) = ops.published_version(&broken).await {
+                inputs.published = Some(p.clone());
+                decision = Decision::Install { published: p };
+                install_target = Some(broken);
+                is_repair = true;
+            }
+        } else if matches!(
+            decision,
+            Decision::Install { .. }
+                | Decision::Skip(SkipReason::UpToDate)
+                | Decision::Skip(SkipReason::InstalledNewer)
+        ) {
+            // Readable again by other means (someone reinstalled it).
+            state.repair = None;
+        }
+    }
     let mut report = TickReport {
         decision: decision.clone(),
         installed: inputs.installed.clone(),
@@ -712,7 +744,7 @@ pub(crate) async fn tick<O: CliOps>(
         did_not_take: false,
     };
 
-    if let (Decision::Install { published }, Some(install)) = (&decision, &located) {
+    if let (Decision::Install { published }, Some(install)) = (&decision, &install_target) {
         let run = {
             let _held = flag.hold();
             ops.install(install, published).await
@@ -721,8 +753,16 @@ pub(crate) async fn tick<O: CliOps>(
         report.reread = ops.installed_version(install).await;
         if report.reread.as_deref() != Some(published.as_str()) {
             report.did_not_take = true;
-            state.backoff_until = Some(now + DID_NOT_TAKE_BACKOFF);
+            if report.reread.is_none() && !is_repair {
+                // The install left NO readable CLI: repair next tick (once)
+                // instead of leaving it broken behind a 24 h backoff.
+                state.repair = Some(install.clone());
+            } else {
+                state.repair = None;
+                state.backoff_until = Some(now + DID_NOT_TAKE_BACKOFF);
+            }
         } else {
+            state.repair = None;
             state.backoff_until = None;
         }
     }
@@ -731,7 +771,11 @@ pub(crate) async fn tick<O: CliOps>(
     if decision == Decision::Skip(SkipReason::UpToDate) {
         state.backoff_until = None;
     }
-    state.updater_serving = serves_children(&decision, state.backoff_until, now);
+    // Never serve over a CLI our install left unreadable, or one that did not
+    // take: a child told to defer would be left on a broken or stale CLI.
+    state.updater_serving = serves_children(&decision, state.backoff_until, now)
+        && !report.did_not_take
+        && state.repair.is_none();
     report
 }
 
@@ -1666,5 +1710,62 @@ mod tests {
         tick(&ops, &mut state, &ops.flag, now + Duration::from_secs(60)).await;
         assert!(state.updater_serving);
         assert!(state.backoff_until.is_none());
+    }
+
+    // ---- Round 4 -----------------------------------------------------------
+
+    /// Finding 4: an install killed mid-reify leaves the CLI unreadable (and
+    /// `locate` blind to it). The next tick REPAIRS through the remembered
+    /// install instead of skipping forever, and children are not served while
+    /// it is broken.
+    #[tokio::test]
+    async fn cli_update_an_install_that_leaves_the_cli_unreadable_is_repaired_next_tick() {
+        let ops = FakeOps::new(&[Some("2.1.303"), None], Some("2.1.304"));
+        let mut state = UpdaterState::default();
+        let now = Instant::now();
+        let r = tick(&ops, &mut state, &ops.flag, now).await;
+        assert!(r.did_not_take && r.reread.is_none());
+        assert!(state.repair.is_some(), "a repair is pending");
+        assert!(
+            state.backoff_until.is_none(),
+            "no 24 h backoff over a broken CLI"
+        );
+        assert!(!state.updater_serving, "never serve over an unreadable CLI");
+
+        let mut ops2 = FakeOps::new(&[Some("2.1.304")], Some("2.1.304"));
+        ops2.located = None; // `bin/claude` is gone: locate cannot find it
+        let r2 = tick(&ops2, &mut state, &ops2.flag, now + TICK_INTERVAL).await;
+        assert_eq!(
+            r2.decision,
+            Decision::Install {
+                published: "2.1.304".into()
+            }
+        );
+        assert_eq!(ops2.installs.load(Ordering::SeqCst), 1, "repaired");
+        assert!(state.repair.is_none());
+        assert!(state.updater_serving);
+    }
+
+    #[tokio::test]
+    async fn cli_update_a_repair_that_also_fails_backs_off() {
+        let ops = FakeOps::new(&[Some("2.1.303"), None], Some("2.1.304"));
+        let mut state = UpdaterState::default();
+        let now = Instant::now();
+        tick(&ops, &mut state, &ops.flag, now).await;
+        let mut ops2 = FakeOps::new(&[None], Some("2.1.304"));
+        ops2.located = None;
+        tick(&ops2, &mut state, &ops2.flag, now + TICK_INTERVAL).await;
+        assert_eq!(ops2.installs.load(Ordering::SeqCst), 1);
+        assert!(state.repair.is_none(), "one repair, not a loop");
+        assert!(state.backoff_until.is_some());
+        assert!(!state.updater_serving);
+        let mut ops3 = FakeOps::new(&[None], Some("2.1.304"));
+        ops3.located = None;
+        tick(&ops3, &mut state, &ops3.flag, now + TICK_INTERVAL * 2).await;
+        assert_eq!(
+            ops3.installs.load(Ordering::SeqCst),
+            0,
+            "bounded by the backoff"
+        );
     }
 }
