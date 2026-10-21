@@ -786,11 +786,16 @@ pub async fn dispatch_subtask(
         // task_run_id ↔ session_id identity binding (mirrors create_ai_session).
         // The run association (page_id = run_id) is encoded in the purpose so the
         // coord session plane can group workers by their run.
-        registrar.register_session(
-            &task_run_id.to_string(),
-            &format!("orchestration worker {} (run {})", subtask.task_id, run_id),
-            subtask.repo.clone(),
-        );
+        // The worker's tenant follows the workspace + repo it runs in, not
+        // the machine default (plan 2026-09-20 Phase 5).
+        registrar
+            .register_session_in(
+                &task_run_id.to_string(),
+                &format!("orchestration worker {} (run {})", subtask.task_id, run_id),
+                subtask.repo.clone(),
+                Some(std::path::Path::new(&working_dir)),
+            )
+            .await;
     } else {
         warn!("dispatch_subtask: AiCoordRegistrar not available; skipping coord identity binding");
     }
