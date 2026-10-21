@@ -78,9 +78,9 @@
 //! holder that kept its pane alive across the restart may still be adopted —
 //! and the in-flight and live-process guards are unchanged. A row held for a
 //! hand restore is the operator's only (`skipped(held_for_hand_restore)` for
-//! an autonomous caller), and only the operator's Restore lifts a finished
-//! cohort row's finish mark — after every guard, just before the spawn, put
-//! back if the resume does not land. A cohort row is resumed at
+//! an autonomous caller), and only the operator's Restore of a finished
+//! cohort row is admitted; its finish mark is lifted once the resume is
+//! verified, so a refused or failed Restore leaves it untouched. A cohort row is resumed at
 //! the effort it ran at (`--effort <level>`, when that differs from its
 //! account's baseline) and the verdict, with the effort read-back, is
 //! recorded on the cohort row.
@@ -259,9 +259,9 @@ struct Candidate {
     zone_index: i32,
     /// Set when the id is a row of the restoring cohort.
     cohort: Option<CohortMember>,
-    /// A FINISHED cohort row restored by the operator: the core lifts the
-    /// finish mark immediately before the spawn (D4), and puts it back if the
-    /// resume does not land.
+    /// A FINISHED cohort row restored by the operator: the core lifts its
+    /// finish mark once the resume is verified (D4) — never for a Restore that
+    /// is refused or fails.
     lift_finish: bool,
 }
 
@@ -272,8 +272,9 @@ struct CohortMember {
     /// Why the row's recorded terminal rules out a cold resume of an OPEN row:
     /// `live_terminal` (live in this runner), `holder_adoption_pending` (a PTY
     /// holder kept its pane alive across the restart and the runner is still
-    /// adopting it), `holder_sweep_pending` (the holder census is not in, so
-    /// that cannot be ruled out yet). `None` when nothing does.
+    /// adopting it), `holder_alive_not_adopted` (a live holder the sweep left
+    /// running with no tab), `holder_sweep_pending` (the holder census is not
+    /// in, so none of that can be ruled out yet). `None` when nothing does.
     terminal_blocker: Option<&'static str>,
     /// The level to pass as `--effort`.
     effort: Option<String>,
@@ -308,6 +309,9 @@ fn live_terminal_blocker(tm: &TerminalManager, terminal_id: &str) -> Option<&'st
     }
     if sweep::adoption_pending(terminal_id) {
         return Some("holder_adoption_pending");
+    }
+    if sweep::holder_left_running(terminal_id) {
+        return Some("holder_alive_not_adopted");
     }
     if sweep::sweep_status(Duration::ZERO).held.is_none() {
         return Some("holder_sweep_pending");
@@ -378,23 +382,6 @@ fn classify(
         cohort: cohort.cloned(),
         lift_finish,
     })
-}
-
-/// Lift `id`'s finish mark for a restore: `Ok(reason)` with the reason it
-/// carried, so [`restore_finish`] can put it back if the resume does not land.
-fn lift_finish(store: &SessionLifecycleStore, id: &str) -> Result<Option<String>, String> {
-    let prior = store.get(id).and_then(|r| r.finish_reason);
-    store
-        .set_finished(id, false, None)
-        .map(|_| prior)
-        .map_err(|e| format!("finish_mark_unliftable({e:?})"))
-}
-
-/// Put back a finish mark [`lift_finish`] lifted for a resume that did not land.
-fn restore_finish(store: &SessionLifecycleStore, id: &str, reason: Option<String>) {
-    if let Err(e) = store.set_finished(id, true, reason) {
-        warn!(id, error = ?e, "resume_door: could not restore the finish mark after a failed resume");
-    }
 }
 
 /// What a request asked for, once validated.
@@ -478,6 +465,23 @@ fn gateway_refusal(gateway_declared: bool) -> Option<String> {
 /// [`gateway_refusal`] over the live gateway state.
 fn live_gateway_refusal() -> Option<String> {
     gateway_refusal(crate::model_gateway::gateway_declared())
+}
+
+/// Whether `row`, the verdict for a cohort member, is recorded on the cohort
+/// row. Everything is, except `skipped(in_flight)`: that is ANOTHER call's
+/// restore of the same row, whose own verdict is the one to keep.
+fn records_verdict(row: &ResumeRow) -> bool {
+    row.reason.as_deref() != Some("in_flight")
+}
+
+/// Ids a call is resuming right now ([`InFlight`]). The lifecycle poll asks
+/// before it records a cohort row as running, so its observation of the pane
+/// a resume is still verifying never pre-empts that resume's own verdict.
+pub fn in_flight(id: &str) -> bool {
+    IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(id)
 }
 
 /// `skipped(resource_guard:<lane>)`'s reason for a spawn error that is the
@@ -779,28 +783,18 @@ async fn resume_one(
             DrainGate::Allow => DrainGate::Allow,
             deferred => deferred,
         };
+    // A busy box is a skip that must not spend one of the session's
+    // `MIGRATION_CAP` slots, so the resource guard is asked BEFORE the
+    // budget; the spawn seam's own gate stays the authority (see below).
+    if let Err(e) = crate::resource_guard::precheck_spawn("terminal session", false) {
+        return spawn_error_row(&cand.id, &e);
+    }
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Err(why) = admit(gate, || {
         crate::terminal::account_migration::migration_cap_permits(&cand.id, now_ms)
     }) {
         return ResumeRow::skipped(&cand.id, why);
     }
-    // Every guard passed: lift a finished cohort row's mark now, never before
-    // — a refused Restore leaves it where it was.
-    let lifted = if cand.lift_finish {
-        match lift_finish(store, &cand.id) {
-            Ok(reason) => Some(reason),
-            Err(why) => return ResumeRow::skipped(&cand.id, why),
-        }
-    } else {
-        None
-    };
-    let refinish = |row: ResumeRow| {
-        if let Some(reason) = lifted.clone() {
-            restore_finish(store, &cand.id, reason);
-        }
-        row
-    };
 
     let effort = cand.cohort.as_ref().and_then(|m| m.effort.clone());
     let spawn = {
@@ -851,15 +845,17 @@ async fn resume_one(
     };
     let terminal_id = match spawn {
         Ok(Ok((terminal_id, _coord_id))) => terminal_id,
-        // Refused before anything started: the box is busy, retry later.
-        Ok(Err(e)) => return refinish(spawn_error_row(&cand.id, &e)),
-        Err(e) => {
-            return refinish(ResumeRow::failed(
-                &cand.id,
-                format!("spawn_task: {e}"),
-                None,
-            ))
+        // Refused before anything started: the box is busy, retry later. The
+        // seam's gate can still refuse after the pre-check passed (the box
+        // crossed its limit in between); that slot is handed back too.
+        Ok(Err(e)) => {
+            let row = spawn_error_row(&cand.id, &e);
+            if row.outcome == "skipped" {
+                crate::terminal::account_migration::migration_cap_refund(&cand.id, now_ms);
+            }
+            return row;
         }
+        Err(e) => return ResumeRow::failed(&cand.id, format!("spawn_task: {e}"), None),
     };
     // A cohort row's resume was attempted: stamp the restore marker now (tier
     // `failed` until the process read below proves it), never at boot — a
@@ -871,6 +867,14 @@ async fn resume_one(
         Ok(ev) => {
             if cand.cohort.is_some() {
                 store.clear_restore_pending(&cand.id);
+            }
+            // A FINISHED cohort row restored by the operator is live work
+            // again: its finish mark is lifted now that the resume is proven,
+            // so a refused or failed Restore never touches it.
+            if cand.lift_finish {
+                if let Err(e) = store.set_finished(&cand.id, false, None) {
+                    warn!(id = %cand.id, error = ?e, "resume_door: resumed, but the finish mark could not be lifted");
+                }
             }
             let mut row = ResumeRow::resumed(&cand.id, ev);
             if let Some(wanted) = effort {
@@ -889,7 +893,7 @@ async fn resume_one(
             }
             row
         }
-        Err(reason) => refinish(ResumeRow::failed(
+        Err(reason) => ResumeRow::failed(
             &cand.id,
             reason,
             Some(ProcessEvidence {
@@ -899,7 +903,7 @@ async fn resume_one(
                 cwd: None,
                 claude_config_dir: None,
             }),
-        )),
+        ),
     }
 }
 
@@ -946,10 +950,7 @@ async fn run_batch(
         info!(id = %row.id, verdict = %row.verdict, effort = ?row.effort, "resume_door: verdict");
         // A cohort row's verdict also lands on the row itself, except a skip
         // that is another call's in-flight restore of the same row.
-        if let Some(m) = member
-            .as_ref()
-            .filter(|_| row.reason.as_deref() != Some("in_flight"))
-        {
+        if let Some(m) = member.as_ref().filter(|_| records_verdict(&row)) {
             crate::restart_prep::restore::note_restore(
                 &m.prepare_id,
                 id,
@@ -1446,6 +1447,7 @@ mod tests {
         for blocker in [
             "live_terminal",
             "holder_adoption_pending",
+            "holder_alive_not_adopted",
             "holder_sweep_pending",
         ] {
             let member = cohort_member(Some(&cohort), ID, Some(&open), |t| {
@@ -1513,24 +1515,52 @@ mod tests {
     }
 
     #[test]
-    fn a_lifted_finish_mark_is_put_back_with_its_reason() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
-        store.record_open(super::super::session_lifecycle_store::test_open_record(ID));
-        store
-            .set_finished(ID, true, Some("work done".to_string()))
-            .unwrap();
-        let reason = lift_finish(&store, ID).expect("lifted");
-        assert_eq!(reason.as_deref(), Some("work done"));
-        let lifted = store.get(ID).unwrap();
-        assert!(lifted.finished_at.is_none());
-        // Admitted now as an ordinary row (no cohort needed once un-finished).
-        assert!(classify(ID, Some(&lifted), None, false).is_err_and(|e| e == "not_closed"));
-        restore_finish(&store, ID, reason);
-        let back = store.get(ID).unwrap();
-        assert!(back.finished_at.is_some());
-        assert_eq!(back.finish_reason.as_deref(), Some("work done"));
-        assert!(lift_finish(&store, "never-seen").is_err());
+    fn every_cohort_verdict_is_recorded_but_another_calls_in_flight_skip() {
+        assert!(records_verdict(&ResumeRow::skipped(ID, "live_terminal")));
+        assert!(records_verdict(&ResumeRow::failed(ID, "x", None)));
+        assert!(records_verdict(&ResumeRow::skipped(
+            ID,
+            "resource_guard:thread_count"
+        )));
+        assert!(!records_verdict(&ResumeRow::skipped(ID, "in_flight")));
+    }
+
+    #[test]
+    fn in_flight_reads_the_claims() {
+        let id = "in-flight-reader-7c1d-resume-door";
+        assert!(!in_flight(id));
+        let claim = InFlight::claim(id).unwrap();
+        assert!(in_flight(id));
+        drop(claim);
+        assert!(!in_flight(id));
+    }
+
+    /// The finish mark of a restored finished cohort row is lifted only once
+    /// the resume is VERIFIED: read off `resume_one`'s source, because the
+    /// spawn needs a running app. Every early return (each guard, a refused or
+    /// failed spawn, a failed verify) therefore leaves the mark untouched.
+    #[test]
+    fn a_finished_rows_mark_is_lifted_only_after_a_verified_resume() {
+        let src = include_str!("resume_door.rs");
+        let (_, rest) = src
+            .split_once("async fn resume_one(")
+            .expect("resume_one exists");
+        let (body, _) = rest.split_once("\n}\n").expect("resume_one's body ends");
+        let lifts: Vec<_> = body.match_indices("set_finished(").collect();
+        assert_eq!(
+            lifts.len(),
+            1,
+            "exactly one finish-mark write in resume_one"
+        );
+        let (lift_at, _) = lifts[0];
+        let (verified_at, _) = body
+            .match_indices("Ok(ev) =>")
+            .next()
+            .expect("the verified arm");
+        assert!(
+            lift_at > verified_at,
+            "the finish mark is lifted inside the verified-resume arm only"
+        );
     }
 
     /// `resume_one` gates on the origin its caller hands it — never a literal

@@ -11300,6 +11300,15 @@ mod tests {
             observed.is_empty(),
             "no placeholder may read as an attempted (failed) boot restore: {observed:?}"
         );
+        // The control: the census DOES count a row once a restore of it is
+        // attempted — which is when, and only when, the resume core stamps it.
+        store.mark_restore_pending("victim-a");
+        let observed = crate::session::restore_census::observe_restored(&store, boot);
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(
+            observed[0].restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED)
+        );
     }
 
     /// The same 5 ticks with NO restoring cohort (a crash boot, no prepare

@@ -922,7 +922,9 @@ impl RestartPrep {
 
     /// Cancel the prepare (and the same-build banner's Release hold): release
     /// the hold and record `cancelled`, which lifts the freeze and any local
-    /// hold. A release that does not SETTLE ([`release_settled`]) leaves the
+    /// hold — or, on a runner REBUILT since the prepare (whose boot step could
+    /// not settle the release), `restoring`, exactly as that boot step would
+    /// have. A release that does not SETTLE ([`release_settled`]) leaves the
     /// prepare in force — the hold still stands — records the attempt, and
     /// errs, so the operator can try again.
     pub async fn cancel(&self, door: &dyn HoldDoor, now_ms: i64) -> Result<PrepareRecord, String> {
@@ -935,12 +937,22 @@ impl RestartPrep {
             .await;
         let outcome = report.outcome.clone();
         let settled = release_settled(&outcome);
+        // On a REBUILT runner — the boot step could not settle its release, so
+        // the record stayed in its window — the release the operator pressed
+        // is the one the boot step owed: the cohort moves to `restoring`, as
+        // the boot step would have moved it, instead of `cancelled`, which
+        // would hand every cohort row to the auto-restore at once (D6).
+        let rebuilt = rec.prepared_build != running_build();
         let rec = self.update(&rec.prepare_id, |r| {
             if settled {
                 r.hold = HoldStatus::ReleaseSent {
                     outcome: outcome.clone(),
                 };
-                r.state = PrepState::Cancelled;
+                r.state = if rebuilt {
+                    PrepState::Restoring
+                } else {
+                    PrepState::Cancelled
+                };
             }
             r.release = Some(report);
         })?;
@@ -1519,6 +1531,30 @@ mod tests {
                         .timestamp_millis()
                 )
             }
+        );
+    }
+
+    /// Phase 6: on a runner REBUILT since the prepare whose boot step could
+    /// not settle the release, the operator's Release hold moves the cohort to
+    /// `restoring` — placeholders, one at a time — not `cancelled`, which
+    /// would hand every cohort row to the auto-restore at once (D6).
+    #[tokio::test]
+    async fn release_hold_on_a_rebuilt_runner_starts_the_restore_instead_of_cancelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        let rec = prepare(&ctl, &door).await;
+        ctl.update(&rec.prepare_id, |r| {
+            r.prepared_build = "an-older-build".to_string()
+        })
+        .unwrap();
+        let released = ctl.cancel(&*door, T0 + 5_000).await.unwrap();
+        assert_eq!(released.state, PrepState::Restoring);
+        assert_eq!(released.hold.label(), "release: released");
+        assert!(!ctl.accounts_frozen(T0 + 5_000), "the freeze is lifted");
+        assert!(
+            crate::restart_prep::restore::RestoringCohort::of(&released).is_some(),
+            "the cohort is restored by hand"
         );
     }
 

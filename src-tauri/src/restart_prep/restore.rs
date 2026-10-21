@@ -85,14 +85,31 @@ pub const VERDICT_RUNNING: &str = "running";
 
 impl RowRestore {
     /// The row's session is back: the resume landed (verified by a process
-    /// read), the poll observed it running ([`VERDICT_RUNNING`]), or a Restore
-    /// found it already running here (`skipped(live_terminal)` /
-    /// `skipped(live_process(..))`). A pending holder adoption is NOT back yet.
+    /// read), or the lifecycle poll observed it alive in a live terminal
+    /// ([`VERDICT_RUNNING`]). A Restore that merely FOUND a live terminal or a
+    /// live process (`skipped(live_terminal)`, `skipped(live_process(..))`) is
+    /// not proof — a pane left by a failed attempt, a `claude` of another
+    /// instance — and a pending holder adoption is not back yet either.
     pub fn is_back(&self) -> bool {
-        self.verdict == "resumed"
-            || self.verdict == VERDICT_RUNNING
-            || self.verdict == "skipped(live_terminal)"
-            || self.verdict.starts_with("skipped(live_process(")
+        self.verdict == "resumed" || self.verdict == VERDICT_RUNNING
+    }
+
+    /// The poll's observation, which the resume core's own verdict for the
+    /// same row may replace (it carries the effort read-back).
+    fn is_observation(&self) -> bool {
+        self.verdict == VERDICT_RUNNING
+    }
+}
+
+/// Whether a new verdict `next` may be written over `row`'s current one: a
+/// row that is not back takes any verdict; a row the poll merely observed
+/// running takes the resume core's verdict for it (never another
+/// observation); a row whose resume landed takes nothing.
+fn may_record(row: &CohortRow, next: &RowRestore) -> bool {
+    match &row.restore {
+        None => true,
+        Some(current) if !current.is_back() => true,
+        Some(current) => current.is_observation() && !next.is_observation(),
     }
 }
 
@@ -201,8 +218,10 @@ pub fn restoring_cohort_ids() -> HashSet<String> {
 /// Record a restore verdict on the cohort row `claude_session_id` of prepare
 /// `prepare_id`, while that record is `restoring`. `Ok(false)` when the record
 /// is no longer restoring or carries no such row (nothing written), and when
-/// the row is already back — a later call's stale skip never overwrites a
-/// landed restore. Once every row is back the record moves to `done`; a row
+/// the row may not take it ([`may_record`]) — a later call's stale skip never
+/// overwrites a landed restore, and the poll's observation never overwrites
+/// the resume core's verdict (with its effort read-back), though that verdict
+/// does replace the observation. Once every row is back the record moves to `done`; a row
 /// that is never restored (held, Finished) keeps it `restoring` until the
 /// cohort is dismissed.
 pub fn note_restore_on(
@@ -214,10 +233,9 @@ pub fn note_restore_on(
     let applies = ctl.record().is_some_and(|r| {
         r.prepare_id == prepare_id
             && r.state == PrepState::Restoring
-            && r.cohort
-                .rows
-                .iter()
-                .any(|row| row.session.claude_session_id == claude_session_id && !restored(row))
+            && r.cohort.rows.iter().any(|row| {
+                row.session.claude_session_id == claude_session_id && may_record(row, &restore)
+            })
     });
     if !applies {
         return Ok(false);
@@ -230,7 +248,8 @@ pub fn note_restore_on(
             .cohort
             .rows
             .iter_mut()
-            .find(|row| row.session.claude_session_id == claude_session_id && !restored(row))
+            .find(|row| row.session.claude_session_id == claude_session_id)
+            .filter(|row| may_record(row, &restore))
         {
             row.restore = Some(restore);
         }
@@ -275,19 +294,51 @@ pub fn note_restore(
 /// set. A no-op when there is no restoring cohort, the row is not in it, or it
 /// is back already — so a poll tick that sees it again writes nothing.
 pub fn note_running(claude_session_id: &str) {
-    let Some(cohort) = restoring_cohort() else {
+    let Some(ctl) = super::prepare::install_live() else {
         return;
     };
-    if !cohort.contains(claude_session_id) {
-        return;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let in_flight = crate::session::resume_door::in_flight(claude_session_id);
+    if let Err(e) = note_running_on(ctl, claude_session_id, in_flight, now_ms) {
+        warn!(
+            session = claude_session_id,
+            error = %e,
+            "restart_prep: running observation not recorded on the cohort row"
+        );
     }
-    note_restore(
+}
+
+/// [`note_running`] on `ctl`. `in_flight` is whether a resume of the row is
+/// in progress right now: its own verdict, effort read-back included, is
+/// the one to record, so the observation of its still-verifying pane is
+/// skipped. `Ok(false)` when nothing was written.
+pub fn note_running_on(
+    ctl: &RestartPrep,
+    claude_session_id: &str,
+    in_flight: bool,
+    now_ms: i64,
+) -> Result<bool, String> {
+    if in_flight {
+        return Ok(false);
+    }
+    let Some(cohort) = ctl.record().as_ref().and_then(RestoringCohort::of) else {
+        return Ok(false);
+    };
+    if !cohort.contains(claude_session_id) {
+        return Ok(false);
+    }
+    note_restore_on(
+        ctl,
         &cohort.prepare_id,
         claude_session_id,
-        VERDICT_RUNNING,
-        None,
-        None,
-    );
+        RowRestore {
+            at_ms: now_ms,
+            at: rfc3339(now_ms),
+            verdict: VERDICT_RUNNING.to_string(),
+            effort_applied: None,
+            effort: None,
+        },
+    )
 }
 
 /// PURE: what one read of the pane says about the re-applied `wanted` level.
@@ -512,15 +563,12 @@ mod tests {
             effort_applied: None,
             effort: None,
         };
-        for back in [
-            "resumed",
-            VERDICT_RUNNING,
-            "skipped(live_terminal)",
-            "skipped(live_process(pid 7))",
-        ] {
+        for back in ["resumed", VERDICT_RUNNING] {
             assert!(r(back).is_back(), "{back}");
         }
         for waiting in [
+            "skipped(live_terminal)",
+            "skipped(live_process(pid 7))",
             "skipped(holder_adoption_pending)",
             "skipped(resource_guard:thread_count)",
             "failed(no_claude_resume_process_observed)",
@@ -528,13 +576,62 @@ mod tests {
         ] {
             assert!(!r(waiting).is_back(), "{waiting}");
         }
-        // A row found running leaves the waiting set.
+        // A row seen running leaves the waiting set; one merely found with a
+        // live terminal does not.
         let mut rec = record(PrepState::Restoring, &["a", "b"]);
-        rec.cohort.rows[0].restore = Some(r("skipped(live_terminal)"));
+        rec.cohort.rows[0].restore = Some(r(VERDICT_RUNNING));
+        rec.cohort.rows[1].restore = Some(r("skipped(live_terminal)"));
         let waiting = RestoringCohort::of(&rec).unwrap();
         assert!(!waiting.contains("a") && waiting.contains("b"));
-        // With no live controller, the poll's observation writes nothing.
-        note_running("a");
+    }
+
+    #[test]
+    fn the_polls_observation_never_pre_empts_the_resume_cores_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &["s1", "s2"], 1_000);
+        let prepare_id = ctl.record().unwrap().prepare_id;
+        // Not restoring yet: the observation writes nothing.
+        assert_eq!(note_running_on(&ctl, "s1", false, 2), Ok(false));
+        ctl.update(&prepare_id, |r| r.state = PrepState::Restoring)
+            .unwrap();
+        // A resume of s1 is in flight: its own verdict is the one to keep.
+        assert_eq!(note_running_on(&ctl, "s1", true, 2), Ok(false));
+        // The poll saw s1 alive first (the new pane registered before the
+        // read-back finished): recorded, and the row is back...
+        assert_eq!(note_running_on(&ctl, "s1", false, 3), Ok(true));
+        assert_eq!(
+            note_running_on(&ctl, "s1", false, 4),
+            Ok(false),
+            "once only"
+        );
+        // ...yet the resume core's verdict, effort read-back included, still
+        // replaces the observation.
+        let verdict = RowRestore {
+            at_ms: 5,
+            at: rfc3339(5),
+            verdict: "resumed".to_string(),
+            effort_applied: Some("max".to_string()),
+            effort: Some(effort_not_restored("indicator_not_seen")),
+        };
+        assert_eq!(
+            note_restore_on(&ctl, &prepare_id, "s1", verdict.clone()),
+            Ok(true)
+        );
+        let row = ctl.record().unwrap().cohort.rows[0].clone();
+        assert_eq!(row.restore, Some(verdict));
+        // And a later observation never overwrites it.
+        assert_eq!(note_running_on(&ctl, "s1", false, 6), Ok(false));
+        assert_eq!(
+            ctl.record().unwrap().cohort.rows[0]
+                .restore
+                .as_ref()
+                .and_then(|r| r.effort.clone()),
+            Some("effort_not_restored(indicator_not_seen)".to_string())
+        );
+        // A row nobody restored is outside nothing: s2 is still waiting.
+        assert!(RestoringCohort::of(&ctl.record().unwrap())
+            .unwrap()
+            .contains("s2"));
     }
 
     #[test]

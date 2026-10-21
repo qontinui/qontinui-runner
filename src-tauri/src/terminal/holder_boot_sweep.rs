@@ -215,6 +215,49 @@ pub fn adoption_pending(terminal_id: &str) -> bool {
         .contains(terminal_id)
 }
 
+/// Terminal ids whose holder the sweep found ALIVE and is leaving running with
+/// no tab: a live holder below this runner's data path (`Incompatible`,
+/// `LeftAlone`), a pane whose holder holds its lock but does not answer
+/// (`Unknown`), or a deferred adoption whose background retry gave up. Its
+/// `claude` may still be running the session, so a cold `--resume` of that
+/// session would be a second process on one transcript — the restart
+/// restore's cohort mode refuses an open row on such a terminal (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, Phase 6).
+/// Never cleared within a process: nothing here proves such a holder gone.
+static LEFT_RUNNING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Whether the sweep left `terminal_id`'s live holder running with no tab
+/// (see [`LEFT_RUNNING`]).
+pub fn holder_left_running(terminal_id: &str) -> bool {
+    LEFT_RUNNING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(terminal_id)
+}
+
+fn note_left_running(terminal_id: &str) {
+    LEFT_RUNNING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(terminal_id.to_string());
+}
+
+/// PURE: the census entries whose holder is alive (or cannot be ruled out)
+/// and which no adoption will take — `Incompatible` and `Unknown`. A `Live`
+/// entry goes to an adoption, whose own outcome decides; a `Reaped` one is gone.
+pub fn left_running_in_census(entries: &[SweepEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.outcome,
+                SweepOutcome::Incompatible { .. } | SweepOutcome::Unknown { .. }
+            )
+        })
+        .map(|e| e.pane_id.clone())
+        .collect()
+}
+
 fn set_adoption_pending(terminal_id: &str, pending: bool) {
     let mut set = ADOPTION_PENDING.lock().unwrap_or_else(|p| p.into_inner());
     if pending {
@@ -880,6 +923,7 @@ fn spawn_background_retry(
             }
         }
         if matches!(late, AdoptOutcome::Deferred(_)) {
+            note_left_running(&adoption.pane_id);
             error!(
                 pane = %adoption.pane_id,
                 outcome = ?late,
@@ -966,12 +1010,15 @@ fn adopt_all(
                     ),
                     // HolderGone comes only from the background retry.
                     AdoptOutcome::Ended(_) | AdoptOutcome::HolderGone => {}
-                    AdoptOutcome::LeftAlone(why) => warn!(
-                        pane = %adoption.pane_id,
-                        why = %why,
-                        "pty holder boot sweep: a live holder below this runner's data path — \
-                         left running, not adopted (plan D15)"
-                    ),
+                    AdoptOutcome::LeftAlone(why) => {
+                        note_left_running(&adoption.pane_id);
+                        warn!(
+                            pane = %adoption.pane_id,
+                            why = %why,
+                            "pty holder boot sweep: a live holder below this runner's data path — \
+                             left running, not adopted (plan D15)"
+                        )
+                    }
                     AdoptOutcome::Deferred(why) => {
                         error!(
                             pane = %adoption.pane_id,
@@ -1073,6 +1120,9 @@ fn sweep_and_adopt(
         pane_dir,
         &skip,
         |entries| {
+            for id in left_running_in_census(entries) {
+                note_left_running(&id);
+            }
             let adoptions = plan_adoptions(entries, &already_open, |terminal_id| {
                 store
                     .as_deref()?
@@ -1145,6 +1195,9 @@ mod tests {
                 },
             },
         ];
+        // The wedged and the incompatible holders are left running with no
+        // tab; the live ones go to an adoption.
+        assert_eq!(left_running_in_census(&entries), ["t-wedged", "t-old"]);
         let plans = plan_adoptions(&entries, &["t-open-already".to_string()], |id| {
             (id == "t-known").then(|| ("sess-1".to_string(), "page-2".to_string()))
         });

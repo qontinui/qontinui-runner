@@ -91,6 +91,21 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     true
 }
 
+/// Hand back the `MIGRATION_CAP` slot [`migration_cap_permits`] recorded for
+/// `claude_session_id` at `at_ms`, for an attempt that started nothing (the
+/// resume door's spawn the resource guard refused). Removes one slot stamped
+/// exactly `at_ms`; a no-op when there is none.
+pub(crate) fn migration_cap_refund(claude_session_id: &str, at_ms: i64) {
+    let Ok(mut hist) = MIGRATION_HISTORY.lock() else {
+        return;
+    };
+    if let Some(entry) = hist.as_mut().and_then(|m| m.get_mut(claude_session_id)) {
+        if let Some(i) = entry.iter().rposition(|t| *t == at_ms) {
+            entry.remove(i);
+        }
+    }
+}
+
 /// Outcome payload emitted on `session-account-migrated`.
 #[derive(Debug)]
 pub struct MigrationOutcome {
@@ -1553,6 +1568,21 @@ mod tests {
             argv.windows(2).any(|w| w == ["--settings", "hooks.json"]),
             "extra_required tail must survive: {argv:?}"
         );
+    }
+
+    #[test]
+    fn a_refunded_slot_is_available_again() {
+        let id = "cap-refund-test-9d8e-account-migration";
+        let now = chrono::Utc::now().timestamp_millis();
+        for _ in 0..MIGRATION_CAP {
+            assert!(migration_cap_permits(id, now));
+        }
+        assert!(!migration_cap_permits(id, now), "the cap is full");
+        migration_cap_refund(id, now);
+        assert!(migration_cap_permits(id, now), "the refunded slot is free");
+        // Refunding a slot that was never taken changes nothing.
+        migration_cap_refund(id, now - 1);
+        assert!(!migration_cap_permits(id, now));
     }
 
     /// The restart restore's effort re-apply (plan

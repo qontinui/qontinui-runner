@@ -1870,7 +1870,11 @@ fn live_restore_set_body(
                 .as_ref()
                 .is_some_and(|tm| tm.get(terminal_id).is_some())
                 || crate::terminal::holder_boot_sweep::adoption_pending(terminal_id)
+                || crate::terminal::holder_boot_sweep::holder_left_running(terminal_id)
         },
+        crate::terminal::holder_boot_sweep::sweep_status(std::time::Duration::ZERO)
+            .held
+            .is_none(),
     )
 }
 
@@ -1887,7 +1891,8 @@ fn live_restore_set_body(
 /// poll holds those rows open meanwhile (`in_active_cohort`).
 ///
 /// A cohort row whose terminal is live (`terminal_live`: this runner holds
-/// it, or a PTY holder kept it alive and its adoption is pending) is running,
+/// it, or a PTY holder kept it alive — adoption pending, or left running with
+/// no tab) is running,
 /// not waiting: it stays wherever the ordinary restore set put it and is no
 /// placeholder. With no restoring cohort — a crash boot, or no prepare at
 /// all — the body is exactly `{"sessions": [...]}`, as before.
@@ -1896,6 +1901,7 @@ fn restore_set_body(
     cohort: Option<&crate::restart_prep::restore::RestoringCohort>,
     placeholder_of: impl Fn(&str) -> Option<RestoreCandidate>,
     terminal_live: impl Fn(&str) -> bool,
+    holder_sweep_pending: bool,
 ) -> serde_json::Value {
     let Some(cohort) = cohort else {
         return serde_json::json!({ "sessions": rows });
@@ -1917,7 +1923,13 @@ fn restore_set_body(
     serde_json::json!({
         "sessions": sessions,
         "placeholders": placeholders,
-        "restartPrep": { "prepareId": cohort.prepare_id, "state": "restoring" },
+        "restartPrep": {
+            "prepareId": cohort.prepare_id,
+            "state": "restoring",
+            // The PTY holder census is not in yet: a placeholder's pane may
+            // still turn out to be alive and be adopted. Re-read once it is.
+            "holderSweepPending": holder_sweep_pending,
+        },
     })
 }
 
@@ -3260,7 +3272,7 @@ mod tests {
             })
         };
         let none_live = |_: &str| false;
-        let crash_boot = restore_set_body(candidates(), None, record_of, none_live);
+        let crash_boot = restore_set_body(candidates(), None, record_of, none_live, false);
         assert_eq!(ids(&crash_boot, "sessions"), ["a", "b", "c"]);
         assert_eq!(
             crash_boot.as_object().map(|o| o.len()),
@@ -3275,7 +3287,13 @@ mod tests {
             "gone",
         ]);
         let record_or_gone = |id: &str| if id == "gone" { None } else { record_of(id) };
-        let prepared = restore_set_body(candidates(), Some(&cohort), record_or_gone, none_live);
+        let prepared = restore_set_body(
+            candidates(),
+            Some(&cohort),
+            record_or_gone,
+            none_live,
+            false,
+        );
         assert_eq!(ids(&prepared, "sessions"), ["a"]);
         // Every waiting row with a record — a finished, closed one too, which
         // the restorable set never offers — and nothing without a record.
@@ -3284,6 +3302,7 @@ mod tests {
             ["b", "c", "finished-closed"]
         );
         assert_eq!(prepared["restartPrep"]["prepareId"], "prep-test");
+        assert_eq!(prepared["restartPrep"]["holderSweepPending"], false);
 
         // A cohort row whose terminal is live (a PTY holder kept it) is running,
         // not waiting: it stays in `sessions` and is no placeholder.
@@ -3295,9 +3314,16 @@ mod tests {
             rows
         };
         let c_live = |t: &str| t == "term-c";
-        let held = restore_set_body(rows_with_live_c(), Some(&cohort), record_or_gone, c_live);
+        let held = restore_set_body(
+            rows_with_live_c(),
+            Some(&cohort),
+            record_or_gone,
+            c_live,
+            true,
+        );
         assert_eq!(ids(&held, "sessions"), ["a", "c"]);
         assert_eq!(ids(&held, "placeholders"), ["b", "finished-closed"]);
+        assert_eq!(held["restartPrep"]["holderSweepPending"], true);
     }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never
