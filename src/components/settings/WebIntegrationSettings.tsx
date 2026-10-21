@@ -39,6 +39,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { EgressPrivacyPanel } from "./EgressPrivacyPanel";
 import type { LogFunction } from "./types";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
 import {
@@ -1231,6 +1232,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           )}
         </div>
       </div>
+
+      {/* Privacy — the six outbound data flows and this project's switch for
+          each (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
+          Phase 8). Read-only: the switches are written in the web console.
+          The user's own sync toggles below stay independent of it. */}
+      <EgressPrivacyPanel webAppUrl={status?.webBaseUrl?.trim() || webAppUrl} />
 
       {/* Session metadata sync — independent consent toggle (gate 2 of the
           session-history cloud-sync consent model, split off by plan
