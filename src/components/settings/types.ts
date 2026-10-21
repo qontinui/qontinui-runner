@@ -87,6 +87,8 @@ export interface UpdateInfo {
   current_version?: string;
   notes?: string;
   development?: boolean;
+  /** `"egress_off"` when the project turned update checks off. */
+  status?: string;
 }
 
 export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | "error";
