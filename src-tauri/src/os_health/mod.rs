@@ -237,15 +237,81 @@ impl SnapshotCell {
     }
 
     pub(crate) fn store(&self, snap: OsHealthSnapshot) {
-        let snap = Arc::new(snap);
-        *self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snap);
+        self.set(Some(Arc::new(snap)));
+    }
+
+    /// Replace the cell's content, returning the previous one.
+    fn set(&self, snap: Option<Arc<OsHealthSnapshot>>) -> Option<Arc<OsHealthSnapshot>> {
+        std::mem::replace(
+            &mut *self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            snap,
+        )
     }
 }
 
 static CELL: SnapshotCell = SnapshotCell::new();
+
+/// How old a snapshot may be and still be served as CURRENT. A tick is 30 s
+/// and a probe tick can hold the thread for the 30 s probe bound on top, so
+/// the gap between two stores is at most about a minute; 120 s is two missed
+/// ticks — a stopped, panicking or wedged collector, not a slow one. Past it,
+/// the resource sample drops the kernel readings (a stale reading must never
+/// be republished as a fresh one) and `/health` `osHealth` says `stale`.
+pub(crate) const STALE_AFTER_SECS: i64 = 120;
+
+/// Whether `snap`, read at its `read_at`, is too old to serve as current at
+/// `now`.
+pub(crate) fn is_stale(snap: &OsHealthSnapshot, now: DateTime<Utc>) -> bool {
+    (now - snap.read_at).num_seconds() > STALE_AFTER_SECS
+}
+
+/// Serialises the tests that write the process-global cell (and, in Phase 5,
+/// the controls and slope history), so they cannot read one another's
+/// injections.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy, as
+/// `env_test_lock_hierarchy_guard` requires of every test lock:
+/// `hierarchy_lock` takes the (per-thread reentrant) env lock first, so a
+/// holder — the host-lane arming test holds it across `collect_host_lane()` —
+/// can take the env lock again in either order without an AB/BA deadlock.
+#[cfg(test)]
+pub(crate) fn test_cell_lock() -> crate::test_env::TestLockGuard {
+    static LOCK: Mutex<()> = Mutex::new(());
+    crate::test_env::hierarchy_lock(&LOCK)
+}
+
+/// The test seam into the PROCESS-GLOBAL cell — the one `/health` and the
+/// resource sample's host lane read. Puts `snap` there (`None` empties it)
+/// until the returned guard drops, which restores what was there before
+/// ("clear for tests"). Holds [`test_cell_lock`] for its lifetime. Compiled
+/// for tests only; nothing in a shipped build can write the cell but the
+/// `os-health` thread.
+#[cfg(test)]
+pub(crate) fn store_for_tests(snap: Option<OsHealthSnapshot>) -> StoredForTests {
+    let lock = test_cell_lock();
+    let previous = CELL.set(snap.map(Arc::new));
+    StoredForTests {
+        previous,
+        _lock: lock,
+    }
+}
+
+/// Restores the cell on drop. See [`store_for_tests`].
+#[cfg(test)]
+pub(crate) struct StoredForTests {
+    previous: Option<Arc<OsHealthSnapshot>>,
+    _lock: crate::test_env::TestLockGuard,
+}
+
+#[cfg(test)]
+impl Drop for StoredForTests {
+    fn drop(&mut self) {
+        CELL.set(self.previous.take());
+    }
+}
 
 /// The latest snapshot the `os-health` thread stored, or `None` before its
 /// first tick (UNKNOWN — never healthy). Never blocks on a fresh read.
@@ -292,30 +358,87 @@ fn production_source() -> Box<dyn GaugeSource + Send> {
 /// instrument starts failing, INFO when it answers again, DEBUG while it keeps
 /// failing. A 30 s loop against a broken instrument would otherwise bury the
 /// log in 120 identical WARNs an hour (D6's `warn_once`-style limiter).
+///
+/// **Bounded for a FLAPPING instrument too.** Transitions alone do not bound
+/// an instrument that fails every other tick — that is a WARN a minute,
+/// forever. So each instrument gets [`FLAP_WARN_BUDGET`] failure WARNs for the
+/// life of the process; the last of them says so, and every transition after
+/// it (failing and recovering alike) is DEBUG.
 #[derive(Debug, Default)]
 pub(crate) struct FailureLog {
     failing: BTreeMap<&'static str, bool>,
+    warned: BTreeMap<&'static str, u32>,
+}
+
+/// Failure WARNs one instrument may emit before its transitions go to DEBUG.
+pub(crate) const FLAP_WARN_BUDGET: u32 = 3;
+
+/// The level one recorded result is logged at; `None` logs nothing above
+/// DEBUG. Split out of [`FailureLog::record`] so the limiter is testable
+/// without a tracing subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogLevel {
+    /// The instrument started failing, inside its WARN budget.
+    Warn,
+    /// The instrument started failing and this is the LAST WARN it gets.
+    WarnLast,
+    /// The instrument answers again, after a failure that was WARNed.
+    Info,
+    /// Anything else: still failing, or a transition past the budget.
+    Debug,
 }
 
 impl FailureLog {
+    /// Classify one result for `instrument` and update the state.
+    pub(crate) fn level_for(&mut self, instrument: &'static str, ok: bool) -> LogLevel {
+        let was_failing = self.failing.insert(instrument, !ok) == Some(true);
+        let warned = self.warned.get(instrument).copied().unwrap_or(0);
+        match (ok, was_failing) {
+            // A recovery from a failure that was WARNed (every failure
+            // transition inside the budget is), unless that WARN was the last.
+            (true, true) if warned < FLAP_WARN_BUDGET => LogLevel::Info,
+            (false, false) if warned < FLAP_WARN_BUDGET => {
+                self.warned.insert(instrument, warned + 1);
+                if warned + 1 == FLAP_WARN_BUDGET {
+                    LogLevel::WarnLast
+                } else {
+                    LogLevel::Warn
+                }
+            }
+            _ => LogLevel::Debug,
+        }
+    }
+
     /// Pass an instrument's result through, logging a state change.
-    pub(crate) fn record<T>(&mut self, instrument: &'static str, r: Result<T, String>) -> Option<T> {
+    pub(crate) fn record<T>(
+        &mut self,
+        instrument: &'static str,
+        r: Result<T, String>,
+    ) -> Option<T> {
+        let level = self.level_for(instrument, r.is_ok());
         match r {
             Ok(v) => {
-                if self.failing.insert(instrument, false) == Some(true) {
-                    info!(instrument, "os-health: {instrument} answers again");
+                match level {
+                    LogLevel::Info => info!(instrument, "os-health: {instrument} answers again"),
+                    _ => debug!(instrument, "os-health: {instrument} answers"),
                 }
                 Some(v)
             }
             Err(reason) => {
-                if self.failing.insert(instrument, true) == Some(true) {
-                    debug!(instrument, "os-health: {instrument} still failing: {reason}");
-                } else {
-                    warn!(
+                match level {
+                    LogLevel::Warn => warn!(
                         instrument,
                         "os-health: {instrument} failed: {reason} — its readings are \
                          published as UNKNOWN (NULL), never 0, until it answers again"
-                    );
+                    ),
+                    LogLevel::WarnLast => warn!(
+                        instrument,
+                        "os-health: {instrument} failed: {reason} — its readings are \
+                         published as UNKNOWN (NULL), never 0, until it answers again. \
+                         This is its {FLAP_WARN_BUDGET}th failure WARN: it is flapping, and \
+                         its further transitions are logged at DEBUG"
+                    ),
+                    _ => debug!(instrument, "os-health: {instrument} failing: {reason}"),
                 }
                 None
             }
@@ -387,7 +510,10 @@ impl Collector {
         self.gauges = self.cfg.source.gauges(&mut self.log);
         let read_at = Utc::now();
         self.read_at = Some(read_at);
-        if self.tick.is_multiple_of(self.cfg.pool_tags_every_ticks.max(1)) {
+        if self
+            .tick
+            .is_multiple_of(self.cfg.pool_tags_every_ticks.max(1))
+        {
             let tags = self.cfg.source.pool_tags(&mut self.log);
             // A failed re-read publishes NULL — not the last good table — so
             // NULL means only "never read" or "read failed" (plan D2, vet R8).
@@ -402,6 +528,8 @@ impl Collector {
             if let Some(probe) = &self.cfg.probe {
                 let run = probe.run_once();
                 log_probe(&mut self.log, &run);
+                // An `Unavailable` result empties the window (instrument
+                // failure — see `ProbeWindow::push`).
                 self.window.push(run.result);
                 publish(self.snapshot());
             }
@@ -416,6 +544,13 @@ impl Collector {
         if self.pool.tags.is_some() {
             instruments.push(instrument::POOL_TAGS);
         }
+        let spawn_probe = self.window.stats();
+        // The probe ANSWERED when its window holds a result — a timeout or a
+        // create error is an answer about the OS. A missing probe program
+        // empties the window, so it is not named.
+        if spawn_probe.is_some() {
+            instruments.push(instrument::SPAWN_PROBE);
+        }
         OsHealthSnapshot {
             platform: self.cfg.platform,
             kernel_paged_bytes: g.kernel_paged_bytes,
@@ -427,7 +562,7 @@ impl Collector {
             os_booted_at: g.os_booted_at,
             kernel_pool_top_tags: self.pool.tags.clone(),
             kernel_pool_tags_at: self.pool.at,
-            spawn_probe: self.window.stats(),
+            spawn_probe,
             kernel_source: kernel_source(self.cfg.platform, &instruments),
             read_at: self.read_at.unwrap_or_else(Utc::now),
         }
@@ -454,8 +589,17 @@ fn log_probe(log: &mut FailureLog, run: &ProbeRun) {
             "the trivial child could not be created (os error {code:?}) — counted in errors, \
              not as a latency sample"
         )),
+        ProbeResult::ExitedNonZero { code } => Err(format!(
+            "the trivial child was created but exited failing (exit status {code:?}, \
+             0xC0000142 is STATUS_DLL_INIT_FAILED) — counted in errors, not as a latency sample"
+        )),
+        ProbeResult::Unavailable => Err(
+            "the probe program was not found — an INSTRUMENT failure, not a measurement of \
+             the OS: the probe window is emptied and spawn latency reads UNKNOWN"
+                .to_string(),
+        ),
     };
-    log.record("spawn-probe", outcome);
+    log.record(instrument::SPAWN_PROBE, outcome);
 }
 
 /// Run `collector` on a new `os-health` thread until `stop` is set, ticking
@@ -472,9 +616,29 @@ pub(crate) fn spawn_collector_thread(
 
 fn run_loop(mut collector: Collector, publish: &dyn Fn(OsHealthSnapshot), stop: &AtomicBool) {
     let period = collector.cfg.period;
+    let mut panics: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         let tick_started = Instant::now();
-        collector.step(publish);
+        // A panic in one tick (a parser bug on a build we have never seen, a
+        // poisoned invariant) must not end the thread: the cell would then
+        // hold its last snapshot forever. Catch it, say so, and tick again —
+        // the stale gate (`STALE_AFTER_SECS`) covers the gap meanwhile.
+        let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            collector.step(publish);
+        }));
+        if let Err(payload) = stepped {
+            panics = panics.saturating_add(1);
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            if panics <= FLAP_WARN_BUDGET {
+                warn!("os-health: a collector tick panicked ({what}); the thread carries on (panic #{panics})");
+            } else {
+                debug!("os-health: a collector tick panicked ({what}) (panic #{panics})");
+            }
+        }
         // A tick that overran (a 30 s probe timeout) starts the next at once.
         let next = tick_started + period;
         loop {
@@ -530,11 +694,7 @@ pub(crate) fn start() {
 /// tests here and Phase 5's verdict tests.
 #[cfg(test)]
 pub(crate) fn incident_snapshot_for_tests() -> OsHealthSnapshot {
-    let at = |s: &str| {
-        DateTime::parse_from_rfc3339(s)
-            .unwrap()
-            .with_timezone(&Utc)
-    };
+    let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
     OsHealthSnapshot {
         platform: OsPlatform::Windows,
         kernel_paged_bytes: Some(24_282_075_136),
@@ -570,7 +730,7 @@ pub(crate) fn incident_snapshot_for_tests() -> OsHealthSnapshot {
             errors: 1,
             error_code: Some(1450),
         }),
-        kernel_source: Some("windows:getperformanceinfo+objecttypes+pooltags".into()),
+        kernel_source: Some("windows:getperformanceinfo+objecttypes+pooltags+spawn-probe".into()),
         read_at: at("2026-10-19T08:20:52Z"),
     }
 }
@@ -678,7 +838,10 @@ mod tests {
     #[test]
     fn the_production_cadences_are_the_plans() {
         assert_eq!(GAUGE_PERIOD, Duration::from_secs(30));
-        assert_eq!(GAUGE_PERIOD * PROBE_EVERY_TICKS as u32, Duration::from_secs(60));
+        assert_eq!(
+            GAUGE_PERIOD * PROBE_EVERY_TICKS as u32,
+            Duration::from_secs(60)
+        );
         assert_eq!(
             GAUGE_PERIOD * POOL_TAGS_EVERY_TICKS as u32,
             Duration::from_secs(150)
@@ -706,14 +869,21 @@ mod tests {
             },
             spawn_probe::PROBE_TIMEOUT,
         );
-        let (cfg, _, gauge_threads) =
-            scripted_config(OsPlatform::current(), windows_like_gauges(), vec![], Some(probe));
+        let (cfg, _, gauge_threads) = scripted_config(
+            OsPlatform::current(),
+            windows_like_gauges(),
+            vec![],
+            Some(probe),
+        );
         let cell = Arc::new(SnapshotCell::new());
         let sink = Arc::clone(&cell);
         let stop = Arc::new(AtomicBool::new(false));
-        let handle =
-            spawn_collector_thread(Collector::new(cfg), move |s| sink.store(s), Arc::clone(&stop))
-                .unwrap();
+        let handle = spawn_collector_thread(
+            Collector::new(cfg),
+            move |s| sink.store(s),
+            Arc::clone(&stop),
+        )
+        .unwrap();
         let got = wait_for(&cell, Duration::from_secs(60), |s| {
             s.spawn_probe.is_some_and(|p| p.count >= 1)
         });
@@ -730,6 +900,14 @@ mod tests {
     /// parked on a blocking wait, starve a test-local runtime completely —
     /// the shape `mcp-api-rt` was in during the incident — and the real
     /// production probe still delivers.
+    ///
+    /// What this does NOT prove: it starves a TEST-LOCAL runtime, not
+    /// `mcp-api-rt` itself (that runtime exists only inside
+    /// `serve_on_dedicated_runtime`, so a unit test cannot block it), and it
+    /// says nothing about OS-level starvation — a box whose process creation
+    /// takes seconds slows this thread's probe exactly as much as any other
+    /// thread's, which is the measurement. It proves the collector's path
+    /// contains no tokio dependency that a starved runtime could stall.
     #[test]
     fn probe_results_arrive_while_every_tokio_worker_is_blocked() {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -779,9 +957,12 @@ mod tests {
         let cell = Arc::new(SnapshotCell::new());
         let sink = Arc::clone(&cell);
         let stop = Arc::new(AtomicBool::new(false));
-        let handle =
-            spawn_collector_thread(Collector::new(cfg), move |s| sink.store(s), Arc::clone(&stop))
-                .unwrap();
+        let handle = spawn_collector_thread(
+            Collector::new(cfg),
+            move |s| sink.store(s),
+            Arc::clone(&stop),
+        )
+        .unwrap();
         let got = wait_for(&cell, Duration::from_secs(60), |s| {
             s.spawn_probe.is_some_and(|p| p.count >= 2)
         });
@@ -800,16 +981,23 @@ mod tests {
     #[test]
     fn a_probe_timeout_does_not_wedge_the_thread() {
         let probe = SpawnProbe::with(spawn_probe::sleeper, Duration::from_millis(200));
-        let (mut cfg, _, _) =
-            scripted_config(OsPlatform::current(), windows_like_gauges(), vec![], Some(probe));
+        let (mut cfg, _, _) = scripted_config(
+            OsPlatform::current(),
+            windows_like_gauges(),
+            vec![],
+            Some(probe),
+        );
         cfg.probe_every_ticks = 1;
         let cell = Arc::new(SnapshotCell::new());
         let sink = Arc::clone(&cell);
         let stop = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
-        let handle =
-            spawn_collector_thread(Collector::new(cfg), move |s| sink.store(s), Arc::clone(&stop))
-                .unwrap();
+        let handle = spawn_collector_thread(
+            Collector::new(cfg),
+            move |s| sink.store(s),
+            Arc::clone(&stop),
+        )
+        .unwrap();
         // Three consecutive timeouts: the thread got back after each.
         let got = wait_for(&cell, Duration::from_secs(60), |s| {
             s.spawn_probe.is_some_and(|p| p.timeouts >= 3)
@@ -821,7 +1009,11 @@ mod tests {
         assert_eq!(p.max_ms, Some(30_000));
         assert_eq!(p.successes(), 0);
         // Three 60 s children were each killed at their 200 ms bound.
-        assert!(started.elapsed() < Duration::from_secs(45), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(45),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -859,7 +1051,10 @@ mod tests {
         c.step(&publish); // tick 5: pool read #2 FAILS
         assert_eq!(*pool_calls.lock().unwrap(), 2);
         let t5 = published.lock().unwrap().last().unwrap().clone();
-        assert_eq!(t5.kernel_pool_top_tags, None, "a failed re-read is NULL, not the old table");
+        assert_eq!(
+            t5.kernel_pool_top_tags, None,
+            "a failed re-read is NULL, not the old table"
+        );
         assert_eq!(t5.kernel_pool_tags_at, None);
         assert_eq!(
             t5.kernel_source.as_deref(),
@@ -871,14 +1066,20 @@ mod tests {
         }
         assert_eq!(*pool_calls.lock().unwrap(), 3, "ticks 0, 5 and 10");
         assert_eq!(
-            published.lock().unwrap().last().unwrap().kernel_pool_top_tags,
+            published
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .kernel_pool_top_tags,
             Some(vec![tag("File", 1)])
         );
     }
 
     #[test]
     fn a_failed_read_publishes_none_and_no_instrument() {
-        let (cfg, _, _) = scripted_config(OsPlatform::Windows, GaugeReading::default(), vec![], None);
+        let (cfg, _, _) =
+            scripted_config(OsPlatform::Windows, GaugeReading::default(), vec![], None);
         let mut c = Collector::new(cfg);
         let published: Arc<Mutex<Vec<OsHealthSnapshot>>> = Arc::default();
         let sink = Arc::clone(&published);
@@ -894,7 +1095,10 @@ mod tests {
         assert_eq!(s.kernel_pool_top_tags, None);
         assert_eq!(s.kernel_pool_bytes(), None);
         assert_eq!(s.spawn_probe, None);
-        assert_eq!(s.kernel_source, None, "nothing answered, so nothing is named");
+        assert_eq!(
+            s.kernel_source, None,
+            "nothing answered, so nothing is named"
+        );
         // UNKNOWN on Windows, where every one of these applies.
         assert!(s.platform.not_applicable().is_empty());
     }
@@ -925,7 +1129,12 @@ mod tests {
         assert_eq!(s.kernel_pool_bytes(), Some((600_000 + 360_000) * 1024));
         assert_eq!(
             OsPlatform::Linux.not_applicable(),
-            vec!["tokenObjects", "processObjects", "poolTopTags", "poolTagsAt"]
+            vec![
+                "tokenObjects",
+                "processObjects",
+                "poolTopTags",
+                "poolTagsAt"
+            ]
         );
         assert!(!OsPlatform::Linux.has_kernel_objects());
         assert!(OsPlatform::Linux.has_spawn_probe());
@@ -933,13 +1142,19 @@ mod tests {
 
     #[test]
     fn the_probe_runs_every_second_tick_and_errors_are_counted_with_their_code() {
-        let missing = std::env::temp_dir().join("os-health-probe-missing-77c1.exe");
+        // A file that is not an executable: a real create failure, not
+        // `NotFound`.
+        let bad = spawn_probe::not_an_executable();
         let probe = SpawnProbe::with(
-            move || crate::process_helpers::no_window(&missing),
+            move || crate::process_helpers::no_window(&bad),
             Duration::from_secs(5),
         );
-        let (cfg, _, _) =
-            scripted_config(OsPlatform::current(), windows_like_gauges(), vec![], Some(probe));
+        let (cfg, _, _) = scripted_config(
+            OsPlatform::Windows,
+            windows_like_gauges(),
+            vec![],
+            Some(probe),
+        );
         let mut c = Collector::new(cfg);
         let published: Arc<Mutex<Vec<OsHealthSnapshot>>> = Arc::default();
         let sink = Arc::clone(&published);
@@ -947,13 +1162,127 @@ mod tests {
         for _ in 0..6 {
             c.step(&publish);
         }
-        let p = published.lock().unwrap().last().unwrap().spawn_probe.unwrap();
+        let last = published.lock().unwrap().last().unwrap().clone();
+        let p = last.spawn_probe.unwrap();
         // Ticks 0, 2 and 4.
         assert_eq!(p.count, 3);
         assert_eq!(p.errors, 3);
-        assert_eq!(p.error_code, Some(2));
-        assert_eq!((p.p50_ms, p.max_ms), (None, None), "an error is not a sample");
+        assert_eq!(p.error_code, Some(spawn_probe::NOT_AN_EXE_SPAWN_ERROR));
+        assert_eq!(
+            (p.p50_ms, p.max_ms),
+            (None, None),
+            "an error is not a sample"
+        );
         assert_eq!(p.successes(), 0);
+        // A create error is an ANSWER about the OS: the probe is named.
+        assert_eq!(
+            last.kernel_source.as_deref(),
+            Some("windows:getperformanceinfo+objecttypes+spawn-probe")
+        );
+    }
+
+    /// `kernel_source` names `spawn-probe` exactly when the probe window holds
+    /// a result: not before the first probe, and not once a missing probe
+    /// program (an instrument failure) has emptied it.
+    #[test]
+    fn kernel_source_names_the_spawn_probe_only_while_it_answers() {
+        let missing = std::env::temp_dir().join("os-health-probe-missing-77c1.exe");
+        let present = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&present);
+        let probe = SpawnProbe::with(
+            move || {
+                if flag.load(Ordering::Relaxed) {
+                    spawn_probe::probe_command()
+                } else {
+                    crate::process_helpers::no_window(&missing)
+                }
+            },
+            Duration::from_secs(20),
+        );
+        let (mut cfg, _, _) = scripted_config(
+            OsPlatform::Windows,
+            windows_like_gauges(),
+            vec![],
+            Some(probe),
+        );
+        cfg.probe_every_ticks = 1;
+        let mut c = Collector::new(cfg);
+        let published: Arc<Mutex<Vec<OsHealthSnapshot>>> = Arc::default();
+        let sink = Arc::clone(&published);
+        let publish = move |s: OsHealthSnapshot| sink.lock().unwrap().push(s);
+
+        c.step(&publish);
+        {
+            let got = published.lock().unwrap();
+            // The gauge publish, before the probe ran.
+            assert_eq!(
+                got[0].kernel_source.as_deref(),
+                Some("windows:getperformanceinfo+objecttypes")
+            );
+            // The publish after the probe.
+            assert_eq!(
+                got[1].kernel_source.as_deref(),
+                Some("windows:getperformanceinfo+objecttypes+spawn-probe")
+            );
+            assert!(got[1].spawn_probe.is_some_and(|p| p.successes() == 1));
+        }
+        present.store(false, Ordering::Relaxed);
+        c.step(&publish);
+        let last = published.lock().unwrap().last().unwrap().clone();
+        assert_eq!(
+            last.spawn_probe, None,
+            "a missing probe program is UNKNOWN, not a failure"
+        );
+        assert_eq!(
+            last.kernel_source.as_deref(),
+            Some("windows:getperformanceinfo+objecttypes")
+        );
+    }
+
+    /// A tick that panics does not end the `os-health` thread: the next tick
+    /// still publishes.
+    #[test]
+    fn a_panicking_tick_does_not_end_the_thread() {
+        struct PanicsFirst {
+            calls: u32,
+        }
+        impl GaugeSource for PanicsFirst {
+            fn gauges(&mut self, _log: &mut FailureLog) -> GaugeReading {
+                self.calls += 1;
+                assert!(self.calls > 1, "os-health test: the first tick panics");
+                windows_like_gauges()
+            }
+        }
+        let cfg = CollectorConfig {
+            platform: OsPlatform::Windows,
+            period: Duration::from_millis(10),
+            probe_every_ticks: PROBE_EVERY_TICKS,
+            pool_tags_every_ticks: POOL_TAGS_EVERY_TICKS,
+            source: Box::new(PanicsFirst { calls: 0 }),
+            probe: None,
+        };
+        let cell = Arc::new(SnapshotCell::new());
+        let sink = Arc::clone(&cell);
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_collector_thread(
+            Collector::new(cfg),
+            move |s| sink.store(s),
+            Arc::clone(&stop),
+        )
+        .unwrap();
+        let got = wait_for(&cell, Duration::from_secs(30), |s| {
+            s.kernel_token_objects.is_some()
+        });
+        stop_and_join(&stop, handle);
+        assert!(got.is_some(), "the thread died with its first tick");
+    }
+
+    #[test]
+    fn staleness_is_two_missed_ticks() {
+        assert_eq!(STALE_AFTER_SECS, 120);
+        let s = incident_snapshot_for_tests();
+        assert!(!is_stale(&s, s.read_at + chrono::Duration::seconds(120)));
+        assert!(is_stale(&s, s.read_at + chrono::Duration::seconds(121)));
     }
 
     #[test]
@@ -961,10 +1290,7 @@ mod tests {
         let cell = SnapshotCell::new();
         assert!(cell.load().is_none());
         cell.store(incident_snapshot_for_tests());
-        assert_eq!(
-            cell.load().unwrap().kernel_token_objects,
-            Some(4_365_962)
-        );
+        assert_eq!(cell.load().unwrap().kernel_token_objects, Some(4_365_962));
         assert_eq!(
             incident_snapshot_for_tests().kernel_pool_bytes(),
             Some(24_282_075_136 + 15_075_627_008)
@@ -980,5 +1306,47 @@ mod tests {
         assert_eq!(log.record::<u8>("x", Err("boom".into())), None);
         assert_eq!(log.record("x", Ok::<_, String>(6)), Some(6));
         assert_eq!(log.failing.get("x"), Some(&false));
+
+        // The levels: WARN on the transition into failure, DEBUG while it
+        // keeps failing, INFO on the recovery.
+        let mut log = FailureLog::default();
+        assert_eq!(log.level_for("y", true), LogLevel::Debug);
+        assert_eq!(log.level_for("y", false), LogLevel::Warn);
+        assert_eq!(log.level_for("y", false), LogLevel::Debug);
+        assert_eq!(log.level_for("y", true), LogLevel::Info);
+        assert_eq!(log.level_for("y", true), LogLevel::Debug);
+    }
+
+    /// An instrument that fails every other tick gets FLAP_WARN_BUDGET
+    /// WARNs for the life of the process, the last one flagged, and nothing
+    /// above DEBUG after it — not a WARN a minute forever.
+    #[test]
+    fn a_flapping_instrument_is_warned_about_a_bounded_number_of_times() {
+        let mut log = FailureLog::default();
+        let mut levels = Vec::new();
+        for _ in 0..50 {
+            levels.push(log.level_for("flappy", false));
+            levels.push(log.level_for("flappy", true));
+        }
+        let warns = levels
+            .iter()
+            .filter(|l| matches!(l, LogLevel::Warn | LogLevel::WarnLast))
+            .count();
+        assert_eq!(warns, FLAP_WARN_BUDGET as usize, "{levels:?}");
+        assert_eq!(
+            levels.iter().filter(|l| **l == LogLevel::WarnLast).count(),
+            1,
+            "{levels:?}"
+        );
+        // Recoveries are INFO only for the WARNed failures before the last.
+        assert_eq!(
+            levels.iter().filter(|l| **l == LogLevel::Info).count(),
+            FLAP_WARN_BUDGET as usize - 1,
+            "{levels:?}"
+        );
+        let last_loud = levels.iter().rposition(|l| *l != LogLevel::Debug).unwrap();
+        assert!(last_loud < 2 * FLAP_WARN_BUDGET as usize, "{levels:?}");
+        // The budget is per instrument.
+        assert_eq!(log.level_for("other", false), LogLevel::Warn);
     }
 }

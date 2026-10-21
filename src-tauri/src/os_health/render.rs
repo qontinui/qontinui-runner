@@ -8,7 +8,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::{current, OsHealthSnapshot, OsPlatform, PoolTag};
+use super::{current, is_stale, OsHealthSnapshot, OsPlatform, PoolTag, STALE_AFTER_SECS};
 
 fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -18,20 +18,33 @@ fn rfc3339(t: DateTime<Utc>) -> String {
 ///
 /// Phase 5 adds `verdict` and `reasons` to this same object.
 pub(crate) fn health_json() -> Value {
-    health_json_from(OsPlatform::current(), current().as_deref())
+    health_json_from(OsPlatform::current(), current().as_deref(), Utc::now())
 }
 
-/// [`health_json`] over an explicit platform and snapshot.
+/// [`health_json`] over an explicit platform, snapshot and clock.
 ///
 /// Before the first tick `readings` is `null` and a `note` says so: UNKNOWN,
 /// never healthy. After it, each reading is a number or `null`; a `null` named
 /// in `notApplicable` does not exist on this OS, any other `null` is UNKNOWN.
-pub(crate) fn health_json_from(platform: OsPlatform, snap: Option<&OsHealthSnapshot>) -> Value {
+///
+/// `ageSecs` is how old the readings are at `now`, and `stale` is true once
+/// that passes `staleAfterSecs` — the `os-health` thread has stopped storing
+/// (died, panicking every tick, or wedged). The readings are still shown so an
+/// operator can see the last thing it measured, but they are not current, and
+/// the resource sample stops publishing them.
+pub(crate) fn health_json_from(
+    platform: OsPlatform,
+    snap: Option<&OsHealthSnapshot>,
+    now: DateTime<Utc>,
+) -> Value {
     let Some(s) = snap else {
         return json!({
             "readings": null,
             "source": null,
             "readAt": null,
+            "ageSecs": null,
+            "stale": null,
+            "staleAfterSecs": STALE_AFTER_SECS,
             "platform": platform.as_str(),
             "notApplicable": platform.not_applicable(),
             "note": "no os-health tick has completed in this process yet — UNKNOWN, never healthy",
@@ -67,6 +80,9 @@ pub(crate) fn health_json_from(platform: OsPlatform, snap: Option<&OsHealthSnaps
         },
         "source": s.kernel_source,
         "readAt": rfc3339(s.read_at),
+        "ageSecs": (now - s.read_at).num_seconds(),
+        "stale": is_stale(s, now),
+        "staleAfterSecs": STALE_AFTER_SECS,
         "platform": s.platform.as_str(),
         "notApplicable": s.platform.not_applicable(),
     })
@@ -160,7 +176,32 @@ impl OsHealthSampleFields {
 /// The host lane's copy of the cached snapshot. Cheap — a lock and a clone —
 /// so `collect_host_lane` pays nothing for it.
 pub(crate) fn sample_fields() -> OsHealthSampleFields {
-    OsHealthSampleFields::from_snapshot(current().as_deref())
+    sample_fields_at(current().as_deref(), Utc::now())
+}
+
+/// [`sample_fields`] over an explicit snapshot and clock.
+///
+/// **A stale snapshot publishes NOTHING.** Every resource sample is stamped
+/// with its own `sampled_at`, so republishing a reading the `os-health` thread
+/// took ten minutes ago would tell coord the box measured it now — and a box
+/// whose collector has died would keep "measuring" its last numbers forever.
+/// Past [`STALE_AFTER_SECS`] the kernel columns are omitted (NULL, UNKNOWN),
+/// which coord holds on rather than grades.
+pub(crate) fn sample_fields_at(
+    snap: Option<&OsHealthSnapshot>,
+    now: DateTime<Utc>,
+) -> OsHealthSampleFields {
+    match snap {
+        Some(s) if is_stale(s, now) => {
+            tracing::debug!(
+                "os-health: the cached snapshot is {} s old (> {STALE_AFTER_SECS} s) — the \
+                 resource sample omits the kernel readings",
+                (now - s.read_at).num_seconds()
+            );
+            OsHealthSampleFields::default()
+        }
+        other => OsHealthSampleFields::from_snapshot(other),
+    }
 }
 
 #[cfg(test)]
@@ -168,9 +209,15 @@ mod tests {
     use super::super::incident_snapshot_for_tests;
     use super::*;
 
+    /// `health_json_from` at the snapshot's own read time (never stale).
+    fn json_of(platform: OsPlatform, snap: Option<&OsHealthSnapshot>) -> Value {
+        let now = snap.map_or_else(Utc::now, |s| s.read_at);
+        health_json_from(platform, snap, now)
+    }
+
     #[test]
     fn health_json_is_unknown_before_the_first_tick() {
-        let v = health_json_from(OsPlatform::Windows, None);
+        let v = json_of(OsPlatform::Windows, None);
         assert_eq!(v["readings"], Value::Null);
         assert_eq!(v["source"], Value::Null);
         assert_eq!(v["readAt"], Value::Null);
@@ -180,7 +227,7 @@ mod tests {
 
     #[test]
     fn health_json_serves_the_readings_by_name() {
-        let v = health_json_from(OsPlatform::Windows, Some(&incident_snapshot_for_tests()));
+        let v = json_of(OsPlatform::Windows, Some(&incident_snapshot_for_tests()));
         let r = &v["readings"];
         assert_eq!(r["kernelPagedBytes"], 24_282_075_136_i64);
         assert_eq!(r["kernelNonpagedBytes"], 15_075_627_008_i64);
@@ -205,7 +252,12 @@ mod tests {
                 "errorCode": 1450,
             })
         );
-        assert_eq!(v["source"], "windows:getperformanceinfo+objecttypes+pooltags");
+        assert_eq!(
+            v["source"],
+            "windows:getperformanceinfo+objecttypes+pooltags+spawn-probe"
+        );
+        assert_eq!(v["ageSecs"], 0);
+        assert_eq!(v["stale"], false);
         assert_eq!(v["readAt"], "2026-10-19T08:20:52Z");
         assert_eq!(v["notApplicable"], json!([]));
     }
@@ -216,7 +268,7 @@ mod tests {
         s.kernel_token_objects = None;
         s.spawn_probe = None;
         s.kernel_pool_top_tags = None;
-        let v = health_json_from(OsPlatform::Windows, Some(&s));
+        let v = json_of(OsPlatform::Windows, Some(&s));
         assert_eq!(v["readings"]["tokenObjects"], Value::Null);
         assert_eq!(v["readings"]["spawnProbe"], Value::Null);
         assert_eq!(v["readings"]["poolTopTags"], Value::Null);
@@ -232,6 +284,42 @@ mod tests {
         s.os_process_count = Some(i64::from(i32::MAX) + 10);
         let f = OsHealthSampleFields::from_snapshot(Some(&s));
         assert_eq!(f.os_process_count, Some(i32::MAX));
+    }
+
+    /// A snapshot read ten minutes ago is NOT republished as a fresh sample,
+    /// and `/health` says it is stale and how old.
+    #[test]
+    fn a_ten_minute_old_snapshot_is_not_republished_and_reads_stale() {
+        let s = incident_snapshot_for_tests();
+        let now = s.read_at + chrono::Duration::minutes(10);
+        assert_eq!(
+            sample_fields_at(Some(&s), now),
+            OsHealthSampleFields::default()
+        );
+        assert_eq!(
+            serde_json::to_value(sample_fields_at(Some(&s), now)).unwrap(),
+            json!({}),
+            "not one kernel key on the wire"
+        );
+        let v = health_json_from(OsPlatform::Windows, Some(&s), now);
+        assert_eq!(v["stale"], true);
+        assert_eq!(v["ageSecs"], 600);
+        assert_eq!(v["staleAfterSecs"], STALE_AFTER_SECS);
+        assert_eq!(
+            v["readings"]["tokenObjects"], 4_365_962,
+            "still shown, flagged stale"
+        );
+
+        // Inside the bound it is published as read.
+        let fresh = s.read_at + chrono::Duration::seconds(STALE_AFTER_SECS);
+        assert_eq!(
+            sample_fields_at(Some(&s), fresh),
+            OsHealthSampleFields::from_snapshot(Some(&s))
+        );
+        assert_eq!(
+            health_json_from(OsPlatform::Windows, Some(&s), fresh)["stale"],
+            false
+        );
     }
 
     #[test]
