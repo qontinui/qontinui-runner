@@ -201,6 +201,12 @@ pub struct PrepareRecord {
     /// The notice loop's last verdict (Phase 4). `None` before its first tick.
     #[serde(default)]
     pub verdict: Option<notice::PrepVerdict>,
+    /// The runner PROCESS that prepared ([`running_process`]), so "has the
+    /// runner restarted since the prepare?" is answered by the record itself,
+    /// whether or not the boot step has run yet (Phase 6). `None` on a record
+    /// written before this field existed.
+    #[serde(default)]
+    pub prepared_process: Option<String>,
 }
 
 impl PrepareRecord {
@@ -221,7 +227,19 @@ impl PrepareRecord {
             release: None,
             last_change_at_ms: None,
             verdict: None,
+            prepared_process: Some(running_process().to_string()),
         }
+    }
+
+    /// Whether the runner restarted since this record was prepared: another
+    /// build, or another process of the same build. A record that predates
+    /// [`Self::prepared_process`] answers only by build.
+    pub fn restarted_since(&self) -> bool {
+        self.prepared_build != running_build()
+            || self
+                .prepared_process
+                .as_deref()
+                .is_some_and(|p| p != running_process())
     }
 
     /// A prepare still in its restart window: preparing or ready. A record
@@ -247,6 +265,13 @@ pub(crate) fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|t| t.to_rfc3339())
         .unwrap_or_default()
+}
+
+/// A per-process identity, minted once: two processes of one build differ.
+pub fn running_process() -> &'static str {
+    static ID: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+    &ID
 }
 
 /// This binary's build id — the value `/health` serves as `buildId`.

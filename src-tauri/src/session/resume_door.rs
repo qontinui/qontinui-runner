@@ -280,6 +280,10 @@ struct CohortMember {
     effort: Option<String>,
     /// Held for a hand restore (D6): only the operator origin restores it.
     held: bool,
+    /// Whether the restore set has withheld the cohort's rows from the
+    /// webview's boot restore ([`crate::restart_prep::restore::placeholders_served`]).
+    /// Until it has, the boot restore owns an open row.
+    placeholders_served: bool,
 }
 
 /// The cohort membership of `id`, when `cohort` holds it. `terminal_blocker`
@@ -289,6 +293,7 @@ fn cohort_member(
     id: &str,
     rec: Option<&TerminalSessionRecord>,
     terminal_blocker: impl Fn(&str) -> Option<&'static str>,
+    placeholders_served: bool,
 ) -> Option<CohortMember> {
     let cohort = cohort?;
     let target = cohort.target(id)?;
@@ -297,6 +302,7 @@ fn cohort_member(
         terminal_blocker: rec.and_then(|r| terminal_blocker(&r.terminal_id)),
         effort: target.effort.clone(),
         held: target.held,
+        placeholders_served,
     })
 }
 
@@ -349,6 +355,9 @@ fn classify(
     match (rec.state.as_str(), cohort) {
         ("closed", _) => {}
         ("open", Some(member)) => {
+            if !member.placeholders_served {
+                return Err("boot_restore_owns_row".to_string());
+            }
             if let Some(blocker) = member.terminal_blocker {
                 return Err(blocker.to_string());
             }
@@ -953,9 +962,13 @@ async fn run_batch(
         // Re-read per id: an overlapping call may have restored a row since
         // this batch began, and a restored row is no longer in the cohort.
         let cohort = crate::restart_prep::restore::restoring_cohort();
-        let member = cohort_member(cohort.as_ref(), id, rec.as_ref(), |t| {
-            live_terminal_blocker(&tm, t)
-        });
+        let member = cohort_member(
+            cohort.as_ref(),
+            id,
+            rec.as_ref(),
+            |t| live_terminal_blocker(&tm, t),
+            crate::restart_prep::restore::placeholders_served(),
+        );
         // One call per id at a time, held through spawn, verify AND the
         // recording of the verdict below — so the lifecycle poll's `running`
         // observation (skipped while the id is in flight) can never land
@@ -1438,7 +1451,7 @@ mod tests {
     fn an_open_cohort_row_with_no_terminal_resumes_and_outside_the_cohort_is_refused() {
         let cohort = restoring(&[ID]);
         let open = rec("open");
-        let member = cohort_member(Some(&cohort), ID, Some(&open), no_blocker);
+        let member = cohort_member(Some(&cohort), ID, Some(&open), no_blocker, true);
         let cand =
             classify(ID, Some(&open), member.as_ref(), true).expect("admitted in cohort mode");
         assert!(!cand.lift_finish);
@@ -1452,7 +1465,7 @@ mod tests {
         // The same open row with no cohort, or with a cohort that does not hold it.
         assert_eq!(reason(classify(ID, Some(&open), None, true)), "not_closed");
         let other = restoring(&["11111111-1111-4111-8111-111111111111"]);
-        let not_member = cohort_member(Some(&other), ID, Some(&open), no_blocker);
+        let not_member = cohort_member(Some(&other), ID, Some(&open), no_blocker, true);
         assert_eq!(not_member, None);
         assert_eq!(
             reason(classify(ID, Some(&open), not_member.as_ref(), true)),
@@ -1460,9 +1473,24 @@ mod tests {
         );
         // A closed cohort row is admitted and still carries its effort.
         let closed = rec("closed");
-        let member = cohort_member(Some(&cohort), ID, Some(&closed), no_blocker);
+        let member = cohort_member(Some(&cohort), ID, Some(&closed), no_blocker, true);
         let cand = classify(ID, Some(&closed), member.as_ref(), true).unwrap();
         assert_eq!(cand.cohort.and_then(|m| m.effort).as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn an_open_cohort_row_is_the_boot_restores_until_placeholders_were_served() {
+        let cohort = restoring(&[ID]);
+        let open = rec("open");
+        let unserved = cohort_member(Some(&cohort), ID, Some(&open), no_blocker, false);
+        assert_eq!(
+            reason(classify(ID, Some(&open), unserved.as_ref(), true)),
+            "boot_restore_owns_row"
+        );
+        // A CLOSED cohort row is no boot restore's: still admitted.
+        let closed = rec("closed");
+        let unserved = cohort_member(Some(&cohort), ID, Some(&closed), no_blocker, false);
+        assert!(classify(ID, Some(&closed), unserved.as_ref(), true).is_ok());
     }
 
     #[test]
@@ -1475,9 +1503,13 @@ mod tests {
             "holder_alive_not_adopted",
             "holder_sweep_pending",
         ] {
-            let member = cohort_member(Some(&cohort), ID, Some(&open), |t| {
-                (t == "t").then_some(blocker)
-            });
+            let member = cohort_member(
+                Some(&cohort),
+                ID,
+                Some(&open),
+                |t| (t == "t").then_some(blocker),
+                true,
+            );
             assert_eq!(
                 reason(classify(ID, Some(&open), member.as_ref(), true)),
                 blocker
@@ -1485,7 +1517,13 @@ mod tests {
         }
         // A CLOSED cohort row's old terminal is not consulted.
         let closed = rec("closed");
-        let member = cohort_member(Some(&cohort), ID, Some(&closed), |_| Some("live_terminal"));
+        let member = cohort_member(
+            Some(&cohort),
+            ID,
+            Some(&closed),
+            |_| Some("live_terminal"),
+            true,
+        );
         assert!(classify(ID, Some(&closed), member.as_ref(), true).is_ok());
     }
 
@@ -1493,7 +1531,7 @@ mod tests {
     fn an_admitted_open_cohort_row_with_a_live_holder_is_still_skipped() {
         let cohort = restoring(&[ID]);
         let open = rec("open");
-        let member = cohort_member(Some(&cohort), ID, Some(&open), no_blocker);
+        let member = cohort_member(Some(&cohort), ID, Some(&open), no_blocker, true);
         let cand = classify(ID, Some(&open), member.as_ref(), true).expect("admitted");
         // The live-holder guard runs for every candidate, cohort rows included.
         let skip = holder_skip(&cand.id, Ok(Some(4242))).expect("a live holder skips");
@@ -1509,7 +1547,8 @@ mod tests {
         let mut cohort_rec = rec("open");
         cohort_rec.claude_session_id = ID.to_string();
         let cohort = restoring(&[ID]);
-        let mut member = cohort_member(Some(&cohort), ID, Some(&cohort_rec), no_blocker).unwrap();
+        let mut member =
+            cohort_member(Some(&cohort), ID, Some(&cohort_rec), no_blocker, true).unwrap();
         member.held = true;
         assert_eq!(
             reason(classify(ID, Some(&cohort_rec), Some(&member), false)),
@@ -1523,7 +1562,7 @@ mod tests {
         let cohort = restoring(&[ID]);
         let mut finished = rec("closed");
         finished.finished_at = Some(9);
-        let member = cohort_member(Some(&cohort), ID, Some(&finished), no_blocker);
+        let member = cohort_member(Some(&cohort), ID, Some(&finished), no_blocker, true);
         // The operator: admitted, and the core lifts the mark once the resume
         // is verified.
         let cand = classify(ID, Some(&finished), member.as_ref(), true).expect("admitted");
@@ -1583,9 +1622,15 @@ mod tests {
             .match_indices("Ok(ev) =>")
             .next()
             .expect("the verified arm");
+        let (failed_at, _) = body
+            .match_indices("Err(reason) =>")
+            .next()
+            .expect("the failed-verify arm");
+        assert!(verified_at < failed_at, "the verified arm comes first");
         assert!(
-            lift_at > verified_at,
-            "the finish mark is lifted inside the verified-resume arm only"
+            verified_at < lift_at && lift_at < failed_at,
+            "the finish mark is lifted inside the verified-resume arm only — never in \
+             the failed-verify arm, nor after the match"
         );
     }
 

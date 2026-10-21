@@ -1857,6 +1857,12 @@ fn live_restore_set_body(
     if !placeholders {
         return restore_set_body(rows, None, |_| None, |_| false, |_| None, false);
     }
+    let cohort = crate::restart_prep::restore::restoring_cohort();
+    if cohort.is_some() {
+        // From here the open cohort rows are the operator's to restore, not
+        // the boot restore's: the resume core may admit them.
+        crate::restart_prep::restore::note_placeholders_served();
+    }
     use tauri::Manager;
     let terminals = crate::tauri_app_handle::current().and_then(|app| {
         app.try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -1864,7 +1870,7 @@ fn live_restore_set_body(
     });
     restore_set_body(
         rows,
-        crate::restart_prep::restore::restoring_cohort().as_ref(),
+        cohort.as_ref(),
         |id| {
             store.get(id).map(|rec| {
                 let transcript_exists = store

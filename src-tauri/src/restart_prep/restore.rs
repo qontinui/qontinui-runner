@@ -205,6 +205,24 @@ impl RestoringCohort {
     }
 }
 
+/// Set once this process has served a restoring cohort's rows as placeholders
+/// to a caller that draws them (`terminal_session_list_open` with
+/// `placeholders: true`). Until then the webview's boot restore owns every
+/// open cohort row — it auto-restores it, keeping the old terminal id until
+/// its handshake verifies — so the resume core must not admit one beside it.
+static PLACEHOLDERS_SERVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that the restore set withheld the cohort rows as placeholders.
+pub fn note_placeholders_served() {
+    PLACEHOLDERS_SERVED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether [`note_placeholders_served`] has run in this process.
+pub fn placeholders_served() -> bool {
+    PLACEHOLDERS_SERVED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The live record's restoring cohort. `None` with no controller (every unit
 /// test), no record, or a record that is not `restoring` — the crash-boot and
 /// never-prepared paths, which are unchanged.

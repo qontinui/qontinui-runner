@@ -949,7 +949,9 @@ impl RestartPrep {
         // with that restart exactly as with a rebuild, and D6 covers every
         // prepared restart. Only a cancel before any restart — the sessions
         // still running — is a true cancel.
-        let rebuilt = rec.prepared_build != running_build() || self.same_build_restart();
+        // Answered by the record itself (`restarted_since`), so a Release
+        // pressed before the boot step has run is judged the same way.
+        let rebuilt = rec.restarted_since() || self.same_build_restart();
         let rec = self.update(&rec.prepare_id, |r| {
             if settled {
                 r.hold = HoldStatus::ReleaseSent {
@@ -1623,6 +1625,25 @@ mod tests {
         let rebuilt = ctl.cancel(&*door, T0 + 2_000).await.unwrap();
         assert_eq!(rebuilt.state, PrepState::Restoring);
         assert!(!RestartPrep::owes_resume(&rebuilt, T0 + 2_001));
+    }
+
+    /// Review round 5: Release hold pressed after a same-build restart but
+    /// BEFORE the boot step ran still starts the hand restore — the record
+    /// names the process that prepared, and this is another one.
+    #[tokio::test]
+    async fn a_release_before_the_boot_step_after_a_restart_starts_the_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        let rec = prepare(&ctl, &door).await;
+        assert!(!rec.restarted_since(), "the process that prepared");
+        ctl.update(&rec.prepare_id, |r| {
+            r.prepared_process = Some("a-previous-runner-process".to_string())
+        })
+        .unwrap();
+        assert!(!ctl.same_build_restart(), "no boot step has run");
+        let released = ctl.cancel(&*door, T0 + 5_000).await.unwrap();
+        assert_eq!(released.state, PrepState::Restoring);
     }
 
     #[tokio::test]
