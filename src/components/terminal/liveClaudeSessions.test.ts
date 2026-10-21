@@ -10,10 +10,8 @@ import {
   extractLiveSessions,
   extractLiveSessionsStrict,
   fetchLiveClaudeSessionIds,
-  groupByAccount,
   isOperatorNamed,
   registryNamesBySessionId,
-  sharedSessionIds,
   type LiveClaudeSession,
 } from "./liveClaudeSessions";
 
@@ -90,8 +88,8 @@ describe("isOperatorNamed (the nameSource gate)", () => {
   });
 
   it("degrades rather than throwing when `name` is missing entirely", () => {
-    // Same defensiveness `groupByAccount` applies to `account`: the payload
-    // reaches us through an unchecked cast and this runs during render.
+    // The payload reaches us through an unchecked cast and this runs during
+    // render.
     const s = mk();
     delete (s as { name?: unknown }).name;
     expect(isOperatorNamed(s)).toBe(false);
@@ -205,29 +203,6 @@ describe("extractLiveSessionsStrict (liveness polarity)", () => {
   });
 });
 
-describe("sharedSessionIds", () => {
-  it("reports ids held by more than one live process", () => {
-    // The restore-duplication symptom: one session id, several live processes,
-    // each with its own auto-generated name.
-    const sessions = [
-      mk({ sessionId: "dup", pid: 10, name: "qontinui-web-0c" }),
-      mk({ sessionId: "dup", pid: 11, name: "qontinui-web-07" }),
-      mk({ sessionId: "solo", pid: 12, name: "qontinui-root-11" }),
-    ];
-    const shared = sharedSessionIds(sessions);
-    expect([...shared.keys()]).toEqual(["dup"]);
-    expect(shared.get("dup")!.map((s) => s.name)).toEqual(["qontinui-web-0c", "qontinui-web-07"]);
-  });
-
-  it("is empty when every id is unique", () => {
-    expect(sharedSessionIds([mk({ sessionId: "a" }), mk({ sessionId: "b" })]).size).toBe(0);
-  });
-
-  it("is empty for no sessions", () => {
-    expect(sharedSessionIds([]).size).toBe(0);
-  });
-});
-
 describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
@@ -297,26 +272,5 @@ describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", (
     });
     const ids = await fetchLiveClaudeSessionIds();
     expect([...ids!]).toEqual(["ok"]);
-  });
-});
-
-describe("groupByAccount", () => {
-  it("groups by label and preserves input order within a group", () => {
-    const sessions = [
-      mk({ account: { label: "gmail", wrapper: "clg" }, name: "a" }),
-      mk({ account: { label: "paktis", wrapper: "clp" }, name: "b" }),
-      mk({ account: { label: "gmail", wrapper: "clg" }, name: "c" }),
-    ];
-    const g = groupByAccount(sessions);
-    expect([...g.keys()]).toEqual(["gmail", "paktis"]);
-    expect(g.get("gmail")!.map((s) => s.name)).toEqual(["a", "c"]);
-  });
-
-  it("buckets a missing account under 'unknown' instead of throwing", () => {
-    const s = mk();
-    // Force the defensive path: the Rust side always sends `account`, but a
-    // version skew must not crash the grouping.
-    delete (s as { account?: unknown }).account;
-    expect([...groupByAccount([s]).keys()]).toEqual(["unknown"]);
   });
 });
