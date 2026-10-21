@@ -2846,6 +2846,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_session::commit_session_progress,
             commands::ai_session::create_ai_session,
             coord_drain_state::coord_drain_state_get,
+            os_health::os_health_get,
             commands::operator_doors::operator_run_prompt,
             commands::operator_doors::operator_run_unified_workflow,
             commands::operator_doors::operator_execute_inline_workflow,

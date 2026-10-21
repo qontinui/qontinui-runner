@@ -2,7 +2,8 @@
 //! measured on EVERY runner instance.
 //!
 //! Plan `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`,
-//! Phase 4. On 2026-10-15 spaceship booted into a `win32kfull.sys`
+//! Phases 4 (measure, publish) and 5 (the local verdict and the user banner,
+//! [`verdict`]). On 2026-10-15 spaceship booted into a `win32kfull.sys`
 //! (10.0.26100.9711) that leaks a primary-token reference on every console
 //! attach. Over 3.75 days it leaked 4.2M Token objects and ~40 GB of kernel
 //! pool, and every process creation slowed from tens of ms to seconds — while
@@ -54,6 +55,7 @@
 mod parse;
 mod render;
 mod spawn_probe;
+mod verdict;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -73,6 +75,8 @@ use parse::{instrument, GaugeReading};
 pub(crate) use render::{health_json, sample_fields, OsHealthSampleFields};
 use spawn_probe::{ProbeResult, ProbeRun, ProbeWindow, SpawnProbe};
 pub(crate) use spawn_probe::{SpawnProbeStats, CENSORED_MS};
+use verdict::Band;
+pub(crate) use verdict::{set_fleet_controls, OsHealthControls};
 
 /// The collector thread's name. `/health` `threadCensus` shows it, and a test
 /// pins that the probe body runs on it.
@@ -268,8 +272,8 @@ pub(crate) fn is_stale(snap: &OsHealthSnapshot, now: DateTime<Utc>) -> bool {
     (now - snap.read_at).num_seconds() > STALE_AFTER_SECS
 }
 
-/// Serialises the tests that write the process-global cell (and, in Phase 5,
-/// the controls and slope history), so they cannot read one another's
+/// Serialises the tests that write the process-global cell, the cached
+/// controls or the slope history, so they cannot read one another's
 /// injections.
 ///
 /// A CHILD of `env_lock` in the test-lock hierarchy, as
@@ -654,12 +658,161 @@ fn run_loop(mut collector: Collector, publish: &dyn Fn(OsHealthSnapshot), stop: 
     }
 }
 
+/// `os_health_get` — the App-root `OsHealthBanner`'s getter: the same object
+/// `/health` serves as `osHealth`. Reads the cell; never measures.
+#[tauri::command]
+pub fn os_health_get() -> serde_json::Value {
+    health_json()
+}
+
+/// Tauri event emitted when the `osHealth` verdict changes. Payload: the same
+/// object `/health` serves as `osHealth` ([`health_json`]). The UI's 30 s poll
+/// covers a change in the reasons alone.
+pub(crate) const OS_HEALTH_EVENT: &str = "os-health-changed";
+
+/// The cell's writer: remember the Token reading for the S7 slope, store, and
+/// tell the UI when the verdict changed.
+fn publish_to_cell(snap: OsHealthSnapshot) {
+    verdict::record_history(&snap);
+    CELL.store(snap);
+    emit_on_verdict_change();
+}
+
+/// Emit [`OS_HEALTH_EVENT`] when the verdict differs from the last one emitted.
+fn emit_on_verdict_change() {
+    static LAST: Mutex<Option<Band>> = Mutex::new(None);
+    let now = verdict::current_verdict(OsPlatform::current(), current().as_deref()).verdict;
+    let changed = {
+        let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = *last != Some(now);
+        *last = Some(now);
+        changed
+    };
+    if !changed {
+        return;
+    }
+    let Some(handle) = crate::tauri_app_handle::current() else {
+        return;
+    };
+    use tauri::Emitter;
+    if let Err(e) = handle.emit(OS_HEALTH_EVENT, health_json()) {
+        debug!("os-health: emit {OS_HEALTH_EVENT} failed: {e}");
+    }
+}
+
+/// DEBUG AND TEST BUILDS ONLY — the live-check injection.
+///
+/// `QONTINUI_OS_HEALTH_INJECT=incident|unknown` in a debug runner's spawn
+/// environment replaces the collector with a fixed snapshot, re-stamped every
+/// tick, so a live check can see the verdict and the banner on a healthy
+/// machine. `incident` is degraded spaceship's readings (a breach on S7, S8
+/// and S9); `unknown` is every applicable reading NULL. While it is set no
+/// resource sample carries kernel readings — a faked reading must never reach
+/// coord — and `/health` `osHealth.injected` is true. Pair it with
+/// `QONTINUI_OS_HEALTH_BANNER_DWELL_SECS` to shorten the 10-minute dwell.
+///
+/// A RELEASE build compiles none of this: [`injected`] is constant `false`
+/// and the variable is never read, so no environment can make a shipped
+/// runner serve a fabricated reading.
+#[cfg(any(debug_assertions, test))]
+pub(crate) const INJECT_ENV: &str = "QONTINUI_OS_HEALTH_INJECT";
+
+#[cfg(any(debug_assertions, test))]
+static INJECTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process serves an injected snapshot (see [`INJECT_ENV`]).
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn injected() -> bool {
+    INJECTED.load(Ordering::Relaxed)
+}
+
+/// A release build has no injection: never injected.
+#[cfg(not(any(debug_assertions, test)))]
+pub(crate) const fn injected() -> bool {
+    false
+}
+
+/// The snapshot an [`INJECT_ENV`] value names, stamped `now`.
+#[cfg(any(debug_assertions, test))]
+fn injected_snapshot(kind: &str, now: DateTime<Utc>) -> Option<OsHealthSnapshot> {
+    match kind.trim() {
+        "incident" => {
+            let mut s = incident_snapshot();
+            s.read_at = now;
+            s.kernel_pool_tags_at = Some(now);
+            Some(s)
+        }
+        "unknown" => Some(OsHealthSnapshot {
+            platform: OsPlatform::current(),
+            kernel_paged_bytes: None,
+            kernel_nonpaged_bytes: None,
+            kernel_handle_count: None,
+            kernel_token_objects: None,
+            kernel_process_objects: None,
+            os_process_count: None,
+            os_booted_at: None,
+            kernel_pool_top_tags: None,
+            kernel_pool_tags_at: None,
+            spawn_probe: None,
+            kernel_source: None,
+            read_at: now,
+        }),
+        _ => None,
+    }
+}
+
+/// Start the injected-snapshot thread in place of the collector when
+/// [`INJECT_ENV`] names a known snapshot. `true` when it did.
+#[cfg(any(debug_assertions, test))]
+fn try_start_injected() -> bool {
+    let Ok(kind) = std::env::var(INJECT_ENV) else {
+        return false;
+    };
+    if kind.trim().is_empty() {
+        return false;
+    }
+    if injected_snapshot(&kind, Utc::now()).is_none() {
+        warn!(
+            "os-health: {INJECT_ENV}={kind:?} is not `incident` or `unknown` — ignored, the \
+             real collector runs"
+        );
+        return false;
+    }
+    INJECTED.store(true, Ordering::Relaxed);
+    warn!(
+        "os-health: {INJECT_ENV}={kind} — this DEBUG build serves an INJECTED snapshot instead \
+         of measuring this machine; /health osHealth.injected is true and no resource sample \
+         carries kernel readings"
+    );
+    let spawned = std::thread::Builder::new()
+        .name(THREAD_NAME.to_string())
+        .spawn(move || loop {
+            if let Some(s) = injected_snapshot(&kind, Utc::now()) {
+                publish_to_cell(s);
+            }
+            std::thread::park_timeout(GAUGE_PERIOD);
+        });
+    if let Err(e) = spawned {
+        warn!("os-health: could not start the injected-snapshot thread ({e})");
+    }
+    true
+}
+
+/// A release build never injects.
+#[cfg(not(any(debug_assertions, test)))]
+fn try_start_injected() -> bool {
+    false
+}
+
 /// Start the `os-health` thread. Called once from `run_app` on EVERY instance
 /// — primary, secondary/temp, with or without a coord credential — and never
 /// gated on `fleet::machine_state_publish_allowed`. A second call is a no-op.
 pub(crate) fn start() {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if try_start_injected() {
         return;
     }
     let platform = OsPlatform::current();
@@ -670,11 +823,7 @@ pub(crate) fn start() {
         );
     }
     let collector = Collector::new(CollectorConfig::production());
-    match spawn_collector_thread(
-        collector,
-        |snap| CELL.store(snap),
-        Arc::new(AtomicBool::new(false)),
-    ) {
+    match spawn_collector_thread(collector, publish_to_cell, Arc::new(AtomicBool::new(false))) {
         Ok(_) => info!(
             "os-health: collector thread started (gauges every {}s, spawn probe every {}s, \
              pool tags every {}s)",
@@ -690,10 +839,17 @@ pub(crate) fn start() {
 }
 
 /// The incident snapshot — degraded spaceship's readings from the captured
-/// buffers (2026-10-19T08:20:52Z) and the diagnostic's spawn latency. For
-/// tests here and Phase 5's verdict tests.
+/// buffers (2026-10-19T08:20:52Z) and the diagnostic's spawn latency. The
+/// tests' fixture.
 #[cfg(test)]
 pub(crate) fn incident_snapshot_for_tests() -> OsHealthSnapshot {
+    incident_snapshot()
+}
+
+/// See [`incident_snapshot_for_tests`]; also what a debug build's
+/// [`INJECT_ENV`]`=incident` serves. Not compiled into a release build.
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn incident_snapshot() -> OsHealthSnapshot {
     let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
     OsHealthSnapshot {
         platform: OsPlatform::Windows,
@@ -1275,6 +1431,31 @@ mod tests {
         });
         stop_and_join(&stop, handle);
         assert!(got.is_some(), "the thread died with its first tick");
+    }
+
+    /// The debug-only live injection: `incident` grades breach and is flagged
+    /// `injected`, `unknown` is all-NULL, anything else is refused (the real
+    /// collector runs). The env read itself is exercised by no test — it would
+    /// race every other test in the process.
+    #[test]
+    fn the_debug_injection_serves_the_incident_or_all_null_and_nothing_else() {
+        let now = Utc::now();
+        let s = injected_snapshot("incident", now).unwrap();
+        assert_eq!(s.read_at, now);
+        assert_eq!(s.kernel_token_objects, Some(4_365_962));
+        let v = verdict::grade(
+            OsPlatform::Windows,
+            Some(&s),
+            verdict::Slope::Unknown("test"),
+            verdict::Thresholds::DEFAULT,
+            now,
+        );
+        assert_eq!(v.verdict, Band::Breach);
+        let u = injected_snapshot(" unknown ", now).unwrap();
+        assert_eq!(u.kernel_source, None);
+        assert_eq!(u.spawn_probe, None);
+        assert_eq!(injected_snapshot("healthy", now), None);
+        assert_eq!(injected_snapshot("", now), None);
     }
 
     #[test]

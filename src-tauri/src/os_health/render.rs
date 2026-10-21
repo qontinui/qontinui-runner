@@ -1,5 +1,7 @@
-//! The two places an [`OsHealthSnapshot`] leaves the process: `/health`
-//! `osHealth`, and the resource sample's host lane.
+//! The places an [`OsHealthSnapshot`] leaves the process: `/health`
+//! `osHealth` (also served to the App-root banner by the `os_health_get`
+//! command and the `os-health-changed` event), and the resource sample's host
+//! lane.
 //!
 //! Both read the cell and never the machine, so neither can be made to wait on
 //! a kernel query or a spawn.
@@ -8,20 +10,71 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::{current, is_stale, OsHealthSnapshot, OsPlatform, PoolTag, STALE_AFTER_SECS};
+use super::verdict::{current_verdict_at, OsVerdict};
+use super::{current, injected, is_stale, OsHealthSnapshot, OsPlatform, PoolTag, STALE_AFTER_SECS};
+
+/// How long `verdict = breach` must hold before the App-root banner shows
+/// (plan D5). The UI reads it from `osHealth.bannerDwellSecs`.
+pub(crate) const BANNER_DWELL_SECS: u64 = 600;
+
+/// DEBUG AND TEST BUILDS ONLY: `QONTINUI_OS_HEALTH_BANNER_DWELL_SECS` shortens
+/// the dwell for a live check of the banner (see `os_health::INJECT_ENV`). A
+/// release build never reads it and always serves [`BANNER_DWELL_SECS`].
+#[cfg(any(debug_assertions, test))]
+pub(crate) const BANNER_DWELL_ENV: &str = "QONTINUI_OS_HEALTH_BANNER_DWELL_SECS";
+
+#[cfg(any(debug_assertions, test))]
+fn banner_dwell_secs() -> u64 {
+    std::env::var(BANNER_DWELL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(BANNER_DWELL_SECS)
+}
+
+#[cfg(not(any(debug_assertions, test)))]
+fn banner_dwell_secs() -> u64 {
+    BANNER_DWELL_SECS
+}
 
 fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// `/health` `osHealth`, read from the cell — never blocking on a fresh read.
-///
-/// Phase 5 adds `verdict` and `reasons` to this same object.
+/// `/health` `osHealth`, read from the cell — never blocking on a fresh read —
+/// with the local verdict (plan D5). It does NOT feed `derived_status`: that
+/// says whether THIS RUNNER is healthy, and a runner restart cannot fix a
+/// kernel leak.
 pub(crate) fn health_json() -> Value {
-    health_json_from(OsPlatform::current(), current().as_deref(), Utc::now())
+    let platform = OsPlatform::current();
+    let snap = current();
+    let now = Utc::now();
+    let verdict = current_verdict_at(platform, snap.as_deref(), now);
+    let mut v = health_json_from(platform, snap.as_deref(), &verdict, now);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("injected".into(), Value::Bool(injected()));
+        obj.insert("bannerDwellSecs".into(), json!(banner_dwell_secs()));
+    }
+    v
 }
 
-/// [`health_json`] over an explicit platform, snapshot and clock.
+/// [`health_json`] over an explicit platform, snapshot, verdict and clock:
+/// the readings ([`readings_json`]) with the verdict's `verdict`, `reasons`,
+/// `axes`, `tokenSlopePerHour` and `thresholds` beside them.
+pub(crate) fn health_json_from(
+    platform: OsPlatform,
+    snap: Option<&OsHealthSnapshot>,
+    verdict: &OsVerdict,
+    now: DateTime<Utc>,
+) -> Value {
+    let mut v = readings_json(platform, snap, now);
+    if let (Some(obj), Value::Object(fields)) = (v.as_object_mut(), verdict.json_fields()) {
+        obj.extend(fields);
+    }
+    v
+}
+
+/// The readings half of `osHealth`, over an explicit platform, snapshot and
+/// clock.
 ///
 /// Before the first tick `readings` is `null` and a `note` says so: UNKNOWN,
 /// never healthy. After it, each reading is a number or `null`; a `null` named
@@ -32,7 +85,7 @@ pub(crate) fn health_json() -> Value {
 /// (died, panicking every tick, or wedged). The readings are still shown so an
 /// operator can see the last thing it measured, but they are not current, and
 /// the resource sample stops publishing them.
-pub(crate) fn health_json_from(
+fn readings_json(
     platform: OsPlatform,
     snap: Option<&OsHealthSnapshot>,
     now: DateTime<Utc>,
@@ -175,7 +228,13 @@ impl OsHealthSampleFields {
 
 /// The host lane's copy of the cached snapshot. Cheap — a lock and a clone —
 /// so `collect_host_lane` pays nothing for it.
+///
+/// Empty while a debug build serves an INJECTED snapshot
+/// (`os_health::INJECT_ENV`): a faked reading must never reach coord.
 pub(crate) fn sample_fields() -> OsHealthSampleFields {
+    if injected() {
+        return OsHealthSampleFields::default();
+    }
     sample_fields_at(current().as_deref(), Utc::now())
 }
 
@@ -206,13 +265,26 @@ pub(crate) fn sample_fields_at(
 
 #[cfg(test)]
 mod tests {
-    use super::super::incident_snapshot_for_tests;
+    use super::super::verdict::{grade, Slope, Thresholds};
+    use super::super::{incident_snapshot_for_tests, store_for_tests};
     use super::*;
 
-    /// `health_json_from` at the snapshot's own read time (never stale).
+    /// `health_json_from` at `now`, graded with the defaults and no slope.
+    fn json_at(platform: OsPlatform, snap: Option<&OsHealthSnapshot>, now: DateTime<Utc>) -> Value {
+        let v = grade(
+            platform,
+            snap,
+            Slope::Unknown("test"),
+            Thresholds::DEFAULT,
+            now,
+        );
+        health_json_from(platform, snap, &v, now)
+    }
+
+    /// [`json_at`] at the snapshot's own read time (never stale).
     fn json_of(platform: OsPlatform, snap: Option<&OsHealthSnapshot>) -> Value {
         let now = snap.map_or_else(Utc::now, |s| s.read_at);
-        health_json_from(platform, snap, now)
+        json_at(platform, snap, now)
     }
 
     #[test]
@@ -301,8 +373,12 @@ mod tests {
             json!({}),
             "not one kernel key on the wire"
         );
-        let v = health_json_from(OsPlatform::Windows, Some(&s), now);
+        let v = json_at(OsPlatform::Windows, Some(&s), now);
         assert_eq!(v["stale"], true);
+        assert_eq!(
+            v["verdict"], "unknown",
+            "a stale breach is not a current breach"
+        );
         assert_eq!(v["ageSecs"], 600);
         assert_eq!(v["staleAfterSecs"], STALE_AFTER_SECS);
         assert_eq!(
@@ -317,9 +393,72 @@ mod tests {
             OsHealthSampleFields::from_snapshot(Some(&s))
         );
         assert_eq!(
-            health_json_from(OsPlatform::Windows, Some(&s), fresh)["stale"],
+            json_at(OsPlatform::Windows, Some(&s), fresh)["stale"],
             false
         );
+        assert_eq!(
+            json_at(OsPlatform::Windows, Some(&s), fresh)["verdict"],
+            "breach"
+        );
+    }
+
+    #[test]
+    fn health_json_carries_the_verdict_beside_the_readings() {
+        let v = json_of(OsPlatform::Windows, Some(&incident_snapshot_for_tests()));
+        assert_eq!(v["verdict"], "breach");
+        assert_eq!(
+            v["axes"],
+            json!({"S7": "breach", "S8": "breach", "S9": "breach"})
+        );
+        let rules: Vec<&str> = v["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["rule"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            rules,
+            ["token_objects", "pool_total", "pool_nonpaged", "spawn_p50"]
+        );
+        assert_eq!(v["reasons"][0]["axis"], "S7");
+        assert_eq!(v["reasons"][0]["band"], "breach");
+        assert_eq!(v["reasons"][0]["value"], 4_365_962);
+        assert_eq!(v["thresholds"]["tokenObjectsBreach"], 1_000_000);
+        // The readings are still there.
+        assert_eq!(v["readings"]["tokenObjects"], 4_365_962);
+
+        let v = json_of(OsPlatform::Windows, None);
+        assert_eq!(v["verdict"], "unknown");
+        assert_eq!(v["readings"], Value::Null);
+    }
+
+    /// The live door reads the PROCESS-GLOBAL cell (through the test seam) and
+    /// grades it; an empty cell is UNKNOWN.
+    #[test]
+    fn health_json_reads_the_cell_and_grades_it() {
+        let mut s = incident_snapshot_for_tests();
+        s.read_at = Utc::now();
+        let platform = OsPlatform::current();
+        s.platform = platform;
+        {
+            let _cell = store_for_tests(Some(s));
+            let v = health_json();
+            assert_eq!(v["readings"]["tokenObjects"], 4_365_962);
+            assert_eq!(
+                v["injected"], false,
+                "the test seam is not the env injection"
+            );
+            assert_eq!(v["bannerDwellSecs"], BANNER_DWELL_SECS);
+            assert_eq!(v["verdict"], "breach");
+            if platform != OsPlatform::Windows {
+                // Off Windows S7/S8 are skipped; S9 still breaches.
+                assert_eq!(v["axes"]["S7"], "not_applicable");
+            }
+        }
+        {
+            let _cell = store_for_tests(None);
+            assert_eq!(health_json()["verdict"], "unknown");
+        }
     }
 
     #[test]

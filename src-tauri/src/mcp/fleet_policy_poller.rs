@@ -2149,6 +2149,52 @@ struct ControlsPayload {
     max_threads_sessions: Option<i64>,
     #[serde(default)]
     max_threads_sessions_critical: Option<i64>,
+    /// The eight S7–S9 kernel/spawn thresholds (plan
+    /// `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`
+    /// D4, web revision `kernel_gauges_01`). The runner's local `osHealth`
+    /// verdict grades against these so it and coord use one number; NULL or
+    /// absent means the compiled default in `os_health::verdict` applies.
+    #[serde(default)]
+    kernel_token_objects_warn: Option<i64>,
+    #[serde(default)]
+    kernel_token_objects_breach: Option<i64>,
+    #[serde(default)]
+    kernel_token_slope_warn_per_hour: Option<i64>,
+    #[serde(default)]
+    kernel_pool_warn_bytes: Option<i64>,
+    #[serde(default)]
+    kernel_pool_breach_bytes: Option<i64>,
+    #[serde(default)]
+    kernel_nonpaged_warn_bytes: Option<i64>,
+    #[serde(default)]
+    spawn_p50_warn_ms: Option<i64>,
+    #[serde(default)]
+    spawn_p50_breach_ms: Option<i64>,
+}
+
+/// Fold a decoded response into the `osHealth` controls to cache. PURE.
+///
+/// Same fail-safe as [`session_floors_from`]: anything but a readable controls
+/// object yields all-`None`, which grades against the compiled defaults —
+/// coord's own defaults — rather than against nothing. A negative value is
+/// dropped later, in `Thresholds::with_controls`.
+fn os_health_controls_from(body: &FleetPolicyResponse) -> crate::os_health::OsHealthControls {
+    if body.controls_available == Some(false) {
+        return crate::os_health::OsHealthControls::default();
+    }
+    let Some(c) = body.controls.as_ref() else {
+        return crate::os_health::OsHealthControls::default();
+    };
+    crate::os_health::OsHealthControls {
+        kernel_token_objects_warn: c.kernel_token_objects_warn,
+        kernel_token_objects_breach: c.kernel_token_objects_breach,
+        kernel_token_slope_warn_per_hour: c.kernel_token_slope_warn_per_hour,
+        kernel_pool_warn_bytes: c.kernel_pool_warn_bytes,
+        kernel_pool_breach_bytes: c.kernel_pool_breach_bytes,
+        kernel_nonpaged_warn_bytes: c.kernel_nonpaged_warn_bytes,
+        spawn_p50_warn_ms: c.spawn_p50_warn_ms,
+        spawn_p50_breach_ms: c.spawn_p50_breach_ms,
+    }
 }
 
 /// One control column → a floor this runner will honour. PURE.
@@ -2369,8 +2415,11 @@ enum PollOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlsOutcome {
     /// Coord returned 2xx — cache replaced with these floors (possibly "none",
-    /// which is a legitimate answer, not an error).
-    Updated(SessionFloorsByLane),
+    /// which is a legitimate answer, not an error), and the `osHealth`
+    /// thresholds from the same controls object.
+    /// Boxed: the eight optional thresholds would otherwise make every
+    /// `ControlsOutcome` (and the last-logged copy) 128 bytes wider.
+    Updated(SessionFloorsByLane, Box<crate::os_health::OsHealthControls>),
     /// No device JWT yet (unpaired) — poll skipped, cache untouched.
     SkippedNoJwt,
     /// Coord said 401 / 404 — cache RESET to no floors (fail-safe).
@@ -2591,8 +2640,14 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         let controls_outcome = poll_controls_once().await;
 
         match &controls_outcome {
-            ControlsOutcome::Updated(floors) => set_floors(*floors),
-            ControlsOutcome::Reset(_) => set_floors(SessionFloorsByLane::default()),
+            ControlsOutcome::Updated(floors, os_health) => {
+                set_floors(*floors);
+                crate::os_health::set_fleet_controls(**os_health);
+            }
+            ControlsOutcome::Reset(_) => {
+                set_floors(SessionFloorsByLane::default());
+                crate::os_health::set_fleet_controls(crate::os_health::OsHealthControls::default());
+            }
             // Skipped / Kept leave the cache as-is (last-good or "no floors").
             ControlsOutcome::SkippedNoJwt | ControlsOutcome::Kept(_) => {}
         }
@@ -2600,11 +2655,12 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         let controls_changed = is_new_outcome(last_logged_controls.as_ref(), &controls_outcome);
         if controls_changed {
             match &controls_outcome {
-                ControlsOutcome::Updated(floors) => {
+                ControlsOutcome::Updated(floors, os_health) => {
                     info!(
-                        "fleet_policy_poller: fleet session floors ({}) = {}",
+                        "fleet_policy_poller: fleet session floors ({}) = {}; osHealth controls = {:?} (None = compiled default)",
                         CONTROLS_DOMAIN,
-                        describe_floors(floors)
+                        describe_floors(floors),
+                        os_health
                     );
                 }
                 ControlsOutcome::SkippedNoJwt => {
@@ -3326,7 +3382,10 @@ async fn poll_egress_with<F, Fut>(
 /// current.
 async fn poll_controls_once() -> ControlsOutcome {
     match fetch_fleet_policy(CONTROLS_DOMAIN).await {
-        Ok(body) => ControlsOutcome::Updated(session_floors_from(&body)),
+        Ok(body) => ControlsOutcome::Updated(
+            session_floors_from(&body),
+            Box::new(os_health_controls_from(&body)),
+        ),
         Err(FetchError::NoJwt) => ControlsOutcome::SkippedNoJwt,
         Err(FetchError::AuthOrAbsent(status)) => ControlsOutcome::Reset(status),
         Err(FetchError::Failed(e)) => ControlsOutcome::Kept(e),
@@ -3669,6 +3728,57 @@ mod tests {
                 "controls":{"min_free_bytes_sessions_host":0}}"#,
         );
         assert_eq!(floors.host.warn_free_bytes, Some(0));
+    }
+
+    fn os_controls_of(json: &str) -> crate::os_health::OsHealthControls {
+        let body: FleetPolicyResponse = serde_json::from_str(json).expect("decodes");
+        os_health_controls_from(&body)
+    }
+
+    /// The eight S7–S9 controls decode by their coord column names; absent and
+    /// NULL are `None` (compiled default), and an unreadable controls object
+    /// yields no override at all.
+    #[test]
+    fn os_health_controls_decode_by_column_name_and_absent_is_none() {
+        let c = os_controls_of(
+            r#"{"controls_available":true,
+                "controls":{"kernel_token_objects_warn":1000,
+                            "kernel_token_objects_breach":5000,
+                            "kernel_token_slope_warn_per_hour":100,
+                            "kernel_pool_warn_bytes":1073741824,
+                            "kernel_pool_breach_bytes":2147483648,
+                            "kernel_nonpaged_warn_bytes":536870912,
+                            "spawn_p50_warn_ms":10,
+                            "spawn_p50_breach_ms":20,
+                            "min_free_bytes_sessions_host":3221225472}}"#,
+        );
+        assert_eq!(
+            c,
+            crate::os_health::OsHealthControls {
+                kernel_token_objects_warn: Some(1000),
+                kernel_token_objects_breach: Some(5000),
+                kernel_token_slope_warn_per_hour: Some(100),
+                kernel_pool_warn_bytes: Some(1_073_741_824),
+                kernel_pool_breach_bytes: Some(2_147_483_648),
+                kernel_nonpaged_warn_bytes: Some(536_870_912),
+                spawn_p50_warn_ms: Some(10),
+                spawn_p50_breach_ms: Some(20),
+            }
+        );
+        let partial = os_controls_of(
+            r#"{"controls_available":true,
+                "controls":{"spawn_p50_breach_ms":500,"kernel_token_objects_warn":null}}"#,
+        );
+        assert_eq!(partial.spawn_p50_breach_ms, Some(500));
+        assert_eq!(partial.kernel_token_objects_warn, None);
+        assert_eq!(partial.kernel_pool_warn_bytes, None);
+        let none = crate::os_health::OsHealthControls::default();
+        assert_eq!(
+            os_controls_of(r#"{"controls_available":false,"controls":{"spawn_p50_warn_ms":1}}"#),
+            none
+        );
+        assert_eq!(os_controls_of(r#"{"controls":null}"#), none);
+        assert_eq!(os_controls_of("{}"), none);
     }
 
     #[test]
