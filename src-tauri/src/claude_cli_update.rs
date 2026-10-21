@@ -761,7 +761,7 @@ fn tail(bytes: &[u8], max: usize) -> String {
     let start = (start..=s.len())
         .find(|i| s.is_char_boundary(*i))
         .unwrap_or(s.len());
-    s[start..].to_string()
+    s.get(start..).unwrap_or_default().to_string()
 }
 
 async fn run_capture(
