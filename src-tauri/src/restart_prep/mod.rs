@@ -22,11 +22,20 @@
 //!   `GET /control/restart-prep`. Both report the persisted record (if any)
 //!   and a LIVE cohort preview computed in memory; neither writes anything.
 //!
-//! The prepare action, the coord self-hold, the account freeze, the notice
-//! loop and the restore are later phases.
+//! ## Phase 3: the hold, the cancel, the build-change release, the freeze
+//!
+//! [`prepare`] holds and releases spawns: the prepare action, its cancel, the
+//! boot step that releases the hold once the runner is rebuilt, the account
+//! freeze, and the runner-local hold that gates `drain_gate` where there is
+//! no coord lever (D1, D3).
+//!
+//! The notice loop and the restore are later phases.
 
 pub mod cohort;
 pub mod effort;
+pub mod prepare;
+
+pub use prepare::{accounts_frozen, freeze_hit, local_hold_reason, on_boot};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,6 +91,11 @@ pub enum HoldStatus {
     /// A secondary instance: the runner-local hold over its own spawns only.
     /// A secondary never drains the device, which the primary shares.
     LocalSecondary,
+    /// The hold was let go (cancel, or the rebuilt runner's boot). `outcome`
+    /// is what the release returned, VERBATIM — coord's `released |
+    /// not_owner | absent | unreadable`, or `local` for a runner-local hold,
+    /// or why no release could be sent. Never collapsed to "ok".
+    ReleaseSent { outcome: String },
 }
 
 impl HoldStatus {
@@ -94,8 +108,40 @@ impl HoldStatus {
             Self::Unconfirmed { cause } => format!("unconfirmed: {cause}"),
             Self::Local => "local".to_string(),
             Self::LocalSecondary => "local (secondary)".to_string(),
+            Self::ReleaseSent { outcome } => format!("release: {outcome}"),
         }
     }
+
+    /// Whether this status is a runner-local hold (no coord lever).
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local | Self::LocalSecondary)
+    }
+}
+
+/// What let the hold go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseTrigger {
+    /// The operator cancelled the prepare (or pressed Release hold).
+    Cancel,
+    /// A runner on a different build booted over the record.
+    Rebuild,
+}
+
+/// One release of the hold, as it was answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseReport {
+    pub at_ms: i64,
+    pub at: String,
+    pub trigger: ReleaseTrigger,
+    /// The build that sent the release.
+    pub on_build: String,
+    /// The release's answer, verbatim (see [`HoldStatus::ReleaseSent`]).
+    pub outcome: String,
+    /// The device's own drain as read back after the release (`clear`,
+    /// `drained (<reason>)`, `unreadable: <cause>`); `None` when no coord
+    /// release was sent.
+    pub read_back: Option<String>,
 }
 
 /// The persisted prepare.
@@ -113,6 +159,20 @@ pub struct PrepareRecord {
     pub state: PrepState,
     pub hold: HoldStatus,
     pub cohort: Cohort,
+    /// The operator's reason, as sent to coord (after the hold's own prefix).
+    #[serde(default)]
+    pub reason: String,
+    /// When the hold lapses by itself: the backstop for a rebuild that never
+    /// happens (D1). Coord's own `until` once a coord hold answered, else the
+    /// runner's default. A record past it reads "hold expired at …", and
+    /// neither the local hold nor the account freeze applies any more.
+    #[serde(default)]
+    pub hold_until_ms: Option<i64>,
+    #[serde(default)]
+    pub hold_until: Option<String>,
+    /// The release, once the hold was let go.
+    #[serde(default)]
+    pub release: Option<ReleaseReport>,
 }
 
 impl PrepareRecord {
@@ -127,11 +187,33 @@ impl PrepareRecord {
             state: PrepState::Preparing,
             hold: HoldStatus::NotAttempted,
             cohort,
+            reason: String::new(),
+            hold_until_ms: None,
+            hold_until: None,
+            release: None,
         }
+    }
+
+    /// A prepare still in its restart window: preparing or ready. A record
+    /// that is restoring, done or cancelled holds nothing.
+    pub fn in_window(&self) -> bool {
+        matches!(self.state, PrepState::Preparing | PrepState::Ready)
+    }
+
+    /// Whether the hold's `until` has passed at `now_ms`. A record with no
+    /// `until` has not expired.
+    pub fn hold_expired(&self, now_ms: i64) -> bool {
+        self.hold_until_ms.is_some_and(|u| now_ms >= u)
+    }
+
+    /// In its window and not past its `until`: the prepare is ACTIVE — the
+    /// account freeze applies, and a local hold holds.
+    pub fn is_active(&self, now_ms: i64) -> bool {
+        self.in_window() && !self.hold_expired(now_ms)
     }
 }
 
-fn rfc3339(ms: i64) -> String {
+pub(crate) fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|t| t.to_rfc3339())
         .unwrap_or_default()
@@ -212,12 +294,17 @@ pub struct RestartPrepStatus {
     /// the CLI version it was observed on.
     pub cli_default_effort: Option<String>,
     pub cli_default_observed_on: String,
+    /// What the record means NOW: the hold as the panel spells it (including
+    /// "hold expired at …"), whether the freeze and the local hold apply, and
+    /// the "same build — spawns still held" flag. `None` with no record.
+    pub view: Option<prepare::PrepView>,
 }
 
-/// Assemble the status from the running app. Errs only when the lifecycle
-/// store is not managed — a cohort read without it would be an empty list
-/// that looks like "no sessions open".
-pub fn status_from_app(app: &tauri::AppHandle) -> Result<RestartPrepStatus, String> {
+/// The cohort a prepare taken now pins, from the running app. Errs only when
+/// the lifecycle store is not managed — a cohort read without it would be an
+/// empty list that looks like "no sessions open". Disk work: call it off the
+/// async runtime.
+pub fn live_cohort_from_app(app: &tauri::AppHandle) -> Result<Cohort, String> {
     use tauri::Manager;
 
     let store = app
@@ -243,9 +330,25 @@ pub fn status_from_app(app: &tauri::AppHandle) -> Result<RestartPrepStatus, Stri
         chrono::Utc::now().timestamp_millis(),
         crate::session::shutdown_marker::boot_classification(),
     );
+    Ok(live_cohort)
+}
+
+/// Assemble the status from the running app. Errs when the cohort cannot be
+/// read (see [`live_cohort_from_app`]).
+pub fn status_from_app(app: &tauri::AppHandle) -> Result<RestartPrepStatus, String> {
+    let live_cohort = live_cohort_from_app(app)?;
     let path = record_path();
+    let record = load_from(&path);
+    let view = record.as_ref().map(|r| {
+        prepare::view_of(
+            r,
+            prepare::same_build_restart(),
+            chrono::Utc::now().timestamp_millis(),
+        )
+    });
     Ok(RestartPrepStatus {
-        record: load_from(&path),
+        record,
+        view,
         record_path: path.to_string_lossy().replace('\\', "/"),
         running_build: running_build().to_string(),
         live_cohort,

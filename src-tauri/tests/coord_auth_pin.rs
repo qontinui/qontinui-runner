@@ -926,6 +926,14 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// when this device is paired with more tenants, so there is no future phase
 /// for it to owe. So `device` 21 -> 22.
 ///
+/// Plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`
+/// Phase 3 routes the restart prepare's `POST /coord/devices/me/hold` and
+/// `POST /coord/devices/me/release` through that SAME site
+/// (`coord_drain_state::device_request`), so the count does not move: both act
+/// on the device the JWT names, write the very drain row `me/drain` reads, and
+/// carry no tenant field. They must present the same credential as the read
+/// that confirms them, which one seam guarantees and two would not.
+///
 /// Phase 5 of
 /// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`
 /// added two new `mcp/plan_library.rs` forwards to the same qontinui-web base

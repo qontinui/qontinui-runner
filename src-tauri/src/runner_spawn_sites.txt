@@ -46,6 +46,8 @@ agent_runtime.rs | run_continuation_headless | autonomous | run_gate_continuatio
 agent_runtime.rs | run_continuation_terminal | autonomous | run_gate_continuation_inner
 claude_session/runner.rs | run_claude_session_interactive | helper | run_claude_session_interactive(
 claude_session/runner.rs | run_claude_session_interactive_with_retry | helper | run_claude_session_interactive_with_retry(
+claude_session/session.rs | auto_restart_on_rate_limit | exempt | restarts a chat session that exited on a rate limit under another account — the work is already running; a restart prepare freezes it (rate_limit_rotation, plan 2026-10-21-operator-prepare-for-restart-and-progressive-restore D3)
+claude_session/session.rs | promote_to_worktree | exempt | replaces a running chat session's CLI with one whose cwd is a worktree — the same session, already running, moved not started
 commands/ai_session.rs | create_ai_session | operator | -
 commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions
 commands/config.rs | get_workspace_paths_impl | exempt | only resolves the spawn script's path for display; launches nothing

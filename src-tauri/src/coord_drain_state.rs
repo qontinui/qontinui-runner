@@ -198,8 +198,45 @@ impl DrainGate {
 
 /// The gate for `origin` against the CURRENT cached state. Cheap and
 /// synchronous; never performs I/O.
+///
+/// Also honours the operator restart prepare's RUNNER-LOCAL hold
+/// ([`crate::restart_prep::local_hold_reason`]). That hold exists only where
+/// there is no coord lever to split — a runner that is not a coord device
+/// (`NotEnrolled`), or a secondary instance, which must never drain the device
+/// the primary shares (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D1). On
+/// the primary of an enrolled device the prepare holds spawns through coord's
+/// own drain instead, so there is still one lever per device.
 pub fn drain_gate(origin: SpawnOrigin) -> DrainGate {
-    gate_for(&current(), origin)
+    let local = crate::restart_prep::local_hold_reason();
+    gate_with_local_hold(&current(), origin, local.as_deref(), Utc::now())
+}
+
+/// PURE: [`gate_for_at`] with the restart prepare's runner-local hold applied
+/// first. `local_hold` is the hold's operator-readable description, `None`
+/// when no local hold is active. An operator origin is never held.
+pub fn gate_with_local_hold(
+    state: &CoordDrainState,
+    origin: SpawnOrigin,
+    local_hold: Option<&str>,
+    now: DateTime<Utc>,
+) -> DrainGate {
+    if origin.is_autonomous() {
+        if let Some(hold) = local_hold {
+            return DrainGate::Defer {
+                reason: format!(
+                    "a restart prepare holds this runner's autonomous spawns ({hold}) — the \
+                     {origin} spawn is deferred until the prepare is cancelled or the runner \
+                     is rebuilt"
+                ),
+                // The deferral IS a hold the operator set, which is what
+                // `Drained` / `device_drained` tells every surface; `Unknown`
+                // would claim the state could not be read.
+                class: DeferClass::Drained,
+            };
+        }
+    }
+    gate_for_at(state, origin, now)
 }
 
 /// [`drain_gate`], also recording a deferral of `work_key` so the banner's
@@ -865,6 +902,30 @@ pub fn record_deferral(origin: SpawnOrigin, key: &str) {
     }
 }
 
+/// Wake every [`subscribe`]r (and so every [`wait_until_allowed`]) to
+/// re-check the gate. For a change the cached coord state does not carry —
+/// the restart prepare's runner-local hold lifting — which would otherwise
+/// be seen only on the next heartbeat-interval re-check.
+pub fn nudge_waiters() {
+    global().tx.send_replace(current());
+    emit_snapshot();
+}
+
+/// Fold a `GET /coord/devices/me/drain` read another module made (the restart
+/// prepare's hold read-back) into the cached state, exactly as the heartbeat
+/// folds its own: a fresh read is a fresh read, whoever asked.
+pub fn fold_me_drain_read(read: &Result<DrainObservation, String>) {
+    match read {
+        Ok(obs) => {
+            let obs = obs.clone();
+            fold(|tr, now| tr.observe(obs, now));
+        }
+        Err(e) => {
+            debug!("coord_drain_state: an out-of-band me/drain read failed ({e}); not folded")
+        }
+    }
+}
+
 /// Resolve once autonomous spawns of `origin` may run. Wakes on every state
 /// change and re-checks every heartbeat interval (staleness is time-based).
 pub async fn wait_until_allowed(origin: SpawnOrigin) {
@@ -1030,7 +1091,7 @@ pub enum HeartbeatOutcome {
 /// a MISS — trending to `Unknown`, which defers. Absent stays `NotEnrolled`.
 /// The network direction already had this right: every non-2xx and transport
 /// error is an `Err` from [`read_me_drain`] and folds as a miss.
-enum Enrollment {
+pub(crate) enum Enrollment {
     /// A coord device, with this base.
     Enrolled(String),
     /// Positively NOT a coord device: the file is genuinely absent, or names no
@@ -1043,7 +1104,7 @@ enum Enrollment {
 
 /// Why this runner is not a coord device, the base if it is, or that the local
 /// files could not answer. See [`Enrollment`].
-fn enrollment() -> Enrollment {
+pub(crate) fn enrollment() -> Enrollment {
     use qontinui_runner_lib::ambient::MachineJsonError;
 
     let machine = match qontinui_runner_lib::ambient::try_read_machine_json() {
@@ -1095,20 +1156,37 @@ fn enrollment() -> Enrollment {
     }
 }
 
-/// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
-async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
-    let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
-    // A per-read client, like the heartbeat's: the caller may run on the
-    // heartbeat's dedicated current-thread runtime, and a pooled connection
-    // must not outlive the runtime that opened it.
-    // OS resolver (outbound_net::os_dns): the hickory resolver this replaced
-    // spent the whole timeout on DNS on a VPN box.
-    let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
+/// A per-call client for this module's coord calls.
+///
+/// Per call, like the heartbeat's: the caller may run on the heartbeat's
+/// dedicated current-thread runtime, and a pooled connection must not outlive
+/// the runtime that opened it. OS resolver (`outbound_net::os_dns`): the
+/// hickory resolver this replaced spent the whole timeout on DNS on a VPN box.
+fn device_client() -> Result<reqwest::Client, String> {
+    qontinui_runner_lib::outbound_net::os_dns::client_builder()
         .timeout(ME_DRAIN_TIMEOUT)
         .build()
-        .map_err(|e| format!("reqwest builder: {e}"))?;
-    // coord-tenant-scope(device): the route answers for the device JWT's own device; there is no tenant in the request.
-    let resp = crate::auth::attach_device_auth(client.get(&url))
+        .map_err(|e| format!("reqwest builder: {e}"))
+}
+
+/// The ONE device-JWT seam for this module's coord calls: the drain read, and
+/// the restart prepare's self-hold and release (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D1),
+/// which act on the same drain row the read returns.
+fn device_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    // coord-tenant-scope(device): every route sent through here (`me/drain`, `me/hold`, `me/release`) acts on the device the JWT was minted for; coord keys the drain row by device_id and the request carries no tenant field to set.
+    crate::auth::attach_device_auth(client.request(method, url))
+}
+
+/// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
+pub(crate) async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
+    let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
+    let client = device_client()?;
+    let resp = device_request(&client, reqwest::Method::GET, &url)
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
@@ -1119,6 +1197,26 @@ async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
         return Err(format!("GET {url} returned {status}: {excerpt}"));
     }
     Ok(parse_me_drain_response(&body))
+}
+
+/// `POST {base}{path}` with a JSON body under the device JWT → the status and
+/// body as coord gave them (any status — the caller maps them), or the
+/// transport failure. For the restart prepare's `me/hold` and `me/release`.
+pub(crate) async fn post_device_json(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<(u16, String), String> {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
+    let client = device_client()?;
+    let resp = device_request(&client, reqwest::Method::POST, &url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    Ok((status, text))
 }
 
 /// Fold one heartbeat tick's result. Reads `me/drain` when the tick shows a
@@ -1182,6 +1280,10 @@ pub async fn boot_read() {
     {
         return;
     }
+    // Load the restart prepare's record before the drain read can fold a
+    // `NotEnrolled` that ALLOWS autonomous spawns, so a runner-local hold
+    // persisted by the last process is enforced from the first allowing state.
+    crate::restart_prep::prepare::install_live();
     match enrollment() {
         Enrollment::Enrolled(base) => match read_me_drain(&base).await {
             Ok(obs) => {
@@ -1198,6 +1300,13 @@ pub async fn boot_read() {
             fold(|tr, now| tr.observe(DrainObservation::NotEnrolled { why }, now));
         }
     }
+    // The restart prepare's boot step runs AFTER the drain read and BEFORE
+    // the flag every restore and resume waits on (`await_boot_read`), so a
+    // rebuilt runner's release of its own restart hold lands before any of
+    // them decides against the drain (plan
+    // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+    // Phase 3). Bounded by its own coord timeouts.
+    crate::restart_prep::on_boot().await;
     g.boot_read_finished
         .store(true, std::sync::atomic::Ordering::SeqCst);
     g.boot_read_done.notify_waiters();
