@@ -1127,6 +1127,14 @@ fn output_chunk_terminal_429_reason(body: &str) -> Option<&'static str> {
     parse_output_chunk_429(body)?.terminal_reason()
 }
 
+/// Whether an `output_chunk` 429 is coord's ingest-side egress refusal. Reads
+/// the parsed `error` field, never a substring: a proxy page or a
+/// `{"error":"rate_limited","detail":"…egress_off…"}` body that merely
+/// mentions the reason stays retryable rather than losing the chunk.
+fn output_chunk_429_is_egress_off(body: &str) -> bool {
+    parse_output_chunk_429(body).is_some_and(|p| p.error == "egress_off")
+}
+
 /// The reason to NAME in a log line for an `output_chunk` 429: coord's parsed
 /// `error` code (annotated when it is the deploy-window `column_missing`
 /// stand-in), or a generic "rate limited" when the body carries none.
@@ -2034,7 +2042,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             let status = resp.status();
             if kind == "output_chunk" && status == StatusCode::TOO_MANY_REQUESTS {
                 let detail = resp.text().await.unwrap_or_default();
-                if detail.contains("egress_off") {
+                if output_chunk_429_is_egress_off(&detail) {
                     // Coord's ingest-side second line of the egress switch
                     // refused it. The runner's own gate above should have
                     // caught it first (a flip coord saw before our next
@@ -2917,13 +2925,6 @@ fn progress_body(payload: &JsonValue) -> JsonValue {
     json!({ "progress": JsonValue::Object(progress) })
 }
 
-/// Build the `POST /sessions/:id/output` body from an `output_chunk`
-/// outbox payload. The transcript emitter records `{stream, chunk_offset,
-/// payload_b64}` — forward exactly the subset coord's ingest understands.
-/// `stream` defaults to "transcript" when absent: the ONLY writer of
-/// `output_chunk` outbox rows is the transcript emitter (the PTY stream
-/// bypasses the outbox via `output_pipe.rs`), so a missing field can only
-/// be a transcript row.
 /// Output chunks the drain ACKed and dropped because their egress switch was
 /// off (both streams). Process-global, read by tests and diagnostics; the
 /// per-flow tally is in `/health` `egress.<flow>.refused`.
@@ -2964,6 +2965,13 @@ fn output_chunk_egress_refusal(
 /// (coord's `session_output.stream` default).
 const PTY_STREAM: &str = "pty";
 
+/// Build the `POST /sessions/:id/output` body from an `output_chunk`
+/// outbox payload. The transcript emitter records `{stream, chunk_offset,
+/// payload_b64}` — forward exactly the subset coord's ingest understands.
+/// `stream` defaults to "transcript" when absent: the ONLY writer of
+/// `output_chunk` outbox rows is the transcript emitter (the PTY stream
+/// bypasses the outbox via `output_pipe.rs`), so a missing field can only
+/// be a transcript row.
 fn output_chunk_body(payload: &JsonValue) -> JsonValue {
     json!({
         "chunk_offset": payload.get("chunk_offset").cloned().unwrap_or(json!(0)),
@@ -5584,6 +5592,73 @@ mod tests {
                 other => panic!("{body}: must be retried, got {other:?}"),
             }
         }
+    }
+
+    /// Coord's ingest-side egress refusal is recognised by its parsed `error`
+    /// field only: `{"error":"egress_off"}` is ACK-dropped and counted, while a
+    /// body that merely MENTIONS egress_off (in `detail`, or a proxy page)
+    /// stays retryable, so the chunk is not lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_chunk_egress_off_429_drops_only_on_the_parsed_error() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let chunk = outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::OutputChunk,
+                json!({ "stream": "transcript", "chunk_offset": 0, "payload_b64": "eA==" }),
+            )
+            .unwrap();
+
+        for body in [
+            json!({ "error": "rate_limited", "detail": "egress_off for another flow" }).to_string(),
+            json!({ "detail": "egress_off" }).to_string(),
+            "<html>proxy says egress_off</html>".to_string(),
+        ] {
+            rec.lock().await.output_429_body = Some(body.clone());
+            match push_record(&coord.inner, &chunk).await {
+                PushOutcome::Transport(msg) => assert_eq!(
+                    classify_push_failure(&msg, false).0,
+                    "rate_limited",
+                    "{body}: a 429 that only mentions egress_off is retried"
+                ),
+                other => panic!("{body}: must be retried, got {other:?}"),
+            }
+        }
+
+        rec.lock().await.output_429_body =
+            Some(json!({ "error": "egress_off", "flow": "transcript_sync" }).to_string());
+        let before = OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed);
+        assert!(
+            matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
+            "a parsed egress_off 429 ACK-drops the chunk"
+        );
+        assert!(
+            OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed) > before,
+            "the egress_off drop is counted"
+        );
+    }
+
+    #[test]
+    fn output_chunk_429_is_egress_off_reads_the_error_field() {
+        assert!(output_chunk_429_is_egress_off(r#"{"error":"egress_off"}"#));
+        assert!(!output_chunk_429_is_egress_off(
+            r#"{"error":"rate_limited","detail":"egress_off"}"#
+        ));
+        assert!(!output_chunk_429_is_egress_off(
+            r#"{"detail":"egress_off"}"#
+        ));
+        assert!(!output_chunk_429_is_egress_off("egress_off"));
+        assert!(!output_chunk_429_is_egress_off(""));
     }
 
     #[test]
