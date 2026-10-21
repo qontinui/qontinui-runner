@@ -171,8 +171,9 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // `spawn_exited_request`'s agent arm (plan
     // `2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer`
     // Phase 4): the clean-exit report presents the agent's OWN coord JWT, which
-    // coord's reporter check accepts on any device, so the exit row is recorded
-    // verified even where the default binding is not the allocation's device.
+    // coord's reporter check accepts when the JWT's device_id is one of the
+    // allocation's devices (as the launching device is), so the exit row is
+    // recorded verified even where the default binding is not that device.
     // Its device-token fallback arm is the `session-noop` 7 -> 8 below.
     ("agent_runtime.rs", "agent-jwt", 1),
     ("agent_token/mod.rs", "agent-jwt", 1),
