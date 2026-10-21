@@ -60,7 +60,14 @@ vi.mock("./useZoneVirtualization", async (importOriginal) => ({
     cellFor: () => null,
   }),
 }));
-vi.mock("./useLiveClaudeSessionNames", () => ({ useLiveClaudeSessionNames: () => new Map() }));
+vi.mock("./useLiveClaudeSessions", () => ({
+  useLiveClaudeSessions: () => ({
+    read: "ok",
+    bySessionId: new Map(),
+    names: new Map(),
+    pids: new Set(),
+  }),
+}));
 
 vi.mock("./contexts", () => {
   const noop = () => {};

@@ -130,7 +130,9 @@ impl PaneKey {
         ))
     }
 
-    fn as_str(&self) -> &str {
+    /// The key's string form — also the `pane:` arm of
+    /// [`crate::session::session_org_store::session_key`].
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }

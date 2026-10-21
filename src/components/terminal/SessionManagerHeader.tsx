@@ -1,6 +1,7 @@
 /**
- * Session Manager header — title row, account-usage chips, status quick
- * filters, search, account filters and the group/sort selects.
+ * Session Manager header — title row, account-usage chips, the query bar
+ * (`SessionQueryBar`: the D5 grammar input, its chips with counts, the account
+ * and group pickers and the saved views) and the group/sort selects.
  *
  * Addressability contract (plan
  * `2026-07-19-session-titles-ansi-and-ui-bridge-friction`, Task C). Every
@@ -9,44 +10,50 @@
  * `data-testid`. Each interactive control now registers through the SDK's
  * `useUIElement` under an author-stamped id following the convention
  * `SessionManagerToggle` established (`terminal.session-manager-toggle`), and
- * the header root carries the panel's COUNTS and current FILTER state as
- * `data-*` attributes — `ElementState.dataset` projects them, so
+ * the header root carries the panel's COUNTS and current QUERY as `data-*`
+ * attributes — `ElementState.dataset` projects them, so
  * `GET /control/element/terminal.session-manager-header` answers "how many
- * frozen sessions, and what is filtered right now" in one read.
+ * sessions need you, and what is filtered right now" in one read. The filter
+ * itself is the query bar's (plan
+ * `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+ * Phase 4): one query string, which every chip and picker edits.
  *
  * The account-usage chips are the one non-interactive surface, so they use
  * `data-ui-bridge-content` (the SDK's opt-in semantic-content selector) rather
  * than a hook — there is nothing to drive on them, only text to assert.
  */
-import { RefreshCw, Search, Filter } from "lucide-react";
-import { useUIElement, type StandardAction } from "@qontinui/ui-bridge";
+import { RefreshCw, PanelLeftClose, Sparkles } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 
-import type {
-  SessionLiveStatus,
-  SessionGroupBy,
-  SessionSortBy,
-  AccountUsageInfo,
-} from "./useSessionManager";
+import type { SessionGroupBy, SessionSortBy, AccountUsageInfo } from "./useSessionManager";
+import type { SessionActivity } from "./sessionStatusModel";
+import { SessionQueryBar, type SessionQueryBarProps } from "./SessionQueryBar";
+import { parseGroupBy } from "./sessionGrouping";
+import { SESSION_ORG_CONTROLS, sessionOrgControlAttrs } from "./sessionOrgControls";
 
 interface SessionManagerHeaderProps {
   loading: boolean;
-  searchQuery: string;
-  onSearchChange: (q: string) => void;
-  statusFilter: SessionLiveStatus | "all";
-  onStatusFilterChange: (f: SessionLiveStatus | "all") => void;
-  accountFilter: string | "all";
-  onAccountFilterChange: (f: string | "all") => void;
+  /** The query bar — the whole filter (D5). */
+  queryBar: SessionQueryBarProps;
   groupBy: SessionGroupBy;
   onGroupByChange: (g: SessionGroupBy) => void;
   sortBy: SessionSortBy;
   onSortByChange: (s: SessionSortBy) => void;
   accountUsage: AccountUsageInfo[];
-  accounts: string[];
   onRefresh: () => void;
-  frozenCount: number;
-  needsInputCount: number;
-  activeCount: number;
+  /** Rows per activity, over every Live row — the root's dataset counts. */
+  activityCounts: Readonly<Record<SessionActivity, number>>;
+  /** Rows the filter shows. */
   totalCount: number;
+  /** Collapse the panel to its rail (icons only). */
+  onToggleRail?: () => void;
+  /** Open "Suggest groups"; offered only in the "My groups" lens. */
+  onSuggestGroups?: () => void;
+  /**
+   * The org store's in-flight or refused state ("saving 1…", "refused: …"),
+   * so an organization click acknowledges itself; `null` when settled.
+   */
+  orgStatus?: string | null;
 }
 
 const ACCOUNT_COLORS: Record<string, string> = {
@@ -63,99 +70,35 @@ function getAccountColor(label: string): string {
 export const SESSION_MANAGER_HEADER_IDS = {
   root: "terminal.session-manager-header",
   refresh: "terminal.session-manager-refresh",
-  search: "terminal.session-manager-search",
-  filterFrozen: "terminal.session-manager-filter-frozen",
-  filterNeedsInput: "terminal.session-manager-filter-needs-input",
-  filterActive: "terminal.session-manager-filter-active",
-  filterClear: "terminal.session-manager-filter-clear",
   groupBy: "terminal.session-manager-group-by",
   sortBy: "terminal.session-manager-sort-by",
 } as const;
 
-/** Per-account filter button id — one per rendered account. */
-export function sessionManagerAccountFilterId(account: string): string {
-  return `terminal.session-manager-account-${account}`;
-}
-
-/**
- * Actions the search box advertises. `inferActions('input')` omits `sendKeys`,
- * which is the same per-element under-advertisement that made the command bar
- * reject a driver's keystrokes (`CommandBar.tsx`
- * `COMMAND_BAR_INPUT_ACTIONS`) — filtering the session list means typing into
- * this box, so it is advertised here for the same reason and with the same
- * SDK descriptor-array contract.
- */
-export const SEARCH_INPUT_ACTIONS: StandardAction[] = [
-  "focus",
-  "blur",
-  "hover",
-  "scroll",
-  "scrollIntoView",
-  "click",
-  "hoverClick",
-  "type",
-  "clear",
-  "sendKeys",
-];
-
-/**
- * One account filter button. Its own component so the `useUIElement` call is a
- * plain unconditional hook per rendered account — same shape as
- * `SessionInfoDropdown`'s `InfoRow`.
- */
-function AccountFilterButton({
-  account,
-  active,
-  onToggle,
-}: {
-  account: string;
-  active: boolean;
-  onToggle: () => void;
-}) {
-  const { ref } = useUIElement({
-    id: sessionManagerAccountFilterId(account),
-    type: "button",
-    label: `Filter sessions by account ${account}`,
-  });
-  return (
-    <button
-      ref={ref}
-      data-ui-bridge-id={sessionManagerAccountFilterId(account)}
-      data-account={account}
-      data-active={active ? "true" : "false"}
-      aria-pressed={active}
-      onClick={onToggle}
-      className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-        active
-          ? "bg-[#7aa2f7]/15 text-[#7aa2f7] border border-[#7aa2f7]/30"
-          : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d] border border-transparent"
-      }`}
-    >
-      {account}
-    </button>
-  );
-}
-
 export function SessionManagerHeader({
   loading,
-  searchQuery,
-  onSearchChange,
-  statusFilter,
-  onStatusFilterChange,
-  accountFilter,
-  onAccountFilterChange,
+  queryBar,
   groupBy,
   onGroupByChange,
   sortBy,
   onSortByChange,
   accountUsage,
-  accounts,
   onRefresh,
-  frozenCount,
-  needsInputCount,
-  activeCount,
+  activityCounts,
   totalCount,
+  onToggleRail,
+  onSuggestGroups,
+  orgStatus = null,
 }: SessionManagerHeaderProps) {
+  const { ref: railRef } = useUIElement({
+    id: SESSION_ORG_CONTROLS.railToggle.id,
+    type: "button",
+    label: "Collapse the Session Manager to a rail",
+  });
+  const { ref: suggestRef } = useUIElement({
+    id: SESSION_ORG_CONTROLS.suggestGroups.id,
+    type: "button",
+    label: "Suggest groups",
+  });
   const { ref: rootRef } = useUIElement({
     id: SESSION_MANAGER_HEADER_IDS.root,
     type: "generic",
@@ -165,32 +108,6 @@ export function SessionManagerHeader({
     id: SESSION_MANAGER_HEADER_IDS.refresh,
     type: "button",
     label: "Refresh sessions",
-  });
-  const { ref: searchRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.search,
-    type: "input",
-    label: "Search sessions",
-    actions: SEARCH_INPUT_ACTIONS,
-  });
-  const { ref: filterFrozenRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.filterFrozen,
-    type: "button",
-    label: "Filter frozen sessions",
-  });
-  const { ref: filterNeedsInputRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.filterNeedsInput,
-    type: "button",
-    label: "Filter sessions needing input",
-  });
-  const { ref: filterActiveRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.filterActive,
-    type: "button",
-    label: "Filter active sessions",
-  });
-  const { ref: filterClearRef } = useUIElement({
-    id: SESSION_MANAGER_HEADER_IDS.filterClear,
-    type: "button",
-    label: "Clear session status filter",
   });
   const { ref: groupByRef } = useUIElement({
     id: SESSION_MANAGER_HEADER_IDS.groupBy,
@@ -207,16 +124,14 @@ export function SessionManagerHeader({
     <div
       ref={rootRef}
       data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.root}
-      // Counts + live filter state, projected into `ElementState.dataset` so a
-      // driver reads them in one call instead of scraping the chip labels
-      // (which self-hide at zero — a scrape cannot distinguish "no frozen
-      // sessions" from "chip not rendered").
+      // Counts + the live query, projected into `ElementState.dataset` so a
+      // driver reads them in one call instead of scraping the chip labels.
       data-total-count={totalCount}
-      data-frozen-count={frozenCount}
-      data-needs-input-count={needsInputCount}
-      data-active-count={activeCount}
-      data-status-filter={statusFilter}
-      data-account-filter={accountFilter}
+      data-needs-you-count={activityCounts["needs-you"]}
+      data-no-output-count={activityCounts["no-output-mid-tool"]}
+      data-working-count={activityCounts.working}
+      data-unknown-count={activityCounts.unknown}
+      data-query={queryBar.query}
       data-group-by={groupBy}
       data-sort-by={sortBy}
       data-loading={loading ? "true" : "false"}
@@ -233,18 +148,54 @@ export function SessionManagerHeader({
             {totalCount}
           </span>
         </div>
-        <button
-          ref={refreshRef}
-          data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.refresh}
-          onClick={onRefresh}
-          disabled={loading}
-          className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors"
-          title="Refresh sessions"
-          aria-label="Refresh sessions"
-        >
-          <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
-        </button>
+        <div className="flex items-center gap-0.5">
+          {onSuggestGroups && (
+            <button
+              ref={suggestRef}
+              {...sessionOrgControlAttrs("suggestGroups")}
+              onClick={onSuggestGroups}
+              className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
+              title="Suggest groups for ungrouped sessions by plan, pull request, branch or repo"
+            >
+              <Sparkles className="w-3 h-3" />
+              Suggest groups
+            </button>
+          )}
+          <button
+            ref={refreshRef}
+            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.refresh}
+            onClick={onRefresh}
+            disabled={loading}
+            className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors"
+            title="Refresh sessions"
+            aria-label="Refresh sessions"
+          >
+            <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
+          </button>
+          {onToggleRail && (
+            <button
+              ref={railRef}
+              {...sessionOrgControlAttrs("railToggle")}
+              onClick={onToggleRail}
+              aria-pressed={false}
+              className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors"
+              title="Collapse to a rail (status dots only)"
+              aria-label="Collapse the Session Manager to a rail"
+            >
+              <PanelLeftClose className="w-3 h-3" />
+            </button>
+          )}
+        </div>
       </div>
+      {orgStatus && (
+        <div
+          data-testid="session-org-status"
+          className="px-3 pb-1 text-[10px] text-[#565f89] truncate"
+          title={orgStatus}
+        >
+          Groups: {orgStatus}
+        </div>
+      )}
 
       {/* Account usage chips */}
       {accountUsage.length > 0 && (
@@ -285,103 +236,7 @@ export function SessionManagerHeader({
         </div>
       )}
 
-      {/* Status quick-filter chips */}
-      <div className="flex items-center gap-1 px-3 pb-1.5">
-        {frozenCount > 0 && (
-          <button
-            ref={filterFrozenRef}
-            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.filterFrozen}
-            aria-pressed={statusFilter === "frozen"}
-            onClick={() => onStatusFilterChange(statusFilter === "frozen" ? "all" : "frozen")}
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-              statusFilter === "frozen"
-                ? "bg-[#f7768e]/20 text-[#f7768e] border border-[#f7768e]/30"
-                : "bg-[#1a1b26] text-[#f7768e]/70 border border-[#2a2d3d] hover:bg-[#f7768e]/10"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-[#f7768e]" />
-            {frozenCount} frozen
-          </button>
-        )}
-        {needsInputCount > 0 && (
-          <button
-            ref={filterNeedsInputRef}
-            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.filterNeedsInput}
-            aria-pressed={statusFilter === "needs-input"}
-            onClick={() =>
-              onStatusFilterChange(statusFilter === "needs-input" ? "all" : "needs-input")
-            }
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-              statusFilter === "needs-input"
-                ? "bg-[#e0af68]/20 text-[#e0af68] border border-[#e0af68]/30"
-                : "bg-[#1a1b26] text-[#e0af68]/70 border border-[#2a2d3d] hover:bg-[#e0af68]/10"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-[#e0af68]" />
-            {needsInputCount} input
-          </button>
-        )}
-        {activeCount > 0 && (
-          <button
-            ref={filterActiveRef}
-            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.filterActive}
-            aria-pressed={statusFilter === "active-in-zone"}
-            onClick={() =>
-              onStatusFilterChange(statusFilter === "active-in-zone" ? "all" : "active-in-zone")
-            }
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-              statusFilter === "active-in-zone"
-                ? "bg-[#9ece6a]/20 text-[#9ece6a] border border-[#9ece6a]/30"
-                : "bg-[#1a1b26] text-[#9ece6a]/70 border border-[#2a2d3d] hover:bg-[#9ece6a]/10"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-[#9ece6a]" />
-            {activeCount} active
-          </button>
-        )}
-        {statusFilter !== "all" && (
-          <button
-            ref={filterClearRef}
-            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.filterClear}
-            onClick={() => onStatusFilterChange("all")}
-            className="px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
-          >
-            clear
-          </button>
-        )}
-      </div>
-
-      {/* Search bar */}
-      <div className="px-3 pb-2">
-        <div className="relative">
-          <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#565f89]" />
-          <input
-            ref={searchRef}
-            data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.search}
-            aria-label="Search sessions"
-            type="text"
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-            placeholder="Search sessions..."
-            className="w-full pl-7 pr-2 py-1 text-xs bg-[#1a1b26] border border-[#2a2d3d] rounded text-[#a9b1d6] placeholder-[#414868] focus:outline-none focus:border-[#7aa2f7]/50"
-          />
-        </div>
-      </div>
-
-      {/* Account filter row */}
-      {accounts.length > 1 && (
-        <div className="flex items-center gap-1.5 px-3 pb-1.5">
-          <Filter className="w-3 h-3 text-[#565f89] shrink-0" />
-          {accounts.map((acct) => (
-            <AccountFilterButton
-              key={acct}
-              account={acct}
-              active={accountFilter === acct}
-              onToggle={() => onAccountFilterChange(accountFilter === acct ? "all" : acct)}
-            />
-          ))}
-        </div>
-      )}
+      <SessionQueryBar {...queryBar} />
 
       {/* Group by / Sort by row */}
       <div className="flex items-center gap-2 px-3 pb-2">
@@ -392,11 +247,10 @@ export function SessionManagerHeader({
             data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.groupBy}
             aria-label="Group sessions by"
             value={groupBy}
-            onChange={(e) =>
-              onGroupByChange(e.target.value as "status" | "account" | "project" | "date")
-            }
+            onChange={(e) => onGroupByChange(parseGroupBy(e.target.value))}
             className="text-[10px] bg-[#1a1b26] border border-[#2a2d3d] rounded px-1 py-0.5 text-[#a9b1d6] focus:outline-none focus:border-[#7aa2f7]/50"
           >
+            <option value="groups">My groups</option>
             <option value="status">Status</option>
             <option value="account">Account</option>
             <option value="project">Project</option>
