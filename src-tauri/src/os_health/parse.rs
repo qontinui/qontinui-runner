@@ -20,10 +20,14 @@ use serde::Serialize;
 
 /// `OBJECT_TYPE_INFORMATION` (x64) — the byte offsets the parser reads.
 ///
-/// `NtQueryObject(NULL, ObjectTypesInformation)` is undocumented but has had
-/// this layout since Windows 8 (Process Hacker and Sysinternals read it the
-/// same way). The buffer is a `u32` type count, padded to 8, then one entry
-/// per type:
+/// `NtQueryObject(NULL, ObjectTypesInformation)` is undocumented. The layout
+/// below is the one Process Hacker reads, and it is VERIFIED here only against
+/// the real buffer captured on Windows 10.0.26200 (`object_types_26200.bin`,
+/// tested below) — no claim is made for any other build. A build whose layout
+/// differs fails the parse's own sanity checks (an odd name length, an absurd
+/// type count, no `Token` or no `Process` row) and reads UNKNOWN, never a false
+/// number. The buffer is a `u32` type count, padded to 8, then one entry per
+/// type:
 ///
 /// | Offset | Field |
 /// |---|---|
@@ -142,24 +146,24 @@ pub(crate) struct ObjectTypeCounts {
     /// `win32kfull.sys` 10.0.26100.9711 leak (4,365,962 on degraded spaceship).
     pub(crate) token_objects: u32,
     /// `Process` `TotalNumberOfObjects` — live processes plus zombies.
-    /// `None` when the buffer has no `Process` row.
-    pub(crate) process_objects: Option<u32>,
+    pub(crate) process_objects: u32,
 }
 
 /// Token and Process object counts, or `None` (UNKNOWN).
 ///
-/// **A buffer with no `Token` entry is UNKNOWN, not "zero tokens".** Every
-/// Windows kernel has a Token type; a parse that does not find one has misread
-/// the layout, and the one number this axis exists to publish must not be
-/// invented from that (plan Risks: "a parse sanity check — a Token entry must
-/// exist — guards it").
+/// **A buffer with no `Token` entry, or no `Process` entry, is UNKNOWN — not
+/// "zero tokens", and not "Token known, Process unknown".** Every Windows
+/// kernel has both types; a parse that does not find one of them has misread
+/// the layout, and then neither count from it can be trusted (plan Risks: "a
+/// parse sanity check — a Token entry must exist — guards it"; the Phase 4
+/// review extended the same rule to `Process`).
 pub(crate) fn object_type_counts(buf: &[u8]) -> Option<ObjectTypeCounts> {
     let entries = parse_object_types(buf)?;
     let token = entries.iter().find(|e| e.name == "Token")?;
-    let process = entries.iter().find(|e| e.name == "Process");
+    let process = entries.iter().find(|e| e.name == "Process")?;
     Some(ObjectTypeCounts {
         token_objects: token.objects,
-        process_objects: process.map(|p| p.objects),
+        process_objects: process.objects,
     })
 }
 
@@ -174,10 +178,16 @@ pub(crate) struct PoolTag {
     pub(crate) tag: String,
     /// `PagedUsed + NonPagedUsed`.
     pub(crate) bytes: i64,
-    /// `(PagedAllocs - PagedFrees) + (NonPagedAllocs - NonPagedFrees)`,
-    /// computed in `i64`: the counters wrap independently, so a per-pool
-    /// difference can be negative, and an unsigned subtraction would turn that
-    /// into four billion.
+    /// `(PagedAllocs - PagedFrees) + (NonPagedAllocs - NonPagedFrees)`, each
+    /// difference taken MODULO 2^32 and then widened ([`outstanding`]).
+    ///
+    /// The four counters are free-running `u32`s that wrap independently. On a
+    /// tag that has turned over more than 2^32 allocations, `PagedAllocs` has
+    /// wrapped and reads SMALLER than `PagedFrees`, while the true outstanding
+    /// count is still small and positive. `allocs.wrapping_sub(frees)` recovers
+    /// it exactly as long as fewer than 2^32 allocations are live at once,
+    /// which no pool can hold. A signed difference would instead publish a
+    /// large negative number for exactly the busiest tags.
     pub(crate) outstanding_allocs: i64,
 }
 
@@ -218,6 +228,12 @@ pub(crate) struct PoolTagTable {
     pub(crate) top: Vec<PoolTag>,
 }
 
+/// Live allocations of one pool out of its free-running `u32` counters: the
+/// difference modulo 2^32 (see [`PoolTag::outstanding_allocs`]).
+fn outstanding(allocs: u32, frees: u32) -> i64 {
+    i64::from(allocs.wrapping_sub(frees))
+}
+
 /// Parse a `SystemPoolTagInformation` buffer (x64 layout).
 ///
 /// `None` for a buffer shorter than its declared entries (truncated) and for
@@ -237,16 +253,17 @@ pub(crate) fn parse_pool_tags(buf: &[u8]) -> Option<PoolTagTable> {
         let o = PT_HEADER_BYTES + i * PT_STRIDE;
         let raw: [u8; 4] = buf.get(o..o + 4)?.try_into().ok()?;
         let tag = render_pool_tag(raw);
-        let paged_allocs = i64::from(read_u32(buf, o + 4)?);
-        let paged_frees = i64::from(read_u32(buf, o + 8)?);
+        let paged_allocs = read_u32(buf, o + 4)?;
+        let paged_frees = read_u32(buf, o + 8)?;
         let paged_used = read_u64(buf, o + 16)?;
-        let nonpaged_allocs = i64::from(read_u32(buf, o + 24)?);
-        let nonpaged_frees = i64::from(read_u32(buf, o + 28)?);
+        let nonpaged_allocs = read_u32(buf, o + 24)?;
+        let nonpaged_frees = read_u32(buf, o + 28)?;
         let nonpaged_used = read_u64(buf, o + 32)?;
         tags.push(PoolTag {
             tag,
             bytes: clamp_i64(paged_used.saturating_add(nonpaged_used)),
-            outstanding_allocs: (paged_allocs - paged_frees) + (nonpaged_allocs - nonpaged_frees),
+            outstanding_allocs: outstanding(paged_allocs, paged_frees)
+                + outstanding(nonpaged_allocs, nonpaged_frees),
         });
     }
     // Largest first; stable, so equal byte counts keep the kernel's order.
@@ -297,6 +314,9 @@ pub(crate) mod instrument {
     pub(crate) const FILE_NR: &str = "file-nr";
     pub(crate) const PROC_STAT: &str = "proc-stat";
     pub(crate) const PROC_PIDS: &str = "proc-pids";
+    /// The D3 probe: named once its rolling window holds at least one result.
+    /// Coord accepts the name verbatim in `kernel_source`.
+    pub(crate) const SPAWN_PROBE: &str = "spawn-probe";
 }
 
 /// Compose a Windows tick. Each input is `None` when that read failed.
@@ -317,9 +337,8 @@ pub(crate) fn windows_gauges(
         // A zero page size would turn every page count into 0 bytes — a
         // number, and the wrong one.
         if p.page_size > 0 {
-            g.kernel_paged_bytes = Some(clamp_i64(
-                p.kernel_paged_pages.saturating_mul(p.page_size),
-            ));
+            g.kernel_paged_bytes =
+                Some(clamp_i64(p.kernel_paged_pages.saturating_mul(p.page_size)));
             g.kernel_nonpaged_bytes = Some(clamp_i64(
                 p.kernel_nonpaged_pages.saturating_mul(p.page_size),
             ));
@@ -337,7 +356,7 @@ pub(crate) fn windows_gauges(
     }
     if let Some(o) = objects {
         g.kernel_token_objects = Some(i64::from(o.token_objects));
-        g.kernel_process_objects = o.process_objects.map(i64::from);
+        g.kernel_process_objects = Some(i64::from(o.process_objects));
         g.instruments.push(instrument::OBJECT_TYPES);
     }
     g
@@ -351,7 +370,11 @@ fn meminfo_bytes(meminfo: &str, key: &str) -> Option<i64> {
 
 /// `/proc/sys/fs/file-nr`'s first field: allocated file handles.
 pub(crate) fn parse_file_nr(text: &str) -> Option<i64> {
-    text.split_whitespace().next()?.parse::<i64>().ok().filter(|v| *v > 0)
+    text.split_whitespace()
+        .next()?
+        .parse::<i64>()
+        .ok()
+        .filter(|v| *v > 0)
 }
 
 /// `/proc/stat`'s `btime` line: the boot instant in Unix seconds.
@@ -419,10 +442,53 @@ pub(crate) fn is_pid_dir_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Keep a boot instant stable across ticks.
+/// `SYSTEM_TIMEOFDAY_INFORMATION` (`NtQuerySystemInformation` class 3): its
+/// first field is `BootTime`, a `LARGE_INTEGER` FILETIME (100 ns ticks since
+/// 1601-01-01 UTC). 48 bytes on x64; only the first 8 are read.
+pub(crate) const TIME_OF_DAY_BYTES: usize = 48;
+/// FILETIME ticks between 1601-01-01 and the Unix epoch.
+const FILETIME_UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+
+/// The kernel's own boot instant out of a `SystemTimeOfDayInformation`
+/// buffer, floored to the whole second; `None` for a short buffer or a value
+/// that is not a plausible instant (zero, or not after the Unix epoch).
 ///
-/// Windows has no boot timestamp in `GetPerformanceInfo`; the collector
-/// derives one as `now - GetTickCount64()`, which jitters by the tick
+/// The kernel holds this value for the life of the boot, so every process
+/// that reads it — this runner, the same runner after a restart, the next
+/// build — publishes the SAME `os_booted_at`. The fallback,
+/// `now - GetTickCount64()`, is re-derived per process and can land a second
+/// apart across a restart, which would split one boot in two for coord's S7
+/// slope (it groups samples by `os_booted_at`).
+pub(crate) fn parse_boot_time_of_day(buf: &[u8]) -> Option<DateTime<Utc>> {
+    let ticks = i64::try_from(read_u64(buf, 0)?).ok()?;
+    let since_epoch = ticks.checked_sub(FILETIME_UNIX_EPOCH_TICKS)?;
+    if since_epoch <= 0 {
+        return None;
+    }
+    DateTime::from_timestamp(since_epoch / 10_000_000, 0)
+}
+
+/// The boot instant a Windows tick publishes: the kernel's `BootTime` when
+/// that query answered, else the `GetTickCount64` derivation held stable by
+/// [`stable_boot_time`]. PURE, so the choice is testable off Windows.
+pub(crate) fn resolve_boot_time(
+    kernel: Option<DateTime<Utc>>,
+    prev: Option<DateTime<Utc>>,
+    tick_derived: Option<DateTime<Utc>>,
+    tolerance_secs: i64,
+) -> Option<DateTime<Utc>> {
+    kernel.or_else(|| {
+        tick_derived
+            .map(|fresh| stable_boot_time(prev, fresh, tolerance_secs))
+            .or(prev)
+    })
+}
+
+/// Keep a boot instant stable across ticks — the FALLBACK path only.
+///
+/// The collector uses the kernel's own `BootTime` ([`parse_boot_time_of_day`])
+/// as is. Only when that query fails does it derive one as
+/// `now - GetTickCount64()`, which jitters by the tick
 /// resolution (~16 ms) and drifts as NTP slews the wall clock. Coord's S7
 /// slope groups samples by `os_booted_at`, so a value that moved every tick
 /// would split one boot into thousands. The previous value is therefore kept
@@ -481,9 +547,25 @@ mod tests {
             counts,
             ObjectTypeCounts {
                 token_objects: 4_365_962,
-                process_objects: Some(2_930),
+                process_objects: 2_930,
             }
         );
+    }
+
+    #[test]
+    fn an_object_types_buffer_with_no_process_entry_is_unknown() {
+        // The real buffer with ONE byte changed: "Process" -> "Procesz". The
+        // Process entry sits at 0x2e8; the final 's' is UTF-16 unit 6.
+        let mut b = OBJECT_TYPES_26200.to_vec();
+        let s_at = 0x2e8 + 0x68 + 6 * 2;
+        assert_eq!(&b[s_at..s_at + 2], &[b's', 0]);
+        b[s_at] = b'z';
+        let entries = parse_object_types(&b).expect("still a well-formed buffer");
+        assert!(entries.iter().any(|e| e.name == "Token"));
+        assert!(entries.iter().all(|e| e.name != "Process"));
+        // Token is present and correct, and the read is still UNKNOWN: a
+        // buffer missing a row every kernel has is a misread.
+        assert_eq!(object_type_counts(&b), None);
     }
 
     #[test]
@@ -556,10 +638,7 @@ mod tests {
         // either cannot pass silently.
         let c: serde_json::Value = serde_json::from_str(CAPTURE_26200).unwrap();
         assert_eq!(c["object_types_information"]["type_count"], 75);
-        assert_eq!(
-            c["object_types_information"]["token"]["objects"],
-            4_365_962
-        );
+        assert_eq!(c["object_types_information"]["token"]["objects"], 4_365_962);
         assert_eq!(c["object_types_information"]["process"]["objects"], 2_930);
         assert_eq!(c["pool_tag_information"]["tag_count"], 3_379);
         let top = parse_pool_tags(POOL_TAGS_26200).unwrap().top;
@@ -575,7 +654,11 @@ mod tests {
     #[test]
     fn a_truncated_or_empty_pool_tag_buffer_is_unknown() {
         for cut in [0, 7, 8, 48, POOL_TAGS_26200.len() - 1] {
-            assert_eq!(parse_pool_tags(&POOL_TAGS_26200[..cut]), None, "cut at {cut}");
+            assert_eq!(
+                parse_pool_tags(&POOL_TAGS_26200[..cut]),
+                None,
+                "cut at {cut}"
+            );
         }
         let mut empty = vec![0u8; 8];
         empty[0..4].copy_from_slice(&0u32.to_le_bytes());
@@ -613,13 +696,15 @@ mod tests {
     }
 
     #[test]
-    fn outstanding_allocs_are_signed_not_wrapped() {
-        // One tag whose frees exceed its allocs (the counters wrap per pool).
+    fn outstanding_allocs_survive_a_wrapped_alloc_counter() {
+        // A busy tag whose PagedAllocs has wrapped past 2^32 while its frees
+        // have not yet: allocs reads 3, frees 0xFFFF_FFF0, so 19 are live.
+        // The nonpaged pool has not wrapped: 1 alloc, 0 frees.
         let mut b = vec![0u8; 8 + 40];
         b[0..4].copy_from_slice(&1u32.to_le_bytes());
         b[8..12].copy_from_slice(b"Wrap");
-        b[12..16].copy_from_slice(&5u32.to_le_bytes()); // paged allocs
-        b[16..20].copy_from_slice(&7u32.to_le_bytes()); // paged frees
+        b[12..16].copy_from_slice(&3u32.to_le_bytes()); // paged allocs (wrapped)
+        b[16..20].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes()); // paged frees
         b[24..32].copy_from_slice(&100u64.to_le_bytes()); // paged used
         b[32..36].copy_from_slice(&1u32.to_le_bytes()); // nonpaged allocs
         b[36..40].copy_from_slice(&0u32.to_le_bytes()); // nonpaged frees
@@ -630,9 +715,54 @@ mod tests {
             vec![PoolTag {
                 tag: "Wrap".into(),
                 bytes: 128,
-                outstanding_allocs: -1,
+                outstanding_allocs: 20,
             }]
         );
+        assert_eq!(outstanding(3, 0xFFFF_FFF0), 19);
+        assert_eq!(outstanding(10, 4), 6);
+        assert_eq!(outstanding(0, 0), 0);
+    }
+
+    #[test]
+    fn the_kernel_boot_time_parses_from_time_of_day_information() {
+        // 2026-10-15T06:12:00.123Z as FILETIME ticks: floored to the second.
+        let unix = 1_792_044_720_i64;
+        let ticks = unix * 10_000_000 + 1_230_000 + FILETIME_UNIX_EPOCH_TICKS;
+        let mut b = vec![0u8; TIME_OF_DAY_BYTES];
+        b[0..8].copy_from_slice(&u64::try_from(ticks).unwrap().to_le_bytes());
+        assert_eq!(parse_boot_time_of_day(&b), Some(at(unix)));
+        assert_eq!(at(unix).to_rfc3339(), "2026-10-15T06:12:00+00:00");
+        // Short, zero or pre-epoch buffers are UNKNOWN.
+        assert_eq!(parse_boot_time_of_day(&b[..7]), None);
+        assert_eq!(parse_boot_time_of_day(&[0u8; TIME_OF_DAY_BYTES]), None);
+        let mut early = vec![0u8; TIME_OF_DAY_BYTES];
+        early[0..8].copy_from_slice(&1_000u64.to_le_bytes());
+        assert_eq!(parse_boot_time_of_day(&early), None);
+    }
+
+    #[test]
+    fn the_kernel_boot_time_wins_and_the_tick_derivation_is_only_a_fallback() {
+        let kernel = at(1_760_000_000);
+        let prev = at(1_760_000_003);
+        let tick = at(1_760_000_004);
+        // The kernel answered: its value, whatever the derivation says.
+        assert_eq!(
+            resolve_boot_time(Some(kernel), Some(prev), Some(tick), 120),
+            Some(kernel)
+        );
+        assert_eq!(
+            resolve_boot_time(Some(kernel), None, None, 120),
+            Some(kernel)
+        );
+        // It did not: the derivation, held to the previous value within tolerance.
+        assert_eq!(
+            resolve_boot_time(None, Some(prev), Some(tick), 120),
+            Some(prev)
+        );
+        assert_eq!(resolve_boot_time(None, None, Some(tick), 120), Some(tick));
+        // Neither answered this tick: keep what we had.
+        assert_eq!(resolve_boot_time(None, Some(prev), None, 120), Some(prev));
+        assert_eq!(resolve_boot_time(None, None, None, 120), None);
     }
 
     fn at(secs: i64) -> DateTime<Utc> {
@@ -703,11 +833,19 @@ mod tests {
     #[test]
     fn linux_gauges_follow_the_d2_mapping_and_leave_windows_axes_not_applicable() {
         let stat = "cpu  1 2 3 4\nbtime 1760000000\nprocesses 12345\n";
-        let g = linux_gauges(Some(MEMINFO), Some("4128\t0\t9223372036854775807\n"), Some(stat), Some(312));
+        let g = linux_gauges(
+            Some(MEMINFO),
+            Some("4128\t0\t9223372036854775807\n"),
+            Some(stat),
+            Some(312),
+        );
         // paged = SReclaimable only — NOT Slab, which already contains SUnreclaim.
         assert_eq!(g.kernel_paged_bytes, Some(600_000 * 1024));
         // nonpaged = SUnreclaim + KernelStack + PageTables.
-        assert_eq!(g.kernel_nonpaged_bytes, Some((300_000 + 20_000 + 40_000) * 1024));
+        assert_eq!(
+            g.kernel_nonpaged_bytes,
+            Some((300_000 + 20_000 + 40_000) * 1024)
+        );
         assert_eq!(g.kernel_handle_count, Some(4_128));
         assert_eq!(g.os_booted_at, Some(at(1_760_000_000)));
         assert_eq!(g.os_process_count, Some(312));
@@ -732,7 +870,10 @@ mod tests {
         assert_eq!(g.kernel_nonpaged_bytes, None);
         assert_eq!(g.kernel_handle_count, None);
         assert_eq!(g.os_booted_at, None);
-        assert_eq!(g.os_process_count, None, "a walk that counted 0 is not 0 processes");
+        assert_eq!(
+            g.os_process_count, None,
+            "a walk that counted 0 is not 0 processes"
+        );
         assert_eq!(g.instruments, vec!["proc-meminfo"]);
     }
 
