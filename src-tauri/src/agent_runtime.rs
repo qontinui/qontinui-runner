@@ -1052,7 +1052,7 @@ pub(crate) fn claude_bin_path() -> String {
 /// such a file would trade that for an `EACCES` on every attempt. On
 /// Windows, and for anything that is not an absolute path, `resolved` is
 /// returned as is.
-fn launchable_or_bare(resolved: String) -> String {
+pub(crate) fn launchable_or_bare(resolved: String) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
