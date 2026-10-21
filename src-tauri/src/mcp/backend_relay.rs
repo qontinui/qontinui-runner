@@ -2468,55 +2468,8 @@ async fn handle_outbound(
                     }
                 }
 
-                // Wire shapes are defined in `qontinui_runner_lib::relay_envelopes`
-                // (lib-side so the schema_export aggregator can register them) —
-                // see that module's docs for the discriminated-union contract
-                // shared with web + mobile consumers via
-                // `@qontinui/shared-types/tauri-events`.
-                use qontinui_runner_lib::relay_envelopes::RunnerRelayMessage;
-                let relay_msg = match channel {
-                    "phase-result" => {
-                        // event.payload = { execution_id, result }
-                        let payload = event.get("payload").cloned().unwrap_or(Value::Null);
-                        RunnerRelayMessage::PhaseCompleted { data: payload }
-                    }
-                    "ui-error" => RunnerRelayMessage::UiError {
-                        data: event.get("payload").cloned().unwrap_or(Value::Null),
-                    },
-                    "recent-crash" => RunnerRelayMessage::RecentCrash {
-                        data: event.get("payload").cloned().unwrap_or(Value::Null),
-                    },
-                    "ai-output" => RunnerRelayMessage::ChatResponse {
-                        data: event.get("payload").cloned().unwrap_or(Value::Null),
-                    },
-                    "session-state" => RunnerRelayMessage::ChatSessionState {
-                        data: event.get("payload").cloned().unwrap_or(Value::Null),
-                    },
-                    "terminal-output" => RunnerRelayMessage::TerminalOutput {
-                        terminal_id: event
-                            .get("payload")
-                            .and_then(|p| p.get("terminal_id"))
-                            .cloned()
-                            .unwrap_or(Value::Null),
-                        data: event
-                            .get("payload")
-                            .and_then(|p| p.get("data"))
-                            .cloned()
-                            .unwrap_or(Value::Null),
-                    },
-                    "terminal-exit" => RunnerRelayMessage::TerminalExit {
-                        terminal_id: event
-                            .get("payload")
-                            .and_then(|p| p.get("terminal_id"))
-                            .cloned()
-                            .unwrap_or(Value::Null),
-                        exit_code: event
-                            .get("payload")
-                            .and_then(|p| p.get("exit_code"))
-                            .cloned()
-                            .unwrap_or(Value::Null),
-                    },
-                    _ => continue,
+                let Some(relay_msg) = relay_message_for_event(channel, &event) else {
+                    continue;
                 };
 
                 let text = serde_json::to_string(&relay_msg).unwrap_or_default();
@@ -2540,6 +2493,66 @@ async fn handle_outbound(
             }
         }
     }
+}
+
+/// Map one `event_broadcast` event (`{"channel", "payload"}`) to the typed
+/// relay frame [`handle_outbound`] forwards, or `None` for a channel the relay
+/// does not carry. Pure: the terminal flood control stays in the caller.
+///
+/// Wire shapes are defined in `qontinui_runner_lib::relay_envelopes`
+/// (lib-side so the schema_export aggregator can register them) — see that
+/// module's docs for the discriminated-union contract shared with web +
+/// mobile consumers via `@qontinui/shared-types/tauri-events`.
+fn relay_message_for_event(
+    channel: &str,
+    event: &Value,
+) -> Option<qontinui_runner_lib::relay_envelopes::RunnerRelayMessage> {
+    use qontinui_runner_lib::relay_envelopes::RunnerRelayMessage;
+    let msg = match channel {
+        "phase-result" => {
+            // event.payload = { execution_id, result }
+            let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+            RunnerRelayMessage::PhaseCompleted { data: payload }
+        }
+        "ui-error" => RunnerRelayMessage::UiError {
+            data: event.get("payload").cloned().unwrap_or(Value::Null),
+        },
+        "recent-crash" => RunnerRelayMessage::RecentCrash {
+            data: event.get("payload").cloned().unwrap_or(Value::Null),
+        },
+        "ai-output" => RunnerRelayMessage::ChatResponse {
+            data: event.get("payload").cloned().unwrap_or(Value::Null),
+        },
+        "session-state" => RunnerRelayMessage::ChatSessionState {
+            data: event.get("payload").cloned().unwrap_or(Value::Null),
+        },
+        "terminal-output" => RunnerRelayMessage::TerminalOutput {
+            terminal_id: event
+                .get("payload")
+                .and_then(|p| p.get("terminal_id"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            data: event
+                .get("payload")
+                .and_then(|p| p.get("data"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+        "terminal-exit" => RunnerRelayMessage::TerminalExit {
+            terminal_id: event
+                .get("payload")
+                .and_then(|p| p.get("terminal_id"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            exit_code: event
+                .get("payload")
+                .and_then(|p| p.get("exit_code"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+        _ => return None,
+    };
+    Some(msg)
 }
 
 /// Build the `last_error` text for a socket that closed *before* the
@@ -4023,16 +4036,23 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
             about anything — workflows, automation, code questions, or general topics."
             .to_string();
 
+        // Session context so this relay chat's output carries its run id
+        // (`AiOutputEvent.taskRunId`) and the stdout dispatcher emits its
+        // turn-end state transitions — both are gated on `session_ctx` being
+        // `Some`. Same shape as `mcp::task_runs::create_ai_session`.
+        let session_ctx =
+            crate::mcp::shared::AiSessionContext::setup(&bg_task_run_id, &bg_task_name);
+
         match crate::claude_session::ClaudeSession::spawn(
             &working_dir,
             &bg_task_run_id,
             &bg_state.app_handle,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            Some(session_ctx),
+            None, // finding_ctx
+            None, // progress_ctx
+            None, // pid_tracker
+            None, // model_override
+            None, // worktree
             None, // tool_policy
             None, // cli_session_ctx
             None, // agent_log_emitter — relay path, no coord agent_logs
@@ -8916,5 +8936,67 @@ mod relay_create_drain_message_tests {
             );
             assert_eq!(message.matches(" — ").count(), 1, "{message}");
         }
+    }
+}
+
+#[cfg(test)]
+mod outbound_mapping_tests {
+    //! `relay_message_for_event` — what `handle_outbound` puts on the wire for
+    //! an `event_broadcast` event. The `session-state` case is driven from
+    //! the exact payload `emit_session_state_ex` publishes, so a drift in
+    //! either half shows up here rather than as a silent web panel.
+    use super::relay_message_for_event;
+    use crate::commands::ai_session::{
+        session_state_ws_payload, SessionStateEvent, SESSION_STATE_WS_CHANNEL,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn a_published_session_state_reaches_the_relay_as_chat_session_state() {
+        let event = SessionStateEvent {
+            task_run_id: "run-1".to_string(),
+            session_id: "sess-1".to_string(),
+            state: "ready".to_string(),
+            resumed: false,
+        };
+        let payload = session_state_ws_payload(&event).unwrap();
+        // The envelope `broadcast_ws_notification` wraps every payload in.
+        let broadcast = json!({ "channel": SESSION_STATE_WS_CHANNEL, "payload": payload });
+        assert_eq!(
+            broadcast,
+            json!({
+                "channel": "session-state",
+                "payload": { "taskRunId": "run-1", "sessionId": "sess-1", "state": "ready" }
+            })
+        );
+
+        let frame = relay_message_for_event(SESSION_STATE_WS_CHANNEL, &broadcast)
+            .expect("session-state is a relayed channel");
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            json!({
+                "type": "chat_session_state",
+                "data": { "taskRunId": "run-1", "sessionId": "sess-1", "state": "ready" }
+            })
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_state_carries_the_resumed_flag() {
+        let event = SessionStateEvent {
+            task_run_id: "run-2".to_string(),
+            session_id: "sess-2".to_string(),
+            state: "processing".to_string(),
+            resumed: true,
+        };
+        let payload = session_state_ws_payload(&event).unwrap();
+        assert_eq!(payload["resumed"], json!(true));
+        assert_eq!(payload["taskRunId"], json!("run-2"));
+    }
+
+    #[test]
+    fn an_unrelayed_channel_maps_to_nothing() {
+        let broadcast = json!({ "channel": "workflow-progress", "payload": {} });
+        assert!(relay_message_for_event("workflow-progress", &broadcast).is_none());
     }
 }
