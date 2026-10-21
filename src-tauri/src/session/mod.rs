@@ -66,6 +66,7 @@ pub mod coord_transport_rung; // WHICH transport rung carried a coord call — t
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
 pub mod handoff;
+pub mod in_flight; // The ONE session-scope in-flight registry — migration, resume door and respawn receiver; held by the lifecycle poll (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
 pub mod intent;
 pub mod local_store;
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)

@@ -4956,18 +4956,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // restore — never closed `no-terminal` meanwhile.
                             let adoption_pending =
                                 terminal::holder_boot_sweep::adoption_pending(&rec.terminal_id);
-                            let action = hold_for_withheld_boot_restore(
-                                classify(
-                                    live_is_alive,
-                                    claude_present,
-                                    prior,
-                                    prior_no_match,
-                                    snapshot_ok,
-                                    restore_pending,
-                                    confirmed,
-                                    worker_plane,
+                            // A respawn (account migration, resume door,
+                            // respawn receiver) is proving this session's new
+                            // pane alive or rolling it back: its row may sit
+                            // on a pane whose child already exited, and a
+                            // close here would destroy what the retry or the
+                            // rollback rebinds (plan
+                            // 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn).
+                            let respawn_in_flight =
+                                session::in_flight::is_in_flight(&rec.claude_session_id);
+                            let action = session::in_flight::hold_for_in_flight_respawn(
+                                hold_for_withheld_boot_restore(
+                                    classify(
+                                        live_is_alive,
+                                        claude_present,
+                                        prior,
+                                        prior_no_match,
+                                        snapshot_ok,
+                                        restore_pending,
+                                        confirmed,
+                                        worker_plane,
+                                    ),
+                                    held || adoption_pending,
                                 ),
-                                held || adoption_pending,
+                                respawn_in_flight,
                             );
                             if adoption_pending && action == PollAction::Skip {
                                 consecutive_no_match.remove(&rec.claude_session_id);
