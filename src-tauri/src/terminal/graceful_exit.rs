@@ -193,7 +193,7 @@ const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
 /// phrases. That errs toward refusing, which is right for `/exit`: a refusal
 /// only postpones a wind-down.
 pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
-    prompt_ready_with(screen, DIALOG_MARKERS)
+    prompt_ready_with(screen, DIALOG_MARKERS, true)
 }
 
 /// May a message be PASTED into the input box now? The same checks as
@@ -210,14 +210,55 @@ pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
 /// selected choice sits on the cursor row as a numbered option, and it prints
 /// the chrome hints.
 pub fn input_prompt_ready(screen: &ScreenText) -> Result<(), String> {
-    prompt_ready_with(screen, DIALOG_CHROME_MARKERS)
+    prompt_ready_with(screen, DIALOG_CHROME_MARKERS, true)
 }
 
-fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(), String> {
+/// May a message be typed into the input box of a BUSY turn? (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D2.)
+///
+/// [`input_prompt_ready`] minus the turn-complete predicate, plus the busy
+/// marker ([`crate::terminal::account_migration::BUSY_MARKER`]): Claude is
+/// mid-turn, AND its input box is the thing under the cursor, empty, with no
+/// numbered choice selected and no dialog chrome showing. Every screen check
+/// [`input_prompt_ready`] makes except "the screen looks idle" is kept, so a
+/// permission dialog that opens during a turn is refused here exactly as it
+/// is there.
+///
+/// Requiring the busy marker keeps the two arms disjoint: an idle screen is
+/// [`input_prompt_ready`]'s, never this one's, so a caller cannot reach an
+/// idle pane through the arm that skips the idle check.
+///
+/// Whether Claude Code QUEUES text typed into a busy turn's prompt box, and
+/// delivers it at the next input point, is the plan's Phase 1 probe 2 — this
+/// predicate only says the box is safe to type into.
+pub fn busy_prompt_accepts_input(screen: &ScreenText) -> Result<(), String> {
+    let normalized = super::output_scan::normalize(&screen.lines.join("\n"));
+    if !normalized.contains(super::account_migration::BUSY_MARKER) {
+        return Err(format!(
+            "no busy marker (`{}`) on screen — not a busy turn",
+            super::account_migration::BUSY_MARKER
+        ));
+    }
+    prompt_ready_with(screen, DIALOG_CHROME_MARKERS, false)
+}
+
+/// The shared screen check behind [`exit_prompt_ready`],
+/// [`input_prompt_ready`] and [`busy_prompt_accepts_input`].
+///
+/// `require_idle` adds the shared turn-complete predicate
+/// ([`snapshot_looks_idle`]). It is `false` ONLY for the busy arm, which
+/// checks the opposite (the busy marker) itself; every other check — the
+/// cursor-row `❯`, an empty input line, no numbered choice, no dialog text —
+/// applies to both.
+fn prompt_ready_with(
+    screen: &ScreenText,
+    dialog_markers: &[&str],
+    require_idle: bool,
+) -> Result<(), String> {
     let Some(line) = prompt_line(screen) else {
         return Err("no `❯` input prompt on the cursor row".to_string());
     };
-    if !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
+    if require_idle && !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
         return Err("the screen does not look idle".to_string());
     }
     if is_numbered_option(&line.input) {
@@ -780,6 +821,81 @@ mod tests {
             3,
             3,
         )
+    }
+
+    /// A turn in progress: the spinner line carries the busy marker, and the
+    /// input box below it is empty with the cursor at the input start — the
+    /// shape Claude Code paints while it works and the operator has typed
+    /// nothing.
+    fn busy_turn() -> ScreenText {
+        screen(
+            vec![
+                "✻ Churning… (12s · ↓ 310 tokens · esc to interrupt)".to_string(),
+                format!("{}● high · /effort", " ".repeat(102)),
+                edge(),
+                "❯\u{a0}".to_string(),
+                edge(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+            ],
+            3,
+            2,
+        )
+    }
+
+    /// A permission dialog opened mid-turn: the busy marker is still painted,
+    /// and the cursor row holds the dialog's selected numbered choice.
+    fn busy_turn_with_a_selected_choice() -> ScreenText {
+        screen(
+            vec![
+                "✻ Churning… (40s · esc to interrupt)".to_string(),
+                " Bash command".to_string(),
+                "   rm -rf build".to_string(),
+                " Do you want to proceed?".to_string(),
+                " ❯ 1. Yes".to_string(),
+                "   2. No, and tell Claude what to do differently (esc)".to_string(),
+            ],
+            4,
+            3,
+        )
+    }
+
+    #[test]
+    fn a_busy_screen_passes_the_busy_arm_and_fails_input_prompt_ready() {
+        let s = busy_turn();
+        assert_eq!(busy_prompt_accepts_input(&s), Ok(()));
+        let why = input_prompt_ready(&s).unwrap_err();
+        assert!(why.contains("idle"), "refused for the idle check: {why}");
+    }
+
+    #[test]
+    fn a_busy_screen_with_a_selected_numbered_choice_fails_both_arms() {
+        let s = busy_turn_with_a_selected_choice();
+        let busy = busy_prompt_accepts_input(&s).unwrap_err();
+        assert!(busy.contains("numbered choice"), "busy arm: {busy}");
+        assert!(input_prompt_ready(&s).is_err());
+    }
+
+    #[test]
+    fn the_busy_arm_keeps_every_screen_check_but_the_idle_one() {
+        // An idle screen is NOT the busy arm's: no busy marker.
+        let idle = busy_prompt_accepts_input(&empty_prompt()).unwrap_err();
+        assert!(idle.contains("busy marker"), "{idle}");
+        // A half-typed prompt during a turn: the operator's draft.
+        let mut draft = busy_turn();
+        draft.lines[3] = "❯\u{a0}half a thought".to_string();
+        draft.cursor_col = 16;
+        assert!(busy_prompt_accepts_input(&draft).is_err());
+        // Cursor parked at the input start over typed text is refused too.
+        draft.cursor_col = 2;
+        assert!(busy_prompt_accepts_input(&draft).is_err());
+        // Dialog chrome above the cursor during a turn.
+        let mut chrome = busy_turn();
+        chrome.lines[1] = "  Enter to confirm · Esc to cancel".to_string();
+        assert!(busy_prompt_accepts_input(&chrome).is_err());
+        // No `❯` on the cursor row: the cursor is up in streaming output.
+        let mut streaming = busy_turn();
+        streaming.cursor_row = 0;
+        assert!(busy_prompt_accepts_input(&streaming).is_err());
     }
 
     #[test]

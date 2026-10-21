@@ -238,6 +238,7 @@ mod repo_detection;
 /// (`terminal::session`) and the secondary runner process (`instance_manager`) —
 /// sit in different subtrees.
 mod resource_guard;
+mod restart_prep; // Operator "prepare for restart": cohort record, effort, reads (plan 2026-10-21-operator-prepare-for-restart-and-progressive-restore)
 mod restate;
 mod rework;
 mod routing;

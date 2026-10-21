@@ -253,7 +253,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
 /// most recent assistant turn (`.message.model`). `None` when the transcript
 /// is unreadable or records no real model (synthetic error turns are
 /// skipped) — the respawn then omits `--model` and the CLI default applies.
-fn transcript_last_model(path: &Path) -> Option<String> {
+pub(crate) fn transcript_last_model(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     for line in content.lines().rev() {
         // Cheap pre-filter before parsing multi-KB JSONL lines.
@@ -304,7 +304,7 @@ it left off; if you were idle awaiting operator input, say so and wait.";
 ///
 /// Painted while Claude is mid-turn — if visible, the session already picked
 /// itself up (or the operator beat us to it) and no nudge is needed.
-const BUSY_MARKER: &str = "esc to interrupt";
+pub(crate) const BUSY_MARKER: &str = "esc to interrupt";
 
 /// What one grid read tells the idle watcher.
 #[derive(Debug, PartialEq, Eq)]
