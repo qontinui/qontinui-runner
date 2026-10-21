@@ -73,6 +73,7 @@ mod check_generation;
 mod ci_node;
 mod claude_accounts;
 mod claude_cli_spawn;
+mod claude_cli_update;
 mod claude_protocol;
 mod claude_session;
 mod click_overlay;
@@ -5769,6 +5770,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let health_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
                 let health_im = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
                 instance_health::start_instance_health_monitor(health_pg, health_im);
+
+                // The runner-owned Claude CLI updater (plan
+                // `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`,
+                // Phase 2). Primary only: installing is a machine-wide duty and two
+                // runners on one box would race each other's installs. A secondary
+                // never completes a version read, so its children keep the CLI's
+                // own updater (see `claude_cli_update::child_env_pairs`).
+                tauri::async_runtime::spawn(async move {
+                    claude_cli_update::run_periodic().await;
+                });
             }
 
             // Start scheduler service in background (skip for secondary instances to avoid duplicate executions)

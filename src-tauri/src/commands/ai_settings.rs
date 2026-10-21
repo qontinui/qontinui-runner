@@ -147,6 +147,7 @@ pub fn save_ai_settings(
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
     account_selection_pinned: Option<bool>,
+    runner_manages_cli_updates: Option<bool>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, account_selection_pinned={:?}, video_after_iterations={:?}, interactive={:?}",
@@ -203,6 +204,9 @@ pub fn save_ai_settings(
                 ),
                 auto_continue_after_migration: auto_continue_after_migration
                     .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
+                // `None` (an older frontend) preserves the configured value.
+                runner_manages_cli_updates: runner_manages_cli_updates
+                    .unwrap_or(existing_settings.claude_cli.runner_manages_cli_updates),
             },
             claude_api: ClaudeApiSettings { model, max_tokens },
             // Preserve existing Gemini settings
