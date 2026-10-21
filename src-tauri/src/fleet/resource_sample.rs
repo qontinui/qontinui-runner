@@ -3157,7 +3157,10 @@ MemAvailable:   15335424 kB
         for k in KERNEL_KEYS {
             assert!(!obj.contains_key(k), "{k} must be omitted when None");
         }
-        assert!(!obj.contains_key("os_health"), "the group must be flattened");
+        assert!(
+            !obj.contains_key("os_health"),
+            "the group must be flattened"
+        );
 
         // The incident snapshot: every key, top-level, with its value.
         let mut s = ResourceSample::empty(Lane::Host, None);
@@ -3188,7 +3191,10 @@ MemAvailable:   15335424 kB
         assert_eq!(v["spawn_probe_timeouts"], 1);
         assert_eq!(v["spawn_probe_errors"], 1);
         assert_eq!(v["spawn_probe_error_code"], 1450);
-        assert_eq!(v["kernel_source"], "windows:getperformanceinfo+objecttypes+pooltags");
+        assert_eq!(
+            v["kernel_source"],
+            "windows:getperformanceinfo+objecttypes+pooltags+spawn-probe"
+        );
         // The pre-existing columns are untouched by the flatten.
         assert_eq!(v["lane"], "host");
         assert_eq!(v["source"], "runner");
@@ -3207,13 +3213,85 @@ MemAvailable:   15335424 kB
         assert_eq!(v["spawn_probe_timeouts"], 0);
     }
 
-    /// The host lane COPIES the os-health snapshot and reads nothing itself.
+    /// THE PUBLISH-PATH ARMING TEST (plan
+    /// `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`
+    /// Phase 4). It enters through `collect_host_lane()` — the function
+    /// `publish_once` → `collect` runs for every primary's host-lane row — with
+    /// the incident snapshot in the PROCESS-GLOBAL `os-health` cell, and
+    /// serializes the POST body exactly as `publish_once` builds it. Every
+    /// kernel column must arrive as a top-level key of `samples[0]`, with the
+    /// incident's values. An empty cell must put none of them on the wire.
     #[test]
-    fn the_host_lane_copies_the_os_health_snapshot() {
-        let host = collect_host_lane_src();
+    fn the_host_lane_publishes_the_os_health_cell_as_top_level_column_keys() {
+        const KERNEL_KEYS: [&str; 16] = [
+            "kernel_paged_bytes",
+            "kernel_nonpaged_bytes",
+            "kernel_handle_count",
+            "kernel_token_objects",
+            "kernel_process_objects",
+            "os_process_count",
+            "os_booted_at",
+            "kernel_pool_top_tags",
+            "kernel_pool_tags_at",
+            "spawn_probe_p50_ms",
+            "spawn_probe_max_ms",
+            "spawn_probe_count",
+            "spawn_probe_timeouts",
+            "spawn_probe_errors",
+            "spawn_probe_error_code",
+            "kernel_source",
+        ];
+        let wire = |host: ResourceSample| {
+            serde_json::to_value(ResourceSampleReq {
+                device_id: "dev".into(),
+                tenant_id: None,
+                sampled_at: chrono::Utc::now().to_rfc3339(),
+                samples: vec![host],
+            })
+            .unwrap()
+        };
+
+        let mut snap = crate::os_health::incident_snapshot_for_tests();
+        // Read just now, so the stale gate passes it through.
+        snap.read_at = chrono::Utc::now();
+        let v = {
+            let _cell = crate::os_health::store_for_tests(Some(snap));
+            wire(collect_host_lane())
+        };
+        let row = v["samples"][0].as_object().expect("one host-lane row");
+        assert_eq!(row["lane"], "host");
+        for k in KERNEL_KEYS {
+            assert!(
+                row.contains_key(k),
+                "{k} missing from the host-lane row: {v}"
+            );
+        }
         assert!(
-            host.contains("s.os_health = crate::os_health::sample_fields();"),
-            "the host lane must publish the os-health thread's cached snapshot"
+            !row.contains_key("os_health"),
+            "the group must be flattened"
         );
+        assert_eq!(row["kernel_token_objects"], 4_365_962);
+        assert_eq!(row["kernel_process_objects"], 2_930);
+        assert_eq!(row["kernel_paged_bytes"], 24_282_075_136_i64);
+        assert_eq!(row["kernel_pool_top_tags"][1]["tag"], "Toke");
+        assert_eq!(row["spawn_probe_p50_ms"], 2_400);
+        assert_eq!(row["spawn_probe_error_code"], 1450);
+        assert_eq!(
+            row["kernel_source"],
+            "windows:getperformanceinfo+objecttypes+pooltags+spawn-probe"
+        );
+
+        // An empty cell (before the first tick): no kernel key at all.
+        let v = {
+            let _cell = crate::os_health::store_for_tests(None);
+            wire(collect_host_lane())
+        };
+        let row = v["samples"][0].as_object().unwrap();
+        for k in KERNEL_KEYS {
+            assert!(
+                !row.contains_key(k),
+                "{k} present with an empty os-health cell: {v}"
+            );
+        }
     }
 }

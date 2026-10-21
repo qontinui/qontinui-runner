@@ -10,16 +10,21 @@
 //! ## Why every probe goes through `run_with_timeout`
 //!
 //! [`crate::process_helpers::run_with_timeout`] kills the whole process TREE
-//! when its bound expires, and reaps it. An abandoned probe child is not a
-//! hypothetical: the runner's own resource sampler once piled up **512** stuck
-//! `wsl.exe` holding 98k handles by abandoning its probes
+//! when its bound expires, and reaps it — the tree kill and the reap are
+//! pinned by that helper's own tests
+//! (`process_helpers::tests::a_timed_out_child_reaps_its_whole_tree_and_leaks_no_reader_threads`
+//! and `a_tree_timeout_still_reaps_the_whole_group`), and this module's
+//! `a_probe_timeout_is_a_censored_30_000_ms_sample_and_the_child_is_killed`
+//! asserts the probe got the kill and the reap back. An abandoned probe child
+//! is not a hypothetical: the runner's own resource sampler once piled up
+//! **512** stuck `wsl.exe` holding 98k handles by abandoning its probes
 //! (`fleet::resource_sample::wsl_probe`). A probe meant to detect a sick
 //! kernel must not be what sickens it. The probe runs synchronously on the one
 //! `os-health` thread, so exactly one is ever in flight.
 //!
 //! ## What a result means
 //!
-//! * A child that exited is a latency **sample**.
+//! * A child that exited **successfully** is a latency **sample**.
 //! * A child that overran the bound is a **censored sample** at
 //!   [`CENSORED_MS`]: it is the worst reading there is, not an absence of one,
 //!   so it counts in p50 and max. Dropping it would leave a box whose every
@@ -28,14 +33,30 @@
 //! * A child that could not be created at all (Windows error 1450,
 //!   `NoSystemResources`) is **not** a latency sample. It counts in `errors`,
 //!   and the latest OS error code rides beside it.
+//! * A child that was created but **exited with a failure status** is not a
+//!   sample either: `cmd.exe /c exit` and `true` cannot fail on a healthy box,
+//!   and the way they do fail on a sick one is `0xC0000142`
+//!   (`STATUS_DLL_INIT_FAILED`, the desktop-heap / resource-exhaustion exit),
+//!   which is a FAILED process creation, not a fast one. It counts in `errors`
+//!   with the exit status as its code.
+//! * A probe program that does not exist (`NotFound`) is an INSTRUMENT
+//!   failure, not a measurement of the OS: the window is emptied, so the stats
+//!   read UNKNOWN (and `kernel_source` stops naming `spawn-probe`) until the
+//!   program can be found again. Counting it as a create error would grade a
+//!   box with a broken `PATH` as one that cannot create processes.
 //!
-//! ## Measurement resolution
+//! ## Measurement resolution, and what the number includes
 //!
+//! The reading is wall time around the WHOLE `run_with_timeout` call, so it
+//! includes, beyond process creation itself: setting up the two pipe readers,
+//! the poll granularity, and on a completed child the bounded pipe drain; on a
+//! timeout it includes the tree kill and the reap (a timeout publishes the
+//! fixed [`CENSORED_MS`], so that only shows in the log's `elapsed`).
 //! `run_with_timeout` polls the child with a backoff that starts at 2 ms and
 //! settles at 50 ms, so a reading is rounded UP to the next poll: a 20 ms child
-//! reads ~30 ms, and above ~110 ms the error is at most 50 ms. That is well
-//! inside the S9 bands (250 ms warn, 1,000 ms breach) and is the price of never
-//! calling an unbounded `Child::wait`.
+//! reads ~30 ms, and above ~110 ms the error is at most 50 ms. All of that is
+//! well inside the S9 bands (250 ms warn, 1,000 ms breach) and is the price of
+//! never calling an unbounded `Child::wait`.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -60,13 +81,21 @@ pub(crate) const WINDOW: usize = 10;
 /// One probe's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeResult {
-    /// The child was created and exited on its own; wall time spawn → exit.
+    /// The child was created and exited SUCCESSFULLY on its own; wall time
+    /// around the whole bounded run (see the module docs).
     Completed { ms: u32 },
     /// The child overran the bound; its tree was killed and reaped.
     TimedOut,
     /// The child could not be created, or could not be polled. `code` is
     /// `raw_os_error()`.
     SpawnError { code: Option<i32> },
+    /// The child was created but exited with a failure status — on Windows
+    /// typically `0xC0000142` (`STATUS_DLL_INIT_FAILED`). `code` is the exit
+    /// status (`None` for a Unix child killed by a signal).
+    ExitedNonZero { code: Option<i32> },
+    /// The probe program was not found: an instrument failure, not a
+    /// measurement. Empties the window (see [`ProbeWindow::push`]).
+    Unavailable,
 }
 
 /// What one probe did: the [`ProbeResult`] plus the evidence a caller logs and
@@ -78,7 +107,9 @@ pub(crate) struct ProbeRun {
     pub(crate) killed_pid: Option<u32>,
     /// Whether the killed child was reaped, on a timeout.
     pub(crate) reaped: Option<bool>,
-    /// Wall time this probe held the calling thread.
+    /// Wall time this probe held the calling thread — the whole bounded run,
+    /// including pipe-reader setup, the drain and (on a timeout) the tree kill
+    /// and the reap.
     pub(crate) elapsed: Duration,
 }
 
@@ -121,15 +152,25 @@ impl SpawnProbe {
         let out = crate::process_helpers::run_with_timeout(cmd, self.timeout);
         let elapsed = started.elapsed();
         let (result, killed_pid, reaped) = match out {
-            Ok(TimedOutput::Completed(_)) => (
+            Ok(TimedOutput::Completed(o)) if o.status.success() => (
                 ProbeResult::Completed {
                     ms: u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX),
                 },
                 None,
                 None,
             ),
+            Ok(TimedOutput::Completed(o)) => (
+                ProbeResult::ExitedNonZero {
+                    code: o.status.code(),
+                },
+                None,
+                None,
+            ),
             Ok(TimedOutput::TimedOut { pid, reaped }) => {
                 (ProbeResult::TimedOut, Some(pid), Some(reaped))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (ProbeResult::Unavailable, None, None)
             }
             Err(e) => (
                 ProbeResult::SpawnError {
@@ -163,10 +204,24 @@ pub(crate) fn probe_command() -> std::process::Command {
     cmd
 }
 
-/// `/bin/true`.
+/// `true`, by absolute path: `/bin/true`, else `/usr/bin/true` (a usr-merged
+/// or minimal distribution may have only one), else a bare `true` resolved
+/// through `PATH`. If none exists the spawn fails `NotFound`, which the probe
+/// reports as an instrument failure ([`ProbeResult::Unavailable`]).
 #[cfg(not(windows))]
 pub(crate) fn probe_command() -> std::process::Command {
-    crate::process_helpers::no_window("/bin/true")
+    crate::process_helpers::no_window(true_program(|p| p.exists()))
+}
+
+/// The `true` program to run, given which paths exist. PURE apart from
+/// `exists`, so the fallback order is testable on any OS.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn true_program(exists: impl Fn(&std::path::Path) -> bool) -> std::path::PathBuf {
+    ["/bin/true", "/usr/bin/true"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| exists(p))
+        .unwrap_or_else(|| std::path::PathBuf::from("true"))
 }
 
 /// The published reading over the last [`WINDOW`] probes.
@@ -181,10 +236,13 @@ pub(crate) struct SpawnProbeStats {
     pub(crate) count: u32,
     /// Censored samples in the window.
     pub(crate) timeouts: u32,
-    /// Probes in the window whose child could not be created.
+    /// Probes in the window whose child could not be created, or was created
+    /// and exited with a failure status.
     pub(crate) errors: u32,
-    /// The OS error code of the LATEST error in the window, when it carried
-    /// one. `None` once every error has aged out.
+    /// The code of the LATEST error in the window, when it carried one: the
+    /// OS error for a create failure, the exit status for a child that exited
+    /// failing (e.g. `0xC0000142` as an `i32`). `None` once every error has
+    /// aged out.
     pub(crate) error_code: Option<i32>,
 }
 
@@ -206,7 +264,15 @@ pub(crate) struct ProbeWindow {
 
 impl ProbeWindow {
     /// Add one result, dropping the oldest once the window is full.
+    ///
+    /// [`ProbeResult::Unavailable`] instead EMPTIES the window: the instrument
+    /// is broken, so the stats must read UNKNOWN rather than keep serving the
+    /// last measurements as if they were current.
     pub(crate) fn push(&mut self, r: ProbeResult) {
+        if r == ProbeResult::Unavailable {
+            self.results.clear();
+            return;
+        }
         if self.results.len() == WINDOW {
             self.results.pop_front();
         }
@@ -224,15 +290,23 @@ impl ProbeWindow {
             .filter_map(|r| match r {
                 ProbeResult::Completed { ms } => Some(*ms),
                 ProbeResult::TimedOut => Some(CENSORED_MS),
-                ProbeResult::SpawnError { .. } => None,
+                ProbeResult::SpawnError { .. }
+                | ProbeResult::ExitedNonZero { .. }
+                | ProbeResult::Unavailable => None,
             })
             .collect();
         samples.sort_unstable();
         let count = |pred: fn(&ProbeResult) -> bool| -> u32 {
             u32::try_from(self.results.iter().filter(|r| pred(r)).count()).unwrap_or(u32::MAX)
         };
+        let is_error = |r: &ProbeResult| {
+            matches!(
+                r,
+                ProbeResult::SpawnError { .. } | ProbeResult::ExitedNonZero { .. }
+            )
+        };
         let error_code = self.results.iter().rev().find_map(|r| match r {
-            ProbeResult::SpawnError { code } => Some(*code),
+            ProbeResult::SpawnError { code } | ProbeResult::ExitedNonZero { code } => Some(*code),
             _ => None,
         });
         Some(SpawnProbeStats {
@@ -240,7 +314,7 @@ impl ProbeWindow {
             max_ms: samples.last().copied(),
             count: count(|_| true),
             timeouts: count(|r| matches!(r, ProbeResult::TimedOut)),
-            errors: count(|r| matches!(r, ProbeResult::SpawnError { .. })),
+            errors: count(is_error),
             error_code: error_code.flatten(),
         })
     }
@@ -262,6 +336,23 @@ pub(crate) fn sleeper() -> std::process::Command {
         c
     }
 }
+
+/// A file that exists but is not an executable: a real create failure that is
+/// not `NotFound`. Written once per test process, under the temp dir.
+#[cfg(test)]
+pub(crate) fn not_an_executable() -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("os-health-not-an-exe-{}.exe", std::process::id()));
+    if !p.exists() {
+        std::fs::write(&p, b"this is not an executable image").expect("write the fake exe");
+    }
+    p
+}
+
+/// The OS error creating [`not_an_executable`] fails with:
+/// ERROR_EXE_MACHINE_TYPE_MISMATCH (216, a file too short to carry a PE
+/// header) on Windows, EACCES (no execute bit) on Linux.
+#[cfg(test)]
+pub(crate) const NOT_AN_EXE_SPAWN_ERROR: i32 = if cfg!(windows) { 216 } else { 13 };
 
 #[cfg(test)]
 mod tests {
@@ -310,16 +401,18 @@ mod tests {
 
     #[test]
     fn a_spawn_error_counts_in_errors_with_its_os_code_and_is_not_a_sample() {
-        // An existing directory and a missing file: ERROR_FILE_NOT_FOUND on
-        // Windows, ENOENT on Linux — both 2.
-        let missing = std::env::temp_dir().join("os-health-probe-missing-0e1f.exe");
-        assert!(!missing.exists());
+        let bad = not_an_executable();
         let run = SpawnProbe::with(
-            move || crate::process_helpers::no_window(&missing),
+            move || crate::process_helpers::no_window(&bad),
             Duration::from_secs(5),
         )
         .run_once();
-        assert_eq!(run.result, ProbeResult::SpawnError { code: Some(2) });
+        assert_eq!(
+            run.result,
+            ProbeResult::SpawnError {
+                code: Some(NOT_AN_EXE_SPAWN_ERROR)
+            }
+        );
 
         let mut w = ProbeWindow::default();
         w.push(run.result);
@@ -331,9 +424,79 @@ mod tests {
                 count: 1,
                 timeouts: 0,
                 errors: 1,
-                error_code: Some(2),
+                error_code: Some(NOT_AN_EXE_SPAWN_ERROR),
             })
         );
+    }
+
+    /// A child that exits failing is a failed process creation, never a fast
+    /// healthy sample (`0xC0000142` is how `cmd /c exit` fails on a box out of
+    /// desktop heap). Exit status 7 stands in for it.
+    #[test]
+    fn a_non_zero_exit_counts_in_errors_with_its_exit_code_and_is_not_a_sample() {
+        let failing = || {
+            #[cfg(windows)]
+            {
+                let mut c = crate::process_helpers::cmd_no_window();
+                c.args(["/c", "exit 7"]);
+                c
+            }
+            #[cfg(not(windows))]
+            {
+                let mut c = crate::process_helpers::no_window("sh");
+                c.args(["-c", "exit 7"]);
+                c
+            }
+        };
+        let run = SpawnProbe::with(failing, Duration::from_secs(10)).run_once();
+        assert_eq!(run.result, ProbeResult::ExitedNonZero { code: Some(7) });
+
+        let mut w = ProbeWindow::default();
+        w.push(ProbeResult::Completed { ms: 20 });
+        w.push(run.result);
+        let s = w.stats().unwrap();
+        assert_eq!((s.count, s.errors, s.error_code), (2, 1, Some(7)));
+        assert_eq!(
+            (s.p50_ms, s.max_ms),
+            (Some(20), Some(20)),
+            "the failed exit is not a sample"
+        );
+        assert_eq!(s.successes(), 1);
+    }
+
+    /// A probe program that does not exist is an instrument failure: the
+    /// stats go UNKNOWN, and it is NOT counted as the OS failing to create a
+    /// process (which S9 would grade `spawn_failed`).
+    #[test]
+    fn a_missing_probe_program_is_an_instrument_failure_not_a_measurement() {
+        let missing = std::env::temp_dir().join("os-health-probe-missing-0e1f.exe");
+        assert!(!missing.exists());
+        let run = SpawnProbe::with(
+            move || crate::process_helpers::no_window(&missing),
+            Duration::from_secs(5),
+        )
+        .run_once();
+        assert_eq!(run.result, ProbeResult::Unavailable);
+
+        let mut w = ProbeWindow::default();
+        for _ in 0..3 {
+            w.push(ProbeResult::Completed { ms: 20 });
+        }
+        w.push(run.result);
+        assert_eq!(w.stats(), None, "a broken instrument empties the window");
+        w.push(ProbeResult::Completed { ms: 25 });
+        assert_eq!(w.stats().unwrap().count, 1);
+    }
+
+    #[test]
+    fn the_true_program_falls_back_from_bin_to_usr_bin_to_path() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(true_program(|_| true), PathBuf::from("/bin/true"));
+        assert_eq!(
+            true_program(|p| p == Path::new("/usr/bin/true")),
+            PathBuf::from("/usr/bin/true")
+        );
+        assert_eq!(true_program(|_| false), PathBuf::from("true"));
     }
 
     #[test]
@@ -377,5 +540,12 @@ mod tests {
         assert_eq!((s.count, s.timeouts, s.errors), (4, 1, 1));
         assert_eq!(s.error_code, Some(1450));
         assert_eq!(s.successes(), 2);
+        // A later failing exit is the latest error code.
+        w.push(ProbeResult::ExitedNonZero {
+            code: Some(0xC000_0142_u32 as i32),
+        });
+        let s = w.stats().unwrap();
+        assert_eq!((s.count, s.errors), (5, 2));
+        assert_eq!(s.error_code, Some(0xC000_0142_u32 as i32));
     }
 }

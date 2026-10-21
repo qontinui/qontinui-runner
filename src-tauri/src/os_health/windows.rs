@@ -10,8 +10,16 @@
 //! (`crates/runner-win32/src/lib.rs`). `wedge_diagnostics.rs`'s hand-declared
 //! `NtQuerySystemInformation` is therefore not the template here.
 //!
-//! None of the four needs elevation: verified 2026-10-19 on spaceship as a
-//! basic user (`runas /trustlevel:0x20000`).
+//! The plan records these reads answering as a basic user
+//! (`runas /trustlevel:0x20000`) on spaceship on 2026-10-19. That is an
+//! operator's observation, not something this file's tests establish: the live
+//! test below runs at whatever integrity level the test process has, which on
+//! a developer box is usually a filtered admin token.
+//!
+//! The boot instant is the kernel's own `BootTime`
+//! (`NtQuerySystemInformation(SystemTimeOfDayInformation)`), so it is the same
+//! value in every process for the life of the boot; `now - GetTickCount64()`
+//! is only the fallback when that query fails.
 //!
 //! The parsing is in [`super::parse`], compiled on every OS so the fixture
 //! tests run on Linux CI too; this file only does the reads.
@@ -35,6 +43,8 @@ use super::{FailureLog, GaugeSource};
 const OBJECT_TYPES_INFORMATION: OBJECT_INFORMATION_CLASS = 3;
 /// `SystemPoolTagInformation`; not among the classes `windows-sys` names.
 const SYSTEM_POOL_TAG_INFORMATION: SYSTEM_INFORMATION_CLASS = 22;
+/// `SystemTimeOfDayInformation`, pinned by number beside the other two.
+const SYSTEM_TIME_OF_DAY_INFORMATION: SYSTEM_INFORMATION_CLASS = 3;
 
 /// First-try buffer sizes. Measured on degraded spaceship: 10,056 bytes of
 /// object types and 135,168 of pool tags (3,379 tags), so one call normally
@@ -60,13 +70,19 @@ impl GaugeSource for WindowsCollector {
     fn gauges(&mut self, log: &mut FailureLog) -> GaugeReading {
         let perf = log.record(instrument::GET_PERFORMANCE_INFO, performance_info());
         let objects = log.record(instrument::OBJECT_TYPES, object_types());
-        if let Some(fresh) = boot_time_now() {
-            self.booted_at = Some(parse::stable_boot_time(
-                self.booted_at,
-                fresh,
-                BOOT_TIME_TOLERANCE_SECS,
-            ));
-        }
+        let kernel_boot = log.record("boot-time-of-day", kernel_boot_time());
+        // The tick derivation is only computed when the kernel did not answer.
+        let tick_derived = if kernel_boot.is_none() {
+            boot_time_from_tick_count()
+        } else {
+            None
+        };
+        self.booted_at = parse::resolve_boot_time(
+            kernel_boot,
+            self.booted_at,
+            tick_derived,
+            BOOT_TIME_TOLERANCE_SECS,
+        );
         parse::windows_gauges(perf, objects, self.booted_at)
     }
 
@@ -75,8 +91,29 @@ impl GaugeSource for WindowsCollector {
     }
 }
 
-/// `now - GetTickCount64()`, floored to the whole second.
-fn boot_time_now() -> Option<DateTime<Utc>> {
+/// The kernel's `BootTime`, out of
+/// `NtQuerySystemInformation(SystemTimeOfDayInformation)`.
+fn kernel_boot_time() -> Result<DateTime<Utc>, String> {
+    let buf = nt_query(
+        "NtQuerySystemInformation(SystemTimeOfDayInformation)",
+        parse::TIME_OF_DAY_BYTES,
+        |ptr, len, ret| {
+            // SAFETY: `ptr` points to `len` writable, 8-aligned bytes and `ret`
+            // to a live u32, both owned by `nt_query` for the duration of the
+            // call.
+            unsafe { NtQuerySystemInformation(SYSTEM_TIME_OF_DAY_INFORMATION, ptr, len, ret) }
+        },
+    )?;
+    parse::parse_boot_time_of_day(buf.bytes()).ok_or_else(|| {
+        format!(
+            "SystemTimeOfDayInformation: {} bytes carried no plausible BootTime",
+            buf.len
+        )
+    })
+}
+
+/// The fallback: `now - GetTickCount64()`, floored to the whole second.
+fn boot_time_from_tick_count() -> Option<DateTime<Utc>> {
     // SAFETY: no arguments, no preconditions; cannot fail.
     let uptime_ms = unsafe { GetTickCount64() };
     let uptime = TimeDelta::try_milliseconds(i64::try_from(uptime_ms).ok()?)?;
@@ -125,7 +162,15 @@ fn object_types() -> Result<ObjectTypeCounts, String> {
             // system-wide type table and touches no handle; `ptr` points to
             // `len` writable, 8-aligned bytes and `ret` to a live u32, both
             // owned by `nt_query` for the duration of the call.
-            unsafe { NtQueryObject(std::ptr::null_mut(), OBJECT_TYPES_INFORMATION, ptr, len, ret) }
+            unsafe {
+                NtQueryObject(
+                    std::ptr::null_mut(),
+                    OBJECT_TYPES_INFORMATION,
+                    ptr,
+                    len,
+                    ret,
+                )
+            }
         },
     )?;
     parse::object_type_counts(buf.bytes()).ok_or_else(|| {
@@ -176,9 +221,7 @@ impl AlignedBuf {
         // SAFETY: `words` owns `cap` initialized bytes (every `u64` was
         // zero-initialized and then possibly written by the kernel), `len` is
         // clamped to `cap`, and `u8` has alignment 1.
-        unsafe {
-            std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len.min(cap))
-        }
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len.min(cap)) }
     }
 }
 
@@ -233,9 +276,11 @@ mod tests {
     use super::*;
 
     /// The real calls, on the machine running the test: every Windows axis
-    /// answers unelevated, and the numbers are plausible for a live box.
+    /// answers, and the numbers are plausible for a live box. It runs at the
+    /// test process's own integrity level, so it does NOT prove the reads work
+    /// unelevated (see the module docs).
     #[test]
-    fn the_live_windows_reads_answer_unelevated() {
+    fn the_live_windows_reads_answer() {
         let mut log = FailureLog::default();
         let mut c = WindowsCollector::default();
         let g = c.gauges(&mut log);
@@ -251,20 +296,35 @@ mod tests {
         let booted = g.os_booted_at.unwrap();
         assert!(booted < Utc::now(), "{booted}");
 
-        let tags = c.pool_tags(&mut log).expect("SystemPoolTagInformation answers");
+        let tags = c
+            .pool_tags(&mut log)
+            .expect("SystemPoolTagInformation answers");
         assert!(!tags.is_empty() && tags.len() <= 8, "{tags:?}");
-        assert!(tags.windows(2).all(|w| w[0].bytes >= w[1].bytes), "{tags:?}");
+        assert!(
+            tags.windows(2).all(|w| w[0].bytes >= w[1].bytes),
+            "{tags:?}"
+        );
     }
 
-    /// The boot instant is held across ticks rather than re-derived with
-    /// jitter every 30 s.
+    /// The boot instant is the kernel's `BootTime`: the same in a FRESH
+    /// collector (a restarted runner) as in a long-lived one, and exactly the
+    /// value the kernel query returns rather than a per-process derivation.
     #[test]
-    fn the_boot_time_is_stable_across_ticks() {
+    fn the_boot_time_is_the_kernels_and_survives_a_restart() {
+        let kernel = kernel_boot_time().expect("SystemTimeOfDayInformation answers");
+        assert!(kernel < Utc::now(), "{kernel}");
         let mut log = FailureLog::default();
         let mut c = WindowsCollector::default();
         let first = c.gauges(&mut log).os_booted_at;
+        assert_eq!(first, Some(kernel));
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         assert_eq!(c.gauges(&mut log).os_booted_at, first);
+        // A new collector — what a restarted runner builds — agrees exactly.
+        let mut restarted = WindowsCollector::default();
+        assert_eq!(
+            restarted.gauges(&mut FailureLog::default()).os_booted_at,
+            first
+        );
     }
 
     /// The grow loop: a short buffer is retried bigger, a non-mismatch failure
