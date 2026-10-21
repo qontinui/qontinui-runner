@@ -2511,7 +2511,22 @@ pub(crate) fn admit_spawn(
     resource_override: bool,
     app: Option<&AppHandle>,
 ) -> Result<(), String> {
-    match probe_for_spawn() {
+    admit_verdict(probe_for_spawn(), what, resource_override, app)
+}
+
+/// [`admit_spawn`]'s decision, given the verdict instead of taking a reading.
+///
+/// Split out so the ladder — Proceed, Warn-and-proceed, Critical-refuse,
+/// Critical-overridden — is testable without a live sensor. An unreadable
+/// sensor reaches here as [`SpawnGate::Proceed`] ([`evaluate`] fails open), so
+/// "metric unavailable" is the Proceed arm by construction.
+fn admit_verdict(
+    verdict: SpawnGate,
+    what: &str,
+    resource_override: bool,
+    app: Option<&AppHandle>,
+) -> Result<(), String> {
+    match verdict {
         SpawnGate::Proceed => Ok(()),
         SpawnGate::Warn(observation) => {
             let message = format!(
@@ -2558,6 +2573,77 @@ pub(crate) fn admit_spawn(
             Err(critical_refusal(what, &observation))
         }
     }
+}
+
+/// The typed form of a CRITICAL refusal, for spawn seams that return
+/// `anyhow::Result` rather than `Result<_, String>`.
+///
+/// The headless seam (`agent_runtime::spawn_claude_child`) is the one today. Its
+/// `Display` is the [`CRITICAL_REFUSAL_PREFIX`]-tagged refusal text byte for
+/// byte, so a caller that only formats the error (`spawn failure: {e}`) still
+/// carries the prefix coord and the log greps match on. A caller that has to
+/// treat a refusal differently from a real spawn failure (a refusal is
+/// retryable: the box may have headroom again in a minute, while a missing
+/// binary will not fix itself) recovers it with
+/// [`is_resource_guard_refusal`].
+#[derive(Debug, Clone)]
+pub(crate) struct ResourceGuardRefusal {
+    refusal: String,
+    /// The lane that refused. `Option` only because the type is built from
+    /// [`admit_verdict`]'s `Err`, which only a CRITICAL verdict produces.
+    metric: Option<LaneMetric>,
+}
+
+impl ResourceGuardRefusal {
+    /// The pressure class of the lane that refused, in the `<class>` vocabulary
+    /// `agent_runtime`'s load stamps use: `commit_pressure` (memory lane) or
+    /// `thread_pressure`. `resource_guard` when the lane is unknown.
+    pub(crate) fn pressure_class(&self) -> &'static str {
+        match self.metric {
+            Some(LaneMetric::FreeCommitBytes) => "commit_pressure",
+            Some(LaneMetric::ThreadCount) => "thread_pressure",
+            None => "resource_guard",
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceGuardRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.refusal)
+    }
+}
+
+impl std::error::Error for ResourceGuardRefusal {}
+
+/// Whether `e` is a resource-guard refusal: the typed [`ResourceGuardRefusal`],
+/// or any error whose text carries [`CRITICAL_REFUSAL_PREFIX`] (a `String`
+/// refusal from the PTY seam that was wrapped in `anyhow!` on its way up).
+pub(crate) fn is_resource_guard_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ResourceGuardRefusal>().is_some()
+        || e.to_string().contains(CRITICAL_REFUSAL_PREFIX)
+}
+
+/// [`admit_spawn`] for an UNATTENDED headless spawn: no override (nobody is
+/// there to press "Start anyway"), no webview notice (no pane exists to
+/// attach one to; the WARN arm's log line is the record), and the refusal
+/// typed for an `anyhow` seam.
+///
+/// Same verdict, same floors, same fail-open on an unreadable sensor as the PTY
+/// seam's gate. That is the point: before this, a `claude` started through
+/// `spawn_claude_child` never met the memory lane at all, so the runner's own
+/// headless launches — and their automatic restarts — kept starting below the
+/// critical commit floor that refused a terminal.
+pub(crate) fn admit_headless_spawn(what: &str) -> Result<(), ResourceGuardRefusal> {
+    admit_headless_verdict(probe_for_spawn(), what)
+}
+
+fn admit_headless_verdict(verdict: SpawnGate, what: &str) -> Result<(), ResourceGuardRefusal> {
+    let metric = match &verdict {
+        SpawnGate::Critical(o) => Some(o.metric),
+        SpawnGate::Proceed | SpawnGate::Warn(_) => None,
+    };
+    admit_verdict(verdict, what, false, None)
+        .map_err(|refusal| ResourceGuardRefusal { refusal, metric })
 }
 
 /// Early-out for callers that do expensive, side-effecting work BEFORE they
@@ -5610,5 +5696,117 @@ mod tests {
             }
         });
         assert!(quiet.is_empty(), "{quiet}");
+    }
+
+    // ---- The headless seam's decision ladder (admit_headless_verdict) ----
+    //
+    // The verdict is computed by `evaluate` from the live reading; these pin
+    // what the UNATTENDED headless seam does with each verdict, fed through the
+    // same `evaluate` so the floors are the shipped ones, not hand-built gates.
+
+    /// Above the warn floor: proceed, and say nothing.
+    #[test]
+    fn headless_seam_proceeds_with_headroom() {
+        let g = defaults();
+        let (res, logs) = capture_logs(|| {
+            admit_headless_verdict(
+                evaluate("host", Some(8 * GIB_U64), &g),
+                "headless agent session",
+            )
+        });
+        assert!(res.is_ok());
+        assert!(logs.is_empty(), "{logs}");
+    }
+
+    /// Between the floors: warn and proceed — the unattended seam does NOT
+    /// throttle here. Unattended admission defers earlier, at the pre-claim
+    /// check, where a deferral costs nothing; this seam is the backstop.
+    #[test]
+    fn headless_seam_warns_and_proceeds_between_the_floors() {
+        let g = defaults();
+        let (res, logs) = capture_logs(|| {
+            admit_headless_verdict(
+                evaluate("host", Some(2 * GIB_U64), &g),
+                "headless agent session",
+            )
+        });
+        assert!(res.is_ok());
+        assert!(
+            logs.contains("spawning past the session warn limit"),
+            "{logs}"
+        );
+    }
+
+    /// Below the critical floor: refuse with the typed error, whose text is
+    /// the prefixed wire, and log a greppable line naming observed bytes, the
+    /// floor and the spawn path.
+    #[test]
+    fn headless_seam_refuses_below_the_critical_floor_and_logs_why() {
+        let g = defaults();
+        let observed = GIB_U64 / 2;
+        let (res, logs) = capture_logs(|| {
+            admit_headless_verdict(
+                evaluate("host", Some(observed), &g),
+                "headless agent session",
+            )
+        });
+        let refusal = res.expect_err("below the critical floor must refuse");
+        let text = refusal.to_string();
+        assert!(
+            text.starts_with(&format!("{CRITICAL_REFUSAL_PREFIX}free_commit_bytes: ")),
+            "{text}"
+        );
+        assert!(text.contains("headless agent session"), "{text}");
+        assert!(
+            logs.contains("refusing to spawn past the session critical limit"),
+            "{logs}"
+        );
+        assert!(logs.contains(&format!("observed={observed}")), "{logs}");
+        assert!(
+            logs.contains(&format!("limit={}", g.critical_free_commit_bytes)),
+            "{logs}"
+        );
+        assert!(logs.contains("headless agent session"), "{logs}");
+    }
+
+    /// The sensor could not be read: fail OPEN (proceed, silently). A guard
+    /// that blocks on a missing reading turns a broken probe into a box that
+    /// can start nothing, with no override on an unattended path.
+    #[test]
+    fn headless_seam_proceeds_when_the_reading_is_unavailable() {
+        let g = defaults();
+        let (res, logs) = capture_logs(|| {
+            admit_headless_verdict(evaluate("host", None, &g), "headless agent session")
+        });
+        assert!(res.is_ok());
+        assert!(logs.is_empty(), "{logs}");
+    }
+
+    /// The unattended seam has no override: a critical verdict refuses even
+    /// though `admit_verdict` would let an attended caller through.
+    #[test]
+    fn headless_seam_never_overrides() {
+        let g = defaults();
+        let critical = evaluate("host", Some(GIB_U64 / 2), &g);
+        assert!(admit_verdict(critical.clone(), "terminal session", true, None).is_ok());
+        assert!(admit_headless_verdict(critical, "headless agent session").is_err());
+    }
+
+    /// Callers recognise a refusal whether it arrives typed or as the PTY
+    /// seam's prefixed string wrapped in `anyhow!` — and nothing else.
+    #[test]
+    fn a_refusal_is_recognised_typed_or_as_text() {
+        let g = defaults();
+        let typed = admit_headless_verdict(evaluate("host", Some(GIB_U64 / 2), &g), "x")
+            .expect_err("refuses");
+        assert_eq!(typed.pressure_class(), "commit_pressure");
+        let text = typed.to_string();
+        assert!(is_resource_guard_refusal(&anyhow::Error::new(typed)));
+        assert!(is_resource_guard_refusal(&anyhow::anyhow!(
+            "terminal session create failed: {text}"
+        )));
+        assert!(!is_resource_guard_refusal(&anyhow::anyhow!(
+            "No such file or directory"
+        )));
     }
 }
