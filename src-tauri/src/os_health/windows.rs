@@ -43,8 +43,9 @@ use super::{FailureLog, GaugeSource};
 const OBJECT_TYPES_INFORMATION: OBJECT_INFORMATION_CLASS = 3;
 /// `SystemPoolTagInformation`; not among the classes `windows-sys` names.
 const SYSTEM_POOL_TAG_INFORMATION: SYSTEM_INFORMATION_CLASS = 22;
-/// `SystemTimeOfDayInformation`, pinned by number beside the other two.
-const SYSTEM_TIME_OF_DAY_INFORMATION: SYSTEM_INFORMATION_CLASS = 3;
+/// `SystemTimeOfDayInformation`, the class `windows-sys` names.
+const SYSTEM_TIME_OF_DAY_INFORMATION: SYSTEM_INFORMATION_CLASS =
+    windows_sys::Wdk::System::SystemInformation::SystemTimeOfDayInformation;
 
 /// First-try buffer sizes. Measured on degraded spaceship: 10,056 bytes of
 /// object types and 135,168 of pool tags (3,379 tags), so one call normally
