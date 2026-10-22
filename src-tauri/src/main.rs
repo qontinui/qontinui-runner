@@ -5167,6 +5167,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         emit_session_bound(&poll_app_handle, &titles_outcome.rebinds);
 
+                        // Duplicate-host report (same plan, Phase 5): a session
+                        // id held by two VALID interactive processes is a forked
+                        // conversation. Report-only — one warn + one coord
+                        // finding per new occurrence; never closes anything.
+                        // Unguarded for the same reason as the titles pass, and
+                        // reuses this tick's `snap` (an unreadable one is
+                        // UNKNOWN, never "no duplicates").
+                        session::duplicate_hosts::run_duplicate_hosts_pass(
+                            &poll_lifecycle_store,
+                            &live_for_titles,
+                            &snap,
+                        );
+
                         poll_lifecycle_store.prune(
                             chrono::Utc::now().timestamp_millis(),
                             &live_terminal_ids,
