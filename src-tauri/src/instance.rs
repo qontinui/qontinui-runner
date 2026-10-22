@@ -107,7 +107,7 @@ fn runner_kind_from(
 ///
 /// Returns `None` — the unscoped, primary-owned path — ONLY for a runner that
 /// presents no secondary signal at all.
-fn resolve_data_subdir(
+pub(crate) fn resolve_data_subdir(
     name: Option<&str>,
     instance_root: Option<&Path>,
     primary_port: Option<u16>,
@@ -202,7 +202,7 @@ pub fn scope_path(base: &Path) -> PathBuf {
 
 /// Env-free core of [`scope_path`]; `subdir` is consulted only when the base
 /// is not already inside `instance_root`.
-fn scope_path_for(
+pub(crate) fn scope_path_for(
     base: &Path,
     instance_root: Option<&Path>,
     subdir: impl FnOnce() -> Option<String>,

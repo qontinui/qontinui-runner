@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use super::screenshots::lookup_element_normalized_rect;
 use super::vision_ai::{self, OcrClient, VlmClient};
+use super::vision_capture_access::capture_access;
 use super::vision_frame_source::resolve_frame_provider;
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -185,6 +186,13 @@ pub struct CaptureRequest {
     /// Participates in the cache key via the request's `Debug` formatting.
     #[serde(default)]
     pub target: Option<String>,
+    /// `true` returns the encoded bytes as `base64` in the response (capped
+    /// at [`super::vision_capture_access::INLINE_MAX_BYTES`]; over the cap the
+    /// request gets a 413 `INLINE_TOO_LARGE` naming `url`). The handlers
+    /// `take()` it before composing the cache key, so it never splits a cache
+    /// entry. In multi-output mode it applies to every output.
+    #[serde(default)]
+    pub inline: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +225,8 @@ impl From<&NamedCapture> for CaptureRequest {
             // Parent `target` is threaded through `do_multi_capture` separately,
             // not via NamedCapture (which carries no per-capture target).
             target: None,
+            // Parent `inline` is threaded through `do_multi_capture` too.
+            inline: None,
         }
     }
 }
@@ -224,8 +234,17 @@ impl From<&NamedCapture> for CaptureRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureResponse {
-    /// `tmp_vision_cache/<sha256>.<ext>` (relative to the runner CWD).
-    pub path: String,
+    /// Relative HTTP path serving the bytes: `/ui-bridge/vision/cache/<sha256>`
+    /// ([`super::vision_capture_access::cache_url`]). Works through every door
+    /// (loopback, relay, remote) — resolve it against the runner origin.
+    pub url: String,
+    /// Standard base64 of the encoded bytes — present only when the request
+    /// set `inline: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base64: Option<String>,
+    /// Hex SHA-256 of the cache KEY (`v=1|mut=<mutation_id>|req=<request>`),
+    /// NOT of the image bytes: identical images under different keys differ.
+    /// It names the cache entry `url` serves.
     pub sha256: String,
     pub width: u32,
     pub height: u32,
@@ -283,6 +302,7 @@ impl From<CaptureSpec> for CaptureRequest {
             // `CaptureSpec` carries no target; callers (diff, baseline) set it
             // explicitly on the produced `CaptureRequest` when needed.
             target: None,
+            inline: None,
         }
     }
 }
@@ -431,6 +451,10 @@ pub struct RawRequest {
     /// [`super::vision_frame_source`]. Participates in the cache key.
     #[serde(default)]
     pub target: Option<String>,
+    /// `true` returns the PNG bytes as `base64` (see
+    /// [`CaptureRequest::inline`]). Taken before the cache key is composed.
+    #[serde(default)]
+    pub inline: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -825,12 +849,12 @@ fn build_raw_pipeline(crop: Option<Region>) -> Pipeline {
 /// a single `read_dir` + prefix match suffices.
 ///
 /// `dir` MUST be the `VisionCache`'s own absolute root
-/// (`state.vision_cache.root()`). A previous version resolved a bare
-/// `"tmp_vision_cache"` against the process CWD — which is NOT the runner root
-/// (the Tauri exe is launched from elsewhere) — so every GET-by-sha 404'd with
-/// "cache empty" even though `VisionCache::put` had written the file under the
-/// absolute root `current_runner_path().join("tmp_vision_cache")`.
-fn find_cache_file(dir: &StdPath, sha: &str) -> std::io::Result<Option<(PathBuf, String)>> {
+/// (`state.vision_cache.root()`, built by
+/// [`super::vision_capture_access::vision_cache_root_from`]). A previous version
+/// resolved a bare relative directory name against the process CWD, so every
+/// GET-by-sha 404'd with "cache empty" even though `VisionCache::put` had
+/// written the file under the absolute root.
+pub(super) fn find_cache_file(dir: &StdPath, sha: &str) -> std::io::Result<Option<(PathBuf, String)>> {
     let prefix = format!("{}.", sha);
     for entry in std::fs::read_dir(dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -839,25 +863,6 @@ fn find_cache_file(dir: &StdPath, sha: &str) -> std::io::Result<Option<(PathBuf,
         }
     }
     Ok(None)
-}
-
-/// Render a cache entry's on-disk path as the host-agnostic relative form
-/// `tmp_vision_cache/<sha256>.<ext>` for [`CaptureResponse::path`].
-///
-/// The `VisionCache` root is built **absolute** in `mcp_api::api_state_init`
-/// (`current_runner_path().join("tmp_vision_cache")`) so file IO is correct
-/// regardless of CWD. The response `path` is diagnostic-only — every consumer
-/// fetches bytes by `sha256` via `/vision/raw` (`fetchVisionCacheBytes`), never
-/// by `path` — so we strip the absolute prefix and emit the relative path the
-/// response contract already promises. Cache entries are always flat
-/// files directly under the root, so the file name plus the fixed
-/// `tmp_vision_cache/` prefix is sufficient; the smoke gate's
-/// `^tmp_vision_cache[\\/]` regex accepts either slash flavour.
-fn relative_cache_path(p: &StdPath) -> String {
-    match p.file_name() {
-        Some(name) => format!("tmp_vision_cache/{}", name.to_string_lossy()),
-        None => p.to_string_lossy().into_owned(),
-    }
 }
 
 // ============================================================================
@@ -873,14 +878,15 @@ async fn vision_capture_handler(
     body: Option<Json<CaptureRequest>>,
 ) -> Result<Json<ApiResponse<VisionCaptureResp>>, (StatusCode, Json<ApiResponse<()>>)> {
     let mut req = body.map(|b| b.0).unwrap_or_default();
+    let inline = req.inline.take().unwrap_or(false);
     if let Some(captures) = req.captures.take() {
         let force = req.force.unwrap_or(false);
-        let captures_map = do_multi_capture(&state, captures, force, &req.target).await?;
+        let captures_map = do_multi_capture(&state, captures, force, &req.target, inline).await?;
         return Ok(Json(ApiResponse::success(VisionCaptureResp::Multi {
             captures: captures_map,
         })));
     }
-    let resp = do_capture(&state, req, false).await?;
+    let resp = do_capture(&state, req, false, inline).await?;
     Ok(Json(ApiResponse::success(VisionCaptureResp::Single(resp))))
 }
 
@@ -891,7 +897,8 @@ async fn vision_annotate_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<CaptureRequest>>,
 ) -> Result<Json<ApiResponse<VisionCaptureResp>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let req = body.map(|b| b.0).unwrap_or_default();
+    let mut req = body.map(|b| b.0).unwrap_or_default();
+    let inline = req.inline.take().unwrap_or(false);
     if req.annotate_elements.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -910,7 +917,7 @@ async fn vision_annotate_handler(
             )),
         ));
     }
-    let resp = do_capture(&state, req, true).await?;
+    let resp = do_capture(&state, req, true, inline).await?;
     Ok(Json(ApiResponse::success(VisionCaptureResp::Single(resp))))
 }
 
@@ -922,6 +929,7 @@ async fn do_capture(
     state: &Arc<ApiState>,
     req: CaptureRequest,
     require_annotations: bool,
+    inline: bool,
 ) -> Result<CaptureResponse, (StatusCode, Json<ApiResponse<()>>)> {
     if require_annotations
         && req
@@ -968,8 +976,11 @@ async fn do_capture(
                 &hit.sha256_hex[..12],
                 bytes.len()
             );
+            let access = capture_access(&hit.sha256_hex, &bytes, inline)
+                .map_err(|e| e.into_api_error())?;
             return Ok(CaptureResponse {
-                path: relative_cache_path(&hit.path),
+                url: access.url,
+                base64: access.base64,
                 sha256: hit.sha256_hex,
                 width: decoded.width(),
                 height: decoded.height(),
@@ -1049,8 +1060,11 @@ async fn do_capture(
         height
     );
 
+    let access =
+        capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
     Ok(CaptureResponse {
-        path: relative_cache_path(&hit.path),
+        url: access.url,
+        base64: access.base64,
         sha256: hit.sha256_hex,
         width,
         height,
@@ -1104,6 +1118,7 @@ async fn do_multi_capture(
     captures: Vec<NamedCapture>,
     force: bool,
     target: &Option<String>,
+    inline: bool,
 ) -> Result<std::collections::HashMap<String, CaptureResponse>, (StatusCode, Json<ApiResponse<()>>)>
 {
     use std::collections::HashMap;
@@ -1163,10 +1178,13 @@ async fn do_multi_capture(
                         Json(api_error(format!("decode cached: {}", e))),
                     )
                 })?;
+                let access = capture_access(&hit.sha256_hex, &bytes, inline)
+                    .map_err(|e| e.into_api_error())?;
                 results.insert(
                     cap.name.clone(),
                     CaptureResponse {
-                        path: relative_cache_path(&hit.path),
+                        url: access.url,
+                        base64: access.base64,
                         sha256: hit.sha256_hex,
                         width: decoded.width(),
                         height: decoded.height(),
@@ -1274,10 +1292,13 @@ async fn do_multi_capture(
                     Json(api_error(format!("cache put '{}': {}", name, e))),
                 )
             })?;
+        let access =
+            capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
         results.insert(
             name,
             CaptureResponse {
-                path: relative_cache_path(&hit.path),
+                url: access.url,
+                base64: access.base64,
                 sha256: hit.sha256_hex,
                 width,
                 height,
@@ -1419,7 +1440,9 @@ async fn vision_diff_handler(
 
     Ok(Json(ApiResponse::success(DiffResponse {
         capture: CaptureResponse {
-            path: relative_cache_path(&hit.path),
+            // `vision/diff` has no `inline` field: its capture is fetched by `url`.
+            url: super::vision_capture_access::cache_url(&hit.sha256_hex),
+            base64: None,
             sha256: hit.sha256_hex,
             width: decoded.width(),
             height: decoded.height(),
@@ -1617,12 +1640,15 @@ async fn vision_raw_handler(
         return Err((StatusCode::NOT_FOUND, Json(api_error(""))));
     }
 
-    let req = body.map(|b| b.0).unwrap_or(RawRequest {
+    let mut req = body.map(|b| b.0).unwrap_or(RawRequest {
         region: None,
         element: None,
         reason: None,
         target: None,
+        inline: None,
     });
+    // Taken before `req` is Debug-formatted into the cache key below.
+    let inline = req.inline.take().unwrap_or(false);
     let reason = req.reason.clone().unwrap_or_default();
     if !matches!(reason.as_str(), "vga_grounding" | "regression_baseline") {
         return Err((
@@ -1687,8 +1713,11 @@ async fn vision_raw_handler(
             )
         })?;
 
+    let access =
+        capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
     Ok(Json(ApiResponse::success(CaptureResponse {
-        path: relative_cache_path(&hit.path),
+        url: access.url,
+        base64: access.base64,
         sha256: hit.sha256_hex,
         width: decoded.width(),
         height: decoded.height(),
@@ -3035,7 +3064,8 @@ mod tests {
         // Mirror exactly the struct the cache-HIT branch builds: every field
         // populated from the cache entry, `capture_backend: None`.
         let resp = CaptureResponse {
-            path: "tmp_vision_cache/deadbeef.jpeg".to_string(),
+            url: "/ui-bridge/vision/cache/deadbeef".to_string(),
+            base64: None,
             sha256: "deadbeef".to_string(),
             width: 1280,
             height: 720,
@@ -3078,7 +3108,7 @@ mod tests {
 
     /// Regression: the GET-by-sha handler must scan the SAME absolute root the
     /// writer (`VisionCache::put`) uses (`VisionCache::root()`), not a
-    /// CWD-relative `"tmp_vision_cache"`. Before the fix, the reader resolved a
+    /// CWD-relative directory name. Before the fix, the reader resolved a
     /// bare relative path against the process CWD (≠ runner root), so every
     /// GET-by-sha 404'd with "cache empty" even though the file existed under the
     /// absolute cache root. `find_cache_file` driven by `cache.root()` finds it.

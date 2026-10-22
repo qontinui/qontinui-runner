@@ -492,17 +492,34 @@ map timeout → 422 itself; the framework will not derive this from the body
 shape. Any new SDK endpoint with a non-200 success status needs the same
 explicit `(StatusCode, Json<...>)` return tuple.
 
-### Vision capture `path` is relative
-`CaptureResponse.path` (returned by `/vision/capture`, `/vision/annotate`, and
-the other vision endpoints) is the **relative** form
-`tmp_vision_cache/<sha256>.<ext>`, not an absolute host path. The on-disk
-`VisionCache` root is built absolute in `mcp_api::api_state_init`
-(`current_runner_path().join("tmp_vision_cache")`) so file IO is CWD-independent,
-but the response strips that prefix at serialization time
-(`vision_routes::relative_cache_path`). `path` is **diagnostic-only**: every
-consumer fetches the actual bytes by `sha256` via `/vision/raw`
-(`fetchVisionCacheBytes(meta.sha256)`), never by `path`. Emitting a relative
-path keeps the response host-agnostic for cross-machine relay consumers.
+### Vision capture bytes: `url`, or `inline: true`
+`CaptureResponse` (returned by `/vision/capture`, `/vision/annotate`,
+`/vision/raw`, and inside `/vision/diff`) carries **`url`**, the relative HTTP
+path `/ui-bridge/vision/cache/<sha256>` that serves the encoded bytes
+(`vision_capture_access::cache_url`). It is relative so it works through every
+door — loopback, relay, remote; resolve it against the runner origin. There is
+no host file path in the response.
+
+`capture`, `annotate` and `raw` accept **`inline: true`**, which adds `base64`
+(standard alphabet) to the same response. Inline is capped at 5 MiB
+(`vision_capture_access::INLINE_MAX_BYTES`, the Claude vision input ceiling the
+default `claude_vision_v1` contract keeps under). Over the cap the request
+gets **413** with `code: "INLINE_TOO_LARGE"` and `hint: {url, bytes, maxBytes}`
+— never a truncated string; the capture is still cached, so follow `url`.
+`inline` is taken off the request before the cache key is composed, so it never
+splits a cache entry.
+
+`sha256` is the hash of the cache **key** (`v=1|mut=<mutation_id>|req=<request>`),
+**not** of the image bytes: two identical images captured under different keys
+have different values. Do not use it as a content hash.
+
+The cache lives in the runner's instance-scoped DataLocal directory —
+`<data_local>/com.qontinui.runner/vision_cache`, under the instance root for a
+subject runner and with an `instance-<name>` subdir for a named secondary
+(`instance_env::runner_data_local_base` + `instance::scope_path`). It is never
+the source checkout or the process CWD; an unresolvable base fails runner
+start-up loudly. `tmp_vision_cache/` is only ever written by runner builds that
+predate this.
 
 ### 404 discriminator: empty body vs structured envelope
 A 404 from a route with a `:param`/`{name}` segment is ambiguous on its own, so

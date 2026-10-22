@@ -4,10 +4,11 @@
  * These wrappers exist because Phase 2 of the UI Bridge vision-pipeline plan
  * removed the legacy `/ui-bridge/control/screenshot`, `/ui-bridge/sdk/screenshot`,
  * and `/ui-bridge/control/annotated-screenshot` routes. The new endpoints
- * return `{ path, sha256, width, height, bytes, format, contract }` — base64
- * image data is no longer in the JSON payload. Consumers that still need
- * in-process base64 use `captureScreenshotBase64`, which performs the
- * extra `GET /ui-bridge/vision/cache/{sha256}` fetch and encodes the bytes.
+ * return `{ url, sha256, width, height, bytes, format, contract }`, where `url`
+ * is `GET /ui-bridge/vision/cache/<sha256>`. Base64 bytes are in the payload
+ * only when the request sets `inline: true` (capped at 5 MiB — over the cap the
+ * runner answers 413 `INLINE_TOO_LARGE` naming `url`). `captureScreenshotBase64`
+ * asks for `inline: true` so it needs no second round-trip.
  */
 import { getApiBase, tracedFetch } from "./runner-api";
 
@@ -17,8 +18,14 @@ import { getApiBase, tracedFetch } from "./runner-api";
  * `src-tauri/src/mcp/ui_bridge/vision_routes.rs`.
  */
 export interface VisionCaptureResponse {
-  /** `tmp_vision_cache/<sha256>.<ext>` relative to runner CWD. */
-  path: string;
+  /** Relative HTTP path serving the bytes: `/ui-bridge/vision/cache/<sha256>`. */
+  url: string;
+  /** Standard base64 of the bytes — present only when the request set `inline: true`. */
+  base64?: string;
+  /**
+   * Hex SHA-256 of the runner's cache KEY (mutation id + request shape), NOT a
+   * hash of the image bytes. Names the entry `url` serves.
+   */
   sha256: string;
   width: number;
   height: number;
@@ -38,11 +45,29 @@ export interface VisionCaptureRequest {
   contract?: "claude" | "webp" | "png_strict";
   /** Bypass cache (Phase 2: accepted but no-op). */
   force?: boolean;
+  /**
+   * Return the bytes as `base64` in the same response (capped at 5 MiB; over
+   * the cap the runner answers 413 `INLINE_TOO_LARGE` with `hint.url`).
+   */
+  inline?: boolean;
+}
+
+/** A non-2xx `vision/capture` answer, with its HTTP status and envelope `code`. */
+export class VisionCaptureError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = "VisionCaptureError";
+  }
 }
 
 /**
  * POST `/ui-bridge/vision/capture` and return the JSON envelope. Throws if
- * the request fails or the server returns a non-success payload.
+ * the request fails or the server returns a non-success payload (a
+ * `VisionCaptureError` for a non-2xx status).
  */
 export async function captureVision(
   req: VisionCaptureRequest = {},
@@ -53,7 +78,20 @@ export async function captureVision(
     body: JSON.stringify({ contract: "claude", ...req }),
   });
   if (!resp.ok) {
-    throw new Error(`vision/capture failed: HTTP ${resp.status}`);
+    let code: string | undefined;
+    try {
+      const body: unknown = await resp.json();
+      if (body && typeof body === "object" && "code" in body) {
+        code = String((body as { code: unknown }).code);
+      }
+    } catch {
+      // Non-JSON error body: the status alone is the signal.
+    }
+    throw new VisionCaptureError(
+      `vision/capture failed: HTTP ${resp.status}${code ? ` ${code}` : ""}`,
+      resp.status,
+      code,
+    );
   }
   const json = await resp.json();
   // The server wraps responses in `ApiResponse { success, data, error }`.
@@ -99,14 +137,15 @@ function uint8ToBase64(bytes: Uint8Array): string {
 
 /**
  * High-level helper that mirrors the legacy `/ui-bridge/sdk/screenshot`
- * response shape: `{ screenshot, width, height, format, sha256, path }`.
- * Performs `vision/capture` followed by a `vision/cache/{sha}` GET to
- * materialize the base64 payload in-process.
+ * response shape: `{ screenshot, width, height, format, sha256, url }`.
+ * Performs one `vision/capture` with `inline: true`, so the base64 payload
+ * arrives in the same response. A capture over the runner's inline cap
+ * (413 `INLINE_TOO_LARGE`) is re-requested without `inline` and fetched by
+ * its cache URL instead.
  *
  * Use this only when a downstream consumer genuinely needs the base64 bytes
- * (e.g. client-side thumbnail cropping). When you can pass the file path or
- * fetch via the cache URL directly, prefer `captureVision` to avoid the
- * extra round-trip and the cost of base64 encoding multi-MB buffers.
+ * (e.g. client-side thumbnail cropping). When you can fetch via the cache
+ * URL directly, prefer `captureVision` to avoid moving multi-MB base64 strings.
  */
 export async function captureScreenshotBase64(
   req: VisionCaptureRequest = {},
@@ -117,17 +156,26 @@ export async function captureScreenshotBase64(
   height: number;
   format: "jpeg" | "webp" | "png";
   sha256: string;
-  path: string;
+  url: string;
 }> {
-  const meta = await captureVision(req);
-  const bytes = await fetchVisionCacheBytes(meta.sha256);
-  const screenshot = uint8ToBase64(bytes);
+  let meta: VisionCaptureResponse;
+  try {
+    meta = await captureVision({ ...req, inline: true });
+  } catch (e) {
+    if (!(e instanceof VisionCaptureError && e.code === "INLINE_TOO_LARGE")) {
+      throw e;
+    }
+    // The capture is cached; this second call is a cache hit.
+    meta = await captureVision({ ...req, inline: false });
+  }
+  const screenshot =
+    meta.base64 ?? uint8ToBase64(await fetchVisionCacheBytes(meta.sha256));
   return {
     screenshot,
     width: meta.width,
     height: meta.height,
     format: meta.format,
     sha256: meta.sha256,
-    path: meta.path,
+    url: meta.url,
   };
 }
