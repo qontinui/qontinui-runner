@@ -29,7 +29,8 @@
 //!    provisional until it does). No guessing. The cmdline query is TARGETED at
 //!    exactly the anchor pids of unbound terminals — never a table-wide fetch —
 //!    and fails open (unavailable ⇒ fall through to rung 3).
-//! 2½. **Provider registry** ([`provider_rung`]): Claude Code's own
+//!
+//!    **Rung 2½ — provider registry** ([`provider_rung`]): Claude Code's own
 //!    `<config>/sessions/<pid>.json` for the anchor pid, VALID per
 //!    [`registry_row_validity`](crate::session::claude_session_registry::registry_row_validity)
 //!    (live claude pid + matching `procStart`), names the id the process runs
