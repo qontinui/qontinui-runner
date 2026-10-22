@@ -52,7 +52,9 @@ use qontinui_pty_holder::proc_identity::is_same_process;
 use qontinui_pty_holder::protocol::PROTOCOL_VERSIONS;
 
 use super::TerminalManager;
-use crate::session::tracking_health::{HolderCensus, HolderPane, HolderPaneState};
+use crate::session::tracking_health::{
+    HolderCensus, HolderPane, HolderPaneState, HolderProtection, PaneHandoff,
+};
 
 /// The one deadline every holder's handshake shares. A healthy holder answers
 /// in milliseconds; a holder that misses this is reported Unknown, which
@@ -156,7 +158,13 @@ pub fn add_in_flight(census: &mut HolderCensus, in_flight: &[String]) {
                 "being spawned by this runner (in flight) — not probed, counted".to_string(),
             ),
             claude_pids: Vec::new(),
+            protection: HolderProtection::Unknown,
+            handoff: PaneHandoff::Unknown,
+            handoff_reason: None,
         });
+        if let Some(p) = census.panes.last_mut() {
+            p.refresh_handoff();
+        }
     }
     census.panes.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
 }
@@ -236,7 +244,9 @@ pub fn census_in(
                 .map(|row| {
                     let lock_file = lock_file_for(&pane_dir, &row.pane_id);
                     let record = move || read_record(&lock_file);
-                    pane_from_row(row, record, is_same_process)
+                    let mut pane = pane_from_row(row, record, is_same_process);
+                    observe_protection(&mut pane, holder_protection);
+                    pane
                 })
                 .collect(),
             ..HolderCensus::default()
@@ -293,6 +303,9 @@ pub fn pane_from_row(
         holder_versions: Vec::new(),
         detail,
         claude_pids: Vec::new(),
+        protection: HolderProtection::Unknown,
+        handoff: PaneHandoff::Unknown,
+        handoff_reason: None,
     };
     // The pids an unanswered or incompatible holder's record names, each kept
     // unless its own start token proves it recycled.
@@ -307,7 +320,7 @@ pub fn pane_from_row(
         }
         pane
     };
-    match row.probe.clone() {
+    let mut pane = match row.probe.clone() {
         Probe::Healthy { hello_ack } => HolderPane {
             holder_pid: Some(hello_ack.holder_pid),
             child_pid: hello_ack.child_pid,
@@ -357,6 +370,80 @@ pub fn pane_from_row(
             HolderPaneState::Unknown,
             Some("the census reported no lock file for a lock file it walked".to_string()),
         ),
+    };
+    pane.refresh_handoff();
+    pane
+}
+
+/// Fill a census row's [`HolderProtection`] from its LIVE holder (`observe`
+/// is [`holder_protection`] in production) and re-derive its handoff verdict.
+/// A dead holder has nothing to observe: its protection stays `unknown`, and
+/// its verdict is decided by its child alone.
+pub fn observe_protection(pane: &mut HolderPane, observe: impl FnOnce(u32) -> HolderProtection) {
+    pane.protection = match (pane.state, pane.holder_pid) {
+        (HolderPaneState::Dead, _) | (_, None) => HolderProtection::Unknown,
+        (_, Some(pid)) => observe(pid),
+    };
+    pane.refresh_handoff();
+}
+
+/// Whether holder `pid` is protected from the runner's own stop — the
+/// spawner's `Unprotected::Cgroup` (`qontinui_pty_holder::spawn`), OBSERVED
+/// from the live holder rather than remembered from its spawn, so a pane this
+/// runner adopted after a restart carries it too and nothing is persisted.
+///
+/// Linux: [`protection_from_cgroup`] over `/proc/<pid>/cgroup`; an unreadable
+/// one is `unknown`. Elsewhere: `protected` by spawn-route construction — no
+/// Windows or macOS route leaves a holder inside the runner's kill domain
+/// (the spawner never reports `Unprotected` there).
+pub fn holder_protection(pid: u32) -> HolderProtection {
+    #[cfg(target_os = "linux")]
+    {
+        protection_from_cgroup(
+            std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                .ok()
+                .as_deref(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        HolderProtection::Protected
+    }
+}
+
+/// Classify a `/proc/<pid>/cgroup` body (`None`: unreadable). Fail-closed:
+/// anything not parseable is `unknown`, never `protected`.
+///
+/// - the deepest unit is the holder's own `qontinui-pty-holder-*.scope` (the
+///   scope route) → `protected`;
+/// - otherwise inside a unit whose stop the runner can trigger
+///   (`spawn::cgroup_is_in_systemd_unit`, the spawner's own test) →
+///   `unprotected_cgroup`;
+/// - otherwise (no unit, a login session, the user manager) → `protected`.
+pub fn protection_from_cgroup(cgroup_file: Option<&str>) -> HolderProtection {
+    use qontinui_pty_holder::spawn::{cgroup_is_in_systemd_unit, HOLDER_UNIT_PREFIX};
+    let Some(body) = cgroup_file else {
+        return HolderProtection::Unknown;
+    };
+    let paths: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.splitn(3, ':').nth(2))
+        .collect();
+    if paths.is_empty() {
+        return HolderProtection::Unknown;
+    }
+    let own_scope = paths.iter().any(|path| {
+        path.split('/')
+            .rfind(|c| c.ends_with(".service") || c.ends_with(".scope"))
+            .is_some_and(|u| u.starts_with(HOLDER_UNIT_PREFIX) && u.ends_with(".scope"))
+    });
+    if own_scope {
+        HolderProtection::Protected
+    } else if cgroup_is_in_systemd_unit(body) {
+        HolderProtection::UnprotectedCgroup
+    } else {
+        HolderProtection::Protected
     }
 }
 
@@ -598,6 +685,95 @@ mod tests {
         let none = verified_holder_children_in(&dir, &terminals, |_, _| false);
         assert!(none.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D4/D6: a holder's protection is read from its cgroup, fail-closed —
+    /// its own holder scope is protected, a shared unit cgroup is
+    /// `unprotected_cgroup`, and an unreadable or unparseable body is
+    /// `unknown`, never protected.
+    #[test]
+    fn pty_holder_protection_reads_the_holders_cgroup_fail_closed() {
+        let own_scope = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/\
+                         qontinui-pty-holder-p1-1-2.scope\n";
+        assert_eq!(
+            protection_from_cgroup(Some(own_scope)),
+            HolderProtection::Protected
+        );
+        let in_runner_unit = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/\
+                              qontinui-runner.service\n";
+        assert_eq!(
+            protection_from_cgroup(Some(in_runner_unit)),
+            HolderProtection::UnprotectedCgroup
+        );
+        let login_session = "0::/user.slice/user-1000.slice/session-3.scope\n";
+        assert_eq!(
+            protection_from_cgroup(Some(login_session)),
+            HolderProtection::Protected
+        );
+        assert_eq!(protection_from_cgroup(None), HolderProtection::Unknown);
+        assert_eq!(protection_from_cgroup(Some("")), HolderProtection::Unknown);
+        assert_eq!(
+            protection_from_cgroup(Some("garbage")),
+            HolderProtection::Unknown
+        );
+    }
+
+    /// The census fills protection only from a LIVE holder pid, and the
+    /// handoff verdict follows it.
+    #[test]
+    fn pty_holder_census_observes_protection_and_derives_the_handoff() {
+        use crate::session::tracking_health::HandoffReason;
+        let live = || {
+            pane_from_row(
+                row(
+                    "a",
+                    Probe::Healthy {
+                        hello_ack: HelloAck {
+                            version: 3,
+                            holder_build: "b".into(),
+                            holder_pid: 10,
+                            child_pid: Some(11),
+                        },
+                    },
+                ),
+                || None,
+                same_as_recorded,
+            )
+        };
+        let unobserved = live();
+        assert_eq!(unobserved.protection, HolderProtection::Unknown);
+        assert_eq!(unobserved.handoff, PaneHandoff::Unknown);
+
+        let mut kept = live();
+        observe_protection(&mut kept, |pid| {
+            assert_eq!(pid, 10);
+            HolderProtection::Protected
+        });
+        assert_eq!(
+            (kept.handoff, kept.handoff_reason),
+            (PaneHandoff::Survivable, None)
+        );
+
+        let mut doomed = live();
+        observe_protection(&mut doomed, |_| HolderProtection::UnprotectedCgroup);
+        assert_eq!(
+            (doomed.handoff, doomed.handoff_reason),
+            (PaneHandoff::Killed, Some(HandoffReason::UnprotectedCgroup))
+        );
+
+        let mut dead = pane_from_row(
+            row(
+                "d",
+                Probe::Dead {
+                    record: Some(rec(20, Some(21))),
+                },
+            ),
+            || None,
+            same_as_recorded,
+        );
+        observe_protection(&mut dead, |_| panic!("a dead holder is not observed"));
+        assert_eq!(dead.protection, HolderProtection::Unknown);
+        assert_eq!(dead.handoff, PaneHandoff::Killed);
     }
 
     /// Review F2: every terminal still being built after the snapshot is a
