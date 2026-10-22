@@ -82,6 +82,29 @@ pub enum CredentialScrub {
     ScrubbedOutOfProcess,
 }
 
+/// What a pane whose child lives in an out-of-process PTY holder can say about
+/// that holder — the facts a HANDOFF close needs (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D2/D4). [`PaneIo::holder_handoff`] answers `None` for a pane whose process
+/// lives in this runner (a `LocalPty`), which a handoff close therefore kills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderHandoff {
+    /// The holder serving the pane now.
+    pub holder_pid: u32,
+    /// The pane's child, in the holder's pid namespace.
+    pub child_pid: u32,
+    /// `Some` (the holder's own wording) when the holder will NOT outlive the
+    /// runner even though it is detached — today only a holder sharing the
+    /// runner's systemd unit cgroup (`Unprotected::Cgroup`).
+    pub unprotected: Option<String>,
+    /// Whether the holder TOOK this pane's `detach` frame within its budget.
+    /// `false` before any release, and after a release whose frame the holder
+    /// did not take (the connection was ended instead, which the holder also
+    /// reads as a detach — but an unanswering holder cannot be confirmed to
+    /// have kept its child).
+    pub detach_confirmed: bool,
+}
+
 /// A byte source and sink for one terminal pane.
 ///
 /// Constructed once, inside `TerminalSession::spawn`, and shared with the
@@ -159,6 +182,14 @@ pub trait PaneIo: Send + Sync {
 
     /// How this implementation discharged the credential-scrub obligation.
     fn credential_scrub(&self) -> CredentialScrub;
+
+    /// The out-of-process holder this pane's child lives in, while there is a
+    /// live one to hand off — `None` for an in-process pane, and for a holder
+    /// pane whose child has already exited or whose holder is gone. See
+    /// [`HolderHandoff`].
+    fn holder_handoff(&self) -> Option<HolderHandoff> {
+        None
+    }
 
     /// Close the underlying handles so a reader blocked in `read()` unblocks.
     /// Bounded by `budget`; `Err` means the handles could not be reached in

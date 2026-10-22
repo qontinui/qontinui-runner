@@ -130,6 +130,21 @@ impl PaneKey {
         ))
     }
 
+    /// Terminal-id key: the coord session of the LIVE terminal `terminal_id`,
+    /// kept for the one restore that reuses a terminal id — a holder pane the
+    /// next runner's boot sweep adopts under the same id (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D8). The create triple cannot serve there: the pane's working dir may
+    /// have been reassigned to a worktree after the key was taken and its
+    /// title renamed since, and the holder's restore metadata carries neither
+    /// original. A leading `terminal` segment and two fields keep it disjoint
+    /// from every other key form (three, four and five fields). Removed when
+    /// the terminal really exits, so it does not accumulate.
+    pub fn for_terminal(terminal_id: &str) -> Self {
+        const SEP: char = '\u{1f}';
+        PaneKey(format!("terminal{SEP}{}", terminal_id.trim()))
+    }
+
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -196,8 +211,8 @@ impl PaneSessionStore {
     /// Drop a pane's mapping (e.g. when its coord row was GC'd and the
     /// resume fell back to a fresh id — the fresh id is `put` over the top,
     /// so explicit removal is only needed if a caller wants to forget a
-    /// pane entirely). Best-effort flush.
-    #[allow(dead_code)]
+    /// pane entirely, as a terminal's real exit does for its
+    /// [`PaneKey::for_terminal`] mapping). Best-effort flush.
     pub fn remove(&self, key: &PaneKey) {
         let snapshot = {
             let mut m = match self.map.lock() {
