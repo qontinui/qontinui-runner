@@ -221,12 +221,11 @@ describe("patchPendingTab", () => {
 });
 
 describe("mayRestoreIntoZone", () => {
-  const zonedAtClose = new Set(["a", "b", "c"]);
   it.each([
     ["an empty zone is reclaimed", null, true],
-    ["a tab that arrived after the close (unzoned then) is displaced", "new-tab", true],
-    ["a tab that already held a zone and was moved there is left alone", "c", false],
+    ["a tab opened into the vacancy during the window is left alone", "new-tab", false],
+    ["a tab dragged into the zone during the window is left alone", "c", false],
   ] as const)("%s", (_label, occupant, expected) => {
-    expect(mayRestoreIntoZone(occupant, zonedAtClose)).toBe(expected);
+    expect(mayRestoreIntoZone(occupant)).toBe(expected);
   });
 });

@@ -151,6 +151,12 @@ export interface EffectArms {
    * two `restart=` variants below carry this arm with them.
    */
   sessionStates: "waiting" | "errored";
+  /**
+   * `session.closeTerminal` — the `CloseRoute` it took. `/close` reports a
+   * deferred close as pending ("closing … (undo 10 s)") and a worker view as
+   * hidden, so the route is evidence its verdict is derived from.
+   */
+  closeRoute: "kill-now" | "defer" | "hide-worker";
 }
 
 /**
@@ -177,6 +183,7 @@ export const DEFAULT_ARMS: EffectArms = {
   cards: "empty",
   spawn: "full",
   sessionStates: "waiting",
+  closeRoute: "kill-now",
 };
 
 /**
@@ -211,6 +218,8 @@ export const ARM_VARIANTS: ReadonlyArray<{ name: string; arms: Partial<EffectArm
   { name: "liveSessions=two", arms: { liveSessions: "two" } },
   { name: "cards=populated", arms: { cards: "populated" } },
   { name: "spawn=short", arms: { spawn: "short" } },
+  { name: "closeRoute=defer", arms: { closeRoute: "defer" } },
+  { name: "closeRoute=hide-worker", arms: { closeRoute: "hide-worker" } },
 ];
 
 /** What a loaded real registry gives a spec. */
@@ -420,7 +429,7 @@ async function build(): Promise<RealRegistryHarness> {
       tabs: [{ id: "tab-a" }, { id: "tab-b" }],
       activeId: "tab-a",
       setActiveId: rec("session.setActiveId", undefined),
-      closeTerminal: rec("session.closeTerminal", undefined),
+      closeTerminal: recArm("session.closeTerminal", () => arms.closeRoute),
       terminalRefs: { current: terminalRefs },
       sessionStates,
       pageId: "page-1",
