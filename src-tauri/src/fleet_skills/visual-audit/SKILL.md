@@ -1,6 +1,6 @@
 ---
 name: visual-audit
-description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the 20-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag, and the L1 image assertions image_palette_within, no_near_duplicate_images, no_placeholder_images, image_focal_visible, transparent_image_legible, salience_order, image_sharpness_at_least, image_blockiness_within). Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
+description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the 20-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag, and eight L1 image assertions). Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
 user-invocable: true
 ---
 
@@ -134,9 +134,10 @@ read the frame, so a runner reporting `frontendState: "window_missing"` still
 answers every geometric question. A failed capture comes back as
 `frameError` in the response — check for it rather than assuming the pixels
 agreed. Only `color`, `dynamic` and `image` need the frame, and without one
-they answer `Blocked` with a `skipped` finding; the image assertions answer
-`outcome: "unknown"` (a slot placeholder marker still fails
-`no_placeholder_images`, since that needs no pixels).
+they answer `Blocked` with a `skipped` finding; the pixel-reading image
+assertions answer `outcome: "unknown"` (a slot placeholder marker still fails
+`no_placeholder_images`, since that needs no pixels, and `image_focal_visible`
+reads media facts, not the frame).
 
 The same holds for the `vision-audit` binary, where `--frame` is optional —
 that is the path qontinui-web's CI style gate uses, with no runner in the loop
@@ -348,8 +349,23 @@ Each assertion is a tagged-JSON object:
 Every threshold on an image assertion is the CALLER's (a slot spec or the
 visual system); an omitted one answers `outcome: "unknown"`, never a pass.
 `no_near_duplicate_images` and `no_placeholder_images` are page-wide and
-answer `unknown` whenever an image is unreadable — today, any image a producer
-reports `visible: false` without a `visibility_reason`.
+answer `unknown` whenever an image on the page is unreadable. An image is
+unreadable — never silently skipped — when, for example (the full rules are
+`image::unreadable` and `image::locate` in rust-vision-core):
+
+- the producer reports it `occluded`, `off-screen`, or not visible for a
+  reason vision-core does not interpret;
+- it is `visible: false` with no `visibility_reason` — which today is every
+  off-screen image from a producer that does not send the reason;
+- it lies wholly inside the element its `occluded_by` names;
+- it is an `img`/`picture`/`video`/`canvas` with no `object_fit`, or a
+  `contain` / `none` / `scale-down` fit that cannot be placed without
+  `natural_px`;
+- it has no bbox, or lies wholly outside the frame.
+
+An image that paints nothing (zero-area, or reported `hidden` / `no-layout`)
+is left out instead, and CSS backgrounds are left out of the page-wide checks
+with a disclosed count (a slot placeholder marker on one still fails).
 
 ### Example: audit the page for the kinds of bugs Phase 6 was designed to catch
 
