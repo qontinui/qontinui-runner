@@ -4,9 +4,9 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 187
+# total: 188
 #   guarded: 22
-#   literal: 64
+#   literal: 65
 #   registry: 44
 #   delegated: 9
 #   builtin: 15
@@ -57,11 +57,12 @@ src/components/settings/Settings.tsx:169	literal	component	reset	schema=no	arity
 src/components/settings/Settings.tsx:191	guarded	component	switch-tab	schema=yes	arity=-	effect=write
 src/components/settings/Settings.tsx:223	literal	component	list-tabs	schema=no	arity=0	effect=read
 src/components/terminal/CommandBar.selection.test.ts:39	fixture	free	-	schema=no	arity=0	effect=-
-src/components/terminal/RestartPrepPanel.tsx:140	literal	component	prepare	schema=no	arity=0	effect=write
-src/components/terminal/RestartPrepPanel.tsx:213	literal	component	toggle	schema=no	arity=0	effect=write
-src/components/terminal/RestartPrepPanel.tsx:328	literal	component	refresh	schema=no	arity=0	effect=read
-src/components/terminal/RestartPrepPanel.tsx:336	literal	component	close	schema=no	arity=0	effect=read
-src/components/terminal/RestartPrepPanel.tsx:361	literal	component	cancel	schema=no	arity=0	effect=write
+src/components/terminal/RestartPrepPanel.tsx:158	literal	component	prepare	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:244	literal	component	toggle	schema=no	arity=0	effect=write
+src/components/terminal/RestartPrepPanel.tsx:376	literal	component	refresh	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx:384	literal	component	close	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx:409	literal	component	cancel	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx:430	literal	component	extend	schema=no	arity=0	effect=destructive
 src/components/terminal/SinceRestartSection.tsx:344	literal	component	resume-selected	schema=no	arity=0	effect=destructive
 src/components/terminal/SinceRestartSection.tsx:355	literal	component	capture-now	schema=no	arity=0	effect=write
 src/components/terminal/SinceRestartSection.tsx:365	literal	component	refresh	schema=no	arity=0	effect=read
@@ -177,7 +178,7 @@ src/components/terminal/commands/useTerminalCommands.ts:1880	registry	free	termi
 src/components/terminal/commands/useTerminalCommands.ts:1916	registry	free	terminal.copy-names	schema=yes	arity=0	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:2016	registry	free	terminal.prepare-restart	schema=yes	arity=1	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:2061	registry	free	terminal.cancel-restart-prep	schema=yes	arity=0	effect=-
-src/components/terminal/commands/useTerminalCommands.ts:2077	registry	free	terminal.elevated	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts:2080	registry	free	terminal.elevated	schema=yes	arity=0	effect=-
 src/components/terminal/createPlainTerminalAction.ts:64	literal	free	-	schema=no	arity=0	effect=write
 src/components/terminal/terminalLaunchMenuActions.ts:120	guarded	free	create-plain	schema=yes	arity=-	effect=write
 src/components/terminal/terminalLaunchMenuActions.ts:137	guarded	free	create-ai-session	schema=yes	arity=-	effect=destructive

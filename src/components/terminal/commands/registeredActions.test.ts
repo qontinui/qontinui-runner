@@ -197,9 +197,11 @@ describe("registered actions — the cost/destruction declarations are not empty
         .sort(),
     ).toEqual([
       "terminal.approve-all",
+      // The restart prepare and its cancel type a save-and-pause / resume
+      // notice into live sessions — a keystroke delivered to a subprocess,
+      // which cannot be taken back.
+      "terminal.cancel-restart-prep",
       "terminal.close",
-      // Types a save-and-pause notice into every live session — a keystroke
-      // delivered to a subprocess, which cannot be taken back.
       "terminal.prepare-restart",
       "terminal.restart",
     ]);

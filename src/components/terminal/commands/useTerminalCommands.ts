@@ -2146,6 +2146,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "the sessions that were asked to pause to resume. Same as `/prepare-restart cancel`.",
     paramSchema: SCHEMA.empty,
     patterns: [/^cancel\s+(?:the\s+)?restart(?:\s+prep(?:are)?)?$/i],
+    // Like `/prepare-restart`: the cancel types "resume your work" into every
+    // session that was told to pause, which cannot be taken back.
+    destructive: true,
     handler: async (): Promise<CommandResult<EffectReport>> => cancelRestartPrep(),
   });
 

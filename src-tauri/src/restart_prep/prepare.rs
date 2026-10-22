@@ -93,6 +93,11 @@ pub const RESTART_PREP_CHANGED_EVENT: &str = "restart-prep-changed";
 /// The runner's default hold length when coord gives none: 6 h (D1).
 pub const DEFAULT_HOLD_MS: i64 = 6 * 60 * 60 * 1000;
 
+/// The furthest out an Extend may push the hold's `until`, from now: under
+/// coord's own 30-day drain ceiling (`MAX_DRAIN_DAYS`, which refuses a
+/// later `until` with a 400), with a day of margin for clock skew.
+pub const MAX_HOLD_MS: i64 = 29 * 24 * 60 * 60 * 1000;
+
 /// The prefix coord writes before the prepare id in the hold's `reason`.
 pub const HOLD_REASON_PREFIX: &str = "restart-hold:";
 
@@ -923,6 +928,37 @@ impl RestartPrep {
         self.take_hold(door, &rec).await
     }
 
+    /// Extend the hold (the panel's Extend, D1): push its `until` out by
+    /// [`DEFAULT_HOLD_MS`] from the later of now and the current `until` —
+    /// so an expired hold is renewed from now — capped at [`MAX_HOLD_MS`]
+    /// from now. The extended `until` is then sent through the same hold
+    /// call as the prepare (same `prepare_id`, so coord treats it as a repeat
+    /// of the caller's own hold and moves only its deadline), and the record
+    /// takes coord's answer: its `until` when one came back, and the hold
+    /// status the read-back supports. A runner-local hold just takes the new
+    /// `until`. Errs when no prepare is in its window or the hold is already
+    /// at the ceiling.
+    pub async fn extend(&self, door: &dyn HoldDoor, now_ms: i64) -> Result<PrepareRecord, String> {
+        let _op = self.ops.lock().await;
+        let Some(rec) = self.record().filter(PrepareRecord::in_window) else {
+            return Err("no prepare is in progress — nothing to extend".to_string());
+        };
+        let from = rec.hold_until_ms.unwrap_or(now_ms).max(now_ms);
+        let until = (from + DEFAULT_HOLD_MS).min(now_ms + MAX_HOLD_MS);
+        if rec.hold_until_ms.is_some_and(|u| until <= u) {
+            return Err(format!(
+                "the hold already runs to {} — the longest it may be held from now",
+                rec.hold_until.as_deref().unwrap_or("?")
+            ));
+        }
+        let rec = self.update(&rec.prepare_id, |r| {
+            r.hold_until_ms = Some(until);
+            r.hold_until = Some(rfc3339(until));
+        })?;
+        info!(prepare = %rec.prepare_id, until = %rfc3339(until), "restart_prep: hold extended");
+        self.take_hold(door, &rec).await
+    }
+
     /// Cancel the prepare (and the same-build banner's Release hold): release
     /// the hold and record `cancelled`, which lifts the freeze and any local
     /// hold — or, once the runner has restarted since the prepare (rebuilt
@@ -1154,6 +1190,13 @@ pub async fn prepare_from_app(
         .await?;
     // The first notice pass now rather than on the loop's next tick.
     tauri::async_runtime::spawn(super::notice::tick_live());
+    Ok(changed_payload(ctl, rec))
+}
+
+/// The Tauri `restart_prep_extend` body.
+pub async fn extend_from_app() -> Result<PrepChanged, String> {
+    let ctl = install_live().ok_or("restart prepare is not available in this build")?;
+    let rec = ctl.extend(&LiveDoor, now_ms()).await?;
     Ok(changed_payload(ctl, rec))
 }
 
@@ -2069,5 +2112,94 @@ mod tests {
             v.hold_expired_at, None,
             "a cancelled record is not 'expired'"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_prep_extend_moves_the_coord_hold_s_until_and_reads_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        let rec = prepare(&ctl, &door).await;
+        assert_eq!(rec.hold, HoldStatus::Confirmed);
+        let now = T0 + 60_000;
+        let ext = ctl.extend(&*door, now).await.unwrap();
+        let want = T0 + 2 * DEFAULT_HOLD_MS;
+        assert_eq!(ext.hold_until_ms, Some(want), "6 h past the current until");
+        assert_eq!(ext.hold, HoldStatus::Confirmed);
+        let holds = door.holds.lock().unwrap().clone();
+        assert_eq!(holds.len(), 2, "the extension is one more hold call");
+        assert_eq!(
+            holds[1].prepare_id, rec.prepare_id,
+            "a repeat of the same hold"
+        );
+        assert_eq!(holds[1].until, Some(rfc3339(want)));
+        assert_eq!(
+            super::super::load_from(&dir.path().join(super::super::RECORD_FILE))
+                .unwrap()
+                .hold_until_ms,
+            Some(want),
+            "persisted"
+        );
+        // Coord's own answer wins over the requested until.
+        *door.until_reply.lock().unwrap() = Some(T0 + DEFAULT_HOLD_MS + 1_000);
+        let ext = ctl.extend(&*door, now).await.unwrap();
+        assert_eq!(ext.hold_until_ms, Some(T0 + DEFAULT_HOLD_MS + 1_000));
+        // A refused extension is not reported as confirmed.
+        *door.hold_reply.lock().unwrap() = Some(HoldCall::Unreachable {
+            cause: "timeout".to_string(),
+        });
+        let ext = ctl.extend(&*door, now).await.unwrap();
+        assert!(
+            matches!(ext.hold, HoldStatus::Unconfirmed { .. }),
+            "{:?}",
+            ext.hold
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_prep_extend_renews_an_expired_local_hold_from_now_and_stops_at_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let until = T0 + 1_000;
+        let ctl = seeded(&dir, running_build(), HoldStatus::Local, until);
+        let door = MockDoor::new(HoldRole::NotEnrolled {
+            why: "test".to_string(),
+        });
+        let now = T0 + 10_000;
+        assert!(!ctl.record().unwrap().is_active(now), "expired");
+        let ext = ctl.extend(&*door, now).await.unwrap();
+        assert_eq!(
+            ext.hold_until_ms,
+            Some(now + DEFAULT_HOLD_MS),
+            "renewed from now"
+        );
+        assert_eq!(ext.hold, HoldStatus::Local);
+        assert!(ext.is_active(now), "active again");
+        assert_eq!(door.hold_count(), 0, "a local hold calls no coord");
+        // Repeated extensions stop at the ceiling, then refuse.
+        let mut last = ext;
+        for _ in 0..200 {
+            match ctl.extend(&*door, now).await {
+                Ok(r) => last = r,
+                Err(e) => {
+                    assert!(e.contains("longest"), "{e}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(last.hold_until_ms, Some(now + MAX_HOLD_MS));
+        assert!(ctl.extend(&*door, now).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restart_prep_extend_refuses_outside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        assert!(ctl.extend(&*door, T0).await.is_err(), "no record");
+        prepare(&ctl, &door).await;
+        ctl.cancel(&*door, T0).await.unwrap();
+        let err = ctl.extend(&*door, T0).await.unwrap_err();
+        assert!(err.contains("nothing to extend"), "{err}");
+        assert_eq!(door.hold_count(), 1, "only the prepare's hold");
     }
 }

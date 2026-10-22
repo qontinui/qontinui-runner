@@ -13,8 +13,9 @@
 //!   only, with no HTTP twin, and OFF the UI-Bridge invoke allowlist — an
 //!   allowlisted command is reachable by any local process over
 //!   `POST /ui-bridge/invoke/<name>`.
-//! * `restart_prep_dismiss` (Phase 6) and `restart_prep_set_held` (Phase 5,
-//!   the panel's held toggle) are operator doors of the same kind.
+//! * `restart_prep_dismiss` (Phase 6), and `restart_prep_extend` and
+//!   `restart_prep_set_held` (Phase 5, the panel's Extend and held toggle),
+//!   are operator doors of the same kind.
 
 /// `restart_prep_status` — the persisted prepare record (if any) and the live
 /// cohort a prepare taken now would pin.
@@ -40,6 +41,14 @@ pub async fn restart_prep_prepare(
 #[tauri::command]
 pub async fn restart_prep_cancel() -> Result<crate::restart_prep::prepare::PrepChanged, String> {
     crate::restart_prep::prepare::cancel_from_app().await
+}
+
+/// `restart_prep_extend` — the panel's Extend: push the spawn hold's `until`
+/// out by 6 h (D1), re-sent to coord as the same hold. Operator-only, like
+/// the doors above.
+#[tauri::command]
+pub async fn restart_prep_extend() -> Result<crate::restart_prep::prepare::PrepChanged, String> {
+    crate::restart_prep::prepare::extend_from_app().await
 }
 
 /// `restart_prep_dismiss` — end a rebuilt runner's restore of the cohort
@@ -70,6 +79,7 @@ crate::ipc_group!(
     restart_prep_status,
     restart_prep_prepare,
     restart_prep_cancel,
+    restart_prep_extend,
     restart_prep_dismiss,
     restart_prep_set_held
 );

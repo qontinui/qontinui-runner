@@ -11,6 +11,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { loadRealRegistry, type RealRegistryHarness } from "./realRegistry.testkit";
+import { run as runTyped } from "./pipeline.testkit";
 import type { CommandResult } from "./types";
 import { describeReport, isEffectReport } from "./verdict";
 
@@ -58,6 +59,16 @@ describe("/prepare-restart", () => {
     } finally {
       h.resetArms();
     }
+  });
+
+  it("the TYPED `/prepare-restart cancel` reaches the cancel, not a prepare", async () => {
+    h.resetArms();
+    h.reset();
+    const out = await runTyped("/prepare-restart cancel", (id) => h.byId(id));
+    expect(out.actionId).toBe("terminal.prepare-restart");
+    expect(out.args).toEqual({ reason: "cancel" });
+    expect(out.verdict).toBe("ok");
+    expect(invokes().map(([cmd]) => cmd)).toEqual(["restart_prep_cancel"]);
   });
 
   it("`/prepare-restart cancel` cancels instead of preparing", async () => {

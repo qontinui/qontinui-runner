@@ -203,7 +203,9 @@ export function rowName(row: CohortRow): string {
 export type Headline =
   | { kind: "ready"; text: string }
   | { kind: "waiting"; text: string; blockers: Blocker[] }
-  | { kind: "unknown"; text: string };
+  /** `blockers`: every blocker the verdict named, so a prepare-wide UNKNOWN
+   * never hides which sessions are still working (empty when none was read). */
+  | { kind: "unknown"; text: string; blockers: Blocker[] };
 
 export const READY_HEADLINE = "Safe to restart — rebuild and restart the runner now";
 
@@ -230,16 +232,25 @@ export interface HeadlineInput {
  *   UNKNOWN — never a default of either answer.
  * - A PREPARE-WIDE blocker (no session: the hold, the census, the re-capture)
  *   is an input the safety claim rests on, so it makes the headline UNKNOWN
- *   naming it; "Waiting on N sessions" is said only of sessions.
+ *   naming it; "Waiting on N sessions" is said only of sessions. The UNKNOWN
+ *   still carries every blocker, so the session list stays on screen.
  * - A verdict that contradicts itself (ready with blockers, not ready with
  *   none) is UNKNOWN too.
  */
 export function restartPrepHeadline({ record, readError, loaded }: HeadlineInput): Headline | null {
   if (readError !== null) {
-    return { kind: "unknown", text: `UNKNOWN: the restart-prep record (${readError})` };
+    return {
+      kind: "unknown",
+      text: `UNKNOWN: the restart-prep record (${readError})`,
+      blockers: [],
+    };
   }
   if (!loaded) {
-    return { kind: "unknown", text: "UNKNOWN: the restart-prep record (not read yet)" };
+    return {
+      kind: "unknown",
+      text: "UNKNOWN: the restart-prep record (not read yet)",
+      blockers: [],
+    };
   }
   if (!record || !inWindow(record)) return null;
   const verdict = record.verdict;
@@ -247,12 +258,17 @@ export function restartPrepHeadline({ record, readError, loaded }: HeadlineInput
     return {
       kind: "unknown",
       text: "UNKNOWN: the verdict (the runner has not evaluated this prepare yet)",
+      blockers: [],
     };
   }
   const blockers = Array.isArray(verdict.blockers) ? verdict.blockers : [];
   const prepareWide = blockers.filter((b) => !b.session);
   if (prepareWide.length > 0) {
-    return { kind: "unknown", text: `UNKNOWN: ${prepareWide.map((b) => b.reason).join("; ")}` };
+    return {
+      kind: "unknown",
+      text: `UNKNOWN: ${prepareWide.map((b) => b.reason).join("; ")}`,
+      blockers,
+    };
   }
   if (verdict.ready_to_restart && blockers.length === 0) {
     return { kind: "ready", text: READY_HEADLINE };
@@ -270,6 +286,7 @@ export function restartPrepHeadline({ record, readError, loaded }: HeadlineInput
     text: verdict.ready_to_restart
       ? "UNKNOWN: the verdict (ready, yet it names blockers)"
       : "UNKNOWN: the verdict (not ready, and it names no blocker)",
+    blockers,
   };
 }
 
@@ -298,8 +315,13 @@ export function effortBadge(row: CohortRow): string {
 
 // ── The store ─────────────────────────────────────────────────────────
 
-/** An operator action's acknowledgement (`an-action-must-acknowledge-itself`). */
-export type ActionPhase = "idle" | "received" | "in-flight" | "done" | "failed";
+/**
+ * An operator action's acknowledgement (`an-action-must-acknowledge-itself`).
+ * The click's receipt IS the `in-flight` render: the control turns into a
+ * disabled spinner in the same frame as the click, before anything is sent,
+ * and then reaches a terminal `done` or `failed` that says what happened.
+ */
+export type ActionPhase = "idle" | "in-flight" | "done" | "failed";
 
 export interface ActionState {
   phase: ActionPhase;
@@ -309,6 +331,9 @@ export interface ActionState {
 
 const IDLE: ActionState = { phase: "idle" };
 
+/** The record-wide operator actions, each with its own acknowledgement. */
+type PrepAction = "prepare" | "cancel" | "extend";
+
 export interface RestartPrepSnapshot {
   record: PrepareRecord | null;
   view: PrepView | null;
@@ -317,6 +342,7 @@ export interface RestartPrepSnapshot {
   panelOpen: boolean;
   prepare: ActionState;
   cancel: ActionState;
+  extend: ActionState;
   /** Per Claude session id: the held toggle's acknowledgement. */
   held: Readonly<Record<string, ActionState>>;
 }
@@ -345,6 +371,8 @@ export interface RestartPrepStore {
   prepare(reason?: string): Promise<PrepChanged>;
   /** Cancel the prepare (also the "Release hold" of a same-build restart). */
   cancel(): Promise<PrepChanged>;
+  /** Extend the spawn hold's `until` by 6 h (re-sent to coord as the same hold). */
+  extend(): Promise<PrepChanged>;
   /** The held toggle: hold a row for a hand restore, or release it. */
   setHeld(claudeSessionId: string, held: boolean): Promise<PrepareRecord>;
   openPanel(): { changed: boolean };
@@ -360,14 +388,14 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     panelOpen: false,
     prepare: IDLE,
     cancel: IDLE,
+    extend: IDLE,
     held: {},
   };
   const listeners = new Set<() => void>();
   let refs = 0;
   let stopListening: (() => void) | null = null;
   let listening = false;
-  let inflightPrepare: Promise<PrepChanged> | null = null;
-  let inflightCancel: Promise<PrepChanged> | null = null;
+  const inflight: Partial<Record<PrepAction, Promise<PrepChanged>>> = {};
   /** Bumped by every event, so an action reply older than an event is not applied over it. */
   let eventSeq = 0;
 
@@ -399,11 +427,12 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
         record?: unknown;
         view?: unknown;
       } | null;
+      // An event that landed while this read was out is newer than any of it.
+      if (eventSeq !== seq) return;
       if (typeof status !== "object" || status === null) {
         set({ readError: "the status came back in an unrecognized shape", loaded: true });
         return;
       }
-      if (eventSeq !== seq) return;
       if (status.record === null || status.record === undefined) {
         set({ record: null, view: null, readError: null, loaded: true });
         return;
@@ -416,6 +445,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
       }
       set({ record, view, readError: null, loaded: true });
     } catch (err) {
+      if (eventSeq !== seq) return;
       set({
         readError: describeThrown(err, "could not read the restart-prep record"),
         loaded: true,
@@ -466,51 +496,37 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     };
   };
 
-  const prepare = (reason = ""): Promise<PrepChanged> => {
-    if (inflightPrepare) return inflightPrepare;
-    set({ prepare: { phase: "received" } });
+  /**
+   * One prepare / cancel / extend: in flight at once per action — a second
+   * call JOINS the first (same promise, nothing sent twice; a joining
+   * prepare's reason is the first one's) — then a terminal phase naming the
+   * hold the backend read back, or its refusal.
+   */
+  const runAction = (
+    action: PrepAction,
+    cmd: string,
+    args?: Record<string, unknown>,
+  ): Promise<PrepChanged> => {
+    const joined = inflight[action];
+    if (joined) return joined;
+    set({ [action]: { phase: "in-flight" } });
     const seq = eventSeq;
     const run = (async (): Promise<PrepChanged> => {
-      set({ prepare: { phase: "in-flight" } });
       try {
-        const reply = asPrepChanged(await deps.invoke("restart_prep_prepare", { reason }));
-        if (!reply) throw new Error("the prepare reply came back in an unrecognized shape");
+        const reply = asPrepChanged(await deps.invoke(cmd, args));
+        if (!reply) throw new Error(`the ${action} reply came back in an unrecognized shape`);
         applyReply(reply, seq);
-        set({ prepare: { phase: "done", message: `hold ${reply.view.hold}` } });
+        set({ [action]: { phase: "done", message: `hold ${reply.view.hold}` } });
         return reply;
       } catch (err) {
-        const message = describeThrown(err, "the prepare failed");
-        set({ prepare: { phase: "failed", message } });
+        const message = describeThrown(err, `the ${action} failed`);
+        set({ [action]: { phase: "failed", message } });
         throw new Error(message, { cause: err });
       } finally {
-        inflightPrepare = null;
+        delete inflight[action];
       }
     })();
-    inflightPrepare = run;
-    return run;
-  };
-
-  const cancel = (): Promise<PrepChanged> => {
-    if (inflightCancel) return inflightCancel;
-    set({ cancel: { phase: "received" } });
-    const seq = eventSeq;
-    const run = (async (): Promise<PrepChanged> => {
-      set({ cancel: { phase: "in-flight" } });
-      try {
-        const reply = asPrepChanged(await deps.invoke("restart_prep_cancel"));
-        if (!reply) throw new Error("the cancel reply came back in an unrecognized shape");
-        applyReply(reply, seq);
-        set({ cancel: { phase: "done", message: `hold ${reply.view.hold}` } });
-        return reply;
-      } catch (err) {
-        const message = describeThrown(err, "the cancel failed");
-        set({ cancel: { phase: "failed", message } });
-        throw new Error(message, { cause: err });
-      } finally {
-        inflightCancel = null;
-      }
-    })();
-    inflightCancel = run;
+    inflight[action] = run;
     return run;
   };
 
@@ -522,6 +538,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
       throw new Error("no restart prepare is recorded");
     }
     mark({ phase: "in-flight" });
+    const seq = eventSeq;
     try {
       const reply = asPrepareRecord(
         await deps.invoke("restart_prep_set_held", {
@@ -531,9 +548,13 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
         }),
       );
       if (!reply) throw new Error("the reply came back in an unrecognized shape");
-      // The backend announces the change too; applying the reply here keeps
-      // the toggle honest where the event channel is down.
-      if (snap.record?.prepare_id === reply.prepare_id) set({ record: reply });
+      // The backend announces the change too; applying the reply keeps the
+      // toggle honest where the event channel is down — but never over an
+      // event that landed meanwhile (a notice tick queued behind the toggle
+      // runs, and announces, the moment the toggle lets go).
+      if (eventSeq === seq && snap.record?.prepare_id === reply.prepare_id) {
+        set({ record: reply });
+      }
       const row = reply.cohort.rows.find((r) => r.session.claudeSessionId === claudeSessionId);
       if (!row || row.held !== held) {
         throw new Error("the record does not show the change");
@@ -555,8 +576,9 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     },
     retain,
     refresh,
-    prepare,
-    cancel,
+    prepare: (reason = "") => runAction("prepare", "restart_prep_prepare", { reason }),
+    cancel: () => runAction("cancel", "restart_prep_cancel"),
+    extend: () => runAction("extend", "restart_prep_extend"),
     setHeld,
     openPanel() {
       const changed = !snap.panelOpen;

@@ -406,6 +406,14 @@ pub async fn set_held_on(
         ));
     }
     ctl.update(prepare_id, |r| {
+        // Re-checked on the current record: a dismiss or the last restore
+        // verdict does not take `ops`, and may have ended the cohort since.
+        if !matches!(
+            r.state,
+            PrepState::Preparing | PrepState::Ready | PrepState::Restoring
+        ) {
+            return;
+        }
         if let Some(row) = r
             .cohort
             .rows

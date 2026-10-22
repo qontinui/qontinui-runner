@@ -37,6 +37,7 @@ import {
 export const PREPARE_RESTART_BUTTON_ID = "terminal.prepare-restart-button";
 export const RESTART_PREP_PANEL_ID = "terminal.restart-prep-panel";
 export const RESTART_PREP_CANCEL_ID = "terminal.restart-prep-cancel";
+export const RESTART_PREP_EXTEND_ID = "terminal.restart-prep-extend";
 export const restartPrepRowId = (sessionId: string): string =>
   `terminal.restart-prep-row-${sessionId}`;
 export const restartPrepHeldId = (sessionId: string): string =>
@@ -48,11 +49,17 @@ export function useRestartPrep(store: RestartPrepStore = restartPrepStore): Rest
   return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 }
 
-const busy = (a: ActionState): boolean => a.phase === "received" || a.phase === "in-flight";
+const busy = (a: ActionState): boolean => a.phase === "in-flight";
 
 /**
  * The header button's label, disabled flag and tone — pure, so the
  * acknowledgement states are pinned without a DOM.
+ *
+ * While a prepare is in its window the button reads that prepare's headline
+ * and a click only OPENS the panel: the prepare is already running, and
+ * re-sending it (a write that may retry the coord hold and starts a notice
+ * pass) is `/prepare-restart`'s job, not a glance at the progress. "Disabled
+ * while preparing" is therefore the request in flight, not the whole window.
  */
 export function prepareButtonState(snap: RestartPrepSnapshot): {
   label: string;
@@ -61,9 +68,6 @@ export function prepareButtonState(snap: RestartPrepSnapshot): {
   tone: "idle" | "ok" | "wait" | "error";
   title: string;
 } {
-  if (snap.prepare.phase === "received") {
-    return { label: "Received…", disabled: true, spinner: true, tone: "wait", title: "Received" };
-  }
   if (snap.prepare.phase === "in-flight") {
     return {
       label: "Preparing…",
@@ -71,15 +75,6 @@ export function prepareButtonState(snap: RestartPrepSnapshot): {
       spinner: true,
       tone: "wait",
       title: "Holding spawns and recording every session",
-    };
-  }
-  if (snap.prepare.phase === "failed") {
-    return {
-      label: "Prepare failed — retry",
-      disabled: false,
-      spinner: false,
-      tone: "error",
-      title: snap.prepare.message ?? "the prepare failed",
     };
   }
   if (inWindow(snap.record)) {
@@ -95,7 +90,27 @@ export function prepareButtonState(snap: RestartPrepSnapshot): {
       disabled: false,
       spinner: false,
       tone: headline?.kind === "ready" ? "ok" : headline?.kind === "waiting" ? "wait" : "error",
-      title: headline?.text ?? "",
+      title: `${headline?.text ?? ""} — click to open the progress panel`,
+    };
+  }
+  if (snap.prepare.phase === "failed") {
+    return {
+      label: "Prepare failed — retry",
+      disabled: false,
+      spinner: false,
+      tone: "error",
+      title: snap.prepare.message ?? "the prepare failed",
+    };
+  }
+  if (snap.readError !== null) {
+    // An unread record is not "no prepare": say so, and still let the
+    // operator prepare (the backend answers a running prepare with itself).
+    return {
+      label: "Restart prep: UNKNOWN",
+      disabled: false,
+      spinner: false,
+      tone: "error",
+      title: `The restart-prep record could not be read (${snap.readError}) — click to prepare`,
     };
   }
   return {
@@ -116,12 +131,15 @@ const TONE_CLASS = {
   error: "text-[#f7768e] bg-[#f7768e]/10 hover:bg-[#f7768e]/20",
 } as const;
 
-/** Prepare (or re-open the panel of the prepare already running). */
-function startPrepare(store: RestartPrepStore): void {
+/**
+ * The button's click: open the panel, and prepare unless a prepare is
+ * already in its window. Resolves to the reply (or `null` when it only
+ * opened the panel); rejects with the backend's refusal.
+ */
+function clickPrepare(store: RestartPrepStore): Promise<unknown> {
   store.openPanel();
-  store.prepare("").catch(() => {
-    // The failure is on the button and in the panel (`prepare.phase`).
-  });
+  if (inWindow(store.getSnapshot().record)) return Promise.resolve(null);
+  return store.prepare("");
 }
 
 /** The header button, and the panel below it while open. */
@@ -135,17 +153,19 @@ export function PrepareRestartButton({ store = restartPrepStore }: { store?: Res
     description:
       "Prepare the runner for a restart: hold new spawns until it is rebuilt, tell live sessions " +
       "to save and pause, keep limit-hit sessions on their account, record every session, and " +
-      "open the progress panel. Idempotent while a prepare is running.",
+      "open the progress panel. While a prepare is running it only opens the panel.",
     actions: [
       {
         id: "prepare",
         label: "Prepare for restart",
-        description: "Start (or re-join) the restart prepare and open its panel.",
-        // `write` — takes a spawn hold (a coord drain of this device's agent lane on
-        // the primary) and types a save-and-pause notice into live sessions. Cancel
-        // reverses all of it but the notices.
-        effect: "write",
-        handler: () => startPrepare(store),
+        description:
+          "Start the restart prepare and open its panel (only open it, while one is running).",
+        // `destructive` (CONTRACT.md "Promotion to destructive", Dim 1 + Dim 2):
+        // it drains this device's coord agent lane — machine/fleet state — and
+        // types a save-and-pause notice into every live session, which Cancel
+        // cannot take back. The plan's Phase 5 said `write`; the rubric decides.
+        effect: "destructive",
+        handler: () => clickPrepare(store),
       },
     ],
     state: () => ({ label: state.label, disabled: state.disabled }),
@@ -159,7 +179,11 @@ export function PrepareRestartButton({ store = restartPrepStore }: { store?: Res
           data-ui-bridge-id={PREPARE_RESTART_BUTTON_ID}
           data-prepare-phase={snap.prepare.phase}
           disabled={state.disabled}
-          onClick={() => startPrepare(store)}
+          onClick={() => {
+            clickPrepare(store).catch(() => {
+              // Shown on the button and in the panel (`prepare.phase`).
+            });
+          }}
           title={state.title}
           className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] leading-none whitespace-nowrap transition-colors disabled:opacity-70 disabled:cursor-wait ${TONE_CLASS[state.tone]}`}
         >
@@ -197,9 +221,16 @@ function RestartPrepRow({
   const id = row.session.claudeSessionId;
   const chip = rowStateChip(row);
   const toggling = heldState?.phase === "in-flight";
-  const toggle = (): void => {
-    if (!canToggle || toggling) return;
-    store.setHeld(id, !row.held).catch(() => {
+  /** Rejects (to a UI Bridge caller) when the toggle cannot act — never a silent no-op. */
+  const toggle = (): Promise<unknown> => {
+    if (!canToggle) {
+      return Promise.reject(new Error("this prepare is over — a held flag no longer applies"));
+    }
+    if (toggling) return Promise.reject(new Error("the held flag is already changing"));
+    return store.setHeld(id, !row.held);
+  };
+  const onToggleClick = (): void => {
+    toggle().catch(() => {
       // Shown on the toggle (`held[id].phase === "failed"`).
     });
   };
@@ -256,7 +287,7 @@ function RestartPrepRow({
         data-held={row.held ? "true" : "false"}
         data-held-phase={heldState?.phase ?? "idle"}
         disabled={!canToggle || toggling}
-        onClick={toggle}
+        onClick={onToggleClick}
         title={
           heldState?.phase === "failed"
             ? `Could not change the hold: ${heldState.message ?? ""}`
@@ -279,10 +310,18 @@ function RestartPrepRow({
   );
 }
 
+/** An RFC 3339 instant in the operator's locale; the raw value when unparseable. */
+function formatWhen(rfc3339: string): string {
+  const t = Date.parse(rfc3339);
+  return Number.isNaN(t) ? rfc3339 : new Date(t).toLocaleString();
+}
+
 /** Where a prepare that is not in its window stands. */
 function endedLine(snap: RestartPrepSnapshot): string {
   const rec = snap.record;
-  if (!rec) return "No restart prepare is in progress.";
+  // `record: None` is "no READABLE record" (`RestartPrepStatus::record`), not
+  // proof that no prepare ran — an unparseable record reads the same.
+  if (!rec) return "No readable prepare record: none is running, or its record could not be read.";
   switch (rec.state) {
     case "cancelled":
       return `Prepare cancelled — spawns are no longer held (${snap.view?.hold ?? "release unread"}).`;
@@ -311,12 +350,21 @@ export function RestartPrepPanel({
     rec?.state === "preparing" || rec?.state === "ready" || rec?.state === "restoring";
   const cancelBusy = busy(snap.cancel);
   const releaseLabel = view?.same_build_hold || view?.release_failed ? "Release hold" : "Cancel";
-  const cancel = (): void => {
-    if (!active || cancelBusy) return;
-    store.cancel().catch(() => {
-      // Shown beside the button (`cancel.phase === "failed"`).
+  /** Rejects (to a UI Bridge caller) when there is nothing to cancel. */
+  const cancel = (): Promise<unknown> =>
+    active
+      ? store.cancel()
+      : Promise.reject(new Error("no prepare is in progress — nothing to cancel"));
+  const extend = (): Promise<unknown> =>
+    active
+      ? store.extend()
+      : Promise.reject(new Error("no prepare is in progress — nothing to extend"));
+  const swallow = (p: Promise<unknown>): void => {
+    p.catch(() => {
+      // Shown beside the button (`cancel` / `extend` phase `failed`).
     });
   };
+  const extendBusy = busy(snap.extend);
 
   useUIComponent({
     id: RESTART_PREP_PANEL_ID,
@@ -362,12 +410,34 @@ export function RestartPrepPanel({
         id: "cancel",
         label: releaseLabel,
         description: "Cancel the prepare (or release a same-build restart's hold).",
-        // `write` — releases this device's spawn hold and unfreezes account moves.
-        effect: "write",
+        // `destructive` (CONTRACT.md Dim 2 + Dim 1): it releases this device's coord
+        // drain — machine/fleet state — and types "resume your work" into every
+        // session that was told to pause. The plan's Phase 5 said `write`.
+        effect: "destructive",
         handler: () => cancel(),
       },
     ],
     state: () => ({ phase: snap.cancel.phase, enabled: active && !cancelBusy }),
+  });
+
+  useUIComponent({
+    id: RESTART_PREP_EXTEND_ID,
+    name: "Extend the restart hold",
+    description:
+      "Push the spawn hold's expiry 6 hours later (an expired hold is renewed from now), up to " +
+      "coord's drain ceiling. Re-sent to coord as the same hold.",
+    actions: [
+      {
+        id: "extend",
+        label: "Extend 6 h",
+        description: "Extend the spawn hold by 6 hours.",
+        // `destructive` (CONTRACT.md Dim 2): it lengthens this device's coord drain —
+        // machine/fleet state that keeps agent work off this machine for longer.
+        effect: "destructive",
+        handler: () => extend(),
+      },
+    ],
+    state: () => ({ phase: snap.extend.phase, enabled: active && !extendBusy }),
   });
 
   const headlineClass =
@@ -401,7 +471,7 @@ export function RestartPrepPanel({
       {headline ? (
         <div className="px-2 pb-1" data-restart-prep-headline={headline.kind}>
           <div className={`font-medium ${headlineClass}`}>{headline.text}</div>
-          {headline.kind === "waiting" && (
+          {headline.kind !== "ready" && headline.blockers.length > 0 && (
             <ul className="mt-0.5 space-y-0.5 text-[#a9b1d6]">
               {headline.blockers.map((b, i) => (
                 <li key={`${b.session ?? "prepare"}-${i}`}>{blockerLine(b)}</li>
@@ -422,7 +492,26 @@ export function RestartPrepPanel({
       {rec && view && (
         <div className="px-2 pb-1 text-[#a9b1d6]" data-restart-prep-hold={view.hold}>
           Hold: {view.hold}
-          {active && rec.hold_until && !view.hold_expired_at && ` · expires ${rec.hold_until}`}
+          {active && rec.hold_until && !view.hold_expired_at && (
+            <span title={rec.hold_until}> · expires {formatWhen(rec.hold_until)}</span>
+          )}
+          {active && (
+            <button
+              type="button"
+              data-ui-bridge-id={RESTART_PREP_EXTEND_ID}
+              data-extend-phase={snap.extend.phase}
+              disabled={extendBusy}
+              onClick={() => swallow(extend())}
+              title="Push the hold's expiry 6 hours later"
+              className="ml-2 inline-flex items-center gap-1 px-1 rounded text-[#7aa2f7] bg-[#7aa2f7]/10 hover:bg-[#7aa2f7]/20 disabled:opacity-60 disabled:cursor-wait"
+            >
+              {extendBusy && <Loader2 className="w-2.5 h-2.5 animate-spin" />}
+              {extendBusy ? "Extending…" : "Extend 6 h"}
+            </button>
+          )}
+          {snap.extend.phase === "failed" && (
+            <div className="text-[#f7768e]">Extend failed: {snap.extend.message}</div>
+          )}
           {view.same_build_hold && (
             <div className="text-[#e0af68]">
               Restarted on the same build. Spawns still held — Release hold to resume them.
@@ -458,15 +547,11 @@ export function RestartPrepPanel({
             data-ui-bridge-id={RESTART_PREP_CANCEL_ID}
             data-cancel-phase={snap.cancel.phase}
             disabled={cancelBusy}
-            onClick={cancel}
+            onClick={() => swallow(cancel())}
             className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#f7768e] bg-[#f7768e]/10 hover:bg-[#f7768e]/20 disabled:opacity-60 disabled:cursor-wait"
           >
             {cancelBusy && <Loader2 className="w-2.5 h-2.5 animate-spin" />}
-            {snap.cancel.phase === "received"
-              ? "Received…"
-              : snap.cancel.phase === "in-flight"
-                ? "Releasing…"
-                : releaseLabel}
+            {cancelBusy ? "Releasing…" : releaseLabel}
           </button>
           <span className="text-[#565f89]">
             Releases the spawn hold and the account freeze; notices already sent stay sent.

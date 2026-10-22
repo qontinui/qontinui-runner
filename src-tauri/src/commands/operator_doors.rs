@@ -357,6 +357,7 @@ mod tests {
             "operator_resume_sessions",
             "restart_prep_prepare",
             "restart_prep_cancel",
+            "restart_prep_extend",
             "restart_prep_dismiss",
             "restart_prep_set_held",
             "scheduler_run_task_now",

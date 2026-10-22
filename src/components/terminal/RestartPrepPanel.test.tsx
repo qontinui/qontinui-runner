@@ -33,6 +33,7 @@ function snapshot(over: Partial<RestartPrepSnapshot> = {}): RestartPrepSnapshot 
     panelOpen: true,
     prepare: { phase: "idle" },
     cancel: { phase: "idle" },
+    extend: { phase: "idle" },
     held: {},
     ...over,
   };
@@ -48,6 +49,7 @@ function frozenStore(snap: RestartPrepSnapshot): RestartPrepStore {
     refresh: async () => {},
     prepare: never,
     cancel: never,
+    extend: never,
     setHeld: never,
     openPanel: () => ({ changed: false }),
     closePanel: () => {},
@@ -58,9 +60,9 @@ const renderPanel = (snap: RestartPrepSnapshot): string =>
   renderToStaticMarkup(<RestartPrepPanel snapshot={snap} store={frozenStore(snap)} />);
 
 describe("the header button acknowledges itself", () => {
-  it("is disabled with a spinner while the prepare is received or in flight", () => {
-    for (const phase of ["received", "in-flight"] as const) {
-      const s = prepareButtonState(snapshot({ record: null, prepare: { phase } }));
+  it("is disabled with a spinner while the prepare is in flight", () => {
+    for (const rec of [null, record()]) {
+      const s = prepareButtonState(snapshot({ record: rec, prepare: { phase: "in-flight" } }));
       expect(s.disabled).toBe(true);
       expect(s.spinner).toBe(true);
     }
@@ -84,6 +86,18 @@ describe("the header button acknowledges itself", () => {
       snapshot({ record: null, prepare: { phase: "failed", message: "coord unreachable" } }),
     );
     expect(failed).toMatchObject({ disabled: false, tone: "error", title: "coord unreachable" });
+    // An unread record is UNKNOWN, never the idle "no prepare" label.
+    expect(prepareButtonState(snapshot({ record: null, readError: "boom" })).label).toBe(
+      "Restart prep: UNKNOWN",
+    );
+  });
+
+  it("a stale failure does not hide a prepare that is running", () => {
+    const ready = record({ verdict: verdict({ ready_to_restart: true }) });
+    const s = prepareButtonState(
+      snapshot({ record: ready, prepare: { phase: "failed", message: "old" } }),
+    );
+    expect(s.label).toBe("Safe to restart");
   });
 
   it("reads the running prepare's headline once there is one", () => {
@@ -137,6 +151,30 @@ describe("the panel headline", () => {
     expect(noVerdict).toContain("UNKNOWN: the verdict");
     expect(noVerdict).not.toContain(READY_HEADLINE);
   });
+
+  it("keeps the session blockers on screen under a prepare-wide UNKNOWN", () => {
+    const html = renderPanel(
+      snapshot({
+        record: record({
+          verdict: verdict({
+            blockers: [
+              { session: null, display_name: null, reason: "the spawn hold is not confirmed (x)" },
+              { session: "s1", display_name: "alpha", reason: "working: mid-turn" },
+            ],
+          }),
+        }),
+      }),
+    );
+    expect(html).toContain('data-headline-kind="unknown"');
+    expect(html).toContain("UNKNOWN: the spawn hold is not confirmed (x)");
+    expect(html).toContain("alpha — working: mid-turn");
+  });
+
+  it("never says 'no prepare' for a record it could not read", () => {
+    const html = renderPanel(snapshot({ record: null }));
+    expect(html).toContain("No readable prepare record");
+    expect(html).not.toContain("No restart prepare is in progress");
+  });
 });
 
 describe("the panel rows and controls", () => {
@@ -176,24 +214,27 @@ describe("the panel rows and controls", () => {
     expect(effects).toMatchObject({
       "terminal.restart-prep-held-s1.toggle": "write",
       "terminal.restart-prep-held-s2.toggle": "write",
-      "terminal.restart-prep-cancel.cancel": "write",
+      "terminal.restart-prep-cancel.cancel": "destructive",
+      "terminal.restart-prep-extend.extend": "destructive",
       "terminal.restart-prep-panel.refresh": "read",
     });
+    expect(html).toContain('data-ui-bridge-id="terminal.restart-prep-extend"');
   });
 
-  it("registers the button with a write effect", () => {
+  it("registers the button as destructive (it drains the device and types into sessions)", () => {
     registered.length = 0;
     renderToStaticMarkup(
       <PrepareRestartButton store={frozenStore(snapshot({ panelOpen: false }))} />,
     );
     expect(registered.find((c) => c.id === "terminal.prepare-restart-button")?.actions).toEqual([
-      expect.objectContaining({ id: "prepare", effect: "write" }),
+      expect.objectContaining({ id: "prepare", effect: "destructive" }),
     ]);
   });
 
   it("offers Cancel only while the prepare is in its window, and says what ended it", () => {
     const cancelled = renderPanel(snapshot({ record: record({ state: "cancelled" }) }));
     expect(cancelled).not.toContain('data-ui-bridge-id="terminal.restart-prep-cancel"');
+    expect(cancelled).not.toContain('data-ui-bridge-id="terminal.restart-prep-extend"');
     expect(cancelled).toContain("Prepare cancelled");
     const sameBuild = snapshot();
     sameBuild.view = { ...sameBuild.view!, same_build_hold: true };

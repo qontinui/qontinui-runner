@@ -53,6 +53,7 @@ describe("restartPrepHeadline — exactly one of three readings", () => {
     expect(restartPrepHeadline({ record: null, readError: "boom", loaded: true })).toEqual({
       kind: "unknown",
       text: "UNKNOWN: the restart-prep record (boom)",
+      blockers: [],
     });
     expect(restartPrepHeadline({ record: record(), readError: null, loaded: false })?.kind).toBe(
       "unknown",
@@ -77,10 +78,10 @@ describe("restartPrepHeadline — exactly one of three readings", () => {
         }),
       }),
     );
-    expect(wide).toEqual({
-      kind: "unknown",
-      text: "UNKNOWN: the restart census could not be taken: x",
-    });
+    expect(wide?.kind).toBe("unknown");
+    expect(wide?.text).toBe("UNKNOWN: the restart census could not be taken: x");
+    // ...and still carries every blocker, so the sessions stay listed.
+    expect(wide?.kind === "unknown" && wide.blockers.map((b) => b.session)).toEqual([null, "a"]);
     // Self-contradicting verdicts.
     expect(
       read(
@@ -164,13 +165,36 @@ describe("the store", () => {
     expect(store.getSnapshot().record?.prepare_id).toBe("prep-1");
   });
 
-  it("acknowledges a prepare as received before anything is sent", () => {
+  it("acknowledges a prepare in the same turn as the click, before anything answers", () => {
     const f = fakeDeps(() => new Promise(() => {}));
     const store = createRestartPrepStore(f.deps);
     const phases: string[] = [];
     store.subscribe(() => phases.push(store.getSnapshot().prepare.phase));
     void store.prepare();
-    expect(phases).toEqual(["received", "in-flight"]);
+    expect(phases).toEqual(["in-flight"]);
+  });
+
+  it("extend and cancel each join their own in-flight call and report the hold", async () => {
+    const resolvers: Record<string, (v: unknown) => void> = {};
+    const f = fakeDeps(
+      (cmd) =>
+        new Promise((r) => {
+          resolvers[cmd] = r;
+        }),
+    );
+    const store = createRestartPrepStore(f.deps);
+    const e1 = store.extend();
+    expect(store.extend()).toBe(e1);
+    const c1 = store.cancel();
+    expect(store.getSnapshot().extend.phase).toBe("in-flight");
+    expect(store.getSnapshot().cancel.phase).toBe("in-flight");
+    resolvers.restart_prep_extend(changed(record({ hold_until: "later" })));
+    await e1;
+    expect(store.getSnapshot().extend).toEqual({ phase: "done", message: "hold confirmed" });
+    resolvers.restart_prep_cancel("not a reply");
+    await expect(c1).rejects.toThrow("unrecognized shape");
+    expect(store.getSnapshot().cancel.phase).toBe("failed");
+    expect(f.calls.map(([c]) => c)).toEqual(["restart_prep_extend", "restart_prep_cancel"]);
   });
 
   it("a refused prepare is a failed phase with the backend's words", async () => {
@@ -255,6 +279,52 @@ describe("the store", () => {
     await store.setHeld("s1", false);
     expect(store.getSnapshot().record?.cohort.rows.map((r) => r.held)).toEqual([false, false]);
     expect(store.getSnapshot().held.s1).toEqual({ phase: "done", message: "released" });
+  });
+
+  it("a held-toggle reply never overwrites an event that landed while it was out", async () => {
+    const rec = record();
+    let answer!: (v: unknown) => void;
+    const f = fakeDeps((cmd) =>
+      cmd === "restart_prep_status"
+        ? Promise.resolve({ record: rec, view: changed(rec).view })
+        : new Promise((r) => {
+            answer = r;
+          }),
+    );
+    const store = createRestartPrepStore(f.deps);
+    store.retain();
+    await store.refresh();
+    const toggled = store.setHeld("s1", true);
+    // The notice tick queued behind the toggle runs and announces first.
+    const newer = record({
+      state: "ready",
+      cohort: { ...rec.cohort, rows: [row("s1", { held: true, pause_state: "paused" })] },
+    });
+    f.emit(changed(newer));
+    answer({ ...rec, cohort: { ...rec.cohort, rows: [row("s1", { held: true })] } });
+    await toggled;
+    expect(store.getSnapshot().record?.state).toBe("ready");
+    expect(store.getSnapshot().record?.cohort.rows[0].pause_state).toBe("paused");
+    expect(store.getSnapshot().held.s1?.phase).toBe("done");
+  });
+
+  it("a failed read that raced a good event does not turn it UNKNOWN", async () => {
+    let fail!: (e: unknown) => void;
+    const f = fakeDeps(
+      () =>
+        new Promise((_, reject) => {
+          fail = reject;
+        }),
+    );
+    const store = createRestartPrepStore(f.deps);
+    store.retain();
+    await Promise.resolve();
+    f.emit(changed(record()));
+    fail(new Error("timeout"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().readError).toBeNull();
+    expect(store.getSnapshot().record?.prepare_id).toBe("prep-1");
   });
 
   it("a held toggle the record does not show is a failure, not a done", async () => {
