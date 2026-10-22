@@ -55,6 +55,16 @@ export function base64ToBytes(b64: string): Uint8Array {
  * per-chunk decoded strings therefore yields byte-identical text to what the
  * instance's `onOutput` prop produced for the same event sequence.
  */
+/**
+ * The session's total output as of one chunk: the chunk's absolute byte offset
+ * plus its length. `undefined` when the event carries no offset (an older
+ * runner), so a caller renders no total rather than guessing one.
+ */
+export function chunkEndOffset(offset: number | undefined, length: number): number | undefined {
+  if (offset === undefined || !Number.isFinite(offset) || offset < 0) return undefined;
+  return offset + length;
+}
+
 export class TerminalOutputCoalescer {
   private readonly decoders = new Map<string, TextDecoder>();
   private readonly buffers = new Map<string, string>();

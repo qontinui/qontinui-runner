@@ -55,6 +55,17 @@ interface ZoneHoverActionsProps {
   inline?: boolean;
 }
 
+/**
+ * Width, in CSS px, the overlay cluster spans from the cell's right edge when it
+ * shows `buttons` buttons: `right-1` (4) + border (2) + `px-1` (8), and per
+ * button `p-1` + a `w-3` icon (20) with a `gap-0.5` (2) between neighbours.
+ * `ZoneLabel` reserves at least this much on hover so the cluster never covers
+ * the header's cwd label; keep it in step with the classes below.
+ */
+export function hoverActionsSpanPx(buttons: number): number {
+  return 4 + 2 + 8 + buttons * 20 + Math.max(0, buttons - 1) * 2;
+}
+
 const EXPORT_FORMATS = ["text", "markdown", "json"] as const;
 type ExportFormat = (typeof EXPORT_FORMATS)[number];
 

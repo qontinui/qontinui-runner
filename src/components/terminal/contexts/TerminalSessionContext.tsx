@@ -107,7 +107,8 @@ import { deriveSyntheticTabs } from "../syntheticTabs";
 import { planTabReveal } from "../tabReveal";
 import { rightPanelModeAfterRowSelect } from "../sessionManagerLiveRows";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
-import { TerminalOutputCoalescer, base64ToBytes } from "../terminalOutputTap";
+import { TerminalOutputCoalescer, base64ToBytes, chunkEndOffset } from "../terminalOutputTap";
+import { getTerminalHotStore } from "../terminalHotStore";
 import { noteDecode, transportClockStart } from "../transportStats";
 
 import { instanceStorage } from "@/lib/instance-storage";
@@ -596,6 +597,11 @@ const PageSessionScope = memo(function PageSessionScope({
 
   useEffect(() => {
     const coalescer = coalescerRef.current;
+    const hotStore = getTerminalHotStore(pageId);
+    // Per-tab total output (end of the newest chunk), published on the same
+    // flush as the decoded text so a streaming pane re-renders once per frame,
+    // not once per raw event.
+    const pendingTotals = new Map<string, number>();
     let rafHandle: ReturnType<typeof requestAnimationFrame> | null = null;
 
     // rAF suspends in occluded/minimized windows (WebView2), which would leave
@@ -619,6 +625,10 @@ const PageSessionScope = memo(function PageSessionScope({
       for (const [tabId, text] of coalescer.drain()) {
         fn(tabId, text);
       }
+      for (const [tabId, total] of pendingTotals) {
+        hotStore.noteTabTotalBytes(tabId, total);
+      }
+      pendingTotals.clear();
     };
     const scheduleFlush = () => {
       if (rafHandle !== null || timeoutHandle !== null) return;
@@ -650,6 +660,10 @@ const PageSessionScope = memo(function PageSessionScope({
       const bytes = base64ToBytes(payload.data);
       noteDecode("tap", decodeStart, bytes.length);
       coalescer.push(tid, bytes);
+      const total = chunkEndOffset(payload.offset, bytes.length);
+      if (total !== undefined) {
+        pendingTotals.set(tid, Math.max(pendingTotals.get(tid) ?? 0, total));
+      }
       scheduleFlush();
     });
 
@@ -660,6 +674,7 @@ const PageSessionScope = memo(function PageSessionScope({
     const unlistenActivity = subscribeTerminalActivityStream((payload) => {
       if (!tabIdSetRef.current.has(payload.terminalId)) return;
       handleActivityDigestRef.current(payload.terminalId, payload.bytesDelta, payload.lines);
+      hotStore.noteTabTotalBytes(payload.terminalId, payload.totalBytesProduced);
     });
 
     return () => {
@@ -671,7 +686,7 @@ const PageSessionScope = memo(function PageSessionScope({
       unlisten();
       unlistenActivity();
     };
-  }, []);
+  }, [pageId]);
 
   // ---- ShellInfra ----
   const fileConflicts = useFileConflicts();
