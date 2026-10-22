@@ -31,7 +31,7 @@ describe("isWriteAction", () => {
   });
 
   it("leaves repositioning actions alone", () => {
-    for (const ok of ["click", "focus", "blur", "scrollIntoView", "hover"]) {
+    for (const ok of ["click", "focus", "blur", "scrollIntoView", "hover", "unhover"]) {
       expect(isWriteAction(ok), ok).toBe(false);
     }
   });
