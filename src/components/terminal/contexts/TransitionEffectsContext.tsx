@@ -28,7 +28,16 @@ type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
  */
 export type RestartOutcome =
   | { restarted: true; tabId: string; retiredTabId: string | null }
-  | { restarted: false; reason: "not-restartable" | "spawn-failed"; state?: string };
+  | {
+      restarted: false;
+      /** `remote-session`: the zone holds a REMOTE tab. A restart spawns a LOCAL
+       *  terminal and retires the old tab, which for a remote pane only detaches
+       *  it — the remote session keeps running and a local shell takes its
+       *  place. Refused; the tab's own reattach control is the remote path
+       *  (`remoteParity.ts`, row `restart`). */
+      reason: "not-restartable" | "spawn-failed" | "remote-session";
+      state?: string;
+    };
 
 export interface TransitionEffectsContextValue extends TransitionEffectsReturn {
   handleRestartInZone: (zoneIdx: number) => Promise<RestartOutcome>;
@@ -97,6 +106,9 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
       const oldTabId = zoneLayout.assignments[zoneIdx];
       const oldTab = tabs.find((t) => t.id === oldTabId);
       const state = oldTabId ? (stateTracking.sessionStates[oldTabId] ?? "idle") : "idle";
+      if (oldTab?.remote != null) {
+        return { restarted: false, reason: "remote-session", state };
+      }
       if (state !== "completed" && state !== "error") {
         return { restarted: false, reason: "not-restartable", state };
       }
