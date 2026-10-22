@@ -3,7 +3,7 @@
  * `environment: "node"` (same precedent as `SessionCountBanner.test.tsx`).
  *
  * Pinned: the button acknowledges itself and is disabled while a prepare is
- * received or in flight; the panel's headline is exactly one of its three
+ * in flight; the panel's headline is exactly one of its three
  * readings; every row shows its name, account, effort, page, state chip and
  * held toggle; and every control registers its UI Bridge id with its declared
  * `effect`.
@@ -11,10 +11,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
-const registered: Array<{ id: string; actions: Array<{ id: string; effect?: string }> }> = [];
+const registered: Array<{
+  id: string;
+  actions: Array<{ id: string; effect?: string }>;
+  state?: () => Record<string, unknown>;
+}> = [];
 vi.mock("@qontinui/ui-bridge", () => ({
-  useUIComponent: (opts: { id: string; actions?: Array<{ id: string; effect?: string }> }) => {
-    registered.push({ id: opts.id, actions: opts.actions ?? [] });
+  useUIComponent: (opts: {
+    id: string;
+    actions?: Array<{ id: string; effect?: string }>;
+    state?: () => Record<string, unknown>;
+  }) => {
+    registered.push({ id: opts.id, actions: opts.actions ?? [], state: opts.state });
     return {};
   },
 }));
@@ -34,16 +42,23 @@ function snapshot(over: Partial<RestartPrepSnapshot> = {}): RestartPrepSnapshot 
     prepare: { phase: "idle" },
     cancel: { phase: "idle" },
     extend: { phase: "idle" },
+    eventsError: null,
     held: {},
     ...over,
   };
 }
 
-/** A store frozen at `snap`; the render reads it and never acts. */
-function frozenStore(snap: RestartPrepSnapshot): RestartPrepStore {
+/** A store frozen at `snap` (replaceable via `set`); the render reads it and never acts. */
+function frozenStore(snap: RestartPrepSnapshot): RestartPrepStore & {
+  set(next: RestartPrepSnapshot): void;
+} {
   const never = () => Promise.reject(new Error("not in a render test"));
+  let current = snap;
   return {
-    getSnapshot: () => snap,
+    set: (next) => {
+      current = next;
+    },
+    getSnapshot: () => current,
     subscribe: () => () => {},
     retain: () => () => {},
     refresh: async () => {},
@@ -89,6 +104,15 @@ describe("the header button acknowledges itself", () => {
     // An unread record is UNKNOWN, never the idle "no prepare" label.
     expect(prepareButtonState(snapshot({ record: null, readError: "boom" })).label).toBe(
       "Restart prep: UNKNOWN",
+    );
+  });
+
+  it("reads 'reading…' before the first answer and 'restoring' while a restore waits", () => {
+    expect(prepareButtonState(snapshot({ record: null, loaded: false })).label).toBe(
+      "Restart prep: reading…",
+    );
+    expect(prepareButtonState(snapshot({ record: record({ state: "restoring" }) })).label).toBe(
+      "Restart prep: restoring",
     );
   });
 
@@ -239,5 +263,58 @@ describe("the panel rows and controls", () => {
     const sameBuild = snapshot();
     sameBuild.view = { ...sameBuild.view!, same_build_hold: true };
     expect(renderPanel(sameBuild)).toContain("Release hold");
+  });
+});
+
+describe("the UI Bridge state is read when it is asked for", () => {
+  it("reports the CURRENT snapshot, not the render's", () => {
+    registered.length = 0;
+    const store = frozenStore(snapshot({ record: null, panelOpen: true }));
+    renderToStaticMarkup(<PrepareRestartButton store={store} />);
+    const button = registered.find((c) => c.id === "terminal.prepare-restart-button");
+    expect(button?.state?.()).toMatchObject({ label: "Prepare for restart" });
+
+    const rec = record({ verdict: verdict({ ready_to_restart: true }) });
+    store.set(snapshot({ record: rec }));
+    expect(button?.state?.()).toMatchObject({ label: "Safe to restart" });
+
+    registered.length = 0;
+    const panelStore = frozenStore(snapshot({ record: record() }));
+    renderToStaticMarkup(
+      <RestartPrepPanel snapshot={panelStore.getSnapshot()} store={panelStore} />,
+    );
+    const panel = registered.find((c) => c.id === "terminal.restart-prep-panel");
+    const held = registered.find((c) => c.id === "terminal.restart-prep-held-s1");
+    expect(held?.state?.()).toMatchObject({ held: false });
+    panelStore.set(
+      snapshot({
+        record: record({
+          verdict: verdict({ ready_to_restart: true }),
+          cohort: {
+            captured_at_ms: 1,
+            captured_at: "",
+            reason: "",
+            rows: [row("s1", { held: true })],
+          },
+        }),
+      }),
+    );
+    expect(held?.state?.()).toMatchObject({ held: true });
+    expect(panel?.state?.()).toMatchObject({ headlineKind: "ready" });
+  });
+});
+
+describe("the panel says what it cannot see", () => {
+  it("names a missing event channel", () => {
+    const html = renderPanel(snapshot({ eventsError: "listen refused" }));
+    expect(html).toContain("Live updates are unavailable (listen refused)");
+  });
+
+  it("reads a verdict evaluated under another hold as UNKNOWN", () => {
+    const snap = snapshot({ record: record({ verdict: verdict({ ready_to_restart: true }) }) });
+    snap.view = { ...snap.view!, hold: "unconfirmed: coord_unreachable: timeout" };
+    const html = renderPanel(snap);
+    expect(html).toContain('data-headline-kind="unknown"');
+    expect(html).not.toContain(READY_HEADLINE);
   });
 });

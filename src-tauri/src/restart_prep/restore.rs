@@ -405,7 +405,8 @@ pub async fn set_held_on(
             "session {claude_session_id} is not in restart prepare {prepare_id}'s cohort"
         ));
     }
-    ctl.update(prepare_id, |r| {
+    let mut applied = false;
+    let rec = ctl.update(prepare_id, |r| {
         // Re-checked on the current record: a dismiss or the last restore
         // verdict does not take `ops`, and may have ended the cohort since.
         if !matches!(
@@ -422,8 +423,17 @@ pub async fn set_held_on(
         {
             row.held = held;
             row.held_by_operator = true;
+            applied = true;
         }
-    })
+    })?;
+    if applied {
+        Ok(rec)
+    } else {
+        Err(format!(
+            "restart prepare {prepare_id} ended while the held flag was being set — nothing \
+             changed"
+        ))
+    }
 }
 
 /// [`set_held_on`] on the live controller (the Tauri `restart_prep_set_held`).

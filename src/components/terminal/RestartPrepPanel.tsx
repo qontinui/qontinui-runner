@@ -3,9 +3,10 @@
  * `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, Phase 5).
  *
  * - {@link PrepareRestartButton} — "Prepare for restart" on the Terminal page,
- *   beside the session-count banner. It acknowledges itself: `Received…`, then
- *   `Preparing…` with a spinner (disabled), then the prepare's own reading
- *   ("Safe to restart" / "Waiting on N" / UNKNOWN) or the failure.
+ *   beside the session-count banner. It acknowledges itself: the click turns
+ *   it into a disabled `Preparing…` spinner in the same frame, then it reads
+ *   the prepare's own state ("Safe to restart" / "Waiting on N" / UNKNOWN) or
+ *   the failure.
  * - {@link RestartPrepPanel} — the hold, one row per cohort session (name,
  *   account, effort and where it was read, page, state chip, held toggle), a
  *   headline that is exactly one of {@link READY_HEADLINE} / "Waiting on N
@@ -68,6 +69,15 @@ export function prepareButtonState(snap: RestartPrepSnapshot): {
   tone: "idle" | "ok" | "wait" | "error";
   title: string;
 } {
+  if (!snap.loaded && snap.readError === null) {
+    return {
+      label: "Restart prep: reading…",
+      disabled: false,
+      spinner: true,
+      tone: "wait",
+      title: "Reading whether a prepare is already running — click to open the panel",
+    };
+  }
   if (snap.prepare.phase === "in-flight") {
     return {
       label: "Preparing…",
@@ -91,6 +101,17 @@ export function prepareButtonState(snap: RestartPrepSnapshot): {
       spinner: false,
       tone: headline?.kind === "ready" ? "ok" : headline?.kind === "waiting" ? "wait" : "error",
       title: `${headline?.text ?? ""} — click to open the progress panel`,
+    };
+  }
+  if (snap.record?.state === "restoring") {
+    return {
+      label: "Restart prep: restoring",
+      disabled: false,
+      spinner: false,
+      tone: "wait",
+      title:
+        "The last prepare's sessions are waiting to be restored — click to open the panel. A new " +
+        "prepare waits until they are restored or dismissed.",
     };
   }
   if (snap.prepare.phase === "failed") {
@@ -138,7 +159,12 @@ const TONE_CLASS = {
  */
 function clickPrepare(store: RestartPrepStore): Promise<unknown> {
   store.openPanel();
-  if (inWindow(store.getSnapshot().record)) return Promise.resolve(null);
+  const snap = store.getSnapshot();
+  // Not yet read, running, or a rebuilt runner's restore in progress: the
+  // click only shows it. Re-sending a prepare is `/prepare-restart`'s job.
+  if (!snap.loaded || inWindow(snap.record) || snap.record?.state === "restoring") {
+    return Promise.resolve(null);
+  }
   return store.prepare("");
 }
 
@@ -168,7 +194,13 @@ export function PrepareRestartButton({ store = restartPrepStore }: { store?: Res
         handler: () => clickPrepare(store),
       },
     ],
-    state: () => ({ label: state.label, disabled: state.disabled }),
+    // Read from the store at CALL time: `useUIComponent` keeps the getter it
+    // registered first, so a closure over this render would serve the first
+    // render's label for good.
+    state: () => {
+      const now = prepareButtonState(store.getSnapshot());
+      return { label: now.label, disabled: now.disabled };
+    },
   });
 
   return (
@@ -243,14 +275,19 @@ function RestartPrepRow({
     actions: [
       {
         id: "toggle",
-        label: row.held ? "Release" : "Hold",
+        label: "Toggle hold",
         description: "Flip whether this session is held for a hand restore.",
         // `write` — flips one flag on the prepare record; toggling again reverses it.
         effect: "write",
         handler: () => toggle(),
       },
     ],
-    state: () => ({ held: row.held, phase: heldState?.phase ?? "idle" }),
+    // At call time, from the store (see the button's `state`).
+    state: () => {
+      const now = store.getSnapshot();
+      const current = now.record?.cohort.rows.find((r) => r.session.claudeSessionId === id);
+      return { held: current?.held ?? null, phase: now.held[id]?.phase ?? "idle" };
+    },
   });
 
   const effortTitle =
@@ -334,6 +371,19 @@ function endedLine(snap: RestartPrepSnapshot): string {
   }
 }
 
+/** What the panel's UI Bridge `state` reports, for a snapshot read at call time. */
+export function panelStateOf(snap: RestartPrepSnapshot): Record<string, unknown> {
+  const headline = restartPrepHeadline(snap);
+  return {
+    headline: headline?.text ?? null,
+    headlineKind: headline?.kind ?? null,
+    state: snap.record?.state ?? null,
+    hold: snap.view?.hold ?? null,
+    rows: snap.record?.cohort.rows.length ?? 0,
+    liveUpdates: snap.eventsError === null,
+  };
+}
+
 /** The panel. Presentational over a snapshot; actions go to `store`. */
 export function RestartPrepPanel({
   snapshot: snap,
@@ -345,6 +395,11 @@ export function RestartPrepPanel({
   const rec = snap.record;
   const view = snap.view;
   const headline = restartPrepHeadline(snap);
+  // Opening the panel reads the record once — the events keep it current
+  // from there, and a panel reopened without them is re-read.
+  useEffect(() => {
+    void store.refresh();
+  }, [store]);
   const active = inWindow(rec);
   const canToggle =
     rec?.state === "preparing" || rec?.state === "ready" || rec?.state === "restoring";
@@ -390,13 +445,8 @@ export function RestartPrepPanel({
         handler: () => store.closePanel(),
       },
     ],
-    state: () => ({
-      headline: headline?.text ?? null,
-      headlineKind: headline?.kind ?? null,
-      state: rec?.state ?? null,
-      hold: view?.hold ?? null,
-      rows: rec?.cohort.rows.length ?? 0,
-    }),
+    // At call time, from the store (see the button's `state`).
+    state: () => panelStateOf(store.getSnapshot()),
   });
 
   useUIComponent({
@@ -417,7 +467,10 @@ export function RestartPrepPanel({
         handler: () => cancel(),
       },
     ],
-    state: () => ({ phase: snap.cancel.phase, enabled: active && !cancelBusy }),
+    state: () => {
+      const now = store.getSnapshot();
+      return { phase: now.cancel.phase, enabled: inWindow(now.record) && !busy(now.cancel) };
+    },
   });
 
   useUIComponent({
@@ -437,7 +490,10 @@ export function RestartPrepPanel({
         handler: () => extend(),
       },
     ],
-    state: () => ({ phase: snap.extend.phase, enabled: active && !extendBusy }),
+    state: () => {
+      const now = store.getSnapshot();
+      return { phase: now.extend.phase, enabled: inWindow(now.record) && !busy(now.extend) };
+    },
   });
 
   const headlineClass =
@@ -481,6 +537,13 @@ export function RestartPrepPanel({
         </div>
       ) : (
         <div className="px-2 pb-1 text-[#a9b1d6]">{endedLine(snap)}</div>
+      )}
+
+      {snap.eventsError !== null && (
+        <div className="px-2 pb-1 text-[#e0af68]">
+          Live updates are unavailable ({snap.eventsError}) — this panel shows the last read; close
+          and reopen it to read again.
+        </div>
       )}
 
       {snap.prepare.phase === "failed" && (

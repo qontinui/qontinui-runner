@@ -913,6 +913,17 @@ impl RestartPrep {
             }
             return self.take_hold(door, &rec).await;
         }
+        // A rebuilt runner's cohort still waiting to be restored is the
+        // operator's restore in progress: its placeholders, the shield that
+        // keeps them from the orphan close, the held marks and the restore
+        // verdicts all live in this record. A new prepare would overwrite it.
+        if let Some(rec) = self.record().filter(|r| r.state == PrepState::Restoring) {
+            return Err(format!(
+                "the last prepare's sessions ({}) are still waiting to be restored — restore \
+                 or dismiss them before preparing again",
+                rec.cohort.rows.len()
+            ));
+        }
         // A fresh prepare is not the one a past same-build boot saw: the flag
         // (the banner, and Release hold's restart test) belongs to that record.
         self.same_build_restart.store(false, Ordering::SeqCst);
@@ -1197,6 +1208,9 @@ pub async fn prepare_from_app(
 pub async fn extend_from_app() -> Result<PrepChanged, String> {
     let ctl = install_live().ok_or("restart prepare is not available in this build")?;
     let rec = ctl.extend(&LiveDoor, now_ms()).await?;
+    // The hold may have changed (a refused extension is unconfirmed): the
+    // verdict is re-evaluated now rather than on the loop's next tick.
+    tauri::async_runtime::spawn(super::notice::tick_live());
     Ok(changed_payload(ctl, rec))
 }
 
@@ -1639,6 +1653,9 @@ mod tests {
         let first = ctl.cancel(&*door, T0 + 2_000).await.unwrap();
         assert_eq!(first.state, PrepState::Restoring);
         assert!(!ctl.same_build_restart(), "the flag left with its record");
+        // A restoring cohort is the operator's to restore or dismiss before a
+        // new prepare may replace it (Phase 5 review round 2).
+        crate::restart_prep::restore::dismiss_on(&ctl, &first.prepare_id).unwrap();
         let second = ctl
             .prepare(&*door, "again", T0 + 3_000, || async {
                 Ok(cohort(&["s1"]))
@@ -2201,5 +2218,35 @@ mod tests {
         let err = ctl.extend(&*door, T0).await.unwrap_err();
         assert!(err.contains("nothing to extend"), "{err}");
         assert_eq!(door.hold_count(), 1, "only the prepare's hold");
+    }
+
+    #[tokio::test]
+    async fn restart_prep_a_prepare_never_overwrites_a_cohort_waiting_to_be_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = controller(&dir);
+        let door = MockDoor::primary();
+        let rec = prepare(&ctl, &door).await;
+        ctl.update(&rec.prepare_id, |r| r.state = PrepState::Restoring)
+            .unwrap();
+        let err = ctl
+            .prepare(&*door, "again", T0 + 1, || async { Ok(cohort(&["s9"])) })
+            .await
+            .unwrap_err();
+        assert!(err.contains("still waiting to be restored"), "{err}");
+        let kept = ctl.record().unwrap();
+        assert_eq!(
+            kept.prepare_id, rec.prepare_id,
+            "the restoring record is kept"
+        );
+        assert_eq!(kept.state, PrepState::Restoring);
+        assert_eq!(door.hold_count(), 1, "no second hold");
+        // Once dismissed (done), a new prepare starts.
+        ctl.update(&rec.prepare_id, |r| r.state = PrepState::Done)
+            .unwrap();
+        let fresh = ctl
+            .prepare(&*door, "again", T0 + 2, || async { Ok(cohort(&["s9"])) })
+            .await
+            .unwrap();
+        assert_ne!(fresh.prepare_id, rec.prepare_id);
     }
 }

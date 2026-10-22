@@ -103,6 +103,17 @@ describe("restartPrepHeadline — exactly one of three readings", () => {
 });
 
 describe("row chips read the backend's observation", () => {
+  it("colours a restore by its verdict", () => {
+    const at = { at_ms: 1, at: "", effort_applied: null, effort: null };
+    expect(rowStateChip(row("a", { restore: { ...at, verdict: "resumed" } })).tone).toBe("ok");
+    expect(rowStateChip(row("a", { restore: { ...at, verdict: "failed(spawn)" } })).tone).toBe(
+      "unknown",
+    );
+    expect(
+      rowStateChip(row("a", { restore: { ...at, verdict: "skipped(resource_guard:x)" } })).tone,
+    ).toBe("wait");
+  });
+
   it("an unread row is unknown, never paused", () => {
     expect(rowStateChip(row("a", { pause_state: null }))).toEqual({
       text: "unknown: not read yet",
@@ -336,6 +347,17 @@ describe("the store", () => {
     await store.refresh();
     await expect(store.setHeld("s1", true)).rejects.toThrow("does not show the change");
     expect(store.getSnapshot().held.s1?.phase).toBe("failed");
+  });
+
+  it("a listener that cannot be set up is reported, not silent", async () => {
+    const store = createRestartPrepStore({
+      invoke: () => Promise.resolve({ record: null, view: null }),
+      listen: () => Promise.reject(new Error("no event plugin")),
+    });
+    store.retain();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().eventsError).toBe("no event plugin");
   });
 
   it("an unreadable status is UNKNOWN in the headline, never 'no prepare'", async () => {

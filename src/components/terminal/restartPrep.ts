@@ -216,6 +216,13 @@ export interface HeadlineInput {
   readError: string | null;
   /** At least one read (or event) answered. */
   loaded: boolean;
+  /**
+   * The record's CURRENT view. The verdict is the notice loop's, evaluated
+   * at its last tick; a hold that changed since (an Extend that coord
+   * refused, a hold that expired) makes that verdict stale. Omitted: not
+   * compared.
+   */
+  view?: PrepView | null;
 }
 
 /**
@@ -235,9 +242,15 @@ export interface HeadlineInput {
  *   naming it; "Waiting on N sessions" is said only of sessions. The UNKNOWN
  *   still carries every blocker, so the session list stays on screen.
  * - A verdict that contradicts itself (ready with blockers, not ready with
- *   none) is UNKNOWN too.
+ *   none), or that was evaluated under a hold that has changed since, is
+ *   UNKNOWN too.
  */
-export function restartPrepHeadline({ record, readError, loaded }: HeadlineInput): Headline | null {
+export function restartPrepHeadline({
+  record,
+  readError,
+  loaded,
+  view,
+}: HeadlineInput): Headline | null {
   if (readError !== null) {
     return {
       kind: "unknown",
@@ -262,6 +275,15 @@ export function restartPrepHeadline({ record, readError, loaded }: HeadlineInput
     };
   }
   const blockers = Array.isArray(verdict.blockers) ? verdict.blockers : [];
+  // Both strings are the backend's one hold label (`HoldStatus::label`, or
+  // "hold expired at …"), so they compare directly.
+  if (view && verdict.hold !== view.hold) {
+    return {
+      kind: "unknown",
+      text: `UNKNOWN: the verdict (evaluated under hold "${verdict.hold}"; the hold now reads "${view.hold}")`,
+      blockers,
+    };
+  }
   const prepareWide = blockers.filter((b) => !b.session);
   if (prepareWide.length > 0) {
     return {
@@ -297,7 +319,12 @@ export function blockerLine(b: Blocker): string {
 
 /** The text and tone of a row's state chip, from what the backend observed. */
 export function rowStateChip(row: CohortRow): { text: string; tone: "ok" | "wait" | "unknown" } {
-  if (row.restore) return { text: `restore: ${row.restore.verdict}`, tone: "wait" };
+  if (row.restore) {
+    const v = row.restore.verdict;
+    const tone =
+      v === "resumed" || v === "running" ? "ok" : v.startsWith("failed") ? "unknown" : "wait";
+    return { text: `restore: ${v}`, tone };
+  }
   const s = row.pause_state;
   if (!s) return { text: "unknown: not read yet", tone: "unknown" };
   if (s === "unknown") return { text: "unknown", tone: "unknown" };
@@ -343,6 +370,12 @@ export interface RestartPrepSnapshot {
   prepare: ActionState;
   cancel: ActionState;
   extend: ActionState;
+  /**
+   * Why the `restart-prep-changed` listener could not be set up, or `null`.
+   * Without it the panel shows only what each read and action returned, and
+   * says so rather than going quietly stale.
+   */
+  eventsError: string | null;
   /** Per Claude session id: the held toggle's acknowledgement. */
   held: Readonly<Record<string, ActionState>>;
 }
@@ -389,6 +422,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     prepare: IDLE,
     cancel: IDLE,
     extend: IDLE,
+    eventsError: null,
     held: {},
   };
   const listeners = new Set<() => void>();
@@ -463,6 +497,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
     deps
       .listen(RESTART_PREP_CHANGED_EVENT, onEvent)
       .then((stop) => {
+        if (snap.eventsError !== null) set({ eventsError: null });
         if (refs === 0) {
           stop();
           listening = false;
@@ -470,10 +505,11 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
           stopListening = stop;
         }
       })
-      .catch(() => {
+      .catch((err) => {
         // No event channel: the panel still reads on mount and applies each
-        // action's own reply; a failed READ is what renders as UNKNOWN.
+        // action's own reply, and says that it is not live.
         listening = false;
+        set({ eventsError: describeThrown(err, "the restart-prep event listener failed") });
       });
   };
 
