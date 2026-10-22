@@ -63,7 +63,7 @@ export function findTerminalsOutsideProject<T extends ReconcilableTerminal>(
   if (!root) return [];
   const normalizedRoot = normalizePathForCompare(root);
   return tabs.filter((t) => {
-    if (t.type === "plan") return false;
+    if (t.type === "plan" || t.type === "restore-placeholder") return false;
     if (t.remote) return false;
     if (!t.isAlive) return false;
     const wd = t.workingDir?.trim();

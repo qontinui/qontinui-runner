@@ -1919,11 +1919,18 @@ fn restore_set_terminal_live(
 /// refuses it the same way. With no restoring cohort — a crash boot, or no prepare at
 /// all — the body is exactly `{"sessions": [...]}`, as before.
 ///
-/// Every row returned under `placeholders` is recorded
-/// ([`crate::restart_prep::restore::note_placeholders_served`]): from here it
-/// is the operator's to restore, not the boot restore's, so the resume core
-/// may admit it while it is still `open`. A cohort row left in `sessions` is
-/// not recorded — the boot restore owns it.
+/// Each row's owner is settled against every earlier read
+/// ([`crate::restart_prep::restore::settle_row_owner`]: the first judgment is
+/// final). A row returned under `placeholders` is the operator's, so the
+/// resume core may admit it while it is still `open`; a cohort row left in
+/// `sessions` is the boot restore's for good, and the core refuses it in any
+/// state (`boot_restore_owns_row`); and an operator's row a later read finds
+/// live is in neither list. So no row is ever in one read's `sessions` and
+/// admitted by the resume core. A boot restore's row that is not live and that
+/// the auto-restore cannot take — outside `rows`, or its PTY holder left
+/// running unadopted — is still returned under `placeholders` with a blocker
+/// (the holder's, else `boot_restore_owns_row`) and out of `sessions`, so it
+/// is seen and counted rather than lost.
 fn restore_set_body(
     rows: Vec<RestoreCandidate>,
     cohort: Option<&crate::restart_prep::restore::RestoringCohort>,
@@ -1945,39 +1952,62 @@ fn restore_set_body(
     // it) — the double resume the per-row served set exists to prevent. The
     // fresh record decides; a row it no longer finds is judged by the record
     // in `rows`, and is never a placeholder.
-    let mut live_cohort: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    // Keyed by the cohort's own id: the one the resume core looks up.
-    let mut served: Vec<(&String, RestoreCandidate)> = Vec::new();
+    //
+    // The verdict is then SETTLED against every earlier read
+    // (`settle_row_owner`, first judgment final): a row once handed to the
+    // boot restore stays in `sessions`, and a row once served stays the
+    // operator's — and is in neither list while a later read finds it live.
+    // A boot restore's row that is no longer live and that the auto-restore
+    // cannot take (not in the restorable `rows`, or its PTY holder was left
+    // running unadopted) is still SHOWN, as a placeholder carrying a blocker —
+    // counted, never admitted.
+    use crate::restart_prep::restore::{settle_row_owner, RowOwner};
+    let mut boot_owned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Keyed by the cohort's own id: the one the resume core looks up. The
+    // blocker overrides the holder's, for a boot restore's row.
+    let mut served: Vec<(&String, RestoreCandidate, Option<&'static str>)> = Vec::new();
     for id in ids {
-        match placeholder_of(id) {
-            Some(r) if terminal_live(&r.record.terminal_id) => {
-                live_cohort.insert(id.as_str());
+        let judged = match placeholder_of(id) {
+            Some(r) if terminal_live(&r.record.terminal_id) => (RowOwner::BootRestore, None),
+            Some(r) => (RowOwner::Operator, Some(r)),
+            None if rows.iter().any(|row| {
+                row.record.claude_session_id == *id && terminal_live(&row.record.terminal_id)
+            }) =>
+            {
+                (RowOwner::BootRestore, None)
             }
-            Some(r) => served.push((id, r)),
-            None => {
-                if rows.iter().any(|row| {
-                    row.record.claude_session_id == *id && terminal_live(&row.record.terminal_id)
-                }) {
-                    live_cohort.insert(id.as_str());
-                }
+            None => continue,
+        };
+        match (settle_row_owner(&cohort.prepare_id, id, judged.0), judged.1) {
+            // Not live, and the auto-restore cannot take it: outside the
+            // restorable `rows`, or a PTY holder the sweep left running still
+            // runs its `claude` (the auto-restore would only find it alive).
+            (RowOwner::BootRestore, Some(r))
+                if !rows.iter().any(|row| row.record.claude_session_id == *id)
+                    || placeholder_blocker(&r.record.terminal_id).is_some() =>
+            {
+                let blocker =
+                    placeholder_blocker(&r.record.terminal_id).unwrap_or("boot_restore_owns_row");
+                served.push((id, r, Some(blocker)));
             }
+            (RowOwner::BootRestore, _) => {
+                boot_owned.insert(id.as_str());
+            }
+            (RowOwner::Operator, Some(r)) => served.push((id, r, None)),
+            (RowOwner::Operator, None) => {}
         }
     }
     let sessions: Vec<RestoreCandidate> = rows
         .into_iter()
         .filter(|r| {
             let id = r.record.claude_session_id.as_str();
-            !waiting.contains(id) || live_cohort.contains(id)
+            !waiting.contains(id) || boot_owned.contains(id)
         })
         .collect();
-    crate::restart_prep::restore::note_placeholders_served(
-        &cohort.prepare_id,
-        served.iter().map(|(id, _)| id.as_str()),
-    );
     let placeholders: Vec<serde_json::Value> = served
         .into_iter()
-        .map(|(_, r)| {
-            let blocker = placeholder_blocker(&r.record.terminal_id);
+        .map(|(_, r, owner_blocker)| {
+            let blocker = owner_blocker.or_else(|| placeholder_blocker(&r.record.terminal_id));
             let mut v = serde_json::to_value(&r).unwrap_or(serde_json::Value::Null);
             if let (Some(obj), Some(b)) = (v.as_object_mut(), blocker) {
                 obj.insert("blocker".to_string(), serde_json::json!(b));
@@ -3390,9 +3420,14 @@ mod tests {
             rows
         };
         let c_live = |t: &str| t == "term-c";
+        // A prepare of its own: under `prepare_id` the earlier read already
+        // settled `c` as the operator's, and an owner never changes
+        // (`settle_row_owner`, pinned by its own test below).
+        let mut fresh = cohort.clone();
+        fresh.prepare_id = "prep-test-held".to_string();
         let held = restore_set_body(
             rows_with_live_c(),
-            Some(&cohort),
+            Some(&fresh),
             record_or_gone,
             c_live,
             b_left_running,
@@ -3468,6 +3503,133 @@ mod tests {
             !placeholder_served(&cohort.prepare_id, &running),
             "a row left in `sessions` stays the boot restore's"
         );
+    }
+
+    /// Phase 7, the open item Phase 6's review left: a row's owner is settled
+    /// by the FIRST read that judged it, so across any number of reads no row
+    /// is both handed to the boot restore (in `sessions`) and admitted by the
+    /// resume core (served). (a) A row an earlier read gave the boot restore is
+    /// never served later, even once its terminal is gone; (b) a row once
+    /// served is in neither list while a later read finds it live, and is a
+    /// placeholder again once it is not.
+    #[test]
+    fn a_cohort_rows_owner_is_settled_by_the_first_read_that_judged_it() {
+        use crate::restart_prep::restore::placeholder_served;
+        use std::cell::RefCell;
+        let (to_boot, to_operator) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let cohort =
+            crate::restart_prep::restore::restoring_cohort_for_test(&[&to_boot, &to_operator]);
+        let row = |id: &str| {
+            let mut record = restore_candidate_record(id);
+            record.terminal_id = format!("term-{id}");
+            RestoreCandidate {
+                record,
+                transcript_exists: Some(true),
+                location: TranscriptLocation::default(),
+            }
+        };
+        let rows = || vec![row(&to_boot), row(&to_operator)];
+        let ids = |body: &serde_json::Value, key: &str| -> Vec<String> {
+            let mut v: Vec<String> = body[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is an array: {body}"))
+                .iter()
+                .map(|r| {
+                    r["claudeSessionId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let live_terminal = RefCell::new(format!("term-{to_boot}"));
+        let read = || {
+            restore_set_body(
+                rows(),
+                Some(&cohort),
+                |id| Some(row(id)),
+                |t: &str| *live_terminal.borrow() == t,
+                |_| None,
+                false,
+            )
+        };
+
+        // Read 1: `to_boot` runs (the boot restore's), `to_operator` waits.
+        let first = read();
+        assert_eq!(ids(&first, "sessions"), [to_boot.clone()]);
+        assert_eq!(ids(&first, "placeholders"), [to_operator.clone()]);
+
+        // Read 2: the two swap — `to_boot`'s pane is gone, `to_operator`'s
+        // came back. Neither changes hands.
+        *live_terminal.borrow_mut() = format!("term-{to_operator}");
+        let second = read();
+        assert_eq!(
+            ids(&second, "sessions"),
+            [to_boot.clone()],
+            "(a) the boot restore keeps its row: {second}"
+        );
+        assert!(
+            ids(&second, "placeholders").is_empty(),
+            "(a) a row the boot restore was given is never served, and (b) a served row \
+             found live is not offered: {second}"
+        );
+        assert!(!placeholder_served(&cohort.prepare_id, &to_boot));
+        assert!(placeholder_served(&cohort.prepare_id, &to_operator));
+
+        // Read 3: nothing runs. `to_operator` is a placeholder again (a Retry
+        // stays possible); `to_boot` still is not.
+        *live_terminal.borrow_mut() = String::new();
+        let third = read();
+        assert_eq!(ids(&third, "sessions"), [to_boot.clone()]);
+        assert_eq!(ids(&third, "placeholders"), [to_operator.clone()]);
+
+        // Read 4: `to_boot` has left the restorable set, so no read can hand it
+        // to the auto-restore any more. It is shown — blocked, never served.
+        let fourth = restore_set_body(
+            vec![row(&to_operator)],
+            Some(&cohort),
+            |id| Some(row(id)),
+            |_: &str| false,
+            |_| None,
+            false,
+        );
+        assert!(ids(&fourth, "sessions").is_empty(), "{fourth}");
+        let blocked: Vec<&serde_json::Value> = fourth["placeholders"]
+            .as_array()
+            .expect("placeholders")
+            .iter()
+            .filter(|p| p["claudeSessionId"] == to_boot.as_str())
+            .collect();
+        assert_eq!(blocked.len(), 1, "{fourth}");
+        assert_eq!(blocked[0]["blocker"], "boot_restore_owns_row");
+        assert!(!placeholder_served(&cohort.prepare_id, &to_boot));
+
+        // Read 5: `to_boot` is restorable again, but its PTY holder was left
+        // running unadopted: the auto-restore could only find it alive, so it
+        // is shown blocked by the holder, and kept out of `sessions`.
+        let held_terminal = format!("term-{to_boot}");
+        let fifth = restore_set_body(
+            rows(),
+            Some(&cohort),
+            |id| Some(row(id)),
+            |_: &str| false,
+            |t: &str| (t == held_terminal).then_some("holder_alive_not_adopted"),
+            false,
+        );
+        assert!(ids(&fifth, "sessions").is_empty(), "{fifth}");
+        let blocked: Vec<&serde_json::Value> = fifth["placeholders"]
+            .as_array()
+            .expect("placeholders")
+            .iter()
+            .filter(|p| p["claudeSessionId"] == to_boot.as_str())
+            .collect();
+        assert_eq!(blocked[0]["blocker"], "holder_alive_not_adopted", "{fifth}");
+        assert!(!placeholder_served(&cohort.prepare_id, &to_boot));
     }
 
     /// Review round 6 (second pass): each cohort row's liveness is judged ONCE,

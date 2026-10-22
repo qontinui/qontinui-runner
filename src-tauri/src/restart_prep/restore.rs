@@ -42,7 +42,7 @@
 //! [`restoring_cohort_ids`] once per lifecycle poll tick, so a placeholder is
 //! never orphan-closed while it waits for its Restore click.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -205,51 +205,82 @@ impl RestoringCohort {
     }
 }
 
-/// The cohort rows this process has served as placeholders, keyed by
-/// `(prepare_id, claude_session_id)`: exactly the rows [`note_placeholders_served`]
-/// was handed by the restore set (`terminal_session_list_open` with
-/// `placeholders: true`), which withheld each of them from the webview's boot
-/// restore. An open cohort row NOT in the set is the boot restore's: the
-/// resume core refuses it (`boot_restore_owns_row`), because the boot restore
-/// may be starting a `claude` the live-holder guard cannot see yet. Additive
-/// for the life of the process: a row once withheld stays the operator's, so
-/// a failed Restore can be retried.
+/// Who restores a cohort row in this process: the operator (the restore set
+/// served it as a placeholder, so the resume core admits it while `open`) or
+/// the webview's boot restore (the restore set left it in `sessions`, which
+/// the webview auto-resumes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOwner {
+    Operator,
+    BootRestore,
+}
+
+/// The owner of each cohort row a `placeholders: true` read judged, keyed by
+/// `(prepare_id, claude_session_id)`.
 ///
-/// The guarantee is PER READ, not across reads. Each read decides from its own
-/// liveness verdict, so a row an EARLIER read put in `sessions` (a
-/// `placeholders: false` read returns every row there) is served — and then
-/// admitted — by a later `placeholders: true` read once its recorded terminal
-/// is not running, even if the boot restore is still bringing it back. That
-/// is unreachable while no reader passes `placeholders: true`; the reader that
-/// does (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
-/// Phase 7) must be the ONLY reader that auto-resumes rows while a cohort is
-/// `restoring` — never a `placeholders: false` read beside it.
-static PLACEHOLDERS_SERVED: std::sync::Mutex<BTreeSet<(String, String)>> =
-    std::sync::Mutex::new(BTreeSet::new());
+/// **The rule: a row's FIRST judgment is final for the life of the process.**
+/// Each read still judges every row from its own liveness verdict (a row whose
+/// terminal runs is the boot restore's, one whose terminal does not is a
+/// placeholder), but [`settle_row_owner`] keeps the owner the first judgment
+/// recorded, and the restore set builds both lists from the settled owner:
+///
+/// * a row the boot restore was given is never served later, even once its
+///   terminal is gone — it stays in `sessions` for the auto-restore and its
+///   own guards, and the resume core refuses it in EVERY state, `closed`
+///   included (`boot_restore_owns_row`). When it is not live and the
+///   auto-restore cannot take it — outside the restorable set, or its PTY
+///   holder was left running unadopted — the restore set lists it under
+///   `placeholders` with a blocker instead of in `sessions`: it is seen and
+///   counted, and Dismiss releases it to Past Sessions;
+/// * a row once served stays the operator's — a Restore that failed can be
+///   retried — and while a later read finds it live it is in NEITHER list:
+///   not auto-resumed, and not offered (the resume core refuses a live
+///   terminal anyway).
+///
+/// So no row is ever both in a read's `sessions` and admitted by the resume
+/// core, across any number of reads. A `placeholders: false` read judges no
+/// cohort row and records nothing. Two webview readers pass `placeholders:
+/// true` (Phase 7): the boot restore, the one reader that auto-resumes (and
+/// only from `sessions`), and the cohort's periodic re-read, which discards
+/// `sessions`. A `placeholders: false` reader must never auto-resume.
+///
+/// A row first judged live is the boot restore's because its session was
+/// running when this process first looked — a PTY holder kept it across the
+/// restart — so it is no placeholder: the lifecycle poll records it back
+/// ([`note_running`]) once its pane is adopted. If the adoption fails and the
+/// holder ends, the boot restore's holder-sweep re-run brings it back, exactly
+/// as a crash boot would: the session did not stop for the planned restart,
+/// it died after it. If the holder is left running unadopted, the row is shown
+/// blocked (above).
+static ROW_OWNERS: std::sync::Mutex<BTreeMap<(String, String), RowOwner>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
-fn placeholders_served_set() -> std::sync::MutexGuard<'static, BTreeSet<(String, String)>> {
-    PLACEHOLDERS_SERVED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+fn row_owners() -> std::sync::MutexGuard<'static, BTreeMap<(String, String), RowOwner>> {
+    ROW_OWNERS.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Record that the restore set withheld the rows `claude_session_ids` of
-/// prepare `prepare_id` as placeholders.
-pub fn note_placeholders_served<'a>(
-    prepare_id: &str,
-    claude_session_ids: impl IntoIterator<Item = &'a str>,
-) {
-    let mut served = placeholders_served_set();
-    for id in claude_session_ids {
-        served.insert((prepare_id.to_string(), id.to_string()));
-    }
+/// Settle the owner of row `claude_session_id` of prepare `prepare_id`: the
+/// owner already recorded for it, else `judged`, which is recorded. See
+/// `ROW_OWNERS` for the rule.
+pub fn settle_row_owner(prepare_id: &str, claude_session_id: &str, judged: RowOwner) -> RowOwner {
+    *row_owners()
+        .entry((prepare_id.to_string(), claude_session_id.to_string()))
+        .or_insert(judged)
 }
 
-/// Whether the row `claude_session_id` of prepare `prepare_id` was served as a
-/// placeholder by [`note_placeholders_served`] in this process. Per read, not
-/// across reads: see `PLACEHOLDERS_SERVED` for what that leaves to Phase 7.
+/// The settled owner of row `claude_session_id` of prepare `prepare_id`, or
+/// `None` when no `placeholders: true` read has judged it yet.
+pub fn row_owner(prepare_id: &str, claude_session_id: &str) -> Option<RowOwner> {
+    row_owners()
+        .get(&(prepare_id.to_string(), claude_session_id.to_string()))
+        .copied()
+}
+
+/// Whether the row `claude_session_id` of prepare `prepare_id` is the
+/// operator's: the restore set served it as a placeholder in this process
+/// (see `ROW_OWNERS`).
 pub fn placeholder_served(prepare_id: &str, claude_session_id: &str) -> bool {
-    placeholders_served_set().contains(&(prepare_id.to_string(), claude_session_id.to_string()))
+    row_owner(prepare_id, claude_session_id) == Some(RowOwner::Operator)
 }
 
 /// The live record's restoring cohort. `None` with no controller (every unit

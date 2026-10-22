@@ -32,6 +32,15 @@ import {
   typedConfigDir,
 } from "./defaultConfigHome";
 import { displayNameOf } from "@/lib/session-ledger";
+import {
+  missingPlaceholderPages,
+  placeholderMayTakeZone,
+  parsePlaceholderSet,
+  requestEnsurePages,
+  restoreCohortStore,
+  type PlaceholderRecord,
+  type RestartPrepRef,
+} from "./restorePlaceholders";
 
 /**
  * Fetch the durable RESTORABLE session records for `pageId` from the backend
@@ -462,6 +471,24 @@ export interface RestoreSet {
    * once autonomous spawns are allowed again.
    */
   deferredByDrain: string | null;
+  /**
+   * A prepared restart's cohort, EVERY page's (plan
+   * `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+   * Phase 7): sessions the backend withheld from `records` so the operator
+   * restores them by hand, one at a time. Each becomes a placeholder tab on its
+   * own page — never an auto-resume. Offered under a drain too: an operator
+   * restore is not deferred by it.
+   */
+  placeholders: PlaceholderRecord[];
+  /** Which prepare's cohort is restoring; `null` when none is. */
+  restartPrep: RestartPrepRef | null;
+  /**
+   * Whether the placeholder half was READ. `false` when the call failed or
+   * the answer was not a restore set: then `placeholders`/`restartPrep` are
+   * UNKNOWN, not empty, and must not be published (that would wipe every
+   * page's placeholders).
+   */
+  placeholdersRead: boolean;
 }
 
 /**
@@ -478,11 +505,30 @@ export async function fetchRestoreSet(
     // may tell the backend's lifecycle poll that the restore was withheld or
     // has run (plan `2026-10-01-drain-deferred-restore-is-swept-as-orphans`).
     // The other readers of this command must not.
-    resp = await invoke<CommandResponse>("terminal_session_list_open", { purpose: "restore" });
+    //
+    // `placeholders: true`: this restore DRAWS a prepared restart's cohort as
+    // placeholders, so the backend withholds those rows from `sessions` and
+    // the auto-resume below never sees them. It is the only reader that
+    // auto-resumes; the other one that opts in, the cohort store's re-read,
+    // discards `sessions`.
+    resp = await invoke<CommandResponse>("terminal_session_list_open", {
+      purpose: "restore",
+      placeholders: true,
+    });
   } catch (err) {
     console.warn("[TerminalPage] terminal_session_list_open failed:", err);
-    return { records: [], deferredByDrain: null };
+    return {
+      records: [],
+      deferredByDrain: null,
+      placeholders: [],
+      restartPrep: null,
+      placeholdersRead: false,
+    };
   }
+  const parsed = parsePlaceholderSet(resp?.data);
+  const placeholdersRead = parsed !== null;
+  const placeholders = parsed?.placeholders ?? [];
+  const restartPrep = parsed?.restartPrep ?? null;
   const data = resp?.data as
     | { sessions?: TerminalSessionRecord[]; deferredByDrain?: { reason?: unknown } | null }
     | undefined;
@@ -494,10 +540,15 @@ export async function fetchRestoreSet(
         typeof reason === "string" && reason.length > 0
           ? reason
           : "deferred by the coord device drain",
+      placeholders,
+      restartPrep,
+      placeholdersRead,
     };
   }
   const sessions = data?.sessions;
-  if (!Array.isArray(sessions)) return { records: [], deferredByDrain: null };
+  if (!Array.isArray(sessions)) {
+    return { records: [], deferredByDrain: null, placeholders, restartPrep, placeholdersRead };
+  }
   const byId = new Map<string, TerminalSessionRecord>();
   for (const rec of sessions) {
     if (!rec || typeof rec.claudeSessionId !== "string") continue;
@@ -508,7 +559,54 @@ export async function fetchRestoreSet(
     }
     if (!byId.has(rec.claudeSessionId)) byId.set(rec.claudeSessionId, rec);
   }
-  return { records: [...byId.values()], deferredByDrain: null };
+  return {
+    records: [...byId.values()],
+    deferredByDrain: null,
+    placeholders,
+    restartPrep,
+    placeholdersRead,
+  };
+}
+
+/**
+ * Lay a prepared restart's placeholders out on THIS page (Phase 7, D6): one
+ * placeholder tab per cohort session recorded on `pageId` that is not already
+ * running in one of its tabs, in its recorded zone when that zone is free
+ * (`placeholderMayTakeZone` — never over a tab already there; a record that
+ * claims the zone later in the run takes it, as records own their zones).
+ * A placeholder on a page this window no longer has asks for that page to be
+ * recreated (`ensurePages`); its own restore lays it out when it is opened.
+ * Nothing here spawns or resumes. Returns the placeholder tab ids created.
+ * Exported for unit tests.
+ */
+export function placeRestorePlaceholders(params: {
+  placeholders: readonly PlaceholderRecord[];
+  pageId: string;
+  knownPageIds: readonly string[];
+  assignments: Record<number, string>;
+  /** Sessions already running in one of this page's tabs. */
+  runningSessionIds: ReadonlySet<string>;
+  createTab: (claudeSessionId: string, name: string, workingDir: string | null) => string;
+  assignTabToZone: (zoneIdx: number, tabId: string) => void;
+  ensurePages: (pages: Array<{ id: string; name: string }>) => void;
+}): string[] {
+  const created: string[] = [];
+  for (const rec of params.placeholders) {
+    if (classifyRestoreAction(rec, null) !== "restore-placeholder") continue;
+    if ((rec.pageId || "default") !== params.pageId) continue;
+    if (params.runningSessionIds.has(rec.claudeSessionId)) continue;
+    const tabId = params.createTab(
+      rec.claudeSessionId,
+      restoreTabName(rec),
+      rec.workingDir?.trim() || null,
+    );
+    created.push(tabId);
+    if (placeholderMayTakeZone(rec.zoneIndex, tabId, params.assignments)) {
+      params.assignTabToZone(rec.zoneIndex, tabId);
+    }
+  }
+  params.ensurePages(missingPlaceholderPages(params.placeholders, params.knownPageIds));
+  return created;
 }
 
 /**
@@ -1148,7 +1246,17 @@ function isValidSessionId(id: string): boolean {
  * (cold boot, no live process) still can't be auto-resumed. Pure + exported so
  * the gate is unit-testable without React.
  */
-export type RestoreAction = "auto-resume" | "terminal-only" | "skip-invalid" | "needs-account";
+export type RestoreAction =
+  | "auto-resume"
+  | "terminal-only"
+  | "skip-invalid"
+  | "needs-account"
+  /**
+   * A prepared restart's cohort session (Phase 7): shown as a placeholder in
+   * its recorded zone and restored only by the operator, through the backend
+   * queue — never resumed here.
+   */
+  | "restore-placeholder";
 
 /** Why a record's account could not be established. */
 export type NeedsAccountReason =
@@ -1325,10 +1433,14 @@ export function classifyRestoreAction(
     TerminalSessionRecord,
     "claudeSessionId" | "origin" | "confirmedAt" | "provider" | "transcriptExists"
   > &
-    RestoreAccountFields,
+    RestoreAccountFields & { restorePlaceholder?: boolean },
   home: string | null,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
+  // First: whatever the record would otherwise classify as, a cohort
+  // placeholder is never auto-resumed — the backend admits the operator's
+  // restore of it, and only that.
+  if (rec.restorePlaceholder === true) return "restore-placeholder";
   if (rec.origin === "authoritative" || rec.origin === "observed") {
     // Authoritative/observed-but-unconfirmed ⇒ phantom shell — restore the
     // terminal only, never auto-resume a session that may never have existed.
@@ -1398,6 +1510,16 @@ interface UseTerminalInitializationParams {
     spawnSource?: ResourceGuardSource,
   ) => Promise<string | null>;
   createPlanTab: (filePath: string) => string | null;
+  /**
+   * Add a prepared restart's placeholder tab (Phase 7; `useTerminalManager.
+   * createRestorePlaceholderTab`). Optional so a harness without one restores
+   * as before — the placeholders are then simply not drawn.
+   */
+  createRestorePlaceholderTab?: (
+    claudeSessionId: string,
+    name: string,
+    workingDir: string | null,
+  ) => string;
   /**
    * Add the grid tab for a Conductor worker's durable record (`taskRunId`
    * set). Such a record names NO terminal process — its `terminalId` is the
@@ -1482,6 +1604,7 @@ export function useTerminalInitialization({
   reconnectToExistingSessions,
   createTerminal,
   createPlanTab,
+  createRestorePlaceholderTab,
   adoptWorkerTab,
   setInitialized,
   updateTab,
@@ -1776,10 +1899,35 @@ export function useTerminalInitialization({
         //    pins / focusedZone / scrollback) — matched by zoneIndex.
         const adoptOrphans = !didClaimOrphanAdoption.current;
         didClaimOrphanAdoption.current = true;
+        const knownPageIds = loadKnownPageIds();
         const restoreSet = await fetchRestoreSet(pageId, {
-          knownPageIds: loadKnownPageIds(),
+          knownPageIds,
           adoptOrphans,
         });
+        // A prepared restart's cohort (Phase 7): every page's placeholders go
+        // to the app-wide store (the strip and the queue read it), and THIS
+        // page's become placeholder tabs in their recorded zones — before any
+        // record claims a zone, and under a drain too (an operator restore is
+        // not deferred by it).
+        if (restoreSet.placeholdersRead) restoreCohortStore.publish(restoreSet);
+        else restoreCohortStore.markUnread();
+        // Only on a page's FIRST run: a re-run (drain, holder sweep) leaves
+        // placeholders to the page's binding, which adds newly waiting ones and
+        // does not force back one the operator closed.
+        if (createRestorePlaceholderTab && !isDrainRerun) {
+          placeRestorePlaceholders({
+            placeholders: restoreSet.placeholders,
+            pageId,
+            knownPageIds,
+            assignments: zoneLayout.assignments,
+            runningSessionIds: new Set(
+              liveTabsRef.current.map((t) => t.claudeSessionId).filter((id): id is string => !!id),
+            ),
+            createTab: createRestorePlaceholderTab,
+            assignTabToZone: zoneLayout.assignTabToZone,
+            ensurePages: requestEnsurePages,
+          });
+        }
         if (restoreSet.deferredByDrain !== null) {
           // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
           // Phase 3): the backend withheld the restore set because restoring
@@ -2358,6 +2506,7 @@ export function useTerminalInitialization({
     createTerminal,
     adoptWorkerTab,
     createPlanTab,
+    createRestorePlaceholderTab,
     setInitialized,
     sessionPersistence,
     zoneLayout,
@@ -2443,7 +2592,9 @@ export function useTerminalInitialization({
     if (currentTabs.length === 0) return;
 
     try {
-      const terminalTabs = currentTabs.filter((t) => t.type !== "plan");
+      const terminalTabs = currentTabs.filter(
+        (t) => t.type !== "plan" && t.type !== "restore-placeholder",
+      );
       const pathMap = await sessionPersistence.saveScrollbackBuffers(terminalTabs);
       const tabIdToSessionIndex: Record<string, number> = {};
       // The same assignments the layout save walks, so the indices line up.

@@ -131,14 +131,20 @@ export function panePositionOf(
 
 /**
  * Does this tab take a PARKED cell — mounted, `visible={false}`, no zone on
- * screen? A Conductor worker or a plan tab never does (no PTY to keep warm).
+ * screen? A Conductor worker, a plan tab or a restore placeholder never does
+ * (no PTY to keep warm).
  */
 function takesParkedCell(
   tab: ZoneCellSharedProps["tabs"][number],
   classification: TabClassification | undefined,
 ): boolean {
   if (classification === "offscreen") return true;
-  return classification === "hidden" && tab.type !== "plan" && !tab.sessionBacked;
+  return (
+    classification === "hidden" &&
+    tab.type !== "plan" &&
+    tab.type !== "restore-placeholder" &&
+    !tab.sessionBacked
+  );
 }
 
 export function buildZoneCells({

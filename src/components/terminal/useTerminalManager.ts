@@ -11,6 +11,7 @@ import {
 import { createLogger } from "@/lib/logger";
 import { spawnWithResourceGuard, type ResourceGuardSource } from "@/lib/resourceGuard";
 import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
+import { restorePlaceholderTabId } from "./restorePlaceholders";
 import {
   EMPTY_HIDDEN_WORKER_STATE,
   beginRestore,
@@ -83,8 +84,13 @@ export interface TerminalTab {
   exitCode: number | null;
   workingDir?: string;
   createdAt?: number;
-  /** Tab type: "terminal" (default) or "plan" (markdown viewer) */
-  type?: "terminal" | "plan";
+  /**
+   * Tab type: "terminal" (default), "plan" (markdown viewer) or
+   * "restore-placeholder" — a restart cohort session waiting for its Restore
+   * (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+   * Phase 7). Neither of the last two has a PTY (see {@link isPtylessTab}).
+   */
+  type?: "terminal" | "plan" | "restore-placeholder";
   /** Absolute path to the markdown file (only for plan tabs) */
   planFilePath?: string;
   /** True while the frontend is replaying the scrollback buffer from Rust. */
@@ -241,6 +247,40 @@ export function buildSessionCloseRecord(
     terminalId: closing.id,
     reason,
   });
+}
+
+/**
+ * A tab with no PTY behind it: a plan viewer, or a restart cohort's restore
+ * placeholder. The backend never lists either, so the re-sync keeps them, and
+ * nothing may attach a `TerminalInstance` or send a `terminal_close` for one.
+ */
+export function isPtylessTab(t: Pick<TerminalTab, "id" | "type">): boolean {
+  return t.type === "plan" || t.type === "restore-placeholder" || t.id.startsWith("plan-");
+}
+
+/**
+ * Pure: the tab a restart cohort placeholder occupies. Keyed by the session
+ * (`restorePlaceholderTabId`), so creating it twice is a no-op. It carries no
+ * `claudeSessionId`: every reader of that field takes it for a session RUNNING
+ * in the tab (state tracking, the roster's "is it back" check, Retry), and a
+ * placeholder's session is not running anywhere yet.
+ */
+export function restorePlaceholderTab(
+  claudeSessionId: string,
+  name: string,
+  workingDir: string | null,
+  now: number = Date.now(),
+): TerminalTab {
+  return {
+    id: restorePlaceholderTabId(claudeSessionId),
+    title: name,
+    pid: null,
+    isAlive: true,
+    exitCode: null,
+    workingDir: workingDir ?? undefined,
+    createdAt: now,
+    type: "restore-placeholder",
+  };
 }
 
 /**
@@ -538,7 +578,7 @@ export function reconcileTabsWithBackend(
   const kept = tabs.filter((t) => {
     if (backendById.has(t.id)) return true;
     // Tabs the backend structurally cannot list.
-    if (t.type === "plan" || t.id.startsWith("plan-")) return true;
+    if (isPtylessTab(t)) return true;
     if (t.__synthetic) return true;
     // A Conductor worker has no PTY; `terminal_list` is the wrong census for
     // it (its liveness is the SessionManager's, read by `WorkerSessionCell`).
@@ -1497,6 +1537,31 @@ export function useTerminalManager(
     return id;
   }, []);
 
+  /**
+   * Add a restart cohort placeholder tab (Phase 7). Idempotent by session, and
+   * never steals `activeId`: a boot can land dozens of them at once.
+   */
+  const createRestorePlaceholderTab = useCallback(
+    (claudeSessionId: string, name: string, workingDir: string | null): string => {
+      const tab = restorePlaceholderTab(claudeSessionId, name, workingDir);
+      setTabs((prev) => (prev.some((t) => t.id === tab.id) ? prev : [...prev, tab]));
+      return tab.id;
+    },
+    [],
+  );
+
+  /**
+   * Drop restore placeholder tabs (all of them, or the named sessions'). No
+   * backend call: a placeholder has no PTY, and its session stays wherever
+   * the restore or a dismissal left it.
+   */
+  const removeRestorePlaceholderTabs = useCallback((claudeSessionIds?: readonly string[]) => {
+    const ids = claudeSessionIds ? new Set(claudeSessionIds.map(restorePlaceholderTabId)) : null;
+    const drop = (t: TerminalTab) =>
+      t.type === "restore-placeholder" && (ids === null || ids.has(t.id));
+    setTabs((prev) => (prev.some(drop) ? prev.filter((t) => !drop(t)) : prev));
+  }, []);
+
   const closeTerminal = useCallback(
     (id: string) => {
       // Capture the closing tab's Claude session id (read-only) so we can record
@@ -1528,7 +1593,12 @@ export function useTerminalManager(
       // Update React state immediately so the UI is responsive.
       // The Rust-side close (process kill + thread join) runs in the background.
       setTabs((prev) => {
-        closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
+        // A restore placeholder's session is not running here, and closing
+        // its tab only hides it — the cohort row keeps waiting.
+        closeRecord =
+          sessionBacked || closingTab?.type === "restore-placeholder"
+            ? null
+            : buildSessionCloseRecord(prev, id);
         const next = prev.filter((t) => t.id !== id);
         setActiveId((currentActive) => {
           if (currentActive !== id) return currentActive;
@@ -1546,9 +1616,9 @@ export function useTerminalManager(
         });
       }
 
-      // Only invoke Rust close for terminal tabs (plan tabs and worker views
-      // have no PTY)
-      if (!id.startsWith("plan-") && !sessionBacked) {
+      // Only invoke Rust close for terminal tabs (plan tabs, restore
+      // placeholders and worker views have no PTY)
+      if (!(closingTab && isPtylessTab(closingTab)) && !id.startsWith("plan-") && !sessionBacked) {
         // Whatever the last close left on screen, it does not describe THIS
         // one. Clearing first means a stale warning can never be read as the
         // outcome of the close the operator just performed — and a close that
@@ -1636,6 +1706,8 @@ export function useTerminalManager(
     setInitialized,
     createTerminal,
     createPlanTab,
+    createRestorePlaceholderTab,
+    removeRestorePlaceholderTabs,
     closeTerminal,
     renameTab,
     updateTab,

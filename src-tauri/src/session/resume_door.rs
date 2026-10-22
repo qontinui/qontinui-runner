@@ -76,10 +76,10 @@
 //! set has served THAT row as a placeholder. Until it has, the webview's boot
 //! restore owns the row (`skipped(boot_restore_owns_row)`): the restore set
 //! left it in `sessions`, and the boot restore may be starting a `claude` the
-//! live-process guard cannot see yet. The record is per read: a row an
-//! earlier read handed the boot restore can still be served by a later one
-//! (see `PLACEHOLDERS_SERVED` in [`crate::restart_prep::restore`] for the
-//! constraint that puts on the Phase 7 reader).
+//! live-process guard cannot see yet. A row's owner is settled by the first
+//! read that judged it and never changes after (see `ROW_OWNERS` in
+//! [`crate::restart_prep::restore`]), so a row once handed to the boot
+//! restore is never admitted here while open.
 //! An open row outside the cohort is still `skipped(not_closed)`, an
 //! open cohort row whose terminal IS live is `skipped(live_terminal)` — or
 //! `skipped(holder_adoption_pending | holder_sweep_pending)` while a PTY
@@ -294,6 +294,11 @@ struct CohortMember {
     /// ([`crate::restart_prep::restore::placeholder_served`]). Until it has,
     /// the boot restore owns the row while it is open.
     placeholder_served: bool,
+    /// Whether the restore set handed THIS row to the webview's boot restore
+    /// (its settled owner, [`crate::restart_prep::restore::row_owner`]). Such
+    /// a row is the boot restore's in EVERY state — a `closed` one included —
+    /// so the core never resumes it beside the auto-restore.
+    boot_owned: bool,
 }
 
 /// The cohort membership of `id`, when `cohort` holds it. `terminal_blocker`
@@ -313,6 +318,7 @@ fn cohort_member(
         effort: target.effort.clone(),
         held: target.held,
         placeholder_served,
+        boot_owned: false,
     })
 }
 
@@ -325,9 +331,19 @@ fn served_cohort_member(
     rec: Option<&TerminalSessionRecord>,
     terminal_blocker: impl Fn(&str) -> Option<&'static str>,
 ) -> Option<CohortMember> {
-    let served =
-        cohort.is_some_and(|c| crate::restart_prep::restore::placeholder_served(&c.prepare_id, id));
-    cohort_member(cohort, id, rec, terminal_blocker, served)
+    use crate::restart_prep::restore::{row_owner, RowOwner};
+    let owner = cohort.and_then(|c| row_owner(&c.prepare_id, id));
+    cohort_member(
+        cohort,
+        id,
+        rec,
+        terminal_blocker,
+        owner == Some(RowOwner::Operator),
+    )
+    .map(|m| CohortMember {
+        boot_owned: owner == Some(RowOwner::BootRestore),
+        ..m
+    })
 }
 
 /// [`CohortMember::terminal_blocker`] in the running app: the terminal
@@ -380,6 +396,9 @@ fn classify(
     };
     if rec.provider != super::session_lifecycle_store::DEFAULT_PROVIDER {
         return Err(format!("provider_{}", rec.provider));
+    }
+    if cohort.is_some_and(|m| m.boot_owned) {
+        return Err("boot_restore_owns_row".to_string());
     }
     match (rec.state.as_str(), cohort) {
         ("closed", _) => {}
@@ -1530,7 +1549,7 @@ mod tests {
     /// prepare, admits nothing.
     #[test]
     fn an_open_cohort_row_is_admitted_only_once_the_restore_set_served_that_row() {
-        use crate::restart_prep::restore::note_placeholders_served;
+        use crate::restart_prep::restore::{settle_row_owner, RowOwner};
         let (served, left_to_boot) = (fresh_id(), fresh_id());
         let cohort = restoring(&[&served, &left_to_boot]);
         let admit = |id: &str| {
@@ -1540,7 +1559,7 @@ mod tests {
             classify(id, Some(&open), member.as_ref(), true).map(|_| ())
         };
         assert_eq!(admit(&served), Err("boot_restore_owns_row".to_string()));
-        note_placeholders_served(&cohort.prepare_id, [served.as_str()]);
+        settle_row_owner(&cohort.prepare_id, &served, RowOwner::Operator);
         assert_eq!(admit(&served), Ok(()));
         // The row the restore set left in `sessions` (its terminal looked live)
         // was never served: still the boot restore's while it is open.
@@ -1548,19 +1567,48 @@ mod tests {
             admit(&left_to_boot),
             Err("boot_restore_owns_row".to_string())
         );
-        note_placeholders_served("another-prepare", [left_to_boot.as_str()]);
+        settle_row_owner("another-prepare", &left_to_boot, RowOwner::Operator);
         assert_eq!(
             admit(&left_to_boot),
             Err("boot_restore_owns_row".to_string())
         );
         // A row outside the cohort is no member at all, served or not.
         let outsider = fresh_id();
-        note_placeholders_served(&cohort.prepare_id, [outsider.as_str()]);
+        settle_row_owner(&cohort.prepare_id, &outsider, RowOwner::Operator);
         assert_eq!(
             served_cohort_member(Some(&cohort), &outsider, None, no_blocker),
             None
         );
         assert_eq!(served_cohort_member(None, &served, None, no_blocker), None);
+    }
+
+    /// Phase 7: a row the restore set handed to the boot restore is the boot
+    /// restore's in EVERY state. A `closed` one too — the auto-restore may be
+    /// resuming it from the same read — so the core never resumes it beside
+    /// the auto-restore.
+    #[test]
+    fn a_row_handed_to_the_boot_restore_is_refused_open_or_closed() {
+        use crate::restart_prep::restore::{settle_row_owner, RowOwner};
+        let to_boot = fresh_id();
+        let cohort = restoring(&[&to_boot]);
+        settle_row_owner(&cohort.prepare_id, &to_boot, RowOwner::BootRestore);
+        for state in ["open", "closed"] {
+            let mut r = rec(state);
+            r.claude_session_id = to_boot.clone();
+            let member = served_cohort_member(Some(&cohort), &to_boot, Some(&r), no_blocker);
+            assert_eq!(
+                classify(&to_boot, Some(&r), member.as_ref(), true).map(|_| ()),
+                Err("boot_restore_owns_row".to_string()),
+                "{state}"
+            );
+        }
+        // A closed row nobody judged is still admitted (the pre-Phase-7 shape).
+        let unjudged = fresh_id();
+        let cohort = restoring(&[&unjudged]);
+        let mut r = rec("closed");
+        r.claude_session_id = unjudged.clone();
+        let member = served_cohort_member(Some(&cohort), &unjudged, Some(&r), no_blocker);
+        assert!(classify(&unjudged, Some(&r), member.as_ref(), true).is_ok());
     }
 
     /// Review round 6, finding 2: a pane whose child exited stays in the

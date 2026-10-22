@@ -95,6 +95,7 @@ import { useRegistryAwareness } from "./useRegistryAwareness";
 import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
 import { MidSessionToast } from "./MidSessionToast";
 import { RemoteCloseNotice } from "./RemoteCloseNotice";
+import { RestorePageBar } from "./RestorePageBar";
 import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner";
 import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
@@ -198,6 +199,7 @@ function TerminalPageInner({
     updateTab,
     reconnectToExistingSessions,
     createPlanTab,
+    createRestorePlaceholderTab,
     adoptWorkerTab,
     hiddenWorkers,
     restoreHiddenWorkers,
@@ -997,6 +999,10 @@ function TerminalPageInner({
   // under the default account fails as "No conversation found".
   const { resumeTarget } = shellIntegration;
   const { setNotification } = workflowGen;
+  const notifyRestorePage = useCallback(
+    (message: string) => setNotification({ message, type: "success" }),
+    [setNotification],
+  );
   const handleResumePastSession = useCallback(
     (ps: PastSession) => {
       void pastSessionResumeNotice(ps, resumeTarget).then((notice) => {
@@ -1037,6 +1043,7 @@ function TerminalPageInner({
       reconnectToExistingSessions,
       createTerminal,
       createPlanTab,
+      createRestorePlaceholderTab,
       adoptWorkerTab,
       setInitialized,
       updateTab,
@@ -1595,6 +1602,12 @@ function TerminalPageInner({
           {remoteCloseNotice && (
             <RemoteCloseNotice notice={remoteCloseNotice} onDismiss={dismissRemoteCloseNotice} />
           )}
+
+          {/* A prepared restart's placeholders on this page: "Restore all on
+            this page (n)" (plan
+            `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+            Phase 7). Renders nothing on a page with none. */}
+          <RestorePageBar pageId={pageId} notify={notifyRestorePage} />
 
           <div className="flex-1 flex flex-row overflow-hidden">
             {workflowGen.showSidebar && (

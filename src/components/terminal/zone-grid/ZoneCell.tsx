@@ -23,7 +23,7 @@
  */
 import { memo, useCallback, useMemo, useRef, type RefObject } from "react";
 import { Terminal, Filter, RefreshCw, MessageSquare } from "lucide-react";
-import type { TerminalTab } from "../useTerminalManager";
+import { isPtylessTab, type TerminalTab } from "../useTerminalManager";
 import type { SessionState, ZoneAssignments } from "../useZoneLayout";
 import {
   TerminalInstance,
@@ -31,6 +31,7 @@ import {
   type ShellIntegrationEvent,
 } from "../TerminalInstance";
 import { PlanViewer } from "../PlanViewer";
+import { RestorePlaceholderPane } from "../RestorePlaceholderPane";
 import { WorkerSessionCell } from "../WorkerSessionCell";
 import { SuggestionChip } from "../suggestions";
 import { ZoneHoverActions } from "../ZoneHoverActions";
@@ -74,7 +75,7 @@ export function reviewPanelAvailable(
   tab: TerminalTab | undefined,
   promptsAvailable: boolean,
 ): boolean {
-  return promptsAvailable && !!tab && !tab.sessionBacked && tab.type !== "plan";
+  return promptsAvailable && !!tab && !tab.sessionBacked && !isPtylessTab(tab);
 }
 
 export interface ZoneCellProps {
@@ -300,14 +301,14 @@ function ZoneCellInner({
   // The maximized zone always mounts its terminal: it fills the page, so a
   // flow grid's virtualization of it would leave the page blank.
   const isVirtual =
-    classification === "assigned-virtual" && tab?.type !== "plan" && !isMaximizedPane;
+    classification === "assigned-virtual" && !!tab && !isPtylessTab(tab) && !isMaximizedPane;
   // Mount the inline TerminalInstance only for a non-plan tab the classifier
   // owns as live (`assigned` in preset mode, `assigned-live` near the viewport
   // in flow mode, `assigned` in tmux mode) or as parked (`hidden` in the grid,
   // `offscreen` in tmux). A virtual zone mounts zero instances.
   const shouldMountInstance =
     !!tab &&
-    tab.type !== "plan" &&
+    !isPtylessTab(tab) &&
     (isMaximizedPane ||
       classification === "assigned" ||
       classification === "assigned-live" ||
@@ -407,7 +408,7 @@ function ZoneCellInner({
   const useCompact =
     !hideZoneChrome &&
     tab &&
-    tab.type !== "plan" &&
+    !isPtylessTab(tab) &&
     !isFocused &&
     !isPinned &&
     (autoCompact || forceCompact);
@@ -886,6 +887,12 @@ function ZoneCellInner({
           {tab.type === "plan" && tab.planFilePath ? (
             <div className="h-full w-full">
               <PlanViewer filePath={tab.planFilePath} visible={!useCompact && !isParked} />
+            </div>
+          ) : tab.type === "restore-placeholder" ? (
+            // A restart cohort session waiting for its Restore: no PTY, so no
+            // TerminalInstance (Phase 7).
+            <div className="h-full w-full">
+              <RestorePlaceholderPane tabId={tab.id} />
             </div>
           ) : (
             <div

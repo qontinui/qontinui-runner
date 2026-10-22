@@ -102,6 +102,7 @@ import { deriveSyntheticTabs } from "../syntheticTabs";
 import { planTabReveal } from "../tabReveal";
 import { rightPanelModeAfterRowSelect } from "../sessionManagerLiveRows";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
+import { useRestorePlaceholderBinding } from "../useRestorePlaceholderBinding";
 import { TerminalOutputCoalescer, base64ToBytes, chunkEndOffset } from "../terminalOutputTap";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { noteDecode, transportClockStart } from "../transportStats";
@@ -300,6 +301,19 @@ const PageSessionScope = memo(function PageSessionScope({
     return keys;
   }, [tabs]);
   const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds, sessionKeyByTab);
+
+  // A prepared restart's placeholders on this page: replaced in their zone by
+  // the live pane once the restore queue brings them back, dropped once they
+  // are no longer waiting (plan
+  // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, Phase 7).
+  useRestorePlaceholderBinding({
+    pageId,
+    tabs,
+    assignments: zoneLayout.assignments,
+    createRestorePlaceholderTab: terminalManager.createRestorePlaceholderTab,
+    removeRestorePlaceholderTabs: terminalManager.removeRestorePlaceholderTabs,
+    assignTabToZone: zoneLayout.assignTabToZone,
+  });
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
   // (from ZoneMetadataProvider) so each page owns its own labels regardless of
