@@ -12,6 +12,7 @@
 //! shared `ipc_handler_*` macro definitions, and a small drift-test
 //! module. All per-endpoint handlers live in their family submodules.
 
+pub mod action_vocabulary;
 pub mod ai;
 pub mod ai_analyze;
 pub mod analytics;
