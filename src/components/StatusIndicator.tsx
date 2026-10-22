@@ -1,9 +1,6 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useReducer, useRef } from "react";
 import {
-  AlertCircle,
   Info,
-  AlertTriangle,
-  X,
   Tag,
   FolderKanban,
   Globe,
@@ -14,21 +11,28 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { BackgroundActivity, ActivityType } from "../hooks/useBackgroundActivities";
-import { getSeverityColors, getAccentColors } from "@/design-system";
+import { getAccentColors } from "@/design-system";
 import { DoctorHealthBadge } from "./doctor";
+import { ErrorBanner, ErrorResidual } from "./ErrorBanner";
+import {
+  INITIAL_ERROR_BANNER_STATE,
+  errorBannerReducer,
+  errorBannerView,
+  type ErrorEventPayload,
+} from "./errorBannerState";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
 const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
 
-interface ErrorEvent {
-  title: string;
-  message: string;
-  details?: string;
+/** Payload of the backend's `error-cleared` event: the fault was observed gone. */
+interface ErrorClearedEvent {
   error_code: string;
-  severity: "info" | "warning" | "error" | "critical";
-  recoverable: boolean;
-  suggested_action?: string;
 }
+
+/** How long a transient `info` event stays up before it auto-hides. */
+const INFO_AUTO_HIDE_MS = 5000;
+/** Re-render cadence for the residual's "last seen" age. */
+const RESIDUAL_TICK_MS = 15000;
 
 interface StatusIndicatorProps {
   pythonStatus: "stopped" | "running";
@@ -65,8 +69,9 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   executionActive,
   backgroundActivities = [],
 }) => {
-  const [error, setError] = useState<ErrorEvent | null>(null);
-  const [showError, setShowError] = useState(false);
+  const [banner, dispatchBanner] = useReducer(errorBannerReducer, INITIAL_ERROR_BANNER_STATE);
+  const infoTimers = useRef(new Set<ReturnType<typeof setTimeout>>());
+  const [now, setNow] = useState(() => Date.now());
   const [isBeta] = useState(true);
   const [runnerName, setRunnerName] = useState<string>(() => {
     return instanceStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
@@ -80,14 +85,26 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   });
 
   useEffect(() => {
-    const unlistenError = listen<ErrorEvent>("error", (event) => {
-      setError(event.payload);
-      setShowError(true);
-
-      // Auto-hide info messages after 5 seconds
+    const timers = infoTimers.current;
+    const unlistenError = listen<ErrorEventPayload>("error", (event) => {
+      const at = Date.now();
+      dispatchBanner({ type: "received", error: event.payload, at });
+      // Only an `info` is transient. The expiry names the occurrence it was
+      // armed for, so it can never hide a later event (the reducer ignores it).
       if (event.payload.severity === "info") {
-        setTimeout(() => setShowError(false), 5000);
+        const code = event.payload.error_code;
+        const timer = setTimeout(() => {
+          timers.delete(timer);
+          dispatchBanner({ type: "expired", errorCode: code, at });
+        }, INFO_AUTO_HIDE_MS);
+        timers.add(timer);
       }
+    });
+    // The emitter observed the fault gone: the banner or residual for that code
+    // goes away. Emitters that never report a clear leave the residual standing,
+    // with its last-seen time, rather than inventing one.
+    const unlistenCleared = listen<ErrorClearedEvent>("error-cleared", (event) => {
+      dispatchBanner({ type: "cleared", errorCode: event.payload.error_code });
     });
 
     // Listen for runner name changes from settings
@@ -109,6 +126,9 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
 
     return () => {
       unlistenError.then((fn) => fn());
+      unlistenCleared.then((fn) => fn());
+      timers.forEach((t) => clearTimeout(t));
+      timers.clear();
       window.removeEventListener("runner-name-changed", handleRunnerNameChange as EventListener);
       window.removeEventListener(
         "project-selection-changed",
@@ -117,26 +137,15 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
     };
   }, []);
 
-  // Use design system for severity colors
-  const getErrorSeverityClasses = (severity: string) => {
-    const colors = getSeverityColors(severity);
-    return `${colors.bg} ${colors.text} ${colors.border}`;
-  };
+  const bannerView = errorBannerView(banner);
 
-  const getSeverityIcon = (severity: string) => {
-    switch (severity) {
-      case "info":
-        return <Info className="w-5 h-5" />;
-      case "warning":
-        return <AlertTriangle className="w-5 h-5" />;
-      case "error":
-        return <AlertCircle className="w-5 h-5" />;
-      case "critical":
-        return <AlertCircle className="w-5 h-5" />;
-      default:
-        return <Info className="w-5 h-5" />;
-    }
-  };
+  // Keep the residual's "last seen" age honest while it is on screen.
+  useEffect(() => {
+    if (bannerView !== "residual") return;
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), RESIDUAL_TICK_MS);
+    return () => clearInterval(id);
+  }, [bannerView, banner.lastSeenAt]);
 
   return (
     <div className="relative">
@@ -195,6 +204,16 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
         {/* Doctor Health Badge - Shows when AI processes appear stuck */}
         <DoctorHealthBadge />
 
+        {/* A dismissed fault stays visible here until it is observed cleared */}
+        {bannerView === "residual" && banner.current && banner.lastSeenAt !== null && (
+          <ErrorResidual
+            error={banner.current}
+            lastSeenAt={banner.lastSeenAt}
+            now={now}
+            onReopen={() => dispatchBanner({ type: "reopened" })}
+          />
+        )}
+
         {/* Active Processes Section - Only shown when there is activity */}
         {(executionActive || backgroundActivities.length > 0) && (
           <>
@@ -251,41 +270,12 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
         )}
       </div>
 
-      {/* Error Display */}
-      {showError && error && (
-        <div
-          className={`fixed top-20 right-4 max-w-md z-40 p-4 rounded-lg shadow-lg border ${getErrorSeverityClasses(error.severity)}`}
-        >
-          <div className="flex items-start gap-3">
-            <div className="shrink-0 mt-0.5">{getSeverityIcon(error.severity)}</div>
-            <div className="flex-1">
-              <div className="flex justify-between items-start">
-                <h3 className="font-semibold">{error.title}</h3>
-                <button
-                  onClick={() => setShowError(false)}
-                  className="ml-2 p-1 hover:bg-black/10 rounded"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-              <p className="mt-1 text-sm">{error.message}</p>
-              {error.details && (
-                <details className="mt-2">
-                  <summary className="text-xs cursor-pointer hover:underline">
-                    Technical Details
-                  </summary>
-                  <pre className="mt-1 text-xs bg-black/10 p-2 rounded overflow-x-auto">
-                    {error.details}
-                  </pre>
-                </details>
-              )}
-              {error.suggested_action && (
-                <p className="mt-2 text-sm font-medium">💡 {error.suggested_action}</p>
-              )}
-              <p className="mt-2 text-xs opacity-60">Error Code: {error.error_code}</p>
-            </div>
-          </div>
-        </div>
+      {/* Error Display — in flow, under the status bar, never over a pane */}
+      {bannerView === "banner" && banner.current && (
+        <ErrorBanner
+          error={banner.current}
+          onDismiss={() => dispatchBanner({ type: "dismissed" })}
+        />
       )}
     </div>
   );
