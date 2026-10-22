@@ -34,15 +34,19 @@ function SeverityIcon({ severity, className }: { severity: string; className: st
 export function ErrorBanner({
   error,
   onDismiss,
+  slot = "fault",
 }: {
   error: ErrorEventPayload;
   onDismiss: () => void;
+  /** An `info` and a fault may share a code; their ids must not collide. */
+  slot?: "fault" | "info";
 }) {
   const label = dismissLabel(error);
+  const idCode = slot === "info" ? `info-${error.error_code}` : error.error_code;
   return (
     <div
       role="alert"
-      data-ui-bridge-id={`app-error-banner-${error.error_code}`}
+      data-ui-bridge-id={`app-error-banner-${idCode}`}
       data-content-role="status"
       data-content-label="app error"
       className={`flex items-start gap-3 px-4 py-2 border-b ${severityClasses(error.severity)}`}
@@ -73,7 +77,7 @@ export function ErrorBanner({
         onClick={onDismiss}
         aria-label={label}
         title={label}
-        data-ui-bridge-id={`app-error-banner-dismiss-${error.error_code}`}
+        data-ui-bridge-id={`app-error-banner-dismiss-${idCode}`}
         className="shrink-0 ml-2 p-1 hover:bg-black/10 rounded"
       >
         <X className="w-4 h-4" />

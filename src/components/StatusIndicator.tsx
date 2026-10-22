@@ -275,13 +275,34 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       </div>
 
       {/* Error Display — in flow, under the status bar, never over a pane */}
-      {bannerView.banners.map((error) => (
-        <ErrorBanner
-          key={error.error_code}
-          error={error}
-          onDismiss={() => dispatchBanner({ type: "dismissed", errorCode: error.error_code })}
-        />
-      ))}
+      {(bannerView.faults.length > 0 || bannerView.info) && (
+        // Bounded, so a pile of open faults cannot push the panes off-screen.
+        <div className="max-h-[40vh] overflow-y-auto">
+          {bannerView.faults.map((error) => (
+            <ErrorBanner
+              key={`fault:${error.error_code}`}
+              error={error}
+              onDismiss={() =>
+                dispatchBanner({ type: "dismissed", errorCode: error.error_code, slot: "fault" })
+              }
+            />
+          ))}
+          {bannerView.info && (
+            <ErrorBanner
+              key={`info:${bannerView.info.error_code}`}
+              slot="info"
+              error={bannerView.info}
+              onDismiss={() =>
+                dispatchBanner({
+                  type: "dismissed",
+                  errorCode: bannerView.info!.error_code,
+                  slot: "info",
+                })
+              }
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 };

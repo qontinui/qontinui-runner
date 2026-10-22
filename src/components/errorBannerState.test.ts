@@ -27,10 +27,9 @@ function run(actions: ErrorBannerAction[]): ErrorBannerState {
 /** The view as literal code lists: banners, then residual chips. */
 function view(actions: ErrorBannerAction[]): { banners: string[]; residuals: string[] } {
   const v = errorBannerView(run(actions));
-  return {
-    banners: v.banners.map((e) => e.error_code),
-    residuals: v.residuals.map((f) => f.error.error_code),
-  };
+  const banners = v.faults.map((e) => e.error_code);
+  if (v.info) banners.push(`info:${v.info.error_code}`);
+  return { banners, residuals: v.residuals.map((f) => f.error.error_code) };
 }
 
 const NL = "COORD_LIVENESS_NO_LEADER";
@@ -57,7 +56,7 @@ describe("errorBannerReducer + errorBannerView", () => {
       name: "dismiss collapses a non-info fault to the residual",
       actions: [
         { type: "received", error: NO_LEADER, at: 1 },
-        { type: "dismissed", errorCode: NL },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
       ],
       banners: [],
       residuals: [NL],
@@ -66,7 +65,7 @@ describe("errorBannerReducer + errorBannerView", () => {
       name: "the same code re-emitted while dismissed keeps the residual",
       actions: [
         { type: "received", error: NO_LEADER, at: 1 },
-        { type: "dismissed", errorCode: NL },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
         { type: "received", error: NO_LEADER, at: 2 },
       ],
       banners: [],
@@ -76,7 +75,7 @@ describe("errorBannerReducer + errorBannerView", () => {
       name: "a different code shows its banner and keeps the dismissed fault's residual",
       actions: [
         { type: "received", error: NO_LEADER, at: 1 },
-        { type: "dismissed", errorCode: NL },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
         { type: "received", error: WORKER_DEAD, at: 2 },
       ],
       banners: [WD],
@@ -86,7 +85,7 @@ describe("errorBannerReducer + errorBannerView", () => {
       name: "an observed clear of a code removes its residual",
       actions: [
         { type: "received", error: NO_LEADER, at: 1 },
-        { type: "dismissed", errorCode: NL },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
         { type: "cleared", errorCode: NL },
       ],
       banners: [],
@@ -105,7 +104,7 @@ describe("errorBannerReducer + errorBannerView", () => {
       name: "a clear for a different code leaves the fault in place",
       actions: [
         { type: "received", error: NO_LEADER, at: 1 },
-        { type: "dismissed", errorCode: NL },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
         { type: "cleared", errorCode: WD },
       ],
       banners: [],
@@ -115,7 +114,7 @@ describe("errorBannerReducer + errorBannerView", () => {
       name: "a never-cleared fault keeps the residual",
       actions: [
         { type: "received", error: NO_LEADER, at: 1 },
-        { type: "dismissed", errorCode: NL },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
         { type: "expired", errorCode: NL, at: 1 },
       ],
       banners: [],
@@ -125,7 +124,7 @@ describe("errorBannerReducer + errorBannerView", () => {
       name: "the residual re-opens the banner on click",
       actions: [
         { type: "received", error: NO_LEADER, at: 1 },
-        { type: "dismissed", errorCode: NL },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
         { type: "reopened", errorCode: NL },
       ],
       banners: [NL],
@@ -135,7 +134,7 @@ describe("errorBannerReducer + errorBannerView", () => {
       name: "a dismissed info leaves no residual",
       actions: [
         { type: "received", error: INFO, at: 1 },
-        { type: "dismissed", errorCode: "INFO_1" },
+        { type: "dismissed", errorCode: "INFO_1", slot: "info" },
       ],
       banners: [],
       residuals: [],
@@ -166,19 +165,39 @@ describe("errorBannerReducer + errorBannerView", () => {
         { type: "received", error: INFO, at: 2 },
         { type: "expired", errorCode: "INFO_1", at: 1 },
       ],
-      banners: ["INFO_1"],
+      banners: ["info:INFO_1"],
       residuals: [],
     },
     {
       name: "an info that arrives and expires never erases a dismissed live fault",
       actions: [
         { type: "received", error: NO_LEADER, at: 1 },
-        { type: "dismissed", errorCode: NL },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
         { type: "received", error: INFO, at: 2 },
         { type: "expired", errorCode: "INFO_1", at: 2 },
       ],
       banners: [],
       residuals: [NL],
+    },
+    {
+      name: "dismissing a fault's banner never dismisses an info that shares its code",
+      actions: [
+        { type: "received", error: NO_LEADER, at: 1 },
+        { type: "received", error: fault(NL, "info"), at: 2 },
+        { type: "dismissed", errorCode: NL, slot: "fault" },
+      ],
+      banners: [`info:${NL}`],
+      residuals: [NL],
+    },
+    {
+      name: "a dismissed fault re-reported with a different message re-opens its banner",
+      actions: [
+        { type: "received", error: WORKER_DEAD, at: 1 },
+        { type: "dismissed", errorCode: WD, slot: "fault" },
+        { type: "received", error: { ...WORKER_DEAD, message: "a second worker died" }, at: 2 },
+      ],
+      banners: [WD],
+      residuals: [],
     },
   ];
 
@@ -191,7 +210,7 @@ describe("errorBannerReducer + errorBannerView", () => {
   it("a re-emission while dismissed refreshes last-seen", () => {
     const s = run([
       { type: "received", error: NO_LEADER, at: 1000 },
-      { type: "dismissed", errorCode: NL },
+      { type: "dismissed", errorCode: NL, slot: "fault" },
       { type: "received", error: NO_LEADER, at: 5000 },
     ]);
     expect(s.faults.map((f) => f.lastSeenAt)).toEqual([5000]);
