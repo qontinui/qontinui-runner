@@ -46,16 +46,6 @@ export function base64ToBytes(b64: string): Uint8Array {
 }
 
 /**
- * Per-terminal streaming decode + per-frame coalescing.
- *
- * Ordering is preserved per tab (chunks are appended in arrival order), and
- * the streaming decoder holds back an incomplete trailing multibyte sequence
- * until its continuation bytes arrive — exactly as `TerminalInstance`'s
- * per-instance `TextDecoder({ stream: true })` does. Concatenating the
- * per-chunk decoded strings therefore yields byte-identical text to what the
- * instance's `onOutput` prop produced for the same event sequence.
- */
-/**
  * The session's total output as of one chunk: the chunk's absolute byte offset
  * plus its length. `undefined` when the event carries no offset (an older
  * runner), so a caller renders no total rather than guessing one.
@@ -65,6 +55,16 @@ export function chunkEndOffset(offset: number | undefined, length: number): numb
   return offset + length;
 }
 
+/**
+ * Per-terminal streaming decode + per-frame coalescing.
+ *
+ * Ordering is preserved per tab (chunks are appended in arrival order), and
+ * the streaming decoder holds back an incomplete trailing multibyte sequence
+ * until its continuation bytes arrive — exactly as `TerminalInstance`'s
+ * per-instance `TextDecoder({ stream: true })` does. Concatenating the
+ * per-chunk decoded strings therefore yields byte-identical text to what the
+ * instance's `onOutput` prop produced for the same event sequence.
+ */
 export class TerminalOutputCoalescer {
   private readonly decoders = new Map<string, TextDecoder>();
   private readonly buffers = new Map<string, string>();

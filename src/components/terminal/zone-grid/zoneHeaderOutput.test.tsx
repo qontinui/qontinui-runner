@@ -34,6 +34,8 @@ describe("formatTotalOutput", () => {
     [1024, "1 KB output"],
     [67_036, "65 KB output"],
     [376_950, "368 KB output"],
+    [1024 * 1024 - 513, "1023 KB output"],
+    [1024 * 1024 - 1, "1.0 MB output"],
     [1024 * 1024, "1.0 MB output"],
     [5 * 1024 * 1024 + 512 * 1024, "5.5 MB output"],
   ])("%s bytes -> %s", (bytes, expected) => {
@@ -51,6 +53,25 @@ describe("TotalOutputLabel", () => {
 
   it("renders nothing while the total is unknown", () => {
     expect(renderToStaticMarkup(<TotalOutputLabel totalBytes={undefined} />)).toBe("");
+  });
+});
+
+describe("event streams -> hot store wiring", () => {
+  const ctx = read("../contexts/TerminalSessionContext.tsx");
+
+  it("the output tap records each chunk's end offset and publishes it on flush", () => {
+    expect(ctx).toContain("const total = chunkEndOffset(payload.offset, bytes.length);");
+    expect(ctx).toContain("pendingTotals.set(tid, Math.max(pendingTotals.get(tid) ?? 0, total));");
+    expect(ctx).toMatch(
+      /for \(const \[tabId, total\] of pendingTotals\) \{\s*hotStore\.noteTabTotalBytes\(tabId, total\);/,
+    );
+    expect(ctx).toContain("pendingTotals.clear();");
+  });
+
+  it("the activity digest (unwatched tabs) feeds the same field", () => {
+    expect(ctx).toContain(
+      "hotStore.noteTabTotalBytes(payload.terminalId, payload.totalBytesProduced);",
+    );
   });
 });
 

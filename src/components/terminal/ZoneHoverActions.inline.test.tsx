@@ -119,12 +119,20 @@ describe("header reserve for the hover overlay", () => {
     const html = render({ zoneIdx: 0 });
     const buttons = (html.match(/<button/g) ?? []).length;
     expect(buttons).toBe(6);
+    // The classes `hoverActionsSpanPx` is derived from. Widening a button or
+    // the cluster's padding changes one of these and fails here.
+    expect(html).toContain("absolute top-1 right-1");
+    expect(html).toContain("flex items-center gap-0.5 px-1 py-0.5 bg-[#13141f]/90 border ");
+    expect((html.match(/class="p-1 rounded/g) ?? []).length).toBe(buttons);
+    expect((html.match(/ w-3 h-3"/g) ?? []).length).toBe(buttons);
     expect(hoverActionsSpanPx(buttons)).toBe(144);
     expect(hoverActionsSpanPx(buttons)).toBeLessThanOrEqual(ZONE_HEADER_HOVER_RESERVE_PX);
   });
 
   it("the class carries the same number and applies on group hover", () => {
-    expect(ZONE_HEADER_HOVER_RESERVE_CLASS).toBe(`group-hover:pr-[${ZONE_HEADER_HOVER_RESERVE_PX}px]`);
+    expect(ZONE_HEADER_HOVER_RESERVE_CLASS.split(" ")).toContain(
+      `group-hover:pr-[${ZONE_HEADER_HOVER_RESERVE_PX}px]`,
+    );
   });
 
   it("the zone header applies the reserve and keeps the cwd label reachable", () => {
@@ -135,7 +143,9 @@ describe("header reserve for the hover overlay", () => {
     expect(label).toContain("${ZONE_HEADER_HOVER_RESERVE_CLASS}");
     // The cwd span carries the full path as its title and takes pointer
     // events, or the title could never show.
-    const cwd = label.slice(label.indexOf("data-zone-cwd-label") - 200, label.indexOf("data-zone-cwd-label"));
+    const marker = label.indexOf("data-zone-cwd-label");
+    expect(marker).toBeGreaterThan(200);
+    const cwd = label.slice(marker - 200, marker);
     expect(cwd).toContain("title={tab.workingDir}");
     expect(cwd).not.toContain("pointer-events-none");
   });
