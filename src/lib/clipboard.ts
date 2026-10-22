@@ -8,6 +8,26 @@ import { invoke } from "@tauri-apps/api/core";
 let browserWriteText: ((text: string) => Promise<void>) | null = null;
 let browserReadText: (() => Promise<string>) | null = null;
 
+/** True once {@link installNativeClipboardShim} has patched `navigator.clipboard`. */
+let shimInstalled = false;
+
+/**
+ * The browser fallbacks. Once the shim is installed, `navigator.clipboard` IS
+ * the shim, so calling it from a fallback would loop back into the native
+ * command forever; with no saved browser function the fallback rejects instead.
+ */
+function browserWriteTextFallback(text: string): Promise<void> {
+  if (browserWriteText) return browserWriteText(text);
+  if (shimInstalled) return Promise.reject(new Error("no browser clipboard writeText"));
+  return navigator.clipboard.writeText(text);
+}
+
+function browserReadTextFallback(): Promise<string> {
+  if (browserReadText) return browserReadText();
+  if (shimInstalled) return Promise.reject(new Error("no browser clipboard readText"));
+  return navigator.clipboard.readText();
+}
+
 /**
  * Write text to the OS clipboard reliably from within the Tauri webview.
  *
@@ -36,7 +56,7 @@ export async function writeClipboard(text: string): Promise<boolean> {
     // command is somehow unavailable). This is the flaky path, hence the
     // native attempt first.
     try {
-      await (browserWriteText ?? ((t: string) => navigator.clipboard.writeText(t)))(text);
+      await browserWriteTextFallback(text);
       return true;
     } catch (browserErr) {
       console.error("writeClipboard failed (native + browser):", nativeErr, browserErr);
@@ -64,7 +84,7 @@ export async function readClipboard(): Promise<string> {
     return text;
   } catch (nativeErr) {
     try {
-      return await (browserReadText ?? (() => navigator.clipboard.readText()))();
+      return await browserReadTextFallback();
     } catch (browserErr) {
       throw new Error(
         `readClipboard failed (native: ${String(nativeErr)}; browser: ${String(browserErr)})`,
@@ -101,6 +121,7 @@ export function installNativeClipboardShim(): void {
     } else {
       Object.defineProperty(navigator, "clipboard", { value: shim, configurable: true });
     }
+    shimInstalled = true;
   } catch {
     // Read-only clipboard object: callers keep the browser API.
   }

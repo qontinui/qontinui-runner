@@ -136,15 +136,24 @@ pub fn clipboard_write_text(text: String) -> Result<(), String> {
 /// WebView2, so terminal paste silently did nothing there. An empty or
 /// non-text clipboard is `Ok("")`, not an error, so callers can tell "nothing
 /// to paste" from "the read failed".
+///
+/// Async and off the main thread on purpose: on X11 arboard waits (up to 4s)
+/// for the selection owner to answer, and when that owner is this app's own
+/// GTK webview it can only answer from the main thread. A sync command runs ON
+/// the main thread, so it would block the very reply it is waiting for.
 #[tauri::command]
-pub fn clipboard_read_text() -> Result<String, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
-    match clipboard.get_text() {
-        Ok(text) => Ok(text),
-        Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
-        Err(e) => Err(format!("Clipboard read failed: {}", e)),
-    }
+pub async fn clipboard_read_text() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
+        match clipboard.get_text() {
+            Ok(text) => Ok(text),
+            Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+            Err(e) => Err(format!("Clipboard read failed: {}", e)),
+        }
+    })
+    .await
+    .map_err(|e| format!("Clipboard read task failed: {}", e))?
 }
 
 /// Response from POST /api/v1/files/upload
