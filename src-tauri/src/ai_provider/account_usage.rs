@@ -1,10 +1,13 @@
 //! Weekly-usage-aware Claude account selection.
 //!
 //! [`pick_best_account`] picks an effective Claude config dir from the
-//! configured `claude_config_dirs`, using one of two ranking strategies
+//! configured `claude_config_dirs`, using one of four ranking strategies
 //! depending on `account_selection_mode`:
 //!
-//! - `HighestExpectedUsage` (the default): among accounts that are **not** in
+//! - `AlternatingHandoff` (the default) and `WeightedRandom`: see "Handoff
+//!   strategies" below. At spawn time `AlternatingHandoff` picks exactly as
+//!   `HighestExpectedUsage` does (its "account 1"); `WeightedRandom` draws.
+//! - `HighestExpectedUsage`: among accounts that are **not** in
 //!   a rate-limit cooldown, not exhausted, AND currently under their expected
 //!   linear pace (actual 7-day utilization < expected utilization at this
 //!   point in the billing window), picks the one with the **highest expected
@@ -70,13 +73,49 @@
 //!
 //! [`pick_best_account`] is a no-op when `account_selection_mode == Manual`
 //! or no accounts are configured.
+//!
+//! # Handoff strategies
+//!
+//! A *handoff* is a token-exhausted session moving to another account
+//! ([`pick_migration_target`]). Both strategies consider only the accounts
+//! that are under their expected pace (actual 7-day utilization < expected),
+//! usable, out of cooldown and logged in — see
+//! [`super::config::under_pace_shortfall`]:
+//!
+//! - `WeightedRandom`: each account's weight is `expected * (expected -
+//!   actual)`. The weights are laid end to end as ranges from 0 to their sum,
+//!   and a uniform draw in that span picks the account whose range holds it
+//!   ([`weighted_pick`]).
+//! - `AlternatingHandoff`: the accounts are sorted by expected usage, highest
+//!   first. Handoffs alternate between the first account and each of the
+//!   others in turn — 1,2,1,3,1,4,1,2,... — continuing from the handoffs of
+//!   the last [`HANDOFF_WINDOW`], kept in an in-memory ledger; with none in the
+//!   window the first account gets it ([`alternating_pick`]). "In turn" is
+//!   least-recently-served first, so an account whose rank moves mid-cycle is
+//!   neither served twice nor skipped. The ledger lives in this process, so a
+//!   runner restart starts the sequence over.
+//!
+//! With no account under pace both fall back to the cross-mode ranking
+//! [`pick_target_from`] uses. Every handoff in every mode is recorded in the
+//! ledger, so switching to `AlternatingHandoff` continues from real history.
 
 use super::config::{cmp_rank, UsageRank};
 use crate::claude_session::federation::derive_account_name;
 use crate::settings::{self, AccountSelectionMode};
+use std::collections::VecDeque;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::info;
+
+/// How far back [`AccountSelectionMode::AlternatingHandoff`] looks at earlier
+/// handoffs.
+pub const HANDOFF_WINDOW: Duration = Duration::from_secs(3 * 3600);
+
+/// Handoffs as `(when, target config dir)`, oldest first, pruned to
+/// [`HANDOFF_WINDOW`] whenever it is read. `Instant` is monotonic, so a wall
+/// clock step neither drops nor keeps entries wrongly.
+static HANDOFFS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new());
 
 /// Pin the most-available Claude config dir as the effective account for the
 /// current process. Call this once at the start of each logical unit of AI
@@ -92,7 +131,8 @@ use tracing::info;
 /// `config_dir`). With several, selection prefers (per the active mode) the
 /// non-cooled, non-exhausted account either furthest under its expected pace
 /// (`LeastUsage`) or, among those under pace, with the highest expected usage
-/// (`HighestExpectedUsage`, the default); falls back to first-non-cooled
+/// (`HighestExpectedUsage` and `AlternatingHandoff`, the default; or a weighted
+/// draw under `WeightedRandom`); falls back to first-non-cooled
 /// (cold start), then to the soonest-to-expire cooldown when every account is
 /// rate-limited. Full key: the module doc.
 pub fn pick_best_account() {
@@ -117,14 +157,34 @@ pub fn pick_best_account() {
     }
 
     let chosen = match mode {
-        AccountSelectionMode::HighestExpectedUsage => pick_from_highest_expected(
-            &config_dirs,
-            |d| super::oauth_refresh::has_valid_credentials(d),
-            |d| super::config::is_account_cooled_down(d),
-            |d| super::config::usage_rank_highest_expected(d),
-            |d| super::config::account_known_exhausted(d),
-            |d| super::config::time_until_cooled_down(d),
-        ),
+        AccountSelectionMode::WeightedRandom => {
+            let candidates = under_pace_candidates(&config_dirs, |d| {
+                super::oauth_refresh::has_valid_credentials(d)
+                    && !super::config::is_account_cooled_down(d)
+            });
+            weighted_pick(&candidates, rand::random::<f64>()).or_else(|| {
+                pick_from_highest_expected(
+                    &config_dirs,
+                    |d| super::oauth_refresh::has_valid_credentials(d),
+                    |d| super::config::is_account_cooled_down(d),
+                    |d| super::config::usage_rank_highest_expected(d),
+                    |d| super::config::account_known_exhausted(d),
+                    |d| super::config::time_until_cooled_down(d),
+                )
+            })
+        }
+        // At spawn time the alternating strategy's "account 1" is exactly the
+        // highest-expected pick; the alternation applies to handoffs.
+        AccountSelectionMode::HighestExpectedUsage | AccountSelectionMode::AlternatingHandoff => {
+            pick_from_highest_expected(
+                &config_dirs,
+                |d| super::oauth_refresh::has_valid_credentials(d),
+                |d| super::config::is_account_cooled_down(d),
+                |d| super::config::usage_rank_highest_expected(d),
+                |d| super::config::account_known_exhausted(d),
+                |d| super::config::time_until_cooled_down(d),
+            )
+        }
         AccountSelectionMode::LeastUsage => pick_from(
             &config_dirs,
             |d| super::oauth_refresh::has_valid_credentials(d),
@@ -299,19 +359,194 @@ fn pick_from_highest_expected<'a>(
 /// `account_selection_mode == LeastUsage`: the migration feature has its own
 /// settings switch (`claude_cli.auto_migrate_on_token_exhaustion`), and a
 /// Manual-mode operator who triggers a manual migration still wants a target.
+///
+/// Under `WeightedRandom` and `AlternatingHandoff` the target is chosen by
+/// that strategy (module doc, "Handoff strategies") and the ranking above is
+/// only the fallback for when no account is under pace. The pick is recorded
+/// in the handoff ledger under the same lock that read it, so a burst of
+/// concurrent handoffs each sees the ones before it. A migration that fails
+/// after the pick still counts as a handoff in the ledger.
 pub fn pick_migration_target(exclude_dir: &str) -> Option<String> {
     let config_dirs: Vec<String> = settings::get_claude_config_dirs()
         .into_iter()
         .filter(|d| d != exclude_dir)
         .collect();
 
-    pick_target_from(
-        &config_dirs,
-        |d| super::oauth_refresh::has_valid_credentials(d),
-        |d| super::config::is_account_cooled_down(d),
-        |d| super::config::usage_rank(d),
-        |d| super::config::account_known_exhausted(d),
+    let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    prune_handoffs(&mut ledger, now);
+    let under = under_pace_candidates(&config_dirs, |d| {
+        super::oauth_refresh::has_valid_credentials(d)
+            && !super::config::is_account_cooled_down(d)
+            && !super::config::account_known_exhausted(d)
+    });
+    let chosen = choose_handoff_target(
+        crate::claude_accounts::effective_selection_mode(),
+        &under,
+        ledger.iter().map(|(_, d)| d.as_str()),
+        rand::random::<f64>(),
     )
+    .or_else(|| {
+        pick_target_from(
+            &config_dirs,
+            |d| super::oauth_refresh::has_valid_credentials(d),
+            |d| super::config::is_account_cooled_down(d),
+            |d| super::config::usage_rank(d),
+            |d| super::config::account_known_exhausted(d),
+        )
+    });
+    if let Some(dir) = &chosen {
+        ledger.push_back((now, dir.clone()));
+    }
+    chosen
+}
+
+/// The strategy half of [`pick_migration_target`], free of globals: `under`
+/// is the eligible under-pace accounts sorted by expected usage (highest
+/// first), `recent` the targets of the handoffs in the window, oldest first,
+/// and `roll` a uniform draw in `[0, 1)`. `None` for a mode with no handoff
+/// strategy of its own, or when no account is under pace — the caller then
+/// falls back to the cross-mode ranking.
+fn choose_handoff_target<'a>(
+    mode: AccountSelectionMode,
+    under: &[UnderPace],
+    recent: impl DoubleEndedIterator<Item = &'a str> + Clone,
+    roll: f64,
+) -> Option<String> {
+    match mode {
+        AccountSelectionMode::WeightedRandom => weighted_pick(under, roll),
+        AccountSelectionMode::AlternatingHandoff => alternating_pick(under, recent),
+        AccountSelectionMode::Manual
+        | AccountSelectionMode::LeastUsage
+        | AccountSelectionMode::HighestExpectedUsage => None,
+    }
+}
+
+/// Record a handoff whose target the caller chose itself (an explicit
+/// migration target), so [`AccountSelectionMode::AlternatingHandoff`] sees it.
+pub fn record_handoff(config_dir: &str) {
+    let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    prune_handoffs(&mut ledger, now);
+    ledger.push_back((now, config_dir.to_string()));
+}
+
+/// Withdraw the most recent handoff to `config_dir`: the migration it was
+/// recorded for failed, so the session never reached that account and the
+/// alternation must not count it.
+pub fn unrecord_handoff(config_dir: &str) {
+    let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = ledger.iter().rposition(|(_, d)| d == config_dir) {
+        ledger.remove(i);
+    }
+}
+
+fn prune_handoffs(ledger: &mut VecDeque<(Instant, String)>, now: Instant) {
+    while ledger
+        .front()
+        .is_some_and(|(at, _)| now.saturating_duration_since(*at) > HANDOFF_WINDOW)
+    {
+        ledger.pop_front();
+    }
+}
+
+/// One account under its expected pace: `(config dir, expected utilization,
+/// shortfall = expected - actual)`.
+type UnderPace = (String, f64, f64);
+
+/// The accounts among `config_dirs` that pass `eligible` and are under their
+/// expected pace ([`super::config::under_pace_shortfall`]), sorted by
+/// expected usage, highest first (stable, so ties keep roster order).
+fn under_pace_candidates(
+    config_dirs: &[String],
+    eligible: impl Fn(&str) -> bool,
+) -> Vec<UnderPace> {
+    let mut under: Vec<UnderPace> = config_dirs
+        .iter()
+        .filter(|d| eligible(d))
+        .filter_map(|d| {
+            super::config::under_pace_shortfall(d)
+                .map(|(expected, shortfall)| (d.clone(), expected, shortfall))
+        })
+        .collect();
+    sort_by_expected_desc(&mut under);
+    under
+}
+
+fn sort_by_expected_desc(under: &mut [UnderPace]) {
+    under.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+/// `WeightedRandom`: each candidate's weight is `expected * shortfall`; the
+/// weights are laid end to end from 0, and `roll` (uniform in `[0, 1)`)
+/// scaled to their sum picks the candidate whose range holds it. `None` when
+/// there is no candidate or every weight is zero.
+fn weighted_pick(candidates: &[UnderPace], roll: f64) -> Option<String> {
+    let weights: Vec<f64> = candidates
+        .iter()
+        .map(|(_, expected, shortfall)| (expected * shortfall).max(0.0))
+        .collect();
+    let total: f64 = weights.iter().sum();
+    if !(total > 0.0) {
+        return None;
+    }
+    let point = roll.clamp(0.0, 1.0) * total;
+    let mut end = 0.0;
+    for ((dir, _, _), w) in candidates.iter().zip(&weights) {
+        end += w;
+        if point < end {
+            return Some(dir.clone());
+        }
+    }
+    // `roll` at the top of its range: the last account with a weight.
+    candidates
+        .iter()
+        .zip(&weights)
+        .rev()
+        .find(|(_, w)| **w > 0.0)
+        .map(|((dir, _, _), _)| dir.clone())
+}
+
+/// `AlternatingHandoff`: `candidates` sorted by expected usage, highest first
+/// (account 1 first); `recent` the targets of the handoffs in the window,
+/// oldest first. Account 1 gets every other handoff; the ones between go to
+/// the other accounts in turn: 1,2,1,3,1,4,1,2,... With no handoff in the
+/// window, account 1.
+///
+/// "In turn" is the other account served least recently, an account never
+/// served in the window first and in rank order. With a stable ranking that
+/// is exactly 2,3,4,2,...; when ranks move mid-cycle it still serves each
+/// account once before any account twice.
+fn alternating_pick<'a>(
+    candidates: &[UnderPace],
+    recent: impl DoubleEndedIterator<Item = &'a str> + Clone,
+) -> Option<String> {
+    let (first, others) = candidates.split_first()?;
+    let first = first.0.as_str();
+    let Some(last) = recent.clone().next_back() else {
+        return Some(first.to_string());
+    };
+    // The previous handoff went elsewhere (or nothing else qualifies): back
+    // to account 1.
+    if last != first || others.is_empty() {
+        return Some(first.to_string());
+    }
+    // It went to account 1: the other account served least recently.
+    let last_served = |dir: &str| {
+        recent
+            .clone()
+            .enumerate()
+            .filter(|(_, d)| *d == dir)
+            .map(|(i, _)| i)
+            .last()
+    };
+    others
+        .iter()
+        .min_by_key(|(dir, _, _)| match last_served(dir) {
+            None => (0, 0),
+            Some(i) => (1, i),
+        })
+        .map(|(dir, _, _)| dir.clone())
 }
 
 /// Pure core of [`pick_migration_target`], parameterised like [`pick_from`]
@@ -515,6 +750,200 @@ mod tests {
     use super::super::config::{record_account_usage, usage_rank, PaceRank};
     use super::*;
     use std::time::Duration;
+
+    fn ranked_under_pace(rows: &[(&str, f64, f64)]) -> Vec<UnderPace> {
+        let mut v: Vec<UnderPace> = rows
+            .iter()
+            .map(|(d, e, s)| (d.to_string(), *e, *s))
+            .collect();
+        sort_by_expected_desc(&mut v);
+        v
+    }
+
+    /// Drive `alternating_pick` for `n` handoffs, feeding each pick back as
+    /// history, and return the account numbers (1-based, by expected rank).
+    fn alternate(cands: &[UnderPace], n: usize) -> Vec<usize> {
+        let mut history: Vec<String> = Vec::new();
+        (0..n)
+            .map(|_| {
+                let pick = alternating_pick(cands, history.iter().map(String::as_str)).unwrap();
+                history.push(pick.clone());
+                cands.iter().position(|(d, _, _)| *d == pick).unwrap() + 1
+            })
+            .collect()
+    }
+
+    #[test]
+    fn alternating_pick_follows_the_one_two_one_three_sequence() {
+        let cands = ranked_under_pace(&[
+            ("b", 0.6, 0.1),
+            ("a", 0.8, 0.1),
+            ("d", 0.2, 0.1),
+            ("c", 0.4, 0.1),
+        ]);
+        assert_eq!(alternate(&cands, 10), vec![1, 2, 1, 3, 1, 4, 1, 2, 1, 3]);
+    }
+
+    #[test]
+    fn alternating_pick_without_history_is_account_one() {
+        let cands = ranked_under_pace(&[("a", 0.3, 0.1), ("b", 0.7, 0.1)]);
+        assert_eq!(
+            alternating_pick(&cands, std::iter::empty()),
+            Some("b".into())
+        );
+    }
+
+    #[test]
+    fn alternating_pick_returns_to_account_one_after_any_other_target() {
+        let cands = ranked_under_pace(&[("a", 0.8, 0.1), ("b", 0.6, 0.1)]);
+        // The last handoff went to an account that no longer qualifies.
+        assert_eq!(
+            alternating_pick(&cands, ["gone"].into_iter()),
+            Some("a".into())
+        );
+        assert_eq!(
+            alternating_pick(&cands, ["a", "b"].into_iter()),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn alternating_pick_continues_after_the_last_other_in_the_window() {
+        let cands = ranked_under_pace(&[("a", 0.8, 0.1), ("b", 0.6, 0.1), ("c", 0.4, 0.1)]);
+        assert_eq!(
+            alternating_pick(&cands, ["b", "a"].into_iter()),
+            Some("c".into())
+        );
+        assert_eq!(
+            alternating_pick(&cands, ["c", "a"].into_iter()),
+            Some("b".into())
+        );
+    }
+
+    #[test]
+    fn alternating_pick_single_account_and_empty() {
+        let one = ranked_under_pace(&[("a", 0.5, 0.1)]);
+        assert_eq!(alternate(&one, 3), vec![1, 1, 1]);
+        assert_eq!(alternating_pick(&[], std::iter::empty()), None);
+    }
+
+    #[test]
+    fn weighted_pick_maps_the_roll_onto_consecutive_ranges() {
+        // Weights: a = 0.5*0.2 = 0.1, b = 0.25*0.4 = 0.1, c = 0.8*0.25 = 0.2;
+        // sorted by expected: c [0, 0.2), a [0.2, 0.3), b [0.3, 0.4).
+        let cands = ranked_under_pace(&[("a", 0.5, 0.2), ("b", 0.25, 0.4), ("c", 0.8, 0.25)]);
+        assert_eq!(weighted_pick(&cands, 0.0), Some("c".into()));
+        assert_eq!(weighted_pick(&cands, 0.49), Some("c".into()));
+        assert_eq!(weighted_pick(&cands, 0.51), Some("a".into()));
+        assert_eq!(weighted_pick(&cands, 0.76), Some("b".into()));
+        assert_eq!(weighted_pick(&cands, 1.0), Some("b".into()));
+    }
+
+    #[test]
+    fn weighted_pick_has_nothing_to_draw_from_zero_weights() {
+        assert_eq!(weighted_pick(&[], 0.5), None);
+        assert_eq!(
+            weighted_pick(&ranked_under_pace(&[("a", 0.0, 0.3)]), 0.5),
+            None
+        );
+    }
+
+    #[test]
+    fn prune_handoffs_drops_entries_older_than_the_window() {
+        let t0 = Instant::now();
+        let mut ledger: VecDeque<(Instant, String)> = [
+            (t0, "old".to_string()),
+            (t0 + Duration::from_secs(10), "edge".to_string()),
+            (t0 + Duration::from_secs(20), "new".to_string()),
+        ]
+        .into();
+        prune_handoffs(&mut ledger, t0 + HANDOFF_WINDOW + Duration::from_secs(5));
+        assert_eq!(
+            ledger.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>(),
+            vec!["edge", "new"]
+        );
+    }
+
+    #[test]
+    fn alternating_pick_neither_repeats_nor_skips_when_ranks_move() {
+        // b and c were served; c's rank has since risen above b's, and d was
+        // never served. The next "other" is d, not b again.
+        let cands = ranked_under_pace(&[
+            ("a", 0.9, 0.1),
+            ("c", 0.7, 0.1),
+            ("b", 0.6, 0.1),
+            ("d", 0.5, 0.1),
+        ]);
+        assert_eq!(
+            alternating_pick(&cands, ["a", "b", "a", "c", "a"].into_iter()),
+            Some("d".into())
+        );
+        // All served: the one served longest ago.
+        assert_eq!(
+            alternating_pick(&cands, ["a", "b", "a", "c", "a", "d", "a"].into_iter()),
+            Some("b".into())
+        );
+    }
+
+    #[test]
+    fn choose_handoff_target_dispatches_on_mode() {
+        let cands = ranked_under_pace(&[("a", 0.8, 0.1), ("b", 0.6, 0.3)]);
+        let none: [&str; 0] = [];
+        assert_eq!(
+            choose_handoff_target(
+                AccountSelectionMode::AlternatingHandoff,
+                &cands,
+                none.into_iter(),
+                0.0
+            ),
+            Some("a".into())
+        );
+        // Weights: a 0.08, b 0.18; a roll of 0.5 lands in b's range.
+        assert_eq!(
+            choose_handoff_target(
+                AccountSelectionMode::WeightedRandom,
+                &cands,
+                none.into_iter(),
+                0.5
+            ),
+            Some("b".into())
+        );
+        for mode in [
+            AccountSelectionMode::Manual,
+            AccountSelectionMode::LeastUsage,
+            AccountSelectionMode::HighestExpectedUsage,
+        ] {
+            assert_eq!(
+                choose_handoff_target(mode, &cands, none.into_iter(), 0.5),
+                None
+            );
+        }
+        // Nothing under pace: no strategy pick, the caller falls back.
+        assert_eq!(
+            choose_handoff_target(
+                AccountSelectionMode::AlternatingHandoff,
+                &[],
+                none.into_iter(),
+                0.0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn alternating_pick_without_the_exhausted_source_starts_from_the_next_account() {
+        // Account 1 ("a") ran out and is the source, so it is not a candidate:
+        // the sequence runs over the remaining accounts, b first.
+        let cands = ranked_under_pace(&[("b", 0.6, 0.1), ("c", 0.4, 0.1)]);
+        assert_eq!(
+            alternating_pick(&cands, ["a", "b", "a"].into_iter()),
+            Some("b".into())
+        );
+        assert_eq!(
+            alternating_pick(&cands, ["a", "b"].into_iter()),
+            Some("c".into())
+        );
+    }
 
     // The pick logic in `pick_best_account` reads global settings
     // (`settings::get_ai_settings`, `settings::get_claude_config_dirs`),
