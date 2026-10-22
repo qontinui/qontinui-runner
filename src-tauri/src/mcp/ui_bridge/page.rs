@@ -102,12 +102,7 @@ impl RequestHints for NavigateAndWaitRequest {
     }
     fn shape_error_data() -> Option<serde_json::Value> {
         Some(serde_json::json!({
-            "allowedActions": [
-                "click", "doubleClick", "double_click", "double", "right", "middle",
-                "type", "sendKeys", "clear", "select", "focus", "blur", "hover",
-                "scroll", "scrollIntoView", "scroll_into_view", "check", "uncheck",
-                "toggle", "drag", "setValue", "submit", "reset", "autocomplete"
-            ]
+            "allowedActions": crate::mcp::ui_bridge::elements::SUPPORTED_ACTION_NAMES
         }))
     }
 }
@@ -4321,6 +4316,22 @@ mod set_tab_readback_tests {
         assert_eq!(
             parse_set_tab_readback(r#"{"pageIdChain":"x"}"#),
             SetTabReadback::default()
+        );
+    }
+}
+
+#[cfg(test)]
+mod allowed_actions_tests {
+    use super::*;
+
+    /// The shape-error `allowedActions` list is derived from the route's own
+    /// allowlist, so it cannot drift from what `validate_action_name` accepts.
+    #[test]
+    fn navigate_and_wait_allowed_actions_equal_supported_action_names() {
+        let data = NavigateAndWaitRequest::shape_error_data().expect("data");
+        assert_eq!(
+            data["allowedActions"],
+            serde_json::json!(crate::mcp::ui_bridge::elements::SUPPORTED_ACTION_NAMES)
         );
     }
 }
