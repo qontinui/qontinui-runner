@@ -857,6 +857,25 @@ fn delta_sync_refuses_a_destination_written_after_the_carry() {
 }
 
 #[test]
+fn delta_sync_retries_a_file_the_carry_failed_to_write() {
+    let tmp = scratch("delta-retry");
+    let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
+    seed_session(&src, WD, SID, &[("subagents/agent-a1.jsonl", b"a\n")]);
+    let mut carried = carry(&src, &dst);
+    // As if the carry's write had failed: no destination, recorded absent.
+    let dst_file = literal_sidecar(&dst)
+        .join("subagents")
+        .join("agent-a1.jsonl");
+    std::fs::remove_file(&dst_file).unwrap();
+    carried.files[0].dst = None;
+
+    let done = sync(&src, &dst, &carried);
+    assert_eq!(done.copied, 1, "{done:?}");
+    assert_eq!(std::fs::read(&dst_file).unwrap(), b"a\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn delta_sync_never_touches_the_main_transcript() {
     let tmp = scratch("delta-main");
     let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
