@@ -101,6 +101,7 @@ import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
 import { CoordWarningBanner } from "./CoordWarningBanner";
 import { SessionCountBanner } from "./SessionCountBanner";
+import { PrepareRestartButton } from "./RestartPrepPanel";
 import { loadPerfCaps } from "@/lib/perfCaps";
 import { ProjectFolderChip } from "./ProjectFolderChip";
 import { useApplyZoneProfile } from "./useApplyZoneProfile";
@@ -1572,6 +1573,13 @@ function TerminalPageInner({
             reads the threshold from the caps store itself, so this page does
             not subscribe to it. */}
           <SessionCountBanner openPaneCount={tabs.length} />
+
+          {/* Operator "prepare for restart" (plan
+            `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+            Phase 5): the button, and below it while open the progress panel —
+            the same store `/prepare-restart` drives. In flow, so it never
+            covers a pane. */}
+          <PrepareRestartButton />
 
           {uiState.showTimeline && zoneLayout.isMultiZone && (
             <ZoneTimeline

@@ -1,0 +1,579 @@
+/**
+ * The operator's "prepare for restart" — the frontend half (plan
+ * `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, Phase 5).
+ *
+ * The backend (`src-tauri/src/restart_prep/`) holds spawns, tells live sessions
+ * to save and pause, freezes account moves and records every session. This
+ * module is what the Terminal page reads it through:
+ *
+ * - the WIRE types of the prepare record (`restart_prep_status` /
+ *   `restart_prep_prepare` / `restart_prep_cancel` / `restart_prep_set_held`
+ *   and the `restart-prep-changed` event payload), snake_case as Rust sends
+ *   them — the cohort's `session` is the ledger entry, camelCase;
+ * - PURE readings of a record: the headline, a row's state chip, its effort
+ *   badge. Pure so the `environment: "node"` vitest suite pins them;
+ * - ONE store per webview ({@link restartPrepStore}). The header button, the
+ *   panel and the `/prepare-restart` command all drive it, so a prepare started
+ *   from the command bar and one started from the button are the same prepare,
+ *   and a second click while one is in flight joins it instead of sending
+ *   another.
+ *
+ * The store LISTENS to `restart-prep-changed` (emitted by the backend on every
+ * state change) instead of polling; it reads `restart_prep_status` once when the
+ * first consumer mounts, because an event only says what changed after it.
+ */
+
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+
+import { describeThrown } from "@/lib/utils";
+
+// ── Wire types ────────────────────────────────────────────────────────
+
+/** `restart_prep::PrepState`. */
+export type PrepState = "preparing" | "ready" | "restoring" | "done" | "cancelled";
+
+/** `restart_prep::HoldStatus` (internally tagged on `status`). */
+export type HoldStatus =
+  | { status: "not_attempted" }
+  | { status: "confirmed" }
+  | { status: "unconfirmed"; cause: string }
+  | { status: "local" }
+  | { status: "local_secondary" }
+  | { status: "release_sent"; outcome: string };
+
+/** `restart_prep::effort::Effort`. */
+export interface Effort {
+  level: string | null;
+  source: "screen" | "account_default" | "unknown";
+}
+
+/** `restart_prep::effort::Baseline`. */
+export interface Baseline {
+  baseline: string | null;
+  default_source: "settings" | "cli_default" | "unknown";
+}
+
+/** `restart_prep::cohort::PauseState`. */
+export type PauseState =
+  | "working"
+  | "notified"
+  | "paused"
+  | "finished"
+  | "closed"
+  | "limit_hit"
+  | "unknown";
+
+/** The fields of the ledger entry (`session_ledger::LedgerEntry`) the panel reads. */
+export interface CohortSession {
+  claudeSessionId: string;
+  terminalId: string;
+  pageId: string;
+  zoneIndex: number;
+  title: string | null;
+  sessionName: string | null;
+  accountLabel: string | null;
+  configDir: string | null;
+}
+
+/** `restart_prep::restore::RowRestore`. */
+export interface RowRestore {
+  at_ms: number;
+  at: string;
+  verdict: string;
+  effort_applied: string | null;
+  effort: string | null;
+}
+
+/** `restart_prep::cohort::CohortRow` — the fields the panel reads. */
+export interface CohortRow {
+  session: CohortSession;
+  effort: Effort;
+  baseline: Baseline;
+  model: string | null;
+  state_at_prepare: string;
+  held: boolean;
+  held_by_operator?: boolean;
+  notified_at: number | null;
+  limit_reset_at: number | null;
+  finished: boolean | null;
+  pause_state?: PauseState | null;
+  pause_reason?: string | null;
+  has_live_children?: boolean | null;
+  notice_skipped?: string | null;
+  restore?: RowRestore | null;
+}
+
+/** `restart_prep::notice::Blocker`. */
+export interface Blocker {
+  session: string | null;
+  display_name: string | null;
+  reason: string;
+}
+
+/** `restart_prep::notice::PrepVerdict`. */
+export interface PrepVerdict {
+  prepare_id: string;
+  state: PrepState;
+  hold: string;
+  ready_to_restart: boolean;
+  blockers: Blocker[];
+  cohort_captured_at_ms: number;
+  evaluated_at_ms: number;
+  evaluated_at: string;
+}
+
+/** `restart_prep::PrepareRecord` — the fields the panel reads. */
+export interface PrepareRecord {
+  prepare_id: string;
+  started_at_ms: number;
+  started_at: string;
+  prepared_build: string;
+  state: PrepState;
+  hold: HoldStatus;
+  cohort: { captured_at_ms: number; captured_at: string; reason: string; rows: CohortRow[] };
+  reason: string;
+  hold_until_ms: number | null;
+  hold_until: string | null;
+  verdict: PrepVerdict | null;
+}
+
+/** `restart_prep::prepare::PrepView`. */
+export interface PrepView {
+  hold: string;
+  active: boolean;
+  accounts_frozen: boolean;
+  local_hold: boolean;
+  same_build_hold: boolean;
+  hold_expired_at: string | null;
+  release_failed: string | null;
+}
+
+/** `restart_prep::prepare::PrepChanged` — the event payload and the action replies. */
+export interface PrepChanged {
+  record: PrepareRecord;
+  view: PrepView;
+}
+
+/** The Tauri event the backend emits on every prepare state change. */
+export const RESTART_PREP_CHANGED_EVENT = "restart-prep-changed";
+
+/**
+ * Narrow an untrusted value to a {@link PrepareRecord}. A shape surprise is
+ * `null` — a failed read the panel renders as UNKNOWN — never a half-read
+ * record whose missing fields would render as defaults.
+ */
+export function asPrepareRecord(value: unknown): PrepareRecord | null {
+  if (typeof value !== "object" || value === null) return null;
+  const r = value as Partial<PrepareRecord>;
+  if (typeof r.prepare_id !== "string" || typeof r.state !== "string") return null;
+  if (typeof r.hold !== "object" || r.hold === null) return null;
+  if (typeof r.cohort !== "object" || r.cohort === null || !Array.isArray(r.cohort.rows)) {
+    return null;
+  }
+  return r as PrepareRecord;
+}
+
+/** Narrow an untrusted value to a {@link PrepChanged}; `null` on any surprise. */
+export function asPrepChanged(value: unknown): PrepChanged | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as { record?: unknown; view?: unknown };
+  const record = asPrepareRecord(v.record);
+  const view = v.view as Partial<PrepView> | undefined;
+  if (!record || typeof view !== "object" || view === null || typeof view.hold !== "string") {
+    return null;
+  }
+  return { record, view: view as PrepView };
+}
+
+// ── Pure readings ─────────────────────────────────────────────────────
+
+/** A prepare in its restart window — the one the panel's headline is about. */
+export function inWindow(record: PrepareRecord | null): boolean {
+  return record?.state === "preparing" || record?.state === "ready";
+}
+
+/** The name the panel shows: the session name, else the tab title, else the id. */
+export function rowName(row: CohortRow): string {
+  return (
+    row.session.sessionName?.trim() || row.session.title?.trim() || row.session.claudeSessionId
+  );
+}
+
+/** The headline's three — and only three — readings. */
+export type Headline =
+  | { kind: "ready"; text: string }
+  | { kind: "waiting"; text: string; blockers: Blocker[] }
+  | { kind: "unknown"; text: string };
+
+export const READY_HEADLINE = "Safe to restart — rebuild and restart the runner now";
+
+/** What the headline is computed from. */
+export interface HeadlineInput {
+  record: PrepareRecord | null;
+  /** The last read of the record failed. */
+  readError: string | null;
+  /** At least one read (or event) answered. */
+  loaded: boolean;
+}
+
+/**
+ * The panel's headline: EXACTLY one of "Safe to restart — …", "Waiting on N
+ * sessions" (each blocker named) or "UNKNOWN: <input>". `null` only when there
+ * is no prepare in its window to headline (none, or one that already ended —
+ * the panel says which instead).
+ *
+ * Read from the backend's own verdict (`record.verdict`, Phase 4), never
+ * re-derived here: the verdict is the one place "ready" is decided, and a
+ * second derivation would be a second answer.
+ *
+ * - An unread record, or a verdict that is absent or about another prepare, is
+ *   UNKNOWN — never a default of either answer.
+ * - A PREPARE-WIDE blocker (no session: the hold, the census, the re-capture)
+ *   is an input the safety claim rests on, so it makes the headline UNKNOWN
+ *   naming it; "Waiting on N sessions" is said only of sessions.
+ * - A verdict that contradicts itself (ready with blockers, not ready with
+ *   none) is UNKNOWN too.
+ */
+export function restartPrepHeadline({ record, readError, loaded }: HeadlineInput): Headline | null {
+  if (readError !== null) {
+    return { kind: "unknown", text: `UNKNOWN: the restart-prep record (${readError})` };
+  }
+  if (!loaded) {
+    return { kind: "unknown", text: "UNKNOWN: the restart-prep record (not read yet)" };
+  }
+  if (!record || !inWindow(record)) return null;
+  const verdict = record.verdict;
+  if (!verdict || verdict.prepare_id !== record.prepare_id) {
+    return {
+      kind: "unknown",
+      text: "UNKNOWN: the verdict (the runner has not evaluated this prepare yet)",
+    };
+  }
+  const blockers = Array.isArray(verdict.blockers) ? verdict.blockers : [];
+  const prepareWide = blockers.filter((b) => !b.session);
+  if (prepareWide.length > 0) {
+    return { kind: "unknown", text: `UNKNOWN: ${prepareWide.map((b) => b.reason).join("; ")}` };
+  }
+  if (verdict.ready_to_restart && blockers.length === 0) {
+    return { kind: "ready", text: READY_HEADLINE };
+  }
+  if (!verdict.ready_to_restart && blockers.length > 0) {
+    const n = new Set(blockers.map((b) => b.session)).size;
+    return {
+      kind: "waiting",
+      text: `Waiting on ${n} session${n === 1 ? "" : "s"}`,
+      blockers,
+    };
+  }
+  return {
+    kind: "unknown",
+    text: verdict.ready_to_restart
+      ? "UNKNOWN: the verdict (ready, yet it names blockers)"
+      : "UNKNOWN: the verdict (not ready, and it names no blocker)",
+  };
+}
+
+/** A blocker's line: who, then why. */
+export function blockerLine(b: Blocker): string {
+  return `${b.display_name?.trim() || b.session || "prepare"} — ${b.reason}`;
+}
+
+/** The text and tone of a row's state chip, from what the backend observed. */
+export function rowStateChip(row: CohortRow): { text: string; tone: "ok" | "wait" | "unknown" } {
+  if (row.restore) return { text: `restore: ${row.restore.verdict}`, tone: "wait" };
+  const s = row.pause_state;
+  if (!s) return { text: "unknown: not read yet", tone: "unknown" };
+  if (s === "unknown") return { text: "unknown", tone: "unknown" };
+  const text = s.replace(/_/g, " ");
+  const tone = s === "paused" || s === "finished" || s === "closed" ? "ok" : "wait";
+  return { text, tone };
+}
+
+/** The effort badge: the level and where it was read, or "effort unknown". */
+export function effortBadge(row: CohortRow): string {
+  const { level, source } = row.effort ?? { level: null, source: "unknown" };
+  if (!level || source === "unknown") return "effort unknown";
+  return `${level} · ${source === "screen" ? "screen" : "account default"}`;
+}
+
+// ── The store ─────────────────────────────────────────────────────────
+
+/** An operator action's acknowledgement (`an-action-must-acknowledge-itself`). */
+export type ActionPhase = "idle" | "received" | "in-flight" | "done" | "failed";
+
+export interface ActionState {
+  phase: ActionPhase;
+  /** The terminal state's one line: what happened, or why it failed. */
+  message?: string;
+}
+
+const IDLE: ActionState = { phase: "idle" };
+
+export interface RestartPrepSnapshot {
+  record: PrepareRecord | null;
+  view: PrepView | null;
+  readError: string | null;
+  loaded: boolean;
+  panelOpen: boolean;
+  prepare: ActionState;
+  cancel: ActionState;
+  /** Per Claude session id: the held toggle's acknowledgement. */
+  held: Readonly<Record<string, ActionState>>;
+}
+
+/** What the store reaches the backend through; injected so tests need no Tauri. */
+export interface RestartPrepDeps {
+  invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+  listen: (event: string, onPayload: (payload: unknown) => void) => Promise<() => void>;
+}
+
+export interface RestartPrepStore {
+  getSnapshot(): RestartPrepSnapshot;
+  subscribe(listener: () => void): () => void;
+  /**
+   * Start listening to `restart-prep-changed` and read the record once.
+   * Reference-counted: the last `release` stops listening.
+   */
+  retain(): () => void;
+  /** Re-read the record (`restart_prep_status`). */
+  refresh(): Promise<void>;
+  /**
+   * Prepare for a restart. A call while one is in flight JOINS it (the same
+   * promise; nothing is sent twice). Resolves to the reply, or throws the
+   * backend's refusal.
+   */
+  prepare(reason?: string): Promise<PrepChanged>;
+  /** Cancel the prepare (also the "Release hold" of a same-build restart). */
+  cancel(): Promise<PrepChanged>;
+  /** The held toggle: hold a row for a hand restore, or release it. */
+  setHeld(claudeSessionId: string, held: boolean): Promise<PrepareRecord>;
+  openPanel(): { changed: boolean };
+  closePanel(): void;
+}
+
+export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore {
+  let snap: RestartPrepSnapshot = {
+    record: null,
+    view: null,
+    readError: null,
+    loaded: false,
+    panelOpen: false,
+    prepare: IDLE,
+    cancel: IDLE,
+    held: {},
+  };
+  const listeners = new Set<() => void>();
+  let refs = 0;
+  let stopListening: (() => void) | null = null;
+  let listening = false;
+  let inflightPrepare: Promise<PrepChanged> | null = null;
+  let inflightCancel: Promise<PrepChanged> | null = null;
+  /** Bumped by every event, so an action reply older than an event is not applied over it. */
+  let eventSeq = 0;
+
+  const set = (patch: Partial<RestartPrepSnapshot>): void => {
+    snap = { ...snap, ...patch };
+    for (const l of listeners) l();
+  };
+
+  const applyChanged = (changed: PrepChanged): void => {
+    set({ record: changed.record, view: changed.view, readError: null, loaded: true });
+  };
+
+  /** Apply an action's reply unless an event arrived while it was in flight. */
+  const applyReply = (changed: PrepChanged, seqAtStart: number): void => {
+    if (eventSeq === seqAtStart) applyChanged(changed);
+  };
+
+  const onEvent = (payload: unknown): void => {
+    const changed = asPrepChanged(payload);
+    if (!changed) return;
+    eventSeq += 1;
+    applyChanged(changed);
+  };
+
+  const refresh = async (): Promise<void> => {
+    const seq = eventSeq;
+    try {
+      const status = (await deps.invoke("restart_prep_status")) as {
+        record?: unknown;
+        view?: unknown;
+      } | null;
+      if (typeof status !== "object" || status === null) {
+        set({ readError: "the status came back in an unrecognized shape", loaded: true });
+        return;
+      }
+      if (eventSeq !== seq) return;
+      if (status.record === null || status.record === undefined) {
+        set({ record: null, view: null, readError: null, loaded: true });
+        return;
+      }
+      const record = asPrepareRecord(status.record);
+      const view = status.view as PrepView | null | undefined;
+      if (!record || typeof view !== "object" || view === null) {
+        set({ readError: "the record came back in an unrecognized shape", loaded: true });
+        return;
+      }
+      set({ record, view, readError: null, loaded: true });
+    } catch (err) {
+      set({
+        readError: describeThrown(err, "could not read the restart-prep record"),
+        loaded: true,
+      });
+    }
+  };
+
+  /**
+   * One `listen` at a time: a release while it is still being set up stops it
+   * as soon as it answers, and a retain in the meantime reuses it.
+   */
+  const startListening = (): void => {
+    if (listening) return;
+    listening = true;
+    deps
+      .listen(RESTART_PREP_CHANGED_EVENT, onEvent)
+      .then((stop) => {
+        if (refs === 0) {
+          stop();
+          listening = false;
+        } else {
+          stopListening = stop;
+        }
+      })
+      .catch(() => {
+        // No event channel: the panel still reads on mount and applies each
+        // action's own reply; a failed READ is what renders as UNKNOWN.
+        listening = false;
+      });
+  };
+
+  const retain = (): (() => void) => {
+    refs += 1;
+    if (refs === 1) {
+      startListening();
+      void refresh();
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      refs -= 1;
+      if (refs === 0 && stopListening) {
+        stopListening();
+        stopListening = null;
+        listening = false;
+      }
+    };
+  };
+
+  const prepare = (reason = ""): Promise<PrepChanged> => {
+    if (inflightPrepare) return inflightPrepare;
+    set({ prepare: { phase: "received" } });
+    const seq = eventSeq;
+    const run = (async (): Promise<PrepChanged> => {
+      set({ prepare: { phase: "in-flight" } });
+      try {
+        const reply = asPrepChanged(await deps.invoke("restart_prep_prepare", { reason }));
+        if (!reply) throw new Error("the prepare reply came back in an unrecognized shape");
+        applyReply(reply, seq);
+        set({ prepare: { phase: "done", message: `hold ${reply.view.hold}` } });
+        return reply;
+      } catch (err) {
+        const message = describeThrown(err, "the prepare failed");
+        set({ prepare: { phase: "failed", message } });
+        throw new Error(message, { cause: err });
+      } finally {
+        inflightPrepare = null;
+      }
+    })();
+    inflightPrepare = run;
+    return run;
+  };
+
+  const cancel = (): Promise<PrepChanged> => {
+    if (inflightCancel) return inflightCancel;
+    set({ cancel: { phase: "received" } });
+    const seq = eventSeq;
+    const run = (async (): Promise<PrepChanged> => {
+      set({ cancel: { phase: "in-flight" } });
+      try {
+        const reply = asPrepChanged(await deps.invoke("restart_prep_cancel"));
+        if (!reply) throw new Error("the cancel reply came back in an unrecognized shape");
+        applyReply(reply, seq);
+        set({ cancel: { phase: "done", message: `hold ${reply.view.hold}` } });
+        return reply;
+      } catch (err) {
+        const message = describeThrown(err, "the cancel failed");
+        set({ cancel: { phase: "failed", message } });
+        throw new Error(message, { cause: err });
+      } finally {
+        inflightCancel = null;
+      }
+    })();
+    inflightCancel = run;
+    return run;
+  };
+
+  const setHeld = async (claudeSessionId: string, held: boolean): Promise<PrepareRecord> => {
+    const record = snap.record;
+    const mark = (s: ActionState): void => set({ held: { ...snap.held, [claudeSessionId]: s } });
+    if (!record) {
+      mark({ phase: "failed", message: "no restart prepare is recorded" });
+      throw new Error("no restart prepare is recorded");
+    }
+    mark({ phase: "in-flight" });
+    try {
+      const reply = asPrepareRecord(
+        await deps.invoke("restart_prep_set_held", {
+          prepareId: record.prepare_id,
+          claudeSessionId,
+          held,
+        }),
+      );
+      if (!reply) throw new Error("the reply came back in an unrecognized shape");
+      // The backend announces the change too; applying the reply here keeps
+      // the toggle honest where the event channel is down.
+      if (snap.record?.prepare_id === reply.prepare_id) set({ record: reply });
+      const row = reply.cohort.rows.find((r) => r.session.claudeSessionId === claudeSessionId);
+      if (!row || row.held !== held) {
+        throw new Error("the record does not show the change");
+      }
+      mark({ phase: "done", message: held ? "held" : "released" });
+      return reply;
+    } catch (err) {
+      const message = describeThrown(err, "could not change the hold");
+      mark({ phase: "failed", message });
+      throw new Error(message, { cause: err });
+    }
+  };
+
+  return {
+    getSnapshot: () => snap,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    retain,
+    refresh,
+    prepare,
+    cancel,
+    setHeld,
+    openPanel() {
+      const changed = !snap.panelOpen;
+      if (changed) set({ panelOpen: true });
+      return { changed };
+    },
+    closePanel() {
+      if (snap.panelOpen) set({ panelOpen: false });
+    },
+  };
+}
+
+/** The webview's one store. Loads `listen` lazily so a node test never touches it. */
+export const restartPrepStore: RestartPrepStore = createRestartPrepStore({
+  invoke: (cmd, args) => tauriInvoke(cmd, args),
+  listen: async (event, onPayload) => {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen(event, (e) => onPayload(e.payload));
+  },
+});

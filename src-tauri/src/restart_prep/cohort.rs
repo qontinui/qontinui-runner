@@ -93,6 +93,11 @@ pub struct CohortRow {
     /// Held for a hand restore: `effort > baseline`, `false` when either side
     /// is unknown. Bulk restore skips a held row; the operator can release it.
     pub held: bool,
+    /// The operator set [`Self::held`] by hand (the panel's held toggle,
+    /// [`super::restore::set_held_on`]). A re-capture never recomputes an
+    /// operator's choice from a newly read effort.
+    #[serde(default)]
+    pub held_by_operator: bool,
     /// Unix millis the save-and-pause notice was delivered (Phase 4).
     pub notified_at: Option<i64>,
     /// Unix millis the account's usage window resets, when a confirmed
@@ -236,6 +241,7 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
         baseline,
         model: facts.model,
         held,
+        held_by_operator: false,
         notified_at: None,
         limit_reset_at: None,
         finished: facts.finished,
@@ -261,7 +267,8 @@ pub fn build_row(session: LedgerEntry, facts: RowFacts) -> CohortRow {
 ///   `held`, `state_at_prepare` (a `limit_hit` mark included), the notice and
 ///   usage-limit stamps — and takes the fresh ledger entry (a tab may have
 ///   moved) and work axis. An effort that was unread at prepare and is read
-///   now is taken from the fresh row; a read one is never overwritten.
+///   now is taken from the fresh row; a read one is never overwritten. The
+///   fresh row's `held` comes with it unless the operator set `held` by hand.
 /// * A session only in the fresh capture (opened during the prepare) joins.
 /// * A session only in the pinned cohort is kept — every session is recorded —
 ///   and stamped `left_capture_at` the first time it is missing.
@@ -296,7 +303,9 @@ pub fn merge_recapture(pinned: &Cohort, fresh: Cohort, now_ms: i64) -> Cohort {
                 {
                     row.effort = fresh_row.effort;
                     row.baseline = fresh_row.baseline;
-                    row.held = fresh_row.held;
+                    if !row.held_by_operator {
+                        row.held = fresh_row.held;
+                    }
                 }
                 row.left_capture_at = None;
             }
@@ -643,6 +652,47 @@ mod tests {
         assert!(!r.held);
         assert_eq!(r.state_at_prepare, StateAtPrepare::Unknown);
         assert_eq!(r.finished, None);
+    }
+
+    #[test]
+    fn a_recapture_that_first_reads_the_effort_keeps_the_operators_held_choice() {
+        let unread = RowFacts {
+            finished: Some(false),
+            ..Default::default()
+        };
+        let read_max = || RowFacts {
+            screen: Some(idle_at("◉ max · /effort")),
+            finished: Some(false),
+            ..Default::default()
+        };
+        let pinned = build_cohort(
+            ledger(&["a", "b"]),
+            &fixed(vec![("a", unread.clone()), ("b", unread)]),
+        );
+        assert!(
+            !pinned.rows[0].held && !pinned.rows[1].held,
+            "unknown effort: not held"
+        );
+        // The operator released `a` by hand (held stays false, but it is now
+        // THEIR false); `b` is untouched.
+        let mut pinned = pinned;
+        pinned.rows[0].held_by_operator = true;
+        let fresh = build_cohort(
+            ledger(&["a", "b"]),
+            &fixed(vec![("a", read_max()), ("b", read_max())]),
+        );
+        let merged = merge_recapture(&pinned, fresh, 1_000);
+        assert_eq!(
+            merged.rows[0].effort.level.as_deref(),
+            Some("max"),
+            "effort taken"
+        );
+        assert!(
+            !merged.rows[0].held,
+            "the operator's choice survives the first read"
+        );
+        assert!(merged.rows[0].held_by_operator);
+        assert!(merged.rows[1].held, "an untouched row takes the fresh held");
     }
 
     #[test]

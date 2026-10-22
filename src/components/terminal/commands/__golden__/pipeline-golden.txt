@@ -31,7 +31,7 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 3148
+# tier: golden   inputs: 3400
 
 /admin	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
 /admin "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
@@ -213,6 +213,76 @@
 /auto-restart 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-restart	[]	unbound	-
 /auto-restart 3 best	literal	terminal.toggle-auto-restart	[]	unbound	-
 /auto-restart 3 best --tenant	literal	terminal.toggle-auto-restart	[]	unbound	-
+/cancel restart	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel restart "1 gmail fix the bug"	none	-	null	none	-
+/cancel restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel restart "3 best"	none	-	null	none	-
+/cancel restart "3 best" --tenant	none	-	null	none	-
+/cancel restart --tenant	none	-	null	none	-
+/cancel restart 1 gmail fix the bug	none	-	null	none	-
+/cancel restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel restart 3 best	none	-	null	none	-
+/cancel restart 3 best --tenant	none	-	null	none	-
+/cancel restart prep	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel restart prep "1 gmail fix the bug"	none	-	null	none	-
+/cancel restart prep "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel restart prep "3 best"	none	-	null	none	-
+/cancel restart prep "3 best" --tenant	none	-	null	none	-
+/cancel restart prep --tenant	none	-	null	none	-
+/cancel restart prep 1 gmail fix the bug	none	-	null	none	-
+/cancel restart prep 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel restart prep 3 best	none	-	null	none	-
+/cancel restart prep 3 best --tenant	none	-	null	none	-
+/cancel restart prepare	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel restart prepare "1 gmail fix the bug"	none	-	null	none	-
+/cancel restart prepare "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel restart prepare "3 best"	none	-	null	none	-
+/cancel restart prepare "3 best" --tenant	none	-	null	none	-
+/cancel restart prepare --tenant	none	-	null	none	-
+/cancel restart prepare 1 gmail fix the bug	none	-	null	none	-
+/cancel restart prepare 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel restart prepare 3 best	none	-	null	none	-
+/cancel restart prepare 3 best --tenant	none	-	null	none	-
+/cancel the restart	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel the restart "1 gmail fix the bug"	none	-	null	none	-
+/cancel the restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel the restart "3 best"	none	-	null	none	-
+/cancel the restart "3 best" --tenant	none	-	null	none	-
+/cancel the restart --tenant	none	-	null	none	-
+/cancel the restart 1 gmail fix the bug	none	-	null	none	-
+/cancel the restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel the restart 3 best	none	-	null	none	-
+/cancel the restart 3 best --tenant	none	-	null	none	-
+/cancel the restart prep	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel the restart prep "1 gmail fix the bug"	none	-	null	none	-
+/cancel the restart prep "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel the restart prep "3 best"	none	-	null	none	-
+/cancel the restart prep "3 best" --tenant	none	-	null	none	-
+/cancel the restart prep --tenant	none	-	null	none	-
+/cancel the restart prep 1 gmail fix the bug	none	-	null	none	-
+/cancel the restart prep 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel the restart prep 3 best	none	-	null	none	-
+/cancel the restart prep 3 best --tenant	none	-	null	none	-
+/cancel the restart prepare	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel the restart prepare "1 gmail fix the bug"	none	-	null	none	-
+/cancel the restart prepare "1 gmail fix the bug" --tenant	none	-	null	none	-
+/cancel the restart prepare "3 best"	none	-	null	none	-
+/cancel the restart prepare "3 best" --tenant	none	-	null	none	-
+/cancel the restart prepare --tenant	none	-	null	none	-
+/cancel the restart prepare 1 gmail fix the bug	none	-	null	none	-
+/cancel the restart prepare 1 gmail fix the bug --tenant	none	-	null	none	-
+/cancel the restart prepare 3 best	none	-	null	none	-
+/cancel the restart prepare 3 best --tenant	none	-	null	none	-
+/cancel-restart	literal	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+/cancel-restart "1 gmail fix the bug"	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart "1 gmail fix the bug" --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart "3 best"	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart "3 best" --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart 1 gmail fix the bug	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart 1 gmail fix the bug --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart 3 best	literal	terminal.cancel-restart-prep	[]	unbound	-
+/cancel-restart 3 best --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
 /clear-tag	pattern	terminal.tag-clear	[]	ok	noop /tag-clear · no tag filters cleared
 /clear-tag "1 gmail fix the bug"	none	-	null	none	-
 /clear-tag "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -569,8 +639,6 @@
 /generate-workflow 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound	-
 /generate-workflow 3 best	literal	terminal.generate-workflow	[]	unbound	-
 /generate-workflow 3 best --tenant	literal	terminal.generate-workflow	[]	unbound	-
-/grid mode	pattern	terminal.mode	[["mode","grid"]]	ok	noop /terminal.mode · work mode was already grid
-/grid mode --tenant	none	-	null	none	-
 /help	pattern	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
 /help "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound	-
 /help "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound	-
@@ -801,6 +869,86 @@
 /plan-verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound	-
 /plan-verify 3 best	literal	terminal.plan-verify	[]	unbound	-
 /plan-verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound	-
+/prep-restart	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prep-restart 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare for a restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare for a restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare for a restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare for a restart "3 best"	none	-	null	none	-
+/prepare for a restart "3 best" --tenant	none	-	null	none	-
+/prepare for a restart --tenant	none	-	null	none	-
+/prepare for a restart 1 gmail fix the bug	none	-	null	none	-
+/prepare for a restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare for a restart 3 best	none	-	null	none	-
+/prepare for a restart 3 best --tenant	none	-	null	none	-
+/prepare for restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare for restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare for restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare for restart "3 best"	none	-	null	none	-
+/prepare for restart "3 best" --tenant	none	-	null	none	-
+/prepare for restart --tenant	none	-	null	none	-
+/prepare for restart 1 gmail fix the bug	none	-	null	none	-
+/prepare for restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare for restart 3 best	none	-	null	none	-
+/prepare for restart 3 best --tenant	none	-	null	none	-
+/prepare restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare restart "3 best"	none	-	null	none	-
+/prepare restart "3 best" --tenant	none	-	null	none	-
+/prepare restart --tenant	none	-	null	none	-
+/prepare restart 1 gmail fix the bug	none	-	null	none	-
+/prepare restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare restart 3 best	none	-	null	none	-
+/prepare restart 3 best --tenant	none	-	null	none	-
+/prepare the runner for a restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare the runner for a restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare the runner for a restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare the runner for a restart "3 best"	none	-	null	none	-
+/prepare the runner for a restart "3 best" --tenant	none	-	null	none	-
+/prepare the runner for a restart --tenant	none	-	null	none	-
+/prepare the runner for a restart 1 gmail fix the bug	none	-	null	none	-
+/prepare the runner for a restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare the runner for a restart 3 best	none	-	null	none	-
+/prepare the runner for a restart 3 best --tenant	none	-	null	none	-
+/prepare the runner for restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare the runner for restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare the runner for restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare the runner for restart "3 best"	none	-	null	none	-
+/prepare the runner for restart "3 best" --tenant	none	-	null	none	-
+/prepare the runner for restart --tenant	none	-	null	none	-
+/prepare the runner for restart 1 gmail fix the bug	none	-	null	none	-
+/prepare the runner for restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare the runner for restart 3 best	none	-	null	none	-
+/prepare the runner for restart 3 best --tenant	none	-	null	none	-
+/prepare the runner restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare the runner restart "1 gmail fix the bug"	none	-	null	none	-
+/prepare the runner restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+/prepare the runner restart "3 best"	none	-	null	none	-
+/prepare the runner restart "3 best" --tenant	none	-	null	none	-
+/prepare the runner restart --tenant	none	-	null	none	-
+/prepare the runner restart 1 gmail fix the bug	none	-	null	none	-
+/prepare the runner restart 1 gmail fix the bug --tenant	none	-	null	none	-
+/prepare the runner restart 3 best	none	-	null	none	-
+/prepare the runner restart 3 best --tenant	none	-	null	none	-
+/prepare-restart	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/prepare-restart 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 /prev session	pattern	terminal.focus	[["target","prev"]]	ok	ok /focus ✓ focused 1 zone
 /prev session --tenant	none	-	null	none	-
 /previous session	pattern	terminal.focus	[["target","previous"]]	ok	ok /focus ✓ focused 1 zone
@@ -879,6 +1027,16 @@
 /restart 3 --tenant	literal	terminal.restart	[["zone","3 --tenant"]]	error:invalid-zone	error /restart: "3 --tenant" is not a zone number
 /restart 3 best	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone	error /restart: "3 best" is not a zone number
 /restart 3 best --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone	error /restart: "3 best --tenant" is not a zone number
+/restart-prep	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+/restart-prep 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 /resume	pattern	terminal.resume	[]	ok	ok /resume ✓ opened the sessions sidebar
 /resume "1 gmail fix the bug"	literal	terminal.resume	[]	unbound	-
 /resume "1 gmail fix the bug" --tenant	literal	terminal.resume	[]	unbound	-
@@ -1203,18 +1361,6 @@
 /tags-clear 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound	-
 /tags-clear 3 best	literal	terminal.tag-clear	[]	unbound	-
 /tags-clear 3 best --tenant	literal	terminal.tag-clear	[]	unbound	-
-/terminal.mode	literal	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-/terminal.mode "1 gmail fix the bug"	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
-/terminal.mode "1 gmail fix the bug" --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
-/terminal.mode "3 best"	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
-/terminal.mode "3 best" --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
-/terminal.mode --tenant	literal	terminal.mode	[["mode","--tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "--tenant"
-/terminal.mode 1 gmail fix the bug	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
-/terminal.mode 1 gmail fix the bug --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
-/terminal.mode 3 best	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
-/terminal.mode 3 best --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
-/tmux mode	pattern	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-/tmux mode --tenant	none	-	null	none	-
 /toggle auto focus	pattern	terminal.toggle-auto-focus	[]	ok	ok /auto-focus ✓ enabled auto-focus
 /toggle auto focus "1 gmail fix the bug"	none	-	null	none	-
 /toggle auto focus "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -1405,30 +1551,6 @@
 /verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound	-
 /verify 3 best	literal	terminal.plan-verify	[]	unbound	-
 /verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound	-
-/work mode	fuzzy	terminal.mode	[["mode","mode"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "mode"
-/work mode "1 gmail fix the bug"	none	-	null	none	-
-/work mode "1 gmail fix the bug" --tenant	none	-	null	none	-
-/work mode "3 best"	none	-	null	none	-
-/work mode "3 best" --tenant	none	-	null	none	-
-/work mode --tenant	none	-	null	none	-
-/work mode 1 gmail fix the bug	none	-	null	none	-
-/work mode 1 gmail fix the bug --tenant	none	-	null	none	-
-/work mode 3 best	none	-	null	none	-
-/work mode 3 best --tenant	none	-	null	none	-
-/work mode grid	pattern	terminal.mode	[["mode","grid"]]	ok	noop /terminal.mode · work mode was already grid
-/work mode grid --tenant	none	-	null	none	-
-/work mode tmux	pattern	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-/work mode tmux --tenant	none	-	null	none	-
-/work-mode	literal	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-/work-mode "1 gmail fix the bug"	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
-/work-mode "1 gmail fix the bug" --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
-/work-mode "3 best"	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
-/work-mode "3 best" --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
-/work-mode --tenant	literal	terminal.mode	[["mode","--tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "--tenant"
-/work-mode 1 gmail fix the bug	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
-/work-mode 1 gmail fix the bug --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
-/work-mode 3 best	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
-/work-mode 3 best --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
 /yes all	pattern	terminal.approve-all	[]	ok	error /approve-all ✗ approved 0 of 1 session — 1 TERMINAL_WRITE_FAILED
 /yes all "1 gmail fix the bug"	none	-	null	none	-
 /yes all "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -1619,6 +1741,76 @@ auto-restart 1 gmail fix the bug	literal	terminal.toggle-auto-restart	[]	unbound
 auto-restart 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-restart	[]	unbound	-
 auto-restart 3 best	literal	terminal.toggle-auto-restart	[]	unbound	-
 auto-restart 3 best --tenant	literal	terminal.toggle-auto-restart	[]	unbound	-
+cancel restart	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel restart "1 gmail fix the bug"	none	-	null	none	-
+cancel restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel restart "3 best"	none	-	null	none	-
+cancel restart "3 best" --tenant	none	-	null	none	-
+cancel restart --tenant	none	-	null	none	-
+cancel restart 1 gmail fix the bug	none	-	null	none	-
+cancel restart 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel restart 3 best	none	-	null	none	-
+cancel restart 3 best --tenant	none	-	null	none	-
+cancel restart prep	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel restart prep "1 gmail fix the bug"	none	-	null	none	-
+cancel restart prep "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel restart prep "3 best"	none	-	null	none	-
+cancel restart prep "3 best" --tenant	none	-	null	none	-
+cancel restart prep --tenant	none	-	null	none	-
+cancel restart prep 1 gmail fix the bug	none	-	null	none	-
+cancel restart prep 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel restart prep 3 best	none	-	null	none	-
+cancel restart prep 3 best --tenant	none	-	null	none	-
+cancel restart prepare	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel restart prepare "1 gmail fix the bug"	none	-	null	none	-
+cancel restart prepare "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel restart prepare "3 best"	none	-	null	none	-
+cancel restart prepare "3 best" --tenant	none	-	null	none	-
+cancel restart prepare --tenant	none	-	null	none	-
+cancel restart prepare 1 gmail fix the bug	none	-	null	none	-
+cancel restart prepare 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel restart prepare 3 best	none	-	null	none	-
+cancel restart prepare 3 best --tenant	none	-	null	none	-
+cancel the restart	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel the restart "1 gmail fix the bug"	none	-	null	none	-
+cancel the restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel the restart "3 best"	none	-	null	none	-
+cancel the restart "3 best" --tenant	none	-	null	none	-
+cancel the restart --tenant	none	-	null	none	-
+cancel the restart 1 gmail fix the bug	none	-	null	none	-
+cancel the restart 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel the restart 3 best	none	-	null	none	-
+cancel the restart 3 best --tenant	none	-	null	none	-
+cancel the restart prep	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel the restart prep "1 gmail fix the bug"	none	-	null	none	-
+cancel the restart prep "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel the restart prep "3 best"	none	-	null	none	-
+cancel the restart prep "3 best" --tenant	none	-	null	none	-
+cancel the restart prep --tenant	none	-	null	none	-
+cancel the restart prep 1 gmail fix the bug	none	-	null	none	-
+cancel the restart prep 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel the restart prep 3 best	none	-	null	none	-
+cancel the restart prep 3 best --tenant	none	-	null	none	-
+cancel the restart prepare	pattern	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel the restart prepare "1 gmail fix the bug"	none	-	null	none	-
+cancel the restart prepare "1 gmail fix the bug" --tenant	none	-	null	none	-
+cancel the restart prepare "3 best"	none	-	null	none	-
+cancel the restart prepare "3 best" --tenant	none	-	null	none	-
+cancel the restart prepare --tenant	none	-	null	none	-
+cancel the restart prepare 1 gmail fix the bug	none	-	null	none	-
+cancel the restart prepare 1 gmail fix the bug --tenant	none	-	null	none	-
+cancel the restart prepare 3 best	none	-	null	none	-
+cancel the restart prepare 3 best --tenant	none	-	null	none	-
+cancel-restart	literal	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+cancel-restart "1 gmail fix the bug"	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart "1 gmail fix the bug" --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart "3 best"	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart "3 best" --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart 1 gmail fix the bug	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart 1 gmail fix the bug --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart 3 best	literal	terminal.cancel-restart-prep	[]	unbound	-
+cancel-restart 3 best --tenant	literal	terminal.cancel-restart-prep	[]	unbound	-
 clear-tag	pattern	terminal.tag-clear	[]	ok	noop /tag-clear · no tag filters cleared
 clear-tag "1 gmail fix the bug"	none	-	null	none	-
 clear-tag "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -1975,8 +2167,6 @@ generate-workflow 1 gmail fix the bug	literal	terminal.generate-workflow	[]	unbo
 generate-workflow 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound	-
 generate-workflow 3 best	literal	terminal.generate-workflow	[]	unbound	-
 generate-workflow 3 best --tenant	literal	terminal.generate-workflow	[]	unbound	-
-grid mode	pattern	terminal.mode	[["mode","grid"]]	ok	noop /terminal.mode · work mode was already grid
-grid mode --tenant	none	-	null	none	-
 help	pattern	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
 help "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound	-
 help "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound	-
@@ -2207,6 +2397,86 @@ plan-verify 1 gmail fix the bug	literal	terminal.plan-verify	[]	unbound	-
 plan-verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound	-
 plan-verify 3 best	literal	terminal.plan-verify	[]	unbound	-
 plan-verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound	-
+prep-restart	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prep-restart 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare for a restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare for a restart "1 gmail fix the bug"	none	-	null	none	-
+prepare for a restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare for a restart "3 best"	none	-	null	none	-
+prepare for a restart "3 best" --tenant	none	-	null	none	-
+prepare for a restart --tenant	none	-	null	none	-
+prepare for a restart 1 gmail fix the bug	none	-	null	none	-
+prepare for a restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare for a restart 3 best	none	-	null	none	-
+prepare for a restart 3 best --tenant	none	-	null	none	-
+prepare for restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare for restart "1 gmail fix the bug"	none	-	null	none	-
+prepare for restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare for restart "3 best"	none	-	null	none	-
+prepare for restart "3 best" --tenant	none	-	null	none	-
+prepare for restart --tenant	none	-	null	none	-
+prepare for restart 1 gmail fix the bug	none	-	null	none	-
+prepare for restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare for restart 3 best	none	-	null	none	-
+prepare for restart 3 best --tenant	none	-	null	none	-
+prepare restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare restart "1 gmail fix the bug"	none	-	null	none	-
+prepare restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare restart "3 best"	none	-	null	none	-
+prepare restart "3 best" --tenant	none	-	null	none	-
+prepare restart --tenant	none	-	null	none	-
+prepare restart 1 gmail fix the bug	none	-	null	none	-
+prepare restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare restart 3 best	none	-	null	none	-
+prepare restart 3 best --tenant	none	-	null	none	-
+prepare the runner for a restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare the runner for a restart "1 gmail fix the bug"	none	-	null	none	-
+prepare the runner for a restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare the runner for a restart "3 best"	none	-	null	none	-
+prepare the runner for a restart "3 best" --tenant	none	-	null	none	-
+prepare the runner for a restart --tenant	none	-	null	none	-
+prepare the runner for a restart 1 gmail fix the bug	none	-	null	none	-
+prepare the runner for a restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare the runner for a restart 3 best	none	-	null	none	-
+prepare the runner for a restart 3 best --tenant	none	-	null	none	-
+prepare the runner for restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare the runner for restart "1 gmail fix the bug"	none	-	null	none	-
+prepare the runner for restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare the runner for restart "3 best"	none	-	null	none	-
+prepare the runner for restart "3 best" --tenant	none	-	null	none	-
+prepare the runner for restart --tenant	none	-	null	none	-
+prepare the runner for restart 1 gmail fix the bug	none	-	null	none	-
+prepare the runner for restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare the runner for restart 3 best	none	-	null	none	-
+prepare the runner for restart 3 best --tenant	none	-	null	none	-
+prepare the runner restart	pattern	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare the runner restart "1 gmail fix the bug"	none	-	null	none	-
+prepare the runner restart "1 gmail fix the bug" --tenant	none	-	null	none	-
+prepare the runner restart "3 best"	none	-	null	none	-
+prepare the runner restart "3 best" --tenant	none	-	null	none	-
+prepare the runner restart --tenant	none	-	null	none	-
+prepare the runner restart 1 gmail fix the bug	none	-	null	none	-
+prepare the runner restart 1 gmail fix the bug --tenant	none	-	null	none	-
+prepare the runner restart 3 best	none	-	null	none	-
+prepare the runner restart 3 best --tenant	none	-	null	none	-
+prepare-restart	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+prepare-restart 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 prev session	pattern	terminal.focus	[["target","prev"]]	ok	ok /focus ✓ focused 1 zone
 prev session --tenant	none	-	null	none	-
 previous session	pattern	terminal.focus	[["target","previous"]]	ok	ok /focus ✓ focused 1 zone
@@ -2285,6 +2555,16 @@ restart 3	pattern	terminal.restart	[["zone",3]]	error:not-restartable	error /res
 restart 3 --tenant	literal	terminal.restart	[["zone","3 --tenant"]]	error:invalid-zone	error /restart: "3 --tenant" is not a zone number
 restart 3 best	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone	error /restart: "3 best" is not a zone number
 restart 3 best --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone	error /restart: "3 best --tenant" is not a zone number
+restart-prep	literal	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep "1 gmail fix the bug"	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep "1 gmail fix the bug" --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep "3 best"	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep "3 best" --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep --tenant	literal	terminal.prepare-restart	[["reason","--tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep 1 gmail fix the bug	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep 1 gmail fix the bug --tenant	literal	terminal.prepare-restart	[["reason","1 gmail fix the bug --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep 3 best	literal	terminal.prepare-restart	[["reason","3 best"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+restart-prep 3 best --tenant	literal	terminal.prepare-restart	[["reason","3 best --tenant"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 resume	pattern	terminal.resume	[]	ok	ok /resume ✓ opened the sessions sidebar
 resume "1 gmail fix the bug"	literal	terminal.resume	[]	unbound	-
 resume "1 gmail fix the bug" --tenant	literal	terminal.resume	[]	unbound	-
@@ -2609,18 +2889,6 @@ tags-clear 1 gmail fix the bug	literal	terminal.tag-clear	[]	unbound	-
 tags-clear 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound	-
 tags-clear 3 best	literal	terminal.tag-clear	[]	unbound	-
 tags-clear 3 best --tenant	literal	terminal.tag-clear	[]	unbound	-
-terminal.mode	literal	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-terminal.mode "1 gmail fix the bug"	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
-terminal.mode "1 gmail fix the bug" --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
-terminal.mode "3 best"	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
-terminal.mode "3 best" --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
-terminal.mode --tenant	literal	terminal.mode	[["mode","--tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "--tenant"
-terminal.mode 1 gmail fix the bug	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
-terminal.mode 1 gmail fix the bug --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
-terminal.mode 3 best	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
-terminal.mode 3 best --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
-tmux mode	pattern	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-tmux mode --tenant	none	-	null	none	-
 toggle auto focus	pattern	terminal.toggle-auto-focus	[]	ok	ok /auto-focus ✓ enabled auto-focus
 toggle auto focus "1 gmail fix the bug"	none	-	null	none	-
 toggle auto focus "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -2811,30 +3079,6 @@ verify 1 gmail fix the bug	literal	terminal.plan-verify	[]	unbound	-
 verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound	-
 verify 3 best	literal	terminal.plan-verify	[]	unbound	-
 verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound	-
-work mode	fuzzy	terminal.mode	[["mode","mode"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "mode"
-work mode "1 gmail fix the bug"	none	-	null	none	-
-work mode "1 gmail fix the bug" --tenant	none	-	null	none	-
-work mode "3 best"	none	-	null	none	-
-work mode "3 best" --tenant	none	-	null	none	-
-work mode --tenant	none	-	null	none	-
-work mode 1 gmail fix the bug	none	-	null	none	-
-work mode 1 gmail fix the bug --tenant	none	-	null	none	-
-work mode 3 best	none	-	null	none	-
-work mode 3 best --tenant	none	-	null	none	-
-work mode grid	pattern	terminal.mode	[["mode","grid"]]	ok	noop /terminal.mode · work mode was already grid
-work mode grid --tenant	none	-	null	none	-
-work mode tmux	pattern	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-work mode tmux --tenant	none	-	null	none	-
-work-mode	literal	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-work-mode "1 gmail fix the bug"	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
-work-mode "1 gmail fix the bug" --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
-work-mode "3 best"	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
-work-mode "3 best" --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
-work-mode --tenant	literal	terminal.mode	[["mode","--tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "--tenant"
-work-mode 1 gmail fix the bug	literal	terminal.mode	[["mode","1 gmail fix the bug"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug"
-work-mode 1 gmail fix the bug --tenant	literal	terminal.mode	[["mode","1 gmail fix the bug --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "1 gmail fix the bug --tenant"
-work-mode 3 best	literal	terminal.mode	[["mode","3 best"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best"
-work-mode 3 best --tenant	literal	terminal.mode	[["mode","3 best --tenant"]]	error:invalid-mode	error /terminal.mode: mode must be one of: grid, tmux — got "3 best --tenant"
 yes all	pattern	terminal.approve-all	[]	ok	error /approve-all ✗ approved 0 of 1 session — 1 TERMINAL_WRITE_FAILED
 yes all "1 gmail fix the bug"	none	-	null	none	-
 yes all "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -2857,6 +3101,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.auto-approve [bool] do the thing	ai	terminal.auto-approve	[]	refused	error /auto-approve: "action" must be text or a number (got true/false)
 «ai» terminal.auto-approve [empty] do the thing	ai	terminal.auto-approve	[]	error:invalid-args	error /auto-approve: action is required (add, remove, list, clear)
 «ai» terminal.auto-approve [valid] do the thing	ai	terminal.auto-approve	[["action","list"],["pattern","yes"]]	ok	ok /auto-approve ✓ listed 1 auto-approve pattern — armed
+«ai» terminal.cancel-restart-prep [alien] do the thing	ai	terminal.cancel-restart-prep	[["nonsense","x"]]	refused	error /cancel-restart: takes no arguments (got "nonsense")
+«ai» terminal.cancel-restart-prep [bool] do the thing	ai	terminal.cancel-restart-prep	[]	refused	error /cancel-restart: "count" must be text or a number (got true/false)
+«ai» terminal.cancel-restart-prep [empty] do the thing	ai	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+«ai» terminal.cancel-restart-prep [valid] do the thing	ai	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
 «ai» terminal.close [alien] do the thing	ai	terminal.close	[["nonsense","x"]]	refused	error /close: takes no argument named "nonsense"
 «ai» terminal.close [bool] do the thing	ai	terminal.close	[]	refused	error /close: "zone" must be text or a number (got true/false)
 «ai» terminal.close [empty] do the thing	ai	terminal.close	[]	ok	ok /close ✓ closed 1 session — tab-a
@@ -2901,10 +3149,6 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.metrics [bool] do the thing	ai	terminal.metrics	[]	refused	error /metrics: "count" must be text or a number (got true/false)
 «ai» terminal.metrics [empty] do the thing	ai	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
 «ai» terminal.metrics [valid] do the thing	ai	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
-«ai» terminal.mode [alien] do the thing	ai	terminal.mode	[["nonsense","x"]]	refused	error /terminal.mode: takes no argument named "nonsense"
-«ai» terminal.mode [bool] do the thing	ai	terminal.mode	[]	refused	error /terminal.mode: "mode" must be text or a number (got true/false)
-«ai» terminal.mode [empty] do the thing	ai	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-«ai» terminal.mode [valid] do the thing	ai	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
 «ai» terminal.mute [alien] do the thing	ai	terminal.mute	[["nonsense","x"]]	refused	error /mute: takes no arguments (got "nonsense")
 «ai» terminal.mute [bool] do the thing	ai	terminal.mute	[]	refused	error /mute: "count" must be text or a number (got true/false)
 «ai» terminal.mute [empty] do the thing	ai	terminal.mute	[]	ok	noop /mute · sound was already muted
@@ -2925,6 +3169,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.plan-verify [bool] do the thing	ai	terminal.plan-verify	[]	refused	error /plan-verify: "count" must be text or a number (got true/false)
 «ai» terminal.plan-verify [empty] do the thing	ai	terminal.plan-verify	[]	error:no-plan	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
 «ai» terminal.plan-verify [valid] do the thing	ai	terminal.plan-verify	[]	error:no-plan	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
+«ai» terminal.prepare-restart [alien] do the thing	ai	terminal.prepare-restart	[["nonsense","x"]]	refused	error /prepare-restart: takes no argument named "nonsense"
+«ai» terminal.prepare-restart [bool] do the thing	ai	terminal.prepare-restart	[]	refused	error /prepare-restart: "reason" must be text or a number (got true/false)
+«ai» terminal.prepare-restart [empty] do the thing	ai	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+«ai» terminal.prepare-restart [valid] do the thing	ai	terminal.prepare-restart	[["reason","rebuild"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 «ai» terminal.prompt [alien] do the thing	ai	terminal.prompt	[["nonsense","x"]]	refused	error /prompt: takes no arguments (got "nonsense")
 «ai» terminal.prompt [bool] do the thing	ai	terminal.prompt	[]	refused	error /prompt: "count" must be text or a number (got true/false)
 «ai» terminal.prompt [empty] do the thing	ai	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
@@ -3025,6 +3273,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.auto-approve [bool]	direct	terminal.auto-approve	[["action",true]]	threw	error /auto-approve: "action" must be text or a number (got true/false)
 «direct» terminal.auto-approve [empty]	direct	terminal.auto-approve	[]	threw	error /auto-approve: action is required (add, remove, list, clear)
 «direct» terminal.auto-approve [valid]	direct	terminal.auto-approve	[["action","list"],["pattern","yes"]]	ok	ok /auto-approve ✓ listed 1 auto-approve pattern — armed
+«direct» terminal.cancel-restart-prep [alien]	direct	terminal.cancel-restart-prep	[["nonsense","x"]]	threw	error /cancel-restart: takes no arguments (got "nonsense")
+«direct» terminal.cancel-restart-prep [bool]	direct	terminal.cancel-restart-prep	[["count",true]]	threw	error /cancel-restart: "count" must be text or a number (got true/false)
+«direct» terminal.cancel-restart-prep [empty]	direct	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
+«direct» terminal.cancel-restart-prep [valid]	direct	terminal.cancel-restart-prep	[]	ok	ok /cancel-restart ✓ cancelled the restart prepare — hold release: released
 «direct» terminal.close [alien]	direct	terminal.close	[["nonsense","x"]]	threw	error /close: takes no argument named "nonsense"
 «direct» terminal.close [bool]	direct	terminal.close	[["zone",true]]	threw	error /close: "zone" must be text or a number (got true/false)
 «direct» terminal.close [empty]	direct	terminal.close	[]	ok	ok /close ✓ closed 1 session — tab-a
@@ -3069,10 +3321,6 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.metrics [bool]	direct	terminal.metrics	[["count",true]]	threw	error /metrics: "count" must be text or a number (got true/false)
 «direct» terminal.metrics [empty]	direct	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
 «direct» terminal.metrics [valid]	direct	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
-«direct» terminal.mode [alien]	direct	terminal.mode	[["nonsense","x"]]	threw	error /terminal.mode: takes no argument named "nonsense"
-«direct» terminal.mode [bool]	direct	terminal.mode	[["mode",true]]	threw	error /terminal.mode: "mode" must be text or a number (got true/false)
-«direct» terminal.mode [empty]	direct	terminal.mode	[]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
-«direct» terminal.mode [valid]	direct	terminal.mode	[["mode","tmux"]]	ok	ok /terminal.mode ✓ entered tmux mode — session manager opened
 «direct» terminal.mute [alien]	direct	terminal.mute	[["nonsense","x"]]	threw	error /mute: takes no arguments (got "nonsense")
 «direct» terminal.mute [bool]	direct	terminal.mute	[["count",true]]	threw	error /mute: "count" must be text or a number (got true/false)
 «direct» terminal.mute [empty]	direct	terminal.mute	[]	ok	noop /mute · sound was already muted
@@ -3093,6 +3341,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.plan-verify [bool]	direct	terminal.plan-verify	[["count",true]]	threw	error /plan-verify: "count" must be text or a number (got true/false)
 «direct» terminal.plan-verify [empty]	direct	terminal.plan-verify	[]	threw	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
 «direct» terminal.plan-verify [valid]	direct	terminal.plan-verify	[]	threw	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
+«direct» terminal.prepare-restart [alien]	direct	terminal.prepare-restart	[["nonsense","x"]]	threw	error /prepare-restart: takes no argument named "nonsense"
+«direct» terminal.prepare-restart [bool]	direct	terminal.prepare-restart	[["reason",true]]	threw	error /prepare-restart: "reason" must be text or a number (got true/false)
+«direct» terminal.prepare-restart [empty]	direct	terminal.prepare-restart	[]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
+«direct» terminal.prepare-restart [valid]	direct	terminal.prepare-restart	[["reason","rebuild"]]	ok	ok /prepare-restart ✓ started the restart prepare — hold confirmed; 2 sessions recorded
 «direct» terminal.prompt [alien]	direct	terminal.prompt	[["nonsense","x"]]	threw	error /prompt: takes no arguments (got "nonsense")
 «direct» terminal.prompt [bool]	direct	terminal.prompt	[["count",true]]	threw	error /prompt: "count" must be text or a number (got true/false)
 «direct» terminal.prompt [empty]	direct	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library

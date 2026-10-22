@@ -364,6 +364,71 @@ pub fn dismiss_on(ctl: &RestartPrep, prepare_id: &str) -> Result<PrepareRecord, 
     }
 }
 
+/// Set cohort row `claude_session_id`'s `held` flag by hand (the panel's held
+/// toggle, D6): a held row is skipped by every bulk restore and restored only
+/// by its own button. Allowed while the prepare is in its window or the cohort
+/// is restoring — the two states in which a later restore can read the flag.
+/// Marks the row `held_by_operator`, so a re-capture that first reads the
+/// row's effort never recomputes the operator's choice. Idempotent; persists
+/// and announces `restart-prep-changed` through [`RestartPrep::update`].
+///
+/// Serialized with the notice tick (`ops`): the tick replaces the whole cohort
+/// with the one it re-captured at its start, so a toggle written while it ran
+/// would be lost.
+pub async fn set_held_on(
+    ctl: &RestartPrep,
+    prepare_id: &str,
+    claude_session_id: &str,
+    held: bool,
+) -> Result<PrepareRecord, String> {
+    let _op = ctl.ops.lock().await;
+    let current = ctl
+        .record()
+        .filter(|r| r.prepare_id == prepare_id)
+        .ok_or_else(|| format!("no restart prepare {prepare_id} — nothing to hold"))?;
+    if !matches!(
+        current.state,
+        PrepState::Preparing | PrepState::Ready | PrepState::Restoring
+    ) {
+        return Err(format!(
+            "restart prepare {prepare_id} is {:?} — a held flag no longer means anything",
+            current.state
+        ));
+    }
+    if !current
+        .cohort
+        .rows
+        .iter()
+        .any(|row| row.session.claude_session_id == claude_session_id)
+    {
+        return Err(format!(
+            "session {claude_session_id} is not in restart prepare {prepare_id}'s cohort"
+        ));
+    }
+    ctl.update(prepare_id, |r| {
+        if let Some(row) = r
+            .cohort
+            .rows
+            .iter_mut()
+            .find(|row| row.session.claude_session_id == claude_session_id)
+        {
+            row.held = held;
+            row.held_by_operator = true;
+        }
+    })
+}
+
+/// [`set_held_on`] on the live controller (the Tauri `restart_prep_set_held`).
+pub async fn set_held(
+    prepare_id: &str,
+    claude_session_id: &str,
+    held: bool,
+) -> Result<PrepareRecord, String> {
+    let ctl =
+        super::prepare::install_live().ok_or("restart prepare is not available in this build")?;
+    set_held_on(ctl, prepare_id, claude_session_id, held).await
+}
+
 /// [`dismiss_on`] on the live controller (the Tauri `restart_prep_dismiss`).
 pub fn dismiss(prepare_id: &str) -> Result<PrepareRecord, String> {
     let ctl =
@@ -918,5 +983,82 @@ mod tests {
         note_restore_on(&ctl, &prepare_id, "s2", verdict("resumed")).unwrap();
         assert_eq!(ctl.record().unwrap().state, PrepState::Done);
         assert_eq!(RestoringCohort::of(&ctl.record().unwrap()), None);
+    }
+
+    /// The held toggle round-trips: set, persisted, announced, read back by
+    /// the restore set; set back, the same. Repeating it is idempotent.
+    #[tokio::test]
+    async fn restart_prep_the_held_toggle_round_trips_and_is_announced() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restart-prep.json");
+        let prepare_id = active_controller_for_test(dir.path(), &["s1", "s2"], 1_000)
+            .record()
+            .unwrap()
+            .prepare_id;
+        let seen = Arc::new(AtomicUsize::new(0));
+        let held_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen2, held2) = (seen.clone(), held_seen.clone());
+        let ctl = RestartPrep::load(
+            path.clone(),
+            Some(Box::new(move |c: &super::super::prepare::PrepChanged| {
+                seen2.fetch_add(1, Ordering::SeqCst);
+                held2.lock().unwrap().push(c.record.cohort.rows[0].held);
+            })),
+        );
+        assert!(
+            !ctl.record().unwrap().cohort.rows[0].held,
+            "unknown effort: not held"
+        );
+
+        let rec = set_held_on(&ctl, &prepare_id, "s1", true).await.unwrap();
+        assert!(rec.cohort.rows[0].held && rec.cohort.rows[0].held_by_operator);
+        assert!(
+            !rec.cohort.rows[1].held && !rec.cohort.rows[1].held_by_operator,
+            "only s1"
+        );
+        let on_disk = crate::restart_prep::load_from(&path).unwrap();
+        assert!(on_disk.cohort.rows[0].held, "persisted");
+
+        // Once restoring, the restore set reads the operator's flag.
+        ctl.update(&prepare_id, |r| r.state = PrepState::Restoring)
+            .unwrap();
+        let cohort = RestoringCohort::of(&ctl.record().unwrap()).unwrap();
+        assert!(cohort.target("s1").unwrap().held);
+        // Released again — still allowed while restoring.
+        set_held_on(&ctl, &prepare_id, "s1", false).await.unwrap();
+        let cohort = RestoringCohort::of(&ctl.record().unwrap()).unwrap();
+        assert!(!cohort.target("s1").unwrap().held);
+        assert!(!crate::restart_prep::load_from(&path).unwrap().cohort.rows[0].held);
+        // Idempotent.
+        let again = set_held_on(&ctl, &prepare_id, "s1", false).await.unwrap();
+        assert!(!again.cohort.rows[0].held);
+
+        assert_eq!(seen.load(Ordering::SeqCst), 4, "every write is announced");
+        assert_eq!(*held_seen.lock().unwrap(), [true, true, false, false]);
+    }
+
+    #[tokio::test]
+    async fn restart_prep_the_held_toggle_refuses_what_it_cannot_mean() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &["s1"], 1_000);
+        let prepare_id = ctl.record().unwrap().prepare_id;
+        let before = ctl.record().unwrap();
+        assert!(set_held_on(&ctl, "another-prepare", "s1", true)
+            .await
+            .is_err());
+        assert!(set_held_on(&ctl, &prepare_id, "not-in-cohort", true)
+            .await
+            .is_err());
+        assert_eq!(ctl.record().unwrap(), before, "a refusal writes nothing");
+        for state in [PrepState::Cancelled, PrepState::Done] {
+            ctl.update(&prepare_id, |r| r.state = state).unwrap();
+            let err = set_held_on(&ctl, &prepare_id, "s1", true)
+                .await
+                .unwrap_err();
+            assert!(err.contains("no longer means anything"), "{state:?}: {err}");
+            assert!(!ctl.record().unwrap().cohort.rows[0].held);
+        }
     }
 }

@@ -13,6 +13,8 @@
 //!   only, with no HTTP twin, and OFF the UI-Bridge invoke allowlist — an
 //!   allowlisted command is reachable by any local process over
 //!   `POST /ui-bridge/invoke/<name>`.
+//! * `restart_prep_dismiss` (Phase 6) and `restart_prep_set_held` (Phase 5,
+//!   the panel's held toggle) are operator doors of the same kind.
 
 /// `restart_prep_status` — the persisted prepare record (if any) and the live
 /// cohort a prepare taken now would pin.
@@ -51,9 +53,23 @@ pub async fn restart_prep_dismiss(
     crate::restart_prep::restore::dismiss(&prepare_id)
 }
 
+/// `restart_prep_set_held` — the panel's held toggle (D6): hold a cohort row
+/// for a hand restore, or release it to the bulk restores. Operator-only, like
+/// the doors above: it decides which sessions an operator's "Restore all"
+/// brings back.
+#[tauri::command]
+pub async fn restart_prep_set_held(
+    prepare_id: String,
+    claude_session_id: String,
+    held: bool,
+) -> Result<crate::restart_prep::PrepareRecord, String> {
+    crate::restart_prep::restore::set_held(&prepare_id, &claude_session_id, held).await
+}
+
 crate::ipc_group!(
     restart_prep_status,
     restart_prep_prepare,
     restart_prep_cancel,
-    restart_prep_dismiss
+    restart_prep_dismiss,
+    restart_prep_set_held
 );

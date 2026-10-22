@@ -358,6 +358,7 @@ mod tests {
             "restart_prep_prepare",
             "restart_prep_cancel",
             "restart_prep_dismiss",
+            "restart_prep_set_held",
             "scheduler_run_task_now",
             "steward_start",
         ] {

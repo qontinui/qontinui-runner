@@ -67,6 +67,7 @@ import {
   parseWorkModeRequest,
   type WorkModeChange,
 } from "../terminalWorkModeControl";
+import { restartPrepStore, type PrepChanged } from "../restartPrep";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -233,6 +234,10 @@ const SCHEMA = {
   mode: { mode: `string (optional) — one of ${WORK_MODE_NAMES.join(", ")}; omitted toggles` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
   swap: { a: "number (1-based zone index)", b: "number (1-based zone index)" },
+  prepareRestart: {
+    reason:
+      'string (optional reason recorded with the spawn hold; the word "cancel" cancels the prepare instead)',
+  },
 } as const;
 
 /**
@@ -1972,8 +1977,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
 
   // 36. /copy-names — copy the roster's UNFINISHED sessions + resume lines
   //
-  // Written for the rebuild loop: write the sessions down, rebuild the runner,
-  // resume them — and for pasting the list into notes or onto another machine.
+  // For pasting the list into notes or onto another machine. The rebuild loop
+  // it was first written for is `/prepare-restart` now (below), which records
+  // every session for an in-place restore.
   //
   // Source: the session ledger's CURRENT roster (`session_ledger_report`,
   // plan `2026-10-04-runner-session-roster-restore-picker` Phase 5) — the same
@@ -1995,7 +2001,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Copy every UNFINISHED session on the runner's roster — the sessions a " +
       "restart would bring back — with its name and its ready-to-run " +
       "`cd … && CLAUDE_CONFIG_DIR=… claude --resume <id>` line, grouped by " +
-      "account. Finished sessions are skipped.",
+      "account, for notes or another machine. Finished sessions are skipped. " +
+      "To restart this runner, use /prepare-restart: it records every session " +
+      "for an in-place restore.",
     paramSchema: SCHEMA.empty,
     patterns: [/^copy[- ]names$/i, /^copy[- ]sessions$/i, /^session[- ]names$/i],
     handler: async (): Promise<CommandResult<{ count: number }>> => {
@@ -2073,6 +2081,74 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     },
   });
 
+  // 37. /prepare-restart — bring the runner to a point where it can be
+  // restarted safely (plan
+  // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+  // Phase 5): hold spawns until the rebuild, tell live sessions to save and
+  // pause, keep limit-hit sessions on their account, record every session —
+  // then open the progress panel. The same store the header button drives, so
+  // a second prepare while one runs JOINS it and the backend's own prepare is
+  // idempotent while one is active.
+  //
+  // `/prepare-restart cancel` is the cancel: the resolver binds the first
+  // token to the action and the rest to `reason`, so the word arrives here.
+  useCommandAction({
+    id: "terminal.prepare-restart",
+    slash: "/prepare-restart",
+    aliases: ["/restart-prep", "/prep-restart"],
+    label: "Prepare for restart",
+    description:
+      "Prepare the runner for a restart: hold new spawns until it is rebuilt, tell live " +
+      "sessions to save their work and pause, keep limit-hit sessions on their account, and " +
+      "record every session (page, pane, account, effort) for an in-place restore. Opens the " +
+      "progress panel, whose headline says when it is safe to restart. Optional reason. " +
+      "`/prepare-restart cancel` cancels it.",
+    paramSchema: SCHEMA.prepareRestart,
+    patterns: [/^prepare\s+(?:the\s+runner\s+)?(?:for\s+(?:a\s+)?)?restart$/i],
+    // Not costly — it spends no AI capacity and starts no process. But it types a
+    // save-and-pause notice into every live session, and a keystroke delivered to
+    // a subprocess cannot be taken back (`types.ts::destructive`): a literal slash
+    // must never be rerouted into it by a Tier-2 pattern.
+    costly: false,
+    destructive: true,
+    handler: async (args): Promise<CommandResult<EffectReport>> => {
+      const reason = textArg(args, "reason").trim();
+      if (/^cancel$/i.test(reason)) return cancelRestartPrep();
+      const startedAt = Date.now();
+      restartPrepStore.openPanel();
+      let reply: PrepChanged;
+      try {
+        reply = await restartPrepStore.prepare(reason);
+      } catch (err) {
+        return fail("prepare-failed", describeThrown(err, "the restart prepare failed"));
+      }
+      // The backend answers an ACTIVE prepare with that prepare; one that began
+      // before this call is the operator's earlier prepare, not a new one.
+      const fresh = reply.record.started_at_ms >= startedAt;
+      const n = reply.record.cohort.rows.length;
+      return ok(
+        stateEffect("started", "the restart prepare", fresh, {
+          detail: `hold ${reply.view.hold}; ${n} session${n === 1 ? "" : "s"} recorded`,
+        }),
+      );
+    },
+  });
+
+  // 38. /cancel-restart — cancel the prepare (also the same-build restart's
+  // "Release hold"): release the spawn hold, lift the account freeze, and tell
+  // the told sessions to resume. `/prepare-restart cancel` lands here too.
+  useCommandAction({
+    id: "terminal.cancel-restart-prep",
+    slash: "/cancel-restart",
+    label: "Cancel the restart prepare",
+    description:
+      "Cancel the restart prepare: release the spawn hold, lift the account freeze, and tell " +
+      "the sessions that were asked to pause to resume. Same as `/prepare-restart cancel`.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^cancel\s+(?:the\s+)?restart(?:\s+prep(?:are)?)?$/i],
+    handler: async (): Promise<CommandResult<EffectReport>> => cancelRestartPrep(),
+  });
+
   // ── /elevated ────────────────────────────────────────────────────────
   // Opens a separate Administrator PowerShell window through a UAC prompt. It
   // is not a PTY tab (see `open_elevated_terminal`), so there is no tab id to
@@ -2116,6 +2192,35 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   // signature placeholder (handlers below don't consult `ctx` directly
   // today — Phase 2's CommandBar wires it in for cancellation).
   void setActiveId;
+}
+
+/**
+ * `/cancel-restart` and `/prepare-restart cancel`: cancel through the shared
+ * store, and report what the backend says the hold did — `cancelled`, or
+ * `released` when the runner already restarted and the cohort moved on to its
+ * restore. A refusal (nothing to cancel; a release coord did not settle) is
+ * the backend's own words.
+ */
+async function cancelRestartPrep(): Promise<CommandResult<EffectReport>> {
+  let reply: PrepChanged;
+  try {
+    reply = await restartPrepStore.cancel();
+  } catch (err) {
+    return fail("cancel-failed", describeThrown(err, "the restart prepare could not be cancelled"));
+  }
+  const cancelled = reply.record.state === "cancelled";
+  return ok(
+    stateEffect(
+      cancelled ? "cancelled" : "released",
+      cancelled ? "the restart prepare" : "the restart hold",
+      true,
+      {
+        detail: cancelled
+          ? `hold ${reply.view.hold}`
+          : `hold ${reply.view.hold}; the cohort is ${reply.record.state}`,
+      },
+    ),
+  );
 }
 
 /** Re-export so tests + the index barrel can reach a single source. */
