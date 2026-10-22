@@ -1217,8 +1217,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 43,
-        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 44,
+        "expected 44 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1279,7 +1279,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          added mcp/plan_library/followups.rs's single `forward` (work-owed: the follow-up \
          family's five qontinui-web routes, the same session-less posture as its parent's \
          forwards): 42 + 1 = 43. \
-         Found {sites}. A change here \
+         Plan \
+         2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer \
+         Phase 4 then added agent_runtime's spawn_exited_request device-token fallback (POST \
+         /agents/{{agent_id}}/spawn-exited, session-noop, the spawn-failed sibling's posture): \
+         43 to 44. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
