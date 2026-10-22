@@ -2047,15 +2047,14 @@ pub async fn terminal_migrate_session_account(
         return Err("target account equals the session's current account".to_string());
     }
 
-    let outcome =
-        crate::terminal::account_migration::migrate_session_off_runtime(
-            &app,
-            &record,
-            &src,
-            &dst,
-            subject.old_writer,
-        )
-        .await?;
+    let outcome = crate::terminal::account_migration::migrate_session_off_runtime(
+        &app,
+        &record,
+        &src,
+        &dst,
+        subject.old_writer,
+    )
+    .await?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
