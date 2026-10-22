@@ -298,7 +298,7 @@ fn dispatch_err_message(err: &DispatchError) -> String {
 /// dispatch was attempted but failed — HTTP fallback is *not* safe in that
 /// case because the wrapper has taken ownership of the app.
 ///
-/// Now a thin shim over `AppDispatcher::dispatch`. Eight in-file callers
+/// Now a thin shim over `AppDispatcher::dispatch_websocket`. Eight in-file callers
 /// still rely on the tri-state shape (they synthesize derived responses
 /// from `getControlSnapshot` for WS apps before falling through to the
 /// dedicated HTTP endpoint).
@@ -323,14 +323,17 @@ async fn try_ws_dispatch(
         return Ok(None);
     }
 
-    // For the WS arm, `dispatch` ignores http_method/http_path entirely —
-    // pass placeholders so the call type-checks.
+    // WebSocket ONLY: a registration that turned HTTP since the read above is
+    // refused (`NotWebsocket`) rather than sent down the HTTP arm, and reads
+    // as "not WebSocket" — the caller falls through to the HTTP endpoint, as
+    // it would had the read above seen HTTP.
     match state
         .app_dispatcher
-        .dispatch(&app_id, action, Method::GET, "/", payload)
+        .dispatch_websocket(&app_id, action, payload)
         .await
     {
         Ok(value) => Ok(Some(value)),
+        Err(DispatchError::NotWebsocket(_)) => Ok(None),
         Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::NotConnected(_)))
         | Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::Disconnected)) => {
             Err(format!(
@@ -380,9 +383,24 @@ async fn dispatch_app_request_typed(
         action,
         http_method,
         http_path,
-        ArmPayloads::per_arm(ws_payload, http_body.unwrap_or(serde_json::Value::Null)),
+        split_arm_payloads(ws_payload, http_body),
     )
     .await
+}
+
+/// The per-arm bodies of a caller that builds its WebSocket frame payload and
+/// its HTTP request body separately — the `(ws_payload, http_body)` shape of
+/// [`dispatch_app_request`] and [`dispatch_app_request_by_id`]. `http_body:
+/// None` sends no body on the HTTP arm (`null`). One function for both, so the
+/// pairing cannot drift between them.
+fn split_arm_payloads(
+    ws_payload: serde_json::Value,
+    http_body: Option<serde_json::Value>,
+) -> ArmPayloads {
+    ArmPayloads::PerArm {
+        websocket: ws_payload,
+        http: http_body.unwrap_or(serde_json::Value::Null),
+    }
 }
 
 /// [`dispatch_app_request`] for a command whose two arms take different
@@ -464,7 +482,7 @@ pub async fn dispatch_app_request_by_id(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let payloads = ArmPayloads::per_arm(ws_payload, http_body.unwrap_or(serde_json::Value::Null));
+    let payloads = split_arm_payloads(ws_payload, http_body);
     state
         .app_dispatcher
         .dispatch(app_id, action, http_method, http_path, payloads)
@@ -8012,6 +8030,42 @@ mod tests {
                 name
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // `(ws_payload, http_body)` → per-arm bodies (`dispatch_app_request`,
+    // `dispatch_app_request_by_id`). Which arm a registered app takes is
+    // `app_dispatch`'s `dispatch_sends_each_arm_its_own_body`.
+    // ------------------------------------------------------------------
+
+    use crate::mcp::app_registry::AppTransport;
+
+    #[test]
+    fn split_arm_payloads_sends_ws_payload_to_websocket_and_http_body_to_http() {
+        let ws_payload = serde_json::json!({"componentId": "btn", "actionId": "click"});
+        let http_body = serde_json::json!({"raw": "body"});
+        let arms = split_arm_payloads(ws_payload.clone(), Some(http_body.clone()));
+        assert_eq!(
+            arms.clone().for_transport(AppTransport::Websocket),
+            ws_payload,
+            "WS-transport apps must receive ws_payload"
+        );
+        assert_eq!(
+            arms.for_transport(AppTransport::Http),
+            http_body,
+            "HTTP-transport apps must receive http_body"
+        );
+    }
+
+    #[test]
+    fn split_arm_payloads_sends_null_on_http_when_there_is_no_http_body() {
+        let ws_payload = serde_json::json!({"never": "on http"});
+        let arms = split_arm_payloads(ws_payload.clone(), None);
+        assert_eq!(
+            arms.clone().for_transport(AppTransport::Http),
+            serde_json::Value::Null
+        );
+        assert_eq!(arms.for_transport(AppTransport::Websocket), ws_payload);
     }
 
     // ------------------------------------------------------------------
