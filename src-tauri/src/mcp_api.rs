@@ -11794,16 +11794,18 @@ pub fn create_router(
         // D4+D6 Blind-Spot Recommender Phase 2 — read-through observer facade.
         observer_registry,
         // Phase 3 vision pipeline (cache + concurrency).
-        // Cache root = `tmp_vision_cache/` under the runner's working dir
-        // (scratch-file whitelist per feedback_scratch_file_paths.md).
+        // Cache root = the instance-scoped DataLocal dir
+        // `<data_local>/com.qontinui.runner/vision_cache[/instance-<name>]`,
+        // never the source checkout or the process CWD; unresolvable = loud
+        // failure (plan 2026-10-22-runner-ui-bridge-makes-an-agent-guess-its-own-vocabulary D2).
         // Cap = 512 MB per plan §3.5.
         vision_cache: {
-            let runner_root = crate::mcp::shared::current_runner_path()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                });
-            let root = runner_root.join("tmp_vision_cache");
+            let data_local_base = qontinui_runner_lib::instance_env::runner_data_local_base();
+            let root = crate::mcp::ui_bridge::vision_capture_access::vision_cache_root_from(
+                data_local_base,
+                crate::instance::scope_path,
+            )
+            .unwrap_or_else(|e| panic!("vision cache init: {e}"));
             Arc::new(
                 qontinui_vision_core::VisionCache::new(&root, 512 * 1024 * 1024)
                     .unwrap_or_else(|e| panic!("vision cache init at {}: {e}", root.display())),
