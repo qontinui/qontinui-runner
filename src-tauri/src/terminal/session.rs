@@ -5287,19 +5287,21 @@ impl TerminalSession {
             info!(terminal_id = %self.id, "Terminal session closed");
             return HandoffOutcome::KilledInProcess;
         };
-        if let Some(sink) = sink {
-            sink.emit_handed_off(&self.id, holder.holder_pid);
-        }
+        // The notice is chosen AFTER the release, from what the pane reports
+        // then (review round 2).
         let after = self.io.holder_handoff();
         let holder_gone = after.is_none();
         let outcome = handoff_outcome(&holder, after, released, self.protection_probe);
-        // An unconfirmed handoff whose holder is GONE handed nothing off: the
-        // process died with it. Withdraw the handed-off mark so a later close
-        // of this terminal in this process is a real close again.
         if holder_gone && matches!(outcome, HandoffOutcome::Unconfirmed { .. }) {
+            // An unconfirmed handoff whose holder is GONE handed nothing off:
+            // the pane really ended. Withdraw the handed-off mark so a close of
+            // this terminal is a real close again, and send the EXIT notice.
             if let Some(store) = self.lifecycle_store() {
                 store.unmark_terminal_handed_off(&self.id);
             }
+            self.notify_exit_on_teardown(sink);
+        } else if let Some(sink) = sink {
+            sink.emit_handed_off(&self.id, holder.holder_pid);
         }
         match &outcome {
             HandoffOutcome::Detached { holder_pid } => info!(
@@ -5539,7 +5541,7 @@ const TASKKILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Floor under the `taskkill` cap. Every other step may be squeezed to nothing
 /// by an exhausted shutdown budget; the kill may not, because skipping it leaks
 /// a process tree that outlives the runner.
-const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Cap on each bounded lock acquisition inside
 /// [`TerminalSession::close_with_deadline`] **when a shutdown deadline is in
@@ -9689,6 +9691,8 @@ pub(crate) mod tests {
     pub(crate) struct FakeHolderIo {
         pub(crate) holder: bool,
         pub(crate) take_detach: bool,
+        /// The holder is gone by the end of the release.
+        pub(crate) vanish_on_release: bool,
         pub(crate) kills: std::sync::atomic::AtomicUsize,
         pub(crate) releases: std::sync::atomic::AtomicUsize,
         settled: (Mutex<Option<i32>>, std::sync::Condvar),
@@ -9705,6 +9709,7 @@ pub(crate) mod tests {
             FakeHolderIo {
                 holder,
                 take_detach: true,
+                vanish_on_release: false,
                 kills: Default::default(),
                 releases: Default::default(),
                 settled: (Mutex::new(None), std::sync::Condvar::new()),
@@ -9757,7 +9762,10 @@ pub(crate) mod tests {
             crate::terminal::pane_io::CredentialScrub::NoChildEnv
         }
         fn holder_handoff(&self) -> Option<crate::terminal::pane_io::HolderHandoff> {
-            if !self.holder || self.kill_count() > 0 {
+            if !self.holder
+                || self.kill_count() > 0
+                || (self.vanish_on_release && self.release_count() > 0)
+            {
                 return None;
             }
             Some(crate::terminal::pane_io::HolderHandoff {
@@ -9947,6 +9955,23 @@ pub(crate) mod tests {
             }
         ));
         assert_eq!(untaken.kill_count(), 0);
+    }
+
+    /// Review round 2: a handoff whose holder is GONE by the end of the
+    /// release handed nothing off — the pane really ended, so it sends the
+    /// EXIT notice (the webview drops the tab), not the handed-off one.
+    #[test]
+    fn a_handoff_whose_holder_vanished_sends_the_exit_notice() {
+        let mut io = FakeHolderIo::holder();
+        io.vanish_on_release = true;
+        let (session, _) = handoff_fixture(Arc::new(io), "vanished");
+        let sink = crate::terminal::exit_notice::RecordingExitSink::default();
+        assert!(matches!(
+            session.close_for_handoff_with(None, Some(&sink)),
+            HandoffOutcome::Unconfirmed { .. }
+        ));
+        assert_eq!(sink.notices().len(), 1, "the exit notice");
+        assert!(sink.handed_off().is_empty(), "never the handed-off notice");
     }
 
     /// Review round 1, item 3: a Handoff intent whose pane reports NO live

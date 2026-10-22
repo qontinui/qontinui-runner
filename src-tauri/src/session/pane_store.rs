@@ -268,30 +268,32 @@ impl PaneSessionStore {
     /// Record (or overwrite) terminal `terminal_id`'s coord binding.
     pub fn put_terminal(&self, terminal_id: &str, binding: TerminalCoordBinding) {
         self.mutate_terminals(|m| {
-            m.insert(terminal_id.trim().to_string(), binding);
+            m.insert(terminal_id.trim().to_string(), binding.clone()) != Some(binding)
         });
     }
 
     /// Forget terminal `terminal_id`'s coord binding (its real exit).
     pub fn remove_terminal(&self, terminal_id: &str) {
-        self.mutate_terminals(|m| {
-            m.remove(terminal_id.trim());
-        });
+        self.mutate_terminals(|m| m.remove(terminal_id.trim()).is_some());
     }
 
-    fn mutate_terminals(&self, f: impl FnOnce(&mut HashMap<String, TerminalCoordBinding>)) {
-        let snapshot = {
-            let mut m = match self.terminals.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "pane_store: terminal-binding lock poisoned");
-                    return;
-                }
-            };
-            f(&mut m);
-            m.clone()
+    /// Apply `f` — which answers whether it CHANGED the map — and persist
+    /// only on a change, while still holding the lock. A remove of an absent
+    /// id (every in-process pane's exit, many at once during a handoff
+    /// teardown) therefore writes nothing, and two writers can never land a
+    /// stale snapshot over a newer one (review round 2).
+    fn mutate_terminals(&self, f: impl FnOnce(&mut HashMap<String, TerminalCoordBinding>) -> bool) {
+        let mut m = match self.terminals.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "pane_store: terminal-binding lock poisoned");
+                return;
+            }
         };
-        if let Err(e) = write_json(&terminal_bindings_path(&self.path), &snapshot) {
+        if !f(&mut m) {
+            return;
+        }
+        if let Err(e) = write_json(&terminal_bindings_path(&self.path), &*m) {
             warn!(error = %e, "pane_store: terminal-binding persist failed — kept in memory only");
         }
     }
@@ -307,8 +309,12 @@ fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     })
 }
 
+/// Atomic replace through a temp file UNIQUE to this write (pid + counter), so
+/// no two writes — in this process or another — ever share one.
 fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(tmp, path)?;
@@ -511,6 +517,46 @@ mod tests {
                 .unwrap()
                 .get_terminal("term-1"),
             None
+        );
+    }
+
+    /// Review round 2: removing an id that was never recorded (an in-process
+    /// pane's exit) writes NOTHING — not even an empty file — and a write
+    /// leaves no temp file behind.
+    #[test]
+    fn removing_an_absent_terminal_binding_does_not_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pane-sessions.json");
+        let store = PaneSessionStore::open(&path).unwrap();
+        store.remove_terminal("never-recorded");
+        assert!(
+            !terminal_bindings_path(&path).exists(),
+            "no write for a no-op remove"
+        );
+
+        let binding = TerminalCoordBinding {
+            coord_id: Uuid::new_v4(),
+            tenant_id: None,
+            repo: None,
+            work_unit_slug: None,
+            correlation_topic: None,
+        };
+        store.put_terminal("t", binding);
+        let file = terminal_bindings_path(&path);
+        std::fs::write(&file, b"sentinel").unwrap();
+        store.remove_terminal("still-absent");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"sentinel",
+            "an absent remove leaves the file untouched"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
+            "no temp file left behind"
         );
     }
 }

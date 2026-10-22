@@ -1252,6 +1252,12 @@ impl TerminalManager {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
                 Err(e) => {
                     error!("Sessions lock poisoned during close_all: {}", e);
+                    if mode == CloseMode::Handoff {
+                        info!(
+                            "{} (sessions lock poisoned — nothing closed)",
+                            summary.line()
+                        );
+                    }
                     return summary;
                 }
             }
@@ -1927,9 +1933,22 @@ mod handoff_tests {
         assert_eq!((holder.kill_count(), holder.release_count()), (0, 0));
     }
 
+    /// The REAL bound on the late tail: a release that starts just before the
+    /// cap still runs for its floored budget (`KILL_FLOOR`), inside which the
+    /// detach frame's own budget (`DETACH_FRAME_BUDGET`) is spent; the joins
+    /// are clamped to zero past the deadline. All of it must fit inside the
+    /// force-exit margin.
     #[test]
     fn handoff_late_release_budget_fits_inside_the_force_exit_margin() {
-        assert!(super::HANDOFF_LATE_RELEASE_BUDGET < crate::shutdown_budget::FORCE_EXIT_MARGIN);
+        let floor = crate::terminal::session::KILL_FLOOR;
+        let detach = crate::terminal::daemon_pane_io::DETACH_FRAME_BUDGET;
+        assert!(
+            detach <= floor,
+            "the detach frame is spent inside the release floor"
+        );
+        assert!(
+            super::HANDOFF_LATE_RELEASE_BUDGET + floor < crate::shutdown_budget::FORCE_EXIT_MARGIN
+        );
     }
 
     #[test]
