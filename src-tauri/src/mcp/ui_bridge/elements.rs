@@ -651,7 +651,7 @@ pub async fn ui_bridge_batch_actions_handler(
 /// Includes both `camelCase` and `snake_case` aliases for the multi-token
 /// names because the SDK accepts either (e.g. `scrollIntoView` vs
 /// `scroll_into_view`, see `recovery_executor::execute_recovery_command`).
-const SUPPORTED_ACTION_NAMES: &[&str] = &[
+pub(crate) const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "click",
     // Reveal a hover-gated control (`pointer-events:none` until `:hover`/
     // `group-hover`) then click it, in one dispatch. Handled SDK-side by
@@ -669,6 +669,11 @@ const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "focus",
     "blur",
     "hover",
+    // Release a forced hover (`hover` puts the target into its CSS `:hover`
+    // appearance via `[data-ui-bridge-hover]` twin rules). Added SDK-side in
+    // `@qontinui/ui-bridge` the next minor after 0.35 (plan
+    // 2026-10-22-ui-bridge-hover-forces-the-css-hover-state); forwarded as-is.
+    "unhover",
     "scroll",
     "scrollIntoView",
     "scroll_into_view",
@@ -946,6 +951,10 @@ pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>
                 // this, hover-revealed toolbar buttons (which advertise `click`
                 // but not `hoverClick`) would be rejected here pre-IPC.
                 || (action == "hoverClick" && list.iter().any(|s| s == "click"))
+                // `unhover` releases what `hover` forced, so it is allowed
+                // wherever `hover` is advertised even when the element's
+                // action list predates the SDK's `unhover`.
+                || (action == "unhover" && list.iter().any(|s| s == "hover"))
         }
         // Unknown supported list (fetch failed or element didn't advertise
         // any) — assume yes, so we don't manufacture false ACTION_NOT_SUPPORTED.
@@ -6025,6 +6034,13 @@ mod validate_action_name_tests {
     }
 
     #[test]
+    fn unhover_is_a_supported_action_name() {
+        // Added SDK-side with forced hover; without it the route 400s
+        // before IPC and the forced hover can never be released.
+        assert_eq!(validate_action_name("unhover").unwrap(), "unhover");
+    }
+
+    #[test]
     fn canonical_click_round_trips() {
         // Sanity check the click path explicitly — it's the dominant call
         // site and the one most likely to regress under refactor.
@@ -6280,6 +6296,18 @@ mod action_not_supported_tests {
         ]);
         assert!(!is_action_advertised("setValue", &supported));
         assert!(!is_action_advertised("submit", &supported));
+    }
+
+    #[test]
+    fn is_action_advertised_allows_unhover_where_hover_is_listed() {
+        let supported = Some(vec!["click".to_string(), "hover".to_string()]);
+        assert!(is_action_advertised("unhover", &supported));
+    }
+
+    #[test]
+    fn is_action_advertised_rejects_unhover_without_hover() {
+        let supported = Some(vec!["click".to_string(), "focus".to_string()]);
+        assert!(!is_action_advertised("unhover", &supported));
     }
 
     #[test]
