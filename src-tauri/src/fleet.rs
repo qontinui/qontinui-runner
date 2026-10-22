@@ -9954,24 +9954,46 @@ Add-Content -LiteralPath $Out -Value $lines
     /// heartbeat reaches it through `heartbeat_device_capabilities`. A source
     /// contract, because a blocking call inline in an async fn compiles and
     /// passes every behavioural test while it stalls a runtime worker.
+    ///
+    /// Only the PRODUCTION half of the file is scanned (cut at the test module
+    /// header, via `prod_part`), so the string literals in this test can never
+    /// satisfy or trip it. Whitespace is squeezed out so a rustfmt rewrap does
+    /// not hide a call. Besides `host_capabilities()` itself and the two
+    /// functions that reach it (`heartbeat_capabilities()`, and
+    /// `heartbeat_device_capabilities(..)` outside its blocking-pool call), the
+    /// body must not call the two blocking probes it wraps, `slow_host_probes()`
+    /// and the image probe's `capability_tokens()`, inline either.
     #[test]
     fn heartbeat_runs_the_host_probes_on_the_blocking_pool() {
         let src = include_str!("fleet.rs");
-        let (_, from_fn) = src
+        let prod = prod_part(src);
+        assert!(
+            prod.len() < src.len(),
+            "the test module header must be found"
+        );
+        let (_, from_fn) = prod
             .split_once("pub async fn heartbeat_to_coord(")
             .expect("heartbeat_to_coord is defined in fleet.rs");
         let (body, _) = from_fn
             .split_once("\n}\n")
             .expect("heartbeat_to_coord ends");
+        let body = squeezed(body);
         assert!(
-            body.contains("spawn_blocking_tracked(move || heartbeat_device_capabilities("),
+            body.contains("spawn_blocking_tracked(move||heartbeat_device_capabilities("),
             "heartbeat_to_coord must assemble its capability base via spawn_blocking_tracked"
         );
-        assert!(
-            !body.contains("host_capabilities()")
-                && !body.contains("heartbeat_device_capabilities(ci.enabled"),
-            "heartbeat_to_coord must not run the host probes inline"
-        );
+        for inline in [
+            "host_capabilities()",
+            "heartbeat_capabilities()",
+            "heartbeat_device_capabilities(ci.enabled",
+            "capability_tokens()",
+            "slow_host_probes()",
+        ] {
+            assert!(
+                !body.contains(inline),
+                "heartbeat_to_coord must not call {inline} inline on its async worker"
+            );
+        }
     }
 
     /// PATH resolution must not hallucinate. A name that cannot exist

@@ -50,14 +50,26 @@
 //!   token claims "image work placed here can be served"; over-advertising it
 //!   is the failure with teeth (a placed asset session that cannot generate),
 //!   under-advertising only places the work elsewhere.
-//! * The request is bounded by [`CONNECT_TIMEOUT`] and [`REQUEST_TIMEOUT`], so
-//!   a black-holed host costs the heartbeat at most ~2 s, and that on the
-//!   blocking pool (`heartbeat_to_coord` runs `host_capabilities` through
-//!   `spawn_blocking_tracked`), never on an async worker.
-//! * The verdict — a `false` included — is cached for the parent's
-//!   `HOST_PROBE_TTL` (300 s), like the PATH and Docker probes, so the 30 s
-//!   heartbeat issues at most one request per TTL, and a withdrawn image
-//!   service leaves `coord.devices.capabilities` within one TTL.
+//! * The probe is bounded in wall-clock time, and it runs on the blocking pool
+//!   (`heartbeat_to_coord` runs `host_capabilities` through
+//!   `spawn_blocking_tracked`), never on an async worker. reqwest's blocking
+//!   `timeout` bounds the send and EACH body `read()` separately, so on its own
+//!   a server trickling one byte just inside every timeout could hold the probe
+//!   for as long as it takes to fill the body cap. So the probe takes a
+//!   deadline of [`REQUEST_TIMEOUT`] before it sends, reads the body in its own
+//!   loop and gives up as soon as the deadline has passed, and refuses a
+//!   declared `Content-Length` over the cap before reading anything. The
+//!   deadline is checked between reads, and a read already in flight can wait
+//!   one more `REQUEST_TIMEOUT`, so a probe costs less than
+//!   2 × [`REQUEST_TIMEOUT`] (4 s), connect ([`CONNECT_TIMEOUT`]) included.
+//! * Verdicts are cached ASYMMETRICALLY, because over-advertising is the costly
+//!   direction. A `true` is cached for [`POSITIVE_VERDICT_TTL`] (25 s), under
+//!   one default heartbeat interval (30 s), so a positive verdict is re-probed
+//!   on every tick (sub-millisecond on loopback), and a stopped image upstream
+//!   leaves `coord.devices.capabilities` on the next heartbeat. A `false` is
+//!   cached for the parent's `HOST_PROBE_TTL` (300 s), like the PATH and
+//!   Docker probes, so a host with no image upstream pays one probe per TTL,
+//!   and a newly started one is advertised within that TTL.
 //!
 //! # What the token does NOT claim
 //!
@@ -93,10 +105,19 @@ const IMAGE_MARKER_VALUE: &str = "image_generation";
 /// bounds a configured remote host that drops SYNs.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Whole-request budget, connect included. `/v1/models` is served from
-/// llama-swap's config without touching any model, so it never waits on a
-/// swap or a load.
+/// The probe's deadline, taken before the send, and reqwest's per-operation
+/// timeout (the send, connect included, and each body read). `/v1/models` is
+/// served from llama-swap's config without touching any model, so it never
+/// waits on a swap or a load. The wall-clock bound this buys is in the module
+/// docs: less than twice this value.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a POSITIVE verdict is cached: under one default heartbeat interval
+/// (`COORD_HEARTBEAT_INTERVAL_SECS`, 30 s), so every tick re-probes a host
+/// that advertised the token and a stopped image upstream is withdrawn on the
+/// next heartbeat. A NEGATIVE verdict is cached for the parent's
+/// `HOST_PROBE_TTL`. See the module docs for why the two differ.
+pub(crate) const POSITIVE_VERDICT_TTL: Duration = Duration::from_secs(25);
 
 /// A model list larger than this is not a llama-swap answer; refuse it rather
 /// than buffer it.
@@ -106,8 +127,9 @@ const MAX_BODY_BYTES: u64 = 1024 * 1024;
 static IMAGEGEN_PROBE_CACHE: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
 
 /// The heartbeat's `svc:imagegen` contribution: the token, or nothing.
-/// Cached for `HOST_PROBE_TTL`. BLOCKS on a cache miss (one bounded HTTP
-/// request), so call it only off the async workers.
+/// A `true` is cached for [`POSITIVE_VERDICT_TTL`], a `false` for
+/// `HOST_PROBE_TTL`. BLOCKS on a cache miss (one bounded HTTP request), so
+/// call it only off the async workers.
 pub(crate) fn capability_tokens() -> Vec<String> {
     #[cfg(test)]
     if let Some(forced) = FORCED_VERDICT.with(std::cell::Cell::get) {
@@ -116,6 +138,7 @@ pub(crate) fn capability_tokens() -> Vec<String> {
     let available = cached_probe(
         &IMAGEGEN_PROBE_CACHE,
         Instant::now(),
+        POSITIVE_VERDICT_TTL,
         super::HOST_PROBE_TTL,
         || {
             let endpoint = resolve_endpoint(std::env::var(ENV_IMAGEGEN_ENDPOINT).ok().as_deref());
@@ -149,17 +172,20 @@ fn tokens_for(available: bool) -> Vec<String> {
     }
 }
 
-/// Returns the cached verdict while it is younger than `ttl` at `now`;
-/// otherwise runs `probe` and caches its verdict (a `false` included) as of
-/// `now`. A poisoned lock degrades to probing uncached, never to a panic.
+/// Returns the cached verdict while it is younger, at `now`, than ITS OWN
+/// TTL (`positive_ttl` for a `true`, `negative_ttl` for a `false`);
+/// otherwise runs `probe` and caches its verdict as of `now`. A poisoned lock
+/// degrades to probing uncached, never to a panic.
 fn cached_probe(
     cache: &Mutex<Option<(bool, Instant)>>,
     now: Instant,
-    ttl: Duration,
+    positive_ttl: Duration,
+    negative_ttl: Duration,
     probe: impl FnOnce() -> bool,
 ) -> bool {
     if let Ok(g) = cache.lock() {
         if let Some((verdict, taken)) = g.as_ref() {
+            let ttl = if *verdict { positive_ttl } else { negative_ttl };
             if now.saturating_duration_since(*taken) < ttl {
                 return *verdict;
             }
@@ -182,8 +208,12 @@ fn resolve_endpoint(raw: Option<&str>) -> String {
     chosen.trim_end_matches('/').to_string()
 }
 
-/// `GET <base>/v1/models` and decide. Every failure is `false`.
+/// `GET <base>/v1/models` and decide. Every failure is `false`. `timeout` is
+/// both reqwest's per-operation timeout and the deadline the body loop checks,
+/// so the call returns in less than 2 × `timeout` (see the module docs).
 fn probe_endpoint(base: &str, connect_timeout: Duration, timeout: Duration) -> bool {
+    // Taken BEFORE the send: the deadline covers connect, headers and body.
+    let deadline = Instant::now() + timeout;
     let url = format!("{base}/v1/models");
     let client = match reqwest::blocking::Client::builder()
         .connect_timeout(connect_timeout)
@@ -200,7 +230,7 @@ fn probe_endpoint(base: &str, connect_timeout: Duration, timeout: Duration) -> b
             return false;
         }
     };
-    let resp = match client.get(&url).send() {
+    let mut resp = match client.get(&url).send() {
         Ok(r) => r,
         Err(e) => {
             // debug!: on a host with no image upstream this is a standing,
@@ -216,17 +246,13 @@ fn probe_endpoint(base: &str, connect_timeout: Duration, timeout: Duration) -> b
         debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: GET {url} answered {status} — not advertised");
         return false;
     }
-    let mut body = Vec::new();
-    if let Err(e) = resp.take(MAX_BODY_BYTES + 1).read_to_end(&mut body) {
-        debug!(
-            "host_capabilities: {IMAGEGEN_CAPABILITY}: reading {url} failed ({e}) — not advertised"
-        );
+    if resp.content_length().is_some_and(|n| n > MAX_BODY_BYTES) {
+        debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: {url} declares a body over {MAX_BODY_BYTES} bytes — not advertised");
         return false;
     }
-    if body.len() as u64 > MAX_BODY_BYTES {
-        debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: {url} body exceeds {MAX_BODY_BYTES} bytes — not advertised");
+    let Some(body) = read_body_by_deadline(&mut resp, deadline, &url) else {
         return false;
-    }
+    };
     match image_model_ids(&body) {
         Some(ids) if !ids.is_empty() => {
             debug!(
@@ -241,6 +267,36 @@ fn probe_endpoint(base: &str, connect_timeout: Duration, timeout: Duration) -> b
         None => {
             debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: {url} answered no OpenAI model list — not advertised");
             false
+        }
+    }
+}
+
+/// Read the whole body, giving up (`None`) once `deadline` has passed, when the
+/// body grows past [`MAX_BODY_BYTES`], or on a read error. The deadline is
+/// checked before every read: reqwest bounds each read on its own, not the
+/// sum of them, so this loop is what bounds a trickling server.
+fn read_body_by_deadline(resp: &mut impl Read, deadline: Instant, url: &str) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        if Instant::now() >= deadline {
+            debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: {url} body not complete by the deadline — not advertised");
+            return None;
+        }
+        match resp.read(&mut chunk) {
+            Ok(0) => return Some(body),
+            Ok(n) => {
+                body.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                if body.len() as u64 > MAX_BODY_BYTES {
+                    debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: {url} body exceeds {MAX_BODY_BYTES} bytes — not advertised");
+                    return None;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                debug!("host_capabilities: {IMAGEGEN_CAPABILITY}: reading {url} failed ({e}) — not advertised");
+                return None;
+            }
         }
     }
 }
@@ -336,9 +392,10 @@ mod tests {
         assert!(!probe(&empty), "an empty model list must not advertise");
     }
 
-    /// An alias NAME is not a declaration: the image aliases listed without the
-    /// marker (`includeAliasesInList: true`, or an unrelated config) advertise
-    /// nothing — there is no hard-coded alias list.
+    /// An alias NAME is not a declaration: entries named like the image aliases
+    /// but carrying no `meta.llamaswap` marker (an unrelated config, or the
+    /// marker key in the wrong place) advertise nothing; there is no hard-coded
+    /// alias list.
     #[test]
     fn an_image_alias_name_without_the_marker_advertises_nothing() {
         let body = r#"{"object":"list","data":[
@@ -407,11 +464,93 @@ mod tests {
         assert!(!probe(&base));
     }
 
+    /// Serve ONE response whose head is written verbatim, then `body_chunks`
+    /// one at a time with `gap` between them, stopping when the client goes.
+    /// Then hold the connection for `hold`. Returns the base URL.
+    fn serve_raw(head: String, body_chunks: Vec<Vec<u8>>, gap: Duration, hold: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if stream.write_all(head.as_bytes()).is_err() {
+                    return;
+                }
+                for chunk in body_chunks {
+                    std::thread::sleep(gap);
+                    if stream
+                        .write_all(&chunk)
+                        .and_then(|_| stream.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                std::thread::sleep(hold);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An oversized body with NO declared length (read to EOF) is caught by
+    /// the read loop's cap, never parsed.
     #[test]
     fn oversized_body_advertises_nothing() {
         let pad = " ".repeat(MAX_BODY_BYTES as usize);
-        let body = format!("{LLAMA_SWAP_WITH_IMAGE}{pad}");
-        assert!(!probe(&serve_once("200 OK", body)));
+        let body = format!("{LLAMA_SWAP_WITH_IMAGE}{pad}").into_bytes();
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                    Connection: close\r\n\r\n"
+            .to_string();
+        let base = serve_raw(head, vec![body], Duration::ZERO, Duration::ZERO);
+        assert!(!probe(&base));
+    }
+
+    /// A declared `Content-Length` over the cap is refused BEFORE any body
+    /// read: the server here sends no body at all and holds the connection,
+    /// so only the early refusal returns well inside the per-read timeout.
+    #[test]
+    fn a_declared_oversized_length_is_refused_before_reading() {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let base = serve_raw(head, Vec::new(), Duration::ZERO, Duration::from_secs(10));
+        let started = Instant::now();
+        let ok = probe_endpoint(&base, Duration::from_millis(500), Duration::from_secs(3));
+        assert!(!ok, "a body declared over the cap must not advertise");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the refusal must come before any read, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A server trickling the body one byte at a time, each byte well inside
+    /// the per-read timeout, is cut off by the probe's deadline. Without the
+    /// deadline loop this body would take ~20 s to arrive.
+    #[test]
+    fn a_trickling_server_is_cut_off_at_the_deadline() {
+        let len = 200;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {len}\r\n\r\n"
+        );
+        let chunks = vec![b" ".to_vec(); len];
+        let base = serve_raw(head, chunks, Duration::from_millis(100), Duration::ZERO);
+        let timeout = Duration::from_millis(600);
+        let started = Instant::now();
+        let ok = probe_endpoint(&base, Duration::from_millis(300), timeout);
+        assert!(
+            !ok,
+            "a body not complete by the deadline must not advertise"
+        );
+        assert!(
+            started.elapsed() < timeout * 2 + Duration::from_millis(500),
+            "the probe must end within 2 x its timeout, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -427,52 +566,84 @@ mod tests {
         assert_eq!(image_model_ids(other_key.as_bytes()), Some(Vec::new()));
     }
 
+    /// Each verdict holds for ITS OWN TTL: a cached answer is served while it is
+    /// younger than that TTL, even when the probe would now answer otherwise,
+    /// and is re-probed once it is not.
     #[test]
     fn the_cache_respects_the_ttl() {
         let cache: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
-        let ttl = Duration::from_secs(300);
+        let (pos, neg) = (Duration::from_secs(25), Duration::from_secs(300));
         let calls = AtomicUsize::new(0);
+        let answer = |v: bool| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            v
+        };
         let t0 = Instant::now();
-        let probe_true = || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            true
-        };
-        assert!(cached_probe(&cache, t0, ttl, probe_true));
+        assert!(cached_probe(&cache, t0, pos, neg, || answer(true)));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // Inside the TTL: served from the cache, even though the probe would
-        // now answer differently.
-        let probe_false = || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            false
-        };
-        assert!(cached_probe(
-            &cache,
-            t0 + ttl - Duration::from_millis(1),
-            ttl,
-            probe_false
-        ));
+        let inside = t0 + pos - Duration::from_millis(1);
+        assert!(cached_probe(&cache, inside, pos, neg, || answer(false)));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
-            "a fresh verdict must not re-probe"
+            "a fresh true must not re-probe"
         );
-        // At the TTL: re-probed, and the new verdict (a failure) is cached too.
-        assert!(!cached_probe(&cache, t0 + ttl, ttl, probe_false));
+        // At the positive TTL: re-probed; the new verdict (a failure) is cached.
+        let t1 = t0 + pos;
+        assert!(!cached_probe(&cache, t1, pos, neg, || answer(false)));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
-            "an expired verdict must re-probe"
+            "an expired true must re-probe"
         );
-        assert!(!cached_probe(
-            &cache,
-            t0 + ttl + Duration::from_secs(1),
-            ttl,
-            probe_true
-        ));
+        let inside = t1 + neg - Duration::from_millis(1);
+        assert!(!cached_probe(&cache, inside, pos, neg, || answer(true)));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
-            "a cached failure holds for its TTL"
+            "a fresh false must not re-probe"
+        );
+        assert!(cached_probe(&cache, t1 + neg, pos, neg, || answer(true)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "an expired false must re-probe"
+        );
+    }
+
+    /// Over-advertising is the costly direction, so a `true` expires much
+    /// sooner than a `false`: within one default heartbeat interval (30 s), and
+    /// well inside `HOST_PROBE_TTL`. A cached `true` is therefore re-probed at
+    /// an instant where a cached `false` is still served.
+    #[test]
+    fn a_positive_verdict_expires_sooner_than_a_negative_one() {
+        assert!(POSITIVE_VERDICT_TTL < Duration::from_secs(30));
+        assert!(POSITIVE_VERDICT_TTL < super::super::HOST_PROBE_TTL);
+        let at = POSITIVE_VERDICT_TTL;
+        let neg = super::super::HOST_PROBE_TTL;
+        for (cached, expect_reprobe) in [(true, true), (false, false)] {
+            let cache = Mutex::new(Some((cached, Instant::now())));
+            let calls = AtomicUsize::new(0);
+            let later = Instant::now() + at;
+            let _ = cached_probe(&cache, later, POSITIVE_VERDICT_TTL, neg, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                !cached
+            });
+            assert_eq!(
+                calls.load(Ordering::SeqCst) == 1,
+                expect_reprobe,
+                "a cached {cached} at POSITIVE_VERDICT_TTL: re-probe expected = {expect_reprobe}"
+            );
+        }
+        // And the production path wires the asymmetric pair, not one TTL.
+        let src = include_str!("imagegen_probe.rs");
+        let (prod, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("test module");
+        let squeezed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains("POSITIVE_VERDICT_TTL,super::HOST_PROBE_TTL,"),
+            "capability_tokens must pass POSITIVE_VERDICT_TTL then HOST_PROBE_TTL"
         );
     }
 
