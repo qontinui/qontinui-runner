@@ -911,6 +911,15 @@ pub struct SessionLifecycleStore {
     /// superseded PTY cannot outlive the runner that spawned it, so there is
     /// nothing to persist. Consumed on first match.
     superseded_terminals: Mutex<HashSet<String>>,
+    /// Terminals a HANDOFF close detached from their PTY holder (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// Phase 0 probe 6): the process is still running and the next runner's
+    /// boot sweep adopts it under the SAME record, so a close for one of them —
+    /// a webview `pty-exit`, a late poll — is answered
+    /// [`CloseOutcome::TerminalHandedOff`]: no mutation, no coord `Closed`, no
+    /// workdir nonce revocation. Process-local and NOT consumed: this runner is
+    /// exiting, and every close it still sees for such a terminal is wrong.
+    handed_off_terminals: Mutex<HashSet<String>>,
     /// Process-local ORDER of provider SessionStart hooks: a monotonic counter
     /// and, per session id, the counter value of the most recent hook that
     /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
@@ -1178,6 +1187,7 @@ impl SessionLifecycleStore {
             wal: Mutex::new(WalWriter::default()),
             map: Mutex::new(map),
             superseded_terminals: Mutex::new(HashSet::new()),
+            handed_off_terminals: Mutex::new(HashSet::new()),
             session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
@@ -1729,6 +1739,35 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// Record that `terminal_id` was HANDED OFF — detached, its process left
+    /// running for the next runner (see `handed_off_terminals`). Called by
+    /// the handoff close BEFORE the detach, so no close the detach provokes
+    /// can land first.
+    pub fn mark_terminal_handed_off(&self, terminal_id: &str) {
+        let t = terminal_id.trim();
+        if t.is_empty() {
+            return;
+        }
+        match self.handed_off_terminals.lock() {
+            Ok(mut set) => {
+                set.insert(t.to_string());
+            }
+            Err(e) => warn!(
+                error = %e,
+                terminal_id = %t,
+                "session_lifecycle_store: lock poisoned on mark_terminal_handed_off — a close \
+                 for this handed-off terminal would NOT be refused"
+            ),
+        }
+    }
+
+    fn is_terminal_handed_off(&self, terminal_id: &str) -> bool {
+        self.handed_off_terminals
+            .lock()
+            .map(|set| set.contains(terminal_id.trim()))
+            .unwrap_or(false)
+    }
+
     #[cfg(test)]
     fn superseded_terminal_count(&self) -> usize {
         self.superseded_terminals
@@ -1828,6 +1867,37 @@ impl SessionLifecycleStore {
                     terminal_id: t.to_string(),
                 };
             }
+        }
+
+        // A close for a HANDED-OFF terminal — named by the caller, or (no
+        // expectation) the terminal the named record is open on. Its process
+        // is alive in its holder and the next runner adopts this very record:
+        // closing it would retire the session, queue a coord `Closed`, and on
+        // the workdir's last record revoke the coord-mcp nonce the live
+        // `claude` still uses.
+        let handed_off_terminal = match expect {
+            Some(t) => self.is_terminal_handed_off(t).then(|| t.to_string()),
+            None => self
+                .map
+                .lock()
+                .ok()
+                .and_then(|m| m.get(claude_session_id).cloned())
+                .filter(|r| r.state == "open" && self.is_terminal_handed_off(&r.terminal_id))
+                .map(|r| r.terminal_id),
+        };
+        if let Some(t) = handed_off_terminal {
+            info!(
+                claude_session_id = %claude_session_id,
+                terminal_id = %t,
+                reason = %reason,
+                "session-close: terminal was HANDED OFF to its PTY holder — its process lives on \
+                 for the next runner; close refused (no record close, no coord Closed, no nonce \
+                 revocation)"
+            );
+            return CloseOutcome::TerminalHandedOff {
+                requested: claude_session_id.to_string(),
+                terminal_id: t,
+            };
         }
 
         let (outcome, closed_id, closed, closed_workdir, workdir_still_in_use) = {
@@ -3707,6 +3777,15 @@ pub enum CloseOutcome {
     /// this retires a terminal and closes nothing.
     #[serde(rename_all = "camelCase")]
     TerminalSuperseded {
+        requested: String,
+        terminal_id: String,
+    },
+    /// The named terminal was HANDED OFF — detached from its PTY holder by a
+    /// handoff restart, its process still running for the next runner to
+    /// adopt. Benign no-op: nothing mutated, no observer, the workdir nonce
+    /// kept. See [`SessionLifecycleStore::mark_terminal_handed_off`].
+    #[serde(rename_all = "camelCase")]
+    TerminalHandedOff {
         requested: String,
         terminal_id: String,
     },
@@ -6605,6 +6684,80 @@ mod tests {
             }
         );
         assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    /// Phase 0 probe 6 of plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`:
+    /// a record-close for a HANDED-OFF terminal — the webview's `pty-exit`
+    /// naming it, or a session-only close of a record open on it — closes
+    /// nothing, fires no coord `Closed` observer, and leaves the workdir's
+    /// coord-mcp nonce valid; the same close for a terminal NOT handed off
+    /// does all three (the non-vacuous baseline).
+    #[test]
+    fn a_handed_off_terminal_close_neither_closes_the_record_nor_revokes_the_nonce() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        {
+            let fired = fired.clone();
+            store.attach_close_observer(move |_| {
+                fired.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let wd = format!("D:/handoff-wt-{}", uuid::Uuid::now_v7());
+        let mut handed = auth_on("handed", "term-handed");
+        handed.working_dir = Some(wd.clone());
+        store.record_open(handed);
+        let nonce = crate::coord_mcp::register_proxy_nonce(&wd, None, None);
+        assert!(crate::coord_mcp::proxy_nonce_is_valid(&nonce));
+
+        store.mark_terminal_handed_off("term-handed");
+        assert_eq!(
+            store.record_close_checked("handed", Some("term-handed"), "pty-exit"),
+            CloseOutcome::TerminalHandedOff {
+                requested: "handed".to_string(),
+                terminal_id: "term-handed".to_string(),
+            }
+        );
+        // A session-only close (no terminal named) is refused too.
+        store.record_close("handed", "no-terminal");
+        let live = store.get("handed").unwrap();
+        assert_eq!(
+            live.state, "open",
+            "the next runner adopts this very record"
+        );
+        assert!(live.close_reason.is_none());
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "no coord Closed");
+        assert!(
+            crate::coord_mcp::proxy_nonce_is_valid(&nonce),
+            "the live claude's coord-mcp nonce must survive the handoff"
+        );
+        // D5: the adopted pane's row is still the ONE restore candidate for its
+        // session — not closed, so not dropped, and not duplicated.
+        let offered: Vec<String> = store
+            .restorable_records(chrono::Utc::now().timestamp_millis(), None, false, None)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(offered.iter().filter(|id| *id == "handed").count(), 1);
+
+        // Baseline: the same close for a terminal that was NOT handed off.
+        let wd2 = format!("D:/kill-wt-{}", uuid::Uuid::now_v7());
+        let mut killed = auth_on("killed", "term-killed");
+        killed.working_dir = Some(wd2.clone());
+        store.record_open(killed);
+        let nonce2 = crate::coord_mcp::register_proxy_nonce(&wd2, None, None);
+        assert_eq!(
+            store.record_close_checked("killed", Some("term-killed"), "pty-exit"),
+            CloseOutcome::Closed {
+                claude_session_id: "killed".to_string()
+            }
+        );
+        assert_eq!(store.get("killed").unwrap().state, "closed");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert!(!crate::coord_mcp::proxy_nonce_is_valid(&nonce2));
     }
 
     /// The register is keyed by terminal id alone: a superseded entry must not

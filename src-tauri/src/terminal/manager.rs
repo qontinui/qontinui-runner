@@ -46,6 +46,136 @@ pub struct TerminalManager {
     in_flight: Mutex<HashSet<String>>,
 }
 
+/// How [`TerminalManager::close_all`] treats the panes at shutdown — STATED by
+/// the caller (the close request that started the teardown), never inferred.
+/// Plan `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`, D1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseMode {
+    /// Quit: every pane's process is ended. The window X, and any close
+    /// request that did not ask for a handoff.
+    #[default]
+    Kill,
+    /// Restart: a holder-backed pane is DETACHED and its process left running
+    /// for the next runner's boot sweep to adopt; an in-process pane is still
+    /// killed. Only an explicit `{"handoff":"holders"}` close request asks
+    /// for it.
+    Handoff,
+}
+
+impl CloseMode {
+    /// The mode a close-request body asks for: `{"handoff": "holders"}` is
+    /// [`CloseMode::Handoff`]; an absent field, any other value, or no body
+    /// at all is a normal close (D1 — a handoff is never inferred).
+    pub fn from_request_body(body: Option<&serde_json::Value>) -> Self {
+        match body.and_then(|b| b.get("handoff")).and_then(|h| h.as_str()) {
+            Some("holders") => CloseMode::Handoff,
+            _ => CloseMode::Kill,
+        }
+    }
+}
+
+/// The ONE-SHOT slot that carries a close request's [`CloseMode`] from the
+/// HTTP door to the `CloseRequested` worker that runs the teardown (D1). The
+/// door only calls `window.close()`; the worker the window X shares is what
+/// runs `run_teardown`, so the mode has to travel beside the event.
+///
+/// One-shot on both ends: [`Self::arm`] hands back a guard that CLEARS the
+/// slot unless [`ArmedClose::commit`] is called (a refused close leaves no
+/// mode behind), and [`Self::take`] empties it, so a later X click can never
+/// inherit a handoff.
+#[derive(Debug, Default)]
+pub struct PendingCloseMode(Mutex<Option<CloseMode>>);
+
+impl PendingCloseMode {
+    /// Stage `mode` for the close about to be requested.
+    pub fn arm(&self, mode: CloseMode) -> ArmedClose<'_> {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(mode);
+        ArmedClose {
+            slot: self,
+            committed: false,
+        }
+    }
+
+    /// Take the staged mode, leaving the slot empty; [`CloseMode::Kill`] when
+    /// none was staged (the window X).
+    pub fn take(&self) -> CloseMode {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap_or_default()
+    }
+
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+/// A staged [`PendingCloseMode`]; dropped without [`Self::commit`] it clears
+/// the slot.
+#[must_use = "an armed close mode is cleared on drop unless committed"]
+pub struct ArmedClose<'a> {
+    slot: &'a PendingCloseMode,
+    committed: bool,
+}
+
+impl ArmedClose<'_> {
+    /// The close was requested: leave the mode for the worker to take.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ArmedClose<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.slot.clear();
+        }
+    }
+}
+
+/// What a [`CloseMode::Handoff`] `close_all` did, pane by pane — the counts
+/// its one summary line reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HandoffSummary {
+    /// Detached; the holder took the detach — the process survives.
+    pub detached: usize,
+    /// In-process panes, killed.
+    pub killed_in_process: usize,
+    /// Released, detach not confirmed — may survive.
+    pub unconfirmed: usize,
+    /// Detached, but the holder dies with the runner's unit cgroup.
+    pub killed_unprotected: usize,
+}
+
+impl HandoffSummary {
+    fn count(&mut self, outcome: &super::session::HandoffOutcome) {
+        use super::session::HandoffOutcome as O;
+        match outcome {
+            O::Detached { .. } => self.detached += 1,
+            O::KilledInProcess => self.killed_in_process += 1,
+            O::Unconfirmed { .. } => self.unconfirmed += 1,
+            O::KilledUnprotected { .. } => self.killed_unprotected += 1,
+        }
+    }
+
+    /// The teardown's one summary line.
+    pub fn line(&self) -> String {
+        let mut line = format!(
+            "handoff: {} detached, {} killed (in-process), {} unconfirmed",
+            self.detached, self.killed_in_process, self.unconfirmed
+        );
+        if self.killed_unprotected > 0 {
+            line.push_str(&format!(
+                ", {} killed ({})",
+                self.killed_unprotected,
+                super::session::HandoffOutcome::UNPROTECTED_CGROUP
+            ));
+        }
+        line
+    }
+}
+
 /// Why [`TerminalManager::adopt_holder_pane`] adopted nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdoptError {
@@ -1090,13 +1220,20 @@ impl TerminalManager {
     /// child process tree still dies (that is the part whose omission would
     /// leak processes), while the thread joins and the shim-dir sweep are
     /// skipped. The imminent `process::exit` reclaims the rest.
-    pub fn close_all(&self, deadline: std::time::Instant) {
+    ///
+    /// `mode` ([`CloseMode`]): `Handoff` closes each session through
+    /// `TerminalSession::close_for_handoff`, and a HOLDER pane reached past the
+    /// deadline is still detached rather than given the kill-only fallback —
+    /// killing it on a slow detach would defeat the restart. Returns the
+    /// handoff counts (all zero for `Kill`).
+    pub fn close_all(&self, deadline: std::time::Instant, mode: CloseMode) -> HandoffSummary {
+        let mut summary = HandoffSummary::default();
         let sessions: Vec<Arc<TerminalSession>> = {
             match self.sessions.lock() {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
                 Err(e) => {
                     error!("Sessions lock poisoned during close_all: {}", e);
-                    return;
+                    return summary;
                 }
             }
         };
@@ -1108,17 +1245,34 @@ impl TerminalManager {
         }
 
         if sessions.is_empty() {
-            return;
+            if mode == CloseMode::Handoff {
+                info!("{}", summary.line());
+            }
+            return summary;
         }
 
-        info!("Closing {} terminal session(s)", sessions.len());
+        info!(
+            "Closing {} terminal session(s) ({:?})",
+            sessions.len(),
+            mode
+        );
         let mut degraded = 0usize;
         for session in &sessions {
-            if std::time::Instant::now() >= deadline {
-                session.close_kill_only();
-                degraded += 1;
-            } else {
-                session.close_with_deadline(Some(deadline));
+            let past_deadline = std::time::Instant::now() >= deadline;
+            match mode {
+                CloseMode::Kill if past_deadline => {
+                    session.close_kill_only();
+                    degraded += 1;
+                }
+                CloseMode::Kill => session.close_with_deadline(Some(deadline)),
+                CloseMode::Handoff if past_deadline && !session.is_holder_backed() => {
+                    session.close_kill_only();
+                    summary.count(&super::session::HandoffOutcome::KilledInProcess);
+                    degraded += 1;
+                }
+                CloseMode::Handoff => {
+                    summary.count(&session.close_for_handoff(Some(deadline)));
+                }
             }
         }
         if degraded > 0 {
@@ -1129,7 +1283,11 @@ impl TerminalManager {
                 sessions.len()
             );
         }
+        if mode == CloseMode::Handoff {
+            info!("{}", summary.line());
+        }
         info!("All terminal sessions closed");
+        summary
     }
 
     /// Get a reference to the output interceptor (for adding hooks).
@@ -1334,7 +1492,7 @@ mod tests {
 
         let tm = TerminalManager::new();
         seed(&tm, "close-all-tab");
-        tm.close_all(std::time::Instant::now());
+        tm.close_all(std::time::Instant::now(), super::CloseMode::Kill);
         assert!(tm.remote_identity("close-all-tab").is_none());
         assert!(tm.remote_pane("close-all-tab").is_none());
     }
@@ -1551,5 +1709,349 @@ mod workspace_trust_scope_tests {
             &escape.to_string_lossy(),
             &root.to_string_lossy()
         ));
+    }
+}
+
+/// Plan `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// Phase 2: the close mode, its one-shot slot, and `close_all(Handoff)`.
+#[cfg(test)]
+mod handoff_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{CloseMode, HandoffSummary, PendingCloseMode, TerminalManager};
+    use crate::terminal::session::tests::{make_test_session, FakeHolderIo};
+    use crate::terminal::session::TerminalSession;
+
+    fn pane(tm: &TerminalManager, io: Arc<FakeHolderIo>, id: &str) {
+        let mut s: TerminalSession = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        s.set_id_for_test(id);
+        s.set_io_for_test(io);
+        tm.insert_for_test(id, Arc::new(s));
+    }
+
+    #[test]
+    fn the_close_mode_is_handoff_only_when_the_body_asks_for_holders() {
+        let body = |v: serde_json::Value| CloseMode::from_request_body(Some(&v));
+        assert_eq!(
+            body(serde_json::json!({"handoff": "holders"})),
+            CloseMode::Handoff
+        );
+        assert_eq!(
+            body(serde_json::json!({"handoff": "everything"})),
+            CloseMode::Kill
+        );
+        assert_eq!(body(serde_json::json!({"handoff": true})), CloseMode::Kill);
+        assert_eq!(body(serde_json::json!({"label": "main"})), CloseMode::Kill);
+        assert_eq!(CloseMode::from_request_body(None), CloseMode::Kill);
+    }
+
+    /// D1: a REFUSED close (the guard dropped without `commit`) leaves no mode
+    /// behind, so a later X click is a plain Kill; a committed one is taken
+    /// exactly once.
+    #[test]
+    fn a_refused_close_leaves_no_mode_behind_and_a_taken_one_is_gone() {
+        let slot = PendingCloseMode::default();
+        assert_eq!(
+            slot.take(),
+            CloseMode::Kill,
+            "nothing staged is a Kill (the X)"
+        );
+
+        {
+            let _armed = slot.arm(CloseMode::Handoff);
+            // window.close() failed → the handler returns with the guard
+            // dropped and never committed.
+        }
+        assert_eq!(
+            slot.take(),
+            CloseMode::Kill,
+            "a refused close must not leak its mode"
+        );
+
+        slot.arm(CloseMode::Handoff).commit();
+        assert_eq!(
+            slot.take(),
+            CloseMode::Handoff,
+            "the CloseRequested worker takes it"
+        );
+        assert_eq!(
+            slot.take(),
+            CloseMode::Kill,
+            "one-shot: a later X never inherits it"
+        );
+    }
+
+    /// D1/D4: `close_all(Handoff)` detaches the holder panes and kills the
+    /// in-process one, and reports the counts; `close_all(Kill)` kills all.
+    #[test]
+    fn close_all_handoff_detaches_holders_and_kills_in_process_panes() {
+        let tm = TerminalManager::new();
+        let (a, b, local) = (
+            Arc::new(FakeHolderIo::holder()),
+            Arc::new(FakeHolderIo::holder()),
+            Arc::new(FakeHolderIo::in_process()),
+        );
+        pane(&tm, a.clone(), "ho-a");
+        pane(&tm, b.clone(), "ho-b");
+        pane(&tm, local.clone(), "ho-local");
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+
+        let summary = tm.close_all(far, CloseMode::Handoff);
+
+        assert_eq!(
+            summary,
+            HandoffSummary {
+                detached: 2,
+                killed_in_process: 1,
+                unconfirmed: 0,
+                killed_unprotected: 0
+            }
+        );
+        assert_eq!(
+            summary.line(),
+            "handoff: 2 detached, 1 killed (in-process), 0 unconfirmed"
+        );
+        assert_eq!(
+            (a.kill_count(), b.kill_count()),
+            (0, 0),
+            "holder panes are not killed"
+        );
+        assert_eq!((a.release_count(), b.release_count()), (1, 1));
+        assert_eq!(local.kill_count(), 1);
+        assert_eq!(tm.count(), 0, "every session left the manager");
+
+        let tm = TerminalManager::new();
+        let holder = Arc::new(FakeHolderIo::holder());
+        pane(&tm, holder.clone(), "kill-a");
+        assert_eq!(
+            tm.close_all(far, CloseMode::Kill),
+            HandoffSummary::default()
+        );
+        assert_eq!(
+            holder.kill_count(),
+            1,
+            "a plain shutdown still kills holder panes"
+        );
+    }
+
+    /// Past the deadline, `Kill` falls back to kill-only for every pane, but
+    /// `Handoff` still DETACHES a holder pane: killing it on a slow detach
+    /// would defeat the restart. An in-process pane still gets kill-only.
+    #[test]
+    fn close_all_handoff_past_its_deadline_still_detaches_holder_panes() {
+        let tm = TerminalManager::new();
+        let (holder, local) = (
+            Arc::new(FakeHolderIo::holder()),
+            Arc::new(FakeHolderIo::in_process()),
+        );
+        pane(&tm, holder.clone(), "late-holder");
+        pane(&tm, local.clone(), "late-local");
+        let spent = std::time::Instant::now();
+
+        let summary = tm.close_all(spent, CloseMode::Handoff);
+
+        assert_eq!(summary.detached, 1);
+        assert_eq!(summary.killed_in_process, 1);
+        assert_eq!(holder.kill_count(), 0);
+        assert_eq!(holder.release_count(), 1);
+        assert_eq!(local.kill_count(), 1);
+        assert_eq!(local.release_count(), 0, "kill-only: no release");
+    }
+
+    #[test]
+    fn the_summary_line_names_unprotected_holders_only_when_there_are_any() {
+        let s = HandoffSummary {
+            detached: 1,
+            killed_in_process: 0,
+            unconfirmed: 2,
+            killed_unprotected: 1,
+        };
+        assert_eq!(
+            s.line(),
+            "handoff: 1 detached, 0 killed (in-process), 2 unconfirmed, 1 killed (unprotected_cgroup)"
+        );
+    }
+}
+
+/// Phase 2's integration test, against the REAL `qontinui-pty-holder` and a
+/// REAL `LocalPty`: two holder panes and one in-process pane, `close_all`
+/// with `Handoff`, then the boot sweep's census over the same pane directory
+/// and a fresh-consumer reattach of each live pane. Linux only (POSIX shell
+/// children, `kill(pid, 0)` liveness), like `daemon_pane_io`'s `holder_e2e`.
+///
+/// What is real: the holder processes and their children, the detach the
+/// handoff sends, the in-process PTY and its kill, `boot_sweep_with_pending`
+/// (the census `holder_boot_sweep` runs), `plan_adoptions`, and
+/// `DaemonPaneIo::attach_existing` (the attach `adopt_holder_pane` makes).
+/// What is NOT: the `TerminalSession` around each pane is the unit fixture
+/// (`make_test_session`, no Tauri `AppHandle`, so no reader/waiter thread),
+/// and the re-adoption stops at the attach — `adopt_holder_pane`'s
+/// `insert_with_io` needs a Tauri `AppHandle` to build a session.
+#[cfg(all(test, target_os = "linux"))]
+mod handoff_e2e {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use qontinui_pty_holder::pane::PaneId;
+    use qontinui_pty_holder::sweep::SweepOutcome;
+
+    use super::{CloseMode, TerminalManager};
+    use crate::terminal::daemon_pane_io::DaemonPaneIo;
+    use crate::terminal::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
+    use crate::terminal::session::tests::make_test_session;
+
+    /// The holder cargo built into this target dir. Missing is a FAILURE that
+    /// says how to build it, never a skip.
+    fn holder() -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let profile = exe.parent().and_then(Path::parent).unwrap();
+        let p = profile.join("qontinui-pty-holder");
+        assert!(
+            p.is_file(),
+            "{} is missing — build it first: `cargo build -p qontinui-pty-holder`",
+            p.display()
+        );
+        p
+    }
+
+    fn sh(script: &str) -> ScrubbedCommand {
+        let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", script]);
+        cmd.cwd("/tmp");
+        ScrubbedCommand::seal(cmd)
+    }
+
+    fn alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks for existence.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    fn until(bound: Duration, what: &str, f: impl Fn() -> bool) {
+        let end = std::time::Instant::now() + bound;
+        while !f() {
+            assert!(
+                std::time::Instant::now() < end,
+                "{what} not within {bound:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn child_start(dir: &Path, id: &PaneId) -> (Option<u32>, Option<String>) {
+        let rec =
+            qontinui_pty_holder::lock::read_record(&qontinui_pty_holder::pane::lock_path(dir, id))
+                .expect("the live holder's lock record");
+        (rec.child_pid, rec.child_start)
+    }
+
+    #[test]
+    fn pty_holder_handoff_close_all_leaves_holder_panes_adoptable_and_kills_local() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = PathBuf::from("/tmp").join(format!("ptyh-{}-{nanos:x}", std::process::id()));
+        let ids = [
+            PaneId::new("hand-a").unwrap(),
+            PaneId::new("hand-b").unwrap(),
+        ];
+        let script = "while :; do sleep 1; done";
+
+        let tm = TerminalManager::new();
+        let mut before = Vec::new();
+        for id in &ids {
+            let pane = DaemonPaneIo::spawn(&holder(), &dir, id, &sh(script), 80, 24)
+                .expect("holder spawn + attach");
+            let child = pane.child_pid();
+            assert!(alive(child));
+            let start = child_start(&dir, id);
+            assert_eq!(start.0, Some(child));
+            assert!(
+                start.1.is_some(),
+                "the record carries the child's start token"
+            );
+            before.push((id.to_string(), child, start.1));
+            let mut s = make_test_session(Arc::new(Mutex::new(Vec::new())));
+            s.set_id_for_test(id.as_str());
+            s.set_io_for_test(Arc::new(pane));
+            tm.insert_for_test(id.as_str(), Arc::new(s));
+        }
+        let local = Arc::new(
+            LocalPty::open("hand-local", 80, 24)
+                .and_then(|o| o.spawn(sh(script)))
+                .expect("local pty"),
+        );
+        let local_pid = local.pid().expect("local child pid");
+        let mut s = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        s.set_id_for_test("hand-local");
+        s.set_io_for_test(local.clone());
+        tm.insert_for_test("hand-local", Arc::new(s));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let summary = tm.close_all(deadline, CloseMode::Handoff);
+        assert_eq!(summary.detached, 2, "{summary:?}");
+        assert_eq!(summary.killed_in_process, 1, "{summary:?}");
+        assert_eq!(summary.unconfirmed, 0, "{summary:?}");
+
+        // The in-process pane's child was killed (reaped here: the fixture has
+        // no waiter thread to do it); the holder children run on.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = local.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(waiting.wait());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the killed LocalPty child exits");
+        assert!(!alive(local_pid), "the LocalPty child is gone");
+        for (_, child, _) in &before {
+            assert!(alive(*child), "a handed-off child must keep running");
+        }
+
+        // The boot sweep's census, as the next runner runs it.
+        let mut adoptions = Vec::new();
+        let swept = qontinui_pty_holder::sweep::boot_sweep_with_pending(
+            &dir,
+            Duration::from_secs(5),
+            &[],
+            |entries, _dead| {
+                for e in entries {
+                    assert!(
+                        matches!(e.outcome, SweepOutcome::Live { .. }),
+                        "{}: {:?}",
+                        e.pane_id,
+                        e.outcome
+                    );
+                }
+                adoptions =
+                    crate::terminal::holder_boot_sweep::plan_adoptions(entries, &[], |_| None);
+            },
+        )
+        .expect("sweep");
+        drop(swept);
+        let mut adopted: Vec<String> = adoptions.iter().map(|a| a.pane_id.clone()).collect();
+        adopted.sort();
+        assert_eq!(adopted, vec!["hand-a".to_string(), "hand-b".to_string()]);
+        assert!(
+            !adopted.iter().any(|a| a == "hand-local"),
+            "the LocalPty pane has no holder to adopt"
+        );
+
+        // Reattach each as a fresh consumer, under the same terminal id: same
+        // child pid, same start token.
+        for (id, child, token) in &before {
+            let pid = PaneId::new(id).unwrap();
+            let pane = DaemonPaneIo::attach_existing(&dir, &pid, None, None)
+                .expect("the adopting runner's attach");
+            assert_eq!(pane.child_pid(), *child, "{id}: same child");
+            assert_eq!(child_start(&dir, &pid).1, *token, "{id}: same child_start");
+            // Clean up: end the child through its holder.
+            pane.kill(Duration::from_secs(5)).unwrap();
+            pane.release(Duration::from_secs(2)).unwrap();
+            until(Duration::from_secs(10), "the adopted child to end", || {
+                !alive(*child)
+            });
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
