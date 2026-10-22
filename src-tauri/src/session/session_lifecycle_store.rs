@@ -1729,6 +1729,19 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// The terminals currently marked by [`Self::mark_terminal_superseded`] —
+    /// PTYs whose session has moved to a new pane and whose close is still
+    /// expected. Read by the duplicate-host detector
+    /// ([`crate::session::duplicate_hosts`]) to exclude the account
+    /// migration's own hand-off window. Empty on a poisoned lock (the detector
+    /// then simply excludes less, never more).
+    pub fn superseded_terminal_ids(&self) -> HashSet<String> {
+        self.superseded_terminals
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     fn superseded_terminal_count(&self) -> usize {
         self.superseded_terminals
