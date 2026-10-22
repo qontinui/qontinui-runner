@@ -415,6 +415,12 @@ fn copy_transcript_never_carries_a_leftover_partial_file() {
 /// Link `link` -> `target` as a directory symlink (unix) or a junction
 /// (Windows; `mklink /J` needs no privilege). `false` when the platform
 /// refused, so the caller can say the case went unexercised.
+///
+/// `#[cfg(test)]` is redundant here (this whole file is a test module) but is
+/// what `scripts/check_untimed_subprocess.py` reads to skip a fixture: its
+/// untimed `mklink` was exempt while it lived in `account_migration.rs`'s
+/// inline `mod tests`.
+#[cfg(test)]
 fn link_dir(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     {
