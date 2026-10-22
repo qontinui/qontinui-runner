@@ -492,7 +492,9 @@ fn visibility_verdict_union_is_exactly_the_sdk_four() {
     seen.insert(found["verdict"].to_string());
 
     // 3. Swept, nothing covered, but a canvas nobody attributed, or a census
-    //    that could not be read under ANY of the three reasons: never `clear`.
+    //    that could not be read under ANY of the SDK's four reasons: never
+    //    `clear`. The exhaustive match below (no wildcard) makes a fifth Rust
+    //    variant a compile error here, so the list cannot silently fall behind.
     let stray_report = build_visibility_report(&quiet, 0.02, false, None, Some(&stray));
     assert_eq!(
         stray_report["verdict"], "unknown_canvas",
@@ -505,8 +507,15 @@ fn visibility_verdict_union_is_exactly_the_sdk_four() {
             "page-sdk-lacks-coverage",
         ),
         (CoverageUnavailableReason::AccessorThrew, "accessor-threw"),
+        (CoverageUnavailableReason::NoDocument, "no-document"),
         (CoverageUnavailableReason::IpcFailed, "ipc-failed"),
     ] {
+        match reason {
+            CoverageUnavailableReason::PageSdkLacksCoverage
+            | CoverageUnavailableReason::AccessorThrew
+            | CoverageUnavailableReason::NoDocument
+            | CoverageUnavailableReason::IpcFailed => {}
+        }
         let cov = CanvasCoverage::Unavailable { reason };
         let r = build_visibility_report(&quiet, 0.02, false, None, Some(&cov));
         assert_eq!(

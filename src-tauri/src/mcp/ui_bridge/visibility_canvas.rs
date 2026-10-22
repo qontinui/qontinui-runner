@@ -17,6 +17,7 @@
 //! |-----------------------------------------------|---------------------------------------------|
 //! | `null` (no accessor: page SDK predates it)    | `Unavailable { PageSdkLacksCoverage }`      |
 //! | `{state:"unavailable", reason:"accessor-threw"}` (the TS arm's throw marker) | `Unavailable { AccessorThrew }` |
+//! | `{state:"unavailable", reason:"no-document"}` (a DOM-less registry)       | `Unavailable { NoDocument }`                |
 //! | transport `Err`, a `{success:false}` envelope, or any malformed body | `Unavailable { IpcFailed }` |
 //! | `{canvases, attributed, unattributed[]}`      | `Measured { .. }`                           |
 //!
@@ -36,6 +37,9 @@ pub(crate) enum CoverageUnavailableReason {
     PageSdkLacksCoverage,
     /// The accessor exists but threw (or answered nothing).
     AccessorThrew,
+    /// The registry that answered runs with no DOM (a server-side registry),
+    /// so there were no canvases it could count.
+    NoDocument,
     /// The IPC failed or its answer could not be read.
     IpcFailed,
 }
@@ -45,6 +49,7 @@ impl CoverageUnavailableReason {
         match self {
             Self::PageSdkLacksCoverage => "page-sdk-lacks-coverage",
             Self::AccessorThrew => "accessor-threw",
+            Self::NoDocument => "no-document",
             Self::IpcFailed => "ipc-failed",
         }
     }
@@ -53,6 +58,7 @@ impl CoverageUnavailableReason {
         match s {
             "page-sdk-lacks-coverage" => Some(Self::PageSdkLacksCoverage),
             "accessor-threw" => Some(Self::AccessorThrew),
+            "no-document" => Some(Self::NoDocument),
             "ipc-failed" => Some(Self::IpcFailed),
             _ => None,
         }
@@ -233,6 +239,17 @@ mod tests {
     fn the_ts_throw_marker_is_accessor_threw() {
         let c = parse(json!({ "state": "unavailable", "reason": "accessor-threw" }));
         assert_eq!(reason_of(&c), "accessor-threw");
+    }
+
+    #[test]
+    fn a_dom_less_registry_is_no_document_and_withholds_clear() {
+        let c = parse(json!({ "state": "unavailable", "reason": "no-document" }));
+        assert_eq!(reason_of(&c), "no-document");
+        assert!(c.withholds_clear());
+        assert_eq!(
+            c.to_json(),
+            json!({ "state": "unavailable", "reason": "no-document" })
+        );
     }
 
     #[test]
