@@ -854,7 +854,10 @@ fn build_raw_pipeline(crop: Option<Region>) -> Pipeline {
 /// resolved a bare relative directory name against the process CWD, so every
 /// GET-by-sha 404'd with "cache empty" even though `VisionCache::put` had
 /// written the file under the absolute root.
-pub(super) fn find_cache_file(dir: &StdPath, sha: &str) -> std::io::Result<Option<(PathBuf, String)>> {
+pub(super) fn find_cache_file(
+    dir: &StdPath,
+    sha: &str,
+) -> std::io::Result<Option<(PathBuf, String)>> {
     let prefix = format!("{}.", sha);
     for entry in std::fs::read_dir(dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -976,8 +979,8 @@ async fn do_capture(
                 &hit.sha256_hex[..12],
                 bytes.len()
             );
-            let access = capture_access(&hit.sha256_hex, &bytes, inline)
-                .map_err(|e| e.into_api_error())?;
+            let access =
+                capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
             return Ok(CaptureResponse {
                 url: access.url,
                 base64: access.base64,
@@ -1060,8 +1063,7 @@ async fn do_capture(
         height
     );
 
-    let access =
-        capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
+    let access = capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
     Ok(CaptureResponse {
         url: access.url,
         base64: access.base64,
@@ -1713,8 +1715,7 @@ async fn vision_raw_handler(
             )
         })?;
 
-    let access =
-        capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
+    let access = capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
     Ok(Json(ApiResponse::success(CaptureResponse {
         url: access.url,
         base64: access.base64,
