@@ -30,14 +30,15 @@ describe("formatTotalOutput", () => {
     [-5, null],
     [Number.NaN, null],
     [512, "512 B output"],
-    [1023, "1023 B output"],
-    [1024, "1 KB output"],
-    [67_036, "65 KB output"],
-    [376_950, "368 KB output"],
-    [1024 * 1024 - 513, "1023 KB output"],
-    [1024 * 1024 - 1, "1.0 MB output"],
-    [1024 * 1024, "1.0 MB output"],
-    [5 * 1024 * 1024 + 512 * 1024, "5.5 MB output"],
+    [999, "999 B output"],
+    [1000, "1 KB output"],
+    [67_036, "67 KB output"],
+    // The plan's measured pane: 376 950 bytes is the "377 KB" it names.
+    [376_950, "377 KB output"],
+    [999_499, "999 KB output"],
+    [999_500, "1.0 MB output"],
+    [1_000_000, "1.0 MB output"],
+    [5_500_000, "5.5 MB output"],
   ])("%s bytes -> %s", (bytes, expected) => {
     expect(formatTotalOutput(bytes)).toBe(expected);
   });
@@ -46,7 +47,7 @@ describe("formatTotalOutput", () => {
 describe("TotalOutputLabel", () => {
   it("names the total, never a line count", () => {
     const html = renderToStaticMarkup(<TotalOutputLabel totalBytes={376_950} />);
-    expect(html).toContain(">368 KB output<");
+    expect(html).toContain(">377 KB output<");
     expect(html).toContain("376950 bytes");
     expect(html).not.toMatch(/\blines\b/);
   });
