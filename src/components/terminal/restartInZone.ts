@@ -7,6 +7,7 @@
  */
 
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
+import type { CloseTerminalOptions } from "./useTerminalManager";
 
 /**
  * What a restart attempt actually did.
@@ -42,7 +43,7 @@ export interface RestartInZoneDeps {
     tenantId?: string,
     spawnSource?: ResourceGuardSource,
   ) => Promise<string | null>;
-  closeTerminal: (tabId: string) => void;
+  closeTerminal: (tabId: string, options?: CloseTerminalOptions) => void;
 }
 
 /**
@@ -100,6 +101,8 @@ export async function restartInZone(
   if (label && labelZone !== null) deps.setZoneLabel(labelZone, label);
   // Retire the pane just replaced — after its place points at the
   // replacement, so the zone is never momentarily empty.
-  deps.closeTerminal(oldTabId);
+  // `immediate`: a restart REPLACES the pane, so the retirement is not an
+  // operator close and must not hold the old PTY open for the Undo window.
+  deps.closeTerminal(oldTabId, { immediate: true });
   return { restarted: true, tabId, retiredTabId: oldTabId };
 }
