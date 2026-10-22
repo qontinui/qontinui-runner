@@ -5,15 +5,9 @@
 //! `2026-10-21-account-migration-strands-subagent-transcripts-and-forks-live-sessions`,
 //! Phase 5).
 //!
-//! Lives in its own file, not in `account_migration.rs`, because that module
-//! is being rewritten by the plan's Phase 2 on a separate branch.
-//!
-//! **WIRING OWED:** `account_migration::migrate_session` must call
-//! [`note_migration_respawn`] with the NEW terminal id and the session id
-//! right after its respawn succeeds (next to `store.mark_terminal_superseded`).
-//! Until it does, the detector's only hand-off exclusion is the store's
-//! superseded-terminal register, which covers the old pane from the mark
-//! until its close is consumed.
+//! Lives in its own file, not in `account_migration.rs`, which only calls
+//! [`note_migration_respawn`] — with the NEW terminal id and the session id,
+//! right after a successful respawn, next to `store.mark_terminal_superseded`.
 
 use std::collections::HashSet;
 use std::sync::Mutex;

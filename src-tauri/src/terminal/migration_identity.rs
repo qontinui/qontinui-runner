@@ -24,18 +24,21 @@
 //! - [`resolve_migration_identity`] — the I/O wrapper: ONE process snapshot,
 //!   the pane's claude pids, the registry read, then the pure fn.
 //!
-//! ## Wiring (not done here)
+//! - [`migration_verdict`] — pure: what the migration does with an identity,
+//!   per trigger (the automatic usage-limit hint vs the operator's command).
 //!
-//! `resolve_migration_identity` is to be awaited in BOTH async callers of the
-//! synchronous `migrate_session` — `account_migration::handle_usage_limit_hint`
-//! (before the exhaustion probe; replaces `record.config_dir` as the source
-//! with the returned `config_dir`) and the manual
-//! `commands::terminal::terminal_migrate_session_account` — ABOVE the
-//! continuation GUARD window, passing the resolved `{sid, config_dir}` into
-//! `migrate_session`. `HeldElsewhere`/`Unknown` map to `emit_skipped` reasons
-//! `session-live-in-another-process(pid N)` / `identity-unresolved(<why>)`;
-//! `Rebound` additionally corrects the record via `store.record_open` with an
-//! authoritative origin.
+//! ## Wiring
+//!
+//! Both async callers of the synchronous `migrate_session` —
+//! `account_migration::handle_usage_limit_hint` (before the exhaustion probe)
+//! and `commands::terminal::terminal_migrate_session_account` (before
+//! anything is lifted or spawned) — go through
+//! `account_migration::resolve_migration_subject`, which awaits
+//! [`resolve_migration_identity`], applies [`migration_verdict`], corrects the
+//! record on `Rebound`, and hands the resolved `{sid, config_dir}` (as the
+//! record + source account) into `migrate_session`. The same snapshot also
+//! yields the old pane's `claude` anchor that the post-close delta sync waits
+//! on, so the migration takes one process-table snapshot, not two.
 //!
 //! [`registry_row_validity`]: crate::session::claude_session_registry::registry_row_validity
 
@@ -43,6 +46,7 @@ use std::path::PathBuf;
 
 use crate::process_capture::process_tree::ProcessSnapshot;
 use crate::session::claude_session_registry::{RegistryRow, RowValidity};
+use crate::terminal::graceful_exit::ProcIdentity;
 
 /// The migration's verdict on what the pane is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,22 +172,122 @@ pub fn resolve_from_snapshot(
 /// decide. `pane_child_pid = None` (the manager could not resolve the pane's
 /// child) is `Unknown`.
 ///
-/// To be called from `handle_usage_limit_hint` and
-/// `terminal_migrate_session_account` — see the module doc's "Wiring".
+/// Also returns the pane's `claude` ANCHOR (oldest claude image, pid + start
+/// time) from the same snapshot: the migration's detached delta sync waits for
+/// exactly that process to leave the table, and taking it here spares a second
+/// snapshot. `None` when the pane hosts no claude or the table is unreadable.
 pub async fn resolve_migration_identity(
     pane_child_pid: Option<u32>,
     record_sid: &str,
-) -> MigrationIdentity {
+) -> (MigrationIdentity, Option<ProcIdentity>) {
     let Some(root) = pane_child_pid else {
-        return MigrationIdentity::Unknown("the pane has no resolvable child pid".into());
+        return (
+            MigrationIdentity::Unknown("the pane has no resolvable child pid".into()),
+            None,
+        );
     };
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     if snapshot.names.is_empty() {
-        return MigrationIdentity::Unknown("process table unreadable".into());
+        return (
+            MigrationIdentity::Unknown("process table unreadable".into()),
+            None,
+        );
     }
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
     let rows = crate::session::claude_session_registry::read_registry_rows(&config_dirs, &snapshot);
-    resolve_from_snapshot(root, record_sid, &snapshot, &rows)
+    let writer = crate::process_capture::process_tree::claude_anchor_in_subtree(root, &snapshot)
+        .map(|(pid, started_at)| ProcIdentity { pid, started_at });
+    (
+        resolve_from_snapshot(root, record_sid, &snapshot, &rows),
+        writer,
+    )
+}
+
+/// Who asked for the migration. It decides ONE arm only — `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationTrigger {
+    /// The PTY usage-limit hint: nobody chose this pane, so an unproven
+    /// identity never authorizes closing it (plan Phase 3, "the migration does
+    /// NOT act").
+    UsageLimitHint,
+    /// The operator's `terminal_migrate_session_account` click. The plan keeps
+    /// it as the path that "still handles" a pane the automatic path refused,
+    /// and the click is its own confirmation — so an UNRESOLVED identity falls
+    /// back to the record (said so in a `warn!`). A PROVEN fork
+    /// (`HeldElsewhere`) is refused here too: the click names a pane, not a
+    /// licence to open a second live process on one conversation.
+    OperatorCommand,
+}
+
+/// What the migration does with a resolved identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationVerdict {
+    /// Migrate `sid` out of `config_dir`. `rebound_from` is the record's id
+    /// when the provider named a different one (the caller corrects the
+    /// record before migrating).
+    Proceed {
+        sid: String,
+        config_dir: PathBuf,
+        rebound_from: Option<String>,
+    },
+    /// Operator command with an unresolved identity: migrate the RECORD's
+    /// session out of the record's account. `why` is the unresolved reason.
+    ProceedOnRecord { why: String },
+    /// Do not migrate. `reason` is the typed `session-account-migration-skipped`
+    /// reason: `session-live-in-another-process(pid N)` or
+    /// `identity-unresolved(<why>)`.
+    Refuse { reason: String },
+}
+
+/// Pure: map an identity to the migration's action for `trigger`.
+pub fn migration_verdict(
+    identity: MigrationIdentity,
+    record_sid: &str,
+    trigger: MigrationTrigger,
+) -> MigrationVerdict {
+    match identity {
+        MigrationIdentity::Confirmed { sid, config_dir } => MigrationVerdict::Proceed {
+            sid,
+            config_dir,
+            rebound_from: None,
+        },
+        MigrationIdentity::Rebound { sid, config_dir } => MigrationVerdict::Proceed {
+            sid,
+            config_dir,
+            rebound_from: Some(record_sid.to_string()),
+        },
+        MigrationIdentity::HeldElsewhere { pid } => MigrationVerdict::Refuse {
+            reason: format!("session-live-in-another-process(pid {pid})"),
+        },
+        MigrationIdentity::Unknown(why) => match trigger {
+            MigrationTrigger::UsageLimitHint => MigrationVerdict::Refuse {
+                reason: format!("identity-unresolved({why})"),
+            },
+            MigrationTrigger::OperatorCommand => MigrationVerdict::ProceedOnRecord { why },
+        },
+    }
+}
+
+/// The roster's own spelling of `dir` when one roster entry names the same
+/// path, else `dir` as a string. The usage snapshot and the cooldown map are
+/// keyed by the roster's strings (`account_known_exhausted` is an exact
+/// lookup), while a registry row's dir comes from the discovery sweep, which
+/// may spell an env- or scan-found home differently.
+pub fn roster_spelling(dir: &std::path::Path, roster: &[String]) -> String {
+    roster
+        .iter()
+        .find(|r| std::path::Path::new(r.trim()) == dir)
+        .map(|r| r.trim().to_string())
+        .unwrap_or_else(|| dir.to_string_lossy().into_owned())
+}
+
+/// Whether two spellings of a config dir name the same account, by the
+/// comparison [`roster_spelling`] itself matches with: as paths, after
+/// trimming — so separators, `.` segments and a trailing slash do not count.
+/// Two spellings [`roster_spelling`] maps onto one roster entry are equal
+/// here too.
+pub fn same_config_dir(a: &str, b: &str) -> bool {
+    std::path::Path::new(a.trim()) == std::path::Path::new(b.trim())
 }
 
 #[cfg(test)]
@@ -381,5 +485,116 @@ mod tests {
             decide_migration_identity("a", &[1], &rows),
             MigrationIdentity::Confirmed { .. }
         ));
+    }
+
+    // ── migration_verdict: one test per arm ────────────────────────────────
+
+    /// Mutation check: making the `Confirmed` arm carry `rebound_from:
+    /// Some(..)` (or dropping the registry's `config_dir`) fails this.
+    #[test]
+    fn verdict_confirmed_migrates_the_registry_account() {
+        let id = MigrationIdentity::Confirmed {
+            sid: REC.into(),
+            config_dir: PathBuf::from(".claude-tiohorst"),
+        };
+        for trigger in [
+            MigrationTrigger::UsageLimitHint,
+            MigrationTrigger::OperatorCommand,
+        ] {
+            assert_eq!(
+                migration_verdict(id.clone(), REC, trigger),
+                MigrationVerdict::Proceed {
+                    sid: REC.into(),
+                    config_dir: PathBuf::from(".claude-tiohorst"),
+                    rebound_from: None,
+                }
+            );
+        }
+    }
+
+    /// Rebound migrates the PROVIDER's id and names the record's id so the
+    /// caller corrects the record first.
+    ///
+    /// Mutation check: `rebound_from: None` in the `Rebound` arm fails this.
+    #[test]
+    fn verdict_rebound_migrates_the_provider_id_and_names_the_record_id() {
+        let id = MigrationIdentity::Rebound {
+            sid: "506a0190".into(),
+            config_dir: PathBuf::from(".claude-tiohorst"),
+        };
+        assert_eq!(
+            migration_verdict(id, REC, MigrationTrigger::UsageLimitHint),
+            MigrationVerdict::Proceed {
+                sid: "506a0190".into(),
+                config_dir: PathBuf::from(".claude-tiohorst"),
+                rebound_from: Some(REC.into()),
+            }
+        );
+    }
+
+    /// A proven second live holder refuses on BOTH triggers, with the typed
+    /// reason naming the pid.
+    ///
+    /// Mutation check: routing `HeldElsewhere` to `ProceedOnRecord` for the
+    /// operator command fails the loop's second iteration.
+    #[test]
+    fn verdict_held_elsewhere_refuses_on_every_trigger() {
+        for trigger in [
+            MigrationTrigger::UsageLimitHint,
+            MigrationTrigger::OperatorCommand,
+        ] {
+            assert_eq!(
+                migration_verdict(
+                    MigrationIdentity::HeldElsewhere { pid: P2_PID },
+                    REC,
+                    trigger
+                ),
+                MigrationVerdict::Refuse {
+                    reason: "session-live-in-another-process(pid 46416)".into()
+                }
+            );
+        }
+    }
+
+    /// Unknown refuses the automatic hint (an unproven identity never closes a
+    /// pane) and falls back to the record only for the operator's click.
+    ///
+    /// Mutation check: swapping the two `Unknown` sub-arms fails both
+    /// assertions.
+    #[test]
+    fn verdict_unknown_refuses_the_hint_and_defers_to_the_operator() {
+        let id = MigrationIdentity::Unknown("process table unreadable".into());
+        assert_eq!(
+            migration_verdict(id.clone(), REC, MigrationTrigger::UsageLimitHint),
+            MigrationVerdict::Refuse {
+                reason: "identity-unresolved(process table unreadable)".into()
+            }
+        );
+        assert_eq!(
+            migration_verdict(id, REC, MigrationTrigger::OperatorCommand),
+            MigrationVerdict::ProceedOnRecord {
+                why: "process table unreadable".into()
+            }
+        );
+    }
+
+    /// The registry's dir is re-spelled as the roster entry naming the same
+    /// path, so the exact-string usage lookup finds it; an unlisted dir is
+    /// kept as-is.
+    ///
+    /// Mutation check: returning `dir.to_string_lossy()` unconditionally
+    /// fails the first assertion (the spellings differ).
+    #[test]
+    fn roster_spelling_prefers_the_roster_string() {
+        // `./` is dropped by `Path` component comparison but kept in the
+        // string, so the two spellings differ on every platform.
+        let roster = vec!["/claude/./.claude-lukas".to_string()];
+        let found = PathBuf::from("/claude/.claude-lukas");
+        assert_eq!(roster_spelling(&found, &roster), "/claude/./.claude-lukas");
+        let other = PathBuf::from("/x/.claude-ben");
+        assert_eq!(
+            roster_spelling(&other, &roster),
+            other.to_string_lossy().into_owned()
+        );
     }
 }
