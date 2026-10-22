@@ -2470,10 +2470,10 @@ pub struct AssertResponse {
     pub results: Vec<qontinui_vision_core::AssertionResult>,
     pub all_passed: bool,
     /// Why frame capture failed, when it did. Most assertions evaluate from
-    /// the snapshot and are untouched by it, but the L1 image assertions
-    /// read the frame's pixels and answer `unknown` without one (a slot
-    /// placeholder marker can still fail `no_placeholder_images`) — so it
-    /// must be visible, not inferred from a missing field.
+    /// the snapshot and are untouched by it, but the pixel-reading image
+    /// assertions answer `unknown` without one (a slot placeholder marker can
+    /// still fail `no_placeholder_images`) — so it must be visible, not
+    /// inferred from a missing field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_error: Option<String>,
     /// Provenance of the frame this call captured, when it captured one.
@@ -2667,23 +2667,38 @@ async fn vision_analyze_handler(
         }
     };
 
-    let snapshot = req.snapshot.as_ref();
-    let prior = None; // future: look up by sha256 in cache
-
-    let input = qontinui_vision_core::AnalyzeInput {
-        frame: frame.as_ref(),
-        snapshot,
-        prior_frame: prior,
-    };
-    let result = qontinui_vision_core::analyzers::run(req.analyzer, &input);
-    // Stamped the instant the analyzer returns, not at response assembly —
-    // `evaluatedAt` says when the observation was made, and for a heavy
-    // analyzer over a large frame those are measurably different moments.
-    let evaluated_at = chrono::Utc::now();
+    // The analyzers are CPU-bound pure functions — the `image` analyzer
+    // hashes, clusters and filters every image crop of a full frame — so
+    // they run on the blocking pool, not inline on a tokio worker. The
+    // owned frame and snapshot move in and come back out for the response.
+    let analyzer = req.analyzer;
+    let snapshot = req.snapshot;
+    let (result, evaluated_at, frame, snapshot) = spawn_blocking_tracked(move || {
+        let input = qontinui_vision_core::AnalyzeInput {
+            frame: frame.as_ref(),
+            snapshot: snapshot.as_ref(),
+            prior_frame: None, // future: look up by sha256 in cache
+        };
+        let result = qontinui_vision_core::analyzers::run(analyzer, &input);
+        // Stamped the instant the analyzer returns, not at response assembly —
+        // `evaluatedAt` says when the observation was made, and for a heavy
+        // analyzer over a large frame those are measurably different moments.
+        let evaluated_at = chrono::Utc::now();
+        (result, evaluated_at, frame, snapshot)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "vision/analyze: analyzer task join error: {e}"
+            ))),
+        )
+    })?;
 
     info!(
         "vision/analyze: analyzer={:?} findings={} verdict={:?} frame={}",
-        req.analyzer,
+        analyzer,
         result.findings.len(),
         result.verdict,
         if frame.is_some() {
@@ -2693,11 +2708,11 @@ async fn vision_analyze_handler(
         }
     );
     Ok(Json(ApiResponse::success(AnalyzeResponse::of(
-        req.analyzer,
+        analyzer,
         result,
         frame.as_ref(),
         frame_error,
-        snapshot,
+        snapshot.as_ref(),
         evaluated_at,
     ))))
 }
@@ -2745,41 +2760,62 @@ async fn vision_assert_handler(
             .collect()
     };
 
-    let ocr_borrowed: Option<Vec<qontinui_vision_core::OcrBlockRef<'_>>> =
-        req.ocr_blocks.as_ref().map(|blocks| {
-            blocks
-                .iter()
-                .map(|b| qontinui_vision_core::OcrBlockRef {
-                    bbox: qontinui_vision_core::Region {
-                        // OCR blocks are detected INSIDE a frame, so their
-                        // origin is a buffer index and can never be negative —
-                        // `OcrBbox` stays u32 and the widening cast is lossless.
-                        x: b.bbox.x as i32,
-                        y: b.bbox.y as i32,
-                        w: b.bbox.w,
-                        h: b.bbox.h,
-                    },
-                    text: b.text.as_str(),
-                    confidence: b.confidence,
-                })
-                .collect()
-        });
+    // Evaluated on the blocking pool for the same reason as the analyze
+    // handler: the L1 image assertions read the frame and hash, cluster and
+    // filter image crops. Everything the evaluation borrows moves in owned;
+    // the frame and snapshot come back out for the response.
+    let AssertRequest {
+        assertions,
+        snapshot,
+        ocr_blocks,
+        target: _,
+    } = req;
+    let (results, evaluated_at, frame, snapshot) = spawn_blocking_tracked(move || {
+        let ocr_borrowed: Option<Vec<qontinui_vision_core::OcrBlockRef<'_>>> =
+            ocr_blocks.as_ref().map(|blocks| {
+                blocks
+                    .iter()
+                    .map(|b| qontinui_vision_core::OcrBlockRef {
+                        bbox: qontinui_vision_core::Region {
+                            // OCR blocks are detected INSIDE a frame, so their
+                            // origin is a buffer index and can never be negative —
+                            // `OcrBbox` stays u32 and the widening cast is lossless.
+                            x: b.bbox.x as i32,
+                            y: b.bbox.y as i32,
+                            w: b.bbox.w,
+                            h: b.bbox.h,
+                        },
+                        text: b.text.as_str(),
+                        confidence: b.confidence,
+                    })
+                    .collect()
+            });
 
-    let ctx = qontinui_vision_core::EvalContext {
-        snapshot: req.snapshot.as_ref(),
-        frame: frame.as_ref(),
-        ocr_blocks: ocr_borrowed.as_deref(),
-        baselines: Some(&baselines_owned),
-    };
+        let ctx = qontinui_vision_core::EvalContext {
+            snapshot: snapshot.as_ref(),
+            frame: frame.as_ref(),
+            ocr_blocks: ocr_borrowed.as_deref(),
+            baselines: Some(&baselines_owned),
+        };
 
-    let results: Vec<_> = req
-        .assertions
-        .iter()
-        .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
-        .collect();
-    // See the analyze handler: stamped when evaluation finishes, not at
-    // response assembly.
-    let evaluated_at = chrono::Utc::now();
+        let results: Vec<_> = assertions
+            .iter()
+            .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
+            .collect();
+        // See the analyze handler: stamped when evaluation finishes, not at
+        // response assembly.
+        let evaluated_at = chrono::Utc::now();
+        (results, evaluated_at, frame, snapshot)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "vision/assert: evaluation task join error: {e}"
+            ))),
+        )
+    })?;
     info!(
         "vision/assert: {} assertions, {} passed, {} failed",
         results.len(),
@@ -2789,7 +2825,7 @@ async fn vision_assert_handler(
 
     Ok(Json(ApiResponse::success(AssertResponse::of(
         results,
-        req.snapshot.as_ref(),
+        snapshot.as_ref(),
         frame.as_ref(),
         frame_error,
         evaluated_at,
@@ -2979,23 +3015,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 mod tests {
     use super::*;
 
-    /// The `/vision/assert` 422 hint is the only place the assertion DSL's
-    /// vocabulary is advertised to a caller, and it is a hand-maintained
-    /// duplicate of `qontinui_vision_core::assertions::Assertion` rather than
-    /// a derivation of it — the enum has no `strum`-style variant iterator.
-    /// Adding `element_above` (U3) took the list from 11 to 12, and the L1
-    /// image assertions (image plan Phase 15) from 12 to 20; without a pin, a
-    /// variant added upstream stays undiscoverable while `evaluate_assertion`
-    /// (which is variant-agnostic) handles it fine.
-    ///
-    /// [`assertion_wire_name`] is the link to the enum: its match has no `_`
-    /// arm, so a variant vision-core adds fails this test build until it is
-    /// named there — and every name it returns must be in `EXPECTED`.
-    ///
-    /// The prose hint and the structured array are ALSO two separate copies of
-    /// the same list, so both are checked here.
-    /// The wire name of every `Assertion` variant. No `_` arm, on purpose:
-    /// this match is what ties the hand-written hint to the enum.
+    /// The wire name of every `Assertion` variant. No `_` arm, on purpose: a
+    /// new variant fails the build here, beside [`ASSERTION_WIRE_NAMES`].
     fn assertion_wire_name(a: &qontinui_vision_core::Assertion) -> &'static str {
         use qontinui_vision_core::Assertion as A;
         match a {
@@ -3021,6 +3042,31 @@ mod tests {
             A::ImageBlockinessWithin { .. } => "image_blockiness_within",
         }
     }
+
+    /// Every name [`assertion_wire_name`] returns, in its arm order. Keep the
+    /// two together: an arm added there belongs here too.
+    const ASSERTION_WIRE_NAMES: [&str; 20] = [
+        "no_overlap",
+        "element_above",
+        "contains_text",
+        "text_fits_container",
+        "aligned_horizontally",
+        "aligned_vertically",
+        "color_within",
+        "typography_consistent",
+        "no_layout_shift_since",
+        "no_clipping",
+        "animation_settled",
+        "contrast_meets_wcag",
+        "image_palette_within",
+        "no_near_duplicate_images",
+        "no_placeholder_images",
+        "image_focal_visible",
+        "transparent_image_legible",
+        "salience_order",
+        "image_sharpness_at_least",
+        "image_blockiness_within",
+    ];
 
     /// One parsed instance of every assertion type, from the wire form a
     /// caller writes — so a linked vision-core that lacks a type fails here
@@ -3055,12 +3101,40 @@ mod tests {
         .expect("every advertised assertion type must parse against the linked vision-core")
     }
 
+    /// No `_` arm: a new `Analyzer` variant fails this test build until it
+    /// is given an arm here, beside [`ANALYZER_WIRE_NAMES`].
+    fn analyzer_wire_name(a: qontinui_vision_core::Analyzer) -> &'static str {
+        use qontinui_vision_core::Analyzer as A;
+        match a {
+            A::Layout => "layout",
+            A::Typography => "typography",
+            A::Color => "color",
+            A::Dynamic => "dynamic",
+            A::Elements => "elements",
+            A::Image => "image",
+        }
+    }
+
+    /// Every name [`analyzer_wire_name`] returns, in its arm order. Keep the
+    /// two together: an arm added there belongs here too.
+    const ANALYZER_WIRE_NAMES: [&str; 6] = [
+        "layout",
+        "typography",
+        "color",
+        "dynamic",
+        "elements",
+        "image",
+    ];
+
     /// The `/vision/analyze` 422 hint advertises the analyzer vocabulary the
     /// same way the assert hint does, and drifts the same way: `image` (image
     /// plan Phase 15) was added to vision-core while this list stayed at
-    /// five. The exhaustive match in [`analyzer_wire_name`] is the link to
-    /// the enum, and every advertised name must parse as an `Analyzer` of
-    /// the crate this runner links, whose own `name()` must agree.
+    /// five. [`analyzer_wire_name`]'s missing `_` arm forces a new variant
+    /// to be named beside [`ANALYZER_WIRE_NAMES`], which must equal the
+    /// advertised list; every name must parse as an `Analyzer` of the crate
+    /// this runner links and map back to itself through the match and
+    /// through vision-core's own `name()`. An arm added without its name in
+    /// the array is not detectable at runtime (nothing enumerates the enum).
     #[test]
     fn analyze_request_hint_advertises_every_analyzer() {
         const EXPECTED: [&str; 6] = [
@@ -3085,8 +3159,12 @@ mod tests {
             EXPECTED.as_slice(),
             "allowedAnalyzers drifted from vision-core's Analyzer enum"
         );
+        assert_eq!(
+            ANALYZER_WIRE_NAMES, EXPECTED,
+            "ANALYZER_WIRE_NAMES (beside the exhaustive match) drifted from EXPECTED"
+        );
 
-        for name in EXPECTED {
+        for name in ANALYZER_WIRE_NAMES {
             let parsed: qontinui_vision_core::Analyzer =
                 serde_json::from_value(serde_json::json!(name))
                     .unwrap_or_else(|e| panic!("`{name}` must parse as an Analyzer: {e}"));
@@ -3102,20 +3180,6 @@ mod tests {
                 prose.contains(&format!("\"{name}\"")),
                 "the prose hint omits `{name}`: {prose}"
             );
-        }
-    }
-
-    /// No `_` arm: a new `Analyzer` variant fails this test build until it
-    /// is named here and added to the hint.
-    fn analyzer_wire_name(a: qontinui_vision_core::Analyzer) -> &'static str {
-        use qontinui_vision_core::Analyzer as A;
-        match a {
-            A::Layout => "layout",
-            A::Typography => "typography",
-            A::Color => "color",
-            A::Dynamic => "dynamic",
-            A::Elements => "elements",
-            A::Image => "image",
         }
     }
 
@@ -3187,6 +3251,26 @@ mod tests {
         );
     }
 
+    /// The `/vision/assert` 422 hint is the only place the assertion DSL's
+    /// vocabulary is advertised to a caller, and it is a hand-maintained
+    /// duplicate of `qontinui_vision_core::assertions::Assertion` rather than
+    /// a derivation of it — the enum has no `strum`-style variant iterator.
+    /// Adding `element_above` (U3) took the list from 11 to 12, and the L1
+    /// image assertions (image plan Phase 15) from 12 to 20; without a pin, a
+    /// variant added upstream stays undiscoverable while `evaluate_assertion`
+    /// (which is variant-agnostic) handles it fine.
+    ///
+    /// What ties the list to the enum, and how far: [`assertion_wire_name`]
+    /// has no `_` arm, so a variant vision-core adds fails this test build
+    /// until it is given an arm there — beside [`ASSERTION_WIRE_NAMES`], which
+    /// this test holds equal to `EXPECTED` and to the names the parsed
+    /// samples map to. Nothing can enumerate the enum's variants at runtime,
+    /// so an arm added WITHOUT its name in that array is caught only if a
+    /// sample of it is added too; the compile error is what puts the author
+    /// next to both.
+    ///
+    /// The prose hint and the structured array are ALSO two separate copies of
+    /// the same list, so both are checked here.
     #[test]
     fn assert_request_hint_advertises_the_full_assertion_vocabulary() {
         const EXPECTED: [&str; 20] = [
@@ -3212,21 +3296,26 @@ mod tests {
             "image_blockiness_within",
         ];
 
-        // Every wire name the exhaustive match knows is advertised, and each
-        // one round-trips through the linked crate's serde as that variant.
-        for sample in assertion_samples() {
-            let name = assertion_wire_name(&sample);
-            assert!(
-                EXPECTED.contains(&name),
-                "vision-core variant `{name}` is missing from EXPECTED"
-            );
-            let wire = serde_json::to_value(&sample).expect("serialize assertion");
-            assert_eq!(wire["type"], name, "wire tag of {sample:?}");
-        }
+        // The names the exhaustive match knows are the advertised ones.
         assert_eq!(
-            assertion_samples().len(),
-            EXPECTED.len(),
-            "one sample per advertised type"
+            ASSERTION_WIRE_NAMES, EXPECTED,
+            "ASSERTION_WIRE_NAMES (beside the exhaustive match) drifted from EXPECTED"
+        );
+        // One sample per name, each mapping through the match to that name and
+        // round-tripping through the linked crate's serde as that variant.
+        let sampled: Vec<&str> = assertion_samples()
+            .iter()
+            .map(|sample| {
+                let name = assertion_wire_name(sample);
+                let wire = serde_json::to_value(sample).expect("serialize assertion");
+                assert_eq!(wire["type"], name, "wire tag of {sample:?}");
+                name
+            })
+            .collect();
+        assert_eq!(
+            sampled,
+            ASSERTION_WIRE_NAMES.as_slice(),
+            "one sample per wire name, in order"
         );
 
         let data = <AssertRequest as RequestHints>::shape_error_data()
