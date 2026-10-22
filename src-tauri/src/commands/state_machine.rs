@@ -1,4 +1,4 @@
-//! State machine navigation commands
+//! Action log commands
 //!
 //! This module handles action log operations: viewing and clearing the log.
 
