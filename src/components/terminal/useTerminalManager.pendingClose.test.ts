@@ -77,7 +77,17 @@ let container: HTMLDivElement;
 let root: Root;
 let mounted = false;
 
-/** Let the mocked IPC promises and their `.then` chains commit. */
+/**
+ * Let the mocked IPC promises and their `.then` chains commit.
+ *
+ * Only `setTimeout` / `clearTimeout` are faked, so promise microtasks still run
+ * normally — but only when something awaits. Every mocked `invoke` resolves
+ * immediately, and no chain in the hook is longer than a handful of `.then`
+ * hops, so ten awaited ticks inside one async `act` drain them all (and let
+ * the resulting state commit). Timer-driven work (the 10 s expiry, the 400 ms
+ * exit debounce) is NOT advanced here: tests move the clock explicitly with
+ * `vi.advanceTimersByTime`.
+ */
 async function flush() {
   await act(async () => {
     for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -214,6 +224,46 @@ describe("useTerminalManager deferred close (real hook)", () => {
     expect(tabIds()).toEqual([]);
     expect(kills()).toBe(1);
     expect(toasts).toHaveLength(0);
+  });
+
+  it("Undo then an immediate re-close (before the next commit) defers again, not kill-now", async () => {
+    await mountWith();
+    act(() => {
+      manager().closeTerminal("t1");
+    });
+    // Undo and the second close in ONE act: no commit (and so no post-commit
+    // `tabsRef` effect) runs between them.
+    act(() => {
+      toasts[0].action?.onClick();
+      manager().closeTerminal("t1");
+    });
+    expect(kills()).toBe(0);
+    expect(toasts).toHaveLength(2);
+    expect(toasts[1].action?.label).toBe("Undo");
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(kills()).toBe(1);
+  });
+
+  it("a claudeSessionId pinned during the window is in the close record the expiry sends", async () => {
+    await mountWith();
+    act(() => {
+      manager().closeTerminal("t1");
+    });
+    act(() => {
+      manager().updateTab("t1", { claudeSessionId: "sess-late" });
+    });
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    const records = invokeCalls.filter((c) => c.cmd === "terminal_session_record_close");
+    expect(records).toHaveLength(1);
+    expect(records[0].args).toEqual({
+      claudeSessionId: "sess-late",
+      terminalId: "t1",
+      reason: "explicit",
+    });
   });
 
   it("dismissing an exited session kills at once with no Undo toast", async () => {
