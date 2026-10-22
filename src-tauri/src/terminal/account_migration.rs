@@ -1363,14 +1363,16 @@ mod tests {
     #[test]
     fn carried_subagents_are_named_on_one_line_as_resumable() {
         let text = continue_nudge(&[
-            agent("a10fe2a6718228f32", Some("Finish\nPhase 2\r\tnow")),
+            // Whitespace controls AND a non-whitespace one (ESC), which only
+            // the control-character scrub removes.
+            agent("a10fe2a6718228f32", Some("Finish\nPhase 2\r\tnow\u{1b}[0m")),
             agent("a56400", None),
         ]);
         assert_eq!(
             text.strip_prefix(CONTINUE_NUDGE)
                 .expect("the existing text, then the list"),
             " The migration carried 2 subagent transcript(s) to this account, resumable with \
-             SendMessage to their agent id: a10fe2a6718228f32 (\"Finish Phase 2 now\"), a56400."
+             SendMessage to their agent id: a10fe2a6718228f32 (\"Finish Phase 2 now [0m\"), a56400."
         );
         assert!(
             !text.chars().any(char::is_control),

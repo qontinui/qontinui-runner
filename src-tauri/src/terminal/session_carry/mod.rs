@@ -552,10 +552,14 @@ fn meta_description(path: &Path) -> Option<String> {
 /// - the source must have moved on since the carry: a `.jsonl` must have GROWN
 ///   past both its carried size and the destination's (append-only, never
 ///   truncate); any other file must differ in size or mtime. A file that is new
-///   since the carry counts as moved on when the destination is still absent.
+///   since the carry counts as moved on when the destination is still absent,
+///   and so does a file the carry failed to write.
 ///
-/// The copy re-checks the destination immediately before its rename and backs
-/// out if it changed while the bytes were being written.
+/// The copy re-checks the destination immediately before its rename (and
+/// again before its one retry) and backs out if it changed while the bytes
+/// were being written. That narrows the race with the resumed process to the
+/// gap between that check and the rename; it does not close it — Windows has
+/// no rename-if-unchanged — so this is best-effort, not a guarantee.
 ///
 /// `<sid>.jsonl` is never touched: from the moment of respawn the resumed
 /// process owns the destination's main transcript.
@@ -600,7 +604,11 @@ pub(crate) fn delta_sync(
                 sync.refused_destination_changed += 1;
                 return;
             }
-            let moved_on = recorded.is_none_or(|r| source_moved_on(rel, r.src, src, dst_now));
+            // A file the carry failed to write (destination still absent) is
+            // retried even when its source did not move on: there is nothing
+            // at the destination to overwrite.
+            let moved_on = recorded
+                .is_none_or(|r| r.dst.is_none() || source_moved_on(rel, r.src, src, dst_now));
             if !moved_on {
                 sync.unchanged += 1;
                 return;
@@ -651,17 +659,27 @@ fn copy_if_destination_is(
         std::fs::create_dir_all(parent)?;
     }
     let partial = write_partial(from, to)?;
-    if FileStamp::of(to) != expected {
-        let _ = std::fs::remove_file(&partial);
-        return Ok(false);
-    }
-    match rename_with_retry(&partial, to) {
-        Ok(()) => Ok(true),
-        Err(e) => {
-            let _ = std::fs::remove_file(&partial);
-            Err(e)
+    // Not `rename_with_retry`: a `PermissionDenied` here is most likely the
+    // resumed `claude` holding the destination open while it writes, so the
+    // stamp is checked again before the one retry, never assumed unchanged.
+    let mut attempt = 0;
+    let outcome = loop {
+        if FileStamp::of(to) != expected {
+            break Ok(false);
         }
+        match std::fs::rename(&partial, to) {
+            Ok(()) => break Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt == 0 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    if !matches!(outcome, Ok(true)) {
+        let _ = std::fs::remove_file(&partial);
     }
+    outcome
 }
 
 /// One look at whether the old writer is still alive.
