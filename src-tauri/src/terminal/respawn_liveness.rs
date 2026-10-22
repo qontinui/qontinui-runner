@@ -282,26 +282,28 @@ impl PaneOps for ManagerPanes {
                 return CliPresence::NoCli;
             };
             let Some(pid) = session.child_pid() else {
-                // A remote pane: its subtree cannot be observed from here.
+                info!(
+                    terminal_id,
+                    "respawn-liveness: the pane has no local process id (a remote pane) — whether it hosts a CLI is UNKNOWN"
+                );
                 return CliPresence::Unknown;
             };
             let snapshot =
                 crate::process_capture::process_tree::snapshot_process_table_public().await;
-            // The lifecycle poll's own guard (`tick_snapshot_ok`): an empty
-            // table is a FAILED snapshot, not a process-free machine.
-            if snapshot.parent_map.is_empty() {
-                return CliPresence::Unknown;
-            }
-            // The lifecycle poll's own liveness signal. Reference 0 disables
-            // the PID-reuse guard: the pid is the child of a pane this runner
-            // holds and whose child is still running, so it cannot have been
-            // recycled under it.
-            if crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
-                pid, &snapshot, 0,
-            ) {
-                CliPresence::Hosts
-            } else {
-                CliPresence::NoCli
+            // The steward's own "does a claude live in this pane" read, which
+            // answers `None` for an unreadable (empty) process table — the
+            // lifecycle poll's `tick_snapshot_ok` guard.
+            match crate::mcp::steward::pane_hosts_claude(&snapshot, Some(pid)) {
+                Some(true) => CliPresence::Hosts,
+                Some(false) => CliPresence::NoCli,
+                None => {
+                    info!(
+                        terminal_id,
+                        pid,
+                        "respawn-liveness: the process snapshot is unavailable — whether the pane hosts a CLI is UNKNOWN"
+                    );
+                    CliPresence::Unknown
+                }
             }
         })
     }
@@ -450,6 +452,25 @@ impl<'s> SessionCloseHold<'s> {
 
     fn take(&self, terminal_id: &str) -> Option<HeldClose> {
         self.store.take_held_close(&self.session, terminal_id)
+    }
+
+    /// A pane whose exit-close is already held has EXITED, whatever its last
+    /// screen read said: any verdict but `Died` becomes `Died(None)`, so it is
+    /// never handed (or left) the session. Re-run after every await that
+    /// follows the screen read — a close can be held during any of them.
+    fn judged(&self, terminal_id: &str, verdict: LivenessVerdict) -> LivenessVerdict {
+        match verdict {
+            LivenessVerdict::Died(code) => LivenessVerdict::Died(code),
+            other if self.has_held(terminal_id) => {
+                warn!(
+                    terminal_id,
+                    verdict = ?other,
+                    "respawn-liveness: the pane's exit-close is already held — judged Died"
+                );
+                LivenessVerdict::Died(None)
+            }
+            other => other,
+        }
     }
 
     /// `None` without an old pane.
@@ -738,21 +759,9 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                 Failure::ClosedByUser(c),
             );
         }
-        let verdict = effects.await_liveness(&current).await;
-        // A pane whose exit-close is already held has EXITED, whatever its
-        // last screen read said — it must not be handed the session.
-        let verdict = match verdict {
-            LivenessVerdict::Died(code) => LivenessVerdict::Died(code),
-            other if hold.has_held(&current) => {
-                warn!(
-                    terminal_id = %current,
-                    verdict = ?other,
-                    "respawn-liveness: the pane's exit-close is already held — judged Died"
-                );
-                LivenessVerdict::Died(None)
-            }
-            other => other,
-        };
+        // Judged before the probe below (an exited pane needs no probe) and
+        // again after it (the pane can exit while the probe awaits).
+        let verdict = hold.judged(&current, effects.await_liveness(&current).await);
         // Does the old pane still HOST a CLI? Asked only where the answer is
         // used (an unpainted pane during a migration), and BEFORE the
         // user-close checks below, so a close landing during this await is
@@ -767,6 +776,7 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
             }
             _ => None,
         };
+        let verdict = hold.judged(&current, verdict);
         if hold.old_pane() == Some(OldPane::ClosedByUser) {
             hold.abort_for_closed_old(&current);
             return RespawnOutcome::ClosedByUser { attempts };
@@ -1187,6 +1197,9 @@ mod tests {
         no_claude: std::sync::Mutex<Vec<String>>,
         /// Panes whose subtree cannot be read (a failed process snapshot).
         unreadable: std::sync::Mutex<Vec<String>>,
+        /// Runs once while the NEXT probe awaits — something landing then.
+        #[allow(clippy::type_complexity)]
+        on_probe: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl PaneOps for FakePanes {
@@ -1202,6 +1215,9 @@ mod tests {
                 && !self.closed.lock().unwrap().iter().any(|c| c == terminal_id)
         }
         fn hosts_claude<'a>(&'a self, terminal_id: &'a str) -> BoxFuture<'a, CliPresence> {
+            if let Some(f) = self.on_probe.lock().unwrap().take() {
+                f();
+            }
             let listed = |l: &std::sync::Mutex<Vec<String>>| {
                 l.lock().unwrap().iter().any(|n| n == terminal_id)
             };
@@ -2508,5 +2524,46 @@ mod tests {
             superseded(&store, "new-1"),
             "the unproven pane's close ends nothing"
         );
+    }
+
+    // ---- round 7 -----------------------------------------------------------
+
+    /// The NEW pane exits while the old-pane probe awaits (its pty-exit close
+    /// is held then), and the probe reads the old pane as a bare shell. The
+    /// pane is judged again after the probe: it is DEAD, so it is retried —
+    /// not kept as "unconfirmed" with its held exit-close replayed.
+    #[tokio::test]
+    async fn a_new_pane_exiting_during_the_old_pane_probe_is_retried() {
+        let (dir, store) = fresh_store();
+        let store: &'static SessionLifecycleStore = Box::leak(Box::new(store));
+        let old = record("old", "/src");
+        let mut fx = Fake::new(
+            store,
+            vec![LivenessVerdict::Unconfirmed, LivenessVerdict::Alive],
+        );
+        fx.panes.no_claude.lock().unwrap().push("old".into());
+        *fx.panes.on_probe.lock().unwrap() = Some(Box::new(move || {
+            let o = store.record_close_checked(SID, Some("new-1"), "pty-exit");
+            assert!(
+                matches!(o, CloseOutcome::HeldInFlight { .. }),
+                "fixture: held, {o:?}"
+            );
+        }));
+        let out = confirm_respawn(&mut fx, store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::Alive {
+                terminal_id: "new-2".into(),
+                attempts: 2
+            },
+            "the dead pane is retried, never reported kept"
+        );
+        let row = store.get(SID).unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.terminal_id.as_str()),
+            ("open", "new-2")
+        );
+        assert_eq!(store.held_session_count(), 0);
+        drop(dir);
     }
 }
