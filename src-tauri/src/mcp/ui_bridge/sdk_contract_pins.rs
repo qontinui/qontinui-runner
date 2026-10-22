@@ -893,53 +893,57 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
 }
 
 /// The expected-overlay ADMISSION rule, against the SDK's `modalIdentities`
-/// (`visibility-report.ts`, ui-bridge `eb8ed32`):
-/// `if (modal?.blocking !== true) continue`. Only a modal whose `blocking` is
-/// exactly `true` contributes its `id` / `bridgeId`; `false`, absent and
-/// non-boolean are all NOT admitted, so a detector that omits the flag can
-/// never hide an occlusion. Admission lives in one predicate
-/// (`screenshots.rs::admits_as_expected_overlay`) so a tighter SDK rule is a
-/// one-line change there — and this pin is where that change shows up.
+/// (`visibility-report.ts`, ui-bridge `4846771`):
+/// `if (modal?.blockingSource !== 'element') continue`. Only a modal whose
+/// `blockingSource` is exactly `"element"` contributes its `id` / `bridgeId`.
+/// `"backdrop"`, an absent field (a non-blocking modal, or a page SDK older
+/// than the field — even one saying `blocking: true`), and any other value are
+/// NOT admitted, so a detector that cannot vouch for a modal never hides an
+/// occlusion. Admission lives in one predicate
+/// (`screenshots.rs::admits_as_expected_overlay`), and this pin is where a
+/// change to the SDK rule has to show up.
 #[test]
-fn expected_overlay_admission_is_blocking_true_exactly() {
+fn expected_overlay_admission_is_blocking_source_element_exactly() {
     let ctx = serde_json::json!({
         "modals": [
-            { "id": "blocking-modal", "bridgeId": "bridge-blocking", "blocking": true },
+            { "id": "dialog", "bridgeId": "bridge-dialog", "blocking": true, "blockingSource": "element" },
+            { "id": "backdrop", "bridgeId": "bridge-backdrop", "blocking": true, "blockingSource": "backdrop" },
+            { "id": "legacy", "bridgeId": "bridge-legacy", "blocking": true },
             { "id": "drawer", "bridgeId": "bridge-drawer", "blocking": false },
             { "id": "menu", "bridgeId": "bridge-menu" },
-            { "id": "popover", "bridgeId": "bridge-popover", "blocking": 1 },
         ]
     });
     let ids = modal_ids_from_context(&ctx).expect("modals array present");
     assert_eq!(
         ids.ids,
-        std::collections::HashSet::from(["blocking-modal".to_string()]),
-        "only the blocking modal's id is admitted"
+        std::collections::HashSet::from(["dialog".to_string()]),
+        "only the element-declared modal's id is admitted"
     );
     assert_eq!(
         ids.bridge_ids,
-        std::collections::HashSet::from(["bridge-blocking".to_string()]),
-        "the bridgeId match honours the same blocking rule"
+        std::collections::HashSet::from(["bridge-dialog".to_string()]),
+        "the bridgeId match honours the same rule"
     );
 
-    let none = modal_ids_from_context(&serde_json::json!({
-        "modals": [{ "id": "menu" }]
-    }))
-    .expect("a non-blocking-only stack is still an answer");
-    assert!(
-        none.is_empty(),
-        "absent `blocking` = not blocking = nothing admitted"
-    );
-    let report = build_visibility_report(
-        &[occluded_element("btn-save", "menu", 40.0, "Save")],
-        0.02,
-        false,
-        Some(&none),
-        Some(&CanvasCoverage::measured_empty()),
-    );
-    assert_eq!(report["verdict"], "occlusions_found");
-    assert_eq!(report["expectedOverlaysFiltered"], 0);
-    assert_eq!(report["expectedOverlayDetection"], "modal-stack");
+    // Absent field = not admitted, end to end: the occlusion stays reported.
+    for modal in [
+        serde_json::json!({ "id": "menu", "blocking": true }),
+        serde_json::json!({ "id": "menu", "blocking": true, "blockingSource": "backdrop" }),
+    ] {
+        let none = modal_ids_from_context(&serde_json::json!({ "modals": [modal.clone()] }))
+            .expect("a stack that admits nothing is still an answer");
+        assert!(none.is_empty(), "{modal} must not be admitted");
+        let report = build_visibility_report(
+            &[occluded_element("btn-save", "menu", 40.0, "Save")],
+            0.02,
+            false,
+            Some(&none),
+            Some(&CanvasCoverage::measured_empty()),
+        );
+        assert_eq!(report["verdict"], "occlusions_found", "{modal}");
+        assert_eq!(report["expectedOverlaysFiltered"], 0, "{modal}");
+        assert_eq!(report["expectedOverlayDetection"], "modal-stack", "{modal}");
+    }
 }
 
 /// The TS responder for the census IPC. Same boundary as
