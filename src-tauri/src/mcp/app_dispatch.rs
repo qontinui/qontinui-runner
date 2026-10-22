@@ -628,24 +628,27 @@ impl AppDispatcher {
 // Tests
 // ============================================================================
 
+/// Test fixtures for an [`AppDispatcher`], shared with the tests of the
+/// handlers that dispatch through one (`sdk_client`'s `/sdk/` media override).
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::mcp::app_discovery::DiscoveredApp;
     use crate::mcp::sdk_client::{SdkAppInfo, SdkConnection};
-    use crate::mcp::ws_relay::WsConnectionManager;
     use serde_json::json;
 
     /// The next frame sent to a test WebSocket connection — bounded, so a
     /// dispatch that never sends fails the test instead of hanging it.
-    async fn next_frame(outbound_rx: &mut tokio::sync::mpsc::Receiver<String>) -> String {
+    pub(crate) async fn next_frame(
+        outbound_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> String {
         tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
             .await
             .expect("no frame within 5 s")
             .expect("outbound channel closed")
     }
 
-    fn sample_app(app_id: &str, base_url: &str) -> DiscoveredApp {
+    pub(crate) fn sample_app(app_id: &str, base_url: &str) -> DiscoveredApp {
         DiscoveredApp {
             app_id: app_id.to_string(),
             app_name: "t".into(),
@@ -661,6 +664,76 @@ mod tests {
             discovered_at: 0,
         }
     }
+
+    pub(crate) fn manager_with_active(
+        app_id: &str,
+        url: &str,
+        base_path: &str,
+    ) -> Arc<Mutex<SdkConnectionManager>> {
+        let mut mgr = SdkConnectionManager::new();
+        let info = SdkAppInfo {
+            app_id: app_id.to_string(),
+            app_name: "t".into(),
+            app_type: "web".into(),
+            framework: None,
+            version: None,
+            capabilities: vec![],
+            port: 0,
+        };
+        let conn = SdkConnection {
+            app_url: url.to_string(),
+            base_path: base_path.to_string(),
+            app_info: info,
+            client: reqwest::Client::new(),
+            connected_at: 0,
+            transport_kind: None,
+            physical_device_id: None,
+            activated_by: None,
+        };
+        mgr.connections.insert(url.to_string(), conn);
+        mgr.active_url = Some(url.to_string());
+        Arc::new(Mutex::new(mgr))
+    }
+
+    /// A loopback HTTP app answering ANY method and path with
+    /// `{success: true, got: <the JSON body it was sent, else null>}`, so a
+    /// test can see which arm's body the HTTP arm carried.
+    pub(crate) async fn json_echo_app() -> String {
+        let app = axum::Router::new().fallback(|bytes: axum::body::Bytes| async move {
+            let got: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            axum::Json(json!({"success": true, "got": got}))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        url
+    }
+
+    /// `manager_with_active` with the responsiveness cache primed "responsive"
+    /// as of now, so an HTTP dispatch skips the `/health` probe.
+    pub(crate) async fn responsive_active(
+        app_id: &str,
+        url: &str,
+    ) -> Arc<Mutex<SdkConnectionManager>> {
+        let mgr = manager_with_active(app_id, url, "");
+        {
+            let mut g = mgr.lock().await;
+            g.active_responsive = Some(true);
+            g.active_responsive_checked_at = chrono::Utc::now().timestamp_millis();
+        }
+        mgr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{manager_with_active, next_frame, sample_app};
+    use super::*;
+    use crate::mcp::ws_relay::WsConnectionManager;
+    use serde_json::json;
 
     #[tokio::test]
     async fn unregistered_app_returns_not_registered() {
@@ -721,36 +794,6 @@ mod tests {
 
         let out = handle.await.unwrap().unwrap();
         assert_eq!(out, json!({"ok": true}));
-    }
-
-    fn manager_with_active(
-        app_id: &str,
-        url: &str,
-        base_path: &str,
-    ) -> Arc<Mutex<SdkConnectionManager>> {
-        let mut mgr = SdkConnectionManager::new();
-        let info = SdkAppInfo {
-            app_id: app_id.to_string(),
-            app_name: "t".into(),
-            app_type: "web".into(),
-            framework: None,
-            version: None,
-            capabilities: vec![],
-            port: 0,
-        };
-        let conn = SdkConnection {
-            app_url: url.to_string(),
-            base_path: base_path.to_string(),
-            app_info: info,
-            client: reqwest::Client::new(),
-            connected_at: 0,
-            transport_kind: None,
-            physical_device_id: None,
-            activated_by: None,
-        };
-        mgr.connections.insert(url.to_string(), conn);
-        mgr.active_url = Some(url.to_string());
-        Arc::new(Mutex::new(mgr))
     }
 
     #[tokio::test]

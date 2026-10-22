@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::app_dispatch::{ArmPayloads, DispatchError};
+use super::app_dispatch::{AppDispatcher, ArmPayloads, DispatchError};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
@@ -392,14 +392,16 @@ async fn dispatch_app_request_typed(
     // `ws_payload` goes to the WS arm and `http_body` (or `null`) to the HTTP
     // arm. `dispatch_active` picks the body from the same registry read that
     // picks the arm (`ArmPayloads`), so the two cannot disagree.
-    dispatch_app_request_arms_typed(
-        state,
-        action,
-        http_method,
-        http_path,
-        split_arm_payloads(ws_payload, http_body),
-    )
-    .await
+    state
+        .app_dispatcher
+        .dispatch_active(
+            &state.sdk_connection,
+            action,
+            http_method,
+            http_path,
+            split_arm_payloads(ws_payload, http_body),
+        )
+        .await
 }
 
 /// The per-arm bodies of a caller that builds its WebSocket frame payload and
@@ -415,40 +417,6 @@ fn split_arm_payloads(
         websocket: ws_payload,
         http: http_body.unwrap_or(serde_json::Value::Null),
     }
-}
-
-/// [`dispatch_app_request`] for a command whose two arms take different
-/// bodies, built as one [`ArmPayloads`] so a caller cannot hand one arm's body
-/// to the other.
-pub async fn dispatch_app_request_arms(
-    state: &Arc<ApiState>,
-    action: &str,
-    http_method: Method,
-    http_path: &str,
-    payloads: ArmPayloads,
-) -> Result<serde_json::Value, String> {
-    dispatch_app_request_arms_typed(state, action, http_method, http_path, payloads)
-        .await
-        .map_err(dispatch_err_to_string)
-}
-
-async fn dispatch_app_request_arms_typed(
-    state: &Arc<ApiState>,
-    action: &str,
-    http_method: Method,
-    http_path: &str,
-    payloads: ArmPayloads,
-) -> Result<serde_json::Value, DispatchError> {
-    state
-        .app_dispatcher
-        .dispatch_active(
-            &state.sdk_connection,
-            action,
-            http_method,
-            http_path,
-            payloads,
-        )
-        .await
 }
 
 /// Send an HTTP request to the connected SDK app.
@@ -3486,34 +3454,104 @@ async fn handle_page_scroll_dispatch(
 // for a capture, then is undone.
 // ============================================================================
 
+/// The `/sdk/` media-override bodies, over what a test can construct: the
+/// dispatcher and the SDK connection the axum handlers read out of `ApiState`.
+/// Validation, the ceiling check and the per-arm fill (`sdk_*_bodies`) run
+/// HERE, before anything is dispatched, so a test entering through these
+/// functions observes them.
+pub(crate) async fn sdk_media_override_apply(
+    dispatcher: &AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    // The WS arm is engine-direct and gets an absent decode wait filled; the
+    // HTTP arm's app server fits it to its own relay budget (see
+    // `media_override::WaitFill`).
+    match crate::mcp::ui_bridge::media_override::sdk_override_bodies(body) {
+        Ok(payloads) => {
+            sdk_media_override_dispatch(
+                dispatcher,
+                sdk_connection,
+                "mediaOverride",
+                Method::POST,
+                payloads,
+            )
+            .await
+        }
+        Err(e) => serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e }),
+    }
+}
+
+/// [`sdk_media_override_apply`] for `DELETE`: restore one override or all.
+pub(crate) async fn sdk_media_override_restore(
+    dispatcher: &AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    // Bound `verifyTimeoutMs` to this transport: without it the SDK waits up to
+    // the override's own `decodeTimeoutMs`, which an override applied elsewhere
+    // (the injected runtime allows 60 s) can set past 30 s. The WS arm fills an
+    // absent one; the HTTP arm's app server fits it to its own relay budget.
+    match crate::mcp::ui_bridge::media_override::sdk_restore_bodies(body) {
+        Ok(payloads) => {
+            sdk_media_override_dispatch(
+                dispatcher,
+                sdk_connection,
+                "mediaOverrideRestore",
+                Method::DELETE,
+                payloads,
+            )
+            .await
+        }
+        Err(e) => serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e }),
+    }
+}
+
+/// [`sdk_media_override_apply`] for `GET`: the overrides still active.
+pub(crate) async fn sdk_media_override_list(
+    dispatcher: &AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+) -> serde_json::Value {
+    sdk_media_override_dispatch(
+        dispatcher,
+        sdk_connection,
+        "mediaOverrideList",
+        Method::GET,
+        // As before the extraction: an empty object on the WS arm, no body on
+        // the HTTP arm's GET.
+        split_arm_payloads(serde_json::json!({}), None),
+    )
+    .await
+}
+
+async fn sdk_media_override_dispatch(
+    dispatcher: &AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    action: &str,
+    method: Method,
+    payloads: ArmPayloads,
+) -> serde_json::Value {
+    match dispatcher
+        .dispatch_active(
+            sdk_connection,
+            action,
+            method,
+            "/control/media/override",
+            payloads,
+        )
+        .await
+    {
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": dispatch_err_to_string(e) }),
+    }
+}
+
 /// POST /ui-bridge/sdk/control/media/override — Swap one image slot in place in the SDK app
 async fn handle_media_override(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    // The WS arm is engine-direct and gets an absent decode wait filled; the
-    // HTTP arm's app server fits it to its own relay budget (see
-    // `media_override::WaitFill`).
-    let payloads = match crate::mcp::ui_bridge::media_override::sdk_override_bodies(body) {
-        Ok(b) => b,
-        Err(e) => {
-            return Json(
-                serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e }),
-            )
-        }
-    };
-    match dispatch_app_request_arms(
-        &state,
-        "mediaOverride",
-        Method::POST,
-        "/control/media/override",
-        payloads,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+    Json(sdk_media_override_apply(&state.app_dispatcher, &state.sdk_connection, body).await)
 }
 
 /// DELETE /ui-bridge/sdk/control/media/override — Restore one media override or all, verified
@@ -3524,47 +3562,12 @@ async fn handle_media_override_restore(
     let body = body
         .map(|Json(b)| b)
         .unwrap_or_else(|| serde_json::json!({}));
-    // Bound `verifyTimeoutMs` to this transport: without it the SDK waits up to
-    // the override's own `decodeTimeoutMs`, which an override applied elsewhere
-    // (the injected runtime allows 60 s) can set past 30 s. The WS arm fills an
-    // absent one; the HTTP arm's app server fits it to its own relay budget.
-    let payloads = match crate::mcp::ui_bridge::media_override::sdk_restore_bodies(body) {
-        Ok(b) => b,
-        Err(e) => {
-            return Json(
-                serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e }),
-            )
-        }
-    };
-    match dispatch_app_request_arms(
-        &state,
-        "mediaOverrideRestore",
-        Method::DELETE,
-        "/control/media/override",
-        payloads,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+    Json(sdk_media_override_restore(&state.app_dispatcher, &state.sdk_connection, body).await)
 }
 
 /// GET /ui-bridge/sdk/control/media/override — List the media overrides still active
 async fn handle_media_override_list(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match dispatch_app_request(
-        &state,
-        "mediaOverrideList",
-        serde_json::json!({}),
-        Method::GET,
-        "/control/media/override",
-        None,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+    Json(sdk_media_override_list(&state.app_dispatcher, &state.sdk_connection).await)
 }
 
 /// GET /ui-bridge/sdk/debug/metrics — Debug metrics
@@ -8836,7 +8839,6 @@ mod tests {
             let dispatches = [
                 "dispatch_app_request(",
                 "dispatch_app_request_typed(",
-                "dispatch_app_request_arms(",
                 "dispatch_app_request_by_id(",
                 "dispatch_active(",
                 "sdk_request(",
@@ -9682,5 +9684,151 @@ mod element_filters_tests {
         let filters = ElementFilters::from_query(&q);
         assert!(filters.keeps(&json!({"type": "button"})));
         assert!(filters.keeps(&json!({"category": "content"})));
+    }
+}
+
+/// The `/sdk/` media override, entered through its handler bodies with a real
+/// [`AppDispatcher`]: an HTTP-registered app that echoes what it is sent, and a
+/// WebSocket-registered one whose frame is read off the socket.
+#[cfg(test)]
+mod media_override_dispatch_tests {
+    use super::{
+        sdk_media_override_apply, sdk_media_override_list, sdk_media_override_restore,
+        SdkConnectionManager,
+    };
+    use crate::mcp::app_dispatch::test_support::{
+        json_echo_app, manager_with_active, next_frame, responsive_active, sample_app,
+    };
+    use crate::mcp::app_dispatch::AppDispatcher;
+    use crate::mcp::app_registry::{AppRegistry, AppTransport};
+    use crate::mcp::command_relay::CommandRelay;
+    use crate::mcp::ws_relay::WsConnectionManager;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    type Target = (Arc<AppDispatcher>, Arc<Mutex<SdkConnectionManager>>);
+
+    /// The active app is HTTP-registered and echoes `{success, got: <body>}`.
+    async fn http_app() -> Target {
+        let registry = AppRegistry::new();
+        let url = json_echo_app().await;
+        registry
+            .upsert(
+                sample_app("happ", &url),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        let relay = CommandRelay::new(WsConnectionManager::new());
+        (
+            AppDispatcher::new(registry, relay),
+            responsive_active("happ", &url).await,
+        )
+    }
+
+    /// The payload of the frame a WebSocket-registered active app is sent by
+    /// `call`, which is then abandoned (nothing answers it).
+    async fn websocket_frame<F>(call: F) -> Value
+    where
+        F: FnOnce(Target) -> tokio::task::JoinHandle<Value>,
+    {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "ws-app://wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let pending = call((
+            AppDispatcher::new(registry, relay),
+            manager_with_active("wapp", "ws-app://wapp", ""),
+        ));
+        let frame: Value = serde_json::from_str(&next_frame(&mut outbound_rx).await).unwrap();
+        pending.abort();
+        frame["payload"].clone()
+    }
+
+    fn refused_before_dispatch(out: &Value, needle: &str) {
+        assert_eq!(out["code"], json!("INVALID_REQUEST"), "{out}");
+        assert!(
+            out["error"].as_str().unwrap_or("").contains(needle),
+            "{out}"
+        );
+        assert!(
+            out.get("got").is_none(),
+            "the app must not have been sent it: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sdk_apply_refuses_an_invalid_body_before_anything_is_dispatched() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_apply(&d, &c, json!({"slotId": "a"})).await;
+        refused_before_dispatch(&out, "one of src, srcset, sources or backgroundImage");
+    }
+
+    #[tokio::test]
+    async fn the_sdk_apply_refuses_an_over_budget_wait_before_anything_is_dispatched() {
+        let (d, c) = http_app().await;
+        let body = json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 28_001});
+        let out = sdk_media_override_apply(&d, &c, body).await;
+        refused_before_dispatch(&out, "30000 ms budget");
+    }
+
+    #[tokio::test]
+    async fn the_sdk_apply_sends_an_http_app_no_wait_and_a_websocket_app_the_filled_wait() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_apply(&d, &c, json!({"slotId": "a", "src": "x"})).await;
+        assert_eq!(out["got"], json!({"slotId": "a", "src": "x"}), "{out}");
+
+        let frame = websocket_frame(|(d, c)| {
+            tokio::spawn(async move {
+                sdk_media_override_apply(&d, &c, json!({"slotId": "a", "src": "x"})).await
+            })
+        })
+        .await;
+        assert_eq!(
+            frame,
+            json!({"slotId": "a", "src": "x", "decodeTimeoutMs": 10_000})
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sdk_restore_refuses_an_invalid_body_before_anything_is_dispatched() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_restore(&d, &c, json!({"overrideId": ""})).await;
+        refused_before_dispatch(&out, "overrideId must be a non-empty string");
+        let out = sdk_media_override_restore(&d, &c, json!({"verifyTimeoutMs": 28_001})).await;
+        refused_before_dispatch(&out, "30000 ms budget");
+    }
+
+    #[tokio::test]
+    async fn the_sdk_restore_sends_an_http_app_no_wait_and_a_websocket_app_the_filled_wait() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_restore(&d, &c, json!({"overrideId": "mo-1"})).await;
+        assert_eq!(out["got"], json!({"overrideId": "mo-1"}), "{out}");
+
+        let frame = websocket_frame(|(d, c)| {
+            tokio::spawn(async move { sdk_media_override_restore(&d, &c, json!({})).await })
+        })
+        .await;
+        assert_eq!(frame, json!({"verifyTimeoutMs": 28_000}));
+    }
+
+    #[tokio::test]
+    async fn the_sdk_list_asks_the_active_app_for_its_overrides() {
+        let (d, c) = http_app().await;
+        let out = sdk_media_override_list(&d, &c).await;
+        assert_eq!(out["got"], Value::Null, "the HTTP arm's GET carries no body: {out}");
     }
 }
