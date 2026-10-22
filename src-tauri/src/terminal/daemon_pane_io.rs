@@ -1935,7 +1935,6 @@ impl PaneIo for DaemonPaneIo {
         Some(super::pane_io::HolderHandoff {
             holder_pid: self.holder_pid(),
             child_pid: self.child_pid,
-            unprotected: self.unprotected.as_ref().map(ToString::to_string),
             detach_confirmed: self.detach_frame_taken.load(Ordering::Acquire),
         })
     }

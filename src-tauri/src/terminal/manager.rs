@@ -134,6 +134,13 @@ impl Drop for ArmedClose<'_> {
     }
 }
 
+/// How long `close_all(_, Handoff)` keeps releasing holder panes past its
+/// global deadline before it abandons the rest unreleased (counted
+/// unconfirmed). Comfortably inside the teardown's force-exit margin, so the
+/// handoff can never be what trips the force-exit watchdog
+/// (`handoff_late_release_budget_fits_inside_the_force_exit_margin`).
+pub const HANDOFF_LATE_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What a [`CloseMode::Handoff`] `close_all` did, pane by pane — the counts
 /// its one summary line reports.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -853,6 +860,18 @@ impl TerminalManager {
         let info = session.info();
         let session = Arc::new(session);
 
+        // The terminal id is live in THIS runner now (an adopted holder pane
+        // reuses its id): a handoff mark left on it by an earlier close in this
+        // process must not refuse its later legitimate close.
+        {
+            use tauri::Manager;
+            if let Some(store) = emitter
+                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+            {
+                store.unmark_terminal_handed_off(&id);
+            }
+        }
+
         let mut sessions = self
             .sessions
             .lock()
@@ -1256,9 +1275,25 @@ impl TerminalManager {
             sessions.len(),
             mode
         );
+        if mode == CloseMode::Handoff {
+            let holders = sessions.iter().filter(|s| s.is_holder_backed()).count();
+            info!(
+                "handoff: starting — {} holder pane(s) to detach, {} in-process pane(s) to kill",
+                holders,
+                sessions.len() - holders
+            );
+        }
+        // Past the global deadline a holder pane is still DETACHED (killing it
+        // would defeat the restart), but those late releases are themselves
+        // capped: past `late_cap` the remaining holder panes are abandoned to
+        // their holders unreleased and counted unconfirmed, so the whole close
+        // stays inside the teardown's force-exit budget.
+        let late_cap = deadline + HANDOFF_LATE_RELEASE_BUDGET;
+        let mut abandoned: Vec<Arc<TerminalSession>> = Vec::new();
         let mut degraded = 0usize;
         for session in &sessions {
-            let past_deadline = std::time::Instant::now() >= deadline;
+            let now = std::time::Instant::now();
+            let past_deadline = now >= deadline;
             match mode {
                 CloseMode::Kill if past_deadline => {
                     session.close_kill_only();
@@ -1270,10 +1305,25 @@ impl TerminalManager {
                     summary.count(&super::session::HandoffOutcome::KilledInProcess);
                     degraded += 1;
                 }
+                CloseMode::Handoff if now >= late_cap => {
+                    summary.count(&session.abandon_for_handoff());
+                    abandoned.push(session.clone());
+                }
                 CloseMode::Handoff => {
                     summary.count(&session.close_for_handoff(Some(deadline)));
                 }
             }
+        }
+        if !abandoned.is_empty() {
+            warn!(
+                "handoff: the late-release budget ({:?}) ran out — {} holder pane(s) left to \
+                 their holders unreleased (unconfirmed)",
+                HANDOFF_LATE_RELEASE_BUDGET,
+                abandoned.len()
+            );
+            // Never dropped: dropping a session closes it, and that close kills.
+            // The process is about to exit, which ends the connections.
+            std::mem::forget(abandoned);
         }
         if degraded > 0 {
             warn!(
@@ -1858,6 +1908,30 @@ mod handoff_tests {
         assert_eq!(local.release_count(), 0, "kill-only: no release");
     }
 
+    /// Review round 1, item 5: the late releases are capped. A holder pane
+    /// reached after `deadline + HANDOFF_LATE_RELEASE_BUDGET` is neither
+    /// released nor killed — abandoned to its holder, counted unconfirmed.
+    #[test]
+    fn close_all_handoff_abandons_holder_panes_past_the_late_release_budget() {
+        let tm = TerminalManager::new();
+        let holder = Arc::new(FakeHolderIo::holder());
+        pane(&tm, holder.clone(), "very-late-holder");
+        let long_gone = std::time::Instant::now()
+            .checked_sub(super::HANDOFF_LATE_RELEASE_BUDGET + std::time::Duration::from_secs(1))
+            .expect("the monotonic clock is past a few seconds");
+
+        let summary = tm.close_all(long_gone, CloseMode::Handoff);
+
+        assert_eq!(summary.unconfirmed, 1, "{summary:?}");
+        assert_eq!(summary.detached, 0);
+        assert_eq!((holder.kill_count(), holder.release_count()), (0, 0));
+    }
+
+    #[test]
+    fn handoff_late_release_budget_fits_inside_the_force_exit_margin() {
+        assert!(super::HANDOFF_LATE_RELEASE_BUDGET < crate::shutdown_budget::FORCE_EXIT_MARGIN);
+    }
+
     #[test]
     fn the_summary_line_names_unprotected_holders_only_when_there_are_any() {
         let s = HandoffSummary {
@@ -1975,6 +2049,8 @@ mod handoff_e2e {
             let mut s = make_test_session(Arc::new(Mutex::new(Vec::new())));
             s.set_id_for_test(id.as_str());
             s.set_io_for_test(Arc::new(pane));
+            // The production observation of the live holder's cgroup.
+            s.set_protection_probe_for_test(crate::terminal::holder_census::holder_protection);
             tm.insert_for_test(id.as_str(), Arc::new(s));
         }
         let local = Arc::new(
@@ -1990,7 +2066,14 @@ mod handoff_e2e {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let summary = tm.close_all(deadline, CloseMode::Handoff);
-        assert_eq!(summary.detached, 2, "{summary:?}");
+        // Detached either way; whether this box's holders sit in their own
+        // scope (survivable) or the test's unit cgroup (killed by a unit stop)
+        // is the box's spawn route, and both mean the detach landed.
+        assert_eq!(
+            summary.detached + summary.killed_unprotected,
+            2,
+            "{summary:?}"
+        );
         assert_eq!(summary.killed_in_process, 1, "{summary:?}");
         assert_eq!(summary.unconfirmed, 0, "{summary:?}");
 

@@ -1761,6 +1761,15 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// Withdraw a [`Self::mark_terminal_handed_off`]: the handoff turned out
+    /// to hand nothing off (the holder was gone), or the terminal id is live in
+    /// this runner again — either way a close of it is a real close.
+    pub fn unmark_terminal_handed_off(&self, terminal_id: &str) {
+        if let Ok(mut set) = self.handed_off_terminals.lock() {
+            set.remove(terminal_id.trim());
+        }
+    }
+
     fn is_terminal_handed_off(&self, terminal_id: &str) -> bool {
         self.handed_off_terminals
             .lock()
@@ -6734,6 +6743,8 @@ mod tests {
             crate::coord_mcp::proxy_nonce_is_valid(&nonce),
             "the live claude's coord-mcp nonce must survive the handoff"
         );
+        // Withdrawn (the terminal is live here again): a close is real again,
+        // checked below once the D5 read is done.
         // D5: the adopted pane's row is still the ONE restore candidate for its
         // session — not closed, so not dropped, and not duplicated.
         let offered: Vec<String> = store
@@ -6742,6 +6753,16 @@ mod tests {
             .map(|r| r.claude_session_id)
             .collect();
         assert_eq!(offered.iter().filter(|id| *id == "handed").count(), 1);
+        store.unmark_terminal_handed_off("term-handed");
+        assert_eq!(
+            store.record_close_checked("handed", Some("term-handed"), "explicit"),
+            CloseOutcome::Closed {
+                claude_session_id: "handed".to_string()
+            },
+            "an unmarked terminal's close is a real close"
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert!(!crate::coord_mcp::proxy_nonce_is_valid(&nonce));
 
         // Baseline: the same close for a terminal that was NOT handed off.
         let wd2 = format!("D:/kill-wt-{}", uuid::Uuid::now_v7());
@@ -6756,7 +6777,7 @@ mod tests {
             }
         );
         assert_eq!(store.get("killed").unwrap().state, "closed");
-        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(fired.load(Ordering::SeqCst), 2);
         assert!(!crate::coord_mcp::proxy_nonce_is_valid(&nonce2));
     }
 

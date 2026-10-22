@@ -93,10 +93,6 @@ pub struct HolderHandoff {
     pub holder_pid: u32,
     /// The pane's child, in the holder's pid namespace.
     pub child_pid: u32,
-    /// `Some` (the holder's own wording) when the holder will NOT outlive the
-    /// runner even though it is detached — today only a holder sharing the
-    /// runner's systemd unit cgroup (`Unprotected::Cgroup`).
-    pub unprotected: Option<String>,
     /// Whether the holder TOOK this pane's `detach` frame within its budget.
     /// `false` before any release, and after a release whose frame the holder
     /// did not take (the connection was ended instead, which the holder also

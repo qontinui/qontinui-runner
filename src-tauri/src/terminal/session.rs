@@ -1604,24 +1604,28 @@ impl Waiter {
     /// no exit to record.
     fn settled(&self, waited: Result<i32, String>, effects: &dyn WaiterEffects) -> WaiterVerdict {
         let intent = CloseIntent::load(&self.close_intent);
+        // Only while the pane still reports a holder that took the handoff:
+        // a holder that died (or a child that exited) under the handoff is a
+        // REAL exit, and falls through to the exit path — as a runner-initiated
+        // one, since the runner's close is what this settle answers.
         if intent == CloseIntent::Handoff {
-            self.alive.store(false, Ordering::SeqCst);
-            match self.io.holder_handoff() {
-                Some(h) => info!(
+            if let Some(h) = self.io.holder_handoff() {
+                self.alive.store(false, Ordering::SeqCst);
+                info!(
                     terminal_id = %self.id,
                     holder_pid = h.holder_pid,
                     child_pid = h.child_pid,
                     "terminal handed off — process left running in holder {}",
                     h.holder_pid
-                ),
-                None => warn!(
-                    terminal_id = %self.id,
-                    settled = ?waited,
-                    "terminal handed off, but the pane no longer reports a live holder — the \
-                     next runner's boot sweep decides whether it survived"
-                ),
+                );
+                return WaiterVerdict::HandedOff;
             }
-            return WaiterVerdict::HandedOff;
+            warn!(
+                terminal_id = %self.id,
+                settled = ?waited,
+                "a handoff close's pane no longer reports a live holder — treating the settle \
+                 as the process's exit"
+            );
         }
 
         let code = match waited {
@@ -1643,7 +1647,7 @@ impl Waiter {
         // `on_exit_hook_code`).
         let exit_facts = PaneExitFacts {
             code,
-            close_requested: intent == CloseIntent::RunnerKill,
+            close_requested: intent != CloseIntent::None,
         };
         if let Ok(mut snap) = self.exit_snapshot.lock() {
             *snap = Some((exit_facts, std::time::Instant::now()));
@@ -1727,6 +1731,11 @@ pub struct TerminalSession {
     /// Why the runner is closing this pane — [`CloseIntent`] as a `u8`, shared
     /// with the waiter, which reads it to classify a settled `wait`.
     close_intent: Arc<AtomicU8>,
+    /// How a handoff close observes whether this pane's holder survives the
+    /// runner's stop — `holder_census::holder_protection` (the live holder's
+    /// cgroup, the same reading `/restart-readiness` makes, so an ADOPTED pane
+    /// is classified as truly as a freshly spawned one). A test substitutes it.
+    protection_probe: fn(u32) -> crate::session::tracking_health::HolderProtection,
     /// Exit code (set when process exits).
     exit_code: Arc<Mutex<Option<i32>>>,
     /// The exit facts FROZEN by the waiter as the process ended, with that
@@ -2681,6 +2690,7 @@ impl TerminalSession {
             rows: AtomicU16::new(rows),
             is_alive,
             close_intent,
+            protection_probe: crate::terminal::holder_census::holder_protection,
             exit_code,
             reader_join: Mutex::new(Some(reader_handle)),
             waiter_join: Mutex::new(Some(waiter_handle)),
@@ -5053,7 +5063,7 @@ impl TerminalSession {
     /// exactly as by [`Self::close_with_deadline`]. Plan
     /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
     /// D2.
-    pub fn close_for_handoff(&self, deadline: Option<std::time::Instant>) -> HandoffOutcome {
+    pub(crate) fn close_for_handoff(&self, deadline: Option<std::time::Instant>) -> HandoffOutcome {
         self.close_inner(deadline, CloseKind::Handoff)
     }
 
@@ -5102,11 +5112,7 @@ impl TerminalSession {
             // next runner adopts this pane under, queue a coord `Closed`, or
             // revoke the workdir's coord-mcp nonce the live process still
             // uses (plan Phase 0, probe 6).
-            if let Some(store) = self.app_handle.as_ref().and_then(|app| {
-                tauri::Manager::try_state::<
-                    Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
-                >(app)
-            }) {
+            if let Some(store) = self.lifecycle_store() {
                 store.mark_terminal_handed_off(&self.id);
             }
         } else {
@@ -5284,7 +5290,17 @@ impl TerminalSession {
         if let Some(sink) = sink {
             sink.emit_handed_off(&self.id, holder.holder_pid);
         }
-        let outcome = handoff_outcome(&holder, self.io.holder_handoff(), released);
+        let after = self.io.holder_handoff();
+        let holder_gone = after.is_none();
+        let outcome = handoff_outcome(&holder, after, released, self.protection_probe);
+        // An unconfirmed handoff whose holder is GONE handed nothing off: the
+        // process died with it. Withdraw the handed-off mark so a later close
+        // of this terminal in this process is a real close again.
+        if holder_gone && matches!(outcome, HandoffOutcome::Unconfirmed { .. }) {
+            if let Some(store) = self.lifecycle_store() {
+                store.unmark_terminal_handed_off(&self.id);
+            }
+        }
         match &outcome {
             HandoffOutcome::Detached { holder_pid } => info!(
                 terminal_id = %self.id,
@@ -5296,7 +5312,6 @@ impl TerminalSession {
                 terminal_id = %self.id,
                 holder_pid,
                 reason = %reason,
-                unprotected = ?holder.unprotected,
                 "Terminal session detached, but its holder shares the runner's unit cgroup \
                  and dies with it — reported KILLED, not survivable"
             ),
@@ -5310,6 +5325,44 @@ impl TerminalSession {
             HandoffOutcome::KilledInProcess => {}
         }
         outcome
+    }
+
+    /// The app's session lifecycle store, when this session runs in an app.
+    fn lifecycle_store(
+        &self,
+    ) -> Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>> {
+        let app = self.app_handle.as_ref()?;
+        tauri::Manager::try_state::<
+            Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+        >(app)
+        .map(|s| s.inner().clone())
+    }
+
+    /// Give up on handing this pane off WITHOUT touching it — the handoff
+    /// teardown's total budget ran out before its turn (plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// review round 1). Its intent is recorded as a handoff and its terminal
+    /// marked handed off, exactly as a handoff close would, but nothing is
+    /// released: the imminent process exit ends this runner's connections,
+    /// which the holder reads as a detach, so the process lives on UNCONFIRMED.
+    /// The caller must not let the session DROP afterwards — a drop of a live
+    /// session closes it, and that close kills.
+    pub(crate) fn abandon_for_handoff(&self) -> HandoffOutcome {
+        let holder_pid = self.io.holder_handoff().map(|h| h.holder_pid).unwrap_or(0);
+        CloseIntent::Handoff.store(&self.close_intent);
+        if let Some(store) = self.lifecycle_store() {
+            store.mark_terminal_handed_off(&self.id);
+        }
+        self.is_alive.store(false, Ordering::SeqCst);
+        warn!(
+            terminal_id = %self.id,
+            holder_pid,
+            "handoff budget exhausted — pane left to its holder unreleased (UNCONFIRMED)"
+        );
+        HandoffOutcome::Unconfirmed {
+            holder_pid,
+            reason: "the handoff teardown's budget ran out before this pane's release".to_string(),
+        }
     }
 
     /// Send the pane's tear-down exit notice. Returns `true` when one was sent.
@@ -5396,6 +5449,14 @@ impl TerminalSession {
         self.close_inner_with(deadline, CloseKind::Handoff, sink)
     }
 
+    /// Test seam: how a handoff close observes holder protection.
+    pub(crate) fn set_protection_probe_for_test(
+        &mut self,
+        probe: fn(u32) -> crate::session::tracking_health::HolderProtection,
+    ) {
+        self.protection_probe = probe;
+    }
+
     /// Test seam: rename a fixture session (`make_test_session` is `"test"`).
     pub(crate) fn set_id_for_test(&mut self, id: &str) {
         self.id = id.to_string();
@@ -5412,11 +5473,17 @@ impl TerminalSession {
 /// A handoff close's verdict for one holder pane, from the holder facts read
 /// BEFORE the release (`before`), the facts after it (`after`) and the
 /// release's own result. Pure, so D4's classification is tested on its own.
+///
+/// `protection` observes the live holder (production:
+/// `holder_census::holder_protection`): `UnprotectedCgroup` is reported
+/// KILLED (D4), and an unobservable `Unknown` is never read as survivable.
 fn handoff_outcome(
     before: &super::pane_io::HolderHandoff,
     after: Option<super::pane_io::HolderHandoff>,
     released: Result<(), String>,
+    protection: fn(u32) -> crate::session::tracking_health::HolderProtection,
 ) -> HandoffOutcome {
+    use crate::session::tracking_health::HolderProtection;
     let holder_pid = before.holder_pid;
     if let Err(e) = released {
         return HandoffOutcome::Unconfirmed {
@@ -5434,13 +5501,17 @@ fn handoff_outcome(
             },
         };
     }
-    if before.unprotected.is_some() {
-        return HandoffOutcome::KilledUnprotected {
+    match protection(holder_pid) {
+        HolderProtection::Protected => HandoffOutcome::Detached { holder_pid },
+        HolderProtection::UnprotectedCgroup => HandoffOutcome::KilledUnprotected {
             holder_pid,
             reason: HandoffOutcome::UNPROTECTED_CGROUP.to_string(),
-        };
+        },
+        HolderProtection::Unknown => HandoffOutcome::Unconfirmed {
+            holder_pid,
+            reason: "the holder's protection could not be observed".to_string(),
+        },
     }
-    HandoffOutcome::Detached { holder_pid }
 }
 
 /// The exit code handed to the `on_exit` hook.
@@ -6035,6 +6106,7 @@ pub(crate) mod tests {
             // join nonexistent reader/waiter threads.
             is_alive: Arc::new(AtomicBool::new(false)),
             close_intent: Arc::new(AtomicU8::new(CloseIntent::None as u8)),
+            protection_probe: |_| crate::session::tracking_health::HolderProtection::Protected,
             exit_code: Arc::new(Mutex::new(None)),
             exit_snapshot: Arc::new(Mutex::new(None)),
             reader_join: Mutex::new(None),
@@ -9616,7 +9688,6 @@ pub(crate) mod tests {
     /// holder does — `Ok(0)` on a detach, `Ok(1)` on a kill.
     pub(crate) struct FakeHolderIo {
         pub(crate) holder: bool,
-        pub(crate) unprotected: Option<String>,
         pub(crate) take_detach: bool,
         pub(crate) kills: std::sync::atomic::AtomicUsize,
         pub(crate) releases: std::sync::atomic::AtomicUsize,
@@ -9633,7 +9704,6 @@ pub(crate) mod tests {
         fn new(holder: bool) -> Self {
             FakeHolderIo {
                 holder,
-                unprotected: None,
                 take_detach: true,
                 kills: Default::default(),
                 releases: Default::default(),
@@ -9693,7 +9763,6 @@ pub(crate) mod tests {
             Some(crate::terminal::pane_io::HolderHandoff {
                 holder_pid: 4242,
                 child_pid: 4243,
-                unprotected: self.unprotected.clone(),
                 detach_confirmed: self.take_detach && self.release_count() > 0,
             })
         }
@@ -9832,42 +9901,102 @@ pub(crate) mod tests {
         );
     }
 
-    /// D4: an `Unprotected` holder is still detached (no kill) but reported
-    /// KILLED with `unprotected_cgroup`; a holder that did not take the detach
-    /// is `Unconfirmed`.
+    /// D4 (review round 1: observed from the live holder, not remembered from
+    /// its spawn): a holder in the runner's unit cgroup is still detached (no
+    /// kill) but reported KILLED with `unprotected_cgroup`; an unobservable
+    /// protection is UNCONFIRMED, never survivable; and a holder that did not
+    /// take the detach is UNCONFIRMED.
     #[test]
     fn a_handoff_reports_an_unprotected_holder_killed_and_an_untaken_detach_unconfirmed() {
-        let mut unprotected = FakeHolderIo::holder();
-        unprotected.unprotected = Some("unprotected=cgroup".to_string());
-        let unprotected = Arc::new(unprotected);
-        let (session, _) = handoff_fixture(unprotected.clone(), "cgroup");
+        use crate::session::tracking_health::HolderProtection;
+        let none = Option::<&crate::terminal::exit_notice::RecordingExitSink>::None;
+
+        let io = Arc::new(FakeHolderIo::holder());
+        let (mut session, _) = handoff_fixture(io.clone(), "cgroup");
+        session.set_protection_probe_for_test(|_| HolderProtection::UnprotectedCgroup);
         assert_eq!(
-            session.close_for_handoff_with(
-                None,
-                Option::<&crate::terminal::exit_notice::RecordingExitSink>::None
-            ),
+            session.close_for_handoff_with(None, none),
             HandoffOutcome::KilledUnprotected {
                 holder_pid: 4242,
                 reason: HandoffOutcome::UNPROTECTED_CGROUP.to_string()
             }
         );
-        assert_eq!(unprotected.kill_count(), 0, "still detached, never killed");
+        assert_eq!(io.kill_count(), 0, "still detached, never killed");
+
+        let io = Arc::new(FakeHolderIo::holder());
+        let (mut session, _) = handoff_fixture(io.clone(), "unknown");
+        session.set_protection_probe_for_test(|_| HolderProtection::Unknown);
+        assert!(matches!(
+            session.close_for_handoff_with(None, none),
+            HandoffOutcome::Unconfirmed {
+                holder_pid: 4242,
+                ..
+            }
+        ));
+        assert_eq!(io.kill_count(), 0);
 
         let mut untaken = FakeHolderIo::holder();
         untaken.take_detach = false;
         let untaken = Arc::new(untaken);
         let (session, _) = handoff_fixture(untaken.clone(), "untaken");
         assert!(matches!(
-            session.close_for_handoff_with(
-                None,
-                Option::<&crate::terminal::exit_notice::RecordingExitSink>::None
-            ),
+            session.close_for_handoff_with(None, none),
             HandoffOutcome::Unconfirmed {
                 holder_pid: 4242,
                 ..
             }
         ));
         assert_eq!(untaken.kill_count(), 0);
+    }
+
+    /// Review round 1, item 3: a Handoff intent whose pane reports NO live
+    /// holder when `wait` settles (the holder died, the child exited under the
+    /// handoff) is a real exit — every effect runs, as a runner-initiated one.
+    #[test]
+    fn a_handoff_settle_with_no_live_holder_is_a_runner_initiated_exit() {
+        let io = Arc::new(FakeHolderIo::in_process());
+        let (session, closes) = handoff_fixture(io, "noholder");
+        let facts: Arc<Mutex<Option<PaneExitFacts>>> = Arc::new(Mutex::new(None));
+        {
+            let (closes, facts) = (closes.clone(), facts.clone());
+            session.set_on_exit(Box::new(move |_, exit| {
+                closes.fetch_add(1, Ordering::SeqCst);
+                *facts.lock().unwrap() = Some(exit);
+            }));
+        }
+        CloseIntent::Handoff.store(&session.close_intent);
+        let effects = RecordingWaiterEffects::default();
+
+        assert!(!session.settle_waiter_for_test(Ok(1), &effects));
+        assert_eq!(
+            effects.calls.lock().unwrap().len(),
+            4,
+            "every exit effect runs"
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "the coord row is closed");
+        assert!(facts.lock().unwrap().unwrap().close_requested);
+        assert_eq!(session.exit_code(), Some(1));
+    }
+
+    /// Review round 1, item 5: a pane the handoff budget never reached is
+    /// abandoned untouched — no release, no kill — and reported unconfirmed.
+    #[test]
+    fn abandoning_a_handoff_touches_nothing_and_reports_unconfirmed() {
+        let io = Arc::new(FakeHolderIo::holder());
+        let (session, _) = handoff_fixture(io.clone(), "abandon");
+        assert!(matches!(
+            session.abandon_for_handoff(),
+            HandoffOutcome::Unconfirmed {
+                holder_pid: 4242,
+                ..
+            }
+        ));
+        assert_eq!((io.kill_count(), io.release_count()), (0, 0));
+        assert_eq!(
+            CloseIntent::load(&session.close_intent),
+            CloseIntent::Handoff
+        );
+        assert!(!session.is_alive(), "a later drop must not close (kill) it");
     }
 
     /// D3: the waiter's settle after a HANDOFF runs none of the exit-time side
@@ -9955,10 +10084,11 @@ pub(crate) mod tests {
 
     #[test]
     fn handoff_outcome_classifies_release_failures_as_unconfirmed() {
+        use crate::session::tracking_health::HolderProtection;
+        let protected: fn(u32) -> HolderProtection = |_| HolderProtection::Protected;
         let before = crate::terminal::pane_io::HolderHandoff {
             holder_pid: 7,
             child_pid: 8,
-            unprotected: None,
             detach_confirmed: false,
         };
         let taken = crate::terminal::pane_io::HolderHandoff {
@@ -9966,15 +10096,15 @@ pub(crate) mod tests {
             ..before.clone()
         };
         assert_eq!(
-            handoff_outcome(&before, Some(taken.clone()), Ok(())),
+            handoff_outcome(&before, Some(taken.clone()), Ok(()), protected),
             HandoffOutcome::Detached { holder_pid: 7 }
         );
         assert!(matches!(
-            handoff_outcome(&before, Some(taken), Err("boom".into())),
+            handoff_outcome(&before, Some(taken), Err("boom".into()), protected),
             HandoffOutcome::Unconfirmed { .. }
         ));
         assert!(matches!(
-            handoff_outcome(&before, None, Ok(())),
+            handoff_outcome(&before, None, Ok(()), protected),
             HandoffOutcome::Unconfirmed { .. }
         ));
     }

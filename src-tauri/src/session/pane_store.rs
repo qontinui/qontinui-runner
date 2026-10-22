@@ -130,21 +130,6 @@ impl PaneKey {
         ))
     }
 
-    /// Terminal-id key: the coord session of the LIVE terminal `terminal_id`,
-    /// kept for the one restore that reuses a terminal id — a holder pane the
-    /// next runner's boot sweep adopts under the same id (plan
-    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
-    /// D8). The create triple cannot serve there: the pane's working dir may
-    /// have been reassigned to a worktree after the key was taken and its
-    /// title renamed since, and the holder's restore metadata carries neither
-    /// original. A leading `terminal` segment and two fields keep it disjoint
-    /// from every other key form (three, four and five fields). Removed when
-    /// the terminal really exits, so it does not accumulate.
-    pub fn for_terminal(terminal_id: &str) -> Self {
-        const SEP: char = '\u{1f}';
-        PaneKey(format!("terminal{SEP}{}", terminal_id.trim()))
-    }
-
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -160,6 +145,44 @@ impl PaneKey {
 pub struct PaneSessionStore {
     path: PathBuf,
     map: Mutex<HashMap<String, Uuid>>,
+    /// The coord binding of each LIVE holder-backed terminal, keyed by
+    /// terminal id ([`TerminalCoordBinding`]), persisted beside the pane map
+    /// in [`terminal_bindings_path`].
+    terminals: Mutex<HashMap<String, TerminalCoordBinding>>,
+}
+
+/// What a HOLDER-backed terminal's coord session was registered with, kept
+/// under its terminal id for the one restore that reuses a terminal id: the
+/// next runner's boot sweep adopting the pane (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D8). The create triple cannot serve there — the pane's working dir may have
+/// been reassigned to a worktree after that key was taken and its title renamed
+/// since, and the holder's restore metadata carries neither original — and a
+/// resume needs more than the row id: the TENANT (a non-default tenant's row
+/// probed under the default credential 404s and is re-registered in the wrong
+/// tenant) and the intent fields the row was declared with. Removed when the
+/// terminal really exits, so it does not accumulate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalCoordBinding {
+    pub coord_id: Uuid,
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub work_unit_slug: Option<String>,
+    #[serde(default)]
+    pub correlation_topic: Option<String>,
+}
+
+/// The terminal-binding file beside the pane map at `pane_map_path`:
+/// `<stem>-terminals.json`.
+pub fn terminal_bindings_path(pane_map_path: &Path) -> PathBuf {
+    let stem = pane_map_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "pane-sessions".to_string());
+    pane_map_path.with_file_name(format!("{stem}-terminals.json"))
 }
 
 impl PaneSessionStore {
@@ -170,9 +193,11 @@ impl PaneSessionStore {
             std::fs::create_dir_all(parent)?;
         }
         let map = load_map(&path);
+        let terminals = load_json(&terminal_bindings_path(&path));
         Ok(Self {
             path,
             map: Mutex::new(map),
+            terminals: Mutex::new(terminals),
         })
     }
 
@@ -211,8 +236,8 @@ impl PaneSessionStore {
     /// Drop a pane's mapping (e.g. when its coord row was GC'd and the
     /// resume fell back to a fresh id — the fresh id is `put` over the top,
     /// so explicit removal is only needed if a caller wants to forget a
-    /// pane entirely, as a terminal's real exit does for its
-    /// [`PaneKey::for_terminal`] mapping). Best-effort flush.
+    /// pane entirely). Best-effort flush.
+    #[allow(dead_code)]
     pub fn remove(&self, key: &PaneKey) {
         let snapshot = {
             let mut m = match self.map.lock() {
@@ -229,6 +254,65 @@ impl PaneSessionStore {
             warn!(error = %e, "pane_store: persist failed on remove");
         }
     }
+}
+
+impl PaneSessionStore {
+    /// The recorded coord binding of terminal `terminal_id`, if any.
+    pub fn get_terminal(&self, terminal_id: &str) -> Option<TerminalCoordBinding> {
+        self.terminals
+            .lock()
+            .ok()
+            .and_then(|m| m.get(terminal_id.trim()).cloned())
+    }
+
+    /// Record (or overwrite) terminal `terminal_id`'s coord binding.
+    pub fn put_terminal(&self, terminal_id: &str, binding: TerminalCoordBinding) {
+        self.mutate_terminals(|m| {
+            m.insert(terminal_id.trim().to_string(), binding);
+        });
+    }
+
+    /// Forget terminal `terminal_id`'s coord binding (its real exit).
+    pub fn remove_terminal(&self, terminal_id: &str) {
+        self.mutate_terminals(|m| {
+            m.remove(terminal_id.trim());
+        });
+    }
+
+    fn mutate_terminals(&self, f: impl FnOnce(&mut HashMap<String, TerminalCoordBinding>)) {
+        let snapshot = {
+            let mut m = match self.terminals.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "pane_store: terminal-binding lock poisoned");
+                    return;
+                }
+            };
+            f(&mut m);
+            m.clone()
+        };
+        if let Err(e) = write_json(&terminal_bindings_path(&self.path), &snapshot) {
+            warn!(error = %e, "pane_store: terminal-binding persist failed — kept in memory only");
+        }
+    }
+}
+
+fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    let Ok(bytes) = std::fs::read(path) else {
+        return T::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        warn!(error = %e, path = %path.display(), "pane_store: corrupt file — starting empty");
+        T::default()
+    })
+}
+
+fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn load_map(path: &Path) -> HashMap<String, Uuid> {
@@ -400,5 +484,33 @@ mod tests {
         let id = Uuid::new_v4();
         store.put(&key, id);
         assert_eq!(store.get(&key), Some(id));
+    }
+
+    #[test]
+    fn terminal_bindings_round_trip_through_their_own_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pane-sessions.json");
+        let binding = TerminalCoordBinding {
+            coord_id: Uuid::new_v4(),
+            tenant_id: Some(Uuid::new_v4()),
+            repo: Some("qontinui-runner".into()),
+            work_unit_slug: Some("wu".into()),
+            correlation_topic: None,
+        };
+        {
+            let store = PaneSessionStore::open(&path).unwrap();
+            store.put_terminal("term-1", binding.clone());
+        }
+        assert!(terminal_bindings_path(&path).exists());
+        let store = PaneSessionStore::open(&path).unwrap();
+        assert_eq!(store.get_terminal("term-1"), Some(binding));
+        assert!(store.get(&PaneKey::from_create("", "", "")).is_none());
+        store.remove_terminal("term-1");
+        assert_eq!(
+            PaneSessionStore::open(&path)
+                .unwrap()
+                .get_terminal("term-1"),
+            None
+        );
     }
 }
