@@ -319,17 +319,16 @@ const PageSessionScope = memo(function PageSessionScope({
   }, [zoneLayout.assignments]);
   const closeTerminalInZone = useCallback<typeof managerCloseTerminal>(
     (id, options = {}) => {
-      const atClose = zoneAssignmentsRef.current;
-      const zone = Object.entries(atClose).find(([, tabId]) => tabId === id);
+      const zone = Object.entries(zoneAssignmentsRef.current).find(([, tabId]) => tabId === id);
       const zoneIndex = zone ? Number(zone[0]) : null;
-      const zonedAtClose: ReadonlySet<string> = new Set(Object.values(atClose));
-      // Undo reclaims the zone only if nothing the operator arranged sits
-      // there now (`mayRestoreIntoZone`); otherwise the layout's auto-assign
-      // places the restored tab like any other unzoned one.
+      // Undo reclaims the zone only if it is still empty
+      // (`mayRestoreIntoZone`); otherwise the layout's auto-assign places the
+      // restored tab — in an empty zone if there is one, else unzoned (the
+      // "N more" chip), never by displacing another session.
       const restoreZone = () => {
         if (zoneIndex === null) return;
         const occupant = zoneAssignmentsRef.current[zoneIndex] ?? null;
-        if (mayRestoreIntoZone(occupant, zonedAtClose)) assignTabToZone(zoneIndex, id);
+        if (mayRestoreIntoZone(occupant)) assignTabToZone(zoneIndex, id);
       };
       return managerCloseTerminal(id, {
         ...options,
