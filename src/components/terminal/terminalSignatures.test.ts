@@ -10,13 +10,21 @@ import { describe, expect, it } from "vitest";
 import type { ActionParams, SemanticSnapshot } from "@qontinui/ui-bridge";
 
 import {
+  countLabelledZones,
   CREATE_PLAIN_TERMINAL_SIGNATURE,
+  CREATE_TERMINAL_SIGNATURE,
   LAUNCH_CREATE_PLAIN_SIGNATURE,
-  POP_OUT_PAGE_SIGNATURE,
   predictMoveTerminal,
+  predictPopOutPage,
   predictZoneView,
+  PTY_SPAWN_SETTLE_MS,
+  type ZoneLabelInputs,
 } from "./terminalPageSignatures";
-import { predictLoadProfile, predictSelectLayout } from "./zonePickerSignatures";
+import {
+  loadProfileSignature,
+  predictLoadProfile,
+  predictSelectLayout,
+} from "./zonePickerSignatures";
 import type { ZoneProfile } from "./zoneProfileStorage";
 
 function snap(...ids: string[]): SemanticSnapshot {
@@ -28,6 +36,7 @@ function p(params: Record<string, unknown>): ActionParams {
 }
 
 const GRID = snap("terminal-input-a", "terminal-input-b", "terminal-zone-header-0");
+const ZONE_SURFACE = ["terminal-input-*", "terminal-zone-header-*"];
 
 describe("spawn signatures", () => {
   it("create-plain predicts a terminal-input element appearing, scoped to the zone surface", () => {
@@ -35,20 +44,38 @@ describe("spawn signatures", () => {
     expect(LAUNCH_CREATE_PLAIN_SIGNATURE.predicts(p({ count: 2 }), GRID)).toEqual({
       elementsAppear: [{ id: "terminal-input-*" }],
     });
-    expect(LAUNCH_CREATE_PLAIN_SIGNATURE.scope.elementIds).toEqual([
-      "terminal-input-*",
-      "terminal-zone-header-*",
-    ]);
+    expect(LAUNCH_CREATE_PLAIN_SIGNATURE.scope.elementIds).toEqual(ZONE_SURFACE);
     expect(CREATE_PLAIN_TERMINAL_SIGNATURE.predicts(p({}), snap())).toEqual({
       elementsAppear: [{ id: "terminal-input-*" }],
     });
   });
 
-  it("pop-out-page predicts tab elements leaving only when there are any", () => {
-    expect(POP_OUT_PAGE_SIGNATURE.predicts(p({}), GRID)).toEqual({
+  it("create-terminal shares the zone-surface scope (auto-assignment may add a header)", () => {
+    expect(CREATE_TERMINAL_SIGNATURE.scope.elementIds).toEqual(ZONE_SURFACE);
+  });
+
+  it("spawns wait out the PTY spawn settle window, not the SDK fallback band", () => {
+    expect(LAUNCH_CREATE_PLAIN_SIGNATURE.settleMs).toBe(PTY_SPAWN_SETTLE_MS);
+    expect(CREATE_TERMINAL_SIGNATURE.settleMs).toBe(PTY_SPAWN_SETTLE_MS);
+    expect(loadProfileSignature({}, 0).settleMs).toBe(PTY_SPAWN_SETTLE_MS);
+    expect(PTY_SPAWN_SETTLE_MS).toBeGreaterThanOrEqual(1000);
+  });
+});
+
+describe("pop-out-page", () => {
+  it("the active page predicts its tab elements leaving only when it has terminals", () => {
+    expect(predictPopOutPage(p({}), GRID, "default", 2)).toEqual({
       elementsDisappear: [{ id: "terminal-input-*" }],
     });
-    expect(POP_OUT_PAGE_SIGNATURE.predicts(p({}), snap())).toEqual({});
+    expect(predictPopOutPage(p({}), GRID, "default", 0)).toEqual({});
+    expect(predictPopOutPage(p({ pageId: "default" }), GRID, "default", 0)).toEqual({});
+  });
+
+  it("another page falls back to whether this window renders any tab", () => {
+    expect(predictPopOutPage(p({ pageId: "other" }), GRID, "default", 0)).toEqual({
+      elementsDisappear: [{ id: "terminal-input-*" }],
+    });
+    expect(predictPopOutPage(p({ pageId: "other" }), snap(), "default", 3)).toEqual({});
   });
 });
 
@@ -77,8 +104,8 @@ describe("move-terminal-to-window", () => {
 });
 
 describe("zone view (maximize / restore / toggle)", () => {
-  const tiled = { maximizedZone: null, zoneCount: 4 };
-  const maximized = { maximizedZone: 1, zoneCount: 4 };
+  const tiled = { maximizedZone: null, zoneCount: 4, labelledZonesWhenTiled: 2 };
+  const maximized = { maximizedZone: 1, zoneCount: 4, labelledZonesWhenTiled: 2 };
 
   it("maximizing from the tiled grid removes the zone headers", () => {
     expect(predictZoneView("maximize", p({ zoneIndex: 1 }), GRID, tiled)).toEqual({
@@ -86,17 +113,29 @@ describe("zone view (maximize / restore / toggle)", () => {
     });
   });
 
-  it("restoring from the maximized view brings the headers back", () => {
+  it("restoring brings headers back only when the tiled grid renders some", () => {
     expect(predictZoneView("restore", p({}), snap(), maximized)).toEqual({
       elementsAppear: [{ id: "terminal-zone-header-*" }],
     });
     expect(predictZoneView("restore", p({}), GRID, tiled)).toEqual({});
+    expect(
+      predictZoneView("restore", p({}), snap(), { ...maximized, labelledZonesWhenTiled: 0 }),
+    ).toEqual({});
+    expect(
+      predictZoneView("restore", p({}), snap(), { ...maximized, labelledZonesWhenTiled: null }),
+    ).toEqual({});
   });
 
   it("toggle follows the keyboard rule; an out-of-range index predicts nothing", () => {
     expect(predictZoneView("toggle", p({ zoneIndex: 1 }), snap(), maximized)).toEqual({
       elementsAppear: [{ id: "terminal-zone-header-*" }],
     });
+    expect(
+      predictZoneView("toggle", p({ zoneIndex: 1 }), snap(), {
+        ...maximized,
+        labelledZonesWhenTiled: 0,
+      }),
+    ).toEqual({});
     expect(predictZoneView("toggle", p({ zoneIndex: 2 }), GRID, tiled)).toEqual({
       elementsDisappear: [{ id: "terminal-zone-header-*" }],
     });
@@ -104,12 +143,40 @@ describe("zone view (maximize / restore / toggle)", () => {
   });
 });
 
+describe("countLabelledZones mirrors ZoneGrid's header rule", () => {
+  const base: ZoneLabelInputs = {
+    layoutId: "grid-2x2",
+    zoneCount: 4,
+    assignments: { 0: "a", 1: "b", 3: "gone" },
+    tabs: [{ id: "a" }, { id: "b" }, { id: "plan", type: "plan" }],
+    focusedZone: 0,
+    pinnedZones: new Set<number>(),
+    compactView: false,
+  };
+
+  it("counts occupied zones only (an assignment to a missing tab is empty)", () => {
+    expect(countLabelledZones(base)).toBe(2);
+  });
+
+  it("forced compact drops unfocused, unpinned terminal zones", () => {
+    expect(countLabelledZones({ ...base, compactView: true })).toBe(1);
+    expect(countLabelledZones({ ...base, compactView: true, pinnedZones: new Set([1]) })).toBe(2);
+  });
+
+  it("a single-zone layout renders none; flow-grid is unknown", () => {
+    expect(countLabelledZones({ ...base, zoneCount: 1 })).toBe(0);
+    expect(countLabelledZones({ ...base, layoutId: "flow-grid" })).toBeNull();
+  });
+});
+
 describe("zone pickers", () => {
-  it("select-layout to a single-zone preset removes the zone headers", () => {
-    expect(predictSelectLayout(p({ layoutId: "single" }), GRID)).toEqual({
+  it("select-layout to a single-zone preset removes headers only when auto-grow cannot undo it", () => {
+    expect(predictSelectLayout(p({ layoutId: "single" }), GRID, 1)).toEqual({
       elementsDisappear: [{ id: "terminal-zone-header-*" }],
     });
-    expect(predictSelectLayout(p({ layoutId: "no-such-layout" }), GRID)).toEqual({});
+    // Two tabs overflow a single zone: auto-grow re-expands, headers stay.
+    expect(predictSelectLayout(p({ layoutId: "single" }), GRID, 2)).toEqual({});
+    expect(predictSelectLayout(p({ layoutId: "no-such-layout" }), GRID, 1)).toEqual({});
   });
 
   it("load-profile predicts spawned tabs only when the profile has more sessions than live tabs", () => {
