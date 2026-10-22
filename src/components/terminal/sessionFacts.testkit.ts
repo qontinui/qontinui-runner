@@ -1,7 +1,7 @@
 /**
  * A fully-known `SessionFacts` for the query-engine tests — override what a
  * test is about. Shared by `sessionQuery.test.ts`, `sessionQueryChips.test.ts`
- * and `sessionSearchPalette.test.ts`.
+ * and `sessionSearchPaletteModel.test.ts`.
  */
 
 import { known, type SessionFacts } from "./sessionFacts";

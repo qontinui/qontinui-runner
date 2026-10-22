@@ -20,7 +20,7 @@ import { useCallback, useEffect } from "react";
 
 import { SessionSearchPalette } from "./SessionSearchPalette";
 import { planNewZone } from "./sessionNewZone";
-import type { PaletteEntry } from "./sessionSearchPalette";
+import type { PaletteEntry } from "./sessionSearchPaletteModel";
 import { useSessionSearchPaletteOpen } from "./sessionSearchPaletteStore";
 import type { TerminalWorkMode } from "./terminalWorkMode";
 import { usePastSessions, type PastSession } from "./usePastSessions";

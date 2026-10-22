@@ -36,7 +36,7 @@ import {
   transcriptCoverageNote,
   type PaletteEntry,
   type PaletteMatch,
-} from "./sessionSearchPalette";
+} from "./sessionSearchPaletteModel";
 import {
   sessionSearchPaletteStore,
   useSessionSearchHotkey,

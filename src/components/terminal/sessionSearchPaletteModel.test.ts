@@ -10,7 +10,7 @@ import {
   stepSelection,
   transcriptAnswerFor,
   transcriptCoverageNote,
-} from "./sessionSearchPalette";
+} from "./sessionSearchPaletteModel";
 import { requestSessionSearchOpen, sessionSearchPaletteStore } from "./sessionSearchPaletteStore";
 import type { TranscriptSearchResponse } from "./transcriptSearch";
 import type { PastSession } from "./usePastSessions";
