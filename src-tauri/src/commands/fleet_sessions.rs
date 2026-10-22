@@ -45,6 +45,13 @@ pub struct FleetSessionsArgs {
     pub device_id: Option<String>,
     /// Restrict to one `coord.sessions.state`.
     pub state: Option<String>,
+    /// Restrict to one WORK-axis `session_status` (`?session_status=`, plan
+    /// `2026-09-30-close-remote-sessions-from-the-local-runner` Phase 4) —
+    /// the "Close all finished" read. Applied by coord in SQL and part of the
+    /// cursor's scope fingerprint there. An older coord ignores the parameter
+    /// and serves an unfiltered page, so the caller re-checks every row's
+    /// `sessionStatus` rather than trusting the filter.
+    pub session_status: Option<String>,
     /// Include sessions that have closed. Defaults to false — a picker offering
     /// an attach wants live sessions.
     #[serde(default)]
@@ -94,6 +101,12 @@ fn build_fleet_url(base: &str, args: &FleetSessionsArgs) -> String {
         let s = s.trim();
         if !s.is_empty() {
             query.push(("state", s.to_string()));
+        }
+    }
+    if let Some(s) = args.session_status.as_deref() {
+        let s = s.trim();
+        if !s.is_empty() {
+            query.push(("session_status", s.to_string()));
         }
     }
     if args.include_closed {
@@ -191,6 +204,7 @@ mod tests {
             &FleetSessionsArgs {
                 device_id: Some("   ".to_string()),
                 state: Some(String::new()),
+                session_status: Some("  ".to_string()),
                 include_closed: false,
                 limit: None,
                 cursor: None,
@@ -209,6 +223,7 @@ mod tests {
             &FleetSessionsArgs {
                 device_id: Some("  abc-123  ".to_string()),
                 state: Some("working".to_string()),
+                session_status: None,
                 include_closed: true,
                 limit: Some(25),
                 cursor: None,
@@ -323,6 +338,7 @@ mod tests {
             &FleetSessionsArgs {
                 device_id: Some("dev-1".to_string()),
                 state: Some("active".to_string()),
+                session_status: Some("finished".to_string()),
                 include_closed: true,
                 limit: Some(100),
                 cursor: Some("tok".to_string()),
@@ -331,11 +347,29 @@ mod tests {
         for expected in [
             "device_id=dev-1",
             "state=active",
+            "session_status=finished",
             "include_closed=true",
             "limit=100",
             "cursor=tok",
         ] {
             assert!(url.contains(expected), "missing {expected} in {url}");
         }
+    }
+
+    /// The work-axis filter reaches coord, trimmed. Without it "Close all
+    /// finished" would be a client filter over whatever page coord served.
+    #[test]
+    fn a_session_status_filter_is_sent_trimmed() {
+        let url = build_fleet_url(
+            BASE,
+            &FleetSessionsArgs {
+                session_status: Some("  finished ".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            url,
+            "https://coord.example.test/coord/sessions/fleet?session_status=finished"
+        );
     }
 }
