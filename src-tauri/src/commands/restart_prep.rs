@@ -15,7 +15,17 @@
 //!   `POST /ui-bridge/invoke/<name>`.
 //! * `restart_prep_dismiss` (Phase 6), and `restart_prep_extend` and
 //!   `restart_prep_set_held` (Phase 5, the panel's Extend and held toggle),
-//!   are operator doors of the same kind.
+//!   follow the same convention.
+//! * `restart_prep_current` (Phase 5) — the record and view from this
+//!   process's memory, the payload `restart-prep-changed` carries. Read-only.
+//!
+//! What "off the invoke allowlist" does and does not mean here: no local
+//! process can call these commands by name. But the Terminal page's
+//! restart-prep panel registers UI-Bridge component actions that call them
+//! (prepare, cancel, extend, dismiss, the held toggle), and the bridge serves
+//! those to any local caller — deliberately: the plan names their ids and
+//! drives them through the bridge. They are declared `destructive` (the held
+//! toggle `write`); see route 3 in `commands/operator_doors.rs`.
 
 /// `restart_prep_status` — the persisted prepare record (if any) and the live
 /// cohort a prepare taken now would pin.
@@ -54,8 +64,8 @@ pub async fn restart_prep_cancel() -> Result<crate::restart_prep::prepare::PrepC
 }
 
 /// `restart_prep_extend` — the panel's Extend: push the spawn hold's `until`
-/// out by 6 h (D1), re-sent to coord as the same hold. Operator-only, like
-/// the doors above.
+/// out by 6 h (D1), re-sent to coord as the same hold. Off the invoke
+/// allowlist like the doors above (see the module doc for the panel route).
 #[tauri::command]
 pub async fn restart_prep_extend() -> Result<crate::restart_prep::prepare::PrepChanged, String> {
     crate::restart_prep::prepare::extend_from_app().await
@@ -63,8 +73,8 @@ pub async fn restart_prep_extend() -> Result<crate::restart_prep::prepare::PrepC
 
 /// `restart_prep_dismiss` — end a rebuilt runner's restore of the cohort
 /// `prepare_id` (Phase 6): the record moves to `done`, so its waiting rows are
-/// no longer placeholders nor held from the orphan close. Operator-only, like
-/// the doors above.
+/// no longer placeholders nor held from the orphan close. Off the invoke
+/// allowlist like the doors above (see the module doc for the panel route).
 #[tauri::command]
 pub async fn restart_prep_dismiss(
     prepare_id: String,
@@ -73,9 +83,9 @@ pub async fn restart_prep_dismiss(
 }
 
 /// `restart_prep_set_held` — the panel's held toggle (D6): hold a cohort row
-/// for a hand restore, or release it to the bulk restores. Operator-only, like
-/// the doors above: it decides which sessions an operator's "Restore all"
-/// brings back.
+/// for a hand restore, or release it to the bulk restores. Off the invoke
+/// allowlist like the doors above: it decides which sessions an operator's
+/// "Restore all" brings back.
 #[tauri::command]
 pub async fn restart_prep_set_held(
     prepare_id: String,

@@ -433,6 +433,51 @@ describe("the store", () => {
     expect(f.calls.filter(([c]) => c === "restart_prep_dismiss")).toHaveLength(1);
   });
 
+  it("an Extend coord did not take is a failure that says only the local hold moved", async () => {
+    const rec = record({ hold: { status: "unconfirmed", cause: "x" }, hold_until: "T+12h" });
+    const reply = {
+      record: rec,
+      view: { ...changed(rec).view, hold: "unconfirmed: coord_unreachable: t" },
+    };
+    const f = fakeDeps(async () => reply);
+    const store = createRestartPrepStore(f.deps);
+    await expect(store.extend()).rejects.toThrow("coord did not extend the hold");
+    expect(store.getSnapshot().extend.phase).toBe("failed");
+    expect(store.getSnapshot().extend.message).toContain(
+      "only the runner-local hold now runs to T+12h",
+    );
+    // The record still shows what the backend holds.
+    expect(store.getSnapshot().record?.hold_until).toBe("T+12h");
+  });
+
+  it("of two overlapping reads only the newest lands", async () => {
+    const answers: Array<(v: unknown) => void> = [];
+    const f = fakeDeps(
+      () =>
+        new Promise((r) => {
+          answers.push(r);
+        }),
+    );
+    const store = createRestartPrepStore(f.deps);
+    const older = store.refresh();
+    const newer = store.refresh();
+    answers[1](changed(record({ state: "ready" })));
+    await newer;
+    answers[0](changed(record({ state: "preparing" })));
+    await older;
+    expect(store.getSnapshot().record?.state).toBe("ready");
+  });
+
+  it("a malformed event is surfaced, not silently dropped", async () => {
+    const f = fakeDeps(async () => null);
+    const store = createRestartPrepStore(f.deps);
+    store.retain();
+    await Promise.resolve();
+    await Promise.resolve();
+    f.emit({ record: { nonsense: true } });
+    expect(store.getSnapshot().eventsError).toMatch(/unrecognized shape/);
+  });
+
   it("a listener that cannot be set up is reported, not silent", async () => {
     const store = createRestartPrepStore({
       invoke: () => Promise.resolve(null),

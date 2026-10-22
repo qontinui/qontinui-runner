@@ -13,13 +13,13 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 const registered: Array<{
   id: string;
-  actions: Array<{ id: string; effect?: string }>;
+  actions: Array<{ id: string; effect?: string; handler?: () => unknown }>;
   state?: () => Record<string, unknown>;
 }> = [];
 vi.mock("@qontinui/ui-bridge", () => ({
   useUIComponent: (opts: {
     id: string;
-    actions?: Array<{ id: string; effect?: string }>;
+    actions?: Array<{ id: string; effect?: string; handler?: () => unknown }>;
     state?: () => Record<string, unknown>;
   }) => {
     registered.push({ id: opts.id, actions: opts.actions ?? [], state: opts.state });
@@ -369,5 +369,31 @@ describe("a rebuilt runner's waiting restore", () => {
     expect(renderPanel(snapshot())).not.toContain(
       'data-ui-bridge-id="terminal.restart-prep-dismiss"',
     );
+  });
+});
+
+describe("the bridge prepare never answers success for a prepare it did not start", () => {
+  const prepareHandler = (snap: RestartPrepSnapshot) => {
+    registered.length = 0;
+    renderToStaticMarkup(<PrepareRestartButton store={frozenStore(snap)} />);
+    const button = registered.find((c) => c.id === "terminal.prepare-restart-button");
+    return button?.actions.find((a) => a.id === "prepare")?.handler;
+  };
+
+  it("rejects while a restore waits and before the first read", async () => {
+    await expect(
+      Promise.resolve(prepareHandler(snapshot({ record: record({ state: "restoring" }) }))?.()),
+    ).rejects.toThrow("still waiting to be restored");
+    await expect(
+      Promise.resolve(prepareHandler(snapshot({ record: null, loaded: false }))?.()),
+    ).rejects.toThrow("not been read yet");
+  });
+
+  it("answers with the prepare already running", async () => {
+    await expect(Promise.resolve(prepareHandler(snapshot())?.())).resolves.toEqual({
+      alreadyRunning: true,
+      prepareId: "prep-1",
+      state: "preparing",
+    });
   });
 });

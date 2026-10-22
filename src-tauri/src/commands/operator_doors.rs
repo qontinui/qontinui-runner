@@ -34,6 +34,17 @@
 //!    `import` and `document.cookie`, but NOT `invoke`, so an expression can
 //!    call a Tauri command the allowlist never names.
 //!
+//! 3. **A mounted page's UI-Bridge COMPONENT actions are a route too.** A
+//!    `useUIComponent` action runs in the webview and may `invoke` any command;
+//!    the bridge serves it to any local caller at
+//!    `/control/component/{id}/action/{action}` (`sdk_client.rs`). Its declared
+//!    `effect` only keeps automatic walks out — nothing on the server gates a
+//!    `destructive` one. So a door that must stay operator-only must not be
+//!    wired to a component action. The restart-prep panel's actions (prepare,
+//!    cancel, extend, dismiss, held toggle) ARE wired this way on purpose: the
+//!    plan names their UI-Bridge ids and drives them through the bridge, and
+//!    each declares `destructive` (or `write` for the toggle).
+//!
 //! The honest bound on (2), recorded rather than hand-waved: on a bundled,
 //! CSP-enforcing build the route is dead — `script-src 'self'` without
 //! `unsafe-eval` refuses every expression it would evaluate. So (2) is a

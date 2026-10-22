@@ -404,6 +404,9 @@ export interface ActionState {
 
 const IDLE: ActionState = { phase: "idle" };
 
+/** The hold labels (`HoldStatus::label`) under which spawns are held as asked. */
+const HELD_LABELS = new Set(["confirmed", "local", "local (secondary)"]);
+
 /** The record-wide operator actions, each with its own acknowledgement. */
 type PrepAction = "prepare" | "cancel" | "extend";
 
@@ -489,6 +492,8 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
    * action reply nor a read that started before a newer change lands over it.
    */
   let eventSeq = 0;
+  /** Bumped by every read started; see `refresh`. */
+  let readSeq = 0;
 
   const set = (patch: Partial<RestartPrepSnapshot>): void => {
     snap = { ...snap, ...patch };
@@ -511,20 +516,29 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
 
   const onEvent = (payload: unknown): void => {
     const changed = asPrepChanged(payload);
-    if (!changed) return;
+    if (!changed) {
+      // Never applied half-read — and never silently: the panel would keep
+      // showing the old state as if it were live.
+      set({ eventsError: "a restart-prep-changed event came in an unrecognized shape" });
+      return;
+    }
     eventSeq += 1;
     applyChanged(changed);
   };
 
   const refresh = async (): Promise<void> => {
     const seq = eventSeq;
+    // Reads can overlap (mount, the re-read once the listener is up, a panel
+    // open): only the newest one started may land.
+    const read = ++readSeq;
     try {
       // `restart_prep_current`: the record and view as the runner holds them
       // in memory — exactly what an event carries — with no live cohort
       // capture. `null` is "no readable record", not proof none ever ran.
       const current = await deps.invoke("restart_prep_current");
-      // An event or applied reply that landed while this read was out is newer.
-      if (eventSeq !== seq) return;
+      // An event or applied reply that landed while this read was out is
+      // newer, and so is any read started after this one.
+      if (eventSeq !== seq || read !== readSeq) return;
       if (current === null || current === undefined) {
         set({ record: null, view: null, readError: null, loaded: true });
         return;
@@ -536,7 +550,7 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
       }
       set({ record: changed.record, view: changed.view, readError: null, loaded: true });
     } catch (err) {
-      if (eventSeq !== seq) return;
+      if (eventSeq !== seq || read !== readSeq) return;
       set({
         readError: describeThrown(err, "could not read the restart-prep record"),
         loaded: true,
@@ -613,6 +627,14 @@ export function createRestartPrepStore(deps: RestartPrepDeps): RestartPrepStore 
         const reply = asPrepChanged(await deps.invoke(cmd, args));
         if (!reply) throw new Error(`the ${action} reply came back in an unrecognized shape`);
         applyReply(reply, seq);
+        if (action === "extend" && !HELD_LABELS.has(reply.view.hold)) {
+          // The backend extended only the runner-local backstop: coord did
+          // not take the new deadline, so its drain still ends where it did.
+          throw new Error(
+            `coord did not extend the hold (hold ${reply.view.hold}); only the runner-local ` +
+              `hold now runs to ${reply.record.hold_until ?? "?"} — Extend again to retry`,
+          );
+        }
         const expiry =
           action === "extend" && reply.record.hold_until
             ? `; expires ${reply.record.hold_until}`

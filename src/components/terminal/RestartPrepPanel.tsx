@@ -170,6 +170,36 @@ function clickPrepare(store: RestartPrepStore): Promise<unknown> {
   return store.prepare("");
 }
 
+/**
+ * The bridge's `prepare`: like the click, but it never answers a
+ * success-shaped `null` for a prepare it did not start — it rejects with the
+ * reason, or answers with the prepare that is already running.
+ */
+function bridgePrepare(store: RestartPrepStore): Promise<unknown> {
+  const snap = store.getSnapshot();
+  if (!snap.loaded) {
+    return Promise.reject(
+      new Error("the restart-prep record has not been read yet — try again shortly"),
+    );
+  }
+  store.openPanel();
+  if (snap.record?.state === "restoring") {
+    return Promise.reject(
+      new Error(
+        "the last prepare's sessions are still waiting to be restored — restore or dismiss them first",
+      ),
+    );
+  }
+  if (inWindow(snap.record)) {
+    return Promise.resolve({
+      alreadyRunning: true,
+      prepareId: snap.record?.prepare_id,
+      state: snap.record?.state,
+    });
+  }
+  return store.prepare("");
+}
+
 /** The header button, and the panel below it while open. */
 export function PrepareRestartButton({ store = restartPrepStore }: { store?: RestartPrepStore }) {
   const snap = useRestartPrep(store);
@@ -203,12 +233,7 @@ export function PrepareRestartButton({ store = restartPrepStore }: { store?: Res
         effect: "destructive",
         // Over the bridge a call that cannot prepare yet says so rather than
         // answering a success-shaped `null` after only opening the panel.
-        handler: () =>
-          store.getSnapshot().loaded
-            ? clickPrepare(store)
-            : Promise.reject(
-                new Error("the restart-prep record has not been read yet — try again shortly"),
-              ),
+        handler: () => bridgePrepare(store),
       },
     ],
     // Read from the store at CALL time: `useUIComponent` keeps the getter it
@@ -424,7 +449,8 @@ export function panelStateOf(snap: RestartPrepSnapshot): Record<string, unknown>
     state: snap.record?.state ?? null,
     hold: snap.view?.hold ?? null,
     // `null` while unread — never a count of zero.
-    rows: snap.loaded && snap.readError === null ? (snap.record?.cohort.rows.length ?? 0) : null,
+    // `null` while unread, and for no readable record — never a count of zero.
+    rows: snap.loaded && snap.readError === null ? (snap.record?.cohort.rows.length ?? null) : null,
     listenerError: snap.eventsError,
   };
 }
