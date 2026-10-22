@@ -1238,7 +1238,34 @@ fn hides_text(text: &str, paints_text: bool) -> bool {
     paints_text || !text.is_empty()
 }
 
-/// Extract the modal identity set from a `get_modal_context` IPC answer.
+/// The webview's modal stack, reduced to the identities an occluder can match.
+///
+/// `ids` are `modal.id`; `bridge_ids` are `modal.bridgeId`, the modal element's
+/// `data-ui-bridge-id` (SDK `ModalInfo.bridgeId`). They are kept apart because
+/// they match differently: `bridgeId` matches only `occludedBy == bridgeId`,
+/// never the `<tag>#<id>` DOM-id form (see [`is_tracked_overlay`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ModalIdentities {
+    pub ids: HashSet<String>,
+    pub bridge_ids: HashSet<String>,
+}
+
+impl ModalIdentities {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ids.is_empty() && self.bridge_ids.is_empty()
+    }
+}
+
+impl From<HashSet<String>> for ModalIdentities {
+    fn from(ids: HashSet<String>) -> Self {
+        Self {
+            ids,
+            bridge_ids: HashSet::new(),
+        }
+    }
+}
+
+/// Extract the modal identities from a `get_modal_context` IPC answer.
 ///
 /// The value is the SDK's `SnapshotModalContext` (`{ modals: [{ id, … }], … }`)
 /// or `null`. Returns `None` — detection UNAVAILABLE — for `null`, a non-object,
@@ -1248,7 +1275,7 @@ fn hides_text(text: &str, paints_text: bool) -> bool {
 ///
 /// Entries whose `id` is absent, non-string or empty are skipped, mirroring the
 /// SDK's `if (modal?.id) ids.add(modal.id)` (`visibility-report.ts`
-/// `modalIdentities`).
+/// `modalIdentities`). `bridgeId` is read under the same rule.
 ///
 /// **One deliberate divergence from the SDK — do not "fix" it toward parity.**
 /// The SDK's `modalIdentities` reads `modalContext.modals ?? []`, so ANY defined
@@ -1258,24 +1285,31 @@ fn hides_text(text: &str, paints_text: bool) -> bool {
 /// available", "Unknown request type" from a frontend predating this IPC — into
 /// an `Ok` object with no `modals` key, and reading that as `modal-stack` would
 /// label a failed IPC as a successful classification.
-pub(crate) fn modal_ids_from_context(context: &serde_json::Value) -> Option<HashSet<String>> {
+pub(crate) fn modal_ids_from_context(context: &serde_json::Value) -> Option<ModalIdentities> {
     let modals = context.as_object()?.get("modals")?.as_array()?;
-    Some(
+    let field = |key: &'static str| -> HashSet<String> {
         modals
             .iter()
-            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .filter_map(|m| m.get(key).and_then(|v| v.as_str()))
             .filter(|id| !id.is_empty())
             .map(str::to_string)
-            .collect(),
-    )
+            .collect()
+    };
+    Some(ModalIdentities {
+        ids: field("id"),
+        bridge_ids: field("bridgeId"),
+    })
 }
 
 /// Is `occluded_by` one of the tracked modals, BY IDENTITY?
 ///
 /// A port of the SDK's `isTrackedOverlay` (`visibility-report.ts`), rule for
-/// rule. Exactly two forms match:
+/// rule. Exactly three forms match:
 ///
 /// - `occluded_by == modal.id` — the occluder is registered under the modal's id;
+/// - `occluded_by == modal.bridgeId` — the occluder is named by the modal
+///   element's `data-ui-bridge-id`. Exact equality only: a `<tag>#<bridgeId>`
+///   descriptor names a DOM id, not a bridge id, and does NOT match;
 /// - `"<tag>#<modal.id>"` — an unregistered occluder whose DOM id is the
 ///   modal's. The split is at the FIRST `#` (the SDK's `indexOf('#')` +
 ///   `slice(hash + 1)`), so everything after it is compared whole.
@@ -1284,12 +1318,12 @@ pub(crate) fn modal_ids_from_context(context: &serde_json::Value) -> Option<Hash
 /// matched: they are not identities. An entry marked expected is DROPPED from
 /// the default response, so a loose rule would hide exactly the occlusion
 /// regressions this route exists to surface (`fc6838e`'s own rationale).
-fn is_tracked_overlay(occluded_by: &str, modal_ids: &HashSet<String>) -> bool {
-    if modal_ids.contains(occluded_by) {
+fn is_tracked_overlay(occluded_by: &str, modals: &ModalIdentities) -> bool {
+    if modals.ids.contains(occluded_by) || modals.bridge_ids.contains(occluded_by) {
         return true;
     }
     match occluded_by.split_once('#') {
-        Some((_, after_hash)) => modal_ids.contains(after_hash),
+        Some((_, after_hash)) => modals.ids.contains(after_hash),
         None => false,
     }
 }
@@ -1319,7 +1353,7 @@ pub(crate) fn build_visibility_report(
     elements: &[serde_json::Value],
     min_ratio: f64,
     include_expected: bool,
-    modal_ids: Option<&HashSet<String>>,
+    modal_ids: Option<&ModalIdentities>,
     canvas_coverage: Option<&CanvasCoverage>,
 ) -> serde_json::Value {
     let absent_coverage = CanvasCoverage::Unavailable {
@@ -2012,7 +2046,7 @@ mod visibility_tests {
             ]
         }))
         .expect("modals array present");
-        let mut ids: Vec<_> = ids.into_iter().collect();
+        let mut ids: Vec<_> = ids.ids.into_iter().collect();
         ids.sort();
         assert_eq!(
             ids,
@@ -2027,7 +2061,8 @@ mod visibility_tests {
     #[test]
     fn is_tracked_overlay_matches_identities_only() {
         use super::is_tracked_overlay;
-        let ids: std::collections::HashSet<String> = ["modal-1".to_string()].into_iter().collect();
+        let ids: super::ModalIdentities =
+            std::collections::HashSet::from(["modal-1".to_string()]).into();
 
         assert!(is_tracked_overlay("modal-1", &ids));
         assert!(is_tracked_overlay("div#modal-1", &ids));
@@ -2048,8 +2083,56 @@ mod visibility_tests {
         );
         assert!(!is_tracked_overlay(
             "modal-1",
-            &std::collections::HashSet::new()
+            &super::ModalIdentities::default()
         ));
+    }
+
+    /// SDK `ModalInfo.bridgeId`: an occluder named by the modal element's
+    /// `data-ui-bridge-id` is the tracked modal, by exact equality only.
+    #[test]
+    fn is_tracked_overlay_matches_the_modal_bridge_id_exactly() {
+        use super::{is_tracked_overlay, modal_ids_from_context};
+        let modals = modal_ids_from_context(&json!({
+            "modals": [
+                { "id": "settings-dialog", "bridgeId": "bridge-settings" },
+                { "id": "no-bridge" },
+                { "id": "empty-bridge", "bridgeId": "" },
+                { "id": "numeric-bridge", "bridgeId": 9 },
+            ]
+        }))
+        .expect("modals array present");
+        assert_eq!(
+            modals.bridge_ids,
+            std::collections::HashSet::from(["bridge-settings".to_string()]),
+            "absent, empty and non-string bridgeIds are skipped"
+        );
+
+        assert!(is_tracked_overlay("bridge-settings", &modals));
+        assert!(
+            is_tracked_overlay("settings-dialog", &modals),
+            "the modal.id rule still holds"
+        );
+        assert!(
+            !is_tracked_overlay("div#bridge-settings", &modals),
+            "`<tag>#x` names a DOM id; a bridgeId is not one"
+        );
+        assert!(!is_tracked_overlay("bridge-settings-2", &modals));
+
+        // End to end: the overlay is classified as expected and filtered.
+        let elements = vec![el(
+            "btn-save",
+            "Save",
+            json!({ "occludedBy": "bridge-settings", "occludedPct": 40, "textContent": "Save" }),
+        )];
+        let report = build_visibility_report(
+            &elements,
+            0.02,
+            false,
+            Some(&modals),
+            Some(&CanvasCoverage::measured_empty()),
+        );
+        assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
+        assert_eq!(report["expectedOverlaysFiltered"], json!(1));
     }
 
     /// A canvas surface (`paintsText: true`) has no DOM text, so the DOM rule

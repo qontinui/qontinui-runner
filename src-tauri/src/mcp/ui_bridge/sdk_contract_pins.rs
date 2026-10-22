@@ -63,7 +63,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use super::relay::tabs_response_body;
-use super::screenshots::{build_visibility_report, VisibilityRequest};
+use super::screenshots::{build_visibility_report, ModalIdentities, VisibilityRequest};
 use super::visibility_canvas::CanvasCoverage;
 
 // ---------------------------------------------------------------------------
@@ -583,7 +583,7 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
 #[test]
 fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
     use std::collections::HashSet;
-    let modal_ids: HashSet<String> = ["modal-1".to_string()].into_iter().collect();
+    let modal_ids: ModalIdentities = HashSet::from(["modal-1".to_string()]).into();
     let elements = [occluded_element("btn-save", "modal-1", 40.0, "Save")];
 
     // Default (`includeExpected: false`): the modal overlay is DROPPED and COUNTED.
