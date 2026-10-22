@@ -8654,6 +8654,10 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .unwrap_or_default();
+        // Every async fn, whatever its visibility, starts a chunk of its own.
+        let production = production
+            .replace("\npub(crate) async fn ", "\nasync fn ")
+            .replace("\npub async fn ", "\nasync fn ");
         let mut exempt_seen = Vec::new();
         for chunk in production.split("\nasync fn ").skip(1) {
             let name = chunk.split('(').next().unwrap_or_default();
@@ -8664,6 +8668,7 @@ mod tests {
                 "dispatch_active(",
                 "sdk_request(",
                 "try_ws_dispatch(",
+                "sdk_media_override_",
             ]
             .iter()
             .any(|d| chunk.contains(d));
@@ -9650,10 +9655,17 @@ mod media_override_dispatch_tests {
     async fn the_sdk_list_asks_the_active_app_for_its_overrides() {
         let (d, c) = http_app().await;
         let out = sdk_media_override_list(&d, &c).await;
-        assert_eq!(
-            out["got"],
-            Value::Null,
-            "the HTTP arm's GET carries no body: {out}"
-        );
+        // The app answered (a failed dispatch has no `got` either, so `Null`
+        // alone would not tell the two apart) ...
+        assert_eq!(out["success"], json!(true), "{out}");
+        assert!(out.get("got").is_some(), "{out}");
+        // ... and the HTTP arm's GET carried no body.
+        assert_eq!(out["got"], Value::Null, "{out}");
+
+        let frame = websocket_frame(|(d, c)| {
+            tokio::spawn(async move { sdk_media_override_list(&d, &c).await })
+        })
+        .await;
+        assert_eq!(frame, json!({}));
     }
 }
